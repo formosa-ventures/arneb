@@ -1,0 +1,25 @@
+[workspace]
+members = ["crates/common"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Error handling
+thiserror = "2"
+
+# Serialization & config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Logging & tracing
+tracing = "0.1"
+
+# Arrow columnar format
+arrow = { version = "54", default-features = false }
+
+# Numeric utilities
+num_cpus = "1"

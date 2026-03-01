@@ -1,0 +1,14 @@
+# Build artifacts
+/target/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# Agent configs
+.agents/

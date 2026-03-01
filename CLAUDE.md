@@ -95,6 +95,34 @@ SQL String
 - **Trait-based connectors**: `DataSource` trait abstracts all data access. Adding a new connector = implementing the trait.
 - **Pushdown-first**: Push filters, projections, and limits into connectors whenever possible.
 
+## MVP Phase 1 Roadmap
+
+Eight changes implemented sequentially via OpenSpec (`openspec/changes/`):
+
+| # | Change | Crate | Status | Description |
+|---|--------|-------|--------|-------------|
+| 1 | `common-foundation` | `crates/common` | Done | Shared types (`DataType`, `ScalarValue`, `TableReference`, `ColumnInfo`), error hierarchy (`TrinoError`, `PlanError`, `CatalogError`, etc.), config types |
+| 2 | `sql-parsing` | `crates/sql-parser` | Done | SQL string → AST via `sqlparser-rs`. Custom AST types (`Statement`, `Query`, `Expr`, `SelectItem`, `JoinType`, etc.) |
+| 3 | `catalog-system` | `crates/catalog` | Done | Catalog traits (`CatalogProvider`, `SchemaProvider`, `TableProvider`), in-memory impls, `CatalogManager` with 3-part table resolution |
+| 4 | `query-planning` | `crates/planner` | In Progress | AST → `LogicalPlan` tree. `PlanExpr` (index-based column refs), `QueryPlanner` using `CatalogManager` for table/column resolution |
+| 5 | `execution-engine` | `crates/execution` | Not Started | `PhysicalPlan` operators, vectorized execution on Arrow `RecordBatch` streams |
+| 6 | `connectors-mvp` | `crates/connectors` | Not Started | `DataSource` trait, in-memory connector, CSV/Parquet file connectors |
+| 7 | `pg-wire-protocol` | `crates/protocol` | Not Started | PostgreSQL wire protocol handler for client compatibility |
+| 8 | `server-integration` | `crates/server` | Not Started | Main binary, service orchestration, end-to-end query pipeline |
+
+### Dependency Chain
+
+```
+common-foundation
+  → sql-parsing
+  → catalog-system
+    → query-planning
+      → execution-engine
+        → connectors-mvp
+          → pg-wire-protocol
+            → server-integration
+```
+
 ## Conventions
 
 - Use `thiserror` for library error types, `anyhow` only in binaries/tests.

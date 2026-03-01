@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common"]
+members = ["crates/common", "crates/sql-parser"]
 resolver = "2"
 
 [workspace.package]
@@ -23,3 +23,6 @@ arrow = { version = "54", default-features = false }
 
 # Numeric utilities
 num_cpus = "1"
+
+# SQL parsing
+sqlparser = { version = "0.61", default-features = false, features = ["std"] }

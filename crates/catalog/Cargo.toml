@@ -1,0 +1,8 @@
+[package]
+name = "trino-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+trino-common = { path = "../common" }

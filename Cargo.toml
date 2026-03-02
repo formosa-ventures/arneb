@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/sql-parser", "crates/catalog"]
+members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner"]
 resolver = "2"
 
 [workspace.package]

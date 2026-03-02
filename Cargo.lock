@@ -872,6 +872,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "trino-planner"
+version = "0.1.0"
+dependencies = [
+ "trino-catalog",
+ "trino-common",
+ "trino-sql-parser",
+]
+
+[[package]]
 name = "trino-sql-parser"
 version = "0.1.0"
 dependencies = [

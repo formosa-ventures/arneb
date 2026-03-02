@@ -1,0 +1,16 @@
+[package]
+name = "trino-connectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+trino-common = { path = "../common" }
+trino-catalog = { path = "../catalog" }
+trino-execution = { path = "../execution" }
+arrow.workspace = true
+arrow-csv.workspace = true
+parquet.workspace = true
+
+[dev-dependencies]
+tempfile = "=3.14.0"

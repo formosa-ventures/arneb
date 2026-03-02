@@ -106,7 +106,7 @@ Eight changes implemented sequentially via OpenSpec (`openspec/changes/`):
 | 3 | `catalog-system` | `crates/catalog` | Done | Catalog traits (`CatalogProvider`, `SchemaProvider`, `TableProvider`), in-memory impls, `CatalogManager` with 3-part table resolution |
 | 4 | `query-planning` | `crates/planner` | Done | AST → `LogicalPlan` tree. `PlanExpr` (index-based column refs), `QueryPlanner` using `CatalogManager` for table/column resolution |
 | 5 | `execution-engine` | `crates/execution` | Done | `ExecutionPlan` operators (scan, filter, project, join, aggregate, sort, limit, explain), `DataSource` trait, expression evaluator, `ExecutionContext` physical planner |
-| 6 | `connectors-mvp` | `crates/connectors` | Not Started | `DataSource` trait, in-memory connector, CSV/Parquet file connectors |
+| 6 | `connectors-mvp` | `crates/connectors` | Done | `ConnectorFactory` trait, `ConnectorRegistry`, in-memory connector (MemoryTable/Schema/Catalog), file connector (CSV + Parquet with `FileConnectorFactory`) |
 | 7 | `pg-wire-protocol` | `crates/protocol` | Not Started | PostgreSQL wire protocol handler for client compatibility |
 | 8 | `server-integration` | `crates/server` | Not Started | Main binary, service orchestration, end-to-end query pipeline |
 

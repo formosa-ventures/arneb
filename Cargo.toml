@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution"]
+members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution", "crates/connectors"]
 resolver = "2"
 
 [workspace.package]
@@ -20,6 +20,8 @@ tracing = "0.1"
 
 # Arrow columnar format
 arrow = { version = "54", default-features = false }
+arrow-csv = { version = "54", default-features = false }
+parquet = { version = "54", default-features = false, features = ["arrow"] }
 
 # Numeric utilities
 num_cpus = "1"

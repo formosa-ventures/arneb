@@ -1,0 +1,14 @@
+[package]
+name = "trino-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+trino-common = { path = "../common" }
+trino-planner = { path = "../planner" }
+trino-sql-parser = { path = "../sql-parser" }
+arrow.workspace = true
+
+[dev-dependencies]
+trino-catalog = { path = "../catalog" }

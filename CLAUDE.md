@@ -104,8 +104,8 @@ Eight changes implemented sequentially via OpenSpec (`openspec/changes/`):
 | 1 | `common-foundation` | `crates/common` | Done | Shared types (`DataType`, `ScalarValue`, `TableReference`, `ColumnInfo`), error hierarchy (`TrinoError`, `PlanError`, `CatalogError`, etc.), config types |
 | 2 | `sql-parsing` | `crates/sql-parser` | Done | SQL string → AST via `sqlparser-rs`. Custom AST types (`Statement`, `Query`, `Expr`, `SelectItem`, `JoinType`, etc.) |
 | 3 | `catalog-system` | `crates/catalog` | Done | Catalog traits (`CatalogProvider`, `SchemaProvider`, `TableProvider`), in-memory impls, `CatalogManager` with 3-part table resolution |
-| 4 | `query-planning` | `crates/planner` | In Progress | AST → `LogicalPlan` tree. `PlanExpr` (index-based column refs), `QueryPlanner` using `CatalogManager` for table/column resolution |
-| 5 | `execution-engine` | `crates/execution` | Not Started | `PhysicalPlan` operators, vectorized execution on Arrow `RecordBatch` streams |
+| 4 | `query-planning` | `crates/planner` | Done | AST → `LogicalPlan` tree. `PlanExpr` (index-based column refs), `QueryPlanner` using `CatalogManager` for table/column resolution |
+| 5 | `execution-engine` | `crates/execution` | Done | `ExecutionPlan` operators (scan, filter, project, join, aggregate, sort, limit, explain), `DataSource` trait, expression evaluator, `ExecutionContext` physical planner |
 | 6 | `connectors-mvp` | `crates/connectors` | Not Started | `DataSource` trait, in-memory connector, CSV/Parquet file connectors |
 | 7 | `pg-wire-protocol` | `crates/protocol` | Not Started | PostgreSQL wire protocol handler for client compatibility |
 | 8 | `server-integration` | `crates/server` | Not Started | Main binary, service orchestration, end-to-end query pipeline |

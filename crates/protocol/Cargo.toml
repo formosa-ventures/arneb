@@ -1,0 +1,40 @@
+[package]
+name = "trino-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Internal crates
+trino-common = { path = "../common" }
+trino-sql-parser = { path = "../sql-parser" }
+trino-catalog = { path = "../catalog" }
+trino-planner = { path = "../planner" }
+trino-execution = { path = "../execution" }
+trino-connectors = { path = "../connectors" }
+
+# Arrow columnar format
+arrow = { workspace = true }
+
+# Async runtime & networking
+tokio = { workspace = true }
+
+# PostgreSQL wire protocol
+pgwire = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+chrono = "0.4"
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
+pgwire = { workspace = true }

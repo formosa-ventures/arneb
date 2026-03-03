@@ -1,0 +1,40 @@
+[package]
+name = "trino-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "trino-alt"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+trino-common = { path = "../common" }
+trino-catalog = { path = "../catalog" }
+trino-connectors = { path = "../connectors" }
+trino-protocol = { path = "../protocol" }
+
+# Async runtime
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "signal"] }
+
+# CLI argument parsing
+clap = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Config
+serde = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time", "signal"] }
+pgwire = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true, features = ["arrow"] }
+tempfile = "3"

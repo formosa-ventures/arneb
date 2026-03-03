@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution", "crates/connectors", "crates/protocol"]
+members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution", "crates/connectors", "crates/protocol", "crates/server"]
 resolver = "2"
 
 [workspace.package]
@@ -31,6 +31,15 @@ sqlparser = { version = "0.61", default-features = false, features = ["std"] }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Logging subscriber
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling (binary)
+anyhow = "1"
 
 # PostgreSQL wire protocol
 pgwire = "0.25"

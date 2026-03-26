@@ -169,6 +169,35 @@ pub enum LogicalPlan {
         /// The plan to explain.
         input: Box<LogicalPlan>,
     },
+    /// Exchange boundary between distributed fragments.
+    ExchangeNode {
+        /// The stage that produces this exchange's data.
+        stage_id: trino_common::identifiers::StageId,
+        /// Output schema.
+        schema: Vec<ColumnInfo>,
+    },
+    /// Partial (map-side) aggregation for distributed execution.
+    PartialAggregate {
+        /// Input plan.
+        input: Box<LogicalPlan>,
+        /// Group-by expressions.
+        group_by: Vec<PlanExpr>,
+        /// Aggregate expressions.
+        aggr_exprs: Vec<PlanExpr>,
+        /// Output schema.
+        schema: Vec<ColumnInfo>,
+    },
+    /// Final (reduce-side) aggregation combining partial results.
+    FinalAggregate {
+        /// Input plan (typically an ExchangeNode).
+        input: Box<LogicalPlan>,
+        /// Group-by expressions.
+        group_by: Vec<PlanExpr>,
+        /// Aggregate expressions.
+        aggr_exprs: Vec<PlanExpr>,
+        /// Output schema.
+        schema: Vec<ColumnInfo>,
+    },
 }
 
 /// A join condition in a logical plan.
@@ -196,6 +225,9 @@ impl LogicalPlan {
             LogicalPlan::Sort { input, .. } => input.schema(),
             LogicalPlan::Limit { input, .. } => input.schema(),
             LogicalPlan::Explain { input } => input.schema(),
+            LogicalPlan::ExchangeNode { schema, .. } => schema.clone(),
+            LogicalPlan::PartialAggregate { schema, .. } => schema.clone(),
+            LogicalPlan::FinalAggregate { schema, .. } => schema.clone(),
         }
     }
 }
@@ -374,6 +406,47 @@ fn fmt_plan(plan: &LogicalPlan, f: &mut fmt::Formatter<'_>, indent: usize) -> fm
         }
         LogicalPlan::Explain { input } => {
             writeln!(f, "{pad}Explain:")?;
+            fmt_plan(input, f, indent + 1)
+        }
+        LogicalPlan::ExchangeNode { stage_id, schema } => {
+            write!(
+                f,
+                "{pad}Exchange: stage={stage_id} [{}]",
+                schema
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        LogicalPlan::PartialAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            ..
+        } => {
+            let gb: Vec<String> = group_by.iter().map(|e| e.to_string()).collect();
+            let agg: Vec<String> = aggr_exprs.iter().map(|e| e.to_string()).collect();
+            write!(f, "{pad}PartialAggregate: group_by=[{}]", gb.join(", "))?;
+            if !agg.is_empty() {
+                write!(f, ", aggr=[{}]", agg.join(", "))?;
+            }
+            writeln!(f)?;
+            fmt_plan(input, f, indent + 1)
+        }
+        LogicalPlan::FinalAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            ..
+        } => {
+            let gb: Vec<String> = group_by.iter().map(|e| e.to_string()).collect();
+            let agg: Vec<String> = aggr_exprs.iter().map(|e| e.to_string()).collect();
+            write!(f, "{pad}FinalAggregate: group_by=[{}]", gb.join(", "))?;
+            if !agg.is_empty() {
+                write!(f, ", aggr=[{}]", agg.join(", "))?;
+            }
+            writeln!(f)?;
             fmt_plan(input, f, indent + 1)
         }
     }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution", "crates/connectors", "crates/protocol", "crates/server"]
+members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution", "crates/connectors", "crates/protocol", "crates/server", "crates/scheduler", "crates/rpc"]
 resolver = "2"
 
 [workspace.package]
@@ -46,3 +46,4 @@ pgwire = "0.25"
 async-trait = "0.1"
 futures = "0.3"
 bytes = "1"
+uuid = { version = "1", features = ["v4"] }

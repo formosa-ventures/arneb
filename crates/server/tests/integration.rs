@@ -237,6 +237,261 @@ async fn test_query_nonexistent_table_returns_error() {
     );
 }
 
+// ===========================================================================
+// Phase 2 Integration Tests
+// ===========================================================================
+
+fn create_server_with_two_tables() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
+    use arrow::array::StringArray;
+    use trino_common::types::{ColumnInfo, DataType};
+    use trino_connectors::memory::MemoryTable;
+
+    // Users table: id, name
+    let users_schema = Arc::new(Schema::new(vec![
+        Field::new("id", ArrowDataType::Int32, false),
+        Field::new("name", ArrowDataType::Utf8, false),
+    ]));
+    let users_batch = RecordBatch::try_new(
+        users_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Carol"])),
+        ],
+    )
+    .unwrap();
+    let users_table = Arc::new(MemoryTable::new(
+        vec![
+            ColumnInfo {
+                name: "id".into(),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "name".into(),
+                data_type: DataType::Utf8,
+                nullable: false,
+            },
+        ],
+        vec![users_batch],
+    ));
+
+    // Orders table: id, user_id, amount
+    let orders_schema = Arc::new(Schema::new(vec![
+        Field::new("id", ArrowDataType::Int32, false),
+        Field::new("user_id", ArrowDataType::Int32, false),
+        Field::new("amount", ArrowDataType::Float64, false),
+    ]));
+    let orders_batch = RecordBatch::try_new(
+        orders_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![10, 20, 30, 40])),
+            Arc::new(Int32Array::from(vec![1, 2, 1, 3])),
+            Arc::new(Float64Array::from(vec![100.0, 200.0, 150.0, 300.0])),
+        ],
+    )
+    .unwrap();
+    let orders_table = Arc::new(MemoryTable::new(
+        vec![
+            ColumnInfo {
+                name: "id".into(),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "user_id".into(),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "amount".into(),
+                data_type: DataType::Float64,
+                nullable: false,
+            },
+        ],
+        vec![orders_batch],
+    ));
+
+    let mem_schema = Arc::new(MemorySchema::new());
+    mem_schema.register_table("users", users_table);
+    mem_schema.register_table("orders", orders_table);
+    let mem_catalog = Arc::new(MemoryCatalog::new());
+    mem_catalog.register_schema("default", mem_schema);
+
+    let factory = MemoryConnectorFactory::new(mem_catalog.clone(), "default");
+
+    let catalog_manager = Arc::new(CatalogManager::new("memory", "default"));
+    catalog_manager.register_catalog("memory", mem_catalog);
+
+    let mut registry = ConnectorRegistry::new();
+    registry.register("memory", Arc::new(factory));
+
+    (catalog_manager, Arc::new(registry))
+}
+
+/// Count DataRow ('D') messages in a PG wire response.
+fn count_data_rows(data: &[u8]) -> usize {
+    let mut count = 0;
+    let mut pos = 0;
+    while pos < data.len() {
+        if data[pos] == b'D' {
+            count += 1;
+        }
+        if pos + 5 <= data.len() {
+            let len =
+                i32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+                    as usize;
+            pos += 1 + len;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+#[tokio::test]
+async fn test_phase2_join_query() {
+    let (cm, cr) = create_server_with_two_tables();
+    let addr = start_test_server(cm, cr).await;
+
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(&build_startup_message("test", "test"))
+        .await
+        .unwrap();
+    let _ = read_response(&mut stream).await;
+
+    // Hash join: users JOIN orders ON users.id = orders.user_id
+    stream
+        .write_all(&build_query_message(
+            "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id",
+        ))
+        .await
+        .unwrap();
+    let response = read_response(&mut stream).await;
+
+    assert!(
+        response_contains_message_type(&response, b'T'),
+        "expected RowDescription for JOIN query"
+    );
+    assert!(
+        response_contains_message_type(&response, b'D'),
+        "expected DataRow for JOIN query — hash join should produce results"
+    );
+    // Should have 4 rows (Alice×100, Bob×200, Alice×150, Carol×300)
+    let row_count = count_data_rows(&response);
+    assert_eq!(row_count, 4, "JOIN should produce 4 rows");
+}
+
+#[tokio::test]
+async fn test_phase2_where_filter() {
+    let (cm, cr) = create_server_with_two_tables();
+    let addr = start_test_server(cm, cr).await;
+
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(&build_startup_message("test", "test"))
+        .await
+        .unwrap();
+    let _ = read_response(&mut stream).await;
+
+    // WHERE filter: only id > 1
+    stream
+        .write_all(&build_query_message(
+            "SELECT id, name FROM users WHERE id > 1",
+        ))
+        .await
+        .unwrap();
+    let response = read_response(&mut stream).await;
+
+    let row_count = count_data_rows(&response);
+    assert_eq!(
+        row_count, 2,
+        "WHERE id > 1 should return 2 rows (Bob, Carol)"
+    );
+}
+
+#[tokio::test]
+async fn test_phase2_projection_subset() {
+    let (cm, cr) = create_server_with_two_tables();
+    let addr = start_test_server(cm, cr).await;
+
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(&build_startup_message("test", "test"))
+        .await
+        .unwrap();
+    let _ = read_response(&mut stream).await;
+
+    // Projection: select only 'name' column
+    stream
+        .write_all(&build_query_message("SELECT name FROM users"))
+        .await
+        .unwrap();
+    let response = read_response(&mut stream).await;
+
+    assert!(
+        response_contains_message_type(&response, b'T'),
+        "expected RowDescription for projection query"
+    );
+    let row_count = count_data_rows(&response);
+    assert_eq!(row_count, 3, "SELECT name should return 3 rows");
+}
+
+#[tokio::test]
+async fn test_phase2_order_by_limit() {
+    let (cm, cr) = create_server_with_two_tables();
+    let addr = start_test_server(cm, cr).await;
+
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(&build_startup_message("test", "test"))
+        .await
+        .unwrap();
+    let _ = read_response(&mut stream).await;
+
+    // ORDER BY + LIMIT
+    stream
+        .write_all(&build_query_message(
+            "SELECT id, name FROM users ORDER BY id DESC LIMIT 2",
+        ))
+        .await
+        .unwrap();
+    let response = read_response(&mut stream).await;
+
+    let row_count = count_data_rows(&response);
+    assert_eq!(row_count, 2, "LIMIT 2 should return 2 rows");
+}
+
+#[tokio::test]
+async fn test_phase2_explain_plan() {
+    let (cm, cr) = create_server_with_two_tables();
+    let addr = start_test_server(cm, cr).await;
+
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(&build_startup_message("test", "test"))
+        .await
+        .unwrap();
+    let _ = read_response(&mut stream).await;
+
+    stream
+        .write_all(&build_query_message(
+            "EXPLAIN SELECT name FROM users WHERE id > 1",
+        ))
+        .await
+        .unwrap();
+    let response = read_response(&mut stream).await;
+
+    assert!(
+        response_contains_message_type(&response, b'T'),
+        "EXPLAIN should return RowDescription"
+    );
+    assert!(
+        response_contains_message_type(&response, b'D'),
+        "EXPLAIN should return plan text as DataRow"
+    );
+}
+
 #[test]
 fn test_protocol_config_derivation() {
     let config = ProtocolConfig {

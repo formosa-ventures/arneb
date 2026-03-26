@@ -10,7 +10,7 @@ use trino_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySche
 use trino_connectors::ConnectorRegistry;
 use trino_protocol::{ProtocolConfig, ProtocolServer};
 
-use crate::config::{parse_data_type, AppConfig};
+use crate::config::{parse_data_type, AppConfig, ServerRole};
 
 /// trino-alt — Distributed SQL query engine
 #[derive(Parser)]
@@ -27,6 +27,10 @@ struct CliArgs {
     /// Override listen port
     #[arg(long)]
     port: Option<u16>,
+
+    /// Server role: standalone (default), coordinator, or worker
+    #[arg(long, default_value = "standalone")]
+    role: String,
 }
 
 #[tokio::main]
@@ -45,10 +49,13 @@ async fn main() -> Result<()> {
     if let Some(port) = args.port {
         config.server.port = port;
     }
+    config.cluster.role = args.role;
     config
         .server
         .validate()
         .context("configuration validation failed")?;
+
+    let role = ServerRole::parse(&config.cluster.role).context("invalid server role")?;
 
     // 4. Initialize tracing
     tracing_subscriber::fmt()
@@ -139,25 +146,123 @@ async fn main() -> Result<()> {
     let connector_registry = Arc::new(connector_registry);
     let server = ProtocolServer::new(protocol_config, catalog_manager, connector_registry);
 
-    // 8. Startup banner
-    tracing::info!(
-        address = %listen_addr,
-        tables = table_count,
-        "trino-alt listening"
-    );
+    // 8. Set up Flight RPC server + heartbeat handling
+    let node_registry = trino_scheduler::NodeRegistry::default();
+    let rpc_addr = format!("{}:{}", config.server.bind_address, config.cluster.rpc_port);
 
-    // 9. Run server with graceful shutdown
+    let flight_state = match role {
+        ServerRole::Coordinator | ServerRole::Standalone => {
+            // Coordinator receives heartbeats from workers.
+            let registry = node_registry.clone();
+            trino_rpc::FlightState::with_heartbeat_callback(std::sync::Arc::new(
+                move |msg: trino_rpc::HeartbeatMessage| {
+                    registry.heartbeat(msg.worker_id, msg.flight_address, msg.max_splits);
+                },
+            ))
+        }
+        ServerRole::Worker => {
+            // Workers don't receive heartbeats, just serve data.
+            trino_rpc::FlightState::new()
+        }
+    };
+
+    // 9. Startup banner
+    match role {
+        ServerRole::Worker => {
+            tracing::info!(
+                rpc_address = %rpc_addr,
+                role = %config.cluster.role,
+                "trino-alt worker starting"
+            );
+        }
+        _ => {
+            tracing::info!(
+                pgwire_address = %listen_addr,
+                rpc_address = %rpc_addr,
+                role = %config.cluster.role,
+                tables = table_count,
+                "trino-alt listening"
+            );
+        }
+    }
+
+    // 10. Run services based on role
+    let flight_state_clone = flight_state.clone();
+    let rpc_addr_clone = rpc_addr.clone();
+
     tokio::select! {
-        result = server.start() => {
+        // pgwire server (coordinator + standalone only)
+        result = server.start(), if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) => {
             if let Err(e) = result {
-                tracing::error!(error = %e, "server error");
+                tracing::error!(error = %e, "pgwire server error");
                 bail!("server error: {e}");
             }
         }
+        // Flight RPC server (all roles)
+        result = trino_rpc::start_flight_server(&rpc_addr_clone, flight_state_clone) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "flight server error");
+                bail!("flight server error: {e}");
+            }
+        }
+        // Worker heartbeat loop
+        _ = worker_heartbeat_loop(role, &config, &rpc_addr) => {}
+        // Graceful shutdown
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");
         }
     }
 
     Ok(())
+}
+
+/// Periodically send heartbeat to coordinator (worker mode only).
+async fn worker_heartbeat_loop(role: ServerRole, config: &AppConfig, my_rpc_addr: &str) {
+    if !matches!(role, ServerRole::Worker) {
+        // Non-workers just wait forever (this future is never selected).
+        futures::future::pending::<()>().await;
+        return;
+    }
+
+    let coordinator_address = match &config.cluster.coordinator_address {
+        Some(addr) => format!("http://{addr}"),
+        None => {
+            tracing::error!("worker mode requires --coordinator-address");
+            return;
+        }
+    };
+
+    let worker_id = config
+        .cluster
+        .worker_id
+        .clone()
+        .unwrap_or_else(|| format!("worker-{}", uuid::Uuid::new_v4()));
+
+    let message = trino_rpc::HeartbeatMessage {
+        worker_id: worker_id.clone(),
+        flight_address: format!("http://{my_rpc_addr}"),
+        max_splits: 256,
+    };
+
+    tracing::info!(
+        worker_id = %worker_id,
+        coordinator = %coordinator_address,
+        "starting heartbeat loop"
+    );
+
+    loop {
+        match trino_rpc::send_heartbeat(&coordinator_address, &message).await {
+            Ok(()) => {
+                tracing::debug!(worker_id = %worker_id, "heartbeat sent");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    worker_id = %worker_id,
+                    error = %e,
+                    "heartbeat failed"
+                );
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
 }

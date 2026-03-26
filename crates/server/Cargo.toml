@@ -14,9 +14,13 @@ trino-common = { path = "../common" }
 trino-catalog = { path = "../catalog" }
 trino-connectors = { path = "../connectors" }
 trino-protocol = { path = "../protocol" }
+trino-scheduler = { path = "../scheduler" }
+trino-rpc = { path = "../rpc" }
 
 # Async runtime
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "signal", "time"] }
+futures.workspace = true
+uuid.workspace = true
 
 # CLI argument parsing
 clap = { workspace = true }

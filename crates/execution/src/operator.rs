@@ -1,12 +1,14 @@
 //! Physical execution operators.
 //!
-//! Each operator implements [`ExecutionPlan`] and produces [`RecordBatch`]es
-//! from its children. Operators are assembled into a tree by the physical
-//! planner in [`super::planner`].
+//! Each operator implements [`ExecutionPlan`] and produces a
+//! [`SendableRecordBatchStream`] from its children. Operators are assembled
+//! into a tree by the physical planner in [`super::planner`].
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow::array::{
     self, Array, ArrayRef, AsArray, BooleanArray, Float32Array, Float64Array, Int32Array,
@@ -14,7 +16,12 @@ use arrow::array::{
 };
 use arrow::compute;
 use arrow::datatypes::{self, DataType as ArrowDataType, Field, Schema};
+use async_trait::async_trait;
+use futures::stream::Stream;
 use trino_common::error::ExecutionError;
+use trino_common::stream::{
+    collect_stream, stream_from_batches, RecordBatchStream, SendableRecordBatchStream,
+};
 use trino_common::types::{ColumnInfo, ScalarValue};
 use trino_planner::{LogicalPlan, PlanExpr, SortExpr};
 use trino_sql_parser::ast;
@@ -22,14 +29,16 @@ use trino_sql_parser::ast;
 use crate::aggregate::{self, Accumulator};
 use crate::datasource::DataSource;
 use crate::expression;
+use crate::scan_context::ScanContext;
 
-/// A physical execution operator that produces record batches.
+/// A physical execution operator that produces a stream of record batches.
+#[async_trait]
 pub trait ExecutionPlan: Send + Sync + Debug {
     /// The output schema of this operator.
     fn schema(&self) -> Vec<ColumnInfo>;
 
-    /// Executes the operator and returns all result batches.
-    fn execute(&self) -> Result<Vec<RecordBatch>, ExecutionError>;
+    /// Executes the operator and returns a stream of result batches.
+    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError>;
 
     /// A short display name for EXPLAIN output.
     fn display_name(&self) -> &str;
@@ -44,15 +53,17 @@ pub trait ExecutionPlan: Send + Sync + Debug {
 pub(crate) struct ScanExec {
     pub(crate) source: Arc<dyn DataSource>,
     pub(crate) _table_name: String,
+    pub(crate) scan_context: ScanContext,
 }
 
+#[async_trait]
 impl ExecutionPlan for ScanExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         self.source.schema()
     }
 
-    fn execute(&self) -> Result<Vec<RecordBatch>, ExecutionError> {
-        self.source.scan()
+    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
+        self.source.scan(&self.scan_context).await
     }
 
     fn display_name(&self) -> &str {
@@ -72,39 +83,42 @@ pub(crate) struct ProjectionExec {
     pub(crate) output_schema: Vec<ColumnInfo>,
 }
 
+#[async_trait]
 impl ExecutionPlan for ProjectionExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         self.output_schema.clone()
     }
 
-    fn execute(&self) -> Result<Vec<RecordBatch>, ExecutionError> {
-        let batches = self.input.execute()?;
-        let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
+    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let input_stream = self.input.execute().await?;
+        let exprs = self.exprs.clone();
+        let output_schema = self.output_schema.clone();
+        let arrow_schema = crate::datasource::column_info_to_arrow_schema(&output_schema);
 
-        let mut result = Vec::with_capacity(batches.len());
-        for batch in &batches {
-            let columns: Vec<ArrayRef> = self
-                .exprs
-                .iter()
-                .map(|e| expression::evaluate(e, batch))
-                .collect::<Result<_, _>>()?;
+        Ok(Box::pin(MapStream::new(
+            input_stream,
+            arrow_schema.clone(),
+            move |batch| {
+                let columns: Vec<ArrayRef> = exprs
+                    .iter()
+                    .map(|e| expression::evaluate(e, &batch))
+                    .collect::<Result<_, _>>()?;
 
-            // Cast columns to match output schema types if needed.
-            let columns = columns
-                .into_iter()
-                .zip(arrow_schema.fields())
-                .map(|(col, field)| {
-                    if col.data_type() != field.data_type() {
-                        compute::cast(&col, field.data_type()).map_err(ExecutionError::from)
-                    } else {
-                        Ok(col)
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                let columns = columns
+                    .into_iter()
+                    .zip(arrow_schema.fields())
+                    .map(|(col, field)| {
+                        if col.data_type() != field.data_type() {
+                            compute::cast(&col, field.data_type()).map_err(ExecutionError::from)
+                        } else {
+                            Ok(col)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
-            result.push(RecordBatch::try_new(arrow_schema.clone(), columns)?);
-        }
-        Ok(result)
+                Ok(RecordBatch::try_new(arrow_schema.clone(), columns)?)
+            },
+        )))
     }
 
     fn display_name(&self) -> &str {
@@ -123,32 +137,39 @@ pub(crate) struct FilterExec {
     pub(crate) predicate: PlanExpr,
 }
 
+#[async_trait]
 impl ExecutionPlan for FilterExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         self.input.schema()
     }
 
-    fn execute(&self) -> Result<Vec<RecordBatch>, ExecutionError> {
-        let batches = self.input.execute()?;
-        let mut result = Vec::new();
+    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let input_stream = self.input.execute().await?;
+        let predicate = self.predicate.clone();
+        let schema = input_stream.schema();
 
-        for batch in &batches {
-            let mask_arr = expression::evaluate(&self.predicate, batch)?;
-            let mask = mask_arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    ExecutionError::InvalidOperation(
-                        "filter predicate must produce a boolean array".to_string(),
-                    )
-                })?;
+        Ok(Box::pin(FilterMapStream::new(
+            input_stream,
+            schema,
+            move |batch| {
+                let mask_arr = expression::evaluate(&predicate, &batch)?;
+                let mask = mask_arr
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        ExecutionError::InvalidOperation(
+                            "filter predicate must produce a boolean array".to_string(),
+                        )
+                    })?;
 
-            let filtered = compute::filter_record_batch(batch, mask)?;
-            if filtered.num_rows() > 0 {
-                result.push(filtered);
-            }
-        }
-        Ok(result)
+                let filtered = compute::filter_record_batch(&batch, mask)?;
+                if filtered.num_rows() > 0 {
+                    Ok(Some(filtered))
+                } else {
+                    Ok(None)
+                }
+            },
+        )))
     }
 
     fn display_name(&self) -> &str {
@@ -169,6 +190,7 @@ pub(crate) struct NestedLoopJoinExec {
     pub(crate) condition: trino_planner::JoinCondition,
 }
 
+#[async_trait]
 impl ExecutionPlan for NestedLoopJoinExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         let mut schema = self.left.schema();
@@ -176,42 +198,92 @@ impl ExecutionPlan for NestedLoopJoinExec {
         schema
     }
 
-    fn execute(&self) -> Result<Vec<RecordBatch>, ExecutionError> {
-        let left_batches = self.input_to_single_batch(&self.left)?;
-        let right_batches = self.input_to_single_batch(&self.right)?;
+    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let left_batches = self.collect_input(&self.left).await?;
+        let right_batches = self.collect_input(&self.right).await?;
 
         let left_batch = match left_batches {
             Some(b) => b,
-            None => return Ok(vec![]),
+            None => {
+                let schema = crate::datasource::column_info_to_arrow_schema(&self.schema());
+                return Ok(stream_from_batches(schema, vec![]));
+            }
         };
         let right_batch = match right_batches {
             Some(b) => b,
             None => {
                 return match self.join_type {
                     ast::JoinType::Left | ast::JoinType::Full => {
-                        self.left_unmatched_output(&left_batch, self.right.schema().len())
+                        let result =
+                            self.left_unmatched_output(&left_batch, self.right.schema().len())?;
+                        let schema = result.first().map(|b| b.schema()).unwrap_or_else(|| {
+                            crate::datasource::column_info_to_arrow_schema(&self.schema())
+                        });
+                        Ok(stream_from_batches(schema, result))
                     }
-                    _ => Ok(vec![]),
+                    _ => {
+                        let schema = crate::datasource::column_info_to_arrow_schema(&self.schema());
+                        Ok(stream_from_batches(schema, vec![]))
+                    }
                 };
             }
         };
 
+        let result = self.execute_join(&left_batch, &right_batch)?;
+        let schema = result
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| crate::datasource::column_info_to_arrow_schema(&self.schema()));
+        Ok(stream_from_batches(schema, result))
+    }
+
+    fn display_name(&self) -> &str {
+        "NestedLoopJoinExec"
+    }
+}
+
+impl NestedLoopJoinExec {
+    /// Collect all input batches into a single concatenated batch.
+    async fn collect_input(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<RecordBatch>, ExecutionError> {
+        let stream = plan.execute().await?;
+        let batches = collect_stream(stream).await.map_err(|e| {
+            ExecutionError::InvalidOperation(format!("failed to collect input: {e}"))
+        })?;
+        if batches.is_empty() {
+            return Ok(None);
+        }
+        let batch = if batches.len() == 1 {
+            batches.into_iter().next().unwrap()
+        } else {
+            arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?
+        };
+        if batch.num_rows() == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(batch))
+        }
+    }
+
+    fn execute_join(
+        &self,
+        left_batch: &RecordBatch,
+        right_batch: &RecordBatch,
+    ) -> Result<Vec<RecordBatch>, ExecutionError> {
         let left_rows = left_batch.num_rows();
         let right_rows = right_batch.num_rows();
+        let output_schema = self.build_output_schema(left_batch, right_batch);
 
-        // Build combined schema.
-        let output_schema = self.build_output_schema(&left_batch, &right_batch);
-
-        // Track which rows are matched (for outer joins).
         let mut left_matched = vec![false; left_rows];
         let mut right_matched = vec![false; right_rows];
-
         let mut left_indices = Vec::new();
         let mut right_indices = Vec::new();
 
         for (l, l_matched) in left_matched.iter_mut().enumerate() {
             for (r, r_matched) in right_matched.iter_mut().enumerate() {
-                let pass = self.eval_join_condition(l, r, &left_batch, &right_batch)?;
+                let pass = self.eval_join_condition(l, r, left_batch, right_batch)?;
                 if pass {
                     left_indices.push(l as u32);
                     right_indices.push(r as u32);
@@ -221,7 +293,6 @@ impl ExecutionPlan for NestedLoopJoinExec {
             }
         }
 
-        // Build matched rows.
         let mut result_columns = Vec::new();
         let left_idx_arr = UInt32Array::from(left_indices.clone());
         let right_idx_arr = UInt32Array::from(right_indices.clone());
@@ -299,40 +370,12 @@ impl ExecutionPlan for NestedLoopJoinExec {
         Ok(all_batches)
     }
 
-    fn display_name(&self) -> &str {
-        "NestedLoopJoinExec"
-    }
-}
-
-impl NestedLoopJoinExec {
-    /// Concatenate all input batches into one.
-    fn input_to_single_batch(
-        &self,
-        plan: &Arc<dyn ExecutionPlan>,
-    ) -> Result<Option<RecordBatch>, ExecutionError> {
-        let batches = plan.execute()?;
-        if batches.is_empty() {
-            return Ok(None);
-        }
-        let batch = if batches.len() == 1 {
-            batches.into_iter().next().unwrap()
-        } else {
-            arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?
-        };
-        if batch.num_rows() == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(batch))
-        }
-    }
-
     fn build_output_schema(&self, left: &RecordBatch, right: &RecordBatch) -> Arc<Schema> {
         let mut fields: Vec<Field> = left
             .schema()
             .fields()
             .iter()
             .map(|f| {
-                // For outer joins, left columns become nullable.
                 if matches!(self.join_type, ast::JoinType::Right | ast::JoinType::Full) {
                     Field::new(f.name(), f.data_type().clone(), true)
                 } else {
@@ -358,9 +401,8 @@ impl NestedLoopJoinExec {
         right_batch: &RecordBatch,
     ) -> Result<bool, ExecutionError> {
         match &self.condition {
-            trino_planner::JoinCondition::None => Ok(true), // CROSS JOIN
+            trino_planner::JoinCondition::None => Ok(true),
             trino_planner::JoinCondition::On(expr) => {
-                // Build a single-row combined batch for evaluating the join expr.
                 let combined =
                     self.build_combined_row(left_row, right_row, left_batch, right_batch)?;
                 let result = expression::evaluate(expr, &combined)?;
@@ -407,7 +449,6 @@ impl NestedLoopJoinExec {
         left_batch: &RecordBatch,
         right_cols: usize,
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
-        // Return left rows with nulls for right side.
         let schema = self.schema();
         let arrow_schema = crate::datasource::column_info_to_arrow_schema(&schema);
         let mut cols: Vec<ArrayRef> = Vec::new();
@@ -438,15 +479,39 @@ pub(crate) struct HashAggregateExec {
     pub(crate) output_schema: Vec<ColumnInfo>,
 }
 
+#[async_trait]
 impl ExecutionPlan for HashAggregateExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         self.output_schema.clone()
     }
 
-    fn execute(&self) -> Result<Vec<RecordBatch>, ExecutionError> {
-        let batches = self.input.execute()?;
+    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let stream = self.input.execute().await?;
+        let batches = collect_stream(stream).await.map_err(|e| {
+            ExecutionError::InvalidOperation(format!("failed to collect input: {e}"))
+        })?;
 
-        // Extract aggregate function metadata.
+        let result = self.execute_sync(&batches)?;
+        let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
+        Ok(stream_from_batches(arrow_schema, result))
+    }
+
+    fn display_name(&self) -> &str {
+        "HashAggregateExec"
+    }
+}
+
+#[derive(Debug)]
+struct AggrInfo {
+    name: String,
+    args: Vec<PlanExpr>,
+    is_count_star: bool,
+}
+
+type GroupState = (Vec<ScalarValue>, Vec<Box<dyn Accumulator>>);
+
+impl HashAggregateExec {
+    fn execute_sync(&self, batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, ExecutionError> {
         let aggr_info: Vec<AggrInfo> = self
             .aggr_exprs
             .iter()
@@ -466,27 +531,22 @@ impl ExecutionPlan for HashAggregateExec {
             .collect::<Result<_, _>>()?;
 
         if self.group_by.is_empty() {
-            // No grouping — single global aggregate.
-            return self.execute_no_grouping(&batches, &aggr_info);
+            return self.execute_no_grouping(batches, &aggr_info);
         }
 
-        // Group-by aggregation using a HashMap keyed by stringified group values.
         let mut groups: HashMap<String, GroupState> = HashMap::new();
 
-        for batch in &batches {
-            // Evaluate group-by columns.
+        for batch in batches {
             let group_cols: Vec<ArrayRef> = self
                 .group_by
                 .iter()
                 .map(|e| expression::evaluate(e, batch))
                 .collect::<Result<_, _>>()?;
 
-            // Evaluate aggregate input columns.
             let aggr_input_cols: Vec<ArrayRef> = aggr_info
                 .iter()
                 .map(|info| {
                     if info.is_count_star {
-                        // For COUNT(*), pass the first column as a placeholder.
                         Ok(batch.column(0).clone())
                     } else {
                         expression::evaluate(&info.args[0], batch)
@@ -519,26 +579,9 @@ impl ExecutionPlan for HashAggregateExec {
             }
         }
 
-        // Build output batch.
         self.build_aggregate_output(groups)
     }
 
-    fn display_name(&self) -> &str {
-        "HashAggregateExec"
-    }
-}
-
-#[derive(Debug)]
-struct AggrInfo {
-    name: String,
-    args: Vec<PlanExpr>,
-    is_count_star: bool,
-}
-
-/// Group state: group-by column values + accumulators for each aggregate.
-type GroupState = (Vec<ScalarValue>, Vec<Box<dyn Accumulator>>);
-
-impl HashAggregateExec {
     fn execute_no_grouping(
         &self,
         batches: &[RecordBatch],
@@ -584,7 +627,6 @@ impl HashAggregateExec {
         let num_group_cols = self.group_by.len();
         let num_aggr_cols = self.aggr_exprs.len();
 
-        // Collect group values and aggregate results.
         let mut group_values: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_group_cols];
         let mut aggr_values: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_aggr_cols];
 
@@ -622,18 +664,23 @@ pub(crate) struct SortExec {
     pub(crate) order_by: Vec<SortExpr>,
 }
 
+#[async_trait]
 impl ExecutionPlan for SortExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         self.input.schema()
     }
 
-    fn execute(&self) -> Result<Vec<RecordBatch>, ExecutionError> {
-        let batches = self.input.execute()?;
+    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let stream = self.input.execute().await?;
+        let batches = collect_stream(stream).await.map_err(|e| {
+            ExecutionError::InvalidOperation(format!("failed to collect input: {e}"))
+        })?;
+
         if batches.is_empty() {
-            return Ok(vec![]);
+            let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.input.schema());
+            return Ok(stream_from_batches(arrow_schema, vec![]));
         }
 
-        // Concatenate all batches.
         let schema = batches[0].schema();
         let combined = if batches.len() == 1 {
             batches.into_iter().next().unwrap()
@@ -642,10 +689,9 @@ impl ExecutionPlan for SortExec {
         };
 
         if combined.num_rows() == 0 {
-            return Ok(vec![combined]);
+            return Ok(stream_from_batches(schema, vec![combined]));
         }
 
-        // Build sort columns for Arrow's lexsort_to_indices.
         let sort_columns: Vec<arrow::compute::SortColumn> = self
             .order_by
             .iter()
@@ -663,12 +709,12 @@ impl ExecutionPlan for SortExec {
 
         let indices = compute::lexsort_to_indices(&sort_columns, None)?;
 
-        // Reorder all columns.
         let sorted_columns: Vec<ArrayRef> = (0..combined.num_columns())
             .map(|i| compute::take(combined.column(i), &indices, None).map_err(Into::into))
             .collect::<Result<_, ExecutionError>>()?;
 
-        Ok(vec![RecordBatch::try_new(schema, sorted_columns)?])
+        let result = RecordBatch::try_new(schema.clone(), sorted_columns)?;
+        Ok(stream_from_batches(schema, vec![result]))
     }
 
     fn display_name(&self) -> &str {
@@ -688,18 +734,23 @@ pub(crate) struct LimitExec {
     pub(crate) offset: Option<usize>,
 }
 
+#[async_trait]
 impl ExecutionPlan for LimitExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         self.input.schema()
     }
 
-    fn execute(&self) -> Result<Vec<RecordBatch>, ExecutionError> {
-        let batches = self.input.execute()?;
+    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let stream = self.input.execute().await?;
+        let batches = collect_stream(stream).await.map_err(|e| {
+            ExecutionError::InvalidOperation(format!("failed to collect input: {e}"))
+        })?;
+
         if batches.is_empty() {
-            return Ok(vec![]);
+            let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.input.schema());
+            return Ok(stream_from_batches(arrow_schema, vec![]));
         }
 
-        // Concatenate, then slice.
         let schema = batches[0].schema();
         let combined = if batches.len() == 1 {
             batches.into_iter().next().unwrap()
@@ -714,15 +765,15 @@ impl ExecutionPlan for LimitExec {
         let take = self.limit.map_or(remaining, |l| l.min(remaining));
 
         if take == 0 {
-            // Return empty batch with correct schema.
             let empty_cols: Vec<ArrayRef> = (0..combined.num_columns())
                 .map(|i| combined.column(i).slice(0, 0))
                 .collect();
-            return Ok(vec![RecordBatch::try_new(schema, empty_cols)?]);
+            let empty = RecordBatch::try_new(schema.clone(), empty_cols)?;
+            return Ok(stream_from_batches(schema, vec![empty]));
         }
 
         let sliced = combined.slice(start, take);
-        Ok(vec![sliced])
+        Ok(stream_from_batches(schema, vec![sliced]))
     }
 
     fn display_name(&self) -> &str {
@@ -740,6 +791,7 @@ pub(crate) struct ExplainExec {
     pub(crate) plan: LogicalPlan,
 }
 
+#[async_trait]
 impl ExecutionPlan for ExplainExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         vec![ColumnInfo {
@@ -749,7 +801,7 @@ impl ExecutionPlan for ExplainExec {
         }]
     }
 
-    fn execute(&self) -> Result<Vec<RecordBatch>, ExecutionError> {
+    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
         let plan_text = format!("{}", self.plan);
         let schema = Arc::new(Schema::new(vec![Field::new(
             "plan",
@@ -757,10 +809,10 @@ impl ExecutionPlan for ExplainExec {
             false,
         )]));
         let batch = RecordBatch::try_new(
-            schema,
+            schema.clone(),
             vec![Arc::new(StringArray::from(vec![plan_text.as_str()]))],
         )?;
-        Ok(vec![batch])
+        Ok(stream_from_batches(schema, vec![batch]))
     }
 
     fn display_name(&self) -> &str {
@@ -769,10 +821,132 @@ impl ExecutionPlan for ExplainExec {
 }
 
 // ===========================================================================
+// Stream adapters
+// ===========================================================================
+
+/// A stream that applies a mapping function to each batch from an input stream.
+struct MapStream<F> {
+    input: SendableRecordBatchStream,
+    schema: arrow::datatypes::SchemaRef,
+    map_fn: F,
+}
+
+impl<F> MapStream<F>
+where
+    F: FnMut(RecordBatch) -> Result<RecordBatch, ExecutionError> + Send + Unpin,
+{
+    fn new(
+        input: SendableRecordBatchStream,
+        schema: arrow::datatypes::SchemaRef,
+        map_fn: F,
+    ) -> Self {
+        Self {
+            input,
+            schema,
+            map_fn,
+        }
+    }
+}
+
+impl<F> Stream for MapStream<F>
+where
+    F: FnMut(RecordBatch) -> Result<RecordBatch, ExecutionError> + Send + Unpin,
+{
+    type Item = Result<RecordBatch, trino_common::error::TrinoError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.input).poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                let result = (self.map_fn)(batch).map_err(trino_common::error::TrinoError::from);
+                Poll::Ready(Some(result))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<F> RecordBatchStream for MapStream<F>
+where
+    F: FnMut(RecordBatch) -> Result<RecordBatch, ExecutionError> + Send + Unpin,
+{
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.schema.clone()
+    }
+}
+
+/// A stream that applies a filter-map function (returning `Option<RecordBatch>`)
+/// to each input batch, skipping `None` results.
+struct FilterMapStream<F> {
+    input: SendableRecordBatchStream,
+    schema: arrow::datatypes::SchemaRef,
+    map_fn: F,
+}
+
+impl<F> FilterMapStream<F>
+where
+    F: FnMut(RecordBatch) -> Result<Option<RecordBatch>, ExecutionError> + Send + Unpin,
+{
+    fn new(
+        input: SendableRecordBatchStream,
+        schema: arrow::datatypes::SchemaRef,
+        map_fn: F,
+    ) -> Self {
+        Self {
+            input,
+            schema,
+            map_fn,
+        }
+    }
+}
+
+impl<F> Stream for FilterMapStream<F>
+where
+    F: FnMut(RecordBatch) -> Result<Option<RecordBatch>, ExecutionError> + Send + Unpin,
+{
+    type Item = Result<RecordBatch, trino_common::error::TrinoError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match Pin::new(&mut self.input).poll_next(cx) {
+                Poll::Ready(Some(Ok(batch))) => {
+                    match (self.map_fn)(batch) {
+                        Ok(Some(result)) => {
+                            return Poll::Ready(Some(Ok(result)));
+                        }
+                        Ok(None) => {
+                            // Skip this batch, try next
+                            continue;
+                        }
+                        Err(e) => {
+                            return Poll::Ready(Some(Err(trino_common::error::TrinoError::from(
+                                e,
+                            ))));
+                        }
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl<F> RecordBatchStream for FilterMapStream<F>
+where
+    F: FnMut(RecordBatch) -> Result<Option<RecordBatch>, ExecutionError> + Send + Unpin,
+{
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.schema.clone()
+    }
+}
+
+// ===========================================================================
 // Helpers
 // ===========================================================================
 
-/// Generate a string key for a group-by row.
 fn group_key(group_cols: &[ArrayRef], row: usize) -> Result<String, ExecutionError> {
     let mut key = String::new();
     for (i, col) in group_cols.iter().enumerate() {
@@ -785,7 +959,6 @@ fn group_key(group_cols: &[ArrayRef], row: usize) -> Result<String, ExecutionErr
     Ok(key)
 }
 
-/// Extract a single scalar value from an array at the given index.
 fn extract_scalar(arr: &ArrayRef, index: usize) -> Result<ScalarValue, ExecutionError> {
     if arr.is_null(index) {
         return Ok(ScalarValue::Null);
@@ -821,13 +994,11 @@ fn extract_scalar(arr: &ArrayRef, index: usize) -> Result<ScalarValue, Execution
     }
 }
 
-/// Convert a list of ScalarValues to a single ArrayRef.
 fn scalars_to_array(values: &[ScalarValue], _len: usize) -> Result<ArrayRef, ExecutionError> {
     if values.is_empty() {
         return Ok(Arc::new(array::NullArray::new(0)));
     }
 
-    // Determine type from first non-null value.
     let first_type = values.iter().find(|v| !matches!(v, ScalarValue::Null));
     match first_type {
         Some(ScalarValue::Int32(_)) => {
@@ -896,10 +1067,7 @@ fn scalars_to_array(values: &[ScalarValue], _len: usize) -> Result<ArrayRef, Exe
                 .collect();
             Ok(Arc::new(arr))
         }
-        _ => {
-            // All nulls or unsupported type — produce null array.
-            Ok(Arc::new(array::NullArray::new(values.len())))
-        }
+        _ => Ok(Arc::new(array::NullArray::new(values.len()))),
     }
 }
 
@@ -907,6 +1075,7 @@ fn scalars_to_array(values: &[ScalarValue], _len: usize) -> Result<ArrayRef, Exe
 mod tests {
     use super::*;
     use crate::datasource::InMemoryDataSource;
+    use trino_common::stream::collect_stream;
     use trino_common::types::DataType;
 
     fn make_test_source() -> Arc<dyn DataSource> {
@@ -946,24 +1115,27 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn scan_exec() {
+    #[tokio::test]
+    async fn scan_exec() {
         let source = make_test_source();
         let scan = ScanExec {
             source,
             _table_name: "test".to_string(),
+            scan_context: ScanContext::default(),
         };
-        let batches = scan.execute().unwrap();
+        let stream = scan.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
     }
 
-    #[test]
-    fn filter_exec() {
+    #[tokio::test]
+    async fn filter_exec() {
         let source = make_test_source();
         let scan: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
             source,
             _table_name: "test".to_string(),
+            scan_context: ScanContext::default(),
         });
         let filter = FilterExec {
             input: scan,
@@ -976,17 +1148,19 @@ mod tests {
                 right: Box::new(PlanExpr::Literal(ScalarValue::Int32(1))),
             },
         };
-        let batches = filter.execute().unwrap();
+        let stream = filter.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 2);
     }
 
-    #[test]
-    fn projection_exec() {
+    #[tokio::test]
+    async fn projection_exec() {
         let source = make_test_source();
         let scan: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
             source,
             _table_name: "test".to_string(),
+            scan_context: ScanContext::default(),
         });
         let proj = ProjectionExec {
             input: scan,
@@ -1000,7 +1174,8 @@ mod tests {
                 nullable: false,
             }],
         };
-        let batches = proj.execute().unwrap();
+        let stream = proj.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_columns(), 1);
         let names = batches[0]
             .column(0)
@@ -1010,50 +1185,55 @@ mod tests {
         assert_eq!(names.value(0), "alice");
     }
 
-    #[test]
-    fn limit_exec() {
+    #[tokio::test]
+    async fn limit_exec() {
         let source = make_test_source();
         let scan: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
             source,
             _table_name: "test".to_string(),
+            scan_context: ScanContext::default(),
         });
         let limit = LimitExec {
             input: scan,
             limit: Some(2),
             offset: None,
         };
-        let batches = limit.execute().unwrap();
+        let stream = limit.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_rows(), 2);
     }
 
-    #[test]
-    fn limit_with_offset() {
+    #[tokio::test]
+    async fn limit_with_offset() {
         let source = make_test_source();
         let scan: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
             source,
             _table_name: "test".to_string(),
+            scan_context: ScanContext::default(),
         });
         let limit = LimitExec {
             input: scan,
             limit: Some(1),
             offset: Some(1),
         };
-        let batches = limit.execute().unwrap();
+        let stream = limit.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_rows(), 1);
         let ids = batches[0]
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(ids.value(0), 2); // skipped row 0 (id=1)
+        assert_eq!(ids.value(0), 2);
     }
 
-    #[test]
-    fn sort_exec() {
+    #[tokio::test]
+    async fn sort_exec() {
         let source = make_test_source();
         let scan: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
             source,
             _table_name: "test".to_string(),
+            scan_context: ScanContext::default(),
         });
         let sort = SortExec {
             input: scan,
@@ -1066,7 +1246,8 @@ mod tests {
                 nulls_first: false,
             }],
         };
-        let batches = sort.execute().unwrap();
+        let stream = sort.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         let ids = batches[0]
             .column(0)
             .as_any()
@@ -1077,12 +1258,13 @@ mod tests {
         assert_eq!(ids.value(2), 1);
     }
 
-    #[test]
-    fn aggregate_no_grouping() {
+    #[tokio::test]
+    async fn aggregate_no_grouping() {
         let source = make_test_source();
         let scan: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
             source,
             _table_name: "test".to_string(),
+            scan_context: ScanContext::default(),
         });
         let agg = HashAggregateExec {
             input: scan,
@@ -1115,7 +1297,8 @@ mod tests {
                 },
             ],
         };
-        let batches = agg.execute().unwrap();
+        let stream = agg.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
         let count = batches[0]
@@ -1132,8 +1315,8 @@ mod tests {
         assert_eq!(sum.value(0), 600);
     }
 
-    #[test]
-    fn cross_join() {
+    #[tokio::test]
+    async fn cross_join() {
         let schema1 = Arc::new(Schema::new(vec![Field::new(
             "a",
             ArrowDataType::Int32,
@@ -1156,10 +1339,12 @@ mod tests {
         let left: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
             source: src1,
             _table_name: "t1".to_string(),
+            scan_context: ScanContext::default(),
         });
         let right: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
             source: src2,
             _table_name: "t2".to_string(),
+            scan_context: ScanContext::default(),
         });
 
         let join = NestedLoopJoinExec {
@@ -1169,13 +1354,14 @@ mod tests {
             condition: trino_planner::JoinCondition::None,
         };
 
-        let batches = join.execute().unwrap();
+        let stream = join.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 6); // 2 × 3
+        assert_eq!(total_rows, 6);
     }
 
-    #[test]
-    fn explain_exec() {
+    #[tokio::test]
+    async fn explain_exec() {
         let plan = LogicalPlan::TableScan {
             table: trino_common::types::TableReference::table("test"),
             schema: vec![ColumnInfo {
@@ -1186,7 +1372,8 @@ mod tests {
             alias: None,
         };
         let explain = ExplainExec { plan };
-        let batches = explain.execute().unwrap();
+        let stream = explain.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches.len(), 1);
         let text = batches[0]
             .column(0)

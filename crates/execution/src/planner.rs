@@ -8,10 +8,12 @@ use trino_common::error::ExecutionError;
 use trino_planner::LogicalPlan;
 
 use crate::datasource::DataSource;
+use crate::hash_join::{extract_equi_join_keys, HashJoinExec};
 use crate::operator::{
     ExecutionPlan, ExplainExec, FilterExec, HashAggregateExec, LimitExec, NestedLoopJoinExec,
     ProjectionExec, ScanExec, SortExec,
 };
+use crate::scan_context::ScanContext;
 
 /// Execution context holding registered data sources.
 ///
@@ -59,6 +61,7 @@ impl ExecutionContext {
                 Ok(Arc::new(ScanExec {
                     source: source.clone(),
                     _table_name: key,
+                    scan_context: ScanContext::default(),
                 }))
             }
 
@@ -67,6 +70,60 @@ impl ExecutionContext {
                 exprs,
                 schema,
             } => {
+                // Attempt projection pushdown: if input is a TableScan and all
+                // exprs are simple column references, push projection into ScanContext.
+                if let LogicalPlan::TableScan { table, .. } = input.as_ref() {
+                    let column_indices: Option<Vec<usize>> = exprs
+                        .iter()
+                        .map(|e| match e {
+                            trino_planner::PlanExpr::Column { index, .. } => Some(*index),
+                            _ => None,
+                        })
+                        .collect();
+
+                    if let Some(indices) = column_indices {
+                        let key = table.to_string();
+                        let source = self
+                            .data_sources
+                            .get(&key)
+                            .or_else(|| self.data_sources.get(&table.table))
+                            .ok_or_else(|| {
+                                ExecutionError::InvalidOperation(format!(
+                                    "data source not found for table '{key}'"
+                                ))
+                            })?;
+                        let scan_ctx = ScanContext::default().with_projection(indices.clone());
+                        let scan: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
+                            source: source.clone(),
+                            _table_name: key,
+                            scan_context: scan_ctx,
+                        });
+                        // Rewrite exprs to use sequential indices since the scan
+                        // output now contains only the projected columns in order.
+                        let rewritten_exprs: Vec<_> = indices
+                            .iter()
+                            .enumerate()
+                            .map(|(new_idx, _)| {
+                                let orig = &exprs[new_idx];
+                                match orig {
+                                    trino_planner::PlanExpr::Column { name, .. } => {
+                                        trino_planner::PlanExpr::Column {
+                                            index: new_idx,
+                                            name: name.clone(),
+                                        }
+                                    }
+                                    other => other.clone(),
+                                }
+                            })
+                            .collect();
+                        return Ok(Arc::new(ProjectionExec {
+                            input: scan,
+                            exprs: rewritten_exprs,
+                            output_schema: schema.clone(),
+                        }));
+                    }
+                }
+
                 let input_plan = self.convert(input)?;
                 Ok(Arc::new(ProjectionExec {
                     input: input_plan,
@@ -91,6 +148,22 @@ impl ExecutionContext {
             } => {
                 let left_plan = self.convert(left)?;
                 let right_plan = self.convert(right)?;
+                let left_col_count = left_plan.schema().len();
+
+                // Try to use hash join for equi-join conditions.
+                if let Some(key_pairs) = extract_equi_join_keys(condition, left_col_count) {
+                    let (left_keys, right_keys): (Vec<usize>, Vec<usize>) =
+                        key_pairs.into_iter().unzip();
+                    return Ok(Arc::new(HashJoinExec {
+                        left: left_plan,
+                        right: right_plan,
+                        join_type: *join_type,
+                        left_keys,
+                        right_keys,
+                    }));
+                }
+
+                // Fall back to nested loop for non-equi joins.
                 Ok(Arc::new(NestedLoopJoinExec {
                     left: left_plan,
                     right: right_plan,
@@ -138,6 +211,33 @@ impl ExecutionContext {
             LogicalPlan::Explain { input } => Ok(Arc::new(ExplainExec {
                 plan: *input.clone(),
             })),
+
+            // PartialAggregate and FinalAggregate are treated as regular Aggregate
+            // in single-node mode (no distribution).
+            LogicalPlan::PartialAggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                schema,
+            }
+            | LogicalPlan::FinalAggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                schema,
+            } => {
+                let input_plan = self.convert(input)?;
+                Ok(Arc::new(HashAggregateExec {
+                    input: input_plan,
+                    group_by: group_by.clone(),
+                    aggr_exprs: aggr_exprs.clone(),
+                    output_schema: schema.clone(),
+                }))
+            }
+
+            LogicalPlan::ExchangeNode { .. } => Err(ExecutionError::InvalidOperation(
+                "ExchangeNode cannot be executed in single-node mode".to_string(),
+            )),
         }
     }
 }
@@ -149,6 +249,7 @@ mod tests {
     use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use trino_common::stream::collect_stream;
     use trino_common::types::{ColumnInfo, DataType, ScalarValue, TableReference};
     use trino_planner::PlanExpr;
     use trino_sql_parser::ast;
@@ -195,8 +296,8 @@ mod tests {
         (ctx, schema)
     }
 
-    #[test]
-    fn plan_table_scan() {
+    #[tokio::test]
+    async fn plan_table_scan() {
         let (ctx, schema) = test_context();
         let plan = LogicalPlan::TableScan {
             table: TableReference::table("users"),
@@ -204,12 +305,13 @@ mod tests {
             alias: None,
         };
         let exec = ctx.create_physical_plan(&plan).unwrap();
-        let batches = exec.execute().unwrap();
+        let stream = exec.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_rows(), 5);
     }
 
-    #[test]
-    fn plan_filter() {
+    #[tokio::test]
+    async fn plan_filter() {
         let (ctx, schema) = test_context();
         let plan = LogicalPlan::Filter {
             input: Box::new(LogicalPlan::TableScan {
@@ -227,12 +329,13 @@ mod tests {
             },
         };
         let exec = ctx.create_physical_plan(&plan).unwrap();
-        let batches = exec.execute().unwrap();
+        let stream = exec.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_rows(), 3);
     }
 
-    #[test]
-    fn plan_projection() {
+    #[tokio::test]
+    async fn plan_projection() {
         let (ctx, schema) = test_context();
         let plan = LogicalPlan::Projection {
             input: Box::new(LogicalPlan::TableScan {
@@ -251,12 +354,13 @@ mod tests {
             }],
         };
         let exec = ctx.create_physical_plan(&plan).unwrap();
-        let batches = exec.execute().unwrap();
+        let stream = exec.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_columns(), 1);
     }
 
-    #[test]
-    fn plan_limit_offset() {
+    #[tokio::test]
+    async fn plan_limit_offset() {
         let (ctx, schema) = test_context();
         let plan = LogicalPlan::Limit {
             input: Box::new(LogicalPlan::TableScan {
@@ -268,7 +372,8 @@ mod tests {
             offset: Some(1),
         };
         let exec = ctx.create_physical_plan(&plan).unwrap();
-        let batches = exec.execute().unwrap();
+        let stream = exec.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_rows(), 2);
         let ids = batches[0]
             .column(0)
@@ -279,8 +384,8 @@ mod tests {
         assert_eq!(ids.value(1), 3);
     }
 
-    #[test]
-    fn plan_sort() {
+    #[tokio::test]
+    async fn plan_sort() {
         let (ctx, schema) = test_context();
         let plan = LogicalPlan::Sort {
             input: Box::new(LogicalPlan::TableScan {
@@ -298,7 +403,8 @@ mod tests {
             }],
         };
         let exec = ctx.create_physical_plan(&plan).unwrap();
-        let batches = exec.execute().unwrap();
+        let stream = exec.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         let ids = batches[0]
             .column(0)
             .as_any()
@@ -308,8 +414,8 @@ mod tests {
         assert_eq!(ids.value(4), 1);
     }
 
-    #[test]
-    fn plan_aggregate_count_sum() {
+    #[tokio::test]
+    async fn plan_aggregate_count_sum() {
         let (ctx, schema) = test_context();
         let plan = LogicalPlan::Aggregate {
             input: Box::new(LogicalPlan::TableScan {
@@ -347,7 +453,8 @@ mod tests {
             ],
         };
         let exec = ctx.create_physical_plan(&plan).unwrap();
-        let batches = exec.execute().unwrap();
+        let stream = exec.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_rows(), 1);
         let count = batches[0]
             .column(0)
@@ -363,8 +470,8 @@ mod tests {
         assert_eq!(sum.value(0), 1500);
     }
 
-    #[test]
-    fn plan_explain() {
+    #[tokio::test]
+    async fn plan_explain() {
         let (ctx, schema) = test_context();
         let plan = LogicalPlan::Explain {
             input: Box::new(LogicalPlan::TableScan {
@@ -374,7 +481,8 @@ mod tests {
             }),
         };
         let exec = ctx.create_physical_plan(&plan).unwrap();
-        let batches = exec.execute().unwrap();
+        let stream = exec.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         let text = batches[0]
             .column(0)
             .as_any()
@@ -396,9 +504,8 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
-    #[test]
-    fn end_to_end_filter_project_limit() {
-        // SELECT name FROM users WHERE id > 2 LIMIT 2
+    #[tokio::test]
+    async fn end_to_end_filter_project_limit() {
         let (ctx, schema) = test_context();
         let plan = LogicalPlan::Limit {
             limit: Some(2),
@@ -432,7 +539,8 @@ mod tests {
         };
 
         let exec = ctx.create_physical_plan(&plan).unwrap();
-        let batches = exec.execute().unwrap();
+        let stream = exec.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_rows(), 2);
         let names = batches[0]
             .column(0)

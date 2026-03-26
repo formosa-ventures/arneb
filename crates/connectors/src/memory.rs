@@ -269,8 +269,8 @@ mod tests {
         assert!(catalog.schema("nonexistent").is_none());
     }
 
-    #[test]
-    fn memory_factory_create_data_source() {
+    #[tokio::test]
+    async fn memory_factory_create_data_source() {
         let catalog = Arc::new(MemoryCatalog::new());
         let schema = Arc::new(MemorySchema::new());
         schema.register_table("users", test_table());
@@ -279,7 +279,11 @@ mod tests {
         let factory = MemoryConnectorFactory::new(catalog, "default");
         let table_ref = TableReference::table("users");
         let ds = factory.create_data_source(&table_ref, &[]).unwrap();
-        let batches = ds.scan().unwrap();
+        let stream = ds
+            .scan(&trino_execution::ScanContext::default())
+            .await
+            .unwrap();
+        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
     }

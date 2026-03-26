@@ -6,10 +6,16 @@
 
 pub mod config;
 pub mod error;
+pub mod identifiers;
+pub mod stream;
 pub mod types;
 
 pub use config::ServerConfig;
 pub use error::TrinoError;
+pub use identifiers::{QueryId, SplitId, StageId, TaskId};
+pub use stream::{
+    collect_stream, stream_from_batches, RecordBatchStream, SendableRecordBatchStream,
+};
 pub use types::{
     ColumnInfo, DataType, InvalidTableReference, ScalarValue, TableReference, TimeUnit,
     UnsupportedArrowType,

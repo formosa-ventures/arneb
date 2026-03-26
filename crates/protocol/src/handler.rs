@@ -17,9 +17,10 @@ use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::PgWireFrontendMessage;
 use trino_catalog::CatalogManager;
 use trino_common::error::TrinoError;
+use trino_common::stream::collect_stream;
 use trino_connectors::ConnectorRegistry;
 use trino_execution::{ExecutionContext, ExecutionPlan};
-use trino_planner::{LogicalPlan, QueryPlanner};
+use trino_planner::{LogicalOptimizer, LogicalPlan, QueryPlanner};
 
 use crate::encoding::{column_info_to_field_info, encode_record_batches};
 use crate::error::trino_error_to_pg_error;
@@ -104,20 +105,7 @@ impl SimpleQueryHandler for ConnectionHandler {
 
         tracing::debug!(query = trimmed, "processing simple query");
 
-        let catalog_manager = Arc::clone(&self.catalog_manager);
-        let connector_registry = Arc::clone(&self.connector_registry);
-        let sql = trimmed.to_string();
-
-        let result = tokio::task::spawn_blocking(move || {
-            execute_query(&sql, &catalog_manager, &connector_registry)
-        })
-        .await
-        .map_err(|e| {
-            PgWireError::ApiError(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("task join error: {e}"),
-            )))
-        })?;
+        let result = execute_query(trimmed, &self.catalog_manager, &self.connector_registry).await;
 
         match result {
             Ok((plan, batches)) => {
@@ -137,8 +125,8 @@ impl SimpleQueryHandler for ConnectionHandler {
     }
 }
 
-/// Execute the full query pipeline synchronously.
-fn execute_query(
+/// Execute the full query pipeline asynchronously.
+async fn execute_query(
     sql: &str,
     catalog_manager: &CatalogManager,
     connector_registry: &ConnectorRegistry,
@@ -156,6 +144,10 @@ fn execute_query(
     let planner = QueryPlanner::new(catalog_manager);
     let logical_plan = planner.plan_statement(&statement)?;
 
+    // Step 2.5: Optimize logical plan
+    let optimizer = LogicalOptimizer::default_rules();
+    let logical_plan = optimizer.optimize(logical_plan)?;
+
     // Step 3: Create execution context and register data sources
     let mut exec_ctx = ExecutionContext::new();
     register_data_sources(
@@ -168,8 +160,9 @@ fn execute_query(
     // Step 4: Create physical plan
     let physical_plan = exec_ctx.create_physical_plan(&logical_plan)?;
 
-    // Step 5: Execute
-    let batches = physical_plan.execute()?;
+    // Step 5: Execute (async)
+    let stream = physical_plan.execute().await?;
+    let batches = collect_stream(stream).await?;
 
     Ok((physical_plan, batches))
 }
@@ -184,7 +177,6 @@ fn register_data_sources(
     match plan {
         LogicalPlan::TableScan { table, schema, .. } => {
             let key = table.to_string();
-            // Determine the connector name from the catalog name
             let connector_name = table
                 .catalog
                 .as_deref()
@@ -203,12 +195,17 @@ fn register_data_sources(
         | LogicalPlan::Explain { input } => {
             register_data_sources(input, catalog_manager, registry, ctx)?;
         }
-        LogicalPlan::Aggregate { input, .. } => {
+        LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::PartialAggregate { input, .. }
+        | LogicalPlan::FinalAggregate { input, .. } => {
             register_data_sources(input, catalog_manager, registry, ctx)?;
         }
         LogicalPlan::Join { left, right, .. } => {
             register_data_sources(left, catalog_manager, registry, ctx)?;
             register_data_sources(right, catalog_manager, registry, ctx)?;
+        }
+        LogicalPlan::ExchangeNode { .. } => {
+            // Exchange nodes don't have table scans — they read from other stages.
         }
     }
     Ok(())

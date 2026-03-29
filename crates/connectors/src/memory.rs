@@ -10,7 +10,25 @@ use trino_common::error::ConnectorError;
 use trino_common::types::{ColumnInfo, TableReference};
 use trino_execution::{DataSource, InMemoryDataSource};
 
-use crate::ConnectorFactory;
+use arrow::datatypes::DataType as ArrowDataType;
+
+use crate::{ConnectorFactory, DDLProvider};
+
+fn arrow_type_to_data_type(dt: &ArrowDataType) -> trino_common::types::DataType {
+    use trino_common::types::DataType;
+    match dt {
+        ArrowDataType::Boolean => DataType::Boolean,
+        ArrowDataType::Int8 => DataType::Int8,
+        ArrowDataType::Int16 => DataType::Int16,
+        ArrowDataType::Int32 => DataType::Int32,
+        ArrowDataType::Int64 => DataType::Int64,
+        ArrowDataType::Float32 => DataType::Float32,
+        ArrowDataType::Float64 => DataType::Float64,
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => DataType::Utf8,
+        ArrowDataType::Date32 => DataType::Date32,
+        _ => DataType::Utf8, // fallback
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MemoryTable
@@ -183,9 +201,125 @@ impl fmt::Debug for MemoryConnectorFactory {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MemoryDDLProvider
+// ---------------------------------------------------------------------------
+
+/// DDL provider for in-memory tables.
+#[derive(Debug)]
+pub struct MemoryDDLProvider {
+    catalog: Arc<MemoryCatalog>,
+    default_schema: String,
+}
+
+impl MemoryDDLProvider {
+    fn get_schema(&self) -> Result<Arc<MemorySchema>, ConnectorError> {
+        self.catalog
+            .get_memory_schema(&self.default_schema)
+            .ok_or_else(|| {
+                ConnectorError::TableNotFound(format!("schema '{}' not found", self.default_schema))
+            })
+    }
+}
+
+impl DDLProvider for MemoryDDLProvider {
+    fn create_table(&self, name: &str, schema: &[ColumnInfo]) -> Result<(), ConnectorError> {
+        let mem_schema = self.get_schema()?;
+        {
+            let tables = mem_schema.tables.read().unwrap();
+            if tables.contains_key(name) {
+                return Err(ConnectorError::TableNotFound(format!(
+                    "table '{name}' already exists"
+                )));
+            }
+        }
+        let table = Arc::new(MemoryTable::new(schema.to_vec(), vec![]));
+        mem_schema.register_table(name, table);
+        Ok(())
+    }
+
+    fn drop_table(&self, name: &str) -> Result<(), ConnectorError> {
+        let mem_schema = self.get_schema()?;
+        let mut tables = mem_schema.tables.write().unwrap();
+        if tables.remove(name).is_none() {
+            return Err(ConnectorError::TableNotFound(format!(
+                "table '{name}' not found"
+            )));
+        }
+        Ok(())
+    }
+
+    fn insert_into(&self, name: &str, batches: Vec<RecordBatch>) -> Result<u64, ConnectorError> {
+        let mem_schema = self.get_schema()?;
+        let mut tables = mem_schema.tables.write().unwrap();
+        let table = tables
+            .get_mut(name)
+            .ok_or_else(|| ConnectorError::TableNotFound(format!("table '{name}' not found")))?;
+
+        let row_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let mut existing = table.batches.clone();
+        existing.extend(batches);
+        *table = Arc::new(MemoryTable::new(table.schema.clone(), existing));
+        Ok(row_count)
+    }
+
+    fn delete_from(&self, name: &str, _predicate: Option<&str>) -> Result<u64, ConnectorError> {
+        let mem_schema = self.get_schema()?;
+        let mut tables = mem_schema.tables.write().unwrap();
+        let table = tables
+            .get_mut(name)
+            .ok_or_else(|| ConnectorError::TableNotFound(format!("table '{name}' not found")))?;
+
+        // Simple implementation: if no predicate, delete all rows
+        let row_count: u64 = table.batches.iter().map(|b| b.num_rows() as u64).sum();
+        *table = Arc::new(MemoryTable::new(table.schema.clone(), vec![]));
+        Ok(row_count)
+    }
+
+    fn create_table_as_select(
+        &self,
+        name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<(), ConnectorError> {
+        let mem_schema = self.get_schema()?;
+        {
+            let tables = mem_schema.tables.read().unwrap();
+            if tables.contains_key(name) {
+                return Err(ConnectorError::TableNotFound(format!(
+                    "table '{name}' already exists"
+                )));
+            }
+        }
+        let schema = if batches.is_empty() {
+            vec![]
+        } else {
+            batches[0]
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| ColumnInfo {
+                    name: f.name().clone(),
+                    data_type: arrow_type_to_data_type(f.data_type()),
+                    nullable: f.is_nullable(),
+                })
+                .collect()
+        };
+        let table = Arc::new(MemoryTable::new(schema, batches));
+        mem_schema.register_table(name, table);
+        Ok(())
+    }
+}
+
 impl ConnectorFactory for MemoryConnectorFactory {
     fn name(&self) -> &str {
         "memory"
+    }
+
+    fn ddl_provider(&self) -> Option<Arc<dyn DDLProvider>> {
+        Some(Arc::new(MemoryDDLProvider {
+            catalog: Arc::clone(&self.catalog),
+            default_schema: self.default_schema.clone(),
+        }))
     }
 
     fn create_data_source(

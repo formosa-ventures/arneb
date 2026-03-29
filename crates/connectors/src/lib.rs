@@ -12,4 +12,4 @@ pub mod file;
 pub mod memory;
 mod traits;
 
-pub use traits::{ConnectorFactory, ConnectorRegistry};
+pub use traits::{ConnectorFactory, ConnectorRegistry, DDLProvider};

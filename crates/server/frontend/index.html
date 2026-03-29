@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>trino-alt</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>trino-alt</h1>
+    <nav>
+      <a href="#" onclick="showView('dashboard')" class="active" id="nav-dashboard">Dashboard</a>
+      <a href="#" onclick="showView('queries')" id="nav-queries">Queries</a>
+      <a href="#" onclick="showView('cluster')" id="nav-cluster">Cluster</a>
+    </nav>
+  </header>
+
+  <main>
+    <div id="dashboard" class="view">
+      <h2>Dashboard</h2>
+      <div class="stats">
+        <div class="stat-card">
+          <div class="stat-value" id="running-count">-</div>
+          <div class="stat-label">Running</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="finished-count">-</div>
+          <div class="stat-label">Finished</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="failed-count">-</div>
+          <div class="stat-label">Failed</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="worker-count">-</div>
+          <div class="stat-label">Workers</div>
+        </div>
+      </div>
+      <h3>Recent Queries</h3>
+      <table id="recent-queries">
+        <thead><tr><th>ID</th><th>SQL</th><th>State</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div id="queries" class="view" style="display:none">
+      <h2>Queries</h2>
+      <div class="filters">
+        <select id="state-filter" onchange="refreshQueries()">
+          <option value="">All</option>
+          <option value="RUNNING">Running</option>
+          <option value="QUEUED">Queued</option>
+          <option value="FINISHED">Finished</option>
+          <option value="FAILED">Failed</option>
+          <option value="CANCELLED">Cancelled</option>
+        </select>
+      </div>
+      <table id="query-list">
+        <thead><tr><th>ID</th><th>SQL</th><th>State</th><th>Actions</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div id="cluster" class="view" style="display:none">
+      <h2>Cluster</h2>
+      <div id="server-info" class="info-box"></div>
+      <h3>Workers</h3>
+      <div id="worker-list"></div>
+    </div>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

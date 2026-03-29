@@ -1,4 +1,5 @@
 mod config;
+mod web;
 
 use std::sync::Arc;
 
@@ -66,7 +67,13 @@ async fn main() -> Result<()> {
         .init();
 
     // 5. Create catalog manager + connector registry
-    let catalog_manager = CatalogManager::new("memory", "default");
+    // If config has file tables, default to "file" catalog; otherwise "memory"
+    let default_catalog = if config.tables.is_empty() {
+        "memory"
+    } else {
+        "file"
+    };
+    let catalog_manager = CatalogManager::new(default_catalog, "default");
 
     // Register memory catalog (empty)
     let mem_schema = Arc::new(MemorySchema::new());
@@ -186,7 +193,19 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 10. Run services based on role
+    // 10. Set up Web UI (coordinator + standalone only)
+    let query_tracker = Arc::new(trino_scheduler::QueryTracker::new());
+    let web_state = web::WebState {
+        query_tracker: query_tracker.clone(),
+        node_registry: node_registry.clone(),
+        start_time: std::time::Instant::now(),
+        role: config.cluster.role.clone(),
+    };
+    let web_router = web::build_router(web_state);
+    let web_port = config.server.port + 1000; // default: pgwire port + 1000 (e.g., 5432 → 6432)
+    let web_addr = format!("{}:{}", config.server.bind_address, web_port);
+
+    // 11. Run services based on role
     let flight_state_clone = flight_state.clone();
     let rpc_addr_clone = rpc_addr.clone();
 
@@ -203,6 +222,16 @@ async fn main() -> Result<()> {
             if let Err(e) = result {
                 tracing::error!(error = %e, "flight server error");
                 bail!("flight server error: {e}");
+            }
+        }
+        // Web UI HTTP server (coordinator + standalone only)
+        result = async {
+            let listener = tokio::net::TcpListener::bind(&web_addr).await?;
+            tracing::info!(web_address = %web_addr, "web UI listening");
+            axum::serve(listener, web_router).await
+        }, if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "web server error");
             }
         }
         // Worker heartbeat loop

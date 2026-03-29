@@ -34,7 +34,14 @@ anyhow = { workspace = true }
 
 # Config
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
+
+# Web UI
+axum = { workspace = true }
+tower-http = { workspace = true }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time", "signal"] }

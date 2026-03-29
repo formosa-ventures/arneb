@@ -1,0 +1,42 @@
+bind_address = "127.0.0.1"
+port = 5432
+
+[[tables]]
+name = "lineitem"
+path = "benchmarks/tpch/data/sf001/lineitem.parquet"
+format = "parquet"
+
+[[tables]]
+name = "orders"
+path = "benchmarks/tpch/data/sf001/orders.parquet"
+format = "parquet"
+
+[[tables]]
+name = "customer"
+path = "benchmarks/tpch/data/sf001/customer.parquet"
+format = "parquet"
+
+[[tables]]
+name = "part"
+path = "benchmarks/tpch/data/sf001/part.parquet"
+format = "parquet"
+
+[[tables]]
+name = "partsupp"
+path = "benchmarks/tpch/data/sf001/partsupp.parquet"
+format = "parquet"
+
+[[tables]]
+name = "supplier"
+path = "benchmarks/tpch/data/sf001/supplier.parquet"
+format = "parquet"
+
+[[tables]]
+name = "nation"
+path = "benchmarks/tpch/data/sf001/nation.parquet"
+format = "parquet"
+
+[[tables]]
+name = "region"
+path = "benchmarks/tpch/data/sf001/region.parquet"
+format = "parquet"

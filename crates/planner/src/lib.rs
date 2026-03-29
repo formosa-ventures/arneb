@@ -10,5 +10,5 @@ mod planner;
 
 pub use fragment::{FragmentType, PartitioningScheme, PlanFragment, PlanFragmenter, QueryStage};
 pub use optimizer::{LogicalOptimizer, LogicalRule};
-pub use plan::{JoinCondition, LogicalPlan, PlanExpr, SortExpr};
+pub use plan::{JoinCondition, LogicalPlan, PlanExpr, SortExpr, WindowFunctionDef};
 pub use planner::QueryPlanner;

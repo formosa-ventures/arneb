@@ -6,9 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **trino-alt** — A Trino alternative built in Rust. Distributed SQL query engine for federated queries across heterogeneous data sources.
 
-Trino (formerly PrestoSQL) lets users query data where it lives — across object stores, databases, and other systems — using standard SQL. This project aims to achieve similar goals with Rust's performance and safety guarantees.
-
-**Status**: MVP Phase 1 complete (single-node). All 8 crates implemented and working end-to-end.
+**Status**: Phase 1 (single-node) and Phase 2 (distribution) complete. 18 OpenSpec changes implemented. TPC-H 16/22 queries passing.
 
 ## Build & Development Commands
 
@@ -21,25 +19,29 @@ cargo build --release
 cargo test
 cargo test -- --nocapture                # with stdout
 cargo test <test_name>                   # single test
-cargo test -p <crate_name>              # single crate
 
 # Lint & format
 cargo fmt -- --check                     # check formatting
 cargo fmt                                # auto-format
 cargo clippy -- -D warnings              # lint with warnings as errors
 
-# Run the server
+# Run the server (standalone — single process, default)
 cargo run --bin trino-alt
 cargo run --bin trino-alt -- --config path/to/config.toml
-cargo run --bin trino-alt -- --port 5433 --bind 0.0.0.0
+
+# Run as coordinator + worker (distributed mode)
+cargo run --bin trino-alt -- --config trino-alt.toml --port 5432 --role coordinator
+cargo run --bin trino-alt -- --config worker.toml --role worker
+
+# Run TPC-H benchmark
+cd benchmarks/tpch && cargo run --release -- --engine trino-alt --port 5432
 ```
 
 ### Server Configuration
 
-The server loads config from `trino-alt.toml` (if present), env vars (`TRINO_BIND_ADDRESS`, `TRINO_PORT`, etc.), and CLI args. Precedence: CLI > env > file > defaults.
+The server loads config from `trino-alt.toml` (if present), env vars, and CLI args. Precedence: CLI > env > file > defaults.
 
 ```toml
-# trino-alt.toml
 bind_address = "127.0.0.1"
 port = 5432
 
@@ -47,58 +49,64 @@ port = 5432
 name = "lineitem"
 path = "/data/lineitem.parquet"
 format = "parquet"
+```
+
+**Ports**:
+- Coordinator/Standalone: pgwire (configured port), Web UI (port + 1000), Flight RPC (9090)
+- Worker: Flight RPC only (no pgwire, no Web UI)
+
+**Roles**:
+- `standalone` (default) — single process, all-in-one
+- `coordinator` — accepts SQL, plans queries, dispatches tasks to workers via Flight RPC
+- `worker` — receives tasks from coordinator, executes plan fragments, serves data via Flight RPC
+
+**Worker config** (no `port` needed — worker has no pgwire):
+```toml
+bind_address = "127.0.0.1"
 
 [[tables]]
-name = "orders"
-path = "/data/orders.csv"
-format = "csv"
-schema = [
-    { name = "id", type = "int32" },
-    { name = "customer", type = "utf8" },
-    { name = "total", type = "float64" },
-]
+name = "lineitem"
+path = "/data/lineitem.parquet"
+format = "parquet"
+
+[cluster]
+rpc_port = 9091
+coordinator_address = "127.0.0.1:9090"
+worker_id = "worker-1"
 ```
 
 Connect with any PostgreSQL client: `psql -h 127.0.0.1 -p 5432`
 
 ## Architecture
 
-### MVP Scope
-
-Phase 1 (single-node) — **complete**:
-- SQL parsing and validation (via `sqlparser-rs`)
-- Logical query planning
-- Vectorized execution engine (Arrow-based)
-- Connectors: in-memory, CSV/Parquet files
-- Wire protocol: PostgreSQL wire protocol (via `pgwire`)
-- Server binary with config-driven table registration
-
-Phase 2 (distribution) — not started:
-- Coordinator/Worker separation
-- Distributed query planning and task scheduling
-- Shuffle/exchange operators
-- Query optimization (predicate pushdown, projection pruning)
-- Connector: object stores (S3-compatible)
-
 ### Core Crates (workspace layout)
 
 ```
 crates/
-├── common/            # Shared types (DataType, ScalarValue, ColumnInfo, TableReference),
-│                      # error hierarchy (TrinoError), ServerConfig
-├── sql-parser/        # SQL parsing → AST via sqlparser-rs
-├── catalog/           # CatalogProvider/SchemaProvider/TableProvider traits,
-│                      # in-memory impls, CatalogManager (3-part table resolution)
-├── planner/           # AST → LogicalPlan, QueryPlanner with CatalogManager
-├── execution/         # Physical operators (scan, filter, project, join, aggregate,
-│                      # sort, limit, explain), DataSource trait, ExecutionContext
-├── connectors/        # ConnectorFactory/ConnectorRegistry traits,
-│                      # memory module (MemoryTable/Schema/Catalog),
-│                      # file module (CSV + Parquet via FileConnectorFactory)
-├── protocol/          # PostgreSQL wire protocol v3 (Simple Query) via pgwire,
-│                      # type encoding (Arrow → PG), error mapping (TrinoError → SQLSTATE)
-└── server/            # Main binary (trino-alt), CLI (clap), config loading,
-                       # catalog/connector wiring, graceful shutdown
+├── common/        # Shared types (DataType, ScalarValue, ColumnInfo, TableReference),
+│                  # error hierarchy (TrinoError), identifiers (QueryId, StageId, TaskId)
+├── sql-parser/    # SQL → AST via sqlparser-rs. Supports SELECT, DDL/DML, CASE,
+│                  # CTEs, set operations, window functions, subqueries
+├── catalog/       # CatalogProvider/SchemaProvider/TableProvider traits,
+│                  # in-memory impls, CatalogManager (3-part table resolution)
+├── planner/       # AST → LogicalPlan, QueryPlanner, LogicalOptimizer,
+│                  # PlanFragmenter for distributed execution
+├── execution/     # Physical operators (scan, filter, project, join, aggregate,
+│                  # sort, limit, semi-join, set ops, window, explain),
+│                  # ScalarFunction trait + 19 built-in functions,
+│                  # DataSource trait, ExecutionContext
+├── connectors/    # ConnectorFactory/ConnectorRegistry/DDLProvider traits,
+│                  # memory module (read + write), file module (CSV + Parquet)
+├── protocol/      # PostgreSQL wire protocol v3 (Simple + Extended Query) via pgwire,
+│                  # pg_catalog/information_schema metadata handler,
+│                  # type encoding (Arrow → PG), error mapping, SET/SHOW handling
+├── scheduler/     # QueryTracker (state machine), NodeRegistry (worker heartbeat),
+│                  # ResourceGroupManager, NodeScheduler
+├── rpc/           # Arrow Flight RPC server/client for distributed task execution,
+│                  # heartbeat protocol, output buffer management
+└── server/        # Main binary (trino-alt), CLI (clap), config loading,
+                   # catalog/connector wiring, Web UI (axum + rust-embed),
+                   # graceful shutdown, coordinator/worker startup
 ```
 
 ### Key Data Flow
@@ -107,12 +115,12 @@ crates/
 SQL String
   → Parser (sql-parser) → AST (Statement)
   → Planner (planner) → LogicalPlan
+  → Optimizer → Optimized LogicalPlan
+  → Metadata interception (pg_catalog, information_schema, SET/SHOW)
   → ExecutionContext (execution) → PhysicalPlan (Arc<dyn ExecutionPlan>)
-  → execute() → Vec<RecordBatch>
+  → execute() → SendableRecordBatchStream (async)
   → Protocol (protocol) → PostgreSQL wire format response
 ```
-
-Note: Execution is currently synchronous (`execute() → Result<Vec<RecordBatch>>`). The protocol layer bridges to async via `tokio::task::spawn_blocking`.
 
 ### Key Dependencies
 
@@ -120,6 +128,8 @@ Note: Execution is currently synchronous (`execute() → Result<Vec<RecordBatch>
 - **sqlparser-rs** (`sqlparser` v0.61): SQL dialect parsing into AST.
 - **tokio** (v1): Async runtime for the protocol server.
 - **pgwire** (v0.25): PostgreSQL wire protocol v3 implementation.
+- **axum** (v0.8): HTTP framework for Web UI.
+- **rust-embed** (v8): Embeds frontend assets into binary.
 - **clap** (v4): CLI argument parsing for the server binary.
 - **tracing** / **tracing-subscriber**: Structured logging throughout.
 - **thiserror** / **anyhow**: Error handling (thiserror for libraries, anyhow for the binary).
@@ -127,40 +137,47 @@ Note: Execution is currently synchronous (`execute() → Result<Vec<RecordBatch>
 ### Design Principles
 
 - **Arrow-native**: All intermediate data in Arrow columnar format. No row-by-row processing.
-- **Synchronous execution**: Operators return `Vec<RecordBatch>` synchronously. Async streaming is a Phase 2 goal.
+- **Async streaming**: Operators return `SendableRecordBatchStream` for async execution.
 - **Trait-based connectors**: `DataSource` trait abstracts all data access. Adding a new connector = implementing `ConnectorFactory` + `DataSource`.
-- **Pushdown-first**: Push filters, projections, and limits into connectors whenever possible (not yet implemented — Phase 2).
+- **Pushdown**: Filters, projections, and limits are pushed into connectors when supported.
+- **PostgreSQL compatible**: Full Simple and Extended Query protocol. DBeaver, JDBC, psycopg2 all work out of the box.
 
-## MVP Phase 1 Roadmap
+## SQL Support
 
-Eight changes implemented sequentially via OpenSpec. All complete and archived.
+### Expressions
+CASE WHEN, COALESCE, NULLIF, CAST, BETWEEN, IN, LIKE, IS NULL/NOT NULL, arithmetic, comparison, logical operators, subqueries (IN/EXISTS/scalar)
 
-| # | Change | Crate | Description |
-|---|--------|-------|-------------|
-| 1 | `common-foundation` | `common` | Shared types (`DataType`, `ScalarValue`, `TableReference`, `ColumnInfo`), error hierarchy (`TrinoError`), `ServerConfig` |
-| 2 | `sql-parsing` | `sql-parser` | SQL → AST via `sqlparser-rs`. Custom AST types (`Statement`, `Query`, `Expr`, `SelectItem`, `JoinType`, etc.) |
-| 3 | `catalog-system` | `catalog` | Catalog traits (`CatalogProvider`, `SchemaProvider`, `TableProvider`), in-memory impls, `CatalogManager` |
-| 4 | `query-planning` | `planner` | AST → `LogicalPlan` tree, `PlanExpr` (index-based column refs), `QueryPlanner` |
-| 5 | `execution-engine` | `execution` | Physical operators, `DataSource` trait, expression evaluator, `ExecutionContext` |
-| 6 | `connectors-mvp` | `connectors` | `ConnectorFactory`/`ConnectorRegistry`, memory connector, file connector (CSV + Parquet) |
-| 7 | `pg-wire-protocol` | `protocol` | PostgreSQL wire protocol v3 (Simple Query), type encoding, error mapping |
-| 8 | `server-integration` | `server` | Main binary, CLI, config loading, catalog/connector wiring, graceful shutdown |
+### Statements
+SELECT, EXPLAIN, CREATE TABLE, DROP TABLE, CREATE TABLE AS SELECT, INSERT INTO, DELETE FROM, CREATE VIEW, DROP VIEW
+
+### Advanced DQL
+CTEs (WITH), UNION ALL/UNION/INTERSECT/EXCEPT, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX OVER), GROUP BY with HAVING, ORDER BY on aggregates/aliases
+
+### Scalar Functions (19)
+String: UPPER, LOWER, SUBSTRING, TRIM, LTRIM, RTRIM, CONCAT, LENGTH, REPLACE, POSITION
+Math: ABS, ROUND, CEIL, FLOOR, MOD, POWER
+Date: EXTRACT, CURRENT_DATE, DATE_TRUNC
+
+## Phase Roadmap
+
+### Phase 1 (single-node) — complete
+8 changes: common-foundation, sql-parsing, catalog-system, query-planning, execution-engine, connectors-mvp, pg-wire-protocol, server-integration
+
+### Phase 2 (distribution + advanced SQL) — complete
+10 changes: async-streaming-execution, connector-pushdown, hash-join-operator, logical-plan-optimizer, plan-fragmentation, query-state-machine, flight-rpc-layer, coordinator-worker-split, distributed-operators, tpch-benchmark
+
+### Phase 2.5 (SQL completeness + client compat) — complete
+8 changes: ansi-expressions, scalar-functions, subquery-support, advanced-dql, ddl-dml-connector-delegated, coordinator-web-ui, extended-query-protocol, pg-catalog-metadata
 
 ### OpenSpec Structure
 
 ```
 openspec/
 ├── config.yaml              # OpenSpec configuration
-├── specs/                   # 24 consolidated capability specs (synced from all changes)
-│   ├── common-data-types/   # DataType, ScalarValue, ColumnInfo specs
-│   ├── sql-ast/             # AST node type specs
-│   ├── catalog-traits/      # CatalogProvider/SchemaProvider/TableProvider specs
-│   ├── execution-operators/ # Physical operator specs
-│   ├── pg-encoding/         # Arrow → PostgreSQL type mapping specs
-│   ├── server-startup/      # Server lifecycle specs
-│   └── ...                  # (24 total)
-└── changes/
-    └── archive/             # 8 completed changes (proposal, design, specs, tasks each)
+├── specs/                   # Consolidated capability specs
+└── changes/                 # Change artifacts (proposal, design, specs, tasks)
+    ├── archive/             # Phase 1 archived changes
+    └── <name>/              # Active/completed changes
 ```
 
 ## Conventions
@@ -171,3 +188,5 @@ openspec/
 - Tests live in `#[cfg(test)] mod tests` within source files for unit tests; `tests/` directory for integration tests.
 - Use `tracing` (not `log`) for instrumentation.
 - Config: `serde` + `toml` for deserialization, `TRINO_*` env vars for overrides.
+- Metadata queries (pg_catalog, information_schema) are intercepted in the protocol layer before the SQL parser.
+- Quoted identifiers are stripped during AST conversion (use `Ident.value`, not `to_string()`).

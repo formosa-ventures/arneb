@@ -20,3 +20,11 @@
 # Benchmark generated files
 benchmarks/tpch/data/
 benchmarks/tpch/results/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Rust
+*.rs.bk
+*.pdb

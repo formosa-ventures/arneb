@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+**/target/
 
 # IDE / editor
 .idea/
@@ -12,3 +13,10 @@
 
 # Agent configs
 .agents/
+
+# MCP tools
+.serena/
+
+# Benchmark generated files
+benchmarks/tpch/data/
+benchmarks/tpch/results/

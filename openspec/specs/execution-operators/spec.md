@@ -35,6 +35,24 @@ The system SHALL implement a `NestedLoopJoinExec` operator supporting CROSS, INN
 - **WHEN** a LEFT join is performed and some left rows have no matching right rows
 - **THEN** those left rows appear in the output with NULL values for all right columns
 
+### Requirement: HashJoinExec
+The system SHALL implement a `HashJoinExec` operator for equi-join conditions. It SHALL build a hash table from the right (build) side and probe with the left (probe) side. It SHALL support INNER, LEFT, RIGHT, and FULL join types. Unmatched rows in outer joins SHALL have null-filled columns.
+
+#### Scenario: Hash join on equi-condition
+- **WHEN** `HashJoinExec` joins left(a, b) and right(c, d) on a = c with INNER type
+- **THEN** it returns matching rows with combined schema [a, b, c, d]
+
+#### Scenario: Hash join for LEFT outer join
+- **WHEN** `HashJoinExec` performs a LEFT join and some left rows have no matching right rows
+- **THEN** unmatched left rows appear with NULL values for right columns
+
+### Requirement: HashJoinExec equi-key extraction from mixed conditions
+The system SHALL extract equi-join key pairs from AND conditions that mix equality and non-equality predicates. When a join condition contains both `a = b AND c NOT LIKE '%x%'`, the system SHALL extract `a = b` as the equi-key and use hash join. Non-equi conditions in the AND are skipped for key extraction.
+
+#### Scenario: Mixed equi and non-equi condition
+- **WHEN** join condition is `c_custkey = o_custkey AND o_comment NOT LIKE '%special%'`
+- **THEN** the system extracts `c_custkey = o_custkey` as hash join key and uses HashJoinExec instead of NestedLoopJoinExec
+
 ### Requirement: HashAggregateExec
 The system SHALL implement a `HashAggregateExec` operator that performs hash-based grouping and aggregation. It SHALL support both grouped aggregation (with group-by expressions) and global aggregation (no group-by, producing a single output row). Aggregate expressions SHALL be `PlanExpr::Function` nodes whose names map to accumulators via `create_accumulator()`.
 
@@ -45,6 +63,14 @@ The system SHALL implement a `HashAggregateExec` operator that performs hash-bas
 #### Scenario: Grouped aggregation
 - **WHEN** `HashAggregateExec` groups by a column and computes SUM on another
 - **THEN** `execute()` returns one row per distinct group-by value, each with the correct aggregate
+
+#### Scenario: COUNT(*) with Wildcard argument
+- **WHEN** `HashAggregateExec` encounters `COUNT(*)` planned as `PlanExpr::Function { args: [Wildcard] }`
+- **THEN** it treats Wildcard as "count all rows" and does NOT pass Wildcard to the expression evaluator
+
+#### Scenario: Grouped COUNT(*) with Wildcard
+- **WHEN** `HashAggregateExec` groups by column and computes `COUNT(*)` with Wildcard arg
+- **THEN** each group has the correct row count, not an error about unexpanded wildcard
 
 ### Requirement: SortExec
 The system SHALL implement a `SortExec` operator that concatenates all input batches and sorts them using Arrow's `lexsort_to_indices` with the specified sort expressions (direction, nulls ordering).

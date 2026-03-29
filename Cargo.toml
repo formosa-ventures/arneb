@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution", "crates/connectors", "crates/protocol", "crates/server", "crates/scheduler", "crates/rpc"]
+exclude = ["benchmarks/tpch"]
 resolver = "2"
 
 [workspace.package]
@@ -21,7 +22,7 @@ tracing = "0.1"
 # Arrow columnar format
 arrow = { version = "54", default-features = false }
 arrow-csv = { version = "54", default-features = false }
-parquet = { version = "54", default-features = false, features = ["arrow"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
 
 # Numeric utilities
 num_cpus = "1"
@@ -47,3 +48,10 @@ async-trait = "0.1"
 futures = "0.3"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
+
+# HTTP framework
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+serde_json = "1"
+rust-embed = "8"
+mime_guess = "2"

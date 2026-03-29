@@ -67,6 +67,21 @@ The system SHALL maintain per-connection session state including the database na
 - **WHEN** two clients connect simultaneously and issue different queries
 - **THEN** each query executes independently using the shared CatalogManager and ConnectorRegistry without interference
 
+### Requirement: SET/SHOW/RESET session commands
+The system SHALL accept SET, SHOW, and RESET commands without error. SET and RESET SHALL return a CommandComplete response (no rows). SHOW SHALL return a single-row result with the setting value. These commands are required for JDBC/DBeaver client compatibility.
+
+#### Scenario: SET command
+- **WHEN** a client sends `SET extra_float_digits = 3`
+- **THEN** the server returns CommandComplete("SET") without error
+
+#### Scenario: SHOW command
+- **WHEN** a client sends `SHOW search_path`
+- **THEN** the server returns a single row with the setting value
+
+#### Scenario: RESET command
+- **WHEN** a client sends `RESET ALL`
+- **THEN** the server returns CommandComplete("SET") without error
+
 ### Requirement: Query execution via spawn_blocking
 The system SHALL execute the synchronous query pipeline (parse → plan → execute) inside `tokio::task::spawn_blocking` to avoid blocking the async runtime. The result SHALL be sent back to the async handler for encoding and transmission.
 

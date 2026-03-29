@@ -28,3 +28,29 @@ The `PlanExpr` enum SHALL implement `Display` for human-readable output in EXPLA
 #### Scenario: Displaying a binary operation
 - **WHEN** a `PlanExpr::BinaryOp { left: Column("a"), op: Gt, right: Literal(1) }` is displayed
 - **THEN** it outputs `a > 1`
+
+### Requirement: Type inference for BinaryOp expressions
+The planner SHALL infer the output data type of `PlanExpr::BinaryOp` based on the operand types:
+- Comparison operators (=, !=, <, >, <=, >=, AND, OR, LIKE) SHALL return Boolean
+- If either operand is Float64 or Float32, arithmetic result SHALL be Float64
+- If either operand is Int64, arithmetic result SHALL be Int64
+- If one side is Null and the other is known, the known type SHALL be used
+
+#### Scenario: Float arithmetic type
+- **WHEN** `expr_to_column_info` is called for `PlanExpr::BinaryOp { Literal(100.0), Multiply, Column(SUM_result: Float64) }`
+- **THEN** the resulting ColumnInfo has `data_type: Float64`
+
+#### Scenario: Comparison type
+- **WHEN** `expr_to_column_info` is called for `PlanExpr::BinaryOp { Column(a), Gt, Literal(1) }`
+- **THEN** the resulting ColumnInfo has `data_type: Boolean`
+
+### Requirement: Type inference for aggregate Function expressions
+The planner SHALL infer the output data type of `PlanExpr::Function` for known aggregate functions:
+- COUNT SHALL return Int64
+- SUM/AVG SHALL return the argument type widened to Float64 for floats, Int64 for integers, Float64 as fallback
+- MIN/MAX SHALL return the argument type
+- The column name SHALL use the full display string (e.g., "SUM(age)") to avoid ambiguity with multiple aggregates
+
+#### Scenario: SUM return type
+- **WHEN** `expr_to_column_info` is called for `PlanExpr::Function { name: "SUM", args: [Column(age: Int32)] }`
+- **THEN** the resulting ColumnInfo has `data_type: Int64` and `name: "SUM(age)"`

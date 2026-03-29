@@ -7,6 +7,9 @@ mod session;
 
 pub use server::{ProtocolConfig, ProtocolServer};
 
+// Re-export the distributed executor trait for server crate to implement
+pub use handler::DistributedExecutor;
+
 // Re-export for integration testing
 #[doc(hidden)]
 pub mod __private {

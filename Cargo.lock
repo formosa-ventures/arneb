@@ -2778,6 +2778,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "futures",
+ "serde_json",
  "tokio",
  "trino-catalog",
  "trino-common",
@@ -2789,6 +2790,8 @@ dependencies = [
 name = "trino-planner"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "trino-catalog",
  "trino-common",
  "trino-sql-parser",
@@ -2826,11 +2829,14 @@ dependencies = [
  "async-trait",
  "futures",
  "prost",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",
  "tracing",
  "trino-common",
+ "trino-planner",
 ]
 
 [[package]]
@@ -2849,6 +2855,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "async-trait",
  "axum 0.8.8",
  "clap",
  "futures",
@@ -2867,6 +2874,8 @@ dependencies = [
  "trino-catalog",
  "trino-common",
  "trino-connectors",
+ "trino-execution",
+ "trino-planner",
  "trino-protocol",
  "trino-rpc",
  "trino-scheduler",
@@ -2877,6 +2886,7 @@ dependencies = [
 name = "trino-sql-parser"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "sqlparser",
  "trino-common",
 ]
@@ -2968,6 +2978,7 @@ checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

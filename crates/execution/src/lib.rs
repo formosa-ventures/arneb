@@ -18,6 +18,7 @@ mod hash_join;
 mod operator;
 mod optimizer;
 mod planner;
+// query_coordinator lives in server crate to avoid circular deps
 mod scalar_subquery;
 mod scan_context;
 mod semi_join;
@@ -32,4 +33,5 @@ pub use functions::{default_registry, FunctionRegistry, ScalarFunction};
 pub use operator::ExecutionPlan;
 pub use optimizer::{OptimizationRule, PhysicalPlanOptimizer};
 pub use planner::ExecutionContext;
+// QueryCoordinator is in the server crate (avoids execution↔rpc cycle)
 pub use scan_context::{ConnectorCapabilities, ScanContext};

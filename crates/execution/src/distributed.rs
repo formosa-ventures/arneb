@@ -423,3 +423,67 @@ mod tests {
         );
     }
 }
+
+// ===========================================================================
+// ExchangeExec — reads from a remote worker's OutputBuffer via Flight RPC
+// ===========================================================================
+
+/// Physical operator that reads data from a remote worker via Arrow Flight.
+#[derive(Debug)]
+pub struct ExchangeExec {
+    /// Remote worker's Flight RPC address (e.g., "http://127.0.0.1:9091").
+    remote_address: String,
+    /// Task ID on the remote worker.
+    task_id: String,
+    /// Partition to fetch.
+    partition_id: u32,
+    /// Expected output schema.
+    schema_info: Vec<ColumnInfo>,
+}
+
+impl ExchangeExec {
+    /// Create a new ExchangeExec for reading from a remote worker.
+    pub fn new(
+        remote_address: String,
+        task_id: String,
+        partition_id: u32,
+        schema_info: Vec<ColumnInfo>,
+    ) -> Self {
+        Self {
+            remote_address,
+            task_id,
+            partition_id,
+            schema_info,
+        }
+    }
+}
+
+impl std::fmt::Display for ExchangeExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ExchangeExec({}:{}:{})",
+            self.remote_address, self.task_id, self.partition_id
+        )
+    }
+}
+
+#[async_trait]
+impl ExecutionPlan for ExchangeExec {
+    fn schema(&self) -> Vec<ColumnInfo> {
+        self.schema_info.clone()
+    }
+
+    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
+        // ExchangeExec requires the orchestration layer (QueryCoordinator in server crate)
+        // to inject pre-fetched data. This placeholder returns an error if called directly.
+        Err(ExecutionError::InvalidOperation(format!(
+            "ExchangeExec({}:{}) not yet wired to remote data source",
+            self.remote_address, self.task_id
+        )))
+    }
+
+    fn display_name(&self) -> &str {
+        "ExchangeExec"
+    }
+}

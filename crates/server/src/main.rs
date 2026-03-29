@@ -1,4 +1,6 @@
 mod config;
+pub mod coordinator;
+pub mod task_manager;
 mod web;
 
 use std::sync::Arc;
@@ -151,13 +153,13 @@ async fn main() -> Result<()> {
 
     let catalog_manager = Arc::new(catalog_manager);
     let connector_registry = Arc::new(connector_registry);
-    let server = ProtocolServer::new(protocol_config, catalog_manager, connector_registry);
 
     // 8. Set up Flight RPC server + heartbeat handling
     let node_registry = trino_scheduler::NodeRegistry::default();
     let rpc_addr = format!("{}:{}", config.server.bind_address, config.cluster.rpc_port);
+    let query_tracker = Arc::new(trino_scheduler::QueryTracker::new());
 
-    let flight_state = match role {
+    let mut flight_state = match role {
         ServerRole::Coordinator | ServerRole::Standalone => {
             // Coordinator receives heartbeats from workers.
             let registry = node_registry.clone();
@@ -172,6 +174,38 @@ async fn main() -> Result<()> {
             trino_rpc::FlightState::new()
         }
     };
+
+    // 8.5. Set up distributed execution components
+    // Coordinator: create QueryCoordinator and wire into protocol server
+    // Worker: create TaskManager and register task callback
+    let distributed_executor: Option<Arc<dyn trino_protocol::DistributedExecutor>> = match role {
+        ServerRole::Coordinator => {
+            let coord =
+                coordinator::QueryCoordinator::new(node_registry.clone(), query_tracker.clone());
+            Some(Arc::new(coord))
+        }
+        _ => None,
+    };
+
+    if matches!(role, ServerRole::Worker) {
+        let tm = task_manager::TaskManager::new(
+            flight_state.clone(),
+            catalog_manager.clone(),
+            connector_registry.clone(),
+        );
+        flight_state.set_task_callback(Arc::new(move |descriptor| {
+            tm.handle_task(descriptor);
+        }));
+    }
+
+    let mut server = ProtocolServer::new(
+        protocol_config,
+        catalog_manager.clone(),
+        connector_registry.clone(),
+    );
+    if let Some(ref executor) = distributed_executor {
+        server = server.with_distributed_executor(Arc::clone(executor));
+    }
 
     // 9. Startup banner
     match role {
@@ -194,7 +228,6 @@ async fn main() -> Result<()> {
     }
 
     // 10. Set up Web UI (coordinator + standalone only)
-    let query_tracker = Arc::new(trino_scheduler::QueryTracker::new());
     let web_state = web::WebState {
         query_tracker: query_tracker.clone(),
         node_registry: node_registry.clone(),

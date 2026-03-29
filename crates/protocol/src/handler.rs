@@ -28,6 +28,21 @@ use trino_execution::{ExecutionContext, ExecutionPlan};
 use trino_planner::{LogicalOptimizer, LogicalPlan, QueryPlanner};
 
 use crate::encoding::{column_info_to_field_info, encode_record_batches};
+
+/// Trait for distributed query execution. Implemented by QueryCoordinator
+/// in the server crate and injected into the protocol handler.
+#[async_trait]
+pub trait DistributedExecutor: Send + Sync {
+    /// Execute a query plan distributedly across workers.
+    async fn execute(
+        &self,
+        plan: LogicalPlan,
+        exec_ctx: &ExecutionContext,
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, TrinoError>;
+
+    /// Check if workers are available for distributed execution.
+    fn has_workers(&self) -> bool;
+}
 use crate::error::trino_error_to_pg_error;
 
 fn arrow_type_to_pg(dt: &arrow::datatypes::DataType) -> Type {
@@ -46,6 +61,7 @@ fn arrow_type_to_pg(dt: &arrow::datatypes::DataType) -> Type {
 pub struct HandlerFactory {
     pub catalog_manager: Arc<CatalogManager>,
     pub connector_registry: Arc<ConnectorRegistry>,
+    pub distributed_executor: Option<Arc<dyn DistributedExecutor>>,
 }
 
 impl PgWireHandlerFactory for HandlerFactory {
@@ -56,6 +72,7 @@ impl PgWireHandlerFactory for HandlerFactory {
 
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
         Arc::new(ConnectionHandler {
+            distributed_executor: self.distributed_executor.clone(),
             catalog_manager: Arc::clone(&self.catalog_manager),
             connector_registry: Arc::clone(&self.connector_registry),
         })
@@ -63,6 +80,7 @@ impl PgWireHandlerFactory for HandlerFactory {
 
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
         Arc::new(ConnectionHandler {
+            distributed_executor: self.distributed_executor.clone(),
             catalog_manager: Arc::clone(&self.catalog_manager),
             connector_registry: Arc::clone(&self.connector_registry),
         })
@@ -70,6 +88,7 @@ impl PgWireHandlerFactory for HandlerFactory {
 
     fn startup_handler(&self) -> Arc<Self::StartupHandler> {
         Arc::new(ConnectionHandler {
+            distributed_executor: self.distributed_executor.clone(),
             catalog_manager: Arc::clone(&self.catalog_manager),
             connector_registry: Arc::clone(&self.connector_registry),
         })
@@ -84,6 +103,7 @@ impl PgWireHandlerFactory for HandlerFactory {
 pub struct ConnectionHandler {
     pub catalog_manager: Arc<CatalogManager>,
     pub connector_registry: Arc<ConnectorRegistry>,
+    pub distributed_executor: Option<Arc<dyn DistributedExecutor>>,
 }
 
 #[async_trait]
@@ -157,7 +177,13 @@ impl SimpleQueryHandler for ConnectionHandler {
             };
         }
 
-        let result = execute_query(trimmed, &self.catalog_manager, &self.connector_registry).await;
+        let result = execute_query(
+            trimmed,
+            &self.catalog_manager,
+            &self.connector_registry,
+            self.distributed_executor.as_deref(),
+        )
+        .await;
 
         match result {
             Ok((plan, batches)) => {
@@ -283,7 +309,13 @@ impl ExtendedQueryHandler for ConnectionHandler {
             };
         }
 
-        let result = execute_query(trimmed, &self.catalog_manager, &self.connector_registry).await;
+        let result = execute_query(
+            trimmed,
+            &self.catalog_manager,
+            &self.connector_registry,
+            self.distributed_executor.as_deref(),
+        )
+        .await;
 
         match result {
             Ok((plan, batches)) => {
@@ -415,6 +447,7 @@ async fn execute_query(
     sql: &str,
     catalog_manager: &CatalogManager,
     connector_registry: &ConnectorRegistry,
+    distributed_executor: Option<&dyn DistributedExecutor>,
 ) -> Result<
     (
         Arc<dyn ExecutionPlan>,
@@ -445,7 +478,20 @@ async fn execute_query(
     // Step 3.5: Resolve scalar subqueries in expressions (pre-evaluate them)
     let logical_plan = resolve_plan_subqueries(&exec_ctx, logical_plan).await?;
 
-    // Step 4: Create physical plan
+    // Step 3.6: Check for distributed execution
+    if let Some(executor) = distributed_executor {
+        if executor.has_workers() {
+            tracing::info!("routing query to distributed executor");
+            let batches = executor.execute(logical_plan, &exec_ctx).await?;
+            // Create local physical plan just for schema (not executed)
+            // Fall through to local if distributed fails
+            let local_plan = exec_ctx
+                .create_physical_plan(&optimizer.optimize(planner.plan_statement(&statement)?)?)?;
+            return Ok((local_plan, batches));
+        }
+    }
+
+    // Step 4: Create physical plan (local execution)
     let physical_plan = exec_ctx.create_physical_plan(&logical_plan)?;
 
     // Step 5: Execute (async)

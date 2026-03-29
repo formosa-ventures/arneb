@@ -13,7 +13,7 @@ use trino_sql_parser::ast;
 ///
 /// Unlike AST expressions, column references here are resolved to their
 /// position (index) in the input schema.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PlanExpr {
     /// A column reference resolved to its index in the input schema.
     Column {
@@ -106,7 +106,7 @@ impl PartialEq for PlanExpr {
 }
 
 /// An expression in an ORDER BY clause with sort direction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SortExpr {
     /// The expression to sort by.
     pub expr: PlanExpr,
@@ -120,7 +120,7 @@ pub struct SortExpr {
 ///
 /// Each node represents a relational algebra operation and carries
 /// enough information to determine its output schema.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum LogicalPlan {
     /// Reads all rows from a table.
     TableScan {
@@ -316,7 +316,7 @@ pub enum LogicalPlan {
 }
 
 /// A window function definition within a Window plan node.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WindowFunctionDef {
     /// Function name (e.g., ROW_NUMBER, SUM).
     pub name: String,
@@ -331,7 +331,7 @@ pub struct WindowFunctionDef {
 }
 
 /// A join condition in a logical plan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum JoinCondition {
     /// ON expression.
     On(PlanExpr),

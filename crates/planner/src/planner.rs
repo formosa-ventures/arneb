@@ -1671,4 +1671,19 @@ mod tests {
             _ => panic!("expected Projection"),
         }
     }
+
+    #[test]
+    fn test_logical_plan_serialization_roundtrip() {
+        let plan = plan_sql(
+            "SELECT users.name, SUM(orders.amount) FROM users JOIN orders ON users.id = orders.user_id GROUP BY users.name",
+        ).unwrap();
+
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(!json.is_empty());
+
+        let deserialized: LogicalPlan = serde_json::from_str(&json).unwrap();
+        // Verify structure preserved
+        let schema = deserialized.schema();
+        assert_eq!(schema.len(), plan.schema().len());
+    }
 }

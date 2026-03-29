@@ -3,7 +3,7 @@
 use std::fmt;
 
 /// Uniquely identifies a query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct QueryId(pub uuid::Uuid);
 
 impl QueryId {
@@ -26,7 +26,7 @@ impl fmt::Display for QueryId {
 }
 
 /// Identifies a stage (fragment instance) within a query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct StageId(pub u32);
 
 impl fmt::Display for StageId {
@@ -36,7 +36,7 @@ impl fmt::Display for StageId {
 }
 
 /// Identifies a task (partition of a stage) within a query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TaskId {
     /// The stage this task belongs to.
     pub stage_id: StageId,
@@ -51,7 +51,7 @@ impl fmt::Display for TaskId {
 }
 
 /// Identifies a data split (unit of work for a source scan).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SplitId(pub String);
 
 impl fmt::Display for SplitId {

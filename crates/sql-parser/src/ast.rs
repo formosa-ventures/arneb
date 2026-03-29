@@ -299,7 +299,7 @@ pub struct ColumnRef {
 }
 
 /// A binary operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BinaryOp {
     // Arithmetic
     /// Addition (`+`).
@@ -341,7 +341,7 @@ pub enum BinaryOp {
 }
 
 /// A unary operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum UnaryOp {
     /// Logical NOT.
     Not,
@@ -400,7 +400,7 @@ pub struct Join {
 }
 
 /// The type of a JOIN operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum JoinType {
     /// INNER JOIN.
     Inner,

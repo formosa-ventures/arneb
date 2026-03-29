@@ -5,7 +5,7 @@ use std::fmt;
 use thiserror::Error;
 
 /// Time unit for timestamp types, matching Arrow's TimeUnit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TimeUnit {
     /// Seconds.
     Second,
@@ -52,7 +52,7 @@ impl fmt::Display for TimeUnit {
 
 /// SQL data type system. Maintains SQL semantics (precision, scale, etc.)
 /// while providing conversion to/from Arrow types.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum DataType {
     /// SQL NULL type.
@@ -189,7 +189,7 @@ pub struct InvalidTableReference {
 }
 
 /// Reference to a table using up to three-part naming: catalog.schema.table.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TableReference {
     /// Optional catalog name (first part of `catalog.schema.table`).
     pub catalog: Option<String>,
@@ -268,7 +268,7 @@ impl fmt::Display for TableReference {
 }
 
 /// Metadata for a single column.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ColumnInfo {
     /// Column name.
     pub name: String,
@@ -285,7 +285,7 @@ impl From<ColumnInfo> for arrow::datatypes::Field {
 }
 
 /// Representation of a scalar/literal value in query plans.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum ScalarValue {
     /// SQL NULL.

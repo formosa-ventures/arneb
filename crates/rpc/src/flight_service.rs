@@ -18,15 +18,20 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::heartbeat::HeartbeatMessage;
 use crate::output_buffer::OutputBuffer;
+use crate::task_descriptor::TaskDescriptor;
 
 /// Callback invoked when a heartbeat is received.
 pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatMessage) + Send + Sync>;
+
+/// Callback invoked when a task submission is received.
+pub type TaskCallback = Arc<dyn Fn(TaskDescriptor) + Send + Sync>;
 
 /// Shared state for the Flight service — holds output buffers keyed by task ID.
 #[derive(Clone)]
 pub struct FlightState {
     buffers: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<OutputBuffer>>>>>,
     heartbeat_callback: Option<HeartbeatCallback>,
+    task_callback: Option<TaskCallback>,
 }
 
 impl Default for FlightState {
@@ -34,6 +39,7 @@ impl Default for FlightState {
         Self {
             buffers: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_callback: None,
+            task_callback: None,
         }
     }
 }
@@ -49,7 +55,13 @@ impl FlightState {
         Self {
             buffers: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_callback: Some(callback),
+            task_callback: None,
         }
+    }
+
+    /// Set a task submission callback (for worker mode).
+    pub fn set_task_callback(&mut self, callback: TaskCallback) {
+        self.task_callback = Some(callback);
     }
 
     /// Register an output buffer for a task.
@@ -193,6 +205,28 @@ impl FlightService for TrinoFlightService {
                 }
 
                 let result = arrow_flight::Result { body: "ok".into() };
+                let stream = futures::stream::once(async { Ok(result) });
+                Ok(Response::new(Box::pin(stream)))
+            }
+            "submit_task" => {
+                let descriptor = TaskDescriptor::decode(&action.body)
+                    .map_err(|e| Status::invalid_argument(format!("bad task descriptor: {e}")))?;
+
+                tracing::info!(
+                    task_id = %descriptor.task_id,
+                    stage_id = %descriptor.stage_id,
+                    "received task submission"
+                );
+
+                if let Some(ref callback) = self.state.task_callback {
+                    callback(descriptor);
+                } else {
+                    return Err(Status::unavailable("worker has no task manager registered"));
+                }
+
+                let result = arrow_flight::Result {
+                    body: "task_accepted".into(),
+                };
                 let stream = futures::stream::once(async { Ok(result) });
                 Ok(Response::new(Box::pin(stream)))
             }

@@ -10,11 +10,15 @@ mod exchange_client;
 mod flight_service;
 mod heartbeat;
 mod output_buffer;
+pub mod task_descriptor;
+mod task_submission;
 
 pub use exchange_client::ExchangeClient;
-pub use flight_service::{start_flight_server, FlightState, HeartbeatCallback};
+pub use flight_service::{start_flight_server, FlightState, HeartbeatCallback, TaskCallback};
 pub use heartbeat::{send_heartbeat, HeartbeatMessage};
 pub use output_buffer::OutputBuffer;
+pub use task_descriptor::TaskDescriptor;
+pub use task_submission::submit_task;
 
 /// Test helper: create a FlightServiceServer for integration tests.
 #[doc(hidden)]

@@ -101,7 +101,7 @@ impl ExecutionPlan for ProjectionExec {
             move |batch| {
                 let columns: Vec<ArrayRef> = exprs
                     .iter()
-                    .map(|e| expression::evaluate(e, &batch))
+                    .map(|e| expression::evaluate(e, &batch, None))
                     .collect::<Result<_, _>>()?;
 
                 let columns = columns
@@ -152,7 +152,7 @@ impl ExecutionPlan for FilterExec {
             input_stream,
             schema,
             move |batch| {
-                let mask_arr = expression::evaluate(&predicate, &batch)?;
+                let mask_arr = expression::evaluate(&predicate, &batch, None)?;
                 let mask = mask_arr
                     .as_any()
                     .downcast_ref::<BooleanArray>()
@@ -405,7 +405,7 @@ impl NestedLoopJoinExec {
             trino_planner::JoinCondition::On(expr) => {
                 let combined =
                     self.build_combined_row(left_row, right_row, left_batch, right_batch)?;
-                let result = expression::evaluate(expr, &combined)?;
+                let result = expression::evaluate(expr, &combined, None)?;
                 let bool_arr = result
                     .as_any()
                     .downcast_ref::<BooleanArray>()
@@ -517,7 +517,8 @@ impl HashAggregateExec {
             .iter()
             .map(|e| match e {
                 PlanExpr::Function { name, args, .. } => {
-                    let is_count_star = args.is_empty();
+                    let is_count_star =
+                        args.is_empty() || args.iter().any(|a| matches!(a, PlanExpr::Wildcard));
                     Ok(AggrInfo {
                         name: name.clone(),
                         args: args.clone(),
@@ -540,7 +541,7 @@ impl HashAggregateExec {
             let group_cols: Vec<ArrayRef> = self
                 .group_by
                 .iter()
-                .map(|e| expression::evaluate(e, batch))
+                .map(|e| expression::evaluate(e, batch, None))
                 .collect::<Result<_, _>>()?;
 
             let aggr_input_cols: Vec<ArrayRef> = aggr_info
@@ -549,7 +550,7 @@ impl HashAggregateExec {
                     if info.is_count_star {
                         Ok(batch.column(0).clone())
                     } else {
-                        expression::evaluate(&info.args[0], batch)
+                        expression::evaluate(&info.args[0], batch, None)
                     }
                 })
                 .collect::<Result<_, _>>()?;
@@ -597,7 +598,7 @@ impl HashAggregateExec {
                 let col = if info.is_count_star {
                     batch.column(0).clone()
                 } else {
-                    expression::evaluate(&info.args[0], batch)?
+                    expression::evaluate(&info.args[0], batch, None)?
                 };
                 accumulators[i].update_batch(&col)?;
             }
@@ -696,7 +697,7 @@ impl ExecutionPlan for SortExec {
             .order_by
             .iter()
             .map(|s| {
-                let col = expression::evaluate(&s.expr, &combined)?;
+                let col = expression::evaluate(&s.expr, &combined, None)?;
                 Ok(arrow::compute::SortColumn {
                     values: col,
                     options: Some(arrow::compute::SortOptions {

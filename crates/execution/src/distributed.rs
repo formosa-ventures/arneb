@@ -168,7 +168,7 @@ impl ExecutionPlan for MergeExec {
             .order_by
             .iter()
             .map(|s| {
-                let col = expression::evaluate(&s.expr, &combined)?;
+                let col = expression::evaluate(&s.expr, &combined, None)?;
                 Ok(arrow::compute::SortColumn {
                     values: col,
                     options: Some(arrow::compute::SortOptions {

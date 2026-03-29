@@ -17,8 +17,17 @@ use trino_common::types::ScalarValue;
 use trino_planner::PlanExpr;
 use trino_sql_parser::ast;
 
+use crate::functions::FunctionRegistry;
+
 /// Evaluates a plan expression against a record batch, producing a columnar result.
-pub(crate) fn evaluate(expr: &PlanExpr, batch: &RecordBatch) -> Result<ArrayRef, ExecutionError> {
+///
+/// When `registry` is provided, scalar function calls are resolved through it.
+/// Aggregate functions are still handled by the aggregate operator, not here.
+pub(crate) fn evaluate(
+    expr: &PlanExpr,
+    batch: &RecordBatch,
+    registry: Option<&FunctionRegistry>,
+) -> Result<ArrayRef, ExecutionError> {
     match expr {
         PlanExpr::Column { index, .. } => {
             if *index >= batch.num_columns() {
@@ -34,30 +43,30 @@ pub(crate) fn evaluate(expr: &PlanExpr, batch: &RecordBatch) -> Result<ArrayRef,
         PlanExpr::Literal(value) => scalar_to_array(value, batch.num_rows()),
 
         PlanExpr::BinaryOp { left, op, right } => {
-            let left_arr = evaluate(left, batch)?;
-            let right_arr = evaluate(right, batch)?;
+            let left_arr = evaluate(left, batch, registry)?;
+            let right_arr = evaluate(right, batch, registry)?;
             evaluate_binary_op(&left_arr, op, &right_arr)
         }
 
         PlanExpr::UnaryOp { op, expr } => {
-            let arr = evaluate(expr, batch)?;
+            let arr = evaluate(expr, batch, registry)?;
             evaluate_unary_op(op, &arr)
         }
 
         PlanExpr::IsNull(expr) => {
-            let arr = evaluate(expr, batch)?;
+            let arr = evaluate(expr, batch, registry)?;
             let result = kernels::boolean::is_null(&arr)?;
             Ok(Arc::new(result))
         }
 
         PlanExpr::IsNotNull(expr) => {
-            let arr = evaluate(expr, batch)?;
+            let arr = evaluate(expr, batch, registry)?;
             let result = kernels::boolean::is_not_null(&arr)?;
             Ok(Arc::new(result))
         }
 
         PlanExpr::Cast { expr, data_type } => {
-            let arr = evaluate(expr, batch)?;
+            let arr = evaluate(expr, batch, registry)?;
             let arrow_type: ArrowDataType = data_type.clone().into();
             let result = arrow::compute::cast(&arr, &arrow_type)?;
             Ok(result)
@@ -70,9 +79,9 @@ pub(crate) fn evaluate(expr: &PlanExpr, batch: &RecordBatch) -> Result<ArrayRef,
             high,
         } => {
             // expr BETWEEN low AND high  ≡  expr >= low AND expr <= high
-            let val = evaluate(expr, batch)?;
-            let low_val = evaluate(low, batch)?;
-            let high_val = evaluate(high, batch)?;
+            let val = evaluate(expr, batch, registry)?;
+            let low_val = evaluate(low, batch, registry)?;
+            let high_val = evaluate(high, batch, registry)?;
 
             let ge_low = compare_op(&val, &low_val, CompareOp::GtEq)?;
             let le_high = compare_op(&val, &high_val, CompareOp::LtEq)?;
@@ -91,11 +100,11 @@ pub(crate) fn evaluate(expr: &PlanExpr, batch: &RecordBatch) -> Result<ArrayRef,
             list,
             negated,
         } => {
-            let val = evaluate(expr, batch)?;
+            let val = evaluate(expr, batch, registry)?;
             // OR together equality checks for each list item
             let mut result: Option<BooleanArray> = None;
             for item in list {
-                let item_val = evaluate(item, batch)?;
+                let item_val = evaluate(item, batch, registry)?;
                 let eq = compare_op(&val, &item_val, CompareOp::Eq)?;
                 result = Some(match result {
                     Some(prev) => kernels::boolean::or(&prev, &eq)?,
@@ -114,15 +123,50 @@ pub(crate) fn evaluate(expr: &PlanExpr, batch: &RecordBatch) -> Result<ArrayRef,
             }
         }
 
-        PlanExpr::Function { .. } => {
-            // Aggregate functions are handled by HashAggregateExec, not here.
-            // Scalar functions could be added later.
+        PlanExpr::Function {
+            name,
+            args,
+            distinct: _,
+        } => {
+            // Try scalar function registry first
+            if let Some(reg) = registry {
+                if let Some(func) = reg.get(name) {
+                    let evaluated_args: Vec<ArrayRef> = args
+                        .iter()
+                        .map(|a| evaluate(a, batch, registry))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return func.evaluate(&evaluated_args);
+                }
+            }
+            // Not a known scalar function — aggregate functions are handled by
+            // HashAggregateExec, not here.
+            Err(ExecutionError::InvalidOperation(format!(
+                "unknown scalar function: {name}; aggregate functions are handled by the aggregate operator"
+            )))
+        }
+
+        PlanExpr::ScalarSubquery { .. } => {
+            // Execute the subquery plan and return a scalar value repeated for all rows
+            // This requires an ExecutionContext which we don't have here.
+            // For now, return an error — scalar subqueries in expressions need
+            // to be pre-evaluated at the operator level.
             Err(ExecutionError::InvalidOperation(
-                "function evaluation in expression context not supported; \
-                 aggregate functions are handled by the aggregate operator"
+                "scalar subquery in expression requires pre-evaluation at operator level"
                     .to_string(),
             ))
         }
+
+        PlanExpr::CaseExpr {
+            operand,
+            when_clauses,
+            else_result,
+        } => evaluate_case(
+            operand.as_deref(),
+            when_clauses,
+            else_result.as_deref(),
+            batch,
+            registry,
+        ),
 
         PlanExpr::Wildcard => Err(ExecutionError::InvalidOperation(
             "wildcard should have been expanded during planning".to_string(),
@@ -436,6 +480,159 @@ fn wider_numeric_type(
     }
 }
 
+/// Evaluate a CASE expression.
+///
+/// For searched CASE (operand is None): evaluate each when_clause condition as a boolean,
+/// pick the first matching result.
+/// For simple CASE (operand is Some): compare operand to each when_clause condition using equality.
+fn evaluate_case(
+    operand: Option<&PlanExpr>,
+    when_clauses: &[(PlanExpr, PlanExpr)],
+    else_result: Option<&PlanExpr>,
+    batch: &RecordBatch,
+    registry: Option<&FunctionRegistry>,
+) -> Result<ArrayRef, ExecutionError> {
+    let num_rows = batch.num_rows();
+
+    // Evaluate the operand once if this is a simple CASE
+    let operand_arr = match operand {
+        Some(op) => Some(evaluate(op, batch, registry)?),
+        None => None,
+    };
+
+    // Track which rows have already been assigned a result
+    let mut assigned = vec![false; num_rows];
+    // Collect (condition_mask, result_array) for each WHEN clause
+    let mut branches: Vec<(BooleanArray, ArrayRef)> = Vec::new();
+
+    for (cond, result) in when_clauses {
+        let cond_bool = if let Some(ref op_arr) = operand_arr {
+            // Simple CASE: compare operand to condition value
+            let cond_arr = evaluate(cond, batch, registry)?;
+            compare_op(op_arr, &cond_arr, CompareOp::Eq)?
+        } else {
+            // Searched CASE: condition should evaluate to boolean
+            let cond_arr = evaluate(cond, batch, registry)?;
+            cond_arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    ExecutionError::InvalidOperation(
+                        "CASE WHEN condition must be boolean".to_string(),
+                    )
+                })?
+                .clone()
+        };
+
+        // Mask: only consider rows not yet assigned
+        // A NULL condition is treated as not-matched
+        let effective_mask: BooleanArray = (0..num_rows)
+            .map(|i| {
+                if assigned[i] || cond_bool.is_null(i) {
+                    Some(false)
+                } else {
+                    Some(cond_bool.value(i))
+                }
+            })
+            .collect();
+
+        // Mark newly assigned rows
+        for (i, flag) in assigned.iter_mut().enumerate().take(num_rows) {
+            if !effective_mask.is_null(i) && effective_mask.value(i) {
+                *flag = true;
+            }
+        }
+
+        let result_arr = evaluate(result, batch, registry)?;
+        branches.push((effective_mask, result_arr));
+    }
+
+    // Evaluate ELSE if provided
+    let else_arr = match else_result {
+        Some(el) => Some(evaluate(el, batch, registry)?),
+        None => None,
+    };
+
+    // Determine output type from the first non-null branch result, or else, or default to Utf8
+    let output_type = branches
+        .iter()
+        .map(|(_, arr)| arr.data_type().clone())
+        .chain(else_arr.iter().map(|a| a.data_type().clone()))
+        .find(|dt| *dt != ArrowDataType::Null)
+        .unwrap_or(ArrowDataType::Utf8);
+
+    // Build the result array row by row using arrow's MutableArrayData
+    // Strategy: build nullable arrays for each branch, then select per-row
+    // Simpler approach: build result using take/interleave patterns
+    // For simplicity, we build the result by iterating rows
+
+    // Cast all branch results and else to the output type
+    let cast_branches: Vec<(BooleanArray, ArrayRef)> = branches
+        .into_iter()
+        .map(|(mask, arr)| {
+            let casted = if arr.data_type() == &output_type {
+                arr
+            } else if *arr.data_type() == ArrowDataType::Null {
+                // Create a null array of the target type
+                new_null_array(&output_type, num_rows)
+            } else {
+                arrow::compute::cast(&arr, &output_type).map_err(|e| {
+                    ExecutionError::InvalidOperation(format!("CASE branch type cast failed: {e}"))
+                })?
+            };
+            Ok((mask, casted))
+        })
+        .collect::<Result<Vec<_>, ExecutionError>>()?;
+
+    let else_casted = match else_arr {
+        Some(arr) => {
+            if arr.data_type() == &output_type {
+                Some(arr)
+            } else if *arr.data_type() == ArrowDataType::Null {
+                Some(new_null_array(&output_type, num_rows))
+            } else {
+                Some(arrow::compute::cast(&arr, &output_type).map_err(|e| {
+                    ExecutionError::InvalidOperation(format!("CASE ELSE type cast failed: {e}"))
+                })?)
+            }
+        }
+        None => None,
+    };
+
+    // Build result using arrow interleave: for each row, pick from the right source
+    // We'll use indices into sources array
+    let mut sources: Vec<&ArrayRef> = cast_branches.iter().map(|(_, arr)| arr).collect();
+    let null_arr;
+    if let Some(ref ea) = else_casted {
+        sources.push(ea);
+    } else {
+        null_arr = new_null_array(&output_type, num_rows);
+        sources.push(&null_arr);
+    }
+    let else_idx = sources.len() - 1;
+
+    let indices: Vec<(usize, usize)> = (0..num_rows)
+        .map(|row| {
+            for (branch_idx, (mask, _)) in cast_branches.iter().enumerate() {
+                if !mask.is_null(row) && mask.value(row) {
+                    return (branch_idx, row);
+                }
+            }
+            (else_idx, row)
+        })
+        .collect();
+
+    let source_refs: Vec<&dyn Array> = sources.iter().map(|a| a.as_ref()).collect();
+    let result = arrow::compute::interleave(&source_refs, &indices)?;
+
+    Ok(result)
+}
+
+/// Create a null array of the given type and length.
+fn new_null_array(data_type: &ArrowDataType, len: usize) -> ArrayRef {
+    arrow::array::new_null_array(data_type, len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,7 +664,7 @@ mod tests {
             index: 0,
             name: "a".to_string(),
         };
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(arr.values(), &[1, 2, 3]);
     }
@@ -476,7 +673,7 @@ mod tests {
     fn eval_literal_int() {
         let batch = make_batch();
         let expr = PlanExpr::Literal(ScalarValue::Int64(42));
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(arr.value(0), 42);
         assert_eq!(arr.len(), 3);
@@ -486,7 +683,7 @@ mod tests {
     fn eval_literal_string() {
         let batch = make_batch();
         let expr = PlanExpr::Literal(ScalarValue::Utf8("test".to_string()));
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(arr.value(0), "test");
     }
@@ -503,7 +700,7 @@ mod tests {
             op: ast::BinaryOp::Plus,
             right: Box::new(PlanExpr::Literal(ScalarValue::Int32(1))),
         };
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(arr.values(), &[2, 3, 4]);
     }
@@ -523,7 +720,7 @@ mod tests {
                 name: "b".to_string(),
             }),
         };
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(arr.values(), &[11, 22, 33]);
     }
@@ -540,7 +737,7 @@ mod tests {
             op: ast::BinaryOp::Gt,
             right: Box::new(PlanExpr::Literal(ScalarValue::Int32(1))),
         };
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(!arr.value(0));
         assert!(arr.value(1));
@@ -559,7 +756,7 @@ mod tests {
             op: ast::BinaryOp::And,
             right: Box::new(PlanExpr::Literal(ScalarValue::Boolean(true))),
         };
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(arr.value(0));
         assert!(!arr.value(1));
@@ -576,7 +773,7 @@ mod tests {
                 name: "d".to_string(),
             }),
         };
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(!arr.value(0));
         assert!(arr.value(1));
@@ -593,7 +790,7 @@ mod tests {
                 name: "a".to_string(),
             }),
         };
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(arr.values(), &[-1, -2, -3]);
     }
@@ -615,7 +812,7 @@ mod tests {
             index: 0,
             name: "x".to_string(),
         }));
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(!arr.value(0));
         assert!(arr.value(1));
@@ -635,7 +832,7 @@ mod tests {
             low: Box::new(PlanExpr::Literal(ScalarValue::Int32(1))),
             high: Box::new(PlanExpr::Literal(ScalarValue::Int32(2))),
         };
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(arr.value(0)); // 1 in [1,2]
         assert!(arr.value(1)); // 2 in [1,2]
@@ -657,7 +854,7 @@ mod tests {
             ],
             negated: false,
         };
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(arr.value(0)); // 1 in list
         assert!(!arr.value(1)); // 2 not in list
@@ -676,7 +873,7 @@ mod tests {
             op: ast::BinaryOp::Like,
             right: Box::new(PlanExpr::Literal(ScalarValue::Utf8("he%".to_string()))),
         };
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(arr.value(0)); // "hello" matches
         assert!(!arr.value(1)); // "world" doesn't
@@ -694,7 +891,7 @@ mod tests {
             }),
             data_type: trino_common::types::DataType::Int64,
         };
-        let result = evaluate(&expr, &batch).unwrap();
+        let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(arr.values(), &[1, 2, 3]);
     }
@@ -706,6 +903,169 @@ mod tests {
             index: 99,
             name: "z".to_string(),
         };
-        assert!(evaluate(&expr, &batch).is_err());
+        assert!(evaluate(&expr, &batch, None).is_err());
+    }
+
+    // -- CASE expression tests --
+
+    #[test]
+    fn eval_searched_case() {
+        let batch = make_batch(); // a = [1, 2, 3]
+                                  // CASE WHEN a > 2 THEN 'big' WHEN a > 1 THEN 'medium' ELSE 'small' END
+        let expr = PlanExpr::CaseExpr {
+            operand: None,
+            when_clauses: vec![
+                (
+                    PlanExpr::BinaryOp {
+                        left: Box::new(PlanExpr::Column {
+                            index: 0,
+                            name: "a".into(),
+                        }),
+                        op: ast::BinaryOp::Gt,
+                        right: Box::new(PlanExpr::Literal(ScalarValue::Int32(2))),
+                    },
+                    PlanExpr::Literal(ScalarValue::Utf8("big".into())),
+                ),
+                (
+                    PlanExpr::BinaryOp {
+                        left: Box::new(PlanExpr::Column {
+                            index: 0,
+                            name: "a".into(),
+                        }),
+                        op: ast::BinaryOp::Gt,
+                        right: Box::new(PlanExpr::Literal(ScalarValue::Int32(1))),
+                    },
+                    PlanExpr::Literal(ScalarValue::Utf8("medium".into())),
+                ),
+            ],
+            else_result: Some(Box::new(PlanExpr::Literal(ScalarValue::Utf8(
+                "small".into(),
+            )))),
+        };
+        let result = evaluate(&expr, &batch, None).unwrap();
+        let arr = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(arr.value(0), "small"); // a=1
+        assert_eq!(arr.value(1), "medium"); // a=2
+        assert_eq!(arr.value(2), "big"); // a=3
+    }
+
+    #[test]
+    fn eval_simple_case() {
+        let batch = make_batch(); // a = [1, 2, 3]
+                                  // CASE a WHEN 1 THEN 'one' WHEN 3 THEN 'three' ELSE 'other' END
+        let expr = PlanExpr::CaseExpr {
+            operand: Some(Box::new(PlanExpr::Column {
+                index: 0,
+                name: "a".into(),
+            })),
+            when_clauses: vec![
+                (
+                    PlanExpr::Literal(ScalarValue::Int32(1)),
+                    PlanExpr::Literal(ScalarValue::Utf8("one".into())),
+                ),
+                (
+                    PlanExpr::Literal(ScalarValue::Int32(3)),
+                    PlanExpr::Literal(ScalarValue::Utf8("three".into())),
+                ),
+            ],
+            else_result: Some(Box::new(PlanExpr::Literal(ScalarValue::Utf8(
+                "other".into(),
+            )))),
+        };
+        let result = evaluate(&expr, &batch, None).unwrap();
+        let arr = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(arr.value(0), "one");
+        assert_eq!(arr.value(1), "other");
+        assert_eq!(arr.value(2), "three");
+    }
+
+    #[test]
+    fn eval_case_no_else_returns_null() {
+        let batch = make_batch(); // a = [1, 2, 3]
+                                  // CASE WHEN a > 10 THEN 'big' END → all NULL
+        let expr = PlanExpr::CaseExpr {
+            operand: None,
+            when_clauses: vec![(
+                PlanExpr::BinaryOp {
+                    left: Box::new(PlanExpr::Column {
+                        index: 0,
+                        name: "a".into(),
+                    }),
+                    op: ast::BinaryOp::Gt,
+                    right: Box::new(PlanExpr::Literal(ScalarValue::Int32(10))),
+                },
+                PlanExpr::Literal(ScalarValue::Utf8("big".into())),
+            )],
+            else_result: None,
+        };
+        let result = evaluate(&expr, &batch, None).unwrap();
+        assert!(result.is_null(0));
+        assert!(result.is_null(1));
+        assert!(result.is_null(2));
+    }
+
+    #[test]
+    fn eval_coalesce_desugared() {
+        // Simulate COALESCE(x, 0) where x = [NULL, 2, NULL]
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            ArrowDataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![None, Some(2), None]))],
+        )
+        .unwrap();
+
+        // CASE WHEN x IS NOT NULL THEN x ELSE 0 END
+        let expr = PlanExpr::CaseExpr {
+            operand: None,
+            when_clauses: vec![(
+                PlanExpr::IsNotNull(Box::new(PlanExpr::Column {
+                    index: 0,
+                    name: "x".into(),
+                })),
+                PlanExpr::Column {
+                    index: 0,
+                    name: "x".into(),
+                },
+            )],
+            else_result: Some(Box::new(PlanExpr::Literal(ScalarValue::Int32(0)))),
+        };
+        let result = evaluate(&expr, &batch, None).unwrap();
+        let arr = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(arr.value(0), 0);
+        assert_eq!(arr.value(1), 2);
+        assert_eq!(arr.value(2), 0);
+    }
+
+    #[test]
+    fn eval_nullif_desugared() {
+        let batch = make_batch(); // a = [1, 2, 3]
+                                  // NULLIF(a, 2) → CASE WHEN a = 2 THEN NULL ELSE a END
+        let expr = PlanExpr::CaseExpr {
+            operand: None,
+            when_clauses: vec![(
+                PlanExpr::BinaryOp {
+                    left: Box::new(PlanExpr::Column {
+                        index: 0,
+                        name: "a".into(),
+                    }),
+                    op: ast::BinaryOp::Eq,
+                    right: Box::new(PlanExpr::Literal(ScalarValue::Int32(2))),
+                },
+                PlanExpr::Literal(ScalarValue::Null),
+            )],
+            else_result: Some(Box::new(PlanExpr::Column {
+                index: 0,
+                name: "a".into(),
+            })),
+        };
+        let result = evaluate(&expr, &batch, None).unwrap();
+        let arr = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(arr.value(0), 1);
+        assert!(arr.is_null(1)); // NULLIF(2, 2) = NULL
+        assert_eq!(arr.value(2), 3);
     }
 }

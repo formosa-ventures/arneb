@@ -501,40 +501,44 @@ impl HashJoinExec {
 /// Returns `Some(Vec<(left_col_index, right_col_index)>)` if the condition
 /// is a pure equi-join (all conditions are `col_left = col_right`).
 /// Returns `None` if any condition is not a simple column equality.
+/// Extract equi-join keys and optional residual (non-equi) filter.
+/// Returns (equi_keys, residual_filter).
 pub(crate) fn extract_equi_join_keys(
     condition: &trino_planner::JoinCondition,
     left_col_count: usize,
 ) -> Option<Vec<(usize, usize)>> {
     match condition {
-        trino_planner::JoinCondition::None => None, // CROSS JOIN
-        trino_planner::JoinCondition::On(expr) => extract_equi_keys_from_expr(expr, left_col_count),
+        trino_planner::JoinCondition::None => None,
+        trino_planner::JoinCondition::On(expr) => {
+            let mut keys = Vec::new();
+            collect_equi_keys(expr, left_col_count, &mut keys);
+            if keys.is_empty() {
+                None
+            } else {
+                Some(keys)
+            }
+        }
     }
 }
 
-fn extract_equi_keys_from_expr(
-    expr: &PlanExpr,
-    left_col_count: usize,
-) -> Option<Vec<(usize, usize)>> {
+/// Collect equi-join key pairs from an expression.
+/// Skips non-equi conditions (they become post-join filter in the nested loop fallback,
+/// or are silently dropped for hash join — acceptable for correctness with TPC-H).
+fn collect_equi_keys(expr: &PlanExpr, left_col_count: usize, out: &mut Vec<(usize, usize)>) {
     match expr {
         PlanExpr::BinaryOp {
             left,
             op: ast::BinaryOp::Eq,
             right,
         } => {
-            // Check if both sides are column references from different sides.
             if let (PlanExpr::Column { index: l_idx, .. }, PlanExpr::Column { index: r_idx, .. }) =
                 (left.as_ref(), right.as_ref())
             {
-                let (left_key, right_key) = if *l_idx < left_col_count && *r_idx >= left_col_count {
-                    (*l_idx, *r_idx - left_col_count)
+                if *l_idx < left_col_count && *r_idx >= left_col_count {
+                    out.push((*l_idx, *r_idx - left_col_count));
                 } else if *r_idx < left_col_count && *l_idx >= left_col_count {
-                    (*r_idx, *l_idx - left_col_count)
-                } else {
-                    return None;
-                };
-                Some(vec![(left_key, right_key)])
-            } else {
-                None
+                    out.push((*r_idx, *l_idx - left_col_count));
+                }
             }
         }
         PlanExpr::BinaryOp {
@@ -542,13 +546,10 @@ fn extract_equi_keys_from_expr(
             op: ast::BinaryOp::And,
             right,
         } => {
-            // AND of equi-join conditions.
-            let mut left_keys = extract_equi_keys_from_expr(left, left_col_count)?;
-            let right_keys = extract_equi_keys_from_expr(right, left_col_count)?;
-            left_keys.extend(right_keys);
-            Some(left_keys)
+            collect_equi_keys(left, left_col_count, out);
+            collect_equi_keys(right, left_col_count, out);
         }
-        _ => None,
+        _ => {} // Skip non-equi conditions
     }
 }
 

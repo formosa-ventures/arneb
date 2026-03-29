@@ -51,6 +51,14 @@ mod tests {
     use super::*;
     use trino_common::types::{DataType, ScalarValue};
 
+    /// Helper to extract the SelectBody from a query (panics if it's a set operation).
+    fn select_body(query: &Query) -> &SelectBody {
+        match &query.body {
+            QueryBody::Select(body) => body,
+            other => panic!("expected Select body, got {other:?}"),
+        }
+    }
+
     // -- Basic SELECT tests --
 
     #[test]
@@ -59,8 +67,9 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert_eq!(query.body.projection.len(), 1);
-        match &query.body.projection[0] {
+        let body = select_body(&query);
+        assert_eq!(body.projection.len(), 1);
+        match &body.projection[0] {
             SelectItem::UnnamedExpr(Expr::Literal(ScalarValue::Int64(1))) => {}
             other => panic!("expected literal 1, got {other:?}"),
         }
@@ -72,9 +81,9 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert_eq!(query.body.projection.len(), 2);
-        assert_eq!(query.body.from.len(), 1);
-        match &query.body.from[0].relation {
+        assert_eq!(select_body(&query).projection.len(), 2);
+        assert_eq!(select_body(&query).from.len(), 1);
+        match &select_body(&query).from[0].relation {
             TableFactor::Table { name, alias } => {
                 assert_eq!(name.table, "t");
                 assert!(alias.is_none());
@@ -89,7 +98,10 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert!(matches!(&query.body.projection[0], SelectItem::Wildcard));
+        assert!(matches!(
+            &select_body(&query).projection[0],
+            SelectItem::Wildcard
+        ));
     }
 
     #[test]
@@ -98,7 +110,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::QualifiedWildcard(tr) => {
                 assert_eq!(tr.table, "t");
             }
@@ -114,8 +126,8 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert!(query.body.selection.is_some());
-        match query.body.selection.as_deref() {
+        assert!(select_body(&query).selection.is_some());
+        match select_body(&query).selection.as_deref() {
             Some(Expr::BinaryOp { op, .. }) => {
                 assert_eq!(*op, BinaryOp::Gt);
             }
@@ -130,7 +142,7 @@ mod tests {
             panic!("expected Query");
         };
         // Should parse successfully; exact tree depends on precedence
-        assert!(query.body.selection.is_some());
+        assert!(select_body(&query).selection.is_some());
     }
 
     #[test]
@@ -140,7 +152,7 @@ mod tests {
             panic!("expected Query");
         };
         assert!(matches!(
-            query.body.selection.as_deref(),
+            select_body(&query).selection.as_deref(),
             Some(Expr::IsNull(_))
         ));
     }
@@ -151,7 +163,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match query.body.selection.as_deref() {
+        match select_body(&query).selection.as_deref() {
             Some(Expr::Between { negated, .. }) => {
                 assert!(!negated);
             }
@@ -165,7 +177,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match query.body.selection.as_deref() {
+        match select_body(&query).selection.as_deref() {
             Some(Expr::InList { list, negated, .. }) => {
                 assert_eq!(list.len(), 3);
                 assert!(!negated);
@@ -182,11 +194,14 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert_eq!(query.body.from.len(), 1);
-        assert_eq!(query.body.from[0].joins.len(), 1);
-        assert_eq!(query.body.from[0].joins[0].join_type, JoinType::Inner);
+        assert_eq!(select_body(&query).from.len(), 1);
+        assert_eq!(select_body(&query).from[0].joins.len(), 1);
+        assert_eq!(
+            select_body(&query).from[0].joins[0].join_type,
+            JoinType::Inner
+        );
         assert!(matches!(
-            &query.body.from[0].joins[0].condition,
+            &select_body(&query).from[0].joins[0].condition,
             JoinCondition::On(_)
         ));
     }
@@ -197,7 +212,10 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert_eq!(query.body.from[0].joins[0].join_type, JoinType::Left);
+        assert_eq!(
+            select_body(&query).from[0].joins[0].join_type,
+            JoinType::Left
+        );
     }
 
     #[test]
@@ -206,7 +224,10 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert_eq!(query.body.from[0].joins[0].join_type, JoinType::Right);
+        assert_eq!(
+            select_body(&query).from[0].joins[0].join_type,
+            JoinType::Right
+        );
     }
 
     #[test]
@@ -215,9 +236,12 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert_eq!(query.body.from[0].joins[0].join_type, JoinType::Cross);
+        assert_eq!(
+            select_body(&query).from[0].joins[0].join_type,
+            JoinType::Cross
+        );
         assert!(matches!(
-            &query.body.from[0].joins[0].condition,
+            &select_body(&query).from[0].joins[0].condition,
             JoinCondition::None
         ));
     }
@@ -228,7 +252,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.from[0].joins[0].condition {
+        match &select_body(&query).from[0].joins[0].condition {
             JoinCondition::Using(cols) => {
                 assert_eq!(cols, &["id"]);
             }
@@ -243,7 +267,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert_eq!(query.body.from[0].joins.len(), 2);
+        assert_eq!(select_body(&query).from[0].joins.len(), 2);
     }
 
     // -- Expression tests --
@@ -255,7 +279,7 @@ mod tests {
             panic!("expected Query");
         };
         // Should parse without error; precedence handled by sqlparser
-        assert_eq!(query.body.projection.len(), 1);
+        assert_eq!(select_body(&query).projection.len(), 1);
     }
 
     #[test]
@@ -264,7 +288,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::UnnamedExpr(Expr::Function { name, args, .. }) => {
                 assert_eq!(name, "COUNT");
                 assert_eq!(args.len(), 1);
@@ -280,7 +304,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::UnnamedExpr(Expr::Function { distinct, .. }) => {
                 assert!(distinct);
             }
@@ -294,7 +318,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => {
                 assert_eq!(*data_type, DataType::Int32);
             }
@@ -309,7 +333,7 @@ mod tests {
             panic!("expected Query");
         };
         // Should parse without error
-        assert_eq!(query.body.projection.len(), 1);
+        assert_eq!(select_body(&query).projection.len(), 1);
     }
 
     // -- GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET tests --
@@ -320,7 +344,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert_eq!(query.body.group_by.len(), 1);
+        assert_eq!(select_body(&query).group_by.len(), 1);
     }
 
     #[test]
@@ -329,7 +353,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert!(query.body.having.is_some());
+        assert!(select_body(&query).having.is_some());
     }
 
     #[test]
@@ -360,7 +384,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.from[0].relation {
+        match &select_body(&query).from[0].relation {
             TableFactor::Subquery { alias, .. } => {
                 assert_eq!(alias, "sub");
             }
@@ -374,7 +398,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert!(query.body.selection.is_some());
+        assert!(select_body(&query).selection.is_some());
     }
 
     // -- EXPLAIN test --
@@ -402,32 +426,51 @@ mod tests {
     }
 
     #[test]
-    fn parse_unsupported_create_table() {
-        let result = parse("CREATE TABLE t (a INT)");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, ParseError::UnsupportedFeature(_)));
-        assert!(err.to_string().contains("CREATE TABLE"));
+    fn parse_create_table() {
+        let stmt = parse("CREATE TABLE t (a INT, b VARCHAR)").unwrap();
+        assert!(matches!(stmt, Statement::CreateTable { .. }));
     }
 
     #[test]
-    fn parse_unsupported_insert() {
-        let result = parse("INSERT INTO t VALUES (1)");
-        assert!(result.is_err());
+    fn parse_drop_table() {
+        let stmt = parse("DROP TABLE IF EXISTS t").unwrap();
+        match stmt {
+            Statement::DropTable { if_exists, .. } => assert!(if_exists),
+            other => panic!("expected DropTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_values() {
+        let stmt = parse("INSERT INTO t VALUES (1, 'hello')").unwrap();
+        assert!(matches!(stmt, Statement::InsertInto { .. }));
+    }
+
+    #[test]
+    fn parse_delete_from() {
+        let stmt = parse("DELETE FROM t WHERE id = 1").unwrap();
         assert!(matches!(
-            result.unwrap_err(),
-            ParseError::UnsupportedFeature(_)
+            stmt,
+            Statement::DeleteFrom {
+                predicate: Some(_),
+                ..
+            }
         ));
     }
 
     #[test]
-    fn parse_unsupported_delete() {
-        let result = parse("DELETE FROM t WHERE id = 1");
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ParseError::UnsupportedFeature(_)
-        ));
+    fn parse_create_view() {
+        let stmt = parse("CREATE VIEW v AS SELECT 1").unwrap();
+        assert!(matches!(stmt, Statement::CreateView { .. }));
+    }
+
+    #[test]
+    fn parse_drop_view() {
+        let stmt = parse("DROP VIEW IF EXISTS v").unwrap();
+        match stmt {
+            Statement::DropView { if_exists, .. } => assert!(if_exists),
+            other => panic!("expected DropView, got {other:?}"),
+        }
     }
 
     #[test]
@@ -448,7 +491,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::UnnamedExpr(Expr::Literal(ScalarValue::Int64(42))) => {}
             other => panic!("expected int 42, got {other:?}"),
         }
@@ -460,7 +503,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::UnnamedExpr(Expr::Literal(ScalarValue::Float64(v))) => {
                 assert!((v - 3.14).abs() < f64::EPSILON);
             }
@@ -474,7 +517,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::UnnamedExpr(Expr::Literal(ScalarValue::Utf8(s))) => {
                 assert_eq!(s, "hello");
             }
@@ -488,7 +531,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::UnnamedExpr(Expr::Literal(ScalarValue::Boolean(true))) => {}
             other => panic!("expected true, got {other:?}"),
         }
@@ -500,7 +543,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::UnnamedExpr(Expr::Literal(ScalarValue::Null)) => {}
             other => panic!("expected NULL, got {other:?}"),
         }
@@ -521,7 +564,7 @@ mod tests {
             let Statement::Query(query) = stmt else {
                 panic!("expected Query for {sql_type}");
             };
-            match &query.body.projection[0] {
+            match &select_body(&query).projection[0] {
                 SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => {
                     assert_eq!(*data_type, expected, "failed for {sql_type}");
                 }
@@ -541,7 +584,7 @@ mod tests {
             let Statement::Query(query) = stmt else {
                 panic!("expected Query for {sql_type}");
             };
-            match &query.body.projection[0] {
+            match &select_body(&query).projection[0] {
                 SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => {
                     assert_eq!(*data_type, expected, "failed for {sql_type}");
                 }
@@ -557,7 +600,7 @@ mod tests {
             let Statement::Query(query) = stmt else {
                 panic!("expected Query for {sql_type}");
             };
-            match &query.body.projection[0] {
+            match &select_body(&query).projection[0] {
                 SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => {
                     assert_eq!(*data_type, DataType::Utf8, "failed for {sql_type}");
                 }
@@ -572,7 +615,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => {
                 assert_eq!(
                     *data_type,
@@ -592,7 +635,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => {
                 assert_eq!(*data_type, DataType::Boolean);
             }
@@ -606,7 +649,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => {
                 assert_eq!(*data_type, DataType::Date32);
             }
@@ -620,7 +663,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => {
                 assert_eq!(
                     *data_type,
@@ -670,7 +713,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.projection[0] {
+        match &select_body(&query).projection[0] {
             SelectItem::ExprWithAlias { alias, .. } => {
                 assert_eq!(alias, "col_a");
             }
@@ -686,7 +729,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        assert!(query.body.distinct);
+        assert!(select_body(&query).distinct);
     }
 
     // -- Table with alias --
@@ -697,7 +740,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.from[0].relation {
+        match &select_body(&query).from[0].relation {
             TableFactor::Table { alias, .. } => {
                 assert_eq!(alias.as_deref(), Some("t"));
             }
@@ -713,7 +756,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match &query.body.from[0].relation {
+        match &select_body(&query).from[0].relation {
             TableFactor::Table { name, .. } => {
                 assert_eq!(name.catalog, Some("catalog".to_string()));
                 assert_eq!(name.schema, Some("schema".to_string()));
@@ -731,7 +774,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match query.body.selection.as_deref() {
+        match select_body(&query).selection.as_deref() {
             Some(Expr::BinaryOp {
                 op: BinaryOp::Like, ..
             }) => {}
@@ -747,7 +790,7 @@ mod tests {
         let Statement::Query(query) = stmt else {
             panic!("expected Query");
         };
-        match query.body.selection.as_deref() {
+        match select_body(&query).selection.as_deref() {
             Some(Expr::BinaryOp {
                 op: BinaryOp::NotLike,
                 ..
@@ -765,8 +808,192 @@ mod tests {
             panic!("expected Query");
         };
         assert!(matches!(
-            query.body.selection.as_deref(),
+            select_body(&query).selection.as_deref(),
             Some(Expr::IsNotNull(_))
         ));
+    }
+
+    // -- CASE / COALESCE / NULLIF tests --
+
+    #[test]
+    fn parse_searched_case() {
+        let stmt = parse("SELECT CASE WHEN x > 1 THEN 'a' WHEN x > 2 THEN 'b' ELSE 'c' END FROM t")
+            .unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            }) => {
+                assert!(operand.is_none());
+                assert_eq!(conditions.len(), 2);
+                assert_eq!(results.len(), 2);
+                assert!(else_result.is_some());
+            }
+            other => panic!("expected Case, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_simple_case() {
+        let stmt = parse("SELECT CASE x WHEN 1 THEN 'one' WHEN 2 THEN 'two' END FROM t").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            }) => {
+                assert!(operand.is_some());
+                assert_eq!(conditions.len(), 2);
+                assert_eq!(results.len(), 2);
+                assert!(else_result.is_none());
+            }
+            other => panic!("expected Case, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_coalesce() {
+        let stmt = parse("SELECT COALESCE(a, b, c) FROM t").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            }) => {
+                assert!(operand.is_none());
+                // COALESCE(a, b, c) → WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ELSE c
+                assert_eq!(conditions.len(), 2);
+                assert_eq!(results.len(), 2);
+                assert!(matches!(conditions[0], Expr::IsNotNull(_)));
+                assert!(matches!(conditions[1], Expr::IsNotNull(_)));
+                assert!(else_result.is_some());
+            }
+            other => panic!("expected Case (desugared COALESCE), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_nullif() {
+        let stmt = parse("SELECT NULLIF(a, b) FROM t").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            }) => {
+                assert!(operand.is_none());
+                // NULLIF(a, b) → WHEN a = b THEN NULL ELSE a
+                assert_eq!(conditions.len(), 1);
+                assert!(matches!(
+                    &conditions[0],
+                    Expr::BinaryOp {
+                        op: BinaryOp::Eq,
+                        ..
+                    }
+                ));
+                assert_eq!(results.len(), 1);
+                assert!(matches!(&results[0], Expr::Literal(ScalarValue::Null)));
+                assert!(else_result.is_some());
+            }
+            other => panic!("expected Case (desugared NULLIF), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_case_display() {
+        let expr = Expr::Case {
+            operand: None,
+            conditions: vec![Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef {
+                    name: "x".to_string(),
+                    table: None,
+                })),
+                op: BinaryOp::Gt,
+                right: Box::new(Expr::Literal(ScalarValue::Int64(1))),
+            }],
+            results: vec![Expr::Literal(ScalarValue::Utf8("yes".to_string()))],
+            else_result: Some(Box::new(Expr::Literal(ScalarValue::Utf8("no".to_string())))),
+        };
+        assert_eq!(expr.to_string(), "CASE WHEN x > 1 THEN 'yes' ELSE 'no' END");
+    }
+
+    // -- Subquery expression tests --
+
+    #[test]
+    fn parse_in_subquery() {
+        let stmt = parse("SELECT * FROM t WHERE id IN (SELECT id FROM u)").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected Query");
+        };
+        assert!(matches!(
+            select_body(&query).selection.as_deref(),
+            Some(Expr::InSubquery { negated: false, .. })
+        ));
+    }
+
+    #[test]
+    fn parse_not_in_subquery() {
+        let stmt = parse("SELECT * FROM t WHERE id NOT IN (SELECT id FROM u)").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected Query");
+        };
+        assert!(matches!(
+            select_body(&query).selection.as_deref(),
+            Some(Expr::InSubquery { negated: true, .. })
+        ));
+    }
+
+    #[test]
+    fn parse_exists() {
+        let stmt =
+            parse("SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected Query");
+        };
+        assert!(matches!(
+            select_body(&query).selection.as_deref(),
+            Some(Expr::Exists { negated: false, .. })
+        ));
+    }
+
+    #[test]
+    fn parse_not_exists() {
+        let stmt = parse("SELECT * FROM t WHERE NOT EXISTS (SELECT 1 FROM u)").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected Query");
+        };
+        assert!(matches!(
+            select_body(&query).selection.as_deref(),
+            Some(Expr::Exists { negated: true, .. })
+        ));
+    }
+
+    #[test]
+    fn parse_scalar_subquery() {
+        let stmt = parse("SELECT (SELECT MAX(x) FROM u) FROM t").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(Expr::Subquery(_)) => {}
+            other => panic!("expected Subquery, got {other:?}"),
+        }
     }
 }

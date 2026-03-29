@@ -3,6 +3,7 @@ use trino_common::error::TrinoError;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
+#[allow(dead_code)]
 pub enum ProtocolError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

@@ -5,12 +5,13 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
+use async_trait::async_trait;
 use trino_catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use trino_common::error::{ConnectorError, ExecutionError};
+use trino_common::stream::{stream_from_batches, SendableRecordBatchStream};
 use trino_common::types::{ColumnInfo, TableReference};
-use trino_execution::DataSource;
+use trino_execution::{DataSource, ScanContext};
 
 use crate::ConnectorFactory;
 
@@ -51,12 +52,13 @@ impl CsvDataSource {
     }
 }
 
+#[async_trait]
 impl DataSource for CsvDataSource {
     fn schema(&self) -> Vec<ColumnInfo> {
         self.column_schema.clone()
     }
 
-    fn scan(&self) -> Result<Vec<RecordBatch>, ExecutionError> {
+    async fn scan(&self, ctx: &ScanContext) -> Result<SendableRecordBatchStream, ExecutionError> {
         let file = std::fs::File::open(&self.path).map_err(|e| {
             ExecutionError::InvalidOperation(format!(
                 "failed to open CSV file '{}': {}",
@@ -72,9 +74,37 @@ impl DataSource for CsvDataSource {
 
         let mut batches = Vec::new();
         for result in reader {
-            batches.push(result?);
+            let batch = result?;
+            // Apply projection pushdown: select only requested columns.
+            if let Some(ref projection) = ctx.projection {
+                let columns: Vec<arrow::array::ArrayRef> = projection
+                    .iter()
+                    .map(|&i| batch.column(i).clone())
+                    .collect();
+                let fields: Vec<arrow::datatypes::FieldRef> = projection
+                    .iter()
+                    .map(|&i| batch.schema().field(i).clone().into())
+                    .collect();
+                let projected_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
+                batches.push(
+                    arrow::array::RecordBatch::try_new(projected_schema, columns)
+                        .map_err(ExecutionError::ArrowError)?,
+                );
+            } else {
+                batches.push(batch);
+            }
         }
-        Ok(batches)
+
+        let output_schema = if let Some(ref projection) = ctx.projection {
+            let fields: Vec<arrow::datatypes::FieldRef> = projection
+                .iter()
+                .map(|&i| self.arrow_schema.field(i).clone().into())
+                .collect();
+            std::sync::Arc::new(arrow::datatypes::Schema::new(fields))
+        } else {
+            self.arrow_schema.clone()
+        };
+        Ok(stream_from_batches(output_schema, batches))
     }
 }
 
@@ -122,12 +152,13 @@ impl fmt::Debug for ParquetDataSource {
     }
 }
 
+#[async_trait]
 impl DataSource for ParquetDataSource {
     fn schema(&self) -> Vec<ColumnInfo> {
         self.column_schema.clone()
     }
 
-    fn scan(&self) -> Result<Vec<RecordBatch>, ExecutionError> {
+    async fn scan(&self, ctx: &ScanContext) -> Result<SendableRecordBatchStream, ExecutionError> {
         let file = std::fs::File::open(&self.path).map_err(|e| {
             ExecutionError::InvalidOperation(format!(
                 "failed to open Parquet file '{}': {}",
@@ -136,18 +167,31 @@ impl DataSource for ParquetDataSource {
             ))
         })?;
 
-        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| ExecutionError::InvalidOperation(format!("Parquet reader error: {e}")))?
-            .build()
-            .map_err(|e| {
-                ExecutionError::InvalidOperation(format!("Parquet reader build error: {e}"))
-            })?;
+        let mut builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            file,
+        )
+        .map_err(|e| ExecutionError::InvalidOperation(format!("Parquet reader error: {e}")))?;
+
+        // Apply projection pushdown: only read requested columns.
+        if let Some(ref projection) = ctx.projection {
+            let mask = parquet::arrow::ProjectionMask::roots(
+                builder.parquet_schema(),
+                projection.iter().copied(),
+            );
+            builder = builder.with_projection(mask);
+        }
+
+        let arrow_schema = builder.schema().clone();
+
+        let reader = builder.build().map_err(|e| {
+            ExecutionError::InvalidOperation(format!("Parquet reader build error: {e}"))
+        })?;
 
         let mut batches = Vec::new();
         for result in reader {
             batches.push(result?);
         }
-        Ok(batches)
+        Ok(stream_from_batches(arrow_schema, batches))
     }
 }
 
@@ -386,11 +430,12 @@ fn arrow_schema_to_column_info(schema: &Schema) -> Result<Vec<ColumnInfo>, Conne
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, StringArray};
+    use arrow::array::{Int32Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType as ArrowDataType, Field};
     use std::io::Write;
     use std::path::Path;
     use trino_common::types::DataType;
+    use trino_execution::ScanContext;
 
     fn csv_schema() -> Vec<ColumnInfo> {
         vec![
@@ -443,30 +488,32 @@ mod tests {
 
     // -- CSV tests --
 
-    #[test]
-    fn csv_data_source_reads_file() {
+    #[tokio::test]
+    async fn csv_data_source_reads_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_test_csv(dir.path());
         let ds = CsvDataSource::new(path, csv_schema());
-        let batches = ds.scan().unwrap();
+        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
     }
 
-    #[test]
-    fn csv_data_source_file_not_found() {
+    #[tokio::test]
+    async fn csv_data_source_file_not_found() {
         let ds = CsvDataSource::new("/nonexistent/path.csv", csv_schema());
-        assert!(ds.scan().is_err());
+        assert!(ds.scan(&ScanContext::default()).await.is_err());
     }
 
     // -- Parquet tests --
 
-    #[test]
-    fn parquet_data_source_reads_file() {
+    #[tokio::test]
+    async fn parquet_data_source_reads_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_test_parquet(dir.path());
         let ds = ParquetDataSource::new(&path).unwrap();
-        let batches = ds.scan().unwrap();
+        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
@@ -490,8 +537,8 @@ mod tests {
 
     // -- FileConnectorFactory tests --
 
-    #[test]
-    fn file_factory_csv() {
+    #[tokio::test]
+    async fn file_factory_csv() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_test_csv(dir.path());
         let factory = FileConnectorFactory::new();
@@ -501,12 +548,13 @@ mod tests {
 
         let table_ref = TableReference::table("sales");
         let ds = factory.create_data_source(&table_ref, &[]).unwrap();
-        let batches = ds.scan().unwrap();
+        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
         assert!(!batches.is_empty());
     }
 
-    #[test]
-    fn file_factory_parquet() {
+    #[tokio::test]
+    async fn file_factory_parquet() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_test_parquet(dir.path());
         let factory = FileConnectorFactory::new();
@@ -516,7 +564,8 @@ mod tests {
 
         let table_ref = TableReference::table("events");
         let ds = factory.create_data_source(&table_ref, &[]).unwrap();
-        let batches = ds.scan().unwrap();
+        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
@@ -553,8 +602,8 @@ mod tests {
 
     // -- Integration tests --
 
-    #[test]
-    fn integration_memory_connector() {
+    #[tokio::test]
+    async fn integration_memory_connector() {
         let catalog = Arc::new(MemoryCatalog::new());
         let mem_schema = Arc::new(MemorySchema::new());
 
@@ -581,20 +630,21 @@ mod tests {
         let ds = factory
             .create_data_source(&TableReference::table("t"), &[])
             .unwrap();
-        let batches = ds.scan().unwrap();
+        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_rows(), 2);
     }
 
-    #[test]
-    fn integration_csv_connector() {
+    #[tokio::test]
+    async fn integration_csv_connector() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_test_csv(dir.path());
         let ds = CsvDataSource::new(path, csv_schema());
-        let batches = ds.scan().unwrap();
+        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
 
-        // Verify column values.
         let id_col = batches[0]
             .column(0)
             .as_any()
@@ -603,16 +653,16 @@ mod tests {
         assert_eq!(id_col.value(0), 1);
     }
 
-    #[test]
-    fn integration_parquet_connector() {
+    #[tokio::test]
+    async fn integration_parquet_connector() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_test_parquet(dir.path());
         let ds = ParquetDataSource::new(&path).unwrap();
-        let batches = ds.scan().unwrap();
+        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
 
-        // Verify column values.
         let name_col = batches[0]
             .column(1)
             .as_any()

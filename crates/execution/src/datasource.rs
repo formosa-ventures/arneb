@@ -1,27 +1,34 @@
 //! Data source abstraction for the execution engine.
 //!
 //! The [`DataSource`] trait defines how the execution engine reads data.
-//! Connectors (Change 6) will implement this trait; for now we provide
-//! [`InMemoryDataSource`] for testing.
+//! Connectors implement this trait; [`InMemoryDataSource`] is provided for testing.
 
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use async_trait::async_trait;
 use trino_common::error::ExecutionError;
+use trino_common::stream::{stream_from_batches, SendableRecordBatchStream};
 use trino_common::types::ColumnInfo;
+
+use crate::scan_context::ScanContext;
 
 /// A source of tabular data for the execution engine.
 ///
 /// Implementations produce [`RecordBatch`]es matching their declared schema.
-/// The catalog crate stays metadata-only; this trait lives here because
-/// execution defines what it needs from data providers.
+/// The [`ScanContext`] carries optional pushdown hints (filters, projection, limit).
+#[async_trait]
 pub trait DataSource: Send + Sync + Debug {
     /// Returns the column schema of this data source.
     fn schema(&self) -> Vec<ColumnInfo>;
 
-    /// Scans all rows from this data source.
-    fn scan(&self) -> Result<Vec<RecordBatch>, ExecutionError>;
+    /// Scans rows from this data source as an async stream.
+    ///
+    /// The `ctx` parameter carries optional pushdown hints. Implementations
+    /// should apply as many hints as they support; callers must not rely on
+    /// pushdown being applied (filters/projections above the scan remain).
+    async fn scan(&self, ctx: &ScanContext) -> Result<SendableRecordBatchStream, ExecutionError>;
 }
 
 /// An in-memory data source backed by pre-built [`RecordBatch`]es.
@@ -69,13 +76,15 @@ impl InMemoryDataSource {
     }
 }
 
+#[async_trait]
 impl DataSource for InMemoryDataSource {
     fn schema(&self) -> Vec<ColumnInfo> {
         self.schema.clone()
     }
 
-    fn scan(&self) -> Result<Vec<RecordBatch>, ExecutionError> {
-        Ok(self.batches.clone())
+    async fn scan(&self, _ctx: &ScanContext) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let arrow_schema = column_info_to_arrow_schema(&self.schema);
+        Ok(stream_from_batches(arrow_schema, self.batches.clone()))
     }
 }
 
@@ -91,6 +100,7 @@ mod tests {
     use super::*;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+    use trino_common::stream::collect_stream;
     use trino_common::types::DataType;
 
     fn test_schema() -> Vec<ColumnInfo> {
@@ -108,16 +118,17 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn in_memory_empty() {
+    #[tokio::test]
+    async fn in_memory_empty() {
         let ds = InMemoryDataSource::empty(test_schema());
         assert_eq!(ds.schema().len(), 2);
-        let batches = ds.scan().unwrap();
+        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert!(batches.is_empty());
     }
 
-    #[test]
-    fn in_memory_with_data() {
+    #[tokio::test]
+    async fn in_memory_with_data() {
         let arrow_schema = Arc::new(Schema::new(vec![Field::new(
             "id",
             ArrowDataType::Int32,
@@ -131,7 +142,8 @@ mod tests {
         let ds = InMemoryDataSource::from_batch(batch).unwrap();
         assert_eq!(ds.schema().len(), 1);
         assert_eq!(ds.schema()[0].name, "id");
-        let batches = ds.scan().unwrap();
+        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
     }

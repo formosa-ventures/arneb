@@ -1,0 +1,26 @@
+[package]
+name = "trino-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Arrow Flight RPC layer for inter-node data exchange in trino-alt"
+
+[dependencies]
+trino-common = { path = "../common" }
+trino-planner = { path = "../planner" }
+arrow = { workspace = true }
+arrow-flight = "54"
+tonic = "0.12"
+prost = "0.13"
+tokio = { workspace = true, features = ["sync"] }
+futures.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-stream = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio-stream = "0.1"
+trino-common = { path = "../common" }

@@ -21,6 +21,146 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
             let inner = convert_statement(*statement)?;
             Ok(ast::Statement::Explain(Box::new(inner)))
         }
+        sp::Statement::CreateTable(ct) => {
+            let name = object_name_to_table_reference(&ct.name)?;
+            let columns = ct
+                .columns
+                .into_iter()
+                .map(|col| {
+                    let dt = convert_data_type(col.data_type)?;
+                    Ok(ast::ColumnDef {
+                        name: col.name.value,
+                        data_type: dt,
+                        nullable: true,
+                    })
+                })
+                .collect::<Result<Vec<_>, ParseError>>()?;
+
+            // Check if it's a CTAS
+            if let Some(query) = ct.query {
+                let q = convert_query(*query)?;
+                return Ok(ast::Statement::CreateTableAsSelect {
+                    name,
+                    query: Box::new(q),
+                });
+            }
+
+            Ok(ast::Statement::CreateTable {
+                name,
+                columns,
+                if_not_exists: ct.if_not_exists,
+            })
+        }
+        sp::Statement::Drop {
+            object_type,
+            if_exists,
+            names,
+            ..
+        } => {
+            if names.len() != 1 {
+                return Err(ParseError::UnsupportedFeature(
+                    "DROP with multiple names".to_string(),
+                ));
+            }
+            let name = object_name_to_table_reference(&names[0])?;
+            match object_type {
+                sp::ObjectType::Table => Ok(ast::Statement::DropTable { name, if_exists }),
+                sp::ObjectType::View => Ok(ast::Statement::DropView { name, if_exists }),
+                _ => Err(ParseError::UnsupportedFeature(format!(
+                    "DROP {object_type}"
+                ))),
+            }
+        }
+        sp::Statement::Insert(insert) => {
+            let table = match insert.table {
+                sp::TableObject::TableName(name) => object_name_to_table_reference(&name)?,
+                _ => {
+                    return Err(ParseError::UnsupportedFeature(
+                        "table function insert".to_string(),
+                    ))
+                }
+            };
+            let columns: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
+            let source = if let Some(src) = insert.source {
+                match *src.body {
+                    sp::SetExpr::Values(values) => {
+                        let rows = values
+                            .rows
+                            .into_iter()
+                            .map(|row| {
+                                row.into_iter()
+                                    .map(convert_expr)
+                                    .collect::<Result<Vec<_>, _>>()
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        ast::InsertSource::Values(rows)
+                    }
+                    other => {
+                        // Reconstruct a query for non-VALUES sources
+                        let rebuilt = sp::Query {
+                            body: Box::new(other),
+                            with: src.with,
+                            order_by: src.order_by,
+                            limit_clause: src.limit_clause,
+                            fetch: src.fetch,
+                            locks: src.locks,
+                            for_clause: src.for_clause,
+                            settings: src.settings,
+                            format_clause: src.format_clause,
+                            pipe_operators: src.pipe_operators,
+                        };
+                        let q = convert_query(rebuilt)?;
+                        ast::InsertSource::Query(Box::new(q))
+                    }
+                }
+            } else {
+                return Err(ParseError::InvalidSyntax(
+                    "INSERT requires a source".to_string(),
+                ));
+            };
+            Ok(ast::Statement::InsertInto {
+                table,
+                columns,
+                source,
+            })
+        }
+        sp::Statement::Delete(delete) => {
+            let from_tables = match delete.from {
+                sp::FromTable::WithFromKeyword(t) | sp::FromTable::WithoutKeyword(t) => t,
+            };
+            let table_ref = match from_tables.into_iter().next() {
+                Some(twj) => match twj.relation {
+                    sp::TableFactor::Table { name, .. } => object_name_to_table_reference(&name)?,
+                    _ => {
+                        return Err(ParseError::UnsupportedFeature(
+                            "DELETE from non-table".to_string(),
+                        ))
+                    }
+                },
+                None => {
+                    return Err(ParseError::InvalidSyntax(
+                        "DELETE requires a table".to_string(),
+                    ))
+                }
+            };
+            let predicate = match delete.selection {
+                Some(expr) => Some(Box::new(convert_expr(expr)?)),
+                None => None,
+            };
+            Ok(ast::Statement::DeleteFrom {
+                table: table_ref,
+                predicate,
+            })
+        }
+        sp::Statement::CreateView(cv) => {
+            let view_name = object_name_to_table_reference(&cv.name)?;
+            let q = convert_query(*cv.query)?;
+            Ok(ast::Statement::CreateView {
+                name: view_name,
+                query: Box::new(q),
+                or_replace: cv.or_replace,
+            })
+        }
         other => Err(ParseError::UnsupportedFeature(
             statement_name(&other).to_string(),
         )),
@@ -29,15 +169,28 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
 
 /// Convert a `sqlparser` [`sp::Query`] into a trino-alt [`ast::Query`].
 pub(crate) fn convert_query(query: sp::Query) -> Result<ast::Query, ParseError> {
-    // Convert body
-    let body = match *query.body {
-        sp::SetExpr::Select(select) => convert_select(*select)?,
-        other => {
-            return Err(ParseError::UnsupportedFeature(format!(
-                "query body: {other}"
-            )));
-        }
+    // Convert CTEs
+    let ctes = if let Some(with) = query.with {
+        with.cte_tables
+            .into_iter()
+            .map(|cte| {
+                let name = cte.alias.name.value;
+                let column_aliases: Vec<String> =
+                    cte.alias.columns.iter().map(|c| c.to_string()).collect();
+                let q = convert_query(*cte.query)?;
+                Ok(ast::CTEDefinition {
+                    name,
+                    column_aliases,
+                    query: Box::new(q),
+                })
+            })
+            .collect::<Result<Vec<_>, ParseError>>()?
+    } else {
+        vec![]
     };
+
+    // Convert body (may be a set operation)
+    let body = convert_set_expr(*query.body)?;
 
     // Convert ORDER BY
     let order_by = match query.order_by {
@@ -66,11 +219,46 @@ pub(crate) fn convert_query(query: sp::Query) -> Result<ast::Query, ParseError> 
     };
 
     Ok(ast::Query {
+        ctes,
         body,
         order_by,
         limit,
         offset,
     })
+}
+
+/// Convert a set expression (SELECT, UNION, INTERSECT, EXCEPT).
+fn convert_set_expr(expr: sp::SetExpr) -> Result<ast::QueryBody, ParseError> {
+    match expr {
+        sp::SetExpr::Select(select) => {
+            let body = convert_select(*select)?;
+            Ok(ast::QueryBody::Select(body))
+        }
+        sp::SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            let ast_op = match (op, set_quantifier) {
+                (sp::SetOperator::Union, sp::SetQuantifier::All) => ast::SetOperator::UnionAll,
+                (sp::SetOperator::Union, _) => ast::SetOperator::Union,
+                (sp::SetOperator::Intersect, _) => ast::SetOperator::Intersect,
+                (sp::SetOperator::Except, _) => ast::SetOperator::Except,
+                (sp::SetOperator::Minus, _) => ast::SetOperator::Except,
+            };
+            let l = convert_set_expr(*left)?;
+            let r = convert_set_expr(*right)?;
+            Ok(ast::QueryBody::SetOperation {
+                op: ast_op,
+                left: Box::new(l),
+                right: Box::new(r),
+            })
+        }
+        other => Err(ParseError::UnsupportedFeature(format!(
+            "query body: {other}"
+        ))),
+    }
 }
 
 /// Convert a `sqlparser` [`sp::Select`] into a trino-alt [`ast::SelectBody`].
@@ -292,10 +480,44 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
         } => {
             let e = convert_expr(*expr)?;
             let q = convert_query(*subquery)?;
-            Ok(ast::Expr::InList {
+            Ok(ast::Expr::InSubquery {
                 expr: Box::new(e),
-                list: vec![ast::Expr::Subquery(Box::new(q))],
+                subquery: Box::new(q),
                 negated,
+            })
+        }
+        sp::Expr::Exists { subquery, negated } => {
+            let q = convert_query(*subquery)?;
+            Ok(ast::Expr::Exists {
+                subquery: Box::new(q),
+                negated,
+            })
+        }
+        sp::Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            let op = match operand {
+                Some(expr) => Some(Box::new(convert_expr(*expr)?)),
+                None => None,
+            };
+            let mut conds = Vec::with_capacity(conditions.len());
+            let mut results = Vec::with_capacity(conditions.len());
+            for cw in conditions {
+                conds.push(convert_expr(cw.condition)?);
+                results.push(convert_expr(cw.result)?);
+            }
+            let el = match else_result {
+                Some(expr) => Some(Box::new(convert_expr(*expr)?)),
+                None => None,
+            };
+            Ok(ast::Expr::Case {
+                operand: op,
+                conditions: conds,
+                results,
+                else_result: el,
             })
         }
         sp::Expr::IsFalse(expr) => {
@@ -315,6 +537,88 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
 /// Convert a `sqlparser` [`sp::Function`] into a trino-alt [`ast::Expr::Function`].
 fn convert_function(func: sp::Function) -> Result<ast::Expr, ParseError> {
     let name = func.name.to_string();
+    let name_upper = name.to_uppercase();
+
+    // Desugar COALESCE(a, b, ...) → CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ... ELSE last END
+    if name_upper == "COALESCE" {
+        let raw_args = match func.args {
+            sp::FunctionArguments::List(arg_list) => arg_list
+                .args
+                .into_iter()
+                .map(|a| match a {
+                    sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => convert_expr(e),
+                    _ => Err(ParseError::UnsupportedFeature(
+                        "non-expression COALESCE argument".to_string(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(ParseError::InvalidSyntax(
+                    "COALESCE requires arguments".to_string(),
+                ))
+            }
+        };
+        if raw_args.is_empty() {
+            return Err(ParseError::InvalidSyntax(
+                "COALESCE requires at least one argument".to_string(),
+            ));
+        }
+        if raw_args.len() == 1 {
+            return Ok(raw_args.into_iter().next().unwrap());
+        }
+        let last = raw_args.len() - 1;
+        let mut conditions = Vec::new();
+        let mut results = Vec::new();
+        for arg in &raw_args[..last] {
+            conditions.push(ast::Expr::IsNotNull(Box::new(arg.clone())));
+            results.push(arg.clone());
+        }
+        return Ok(ast::Expr::Case {
+            operand: None,
+            conditions,
+            results,
+            else_result: Some(Box::new(raw_args.into_iter().last().unwrap())),
+        });
+    }
+
+    // Desugar NULLIF(a, b) → CASE WHEN a = b THEN NULL ELSE a END
+    if name_upper == "NULLIF" {
+        let raw_args = match func.args {
+            sp::FunctionArguments::List(arg_list) => arg_list
+                .args
+                .into_iter()
+                .map(|a| match a {
+                    sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => convert_expr(e),
+                    _ => Err(ParseError::UnsupportedFeature(
+                        "non-expression NULLIF argument".to_string(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(ParseError::InvalidSyntax(
+                    "NULLIF requires arguments".to_string(),
+                ))
+            }
+        };
+        if raw_args.len() != 2 {
+            return Err(ParseError::InvalidSyntax(
+                "NULLIF requires exactly two arguments".to_string(),
+            ));
+        }
+        let mut args_iter = raw_args.into_iter();
+        let a = args_iter.next().unwrap();
+        let b = args_iter.next().unwrap();
+        return Ok(ast::Expr::Case {
+            operand: None,
+            conditions: vec![ast::Expr::BinaryOp {
+                left: Box::new(a.clone()),
+                op: ast::BinaryOp::Eq,
+                right: Box::new(b),
+            }],
+            results: vec![ast::Expr::Literal(ScalarValue::Null)],
+            else_result: Some(Box::new(a)),
+        });
+    }
 
     let (args, is_distinct) = match func.args {
         sp::FunctionArguments::None => (vec![], false),
@@ -334,6 +638,42 @@ fn convert_function(func: sp::Function) -> Result<ast::Expr, ParseError> {
             (args, distinct_flag)
         }
     };
+
+    // Check for window function (OVER clause)
+    if let Some(over) = func.over {
+        match over {
+            sp::WindowType::WindowSpec(spec) => {
+                let partition_by = spec
+                    .partition_by
+                    .into_iter()
+                    .map(convert_expr)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let order_by = spec
+                    .order_by
+                    .into_iter()
+                    .map(convert_order_by_expr)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let plain_args = args
+                    .into_iter()
+                    .filter_map(|a| match a {
+                        ast::FunctionArg::Unnamed(e) => Some(e),
+                        ast::FunctionArg::Wildcard => None,
+                    })
+                    .collect();
+                return Ok(ast::Expr::WindowFunction {
+                    name,
+                    args: plain_args,
+                    partition_by,
+                    order_by,
+                });
+            }
+            sp::WindowType::NamedWindow(_) => {
+                return Err(ParseError::UnsupportedFeature(
+                    "named window references".to_string(),
+                ));
+            }
+        }
+    }
 
     Ok(ast::Expr::Function {
         name,
@@ -606,7 +946,15 @@ fn convert_unary_op(op: sp::UnaryOperator) -> Result<ast::UnaryOp, ParseError> {
 
 /// Convert a `sqlparser` [`sp::ObjectName`] into a trino-alt [`TableReference`].
 fn object_name_to_table_reference(name: &sp::ObjectName) -> Result<TableReference, ParseError> {
-    let parts: Vec<String> = name.0.iter().map(|p| p.to_string()).collect();
+    // Use Ident.value to get unquoted identifier names (not .to_string() which preserves quotes)
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .map(|p| match p.as_ident() {
+            Some(ident) => ident.value.clone(),
+            None => p.to_string(),
+        })
+        .collect();
     match parts.len() {
         1 => Ok(TableReference {
             catalog: None,

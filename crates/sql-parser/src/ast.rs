@@ -8,6 +8,26 @@ use std::fmt;
 
 use trino_common::types::{DataType, ScalarValue, TableReference};
 
+/// Column definition for CREATE TABLE.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnDef {
+    /// Column name.
+    pub name: String,
+    /// Column data type.
+    pub data_type: DataType,
+    /// Whether the column is nullable (default true).
+    pub nullable: bool,
+}
+
+/// Source for INSERT INTO.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertSource {
+    /// INSERT INTO ... VALUES (...)
+    Values(Vec<Vec<Expr>>),
+    /// INSERT INTO ... SELECT ...
+    Query(Box<Query>),
+}
+
 /// A top-level SQL statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -15,19 +35,116 @@ pub enum Statement {
     Query(Box<Query>),
     /// EXPLAIN followed by a statement.
     Explain(Box<Statement>),
+    /// CREATE TABLE name (columns...) [IF NOT EXISTS]
+    CreateTable {
+        /// Table name.
+        name: TableReference,
+        /// Column definitions.
+        columns: Vec<ColumnDef>,
+        /// IF NOT EXISTS flag.
+        if_not_exists: bool,
+    },
+    /// DROP TABLE [IF EXISTS] name
+    DropTable {
+        /// Table name.
+        name: TableReference,
+        /// IF EXISTS flag.
+        if_exists: bool,
+    },
+    /// CREATE TABLE name AS SELECT ...
+    CreateTableAsSelect {
+        /// Table name.
+        name: TableReference,
+        /// Source query.
+        query: Box<Query>,
+    },
+    /// INSERT INTO table [(columns)] source
+    InsertInto {
+        /// Target table.
+        table: TableReference,
+        /// Optional column list.
+        columns: Vec<String>,
+        /// Values or subquery source.
+        source: InsertSource,
+    },
+    /// DELETE FROM table [WHERE predicate]
+    DeleteFrom {
+        /// Target table.
+        table: TableReference,
+        /// Optional WHERE predicate.
+        predicate: Option<Box<Expr>>,
+    },
+    /// CREATE [OR REPLACE] VIEW name AS query
+    CreateView {
+        /// View name.
+        name: TableReference,
+        /// Source query.
+        query: Box<Query>,
+        /// Whether OR REPLACE was specified.
+        or_replace: bool,
+    },
+    /// DROP VIEW [IF EXISTS] name
+    DropView {
+        /// View name.
+        name: TableReference,
+        /// IF EXISTS flag.
+        if_exists: bool,
+    },
 }
 
-/// A complete SQL query with optional ORDER BY, LIMIT, and OFFSET.
+/// A Common Table Expression (CTE) definition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTEDefinition {
+    /// The CTE name.
+    pub name: String,
+    /// Optional column aliases.
+    pub column_aliases: Vec<String>,
+    /// The CTE subquery.
+    pub query: Box<Query>,
+}
+
+/// A complete SQL query with optional CTEs, ORDER BY, LIMIT, and OFFSET.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
-    /// The SELECT body of the query.
-    pub body: SelectBody,
+    /// Common Table Expressions (WITH clause).
+    pub ctes: Vec<CTEDefinition>,
+    /// The SELECT body of the query (may be a set operation).
+    pub body: QueryBody,
     /// ORDER BY clauses.
     pub order_by: Vec<OrderByExpr>,
     /// LIMIT expression.
     pub limit: Option<Box<Expr>>,
     /// OFFSET expression.
     pub offset: Option<Box<Expr>>,
+}
+
+/// The body of a query — either a single SELECT or a set operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryBody {
+    /// A simple SELECT statement.
+    Select(SelectBody),
+    /// A set operation (UNION ALL, UNION, INTERSECT, EXCEPT).
+    SetOperation {
+        /// The set operator.
+        op: SetOperator,
+        /// Left side query body.
+        left: Box<QueryBody>,
+        /// Right side query body.
+        right: Box<QueryBody>,
+    },
+}
+
+/// Set operation types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOperator {
+    /// UNION ALL — concatenate without deduplication.
+    UnionAll,
+    /// UNION — concatenate with deduplication.
+    Union,
+    /// INTERSECT — rows in both sides.
+    Intersect,
+    /// EXCEPT — rows in left but not right.
+    Except,
 }
 
 /// The body of a SELECT statement.
@@ -130,8 +247,46 @@ pub enum Expr {
     },
     /// A parenthesized sub-expression.
     Nested(Box<Expr>),
-    /// A subquery expression.
+    /// A subquery expression (scalar subquery).
     Subquery(Box<Query>),
+    /// `expr [NOT] IN (subquery)`.
+    InSubquery {
+        /// The expression being tested.
+        expr: Box<Expr>,
+        /// The subquery providing the set.
+        subquery: Box<Query>,
+        /// Whether this is NOT IN.
+        negated: bool,
+    },
+    /// `[NOT] EXISTS (subquery)`.
+    Exists {
+        /// The subquery.
+        subquery: Box<Query>,
+        /// Whether this is NOT EXISTS.
+        negated: bool,
+    },
+    /// A window function call: `func(...) OVER (PARTITION BY ... ORDER BY ...)`.
+    WindowFunction {
+        /// Function name (e.g., ROW_NUMBER, SUM).
+        name: String,
+        /// Function arguments.
+        args: Vec<Expr>,
+        /// PARTITION BY expressions.
+        partition_by: Vec<Expr>,
+        /// ORDER BY expressions.
+        order_by: Vec<OrderByExpr>,
+    },
+    /// A CASE expression (both searched and simple forms).
+    Case {
+        /// For simple CASE: the operand expression. None for searched CASE.
+        operand: Option<Box<Expr>>,
+        /// The WHEN condition expressions.
+        conditions: Vec<Expr>,
+        /// The THEN result expressions (same length as conditions).
+        results: Vec<Expr>,
+        /// The optional ELSE expression.
+        else_result: Option<Box<Expr>>,
+    },
 }
 
 /// A reference to a column, optionally qualified by a table name.
@@ -144,7 +299,7 @@ pub struct ColumnRef {
 }
 
 /// A binary operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BinaryOp {
     // Arithmetic
     /// Addition (`+`).
@@ -186,7 +341,7 @@ pub enum BinaryOp {
 }
 
 /// A unary operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum UnaryOp {
     /// Logical NOT.
     Not,
@@ -245,7 +400,7 @@ pub struct Join {
 }
 
 /// The type of a JOIN operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum JoinType {
     /// INNER JOIN.
     Inner,
@@ -288,6 +443,15 @@ impl fmt::Display for Statement {
         match self {
             Statement::Query(_) => write!(f, "SELECT ..."),
             Statement::Explain(stmt) => write!(f, "EXPLAIN {stmt}"),
+            Statement::CreateTable { name, .. } => write!(f, "CREATE TABLE {name}"),
+            Statement::DropTable { name, .. } => write!(f, "DROP TABLE {name}"),
+            Statement::CreateTableAsSelect { name, .. } => {
+                write!(f, "CREATE TABLE {name} AS SELECT ...")
+            }
+            Statement::InsertInto { table, .. } => write!(f, "INSERT INTO {table}"),
+            Statement::DeleteFrom { table, .. } => write!(f, "DELETE FROM {table}"),
+            Statement::CreateView { name, .. } => write!(f, "CREATE VIEW {name}"),
+            Statement::DropView { name, .. } => write!(f, "DROP VIEW {name}"),
         }
     }
 }
@@ -389,6 +553,75 @@ impl fmt::Display for Expr {
             Expr::Cast { expr, data_type } => write!(f, "CAST({expr} AS {data_type})"),
             Expr::Nested(expr) => write!(f, "({expr})"),
             Expr::Subquery(_) => write!(f, "(subquery)"),
+            Expr::InSubquery { expr, negated, .. } => {
+                if *negated {
+                    write!(f, "{expr} NOT IN (subquery)")
+                } else {
+                    write!(f, "{expr} IN (subquery)")
+                }
+            }
+            Expr::WindowFunction {
+                name,
+                args,
+                partition_by,
+                order_by,
+            } => {
+                write!(f, "{name}(")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ") OVER (")?;
+                if !partition_by.is_empty() {
+                    write!(f, "PARTITION BY ")?;
+                    for (i, p) in partition_by.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{p}")?;
+                    }
+                }
+                if !order_by.is_empty() {
+                    if !partition_by.is_empty() {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "ORDER BY ")?;
+                    for (i, o) in order_by.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", o.expr)?;
+                    }
+                }
+                write!(f, ")")
+            }
+            Expr::Exists { negated, .. } => {
+                if *negated {
+                    write!(f, "NOT EXISTS (subquery)")
+                } else {
+                    write!(f, "EXISTS (subquery)")
+                }
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                write!(f, "CASE")?;
+                if let Some(op) = operand {
+                    write!(f, " {op}")?;
+                }
+                for (cond, res) in conditions.iter().zip(results.iter()) {
+                    write!(f, " WHEN {cond} THEN {res}")?;
+                }
+                if let Some(el) = else_result {
+                    write!(f, " ELSE {el}")?;
+                }
+                write!(f, " END")
+            }
         }
     }
 }

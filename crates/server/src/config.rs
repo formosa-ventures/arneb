@@ -12,6 +12,73 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub tables: Vec<TableConfig>,
+
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+}
+
+/// Cluster configuration for distributed mode.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ClusterConfig {
+    /// Server role: "standalone" (default), "coordinator", or "worker".
+    #[serde(default = "default_role")]
+    pub role: String,
+
+    /// Address of the coordinator (for workers to connect to).
+    #[serde(default)]
+    pub coordinator_address: Option<String>,
+
+    /// Port for inter-node RPC communication (Flight + gRPC).
+    #[serde(default = "default_rpc_port")]
+    pub rpc_port: u16,
+
+    /// Unique worker ID (auto-generated if not set).
+    #[serde(default)]
+    pub worker_id: Option<String>,
+}
+
+fn default_role() -> String {
+    "standalone".to_string()
+}
+
+fn default_rpc_port() -> u16 {
+    9090
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            role: default_role(),
+            coordinator_address: None,
+            rpc_port: default_rpc_port(),
+            worker_id: None,
+        }
+    }
+}
+
+/// Parsed server role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerRole {
+    /// Single-node mode: acts as both coordinator and worker.
+    Standalone,
+    /// Coordinator: accepts client connections, plans queries, schedules tasks.
+    Coordinator,
+    /// Worker: executes tasks assigned by the coordinator.
+    Worker,
+}
+
+impl ServerRole {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "standalone" => Ok(Self::Standalone),
+            "coordinator" => Ok(Self::Coordinator),
+            "worker" => Ok(Self::Worker),
+            other => bail!(
+                "unknown server role: '{other}' (expected: standalone, coordinator, or worker)"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +115,7 @@ impl AppConfig {
                     AppConfig {
                         server: ServerConfig::default(),
                         tables: Vec::new(),
+                        cluster: ClusterConfig::default(),
                     }
                 }
             }
@@ -60,6 +128,7 @@ impl AppConfig {
         Ok(AppConfig {
             server,
             tables: config.tables,
+            cluster: config.cluster,
         })
     }
 }

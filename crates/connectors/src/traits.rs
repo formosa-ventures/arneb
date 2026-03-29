@@ -8,6 +8,35 @@ use trino_common::error::ConnectorError;
 use trino_common::types::{ColumnInfo, TableReference};
 use trino_execution::DataSource;
 
+/// A provider for DDL/DML operations (create, drop, insert, delete).
+///
+/// Connectors that support write operations implement this trait.
+/// Read-only connectors do not need to implement it.
+pub trait DDLProvider: Send + Sync + Debug {
+    /// Create a new table with the given schema.
+    fn create_table(&self, name: &str, schema: &[ColumnInfo]) -> Result<(), ConnectorError>;
+
+    /// Drop an existing table.
+    fn drop_table(&self, name: &str) -> Result<(), ConnectorError>;
+
+    /// Insert record batches into an existing table. Returns the number of rows inserted.
+    fn insert_into(
+        &self,
+        name: &str,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> Result<u64, ConnectorError>;
+
+    /// Delete rows matching a predicate. None means delete all. Returns the number of rows deleted.
+    fn delete_from(&self, name: &str, predicate: Option<&str>) -> Result<u64, ConnectorError>;
+
+    /// Create a table and populate it with the given record batches.
+    fn create_table_as_select(
+        &self,
+        name: &str,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> Result<(), ConnectorError>;
+}
+
 /// Factory that creates [`DataSource`] instances for a connector type.
 pub trait ConnectorFactory: Send + Sync + Debug {
     /// Returns the connector type name (e.g., "memory", "file").
@@ -19,6 +48,11 @@ pub trait ConnectorFactory: Send + Sync + Debug {
         table: &TableReference,
         schema: &[ColumnInfo],
     ) -> Result<Arc<dyn DataSource>, ConnectorError>;
+
+    /// Returns the DDL provider for this connector, if it supports write operations.
+    fn ddl_provider(&self) -> Option<Arc<dyn DDLProvider>> {
+        None
+    }
 }
 
 /// Registry mapping connector names to their factories.

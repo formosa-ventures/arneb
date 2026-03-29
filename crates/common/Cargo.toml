@@ -12,6 +12,10 @@ toml.workspace = true
 tracing.workspace = true
 arrow.workspace = true
 num_cpus.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "=3.14.0"
+tokio = { workspace = true, features = ["rt", "macros"] }

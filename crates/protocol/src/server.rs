@@ -5,7 +5,7 @@ use tokio::net::TcpListener;
 use trino_catalog::CatalogManager;
 use trino_connectors::ConnectorRegistry;
 
-use crate::handler::HandlerFactory;
+use crate::handler::{DistributedExecutor, HandlerFactory};
 
 /// Configuration for the PostgreSQL wire protocol server.
 #[derive(Debug, Clone)]
@@ -29,6 +29,7 @@ pub struct ProtocolServer {
     config: ProtocolConfig,
     catalog_manager: Arc<CatalogManager>,
     connector_registry: Arc<ConnectorRegistry>,
+    distributed_executor: Option<Arc<dyn DistributedExecutor>>,
 }
 
 impl ProtocolServer {
@@ -41,7 +42,14 @@ impl ProtocolServer {
             config,
             catalog_manager,
             connector_registry,
+            distributed_executor: None,
         }
+    }
+
+    /// Set the distributed executor for coordinator mode.
+    pub fn with_distributed_executor(mut self, executor: Arc<dyn DistributedExecutor>) -> Self {
+        self.distributed_executor = Some(executor);
+        self
     }
 
     /// Start the server and begin accepting connections.
@@ -56,6 +64,7 @@ impl ProtocolServer {
         let handler_factory = Arc::new(HandlerFactory {
             catalog_manager: Arc::clone(&self.catalog_manager),
             connector_registry: Arc::clone(&self.connector_registry),
+            distributed_executor: self.distributed_executor.clone(),
         });
 
         loop {

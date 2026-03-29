@@ -74,7 +74,15 @@ The `Expr` enum must support:
 - `FROM t1 LEFT JOIN t2 USING (id)` → Join with LEFT type and USING condition
 - `FROM (SELECT ...) AS sub` → TableFactor::Subquery
 
-### R5: Use shared type definitions
+### R5: Quoted identifier handling
+
+When converting `sqlparser` identifiers to trino-alt `TableReference`, the system SHALL use the unquoted identifier value (`Ident.value`), not the display string (`Ident.to_string()` which preserves double-quote wrapping). This ensures `"default".customer` resolves the same as `default.customer`.
+
+**Scenarios:**
+- `SELECT * FROM "default".customer` → TableReference { schema: Some("default"), table: "customer" } (no quotes in values)
+- `SELECT * FROM "MyTable"` → TableReference { table: "MyTable" } (preserves case but strips quotes)
+
+### R6: Use shared type definitions
 
 - Table references use `trino-common`'s `TableReference`
 - Literal values use `trino-common`'s `ScalarValue`

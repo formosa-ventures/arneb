@@ -8,3 +8,5 @@ license.workspace = true
 trino-common = { path = "../common" }
 trino-sql-parser = { path = "../sql-parser" }
 trino-catalog = { path = "../catalog" }
+serde.workspace = true
+serde_json.workspace = true

@@ -1,6 +1,7 @@
 mod encoding;
 mod error;
 mod handler;
+mod metadata;
 mod server;
 mod session;
 

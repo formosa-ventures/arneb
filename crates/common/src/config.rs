@@ -1,4 +1,4 @@
-//! Server configuration management for trino-alt.
+//! Server configuration management for arneb.
 
 use std::fmt;
 use std::path::Path;
@@ -79,19 +79,19 @@ impl ServerConfig {
     /// Apply environment variable overrides with `TRINO_` prefix.
     /// Env vars take precedence over file/default values.
     pub fn apply_env_overrides(&mut self) -> Result<(), ConfigError> {
-        if let Ok(val) = std::env::var("TRINO_BIND_ADDRESS") {
+        if let Ok(val) = std::env::var("ARNEB_BIND_ADDRESS") {
             self.bind_address = val;
         }
 
-        if let Ok(val) = std::env::var("TRINO_PORT") {
+        if let Ok(val) = std::env::var("ARNEB_PORT") {
             self.port = parse_env_var("port", &val)?;
         }
 
-        if let Ok(val) = std::env::var("TRINO_MAX_WORKER_THREADS") {
+        if let Ok(val) = std::env::var("ARNEB_MAX_WORKER_THREADS") {
             self.max_worker_threads = parse_env_var("max_worker_threads", &val)?;
         }
 
-        if let Ok(val) = std::env::var("TRINO_MAX_MEMORY_MB") {
+        if let Ok(val) = std::env::var("ARNEB_MAX_MEMORY_MB") {
             self.max_memory_mb = parse_env_var("max_memory_mb", &val)?;
         }
 
@@ -122,13 +122,13 @@ impl ServerConfig {
     /// Load configuration: file (optional) + env overrides + validation.
     ///
     /// If `path` is `Some`, loads from that file (error if missing).
-    /// If `path` is `None`, tries the default path `./trino-alt.toml`,
+    /// If `path` is `None`, tries the default path `./arneb.toml`,
     /// falling back to defaults if the file doesn't exist.
     pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
         let mut config = match path {
             Some(p) => Self::from_file(p)?,
             None => {
-                let default_path = Path::new("./trino-alt.toml");
+                let default_path = Path::new("./arneb.toml");
                 if default_path.exists() {
                     Self::from_file(default_path)?
                 } else {
@@ -162,11 +162,11 @@ mod tests {
     // Env vars are process-global. Serialize tests that touch them.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-    fn clear_trino_env_vars() {
-        std::env::remove_var("TRINO_BIND_ADDRESS");
-        std::env::remove_var("TRINO_PORT");
-        std::env::remove_var("TRINO_MAX_WORKER_THREADS");
-        std::env::remove_var("TRINO_MAX_MEMORY_MB");
+    fn clear_arneb_env_vars() {
+        std::env::remove_var("ARNEB_BIND_ADDRESS");
+        std::env::remove_var("ARNEB_PORT");
+        std::env::remove_var("ARNEB_MAX_WORKER_THREADS");
+        std::env::remove_var("ARNEB_MAX_MEMORY_MB");
     }
 
     #[test]
@@ -230,27 +230,27 @@ mod tests {
     #[test]
     fn env_var_override() {
         let _lock = ENV_MUTEX.lock().unwrap();
-        clear_trino_env_vars();
+        clear_arneb_env_vars();
 
-        std::env::set_var("TRINO_BIND_ADDRESS", "10.0.0.1");
+        std::env::set_var("ARNEB_BIND_ADDRESS", "10.0.0.1");
         let mut config = ServerConfig::default();
         config.apply_env_overrides().unwrap();
         assert_eq!(config.bind_address, "10.0.0.1");
 
-        clear_trino_env_vars();
+        clear_arneb_env_vars();
     }
 
     #[test]
     fn env_var_invalid_value() {
         let _lock = ENV_MUTEX.lock().unwrap();
-        clear_trino_env_vars();
+        clear_arneb_env_vars();
 
-        std::env::set_var("TRINO_MAX_MEMORY_MB", "not_a_number");
+        std::env::set_var("ARNEB_MAX_MEMORY_MB", "not_a_number");
         let mut config = ServerConfig::default();
         let result = config.apply_env_overrides();
         assert!(matches!(result, Err(ConfigError::InvalidValue { .. })));
 
-        clear_trino_env_vars();
+        clear_arneb_env_vars();
     }
 
     #[test]
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn load_missing_default_file_uses_defaults() {
         let _lock = ENV_MUTEX.lock().unwrap();
-        clear_trino_env_vars();
+        clear_arneb_env_vars();
 
         let config = ServerConfig::load(None).unwrap();
         assert_eq!(config.bind_address, "127.0.0.1");

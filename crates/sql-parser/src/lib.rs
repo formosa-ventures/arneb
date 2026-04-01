@@ -2,11 +2,11 @@
 #![warn(unreachable_pub)]
 #![deny(unsafe_code)]
 
-//! SQL parser for trino-alt.
+//! SQL parser for arneb.
 //!
-//! Parses SQL strings into a trino-alt-specific AST using `sqlparser-rs`
+//! Parses SQL strings into a arneb-specific AST using `sqlparser-rs`
 //! as the underlying parser. Only the SQL subset required for the MVP is
-//! supported; unsupported constructs produce [`trino_common::error::ParseError`].
+//! supported; unsupported constructs produce [`arneb_common::error::ParseError`].
 
 pub mod ast;
 mod convert;
@@ -14,19 +14,19 @@ mod convert;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use trino_common::error::ParseError;
+use arneb_common::error::ParseError;
 
 pub use ast::*;
 
-/// Parse a SQL string into a trino-alt [`Statement`].
+/// Parse a SQL string into a arneb [`Statement`].
 ///
 /// Uses `sqlparser-rs` with the [`GenericDialect`] for lexing and parsing,
-/// then converts to trino-alt's AST representation.
+/// then converts to arneb's AST representation.
 ///
 /// # Errors
 ///
 /// Returns [`ParseError::InvalidSyntax`] for syntax errors and
-/// [`ParseError::UnsupportedFeature`] for valid SQL that trino-alt
+/// [`ParseError::UnsupportedFeature`] for valid SQL that arneb
 /// does not yet support.
 pub fn parse(sql: &str) -> Result<Statement, ParseError> {
     let dialect = GenericDialect {};
@@ -49,7 +49,7 @@ pub fn parse(sql: &str) -> Result<Statement, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trino_common::types::{DataType, ScalarValue};
+    use arneb_common::types::{DataType, ScalarValue};
 
     /// Helper to extract the SelectBody from a query (panics if it's a set operation).
     fn select_body(query: &Query) -> &SelectBody {
@@ -668,7 +668,7 @@ mod tests {
                 assert_eq!(
                     *data_type,
                     DataType::Timestamp {
-                        unit: trino_common::types::TimeUnit::Microsecond,
+                        unit: arneb_common::types::TimeUnit::Microsecond,
                         timezone: None
                     }
                 );

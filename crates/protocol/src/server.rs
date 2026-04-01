@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use trino_catalog::CatalogManager;
-use trino_connectors::ConnectorRegistry;
+use arneb_catalog::CatalogManager;
+use arneb_connectors::ConnectorRegistry;
 
 use crate::handler::{DistributedExecutor, HandlerFactory};
 
@@ -24,7 +24,7 @@ impl Default for ProtocolConfig {
 /// PostgreSQL wire protocol server.
 ///
 /// Accepts TCP connections and processes queries through the full
-/// trino-alt pipeline: parse → plan → execute → encode results.
+/// arneb pipeline: parse → plan → execute → encode results.
 pub struct ProtocolServer {
     config: ProtocolConfig,
     catalog_manager: Arc<CatalogManager>,

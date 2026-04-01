@@ -6,11 +6,11 @@ use arrow::record_batch::RecordBatch;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use trino_catalog::CatalogManager;
-use trino_connectors::file::{FileCatalog, FileConnectorFactory, FileFormat, FileSchema};
-use trino_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
-use trino_connectors::ConnectorRegistry;
-use trino_protocol::ProtocolConfig;
+use arneb_catalog::CatalogManager;
+use arneb_connectors::file::{FileCatalog, FileConnectorFactory, FileFormat, FileSchema};
+use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
+use arneb_connectors::ConnectorRegistry;
+use arneb_protocol::ProtocolConfig;
 
 /// Helper to start a server on a random port and return the address.
 async fn start_test_server(
@@ -20,7 +20,7 @@ async fn start_test_server(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
 
-    let handler_factory = Arc::new(trino_protocol::__private::HandlerFactory {
+    let handler_factory = Arc::new(arneb_protocol::__private::HandlerFactory {
         catalog_manager,
         connector_registry,
     });
@@ -242,9 +242,9 @@ async fn test_query_nonexistent_table_returns_error() {
 // ===========================================================================
 
 fn create_server_with_two_tables() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
+    use arneb_common::types::{ColumnInfo, DataType};
+    use arneb_connectors::memory::MemoryTable;
     use arrow::array::StringArray;
-    use trino_common::types::{ColumnInfo, DataType};
-    use trino_connectors::memory::MemoryTable;
 
     // Users table: id, name
     let users_schema = Arc::new(Schema::new(vec![

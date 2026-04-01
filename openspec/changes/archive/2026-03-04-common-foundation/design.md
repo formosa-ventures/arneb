@@ -1,6 +1,6 @@
 ## Context
 
-trino-alt is currently an empty project with only CLAUDE.md defining the architectural blueprint. The `common` crate is the first crate to be built, and all subsequent 8+ crates will depend on it. This means the API design here must be stable and forward-looking — the cost of changes will amplify as more downstream crates are added.
+arneb is currently an empty project with only CLAUDE.md defining the architectural blueprint. The `common` crate is the first crate to be built, and all subsequent 8+ crates will depend on it. This means the API design here must be stable and forward-looking — the cost of changes will amplify as more downstream crates are added.
 
 Project conventions: use `thiserror` (not `anyhow`) for library errors, `tracing` (not `log`) for logging, Arrow as the data format.
 
@@ -26,7 +26,7 @@ Project conventions: use `thiserror` (not `anyhow`) for library errors, `tracing
 
 ### D1: Module structure — Single crate with multiple modules vs Multiple micro-crates
 
-**Choice**: A single `trino-common` crate containing three modules: `error`, `types`, and `config`.
+**Choice**: A single `arneb-common` crate containing three modules: `error`, `types`, and `config`.
 
 **Rationale**: These three modules are highly coupled (error types reference data types, config is used for global settings). Splitting them into multiple crates would increase workspace management overhead and risk circular dependencies with no real benefit.
 
@@ -34,9 +34,9 @@ Project conventions: use `thiserror` (not `anyhow`) for library errors, `tracing
 
 ### D2: Error type design — Single enum vs Layered enums
 
-**Choice**: Layered design. Each domain has its own error enum (`ParseError`, `PlanError`, `ExecutionError`, `ConnectorError`, `CatalogError`, `ConfigError`), composed by a top-level `TrinoError` enum via `#[from]`.
+**Choice**: Layered design. Each domain has its own error enum (`ParseError`, `PlanError`, `ExecutionError`, `ConnectorError`, `CatalogError`, `ConfigError`), composed by a top-level `ArnebError` enum via `#[from]`.
 
-**Rationale**: Each crate only needs to depend on its own domain error type, without being forced to import unrelated error variants. The top-level `TrinoError` is used by the server binary for unified error handling.
+**Rationale**: Each crate only needs to depend on its own domain error type, without being forced to import unrelated error variants. The top-level `ArnebError` is used by the server binary for unified error handling.
 
 **Alternative**: A single large `Error` enum containing all variants. Rejected because it violates Single Responsibility and would become bloated as the project grows.
 
@@ -70,9 +70,9 @@ Project conventions: use `thiserror` (not `anyhow`) for library errors, `tracing
 
 **Alternative**: Use `config-rs`. Rejected because our requirements are simple enough that a direct implementation is more transparent.
 
-### D7: Crate naming — `common` vs `trino-common`
+### D7: Crate naming — `common` vs `arneb-common`
 
-**Choice**: Crate name is `trino-common` (in Cargo.toml's `[package] name`), directory remains `crates/common/`.
+**Choice**: Crate name is `arneb-common` (in Cargo.toml's `[package] name`), directory remains `crates/common/`.
 
 **Rationale**: Avoids conflicts with `common` on crates.io and clearly identifies project ownership. The directory uses the short name to keep paths concise.
 

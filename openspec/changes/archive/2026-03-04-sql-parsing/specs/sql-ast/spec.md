@@ -1,6 +1,6 @@
 ## Overview
 
-Define trino-alt-specific AST types covering the SQL grammar subset needed for the MVP. These types serve as input to the planner and must clearly express SQL semantics while being easy to traverse.
+Define arneb-specific AST types covering the SQL grammar subset needed for the MVP. These types serve as input to the planner and must clearly express SQL semantics while being easy to traverse.
 
 ## Requirements
 
@@ -76,9 +76,9 @@ The `Expr` enum must support:
 
 ### R5: Use shared type definitions
 
-- Table references use `trino-common`'s `TableReference`
-- Literal values use `trino-common`'s `ScalarValue`
-- Data type references use `trino-common`'s `DataType`
-- Errors use `trino-common`'s `ParseError`
+- Table references use `arneb-common`'s `TableReference`
+- Literal values use `arneb-common`'s `ScalarValue`
+- Data type references use `arneb-common`'s `DataType`
+- Errors use `arneb-common`'s `ParseError`
 
 Ensure consistency between the AST and common crate types; avoid duplicate definitions.

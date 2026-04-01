@@ -1,7 +1,7 @@
 ## 1. Crate Setup
 
 - [x] 1.1 Add `crates/sql-parser` to workspace members in root `Cargo.toml`
-- [x] 1.2 Create `crates/sql-parser/Cargo.toml` with package name `trino-sql-parser`, dependencies: `trino-common` (path), `sqlparser` (with sqlparser-rs)
+- [x] 1.2 Create `crates/sql-parser/Cargo.toml` with package name `arneb-sql-parser`, dependencies: `arneb-common` (path), `sqlparser` (with sqlparser-rs)
 - [x] 1.3 Create `crates/sql-parser/src/lib.rs` with module declarations (`pub mod ast;`, `pub mod convert;`), re-exports, and top-level `parse()` function
 
 ## 2. AST Types (`ast` module)
@@ -50,6 +50,6 @@
 ## 5. Integration & Quality
 
 - [x] 5.1 Verify `cargo build` compiles without warnings
-- [x] 5.2 Verify `cargo test -p trino-sql-parser` passes all tests
+- [x] 5.2 Verify `cargo test -p arneb-sql-parser` passes all tests
 - [x] 5.3 Run `cargo clippy -- -D warnings` and fix any lints
 - [x] 5.4 Run `cargo fmt -- --check` and ensure formatting is correct

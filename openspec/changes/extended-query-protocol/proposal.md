@@ -1,6 +1,6 @@
 ## Why
 
-trino-alt currently only implements the PostgreSQL Simple Query protocol. Most SQL clients (DBeaver, JDBC drivers, language-specific PostgreSQL libraries like `node-postgres`, `psycopg2`, Go's `pgx`) default to the Extended Query protocol with prepared statements. This means they either fail to connect or require non-standard configuration (`preferQueryMode=simple`). Supporting Extended Query is essential for real-world client compatibility.
+arneb currently only implements the PostgreSQL Simple Query protocol. Most SQL clients (DBeaver, JDBC drivers, language-specific PostgreSQL libraries like `node-postgres`, `psycopg2`, Go's `pgx`) default to the Extended Query protocol with prepared statements. This means they either fail to connect or require non-standard configuration (`preferQueryMode=simple`). Supporting Extended Query is essential for real-world client compatibility.
 
 ## What Changes
 

@@ -1,8 +1,8 @@
 [package]
-name = "trino-catalog"
+name = "arneb-catalog"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-trino-common = { path = "../common" }
+arneb-common = { path = "../common" }

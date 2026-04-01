@@ -1,10 +1,10 @@
 ## 1. Dependencies and Stream Types (`common` crate)
 
 - [x] 1.1 Add `futures` 0.3 and `async-trait` dependencies to `crates/common/Cargo.toml`
-- [x] 1.2 Define `RecordBatchStream` trait extending `Stream<Item = Result<RecordBatch, TrinoError>> + Send + Unpin` with `schema() -> Arc<Schema>` method
+- [x] 1.2 Define `RecordBatchStream` trait extending `Stream<Item = Result<RecordBatch, ArnebError>> + Send + Unpin` with `schema() -> Arc<Schema>` method
 - [x] 1.3 Define `SendableRecordBatchStream` type alias as `Pin<Box<dyn RecordBatchStream>>`
 - [x] 1.4 Implement `stream_from_batches(schema, batches) -> SendableRecordBatchStream` adapter
-- [x] 1.5 Implement `async fn collect_stream(stream) -> Result<Vec<RecordBatch>, TrinoError>` adapter
+- [x] 1.5 Implement `async fn collect_stream(stream) -> Result<Vec<RecordBatch>, ArnebError>` adapter
 - [x] 1.6 Write tests for `stream_from_batches` (non-empty, empty) and `collect_stream` (success, error propagation)
 
 ## 2. DataSource Trait (`execution` crate)

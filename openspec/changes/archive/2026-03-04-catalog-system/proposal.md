@@ -4,7 +4,7 @@ The planner needs to resolve table references (e.g., `SELECT * FROM users`) into
 
 ## What Changes
 
-- Create `crates/catalog/` crate (package name: `trino-catalog`)
+- Create `crates/catalog/` crate (package name: `arneb-catalog`)
 - Define a `CatalogProvider` trait for registering and looking up catalogs
 - Define a `SchemaProvider` trait for listing and resolving tables within a schema
 - Define a `TableProvider` trait representing a table's schema metadata
@@ -26,6 +26,6 @@ The planner needs to resolve table references (e.g., `SELECT * FROM users`) into
 ## Impact
 
 - **New crate**: `crates/catalog/`
-- **New dependency**: `trino-common` (for `TableReference`, `ColumnInfo`, `DataType`, `CatalogError`)
+- **New dependency**: `arneb-common` (for `TableReference`, `ColumnInfo`, `DataType`, `CatalogError`)
 - **Downstream impact**: The `planner` crate will use `CatalogManager` to resolve table references during planning
 - **Connector integration point**: Future connectors will implement `SchemaProvider`/`TableProvider` to expose their tables through the catalog

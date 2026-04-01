@@ -1,7 +1,7 @@
 //! Task descriptor for distributed task submission.
 
+use arneb_common::identifiers::{QueryId, StageId, TaskId};
 use serde::{Deserialize, Serialize};
-use trino_common::identifiers::{QueryId, StageId, TaskId};
 
 /// Describes a task to be executed on a worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]

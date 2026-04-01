@@ -4,7 +4,7 @@ After parsing SQL into an AST (Change 2), resolving metadata via the catalog (Ch
 
 ## What Changes
 
-- Create `crates/execution/` crate (package name: `trino-execution`)
+- Create `crates/execution/` crate (package name: `arneb-execution`)
 - Define `DataSource` trait — the abstraction execution uses to read data from connectors
 - Implement expression evaluator that turns `PlanExpr` + `RecordBatch` into Arrow arrays using compute kernels
 - Implement `Accumulator` trait and five built-in aggregate functions (COUNT, SUM, AVG, MIN, MAX)
@@ -28,5 +28,5 @@ After parsing SQL into an AST (Change 2), resolving metadata via the catalog (Ch
 ## Impact
 
 - **New crate**: `crates/execution/`
-- **Dependencies**: `trino-common`, `trino-planner`, `trino-sql-parser`
+- **Dependencies**: `arneb-common`, `arneb-planner`, `arneb-sql-parser`
 - **Downstream**: The `connectors` crate (Change 6) will implement `DataSource`; the `server` crate (Change 8) will wire everything together for end-to-end query execution

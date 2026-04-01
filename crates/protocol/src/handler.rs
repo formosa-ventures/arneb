@@ -1,6 +1,12 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use arneb_catalog::CatalogManager;
+use arneb_common::error::ArnebError;
+use arneb_common::stream::collect_stream;
+use arneb_connectors::ConnectorRegistry;
+use arneb_execution::{ExecutionContext, ExecutionPlan};
+use arneb_planner::{LogicalOptimizer, LogicalPlan, QueryPlanner};
 use async_trait::async_trait;
 use futures::stream;
 use futures::Sink;
@@ -20,12 +26,6 @@ use pgwire::api::{ClientInfo, ClientPortalStore, PgWireHandlerFactory, Type};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::PgWireFrontendMessage;
-use trino_catalog::CatalogManager;
-use trino_common::error::TrinoError;
-use trino_common::stream::collect_stream;
-use trino_connectors::ConnectorRegistry;
-use trino_execution::{ExecutionContext, ExecutionPlan};
-use trino_planner::{LogicalOptimizer, LogicalPlan, QueryPlanner};
 
 use crate::encoding::{column_info_to_field_info, encode_record_batches};
 
@@ -38,12 +38,12 @@ pub trait DistributedExecutor: Send + Sync {
         &self,
         plan: LogicalPlan,
         exec_ctx: &ExecutionContext,
-    ) -> Result<Vec<arrow::record_batch::RecordBatch>, TrinoError>;
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, ArnebError>;
 
     /// Check if workers are available for distributed execution.
     fn has_workers(&self) -> bool;
 }
-use crate::error::trino_error_to_pg_error;
+use crate::error::arneb_error_to_pg_error;
 
 fn arrow_type_to_pg(dt: &arrow::datatypes::DataType) -> Type {
     use arrow::datatypes::DataType as ADT;
@@ -171,8 +171,8 @@ impl SimpleQueryHandler for ConnectionHandler {
                         &tag,
                     ))])
                 }
-                Err(e) => Err(trino_error_to_pg_error(&TrinoError::Execution(
-                    trino_common::error::ExecutionError::InvalidOperation(e),
+                Err(e) => Err(arneb_error_to_pg_error(&ArnebError::Execution(
+                    arneb_common::error::ExecutionError::InvalidOperation(e),
                 ))),
             };
         }
@@ -198,7 +198,7 @@ impl SimpleQueryHandler for ConnectionHandler {
 
                 Ok(vec![response])
             }
-            Err(err) => Err(trino_error_to_pg_error(&err)),
+            Err(err) => Err(arneb_error_to_pg_error(&err)),
         }
     }
 }
@@ -242,11 +242,11 @@ fn plan_for_schema(
     sql: &str,
     catalog_manager: &CatalogManager,
 ) -> Result<Vec<pgwire::api::results::FieldInfo>, PgWireError> {
-    let statement = trino_sql_parser::parse(sql).map_err(|e| trino_error_to_pg_error(&e.into()))?;
+    let statement = arneb_sql_parser::parse(sql).map_err(|e| arneb_error_to_pg_error(&e.into()))?;
     let planner = QueryPlanner::new(catalog_manager);
     let plan = planner
         .plan_statement(&statement)
-        .map_err(|e| trino_error_to_pg_error(&e.into()))?;
+        .map_err(|e| arneb_error_to_pg_error(&e.into()))?;
     Ok(column_info_to_field_info(&plan.schema()))
 }
 
@@ -303,8 +303,8 @@ impl ExtendedQueryHandler for ConnectionHandler {
                 Ok(crate::metadata::MetadataResponse::Command(tag)) => {
                     Ok(Response::Execution(pgwire::api::results::Tag::new(&tag)))
                 }
-                Err(e) => Err(trino_error_to_pg_error(&TrinoError::Execution(
-                    trino_common::error::ExecutionError::InvalidOperation(e),
+                Err(e) => Err(arneb_error_to_pg_error(&ArnebError::Execution(
+                    arneb_common::error::ExecutionError::InvalidOperation(e),
                 ))),
             };
         }
@@ -326,7 +326,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
                 let data_row_stream = stream::iter(rows);
                 Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
             }
-            Err(err) => Err(trino_error_to_pg_error(&err)),
+            Err(err) => Err(arneb_error_to_pg_error(&err)),
         }
     }
 
@@ -453,10 +453,10 @@ async fn execute_query(
         Arc<dyn ExecutionPlan>,
         Vec<arrow::record_batch::RecordBatch>,
     ),
-    TrinoError,
+    ArnebError,
 > {
     // Step 1: Parse SQL
-    let statement = trino_sql_parser::parse(sql)?;
+    let statement = arneb_sql_parser::parse(sql)?;
 
     // Step 2: Plan
     let planner = QueryPlanner::new(catalog_manager);
@@ -505,14 +505,14 @@ async fn execute_query(
 async fn resolve_plan_subqueries(
     ctx: &ExecutionContext,
     plan: LogicalPlan,
-) -> Result<LogicalPlan, TrinoError> {
+) -> Result<LogicalPlan, ArnebError> {
     match plan {
         LogicalPlan::Filter { input, predicate } => {
             let input = Box::pin(resolve_plan_subqueries(ctx, *input)).await?;
             let predicate = ctx
                 .resolve_scalar_subqueries(&predicate)
                 .await
-                .map_err(TrinoError::Execution)?;
+                .map_err(ArnebError::Execution)?;
             Ok(LogicalPlan::Filter {
                 input: Box::new(input),
                 predicate,
@@ -529,7 +529,7 @@ async fn resolve_plan_subqueries(
                 let r = ctx
                     .resolve_scalar_subqueries(expr)
                     .await
-                    .map_err(TrinoError::Execution)?;
+                    .map_err(ArnebError::Execution)?;
                 resolved.push(r);
             }
             Ok(LogicalPlan::Projection {
@@ -597,7 +597,7 @@ fn register_data_sources(
     catalog_manager: &CatalogManager,
     registry: &ConnectorRegistry,
     ctx: &mut ExecutionContext,
-) -> Result<(), TrinoError> {
+) -> Result<(), ArnebError> {
     match plan {
         LogicalPlan::TableScan { table, schema, .. } => {
             let key = table.to_string();

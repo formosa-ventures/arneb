@@ -1,12 +1,12 @@
 [package]
-name = "trino-scheduler"
+name = "arneb-scheduler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Query/stage/task state machines and scheduling for trino-alt"
+description = "Query/stage/task state machines and scheduling for arneb"
 
 [dependencies]
-trino-common = { path = "../common" }
+arneb-common = { path = "../common" }
 uuid = { version = "1", features = ["v4"] }
 tokio = { workspace = true }
 tracing.workspace = true

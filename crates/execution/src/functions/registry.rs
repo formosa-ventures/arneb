@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use arneb_common::error::ExecutionError;
+use arneb_common::types::DataType;
 use arrow::array::ArrayRef;
-use trino_common::error::ExecutionError;
-use trino_common::types::DataType;
 
 /// A scalar function that operates on Arrow arrays.
 pub trait ScalarFunction: Send + Sync + Debug {

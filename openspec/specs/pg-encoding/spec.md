@@ -65,19 +65,19 @@ The system SHALL convert a `Vec<ColumnInfo>` (from ExecutionPlan::schema()) into
 - **WHEN** converting `[ColumnInfo { name: "id", data_type: Int32 }, ColumnInfo { name: "name", data_type: Utf8 }]`
 - **THEN** the result is two FieldInfo entries: ("id", OID 23, format 0) and ("name", OID 1043, format 0)
 
-### Requirement: TrinoError to ErrorResponse mapping
-The system SHALL map `TrinoError` variants to PostgreSQL ErrorResponse messages with appropriate SQLSTATE codes and severity. The mapping SHALL be: ParseError→42601, PlanError→42P01 (or 42703 for column errors), ExecutionError→XX000, ConnectorError→58030, CatalogError→3D000, ConfigError→F0000. All errors SHALL use severity ERROR.
+### Requirement: ArnebError to ErrorResponse mapping
+The system SHALL map `ArnebError` variants to PostgreSQL ErrorResponse messages with appropriate SQLSTATE codes and severity. The mapping SHALL be: ParseError→42601, PlanError→42P01 (or 42703 for column errors), ExecutionError→XX000, ConnectorError→58030, CatalogError→3D000, ConfigError→F0000. All errors SHALL use severity ERROR.
 
 #### Scenario: Mapping a parse error
-- **WHEN** a `TrinoError::Parse(ParseError { message: "unexpected token" })` is converted
+- **WHEN** a `ArnebError::Parse(ParseError { message: "unexpected token" })` is converted
 - **THEN** the ErrorResponse has severity "ERROR", SQLSTATE "42601", and message containing "unexpected token"
 
 #### Scenario: Mapping a catalog error
-- **WHEN** a `TrinoError::Catalog(CatalogError::TableNotFound("users"))` is converted
+- **WHEN** a `ArnebError::Catalog(CatalogError::TableNotFound("users"))` is converted
 - **THEN** the ErrorResponse has severity "ERROR", SQLSTATE "3D000", and message containing "users"
 
 #### Scenario: Mapping an execution error
-- **WHEN** a `TrinoError::Execution(ExecutionError::TypeError(..))` is converted
+- **WHEN** a `ArnebError::Execution(ExecutionError::TypeError(..))` is converted
 - **THEN** the ErrorResponse has severity "ERROR", SQLSTATE "XX000", and a descriptive message
 
 ### Requirement: CommandComplete tag generation

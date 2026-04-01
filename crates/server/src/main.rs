@@ -6,18 +6,18 @@ mod web;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use arneb_catalog::CatalogManager;
+use arneb_connectors::file::{FileCatalog, FileConnectorFactory, FileFormat, FileSchema};
+use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
+use arneb_connectors::ConnectorRegistry;
+use arneb_protocol::{ProtocolConfig, ProtocolServer};
 use clap::Parser;
-use trino_catalog::CatalogManager;
-use trino_connectors::file::{FileCatalog, FileConnectorFactory, FileFormat, FileSchema};
-use trino_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
-use trino_connectors::ConnectorRegistry;
-use trino_protocol::{ProtocolConfig, ProtocolServer};
 
 use crate::config::{parse_data_type, AppConfig, ServerRole};
 
-/// trino-alt — Distributed SQL query engine
+/// Arneb — Distributed SQL query engine
 #[derive(Parser)]
-#[command(name = "trino-alt", version, about)]
+#[command(name = "arneb", version, about)]
 struct CliArgs {
     /// Path to TOML config file
     #[arg(long)]
@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
                                     cs.r#type, cs.name, table.name
                                 )
                             })?;
-                            Ok(trino_common::types::ColumnInfo {
+                            Ok(arneb_common::types::ColumnInfo {
                                 name: cs.name.clone(),
                                 data_type: dt,
                                 nullable: true,
@@ -155,30 +155,30 @@ async fn main() -> Result<()> {
     let connector_registry = Arc::new(connector_registry);
 
     // 8. Set up Flight RPC server + heartbeat handling
-    let node_registry = trino_scheduler::NodeRegistry::default();
+    let node_registry = arneb_scheduler::NodeRegistry::default();
     let rpc_addr = format!("{}:{}", config.server.bind_address, config.cluster.rpc_port);
-    let query_tracker = Arc::new(trino_scheduler::QueryTracker::new());
+    let query_tracker = Arc::new(arneb_scheduler::QueryTracker::new());
 
     let mut flight_state = match role {
         ServerRole::Coordinator | ServerRole::Standalone => {
             // Coordinator receives heartbeats from workers.
             let registry = node_registry.clone();
-            trino_rpc::FlightState::with_heartbeat_callback(std::sync::Arc::new(
-                move |msg: trino_rpc::HeartbeatMessage| {
+            arneb_rpc::FlightState::with_heartbeat_callback(std::sync::Arc::new(
+                move |msg: arneb_rpc::HeartbeatMessage| {
                     registry.heartbeat(msg.worker_id, msg.flight_address, msg.max_splits);
                 },
             ))
         }
         ServerRole::Worker => {
             // Workers don't receive heartbeats, just serve data.
-            trino_rpc::FlightState::new()
+            arneb_rpc::FlightState::new()
         }
     };
 
     // 8.5. Set up distributed execution components
     // Coordinator: create QueryCoordinator and wire into protocol server
     // Worker: create TaskManager and register task callback
-    let distributed_executor: Option<Arc<dyn trino_protocol::DistributedExecutor>> = match role {
+    let distributed_executor: Option<Arc<dyn arneb_protocol::DistributedExecutor>> = match role {
         ServerRole::Coordinator => {
             let coord =
                 coordinator::QueryCoordinator::new(node_registry.clone(), query_tracker.clone());
@@ -213,7 +213,7 @@ async fn main() -> Result<()> {
             tracing::info!(
                 rpc_address = %rpc_addr,
                 role = %config.cluster.role,
-                "trino-alt worker starting"
+                "arneb worker starting"
             );
         }
         _ => {
@@ -222,7 +222,7 @@ async fn main() -> Result<()> {
                 rpc_address = %rpc_addr,
                 role = %config.cluster.role,
                 tables = table_count,
-                "trino-alt listening"
+                "arneb listening"
             );
         }
     }
@@ -251,7 +251,7 @@ async fn main() -> Result<()> {
             }
         }
         // Flight RPC server (all roles)
-        result = trino_rpc::start_flight_server(&rpc_addr_clone, flight_state_clone) => {
+        result = arneb_rpc::start_flight_server(&rpc_addr_clone, flight_state_clone) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "flight server error");
                 bail!("flight server error: {e}");
@@ -300,7 +300,7 @@ async fn worker_heartbeat_loop(role: ServerRole, config: &AppConfig, my_rpc_addr
         .clone()
         .unwrap_or_else(|| format!("worker-{}", uuid::Uuid::new_v4()));
 
-    let message = trino_rpc::HeartbeatMessage {
+    let message = arneb_rpc::HeartbeatMessage {
         worker_id: worker_id.clone(),
         flight_address: format!("http://{my_rpc_addr}"),
         max_splits: 256,
@@ -313,7 +313,7 @@ async fn worker_heartbeat_loop(role: ServerRole, config: &AppConfig, my_rpc_addr
     );
 
     loop {
-        match trino_rpc::send_heartbeat(&coordinator_address, &message).await {
+        match arneb_rpc::send_heartbeat(&coordinator_address, &message).await {
             Ok(()) => {
                 tracing::debug!(worker_id = %worker_id, "heartbeat sent");
             }

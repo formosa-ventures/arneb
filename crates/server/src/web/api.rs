@@ -1,12 +1,12 @@
 //! REST API handlers.
 
+use arneb_scheduler::QueryState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::get;
 use axum::Router;
 use serde::Serialize;
-use trino_scheduler::QueryState;
 
 use super::WebState;
 
@@ -98,7 +98,7 @@ async fn get_query(
     Path(id): Path<String>,
 ) -> Result<Json<QueryResponse>, StatusCode> {
     let uuid: uuid::Uuid = id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let query_id = trino_common::identifiers::QueryId(uuid);
+    let query_id = arneb_common::identifiers::QueryId(uuid);
     let info = state
         .query_tracker
         .get_query(&query_id)
@@ -117,7 +117,7 @@ async fn cancel_query(
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     let uuid: uuid::Uuid = id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let query_id = trino_common::identifiers::QueryId(uuid);
+    let query_id = arneb_common::identifiers::QueryId(uuid);
     state
         .query_tracker
         .cancel_query(&query_id)

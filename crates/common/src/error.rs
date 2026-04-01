@@ -1,4 +1,4 @@
-//! Error types for the trino-alt query engine.
+//! Error types for the arneb query engine.
 
 use thiserror::Error;
 
@@ -7,7 +7,7 @@ use crate::types::DataType;
 /// Top-level error type composing all domain errors.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum TrinoError {
+pub enum ArnebError {
     /// SQL parsing error.
     #[error(transparent)]
     Parse(#[from] ParseError),
@@ -151,8 +151,8 @@ pub enum ConfigError {
     },
 }
 
-/// Convenience type alias for Results using TrinoError.
-pub type Result<T> = std::result::Result<T, TrinoError>;
+/// Convenience type alias for Results using ArnebError.
+pub type Result<T> = std::result::Result<T, ArnebError>;
 
 #[cfg(test)]
 mod tests {
@@ -214,46 +214,46 @@ mod tests {
     }
 
     #[test]
-    fn trino_error_from_parse() {
+    fn arneb_error_from_parse() {
         let parse_err = ParseError::InvalidSyntax("bad sql".to_string());
-        let trino_err: TrinoError = parse_err.into();
-        assert!(matches!(trino_err, TrinoError::Parse(_)));
-        assert!(trino_err.to_string().contains("bad sql"));
+        let arneb_err: ArnebError = parse_err.into();
+        assert!(matches!(arneb_err, ArnebError::Parse(_)));
+        assert!(arneb_err.to_string().contains("bad sql"));
     }
 
     #[test]
-    fn trino_error_from_plan() {
+    fn arneb_error_from_plan() {
         let plan_err = PlanError::TableNotFound("users".to_string());
-        let trino_err: TrinoError = plan_err.into();
-        assert!(matches!(trino_err, TrinoError::Plan(_)));
+        let arneb_err: ArnebError = plan_err.into();
+        assert!(matches!(arneb_err, ArnebError::Plan(_)));
     }
 
     #[test]
-    fn trino_error_from_execution() {
+    fn arneb_error_from_execution() {
         let exec_err = ExecutionError::ResourceExhausted("memory limit exceeded".to_string());
-        let trino_err: TrinoError = exec_err.into();
-        assert!(matches!(trino_err, TrinoError::Execution(_)));
+        let arneb_err: ArnebError = exec_err.into();
+        assert!(matches!(arneb_err, ArnebError::Execution(_)));
     }
 
     #[test]
-    fn trino_error_from_connector() {
+    fn arneb_error_from_connector() {
         let conn_err = ConnectorError::ReadError("disk full".to_string());
-        let trino_err: TrinoError = conn_err.into();
-        assert!(matches!(trino_err, TrinoError::Connector(_)));
+        let arneb_err: ArnebError = conn_err.into();
+        assert!(matches!(arneb_err, ArnebError::Connector(_)));
     }
 
     #[test]
-    fn trino_error_from_catalog() {
+    fn arneb_error_from_catalog() {
         let cat_err = CatalogError::TableAlreadyExists("users".to_string());
-        let trino_err: TrinoError = cat_err.into();
-        assert!(matches!(trino_err, TrinoError::Catalog(_)));
+        let arneb_err: ArnebError = cat_err.into();
+        assert!(matches!(arneb_err, ArnebError::Catalog(_)));
     }
 
     #[test]
-    fn trino_error_from_config() {
+    fn arneb_error_from_config() {
         let cfg_err = ConfigError::FileNotFound("/etc/trino.toml".to_string());
-        let trino_err: TrinoError = cfg_err.into();
-        assert!(matches!(trino_err, TrinoError::Config(_)));
+        let arneb_err: ArnebError = cfg_err.into();
+        assert!(matches!(arneb_err, ArnebError::Config(_)));
     }
 
     #[test]

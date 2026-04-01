@@ -1,6 +1,6 @@
 ## Why
 
-trino-alt is a Rust distributed SQL query engine built from scratch. All subsequent crates (sql-parser, planner, optimizer, execution, connectors, catalog, protocol, server) require a shared set of type definitions, error handling mechanisms, and configuration management. The `common` crate is the foundation layer of the entire project and must be established before any other development can proceed.
+arneb is a Rust distributed SQL query engine built from scratch. All subsequent crates (sql-parser, planner, optimizer, execution, connectors, catalog, protocol, server) require a shared set of type definitions, error handling mechanisms, and configuration management. The `common` crate is the foundation layer of the entire project and must be established before any other development can proceed.
 
 ## What Changes
 

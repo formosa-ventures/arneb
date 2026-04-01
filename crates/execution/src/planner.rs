@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use trino_common::error::ExecutionError;
-use trino_planner::{LogicalPlan, PlanExpr};
+use arneb_common::error::ExecutionError;
+use arneb_planner::{LogicalPlan, PlanExpr};
 
 use crate::datasource::DataSource;
 use crate::functions::{default_registry, FunctionRegistry};
@@ -62,7 +62,7 @@ impl ExecutionContext {
             PlanExpr::ScalarSubquery { subplan } => {
                 let exec = self.create_physical_plan(subplan)?;
                 let stream = exec.execute().await?;
-                let batches = trino_common::stream::collect_stream(stream)
+                let batches = arneb_common::stream::collect_stream(stream)
                     .await
                     .map_err(|e| {
                         ExecutionError::InvalidOperation(format!("scalar subquery failed: {e}"))
@@ -74,11 +74,11 @@ impl ExecutionContext {
                     ));
                 }
                 if total_rows == 0 || batches.is_empty() {
-                    return Ok(PlanExpr::Literal(trino_common::types::ScalarValue::Null));
+                    return Ok(PlanExpr::Literal(arneb_common::types::ScalarValue::Null));
                 }
                 let col = batches[0].column(0);
                 if col.is_null(0) {
-                    return Ok(PlanExpr::Literal(trino_common::types::ScalarValue::Null));
+                    return Ok(PlanExpr::Literal(arneb_common::types::ScalarValue::Null));
                 }
                 let val = arrow_to_scalar(col, 0);
                 Ok(PlanExpr::Literal(val))
@@ -135,7 +135,7 @@ impl ExecutionContext {
                     let column_indices: Option<Vec<usize>> = exprs
                         .iter()
                         .map(|e| match e {
-                            trino_planner::PlanExpr::Column { index, .. } => Some(*index),
+                            arneb_planner::PlanExpr::Column { index, .. } => Some(*index),
                             _ => None,
                         })
                         .collect();
@@ -165,8 +165,8 @@ impl ExecutionContext {
                             .map(|(new_idx, _)| {
                                 let orig = &exprs[new_idx];
                                 match orig {
-                                    trino_planner::PlanExpr::Column { name, .. } => {
-                                        trino_planner::PlanExpr::Column {
+                                    arneb_planner::PlanExpr::Column { name, .. } => {
+                                        arneb_planner::PlanExpr::Column {
                                             index: new_idx,
                                             name: name.clone(),
                                         }
@@ -388,10 +388,10 @@ impl ExecutionContext {
 }
 
 /// Extract a scalar value from an Arrow array at a given row.
-fn arrow_to_scalar(array: &arrow::array::ArrayRef, row: usize) -> trino_common::types::ScalarValue {
+fn arrow_to_scalar(array: &arrow::array::ArrayRef, row: usize) -> arneb_common::types::ScalarValue {
+    use arneb_common::types::ScalarValue;
     use arrow::array::{Array, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::DataType as ArrowDT;
-    use trino_common::types::ScalarValue;
 
     if array.is_null(row) {
         return ScalarValue::Null;
@@ -431,13 +431,13 @@ fn arrow_to_scalar(array: &arrow::array::ArrayRef, row: usize) -> trino_common::
 mod tests {
     use super::*;
     use crate::datasource::InMemoryDataSource;
+    use arneb_common::stream::collect_stream;
+    use arneb_common::types::{ColumnInfo, DataType, ScalarValue, TableReference};
+    use arneb_planner::PlanExpr;
+    use arneb_sql_parser::ast;
     use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use trino_common::stream::collect_stream;
-    use trino_common::types::{ColumnInfo, DataType, ScalarValue, TableReference};
-    use trino_planner::PlanExpr;
-    use trino_sql_parser::ast;
 
     fn test_context() -> (ExecutionContext, Vec<ColumnInfo>) {
         let schema = vec![
@@ -578,7 +578,7 @@ mod tests {
                 schema,
                 alias: None,
             }),
-            order_by: vec![trino_planner::SortExpr {
+            order_by: vec![arneb_planner::SortExpr {
                 expr: PlanExpr::Column {
                     index: 0,
                     name: "id".to_string(),

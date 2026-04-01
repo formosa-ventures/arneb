@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Layered error type hierarchy
-The system SHALL provide a layered error type hierarchy where each domain (parsing, planning, execution, connector, catalog, config) has its own error enum defined with `thiserror::Error`. A top-level `TrinoError` enum SHALL compose all domain errors via `#[from]` attributes.
+The system SHALL provide a layered error type hierarchy where each domain (parsing, planning, execution, connector, catalog, config) has its own error enum defined with `thiserror::Error`. A top-level `ArnebError` enum SHALL compose all domain errors via `#[from]` attributes.
 
 #### Scenario: Domain-specific error creation
 - **WHEN** a parse failure occurs in the sql-parser crate
@@ -9,7 +9,7 @@ The system SHALL provide a layered error type hierarchy where each domain (parsi
 
 #### Scenario: Error composition at top level
 - **WHEN** a `ParseError` is propagated to the server binary
-- **THEN** it is automatically convertible to `TrinoError::Parse(ParseError)` via the `From` trait
+- **THEN** it is automatically convertible to `ArnebError::Parse(ParseError)` via the `From` trait
 
 ### Requirement: Error context preservation
 Each domain error enum SHALL implement `std::error::Error` with proper `source()` chaining, so that the full causal chain is available for debugging and logging.
@@ -23,7 +23,7 @@ Each domain error enum SHALL implement `std::error::Error` with proper `source()
 - **THEN** it produces a human-readable message describing the error without exposing the full chain (chain is accessible via `source()`)
 
 ### Requirement: Non-exhaustive error enums
-All domain error enums and the top-level `TrinoError` SHALL be annotated with `#[non_exhaustive]` to allow adding new variants in future crate versions without breaking downstream matches.
+All domain error enums and the top-level `ArnebError` SHALL be annotated with `#[non_exhaustive]` to allow adding new variants in future crate versions without breaking downstream matches.
 
 #### Scenario: Adding a new error variant
 - **WHEN** a new error variant is added to `ExecutionError` in a minor version

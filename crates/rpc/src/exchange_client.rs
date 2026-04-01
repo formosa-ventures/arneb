@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
+use arneb_common::error::ExecutionError;
+use arneb_common::stream::{stream_from_batches, SendableRecordBatchStream};
 use arrow::datatypes::SchemaRef;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Ticket;
 use futures::TryStreamExt;
-use trino_common::error::ExecutionError;
-use trino_common::stream::{stream_from_batches, SendableRecordBatchStream};
 
 /// Client that fetches RecordBatches from a remote Arrow Flight server.
 #[derive(Debug, Clone)]

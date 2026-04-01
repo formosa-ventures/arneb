@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use trino_common::error::ExecutionError;
-use trino_common::identifiers::QueryId;
+use arneb_common::error::ExecutionError;
+use arneb_common::identifiers::QueryId;
 
 use crate::state::{QueryState, QueryStateMachine};
 

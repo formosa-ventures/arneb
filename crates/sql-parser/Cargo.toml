@@ -1,10 +1,10 @@
 [package]
-name = "trino-sql-parser"
+name = "arneb-sql-parser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-trino-common = { path = "../common" }
+arneb-common = { path = "../common" }
 sqlparser.workspace = true
 serde.workspace = true

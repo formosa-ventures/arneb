@@ -2,7 +2,7 @@
 #![warn(unreachable_pub)]
 #![deny(unsafe_code)]
 
-//! Shared types, error handling, and configuration for trino-alt.
+//! Shared types, error handling, and configuration for arneb.
 
 pub mod config;
 pub mod error;
@@ -11,7 +11,7 @@ pub mod stream;
 pub mod types;
 
 pub use config::ServerConfig;
-pub use error::TrinoError;
+pub use error::ArnebError;
 pub use identifiers::{QueryId, SplitId, StageId, TaskId};
 pub use stream::{
     collect_stream, stream_from_batches, RecordBatchStream, SendableRecordBatchStream,

@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: RecordBatchStream trait
-The system SHALL define a `RecordBatchStream` trait that extends `Stream<Item = Result<RecordBatch, TrinoError>> + Send + Unpin`. The trait SHALL include a `schema()` method that returns `Arc<arrow::datatypes::Schema>` so consumers can inspect the output schema without polling the stream.
+The system SHALL define a `RecordBatchStream` trait that extends `Stream<Item = Result<RecordBatch, ArnebError>> + Send + Unpin`. The trait SHALL include a `schema()` method that returns `Arc<arrow::datatypes::Schema>` so consumers can inspect the output schema without polling the stream.
 
 #### Scenario: Stream provides schema before polling
 - **WHEN** a `RecordBatchStream` is created for a data source with columns (id: Int32, name: Utf8)
@@ -27,7 +27,7 @@ The system SHALL provide a `stream_from_batches(schema: Arc<Schema>, batches: Ve
 - **AND** `schema()` still returns the provided schema
 
 ### Requirement: collect_stream adapter
-The system SHALL provide an `async fn collect_stream(stream: SendableRecordBatchStream) -> Result<Vec<RecordBatch>, TrinoError>` function that materializes all batches from a stream into a vector. It SHALL propagate the first error encountered.
+The system SHALL provide an `async fn collect_stream(stream: SendableRecordBatchStream) -> Result<Vec<RecordBatch>, ArnebError>` function that materializes all batches from a stream into a vector. It SHALL propagate the first error encountered.
 
 #### Scenario: Collecting a successful stream
 - **WHEN** `collect_stream(stream)` is awaited on a stream that yields 3 batches

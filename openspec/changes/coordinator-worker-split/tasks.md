@@ -2,7 +2,7 @@
 
 - [x] 1.1 Define `ClusterConfig` struct with fields: `role: String` (default `"standalone"`), `coordinator_address: String` (default empty), `discovery_port: u16` (default `9090`), `worker_id: String` (default empty) — derive `Deserialize`, `Clone`, `Debug`
 - [x] 1.2 Add `#[serde(default)] cluster: ClusterConfig` field to `ServerConfig` in `crates/common`
-- [x] 1.3 Extend `ServerConfig::apply_env_overrides()` to handle `TRINO_CLUSTER_ROLE`, `TRINO_COORDINATOR_ADDRESS`, `TRINO_DISCOVERY_PORT`, `TRINO_WORKER_ID`
+- [x] 1.3 Extend `ServerConfig::apply_env_overrides()` to handle `ARNEB_CLUSTER_ROLE`, `ARNEB_COORDINATOR_ADDRESS`, `ARNEB_DISCOVERY_PORT`, `ARNEB_WORKER_ID`
 - [x] 1.4 Extend `ServerConfig::validate()` to validate cluster config: role must be one of `standalone`/`coordinator`/`worker`, workers require non-empty `coordinator_address`, `discovery_port` must be > 0
 - [x] 1.5 Implement auto-generation of `worker_id` (hostname + 6-char random alphanumeric suffix) when role is `worker` and `worker_id` is empty
 - [x] 1.6 Update `ServerConfig` `Display` impl to include cluster role, coordinator_address (for workers), and worker_id (for workers)
@@ -92,7 +92,7 @@
 
 - [x] 12.1 Test `ClusterConfig` deserialization from TOML with all fields
 - [x] 12.2 Test `ClusterConfig` defaults when `[cluster]` section is absent
-- [x] 12.3 Test env var overrides for cluster settings (`TRINO_CLUSTER_ROLE`, `TRINO_COORDINATOR_ADDRESS`, etc.)
+- [x] 12.3 Test env var overrides for cluster settings (`ARNEB_CLUSTER_ROLE`, `ARNEB_COORDINATOR_ADDRESS`, etc.)
 - [x] 12.4 Test validation: invalid role returns error, worker without coordinator_address returns error, discovery_port 0 returns error
 - [x] 12.5 Test auto-generated worker_id format (contains hostname, has random suffix)
 - [x] 12.6 Test `ServerConfig` Display includes cluster role
@@ -111,6 +111,6 @@
 - [x] 14.2 `cargo test` — all tests pass (including existing Phase 1 tests)
 - [x] 14.3 `cargo clippy -- -D warnings` — clean
 - [x] 14.4 `cargo fmt -- --check` — clean
-- [x] 14.5 `cargo run --bin trino-alt -- --help` shows `--role` argument in usage output
-- [x] 14.6 `cargo run --bin trino-alt -- --role coordinator` starts in coordinator mode (smoke test)
-- [x] 14.7 `cargo run --bin trino-alt -- --role worker --bind 127.0.0.1` prints error about missing coordinator_address
+- [x] 14.5 `cargo run --bin arneb -- --help` shows `--role` argument in usage output
+- [x] 14.6 `cargo run --bin arneb -- --role coordinator` starts in coordinator mode (smoke test)
+- [x] 14.7 `cargo run --bin arneb -- --role worker --bind 127.0.0.1` prints error about missing coordinator_address

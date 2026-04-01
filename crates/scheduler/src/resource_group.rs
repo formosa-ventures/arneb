@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use trino_common::identifiers::QueryId;
+use arneb_common::identifiers::QueryId;
 
 /// Basic admission control: limits concurrent and queued queries.
 #[derive(Debug)]

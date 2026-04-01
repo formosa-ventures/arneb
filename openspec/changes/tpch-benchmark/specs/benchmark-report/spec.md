@@ -1,29 +1,29 @@
 ## ADDED Requirements
 
 ### Requirement: Report generator script
-The system SHALL provide a Python script `scripts/report.py` that reads benchmark result JSON files from both trino-alt and Trino, and produces a markdown comparison report.
+The system SHALL provide a Python script `scripts/report.py` that reads benchmark result JSON files from both arneb and Trino, and produces a markdown comparison report.
 
 #### Scenario: Generate comparison report
-- **WHEN** `python scripts/report.py --trino-alt results/trino_alt_sf1.json --trino results/trino_sf1.json`
+- **WHEN** `python scripts/report.py --arneb results/arneb_sf1.json --trino results/trino_sf1.json`
 - **THEN** a markdown report is printed to stdout with a comparison table
 
 #### Scenario: Missing Trino baseline
-- **WHEN** only the trino-alt results file is provided
-- **THEN** the report shows trino-alt results only with no speedup column
+- **WHEN** only the arneb results file is provided
+- **THEN** the report shows arneb results only with no speedup column
 
 ### Requirement: Comparison table format
-The report SHALL include a markdown table with columns: Query, Trino (ms), trino-alt (ms), Speedup. Speedup SHALL be calculated as `trino_median / trino_alt_median` rounded to 2 decimal places. Values greater than 1.0 indicate trino-alt is faster.
+The report SHALL include a markdown table with columns: Query, Trino (ms), arneb (ms), Speedup. Speedup SHALL be calculated as `trino_median / arneb_median` rounded to 2 decimal places. Values greater than 1.0 indicate arneb is faster.
 
 #### Scenario: Table row format
-- **WHEN** Q1 has trino median 200ms and trino-alt median 150ms
+- **WHEN** Q1 has trino median 200ms and arneb median 150ms
 - **THEN** the table row shows `| Q1 | 200 | 150 | 1.33x |`
 
 #### Scenario: Slower query
-- **WHEN** Q5 has trino median 100ms and trino-alt median 300ms
+- **WHEN** Q5 has trino median 100ms and arneb median 300ms
 - **THEN** the table row shows `| Q5 | 100 | 300 | 0.33x |`
 
 #### Scenario: Skipped query
-- **WHEN** Q15 was skipped in trino-alt
+- **WHEN** Q15 was skipped in arneb
 - **THEN** the table row shows `| Q15 | 200 | SKIP | - |`
 
 ### Requirement: Summary statistics

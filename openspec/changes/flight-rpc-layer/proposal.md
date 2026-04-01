@@ -4,7 +4,7 @@ Distributed query execution requires high-performance inter-node data exchange. 
 
 ## What Changes
 
-- Create new `crates/rpc/` crate (trino-rpc)
+- Create new `crates/rpc/` crate (arneb-rpc)
 - Implement Arrow Flight SQL server using tonic + arrow-flight for RecordBatch streaming
 - Define protobuf messages for task management (TaskRequest, TaskStatus, Heartbeat)
 - Implement OutputBuffer: bounded, partition-aware buffer for task output

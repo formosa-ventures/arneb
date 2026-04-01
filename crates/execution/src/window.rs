@@ -3,13 +3,13 @@
 use std::fmt;
 use std::sync::Arc;
 
+use arneb_common::error::ExecutionError;
+use arneb_common::stream::{collect_stream, stream_from_batches, SendableRecordBatchStream};
+use arneb_common::types::ColumnInfo;
+use arneb_planner::WindowFunctionDef;
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{Field, Schema};
 use async_trait::async_trait;
-use trino_common::error::ExecutionError;
-use trino_common::stream::{collect_stream, stream_from_batches, SendableRecordBatchStream};
-use trino_common::types::ColumnInfo;
-use trino_planner::WindowFunctionDef;
 
 use crate::expression;
 use crate::operator::ExecutionPlan;
@@ -327,9 +327,9 @@ impl ExecutionPlan for WindowExec {
         for f in &self.functions {
             let data_type = match f.name.to_uppercase().as_str() {
                 "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT" => {
-                    trino_common::types::DataType::Int64
+                    arneb_common::types::DataType::Int64
                 }
-                _ => trino_common::types::DataType::Float64,
+                _ => arneb_common::types::DataType::Float64,
             };
             schema.push(ColumnInfo {
                 name: f.output_name.clone(),

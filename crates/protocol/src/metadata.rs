@@ -7,10 +7,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use arneb_catalog::CatalogManager;
+use arneb_common::types::DataType;
 use arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-use trino_catalog::CatalogManager;
-use trino_common::types::DataType;
 
 use crate::encoding::datatype_to_pg_type;
 
@@ -138,7 +138,7 @@ fn handle_version() -> MetaResult {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(StringArray::from(vec![format!(
-            "trino-alt {}",
+            "Arneb {}",
             env!("CARGO_PKG_VERSION")
         )]))],
     )

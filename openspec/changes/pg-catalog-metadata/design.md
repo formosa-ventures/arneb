@@ -1,6 +1,6 @@
 ## Context
 
-DBeaver (and most PostgreSQL GUI clients) sends metadata queries immediately after connecting: `pg_catalog.pg_type`, `pg_catalog.pg_namespace`, `pg_catalog.pg_class`, `pg_catalog.pg_attribute`, `information_schema.tables`, `information_schema.columns`, and `SELECT version()`. These all fail with "table not found" because trino-alt has no system catalog tables.
+DBeaver (and most PostgreSQL GUI clients) sends metadata queries immediately after connecting: `pg_catalog.pg_type`, `pg_catalog.pg_namespace`, `pg_catalog.pg_class`, `pg_catalog.pg_attribute`, `information_schema.tables`, `information_schema.columns`, and `SELECT version()`. These all fail with "table not found" because arneb has no system catalog tables.
 
 CatalogManager already has the metadata needed: `catalog_names()`, `schema_names()`, `table_names()`, `table().schema()` → `Vec<ColumnInfo>`. The gap is exposing this metadata through PostgreSQL system table queries.
 

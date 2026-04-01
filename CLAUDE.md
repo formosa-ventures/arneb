@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**trino-alt** — A Trino alternative built in Rust. Distributed SQL query engine for federated queries across heterogeneous data sources.
+**Arneb** — A Trino alternative built in Rust. Distributed SQL query engine for federated queries across heterogeneous data sources.
 
 **Status**: Phase 1 (single-node) and Phase 2 (distribution) complete. 18 OpenSpec changes implemented. TPC-H 16/22 queries passing.
 
@@ -26,20 +26,20 @@ cargo fmt                                # auto-format
 cargo clippy -- -D warnings              # lint with warnings as errors
 
 # Run the server (standalone — single process, default)
-cargo run --bin trino-alt
-cargo run --bin trino-alt -- --config path/to/config.toml
+cargo run --bin arneb
+cargo run --bin arneb -- --config path/to/config.toml
 
 # Run as coordinator + worker (distributed mode)
-cargo run --bin trino-alt -- --config trino-alt.toml --port 5432 --role coordinator
-cargo run --bin trino-alt -- --config worker.toml --role worker
+cargo run --bin arneb -- --config arneb.toml --port 5432 --role coordinator
+cargo run --bin arneb -- --config worker.toml --role worker
 
 # Run TPC-H benchmark
-cd benchmarks/tpch && cargo run --release -- --engine trino-alt --port 5432
+cd benchmarks/tpch && cargo run --release -- --engine arneb --port 5432
 ```
 
 ### Server Configuration
 
-The server loads config from `trino-alt.toml` (if present), env vars, and CLI args. Precedence: CLI > env > file > defaults.
+The server loads config from `arneb.toml` (if present), env vars, and CLI args. Precedence: CLI > env > file > defaults.
 
 ```toml
 bind_address = "127.0.0.1"
@@ -84,7 +84,7 @@ Connect with any PostgreSQL client: `psql -h 127.0.0.1 -p 5432`
 ```
 crates/
 ├── common/        # Shared types (DataType, ScalarValue, ColumnInfo, TableReference),
-│                  # error hierarchy (TrinoError), identifiers (QueryId, StageId, TaskId)
+│                  # error hierarchy (ArnebError), identifiers (QueryId, StageId, TaskId)
 ├── sql-parser/    # SQL → AST via sqlparser-rs. Supports SELECT, DDL/DML, CASE,
 │                  # CTEs, set operations, window functions, subqueries
 ├── catalog/       # CatalogProvider/SchemaProvider/TableProvider traits,
@@ -104,7 +104,7 @@ crates/
 │                  # ResourceGroupManager, NodeScheduler
 ├── rpc/           # Arrow Flight RPC server/client for distributed task execution,
 │                  # heartbeat protocol, output buffer management
-└── server/        # Main binary (trino-alt), CLI (clap), config loading,
+└── server/        # Main binary (arneb), CLI (clap), config loading,
                    # catalog/connector wiring, Web UI (axum + rust-embed),
                    # graceful shutdown, coordinator/worker startup
 ```
@@ -187,6 +187,6 @@ openspec/
 - All public APIs get doc comments. Internal functions don't need them.
 - Tests live in `#[cfg(test)] mod tests` within source files for unit tests; `tests/` directory for integration tests.
 - Use `tracing` (not `log`) for instrumentation.
-- Config: `serde` + `toml` for deserialization, `TRINO_*` env vars for overrides.
+- Config: `serde` + `toml` for deserialization, `ARNEB_*` env vars for overrides.
 - Metadata queries (pg_catalog, information_schema) are intercepted in the protocol layer before the SQL parser.
 - Quoted identifiers are stripped during AST conversion (use `Ident.value`, not `to_string()`).

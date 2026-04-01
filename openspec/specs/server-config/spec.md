@@ -1,10 +1,10 @@
 ## ADDED Requirements
 
 ### Requirement: TOML configuration file loading
-The system SHALL load server configuration from a TOML file. The default path SHALL be `./trino-alt.toml`. If the file does not exist, the system SHALL use default values for all settings.
+The system SHALL load server configuration from a TOML file. The default path SHALL be `./arneb.toml`. If the file does not exist, the system SHALL use default values for all settings.
 
 #### Scenario: Loading from default path
-- **WHEN** the server starts and `./trino-alt.toml` exists with `bind_address = "0.0.0.0"`
+- **WHEN** the server starts and `./arneb.toml` exists with `bind_address = "0.0.0.0"`
 - **THEN** the config's bind_address is set to `"0.0.0.0"`
 
 #### Scenario: Missing config file uses defaults
@@ -20,18 +20,18 @@ The system SHALL load server configuration from a TOML file. The default path SH
 - **THEN** a `ConfigError::ParseError` is returned with the parse error details
 
 ### Requirement: Environment variable override
-The system SHALL support overriding any config value via environment variables. Environment variables SHALL be prefixed with `TRINO_` and use uppercase with underscores (e.g., `TRINO_BIND_ADDRESS`). Environment variables SHALL take precedence over file values.
+The system SHALL support overriding any config value via environment variables. Environment variables SHALL be prefixed with `TRINO_` and use uppercase with underscores (e.g., `ARNEB_BIND_ADDRESS`). Environment variables SHALL take precedence over file values.
 
 #### Scenario: Env var overrides file value
-- **WHEN** the config file has `port = 8080` and `TRINO_PORT=9090` is set
+- **WHEN** the config file has `port = 8080` and `ARNEB_PORT=9090` is set
 - **THEN** the effective port is `9090`
 
 #### Scenario: Env var with no file
-- **WHEN** no config file exists and `TRINO_PORT=7070` is set
+- **WHEN** no config file exists and `ARNEB_PORT=7070` is set
 - **THEN** the effective port is `7070` with all other values at defaults
 
 #### Scenario: Invalid env var value
-- **WHEN** `TRINO_PORT=not_a_number` is set
+- **WHEN** `ARNEB_PORT=not_a_number` is set
 - **THEN** a `ConfigError::InvalidValue` is returned with key `"port"` and reason describing the expected type
 
 ### Requirement: MVP configuration parameters

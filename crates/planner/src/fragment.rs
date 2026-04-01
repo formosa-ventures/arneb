@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use trino_common::identifiers::StageId;
+use arneb_common::identifiers::StageId;
 
 use crate::plan::LogicalPlan;
 
@@ -339,8 +339,8 @@ impl Default for PlanFragmenter {
 mod tests {
     use super::*;
     use crate::plan::PlanExpr;
-    use trino_common::types::{ColumnInfo, DataType, ScalarValue, TableReference};
-    use trino_sql_parser::ast;
+    use arneb_common::types::{ColumnInfo, DataType, ScalarValue, TableReference};
+    use arneb_sql_parser::ast;
 
     fn scan(name: &str) -> LogicalPlan {
         LogicalPlan::TableScan {

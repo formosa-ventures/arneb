@@ -1,6 +1,6 @@
 ## Overview
 
-Provide a public API for parsing SQL strings into the trino-alt AST. Internally uses `sqlparser-rs` for grammar parsing, then converts to the trino-alt-specific AST representation through a conversion layer.
+Provide a public API for parsing SQL strings into the arneb AST. Internally uses `sqlparser-rs` for grammar parsing, then converts to the arneb-specific AST representation through a conversion layer.
 
 ## Requirements
 
@@ -8,7 +8,7 @@ Provide a public API for parsing SQL strings into the trino-alt AST. Internally 
 
 Provide a `parse(sql: &str) -> Result<Statement, ParseError>` function:
 - Accepts any SQL string
-- Returns the parsed trino-alt `Statement`
+- Returns the parsed arneb `Statement`
 - Returns `ParseError::InvalidSyntax` for syntax errors
 - Returns `ParseError::UnsupportedFeature` for unsupported syntax
 
@@ -20,7 +20,7 @@ Provide a `parse(sql: &str) -> Result<Statement, ParseError>` function:
 
 ### R2: sqlparser-rs AST conversion
 
-Implement conversion from `sqlparser::ast` to the trino-alt AST:
+Implement conversion from `sqlparser::ast` to the arneb AST:
 - Use `GenericDialect` or a custom dialect
 - Correctly convert all AST nodes defined in R1-R5 of the sql-ast spec
 - Return `ParseError::UnsupportedFeature` for unsupported sqlparser AST nodes
@@ -28,7 +28,7 @@ Implement conversion from `sqlparser::ast` to the trino-alt AST:
 The conversion must be a total function — every sqlparser output has a defined handling path (either successful conversion or an unsupported error).
 
 **Scenarios:**
-- `sqlparser::ast::Statement::Query` → Correctly converts to trino-alt `Statement::Query`
+- `sqlparser::ast::Statement::Query` → Correctly converts to arneb `Statement::Query`
 - `sqlparser::ast::Statement::CreateTable` → `Err(ParseError::UnsupportedFeature("CREATE TABLE"))`
 - `sqlparser::ast::Expr::Nested(inner)` → Unwraps the nesting and returns the inner expr directly
 
@@ -50,7 +50,7 @@ Correctly convert `sqlparser::ast::Value` to `ScalarValue`:
 
 ### R4: DataType conversion
 
-Convert `sqlparser::ast::DataType` to `trino-common::DataType`:
+Convert `sqlparser::ast::DataType` to `arneb-common::DataType`:
 - `INT`/`INTEGER` → `DataType::Int32`
 - `BIGINT` → `DataType::Int64`
 - `SMALLINT` → `DataType::Int16`

@@ -102,6 +102,166 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arneb-catalog"
+version = "0.1.0"
+dependencies = [
+ "arneb-common",
+]
+
+[[package]]
+name = "arneb-common"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "futures",
+ "num_cpus",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "arneb-connectors"
+version = "0.1.0"
+dependencies = [
+ "arneb-catalog",
+ "arneb-common",
+ "arneb-execution",
+ "arrow",
+ "arrow-csv",
+ "async-trait",
+ "futures",
+ "parquet",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "arneb-execution"
+version = "0.1.0"
+dependencies = [
+ "arneb-catalog",
+ "arneb-common",
+ "arneb-planner",
+ "arneb-sql-parser",
+ "arrow",
+ "async-trait",
+ "futures",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "arneb-planner"
+version = "0.1.0"
+dependencies = [
+ "arneb-catalog",
+ "arneb-common",
+ "arneb-sql-parser",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "arneb-protocol"
+version = "0.1.0"
+dependencies = [
+ "arneb-catalog",
+ "arneb-common",
+ "arneb-connectors",
+ "arneb-execution",
+ "arneb-planner",
+ "arneb-sql-parser",
+ "arrow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "pgwire",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "arneb-rpc"
+version = "0.1.0"
+dependencies = [
+ "arneb-common",
+ "arneb-planner",
+ "arrow",
+ "arrow-flight",
+ "async-stream",
+ "async-trait",
+ "futures",
+ "prost",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
+name = "arneb-scheduler"
+version = "0.1.0"
+dependencies = [
+ "arneb-common",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "arneb-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arneb-catalog",
+ "arneb-common",
+ "arneb-connectors",
+ "arneb-execution",
+ "arneb-planner",
+ "arneb-protocol",
+ "arneb-rpc",
+ "arneb-scheduler",
+ "arrow",
+ "async-trait",
+ "axum 0.8.8",
+ "clap",
+ "futures",
+ "mime_guess",
+ "parquet",
+ "pgwire",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "arneb-sql-parser"
+version = "0.1.0"
+dependencies = [
+ "arneb-common",
+ "serde",
+ "sqlparser",
+]
+
+[[package]]
 name = "array-init"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2729,166 +2889,6 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "trino-catalog"
-version = "0.1.0"
-dependencies = [
- "trino-common",
-]
-
-[[package]]
-name = "trino-common"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "async-trait",
- "futures",
- "num_cpus",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "trino-connectors"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "arrow-csv",
- "async-trait",
- "futures",
- "parquet",
- "tempfile",
- "tokio",
- "trino-catalog",
- "trino-common",
- "trino-execution",
-]
-
-[[package]]
-name = "trino-execution"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "async-trait",
- "futures",
- "serde_json",
- "tokio",
- "trino-catalog",
- "trino-common",
- "trino-planner",
- "trino-sql-parser",
-]
-
-[[package]]
-name = "trino-planner"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "trino-catalog",
- "trino-common",
- "trino-sql-parser",
-]
-
-[[package]]
-name = "trino-protocol"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "async-trait",
- "bytes",
- "chrono",
- "futures",
- "hex",
- "pgwire",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "trino-catalog",
- "trino-common",
- "trino-connectors",
- "trino-execution",
- "trino-planner",
- "trino-sql-parser",
-]
-
-[[package]]
-name = "trino-rpc"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "arrow-flight",
- "async-stream",
- "async-trait",
- "futures",
- "prost",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "trino-common",
- "trino-planner",
-]
-
-[[package]]
-name = "trino-scheduler"
-version = "0.1.0"
-dependencies = [
- "tokio",
- "tracing",
- "trino-common",
- "uuid",
-]
-
-[[package]]
-name = "trino-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "async-trait",
- "axum 0.8.8",
- "clap",
- "futures",
- "mime_guess",
- "parquet",
- "pgwire",
- "rust-embed",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "trino-catalog",
- "trino-common",
- "trino-connectors",
- "trino-execution",
- "trino-planner",
- "trino-protocol",
- "trino-rpc",
- "trino-scheduler",
- "uuid",
-]
-
-[[package]]
-name = "trino-sql-parser"
-version = "0.1.0"
-dependencies = [
- "serde",
- "sqlparser",
- "trino-common",
 ]
 
 [[package]]

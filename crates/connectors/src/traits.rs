@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use trino_common::error::ConnectorError;
-use trino_common::types::{ColumnInfo, TableReference};
-use trino_execution::DataSource;
+use arneb_common::error::ConnectorError;
+use arneb_common::types::{ColumnInfo, TableReference};
+use arneb_execution::DataSource;
 
 /// A provider for DDL/DML operations (create, drop, insert, delete).
 ///

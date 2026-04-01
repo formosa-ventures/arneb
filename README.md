@@ -1,4 +1,4 @@
-# trino-alt
+# Arneb
 
 A Trino alternative built in Rust. Distributed SQL query engine for federated queries across heterogeneous data sources.
 
@@ -24,10 +24,10 @@ Trino (formerly PrestoSQL) lets users query data where it lives — across objec
 cargo build --release
 
 # Start server (standalone mode)
-./target/release/trino-alt
+./target/release/arneb
 
 # Start with data tables
-./target/release/trino-alt --config trino-alt.toml
+./target/release/arneb --config arneb.toml
 
 # Connect with psql
 psql -h 127.0.0.1 -p 5432
@@ -39,7 +39,7 @@ open http://127.0.0.1:6432
 ### Configuration
 
 ```toml
-# trino-alt.toml
+# Arneb.toml
 bind_address = "127.0.0.1"
 port = 5432
 
@@ -65,10 +65,10 @@ Coordinator handles SQL parsing, planning, and task dispatch. Workers execute pl
 
 ```bash
 # Start coordinator (accepts SQL on port 5432, Web UI on 6432)
-./target/release/trino-alt --config trino-alt.toml --port 5432 --role coordinator
+./target/release/arneb --config arneb.toml --port 5432 --role coordinator
 
 # Start worker (separate terminal — Flight RPC only, no pgwire)
-./target/release/trino-alt --config worker.toml --role worker
+./target/release/arneb --config worker.toml --role worker
 ```
 
 Worker config (`worker.toml` — no `port` needed since worker has no pgwire):
@@ -134,7 +134,7 @@ python3 benchmarks/tpch/scripts/generate_parquet.py
 
 # Run benchmark
 cd benchmarks/tpch && cargo run --release -- \
-  --engine trino-alt --port 5432
+  --engine arneb --port 5432
 ```
 
 ## Development

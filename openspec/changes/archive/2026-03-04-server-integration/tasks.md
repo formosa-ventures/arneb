@@ -3,15 +3,15 @@
 - [x] 1.1 Add `crates/server` to workspace members in root `Cargo.toml`
 - [x] 1.2 Add `clap` (features: derive) and `tracing-subscriber` (features: env-filter) to workspace dependencies in root `Cargo.toml`
 - [x] 1.3 Add `anyhow` to workspace dependencies in root `Cargo.toml`
-- [x] 1.4 Create `crates/server/Cargo.toml` as a binary crate (`[[bin]] name = "trino-alt"`) with dependencies: `trino-common`, `trino-catalog`, `trino-connectors`, `trino-protocol`, `tokio` (features: rt-multi-thread, net, macros, signal), `clap` (features: derive), `tracing`, `tracing-subscriber` (features: env-filter), `anyhow`, `serde` (features: derive), `toml`
-- [x] 1.5 Create `crates/server/src/main.rs` with a placeholder `main()` that prints "trino-alt" and exits
+- [x] 1.4 Create `crates/server/Cargo.toml` as a binary crate (`[[bin]] name = "arneb"`) with dependencies: `arneb-common`, `arneb-catalog`, `arneb-connectors`, `arneb-protocol`, `tokio` (features: rt-multi-thread, net, macros, signal), `clap` (features: derive), `tracing`, `tracing-subscriber` (features: env-filter), `anyhow`, `serde` (features: derive), `toml`
+- [x] 1.5 Create `crates/server/src/main.rs` with a placeholder `main()` that prints "arneb" and exits
 
 ## 2. Configuration Types
 
 - [x] 2.1 Define `TableConfig` struct with fields: `name: String`, `path: String`, `format: String`, `schema: Option<Vec<ColumnSchema>>` — derive `Deserialize`
 - [x] 2.2 Define `ColumnSchema` struct with fields: `name: String`, `r#type: String` — derive `Deserialize`
 - [x] 2.3 Define `AppConfig` struct with `#[serde(flatten)] server: ServerConfig` and `#[serde(default)] tables: Vec<TableConfig>` — derive `Deserialize`
-- [x] 2.4 Implement `AppConfig::load(path: Option<&Path>)` that loads from TOML file (or default `./trino-alt.toml`), applies env overrides via `server.apply_env_overrides()`, validates via `server.validate()`
+- [x] 2.4 Implement `AppConfig::load(path: Option<&Path>)` that loads from TOML file (or default `./arneb.toml`), applies env overrides via `server.apply_env_overrides()`, validates via `server.validate()`
 - [x] 2.5 Implement `parse_data_type(type_name: &str) -> Result<DataType>` mapping string type names (`boolean`, `int8`, `int16`, `int32`, `int64`, `float32`, `float64`, `utf8`, `date32`, `timestamp`) to `DataType` enum values, returning error for unknown types
 
 ## 3. CLI Argument Parsing
@@ -67,7 +67,7 @@
 ## 10. Quality & Build Verification
 
 - [x] 10.1 `cargo build` compiles without warnings
-- [x] 10.2 `cargo test -p trino-server` all tests pass
+- [x] 10.2 `cargo test -p arneb-server` all tests pass
 - [x] 10.3 `cargo clippy -- -D warnings` clean
 - [x] 10.4 `cargo fmt -- --check` clean
-- [x] 10.5 `cargo run --bin trino-alt -- --help` prints usage and exits
+- [x] 10.5 `cargo run --bin arneb -- --help` prints usage and exits

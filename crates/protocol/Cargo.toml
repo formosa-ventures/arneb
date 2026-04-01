@@ -1,17 +1,17 @@
 [package]
-name = "trino-protocol"
+name = "arneb-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 # Internal crates
-trino-common = { path = "../common" }
-trino-sql-parser = { path = "../sql-parser" }
-trino-catalog = { path = "../catalog" }
-trino-planner = { path = "../planner" }
-trino-execution = { path = "../execution" }
-trino-connectors = { path = "../connectors" }
+arneb-common = { path = "../common" }
+arneb-sql-parser = { path = "../sql-parser" }
+arneb-catalog = { path = "../catalog" }
+arneb-planner = { path = "../planner" }
+arneb-execution = { path = "../execution" }
+arneb-connectors = { path = "../connectors" }
 
 # Arrow columnar format
 arrow = { workspace = true }

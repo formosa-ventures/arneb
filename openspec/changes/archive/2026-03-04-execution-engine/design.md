@@ -1,6 +1,6 @@
 ## Context
 
-trino-alt has `common` (shared types, errors), `sql-parser` (SQL → AST), `catalog` (table metadata), and `planner` (AST → LogicalPlan). The execution engine evaluates LogicalPlan trees against actual data, producing Arrow RecordBatch results.
+arneb has `common` (shared types, errors), `sql-parser` (SQL → AST), `catalog` (table metadata), and `planner` (AST → LogicalPlan). The execution engine evaluates LogicalPlan trees against actual data, producing Arrow RecordBatch results.
 
 Project conventions: `Arc<dyn Trait>` for polymorphism, `thiserror` for errors, trait-based extensibility, Arrow columnar format for all intermediate data.
 

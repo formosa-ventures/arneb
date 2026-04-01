@@ -10,6 +10,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arneb_common::error::ExecutionError;
+use arneb_common::stream::{
+    collect_stream, stream_from_batches, RecordBatchStream, SendableRecordBatchStream,
+};
+use arneb_common::types::{ColumnInfo, ScalarValue};
+use arneb_planner::{LogicalPlan, PlanExpr, SortExpr};
+use arneb_sql_parser::ast;
 use arrow::array::{
     self, Array, ArrayRef, AsArray, BooleanArray, Float32Array, Float64Array, Int32Array,
     Int64Array, RecordBatch, StringArray, UInt32Array,
@@ -18,13 +25,6 @@ use arrow::compute;
 use arrow::datatypes::{self, DataType as ArrowDataType, Field, Schema};
 use async_trait::async_trait;
 use futures::stream::Stream;
-use trino_common::error::ExecutionError;
-use trino_common::stream::{
-    collect_stream, stream_from_batches, RecordBatchStream, SendableRecordBatchStream,
-};
-use trino_common::types::{ColumnInfo, ScalarValue};
-use trino_planner::{LogicalPlan, PlanExpr, SortExpr};
-use trino_sql_parser::ast;
 
 use crate::aggregate::{self, Accumulator};
 use crate::datasource::DataSource;
@@ -187,7 +187,7 @@ pub(crate) struct NestedLoopJoinExec {
     pub(crate) left: Arc<dyn ExecutionPlan>,
     pub(crate) right: Arc<dyn ExecutionPlan>,
     pub(crate) join_type: ast::JoinType,
-    pub(crate) condition: trino_planner::JoinCondition,
+    pub(crate) condition: arneb_planner::JoinCondition,
 }
 
 #[async_trait]
@@ -401,8 +401,8 @@ impl NestedLoopJoinExec {
         right_batch: &RecordBatch,
     ) -> Result<bool, ExecutionError> {
         match &self.condition {
-            trino_planner::JoinCondition::None => Ok(true),
-            trino_planner::JoinCondition::On(expr) => {
+            arneb_planner::JoinCondition::None => Ok(true),
+            arneb_planner::JoinCondition::On(expr) => {
                 let combined =
                     self.build_combined_row(left_row, right_row, left_batch, right_batch)?;
                 let result = expression::evaluate(expr, &combined, None)?;
@@ -797,7 +797,7 @@ impl ExecutionPlan for ExplainExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         vec![ColumnInfo {
             name: "plan".to_string(),
-            data_type: trino_common::types::DataType::Utf8,
+            data_type: arneb_common::types::DataType::Utf8,
             nullable: false,
         }]
     }
@@ -853,12 +853,12 @@ impl<F> Stream for MapStream<F>
 where
     F: FnMut(RecordBatch) -> Result<RecordBatch, ExecutionError> + Send + Unpin,
 {
-    type Item = Result<RecordBatch, trino_common::error::TrinoError>;
+    type Item = Result<RecordBatch, arneb_common::error::ArnebError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.input).poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                let result = (self.map_fn)(batch).map_err(trino_common::error::TrinoError::from);
+                let result = (self.map_fn)(batch).map_err(arneb_common::error::ArnebError::from);
                 Poll::Ready(Some(result))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
@@ -906,7 +906,7 @@ impl<F> Stream for FilterMapStream<F>
 where
     F: FnMut(RecordBatch) -> Result<Option<RecordBatch>, ExecutionError> + Send + Unpin,
 {
-    type Item = Result<RecordBatch, trino_common::error::TrinoError>;
+    type Item = Result<RecordBatch, arneb_common::error::ArnebError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
@@ -921,7 +921,7 @@ where
                             continue;
                         }
                         Err(e) => {
-                            return Poll::Ready(Some(Err(trino_common::error::TrinoError::from(
+                            return Poll::Ready(Some(Err(arneb_common::error::ArnebError::from(
                                 e,
                             ))));
                         }
@@ -1076,8 +1076,8 @@ fn scalars_to_array(values: &[ScalarValue], _len: usize) -> Result<ArrayRef, Exe
 mod tests {
     use super::*;
     use crate::datasource::InMemoryDataSource;
-    use trino_common::stream::collect_stream;
-    use trino_common::types::DataType;
+    use arneb_common::stream::collect_stream;
+    use arneb_common::types::DataType;
 
     fn make_test_source() -> Arc<dyn DataSource> {
         let schema = Arc::new(Schema::new(vec![
@@ -1352,7 +1352,7 @@ mod tests {
             left,
             right,
             join_type: ast::JoinType::Cross,
-            condition: trino_planner::JoinCondition::None,
+            condition: arneb_planner::JoinCondition::None,
         };
 
         let stream = join.execute().await.unwrap();
@@ -1364,7 +1364,7 @@ mod tests {
     #[tokio::test]
     async fn explain_exec() {
         let plan = LogicalPlan::TableScan {
-            table: trino_common::types::TableReference::table("test"),
+            table: arneb_common::types::TableReference::table("test"),
             schema: vec![ColumnInfo {
                 name: "id".to_string(),
                 data_type: DataType::Int32,

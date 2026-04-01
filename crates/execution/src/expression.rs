@@ -5,6 +5,10 @@
 
 use std::sync::Arc;
 
+use arneb_common::error::ExecutionError;
+use arneb_common::types::ScalarValue;
+use arneb_planner::PlanExpr;
+use arneb_sql_parser::ast;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, NullArray,
     StringArray,
@@ -12,10 +16,6 @@ use arrow::array::{
 use arrow::compute::kernels;
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow::record_batch::RecordBatch;
-use trino_common::error::ExecutionError;
-use trino_common::types::ScalarValue;
-use trino_planner::PlanExpr;
-use trino_sql_parser::ast;
 
 use crate::functions::FunctionRegistry;
 
@@ -889,7 +889,7 @@ mod tests {
                 index: 0,
                 name: "a".to_string(),
             }),
-            data_type: trino_common::types::DataType::Int64,
+            data_type: arneb_common::types::DataType::Int64,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();

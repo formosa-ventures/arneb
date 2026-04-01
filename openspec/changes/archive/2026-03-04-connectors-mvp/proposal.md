@@ -4,7 +4,7 @@ Changes 1–5 built the full query pipeline (parse → plan → execute), but th
 
 ## What Changes
 
-- Create `crates/connectors/` crate (package name: `trino-connectors`)
+- Create `crates/connectors/` crate (package name: `arneb-connectors`)
 - Implement a `ConnectorFactory` trait that creates `DataSource` instances from catalog table metadata, and a `ConnectorRegistry` that maps catalog names to factories
 - Implement an in-memory connector that wraps pre-built RecordBatches (replacing ad-hoc `InMemoryDataSource` usage with a catalog-integrated connector)
 - Implement a file connector that reads CSV and Parquet files from the local filesystem, producing Arrow RecordBatches
@@ -25,5 +25,5 @@ Changes 1–5 built the full query pipeline (parse → plan → execute), but th
 ## Impact
 
 - **New crate**: `crates/connectors/`
-- **Dependencies**: `trino-common`, `trino-catalog`, `trino-execution` (for `DataSource` trait), `arrow` (with `csv` and `parquet` features), `parquet` crate
+- **Dependencies**: `arneb-common`, `arneb-catalog`, `arneb-execution` (for `DataSource` trait), `arrow` (with `csv` and `parquet` features), `parquet` crate
 - **Downstream**: The `server-integration` crate (Change 8) will use `ConnectorRegistry` to wire catalogs to the execution engine, enabling end-to-end SQL queries against files

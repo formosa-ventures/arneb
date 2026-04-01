@@ -1,23 +1,23 @@
 [package]
-name = "trino-server"
+name = "arneb-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "trino-alt"
+name = "arneb"
 path = "src/main.rs"
 
 [dependencies]
 # Internal crates
-trino-common = { path = "../common" }
-trino-catalog = { path = "../catalog" }
-trino-connectors = { path = "../connectors" }
-trino-execution = { path = "../execution" }
-trino-planner = { path = "../planner" }
-trino-protocol = { path = "../protocol" }
-trino-scheduler = { path = "../scheduler" }
-trino-rpc = { path = "../rpc" }
+arneb-common = { path = "../common" }
+arneb-catalog = { path = "../catalog" }
+arneb-connectors = { path = "../connectors" }
+arneb-execution = { path = "../execution" }
+arneb-planner = { path = "../planner" }
+arneb-protocol = { path = "../protocol" }
+arneb-scheduler = { path = "../scheduler" }
+arneb-rpc = { path = "../rpc" }
 arrow = { workspace = true }
 async-trait.workspace = true
 

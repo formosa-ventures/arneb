@@ -1,9 +1,9 @@
 //! Query planner that converts a parsed SQL AST into a logical plan.
 
-use trino_catalog::CatalogManager;
-use trino_common::error::PlanError;
-use trino_common::types::{ColumnInfo, DataType, ScalarValue};
-use trino_sql_parser::ast;
+use arneb_catalog::CatalogManager;
+use arneb_common::error::PlanError;
+use arneb_common::types::{ColumnInfo, DataType, ScalarValue};
+use arneb_sql_parser::ast;
 
 use crate::plan::{JoinCondition, LogicalPlan, PlanExpr, SortExpr};
 
@@ -1128,9 +1128,9 @@ fn is_aggregate_function(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arneb_catalog::{CatalogManager, MemoryCatalog, MemorySchema, MemoryTable};
+    use arneb_common::types::ColumnInfo;
     use std::sync::Arc;
-    use trino_catalog::{CatalogManager, MemoryCatalog, MemorySchema, MemoryTable};
-    use trino_common::types::ColumnInfo;
 
     /// Create a CatalogManager with a "users" table (id: Int64, name: Utf8, age: Int32).
     fn test_catalog() -> CatalogManager {
@@ -1184,7 +1184,7 @@ mod tests {
     fn plan_sql(sql: &str) -> Result<LogicalPlan, PlanError> {
         let catalog = test_catalog();
         let planner = QueryPlanner::new(&catalog);
-        let stmt = trino_sql_parser::parse(sql).expect("parse failed");
+        let stmt = arneb_sql_parser::parse(sql).expect("parse failed");
         planner.plan_statement(&stmt)
     }
 

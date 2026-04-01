@@ -4,18 +4,18 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
+use arneb_catalog::{CatalogProvider, SchemaProvider, TableProvider};
+use arneb_common::error::ConnectorError;
+use arneb_common::types::{ColumnInfo, TableReference};
+use arneb_execution::{DataSource, InMemoryDataSource};
 use arrow::array::RecordBatch;
-use trino_catalog::{CatalogProvider, SchemaProvider, TableProvider};
-use trino_common::error::ConnectorError;
-use trino_common::types::{ColumnInfo, TableReference};
-use trino_execution::{DataSource, InMemoryDataSource};
 
 use arrow::datatypes::DataType as ArrowDataType;
 
 use crate::{ConnectorFactory, DDLProvider};
 
-fn arrow_type_to_data_type(dt: &ArrowDataType) -> trino_common::types::DataType {
-    use trino_common::types::DataType;
+fn arrow_type_to_data_type(dt: &ArrowDataType) -> arneb_common::types::DataType {
+    use arneb_common::types::DataType;
     match dt {
         ArrowDataType::Boolean => DataType::Boolean,
         ArrowDataType::Int8 => DataType::Int8,
@@ -351,9 +351,9 @@ impl ConnectorFactory for MemoryConnectorFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arneb_common::types::DataType;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-    use trino_common::types::DataType;
 
     fn test_table() -> Arc<MemoryTable> {
         let arrow_schema = Arc::new(Schema::new(vec![Field::new(
@@ -414,10 +414,10 @@ mod tests {
         let table_ref = TableReference::table("users");
         let ds = factory.create_data_source(&table_ref, &[]).unwrap();
         let stream = ds
-            .scan(&trino_execution::ScanContext::default())
+            .scan(&arneb_execution::ScanContext::default())
             .await
             .unwrap();
-        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
     }

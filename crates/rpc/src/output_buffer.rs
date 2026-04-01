@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
+use arneb_common::error::ExecutionError;
 use arrow::array::RecordBatch;
 use tokio::sync::mpsc;
-use trino_common::error::ExecutionError;
 
 /// A bounded buffer where a task writes output RecordBatches partitioned
 /// by index, and remote consumers read from specific partitions.

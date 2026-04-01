@@ -1,16 +1,16 @@
-//! Conversion from `sqlparser-rs` AST to trino-alt AST.
+//! Conversion from `sqlparser-rs` AST to arneb AST.
 //!
 //! This module provides functions to convert `sqlparser::ast` types into
-//! the trino-alt-specific AST types defined in [`crate::ast`]. Unsupported
+//! the arneb-specific AST types defined in [`crate::ast`]. Unsupported
 //! SQL constructs are rejected with [`ParseError::UnsupportedFeature`].
 
+use arneb_common::error::ParseError;
+use arneb_common::types::{DataType, ScalarValue, TableReference, TimeUnit};
 use sqlparser::ast as sp;
-use trino_common::error::ParseError;
-use trino_common::types::{DataType, ScalarValue, TableReference, TimeUnit};
 
 use crate::ast;
 
-/// Convert a `sqlparser` [`sp::Statement`] into a trino-alt [`ast::Statement`].
+/// Convert a `sqlparser` [`sp::Statement`] into a arneb [`ast::Statement`].
 pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, ParseError> {
     match stmt {
         sp::Statement::Query(query) => {
@@ -167,7 +167,7 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
     }
 }
 
-/// Convert a `sqlparser` [`sp::Query`] into a trino-alt [`ast::Query`].
+/// Convert a `sqlparser` [`sp::Query`] into a arneb [`ast::Query`].
 pub(crate) fn convert_query(query: sp::Query) -> Result<ast::Query, ParseError> {
     // Convert CTEs
     let ctes = if let Some(with) = query.with {
@@ -261,7 +261,7 @@ fn convert_set_expr(expr: sp::SetExpr) -> Result<ast::QueryBody, ParseError> {
     }
 }
 
-/// Convert a `sqlparser` [`sp::Select`] into a trino-alt [`ast::SelectBody`].
+/// Convert a `sqlparser` [`sp::Select`] into a arneb [`ast::SelectBody`].
 fn convert_select(select: sp::Select) -> Result<ast::SelectBody, ParseError> {
     let distinct = match &select.distinct {
         Some(sp::Distinct::Distinct) => true,
@@ -316,7 +316,7 @@ fn convert_select(select: sp::Select) -> Result<ast::SelectBody, ParseError> {
     })
 }
 
-/// Convert a `sqlparser` [`sp::SelectItem`] into a trino-alt [`ast::SelectItem`].
+/// Convert a `sqlparser` [`sp::SelectItem`] into a arneb [`ast::SelectItem`].
 fn convert_select_item(item: sp::SelectItem) -> Result<ast::SelectItem, ParseError> {
     match item {
         sp::SelectItem::UnnamedExpr(expr) => {
@@ -352,7 +352,7 @@ fn qualified_wildcard_to_table_reference(
     }
 }
 
-/// Convert a `sqlparser` [`sp::Expr`] into a trino-alt [`ast::Expr`].
+/// Convert a `sqlparser` [`sp::Expr`] into a arneb [`ast::Expr`].
 pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
     match expr {
         sp::Expr::Identifier(ident) => Ok(ast::Expr::Column(ast::ColumnRef {
@@ -534,7 +534,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
     }
 }
 
-/// Convert a `sqlparser` [`sp::Function`] into a trino-alt [`ast::Expr::Function`].
+/// Convert a `sqlparser` [`sp::Function`] into a arneb [`ast::Expr::Function`].
 fn convert_function(func: sp::Function) -> Result<ast::Expr, ParseError> {
     let name = func.name.to_string();
     let name_upper = name.to_uppercase();
@@ -682,7 +682,7 @@ fn convert_function(func: sp::Function) -> Result<ast::Expr, ParseError> {
     })
 }
 
-/// Convert a `sqlparser` [`sp::FunctionArg`] into a trino-alt [`ast::FunctionArg`].
+/// Convert a `sqlparser` [`sp::FunctionArg`] into a arneb [`ast::FunctionArg`].
 fn convert_function_arg(arg: sp::FunctionArg) -> Result<ast::FunctionArg, ParseError> {
     match arg {
         sp::FunctionArg::Unnamed(arg_expr) => match arg_expr {
@@ -701,7 +701,7 @@ fn convert_function_arg(arg: sp::FunctionArg) -> Result<ast::FunctionArg, ParseE
     }
 }
 
-/// Convert a `sqlparser` [`sp::TableWithJoins`] into a trino-alt [`ast::TableWithJoins`].
+/// Convert a `sqlparser` [`sp::TableWithJoins`] into a arneb [`ast::TableWithJoins`].
 fn convert_table_with_joins(twj: sp::TableWithJoins) -> Result<ast::TableWithJoins, ParseError> {
     let relation = convert_table_factor(twj.relation)?;
     let joins = twj
@@ -712,7 +712,7 @@ fn convert_table_with_joins(twj: sp::TableWithJoins) -> Result<ast::TableWithJoi
     Ok(ast::TableWithJoins { relation, joins })
 }
 
-/// Convert a `sqlparser` [`sp::TableFactor`] into a trino-alt [`ast::TableFactor`].
+/// Convert a `sqlparser` [`sp::TableFactor`] into a arneb [`ast::TableFactor`].
 fn convert_table_factor(factor: sp::TableFactor) -> Result<ast::TableFactor, ParseError> {
     match factor {
         sp::TableFactor::Table { name, alias, .. } => {
@@ -753,7 +753,7 @@ fn convert_table_factor(factor: sp::TableFactor) -> Result<ast::TableFactor, Par
     }
 }
 
-/// Convert a `sqlparser` [`sp::Join`] into a trino-alt [`ast::Join`].
+/// Convert a `sqlparser` [`sp::Join`] into a arneb [`ast::Join`].
 fn convert_join(join: sp::Join) -> Result<ast::Join, ParseError> {
     let relation = convert_table_factor(join.relation)?;
     let (join_type, condition) = convert_join_operator(join.join_operator)?;
@@ -792,7 +792,7 @@ fn convert_join_operator(
     }
 }
 
-/// Convert a `sqlparser` [`sp::JoinConstraint`] into a trino-alt [`ast::JoinCondition`].
+/// Convert a `sqlparser` [`sp::JoinConstraint`] into a arneb [`ast::JoinCondition`].
 fn convert_join_constraint(
     constraint: sp::JoinConstraint,
 ) -> Result<ast::JoinCondition, ParseError> {
@@ -822,7 +822,7 @@ fn convert_order_by_clause(order_by: sp::OrderBy) -> Result<Vec<ast::OrderByExpr
     }
 }
 
-/// Convert a `sqlparser` [`sp::OrderByExpr`] into a trino-alt [`ast::OrderByExpr`].
+/// Convert a `sqlparser` [`sp::OrderByExpr`] into a arneb [`ast::OrderByExpr`].
 fn convert_order_by_expr(ob: sp::OrderByExpr) -> Result<ast::OrderByExpr, ParseError> {
     let expr = convert_expr(ob.expr)?;
     let asc = ob.options.asc;
@@ -834,7 +834,7 @@ fn convert_order_by_expr(ob: sp::OrderByExpr) -> Result<ast::OrderByExpr, ParseE
     })
 }
 
-/// Convert a `sqlparser` [`sp::Value`] into a trino-alt [`ScalarValue`].
+/// Convert a `sqlparser` [`sp::Value`] into a arneb [`ScalarValue`].
 pub(crate) fn convert_value(value: sp::Value) -> Result<ScalarValue, ParseError> {
     match value {
         sp::Value::Number(s, _) => {
@@ -860,7 +860,7 @@ pub(crate) fn convert_value(value: sp::Value) -> Result<ScalarValue, ParseError>
     }
 }
 
-/// Convert a `sqlparser` [`sp::DataType`] into a trino-alt [`DataType`].
+/// Convert a `sqlparser` [`sp::DataType`] into a arneb [`DataType`].
 pub(crate) fn convert_data_type(dt: sp::DataType) -> Result<DataType, ParseError> {
     match dt {
         sp::DataType::Boolean => Ok(DataType::Boolean),
@@ -910,7 +910,7 @@ pub(crate) fn convert_data_type(dt: sp::DataType) -> Result<DataType, ParseError
     }
 }
 
-/// Convert a `sqlparser` [`sp::BinaryOperator`] into a trino-alt [`ast::BinaryOp`].
+/// Convert a `sqlparser` [`sp::BinaryOperator`] into a arneb [`ast::BinaryOp`].
 fn convert_binary_op(op: sp::BinaryOperator) -> Result<ast::BinaryOp, ParseError> {
     match op {
         sp::BinaryOperator::Plus => Ok(ast::BinaryOp::Plus),
@@ -932,7 +932,7 @@ fn convert_binary_op(op: sp::BinaryOperator) -> Result<ast::BinaryOp, ParseError
     }
 }
 
-/// Convert a `sqlparser` [`sp::UnaryOperator`] into a trino-alt [`ast::UnaryOp`].
+/// Convert a `sqlparser` [`sp::UnaryOperator`] into a arneb [`ast::UnaryOp`].
 fn convert_unary_op(op: sp::UnaryOperator) -> Result<ast::UnaryOp, ParseError> {
     match op {
         sp::UnaryOperator::Not => Ok(ast::UnaryOp::Not),
@@ -944,7 +944,7 @@ fn convert_unary_op(op: sp::UnaryOperator) -> Result<ast::UnaryOp, ParseError> {
     }
 }
 
-/// Convert a `sqlparser` [`sp::ObjectName`] into a trino-alt [`TableReference`].
+/// Convert a `sqlparser` [`sp::ObjectName`] into a arneb [`TableReference`].
 fn object_name_to_table_reference(name: &sp::ObjectName) -> Result<TableReference, ParseError> {
     // Use Ident.value to get unquoted identifier names (not .to_string() which preserves quotes)
     let parts: Vec<String> = name

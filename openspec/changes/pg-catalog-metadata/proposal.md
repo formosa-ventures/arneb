@@ -1,6 +1,6 @@
 ## Why
 
-DBeaver and other PostgreSQL GUI clients query `pg_catalog.*` and `information_schema.*` system tables immediately after connecting to discover schemas, tables, and columns for the schema browser. trino-alt currently has no system catalog tables — these queries fail with "table not found", making DBeaver's schema browser unusable despite the connection itself working.
+DBeaver and other PostgreSQL GUI clients query `pg_catalog.*` and `information_schema.*` system tables immediately after connecting to discover schemas, tables, and columns for the schema browser. arneb currently has no system catalog tables — these queries fail with "table not found", making DBeaver's schema browser unusable despite the connection itself working.
 
 ## What Changes
 

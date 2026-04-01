@@ -1,6 +1,6 @@
 ## Context
 
-trino-alt has `common` (shared types), `sql-parser` (SQL → AST), and `catalog` (table metadata resolution). The planner converts the AST into a `LogicalPlan` tree — a relational algebra representation that the optimizer and execution engine consume.
+arneb has `common` (shared types), `sql-parser` (SQL → AST), and `catalog` (table metadata resolution). The planner converts the AST into a `LogicalPlan` tree — a relational algebra representation that the optimizer and execution engine consume.
 
 Project conventions: `Arc<dyn Trait>` for polymorphism, `thiserror` for errors, trait-based extensibility.
 

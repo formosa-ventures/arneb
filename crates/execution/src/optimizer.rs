@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use trino_common::error::ExecutionError;
+use arneb_common::error::ExecutionError;
 
 use crate::operator::ExecutionPlan;
 
@@ -57,7 +57,7 @@ mod tests {
     use crate::datasource::InMemoryDataSource;
     use crate::operator::ScanExec;
     use crate::scan_context::ScanContext;
-    use trino_common::types::{ColumnInfo, DataType};
+    use arneb_common::types::{ColumnInfo, DataType};
 
     struct NoOpRule;
 

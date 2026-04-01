@@ -52,8 +52,8 @@ The system SHALL implement `GET /api/v1/cluster/workers` returning a JSON array 
 - **THEN** the response is a JSON array with one entry per registered worker
 
 ### Requirement: Server info endpoint
-The system SHALL implement `GET /api/v1/info` returning a JSON object with: `name` ("trino-alt"), `version`, `uptime_seconds`, `role` (coordinator/worker/standalone).
+The system SHALL implement `GET /api/v1/info` returning a JSON object with: `name` ("arneb"), `version`, `uptime_seconds`, `role` (coordinator/worker/standalone).
 
 #### Scenario: Server info
 - **WHEN** `GET /api/v1/info` is called
-- **THEN** the response includes `"name": "trino-alt"` and the current server role and uptime
+- **THEN** the response includes `"name": "arneb"` and the current server role and uptime

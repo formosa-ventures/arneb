@@ -6,11 +6,11 @@ use arrow::record_batch::RecordBatch;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use trino_catalog::CatalogManager;
-use trino_common::types::{ColumnInfo, DataType};
-use trino_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable};
-use trino_connectors::ConnectorRegistry;
-use trino_protocol::{ProtocolConfig, ProtocolServer};
+use arneb_catalog::CatalogManager;
+use arneb_common::types::{ColumnInfo, DataType};
+use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable};
+use arneb_connectors::ConnectorRegistry;
+use arneb_protocol::{ProtocolConfig, ProtocolServer};
 
 /// Helper to start a server on a random port and return the address.
 async fn start_test_server(
@@ -21,7 +21,7 @@ async fn start_test_server(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
 
-    let handler_factory = Arc::new(trino_protocol::__private::HandlerFactory {
+    let handler_factory = Arc::new(arneb_protocol::__private::HandlerFactory {
         catalog_manager,
         connector_registry,
     });

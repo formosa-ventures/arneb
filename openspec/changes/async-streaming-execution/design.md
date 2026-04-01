@@ -1,6 +1,6 @@
 ## Context
 
-trino-alt Phase 1 is complete with synchronous execution: `ExecutionPlan::execute()` returns `Result<Vec<RecordBatch>>` and the protocol layer bridges to async pgwire via `tokio::task::spawn_blocking`. This works for small datasets but materializes entire result sets in memory before any data reaches the client. Phase 2 requires async streaming for distributed query execution (exchange operators, inter-node communication). This change introduces the streaming foundation.
+arneb Phase 1 is complete with synchronous execution: `ExecutionPlan::execute()` returns `Result<Vec<RecordBatch>>` and the protocol layer bridges to async pgwire via `tokio::task::spawn_blocking`. This works for small datasets but materializes entire result sets in memory before any data reaches the client. Phase 2 requires async streaming for distributed query execution (exchange operators, inter-node communication). This change introduces the streaming foundation.
 
 Current operator categories:
 - **Streaming** (can process batch-at-a-time): ScanExec, FilterExec, ProjectionExec, LimitExec
@@ -36,7 +36,7 @@ The `futures` crate is already a transitive dependency via pgwire/tokio. The `as
 
 **Choice**: Define in `common` crate:
 ```rust
-pub trait RecordBatchStream: Stream<Item = Result<RecordBatch, TrinoError>> + Send + Unpin {
+pub trait RecordBatchStream: Stream<Item = Result<RecordBatch, ArnebError>> + Send + Unpin {
     fn schema(&self) -> Arc<arrow::datatypes::Schema>;
 }
 

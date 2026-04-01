@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: TPC-H query files
-The system SHALL provide SQL files for all 22 TPC-H queries in `benchmarks/tpch/queries/q{01-22}.sql`. Each file SHALL contain a single SQL query adapted from the TPC-H specification to be compatible with the trino-alt SQL parser.
+The system SHALL provide SQL files for all 22 TPC-H queries in `benchmarks/tpch/queries/q{01-22}.sql`. Each file SHALL contain a single SQL query adapted from the TPC-H specification to be compatible with the arneb SQL parser.
 
 #### Scenario: Query files exist
 - **WHEN** the queries directory is listed
@@ -12,7 +12,7 @@ The system SHALL provide SQL files for all 22 TPC-H queries in `benchmarks/tpch/
 - **THEN** it contains a single valid SQL statement ending with a semicolon
 
 ### Requirement: SQL dialect adaptation
-Each TPC-H query SHALL be adapted from the official specification to use SQL syntax supported by the trino-alt parser. Adaptations MAY include: replacing unsupported functions with equivalents, restructuring subqueries, and adjusting date arithmetic syntax.
+Each TPC-H query SHALL be adapted from the official specification to use SQL syntax supported by the arneb parser. Adaptations MAY include: replacing unsupported functions with equivalents, restructuring subqueries, and adjusting date arithmetic syntax.
 
 #### Scenario: Q1 pricing summary report
 - **WHEN** Q1 is executed against SF1 data

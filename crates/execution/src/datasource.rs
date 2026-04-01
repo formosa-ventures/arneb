@@ -6,11 +6,11 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use arneb_common::error::ExecutionError;
+use arneb_common::stream::{stream_from_batches, SendableRecordBatchStream};
+use arneb_common::types::ColumnInfo;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use trino_common::error::ExecutionError;
-use trino_common::stream::{stream_from_batches, SendableRecordBatchStream};
-use trino_common::types::ColumnInfo;
 
 use crate::scan_context::ScanContext;
 
@@ -60,7 +60,7 @@ impl InMemoryDataSource {
             .fields()
             .iter()
             .map(|f| {
-                let data_type = trino_common::types::DataType::try_from(f.data_type().clone())
+                let data_type = arneb_common::types::DataType::try_from(f.data_type().clone())
                     .map_err(|e| ExecutionError::InvalidOperation(e.to_string()))?;
                 Ok(ColumnInfo {
                     name: f.name().clone(),
@@ -98,10 +98,10 @@ pub(crate) fn column_info_to_arrow_schema(columns: &[ColumnInfo]) -> Arc<arrow::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arneb_common::stream::collect_stream;
+    use arneb_common::types::DataType;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-    use trino_common::stream::collect_stream;
-    use trino_common::types::DataType;
 
     fn test_schema() -> Vec<ColumnInfo> {
         vec![

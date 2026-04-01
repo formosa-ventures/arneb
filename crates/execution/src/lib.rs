@@ -2,7 +2,7 @@
 #![warn(unreachable_pub)]
 #![deny(unsafe_code)]
 
-//! Execution engine for the trino-alt query engine.
+//! Execution engine for the arneb query engine.
 //!
 //! Evaluates [`LogicalPlan`] trees against actual data, producing Arrow
 //! [`RecordBatch`] results. This crate defines the [`DataSource`] trait

@@ -19,14 +19,14 @@ The system SHALL define a `ClusterConfig` struct with the following fields: `rol
 - **THEN** all fields are loaded correctly from the config file
 
 ### Requirement: Cluster config environment variable overrides
-The system SHALL support environment variable overrides for cluster configuration: `TRINO_CLUSTER_ROLE`, `TRINO_COORDINATOR_ADDRESS`, `TRINO_DISCOVERY_PORT`, `TRINO_WORKER_ID`. Environment variables SHALL take precedence over file values.
+The system SHALL support environment variable overrides for cluster configuration: `ARNEB_CLUSTER_ROLE`, `ARNEB_COORDINATOR_ADDRESS`, `ARNEB_DISCOVERY_PORT`, `ARNEB_WORKER_ID`. Environment variables SHALL take precedence over file values.
 
 #### Scenario: Env var overrides role
-- **WHEN** the config file has `role = "standalone"` and `TRINO_CLUSTER_ROLE=coordinator` is set
+- **WHEN** the config file has `role = "standalone"` and `ARNEB_CLUSTER_ROLE=coordinator` is set
 - **THEN** the effective role is `"coordinator"`
 
 #### Scenario: Env var sets coordinator address
-- **WHEN** `TRINO_COORDINATOR_ADDRESS=10.0.0.1:9090` is set and no config file exists
+- **WHEN** `ARNEB_COORDINATOR_ADDRESS=10.0.0.1:9090` is set and no config file exists
 - **THEN** the effective coordinator_address is `"10.0.0.1:9090"`
 
 ### Requirement: Cluster config validation

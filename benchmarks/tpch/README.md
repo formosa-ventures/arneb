@@ -1,11 +1,11 @@
 # TPC-H Benchmark
 
-Performance comparison of trino-alt against Trino using TPC-H queries.
+Performance comparison of arneb against Trino using TPC-H queries.
 
 ## Quick Start
 
 ```bash
-# 1. Start trino-alt with TPC-H data
+# 1. Start arneb with TPC-H data
 cargo run --release -- --config benchmarks/tpch/tpch-config.toml
 
 # 2. Run benchmark
@@ -13,7 +13,7 @@ cd benchmarks/tpch
 cargo run --release -- --host 127.0.0.1 --port 5432
 
 # 3. Generate report
-python3 scripts/report.py results/trino-alt_*.json
+python3 scripts/report.py results/arneb_*.json
 ```
 
 ## Data Generation
@@ -83,17 +83,17 @@ cargo run --release -- --num-runs 10 --warm-up 3
 ## Report Generation
 
 ```bash
-# trino-alt only
-python3 scripts/report.py results/trino-alt_*.json
+# arneb only
+python3 scripts/report.py results/arneb_*.json
 
 # Comparison with Trino
-python3 scripts/report.py results/trino-alt_*.json results/trino_*.json
+python3 scripts/report.py results/arneb_*.json results/trino_*.json
 ```
 
 Output format:
 
 ```
-| Query    | trino-alt (ms)  |  Trino (ms)  |  Speedup |
+| Query    | arneb (ms)  |  Trino (ms)  |  Speedup |
 |----------|-----------------|--------------|----------|
 | q01      |           45.2  |       120.5  |    2.67x |
 | q03      |           82.1  |       195.3  |    2.38x |
@@ -105,7 +105,7 @@ Queries tested: 7
 
 ## Queries
 
-Adapted TPC-H queries for trino-alt's SQL dialect:
+Adapted TPC-H queries for arneb's SQL dialect:
 
 | Query | Description | Complexity |
 |-------|------------|------------|

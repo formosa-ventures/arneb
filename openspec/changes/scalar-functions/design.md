@@ -1,6 +1,6 @@
 ## Context
 
-trino-alt has a working execution engine with expression evaluation, aggregate functions, and physical operators. Currently `PlanExpr::Function` is only handled for aggregate functions by the `HashAggregateExec` operator. Scalar function calls (e.g., `UPPER('hello')`, `ABS(-1)`) are not evaluated — they produce an error in `expression.rs`. The function registry and scalar function implementations will live in a new `functions/` module within the `execution` crate.
+arneb has a working execution engine with expression evaluation, aggregate functions, and physical operators. Currently `PlanExpr::Function` is only handled for aggregate functions by the `HashAggregateExec` operator. Scalar function calls (e.g., `UPPER('hello')`, `ABS(-1)`) are not evaluated — they produce an error in `expression.rs`. The function registry and scalar function implementations will live in a new `functions/` module within the `execution` crate.
 
 Project conventions: `Arc<dyn Trait>` for polymorphism, `thiserror` for errors, trait-based extensibility, Arrow columnar format for all intermediate data. Functions operate on Arrow arrays (vectorized), not row-by-row.
 

@@ -1,13 +1,13 @@
 [package]
-name = "trino-rpc"
+name = "arneb-rpc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Arrow Flight RPC layer for inter-node data exchange in trino-alt"
+description = "Arrow Flight RPC layer for inter-node data exchange in arneb"
 
 [dependencies]
-trino-common = { path = "../common" }
-trino-planner = { path = "../planner" }
+arneb-common = { path = "../common" }
+arneb-planner = { path = "../planner" }
 arrow = { workspace = true }
 arrow-flight = "54"
 tonic = "0.12"
@@ -23,4 +23,4 @@ async-stream = "0.3"
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 tokio-stream = "0.1"
-trino-common = { path = "../common" }
+arneb-common = { path = "../common" }

@@ -1,6 +1,6 @@
 ## Context
 
-trino-alt has `common` (shared types, errors) and `sql-parser` (SQL → AST) crates. The next step is a catalog system so the planner can resolve table references to column schemas. In Trino's architecture, catalogs are the top-level namespace: `catalog.schema.table`. Each catalog is backed by a connector, but at the catalog layer we only care about metadata (table names and column schemas), not data access.
+arneb has `common` (shared types, errors) and `sql-parser` (SQL → AST) crates. The next step is a catalog system so the planner can resolve table references to column schemas. In Trino's architecture, catalogs are the top-level namespace: `catalog.schema.table`. Each catalog is backed by a connector, but at the catalog layer we only care about metadata (table names and column schemas), not data access.
 
 Project conventions: trait-based abstractions with `Arc<dyn Trait>`, `thiserror` errors, `#[non_exhaustive]` on extensible enums.
 
@@ -51,7 +51,7 @@ Project conventions: trait-based abstractions with `Arc<dyn Trait>`, `thiserror`
 
 ### D5: Error handling — CatalogError reuse
 
-**Choice**: Reuse `CatalogError` from `trino-common`. The `resolve_table` method returns `Result<Arc<dyn TableProvider>, CatalogError>`.
+**Choice**: Reuse `CatalogError` from `arneb-common`. The `resolve_table` method returns `Result<Arc<dyn TableProvider>, CatalogError>`.
 
 **Rationale**: `CatalogError` already has `CatalogNotFound`, `SchemaNotFound`, and `TableAlreadyExists` variants defined. No new error types needed.
 

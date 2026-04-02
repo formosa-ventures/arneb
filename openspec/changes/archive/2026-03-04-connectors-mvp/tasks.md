@@ -2,7 +2,7 @@
 
 - [x] 1.1 Add `crates/connectors` to workspace members in root `Cargo.toml`
 - [x] 1.2 Add `parquet` to workspace dependencies in root `Cargo.toml`
-- [x] 1.3 Create `crates/connectors/Cargo.toml` with package name `trino-connectors`, dependencies: `trino-common`, `trino-catalog`, `trino-execution`, `arrow` (with `csv` feature), `parquet` (with `arrow` feature)
+- [x] 1.3 Create `crates/connectors/Cargo.toml` with package name `arneb-connectors`, dependencies: `arneb-common`, `arneb-catalog`, `arneb-execution`, `arrow` (with `csv` feature), `parquet` (with `arrow` feature)
 - [x] 1.4 Create `crates/connectors/src/lib.rs` with module declarations and re-exports
 
 ## 2. Connector Traits (`traits` module)
@@ -57,6 +57,6 @@
 - [x] 8.2 Integration test: register CSV file → create data source → scan → verify RecordBatch contents
 - [x] 8.3 Integration test: register Parquet file → create data source → scan → verify RecordBatch contents
 - [x] 8.4 `cargo build` compiles without warnings
-- [x] 8.5 `cargo test -p trino-connectors` all tests pass
+- [x] 8.5 `cargo test -p arneb-connectors` all tests pass
 - [x] 8.6 `cargo clippy -- -D warnings` clean
 - [x] 8.7 `cargo fmt -- --check` clean

@@ -1,6 +1,6 @@
 ## Overview
 
-Define trino-alt-specific AST types covering the SQL grammar subset needed for the MVP. These types serve as input to the planner and must clearly express SQL semantics while being easy to traverse.
+Define arneb-specific AST types covering the SQL grammar subset needed for the MVP. These types serve as input to the planner and must clearly express SQL semantics while being easy to traverse.
 
 ## Requirements
 
@@ -76,7 +76,7 @@ The `Expr` enum must support:
 
 ### R5: Quoted identifier handling
 
-When converting `sqlparser` identifiers to trino-alt `TableReference`, the system SHALL use the unquoted identifier value (`Ident.value`), not the display string (`Ident.to_string()` which preserves double-quote wrapping). This ensures `"default".customer` resolves the same as `default.customer`.
+When converting `sqlparser` identifiers to arneb `TableReference`, the system SHALL use the unquoted identifier value (`Ident.value`), not the display string (`Ident.to_string()` which preserves double-quote wrapping). This ensures `"default".customer` resolves the same as `default.customer`.
 
 **Scenarios:**
 - `SELECT * FROM "default".customer` → TableReference { schema: Some("default"), table: "customer" } (no quotes in values)
@@ -84,9 +84,9 @@ When converting `sqlparser` identifiers to trino-alt `TableReference`, the syste
 
 ### R6: Use shared type definitions
 
-- Table references use `trino-common`'s `TableReference`
-- Literal values use `trino-common`'s `ScalarValue`
-- Data type references use `trino-common`'s `DataType`
-- Errors use `trino-common`'s `ParseError`
+- Table references use `arneb-common`'s `TableReference`
+- Literal values use `arneb-common`'s `ScalarValue`
+- Data type references use `arneb-common`'s `DataType`
+- Errors use `arneb-common`'s `ParseError`
 
 Ensure consistency between the AST and common crate types; avoid duplicate definitions.

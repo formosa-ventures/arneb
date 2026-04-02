@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use trino_catalog::CatalogManager;
-use trino_common::stream::collect_stream;
-use trino_connectors::ConnectorRegistry;
-use trino_planner::LogicalPlan;
-use trino_rpc::{FlightState, OutputBuffer, TaskDescriptor};
+use arneb_catalog::CatalogManager;
+use arneb_common::stream::collect_stream;
+use arneb_connectors::ConnectorRegistry;
+use arneb_planner::LogicalPlan;
+use arneb_rpc::{FlightState, OutputBuffer, TaskDescriptor};
 
 /// Task execution state.
 #[derive(Debug, Clone, PartialEq)]
@@ -81,7 +81,7 @@ impl TaskManager {
             .map_err(|e| format!("failed to deserialize plan: {e}"))?;
 
         // Create execution context and register real data sources via connectors
-        let mut exec_ctx = trino_execution::ExecutionContext::new();
+        let mut exec_ctx = arneb_execution::ExecutionContext::new();
         register_task_data_sources(
             &plan,
             &self.catalog_manager,
@@ -137,7 +137,7 @@ fn register_task_data_sources(
     plan: &LogicalPlan,
     catalog_manager: &CatalogManager,
     connector_registry: &ConnectorRegistry,
-    ctx: &mut trino_execution::ExecutionContext,
+    ctx: &mut arneb_execution::ExecutionContext,
 ) -> Result<(), String> {
     match plan {
         LogicalPlan::TableScan { table, schema, .. } => {

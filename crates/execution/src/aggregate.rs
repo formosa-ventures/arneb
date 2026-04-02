@@ -3,10 +3,10 @@
 //! Each accumulator processes batches of values and produces a single
 //! scalar result. Used by [`super::operator::HashAggregateExec`].
 
+use arneb_common::error::ExecutionError;
+use arneb_common::types::ScalarValue;
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes;
-use trino_common::error::ExecutionError;
-use trino_common::types::ScalarValue;
 
 /// An accumulator that consumes array batches and produces a single scalar.
 pub trait Accumulator: Send + Sync {

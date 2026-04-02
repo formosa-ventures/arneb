@@ -3,9 +3,9 @@
 //! Workers periodically send heartbeat messages to the coordinator
 //! to register themselves and report health.
 
+use arneb_common::error::ExecutionError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Action;
-use trino_common::error::ExecutionError;
 
 /// Heartbeat message sent from worker to coordinator.
 #[derive(Debug, Clone)]

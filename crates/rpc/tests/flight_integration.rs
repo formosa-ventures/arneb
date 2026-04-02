@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
+use arneb_rpc::{ExchangeClient, FlightState, OutputBuffer};
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
-use trino_rpc::{ExchangeClient, FlightState, OutputBuffer};
 
 fn test_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
@@ -22,7 +22,7 @@ async fn start_test_flight_server(state: FlightState) -> String {
 
     tokio::spawn(async move {
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-        let service = trino_rpc::__flight_service_for_test(state);
+        let service = arneb_rpc::__flight_service_for_test(state);
         tonic::transport::Server::builder()
             .add_service(service)
             .serve_with_incoming(incoming)
@@ -68,7 +68,7 @@ async fn flight_server_do_get_roundtrip() {
     .expect("fetch timed out")
     .expect("fetch failed");
 
-    let batches = trino_common::stream::collect_stream(result).await.unwrap();
+    let batches = arneb_common::stream::collect_stream(result).await.unwrap();
 
     assert!(!batches.is_empty(), "should receive at least one batch");
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -87,7 +87,7 @@ async fn flight_server_heartbeat_roundtrip() {
     let addr = start_test_flight_server(state).await;
 
     // Send a heartbeat.
-    let msg = trino_rpc::HeartbeatMessage {
+    let msg = arneb_rpc::HeartbeatMessage {
         worker_id: "test-worker".into(),
         flight_address: "http://localhost:9091".into(),
         max_splits: 128,
@@ -95,7 +95,7 @@ async fn flight_server_heartbeat_roundtrip() {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        trino_rpc::send_heartbeat(&addr, &msg),
+        arneb_rpc::send_heartbeat(&addr, &msg),
     )
     .await
     .expect("heartbeat timed out");

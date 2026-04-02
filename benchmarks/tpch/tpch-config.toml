@@ -1,4 +1,4 @@
-# TPC-H Benchmark Configuration for trino-alt
+# TPC-H Benchmark Configuration for Arneb
 # Generated Parquet data should be in benchmarks/tpch/data/sf1/
 
 bind_address = "127.0.0.1"

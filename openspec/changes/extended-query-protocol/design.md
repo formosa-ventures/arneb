@@ -1,6 +1,6 @@
 ## Context
 
-The PostgreSQL wire protocol has two query modes: Simple Query and Extended Query. trino-alt currently implements only Simple Query via `SimpleQueryHandler`. The Extended Query protocol (`PlaceholderExtendedQueryHandler` — a pgwire no-op) is what most clients use by default. The pgwire 0.25 crate provides the `ExtendedQueryHandler` trait with default implementations for Parse, Bind, Describe, Execute, Sync, and Close — we need to implement three methods: `do_query`, `do_describe_statement`, and `do_describe_portal`, plus a `QueryParser`.
+The PostgreSQL wire protocol has two query modes: Simple Query and Extended Query. arneb currently implements only Simple Query via `SimpleQueryHandler`. The Extended Query protocol (`PlaceholderExtendedQueryHandler` — a pgwire no-op) is what most clients use by default. The pgwire 0.25 crate provides the `ExtendedQueryHandler` trait with default implementations for Parse, Bind, Describe, Execute, Sync, and Close — we need to implement three methods: `do_query`, `do_describe_statement`, and `do_describe_portal`, plus a `QueryParser`.
 
 ## Goals / Non-Goals
 
@@ -24,7 +24,7 @@ The PostgreSQL wire protocol has two query modes: Simple Query and Extended Quer
 
 **Choice**: Use `String` as the `Statement` type for `ExtendedQueryHandler`. The QueryParser simply stores the SQL text. Parameter binding happens at execution time by replacing `$N` placeholders with text values.
 
-**Rationale**: trino-alt's parser (`sqlparser-rs`) doesn't natively support `$N` placeholders. Replacing them with literal values before parsing is the simplest approach. pgwire's `Portal` already provides parameter values from the Bind message.
+**Rationale**: arneb's parser (`sqlparser-rs`) doesn't natively support `$N` placeholders. Replacing them with literal values before parsing is the simplest approach. pgwire's `Portal` already provides parameter values from the Bind message.
 
 **Alternative**: Parse SQL into AST with placeholder nodes, bind at the plan level. Rejected — much more complex, not needed for correctness.
 

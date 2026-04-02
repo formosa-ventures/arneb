@@ -30,5 +30,5 @@ After optimizing the logical plan (Change 4), the system still produces a single
 
 - **Modified crate**: `crates/common/` — new identifier types (`StageId`, `TaskId`, `SplitId`)
 - **Modified crate**: `crates/planner/` — new plan variants, `PlanFragmenter`, `PlanFragment`, `QueryStage`, `PartitioningScheme`
-- **Dependencies**: `trino-common` (identifiers), `trino-planner` (plan types)
+- **Dependencies**: `arneb-common` (identifiers), `arneb-planner` (plan types)
 - **Downstream**: The distributed scheduler (future change) will use `PlanFragment` trees to assign stages to workers; the execution engine will need physical operators for exchange and two-phase aggregation

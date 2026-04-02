@@ -1,6 +1,6 @@
 ## Why
 
-trino-alt has a complete single-node query pipeline with async streaming execution, plan fragmentation, a query state machine, and a Flight RPC layer. However, the server binary runs everything in a single process with no concept of distributed roles. To scale beyond a single machine, the server must support distinct coordinator and worker roles — the coordinator accepts client connections, plans and fragments queries, schedules tasks across workers, and collects results; workers accept task assignments, execute fragments locally, and serve output buffers. This change splits the server into coordinator and worker roles with a backwards-compatible standalone mode that preserves current single-node behavior.
+arneb has a complete single-node query pipeline with async streaming execution, plan fragmentation, a query state machine, and a Flight RPC layer. However, the server binary runs everything in a single process with no concept of distributed roles. To scale beyond a single machine, the server must support distinct coordinator and worker roles — the coordinator accepts client connections, plans and fragments queries, schedules tasks across workers, and collects results; workers accept task assignments, execute fragments locally, and serve output buffers. This change splits the server into coordinator and worker roles with a backwards-compatible standalone mode that preserves current single-node behavior.
 
 ## What Changes
 

@@ -1,9 +1,9 @@
 [package]
-name = "trino-common"
+name = "arneb-common"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Shared types, error handling, and configuration for trino-alt"
+description = "Shared types, error handling, and configuration for arneb"
 
 [dependencies]
 thiserror.workspace = true

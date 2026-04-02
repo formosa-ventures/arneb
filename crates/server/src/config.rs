@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use anyhow::{bail, Result};
+use arneb_common::types::DataType;
+use arneb_common::ServerConfig;
 use serde::Deserialize;
-use trino_common::types::DataType;
-use trino_common::ServerConfig;
 
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
@@ -106,11 +106,11 @@ impl AppConfig {
                     .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", p.display()))?
             }
             None => {
-                let default_path = Path::new("./trino-alt.toml");
+                let default_path = Path::new("./arneb.toml");
                 if default_path.exists() {
                     let content = std::fs::read_to_string(default_path)?;
                     toml::from_str(&content)
-                        .map_err(|e| anyhow::anyhow!("failed to parse trino-alt.toml: {e}"))?
+                        .map_err(|e| anyhow::anyhow!("failed to parse arneb.toml: {e}"))?
                 } else {
                     AppConfig {
                         server: ServerConfig::default(),
@@ -145,7 +145,7 @@ pub fn parse_data_type(type_name: &str) -> Result<DataType> {
         "utf8" => Ok(DataType::Utf8),
         "date32" => Ok(DataType::Date32),
         "timestamp" => Ok(DataType::Timestamp {
-            unit: trino_common::types::TimeUnit::Microsecond,
+            unit: arneb_common::types::TimeUnit::Microsecond,
             timezone: None,
         }),
         other => bail!("unsupported data type: '{other}'"),

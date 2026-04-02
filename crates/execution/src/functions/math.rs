@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
+use arneb_common::error::ExecutionError;
+use arneb_common::types::DataType;
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
 use arrow::datatypes::DataType as ArrowDataType;
-use trino_common::error::ExecutionError;
-use trino_common::types::DataType;
 
 use super::registry::ScalarFunction;
 

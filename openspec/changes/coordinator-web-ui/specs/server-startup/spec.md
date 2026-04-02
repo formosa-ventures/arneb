@@ -18,14 +18,14 @@ The system SHALL start an HTTP server (axum) on a configurable port (default 808
 - **THEN** the HTTP server listens on port 9090
 
 ### Requirement: HTTP port configuration
-The system SHALL add `http_port` to `ServerConfig` with a default value of 8080. The port SHALL follow the same precedence rules as other config values: CLI > env var (`TRINO_HTTP_PORT`) > config file > default.
+The system SHALL add `http_port` to `ServerConfig` with a default value of 8080. The port SHALL follow the same precedence rules as other config values: CLI > env var (`ARNEB_HTTP_PORT`) > config file > default.
 
 #### Scenario: Default HTTP port
 - **WHEN** no `http_port` is configured
 - **THEN** the HTTP server defaults to port 8080
 
 #### Scenario: HTTP port from env var
-- **WHEN** `TRINO_HTTP_PORT=9090` is set and no CLI override exists
+- **WHEN** `ARNEB_HTTP_PORT=9090` is set and no CLI override exists
 - **THEN** the HTTP server listens on port 9090
 
 ### Requirement: Graceful shutdown includes HTTP server

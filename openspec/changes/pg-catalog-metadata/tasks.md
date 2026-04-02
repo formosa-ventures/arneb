@@ -6,7 +6,7 @@
 
 ## 2. version() Function
 
-- [x] 2.1 Detect `SELECT version()` and return a single-row result with "trino-alt {version}"
+- [x] 2.1 Detect `SELECT version()` and return a single-row result with "arneb {version}"
 - [x] 2.2 Also handle common variants: `select version()`, `SELECT VERSION()`
 
 ## 3. pg_catalog.pg_type
@@ -46,7 +46,7 @@
 
 ## 10. Integration Tests
 
-- [x] 10.1 Test `SELECT version()` returns string containing "trino-alt"
+- [x] 10.1 Test `SELECT version()` returns string containing "arneb"
 - [x] 10.2 Test `SELECT * FROM pg_catalog.pg_type` returns rows with known type OIDs
 - [x] 10.3 Test `SELECT table_name FROM information_schema.tables` returns registered table names
 - [x] 10.4 Test `SELECT column_name FROM information_schema.columns WHERE table_name = 'nation'` returns nation's columns

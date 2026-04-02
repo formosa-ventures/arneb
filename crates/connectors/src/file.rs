@@ -5,13 +5,13 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+use arneb_catalog::{CatalogProvider, SchemaProvider, TableProvider};
+use arneb_common::error::{ConnectorError, ExecutionError};
+use arneb_common::stream::{stream_from_batches, SendableRecordBatchStream};
+use arneb_common::types::{ColumnInfo, TableReference};
+use arneb_execution::{DataSource, ScanContext};
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
-use trino_catalog::{CatalogProvider, SchemaProvider, TableProvider};
-use trino_common::error::{ConnectorError, ExecutionError};
-use trino_common::stream::{stream_from_batches, SendableRecordBatchStream};
-use trino_common::types::{ColumnInfo, TableReference};
-use trino_execution::{DataSource, ScanContext};
 
 use crate::ConnectorFactory;
 
@@ -412,7 +412,7 @@ fn arrow_schema_to_column_info(schema: &Schema) -> Result<Vec<ColumnInfo>, Conne
         .fields()
         .iter()
         .map(|f| {
-            let data_type = trino_common::types::DataType::try_from(f.data_type().clone())
+            let data_type = arneb_common::types::DataType::try_from(f.data_type().clone())
                 .map_err(|e| {
                     ConnectorError::UnsupportedOperation(format!(
                         "unsupported Arrow type in Parquet file: {e}"
@@ -430,12 +430,12 @@ fn arrow_schema_to_column_info(schema: &Schema) -> Result<Vec<ColumnInfo>, Conne
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arneb_common::types::DataType;
+    use arneb_execution::ScanContext;
     use arrow::array::{Int32Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType as ArrowDataType, Field};
     use std::io::Write;
     use std::path::Path;
-    use trino_common::types::DataType;
-    use trino_execution::ScanContext;
 
     fn csv_schema() -> Vec<ColumnInfo> {
         vec![
@@ -494,7 +494,7 @@ mod tests {
         let path = write_test_csv(dir.path());
         let ds = CsvDataSource::new(path, csv_schema());
         let stream = ds.scan(&ScanContext::default()).await.unwrap();
-        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
     }
@@ -513,7 +513,7 @@ mod tests {
         let path = write_test_parquet(dir.path());
         let ds = ParquetDataSource::new(&path).unwrap();
         let stream = ds.scan(&ScanContext::default()).await.unwrap();
-        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
@@ -549,7 +549,7 @@ mod tests {
         let table_ref = TableReference::table("sales");
         let ds = factory.create_data_source(&table_ref, &[]).unwrap();
         let stream = ds.scan(&ScanContext::default()).await.unwrap();
-        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         assert!(!batches.is_empty());
     }
 
@@ -565,7 +565,7 @@ mod tests {
         let table_ref = TableReference::table("events");
         let ds = factory.create_data_source(&table_ref, &[]).unwrap();
         let stream = ds.scan(&ScanContext::default()).await.unwrap();
-        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
@@ -631,7 +631,7 @@ mod tests {
             .create_data_source(&TableReference::table("t"), &[])
             .unwrap();
         let stream = ds.scan(&ScanContext::default()).await.unwrap();
-        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_rows(), 2);
     }
 
@@ -641,7 +641,7 @@ mod tests {
         let path = write_test_csv(dir.path());
         let ds = CsvDataSource::new(path, csv_schema());
         let stream = ds.scan(&ScanContext::default()).await.unwrap();
-        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
 
@@ -659,7 +659,7 @@ mod tests {
         let path = write_test_parquet(dir.path());
         let ds = ParquetDataSource::new(&path).unwrap();
         let stream = ds.scan(&ScanContext::default()).await.unwrap();
-        let batches = trino_common::stream::collect_stream(stream).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
 

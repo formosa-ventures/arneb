@@ -1,4 +1,4 @@
-//! Shared data types for the trino-alt query engine.
+//! Shared data types for the arneb query engine.
 
 use std::fmt;
 

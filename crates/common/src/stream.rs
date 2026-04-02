@@ -6,10 +6,10 @@ use std::task::{Context, Poll};
 use arrow::array::RecordBatch;
 use futures::stream::{self, Stream};
 
-use crate::error::TrinoError;
+use crate::error::ArnebError;
 
 /// A stream of [`RecordBatch`]es with a known schema.
-pub trait RecordBatchStream: Stream<Item = Result<RecordBatch, TrinoError>> + Send + Unpin {
+pub trait RecordBatchStream: Stream<Item = Result<RecordBatch, ArnebError>> + Send + Unpin {
     /// Returns the Arrow schema of batches produced by this stream.
     fn schema(&self) -> arrow::datatypes::SchemaRef;
 }
@@ -20,11 +20,11 @@ pub type SendableRecordBatchStream = Pin<Box<dyn RecordBatchStream>>;
 /// Adapter that wraps a `Vec<RecordBatch>` into a [`SendableRecordBatchStream`].
 struct VecBatchStream {
     schema: arrow::datatypes::SchemaRef,
-    inner: stream::Iter<std::vec::IntoIter<Result<RecordBatch, TrinoError>>>,
+    inner: stream::Iter<std::vec::IntoIter<Result<RecordBatch, ArnebError>>>,
 }
 
 impl Stream for VecBatchStream {
-    type Item = Result<RecordBatch, TrinoError>;
+    type Item = Result<RecordBatch, ArnebError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.inner).poll_next(cx)
@@ -46,7 +46,7 @@ pub fn stream_from_batches(
     schema: arrow::datatypes::SchemaRef,
     batches: Vec<RecordBatch>,
 ) -> SendableRecordBatchStream {
-    let items: Vec<Result<RecordBatch, TrinoError>> = batches.into_iter().map(Ok).collect();
+    let items: Vec<Result<RecordBatch, ArnebError>> = batches.into_iter().map(Ok).collect();
     Box::pin(VecBatchStream {
         schema,
         inner: stream::iter(items),
@@ -56,7 +56,7 @@ pub fn stream_from_batches(
 /// Collects all batches from a stream into a `Vec<RecordBatch>`.
 pub async fn collect_stream(
     mut stream: SendableRecordBatchStream,
-) -> Result<Vec<RecordBatch>, TrinoError> {
+) -> Result<Vec<RecordBatch>, ArnebError> {
     use futures::StreamExt;
     let mut batches = Vec::new();
     while let Some(result) = stream.next().await {
@@ -124,7 +124,7 @@ mod tests {
     #[tokio::test]
     async fn collect_stream_error_propagation() {
         let schema = test_schema();
-        let items: Vec<Result<RecordBatch, TrinoError>> = vec![Err(TrinoError::Execution(
+        let items: Vec<Result<RecordBatch, ArnebError>> = vec![Err(ArnebError::Execution(
             crate::error::ExecutionError::InvalidOperation("test error".to_string()),
         ))];
         let stream: SendableRecordBatchStream = Box::pin(VecBatchStream {

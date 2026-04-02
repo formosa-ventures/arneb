@@ -1,7 +1,7 @@
 ## 1. Workspace & Crate Setup
 
 - [x] 1.1 Create root `Cargo.toml` with workspace configuration, add `crates/common` as member
-- [x] 1.2 Create `crates/common/Cargo.toml` with package name `trino-common`, add dependencies: `thiserror`, `serde` (with `derive` feature), `toml`, `tracing`, `arrow` (with `datatypes` feature)
+- [x] 1.2 Create `crates/common/Cargo.toml` with package name `arneb-common`, add dependencies: `thiserror`, `serde` (with `derive` feature), `toml`, `tracing`, `arrow` (with `datatypes` feature)
 - [x] 1.3 Create `crates/common/src/lib.rs` with public module declarations: `pub mod error;`, `pub mod types;`, `pub mod config;` and re-exports
 
 ## 2. Error Types (`error` module)
@@ -12,7 +12,7 @@
 - [x] 2.4 Implement `ConnectorError` enum with `#[non_exhaustive]`: `ConnectionFailed(String)`, `TableNotFound(String)`, `ReadError(String)`, `UnsupportedOperation(String)`
 - [x] 2.5 Implement `CatalogError` enum with `#[non_exhaustive]`: `CatalogNotFound(String)`, `SchemaNotFound(String)`, `TableAlreadyExists(String)`
 - [x] 2.6 Implement `ConfigError` enum with `#[non_exhaustive]`: `FileNotFound(String)`, `ParseError(String)`, `InvalidValue { key, value, reason }`
-- [x] 2.7 Implement top-level `TrinoError` enum composing all domain errors via `#[from]`, with `#[non_exhaustive]`
+- [x] 2.7 Implement top-level `ArnebError` enum composing all domain errors via `#[from]`, with `#[non_exhaustive]`
 - [x] 2.8 Write unit tests: error creation, `Display` formatting, `From` conversions, `source()` chaining
 
 ## 3. Data Types (`types` module)
@@ -40,6 +40,6 @@
 ## 5. Integration & Quality
 
 - [x] 5.1 Verify `cargo build` compiles without warnings
-- [x] 5.2 Verify `cargo test -p trino-common` passes all tests
+- [x] 5.2 Verify `cargo test -p arneb-common` passes all tests
 - [x] 5.3 Run `cargo clippy -- -D warnings` and fix any lints
 - [x] 5.4 Run `cargo fmt -- --check` and ensure formatting is correct

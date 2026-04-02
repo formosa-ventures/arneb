@@ -1,18 +1,18 @@
 [package]
-name = "trino-execution"
+name = "arneb-execution"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-trino-common = { path = "../common" }
-trino-planner = { path = "../planner" }
-trino-sql-parser = { path = "../sql-parser" }
+arneb-common = { path = "../common" }
+arneb-planner = { path = "../planner" }
+arneb-sql-parser = { path = "../sql-parser" }
 serde_json.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
-trino-catalog = { path = "../catalog" }
+arneb-catalog = { path = "../catalog" }
 tokio = { workspace = true, features = ["rt", "macros"] }

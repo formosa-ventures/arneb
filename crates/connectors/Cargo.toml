@@ -1,13 +1,13 @@
 [package]
-name = "trino-connectors"
+name = "arneb-connectors"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-trino-common = { path = "../common" }
-trino-catalog = { path = "../catalog" }
-trino-execution = { path = "../execution" }
+arneb-common = { path = "../common" }
+arneb-catalog = { path = "../catalog" }
+arneb-execution = { path = "../execution" }
 arrow.workspace = true
 arrow-csv.workspace = true
 parquet.workspace = true

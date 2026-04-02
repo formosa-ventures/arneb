@@ -33,8 +33,8 @@ The system SHALL return a result set for queries against `pg_catalog.pg_attribut
 - **THEN** server returns rows for all columns of the lineitem table with correct type OIDs
 
 ### Requirement: version() function returns server identity
-The system SHALL handle `SELECT version()` by returning a single row with a string identifying the server (e.g., "trino-alt 0.1.0").
+The system SHALL handle `SELECT version()` by returning a single row with a string identifying the server (e.g., "arneb 0.1.0").
 
 #### Scenario: SELECT version()
 - **WHEN** client sends `SELECT version()`
-- **THEN** server returns one row with a string containing "trino-alt"
+- **THEN** server returns one row with a string containing "arneb"

@@ -1,7 +1,7 @@
 ## 1. Crate Setup
 
 - [x] 1.1 Add `crates/planner` to workspace members in root `Cargo.toml`
-- [x] 1.2 Create `crates/planner/Cargo.toml` with package name `trino-planner`, dependencies: `trino-common`, `trino-sql-parser`, `trino-catalog`
+- [x] 1.2 Create `crates/planner/Cargo.toml` with package name `arneb-planner`, dependencies: `arneb-common`, `arneb-sql-parser`, `arneb-catalog`
 - [x] 1.3 Create `crates/planner/src/lib.rs` with module declarations and re-exports
 
 ## 2. Plan Types (`plan` module)
@@ -40,6 +40,6 @@
 ## 5. Integration & Quality
 
 - [x] 5.1 Verify `cargo build` compiles without warnings
-- [x] 5.2 Verify `cargo test -p trino-planner` passes all tests
+- [x] 5.2 Verify `cargo test -p arneb-planner` passes all tests
 - [x] 5.3 Run `cargo clippy -- -D warnings` and fix any lints
 - [x] 5.4 Run `cargo fmt -- --check` and ensure formatting is correct

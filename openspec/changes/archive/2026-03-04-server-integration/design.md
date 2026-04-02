@@ -1,6 +1,6 @@
 ## Context
 
-trino-alt has seven crates implementing a complete single-node query pipeline: `common` (shared types/config), `sql-parser` (SQL → AST), `catalog` (metadata resolution), `planner` (AST → logical plan), `execution` (physical operators on Arrow RecordBatches), `connectors` (memory + file data sources), and `protocol` (PostgreSQL wire protocol handler). The protocol crate's `ProtocolServer` accepts TCP connections and runs the full pipeline per query, but requires pre-wired `Arc<CatalogManager>` and `Arc<ConnectorRegistry>` dependencies.
+arneb has seven crates implementing a complete single-node query pipeline: `common` (shared types/config), `sql-parser` (SQL → AST), `catalog` (metadata resolution), `planner` (AST → logical plan), `execution` (physical operators on Arrow RecordBatches), `connectors` (memory + file data sources), and `protocol` (PostgreSQL wire protocol handler). The protocol crate's `ProtocolServer` accepts TCP connections and runs the full pipeline per query, but requires pre-wired `Arc<CatalogManager>` and `Arc<ConnectorRegistry>` dependencies.
 
 The common crate provides `ServerConfig` with TOML + env var loading (`ServerConfig::load()`), defaulting to `127.0.0.1:5432`. The protocol crate provides `ProtocolConfig` with a `bind_address: String` field (e.g., `"127.0.0.1:5433"`). These need to be reconciled into a single configuration flow.
 
@@ -10,7 +10,7 @@ The server crate does not exist yet. No `crates/server/` directory.
 
 **Goals:**
 
-- Produce a `trino-alt` binary that initializes all subsystems and starts accepting PostgreSQL wire protocol connections
+- Produce a `arneb` binary that initializes all subsystems and starts accepting PostgreSQL wire protocol connections
 - Load configuration from TOML file + environment variables + CLI arguments with clear precedence (CLI > env > file > defaults)
 - Register built-in connectors (memory, file) so queries work out of the box
 - Support declarative table registration in the config file so users can query CSV/Parquet files without code
@@ -30,10 +30,10 @@ The server crate does not exist yet. No `crates/server/` directory.
 
 ### D1: Binary crate with local `AppConfig` wrapping `ServerConfig`
 
-**Choice**: Create `crates/server` as a binary crate (`[[bin]] name = "trino-alt"`). Define a local `AppConfig` struct that uses `#[serde(flatten)]` to embed `ServerConfig` and adds a `tables` array for declarative table registration.
+**Choice**: Create `crates/server` as a binary crate (`[[bin]] name = "arneb"`). Define a local `AppConfig` struct that uses `#[serde(flatten)]` to embed `ServerConfig` and adds a `tables` array for declarative table registration.
 
 ```toml
-# trino-alt.toml
+# arneb.toml
 bind_address = "0.0.0.0"
 port = 5433
 
@@ -62,14 +62,14 @@ schema = [
 **Choice**: Use `clap` for CLI argument parsing with three overrides: `--config <path>`, `--bind <address>`, `--port <port>`. The loading sequence:
 
 1. Parse CLI args via `clap`
-2. Load `AppConfig` from TOML (explicit `--config` path, or default `./trino-alt.toml`, or defaults)
-3. Apply env var overrides (`TRINO_BIND_ADDRESS`, `TRINO_PORT`, etc.) via `ServerConfig::apply_env_overrides()`
+2. Load `AppConfig` from TOML (explicit `--config` path, or default `./arneb.toml`, or defaults)
+3. Apply env var overrides (`ARNEB_BIND_ADDRESS`, `ARNEB_PORT`, etc.) via `ServerConfig::apply_env_overrides()`
 4. Apply CLI overrides (`--bind`, `--port`) on top
 5. Validate via `ServerConfig::validate()`
 
 **Rationale**: This follows the standard 12-factor app configuration hierarchy. `clap` is the de facto Rust CLI library and integrates well with the derive API. The existing `ServerConfig::load()` already handles steps 2-3 and 5 — we just add CLI override after env overrides.
 
-**Alternative**: Skip `clap`, use env vars only. Rejected — CLI args provide the best developer experience for quick overrides (`trino-alt --port 5433`) without polluting the shell environment.
+**Alternative**: Skip `clap`, use env vars only. Rejected — CLI args provide the best developer experience for quick overrides (`arneb --port 5433`) without polluting the shell environment.
 
 ### D3: Derive `ProtocolConfig` from `ServerConfig`
 
@@ -81,7 +81,7 @@ schema = [
 
 **Choice**: Parse `[[tables]]` entries from the config file and register each as a data source at startup. Each entry specifies `name`, `path`, `format` (csv/parquet), and optionally `schema` (column definitions, required for CSV). Tables are registered under the `file` catalog's `default` schema.
 
-**Rationale**: Without DDL support, the server needs some way to expose data. Config-driven registration is the simplest approach — users list their data files in `trino-alt.toml` and query them immediately via SQL. Parquet files self-describe their schema; CSV files require explicit schema definition.
+**Rationale**: Without DDL support, the server needs some way to expose data. Config-driven registration is the simplest approach — users list their data files in `arneb.toml` and query them immediately via SQL. Parquet files self-describe their schema; CSV files require explicit schema definition.
 
 **Alternative**: Auto-discover files from a `--data-dir` directory. Deferred — requires format detection, schema inference, and naming conventions. Config-based registration is explicit and predictable.
 

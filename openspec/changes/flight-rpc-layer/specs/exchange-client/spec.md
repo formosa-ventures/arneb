@@ -24,8 +24,8 @@ The system SHALL establish the gRPC connection lazily on the first `fetch_partit
 - **THEN** the same underlying gRPC connection is used
 
 ### Requirement: Error handling
-The system SHALL map gRPC errors to appropriate `TrinoError` variants. Connection failures SHALL be reported as `TrinoError::Internal` with the original error message preserved.
+The system SHALL map gRPC errors to appropriate `ArnebError` variants. Connection failures SHALL be reported as `ArnebError::Internal` with the original error message preserved.
 
 #### Scenario: gRPC NOT_FOUND error
 - **WHEN** the remote server returns NOT_FOUND for an unknown task
-- **THEN** the error is mapped to `TrinoError::Internal` with a descriptive message
+- **THEN** the error is mapped to `ArnebError::Internal` with a descriptive message

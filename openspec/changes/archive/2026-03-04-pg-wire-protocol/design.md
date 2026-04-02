@@ -1,8 +1,8 @@
 ## Context
 
-trino-alt has a complete single-node query pipeline: SQL parsing → logical planning → physical execution, with connectors for in-memory tables and CSV/Parquet files. All execution is synchronous — `ExecutionPlan::execute()` returns `Result<Vec<RecordBatch>>`. The catalog system (`CatalogManager`) resolves table references, and the connector system (`ConnectorRegistry`) maps catalogs to data source factories.
+arneb has a complete single-node query pipeline: SQL parsing → logical planning → physical execution, with connectors for in-memory tables and CSV/Parquet files. All execution is synchronous — `ExecutionPlan::execute()` returns `Result<Vec<RecordBatch>>`. The catalog system (`CatalogManager`) resolves table references, and the connector system (`ConnectorRegistry`) maps catalogs to data source factories.
 
-There is currently no way for external clients to connect and query the engine. The protocol crate introduces a TCP server that speaks the PostgreSQL wire protocol (v3), enabling any PostgreSQL-compatible client to issue SQL queries against trino-alt.
+There is currently no way for external clients to connect and query the engine. The protocol crate introduces a TCP server that speaks the PostgreSQL wire protocol (v3), enabling any PostgreSQL-compatible client to issue SQL queries against arneb.
 
 Project conventions: `Arc<dyn Trait>` for polymorphism, `thiserror` for errors, `tracing` for instrumentation, Arrow columnar format for all intermediate data.
 
@@ -14,7 +14,7 @@ Project conventions: `Arc<dyn Trait>` for polymorphism, `thiserror` for errors, 
 - Implement the Simple Query flow: receive SQL text → execute full pipeline → return results
 - Map Arrow `DataType` to PostgreSQL type OIDs for RowDescription messages
 - Encode Arrow `RecordBatch` column values as text-format DataRow messages
-- Map `TrinoError` variants to PostgreSQL `ErrorResponse` with SQLSTATE codes
+- Map `ArnebError` variants to PostgreSQL `ErrorResponse` with SQLSTATE codes
 - Handle connection lifecycle: startup handshake, authentication (trust mode), query loop, termination
 - Provide a `ProtocolServer` struct that the server crate (Change 8) can instantiate with configured state
 
@@ -49,7 +49,7 @@ Project conventions: `Arc<dyn Trait>` for polymorphism, `thiserror` for errors, 
 
 ### D3: Bridge synchronous execution with async protocol via `spawn_blocking`
 
-**Choice**: The `pgwire` handler is async (tokio). The trino-alt execution engine is synchronous (`execute() → Result<Vec<RecordBatch>>`). Bridge the gap using `tokio::task::spawn_blocking` to run the synchronous query pipeline off the async runtime's thread pool.
+**Choice**: The `pgwire` handler is async (tokio). The arneb execution engine is synchronous (`execute() → Result<Vec<RecordBatch>>`). Bridge the gap using `tokio::task::spawn_blocking` to run the synchronous query pipeline off the async runtime's thread pool.
 
 **Rationale**: The execution engine reads files and performs CPU-intensive operations (sorting, aggregation, joins). Running these synchronously on an async task would block the tokio runtime. `spawn_blocking` moves the work to a dedicated thread pool, keeping the async runtime responsive for other connections.
 
@@ -83,12 +83,12 @@ Project conventions: `Arc<dyn Trait>` for polymorphism, `thiserror` for errors, 
 | Timestamp | TIMESTAMP | 1114 | `YYYY-MM-DD HH:MM:SS` |
 | Null | TEXT | 25 | NULL (no value) |
 
-### D6: Error mapping — TrinoError to PostgreSQL ErrorResponse
+### D6: Error mapping — ArnebError to PostgreSQL ErrorResponse
 
-**Choice**: Map each `TrinoError` variant to a PostgreSQL SQLSTATE code and severity level.
+**Choice**: Map each `ArnebError` variant to a PostgreSQL SQLSTATE code and severity level.
 
 **Mapping**:
-| TrinoError variant | SQLSTATE | Severity | Category |
+| ArnebError variant | SQLSTATE | Severity | Category |
 |---|---|---|---|
 | `Parse(ParseError)` | `42601` (syntax_error) | ERROR | SQL syntax issues |
 | `Plan(PlanError)` | `42P01` (undefined_table) or `42703` (undefined_column) | ERROR | Planning failures |
@@ -106,7 +106,7 @@ crates/protocol/src/
 ├── server.rs       — TCP listener, ProtocolServer struct, connection spawning
 ├── handler.rs      — SimpleQueryHandler + StartupHandler implementations
 ├── encoding.rs     — Arrow DataType → PG Type OID mapping, RecordBatch → DataRow encoding
-├── error.rs        — ProtocolError type, TrinoError → ErrorResponse mapping
+├── error.rs        — ProtocolError type, ArnebError → ErrorResponse mapping
 └── session.rs      — Per-connection session state (database, schema)
 ```
 

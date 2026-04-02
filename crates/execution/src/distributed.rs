@@ -2,14 +2,14 @@
 
 use std::sync::Arc;
 
+use arneb_common::error::ExecutionError;
+use arneb_common::stream::{collect_stream, stream_from_batches, SendableRecordBatchStream};
+use arneb_common::types::ColumnInfo;
+use arneb_planner::SortExpr;
 use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use arrow::compute;
 use arrow::datatypes::{self, DataType as ArrowDataType};
 use async_trait::async_trait;
-use trino_common::error::ExecutionError;
-use trino_common::stream::{collect_stream, stream_from_batches, SendableRecordBatchStream};
-use trino_common::types::ColumnInfo;
-use trino_planner::SortExpr;
 
 use crate::datasource::column_info_to_arrow_schema;
 use crate::expression;
@@ -289,12 +289,12 @@ mod tests {
             vec![
                 ColumnInfo {
                     name: "id".into(),
-                    data_type: trino_common::types::DataType::Int32,
+                    data_type: arneb_common::types::DataType::Int32,
                     nullable: false,
                 },
                 ColumnInfo {
                     name: "name".into(),
-                    data_type: trino_common::types::DataType::Utf8,
+                    data_type: arneb_common::types::DataType::Utf8,
                     nullable: false,
                 },
             ],
@@ -345,7 +345,7 @@ mod tests {
         let merge = MergeExec {
             inputs: vec![src1, src2],
             order_by: vec![SortExpr {
-                expr: trino_planner::PlanExpr::Column {
+                expr: arneb_planner::PlanExpr::Column {
                     index: 0,
                     name: "id".into(),
                 },
@@ -355,12 +355,12 @@ mod tests {
             output_schema: vec![
                 ColumnInfo {
                     name: "id".into(),
-                    data_type: trino_common::types::DataType::Int32,
+                    data_type: arneb_common::types::DataType::Int32,
                     nullable: false,
                 },
                 ColumnInfo {
                     name: "name".into(),
-                    data_type: trino_common::types::DataType::Utf8,
+                    data_type: arneb_common::types::DataType::Utf8,
                     nullable: false,
                 },
             ],
@@ -389,7 +389,7 @@ mod tests {
             order_by: vec![],
             output_schema: vec![ColumnInfo {
                 name: "id".into(),
-                data_type: trino_common::types::DataType::Int32,
+                data_type: arneb_common::types::DataType::Int32,
                 nullable: false,
             }],
         };

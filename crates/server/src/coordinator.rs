@@ -5,16 +5,16 @@
 
 use std::sync::Arc;
 
+use arneb_common::error::{ArnebError, ExecutionError};
+use arneb_common::identifiers::{QueryId, TaskId};
+use arneb_common::stream::collect_stream;
+use arneb_planner::LogicalPlan;
+use arneb_protocol::DistributedExecutor;
+use arneb_scheduler::{NodeRegistry, QueryTracker};
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use trino_common::error::{ExecutionError, TrinoError};
-use trino_common::identifiers::{QueryId, TaskId};
-use trino_common::stream::collect_stream;
-use trino_planner::LogicalPlan;
-use trino_protocol::DistributedExecutor;
-use trino_scheduler::{NodeRegistry, QueryTracker};
 
-use trino_execution::ExecutionContext;
+use arneb_execution::ExecutionContext;
 
 /// Orchestrates distributed query execution across multiple workers.
 pub struct QueryCoordinator {
@@ -45,7 +45,7 @@ impl QueryCoordinator {
         let _query = self.query_tracker.create_query(format!("{plan:?}"));
 
         // Fragment the plan
-        let mut fragmenter = trino_planner::PlanFragmenter::new();
+        let mut fragmenter = arneb_planner::PlanFragmenter::new();
         let root_fragment = fragmenter.fragment(plan.clone());
 
         let workers = self.node_registry.alive_workers();
@@ -93,8 +93,8 @@ impl QueryCoordinator {
 
 /// Dispatch a child fragment to a worker.
 async fn execute_child_on_worker(
-    fragment: &trino_planner::PlanFragment,
-    workers: &[trino_scheduler::WorkerInfo],
+    fragment: &arneb_planner::PlanFragment,
+    workers: &[arneb_scheduler::WorkerInfo],
     stage_results: &mut std::collections::HashMap<u32, Vec<(String, String)>>,
     query_id: &QueryId,
 ) -> Result<(), ExecutionError> {
@@ -121,7 +121,7 @@ async fn execute_child_on_worker(
     let plan_json = serde_json::to_string(&fragment.root)
         .map_err(|e| ExecutionError::InvalidOperation(format!("plan serialization failed: {e}")))?;
 
-    let descriptor = trino_rpc::TaskDescriptor {
+    let descriptor = arneb_rpc::TaskDescriptor {
         task_id,
         stage_id,
         query_id: *query_id,
@@ -141,7 +141,7 @@ async fn execute_child_on_worker(
         "submitting task"
     );
 
-    trino_rpc::submit_task(&flight_addr, &descriptor)
+    arneb_rpc::submit_task(&flight_addr, &descriptor)
         .await
         .map_err(|e| ExecutionError::InvalidOperation(format!("task submission failed: {e}")))?;
 
@@ -156,7 +156,7 @@ async fn execute_child_on_worker(
     Ok(())
 }
 
-fn count_fragments(fragment: &trino_planner::PlanFragment) -> usize {
+fn count_fragments(fragment: &arneb_planner::PlanFragment) -> usize {
     1 + fragment
         .source_fragments
         .iter()
@@ -170,10 +170,10 @@ impl DistributedExecutor for QueryCoordinator {
         &self,
         plan: LogicalPlan,
         exec_ctx: &ExecutionContext,
-    ) -> Result<Vec<RecordBatch>, TrinoError> {
+    ) -> Result<Vec<RecordBatch>, ArnebError> {
         self.execute(plan, exec_ctx)
             .await
-            .map_err(TrinoError::Execution)
+            .map_err(ArnebError::Execution)
     }
 
     fn has_workers(&self) -> bool {

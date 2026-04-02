@@ -4,23 +4,23 @@ use std::time::Instant;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-/// TPC-H Benchmark Runner for trino-alt and Trino
+/// TPC-H Benchmark Runner for arneb and Trino
 ///
 /// Supports two engines:
-/// - trino-alt: connects via PostgreSQL wire protocol
+/// - arneb: connects via PostgreSQL wire protocol
 /// - trino: connects via Trino REST API (/v1/statement)
 #[derive(Parser)]
 #[command(name = "tpch-bench", version, about)]
 struct Args {
-    /// Engine to benchmark: "trino-alt" or "trino"
-    #[arg(long, default_value = "trino-alt")]
+    /// Engine to benchmark: "arneb" or "trino"
+    #[arg(long, default_value = "arneb")]
     engine: String,
 
     /// Host address of the database server
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
-    /// Port number (5432 for trino-alt, 8080 for trino)
+    /// Port number (5432 for arneb, 8080 for trino)
     #[arg(long)]
     port: Option<u16>,
 
@@ -87,7 +87,7 @@ trait BenchClient: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// PostgreSQL wire protocol client (for trino-alt)
+// PostgreSQL wire protocol client (for arneb)
 // ---------------------------------------------------------------------------
 
 struct PgClient {
@@ -214,7 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("connection error: {e}");
                 }
             });
-            println!("Connected to trino-alt at {}:{}", args.host, port);
+            println!("Connected to arneb at {}:{}", args.host, port);
             Box::new(PgClient { client: pg_client })
         }
     };

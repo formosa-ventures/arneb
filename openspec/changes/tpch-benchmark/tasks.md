@@ -36,7 +36,7 @@
 ## 6. Report Generator
 
 - [x] 6.1 Create scripts/report.py reading both JSON result files
-- [x] 6.2 Generate markdown table: query, trino_ms, trino_alt_ms, speedup
+- [x] 6.2 Generate markdown table: query, trino_ms, arneb_ms, speedup
 - [x] 6.3 Calculate summary statistics (geometric mean speedup, median, p95)
 
 ## 7. Documentation

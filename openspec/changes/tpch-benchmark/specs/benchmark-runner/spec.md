@@ -27,7 +27,7 @@ The runner SHALL connect to the server using `tokio-postgres` and execute querie
 - **THEN** it prints an error message and exits with non-zero code
 
 ### Requirement: JSON output format
-The runner SHALL write results to a JSON file at `{output_dir}/trino_alt_sf{N}.json`. The JSON SHALL contain: `engine` ("trino-alt"), `scale_factor`, `timestamp` (ISO 8601), `queries` (array of per-query results with `query_id`, `status` (ok/skipped/error), `runs` array, and `summary` statistics).
+The runner SHALL write results to a JSON file at `{output_dir}/arneb_sf{N}.json`. The JSON SHALL contain: `engine` ("arneb"), `scale_factor`, `timestamp` (ISO 8601), `queries` (array of per-query results with `query_id`, `status` (ok/skipped/error), `runs` array, and `summary` statistics).
 
 #### Scenario: JSON output structure
 - **WHEN** the runner completes all queries

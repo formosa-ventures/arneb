@@ -1,7 +1,7 @@
 ## 1. Crate Setup
 
 - [x] 1.1 Add `crates/execution` to workspace members in root `Cargo.toml`
-- [x] 1.2 Create `crates/execution/Cargo.toml` with package name `trino-execution`, dependencies: `trino-common`, `trino-planner`, `trino-sql-parser`, `arrow`
+- [x] 1.2 Create `crates/execution/Cargo.toml` with package name `arneb-execution`, dependencies: `arneb-common`, `arneb-planner`, `arneb-sql-parser`, `arrow`
 - [x] 1.3 Create `crates/execution/src/lib.rs` with module declarations and re-exports
 
 ## 2. DataSource (`datasource` module)
@@ -59,6 +59,6 @@
 ## 8. Quality
 
 - [x] 8.1 `cargo build` compiles without warnings
-- [x] 8.2 `cargo test -p trino-execution` — all 47 tests pass
+- [x] 8.2 `cargo test -p arneb-execution` — all 47 tests pass
 - [x] 8.3 `cargo clippy -- -D warnings` — clean
 - [x] 8.4 `cargo fmt -- --check` — clean

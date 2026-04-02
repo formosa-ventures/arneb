@@ -1,4 +1,4 @@
-//! Logical plan types for the trino-alt query engine.
+//! Logical plan types for the arneb query engine.
 //!
 //! These types represent relational algebra operations produced by the
 //! query planner. They form a tree that the optimizer transforms and
@@ -6,8 +6,8 @@
 
 use std::fmt;
 
-use trino_common::types::{ColumnInfo, DataType, ScalarValue, TableReference};
-use trino_sql_parser::ast;
+use arneb_common::types::{ColumnInfo, DataType, ScalarValue, TableReference};
+use arneb_sql_parser::ast;
 
 /// An expression within a logical plan.
 ///
@@ -193,7 +193,7 @@ pub enum LogicalPlan {
     /// Exchange boundary between distributed fragments.
     ExchangeNode {
         /// The stage that produces this exchange's data.
-        stage_id: trino_common::identifiers::StageId,
+        stage_id: arneb_common::identifiers::StageId,
         /// Output schema.
         schema: Vec<ColumnInfo>,
     },
@@ -365,7 +365,7 @@ impl LogicalPlan {
                 if sub_schema.is_empty() {
                     vec![ColumnInfo {
                         name: "scalar_subquery".to_string(),
-                        data_type: trino_common::types::DataType::Utf8,
+                        data_type: arneb_common::types::DataType::Utf8,
                         nullable: true,
                     }]
                 } else {

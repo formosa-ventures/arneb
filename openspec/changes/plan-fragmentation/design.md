@@ -1,6 +1,6 @@
 ## Context
 
-trino-alt has `common` (shared types, errors), `sql-parser` (SQL → AST), `catalog` (table metadata), `planner` (AST → LogicalPlan), and `execution` (physical operators). The logical-plan-optimizer (Change 4, Phase 2) produces optimized LogicalPlan trees. Plan fragmentation splits these optimized plans into distributable fragments separated by exchange boundaries.
+arneb has `common` (shared types, errors), `sql-parser` (SQL → AST), `catalog` (table metadata), `planner` (AST → LogicalPlan), and `execution` (physical operators). The logical-plan-optimizer (Change 4, Phase 2) produces optimized LogicalPlan trees. Plan fragmentation splits these optimized plans into distributable fragments separated by exchange boundaries.
 
 Project conventions: `Arc<dyn Trait>` for polymorphism, `thiserror` for errors, Arrow columnar format, trait-based extensibility.
 

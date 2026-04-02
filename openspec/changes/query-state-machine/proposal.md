@@ -4,7 +4,7 @@ A distributed query engine needs rigorous lifecycle management. Without state ma
 
 ## What Changes
 
-- Create new `crates/scheduler/` crate (trino-scheduler)
+- Create new `crates/scheduler/` crate (arneb-scheduler)
 - Implement QueryStateMachine: QUEUED → PLANNING → STARTING → RUNNING → FINISHING → FINISHED + FAILED/CANCELLED
 - Implement StageStateMachine: PLANNED → SCHEDULING → RUNNING → FLUSHING → FINISHED + FAILED/CANCELLED
 - Implement TaskStateMachine: PLANNED → RUNNING → FLUSHING → FINISHED + FAILED/CANCELLED

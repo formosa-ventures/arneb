@@ -4,7 +4,7 @@ Generate a comparison report from TPC-H benchmark results.
 
 Usage:
     python3 benchmarks/tpch/scripts/report.py \
-        benchmarks/tpch/results/trino-alt_*.json \
+        benchmarks/tpch/results/arneb_*.json \
         benchmarks/tpch/results/trino_*.json
 """
 
@@ -54,7 +54,7 @@ def extract_medians(data: dict) -> dict[str, float]:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: report.py <trino-alt-results.json> [trino-results.json]")
+        print("Usage: report.py <arneb-results.json> [trino-results.json]")
         sys.exit(1)
 
     alt_path = sys.argv[1]
@@ -74,14 +74,14 @@ def main():
     # Print header.
     print("# TPC-H Benchmark Comparison")
     print()
-    print(f"**trino-alt**: {alt_data.get('timestamp', 'N/A')}")
+    print(f"**arneb**: {alt_data.get('timestamp', 'N/A')}")
     if trino_path:
         print(f"**Trino**: {trino_data.get('timestamp', 'N/A')}")
     print()
 
     if trino_medians:
         print(
-            f"| {'Query':<8} | {'trino-alt (ms)':>15} | {'Trino (ms)':>12} | {'Speedup':>8} |"
+            f"| {'Query':<8} | {'arneb (ms)':>15} | {'Trino (ms)':>12} | {'Speedup':>8} |"
         )
         print(f"|{'-'*10}|{'-'*17}|{'-'*14}|{'-'*10}|")
     else:
@@ -120,7 +120,7 @@ def main():
         print(f"**Median speedup**: {median(speedups):.2f}x")
     print(f"**Queries tested**: {len(all_ids)}")
     print(
-        f"**Queries passed (trino-alt)**: {len(alt_medians)}/{len(all_ids)}"
+        f"**Queries passed (arneb)**: {len(alt_medians)}/{len(all_ids)}"
     )
 
 

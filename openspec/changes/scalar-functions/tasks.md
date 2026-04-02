@@ -34,6 +34,6 @@
 - [x] 5.2 Add basic type coercion for function arguments: numeric widening (Int32 → Int64 → Float64) and CAST to expected types when safe
 - [x] 5.3 End-to-end test: `SELECT UPPER(name), ABS(balance) FROM table` through logical plan → physical plan → execute → verify RecordBatch contents
 - [x] 5.4 `cargo build` compiles without warnings
-- [x] 5.5 `cargo test -p trino-execution` — all tests pass
+- [x] 5.5 `cargo test -p arneb-execution` — all tests pass
 - [x] 5.6 `cargo clippy -- -D warnings` — clean
 - [x] 5.7 `cargo fmt -- --check` — clean

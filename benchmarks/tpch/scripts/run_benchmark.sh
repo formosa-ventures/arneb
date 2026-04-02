@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# TPC-H Benchmark: trino-alt vs Trino
+# TPC-H Benchmark: Arneb vs Trino
 # =====================================
 # Prerequisites: Docker, Python 3 (with pyarrow, requests)
 #
@@ -31,7 +31,7 @@ for arg in "$@"; do
 done
 
 echo "============================================"
-echo "TPC-H Benchmark: trino-alt vs Trino"
+echo "TPC-H Benchmark: Arneb vs Trino"
 echo "============================================"
 echo "Scale factor: $SCALE_FACTOR"
 echo "Data dir:     $DATA_DIR"
@@ -54,30 +54,30 @@ else
 fi
 
 # ------------------------------------------------------------------
-# Step 2: Build trino-alt and benchmark runner
+# Step 2: Build Arneb and benchmark runner
 # ------------------------------------------------------------------
-echo ">>> Step 2: Building trino-alt and benchmark runner..."
+echo ">>> Step 2: Building Arneb and benchmark runner..."
 cd "$PROJECT_DIR"
-cargo build --release --bin trino-alt 2>&1 | tail -1
+cargo build --release --bin arneb 2>&1 | tail -1
 cd "$BENCH_DIR"
 cargo build --release 2>&1 | tail -1
 echo ""
 
 # ------------------------------------------------------------------
-# Step 3: Start trino-alt and run benchmark
+# Step 3: Start Arneb and run benchmark
 # ------------------------------------------------------------------
-echo ">>> Step 3: Running benchmark against trino-alt..."
+echo ">>> Step 3: Running benchmark against Arneb..."
 
-# Start trino-alt in background
+# Start Arneb in background
 cd "$PROJECT_DIR"
-./target/release/trino-alt --config "$BENCH_DIR/tpch-config.toml" &
-TRINO_ALT_PID=$!
+./target/release/arneb --config "$BENCH_DIR/tpch-config.toml" &
+ARNEB_PID=$!
 sleep 2
 
 # Run benchmark
 cd "$BENCH_DIR"
 ./target/release/tpch-bench \
-    --engine trino-alt \
+    --engine arneb \
     --host 127.0.0.1 \
     --port 5432 \
     --queries-dir "$BENCH_DIR/queries" \
@@ -85,9 +85,9 @@ cd "$BENCH_DIR"
     --warm-up "$WARM_UP" \
     --output-dir "$RESULTS_DIR" || true
 
-# Stop trino-alt
-kill $TRINO_ALT_PID 2>/dev/null || true
-wait $TRINO_ALT_PID 2>/dev/null || true
+# Stop Arneb
+kill $ARNEB_PID 2>/dev/null || true
+wait $ARNEB_PID 2>/dev/null || true
 echo ""
 
 # ------------------------------------------------------------------
@@ -151,13 +151,13 @@ fi
 echo ">>> Step 5: Generating comparison report..."
 cd "$BENCH_DIR"
 
-TRINO_ALT_RESULT=$(ls -t "$RESULTS_DIR"/trino_alt_*.json 2>/dev/null | head -1)
-TRINO_RESULT=$(ls -t "$RESULTS_DIR"/trino_*.json 2>/dev/null | grep -v trino_alt | head -1)
+ARNEB_RESULT=$(ls -t "$RESULTS_DIR"/arneb_*.json 2>/dev/null | head -1)
+TRINO_RESULT=$(ls -t "$RESULTS_DIR"/trino_*.json 2>/dev/null | grep -v arneb | head -1)
 
-if [ -n "$TRINO_ALT_RESULT" ] && [ -n "$TRINO_RESULT" ]; then
-    python3 "$SCRIPT_DIR/report.py" "$TRINO_ALT_RESULT" "$TRINO_RESULT" | tee "$RESULTS_DIR/comparison.md"
-elif [ -n "$TRINO_ALT_RESULT" ]; then
-    python3 "$SCRIPT_DIR/report.py" "$TRINO_ALT_RESULT" | tee "$RESULTS_DIR/comparison.md"
+if [ -n "$ARNEB_RESULT" ] && [ -n "$TRINO_RESULT" ]; then
+    python3 "$SCRIPT_DIR/report.py" "$ARNEB_RESULT" "$TRINO_RESULT" | tee "$RESULTS_DIR/comparison.md"
+elif [ -n "$ARNEB_RESULT" ]; then
+    python3 "$SCRIPT_DIR/report.py" "$ARNEB_RESULT" | tee "$RESULTS_DIR/comparison.md"
 else
     echo "No results found to generate report."
 fi

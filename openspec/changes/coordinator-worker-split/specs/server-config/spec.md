@@ -12,10 +12,10 @@ The system SHALL extend `ServerConfig` with a `cluster` field of type `ClusterCo
 - **THEN** `ClusterConfig` defaults are used (role = "standalone", discovery_port = 9090)
 
 ### Requirement: Environment variable override for cluster settings
-The system SHALL support `TRINO_CLUSTER_ROLE`, `TRINO_COORDINATOR_ADDRESS`, `TRINO_DISCOVERY_PORT`, and `TRINO_WORKER_ID` environment variables within the existing `apply_env_overrides()` method. These SHALL override `[cluster]` values from the config file.
+The system SHALL support `ARNEB_CLUSTER_ROLE`, `ARNEB_COORDINATOR_ADDRESS`, `ARNEB_DISCOVERY_PORT`, and `ARNEB_WORKER_ID` environment variables within the existing `apply_env_overrides()` method. These SHALL override `[cluster]` values from the config file.
 
 #### Scenario: Env var overrides cluster role
-- **WHEN** the config file has `[cluster] role = "standalone"` and `TRINO_CLUSTER_ROLE=worker` is set
+- **WHEN** the config file has `[cluster] role = "standalone"` and `ARNEB_CLUSTER_ROLE=worker` is set
 - **THEN** the effective cluster role is `"worker"`
 
 ### Requirement: Config validation for cluster settings

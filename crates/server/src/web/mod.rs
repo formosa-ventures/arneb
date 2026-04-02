@@ -5,8 +5,8 @@ mod frontend;
 
 use std::sync::Arc;
 
+use arneb_scheduler::{NodeRegistry, QueryTracker};
 use axum::Router;
-use trino_scheduler::{NodeRegistry, QueryTracker};
 
 /// Shared state for web API handlers.
 #[derive(Clone)]

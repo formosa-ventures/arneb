@@ -1,4 +1,4 @@
-// trino-alt Web UI
+// Arneb Web UI
 
 let currentView = 'dashboard';
 let refreshTimer = null;

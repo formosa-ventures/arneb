@@ -52,7 +52,7 @@
 ## 7. Module Integration
 
 - [x] 7.1 Add `pub mod fragment;` to `crates/planner/src/lib.rs` and re-export `PlanFragmenter`, `PlanFragment`, `FragmentType`, `PartitioningScheme`, `QueryStage`
-- [x] 7.2 Add `trino-common` dependency to `crates/planner/Cargo.toml` if not already present (for `StageId`)
+- [x] 7.2 Add `arneb-common` dependency to `crates/planner/Cargo.toml` if not already present (for `StageId`)
 
 ## 8. Tests
 
@@ -69,7 +69,7 @@
 ## 9. Quality
 
 - [x] 9.1 `cargo build` compiles without warnings
-- [x] 9.2 `cargo test -p trino-common` — all tests pass (including new identifier tests)
-- [x] 9.3 `cargo test -p trino-planner` — all tests pass (including new fragmentation tests)
+- [x] 9.2 `cargo test -p arneb-common` — all tests pass (including new identifier tests)
+- [x] 9.3 `cargo test -p arneb-planner` — all tests pass (including new fragmentation tests)
 - [x] 9.4 `cargo clippy -- -D warnings` — clean
 - [x] 9.5 `cargo fmt -- --check` — clean

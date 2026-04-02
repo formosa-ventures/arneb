@@ -1,12 +1,12 @@
-//! AST types for the trino-alt SQL parser.
+//! AST types for the arneb SQL parser.
 //!
-//! These types represent the subset of SQL supported by trino-alt's MVP.
+//! These types represent the subset of SQL supported by arneb's MVP.
 //! They are produced by converting `sqlparser-rs` AST nodes through
 //! the conversion layer in [`crate::convert`].
 
 use std::fmt;
 
-use trino_common::types::{DataType, ScalarValue, TableReference};
+use arneb_common::types::{DataType, ScalarValue, TableReference};
 
 /// Column definition for CREATE TABLE.
 #[derive(Debug, Clone, PartialEq)]

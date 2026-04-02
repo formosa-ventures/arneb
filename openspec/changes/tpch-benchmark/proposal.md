@@ -19,7 +19,7 @@ Performance claims require evidence. TPC-H is the industry-standard analytical b
 - `tpch-queries`: All 22 TPC-H queries adapted for our engine
 - `benchmark-metrics`: Per-query and cluster-level metrics collection
 - `benchmark-runner`: Automated runner with warm-up, multiple iterations, and JSON output
-- `benchmark-report`: Comparison report generator (trino-alt vs Trino)
+- `benchmark-report`: Comparison report generator (arneb vs Trino)
 
 ### Modified Capabilities
 

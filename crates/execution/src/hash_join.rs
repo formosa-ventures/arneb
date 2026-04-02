@@ -3,15 +3,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arneb_common::error::ExecutionError;
+use arneb_common::stream::{collect_stream, stream_from_batches, SendableRecordBatchStream};
+use arneb_common::types::ColumnInfo;
+use arneb_planner::PlanExpr;
+use arneb_sql_parser::ast;
 use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, RecordBatch, UInt32Array};
 use arrow::compute;
 use arrow::datatypes::{self, DataType as ArrowDataType, Field, Schema};
 use async_trait::async_trait;
-use trino_common::error::ExecutionError;
-use trino_common::stream::{collect_stream, stream_from_batches, SendableRecordBatchStream};
-use trino_common::types::ColumnInfo;
-use trino_planner::PlanExpr;
-use trino_sql_parser::ast;
 
 use crate::datasource::column_info_to_arrow_schema;
 use crate::operator::ExecutionPlan;
@@ -504,12 +504,12 @@ impl HashJoinExec {
 /// Extract equi-join keys and optional residual (non-equi) filter.
 /// Returns (equi_keys, residual_filter).
 pub(crate) fn extract_equi_join_keys(
-    condition: &trino_planner::JoinCondition,
+    condition: &arneb_planner::JoinCondition,
     left_col_count: usize,
 ) -> Option<Vec<(usize, usize)>> {
     match condition {
-        trino_planner::JoinCondition::None => None,
-        trino_planner::JoinCondition::On(expr) => {
+        arneb_planner::JoinCondition::None => None,
+        arneb_planner::JoinCondition::On(expr) => {
             let mut keys = Vec::new();
             collect_equi_keys(expr, left_col_count, &mut keys);
             if keys.is_empty() {
@@ -559,8 +559,8 @@ mod tests {
     use crate::datasource::InMemoryDataSource;
     use crate::operator::ScanExec;
     use crate::scan_context::ScanContext;
+    use arneb_common::types::DataType;
     use arrow::array::{Int32Array, Int64Array, StringArray};
-    use trino_common::types::DataType;
 
     fn left_source() -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![
@@ -743,7 +743,7 @@ mod tests {
 
     #[test]
     fn equi_join_detection_simple() {
-        let condition = trino_planner::JoinCondition::On(PlanExpr::BinaryOp {
+        let condition = arneb_planner::JoinCondition::On(PlanExpr::BinaryOp {
             left: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "l.id".into(),
@@ -760,7 +760,7 @@ mod tests {
 
     #[test]
     fn equi_join_detection_multi_key() {
-        let condition = trino_planner::JoinCondition::On(PlanExpr::BinaryOp {
+        let condition = arneb_planner::JoinCondition::On(PlanExpr::BinaryOp {
             left: Box::new(PlanExpr::BinaryOp {
                 left: Box::new(PlanExpr::Column {
                     index: 0,
@@ -791,7 +791,7 @@ mod tests {
 
     #[test]
     fn non_equi_returns_none() {
-        let condition = trino_planner::JoinCondition::On(PlanExpr::BinaryOp {
+        let condition = arneb_planner::JoinCondition::On(PlanExpr::BinaryOp {
             left: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "l.id".into(),

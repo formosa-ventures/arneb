@@ -3,9 +3,9 @@
 //! Applies a sequence of rewrite rules to simplify and optimize the logical plan
 //! before physical planning.
 
-use trino_common::error::PlanError;
-use trino_common::types::ScalarValue;
-use trino_sql_parser::ast;
+use arneb_common::error::PlanError;
+use arneb_common::types::ScalarValue;
+use arneb_sql_parser::ast;
 
 use crate::plan::{LogicalPlan, PlanExpr};
 
@@ -349,7 +349,7 @@ fn eval_arithmetic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trino_common::types::{ColumnInfo, DataType, TableReference};
+    use arneb_common::types::{ColumnInfo, DataType, TableReference};
 
     fn scan_plan() -> LogicalPlan {
         LogicalPlan::TableScan {

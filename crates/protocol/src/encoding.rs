@@ -7,7 +7,7 @@ use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
 use pgwire::api::Type;
 use pgwire::error::PgWireResult;
 
-use trino_common::types::{ColumnInfo, DataType};
+use arneb_common::types::{ColumnInfo, DataType};
 
 /// Maps a trino `DataType` to a PostgreSQL `Type` (OID).
 pub fn datatype_to_pg_type(dt: &DataType) -> Type {

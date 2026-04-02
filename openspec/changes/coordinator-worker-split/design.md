@@ -1,6 +1,6 @@
 ## Context
 
-trino-alt Phase 2 has introduced async streaming execution (Change 1), predicate/projection pushdown (Change 2), query optimization (Change 3), S3 connector (Change 4), plan fragmentation (Change 5), a query state machine (Change 6), and a Flight RPC layer (Change 7). The plan fragmenter splits a LogicalPlan into stages connected by exchange operators. The query state machine tracks query lifecycle (queued → planning → running → finishing → finished/failed). The Flight RPC layer provides inter-node communication for task submission and data exchange.
+arneb Phase 2 has introduced async streaming execution (Change 1), predicate/projection pushdown (Change 2), query optimization (Change 3), S3 connector (Change 4), plan fragmentation (Change 5), a query state machine (Change 6), and a Flight RPC layer (Change 7). The plan fragmenter splits a LogicalPlan into stages connected by exchange operators. The query state machine tracks query lifecycle (queued → planning → running → finishing → finished/failed). The Flight RPC layer provides inter-node communication for task submission and data exchange.
 
 Currently, the server binary runs in a single process: it accepts pgwire connections, plans queries, executes them locally, and returns results. There is no concept of coordinator vs worker roles, no worker tracking, and no distributed task scheduling. The server crate has a `main.rs` with a linear startup sequence: parse CLI → load config → init tracing → wire catalogs/connectors → start pgwire server.
 
@@ -195,7 +195,7 @@ discovery_port = 9090          # port for Flight RPC (coordinator and worker)
 worker_id = ""                 # unique worker identifier (auto-generated if empty)
 ```
 
-The `--role` CLI flag overrides `cluster.role`. The `TRINO_CLUSTER_ROLE`, `TRINO_COORDINATOR_ADDRESS`, `TRINO_DISCOVERY_PORT`, and `TRINO_WORKER_ID` env vars provide overrides.
+The `--role` CLI flag overrides `cluster.role`. The `ARNEB_CLUSTER_ROLE`, `ARNEB_COORDINATOR_ADDRESS`, `ARNEB_DISCOVERY_PORT`, and `ARNEB_WORKER_ID` env vars provide overrides.
 
 **Rationale**: Embedding cluster config in the existing `ServerConfig` keeps a single config file. The `[cluster]` section groups related settings. Auto-generated worker_id (hostname + random suffix) simplifies single-worker setups.
 

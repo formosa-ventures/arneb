@@ -1,6 +1,6 @@
 ## Context
 
-trino-alt has a complete single-node query pipeline: SQL parsing → logical planning → physical execution. The execution engine defines a `DataSource` trait (`schema()` + `scan()`) and includes `InMemoryDataSource` for testing. The catalog system provides metadata-only traits (`CatalogProvider`, `SchemaProvider`, `TableProvider`). Currently there is no way to query data from files or dynamically register data-bearing tables — the gap between catalog metadata and execution data access must be bridged.
+arneb has a complete single-node query pipeline: SQL parsing → logical planning → physical execution. The execution engine defines a `DataSource` trait (`schema()` + `scan()`) and includes `InMemoryDataSource` for testing. The catalog system provides metadata-only traits (`CatalogProvider`, `SchemaProvider`, `TableProvider`). Currently there is no way to query data from files or dynamically register data-bearing tables — the gap between catalog metadata and execution data access must be bridged.
 
 Project conventions: `Arc<dyn Trait>` for polymorphism, `thiserror` for errors, Arrow columnar format, trait-based extensibility.
 
@@ -28,7 +28,7 @@ Project conventions: `Arc<dyn Trait>` for polymorphism, `thiserror` for errors, 
 
 ### D1: Connector crate depends on execution, not the other way around
 
-**Choice**: `crates/connectors` depends on `trino-execution` (for `DataSource` trait) and `trino-catalog` (for catalog traits). The execution crate does not depend on connectors.
+**Choice**: `crates/connectors` depends on `arneb-execution` (for `DataSource` trait) and `arneb-catalog` (for catalog traits). The execution crate does not depend on connectors.
 
 **Rationale**: Connectors are leaf implementations — they implement traits defined by execution and catalog. This keeps the dependency graph clean: `common → catalog → execution ← connectors`. The server crate wires them together.
 

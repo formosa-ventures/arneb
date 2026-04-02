@@ -1,4 +1,4 @@
-//! Query planner for the trino-alt query engine.
+//! Query planner for the arneb query engine.
 //!
 //! Converts parsed SQL AST into a logical query plan tree that the
 //! optimizer and execution engine consume.

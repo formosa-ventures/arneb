@@ -4,7 +4,7 @@ After parsing SQL into an AST, the next step is converting it into a logical que
 
 ## What Changes
 
-- Create `crates/planner/` crate (package name: `trino-planner`)
+- Create `crates/planner/` crate (package name: `arneb-planner`)
 - Define `LogicalPlan` enum representing relational algebra operators
 - Define `PlanExpr` enum for expressions within logical plans
 - Implement `QueryPlanner` that converts a parsed AST `Statement` into a `LogicalPlan`, using the `CatalogManager` to resolve tables and validate columns
@@ -25,5 +25,5 @@ After parsing SQL into an AST, the next step is converting it into a logical que
 ## Impact
 
 - **New crate**: `crates/planner/`
-- **Dependencies**: `trino-common`, `trino-sql-parser`, `trino-catalog`
+- **Dependencies**: `arneb-common`, `arneb-sql-parser`, `arneb-catalog`
 - **Downstream**: The `optimizer` crate will transform LogicalPlan trees; the `execution` crate will convert them to physical plans

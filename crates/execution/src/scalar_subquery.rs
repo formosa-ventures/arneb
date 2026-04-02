@@ -3,12 +3,12 @@
 use std::fmt;
 use std::sync::Arc;
 
+use arneb_common::error::ExecutionError;
+use arneb_common::stream::{collect_stream, stream_from_batches, SendableRecordBatchStream};
+use arneb_common::types::ColumnInfo;
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Field, Schema};
 use async_trait::async_trait;
-use trino_common::error::ExecutionError;
-use trino_common::stream::{collect_stream, stream_from_batches, SendableRecordBatchStream};
-use trino_common::types::ColumnInfo;
 
 use crate::operator::ExecutionPlan;
 
@@ -42,7 +42,7 @@ impl ExecutionPlan for ScalarSubqueryExec {
         if child_schema.is_empty() {
             vec![ColumnInfo {
                 name: "scalar_subquery".to_string(),
-                data_type: trino_common::types::DataType::Utf8,
+                data_type: arneb_common::types::DataType::Utf8,
                 nullable: true,
             }]
         } else {

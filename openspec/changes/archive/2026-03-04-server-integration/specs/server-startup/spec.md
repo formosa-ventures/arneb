@@ -1,11 +1,11 @@
 ## ADDED Requirements
 
 ### Requirement: CLI argument parsing
-The system SHALL accept command-line arguments using `clap` with derive API. Supported arguments SHALL be: `--config <path>` (path to TOML config file), `--bind <address>` (override bind address), and `--port <port>` (override listen port). All arguments SHALL be optional. The binary name SHALL be `trino-alt`.
+The system SHALL accept command-line arguments using `clap` with derive API. Supported arguments SHALL be: `--config <path>` (path to TOML config file), `--bind <address>` (override bind address), and `--port <port>` (override listen port). All arguments SHALL be optional. The binary name SHALL be `arneb`.
 
 #### Scenario: No arguments — use defaults
 - **WHEN** the binary is invoked with no arguments
-- **THEN** the server loads config from `./trino-alt.toml` if it exists, otherwise uses defaults (bind `127.0.0.1`, port `5432`)
+- **THEN** the server loads config from `./arneb.toml` if it exists, otherwise uses defaults (bind `127.0.0.1`, port `5432`)
 
 #### Scenario: Explicit config file path
 - **WHEN** the binary is invoked with `--config /path/to/config.toml`
@@ -23,11 +23,11 @@ The system SHALL accept command-line arguments using `clap` with derive API. Sup
 The system SHALL load configuration following the precedence order: CLI arguments > environment variables > config file > defaults. The system SHALL use `ServerConfig::load()` for file + env + validation, then apply CLI overrides on top. The server crate SHALL define a local `AppConfig` struct that embeds `ServerConfig` via `#[serde(flatten)]` and adds a `tables` array for declarative table registration.
 
 #### Scenario: CLI overrides env var
-- **WHEN** `TRINO_PORT=9999` is set and the binary is invoked with `--port 5433`
+- **WHEN** `ARNEB_PORT=9999` is set and the binary is invoked with `--port 5433`
 - **THEN** the server listens on port `5433` (CLI wins)
 
 #### Scenario: Env var overrides file
-- **WHEN** the config file sets `port = 8080` and `TRINO_PORT=9999` is set
+- **WHEN** the config file sets `port = 8080` and `ARNEB_PORT=9999` is set
 - **THEN** the server listens on port `9999` (env wins over file)
 
 #### Scenario: File overrides defaults
@@ -122,7 +122,7 @@ The system SHALL create a `ProtocolServer` with the derived `ProtocolConfig`, `A
 - **THEN** the server prints an error about the address being in use and exits with a non-zero exit code
 
 ### Requirement: Startup banner
-The system SHALL log a startup banner at `info` level after successful initialization, before entering the accept loop. The banner SHALL include: the server name (`trino-alt`), the listening address and port, the number of registered catalogs, and the number of registered tables.
+The system SHALL log a startup banner at `info` level after successful initialization, before entering the accept loop. The banner SHALL include: the server name (`arneb`), the listening address and port, the number of registered catalogs, and the number of registered tables.
 
 #### Scenario: Banner with tables
 - **WHEN** the server starts with 2 configured tables

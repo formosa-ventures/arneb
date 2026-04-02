@@ -1,4 +1,4 @@
-//! Catalog system for the trino-alt query engine.
+//! Catalog system for the arneb query engine.
 //!
 //! Provides trait-based abstractions for catalog metadata access and
 //! in-memory implementations for MVP usage. The catalog system resolves
@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
-use trino_common::error::CatalogError;
-use trino_common::types::{ColumnInfo, TableReference};
+use arneb_common::error::CatalogError;
+use arneb_common::types::{ColumnInfo, TableReference};
 
 // ---------------------------------------------------------------------------
 // Traits
@@ -250,7 +250,7 @@ impl CatalogManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trino_common::types::DataType;
+    use arneb_common::types::DataType;
 
     // -- Helper --
 

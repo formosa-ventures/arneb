@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# End-to-end integration tests for trino-alt.
+# End-to-end integration tests for arneb.
 # Assumes the server is already running with test data loaded.
 #
 # Prerequisites:
 #   - psql (brew install libpq)
-#   - trino-alt running with orders + items tables
+#   - arneb running with orders + items tables
 #
 # Usage:
 #   # Terminal 1: start server
@@ -96,9 +96,9 @@ assert_contains() {
 # ---------------------------------------------------------------------------
 echo -e "${BOLD}Connecting to $HOST:$PORT ...${NC}"
 if ! psql -h "$HOST" -p "$PORT" -U test -d test -c "" >/dev/null 2>&1; then
-    echo -e "${RED}ERROR: Cannot connect to trino-alt at $HOST:$PORT${NC}"
+    echo -e "${RED}ERROR: Cannot connect to arneb at $HOST:$PORT${NC}"
     echo "Start the server first, e.g.:"
-    echo "  cargo run --release -- --config trino-alt.toml"
+    echo "  cargo run --release -- --config arneb.toml"
     exit 1
 fi
 echo ""

@@ -3,8 +3,8 @@
 use std::fmt;
 use std::time::Instant;
 
-use trino_common::error::ExecutionError;
-use trino_common::identifiers::QueryId;
+use arneb_common::error::ExecutionError;
+use arneb_common::identifiers::QueryId;
 
 // ===========================================================================
 // QueryState

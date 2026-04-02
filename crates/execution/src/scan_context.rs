@@ -1,6 +1,6 @@
 //! Scan context for pushdown hints to connectors.
 
-use trino_planner::PlanExpr;
+use arneb_planner::PlanExpr;
 
 /// Pushdown hints passed to [`DataSource::scan()`](crate::DataSource::scan).
 ///

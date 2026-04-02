@@ -1,7 +1,7 @@
 ## 1. Crate Setup
 
 - [x] 1.1 Add `crates/catalog` to workspace members in root `Cargo.toml`
-- [x] 1.2 Create `crates/catalog/Cargo.toml` with package name `trino-catalog`, dependencies: `trino-common` (path)
+- [x] 1.2 Create `crates/catalog/Cargo.toml` with package name `arneb-catalog`, dependencies: `arneb-common` (path)
 - [x] 1.3 Create `crates/catalog/src/lib.rs` with module declarations and re-exports
 
 ## 2. Trait Definitions
@@ -36,6 +36,6 @@
 ## 6. Integration & Quality
 
 - [x] 6.1 Verify `cargo build` compiles without warnings
-- [x] 6.2 Verify `cargo test -p trino-catalog` passes all tests
+- [x] 6.2 Verify `cargo test -p arneb-catalog` passes all tests
 - [x] 6.3 Run `cargo clippy -- -D warnings` and fix any lints
 - [x] 6.4 Run `cargo fmt -- --check` and ensure formatting is correct

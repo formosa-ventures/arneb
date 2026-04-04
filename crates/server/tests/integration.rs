@@ -23,6 +23,7 @@ async fn start_test_server(
     let handler_factory = Arc::new(arneb_protocol::__private::HandlerFactory {
         catalog_manager,
         connector_registry,
+        distributed_executor: None,
     });
 
     tokio::spawn(async move {

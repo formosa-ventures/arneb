@@ -10,7 +10,7 @@ arneb-common = { path = "../common" }
 arneb-planner = { path = "../planner" }
 arrow = { workspace = true }
 arrow-flight = "54"
-tonic = "0.12"
+tonic = "0.14"
 prost = "0.13"
 tokio = { workspace = true, features = ["sync"] }
 futures.workspace = true

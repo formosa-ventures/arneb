@@ -28,3 +28,6 @@ Thumbs.db
 # Rust
 *.rs.bk
 *.pdb
+
+# Frontend
+web/node_modules/

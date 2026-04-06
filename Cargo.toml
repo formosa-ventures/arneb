@@ -22,7 +22,7 @@ tracing = "0.1"
 
 # Arrow columnar format
 arrow = { version = "58", default-features = false }
-arrow-csv = { version = "54", default-features = false }
+arrow-csv = { version = "58", default-features = false }
 parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
 
 # Numeric utilities

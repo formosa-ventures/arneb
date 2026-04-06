@@ -34,7 +34,7 @@ jobs:
           cache: 'pnpm'
           cache-dependency-path: web/pnpm-lock.yaml
       - run: cd web && pnpm install --frozen-lockfile && pnpm build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: frontend-assets
           path: crates/server/frontend/

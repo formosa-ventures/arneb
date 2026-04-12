@@ -255,6 +255,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_encode_float64_values() {
         let arr: ArrayRef = Arc::new(Float64Array::from(vec![3.14, -0.5]));
         assert_eq!(encode_value(arr.as_ref(), 0), Some("3.14".to_string()));

@@ -130,6 +130,9 @@ pub enum LogicalPlan {
         schema: Vec<ColumnInfo>,
         /// Optional alias for this table.
         alias: Option<String>,
+        /// Connector-specific properties from the table provider.
+        #[serde(default)]
+        properties: std::collections::HashMap<String, String>,
     },
     /// Selects/computes columns.
     Projection {

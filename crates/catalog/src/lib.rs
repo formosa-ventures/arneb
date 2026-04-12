@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 
 use arneb_common::error::CatalogError;
 use arneb_common::types::{ColumnInfo, TableReference};
+use async_trait::async_trait;
 
 // ---------------------------------------------------------------------------
 // Traits
@@ -22,21 +23,23 @@ use arneb_common::types::{ColumnInfo, TableReference};
 /// A catalog is a top-level namespace containing schemas.
 ///
 /// Connectors implement this trait to expose their schema hierarchy.
+#[async_trait]
 pub trait CatalogProvider: fmt::Debug + Send + Sync {
     /// Returns the names of all schemas in this catalog.
-    fn schema_names(&self) -> Vec<String>;
+    async fn schema_names(&self) -> Vec<String>;
 
     /// Returns the schema with the given name, or `None` if it does not exist.
-    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>>;
+    async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>>;
 }
 
 /// A schema is a namespace within a catalog containing tables.
+#[async_trait]
 pub trait SchemaProvider: fmt::Debug + Send + Sync {
     /// Returns the names of all tables in this schema.
-    fn table_names(&self) -> Vec<String>;
+    async fn table_names(&self) -> Vec<String>;
 
     /// Returns the table with the given name, or `None` if it does not exist.
-    fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>>;
+    async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>>;
 }
 
 /// A table exposes its column schema metadata.
@@ -46,6 +49,14 @@ pub trait SchemaProvider: fmt::Debug + Send + Sync {
 pub trait TableProvider: fmt::Debug + Send + Sync {
     /// Returns the column schema for this table.
     fn schema(&self) -> Vec<ColumnInfo>;
+
+    /// Returns connector-specific properties (e.g., storage location, format).
+    ///
+    /// These properties are carried through the logical plan and passed to
+    /// the connector factory at data source creation time. Default: empty.
+    fn properties(&self) -> HashMap<String, String> {
+        HashMap::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -102,15 +113,16 @@ impl Default for MemorySchema {
     }
 }
 
+#[async_trait]
 impl SchemaProvider for MemorySchema {
-    fn table_names(&self) -> Vec<String> {
+    async fn table_names(&self) -> Vec<String> {
         let tables = self.tables.read().unwrap();
         let mut names: Vec<String> = tables.keys().cloned().collect();
         names.sort();
         names
     }
 
-    fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+    async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         self.tables.read().unwrap().get(name).cloned()
     }
 }
@@ -146,15 +158,16 @@ impl Default for MemoryCatalog {
     }
 }
 
+#[async_trait]
 impl CatalogProvider for MemoryCatalog {
-    fn schema_names(&self) -> Vec<String> {
+    async fn schema_names(&self) -> Vec<String> {
         let schemas = self.schemas.read().unwrap();
         let mut names: Vec<String> = schemas.keys().cloned().collect();
         names.sort();
         names
     }
 
-    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+    async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
         self.schemas.read().unwrap().get(name).cloned()
     }
 }
@@ -221,7 +234,7 @@ impl CatalogManager {
     /// - Three-part (`catalog.schema.table`): use all parts as-is
     /// - Two-part (`schema.table`): use default catalog + provided schema
     /// - One-part (`table`): use default catalog + default schema
-    pub fn resolve_table(
+    pub async fn resolve_table(
         &self,
         reference: &TableReference,
     ) -> Result<Arc<dyn TableProvider>, CatalogError> {
@@ -232,16 +245,20 @@ impl CatalogManager {
         let schema_name = reference.schema.as_deref().unwrap_or(&self.default_schema);
         let table_name = &reference.table;
 
-        let catalogs = self.catalogs.read().unwrap();
-        let catalog = catalogs
-            .get(catalog_name)
-            .ok_or_else(|| CatalogError::CatalogNotFound(catalog_name.to_string()))?;
+        let catalog = {
+            let catalogs = self.catalogs.read().unwrap();
+            catalogs
+                .get(catalog_name)
+                .cloned()
+                .ok_or_else(|| CatalogError::CatalogNotFound(catalog_name.to_string()))?
+        };
 
         let schema = catalog
             .schema(schema_name)
+            .await
             .ok_or_else(|| CatalogError::SchemaNotFound(format!("{catalog_name}.{schema_name}")))?;
 
-        schema.table(table_name).ok_or_else(|| {
+        schema.table(table_name).await.ok_or_else(|| {
             CatalogError::SchemaNotFound(format!("{catalog_name}.{schema_name}.{table_name}"))
         })
     }
@@ -298,32 +315,32 @@ mod tests {
 
     // -- MemorySchema tests --
 
-    #[test]
-    fn memory_schema_empty() {
+    #[tokio::test]
+    async fn memory_schema_empty() {
         let schema = MemorySchema::new();
-        assert!(schema.table_names().is_empty());
+        assert!(schema.table_names().await.is_empty());
     }
 
-    #[test]
-    fn memory_schema_register_table() {
+    #[tokio::test]
+    async fn memory_schema_register_table() {
         let schema = MemorySchema::new();
         let table = Arc::new(MemoryTable::new(test_columns()));
         schema.register_table("users", table);
 
-        assert_eq!(schema.table_names(), vec!["users".to_string()]);
-        assert!(schema.table("users").is_some());
+        assert_eq!(schema.table_names().await, vec!["users".to_string()]);
+        assert!(schema.table("users").await.is_some());
     }
 
-    #[test]
-    fn memory_schema_deregister_table() {
+    #[tokio::test]
+    async fn memory_schema_deregister_table() {
         let schema = MemorySchema::new();
         let table = Arc::new(MemoryTable::new(test_columns()));
         schema.register_table("users", table);
 
         let removed = schema.deregister_table("users");
         assert!(removed.is_some());
-        assert!(schema.table("users").is_none());
-        assert!(schema.table_names().is_empty());
+        assert!(schema.table("users").await.is_none());
+        assert!(schema.table_names().await.is_empty());
     }
 
     #[test]
@@ -332,50 +349,50 @@ mod tests {
         assert!(schema.deregister_table("nope").is_none());
     }
 
-    #[test]
-    fn memory_schema_lookup_missing() {
+    #[tokio::test]
+    async fn memory_schema_lookup_missing() {
         let schema = MemorySchema::new();
-        assert!(schema.table("nonexistent").is_none());
+        assert!(schema.table("nonexistent").await.is_none());
     }
 
-    #[test]
-    fn memory_schema_multiple_tables() {
+    #[tokio::test]
+    async fn memory_schema_multiple_tables() {
         let schema = MemorySchema::new();
         schema.register_table("users", Arc::new(MemoryTable::new(test_columns())));
         schema.register_table("orders", Arc::new(MemoryTable::new(vec![])));
 
-        let mut names = schema.table_names();
+        let mut names = schema.table_names().await;
         names.sort();
         assert_eq!(names, vec!["orders".to_string(), "users".to_string()]);
     }
 
     // -- MemoryCatalog tests --
 
-    #[test]
-    fn memory_catalog_empty() {
+    #[tokio::test]
+    async fn memory_catalog_empty() {
         let catalog = MemoryCatalog::new();
-        assert!(catalog.schema_names().is_empty());
+        assert!(catalog.schema_names().await.is_empty());
     }
 
-    #[test]
-    fn memory_catalog_register_schema() {
+    #[tokio::test]
+    async fn memory_catalog_register_schema() {
         let catalog = MemoryCatalog::new();
         let schema = Arc::new(MemorySchema::new());
         catalog.register_schema("default", schema);
 
-        assert_eq!(catalog.schema_names(), vec!["default".to_string()]);
-        assert!(catalog.schema("default").is_some());
+        assert_eq!(catalog.schema_names().await, vec!["default".to_string()]);
+        assert!(catalog.schema("default").await.is_some());
     }
 
-    #[test]
-    fn memory_catalog_deregister_schema() {
+    #[tokio::test]
+    async fn memory_catalog_deregister_schema() {
         let catalog = MemoryCatalog::new();
         let schema = Arc::new(MemorySchema::new());
         catalog.register_schema("default", schema);
 
         let removed = catalog.deregister_schema("default");
         assert!(removed.is_some());
-        assert!(catalog.schema("default").is_none());
+        assert!(catalog.schema("default").await.is_none());
     }
 
     #[test]
@@ -384,19 +401,19 @@ mod tests {
         assert!(catalog.deregister_schema("nope").is_none());
     }
 
-    #[test]
-    fn memory_catalog_lookup_missing() {
+    #[tokio::test]
+    async fn memory_catalog_lookup_missing() {
         let catalog = MemoryCatalog::new();
-        assert!(catalog.schema("nonexistent").is_none());
+        assert!(catalog.schema("nonexistent").await.is_none());
     }
 
-    #[test]
-    fn memory_catalog_multiple_schemas() {
+    #[tokio::test]
+    async fn memory_catalog_multiple_schemas() {
         let catalog = MemoryCatalog::new();
         catalog.register_schema("default", Arc::new(MemorySchema::new()));
         catalog.register_schema("analytics", Arc::new(MemorySchema::new()));
 
-        let mut names = catalog.schema_names();
+        let mut names = catalog.schema_names().await;
         names.sort();
         assert_eq!(names, vec!["analytics".to_string(), "default".to_string()]);
     }
@@ -462,72 +479,72 @@ mod tests {
         assert_eq!(manager.catalog_names(), vec!["memory".to_string()]);
     }
 
-    #[test]
-    fn resolve_table_fully_qualified() {
+    #[tokio::test]
+    async fn resolve_table_fully_qualified() {
         let manager = setup_manager();
         let reference = TableReference {
             catalog: Some("memory".to_string()),
             schema: Some("default".to_string()),
             table: "users".to_string(),
         };
-        let table = manager.resolve_table(&reference).unwrap();
+        let table = manager.resolve_table(&reference).await.unwrap();
         assert_eq!(table.schema().len(), 2);
     }
 
-    #[test]
-    fn resolve_table_two_part() {
+    #[tokio::test]
+    async fn resolve_table_two_part() {
         let manager = setup_manager();
         let reference = TableReference {
             catalog: None,
             schema: Some("analytics".to_string()),
             table: "events".to_string(),
         };
-        let table = manager.resolve_table(&reference).unwrap();
+        let table = manager.resolve_table(&reference).await.unwrap();
         assert_eq!(table.schema().len(), 1);
         assert_eq!(table.schema()[0].name, "event_id");
     }
 
-    #[test]
-    fn resolve_table_one_part() {
+    #[tokio::test]
+    async fn resolve_table_one_part() {
         let manager = setup_manager();
         let reference = TableReference::table("users");
-        let table = manager.resolve_table(&reference).unwrap();
+        let table = manager.resolve_table(&reference).await.unwrap();
         assert_eq!(table.schema().len(), 2);
     }
 
-    #[test]
-    fn resolve_table_catalog_not_found() {
+    #[tokio::test]
+    async fn resolve_table_catalog_not_found() {
         let manager = setup_manager();
         let reference = TableReference {
             catalog: Some("nonexistent".to_string()),
             schema: Some("default".to_string()),
             table: "users".to_string(),
         };
-        let err = manager.resolve_table(&reference).unwrap_err();
+        let err = manager.resolve_table(&reference).await.unwrap_err();
         assert!(matches!(err, CatalogError::CatalogNotFound(_)));
     }
 
-    #[test]
-    fn resolve_table_schema_not_found() {
+    #[tokio::test]
+    async fn resolve_table_schema_not_found() {
         let manager = setup_manager();
         let reference = TableReference {
             catalog: Some("memory".to_string()),
             schema: Some("nonexistent".to_string()),
             table: "users".to_string(),
         };
-        let err = manager.resolve_table(&reference).unwrap_err();
+        let err = manager.resolve_table(&reference).await.unwrap_err();
         assert!(matches!(err, CatalogError::SchemaNotFound(_)));
     }
 
-    #[test]
-    fn resolve_table_table_not_found() {
+    #[tokio::test]
+    async fn resolve_table_table_not_found() {
         let manager = setup_manager();
         let reference = TableReference {
             catalog: Some("memory".to_string()),
             schema: Some("default".to_string()),
             table: "nonexistent".to_string(),
         };
-        let err = manager.resolve_table(&reference).unwrap_err();
+        let err = manager.resolve_table(&reference).await.unwrap_err();
         // Table not found is reported as SchemaNotFound with the full path
         assert!(matches!(err, CatalogError::SchemaNotFound(_)));
         assert!(err.to_string().contains("nonexistent"));

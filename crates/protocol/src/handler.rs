@@ -147,7 +147,7 @@ impl SimpleQueryHandler for ConnectionHandler {
 
         // Intercept metadata queries (pg_catalog, information_schema, version())
         if let Some(meta_result) =
-            crate::metadata::try_handle_metadata(trimmed, &self.catalog_manager)
+            crate::metadata::try_handle_metadata(trimmed, &self.catalog_manager).await
         {
             return match meta_result {
                 Ok(crate::metadata::MetadataResponse::Query(fields, batches)) => {
@@ -238,7 +238,7 @@ fn extract_params(portal: &Portal<String>) -> Vec<Option<String>> {
 }
 
 /// Plan a SQL string (without executing) to obtain output column schema.
-fn plan_for_schema(
+async fn plan_for_schema(
     sql: &str,
     catalog_manager: &CatalogManager,
 ) -> Result<Vec<pgwire::api::results::FieldInfo>, PgWireError> {
@@ -246,6 +246,7 @@ fn plan_for_schema(
     let planner = QueryPlanner::new(catalog_manager);
     let plan = planner
         .plan_statement(&statement)
+        .await
         .map_err(|e| arneb_error_to_pg_error(&e.into()))?;
     Ok(column_info_to_field_info(&plan.schema()))
 }
@@ -284,7 +285,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
 
         // Intercept metadata queries
         if let Some(meta_result) =
-            crate::metadata::try_handle_metadata(trimmed, &self.catalog_manager)
+            crate::metadata::try_handle_metadata(trimmed, &self.catalog_manager).await
         {
             return match meta_result {
                 Ok(crate::metadata::MetadataResponse::Query(fields, batches)) => {
@@ -348,7 +349,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
 
         // Intercept metadata queries for Describe too
         if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) =
-            crate::metadata::try_handle_metadata(sql.trim(), &self.catalog_manager)
+            crate::metadata::try_handle_metadata(sql.trim(), &self.catalog_manager).await
         {
             let field_info: Vec<FieldInfo> = fields
                 .iter()
@@ -360,7 +361,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
             return Ok(DescribeStatementResponse::new(vec![], field_info));
         }
         if let Some(Ok(crate::metadata::MetadataResponse::Command(_))) =
-            crate::metadata::try_handle_metadata(sql.trim(), &self.catalog_manager)
+            crate::metadata::try_handle_metadata(sql.trim(), &self.catalog_manager).await
         {
             return Ok(DescribeStatementResponse::no_data());
         }
@@ -370,7 +371,9 @@ impl ExtendedQueryHandler for ConnectionHandler {
         let param_types = vec![Type::TEXT; param_count];
 
         // Try to plan for schema (may fail if params are needed for planning)
-        let fields = plan_for_schema(sql, &self.catalog_manager).unwrap_or_default();
+        let fields = plan_for_schema(sql, &self.catalog_manager)
+            .await
+            .unwrap_or_default();
 
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
@@ -397,7 +400,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
 
         // Intercept metadata queries
         if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) =
-            crate::metadata::try_handle_metadata(trimmed, &self.catalog_manager)
+            crate::metadata::try_handle_metadata(trimmed, &self.catalog_manager).await
         {
             let field_info: Vec<FieldInfo> = fields
                 .iter()
@@ -409,12 +412,14 @@ impl ExtendedQueryHandler for ConnectionHandler {
             return Ok(DescribePortalResponse::new(field_info));
         }
         if let Some(Ok(crate::metadata::MetadataResponse::Command(_))) =
-            crate::metadata::try_handle_metadata(trimmed, &self.catalog_manager)
+            crate::metadata::try_handle_metadata(trimmed, &self.catalog_manager).await
         {
             return Ok(DescribePortalResponse::no_data());
         }
 
-        let fields = plan_for_schema(trimmed, &self.catalog_manager).unwrap_or_default();
+        let fields = plan_for_schema(trimmed, &self.catalog_manager)
+            .await
+            .unwrap_or_default();
         Ok(DescribePortalResponse::new(fields))
     }
 }
@@ -460,7 +465,7 @@ async fn execute_query(
 
     // Step 2: Plan
     let planner = QueryPlanner::new(catalog_manager);
-    let logical_plan = planner.plan_statement(&statement)?;
+    let logical_plan = planner.plan_statement(&statement).await?;
 
     // Step 2.5: Optimize logical plan
     let optimizer = LogicalOptimizer::default_rules();
@@ -485,8 +490,9 @@ async fn execute_query(
             let batches = executor.execute(logical_plan, &exec_ctx).await?;
             // Create local physical plan just for schema (not executed)
             // Fall through to local if distributed fails
-            let local_plan = exec_ctx
-                .create_physical_plan(&optimizer.optimize(planner.plan_statement(&statement)?)?)?;
+            let local_plan = exec_ctx.create_physical_plan(
+                &optimizer.optimize(planner.plan_statement(&statement).await?)?,
+            )?;
             return Ok((local_plan, batches));
         }
     }
@@ -599,7 +605,12 @@ fn register_data_sources(
     ctx: &mut ExecutionContext,
 ) -> Result<(), ArnebError> {
     match plan {
-        LogicalPlan::TableScan { table, schema, .. } => {
+        LogicalPlan::TableScan {
+            table,
+            schema,
+            properties,
+            ..
+        } => {
             let key = table.to_string();
             let connector_name = table
                 .catalog
@@ -607,7 +618,7 @@ fn register_data_sources(
                 .unwrap_or(catalog_manager.default_catalog());
 
             if let Some(factory) = registry.get(connector_name) {
-                if let Ok(ds) = factory.create_data_source(table, schema) {
+                if let Ok(ds) = factory.create_data_source(table, schema, properties) {
                     ctx.register_data_source(key, ds);
                 }
             }

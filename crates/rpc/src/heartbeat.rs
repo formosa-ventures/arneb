@@ -6,6 +6,7 @@
 use arneb_common::error::ExecutionError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Action;
+use tonic::transport::Channel;
 
 /// Heartbeat message sent from worker to coordinator.
 #[derive(Debug, Clone)]
@@ -56,13 +57,20 @@ pub async fn send_heartbeat(
     coordinator_address: &str,
     message: &HeartbeatMessage,
 ) -> Result<(), ExecutionError> {
-    let mut client = FlightServiceClient::connect(coordinator_address.to_string())
+    let channel = Channel::from_shared(coordinator_address.to_string())
+        .map_err(|e| {
+            ExecutionError::InvalidOperation(format!(
+                "invalid coordinator address {coordinator_address}: {e}"
+            ))
+        })?
+        .connect()
         .await
         .map_err(|e| {
             ExecutionError::InvalidOperation(format!(
                 "failed to connect to coordinator at {coordinator_address}: {e}"
             ))
         })?;
+    let mut client = FlightServiceClient::new(channel);
 
     let action = Action {
         r#type: "heartbeat".to_string(),

@@ -307,16 +307,10 @@ pub async fn start_flight_server(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int32Array;
-    use arrow::array::RecordBatch;
     use arrow::datatypes::{DataType, Field, Schema};
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
-    }
-
-    fn test_batch(schema: &Arc<Schema>, values: Vec<i32>) -> RecordBatch {
-        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap()
     }
 
     #[test]

@@ -6,3 +6,7 @@ license.workspace = true
 
 [dependencies]
 arneb-common = { path = "../common" }
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

@@ -1,0 +1,56 @@
+# Arneb Hive + S3 E2E Test Environment
+#
+# Provides:
+#   - Hive Metastore (standalone mode with embedded Derby)
+#   - MinIO (S3-compatible object storage)
+#
+# Usage:
+#   docker compose up -d
+#   ./scripts/hive-e2e-test.sh
+#   docker compose down -v
+
+services:
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb local/warehouse --ignore-existing &&
+      mc anonymous set download local/warehouse &&
+      exit 0
+      "
+
+  hive-metastore:
+    # Custom image: apache/hive:4.2.0 + hadoop-aws + aws-java-sdk-bundle.
+    # See docker/hive-metastore/Dockerfile and metastore-site.xml.
+    build: ./docker/hive-metastore
+    ports:
+      - "9083:9083"
+    environment:
+      SERVICE_NAME: metastore
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/localhost/9083"]
+      interval: 10s
+      timeout: 5s
+      retries: 10

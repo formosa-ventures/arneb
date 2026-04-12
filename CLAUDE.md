@@ -35,6 +35,13 @@ cargo run --bin arneb -- --config worker.toml --role worker
 
 # Run TPC-H benchmark
 cd benchmarks/tpch && cargo run --release -- --engine arneb --port 5432
+
+# Local Hive + S3 demo (HMS 4.2.0 + MinIO via docker-compose)
+docker compose up -d                                        # start HMS + MinIO
+cargo run --bin hive-demo-setup                             # seed demo.cities + demo.orders
+cargo run --bin arneb -- --config scripts/arneb-hive-demo.toml   # start Arneb with hive catalog
+psql -h 127.0.0.1 -p 5432 -c "SELECT * FROM datalake.demo.cities;"
+docker compose down                                         # tear down
 ```
 
 ### Server Configuration
@@ -49,7 +56,42 @@ port = 5432
 name = "lineitem"
 path = "/data/lineitem.parquet"
 format = "parquet"
+
+# Remote tables (S3, GCS, Azure)
+[[tables]]
+name = "events"
+path = "s3://my-bucket/data/events.parquet"
+format = "parquet"
+
+# Global storage configuration (optional)
+[storage.s3]
+region = "us-east-1"
+endpoint = "http://localhost:9000"  # MinIO/LocalStack; omit for real AWS
+allow_http = true
+# access_key_id and secret_access_key are optional — if omitted,
+# AmazonS3Builder::from_env() picks up AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+# Precedence: config file > env var > IAM role / instance profile.
+# access_key_id = "minioadmin"
+# secret_access_key = "minioadmin"
+
+# [storage.gcs]
+# service_account_path = "/path/to/sa.json"
+
+# Hive Metastore catalog — HMS 4.x supported via crates/hive-metastore
+[[catalogs]]
+name = "datalake"
+type = "hive"
+metastore_uri = "127.0.0.1:9083"   # host:port, no scheme
+default_schema = "default"
+
+# Per-catalog storage override (merges with global [storage])
+[catalogs.storage.s3]
+region = "us-east-1"
+endpoint = "http://localhost:9000"
+allow_http = true
 ```
+
+See `scripts/arneb-hive-demo.toml` for a ready-to-run demo config.
 
 **Ports**:
 - Coordinator/Standalone: pgwire (configured port), Web UI (port + 1000), Flight RPC (9090)
@@ -96,7 +138,14 @@ crates/
 │                  # ScalarFunction trait + 19 built-in functions,
 │                  # DataSource trait, ExecutionContext
 ├── connectors/    # ConnectorFactory/ConnectorRegistry/DDLProvider traits,
-│                  # memory module (read + write), file module (CSV + Parquet)
+│                  # memory + file (CSV/Parquet) connectors,
+│                  # StorageRegistry (S3/GCS/Azure/local object store abstraction)
+├── hive/          # Hive Metastore catalog provider + HiveDataSource,
+│                  # HMS Thrift client wrapper (HMS 4.x via _req API),
+│                  # HiveConnectorFactory wired through StorageRegistry
+├── hive-metastore/# Auto-generated Thrift bindings from Hive 4.2.0 IDL via volo-build.
+│                  # Rebuild with `cargo run -p hive-metastore-thrift-build` after
+│                  # editing `thrift_idl/hive_metastore.thrift`.
 ├── protocol/      # PostgreSQL wire protocol v3 (Simple + Extended Query) via pgwire,
 │                  # pg_catalog/information_schema metadata handler,
 │                  # type encoding (Arrow → PG), error mapping, SET/SHOW handling
@@ -106,7 +155,8 @@ crates/
 │                  # heartbeat protocol, output buffer management
 └── server/        # Main binary (arneb), CLI (clap), config loading,
                    # catalog/connector wiring, Web UI (axum + rust-embed),
-                   # graceful shutdown, coordinator/worker startup
+                   # graceful shutdown, coordinator/worker startup.
+                   # `hive-demo-setup` binary seeds HMS + MinIO with demo tables.
 ```
 
 ### Key Data Flow
@@ -133,6 +183,8 @@ SQL String
 - **clap** (v4): CLI argument parsing for the server binary.
 - **tracing** / **tracing-subscriber**: Structured logging throughout.
 - **thiserror** / **anyhow**: Error handling (thiserror for libraries, anyhow for the binary).
+- **object_store** (v0.11, `aws` feature): Unified S3/GCS/Azure/local filesystem abstraction.
+- **volo-thrift** (v0.10) / **pilota** (v0.11): Async Thrift runtime backing the `hive-metastore` crate. Note: the generated client uses `DefaultMakeCodec::buffered()` (plain TBinaryProtocol) to talk to real HMS servers, not the default TT-Header framing.
 
 ### Design Principles
 

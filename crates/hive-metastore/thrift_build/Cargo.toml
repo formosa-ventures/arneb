@@ -1,0 +1,15 @@
+[package]
+name = "hive-metastore-thrift-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Code generator for hive-metastore Thrift bindings (run manually)"
+
+[[bin]]
+name = "hive-metastore-thrift-build"
+path = "src/main.rs"
+
+[dependencies]
+volo-build = "0.10"
+pilota-build = "0.11"

@@ -488,6 +488,7 @@ mod tests {
             table: TableReference::table("users"),
             schema,
             alias: None,
+            properties: Default::default(),
         };
         let exec = ctx.create_physical_plan(&plan).unwrap();
         let stream = exec.execute().await.unwrap();
@@ -503,6 +504,7 @@ mod tests {
                 table: TableReference::table("users"),
                 schema,
                 alias: None,
+                properties: Default::default(),
             }),
             predicate: PlanExpr::BinaryOp {
                 left: Box::new(PlanExpr::Column {
@@ -527,6 +529,7 @@ mod tests {
                 table: TableReference::table("users"),
                 schema,
                 alias: None,
+                properties: Default::default(),
             }),
             exprs: vec![PlanExpr::Column {
                 index: 1,
@@ -552,6 +555,7 @@ mod tests {
                 table: TableReference::table("users"),
                 schema,
                 alias: None,
+                properties: Default::default(),
             }),
             limit: Some(2),
             offset: Some(1),
@@ -577,6 +581,7 @@ mod tests {
                 table: TableReference::table("users"),
                 schema,
                 alias: None,
+                properties: Default::default(),
             }),
             order_by: vec![arneb_planner::SortExpr {
                 expr: PlanExpr::Column {
@@ -607,6 +612,7 @@ mod tests {
                 table: TableReference::table("users"),
                 schema,
                 alias: None,
+                properties: Default::default(),
             }),
             group_by: vec![],
             aggr_exprs: vec![
@@ -663,6 +669,7 @@ mod tests {
                 table: TableReference::table("users"),
                 schema,
                 alias: None,
+                properties: Default::default(),
             }),
         };
         let exec = ctx.create_physical_plan(&plan).unwrap();
@@ -683,6 +690,7 @@ mod tests {
             table: TableReference::table("nonexistent"),
             schema: vec![],
             alias: None,
+            properties: Default::default(),
         };
         let result = ctx.create_physical_plan(&plan);
         assert!(result.is_err());
@@ -718,6 +726,7 @@ mod tests {
                         table: TableReference::table("users"),
                         schema,
                         alias: None,
+                        properties: Default::default(),
                     }),
                 }),
             }),
@@ -796,6 +805,7 @@ mod tests {
                     table: TableReference::table("t"),
                     schema,
                     alias: None,
+                    properties: Default::default(),
                 }),
                 group_by: vec![PlanExpr::Column {
                     index: 0,
@@ -881,11 +891,13 @@ mod tests {
                 table: TableReference::table("orders"),
                 schema: left_info,
                 alias: None,
+                properties: Default::default(),
             }),
             right: Box::new(LogicalPlan::TableScan {
                 table: TableReference::table("customers"),
                 schema: right_info,
                 alias: None,
+                properties: Default::default(),
             }),
             left_key: PlanExpr::Column {
                 index: 1,
@@ -952,11 +964,13 @@ mod tests {
                 table: TableReference::table("left_t"),
                 schema: left_info,
                 alias: None,
+                properties: Default::default(),
             }),
             right: Box::new(LogicalPlan::TableScan {
                 table: TableReference::table("right_t"),
                 schema: right_info,
                 alias: None,
+                properties: Default::default(),
             }),
             left_key: PlanExpr::Column {
                 index: 0,
@@ -1000,6 +1014,7 @@ mod tests {
                 table: TableReference::table("t"),
                 schema: schema_info,
                 alias: None,
+                properties: Default::default(),
             }),
         };
 
@@ -1033,6 +1048,7 @@ mod tests {
                 table: TableReference::table("empty"),
                 schema: schema_info,
                 alias: None,
+                properties: Default::default(),
             }),
         };
 
@@ -1069,6 +1085,7 @@ mod tests {
                 table: TableReference::table("multi"),
                 schema: schema_info,
                 alias: None,
+                properties: Default::default(),
             }),
         };
 

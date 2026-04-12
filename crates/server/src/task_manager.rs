@@ -140,7 +140,12 @@ fn register_task_data_sources(
     ctx: &mut arneb_execution::ExecutionContext,
 ) -> Result<(), String> {
     match plan {
-        LogicalPlan::TableScan { table, schema, .. } => {
+        LogicalPlan::TableScan {
+            table,
+            schema,
+            properties,
+            ..
+        } => {
             let key = table.to_string();
             let connector_name = table
                 .catalog
@@ -148,7 +153,7 @@ fn register_task_data_sources(
                 .unwrap_or(catalog_manager.default_catalog());
 
             if let Some(factory) = connector_registry.get(connector_name) {
-                if let Ok(ds) = factory.create_data_source(table, schema) {
+                if let Ok(ds) = factory.create_data_source(table, schema, properties) {
                     ctx.register_data_source(key, ds);
                 }
             }

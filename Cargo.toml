@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution", "crates/connectors", "crates/protocol", "crates/server", "crates/scheduler", "crates/rpc"]
+members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution", "crates/connectors", "crates/protocol", "crates/server", "crates/scheduler", "crates/rpc", "crates/hive", "crates/hive-metastore", "crates/hive-metastore/thrift_build"]
 exclude = ["benchmarks/tpch"]
 resolver = "2"
 
@@ -22,8 +22,11 @@ tracing = "0.1"
 
 # Arrow columnar format
 arrow = { version = "58", default-features = false }
-arrow-csv = { version = "54", default-features = false }
-parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
+arrow-csv = { version = "58", default-features = false }
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "object_store"] }
+
+# Object store (S3, GCS, Azure, local filesystem)
+object_store = { version = "0.13", default-features = false, features = ["aws", "fs"] }
 
 # Numeric utilities
 num_cpus = "1"
@@ -46,6 +49,7 @@ anyhow = "1"
 # PostgreSQL wire protocol
 pgwire = "0.25"
 async-trait = "0.1"
+async-recursion = "1"
 futures = "0.3"
 bytes = "1"
 uuid = { version = "1", features = ["v4", "serde"] }

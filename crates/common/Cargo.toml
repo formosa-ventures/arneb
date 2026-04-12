@@ -17,5 +17,5 @@ async-trait.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tempfile = "=3.27.0"
+tempfile = "3"
 tokio = { workspace = true, features = ["rt", "macros"] }

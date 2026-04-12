@@ -9,6 +9,7 @@ use arneb_common::error::ConnectorError;
 use arneb_common::types::{ColumnInfo, TableReference};
 use arneb_execution::{DataSource, InMemoryDataSource};
 use arrow::array::RecordBatch;
+use async_trait::async_trait;
 
 use arrow::datatypes::DataType as ArrowDataType;
 
@@ -102,12 +103,13 @@ impl fmt::Debug for MemorySchema {
     }
 }
 
+#[async_trait]
 impl SchemaProvider for MemorySchema {
-    fn table_names(&self) -> Vec<String> {
+    async fn table_names(&self) -> Vec<String> {
         self.tables.read().unwrap().keys().cloned().collect()
     }
 
-    fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+    async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         self.tables
             .read()
             .unwrap()
@@ -159,12 +161,13 @@ impl fmt::Debug for MemoryCatalog {
     }
 }
 
+#[async_trait]
 impl CatalogProvider for MemoryCatalog {
-    fn schema_names(&self) -> Vec<String> {
+    async fn schema_names(&self) -> Vec<String> {
         self.schemas.read().unwrap().keys().cloned().collect()
     }
 
-    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+    async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
         self.schemas
             .read()
             .unwrap()
@@ -326,6 +329,7 @@ impl ConnectorFactory for MemoryConnectorFactory {
         &self,
         table: &TableReference,
         _schema: &[ColumnInfo],
+        _properties: &std::collections::HashMap<String, String>,
     ) -> Result<Arc<dyn DataSource>, ConnectorError> {
         let schema_name = table.schema.as_deref().unwrap_or(&self.default_schema);
 
@@ -384,23 +388,23 @@ mod tests {
         assert_eq!(schema[0].name, "id");
     }
 
-    #[test]
-    fn memory_schema_register_and_lookup() {
+    #[tokio::test]
+    async fn memory_schema_register_and_lookup() {
         let schema = MemorySchema::new();
         schema.register_table("users", test_table());
-        assert_eq!(schema.table_names().len(), 1);
-        assert!(schema.table("users").is_some());
-        assert!(schema.table("nonexistent").is_none());
+        assert_eq!(schema.table_names().await.len(), 1);
+        assert!(schema.table("users").await.is_some());
+        assert!(schema.table("nonexistent").await.is_none());
     }
 
-    #[test]
-    fn memory_catalog_register_and_lookup() {
+    #[tokio::test]
+    async fn memory_catalog_register_and_lookup() {
         let catalog = MemoryCatalog::new();
         let schema = Arc::new(MemorySchema::new());
         catalog.register_schema("default", schema);
-        assert_eq!(catalog.schema_names().len(), 1);
-        assert!(catalog.schema("default").is_some());
-        assert!(catalog.schema("nonexistent").is_none());
+        assert_eq!(catalog.schema_names().await.len(), 1);
+        assert!(catalog.schema("default").await.is_some());
+        assert!(catalog.schema("nonexistent").await.is_none());
     }
 
     #[tokio::test]
@@ -412,7 +416,9 @@ mod tests {
 
         let factory = MemoryConnectorFactory::new(catalog, "default");
         let table_ref = TableReference::table("users");
-        let ds = factory.create_data_source(&table_ref, &[]).unwrap();
+        let ds = factory
+            .create_data_source(&table_ref, &[], &Default::default())
+            .unwrap();
         let stream = ds
             .scan(&arneb_execution::ScanContext::default())
             .await
@@ -430,7 +436,7 @@ mod tests {
 
         let factory = MemoryConnectorFactory::new(catalog, "default");
         let table_ref = TableReference::table("nonexistent");
-        let result = factory.create_data_source(&table_ref, &[]);
+        let result = factory.create_data_source(&table_ref, &[], &Default::default());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }

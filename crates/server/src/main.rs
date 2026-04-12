@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use arneb_catalog::CatalogManager;
 use arneb_connectors::file::{FileCatalog, FileConnectorFactory, FileFormat, FileSchema};
 use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
-use arneb_connectors::ConnectorRegistry;
+use arneb_connectors::{ConnectorRegistry, StorageRegistry};
 use arneb_protocol::{ProtocolConfig, ProtocolServer};
 use clap::Parser;
 
@@ -69,13 +69,20 @@ async fn main() -> Result<()> {
         .init();
 
     // 5. Create catalog manager + connector registry
-    // If config has file tables, default to "file" catalog; otherwise "memory"
-    let default_catalog = if config.tables.is_empty() {
-        "memory"
-    } else {
+    // Default catalog priority: first hive catalog > file (if tables configured) > memory
+    let default_catalog = if let Some(first_catalog) = config.catalogs.first() {
+        first_catalog.name.as_str()
+    } else if !config.tables.is_empty() {
         "file"
+    } else {
+        "memory"
     };
-    let catalog_manager = CatalogManager::new(default_catalog, "default");
+    let default_schema = config
+        .catalogs
+        .first()
+        .map(|c| c.default_schema.as_str())
+        .unwrap_or("default");
+    let catalog_manager = CatalogManager::new(default_catalog, default_schema);
 
     // Register memory catalog (empty)
     let mem_schema = Arc::new(MemorySchema::new());
@@ -88,9 +95,11 @@ async fn main() -> Result<()> {
     connector_registry.register("memory", Arc::new(mem_factory));
 
     // 6. Register file tables from config
+    let global_cloud_config = config.storage.to_cloud_config();
+    let file_storage_registry = Arc::new(StorageRegistry::with_config(global_cloud_config.clone()));
     let table_count = config.tables.len();
     if !config.tables.is_empty() {
-        let file_factory = Arc::new(FileConnectorFactory::new());
+        let file_factory = Arc::new(FileConnectorFactory::new(file_storage_registry.clone()));
 
         for table in &config.tables {
             let format = match table.format.as_str() {
@@ -129,7 +138,10 @@ async fn main() -> Result<()> {
                 FileFormat::Parquet => None,
             };
 
-            if let Err(e) = file_factory.register_table(&table.name, &table.path, format, schema) {
+            if let Err(e) = file_factory
+                .register_table(&table.name, &table.path, format, schema)
+                .await
+            {
                 tracing::warn!(
                     table = %table.name,
                     path = %table.path,
@@ -143,6 +155,64 @@ async fn main() -> Result<()> {
         let file_catalog = Arc::new(FileCatalog::new("default", file_schema));
         catalog_manager.register_catalog("file", file_catalog);
         connector_registry.register("file", file_factory);
+    }
+
+    // 6.5. Register Hive catalogs from config
+    for catalog_cfg in &config.catalogs {
+        if catalog_cfg.catalog_type != "hive" {
+            tracing::warn!(
+                catalog = %catalog_cfg.name,
+                catalog_type = %catalog_cfg.catalog_type,
+                "unsupported catalog type, skipping"
+            );
+            continue;
+        }
+
+        let metastore_uri = match &catalog_cfg.metastore_uri {
+            Some(uri) => uri.clone(),
+            None => {
+                tracing::warn!(
+                    catalog = %catalog_cfg.name,
+                    "hive catalog missing metastore_uri, skipping"
+                );
+                continue;
+            }
+        };
+
+        // Per-catalog storage: merge catalog override with global config
+        let merged_storage =
+            config::StorageConfig::merge(&config.storage, catalog_cfg.storage.as_ref());
+        let catalog_storage_registry = Arc::new(StorageRegistry::with_config(
+            merged_storage.to_cloud_config(),
+        ));
+
+        match arneb_hive::catalog::HmsClient::new(&metastore_uri).await {
+            Ok(hms_client) => {
+                let hms_client = Arc::new(hms_client);
+                let hive_catalog = Arc::new(arneb_hive::catalog::HiveCatalogProvider::new(
+                    hms_client.clone(),
+                ));
+                catalog_manager.register_catalog(&catalog_cfg.name, hive_catalog);
+
+                let hive_connector =
+                    arneb_hive::datasource::HiveConnectorFactory::new(catalog_storage_registry);
+                connector_registry.register(&catalog_cfg.name, Arc::new(hive_connector));
+
+                tracing::info!(
+                    catalog = %catalog_cfg.name,
+                    metastore = %metastore_uri,
+                    "registered hive catalog"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    catalog = %catalog_cfg.name,
+                    metastore = %metastore_uri,
+                    error = %e,
+                    "failed to connect to hive metastore, skipping catalog"
+                );
+            }
+        }
     }
 
     // 7. Create protocol server

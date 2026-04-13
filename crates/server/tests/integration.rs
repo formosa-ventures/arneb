@@ -1,3 +1,5 @@
+#![allow(clippy::while_let_loop, clippy::approx_constant)]
+
 use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int32Array};
@@ -162,9 +164,108 @@ async fn test_query_parquet_table() {
     writer.close().unwrap();
 
     // Set up file connector
-    let file_factory = Arc::new(FileConnectorFactory::new());
+    let storage_registry = Arc::new(arneb_connectors::StorageRegistry::new());
+    let file_factory = Arc::new(FileConnectorFactory::new(storage_registry));
     file_factory
-        .register_table("test_data", &parquet_path, FileFormat::Parquet, None)
+        .register_table(
+            "test_data",
+            parquet_path.to_str().unwrap(),
+            FileFormat::Parquet,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let file_schema = Arc::new(FileSchema::new(file_factory.clone()));
+    let file_catalog = Arc::new(FileCatalog::new("default", file_schema));
+
+    let catalog_manager = Arc::new(CatalogManager::new("file", "default"));
+    catalog_manager.register_catalog("file", file_catalog);
+
+    let mut registry = ConnectorRegistry::new();
+    registry.register("file", file_factory);
+    let registry = Arc::new(registry);
+
+    let addr = start_test_server(catalog_manager, registry).await;
+
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(&build_startup_message("testuser", "testdb"))
+        .await
+        .unwrap();
+    let _ = read_response(&mut stream).await;
+
+    stream
+        .write_all(&build_query_message("SELECT id, value FROM test_data"))
+        .await
+        .unwrap();
+    let response = read_response(&mut stream).await;
+
+    assert!(
+        response_contains_message_type(&response, b'T'),
+        "expected RowDescription (T)"
+    );
+    assert!(
+        response_contains_message_type(&response, b'D'),
+        "expected DataRow (D)"
+    );
+    assert!(
+        response_contains_message_type(&response, b'C'),
+        "expected CommandComplete (C)"
+    );
+    assert!(
+        response_contains_message_type(&response, b'Z'),
+        "expected ReadyForQuery (Z)"
+    );
+}
+
+#[tokio::test]
+async fn test_query_parquet_via_object_store() {
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{ObjectStoreExt, PutPayload};
+
+    // Write Parquet bytes into InMemory ObjectStore
+    let arrow_schema = Arc::new(Schema::new(vec![
+        Field::new("id", ArrowDataType::Int32, false),
+        Field::new("value", ArrowDataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![42, 99])),
+            Arc::new(Float64Array::from(vec![3.14, 2.72])),
+        ],
+    )
+    .unwrap();
+
+    let mut buf = Vec::new();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buf, arrow_schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let store = Arc::new(InMemory::new());
+    store
+        .put(
+            &ObjectPath::from("data/test.parquet"),
+            PutPayload::from(buf),
+        )
+        .await
+        .unwrap();
+
+    // Register InMemory store as s3://test-bucket
+    let storage_registry = Arc::new(arneb_connectors::StorageRegistry::new());
+    storage_registry.register_store("s3://test-bucket", store);
+
+    let file_factory = Arc::new(FileConnectorFactory::new(storage_registry));
+    file_factory
+        .register_table(
+            "test_data",
+            "s3://test-bucket/data/test.parquet",
+            FileFormat::Parquet,
+            None,
+        )
+        .await
         .unwrap();
 
     let file_schema = Arc::new(FileSchema::new(file_factory.clone()));
@@ -491,6 +592,508 @@ async fn test_phase2_explain_plan() {
         response_contains_message_type(&response, b'D'),
         "EXPLAIN should return plan text as DataRow"
     );
+}
+
+// ===========================================================================
+// Hive Connector Integration Tests
+// ===========================================================================
+
+/// Integration test for the Hive connector path: manually inject Hive
+/// metadata (bypassing HMS Thrift), write Parquet data to an InMemory
+/// ObjectStore, and verify the full query path through pgwire.
+#[tokio::test]
+async fn test_hive_connector_query_via_object_store() {
+    use arneb_common::types::{ColumnInfo, DataType};
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+
+    // 1. Write Parquet data to InMemory ObjectStore
+    let arrow_schema = Arc::new(Schema::new(vec![
+        Field::new("id", ArrowDataType::Int32, false),
+        Field::new("name", ArrowDataType::Utf8, false),
+        Field::new("score", ArrowDataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(arrow::array::StringArray::from(vec![
+                "Alice", "Bob", "Carol",
+            ])),
+            Arc::new(Float64Array::from(vec![95.5, 87.3, 92.1])),
+        ],
+    )
+    .unwrap();
+
+    let mut buf = Vec::new();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buf, arrow_schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    store
+        .put(
+            &ObjectPath::from("warehouse/default/students/data.parquet"),
+            PutPayload::from(buf),
+        )
+        .await
+        .unwrap();
+
+    // 2. Create StorageRegistry with the InMemory store registered for s3://test-lake
+    let storage_registry = Arc::new(arneb_connectors::StorageRegistry::new());
+    storage_registry.register_store("s3://test-lake", store);
+
+    // 3. Create HiveConnectorFactory and pre-register the table location
+    //    (simulates what the production path should do once task 9.1 is fixed)
+    let hive_columns = vec![
+        ColumnInfo {
+            name: "id".into(),
+            data_type: DataType::Int32,
+            nullable: false,
+        },
+        ColumnInfo {
+            name: "name".into(),
+            data_type: DataType::Utf8,
+            nullable: false,
+        },
+        ColumnInfo {
+            name: "score".into(),
+            data_type: DataType::Float64,
+            nullable: false,
+        },
+    ];
+    let hive_factory = arneb_hive::datasource::HiveConnectorFactory::new(storage_registry);
+    hive_factory.register_table_location(
+        "students",
+        "s3://test-lake/warehouse/default/students",
+        hive_columns.clone(),
+    );
+
+    // 4. Create a catalog using HiveTableProvider (no HMS connection needed)
+    let hive_table = Arc::new(arneb_hive::catalog::HiveTableProvider::new(
+        hive_columns,
+        "s3://test-lake/warehouse/default/students".to_string(),
+        "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat".to_string(),
+    ));
+
+    let hive_schema = Arc::new(arneb_catalog::MemorySchema::new());
+    hive_schema.register_table("students", hive_table);
+    let hive_catalog = Arc::new(arneb_catalog::MemoryCatalog::new());
+    hive_catalog.register_schema("default", hive_schema);
+
+    // 5. Wire up CatalogManager and ConnectorRegistry
+    let catalog_manager = Arc::new(CatalogManager::new("hive_lake", "default"));
+    catalog_manager.register_catalog("hive_lake", hive_catalog);
+
+    let mut connector_registry = ConnectorRegistry::new();
+    connector_registry.register("hive_lake", Arc::new(hive_factory));
+    let connector_registry = Arc::new(connector_registry);
+
+    // 6. Start test server and query
+    let addr = start_test_server(catalog_manager, connector_registry).await;
+
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(&build_startup_message("test", "test"))
+        .await
+        .unwrap();
+    let _ = read_response(&mut stream).await;
+
+    // Query the Hive table
+    stream
+        .write_all(&build_query_message("SELECT id, name, score FROM students"))
+        .await
+        .unwrap();
+    let response = read_response(&mut stream).await;
+
+    assert!(
+        response_contains_message_type(&response, b'T'),
+        "expected RowDescription (T) for Hive table query"
+    );
+    assert!(
+        response_contains_message_type(&response, b'D'),
+        "expected DataRow (D) for Hive table query"
+    );
+    let row_count = count_data_rows(&response);
+    assert_eq!(row_count, 3, "Hive table should return 3 rows");
+    assert!(
+        response_contains_message_type(&response, b'C'),
+        "expected CommandComplete (C)"
+    );
+}
+
+// ===========================================================================
+// MinIO S3 Integration Test (requires Docker: docker compose up -d)
+// ===========================================================================
+
+/// Integration test that verifies the full S3 lazy-creation path:
+/// `StorageRegistry::with_config(s3_config)` → MinIO → read Parquet.
+///
+/// Requires: `docker compose up -d` (starts MinIO on localhost:9000).
+/// Run with: `cargo test -p arneb-server -- --ignored test_s3_read_via_minio`
+#[tokio::test]
+#[ignore]
+async fn test_s3_read_via_minio() {
+    use arneb_connectors::{CloudStorageConfig, S3StorageConfig, StorageRegistry};
+    use object_store::aws::AmazonS3Builder;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{ObjectStoreExt, PutPayload};
+
+    let minio_endpoint = "http://localhost:9000";
+    let bucket = "warehouse";
+
+    // 1. Write test Parquet data to MinIO using a direct S3 client
+    let arrow_schema = Arc::new(Schema::new(vec![
+        Field::new("city", ArrowDataType::Utf8, false),
+        Field::new("population", ArrowDataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec![
+                "Taipei", "Tokyo", "Seoul",
+            ])),
+            Arc::new(Int32Array::from(vec![2_646_000, 13_960_000, 9_776_000])),
+        ],
+    )
+    .unwrap();
+
+    let mut buf = Vec::new();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buf, arrow_schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    // Upload directly via AmazonS3Builder (bypasses StorageRegistry)
+    let upload_store = AmazonS3Builder::new()
+        .with_bucket_name(bucket)
+        .with_region("us-east-1")
+        .with_endpoint(minio_endpoint)
+        .with_allow_http(true)
+        .with_access_key_id("minioadmin")
+        .with_secret_access_key("minioadmin")
+        .build()
+        .expect("failed to create S3 client for MinIO");
+
+    upload_store
+        .put(
+            &ObjectPath::from("test/cities/data.parquet"),
+            PutPayload::from(buf),
+        )
+        .await
+        .expect("failed to upload Parquet to MinIO");
+
+    // 2. Read back via StorageRegistry lazy creation (the code path under test)
+    let config = CloudStorageConfig {
+        s3: Some(S3StorageConfig {
+            region: Some("us-east-1".to_string()),
+            endpoint: Some(minio_endpoint.to_string()),
+            allow_http: true,
+            access_key_id: Some("minioadmin".to_string()),
+            secret_access_key: Some("minioadmin".to_string()),
+        }),
+    };
+    let registry = Arc::new(StorageRegistry::with_config(config));
+
+    // Register the table via FileConnectorFactory
+    let file_factory = Arc::new(FileConnectorFactory::new(registry));
+    file_factory
+        .register_table(
+            "cities",
+            &format!("s3://{bucket}/test/cities/data.parquet"),
+            FileFormat::Parquet,
+            None,
+        )
+        .await
+        .expect("failed to register S3 table");
+
+    let file_schema = Arc::new(arneb_connectors::file::FileSchema::new(
+        file_factory.clone(),
+    ));
+    let file_catalog = Arc::new(arneb_connectors::file::FileCatalog::new(
+        "default",
+        file_schema,
+    ));
+
+    let catalog_manager = Arc::new(CatalogManager::new("file", "default"));
+    catalog_manager.register_catalog("file", file_catalog);
+
+    let mut connector_registry = ConnectorRegistry::new();
+    connector_registry.register("file", file_factory);
+    let connector_registry = Arc::new(connector_registry);
+
+    // 3. Start test server and query via pgwire
+    let addr = start_test_server(catalog_manager, connector_registry).await;
+
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(&build_startup_message("test", "test"))
+        .await
+        .unwrap();
+    let _ = read_response(&mut stream).await;
+
+    stream
+        .write_all(&build_query_message(
+            "SELECT city, population FROM cities ORDER BY population",
+        ))
+        .await
+        .unwrap();
+    let response = read_response(&mut stream).await;
+
+    assert!(
+        response_contains_message_type(&response, b'T'),
+        "expected RowDescription (T) — is MinIO running? (docker compose up -d)"
+    );
+    assert!(
+        response_contains_message_type(&response, b'D'),
+        "expected DataRow (D) from MinIO Parquet"
+    );
+    let row_count = count_data_rows(&response);
+    assert_eq!(row_count, 3, "should return 3 city rows from MinIO");
+
+    // Cleanup: remove test data from MinIO
+    let _ = upload_store
+        .delete(&ObjectPath::from("test/cities/data.parquet"))
+        .await;
+}
+
+/// Full E2E test: HMS Thrift → table metadata → MinIO S3 → Parquet read → pgwire query.
+///
+/// Requires: `docker compose up -d` (HMS on localhost:9083, MinIO on localhost:9000).
+/// Run with: `cargo test -p arneb-server -- --ignored test_hive_e2e_hms_s3_parquet --nocapture`
+#[tokio::test]
+#[ignore]
+async fn test_hive_e2e_hms_s3_parquet() {
+    use arneb_connectors::{CloudStorageConfig, S3StorageConfig, StorageRegistry};
+    use hive_metastore::ThriftHiveMetastoreClientBuilder;
+    use object_store::aws::AmazonS3Builder;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{ObjectStoreExt, PutPayload};
+    use pilota::FastStr;
+    use volo_thrift::MaybeException;
+
+    let minio_endpoint = "http://localhost:9000";
+    let hms_addr = "127.0.0.1:9083";
+    let bucket = "warehouse";
+    let db_name = "arneb_e2e_test";
+    let table_name = "students";
+
+    // === Phase 1: Setup — create test data in HMS + MinIO ===
+
+    // 1a. Create Parquet data
+    let arrow_schema = Arc::new(Schema::new(vec![
+        Field::new("id", ArrowDataType::Int32, false),
+        Field::new("name", ArrowDataType::Utf8, false),
+        Field::new("score", ArrowDataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(arrow::array::StringArray::from(vec![
+                "Alice", "Bob", "Carol",
+            ])),
+            Arc::new(Float64Array::from(vec![95.5, 87.3, 92.1])),
+        ],
+    )
+    .unwrap();
+
+    let mut buf = Vec::new();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buf, arrow_schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    // 1b. Upload Parquet to MinIO
+    let s3_store = AmazonS3Builder::new()
+        .with_bucket_name(bucket)
+        .with_region("us-east-1")
+        .with_endpoint(minio_endpoint)
+        .with_allow_http(true)
+        .with_access_key_id("minioadmin")
+        .with_secret_access_key("minioadmin")
+        .build()
+        .expect("failed to create S3 client for MinIO");
+
+    let parquet_path = format!("{db_name}/{table_name}/data.parquet");
+    s3_store
+        .put(
+            &ObjectPath::from(parquet_path.as_str()),
+            PutPayload::from(buf),
+        )
+        .await
+        .expect("failed to upload Parquet to MinIO");
+
+    // 1c. Create database + table in HMS via Thrift
+    let hms_setup_client = ThriftHiveMetastoreClientBuilder::new("hive_metastore")
+        .make_codec(volo_thrift::codec::default::DefaultMakeCodec::buffered())
+        .address(hms_addr.parse::<std::net::SocketAddr>().unwrap())
+        .build();
+
+    // Drop if exists, then create — using _req variants (HMS 5.x forward-compatible)
+    let drop_req = hive_metastore::DropDatabaseRequest {
+        name: FastStr::from(db_name),
+        catalog_name: None,
+        ignore_unknown_db: true,
+        delete_data: true,
+        cascade: true,
+        soft_delete: None,
+        txn_id: None,
+        delete_managed_dir: None,
+    };
+    let _ = hms_setup_client.drop_database_req(drop_req).await;
+
+    let create_db_req = hive_metastore::CreateDatabaseRequest {
+        database_name: FastStr::from(db_name),
+        description: Some(FastStr::from("Arneb E2E test database")),
+        ..Default::default()
+    };
+    match hms_setup_client.create_database_req(create_db_req).await {
+        Ok(MaybeException::Ok(_)) => {}
+        Ok(MaybeException::Exception(ex)) => panic!("HMS create_database_req exception: {ex:?}"),
+        Err(e) => panic!("HMS create_database_req failed: {e}"),
+    }
+
+    // Create external table — store the real S3 location in HMS.
+    // The custom HMS image (docker/hive-metastore/) bundles hadoop-aws,
+    // so HMS can validate s3a:// paths against MinIO directly.
+    let hms_location = format!("s3a://{bucket}/{db_name}/{table_name}");
+
+    let serde = hive_metastore::SerDeInfo {
+        name: Some(FastStr::from(table_name)),
+        serialization_lib: Some(FastStr::from(
+            "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+        )),
+        ..Default::default()
+    };
+
+    let sd = hive_metastore::StorageDescriptor {
+        cols: Some(vec![
+            hive_metastore::FieldSchema {
+                name: Some(FastStr::from("id")),
+                r#type: Some(FastStr::from("int")),
+                comment: None,
+            },
+            hive_metastore::FieldSchema {
+                name: Some(FastStr::from("name")),
+                r#type: Some(FastStr::from("string")),
+                comment: None,
+            },
+            hive_metastore::FieldSchema {
+                name: Some(FastStr::from("score")),
+                r#type: Some(FastStr::from("double")),
+                comment: None,
+            },
+        ]),
+        location: Some(FastStr::from(hms_location.clone())),
+        input_format: Some(FastStr::from(
+            "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+        )),
+        output_format: Some(FastStr::from(
+            "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+        )),
+        serde_info: Some(serde),
+        num_buckets: Some(-1),
+        ..Default::default()
+    };
+
+    let hms_table = hive_metastore::Table {
+        table_name: Some(FastStr::from(table_name)),
+        db_name: Some(FastStr::from(db_name)),
+        owner: Some(FastStr::from("arneb")),
+        sd: Some(sd),
+        partition_keys: Some(vec![]),
+        table_type: Some(FastStr::from("EXTERNAL_TABLE")),
+        ..Default::default()
+    };
+    let create_tbl_req = hive_metastore::CreateTableRequest {
+        table: hms_table,
+        ..Default::default()
+    };
+    match hms_setup_client.create_table_req(create_tbl_req).await {
+        Ok(MaybeException::Ok(_)) => {}
+        Ok(MaybeException::Exception(ex)) => panic!("HMS create_table_req exception: {ex:?}"),
+        Err(e) => panic!("HMS create_table_req failed: {e}"),
+    }
+
+    // === Phase 2: Wire Arneb with real HMS + MinIO ===
+
+    let s3_config = CloudStorageConfig {
+        s3: Some(S3StorageConfig {
+            region: Some("us-east-1".to_string()),
+            endpoint: Some(minio_endpoint.to_string()),
+            allow_http: true,
+            access_key_id: Some("minioadmin".to_string()),
+            secret_access_key: Some("minioadmin".to_string()),
+        }),
+    };
+    let storage_registry = Arc::new(StorageRegistry::with_config(s3_config));
+
+    // Connect to real HMS
+    let hms_client = arneb_hive::catalog::HmsClient::new(hms_addr)
+        .await
+        .expect("failed to connect to HMS");
+    let hms_client = Arc::new(hms_client);
+
+    let hive_catalog = Arc::new(arneb_hive::catalog::HiveCatalogProvider::new(
+        hms_client.clone(),
+    ));
+    let hive_factory = arneb_hive::datasource::HiveConnectorFactory::new(storage_registry);
+    // No manual register_table_location() needed: HMS now stores the real
+    // s3a:// location, and HiveTableProvider::properties() carries it through
+    // the planner → connector factory pipeline automatically.
+
+    let catalog_manager = Arc::new(CatalogManager::new("hive_test", db_name));
+    catalog_manager.register_catalog("hive_test", hive_catalog);
+
+    let mut connector_registry = ConnectorRegistry::new();
+    connector_registry.register("hive_test", Arc::new(hive_factory));
+    let connector_registry = Arc::new(connector_registry);
+
+    // === Phase 3: Query via pgwire ===
+
+    let addr = start_test_server(catalog_manager, connector_registry).await;
+
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(&build_startup_message("test", "test"))
+        .await
+        .unwrap();
+    let _ = read_response(&mut stream).await;
+
+    let sql = format!("SELECT id, name, score FROM hive_test.{db_name}.{table_name}");
+    stream.write_all(&build_query_message(&sql)).await.unwrap();
+    let response = read_response(&mut stream).await;
+
+    assert!(
+        response_contains_message_type(&response, b'T'),
+        "expected RowDescription (T) — full HMS+S3 path"
+    );
+    assert!(
+        response_contains_message_type(&response, b'D'),
+        "expected DataRow (D) — Hive table via HMS metadata + MinIO Parquet"
+    );
+    let row_count = count_data_rows(&response);
+    assert_eq!(
+        row_count, 3,
+        "Hive E2E: expected 3 rows from HMS table backed by MinIO Parquet"
+    );
+
+    // === Phase 4: Cleanup ===
+
+    let cleanup_drop_req = hive_metastore::DropDatabaseRequest {
+        name: FastStr::from(db_name),
+        catalog_name: None,
+        ignore_unknown_db: true,
+        delete_data: true,
+        cascade: true,
+        soft_delete: None,
+        txn_id: None,
+        delete_managed_dir: None,
+    };
+    let _ = hms_setup_client.drop_database_req(cleanup_drop_req).await;
+    let _ = s3_store
+        .delete(&ObjectPath::from(parquet_path.as_str()))
+        .await;
 }
 
 #[test]

@@ -10,7 +10,7 @@ use arneb_catalog::CatalogManager;
 use arneb_common::types::{ColumnInfo, DataType};
 use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable};
 use arneb_connectors::ConnectorRegistry;
-use arneb_protocol::{ProtocolConfig, ProtocolServer};
+use arneb_protocol as _;
 
 /// Helper to start a server on a random port and return the address.
 async fn start_test_server(
@@ -28,16 +28,11 @@ async fn start_test_server(
     });
 
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((socket, _)) => {
-                    let handler = handler_factory.clone();
-                    tokio::spawn(async move {
-                        let _ = pgwire::tokio::process_socket(socket, None, handler).await;
-                    });
-                }
-                Err(_) => break,
-            }
+        while let Ok((socket, _)) = listener.accept().await {
+            let handler = handler_factory.clone();
+            tokio::spawn(async move {
+                let _ = pgwire::tokio::process_socket(socket, None, handler).await;
+            });
         }
     });
 

@@ -8,6 +8,10 @@ license.workspace = true
 name = "arneb"
 path = "src/main.rs"
 
+[[bin]]
+name = "hive-demo-setup"
+path = "src/bin/hive_demo_setup.rs"
+
 [dependencies]
 # Internal crates
 arneb-common = { path = "../common" }
@@ -18,6 +22,7 @@ arneb-planner = { path = "../planner" }
 arneb-protocol = { path = "../protocol" }
 arneb-scheduler = { path = "../scheduler" }
 arneb-rpc = { path = "../rpc" }
+arneb-hive = { path = "../hive" }
 arrow = { workspace = true }
 async-trait.workspace = true
 
@@ -47,9 +52,18 @@ tower-http = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 
+# HMS demo setup binary dependencies
+hive-metastore = { path = "../hive-metastore" }
+volo-thrift = "0.10"
+pilota = "0.11"
+parquet = { workspace = true, features = ["arrow"] }
+object_store.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time", "signal"] }
 pgwire = { workspace = true }
 arrow = { workspace = true }
-parquet = { workspace = true, features = ["arrow"] }
 tempfile = "3"
+arneb-catalog = { path = "../catalog" }
+arneb-hive = { path = "../hive" }
+arneb-connectors = { path = "../connectors" }

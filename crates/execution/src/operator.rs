@@ -1371,6 +1371,7 @@ mod tests {
                 nullable: false,
             }],
             alias: None,
+            properties: Default::default(),
         };
         let explain = ExplainExec { plan };
         let stream = explain.execute().await.unwrap();

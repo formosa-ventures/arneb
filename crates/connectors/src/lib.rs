@@ -10,6 +10,10 @@
 
 pub mod file;
 pub mod memory;
+pub mod storage;
 mod traits;
 
+pub use storage::{
+    CloudStorageConfig, S3StorageConfig, StorageRegistry, StorageScheme, StorageUri,
+};
 pub use traits::{ConnectorFactory, ConnectorRegistry, DDLProvider};

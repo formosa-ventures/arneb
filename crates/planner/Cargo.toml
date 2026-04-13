@@ -10,3 +10,7 @@ arneb-sql-parser = { path = "../sql-parser" }
 arneb-catalog = { path = "../catalog" }
 serde.workspace = true
 serde_json.workspace = true
+async-recursion.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

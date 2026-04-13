@@ -1,5 +1,7 @@
 //! Query planner that converts a parsed SQL AST into a logical plan.
 
+use async_recursion::async_recursion;
+
 use arneb_catalog::CatalogManager;
 use arneb_common::error::PlanError;
 use arneb_common::types::{ColumnInfo, DataType, ScalarValue};
@@ -88,11 +90,12 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Plan a top-level SQL statement.
-    pub fn plan_statement(&self, stmt: &ast::Statement) -> Result<LogicalPlan, PlanError> {
+    #[async_recursion]
+    pub async fn plan_statement(&self, stmt: &ast::Statement) -> Result<LogicalPlan, PlanError> {
         match stmt {
-            ast::Statement::Query(query) => self.plan_query(query),
+            ast::Statement::Query(query) => self.plan_query(query).await,
             ast::Statement::Explain(inner) => {
-                let plan = self.plan_statement(inner)?;
+                let plan = self.plan_statement(inner).await?;
                 Ok(LogicalPlan::Explain {
                     input: Box::new(plan),
                 })
@@ -120,7 +123,7 @@ impl<'a> QueryPlanner<'a> {
                 if_exists: *if_exists,
             }),
             ast::Statement::CreateTableAsSelect { name, query } => {
-                let source = self.plan_query(query)?;
+                let source = self.plan_query(query).await?;
                 Ok(LogicalPlan::CreateTableAsSelect {
                     name: name.clone(),
                     source: Box::new(source),
@@ -132,7 +135,7 @@ impl<'a> QueryPlanner<'a> {
                 source,
             } => {
                 let source_plan = match source {
-                    ast::InsertSource::Query(q) => self.plan_query(q)?,
+                    ast::InsertSource::Query(q) => self.plan_query(q).await?,
                     ast::InsertSource::Values(_rows) => {
                         return Err(PlanError::InvalidExpression(
                             "INSERT INTO ... VALUES not yet supported in planner; use INSERT INTO ... SELECT"
@@ -157,7 +160,7 @@ impl<'a> QueryPlanner<'a> {
                 query,
                 or_replace: _,
             } => {
-                let plan = self.plan_query(query)?;
+                let plan = self.plan_query(query).await?;
                 Ok(LogicalPlan::CreateView {
                     name: name.clone(),
                     sql: format!("{}", ast::Statement::Query(query.clone())),
@@ -172,9 +175,9 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Plan a Query (CTEs + body + ORDER BY + LIMIT/OFFSET).
-    fn plan_query(&self, query: &ast::Query) -> Result<LogicalPlan, PlanError> {
+    async fn plan_query(&self, query: &ast::Query) -> Result<LogicalPlan, PlanError> {
         // TODO: Handle CTEs by registering them for later resolution
-        let mut plan = self.plan_query_body(&query.body)?;
+        let mut plan = self.plan_query_body(&query.body).await?;
 
         // ORDER BY
         if !query.order_by.is_empty() {
@@ -191,7 +194,7 @@ impl<'a> QueryPlanner<'a> {
                 let expr =
                     match self.resolve_order_by_expr_with_select(&ob.expr, &ctx, select_items) {
                         Some(resolved) => resolved,
-                        None => self.plan_expr(&ob.expr, &ctx)?,
+                        None => self.plan_expr(&ob.expr, &ctx).await?,
                     };
                 sort_exprs.push(SortExpr {
                     expr,
@@ -220,12 +223,13 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Plan a QueryBody (SELECT or set operation).
-    fn plan_query_body(&self, body: &ast::QueryBody) -> Result<LogicalPlan, PlanError> {
+    #[async_recursion]
+    async fn plan_query_body(&self, body: &ast::QueryBody) -> Result<LogicalPlan, PlanError> {
         match body {
-            ast::QueryBody::Select(select) => self.plan_select(select),
+            ast::QueryBody::Select(select) => self.plan_select(select).await,
             ast::QueryBody::SetOperation { op, left, right } => {
-                let left_plan = self.plan_query_body(left)?;
-                let right_plan = self.plan_query_body(right)?;
+                let left_plan = self.plan_query_body(left).await?;
+                let right_plan = self.plan_query_body(right).await?;
                 match op {
                     ast::SetOperator::UnionAll => Ok(LogicalPlan::UnionAll {
                         inputs: vec![left_plan, right_plan],
@@ -249,13 +253,13 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Plan a SelectBody: FROM → WHERE → GROUP BY/HAVING → SELECT projection.
-    fn plan_select(&self, body: &ast::SelectBody) -> Result<LogicalPlan, PlanError> {
+    async fn plan_select(&self, body: &ast::SelectBody) -> Result<LogicalPlan, PlanError> {
         // 1. FROM clause → base plan + context
-        let (mut plan, mut ctx) = self.plan_from(&body.from)?;
+        let (mut plan, mut ctx) = self.plan_from(&body.from).await?;
 
         // 2. WHERE
         if let Some(selection) = &body.selection {
-            let predicate = self.plan_expr(selection, &ctx)?;
+            let predicate = self.plan_expr(selection, &ctx).await?;
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
                 predicate,
@@ -265,15 +269,14 @@ impl<'a> QueryPlanner<'a> {
         // 3. GROUP BY / HAVING → Aggregate
         // Also handle implicit aggregate: SELECT SUM(x) FROM t (no GROUP BY but has aggregates)
         let has_group_by = !body.group_by.is_empty();
-        let aggr_exprs_from_select = self.collect_aggregates(&body.projection, &ctx)?;
+        let aggr_exprs_from_select = self.collect_aggregates(&body.projection, &ctx).await?;
         let has_aggregates = has_group_by || !aggr_exprs_from_select.is_empty();
 
         if has_aggregates {
-            let group_by: Vec<PlanExpr> = body
-                .group_by
-                .iter()
-                .map(|e| self.plan_expr(e, &ctx))
-                .collect::<Result<_, _>>()?;
+            let mut group_by = Vec::with_capacity(body.group_by.len());
+            for e in &body.group_by {
+                group_by.push(self.plan_expr(e, &ctx).await?);
+            }
 
             let aggr_exprs = aggr_exprs_from_select;
 
@@ -304,7 +307,7 @@ impl<'a> QueryPlanner<'a> {
             if let Some(having) = &body.having {
                 let num_group_by = body.group_by.len();
                 let rewritten = self.rewrite_aggregates_as_columns(having, &ctx, num_group_by);
-                let predicate = self.plan_expr(&rewritten, &ctx)?;
+                let predicate = self.plan_expr(&rewritten, &ctx).await?;
                 plan = LogicalPlan::Filter {
                     input: Box::new(plan),
                     predicate,
@@ -316,9 +319,10 @@ impl<'a> QueryPlanner<'a> {
         // After aggregate, SELECT expressions that ARE aggregate functions should reference
         // the aggregate output columns by index, not re-resolve their arguments.
         let (proj_exprs, proj_schema) = if has_aggregates {
-            self.plan_aggregate_projection(&body.projection, &ctx, &body.group_by)?
+            self.plan_aggregate_projection(&body.projection, &ctx, &body.group_by)
+                .await?
         } else {
-            self.plan_projection(&body.projection, &ctx)?
+            self.plan_projection(&body.projection, &ctx).await?
         };
 
         plan = LogicalPlan::Projection {
@@ -331,7 +335,7 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Plan the FROM clause: resolve tables, build join tree.
-    fn plan_from(
+    async fn plan_from(
         &self,
         from: &[ast::TableWithJoins],
     ) -> Result<(LogicalPlan, PlanningContext), PlanError> {
@@ -341,11 +345,11 @@ impl<'a> QueryPlanner<'a> {
             ));
         }
 
-        let (mut plan, mut ctx) = self.plan_table_with_joins(&from[0])?;
+        let (mut plan, mut ctx) = self.plan_table_with_joins(&from[0]).await?;
 
         // Multiple FROM items → implicit CROSS JOIN
         for twj in &from[1..] {
-            let (right_plan, right_ctx) = self.plan_table_with_joins(twj)?;
+            let (right_plan, right_ctx) = self.plan_table_with_joins(twj).await?;
             ctx.columns.extend(right_ctx.columns);
             plan = LogicalPlan::Join {
                 left: Box::new(plan),
@@ -359,19 +363,19 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Plan a single FROM item with its joins.
-    fn plan_table_with_joins(
+    async fn plan_table_with_joins(
         &self,
         twj: &ast::TableWithJoins,
     ) -> Result<(LogicalPlan, PlanningContext), PlanError> {
-        let (mut plan, mut ctx) = self.plan_table_factor(&twj.relation)?;
+        let (mut plan, mut ctx) = self.plan_table_factor(&twj.relation).await?;
 
         for join in &twj.joins {
-            let (right_plan, right_ctx) = self.plan_table_factor(&join.relation)?;
+            let (right_plan, right_ctx) = self.plan_table_factor(&join.relation).await?;
             ctx.columns.extend(right_ctx.columns);
 
             let condition = match &join.condition {
                 ast::JoinCondition::On(expr) => {
-                    let plan_expr = self.plan_expr(expr, &ctx)?;
+                    let plan_expr = self.plan_expr(expr, &ctx).await?;
                     JoinCondition::On(plan_expr)
                 }
                 ast::JoinCondition::Using(_) => {
@@ -394,7 +398,7 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Resolve a single table factor (table name or subquery).
-    fn plan_table_factor(
+    async fn plan_table_factor(
         &self,
         factor: &ast::TableFactor,
     ) -> Result<(LogicalPlan, PlanningContext), PlanError> {
@@ -403,6 +407,7 @@ impl<'a> QueryPlanner<'a> {
                 let table_provider = self
                     .catalog
                     .resolve_table(name)
+                    .await
                     .map_err(|_| PlanError::TableNotFound(name.to_string()))?;
                 let schema = table_provider.schema();
                 let qualifier = alias.as_deref().unwrap_or(&name.table);
@@ -410,16 +415,18 @@ impl<'a> QueryPlanner<'a> {
                 let mut ctx = PlanningContext::new();
                 ctx.add_table_columns(Some(qualifier), &schema);
 
+                let properties = table_provider.properties();
                 let plan = LogicalPlan::TableScan {
                     table: name.clone(),
                     schema,
                     alias: alias.clone(),
+                    properties,
                 };
 
                 Ok((plan, ctx))
             }
             ast::TableFactor::Subquery { query, alias } => {
-                let plan = self.plan_query(query)?;
+                let plan = self.plan_query(query).await?;
                 let schema = plan.schema();
                 let mut ctx = PlanningContext::new();
                 ctx.add_table_columns(Some(alias.as_str()), &schema);
@@ -430,7 +437,12 @@ impl<'a> QueryPlanner<'a> {
 
     /// Convert an AST expression to a PlanExpr, resolving column references.
     #[allow(clippy::only_used_in_recursion)]
-    fn plan_expr(&self, expr: &ast::Expr, ctx: &PlanningContext) -> Result<PlanExpr, PlanError> {
+    #[async_recursion]
+    async fn plan_expr(
+        &self,
+        expr: &ast::Expr,
+        ctx: &PlanningContext,
+    ) -> Result<PlanExpr, PlanError> {
         match expr {
             ast::Expr::Column(col_ref) => {
                 let (index, col_info) =
@@ -442,35 +454,36 @@ impl<'a> QueryPlanner<'a> {
             }
             ast::Expr::Literal(val) => Ok(PlanExpr::Literal(val.clone())),
             ast::Expr::BinaryOp { left, op, right } => Ok(PlanExpr::BinaryOp {
-                left: Box::new(self.plan_expr(left, ctx)?),
+                left: Box::new(self.plan_expr(left, ctx).await?),
                 op: *op,
-                right: Box::new(self.plan_expr(right, ctx)?),
+                right: Box::new(self.plan_expr(right, ctx).await?),
             }),
             ast::Expr::UnaryOp { op, expr } => Ok(PlanExpr::UnaryOp {
                 op: *op,
-                expr: Box::new(self.plan_expr(expr, ctx)?),
+                expr: Box::new(self.plan_expr(expr, ctx).await?),
             }),
             ast::Expr::Function {
                 name,
                 args,
                 distinct,
             } => {
-                let plan_args = args
-                    .iter()
-                    .map(|a| match a {
-                        ast::FunctionArg::Unnamed(e) => self.plan_expr(e, ctx),
-                        ast::FunctionArg::Wildcard => Ok(PlanExpr::Wildcard),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut plan_args = Vec::with_capacity(args.len());
+                for a in args {
+                    let plan_arg = match a {
+                        ast::FunctionArg::Unnamed(e) => self.plan_expr(e, ctx).await?,
+                        ast::FunctionArg::Wildcard => PlanExpr::Wildcard,
+                    };
+                    plan_args.push(plan_arg);
+                }
                 Ok(PlanExpr::Function {
                     name: name.clone(),
                     args: plan_args,
                     distinct: *distinct,
                 })
             }
-            ast::Expr::IsNull(inner) => Ok(PlanExpr::IsNull(Box::new(self.plan_expr(inner, ctx)?))),
+            ast::Expr::IsNull(inner) => Ok(PlanExpr::IsNull(Box::new(self.plan_expr(inner, ctx).await?))),
             ast::Expr::IsNotNull(inner) => {
-                Ok(PlanExpr::IsNotNull(Box::new(self.plan_expr(inner, ctx)?)))
+                Ok(PlanExpr::IsNotNull(Box::new(self.plan_expr(inner, ctx).await?)))
             }
             ast::Expr::Between {
                 expr,
@@ -478,33 +491,33 @@ impl<'a> QueryPlanner<'a> {
                 low,
                 high,
             } => Ok(PlanExpr::Between {
-                expr: Box::new(self.plan_expr(expr, ctx)?),
+                expr: Box::new(self.plan_expr(expr, ctx).await?),
                 negated: *negated,
-                low: Box::new(self.plan_expr(low, ctx)?),
-                high: Box::new(self.plan_expr(high, ctx)?),
+                low: Box::new(self.plan_expr(low, ctx).await?),
+                high: Box::new(self.plan_expr(high, ctx).await?),
             }),
             ast::Expr::InList {
                 expr,
                 list,
                 negated,
             } => {
-                let plan_list = list
-                    .iter()
-                    .map(|e| self.plan_expr(e, ctx))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut plan_list = Vec::with_capacity(list.len());
+                for e in list {
+                    plan_list.push(self.plan_expr(e, ctx).await?);
+                }
                 Ok(PlanExpr::InList {
-                    expr: Box::new(self.plan_expr(expr, ctx)?),
+                    expr: Box::new(self.plan_expr(expr, ctx).await?),
                     list: plan_list,
                     negated: *negated,
                 })
             }
             ast::Expr::Cast { expr, data_type } => Ok(PlanExpr::Cast {
-                expr: Box::new(self.plan_expr(expr, ctx)?),
+                expr: Box::new(self.plan_expr(expr, ctx).await?),
                 data_type: data_type.clone(),
             }),
-            ast::Expr::Nested(inner) => self.plan_expr(inner, ctx),
+            ast::Expr::Nested(inner) => self.plan_expr(inner, ctx).await,
             ast::Expr::Subquery(query) => {
-                let subplan = self.plan_query(query)?;
+                let subplan = self.plan_query(query).await?;
                 Ok(PlanExpr::ScalarSubquery {
                     subplan: Box::new(subplan),
                 })
@@ -516,15 +529,15 @@ impl<'a> QueryPlanner<'a> {
                 else_result,
             } => {
                 let op = match operand {
-                    Some(expr) => Some(Box::new(self.plan_expr(expr, ctx)?)),
+                    Some(expr) => Some(Box::new(self.plan_expr(expr, ctx).await?)),
                     None => None,
                 };
                 let mut when_clauses = Vec::with_capacity(conditions.len());
                 for (cond, res) in conditions.iter().zip(results.iter()) {
-                    when_clauses.push((self.plan_expr(cond, ctx)?, self.plan_expr(res, ctx)?));
+                    when_clauses.push((self.plan_expr(cond, ctx).await?, self.plan_expr(res, ctx).await?));
                 }
                 let el = match else_result {
-                    Some(expr) => Some(Box::new(self.plan_expr(expr, ctx)?)),
+                    Some(expr) => Some(Box::new(self.plan_expr(expr, ctx).await?)),
                     None => None,
                 };
                 Ok(PlanExpr::CaseExpr {
@@ -549,7 +562,7 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Build projection expressions and output schema from SELECT items.
-    fn plan_projection(
+    async fn plan_projection(
         &self,
         items: &[ast::SelectItem],
         ctx: &PlanningContext,
@@ -560,13 +573,13 @@ impl<'a> QueryPlanner<'a> {
         for item in items {
             match item {
                 ast::SelectItem::UnnamedExpr(expr) => {
-                    let plan_expr = self.plan_expr(expr, ctx)?;
+                    let plan_expr = self.plan_expr(expr, ctx).await?;
                     let col_info = self.expr_to_column_info(&plan_expr, ctx);
                     exprs.push(plan_expr);
                     schema.push(col_info);
                 }
                 ast::SelectItem::ExprWithAlias { expr, alias } => {
-                    let plan_expr = self.plan_expr(expr, ctx)?;
+                    let plan_expr = self.plan_expr(expr, ctx).await?;
                     let mut col_info = self.expr_to_column_info(&plan_expr, ctx);
                     col_info.name = alias.clone();
                     exprs.push(plan_expr);
@@ -607,7 +620,7 @@ impl<'a> QueryPlanner<'a> {
     /// After GROUP BY, the context only has group-by columns + aggregate outputs.
     /// Expressions in SELECT that are aggregate functions must be mapped to the
     /// aggregate output column by index, not re-resolved.
-    fn plan_aggregate_projection(
+    async fn plan_aggregate_projection(
         &self,
         items: &[ast::SelectItem],
         ctx: &PlanningContext,
@@ -646,7 +659,7 @@ impl<'a> QueryPlanner<'a> {
                         // It's a group-by column — resolve in post-aggregate ctx
                         // Try normal resolution first; if that fails (qualified ref vs
                         // unqualified ctx), try by column name only
-                        let plan_expr = match self.plan_expr(expr, ctx) {
+                        let plan_expr = match self.plan_expr(expr, ctx).await {
                             Ok(pe) => pe,
                             Err(_) => {
                                 // Try matching by unqualified column name
@@ -681,7 +694,7 @@ impl<'a> QueryPlanner<'a> {
                         // Expression containing aggregate (e.g., 100 * SUM(x) / SUM(y))
                         // Replace aggregate sub-expressions with column refs, then plan the rest
                         let rewritten = self.rewrite_aggregates_as_columns(expr, ctx, num_group_by);
-                        let plan_expr = self.plan_expr(&rewritten, ctx)?;
+                        let plan_expr = self.plan_expr(&rewritten, ctx).await?;
                         let mut ci = self.expr_to_column_info(&plan_expr, ctx);
                         if let Some(a) = alias.clone() {
                             ci.name = a;
@@ -690,7 +703,7 @@ impl<'a> QueryPlanner<'a> {
                         schema.push(ci);
                     } else {
                         // Non-aggregate, non-group-by expression — resolve normally
-                        let plan_expr = self.plan_expr(expr, ctx)?;
+                        let plan_expr = self.plan_expr(expr, ctx).await?;
                         let mut ci = self.expr_to_column_info(&plan_expr, ctx);
                         if let Some(a) = alias {
                             ci.name = a;
@@ -925,7 +938,7 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Collect aggregate function expressions from the SELECT list.
-    fn collect_aggregates(
+    async fn collect_aggregates(
         &self,
         items: &[ast::SelectItem],
         ctx: &PlanningContext,
@@ -935,7 +948,7 @@ impl<'a> QueryPlanner<'a> {
             match item {
                 ast::SelectItem::UnnamedExpr(expr)
                 | ast::SelectItem::ExprWithAlias { expr, .. } => {
-                    self.extract_aggregates(expr, ctx, &mut aggregates)?;
+                    self.extract_aggregates(expr, ctx, &mut aggregates).await?;
                 }
                 _ => {}
             }
@@ -944,7 +957,8 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Recursively extract aggregate functions from an expression.
-    fn extract_aggregates(
+    #[async_recursion]
+    async fn extract_aggregates(
         &self,
         expr: &ast::Expr,
         ctx: &PlanningContext,
@@ -952,21 +966,21 @@ impl<'a> QueryPlanner<'a> {
     ) -> Result<(), PlanError> {
         match expr {
             ast::Expr::Function { name, .. } if is_aggregate_function(name) => {
-                let plan_expr = self.plan_expr(expr, ctx)?;
+                let plan_expr = self.plan_expr(expr, ctx).await?;
                 // Avoid duplicates
                 if !out.iter().any(|e| format!("{e}") == format!("{plan_expr}")) {
                     out.push(plan_expr);
                 }
             }
             ast::Expr::BinaryOp { left, right, .. } => {
-                self.extract_aggregates(left, ctx, out)?;
-                self.extract_aggregates(right, ctx, out)?;
+                self.extract_aggregates(left, ctx, out).await?;
+                self.extract_aggregates(right, ctx, out).await?;
             }
             ast::Expr::UnaryOp { expr, .. } => {
-                self.extract_aggregates(expr, ctx, out)?;
+                self.extract_aggregates(expr, ctx, out).await?;
             }
             ast::Expr::Nested(inner) => {
-                self.extract_aggregates(inner, ctx, out)?;
+                self.extract_aggregates(inner, ctx, out).await?;
             }
             _ => {}
         }
@@ -1181,11 +1195,11 @@ mod tests {
         mgr
     }
 
-    fn plan_sql(sql: &str) -> Result<LogicalPlan, PlanError> {
+    async fn plan_sql(sql: &str) -> Result<LogicalPlan, PlanError> {
         let catalog = test_catalog();
         let planner = QueryPlanner::new(&catalog);
         let stmt = arneb_sql_parser::parse(sql).expect("parse failed");
-        planner.plan_statement(&stmt)
+        planner.plan_statement(&stmt).await
     }
 
     // ---------------------------------------------------------------
@@ -1229,9 +1243,11 @@ mod tests {
         assert_eq!(expr.to_string(), "x BETWEEN 1 AND 10");
     }
 
-    #[test]
-    fn test_logical_plan_display() {
-        let plan = plan_sql("SELECT name FROM users WHERE id > 10").unwrap();
+    #[tokio::test]
+    async fn test_logical_plan_display() {
+        let plan = plan_sql("SELECT name FROM users WHERE id > 10")
+            .await
+            .unwrap();
         let display = plan.to_string();
         assert!(display.contains("Projection"));
         assert!(display.contains("Filter"));
@@ -1242,9 +1258,9 @@ mod tests {
     // Simple SELECT (task 4.3)
     // ---------------------------------------------------------------
 
-    #[test]
-    fn test_simple_select() {
-        let plan = plan_sql("SELECT id, name FROM users").unwrap();
+    #[tokio::test]
+    async fn test_simple_select() {
+        let plan = plan_sql("SELECT id, name FROM users").await.unwrap();
         match &plan {
             LogicalPlan::Projection { exprs, schema, .. } => {
                 assert_eq!(exprs.len(), 2);
@@ -1260,9 +1276,11 @@ mod tests {
     // SELECT with WHERE (task 4.4)
     // ---------------------------------------------------------------
 
-    #[test]
-    fn test_select_with_where() {
-        let plan = plan_sql("SELECT name FROM users WHERE id > 10").unwrap();
+    #[tokio::test]
+    async fn test_select_with_where() {
+        let plan = plan_sql("SELECT name FROM users WHERE id > 10")
+            .await
+            .unwrap();
         // Should be Projection(Filter(TableScan))
         match &plan {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
@@ -1280,9 +1298,9 @@ mod tests {
     // SELECT * wildcard expansion (task 4.5)
     // ---------------------------------------------------------------
 
-    #[test]
-    fn test_select_wildcard() {
-        let plan = plan_sql("SELECT * FROM users").unwrap();
+    #[tokio::test]
+    async fn test_select_wildcard() {
+        let plan = plan_sql("SELECT * FROM users").await.unwrap();
         match &plan {
             LogicalPlan::Projection { exprs, schema, .. } => {
                 assert_eq!(exprs.len(), 3, "users has 3 columns");
@@ -1298,11 +1316,12 @@ mod tests {
     // SELECT with JOIN (task 4.6)
     // ---------------------------------------------------------------
 
-    #[test]
-    fn test_select_with_join() {
+    #[tokio::test]
+    async fn test_select_with_join() {
         let plan = plan_sql(
             "SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id",
         )
+        .await
         .unwrap();
 
         match &plan {
@@ -1320,9 +1339,11 @@ mod tests {
     // SELECT with GROUP BY (task 4.7)
     // ---------------------------------------------------------------
 
-    #[test]
-    fn test_select_with_group_by() {
-        let plan = plan_sql("SELECT name, COUNT(*) FROM users GROUP BY name").unwrap();
+    #[tokio::test]
+    async fn test_select_with_group_by() {
+        let plan = plan_sql("SELECT name, COUNT(*) FROM users GROUP BY name")
+            .await
+            .unwrap();
 
         // Should be Projection(Aggregate(TableScan))
         match &plan {
@@ -1337,9 +1358,11 @@ mod tests {
     // SELECT with ORDER BY, LIMIT, OFFSET (task 4.8)
     // ---------------------------------------------------------------
 
-    #[test]
-    fn test_select_with_order_by() {
-        let plan = plan_sql("SELECT id, name FROM users ORDER BY id DESC").unwrap();
+    #[tokio::test]
+    async fn test_select_with_order_by() {
+        let plan = plan_sql("SELECT id, name FROM users ORDER BY id DESC")
+            .await
+            .unwrap();
         match &plan {
             LogicalPlan::Sort { order_by, .. } => {
                 assert_eq!(order_by.len(), 1);
@@ -1349,9 +1372,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_select_with_limit_offset() {
-        let plan = plan_sql("SELECT id FROM users LIMIT 10 OFFSET 5").unwrap();
+    #[tokio::test]
+    async fn test_select_with_limit_offset() {
+        let plan = plan_sql("SELECT id FROM users LIMIT 10 OFFSET 5")
+            .await
+            .unwrap();
         match &plan {
             LogicalPlan::Limit { limit, offset, .. } => {
                 assert_eq!(*limit, Some(10));
@@ -1365,9 +1390,9 @@ mod tests {
     // EXPLAIN (task 4.9)
     // ---------------------------------------------------------------
 
-    #[test]
-    fn test_explain() {
-        let plan = plan_sql("EXPLAIN SELECT id FROM users").unwrap();
+    #[tokio::test]
+    async fn test_explain() {
+        let plan = plan_sql("EXPLAIN SELECT id FROM users").await.unwrap();
         match &plan {
             LogicalPlan::Explain { input } => {
                 assert!(matches!(input.as_ref(), LogicalPlan::Projection { .. }));
@@ -1380,18 +1405,18 @@ mod tests {
     // Error cases (task 4.10)
     // ---------------------------------------------------------------
 
-    #[test]
-    fn test_table_not_found() {
-        let err = plan_sql("SELECT * FROM nonexistent").unwrap_err();
+    #[tokio::test]
+    async fn test_table_not_found() {
+        let err = plan_sql("SELECT * FROM nonexistent").await.unwrap_err();
         match err {
             PlanError::TableNotFound(name) => assert_eq!(name, "nonexistent"),
             _ => panic!("expected TableNotFound, got: {err:?}"),
         }
     }
 
-    #[test]
-    fn test_column_not_found() {
-        let err = plan_sql("SELECT nonexistent FROM users").unwrap_err();
+    #[tokio::test]
+    async fn test_column_not_found() {
+        let err = plan_sql("SELECT nonexistent FROM users").await.unwrap_err();
         match err {
             PlanError::ColumnNotFound(name) => assert_eq!(name, "nonexistent"),
             _ => panic!("expected ColumnNotFound, got: {err:?}"),
@@ -1402,9 +1427,11 @@ mod tests {
     // Aliases, qualified refs, expressions (task 4.11)
     // ---------------------------------------------------------------
 
-    #[test]
-    fn test_alias_in_projection() {
-        let plan = plan_sql("SELECT name AS user_name FROM users").unwrap();
+    #[tokio::test]
+    async fn test_alias_in_projection() {
+        let plan = plan_sql("SELECT name AS user_name FROM users")
+            .await
+            .unwrap();
         match &plan {
             LogicalPlan::Projection { schema, .. } => {
                 assert_eq!(schema[0].name, "user_name");
@@ -1413,9 +1440,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_qualified_column_reference() {
-        let plan = plan_sql("SELECT users.name FROM users").unwrap();
+    #[tokio::test]
+    async fn test_qualified_column_reference() {
+        let plan = plan_sql("SELECT users.name FROM users").await.unwrap();
         match &plan {
             LogicalPlan::Projection { schema, .. } => {
                 assert_eq!(schema[0].name, "name");
@@ -1425,9 +1452,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_expression_in_projection() {
-        let plan = plan_sql("SELECT id + 1 FROM users").unwrap();
+    #[tokio::test]
+    async fn test_expression_in_projection() {
+        let plan = plan_sql("SELECT id + 1 FROM users").await.unwrap();
         match &plan {
             LogicalPlan::Projection { exprs, .. } => {
                 assert!(matches!(exprs[0], PlanExpr::BinaryOp { .. }));
@@ -1436,9 +1463,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_table_alias() {
-        let plan = plan_sql("SELECT u.name FROM users u").unwrap();
+    #[tokio::test]
+    async fn test_table_alias() {
+        let plan = plan_sql("SELECT u.name FROM users u").await.unwrap();
         match &plan {
             LogicalPlan::Projection { schema, .. } => {
                 assert_eq!(schema[0].name, "name");
@@ -1447,9 +1474,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_cross_join_implicit() {
-        let plan = plan_sql("SELECT * FROM users, orders").unwrap();
+    #[tokio::test]
+    async fn test_cross_join_implicit() {
+        let plan = plan_sql("SELECT * FROM users, orders").await.unwrap();
         match &plan {
             LogicalPlan::Projection { input, exprs, .. } => {
                 assert_eq!(exprs.len(), 6); // 3 + 3
@@ -1465,10 +1492,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_qualified_wildcard() {
-        let plan =
-            plan_sql("SELECT users.* FROM users JOIN orders ON users.id = orders.user_id").unwrap();
+    #[tokio::test]
+    async fn test_qualified_wildcard() {
+        let plan = plan_sql("SELECT users.* FROM users JOIN orders ON users.id = orders.user_id")
+            .await
+            .unwrap();
         match &plan {
             LogicalPlan::Projection { exprs, schema, .. } => {
                 assert_eq!(exprs.len(), 3); // only users columns
@@ -1480,9 +1508,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_schema_propagation_through_filter() {
-        let plan = plan_sql("SELECT * FROM users WHERE age > 18").unwrap();
+    #[tokio::test]
+    async fn test_schema_propagation_through_filter() {
+        let plan = plan_sql("SELECT * FROM users WHERE age > 18")
+            .await
+            .unwrap();
         let schema = plan.schema();
         assert_eq!(schema.len(), 3);
     }
@@ -1491,10 +1521,11 @@ mod tests {
     // CASE expression planner tests
     // ---------------------------------------------------------------
 
-    #[test]
-    fn test_searched_case_in_select() {
-        let plan =
-            plan_sql("SELECT CASE WHEN age > 18 THEN 'adult' ELSE 'minor' END FROM users").unwrap();
+    #[tokio::test]
+    async fn test_searched_case_in_select() {
+        let plan = plan_sql("SELECT CASE WHEN age > 18 THEN 'adult' ELSE 'minor' END FROM users")
+            .await
+            .unwrap();
         match &plan {
             LogicalPlan::Projection { exprs, .. } => {
                 assert!(matches!(
@@ -1506,11 +1537,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_simple_case_in_select() {
+    #[tokio::test]
+    async fn test_simple_case_in_select() {
         let plan = plan_sql(
             "SELECT CASE age WHEN 18 THEN 'eighteen' WHEN 21 THEN 'twenty-one' END FROM users",
         )
+        .await
         .unwrap();
         match &plan {
             LogicalPlan::Projection { exprs, .. } => match &exprs[0] {
@@ -1528,9 +1560,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_coalesce_in_select() {
-        let plan = plan_sql("SELECT COALESCE(name, 'unknown') FROM users").unwrap();
+    #[tokio::test]
+    async fn test_coalesce_in_select() {
+        let plan = plan_sql("SELECT COALESCE(name, 'unknown') FROM users")
+            .await
+            .unwrap();
         match &plan {
             LogicalPlan::Projection { exprs, .. } => {
                 assert!(matches!(&exprs[0], PlanExpr::CaseExpr { .. }));
@@ -1539,10 +1573,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_case_in_where() {
+    #[tokio::test]
+    async fn test_case_in_where() {
         let plan =
             plan_sql("SELECT name FROM users WHERE CASE WHEN age > 18 THEN true ELSE false END")
+                .await
                 .unwrap();
         match &plan {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
@@ -1559,10 +1594,11 @@ mod tests {
     // HAVING clause planner tests
     // ---------------------------------------------------------------
 
-    #[test]
-    fn test_having_adds_filter_after_aggregate() {
-        let plan =
-            plan_sql("SELECT name, COUNT(*) FROM users GROUP BY name HAVING COUNT(*) > 1").unwrap();
+    #[tokio::test]
+    async fn test_having_adds_filter_after_aggregate() {
+        let plan = plan_sql("SELECT name, COUNT(*) FROM users GROUP BY name HAVING COUNT(*) > 1")
+            .await
+            .unwrap();
         // Should be Projection(Filter(Aggregate(TableScan)))
         match &plan {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
@@ -1575,9 +1611,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_no_having_no_extra_filter() {
-        let plan = plan_sql("SELECT name, COUNT(*) FROM users GROUP BY name").unwrap();
+    #[tokio::test]
+    async fn test_no_having_no_extra_filter() {
+        let plan = plan_sql("SELECT name, COUNT(*) FROM users GROUP BY name")
+            .await
+            .unwrap();
         // Should be Projection(Aggregate(TableScan)) — no Filter
         match &plan {
             LogicalPlan::Projection { input, .. } => {
@@ -1591,10 +1629,12 @@ mod tests {
     // Bug fix regression tests
     // ---------------------------------------------------------------
 
-    #[test]
-    fn test_sum_non_group_by_column() {
+    #[tokio::test]
+    async fn test_sum_non_group_by_column() {
         // Bug: SUM(age) failed with "column not found: age" after GROUP BY
-        let plan = plan_sql("SELECT name, SUM(age) FROM users GROUP BY name").unwrap();
+        let plan = plan_sql("SELECT name, SUM(age) FROM users GROUP BY name")
+            .await
+            .unwrap();
         match &plan {
             LogicalPlan::Projection { exprs, input, .. } => {
                 assert_eq!(exprs.len(), 2);
@@ -1604,9 +1644,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_multiple_aggregates_with_group_by() {
-        let plan = plan_sql("SELECT name, SUM(age), COUNT(*) FROM users GROUP BY name").unwrap();
+    #[tokio::test]
+    async fn test_multiple_aggregates_with_group_by() {
+        let plan = plan_sql("SELECT name, SUM(age), COUNT(*) FROM users GROUP BY name")
+            .await
+            .unwrap();
         match &plan {
             LogicalPlan::Projection { exprs, .. } => {
                 assert_eq!(exprs.len(), 3);
@@ -1615,10 +1657,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_implicit_aggregate_no_group_by() {
+    #[tokio::test]
+    async fn test_implicit_aggregate_no_group_by() {
         // Bug: SELECT SUM(age) FROM users failed — SUM treated as scalar function
-        let plan = plan_sql("SELECT SUM(age) FROM users").unwrap();
+        let plan = plan_sql("SELECT SUM(age) FROM users").await.unwrap();
         match &plan {
             LogicalPlan::Projection { input, .. } => {
                 assert!(matches!(input.as_ref(), LogicalPlan::Aggregate { .. }));
@@ -1633,9 +1675,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_count_star_no_group_by() {
-        let plan = plan_sql("SELECT COUNT(*) FROM users").unwrap();
+    #[tokio::test]
+    async fn test_count_star_no_group_by() {
+        let plan = plan_sql("SELECT COUNT(*) FROM users").await.unwrap();
         match &plan {
             LogicalPlan::Projection { input, .. } => {
                 assert!(matches!(input.as_ref(), LogicalPlan::Aggregate { .. }));
@@ -1644,11 +1686,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_order_by_aggregate() {
+    #[tokio::test]
+    async fn test_order_by_aggregate() {
         // Bug: ORDER BY SUM(age) failed with "column not found"
         let plan =
             plan_sql("SELECT name, SUM(age) FROM users GROUP BY name ORDER BY SUM(age) DESC")
+                .await
                 .unwrap();
         match &plan {
             LogicalPlan::Sort { order_by, .. } => {
@@ -1659,11 +1702,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_join_with_aggregate() {
+    #[tokio::test]
+    async fn test_join_with_aggregate() {
         let plan = plan_sql(
             "SELECT users.name, SUM(orders.amount) FROM users JOIN orders ON users.id = orders.user_id GROUP BY users.name",
-        ).unwrap();
+        ).await.unwrap();
         match &plan {
             LogicalPlan::Projection { exprs, .. } => {
                 assert_eq!(exprs.len(), 2);
@@ -1672,11 +1715,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_logical_plan_serialization_roundtrip() {
+    #[tokio::test]
+    async fn test_logical_plan_serialization_roundtrip() {
         let plan = plan_sql(
             "SELECT users.name, SUM(orders.amount) FROM users JOIN orders ON users.id = orders.user_id GROUP BY users.name",
-        ).unwrap();
+        ).await.unwrap();
 
         let json = serde_json::to_string(&plan).unwrap();
         assert!(!json.is_empty());

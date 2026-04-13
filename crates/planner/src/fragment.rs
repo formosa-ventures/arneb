@@ -159,12 +159,14 @@ impl PlanFragmenter {
                 table,
                 schema,
                 alias,
+                properties,
             } => {
                 // TableScan becomes a SOURCE fragment.
                 let scan_plan = LogicalPlan::TableScan {
                     table: table.clone(),
                     schema: schema.clone(),
                     alias: alias.clone(),
+                    properties: properties.clone(),
                 };
                 let fragment = PlanFragment {
                     id: self.next_id(),
@@ -351,6 +353,7 @@ mod tests {
                 nullable: false,
             }],
             alias: None,
+            properties: Default::default(),
         }
     }
 

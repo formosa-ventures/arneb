@@ -360,6 +360,7 @@ mod tests {
                 nullable: false,
             }],
             alias: None,
+            properties: Default::default(),
         }
     }
 

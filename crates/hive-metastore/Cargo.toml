@@ -1,0 +1,18 @@
+[package]
+name = "hive-metastore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Hive Metastore Thrift client generated from Hive 4.2.0 IDL"
+
+[lib]
+name = "hive_metastore"
+path = "src/lib.rs"
+
+[dependencies]
+volo = "0.10"
+volo-thrift = "0.10"
+pilota = "0.11"
+anyhow = { workspace = true }
+async-trait.workspace = true

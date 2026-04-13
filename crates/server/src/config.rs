@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Result};
 use arneb_common::types::DataType;
 use arneb_common::ServerConfig;
+use arneb_connectors::{CloudStorageConfig, S3StorageConfig};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -15,6 +16,126 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub cluster: ClusterConfig,
+
+    /// Global storage backend configuration.
+    #[serde(default)]
+    pub storage: StorageConfig,
+
+    /// External catalog configurations (e.g., Hive Metastore).
+    #[serde(default)]
+    pub catalogs: Vec<CatalogConfig>,
+}
+
+/// External catalog configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct CatalogConfig {
+    /// Catalog name (used in SQL: `SELECT * FROM <name>.schema.table`).
+    pub name: String,
+    /// Catalog type (currently only "hive" is supported).
+    #[serde(rename = "type")]
+    pub catalog_type: String,
+    /// Hive Metastore URI (e.g., "thrift://hms.internal:9083").
+    pub metastore_uri: Option<String>,
+    /// Default schema name within this catalog.
+    #[serde(default = "default_catalog_schema")]
+    pub default_schema: String,
+    /// Per-catalog storage configuration (overrides global [storage]).
+    pub storage: Option<StorageConfig>,
+}
+
+fn default_catalog_schema() -> String {
+    "default".to_string()
+}
+
+/// Global storage backend configuration.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct StorageConfig {
+    /// AWS S3 configuration.
+    pub s3: Option<S3Config>,
+    /// Google Cloud Storage configuration.
+    pub gcs: Option<GcsConfig>,
+    /// Azure Blob Storage configuration.
+    pub azure: Option<AzureConfig>,
+}
+
+/// AWS S3 storage configuration.
+///
+/// Credential resolution: config > env var (`AWS_ACCESS_KEY_ID`) > IAM role.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct S3Config {
+    /// AWS region (e.g., "us-east-1").
+    pub region: Option<String>,
+    /// Custom endpoint URL (for MinIO, LocalStack, etc.).
+    pub endpoint: Option<String>,
+    /// Allow HTTP (non-TLS) connections. Default: false.
+    #[serde(default)]
+    pub allow_http: bool,
+    /// AWS access key ID. Overrides `AWS_ACCESS_KEY_ID` env var.
+    pub access_key_id: Option<String>,
+    /// AWS secret access key. Overrides `AWS_SECRET_ACCESS_KEY` env var.
+    pub secret_access_key: Option<String>,
+}
+
+/// Google Cloud Storage configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct GcsConfig {
+    /// Path to service account JSON key file.
+    pub service_account_path: Option<String>,
+}
+
+/// Azure Blob Storage configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct AzureConfig {
+    /// Azure storage account name.
+    pub storage_account: Option<String>,
+    /// Azure storage access key.
+    pub access_key: Option<String>,
+}
+
+impl StorageConfig {
+    /// Merge per-catalog storage config over global config.
+    ///
+    /// Per-catalog fields take precedence when present;
+    /// global fields are used as fallback.
+    pub fn merge(global: &StorageConfig, catalog: Option<&StorageConfig>) -> StorageConfig {
+        let catalog = match catalog {
+            Some(c) => c,
+            None => return global.clone(),
+        };
+
+        StorageConfig {
+            s3: match (&catalog.s3, &global.s3) {
+                (Some(cat), _) => Some(cat.clone()),
+                (None, global_s3) => global_s3.clone(),
+            },
+            gcs: match (&catalog.gcs, &global.gcs) {
+                (Some(cat), _) => Some(cat.clone()),
+                (None, global_gcs) => global_gcs.clone(),
+            },
+            azure: match (&catalog.azure, &global.azure) {
+                (Some(cat), _) => Some(cat.clone()),
+                (None, global_azure) => global_azure.clone(),
+            },
+        }
+    }
+
+    /// Convert to the connector-layer `CloudStorageConfig`.
+    pub fn to_cloud_config(&self) -> CloudStorageConfig {
+        CloudStorageConfig {
+            s3: self.s3.as_ref().map(|s3| S3StorageConfig {
+                region: s3.region.clone(),
+                endpoint: s3.endpoint.clone(),
+                allow_http: s3.allow_http,
+                access_key_id: s3.access_key_id.clone(),
+                secret_access_key: s3.secret_access_key.clone(),
+            }),
+        }
+    }
 }
 
 /// Cluster configuration for distributed mode.
@@ -116,6 +237,8 @@ impl AppConfig {
                         server: ServerConfig::default(),
                         tables: Vec::new(),
                         cluster: ClusterConfig::default(),
+                        storage: StorageConfig::default(),
+                        catalogs: Vec::new(),
                     }
                 }
             }
@@ -129,6 +252,8 @@ impl AppConfig {
             server,
             tables: config.tables,
             cluster: config.cluster,
+            storage: config.storage,
+            catalogs: config.catalogs,
         })
     }
 }
@@ -202,6 +327,104 @@ port = 5432
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.server.port, 5432);
         assert!(config.tables.is_empty());
+    }
+
+    #[test]
+    fn test_app_config_with_storage() {
+        let toml_str = r#"
+bind_address = "0.0.0.0"
+port = 5432
+
+[storage.s3]
+region = "us-east-1"
+endpoint = "http://localhost:9000"
+allow_http = true
+
+[storage.gcs]
+service_account_path = "/path/to/sa.json"
+
+[[tables]]
+name = "remote"
+path = "s3://my-bucket/data/events.parquet"
+format = "parquet"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let s3 = config.storage.s3.unwrap();
+        assert_eq!(s3.region.as_deref(), Some("us-east-1"));
+        assert_eq!(s3.endpoint.as_deref(), Some("http://localhost:9000"));
+        assert!(s3.allow_http);
+
+        let gcs = config.storage.gcs.unwrap();
+        assert_eq!(
+            gcs.service_account_path.as_deref(),
+            Some("/path/to/sa.json")
+        );
+
+        assert!(config.storage.azure.is_none());
+
+        assert_eq!(config.tables[0].path, "s3://my-bucket/data/events.parquet");
+    }
+
+    #[test]
+    fn test_app_config_with_hive_catalog() {
+        let toml_str = r#"
+bind_address = "0.0.0.0"
+port = 5432
+
+[[catalogs]]
+name = "datalake"
+type = "hive"
+metastore_uri = "thrift://hms.internal:9083"
+default_schema = "analytics"
+
+[catalogs.storage]
+[catalogs.storage.s3]
+region = "us-west-2"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.catalogs.len(), 1);
+        let cat = &config.catalogs[0];
+        assert_eq!(cat.name, "datalake");
+        assert_eq!(cat.catalog_type, "hive");
+        assert_eq!(
+            cat.metastore_uri.as_deref(),
+            Some("thrift://hms.internal:9083")
+        );
+        assert_eq!(cat.default_schema, "analytics");
+        let s3 = cat.storage.as_ref().unwrap().s3.as_ref().unwrap();
+        assert_eq!(s3.region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn test_app_config_multiple_catalogs() {
+        let toml_str = r#"
+bind_address = "0.0.0.0"
+port = 5432
+
+[[catalogs]]
+name = "prod"
+type = "hive"
+metastore_uri = "thrift://hms-prod:9083"
+
+[[catalogs]]
+name = "staging"
+type = "hive"
+metastore_uri = "thrift://hms-staging:9083"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.catalogs.len(), 2);
+        assert_eq!(config.catalogs[0].name, "prod");
+        assert_eq!(config.catalogs[1].name, "staging");
+    }
+
+    #[test]
+    fn test_app_config_no_catalogs() {
+        let toml_str = r#"
+bind_address = "0.0.0.0"
+port = 5432
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.catalogs.is_empty());
     }
 
     #[test]

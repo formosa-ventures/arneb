@@ -43,10 +43,15 @@ pub trait ConnectorFactory: Send + Sync + Debug {
     fn name(&self) -> &str;
 
     /// Creates a data source for the given table.
+    ///
+    /// `properties` contains connector-specific metadata from the catalog
+    /// (e.g., storage location for Hive tables). Connectors that don't
+    /// need extra properties can ignore this parameter.
     fn create_data_source(
         &self,
         table: &TableReference,
         schema: &[ColumnInfo],
+        properties: &std::collections::HashMap<String, String>,
     ) -> Result<Arc<dyn DataSource>, ConnectorError>;
 
     /// Returns the DDL provider for this connector, if it supports write operations.
@@ -94,6 +99,7 @@ mod tests {
             &self,
             _table: &TableReference,
             _schema: &[ColumnInfo],
+            _properties: &std::collections::HashMap<String, String>,
         ) -> Result<Arc<dyn DataSource>, ConnectorError> {
             Err(ConnectorError::UnsupportedOperation("dummy".to_string()))
         }

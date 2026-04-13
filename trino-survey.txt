@@ -1,0 +1,260 @@
+構建基於 Rust 的高性能分散式 SQL 查詢引擎：Trino 替代方案之技術規格與實現深度研究報告
+緒論：大數據分析引擎的範式轉移與 Rust 的歷史機遇
+在大數據交互式分析的演進歷程中，分散式 SQL 查詢引擎始終處於核心地位。從最初由 Facebook 開發的 Presto 到後來的分支 Trino，這些基於 Java 虛擬機（JVM）的大量平行處理（MPP）引擎，成功地定義了「存算分離」與「數據聯邦」的現代架構 1。Trino 憑藉其強大的連接器生態系統與 ANSI SQL 兼容性，已成為處理 PB 級數據湖的核心大腦 2。然而，隨著計算硬體邁向多核與高速網絡的新紀元，JVM 架構在內存管理、垃圾回收（GC）延遲、序列化開銷以及 CPU 週期利用率等方面的侷限性，正逐漸成為技術瓶頸 5。
+與此同時，Rust 編程語言的崛起為資料庫系統的重新構建提供了前所未有的技術支撐。Rust 具備的內存安全性、零成本抽象以及對非對稱多處理（Asymmetric Multiprocessing）的優化能力，使其成為打造高效能查詢引擎的理想選擇 8。當前，業界正觀察到從傳統的託管語言轉向系統級語言的趨勢，特別是在 Apache DataFusion、Ballista 等專案的推動下，一個基於 Rust 生態的 Trino 替代方案已具備成熟的實作路徑 5。
+本研究旨在深入探討如何利用 Rust 及其生態系統，成功打造一套具備高性能、高擴展性與安全隔離能力的分布式查詢引擎，以作為 Trino 的下一代替代方案。
+核心架構規格：協調器與工作節點的重塑
+一個健全的分布式查詢引擎必須繼承並優化 Trino 的協調器-工作節點（Coordinator-Worker）模型。在 Rust 實作中，這一模型需要整合異步運行時（Async Runtime）與 Actor 模型，以解決 Java 在處理大規模併發連接時的資源浪費問題 11。
+協調器（Coordinator）：智慧大腦的邏輯規格
+協調器是整個系統的指揮中心。在 Rust 版替代方案中，協調器的核心責任是將 SQL 文本轉化為一個高度優化的分布式執行計畫 6。
+第一階段為解析與語法分析。傳統 Trino 使用 Antlr 進行 SQL 解析，而在 Rust 生態中，sqlparser-rs 已成為事實上的標準 14。該解析器提供手寫的遞歸下降解析與 Pratt 解析法，能精確處理運算符優先級，並支持多種 SQL 方言 15。分析器則需結合元數據 SPI，驗證表的存在性、列類型的一致性以及用戶權限 12。
+第二階段為計畫生成與優化。邏輯計畫生成器將抽象語法樹（AST）轉化為一系列邏輯算子（Logical Operators），隨後優化器通過一系列重寫規則（Rewriting Rules）進行優化 12。這包括謂詞下推（Predicate Pushdown）、投影剪裁（Projection Pruning）以及關鍵的關聯重新排序（Join Reordering） 2。
+第三階段為計畫分段（Fragmentation）。優化後的邏輯計畫被切割為多個執行片段（Fragments），每個片段定義了數據流的邊界 12。在 Trino 中，這決定了數據何時需要通過網絡進行交換（Exchange） 20。
+工作節點（Worker）：高效執行的苦力規格
+工作節點負責具體的算子執行。Rust 實作應全面採用向量化計畫（Vectorized Planning），利用 Apache Arrow 的內存布局來獲取極速性能 5。
+每個工作節點的核心是任務執行器（Task Executor）。在處理數據分片（Splits）時，執行器會實例化驅動程序（Drivers），這些驅動程序是算子管道（Operator Pipeline）的物理實體 23。Rust 的 tokio 任務調度機制能比 Java 的線程池更有效地處理 I/O 密集型任務，減少上下文切換開銷 12。
+
+核心組件
+功能描述
+技術實現建議 (Rust)
+計畫解析
+SQL 文本到 AST 的轉化
+sqlparser-rs (ANSI 兼容) 15
+邏輯計畫
+關係代數表示
+DataFusion LogicalPlan 8
+執行片段
+分散式計畫切分
+PlanFragmenter (自定義實現) 12
+任務執行
+分片處理與流水線執行
+DataFusion ExecutionPlan + tokio 5
+內存池
+算子內存控制
+基於 arrow::MemoryPool 的配額管理 26
+
+成本優化器（CBO）實現詳解
+關聯操作的順序決定了查詢性能的量級差異。Rust 替代方案必須實現一套能媲美甚至超越 Trino 的 CBO 系統 19。
+關聯重新排序算法：從連通子圖到超圖
+對於涉及多表連接的查詢，枚舉所有可能的連接計畫是計算密集的。Trino 在自動模式下會根據表統計信息選擇最優順序 27。
+DPHyp 算法：對於較小規模的查詢（通常表數量 ），應實現基於超圖（Hypergraph）的動態規劃算法 29。該算法能遍歷所有連通子圖，確保在不產生交叉連接（Cross Join）的情況下找到成本最低的計畫 29。Rust 的強類型枚舉非常適合表示超邊與連通性約束。
+遺傳算法（GA）與隨機優化：當連接表數量超過預定義閾值（如 12 個）時，枚舉空間呈階乘級別爆炸 30。此時系統應切換到遺傳算法，在有限的優化時間內尋找局部最優解 30。
+成本模型與統計信息採集
+成本模型的準確性依賴於連接器（Connector）提供的統計數據 12。Rust SPI 應定義一套標準接口來獲取：
+基數估計（Cardinality Estimation）：估算各算子的輸出行數。
+選擇率估計（Selectivity）：利用 join-multi-clause-independence-factor 等參數調整多條件下的過濾效率估算 31。
+硬體成本矩陣：量化 CPU 週期、內存帶寬以及網絡 Shuffle 的相對開銷 6。
+在實踐中，優化器會探索不同的關聯分佈模式。廣播關聯（Broadcast Join）適用於一側數據量極小（如 ）的情況，將其複製到所有節點 27。而分區關聯（Partitioned Join）則需對雙側數據進行哈希重分佈，以支持超大規模數據集的關聯 27。
+任務調度與執行狀態機設計
+分布式環境下的任務調度需要處理複雜的節點狀態與容錯機制。Trino 的 QueryStateMachine 提供了一個從 QUEUED、PLANNING 到 RUNNING、FINISHED 的嚴謹狀態轉移模型 12。
+分層調度器規格
+QueryScheduler：負責整體的查詢生命週期管理。它將執行片段實例化為特定節點上的任務（Tasks） 12。
+StageScheduler：負責管理查詢執行階段。每個階段由一組平行執行的任務組成 12。
+SourcePartitionedScheduler：針對讀取數據源的特殊階段，負責從連接器批量獲取分片並將其放置在合適的工作節點上 12。
+節點調度策略（Node Scheduling）
+為了最大化叢集吞吐量，系統需要精確控制分片的分配 34：
+負載感知調度：調度器應監控各節點的 max-splits-per-node。Trino 預設每個節點最多處理 256 個標準分片 34。
+數據局部性優化：對於支持局部性（Locality）的數據源（如 HDFS 或本地磁碟），調度器應優先將分片分配給存儲該數據的節點 34。
+動態隊列調整：若某節點處理分片速度極快，調度器應動態上調其任務緩衝區，以減少因頻繁心跳導致的延遲 34。
+
+狀態名稱
+描述
+觸發條件
+QUEUED
+查詢進入系統隊列
+資源組配額檢查中 12
+PLANNING
+計畫生成中
+正在調用優化器與 CBO 12
+STARTING
+任務開始分發
+調度器已選定節點並發送請求 12
+RUNNING
+數據正在處理
+至少有一個 Driver 正在工作 12
+FINISHING
+數據處理完畢
+最後一個結果頁面（Page）已生成 12
+FINISHED
+查詢結束
+結果已完全傳回客戶端 12
+
+執行引擎與向量化處理核心
+Rust 替代方案的核心競爭力在於其基於 Apache Arrow 的向量化執行。這不僅避開了 Java 虛擬機的對象頭（Object Header）開銷，更實現了對現代 CPU 特性的極致壓榨 5。
+Apache Arrow 的內存優勢
+傳統引擎（如 Presto 的原始版本）常採用行式處理或緩衝行塊。而在 Rust 替代方案中，數據必須以 Arrow 的列式格式存在於內存中 8。
+零拷貝數據讀取：Arrow 的 C Data Interface 允許不同語言、甚至 WASM 插件與主進程共享同一塊內存區域，無需費時的序列化 38。
+SIMD 指令加速：利用 arrow-rs 等庫，可以針對數列運算、過濾與聚合操作生成 AVX-512 或 NEON 指令。這使得單核 CPU 處理數據的速度提升 5-10 倍 22。
+緩存命中率提升：由於同一列的數據在物理上是連續存放的，處理循環具備極佳的空間局部性（Spatial Locality），大幅減少了緩存失效（Cache Miss） 22。
+分段執行與平行化
+執行引擎將計畫片段轉化為物理操作管道。Rust 的 DataFusion 框架已提供了豐富的算子庫，包括 FilterExec、ProjectionExec 與 HashJoinExec 21。
+為了支持大規模計算，必須實施嚴格的內存配額管理。當聚合操作或關聯操作超過單機內存上限時，引擎應觸發溢寫（Spilling）機制，將中間結果（如 Hash Table 的部分分區）序列化到本地磁碟，並配合 ZSTD 壓縮以減少 I/O 壓力 6。
+數據交換規格：從 HTTP 轉向 Arrow Flight SQL
+Trino 叢集的數據交換長期依賴於自定義的行格式與 HTTP REST API，這在處理海量結果集時會造成嚴重的 CPU 序列化負載 44。在 Rust 替代方案中，應全面改用 Arrow Flight SQL 45。
+Arrow Flight SQL 的運作機制
+Flight SQL 是一個基於 gRPC 的高性能協議，旨在標準化資料庫客戶端與伺服器間的通訊 45。
+原生列式傳輸：數據以 Arrow RecordBatches 形式直接寫入網絡流，發送端無需「行轉列」，接收端也無需「列轉行」 7。
+多流平行讀取：Flight 支持「票據（Ticket）」機制。協調器傳回一組位置信息，客戶端可以同時向多個工作節點發起並行請求，拉取數據片段。這完全消除了單點輸出的瓶頸 45。
+性能基準對比：在實際生產環境測試中，Flight SQL 的數據傳輸速度比傳統 JDBC 快 20-100 倍，且 CPU 佔用率降低了 80% 以上 7。
+
+傳輸技術
+是否零拷貝
+併發能力
+CPU 負荷
+推薦程度
+JDBC (Java)
+否
+低 (單連接)
+極高 7
+不推薦
+JSON Over HTTP
+否
+極低
+災難級 7
+僅限偵錯
+Trino Direct
+否
+中
+中
+可接受
+Arrow Flight SQL
+是
+高 (多流)
+極低 45
+強烈推薦
+
+基於 WebAssembly (WASM) 的插件與連接器規格
+Trino 的成功源於其可擴展的連接器 SPI 1。Rust 替代方案需要一個不僅支持 Rust，更能兼容多語言且具備強沙箱能力的插件系統。WebAssembly 正是解法 22。
+WASM 作為連接器容器的優勢
+強隔離安全性：連接器代碼在獨立的內存沙箱中運行。即使某個自定義連接器崩潰或發生內存洩漏，也不會波及整個工作節點進程 22。
+跨語言擴展性：開發者可以使用 C++、Go、AssemblyScript 甚至 Rust 編寫插件。編譯為 WASM 後，主引擎（使用 wasmtime）可以無縫調用其功能 22。
+動態載入與熱更新：無需重啟伺服器即可更新連接器邏輯。這對於雲原生環境下的持續部署至關重要 22。
+實現零拷貝連接器 SPI
+為了在 WASM 插件中獲取極高性能，必須實施共享內存策略。主機進程（Host）將一個內存區域（Memory Region）映射給 WASM 模組 38。連接器直接在該區域填充數據。配合 Arrow C Data Interface，數據在產生的那一刻即對主引擎可見，完全消除了跨越 WASM 邊界的拷貝成本 38。
+湖倉一體集成：Iceberg-rust 深度研調
+作為 Trino 最核心的應用場景之一，對 Apache Iceberg 表格式的支持必須達到工業級水準 56。
+Rust 版 Iceberg 支持規格
+當前 iceberg-rust 專案正在迅速追趕 Java 實作的功能 56。
+V2 格式支持：必須支持 Merge-on-Read (MoR) 模式，這要求引擎能高效處理 Position Deletes 與 Equality Deletes 文件 58。
+元數據剪裁（Metadata Pruning）：引擎應直接解析 Iceberg 的 metadata.json 與 Manifest 文件，利用分區統計信息（Min/Max）在掃描前過濾 90% 以上的無效文件 43。
+Schema 進化與時間旅行：支持基於 Snapshot ID 的查詢，並處理複雜的列 Add/Drop 操作，確保查詢始終能獲取到正確版本的數據 56。
+與 Java 版本的差異與改進
+Rust 實現可以更積極地採用非同步 I/O。當調度器發現需要讀取 1000 個 Parquet 文件時，可以利用 object_store 庫發起並行請求，並通過向量化 Parquet 讀取器直接將磁碟數據轉化為內存中的 Arrow 陣列，這在性能上相較於 JVM 的傳統同步讀取路徑有顯著優勢 5。
+
+功能領域
+Trino (Java) 現狀
+Rust 替代方案目標
+查詢計畫
+基於 Java 統計模型 28
+深度整合 Puffin 文件摘要 57
+讀取速度
+受限於 JVM Heap 管理
+零拷貝向量化 Parquet 讀取 61
+寫入性能
+同步寫入，延遲較高
+異步多線程並行寫入 12
+格式支持
+支持 V1/V2 56
+率先支持 V3 deletion vectors 64
+
+共通查詢中間表示：Substrait 的應用
+為了打破計算引擎間的「巴別塔」，建議將 Substrait 作為 Rust 替代方案的標準計畫交換格式 66。
+Substrait 提供了一個引擎無關的關係代數序列化標準。這意味著：
+跨工具協作：用戶可以在 Python 中使用 Ibis 構建查詢，生成 Substrait 計畫後直接提交給 Rust 引擎執行，無需通過 SQL 字符串 66。
+優化結果重用：如果前端解析器（如 Apache Calcite）已經完成了複雜的 Join 重新排序與邏輯優化，Rust 引擎可以直接消費該計畫，節省協調器的 CPU 負載 66。
+視圖定義一致性：利用 Substrait 定義 SQL 視圖，可以確保在不同的引擎（如 Spark 與 Rust 引擎）間獲取完全一致的查詢語義 66。
+成功打造 Rust Trino 替代方案的技術路線圖
+要成功交付一個可用的 Trino 替代方案，開發團隊應遵循以下戰略階段：
+第一階段：單機向量化核心 (Months 1-4)
+建立算子庫：整合 arrow-rs 與 DataFusion 的基礎算子，確保物理執行的向量化程度達到 100% 8。
+SQL 兼容性測試：利用 sqlparser-rs 實現完整的 ANSI SQL 解析，並對齊 Trino 的特殊語法（如 UNNEST、TRY 函數） 15。
+高性能存儲讀取：完成對 Parquet 與 CSV 格式的深度優化，實現谓词下推與 Page 級別的剪裁 19。
+第二階段：分散式架構與數據交換 (Months 5-9)
+調度狀態機開發：實現具備狀態追蹤、負載平衡與初步容錯能力的調度器 1。
+Flight SQL 通訊層：使用 tonic (Rust 的 gRPC 框架) 實作 Flight SQL 服務器，用於節點間的數據 Shuffle 45。
+元數據管理：建立對 Hive Metastore 與 Iceberg REST Catalog 的原生 Rust 客戶端支持 58。
+第三階段：生態擴展與安全加固 (Months 10-15)
+WASM 插件系統：設計並開放 WASM 連接器 SDK，允許第三方開發者擴展數據源支持 22。
+進階優化規則：引入基於超圖的 DPHyp 計畫優化器與動態過濾（Dynamic Filtering）機制 29。
+安全審計與權限：整合 RBAC 權限管理模型，實現行級與列級的訪問控制 1。
+結論：邁向更高效、更安全的數據未來
+通過本研究的深度技術調研與規格界定，我們得出的結論是：利用 Rust 重新定義分散式 SQL 查詢引擎不僅是可行的，更是數據基礎設施演進的必然趨勢。
+Rust 的強大之處在於它能在不犧牲開發者生產力的前提下，提供極致的硬體利用率。通過整合 Apache Arrow 標準、WASM 插件體系以及 Flight SQL 高性能傳輸，新的替代方案將能徹底解決 Trino 在大內存與高併發場景下的性能疲態。這不僅是一次語言的更換，更是一次對計算資源調度、數據傳輸語義以及系統安全性邊界的全面升級。
+隨著數據湖倉架構的日益普及，組織對低成本、亞秒級響應與無廠商鎖定引擎的需求將持續激增。這套基於 Rust 的技術規格，將為打造一個能夠支撐未來十年分析需求的「Ludicrous Speed」查詢引擎奠定堅實的基石。
+引用的著作
+Introduction to Trino - Acceldata Open Source Data Platform, 檢索日期：3月 25, 2026， https://docs.acceldata.io/odp/documentation/introduction-to-trino
+Understanding Trino and Presto: Core Features Explained - CelerData, 檢索日期：3月 25, 2026， https://celerdata.com/glossary/understanding-trino-and-presto
+Apache Arrow vs. Trino Comparison - SourceForge, 檢索日期：3月 25, 2026， https://sourceforge.net/software/compare/Apache-Arrow-vs-Trino/
+Is Trino the PostgreSQL of Analytics? | by Sanjeev Mohan - Medium, 檢索日期：3月 25, 2026， https://sanjmo.medium.com/is-trino-the-postgresql-of-analytics-cb263b0fa98e
+Apache DataFusion: The Quiet Engine Powering the Next Generation of Data Systems | by Mojtaba Banaie | Medium, 檢索日期：3月 25, 2026， https://medium.com/@mojtaba.banaie/apache-datafusion-the-quiet-engine-powering-the-next-generation-of-data-systems-38a6b502cea0
+The Trino Optimization Handbook, 檢索日期：3月 25, 2026， https://ivan-shamaev.ru/wp-content/uploads/2025/10/Trino-Ebook.pdf
+How We Made Consuming Trino Results from Python 400× Faster with Apache Arrow | by Jonasbrami | Mar, 2026 | Medium, 檢索日期：3月 25, 2026， https://medium.com/@jonasbrami/how-we-made-consuming-trino-results-from-python-400-faster-with-apache-arrow-7b1578940c37
+Compare Apache DataFusion vs. Trino in 2026 - Slashdot, 檢索日期：3月 25, 2026， https://slashdot.org/software/comparison/Apache-DataFusion-vs-Trino/
+Discussion: "Goals of DataFusion" / "Vision" for DataFusion · apache datafusion · Discussion #6441 - GitHub, 檢索日期：3月 25, 2026， https://github.com/apache/datafusion/discussions/6441
+Apache Data Fusion: Building Next-Generation Analytics from the Ground Up - Medium, 檢索日期：3月 25, 2026， https://medium.com/data-reply-it-datatech/apache-data-fusion-building-next-generation-analytics-from-the-ground-up-560032a151d4
+Trino concepts — Starburst Enterprise, 檢索日期：3月 25, 2026， https://docs.starburst.io/latest/overview/concepts.html
+Trino - Distributed SQL Query Engine - Augment Code, 檢索日期：3月 25, 2026， https://www.augmentcode.com/open-source/trinodb/trino
+Trino Deep Dive - Whitestork, 檢索日期：3月 25, 2026， https://whitestork.me/blog/13/Trino-Deep-Dive
+Writing a Rust SQL Parser in One Week | LakeSail Blog, 檢索日期：3月 25, 2026， https://lakesail.com/blog/sql-parser-in-one-week/
+apache/datafusion-sqlparser-rs: Extensible SQL Lexer and Parser for Rust - GitHub, 檢索日期：3月 25, 2026， https://github.com/apache/datafusion-sqlparser-rs
+matanolabs/sqlparser-rs: Extensible SQL Lexer and Parser for Rust - GitHub, 檢索日期：3月 25, 2026， https://github.com/matanolabs/sqlparser-rs
+Why We Built Our Own SQL Parser From Scratch: A Rust Implementation Story, 檢索日期：3月 25, 2026， https://www.databend.com/blog/category-engineering/2025-09-10-query-parser/
+Trino Code Reading - Keisuke Suzuki, 檢索日期：3月 25, 2026， https://www.keisuke.dev/memo/database/2021-04-29-trino_code_reading.html
+Trino Query Optimization: Best Practices for Speed & Efficiency - CelerData, 檢索日期：3月 25, 2026， https://celerdata.com/glossary/trino-query-optimization
+EXPLAIN — Trino 479 Documentation, 檢索日期：3月 25, 2026， https://trino.io/docs/current/sql/explain.html
+Reading Explain Plans — Apache DataFusion documentation, 檢索日期：3月 25, 2026， https://datafusion.apache.org/user-guide/explain-usage.html
+WASM + Arrow at the Edge. How a zero-copy columnar format and… | by Codastra | Medium, 檢索日期：3月 25, 2026， https://medium.com/@2nick2patel2/wasm-arrow-at-the-edge-18ec95396d4a
+Trino concepts — Trino 479 Documentation, 檢索日期：3月 25, 2026， https://trino.io/docs/current/overview/concepts.html
+Presto: SQL on Everything - Trino, 檢索日期：3月 25, 2026， https://trino.io/Presto_SQL_on_Everything.pdf
+Building Logical Plans — Apache DataFusion documentation, 檢索日期：3月 25, 2026， https://datafusion.apache.org/library-user-guide/building-logical-plans.html
+Memory Management — Apache Arrow v23.0.1, 檢索日期：3月 25, 2026， https://arrow.apache.org/docs/cpp/memory.html
+Cost-based optimizations — Trino 479 Documentation, 檢索日期：3月 25, 2026， https://trino.io/docs/current/optimizer/cost-based-optimizations.html
+Introduction to Trino Cost-Based Optimizer, 檢索日期：3月 25, 2026， https://trino.io/blog/2019/07/04/cbo-introduction.html
+#07 Join Ordering: Bottom-Up :: 15-799 Special Topics in Databases: Query Optimization (Spring 2025) - Carnegie Mellon University, 檢索日期：3月 25, 2026， https://15799.courses.cs.cmu.edu/spring2025/notes/07-joins1.pdf
+TantorLabs/pg_dphyp: DPHyp join ordering algorithm for PostgreSQL - GitHub, 檢索日期：3月 25, 2026， https://github.com/TantorLabs/pg_dphyp
+Optimizer properties — Trino 479 Documentation, 檢索日期：3月 25, 2026， https://trino.io/docs/current/admin/properties-optimizer.html
+System variables | StarRocks, 檢索日期：3月 25, 2026， https://docs.starrocks.io/docs/sql-reference/System_variable/
+ClickHouse vs StarRocks vs Presto vs Trino vs Apache Spark™ — Comparing Analytics Engines - Onehouse, 檢索日期：3月 25, 2026， https://www.onehouse.ai/blog/apache-spark-vs-clickhouse-vs-presto-vs-starrocks-vs-trino-comparing-analytics-engines
+Node scheduler properties — Trino 479 Documentation, 檢索日期：3月 25, 2026， https://trino.io/docs/current/admin/properties-node-scheduler.html
+4.4. Properties Reference — Presto 334 Documentation - GitHub Pages, 檢索日期：3月 25, 2026， https://trinodb.github.io/docs.trino.io/334/admin/properties.html?utm_source=chatgpt.com
+Inefficient scheduling simple and quick to process splits for workers · Issue #15146 · trinodb/trino - GitHub, 檢索日期：3月 25, 2026， https://github.com/trinodb/trino/issues/15146
+How Gluten uses Substrait + Arrow | by Amit Singh Rathore - DataDrivenInvestor, 檢索日期：3月 25, 2026， https://medium.datadriveninvestor.com/how-gluten-uses-substrait-arrow-834240caaf02
+GitHub - kylebarron/arrow-js-ffi: Zero-copy reading of Arrow data from WebAssembly, 檢索日期：3月 25, 2026， https://github.com/kylebarron/arrow-js-ffi
+How to optimize data transfer with Apache Arrow? - Tencent Cloud, 檢索日期：3月 25, 2026， https://www.tencentcloud.com/techpedia/126167
+Zero-copy Apache Arrow with WebAssembly / Kyle Barron - Observable, 檢索日期：3月 25, 2026， https://observablehq.com/@kylebarron/zero-copy-apache-arrow-with-webassembly
+Introducing Minarrow — Apache Arrow implementation for HPC, Native Streaming, and Embedded Systems : r/rust - Reddit, 檢索日期：3月 25, 2026， https://www.reddit.com/r/rust/comments/1nad0us/introducing_minarrow_apache_arrow_implementation/
+Query plans | InfluxDB Cloud Dedicated Documentation, 檢索日期：3月 25, 2026， https://docs.influxdata.com/influxdb3/cloud-dedicated/reference/internals/query-plan/
+Trino Query Performance Optimization Guide: Code Hacks & Examples - E6data, 檢索日期：3月 25, 2026， https://www.e6data.com/query-and-cost-optimization-hub/how-to-optimize-trino-query-performance
+support apache arrow client #24586 - trinodb/trino - GitHub, 檢索日期：3月 25, 2026， https://github.com/trinodb/trino/issues/24586
+A Deep Dive into Apache Arrow Flight and Its Use Cases - CelerData, 檢索日期：3月 25, 2026， https://celerdata.com/glossary/a-deep-dive-into-apache-arrow-flight-and-its-use-cases
+Another big leap: Apache Doris 2.1.0 is released, 檢索日期：3月 25, 2026， https://doris.apache.org/blog/release-note-2.1.0/
+One Trick for a 100× Speed Boost: Unveiling the Black‑Magic Acceleration of Apache Doris + Arrow Flight SQL! | by Hayden | Medium, 檢索日期：3月 25, 2026， https://medium.com/@hhj19075/one-trick-for-a-100-speed-boost-unveiling-the-black-magic-acceleration-of-apache-doris-arrow-52526dc9604c
+Data Wants to Be Free: Fast Data Exchange with Apache Arrow, 檢索日期：3月 25, 2026， https://arrow.apache.org/blog/2025/02/28/data-wants-to-be-free/
+Accelerating Data Transfer with Apache Arrow Flight | TO THE NEW Blog, 檢索日期：3月 25, 2026， https://www.tothenew.com/blog/accelerating-data-transfer-with-apache-arrow-flight/
+Benchmarking the JDBC Bottleneck in Trino - Starburst, 檢索日期：3月 25, 2026， https://www.starburst.io/blog/benchmarking-the-jdbc-bottleneck-in-trino/
+The WebAssembly Component Model: A New Era of Interoperability and Composition, 檢索日期：3月 25, 2026， https://dev.to/vaib/the-webassembly-component-model-a-new-era-of-interoperability-and-composition-4am5
+Memory in wasmtime - Rust - Docs.rs, 檢索日期：3月 25, 2026， https://docs.rs/wasmtime/latest/wasmtime/struct.Memory.html
+SharedMemory in wasmtime - Rust, 檢索日期：3月 25, 2026， https://docs.wasmtime.dev/api/wasmtime/struct.SharedMemory.html
+How to Master the Rust WebAssembly Memory Model and Host Bindings - techbuddies.io, 檢索日期：3月 25, 2026， https://www.techbuddies.io/2026/01/30/how-to-master-the-rust-webassembly-memory-model-and-host-bindings/
+Flat data representation proposal: Enables zero copy shared memory, zero allocation return types, binary serialization · Issue #398 · WebAssembly/component-model - GitHub, 檢索日期：3月 25, 2026， https://github.com/WebAssembly/component-model/issues/398
+Iceberg connector — Trino 479 Documentation, 檢索日期：3月 25, 2026， https://trino.io/docs/current/connector/iceberg.html
+Why Iceberg is So Popular in 2025 | AutoMQ Blog, 檢索日期：3月 25, 2026， https://www.automq.com/blog/why-iceberg-is-so-popular-in-2025
+Apache Iceberg Trino: Modern Data Lakehouse Explained - PuppyGraph, 檢索日期：3月 25, 2026， https://www.puppygraph.com/blog/apache-iceberg-trino
+Apache Iceberg: Architecture, benefits, partitioning | Trino - Starburst, 檢索日期：3月 25, 2026， https://www.starburst.io/blog/introduction-to-apache-iceberg-in-trino/
+Comparative Analysis of Apache Iceberg and Trino in Modern Data Architectures - Medium, 檢索日期：3月 25, 2026， https://medium.com/@hossein.glmm/what-you-need-to-know-about-apache-iceberg-and-trino-fc027ffea748
+Apache DataFusion 51.0.0 Released, 檢索日期：3月 25, 2026， https://datafusion.apache.org/blog/output/2025/11/25/datafusion-51.0.0/
+2025 Year in Review: Apache Iceberg, Polaris, Parquet, and Arrow - DEV Community, 檢索日期：3月 25, 2026， https://dev.to/alexmercedcoder/2025-year-in-review-apache-iceberg-polaris-parquet-and-arrow-4l1p
+We Built an Open Source S3 Tables Alternative | by Yingjun Wu - Data Engineer Things, 檢索日期：3月 25, 2026， https://blog.dataengineerthings.org/we-built-an-open-source-s3-tables-alternative-2b3c95ef4b3a
+Iceberg v3: Getting Started - Starburst, 檢索日期：3月 25, 2026， https://www.starburst.io/blog/iceberg-v3/
+Iceberg v3 and Trino - Starburst forum, 檢索日期：3月 25, 2026， https://www.starburst.io/community/forum/t/iceberg-v3-and-trino/1356/
+Substrait — the Lingua Franca for Databases - Querify Labs, 檢索日期：3月 25, 2026， https://www.querifylabs.com/blog/substrait-the-lingua-franca-for-databases
+About Substrait - Substrait: Cross-Language Serialization for Relational Algebra, 檢索日期：3月 25, 2026， https://substrait.io/about/
+Home - Substrait: Cross-Language Serialization for Relational Algebra, 檢索日期：3月 25, 2026， https://substrait.io/
+​​One query plan, three different engines. | by Omri Eliyahu Levy | Medium, 檢索日期：3月 25, 2026， https://medium.com/@omri-levy/one-query-plan-three-different-engines-e5dc74aeb52f
+Powered by Substrait - Substrait: Cross-Language Serialization for Relational Algebra, 檢索日期：3月 25, 2026， https://substrait.io/community/powered_by/
+datafusion_substrait - Rust - Docs.rs, 檢索日期：3月 25, 2026， https://docs.rs/datafusion-substrait
+Powering Semantic SQL for AI Agents with Apache DataFusion - Wren AI, 檢索日期：3月 25, 2026， https://www.getwren.ai/post/powering-semantic-sql-for-ai-agents-with-apache-datafusion
+Optimizing SQL (and DataFrames) in DataFusion, Part 2, 檢索日期：3月 25, 2026， https://datafusion.apache.org/blog/2025/06/15/optimizing-sql-dataframes-part-two/
+Iceberg Catalogs 2025: Exploring Emerging Metadata Solutions - e6data, 檢索日期：3月 25, 2026， https://www.e6data.com/blog/iceberg-catalogs-2025-emerging-catalogs-modern-metadata-management
+Dynamic filtering — Trino 479 Documentation, 檢索日期：3月 25, 2026， https://trino.io/docs/current/admin/dynamic-filtering.html
+

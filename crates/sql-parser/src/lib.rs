@@ -498,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn parse_float_literal() {
         let stmt = parse("SELECT 3.14").unwrap();
         let Statement::Query(query) = stmt else {

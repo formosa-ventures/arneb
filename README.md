@@ -9,7 +9,7 @@ Trino (formerly PrestoSQL) lets users query data where it lives — across objec
 - **SQL Support**: SELECT, JOIN (INNER/LEFT/RIGHT/FULL/CROSS), GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, CASE/COALESCE/NULLIF, CTEs, UNION/INTERSECT/EXCEPT, window functions, subqueries (IN/EXISTS/scalar), DDL/DML (CREATE/DROP TABLE, INSERT, DELETE, views)
 - **19 Scalar Functions**: UPPER, LOWER, SUBSTRING, TRIM, CONCAT, LENGTH, REPLACE, POSITION, ABS, ROUND, CEIL, FLOOR, MOD, POWER, EXTRACT, CURRENT_DATE, DATE_TRUNC
 - **Arrow-native Execution**: Vectorized columnar processing using Apache Arrow
-- **Connectors**: In-memory tables, CSV files, Parquet files (with DDL write support for memory connector)
+- **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API)
 - **PostgreSQL Wire Protocol**: Compatible with psql, DBeaver, JDBC, psycopg2, node-postgres, and all standard PostgreSQL clients
 - **Extended Query Protocol**: Full prepared statement support (Parse/Bind/Describe/Execute/Sync)
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
@@ -113,12 +113,48 @@ crates/
 ├── catalog/       # Catalog/Schema/Table provider traits
 ├── planner/       # AST → LogicalPlan, optimizer, plan fragmenter
 ├── execution/     # Physical operators, scalar functions, DataSource trait
-├── connectors/    # Memory + File connectors, DDLProvider trait
+├── connectors/    # Memory + File connectors, object store abstraction (S3/GCS/Azure)
+├── hive/          # Hive Metastore catalog provider + HiveDataSource
+├── hive-metastore/# Auto-generated Thrift bindings from Hive 4.2.0 IDL
 ├── protocol/      # PostgreSQL wire protocol (Simple + Extended Query)
 ├── scheduler/     # QueryTracker, NodeRegistry, resource groups
 ├── rpc/           # Arrow Flight RPC for distributed execution
-└── server/        # Main binary, CLI, config, Web UI
+└── server/        # Main binary, CLI, config, Web UI, hive-demo-setup binary
 ```
+
+## Hive Metastore + S3 Demo
+
+Run Arneb against a real Hive Metastore backed by S3-compatible storage, end to
+end, on your laptop:
+
+```bash
+# 1. Bring up HMS 4.2.0 + MinIO via docker-compose
+#    (HMS image is built locally with hadoop-aws + aws-sdk v2 bundled,
+#     so it can validate s3a:// table locations)
+docker compose up -d
+
+# 2. Seed demo tables (writes Parquet to MinIO + registers HMS tables)
+cargo run --bin hive-demo-setup
+
+# 3. Start Arneb with the demo config
+cargo run --bin arneb -- --config scripts/arneb-hive-demo.toml
+
+# 4. Query via psql (or DBeaver / any Postgres client)
+psql -h 127.0.0.1 -p 5432 -c "SELECT * FROM datalake.demo.cities;"
+psql -h 127.0.0.1 -p 5432 -c "
+  SELECT c.name, SUM(o.amount) AS total
+  FROM datalake.demo.cities c
+  JOIN datalake.demo.orders o ON c.id = o.city_id
+  GROUP BY c.name ORDER BY total DESC;"
+
+# 5. Tear down
+docker compose down
+```
+
+The demo exercises the full stack: HMS Thrift (`_req` API surface) → catalog
+resolution → S3 object store → Parquet reader → pgwire response. See
+`crates/hive-metastore/README.md` for how to regenerate the Thrift bindings
+after updating the IDL.
 
 ## TPC-H Benchmark
 

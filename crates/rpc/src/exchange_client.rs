@@ -9,6 +9,7 @@ use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Ticket;
 use futures::TryStreamExt;
+use tonic::transport::Channel;
 
 /// Client that fetches RecordBatches from a remote Arrow Flight server.
 #[derive(Debug, Clone)]
@@ -33,7 +34,14 @@ impl ExchangeClient {
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
         let ticket = Ticket::new(format!("{task_id}:{partition_id}"));
 
-        let mut client = FlightServiceClient::connect(self.address.clone())
+        let channel = Channel::from_shared(self.address.clone())
+            .map_err(|e| {
+                ExecutionError::InvalidOperation(format!(
+                    "invalid Flight server address {}: {e}",
+                    self.address
+                ))
+            })?
+            .connect()
             .await
             .map_err(|e| {
                 ExecutionError::InvalidOperation(format!(
@@ -41,6 +49,7 @@ impl ExchangeClient {
                     self.address
                 ))
             })?;
+        let mut client = FlightServiceClient::new(channel);
 
         let response = client
             .do_get(ticket)
@@ -50,7 +59,7 @@ impl ExchangeClient {
         let flight_stream = FlightRecordBatchStream::new_from_flight_data(
             response
                 .into_inner()
-                .map_err(arrow_flight::error::FlightError::Tonic),
+                .map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
         );
 
         // Collect all batches (for simplicity — true streaming is a future optimization).

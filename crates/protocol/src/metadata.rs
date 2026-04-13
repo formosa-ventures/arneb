@@ -25,7 +25,7 @@ pub(crate) enum MetadataResponse {
 pub(crate) type MetadataResult = Result<MetadataResponse, String>;
 
 /// Try to handle a metadata query. Returns Some if intercepted, None if not.
-pub(crate) fn try_handle_metadata(
+pub(crate) async fn try_handle_metadata(
     sql: &str,
     catalog_manager: &CatalogManager,
 ) -> Option<MetadataResult> {
@@ -42,27 +42,27 @@ pub(crate) fn try_handle_metadata(
         return Some(handle_pg_type());
     }
     if has_from_table(&lower, "pg_class") || lower.contains("pg_catalog.pg_class") {
-        return Some(handle_pg_class(catalog_manager));
+        return Some(handle_pg_class(catalog_manager).await);
     }
     if has_from_table(&lower, "pg_attribute") || lower.contains("pg_catalog.pg_attribute") {
-        return Some(handle_pg_attribute(catalog_manager));
+        return Some(handle_pg_attribute(catalog_manager).await);
     }
     if has_from_table(&lower, "pg_namespace") || lower.contains("pg_catalog.pg_namespace") {
-        return Some(handle_pg_namespace(catalog_manager));
+        return Some(handle_pg_namespace(catalog_manager).await);
     }
     if has_from_table(&lower, "pg_database") || lower.contains("pg_catalog.pg_database") {
-        return Some(handle_pg_database());
+        return Some(handle_pg_database(catalog_manager));
     }
 
     // information_schema
     if lower.contains("information_schema.tables") {
-        return Some(handle_info_tables(catalog_manager));
+        return Some(handle_info_tables(catalog_manager).await);
     }
     if lower.contains("information_schema.columns") {
-        return Some(handle_info_columns(catalog_manager));
+        return Some(handle_info_columns(catalog_manager).await);
     }
     if lower.contains("information_schema.schemata") {
-        return Some(handle_info_schemata(catalog_manager));
+        return Some(handle_info_schemata(catalog_manager).await);
     }
 
     // current_database(), current_schema(), current_user
@@ -209,7 +209,7 @@ fn handle_pg_type() -> MetaResult {
 // pg_catalog.pg_namespace
 // ---------------------------------------------------------------------------
 
-fn handle_pg_namespace(catalog_manager: &CatalogManager) -> MetaResult {
+async fn handle_pg_namespace(catalog_manager: &CatalogManager) -> MetaResult {
     let mut names = Vec::new();
     let mut oids = Vec::new();
 
@@ -222,7 +222,7 @@ fn handle_pg_namespace(catalog_manager: &CatalogManager) -> MetaResult {
     // User schemas from catalogs
     for cat_name in catalog_manager.catalog_names() {
         if let Some(catalog) = catalog_manager.catalog(&cat_name) {
-            for schema_name in catalog.schema_names() {
+            for schema_name in catalog.schema_names().await {
                 if !names.contains(&schema_name) {
                     oids.push(stable_hash(&schema_name));
                     names.push(schema_name);
@@ -250,7 +250,7 @@ fn handle_pg_namespace(catalog_manager: &CatalogManager) -> MetaResult {
 // pg_catalog.pg_class
 // ---------------------------------------------------------------------------
 
-fn handle_pg_class(catalog_manager: &CatalogManager) -> MetaResult {
+async fn handle_pg_class(catalog_manager: &CatalogManager) -> MetaResult {
     let mut oids = Vec::new();
     let mut relnames = Vec::new();
     let mut relnamespaces = Vec::new();
@@ -259,10 +259,10 @@ fn handle_pg_class(catalog_manager: &CatalogManager) -> MetaResult {
 
     for cat_name in catalog_manager.catalog_names() {
         if let Some(catalog) = catalog_manager.catalog(&cat_name) {
-            for schema_name in catalog.schema_names() {
+            for schema_name in catalog.schema_names().await {
                 let ns_oid = stable_hash(&schema_name);
-                if let Some(schema) = catalog.schema(&schema_name) {
-                    for table_name in schema.table_names() {
+                if let Some(schema) = catalog.schema(&schema_name).await {
+                    for table_name in schema.table_names().await {
                         let table_key = format!("{cat_name}.{schema_name}.{table_name}");
                         oids.push(stable_hash(&table_key));
                         relnames.push(table_name.clone());
@@ -270,6 +270,7 @@ fn handle_pg_class(catalog_manager: &CatalogManager) -> MetaResult {
                         relkinds.push("r".to_string());
                         let ncols = schema
                             .table(&table_name)
+                            .await
                             .map(|t| t.schema().len() as i64)
                             .unwrap_or(0);
                         relnatts.push(ncols);
@@ -307,7 +308,7 @@ fn handle_pg_class(catalog_manager: &CatalogManager) -> MetaResult {
 // pg_catalog.pg_attribute
 // ---------------------------------------------------------------------------
 
-fn handle_pg_attribute(catalog_manager: &CatalogManager) -> MetaResult {
+async fn handle_pg_attribute(catalog_manager: &CatalogManager) -> MetaResult {
     let mut attrelids = Vec::new();
     let mut attnames = Vec::new();
     let mut atttypids = Vec::new();
@@ -316,12 +317,12 @@ fn handle_pg_attribute(catalog_manager: &CatalogManager) -> MetaResult {
 
     for cat_name in catalog_manager.catalog_names() {
         if let Some(catalog) = catalog_manager.catalog(&cat_name) {
-            for schema_name in catalog.schema_names() {
-                if let Some(schema) = catalog.schema(&schema_name) {
-                    for table_name in schema.table_names() {
+            for schema_name in catalog.schema_names().await {
+                if let Some(schema) = catalog.schema(&schema_name).await {
+                    for table_name in schema.table_names().await {
                         let table_key = format!("{cat_name}.{schema_name}.{table_name}");
                         let rel_oid = stable_hash(&table_key);
-                        if let Some(table) = schema.table(&table_name) {
+                        if let Some(table) = schema.table(&table_name).await {
                             for (i, col) in table.schema().iter().enumerate() {
                                 attrelids.push(rel_oid);
                                 attnames.push(col.name.clone());
@@ -366,7 +367,10 @@ fn handle_pg_attribute(catalog_manager: &CatalogManager) -> MetaResult {
 // pg_catalog.pg_database
 // ---------------------------------------------------------------------------
 
-fn handle_pg_database() -> MetaResult {
+fn handle_pg_database(catalog_manager: &CatalogManager) -> MetaResult {
+    let names = catalog_manager.catalog_names();
+    let oids: Vec<i64> = names.iter().map(|n| stable_hash(n)).collect();
+
     let schema = Arc::new(Schema::new(vec![
         Field::new("oid", ArrowDataType::Int64, false),
         Field::new("datname", ArrowDataType::Utf8, false),
@@ -374,8 +378,8 @@ fn handle_pg_database() -> MetaResult {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(Int64Array::from(vec![1i64])),
-            Arc::new(StringArray::from(vec!["test"])),
+            Arc::new(Int64Array::from(oids)),
+            Arc::new(StringArray::from(names)),
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -386,7 +390,7 @@ fn handle_pg_database() -> MetaResult {
 // information_schema.tables
 // ---------------------------------------------------------------------------
 
-fn handle_info_tables(catalog_manager: &CatalogManager) -> MetaResult {
+async fn handle_info_tables(catalog_manager: &CatalogManager) -> MetaResult {
     let mut catalogs = Vec::new();
     let mut schemas = Vec::new();
     let mut tables = Vec::new();
@@ -394,9 +398,9 @@ fn handle_info_tables(catalog_manager: &CatalogManager) -> MetaResult {
 
     for cat_name in catalog_manager.catalog_names() {
         if let Some(catalog) = catalog_manager.catalog(&cat_name) {
-            for schema_name in catalog.schema_names() {
-                if let Some(schema) = catalog.schema(&schema_name) {
-                    for table_name in schema.table_names() {
+            for schema_name in catalog.schema_names().await {
+                if let Some(schema) = catalog.schema(&schema_name).await {
+                    for table_name in schema.table_names().await {
                         catalogs.push(cat_name.clone());
                         schemas.push(schema_name.clone());
                         tables.push(table_name);
@@ -430,7 +434,7 @@ fn handle_info_tables(catalog_manager: &CatalogManager) -> MetaResult {
 // information_schema.columns
 // ---------------------------------------------------------------------------
 
-fn handle_info_columns(catalog_manager: &CatalogManager) -> MetaResult {
+async fn handle_info_columns(catalog_manager: &CatalogManager) -> MetaResult {
     let mut catalogs = Vec::new();
     let mut schemas = Vec::new();
     let mut tables = Vec::new();
@@ -441,10 +445,10 @@ fn handle_info_columns(catalog_manager: &CatalogManager) -> MetaResult {
 
     for cat_name in catalog_manager.catalog_names() {
         if let Some(catalog) = catalog_manager.catalog(&cat_name) {
-            for schema_name in catalog.schema_names() {
-                if let Some(schema) = catalog.schema(&schema_name) {
-                    for table_name in schema.table_names() {
-                        if let Some(table) = schema.table(&table_name) {
+            for schema_name in catalog.schema_names().await {
+                if let Some(schema) = catalog.schema(&schema_name).await {
+                    for table_name in schema.table_names().await {
+                        if let Some(table) = schema.table(&table_name).await {
                             for (i, col) in table.schema().iter().enumerate() {
                                 catalogs.push(cat_name.clone());
                                 schemas.push(schema_name.clone());
@@ -490,13 +494,13 @@ fn handle_info_columns(catalog_manager: &CatalogManager) -> MetaResult {
 // information_schema.schemata
 // ---------------------------------------------------------------------------
 
-fn handle_info_schemata(catalog_manager: &CatalogManager) -> MetaResult {
+async fn handle_info_schemata(catalog_manager: &CatalogManager) -> MetaResult {
     let mut catalogs = Vec::new();
     let mut schemas = Vec::new();
 
     for cat_name in catalog_manager.catalog_names() {
         if let Some(catalog) = catalog_manager.catalog(&cat_name) {
-            for schema_name in catalog.schema_names() {
+            for schema_name in catalog.schema_names().await {
                 catalogs.push(cat_name.clone());
                 schemas.push(schema_name);
             }

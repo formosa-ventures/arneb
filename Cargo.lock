@@ -103,6 +103,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arneb-catalog"
 version = "0.1.0"
 dependencies = [
@@ -1516,7 +1525,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "pilota",
- "volo",
+ "volo 0.12.3",
  "volo-thrift",
 ]
 
@@ -2315,6 +2324,19 @@ name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.11.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
 dependencies = [
  "bitflags 2.11.0",
  "cfg-if",
@@ -4571,11 +4593,38 @@ dependencies = [
  "metainfo",
  "motore",
  "mur3",
- "nix",
+ "nix 0.29.0",
  "once_cell",
  "pin-project",
  "rand 0.9.3",
  "socket2 0.5.10",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "volo"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f7c3ac049ca5b63472915be157ec7f2c62fb47dc21dec8cd8f720ac535b208"
+dependencies = [
+ "arc-swap",
+ "async-broadcast",
+ "dashmap",
+ "faststr",
+ "futures",
+ "libc",
+ "metainfo",
+ "motore",
+ "mur3",
+ "nix 0.30.1",
+ "once_cell",
+ "pin-project",
+ "rand 0.9.3",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -4611,7 +4660,7 @@ dependencies = [
  "syn 2.0.117",
  "tempfile",
  "url_path",
- "volo",
+ "volo 0.10.7",
  "walkdir",
 ]
 
@@ -4642,7 +4691,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "volo",
+ "volo 0.10.7",
 ]
 
 [[package]]

@@ -11,5 +11,5 @@ name = "hive-metastore-thrift-build"
 path = "src/main.rs"
 
 [dependencies]
-volo-build = "0.10"
-pilota-build = "0.11"
+volo-build = "0.12"
+pilota-build = "0.13"

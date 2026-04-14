@@ -17,8 +17,8 @@ futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 hive-metastore = { path = "../hive-metastore" }
-volo-thrift = "0.10"
-pilota = "0.11"
+volo-thrift = "0.12"
+pilota = "0.13"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

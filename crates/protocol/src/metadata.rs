@@ -219,13 +219,18 @@ async fn handle_pg_namespace(catalog_manager: &CatalogManager) -> MetaResult {
     names.push("information_schema".to_string());
     oids.push(stable_hash("information_schema"));
 
-    // User schemas from catalogs
+    // User schemas from catalogs (only include schemas that contain tables)
     for cat_name in catalog_manager.catalog_names() {
         if let Some(catalog) = catalog_manager.catalog(&cat_name) {
             for schema_name in catalog.schema_names().await {
-                if !names.contains(&schema_name) {
-                    oids.push(stable_hash(&schema_name));
-                    names.push(schema_name);
+                if names.contains(&schema_name) {
+                    continue;
+                }
+                if let Some(schema) = catalog.schema(&schema_name).await {
+                    if !schema.table_names().await.is_empty() {
+                        oids.push(stable_hash(&schema_name));
+                        names.push(schema_name);
+                    }
                 }
             }
         }
@@ -501,8 +506,12 @@ async fn handle_info_schemata(catalog_manager: &CatalogManager) -> MetaResult {
     for cat_name in catalog_manager.catalog_names() {
         if let Some(catalog) = catalog_manager.catalog(&cat_name) {
             for schema_name in catalog.schema_names().await {
-                catalogs.push(cat_name.clone());
-                schemas.push(schema_name);
+                if let Some(schema) = catalog.schema(&schema_name).await {
+                    if !schema.table_names().await.is_empty() {
+                        catalogs.push(cat_name.clone());
+                        schemas.push(schema_name);
+                    }
+                }
             }
         }
     }

@@ -172,14 +172,14 @@ pub fn encode_record_batches(
         let num_cols = batch.num_columns();
         total_count += num_rows;
 
+        let mut encoder = DataRowEncoder::new(schema.clone());
         for row_idx in 0..num_rows {
-            let mut encoder = DataRowEncoder::new(schema.clone());
             for col_idx in 0..num_cols {
                 let array = batch.column(col_idx);
                 let value = encode_value(array.as_ref(), row_idx);
                 encoder.encode_field(&value)?;
             }
-            rows.push(encoder.finish());
+            rows.push(Ok(encoder.take_row()));
         }
     }
 

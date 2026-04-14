@@ -14,7 +14,6 @@ use pgwire::api::auth::{
     finish_authentication, save_startup_parameters_to_metadata, DefaultServerParameterProvider,
     StartupHandler,
 };
-use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
@@ -22,7 +21,7 @@ use pgwire::api::results::{
     QueryResponse, Response,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, ClientPortalStore, PgWireHandlerFactory, Type};
+use pgwire::api::{ClientInfo, ClientPortalStore, NoopHandler, PgWireServerHandlers, Type};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::PgWireFrontendMessage;
@@ -64,13 +63,8 @@ pub struct HandlerFactory {
     pub distributed_executor: Option<Arc<dyn DistributedExecutor>>,
 }
 
-impl PgWireHandlerFactory for HandlerFactory {
-    type StartupHandler = ConnectionHandler;
-    type SimpleQueryHandler = ConnectionHandler;
-    type ExtendedQueryHandler = ConnectionHandler;
-    type CopyHandler = NoopCopyHandler;
-
-    fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
+impl PgWireServerHandlers for HandlerFactory {
+    fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
         Arc::new(ConnectionHandler {
             distributed_executor: self.distributed_executor.clone(),
             catalog_manager: Arc::clone(&self.catalog_manager),
@@ -78,7 +72,7 @@ impl PgWireHandlerFactory for HandlerFactory {
         })
     }
 
-    fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
         Arc::new(ConnectionHandler {
             distributed_executor: self.distributed_executor.clone(),
             catalog_manager: Arc::clone(&self.catalog_manager),
@@ -86,7 +80,7 @@ impl PgWireHandlerFactory for HandlerFactory {
         })
     }
 
-    fn startup_handler(&self) -> Arc<Self::StartupHandler> {
+    fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
         Arc::new(ConnectionHandler {
             distributed_executor: self.distributed_executor.clone(),
             catalog_manager: Arc::clone(&self.catalog_manager),
@@ -94,8 +88,8 @@ impl PgWireHandlerFactory for HandlerFactory {
         })
     }
 
-    fn copy_handler(&self) -> Arc<Self::CopyHandler> {
-        Arc::new(NoopCopyHandler)
+    fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {
+        Arc::new(NoopHandler)
     }
 }
 
@@ -114,13 +108,13 @@ impl StartupHandler for ConnectionHandler {
         message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         if let PgWireFrontendMessage::Startup(ref startup) = message {
             save_startup_parameters_to_metadata(client, startup);
-            finish_authentication(client, &DefaultServerParameterProvider::default()).await;
+            finish_authentication(client, &DefaultServerParameterProvider::default()).await?;
         }
         Ok(())
     }
@@ -128,13 +122,9 @@ impl StartupHandler for ConnectionHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for ConnectionHandler {
-    async fn do_query<'a, 'b: 'a, C>(
-        &'b self,
-        _client: &mut C,
-        query: &'a str,
-    ) -> PgWireResult<Vec<Response<'a>>>
+    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
@@ -260,12 +250,12 @@ impl ExtendedQueryHandler for ConnectionHandler {
         Arc::new(NoopQueryParser)
     }
 
-    async fn do_query<'a, 'b: 'a, C>(
-        &'b self,
+    async fn do_query<C>(
+        &self,
         _client: &mut C,
-        portal: &'a Portal<Self::Statement>,
+        portal: &Portal<Self::Statement>,
         _max_rows: usize,
-    ) -> PgWireResult<Response<'a>>
+    ) -> PgWireResult<Response>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,

@@ -11,8 +11,8 @@ name = "hive_metastore"
 path = "src/lib.rs"
 
 [dependencies]
-volo = "0.10"
-volo-thrift = "0.10"
-pilota = "0.11"
+volo = "0.12"
+volo-thrift = "0.12"
+pilota = "0.13"
 anyhow = { workspace = true }
 async-trait.workspace = true

@@ -54,8 +54,8 @@ mime_guess = { workspace = true }
 
 # HMS demo setup binary dependencies
 hive-metastore = { path = "../hive-metastore" }
-volo-thrift = "0.10"
-pilota = "0.11"
+volo-thrift = "0.12"
+pilota = "0.13"
 parquet = { workspace = true, features = ["arrow"] }
 object_store.workspace = true
 

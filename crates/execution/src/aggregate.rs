@@ -78,7 +78,11 @@ impl Accumulator for CountAccumulator {
 pub struct SumAccumulator {
     sum_i64: i64,
     sum_f64: f64,
+    sum_decimal: i128,
+    decimal_precision: u8,
+    decimal_scale: i8,
     is_float: bool,
+    is_decimal: bool,
     has_values: bool,
 }
 
@@ -132,6 +136,18 @@ impl Accumulator for SumAccumulator {
                     }
                 }
             }
+            Decimal128(p, s) => {
+                self.is_decimal = true;
+                self.decimal_precision = *p;
+                self.decimal_scale = *s;
+                let arr = values.as_primitive::<datatypes::Decimal128Type>();
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        self.sum_decimal += arr.value(i);
+                        self.has_values = true;
+                    }
+                }
+            }
             dt => {
                 return Err(ExecutionError::InvalidOperation(format!(
                     "SUM not supported for type {dt:?}"
@@ -145,7 +161,13 @@ impl Accumulator for SumAccumulator {
         if !self.has_values {
             return Ok(ScalarValue::Null);
         }
-        if self.is_float {
+        if self.is_decimal {
+            Ok(ScalarValue::Decimal128 {
+                value: self.sum_decimal,
+                precision: 38, // widen to max precision for SUM
+                scale: self.decimal_scale,
+            })
+        } else if self.is_float {
             Ok(ScalarValue::Float64(self.sum_f64 + self.sum_i64 as f64))
         } else {
             Ok(ScalarValue::Int64(self.sum_i64))
@@ -155,7 +177,9 @@ impl Accumulator for SumAccumulator {
     fn reset(&mut self) {
         self.sum_i64 = 0;
         self.sum_f64 = 0.0;
+        self.sum_decimal = 0;
         self.is_float = false;
+        self.is_decimal = false;
         self.has_values = false;
     }
 }
@@ -215,6 +239,15 @@ impl Accumulator for AvgAccumulator {
                 for i in 0..arr.len() {
                     if !arr.is_null(i) {
                         self.sum += arr.value(i);
+                        self.count += 1;
+                    }
+                }
+            }
+            Decimal128(_, _) => {
+                let arr = values.as_primitive::<datatypes::Decimal128Type>();
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        self.sum += arr.value(i) as f64;
                         self.count += 1;
                     }
                 }
@@ -344,6 +377,9 @@ enum OrdScalar {
     Float32(f32),
     Float64(f64),
     Utf8(String),
+    Date32(i32),
+    Decimal128(i128, u8, i8),
+    Timestamp(i64, arneb_common::types::TimeUnit, Option<String>),
 }
 
 impl OrdScalar {
@@ -354,6 +390,17 @@ impl OrdScalar {
             OrdScalar::Float32(v) => ScalarValue::Float32(*v),
             OrdScalar::Float64(v) => ScalarValue::Float64(*v),
             OrdScalar::Utf8(v) => ScalarValue::Utf8(v.clone()),
+            OrdScalar::Date32(v) => ScalarValue::Date32(*v),
+            OrdScalar::Decimal128(v, p, s) => ScalarValue::Decimal128 {
+                value: *v,
+                precision: *p,
+                scale: *s,
+            },
+            OrdScalar::Timestamp(v, u, tz) => ScalarValue::Timestamp {
+                value: *v,
+                unit: *u,
+                timezone: tz.clone(),
+            },
         }
     }
 }
@@ -380,6 +427,9 @@ impl Ord for OrdScalar {
             (OrdScalar::Float32(a), OrdScalar::Float32(b)) => a.total_cmp(b),
             (OrdScalar::Float64(a), OrdScalar::Float64(b)) => a.total_cmp(b),
             (OrdScalar::Utf8(a), OrdScalar::Utf8(b)) => a.cmp(b),
+            (OrdScalar::Date32(a), OrdScalar::Date32(b)) => a.cmp(b),
+            (OrdScalar::Decimal128(a, _, _), OrdScalar::Decimal128(b, _, _)) => a.cmp(b),
+            (OrdScalar::Timestamp(a, _, _), OrdScalar::Timestamp(b, _, _)) => a.cmp(b),
             _ => std::cmp::Ordering::Equal, // mismatched types — shouldn't happen
         }
     }
@@ -407,6 +457,33 @@ fn extract_ordscalar(arr: &ArrayRef, index: usize) -> Result<OrdScalar, Executio
         Utf8 => {
             let a = arr.as_string::<i32>();
             Ok(OrdScalar::Utf8(a.value(index).to_string()))
+        }
+        Date32 => {
+            let a = arr.as_primitive::<datatypes::Date32Type>();
+            Ok(OrdScalar::Date32(a.value(index)))
+        }
+        Decimal128(p, s) => {
+            let a = arr.as_primitive::<datatypes::Decimal128Type>();
+            Ok(OrdScalar::Decimal128(a.value(index), *p, *s))
+        }
+        Timestamp(unit, tz) => {
+            let tu: arneb_common::types::TimeUnit = (*unit).into();
+            let tz_str = tz.as_ref().map(|s| s.to_string());
+            let val = match unit {
+                datatypes::TimeUnit::Second => {
+                    arr.as_primitive::<datatypes::TimestampSecondType>().value(index)
+                }
+                datatypes::TimeUnit::Millisecond => {
+                    arr.as_primitive::<datatypes::TimestampMillisecondType>().value(index)
+                }
+                datatypes::TimeUnit::Microsecond => {
+                    arr.as_primitive::<datatypes::TimestampMicrosecondType>().value(index)
+                }
+                datatypes::TimeUnit::Nanosecond => {
+                    arr.as_primitive::<datatypes::TimestampNanosecondType>().value(index)
+                }
+            };
+            Ok(OrdScalar::Timestamp(val, tu, tz_str))
         }
         dt => Err(ExecutionError::InvalidOperation(format!(
             "MIN/MAX not supported for type {dt:?}"
@@ -518,6 +595,112 @@ mod tests {
     fn min_empty() {
         let acc = MinAccumulator::new();
         assert_eq!(acc.evaluate().unwrap(), ScalarValue::Null);
+    }
+
+    #[test]
+    fn sum_decimal128() {
+        let mut acc = SumAccumulator::new();
+        let arr: ArrayRef = Arc::new(
+            arrow::array::Decimal128Array::from(vec![1000, 2000, 3000])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        acc.update_batch(&arr).unwrap();
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            ScalarValue::Decimal128 {
+                value: 6000,
+                precision: 38,
+                scale: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn avg_decimal128() {
+        let mut acc = AvgAccumulator::new();
+        let arr: ArrayRef = Arc::new(
+            arrow::array::Decimal128Array::from(vec![1000, 2000, 3000])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        acc.update_batch(&arr).unwrap();
+        // AVG returns f64: (1000 + 2000 + 3000) / 3 = 2000.0
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Float64(2000.0));
+    }
+
+    #[test]
+    fn min_decimal128() {
+        let mut acc = MinAccumulator::new();
+        let arr: ArrayRef = Arc::new(
+            arrow::array::Decimal128Array::from(vec![3000, 1000, 2000])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        acc.update_batch(&arr).unwrap();
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            ScalarValue::Decimal128 {
+                value: 1000,
+                precision: 10,
+                scale: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn max_decimal128() {
+        let mut acc = MaxAccumulator::new();
+        let arr: ArrayRef = Arc::new(
+            arrow::array::Decimal128Array::from(vec![1000, 3000, 2000])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        acc.update_batch(&arr).unwrap();
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            ScalarValue::Decimal128 {
+                value: 3000,
+                precision: 10,
+                scale: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn min_timestamp() {
+        use arneb_common::types::TimeUnit;
+        let mut acc = MinAccumulator::new();
+        let arr: ArrayRef = Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+            3000000, 1000000, 2000000,
+        ]));
+        acc.update_batch(&arr).unwrap();
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            ScalarValue::Timestamp {
+                value: 1000000,
+                unit: TimeUnit::Microsecond,
+                timezone: None,
+            }
+        );
+    }
+
+    #[test]
+    fn max_timestamp() {
+        use arneb_common::types::TimeUnit;
+        let mut acc = MaxAccumulator::new();
+        let arr: ArrayRef = Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+            1000000, 3000000, 2000000,
+        ]));
+        acc.update_batch(&arr).unwrap();
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            ScalarValue::Timestamp {
+                value: 3000000,
+                unit: TimeUnit::Microsecond,
+                timezone: None,
+            }
+        );
     }
 
     #[test]

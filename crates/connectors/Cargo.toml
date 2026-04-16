@@ -8,6 +8,8 @@ license.workspace = true
 arneb-common = { path = "../common" }
 arneb-catalog = { path = "../catalog" }
 arneb-execution = { path = "../execution" }
+arneb-planner = { path = "../planner" }
+arneb-sql-parser = { path = "../sql-parser" }
 arrow.workspace = true
 arrow-csv.workspace = true
 parquet.workspace = true

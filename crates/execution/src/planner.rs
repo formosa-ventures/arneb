@@ -192,7 +192,31 @@ impl ExecutionContext {
             }
 
             LogicalPlan::Filter { input, predicate } => {
-                let input_plan = self.convert(input)?;
+                // When filtering a table scan, pass the filter to ScanContext
+                // for potential pushdown into the connector. The FilterExec is
+                // still kept for correctness — the connector may only partially
+                // support the predicate.
+                let input_plan = if let LogicalPlan::TableScan { table, .. } = input.as_ref() {
+                    let key = table.to_string();
+                    let source = self
+                        .data_sources
+                        .get(&key)
+                        .or_else(|| self.data_sources.get(&table.table))
+                        .ok_or_else(|| {
+                            ExecutionError::InvalidOperation(format!(
+                                "data source not found for table '{key}'"
+                            ))
+                        })?;
+                    let scan_ctx =
+                        ScanContext::default().with_filters(vec![predicate.clone()]);
+                    Arc::new(ScanExec {
+                        source: source.clone(),
+                        _table_name: key,
+                        scan_context: scan_ctx,
+                    }) as Arc<dyn ExecutionPlan>
+                } else {
+                    self.convert(input)?
+                };
                 Ok(Arc::new(FilterExec {
                     input: input_plan,
                     predicate: predicate.clone(),

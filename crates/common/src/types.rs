@@ -1,6 +1,7 @@
 //! Shared data types for the arneb query engine.
 
 use std::fmt;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -93,6 +94,12 @@ pub enum DataType {
         /// Optional timezone identifier.
         timezone: Option<String>,
     },
+    /// SQL ARRAY / LIST type.
+    List(Box<DataType>),
+    /// SQL MAP type (key → value).
+    Map(Box<DataType>, Box<DataType>),
+    /// SQL ROW / STRUCT type (named fields).
+    Struct(Vec<(String, DataType)>),
 }
 
 impl fmt::Display for DataType {
@@ -117,6 +124,18 @@ impl fmt::Display for DataType {
                 Some(tz) => write!(f, "Timestamp({unit}, {tz})"),
                 None => write!(f, "Timestamp({unit})"),
             },
+            DataType::List(inner) => write!(f, "List({inner})"),
+            DataType::Map(key, value) => write!(f, "Map({key}, {value})"),
+            DataType::Struct(fields) => {
+                write!(f, "Struct(")?;
+                for (i, (name, dt)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name}: {dt}")?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -141,6 +160,40 @@ impl From<DataType> for arrow::datatypes::DataType {
             DataType::Date32 => arrow::datatypes::DataType::Date32,
             DataType::Timestamp { unit, timezone } => {
                 arrow::datatypes::DataType::Timestamp(unit.into(), timezone.map(|tz| tz.into()))
+            }
+            DataType::List(inner) => {
+                let arrow_inner: arrow::datatypes::DataType = (*inner).into();
+                arrow::datatypes::DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    arrow_inner,
+                    true,
+                )))
+            }
+            DataType::Map(key, value) => {
+                let arrow_key: arrow::datatypes::DataType = (*key).into();
+                let arrow_value: arrow::datatypes::DataType = (*value).into();
+                let entries = arrow::datatypes::Field::new(
+                    "entries",
+                    arrow::datatypes::DataType::Struct(
+                        vec![
+                            arrow::datatypes::Field::new("key", arrow_key, false),
+                            arrow::datatypes::Field::new("value", arrow_value, true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                );
+                arrow::datatypes::DataType::Map(Arc::new(entries), false)
+            }
+            DataType::Struct(fields) => {
+                let arrow_fields: Vec<arrow::datatypes::Field> = fields
+                    .into_iter()
+                    .map(|(name, dt)| {
+                        let arrow_dt: arrow::datatypes::DataType = dt.into();
+                        arrow::datatypes::Field::new(name, arrow_dt, true)
+                    })
+                    .collect();
+                arrow::datatypes::DataType::Struct(arrow_fields.into())
             }
         }
     }
@@ -175,6 +228,37 @@ impl TryFrom<arrow::datatypes::DataType> for DataType {
                 unit: unit.into(),
                 timezone: tz.map(|s| s.to_string()),
             }),
+            arrow::datatypes::DataType::List(field) => {
+                let inner = DataType::try_from(field.data_type().clone())?;
+                Ok(DataType::List(Box::new(inner)))
+            }
+            arrow::datatypes::DataType::LargeList(field) => {
+                let inner = DataType::try_from(field.data_type().clone())?;
+                Ok(DataType::List(Box::new(inner)))
+            }
+            arrow::datatypes::DataType::Map(field, _) => {
+                if let arrow::datatypes::DataType::Struct(fields) = field.data_type() {
+                    if fields.len() == 2 {
+                        let key = DataType::try_from(fields[0].data_type().clone())?;
+                        let value = DataType::try_from(fields[1].data_type().clone())?;
+                        return Ok(DataType::Map(Box::new(key), Box::new(value)));
+                    }
+                }
+                Err(UnsupportedArrowType(arrow::datatypes::DataType::Map(
+                    field.clone(),
+                    false,
+                )))
+            }
+            arrow::datatypes::DataType::Struct(fields) => {
+                let converted: Result<Vec<(String, DataType)>, _> = fields
+                    .iter()
+                    .map(|f| {
+                        DataType::try_from(f.data_type().clone())
+                            .map(|dt| (f.name().clone(), dt))
+                    })
+                    .collect();
+                Ok(DataType::Struct(converted?))
+            }
             other => Err(UnsupportedArrowType(other)),
         }
     }

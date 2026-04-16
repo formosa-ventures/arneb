@@ -3,7 +3,7 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
   title: 'Arneb',
   description: 'A distributed SQL query engine built in Rust',
-  base: '/arneb/',
+  base: '/',
 
   themeConfig: {
     nav: [

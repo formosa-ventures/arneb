@@ -63,17 +63,17 @@ Make sure an Arneb instance is running with the TPC-H data loaded before running
 ## Running the Hive Demo
 
 ```bash
-# Start HMS + MinIO
+# Start MinIO + HMS + Trino
 docker compose up -d
 
-# Seed demo tables
-cargo run --bin hive-demo-setup
+# Seed TPC-H data
+docker compose run --rm tpch-seed
 
 # Start Arneb with Hive catalog
-cargo run --bin arneb -- --config scripts/arneb-hive-demo.toml
+cargo run --bin arneb -- --config benchmarks/tpch/tpch-hive.toml
 
 # Query
-psql -h 127.0.0.1 -p 5432 -c "SELECT * FROM datalake.demo.cities;"
+psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.nation;"
 
 # Tear down
 docker compose down

@@ -119,54 +119,39 @@ crates/
 ├── protocol/      # PostgreSQL wire protocol (Simple + Extended Query)
 ├── scheduler/     # QueryTracker, NodeRegistry, resource groups
 ├── rpc/           # Arrow Flight RPC for distributed execution
-└── server/        # Main binary, CLI, config, Web UI, hive-demo-setup binary
+└── server/        # Main binary, CLI, config, Web UI
 ```
 
-## Hive Metastore + S3 Demo
+## Hive Metastore + S3
 
-Run Arneb against a real Hive Metastore backed by S3-compatible storage, end to
-end, on your laptop:
+Run Arneb against a real Hive Metastore backed by S3-compatible storage:
 
 ```bash
-# 1. Bring up HMS 4.2.0 + MinIO via docker-compose
-#    (HMS image is built locally with hadoop-aws + aws-sdk v2 bundled,
-#     so it can validate s3a:// table locations)
+# 1. Start MinIO + HMS + Trino
 docker compose up -d
 
-# 2. Seed demo tables (writes Parquet to MinIO + registers HMS tables)
-cargo run --bin hive-demo-setup
+# 2. Seed TPC-H data (Parquet on MinIO, tables registered in HMS)
+docker compose run --rm tpch-seed
 
-# 3. Start Arneb with the demo config
-cargo run --bin arneb -- --config scripts/arneb-hive-demo.toml
+# 3. Start Arneb with Hive catalog config
+cargo run --bin arneb -- --config benchmarks/tpch/tpch-hive.toml
 
 # 4. Query via psql (or DBeaver / any Postgres client)
-psql -h 127.0.0.1 -p 5432 -c "SELECT * FROM datalake.demo.cities;"
-psql -h 127.0.0.1 -p 5432 -c "
-  SELECT c.name, SUM(o.amount) AS total
-  FROM datalake.demo.cities c
-  JOIN datalake.demo.orders o ON c.id = o.city_id
-  GROUP BY c.name ORDER BY total DESC;"
+psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.nation;"
 
 # 5. Tear down
 docker compose down
 ```
 
-The demo exercises the full stack: HMS Thrift (`_req` API surface) → catalog
-resolution → S3 object store → Parquet reader → pgwire response. See
-`crates/hive-metastore/README.md` for how to regenerate the Thrift bindings
-after updating the IDL.
-
 ## TPC-H Benchmark
 
-16 out of 22 TPC-H queries pass against official dbgen-generated data.
+16 out of 22 TPC-H queries pass. Both arneb and Trino read the same
+Parquet data from MinIO via Hive Metastore for fair comparison.
 
 ```bash
-# Generate test data (requires Docker)
-docker run --rm -v "$(pwd)/benchmarks/tpch/data/raw:/data" \
-  ghcr.io/scalytics/tpch-docker:main -vf -s 0.01
-
-# Convert to Parquet
-python3 benchmarks/tpch/scripts/generate_parquet.py
+# Start infrastructure and seed data
+docker compose up -d
+docker compose run --rm tpch-seed
 
 # Run benchmark
 cd benchmarks/tpch && cargo run --release -- \

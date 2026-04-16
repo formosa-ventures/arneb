@@ -1,34 +1,80 @@
 # TPC-H Benchmark
 
 Performance comparison of arneb against Trino using TPC-H queries.
+Both engines read the same Parquet data from MinIO via Hive Metastore.
 
 ## Quick Start
 
 ```bash
-# 1. Start arneb with TPC-H data
-cargo run --release -- --config benchmarks/tpch/tpch-config.toml
+# 1. Start infrastructure (MinIO + HMS + Trino)
+docker compose up -d
 
-# 2. Run benchmark
+# 2. Seed TPC-H data (SF1, ~1GB, takes ~2 minutes)
+docker compose run --rm tpch-seed
+
+# 3. Start arneb with Hive config
+cargo run --release --bin arneb -- --config benchmarks/tpch/tpch-hive.toml
+
+# 4. Run benchmark
 cd benchmarks/tpch
 cargo run --release -- --host 127.0.0.1 --port 5432
 
-# 3. Generate report
+# 5. Generate report
 python3 scripts/report.py results/arneb_*.json
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│              docker compose up -d                │
+│                                                  │
+│  MinIO (:9000)   HMS (:9083)   Trino (:8080)    │
+│       │               │              │           │
+│       └───────┬───────┘              │           │
+│               │                      │           │
+│    s3://warehouse/tpch/              │           │
+│    ├── lineitem/ (Parquet)           │           │
+│    ├── orders/                       │           │
+│    └── ... (8 tables)                │           │
+└─────────────────────────────────────────────────┘
+                │                      │
+          ┌─────┴─────┐          ┌─────┴─────┐
+          │   Arneb    │          │   Trino    │
+          │ (pgwire)   │          │ (REST API) │
+          │ :5432      │          │ :8080      │
+          └────────────┘          └────────────┘
+               Same Parquet data → fair comparison
 ```
 
 ## Data Generation
 
-### Using dbgen (official TPC-H tool)
+### Via Docker Compose (recommended)
 
 ```bash
-# Install dbgen
-git clone https://github.com/electrum/tpch-dbgen.git
-cd tpch-dbgen && make
-export PATH=$PATH:$(pwd)
+# Start services
+docker compose up -d
 
-# Generate SF1 (1GB) data
-./benchmarks/tpch/scripts/generate_data.sh 1
+# Seed SF1 data (~1GB, ~2 minutes)
+docker compose run --rm tpch-seed
+
+# Seed with different scale factor
+TPCH_SF=tiny docker compose run --rm tpch-seed   # ~10MB, quick
+TPCH_SF=sf10 docker compose run --rm tpch-seed   # ~10GB, slower
+
+# Verify data
+docker compose exec trino trino --execute "SELECT COUNT(*) FROM hive.tpch.lineitem"
 ```
+
+### Local Parquet files (alternative)
+
+For quick local development without Docker Compose:
+
+```bash
+cargo run --release --bin arneb -- --config benchmarks/tpch/tpch-config.toml
+```
+
+This uses pre-generated Parquet files in `data/sf1/` (not suitable for Trino comparison).
 
 ### TPC-H Tables
 
@@ -48,8 +94,11 @@ export PATH=$PATH:$(pwd)
 ```bash
 cd benchmarks/tpch
 
-# Run all queries
+# Run all queries against arneb
 cargo run --release -- --host 127.0.0.1 --port 5432
+
+# Run against Trino (reads from same Hive tables)
+cargo run --release -- --engine trino --host 127.0.0.1 --port 8080 --catalog hive --schema tpch
 
 # Run specific queries
 cargo run --release -- --queries 1,3,6
@@ -62,22 +111,25 @@ cargo run --release -- --num-runs 10 --warm-up 3
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--engine` | arneb | Engine to benchmark (arneb\|trino) |
 | `--host` | 127.0.0.1 | Database host |
 | `--port` | 5432 | Database port |
+| `--catalog` | tpch | Trino catalog name |
+| `--schema` | sf1 | Trino schema name |
 | `--queries-dir` | benchmarks/tpch/queries | Query SQL files |
 | `--num-runs` | 5 | Total runs per query |
 | `--warm-up` | 2 | Warm-up runs to discard |
 | `--output-dir` | benchmarks/tpch/results | JSON output directory |
 | `--queries` | (all) | Comma-separated query numbers |
 
-## Trino Baseline
+## Full Benchmark (Arneb vs Trino)
 
 ```bash
-# Start Trino with tpch connector
-# (requires Trino installation)
+# Automated: runs both engines and generates report
+./benchmarks/tpch/scripts/run_benchmark.sh
 
-# Run baseline
-./benchmarks/tpch/scripts/run_trino.sh localhost 8080 tpch
+# Skip Trino baseline
+./benchmarks/tpch/scripts/run_benchmark.sh --skip-trino
 ```
 
 ## Report Generation
@@ -116,3 +168,10 @@ Adapted TPC-H queries for arneb's SQL dialect:
 | Q6 | Forecasting Revenue | Single table aggregate |
 | Q10 | Returned Item Reporting | 4-way join + group by |
 | Q12 | Shipping Modes | 2-way join + group by |
+
+## Configuration Files
+
+| File | Description |
+|------|-------------|
+| `tpch-hive.toml` | Arneb config reading from Hive/MinIO (for benchmarks) |
+| `tpch-config.toml` | Arneb config reading local Parquet files (for dev) |

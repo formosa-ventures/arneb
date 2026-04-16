@@ -73,23 +73,21 @@ This starts:
 - **MinIO** — S3-compatible object store on port `9000` (API) and `9001` (console)
 - **Hive Metastore** — HMS 4.2.0 on port `9083`
 
-### Step 2: Seed Demo Data
+### Step 2: Seed TPC-H Data
 
 ```bash
-cargo run --bin hive-demo-setup
+docker compose run --rm tpch-seed
 ```
 
-This creates two demo tables in the `demo` schema:
-- `demo.cities` — sample city data
-- `demo.orders` — sample order data
+This creates 8 TPC-H tables in the `tpch` schema on MinIO via Trino CTAS.
 
 ### Step 3: Start Arneb
 
 ```bash
-cargo run --bin arneb -- --config scripts/arneb-hive-demo.toml
+cargo run --bin arneb -- --config benchmarks/tpch/tpch-hive.toml
 ```
 
-The demo config (`scripts/arneb-hive-demo.toml`) is pre-configured to connect to the local HMS and MinIO:
+The config (`benchmarks/tpch/tpch-hive.toml`) connects to the local HMS and MinIO:
 
 ```toml
 bind_address = "127.0.0.1"
@@ -106,14 +104,14 @@ secret_access_key = "minioadmin"
 name = "datalake"
 type = "hive"
 metastore_uri = "127.0.0.1:9083"
-default_schema = "demo"
+default_schema = "tpch"
 ```
 
 ### Step 4: Run Queries
 
 ```bash
-psql -h 127.0.0.1 -p 5432 -c "SELECT * FROM datalake.demo.cities;"
-psql -h 127.0.0.1 -p 5432 -c "SELECT * FROM datalake.demo.orders LIMIT 10;"
+psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.nation;"
+psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.lineitem;"
 ```
 
 ### Step 5: Tear Down

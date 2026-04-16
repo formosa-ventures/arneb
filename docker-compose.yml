@@ -1,13 +1,16 @@
-# Arneb Hive + S3 E2E Test Environment
+# Arneb Benchmark & E2E Test Environment
 #
 # Provides:
-#   - Hive Metastore (standalone mode with embedded Derby)
 #   - MinIO (S3-compatible object storage)
+#   - Hive Metastore (standalone mode with embedded Derby)
+#   - Trino (query engine for data generation and baseline benchmarks)
+#   - TPC-H / TPC-DS seed services (Trino CTAS into Hive tables)
 #
 # Usage:
-#   docker compose up -d
-#   ./scripts/hive-e2e-test.sh
-#   docker compose down -v
+#   docker compose up -d                    # start MinIO + HMS + Trino
+#   docker compose run tpch-seed            # seed TPC-H data (SF1)
+#   docker compose run tpcds-seed           # seed TPC-DS data (SF1)
+#   docker compose down -v                  # tear down (delete volumes)
 
 services:
   minio:
@@ -54,3 +57,47 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+
+  trino:
+    image: trinodb/trino:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./docker/trino/catalog:/etc/trino/catalog
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "trino", "--execute", "SELECT 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  tpch-seed:
+    image: trinodb/trino:latest
+    volumes:
+      - ./docker/tpch-seed:/seed
+    entrypoint: ["/bin/bash", "/seed/seed.sh"]
+    environment:
+      TPCH_SF: ${TPCH_SF:-sf1}
+      TRINO_SERVER: trino:8080
+    depends_on:
+      trino:
+        condition: service_healthy
+    profiles:
+      - tpch-seed
+
+  tpcds-seed:
+    image: trinodb/trino:latest
+    volumes:
+      - ./docker/tpcds-seed:/seed
+    entrypoint: ["/bin/bash", "/seed/seed.sh"]
+    environment:
+      TPCDS_SF: ${TPCDS_SF:-sf1}
+      TRINO_SERVER: trino:8080
+    depends_on:
+      trino:
+        condition: service_healthy
+    profiles:
+      - tpcds-seed

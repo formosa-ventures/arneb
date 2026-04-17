@@ -207,8 +207,7 @@ impl ExecutionContext {
                                 "data source not found for table '{key}'"
                             ))
                         })?;
-                    let scan_ctx =
-                        ScanContext::default().with_filters(vec![predicate.clone()]);
+                    let scan_ctx = ScanContext::default().with_filters(vec![predicate.clone()]);
                     Arc::new(ScanExec {
                         source: source.clone(),
                         _table_name: key,
@@ -233,8 +232,13 @@ impl ExecutionContext {
                 let right_plan = self.convert(right)?;
                 let left_col_count = left_plan.schema().len();
 
-                // Try to use hash join for equi-join conditions.
-                if let Some(key_pairs) = extract_equi_join_keys(condition, left_col_count) {
+                // Try to use hash join for equi-join conditions. A residual
+                // non-equi predicate (e.g. `AND o_comment NOT LIKE '%x%'` in
+                // TPC-H Q13) is carried through and re-evaluated on each
+                // candidate match so outer-join semantics stay correct.
+                if let Some((key_pairs, residual)) =
+                    extract_equi_join_keys(condition, left_col_count)
+                {
                     let (left_keys, right_keys): (Vec<usize>, Vec<usize>) =
                         key_pairs.into_iter().unzip();
                     return Ok(Arc::new(HashJoinExec {
@@ -243,6 +247,7 @@ impl ExecutionContext {
                         join_type: *join_type,
                         left_keys,
                         right_keys,
+                        residual,
                     }));
                 }
 

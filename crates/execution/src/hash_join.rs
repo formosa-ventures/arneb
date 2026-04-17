@@ -206,6 +206,10 @@ pub(crate) struct HashJoinExec {
     pub(crate) left_keys: Vec<usize>,
     /// Column indices in the right input that form the join key.
     pub(crate) right_keys: Vec<usize>,
+    /// Optional non-equi predicate evaluated on each equi-match candidate
+    /// before it is accepted. Column indices reference the joined layout
+    /// (`left` columns followed by `right` columns).
+    pub(crate) residual: Option<PlanExpr>,
 }
 
 #[async_trait]
@@ -301,13 +305,15 @@ impl HashJoinExec {
 
         let output_schema = self.build_output_schema(left_batch, right_batch);
 
-        let mut left_indices = Vec::new();
-        let mut right_indices = Vec::new();
-        let mut left_matched = vec![false; left_rows];
-        let mut right_matched = vec![false; right_rows];
+        // Phase 1 — collect every equi-key match as a candidate. Matching is
+        // NOT recorded on `left_matched`/`right_matched` yet: a residual
+        // predicate may reject some candidates, and an outer join must still
+        // report those left/right rows as unmatched so the correct NULL-padded
+        // output is produced.
+        let mut cand_left: Vec<u32> = Vec::new();
+        let mut cand_right: Vec<u32> = Vec::new();
 
-        for (l_row, l_matched) in left_matched.iter_mut().enumerate() {
-            // Skip left rows with NULL in key columns.
+        for l_row in 0..left_rows {
             let left_has_null = self
                 .left_keys
                 .iter()
@@ -320,7 +326,6 @@ impl HashJoinExec {
             let candidates = hash_map.probe(hash);
 
             for &(_, r_row) in candidates {
-                // Verify actual equality (handle hash collisions).
                 if keys_equal(
                     left_batch,
                     l_row,
@@ -329,12 +334,33 @@ impl HashJoinExec {
                     r_row,
                     &self.right_keys,
                 )? {
-                    left_indices.push(l_row as u32);
-                    right_indices.push(r_row as u32);
-                    *l_matched = true;
-                    right_matched[r_row] = true;
+                    cand_left.push(l_row as u32);
+                    cand_right.push(r_row as u32);
                 }
             }
+        }
+
+        // Phase 2 — apply the residual predicate (if any) in one batched pass.
+        let (left_indices, right_indices) = if let Some(residual) = &self.residual {
+            self.filter_candidates(
+                left_batch,
+                right_batch,
+                &output_schema,
+                cand_left,
+                cand_right,
+                residual,
+            )?
+        } else {
+            (cand_left, cand_right)
+        };
+
+        let mut left_matched = vec![false; left_rows];
+        let mut right_matched = vec![false; right_rows];
+        for &l in &left_indices {
+            left_matched[l as usize] = true;
+        }
+        for &r in &right_indices {
+            right_matched[r as usize] = true;
         }
 
         let mut all_batches = Vec::new();
@@ -405,6 +431,55 @@ impl HashJoinExec {
         }
 
         Ok(all_batches)
+    }
+
+    /// Materialize equi-match candidates into a joined batch, evaluate the
+    /// residual predicate on it, and return only the candidates that pass.
+    /// Column indices in the residual reference the joined layout (left
+    /// columns first, then right), so `expression::evaluate` can be run
+    /// directly against the concatenated batch.
+    fn filter_candidates(
+        &self,
+        left_batch: &RecordBatch,
+        right_batch: &RecordBatch,
+        output_schema: &Arc<Schema>,
+        cand_left: Vec<u32>,
+        cand_right: Vec<u32>,
+        residual: &PlanExpr,
+    ) -> Result<(Vec<u32>, Vec<u32>), ExecutionError> {
+        if cand_left.is_empty() {
+            return Ok((cand_left, cand_right));
+        }
+
+        let left_idx = UInt32Array::from(cand_left.clone());
+        let right_idx = UInt32Array::from(cand_right.clone());
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+        for col_i in 0..left_batch.num_columns() {
+            cols.push(compute::take(left_batch.column(col_i), &left_idx, None)?);
+        }
+        for col_i in 0..right_batch.num_columns() {
+            cols.push(compute::take(right_batch.column(col_i), &right_idx, None)?);
+        }
+        let joined = RecordBatch::try_new(output_schema.clone(), cols)?;
+        let mask_arr = crate::expression::evaluate(residual, &joined, None)?;
+        let mask = mask_arr
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                ExecutionError::InvalidOperation(
+                    "hash join residual predicate must evaluate to boolean".into(),
+                )
+            })?;
+
+        let mut kept_left = Vec::with_capacity(cand_left.len());
+        let mut kept_right = Vec::with_capacity(cand_right.len());
+        for i in 0..mask.len() {
+            if !mask.is_null(i) && mask.value(i) {
+                kept_left.push(cand_left[i]);
+                kept_right.push(cand_right[i]);
+            }
+        }
+        Ok((kept_left, kept_right))
     }
 
     fn build_output_schema(&self, left: &RecordBatch, right: &RecordBatch) -> Arc<Schema> {
@@ -496,36 +571,71 @@ impl HashJoinExec {
 // Equi-join detection
 // ===========================================================================
 
-/// Analyzes a join condition to extract equi-join key pairs.
+/// Analyzes a join condition to extract equi-join key pairs and any residual
+/// (non-equi) predicate.
 ///
-/// Returns `Some(Vec<(left_col_index, right_col_index)>)` if the condition
-/// is a pure equi-join (all conditions are `col_left = col_right`).
-/// Returns `None` if any condition is not a simple column equality.
-/// Extract equi-join keys and optional residual (non-equi) filter.
-/// Returns (equi_keys, residual_filter).
+/// Returns `Some((keys, residual))` if at least one top-level conjunct is a
+/// column-to-column equality across the two inputs. `keys` holds the equi
+/// pairs; `residual` carries every other conjunct AND-ed together, rewritten
+/// so that right-side column indices are offset by `left_col_count` — matching
+/// the joined batch layout that `HashJoinExec` builds when it evaluates the
+/// residual. Returns `None` when the condition is absent or contains no equi
+/// conjunct (in which case the planner falls back to `NestedLoopJoinExec`).
+///
+/// The residual must be preserved so that `LEFT`/`RIGHT`/`FULL` outer joins
+/// keep the correct non-matching rows: dropping it would degrade an outer
+/// join into an inner-join-with-filter and produce wrong results (TPC-H Q13).
+/// Paired equi-join key indices (left input column, right input column).
+pub(crate) type EquiKeys = Vec<(usize, usize)>;
+
+/// Equi-join keys plus any non-equi residual predicate carried alongside them.
+pub(crate) type EquiJoinSplit = (EquiKeys, Option<PlanExpr>);
+
 pub(crate) fn extract_equi_join_keys(
     condition: &arneb_planner::JoinCondition,
     left_col_count: usize,
-) -> Option<Vec<(usize, usize)>> {
+) -> Option<EquiJoinSplit> {
     match condition {
         arneb_planner::JoinCondition::None => None,
         arneb_planner::JoinCondition::On(expr) => {
             let mut keys = Vec::new();
-            collect_equi_keys(expr, left_col_count, &mut keys);
+            let mut residual_parts: Vec<PlanExpr> = Vec::new();
+            collect_equi_keys(expr, left_col_count, &mut keys, &mut residual_parts);
             if keys.is_empty() {
-                None
-            } else {
-                Some(keys)
+                return None;
             }
+            let residual = residual_parts
+                .into_iter()
+                .reduce(|acc, e| PlanExpr::BinaryOp {
+                    left: Box::new(acc),
+                    op: ast::BinaryOp::And,
+                    right: Box::new(e),
+                });
+            Some((keys, residual))
         }
     }
 }
 
-/// Collect equi-join key pairs from an expression.
-/// Skips non-equi conditions (they become post-join filter in the nested loop fallback,
-/// or are silently dropped for hash join — acceptable for correctness with TPC-H).
-fn collect_equi_keys(expr: &PlanExpr, left_col_count: usize, out: &mut Vec<(usize, usize)>) {
+/// Walks a conjunctive join condition, routing column-to-column equalities
+/// that span the two inputs into `keys` and every other conjunct into
+/// `residuals`. Called recursively through `AND` nodes so that a condition
+/// like `a = b AND c > d AND e LIKE '%x%'` splits cleanly into one equi key
+/// and two residual predicates.
+fn collect_equi_keys(
+    expr: &PlanExpr,
+    left_col_count: usize,
+    keys: &mut Vec<(usize, usize)>,
+    residuals: &mut Vec<PlanExpr>,
+) {
     match expr {
+        PlanExpr::BinaryOp {
+            left,
+            op: ast::BinaryOp::And,
+            right,
+        } => {
+            collect_equi_keys(left, left_col_count, keys, residuals);
+            collect_equi_keys(right, left_col_count, keys, residuals);
+        }
         PlanExpr::BinaryOp {
             left,
             op: ast::BinaryOp::Eq,
@@ -535,21 +645,16 @@ fn collect_equi_keys(expr: &PlanExpr, left_col_count: usize, out: &mut Vec<(usiz
                 (left.as_ref(), right.as_ref())
             {
                 if *l_idx < left_col_count && *r_idx >= left_col_count {
-                    out.push((*l_idx, *r_idx - left_col_count));
+                    keys.push((*l_idx, *r_idx - left_col_count));
+                    return;
                 } else if *r_idx < left_col_count && *l_idx >= left_col_count {
-                    out.push((*r_idx, *l_idx - left_col_count));
+                    keys.push((*r_idx, *l_idx - left_col_count));
+                    return;
                 }
             }
+            residuals.push(expr.clone());
         }
-        PlanExpr::BinaryOp {
-            left,
-            op: ast::BinaryOp::And,
-            right,
-        } => {
-            collect_equi_keys(left, left_col_count, out);
-            collect_equi_keys(right, left_col_count, out);
-        }
-        _ => {} // Skip non-equi conditions
+        _ => residuals.push(expr.clone()),
     }
 }
 
@@ -640,6 +745,7 @@ mod tests {
             join_type: ast::JoinType::Inner,
             left_keys: vec![0],
             right_keys: vec![0],
+            residual: None,
         };
         let stream = join.execute().await.unwrap();
         let batches = collect_stream(stream).await.unwrap();
@@ -655,6 +761,7 @@ mod tests {
             join_type: ast::JoinType::Left,
             left_keys: vec![0],
             right_keys: vec![0],
+            residual: None,
         };
         let stream = join.execute().await.unwrap();
         let batches = collect_stream(stream).await.unwrap();
@@ -670,6 +777,7 @@ mod tests {
             join_type: ast::JoinType::Right,
             left_keys: vec![0],
             right_keys: vec![0],
+            residual: None,
         };
         let stream = join.execute().await.unwrap();
         let batches = collect_stream(stream).await.unwrap();
@@ -685,6 +793,7 @@ mod tests {
             join_type: ast::JoinType::Full,
             left_keys: vec![0],
             right_keys: vec![0],
+            residual: None,
         };
         let stream = join.execute().await.unwrap();
         let batches = collect_stream(stream).await.unwrap();
@@ -734,6 +843,7 @@ mod tests {
             join_type: ast::JoinType::Inner,
             left_keys: vec![0],
             right_keys: vec![0],
+            residual: None,
         };
         let stream = join.execute().await.unwrap();
         let batches = collect_stream(stream).await.unwrap();
@@ -754,8 +864,9 @@ mod tests {
                 name: "r.id".into(),
             }),
         });
-        let keys = extract_equi_join_keys(&condition, 2).unwrap();
+        let (keys, residual) = extract_equi_join_keys(&condition, 2).unwrap();
         assert_eq!(keys, vec![(0, 0)]);
+        assert!(residual.is_none());
     }
 
     #[test]
@@ -785,8 +896,9 @@ mod tests {
                 }),
             }),
         });
-        let keys = extract_equi_join_keys(&condition, 2).unwrap();
+        let (keys, residual) = extract_equi_join_keys(&condition, 2).unwrap();
         assert_eq!(keys, vec![(0, 0), (1, 1)]);
+        assert!(residual.is_none());
     }
 
     #[test]
@@ -803,5 +915,165 @@ mod tests {
             }),
         });
         assert!(extract_equi_join_keys(&condition, 2).is_none());
+    }
+
+    #[test]
+    fn equi_with_residual_is_captured() {
+        // Mirrors TPC-H Q13: `c_custkey = o_custkey AND o_comment NOT LIKE '%x%'`.
+        // The equi key is extracted; the non-equi predicate is returned as a
+        // residual to be evaluated at join time.
+        let condition = arneb_planner::JoinCondition::On(PlanExpr::BinaryOp {
+            left: Box::new(PlanExpr::BinaryOp {
+                left: Box::new(PlanExpr::Column {
+                    index: 0,
+                    name: "l.id".into(),
+                }),
+                op: ast::BinaryOp::Eq,
+                right: Box::new(PlanExpr::Column {
+                    index: 2,
+                    name: "r.id".into(),
+                }),
+            }),
+            op: ast::BinaryOp::And,
+            right: Box::new(PlanExpr::BinaryOp {
+                left: Box::new(PlanExpr::Column {
+                    index: 3,
+                    name: "r.comment".into(),
+                }),
+                op: ast::BinaryOp::NotEq,
+                right: Box::new(PlanExpr::Literal(arneb_common::types::ScalarValue::Utf8(
+                    "special".into(),
+                ))),
+            }),
+        });
+        let (keys, residual) = extract_equi_join_keys(&condition, 2).unwrap();
+        assert_eq!(keys, vec![(0, 0)]);
+        let residual = residual.expect("residual should be captured");
+        // The residual is the original non-equi binary op (column-index 3
+        // already points into the joined layout: 2 left cols + col 1 of right).
+        match residual {
+            PlanExpr::BinaryOp { op, .. } => assert_eq!(op, ast::BinaryOp::NotEq),
+            other => panic!("unexpected residual shape: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hash_join_left_with_residual_preserves_unmatched() {
+        // Regression test for TPC-H Q13: `LEFT JOIN ... ON k = k AND r != 'skip'`.
+        // Left rows whose only matching right row is rejected by the residual
+        // must still appear in the output with NULL-padded right columns.
+        //
+        // left:  (1,a) (2,b) (3,c)
+        // right: (1,"keep") (2,"skip") (3,"keep")
+        //
+        // Expected: id=1 + "keep", id=2 + NULL (residual rejected), id=3 + "keep".
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            Field::new("tag", ArrowDataType::Utf8, false),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            left_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let left_ds = InMemoryDataSource::new(
+            vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                },
+                ColumnInfo {
+                    name: "tag".into(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                },
+            ],
+            vec![left_batch],
+        );
+        let left: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
+            source: Arc::new(left_ds),
+            _table_name: "left".into(),
+            scan_context: ScanContext::default(),
+        });
+
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            Field::new("note", ArrowDataType::Utf8, false),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            right_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["keep", "skip", "keep"])),
+            ],
+        )
+        .unwrap();
+        let right_ds = InMemoryDataSource::new(
+            vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                },
+                ColumnInfo {
+                    name: "note".into(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                },
+            ],
+            vec![right_batch],
+        );
+        let right: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
+            source: Arc::new(right_ds),
+            _table_name: "right".into(),
+            scan_context: ScanContext::default(),
+        });
+
+        // Residual: joined_batch.column(3) != 'skip'. Indices reference the
+        // joined layout (2 left columns + right column 1 => index 3).
+        let residual = PlanExpr::BinaryOp {
+            left: Box::new(PlanExpr::Column {
+                index: 3,
+                name: "note".into(),
+            }),
+            op: ast::BinaryOp::NotEq,
+            right: Box::new(PlanExpr::Literal(arneb_common::types::ScalarValue::Utf8(
+                "skip".into(),
+            ))),
+        };
+
+        let join = HashJoinExec {
+            left,
+            right,
+            join_type: ast::JoinType::Left,
+            left_keys: vec![0],
+            right_keys: vec![0],
+            residual: Some(residual),
+        };
+
+        let stream = join.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
+
+        // Tally by left id, checking whether the right side came back NULL.
+        let mut by_id: HashMap<i32, bool> = HashMap::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let notes = batch.column(3);
+            for row in 0..batch.num_rows() {
+                by_id.insert(ids.value(row), notes.is_null(row));
+            }
+        }
+        assert_eq!(by_id.len(), 3, "all 3 left rows must appear");
+        assert!(!by_id[&1], "id=1 should keep its right side");
+        assert!(by_id[&2], "id=2 residual rejected → right NULL");
+        assert!(!by_id[&3], "id=3 should keep its right side");
     }
 }

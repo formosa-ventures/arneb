@@ -132,8 +132,7 @@ impl DataSource for HiveDataSource {
                 );
                 if selected.len() < file_meta.row_groups().len() {
                     let selectors = build_row_selection(file_meta.row_groups(), &selected);
-                    let selection =
-                        parquet::arrow::arrow_reader::RowSelection::from(selectors);
+                    let selection = parquet::arrow::arrow_reader::RowSelection::from(selectors);
                     builder = builder.with_row_selection(selection);
                 }
             }
@@ -199,9 +198,12 @@ impl DataSource for HiveDataSource {
 
 /// List all data files under a given prefix in an object store.
 ///
-/// Includes files with `.parquet` extension as well as files without any
-/// extension (Trino's Hive connector writes Parquet files without the
-/// `.parquet` suffix). Hidden files and common non-data files are skipped.
+/// Skips hidden files following the Hadoop/Hive convention: any filename
+/// whose first character is `.` or `_` is treated as hidden (e.g. `_SUCCESS`,
+/// `_committed_*`, `.part-xxx.parquet.crc`). This matches Trino's
+/// `HiveFileIterator`. No extension-based filtering is applied — the Hive
+/// table's `InputFormat` (currently Parquet-only in arneb) decides how to
+/// read the remaining files.
 async fn list_parquet_files(
     store: &Arc<dyn ObjectStore>,
     prefix: &ObjectPath,
@@ -213,12 +215,7 @@ async fn list_parquet_files(
             ExecutionError::InvalidOperation(format!("failed to list files at '{}': {}", prefix, e))
         })?;
         let filename = meta.location.filename().unwrap_or_default();
-        // Skip hidden files, metadata files, and known non-data files.
-        if filename.starts_with('.')
-            || filename.starts_with('_')
-            || filename.ends_with(".crc")
-            || filename.ends_with(".metadata")
-        {
+        if filename.starts_with('.') || filename.starts_with('_') {
             continue;
         }
         if meta.size > 0 {
@@ -476,7 +473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_skips_non_parquet_files() {
+    async fn scan_skips_hidden_files() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
         let bytes = write_parquet_bytes(vec![10], vec!["x"]);
@@ -488,21 +485,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Non-parquet file should be skipped.
-        store
-            .put(
-                &ObjectPath::from("warehouse/db/table/_SUCCESS"),
-                PutPayload::from_static(b""),
-            )
-            .await
-            .unwrap();
-        store
-            .put(
-                &ObjectPath::from("warehouse/db/table/metadata.json"),
-                PutPayload::from_static(b"{}"),
-            )
-            .await
-            .unwrap();
+        // Hadoop/Hive hidden-file markers — should be skipped.
+        for hidden in ["_SUCCESS", "_committed_abc", ".hidden"] {
+            store
+                .put(
+                    &ObjectPath::from(format!("warehouse/db/table/{hidden}")),
+                    PutPayload::from_static(b""),
+                )
+                .await
+                .unwrap();
+        }
 
         let ds = HiveDataSource::new(
             store,

@@ -253,8 +253,7 @@ impl TryFrom<arrow::datatypes::DataType> for DataType {
                 let converted: Result<Vec<(String, DataType)>, _> = fields
                     .iter()
                     .map(|f| {
-                        DataType::try_from(f.data_type().clone())
-                            .map(|dt| (f.name().clone(), dt))
+                        DataType::try_from(f.data_type().clone()).map(|dt| (f.name().clone(), dt))
                     })
                     .collect();
                 Ok(DataType::Struct(converted?))

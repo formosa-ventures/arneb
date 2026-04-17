@@ -1,0 +1,27 @@
+# TPC-H Benchmark Configuration for Arneb (Hive + MinIO)
+#
+# Prerequisites:
+#   docker compose up -d          # start MinIO + HMS + Trino
+#   docker compose run tpch-seed  # seed TPC-H SF1 data
+#
+# Usage:
+#   cargo run --bin arneb -- --config benchmarks/tpch/tpch-hive.toml
+#
+# Queries use fully-qualified names: datalake.tpch.<table>
+# Or set default catalog/schema for unqualified table names.
+
+bind_address = "127.0.0.1"
+port = 5432
+
+[storage.s3]
+region = "us-east-1"
+endpoint = "http://localhost:9000"
+allow_http = true
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+
+[[catalogs]]
+name = "datalake"
+type = "hive"
+metastore_uri = "127.0.0.1:9083"
+default_schema = "tpch"

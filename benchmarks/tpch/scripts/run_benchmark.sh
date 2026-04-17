@@ -1,29 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# TPC-H Benchmark: Arneb vs Trino
-# =====================================
-# Prerequisites: Docker, Python 3 (with pyarrow, requests)
+# TPC-H Benchmark: Arneb vs Trino (Hive/MinIO)
+# ================================================
+# Both engines read the same Parquet data from MinIO via HMS.
 #
-# Usage: ./scripts/run_benchmark.sh [--scale-factor sf1] [--skip-trino]
+# Prerequisites:
+#   docker compose up -d          # start MinIO + HMS + Trino
+#   docker compose run tpch-seed  # seed TPC-H SF1 data
+#
+# Usage:
+#   ./scripts/run_benchmark.sh [--skip-trino] [--runs=N]
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BENCH_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_DIR="$(cd "$BENCH_DIR/../.." && pwd)"
 
-SCALE_FACTOR="${SCALE_FACTOR:-sf1}"
-DATA_DIR="$BENCH_DIR/data/$SCALE_FACTOR"
 RESULTS_DIR="$BENCH_DIR/results"
 NUM_RUNS="${NUM_RUNS:-5}"
 WARM_UP="${WARM_UP:-2}"
 SKIP_TRINO="${SKIP_TRINO:-false}"
-TRINO_CONTAINER="tpch-bench-trino"
-TRINO_PORT=18080
+ARNEB_PORT=5432
+TRINO_PORT=8080
 
 # Parse args
 for arg in "$@"; do
     case $arg in
-        --scale-factor=*) SCALE_FACTOR="${arg#*=}"; DATA_DIR="$BENCH_DIR/data/$SCALE_FACTOR" ;;
         --skip-trino) SKIP_TRINO=true ;;
         --runs=*) NUM_RUNS="${arg#*=}" ;;
         *) echo "Unknown arg: $arg"; exit 1 ;;
@@ -33,25 +35,31 @@ done
 echo "============================================"
 echo "TPC-H Benchmark: Arneb vs Trino"
 echo "============================================"
-echo "Scale factor: $SCALE_FACTOR"
-echo "Data dir:     $DATA_DIR"
-echo "Runs:         $NUM_RUNS (warm-up: $WARM_UP)"
+echo "Data source: Hive/MinIO (hive.tpch.*)"
+echo "Runs:        $NUM_RUNS (warm-up: $WARM_UP)"
 echo ""
 
 # ------------------------------------------------------------------
-# Step 1: Generate Parquet data if not present
+# Step 1: Verify Docker Compose services are running
 # ------------------------------------------------------------------
-if [ ! -f "$DATA_DIR/lineitem.parquet" ]; then
-    echo ">>> Step 1: Generating TPC-H Parquet data..."
-    python3 "$SCRIPT_DIR/generate_parquet.py" \
-        --scale-factor "$SCALE_FACTOR" \
-        --output-dir "$DATA_DIR" \
-        --keep-container
-    echo ""
-else
-    echo ">>> Step 1: Data already exists in $DATA_DIR (skipping generation)"
-    echo ""
+echo ">>> Step 1: Checking Docker Compose services..."
+cd "$PROJECT_DIR"
+
+if ! docker compose ps --status running 2>/dev/null | grep -q trino; then
+    echo "Trino is not running. Start services first:"
+    echo "  docker compose up -d"
+    echo "  docker compose run --rm tpch-seed"
+    exit 1
 fi
+
+# Quick check: verify seeded data exists
+ROW_COUNT=$(docker compose exec -T trino trino --execute "SELECT COUNT(*) FROM hive.tpch.nation" 2>/dev/null | tr -d '"' || echo "0")
+if [ "$ROW_COUNT" = "0" ]; then
+    echo "TPC-H data not seeded. Run: docker compose run --rm tpch-seed"
+    exit 1
+fi
+echo "Docker Compose services running. TPC-H data verified."
+echo ""
 
 # ------------------------------------------------------------------
 # Step 2: Build Arneb and benchmark runner
@@ -64,80 +72,44 @@ cargo build --release 2>&1 | tail -1
 echo ""
 
 # ------------------------------------------------------------------
-# Step 3: Start Arneb and run benchmark
+# Step 3: Start Arneb (Hive config) and run benchmark
 # ------------------------------------------------------------------
 echo ">>> Step 3: Running benchmark against Arneb..."
 
-# Start Arneb in background
 cd "$PROJECT_DIR"
-./target/release/arneb --config "$BENCH_DIR/tpch-config.toml" &
+./target/release/arneb --config "$BENCH_DIR/tpch-hive.toml" &
 ARNEB_PID=$!
-sleep 2
+sleep 3
 
-# Run benchmark
 cd "$BENCH_DIR"
 ./target/release/tpch-bench \
     --engine arneb \
     --host 127.0.0.1 \
-    --port 5432 \
+    --port "$ARNEB_PORT" \
     --queries-dir "$BENCH_DIR/queries" \
     --num-runs "$NUM_RUNS" \
     --warm-up "$WARM_UP" \
     --output-dir "$RESULTS_DIR" || true
 
-# Stop Arneb
 kill $ARNEB_PID 2>/dev/null || true
 wait $ARNEB_PID 2>/dev/null || true
 echo ""
 
 # ------------------------------------------------------------------
-# Step 4: Run benchmark against Trino (Docker)
+# Step 4: Run benchmark against Trino (Docker Compose)
 # ------------------------------------------------------------------
 if [ "$SKIP_TRINO" = "true" ]; then
     echo ">>> Step 4: Skipping Trino benchmark (--skip-trino)"
 else
     echo ">>> Step 4: Running benchmark against Trino..."
 
-    # Ensure Trino container is running
-    if ! docker ps --format '{{.Names}}' | grep -q "$TRINO_CONTAINER"; then
-        echo "Starting Trino Docker container on port $TRINO_PORT..."
-        docker rm -f "$TRINO_CONTAINER" 2>/dev/null || true
-
-        # Create Trino config to read from Parquet files via Hive connector
-        TRINO_ETC=$(mktemp -d)
-        mkdir -p "$TRINO_ETC/catalog"
-
-        # Use tpch connector pointing to the same scale factor
-        cat > "$TRINO_ETC/catalog/tpch.properties" <<EOF
-connector.name=tpch
-tpch.splits-per-node=1
-EOF
-
-        docker run -d \
-            --name "$TRINO_CONTAINER" \
-            -p "$TRINO_PORT:8080" \
-            trinodb/trino:latest
-
-        echo -n "Waiting for Trino to start..."
-        for i in $(seq 1 30); do
-            if curl -sf "http://localhost:$TRINO_PORT/v1/info" | grep -q '"starting":false'; then
-                echo " ready!"
-                break
-            fi
-            echo -n "."
-            sleep 2
-        done
-        echo ""
-        rm -rf "$TRINO_ETC"
-    fi
-
     cd "$BENCH_DIR"
     ./target/release/tpch-bench \
         --engine trino \
         --host 127.0.0.1 \
         --port "$TRINO_PORT" \
-        --catalog tpch \
-        --schema "$SCALE_FACTOR" \
+        --catalog hive \
+        --schema tpch \
         --queries-dir "$BENCH_DIR/queries" \
         --num-runs "$NUM_RUNS" \
         --warm-up "$WARM_UP" \

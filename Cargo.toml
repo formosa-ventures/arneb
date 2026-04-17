@@ -23,7 +23,7 @@ tracing = "0.1"
 # Arrow columnar format
 arrow = { version = "58", default-features = false }
 arrow-csv = { version = "58", default-features = false }
-parquet = { version = "58", default-features = false, features = ["arrow", "snap", "object_store"] }
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "object_store", "zstd", "lz4", "brotli", "flate2", "flate2-rust_backened"] }
 
 # Object store (S3, GCS, Azure, local filesystem)
 object_store = { version = "0.13", default-features = false, features = ["aws", "fs"] }

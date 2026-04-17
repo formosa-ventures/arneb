@@ -10,6 +10,7 @@
 
 pub mod file;
 pub mod memory;
+pub mod parquet_pushdown;
 pub mod storage;
 mod traits;
 

@@ -187,19 +187,50 @@ pub(crate) fn scalar_to_array(
         ScalarValue::Float32(v) => Ok(Arc::new(Float32Array::from(vec![*v; num_rows]))),
         ScalarValue::Float64(v) => Ok(Arc::new(Float64Array::from(vec![*v; num_rows]))),
         ScalarValue::Utf8(v) => Ok(Arc::new(StringArray::from(vec![v.as_str(); num_rows]))),
-        ScalarValue::Binary(_) => Err(ExecutionError::InvalidOperation(
-            "binary literal arrays not yet supported".to_string(),
-        )),
-        ScalarValue::Decimal128 { .. } => Err(ExecutionError::InvalidOperation(
-            "decimal literal arrays not yet supported".to_string(),
-        )),
+        ScalarValue::Binary(v) => {
+            Ok(Arc::new(arrow::array::BinaryArray::from(vec![v.as_slice(); num_rows])))
+        }
+        ScalarValue::Decimal128 {
+            value,
+            precision,
+            scale,
+        } => {
+            let arr = arrow::array::Decimal128Array::from(vec![*value; num_rows])
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| {
+                    ExecutionError::InvalidOperation(format!(
+                        "invalid decimal precision/scale: {e}"
+                    ))
+                })?;
+            Ok(Arc::new(arr))
+        }
         ScalarValue::Date32(v) => Ok(Arc::new(arrow::array::Date32Array::from(vec![
             *v;
             num_rows
         ]))),
-        ScalarValue::Timestamp { .. } => Err(ExecutionError::InvalidOperation(
-            "timestamp literal arrays not yet supported".to_string(),
-        )),
+        ScalarValue::Timestamp {
+            value,
+            unit,
+            timezone,
+        } => {
+            let arrow_unit: arrow::datatypes::TimeUnit = (*unit).into();
+            let tz: Option<Arc<str>> = timezone.as_ref().map(|s| Arc::from(s.as_str()));
+            let arr = match arrow_unit {
+                arrow::datatypes::TimeUnit::Second => {
+                    Arc::new(arrow::array::TimestampSecondArray::from(vec![*value; num_rows]).with_timezone_opt(tz)) as ArrayRef
+                }
+                arrow::datatypes::TimeUnit::Millisecond => {
+                    Arc::new(arrow::array::TimestampMillisecondArray::from(vec![*value; num_rows]).with_timezone_opt(tz)) as ArrayRef
+                }
+                arrow::datatypes::TimeUnit::Microsecond => {
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![*value; num_rows]).with_timezone_opt(tz)) as ArrayRef
+                }
+                arrow::datatypes::TimeUnit::Nanosecond => {
+                    Arc::new(arrow::array::TimestampNanosecondArray::from(vec![*value; num_rows]).with_timezone_opt(tz)) as ArrayRef
+                }
+            };
+            Ok(arr)
+        }
         _ => Err(ExecutionError::InvalidOperation(
             "unsupported scalar type for array conversion".to_string(),
         )),
@@ -266,6 +297,31 @@ fn compare_op(
         ArrowDataType::Date32 => {
             let l = left.as_primitive::<Date32Type>();
             let r = right.as_primitive::<Date32Type>();
+            typed_cmp(l, r, op)
+        }
+        ArrowDataType::Decimal128(_, _) => {
+            let l = left.as_primitive::<Decimal128Type>();
+            let r = right.as_primitive::<Decimal128Type>();
+            typed_cmp(l, r, op)
+        }
+        ArrowDataType::Timestamp(TimeUnit::Second, _) => {
+            let l = left.as_primitive::<TimestampSecondType>();
+            let r = right.as_primitive::<TimestampSecondType>();
+            typed_cmp(l, r, op)
+        }
+        ArrowDataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let l = left.as_primitive::<TimestampMillisecondType>();
+            let r = right.as_primitive::<TimestampMillisecondType>();
+            typed_cmp(l, r, op)
+        }
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let l = left.as_primitive::<TimestampMicrosecondType>();
+            let r = right.as_primitive::<TimestampMicrosecondType>();
+            typed_cmp(l, r, op)
+        }
+        ArrowDataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let l = left.as_primitive::<TimestampNanosecondType>();
+            let r = right.as_primitive::<TimestampNanosecondType>();
             typed_cmp(l, r, op)
         }
         dt => Err(ExecutionError::InvalidOperation(format!(
@@ -473,6 +529,23 @@ fn wider_numeric_type(
 
         // Float32 + Float64 → Float64
         (Float32, Float64) | (Float64, Float32) => Ok(Float64),
+
+        // Decimal128 + integer → Decimal128 (cast integer to decimal)
+        (Decimal128(p, s), Int32 | Int64) => Ok(Decimal128(*p, *s)),
+        (Int32 | Int64, Decimal128(p, s)) => Ok(Decimal128(*p, *s)),
+
+        // Decimal128 + float → Float64
+        (Decimal128(_, _), Float32 | Float64) | (Float32 | Float64, Decimal128(_, _)) => {
+            Ok(Float64)
+        }
+
+        // Decimal128 + Decimal128 with different precision/scale → use wider
+        (Decimal128(p1, s1), Decimal128(p2, s2)) => {
+            let scale = (*s1).max(*s2);
+            let precision = ((*p1 as i8 - *s1) .max(*p2 as i8 - *s2) + scale) as u8;
+            let precision = precision.min(38); // Decimal128 max precision
+            Ok(Decimal128(precision, scale))
+        }
 
         _ => Err(ExecutionError::InvalidOperation(format!(
             "cannot coerce {a:?} and {b:?} to a common type"
@@ -894,6 +967,119 @@ mod tests {
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(arr.values(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn eval_decimal128_literal() {
+        let batch = make_batch();
+        let expr = PlanExpr::Literal(ScalarValue::Decimal128 {
+            value: 12345,
+            precision: 10,
+            scale: 2,
+        });
+        let result = evaluate(&expr, &batch, None).unwrap();
+        let arr = result
+            .as_any()
+            .downcast_ref::<arrow::array::Decimal128Array>()
+            .unwrap();
+        assert_eq!(arr.value(0), 12345);
+        assert_eq!(arr.len(), 3);
+    }
+
+    #[test]
+    fn eval_decimal128_comparison() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "price",
+            ArrowDataType::Decimal128(10, 2),
+            false,
+        )]));
+        let arr = arrow::array::Decimal128Array::from(vec![1000, 2000, 3000])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        // price > 20.00 (2000 in scale=2)
+        let expr = PlanExpr::BinaryOp {
+            left: Box::new(PlanExpr::Column {
+                index: 0,
+                name: "price".to_string(),
+            }),
+            op: ast::BinaryOp::Gt,
+            right: Box::new(PlanExpr::Literal(ScalarValue::Decimal128 {
+                value: 2000,
+                precision: 10,
+                scale: 2,
+            })),
+        };
+        let result = evaluate(&expr, &batch, None).unwrap();
+        let bool_arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(!bool_arr.value(0)); // 10.00 not > 20.00
+        assert!(!bool_arr.value(1)); // 20.00 not > 20.00
+        assert!(bool_arr.value(2)); // 30.00 > 20.00
+    }
+
+    #[test]
+    fn eval_decimal128_arithmetic() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "price",
+            ArrowDataType::Decimal128(10, 2),
+            false,
+        )]));
+        let arr = arrow::array::Decimal128Array::from(vec![1000, 2000, 3000])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        // price + 5.00
+        let expr = PlanExpr::BinaryOp {
+            left: Box::new(PlanExpr::Column {
+                index: 0,
+                name: "price".to_string(),
+            }),
+            op: ast::BinaryOp::Plus,
+            right: Box::new(PlanExpr::Literal(ScalarValue::Decimal128 {
+                value: 500,
+                precision: 10,
+                scale: 2,
+            })),
+        };
+        let result = evaluate(&expr, &batch, None).unwrap();
+        let dec_arr = result
+            .as_any()
+            .downcast_ref::<arrow::array::Decimal128Array>()
+            .unwrap();
+        assert_eq!(dec_arr.value(0), 1500); // 10.00 + 5.00 = 15.00
+        assert_eq!(dec_arr.value(1), 2500);
+        assert_eq!(dec_arr.value(2), 3500);
+    }
+
+    #[test]
+    fn eval_timestamp_literal() {
+        let batch = make_batch();
+        let expr = PlanExpr::Literal(ScalarValue::Timestamp {
+            value: 1000000,
+            unit: arneb_common::types::TimeUnit::Microsecond,
+            timezone: None,
+        });
+        let result = evaluate(&expr, &batch, None).unwrap();
+        assert_eq!(
+            *result.data_type(),
+            ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        );
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn eval_binary_literal() {
+        let batch = make_batch();
+        let expr = PlanExpr::Literal(ScalarValue::Binary(vec![0x01, 0x02, 0x03]));
+        let result = evaluate(&expr, &batch, None).unwrap();
+        let arr = result
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .unwrap();
+        assert_eq!(arr.value(0), &[0x01, 0x02, 0x03]);
+        assert_eq!(arr.len(), 3);
     }
 
     #[test]

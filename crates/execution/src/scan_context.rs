@@ -19,6 +19,10 @@ pub struct ScanContext {
 
     /// Maximum number of rows to return.
     pub limit: Option<usize>,
+
+    /// Batch size hint for record batch readers.
+    /// `None` means use the reader's default (typically 8192).
+    pub batch_size: Option<usize>,
 }
 
 impl ScanContext {
@@ -42,6 +46,12 @@ impl ScanContext {
     /// Sets the row limit.
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
+        self
+    }
+
+    /// Sets the batch size hint.
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = Some(batch_size);
         self
     }
 }

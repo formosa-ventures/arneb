@@ -36,11 +36,11 @@ cargo run --bin arneb -- --config worker.toml --role worker
 # Run TPC-H benchmark
 cd benchmarks/tpch && cargo run --release -- --engine arneb --port 5432
 
-# Local Hive + S3 demo (HMS 4.2.0 + MinIO via docker-compose)
-docker compose up -d                                        # start HMS + MinIO
-cargo run --bin hive-demo-setup                             # seed demo.cities + demo.orders
-cargo run --bin arneb -- --config scripts/arneb-hive-demo.toml   # start Arneb with hive catalog
-psql -h 127.0.0.1 -p 5432 -c "SELECT * FROM datalake.demo.cities;"
+# Local Hive + S3 environment (HMS 4.2.0 + MinIO + Trino via docker-compose)
+docker compose up -d                                        # start HMS + MinIO + Trino
+docker compose run --rm tpch-seed                           # seed TPC-H SF1 data
+cargo run --bin arneb -- --config benchmarks/tpch/tpch-hive.toml  # start Arneb with hive catalog
+psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.nation;"
 docker compose down                                         # tear down
 ```
 
@@ -91,7 +91,7 @@ endpoint = "http://localhost:9000"
 allow_http = true
 ```
 
-See `scripts/arneb-hive-demo.toml` for a ready-to-run demo config.
+See `benchmarks/tpch/tpch-hive.toml` for a Hive-backed benchmark config.
 
 **Ports**:
 - Coordinator/Standalone: pgwire (configured port), Web UI (port + 1000), Flight RPC (9090)
@@ -156,7 +156,7 @@ crates/
 └── server/        # Main binary (arneb), CLI (clap), config loading,
                    # catalog/connector wiring, Web UI (axum + rust-embed),
                    # graceful shutdown, coordinator/worker startup.
-                   # `hive-demo-setup` binary seeds HMS + MinIO with demo tables.
+                   # Hive/MinIO seeding handled by docker compose seed services.
 ```
 
 ### Key Data Flow
@@ -184,6 +184,7 @@ SQL String
 - **tracing** / **tracing-subscriber**: Structured logging throughout.
 - **thiserror** / **anyhow**: Error handling (thiserror for libraries, anyhow for the binary).
 - **object_store** (v0.11, `aws` feature): Unified S3/GCS/Azure/local filesystem abstraction.
+- **parquet** (v58): Parquet file reader/writer. Supported compression codecs: Snappy, Gzip, Zstd, LZ4, Brotli, and uncompressed.
 - **volo-thrift** (v0.10) / **pilota** (v0.11): Async Thrift runtime backing the `hive-metastore` crate. Note: the generated client uses `DefaultMakeCodec::buffered()` (plain TBinaryProtocol) to talk to real HMS servers, not the default TT-Header framing.
 
 ### Design Principles
@@ -191,7 +192,7 @@ SQL String
 - **Arrow-native**: All intermediate data in Arrow columnar format. No row-by-row processing.
 - **Async streaming**: Operators return `SendableRecordBatchStream` for async execution.
 - **Trait-based connectors**: `DataSource` trait abstracts all data access. Adding a new connector = implementing `ConnectorFactory` + `DataSource`.
-- **Pushdown**: Filters, projections, and limits are pushed into connectors when supported.
+- **Pushdown**: Filters, projections, and limits are pushed into connectors when supported. Parquet connectors support row group pruning (min/max statistics) and predicate pushdown (ArrowPredicate) for simple column comparisons.
 - **PostgreSQL compatible**: Full Simple and Extended Query protocol. DBeaver, JDBC, psycopg2 all work out of the box.
 
 ## SQL Support

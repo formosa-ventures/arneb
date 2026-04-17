@@ -2,9 +2,12 @@
 #
 # Run TPC-H queries against Trino for baseline comparison.
 #
+# By default, connects to the Docker Compose Trino instance reading
+# from Hive tables on MinIO (same data as arneb).
+#
 # Prerequisites:
-#   - Trino CLI: brew install trino
-#   - Trino server running with tpch connector configured
+#   docker compose up -d          # start MinIO + HMS + Trino
+#   docker compose run tpch-seed  # seed TPC-H data
 #
 # Usage:
 #   ./benchmarks/tpch/scripts/run_trino.sh [host] [port] [catalog]
@@ -14,8 +17,8 @@ set -euo pipefail
 
 HOST="${1:-localhost}"
 PORT="${2:-8080}"
-CATALOG="${3:-tpch}"
-SCHEMA="sf1"
+CATALOG="${3:-hive}"
+SCHEMA="tpch"
 QUERIES_DIR="benchmarks/tpch/queries"
 OUTPUT_DIR="benchmarks/tpch/results"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)

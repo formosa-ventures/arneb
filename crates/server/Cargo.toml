@@ -8,9 +8,6 @@ license.workspace = true
 name = "arneb"
 path = "src/main.rs"
 
-[[bin]]
-name = "hive-demo-setup"
-path = "src/bin/hive_demo_setup.rs"
 
 [dependencies]
 # Internal crates

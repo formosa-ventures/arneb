@@ -120,6 +120,34 @@ impl DataSource for HiveDataSource {
                         ))
                     })?;
 
+            // Apply row group pruning based on filters.
+            if !ctx.filters.is_empty() {
+                let column_names: Vec<String> =
+                    self.column_schema.iter().map(|c| c.name.clone()).collect();
+                let file_meta = builder.metadata().clone();
+                let selected = arneb_connectors::parquet_pushdown::prune_row_groups(
+                    file_meta.row_groups(),
+                    &ctx.filters,
+                    &column_names,
+                );
+                if selected.len() < file_meta.row_groups().len() {
+                    let selectors = build_row_selection(file_meta.row_groups(), &selected);
+                    let selection =
+                        parquet::arrow::arrow_reader::RowSelection::from(selectors);
+                    builder = builder.with_row_selection(selection);
+                }
+            }
+
+            // Apply predicate pushdown for within-row-group filtering.
+            if !ctx.filters.is_empty() {
+                if let Some(row_filter) = arneb_connectors::parquet_pushdown::build_row_filter(
+                    &ctx.filters,
+                    builder.parquet_schema(),
+                ) {
+                    builder = builder.with_row_filter(row_filter);
+                }
+            }
+
             // Apply projection pushdown.
             if let Some(ref projection) = ctx.projection {
                 let mask = parquet::arrow::ProjectionMask::roots(
@@ -127,6 +155,11 @@ impl DataSource for HiveDataSource {
                     projection.iter().copied(),
                 );
                 builder = builder.with_projection(mask);
+            }
+
+            // Apply batch size if configured.
+            if let Some(batch_size) = ctx.batch_size {
+                builder = builder.with_batch_size(batch_size);
             }
 
             let stream = builder.build().map_err(|e| {
@@ -164,7 +197,11 @@ impl DataSource for HiveDataSource {
     }
 }
 
-/// List all `.parquet` files under a given prefix in an object store.
+/// List all data files under a given prefix in an object store.
+///
+/// Includes files with `.parquet` extension as well as files without any
+/// extension (Trino's Hive connector writes Parquet files without the
+/// `.parquet` suffix). Hidden files and common non-data files are skipped.
 async fn list_parquet_files(
     store: &Arc<dyn ObjectStore>,
     prefix: &ObjectPath,
@@ -175,12 +212,39 @@ async fn list_parquet_files(
         let meta = result.map_err(|e| {
             ExecutionError::InvalidOperation(format!("failed to list files at '{}': {}", prefix, e))
         })?;
-        let path_str = meta.location.to_string();
-        if path_str.ends_with(".parquet") {
+        let filename = meta.location.filename().unwrap_or_default();
+        // Skip hidden files, metadata files, and known non-data files.
+        if filename.starts_with('.')
+            || filename.starts_with('_')
+            || filename.ends_with(".crc")
+            || filename.ends_with(".metadata")
+        {
+            continue;
+        }
+        if meta.size > 0 {
             paths.push(meta.location);
         }
     }
     Ok(paths)
+}
+
+/// Build a RowSelector list from selected row group indices.
+fn build_row_selection(
+    row_groups: &[parquet::file::metadata::RowGroupMetaData],
+    selected: &[usize],
+) -> Vec<parquet::arrow::arrow_reader::RowSelector> {
+    use parquet::arrow::arrow_reader::RowSelector;
+    let selected_set: std::collections::HashSet<usize> = selected.iter().copied().collect();
+    let mut selectors = Vec::new();
+    for (idx, rg) in row_groups.iter().enumerate() {
+        let num_rows = rg.num_rows() as usize;
+        if selected_set.contains(&idx) {
+            selectors.push(RowSelector::select(num_rows));
+        } else {
+            selectors.push(RowSelector::skip(num_rows));
+        }
+    }
+    selectors
 }
 
 /// Convert `ColumnInfo` slice to an Arrow schema.
@@ -597,6 +661,90 @@ mod tests {
         let debug_str = format!("{factory:?}");
         assert!(debug_str.contains("HiveConnectorFactory"));
         assert!(debug_str.contains("tbl"));
+    }
+
+    // -- Compression codec tests --
+
+    fn write_parquet_bytes_compressed(
+        ids: Vec<i32>,
+        names: Vec<&str>,
+        compression: parquet::basic::Compression,
+    ) -> Vec<u8> {
+        use parquet::file::properties::WriterProperties;
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap();
+
+        let props = WriterProperties::builder()
+            .set_compression(compression)
+            .build();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, arrow_schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        buf
+    }
+
+    async fn assert_hive_scan_reads_compressed(compression: parquet::basic::Compression) {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let bytes = write_parquet_bytes_compressed(vec![1, 2, 3], vec!["a", "b", "c"], compression);
+        store
+            .put(
+                &ObjectPath::from("warehouse/db/table/data.parquet"),
+                PutPayload::from_bytes(bytes.into()),
+            )
+            .await
+            .unwrap();
+
+        let ds = HiveDataSource::new(
+            store,
+            ObjectPath::from("warehouse/db/table"),
+            test_column_schema(),
+        );
+
+        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn scan_gzip_compressed_parquet() {
+        assert_hive_scan_reads_compressed(parquet::basic::Compression::GZIP(
+            parquet::basic::GzipLevel::default(),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scan_zstd_compressed_parquet() {
+        assert_hive_scan_reads_compressed(parquet::basic::Compression::ZSTD(
+            parquet::basic::ZstdLevel::default(),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scan_lz4_compressed_parquet() {
+        assert_hive_scan_reads_compressed(parquet::basic::Compression::LZ4_RAW).await;
+    }
+
+    #[tokio::test]
+    async fn scan_brotli_compressed_parquet() {
+        assert_hive_scan_reads_compressed(parquet::basic::Compression::BROTLI(
+            parquet::basic::BrotliLevel::default(),
+        ))
+        .await;
     }
 
     #[tokio::test]

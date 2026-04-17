@@ -3,7 +3,7 @@ SELECT
     o_orderpriority,
     COUNT(*) AS order_count
 FROM orders
-WHERE o_orderdate >= CAST('1993-07-01' AS DATE)
-    AND o_orderdate < CAST('1993-10-01' AS DATE)
+WHERE o_orderdate >= DATE '1993-07-01'
+    AND o_orderdate < DATE '1993-10-01'
 GROUP BY o_orderpriority
 ORDER BY o_orderpriority

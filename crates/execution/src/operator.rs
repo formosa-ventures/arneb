@@ -18,8 +18,8 @@ use arneb_common::types::{ColumnInfo, ScalarValue};
 use arneb_planner::{LogicalPlan, PlanExpr, SortExpr};
 use arneb_sql_parser::ast;
 use arrow::array::{
-    self, Array, ArrayRef, AsArray, BooleanArray, Float32Array, Float64Array, Int32Array,
-    Int64Array, RecordBatch, StringArray, UInt32Array,
+    self, Array, ArrayRef, AsArray, BooleanArray, Date32Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::compute;
 use arrow::datatypes::{self, DataType as ArrowDataType, Field, Schema};
@@ -989,6 +989,10 @@ fn extract_scalar(arr: &ArrayRef, index: usize) -> Result<ScalarValue, Execution
             let a = arr.as_boolean();
             Ok(ScalarValue::Boolean(a.value(index)))
         }
+        ArrowDataType::Date32 => {
+            let a = arr.as_primitive::<datatypes::Date32Type>();
+            Ok(ScalarValue::Date32(a.value(index)))
+        }
         dt => Err(ExecutionError::InvalidOperation(format!(
             "cannot extract scalar from type {dt:?}"
         ))),
@@ -1068,6 +1072,17 @@ fn scalars_to_array(values: &[ScalarValue], _len: usize) -> Result<ArrayRef, Exe
                 .collect();
             Ok(Arc::new(arr))
         }
+        Some(ScalarValue::Date32(_)) => {
+            let arr: Date32Array = values
+                .iter()
+                .map(|v| match v {
+                    ScalarValue::Date32(n) => Some(*n),
+                    ScalarValue::Null => None,
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
         _ => Ok(Arc::new(array::NullArray::new(values.len()))),
     }
 }
@@ -1114,6 +1129,30 @@ mod tests {
             ],
             vec![batch],
         ))
+    }
+
+    #[test]
+    fn extract_scalar_supports_date32() {
+        // TPC-H Q3 groups by a date column; before this fix the aggregate
+        // operator failed with "cannot extract scalar from type Date32".
+        let arr: ArrayRef = Arc::new(Date32Array::from(vec![Some(19000), None, Some(19500)]));
+        assert_eq!(extract_scalar(&arr, 0).unwrap(), ScalarValue::Date32(19000));
+        assert_eq!(extract_scalar(&arr, 1).unwrap(), ScalarValue::Null);
+        assert_eq!(extract_scalar(&arr, 2).unwrap(), ScalarValue::Date32(19500));
+    }
+
+    #[test]
+    fn scalars_to_array_supports_date32() {
+        let values = vec![
+            ScalarValue::Date32(19000),
+            ScalarValue::Null,
+            ScalarValue::Date32(19500),
+        ];
+        let arr = scalars_to_array(&values, 3).unwrap();
+        let date_arr = arr.as_primitive::<datatypes::Date32Type>();
+        assert_eq!(date_arr.value(0), 19000);
+        assert!(date_arr.is_null(1));
+        assert_eq!(date_arr.value(2), 19500);
     }
 
     #[tokio::test]

@@ -8,8 +8,8 @@ FROM customer
 JOIN orders ON c_custkey = o_custkey
 JOIN lineitem ON l_orderkey = o_orderkey
 WHERE c_mktsegment = 'BUILDING'
-    AND o_orderdate < '1995-03-15'
-    AND l_shipdate > '1995-03-15'
+    AND o_orderdate < CAST('1995-03-15' AS DATE)
+    AND l_shipdate > CAST('1995-03-15' AS DATE)
 GROUP BY l_orderkey, o_orderdate, o_shippriority
 ORDER BY SUM(l_extendedprice) DESC
 LIMIT 10

@@ -327,6 +327,63 @@ mod tests {
     }
 
     #[test]
+    fn parse_date_typed_string_literal() {
+        // `DATE 'YYYY-MM-DD'` is lowered to `CAST('YYYY-MM-DD' AS DATE)` so
+        // downstream passes (physical planner, expression evaluator) can
+        // reuse the Cast path without needing a separate typed-string node.
+        let stmt = parse("SELECT DATE '1998-12-01'").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(Expr::Cast { expr, data_type }) => {
+                assert_eq!(*data_type, DataType::Date32);
+                match expr.as_ref() {
+                    Expr::Literal(ScalarValue::Utf8(s)) => assert_eq!(s, "1998-12-01"),
+                    other => panic!("expected Utf8 literal, got {other:?}"),
+                }
+            }
+            other => panic!("expected Cast(Utf8 AS Date32), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_date_literal_in_where_clause() {
+        // Regression for the TPC-H Q1 shape: `WHERE l_shipdate <= DATE '1998-12-01'`.
+        let stmt = parse("SELECT * FROM t WHERE d <= DATE '1998-12-01'").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected Query");
+        };
+        let body = select_body(&query);
+        let predicate = body.selection.as_ref().expect("WHERE clause");
+        match predicate.as_ref() {
+            Expr::BinaryOp { right, .. } => match right.as_ref() {
+                Expr::Cast { data_type, expr } => {
+                    assert_eq!(*data_type, DataType::Date32);
+                    assert!(matches!(expr.as_ref(), Expr::Literal(ScalarValue::Utf8(_))));
+                }
+                other => panic!("expected Cast on RHS, got {other:?}"),
+            },
+            other => panic!("expected BinaryOp predicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_timestamp_typed_string_literal() {
+        let stmt = parse("SELECT TIMESTAMP '2025-01-02 03:04:05'").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(Expr::Cast { expr, data_type }) => {
+                assert!(matches!(data_type, DataType::Timestamp { .. }));
+                assert!(matches!(expr.as_ref(), Expr::Literal(ScalarValue::Utf8(_))));
+            }
+            other => panic!("expected Cast(Utf8 AS Timestamp), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_nested_expr() {
         let stmt = parse("SELECT (a + b) * c FROM t").unwrap();
         let Statement::Query(query) = stmt else {

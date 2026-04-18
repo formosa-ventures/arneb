@@ -8,6 +8,6 @@ SELECT
     SUM(l_discount),
     COUNT(*)
 FROM lineitem
-WHERE l_shipdate <= '1998-12-01'
+WHERE l_shipdate <= CAST('1998-12-01' AS DATE)
 GROUP BY l_returnflag, l_linestatus
 ORDER BY l_returnflag, l_linestatus

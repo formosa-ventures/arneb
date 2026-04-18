@@ -53,10 +53,7 @@ pub fn prune_row_groups(
 }
 
 /// Returns `true` if statistics prove the row group cannot contain any matching rows.
-fn can_prune_row_group(
-    rg: &RowGroupMetaData,
-    filters: &[PlanExpr],
-) -> bool {
+fn can_prune_row_group(rg: &RowGroupMetaData, filters: &[PlanExpr]) -> bool {
     for filter in filters {
         if filter_prunes_row_group(rg, filter) {
             return true;
@@ -66,16 +63,12 @@ fn can_prune_row_group(
 }
 
 /// Check if a single filter expression prunes the given row group.
-fn filter_prunes_row_group(
-    rg: &RowGroupMetaData,
-    filter: &PlanExpr,
-) -> bool {
+fn filter_prunes_row_group(rg: &RowGroupMetaData, filter: &PlanExpr) -> bool {
     match filter {
         PlanExpr::BinaryOp { left, op, right } => {
             // AND conjunction: prune if either side proves no match
             if *op == BinaryOp::And {
-                return filter_prunes_row_group(rg, left)
-                    || filter_prunes_row_group(rg, right);
+                return filter_prunes_row_group(rg, left) || filter_prunes_row_group(rg, right);
             }
 
             // Try Column op Literal
@@ -135,25 +128,21 @@ fn column_stats_prune(
 
     // Extract min/max from statistics and compare with the literal.
     match (stats, literal) {
-        (Statistics::Int32(s), ScalarValue::Int32(v)) => {
-            prune_with_minmax_i64(
-                s.min_opt().map(|x| *x as i64),
-                s.max_opt().map(|x| *x as i64),
-                *v as i64,
-                op,
-            )
-        }
+        (Statistics::Int32(s), ScalarValue::Int32(v)) => prune_with_minmax_i64(
+            s.min_opt().map(|x| *x as i64),
+            s.max_opt().map(|x| *x as i64),
+            *v as i64,
+            op,
+        ),
         (Statistics::Int64(s), ScalarValue::Int64(v)) => {
             prune_with_minmax_i64(s.min_opt().copied(), s.max_opt().copied(), *v, op)
         }
-        (Statistics::Int32(s), ScalarValue::Date32(v)) => {
-            prune_with_minmax_i64(
-                s.min_opt().map(|x| *x as i64),
-                s.max_opt().map(|x| *x as i64),
-                *v as i64,
-                op,
-            )
-        }
+        (Statistics::Int32(s), ScalarValue::Date32(v)) => prune_with_minmax_i64(
+            s.min_opt().map(|x| *x as i64),
+            s.max_opt().map(|x| *x as i64),
+            *v as i64,
+            op,
+        ),
         (Statistics::Int64(s), ScalarValue::Date32(v)) => {
             prune_with_minmax_i64(s.min_opt().copied(), s.max_opt().copied(), *v as i64, op)
         }
@@ -207,7 +196,9 @@ fn prune_with_minmax_f64(
 
     match op {
         BinaryOp::Eq => literal < min || literal > max,
-        BinaryOp::NotEq => (min - literal).abs() < f64::EPSILON && (max - literal).abs() < f64::EPSILON,
+        BinaryOp::NotEq => {
+            (min - literal).abs() < f64::EPSILON && (max - literal).abs() < f64::EPSILON
+        }
         BinaryOp::Lt => min >= literal,
         BinaryOp::LtEq => min > literal,
         BinaryOp::Gt => max <= literal,
@@ -255,8 +246,7 @@ fn try_build_predicate(
             }
 
             // Simple Column op Literal
-            let (col_idx, scalar, cmp_op) =
-                extract_column_literal_comparison(left, op, right)?;
+            let (col_idx, scalar, cmp_op) = extract_column_literal_comparison(left, op, right)?;
 
             // Build projection mask for just this column
             let mask = ProjectionMask::leaves(schema, [col_idx]);
@@ -274,8 +264,9 @@ fn try_build_predicate(
 fn build_comparison_predicate(
     literal: ScalarValue,
     op: BinaryOp,
-) -> Option<impl FnMut(arrow::record_batch::RecordBatch) -> Result<BooleanArray, arrow::error::ArrowError>>
-{
+) -> Option<
+    impl FnMut(arrow::record_batch::RecordBatch) -> Result<BooleanArray, arrow::error::ArrowError>,
+> {
     Some(
         move |batch: arrow::record_batch::RecordBatch| -> Result<BooleanArray, arrow::error::ArrowError> {
             let column = batch.column(0);

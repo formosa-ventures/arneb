@@ -470,18 +470,18 @@ fn extract_ordscalar(arr: &ArrayRef, index: usize) -> Result<OrdScalar, Executio
             let tu: arneb_common::types::TimeUnit = (*unit).into();
             let tz_str = tz.as_ref().map(|s| s.to_string());
             let val = match unit {
-                datatypes::TimeUnit::Second => {
-                    arr.as_primitive::<datatypes::TimestampSecondType>().value(index)
-                }
-                datatypes::TimeUnit::Millisecond => {
-                    arr.as_primitive::<datatypes::TimestampMillisecondType>().value(index)
-                }
-                datatypes::TimeUnit::Microsecond => {
-                    arr.as_primitive::<datatypes::TimestampMicrosecondType>().value(index)
-                }
-                datatypes::TimeUnit::Nanosecond => {
-                    arr.as_primitive::<datatypes::TimestampNanosecondType>().value(index)
-                }
+                datatypes::TimeUnit::Second => arr
+                    .as_primitive::<datatypes::TimestampSecondType>()
+                    .value(index),
+                datatypes::TimeUnit::Millisecond => arr
+                    .as_primitive::<datatypes::TimestampMillisecondType>()
+                    .value(index),
+                datatypes::TimeUnit::Microsecond => arr
+                    .as_primitive::<datatypes::TimestampMicrosecondType>()
+                    .value(index),
+                datatypes::TimeUnit::Nanosecond => arr
+                    .as_primitive::<datatypes::TimestampNanosecondType>()
+                    .value(index),
             };
             Ok(OrdScalar::Timestamp(val, tu, tz_str))
         }

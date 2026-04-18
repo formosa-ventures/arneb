@@ -187,9 +187,10 @@ pub(crate) fn scalar_to_array(
         ScalarValue::Float32(v) => Ok(Arc::new(Float32Array::from(vec![*v; num_rows]))),
         ScalarValue::Float64(v) => Ok(Arc::new(Float64Array::from(vec![*v; num_rows]))),
         ScalarValue::Utf8(v) => Ok(Arc::new(StringArray::from(vec![v.as_str(); num_rows]))),
-        ScalarValue::Binary(v) => {
-            Ok(Arc::new(arrow::array::BinaryArray::from(vec![v.as_slice(); num_rows])))
-        }
+        ScalarValue::Binary(v) => Ok(Arc::new(arrow::array::BinaryArray::from(vec![
+            v.as_slice();
+            num_rows
+        ]))),
         ScalarValue::Decimal128 {
             value,
             precision,
@@ -216,18 +217,22 @@ pub(crate) fn scalar_to_array(
             let arrow_unit: arrow::datatypes::TimeUnit = (*unit).into();
             let tz: Option<Arc<str>> = timezone.as_ref().map(|s| Arc::from(s.as_str()));
             let arr = match arrow_unit {
-                arrow::datatypes::TimeUnit::Second => {
-                    Arc::new(arrow::array::TimestampSecondArray::from(vec![*value; num_rows]).with_timezone_opt(tz)) as ArrayRef
-                }
-                arrow::datatypes::TimeUnit::Millisecond => {
-                    Arc::new(arrow::array::TimestampMillisecondArray::from(vec![*value; num_rows]).with_timezone_opt(tz)) as ArrayRef
-                }
-                arrow::datatypes::TimeUnit::Microsecond => {
-                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![*value; num_rows]).with_timezone_opt(tz)) as ArrayRef
-                }
-                arrow::datatypes::TimeUnit::Nanosecond => {
-                    Arc::new(arrow::array::TimestampNanosecondArray::from(vec![*value; num_rows]).with_timezone_opt(tz)) as ArrayRef
-                }
+                arrow::datatypes::TimeUnit::Second => Arc::new(
+                    arrow::array::TimestampSecondArray::from(vec![*value; num_rows])
+                        .with_timezone_opt(tz),
+                ) as ArrayRef,
+                arrow::datatypes::TimeUnit::Millisecond => Arc::new(
+                    arrow::array::TimestampMillisecondArray::from(vec![*value; num_rows])
+                        .with_timezone_opt(tz),
+                ) as ArrayRef,
+                arrow::datatypes::TimeUnit::Microsecond => Arc::new(
+                    arrow::array::TimestampMicrosecondArray::from(vec![*value; num_rows])
+                        .with_timezone_opt(tz),
+                ) as ArrayRef,
+                arrow::datatypes::TimeUnit::Nanosecond => Arc::new(
+                    arrow::array::TimestampNanosecondArray::from(vec![*value; num_rows])
+                        .with_timezone_opt(tz),
+                ) as ArrayRef,
             };
             Ok(arr)
         }
@@ -542,7 +547,7 @@ fn wider_numeric_type(
         // Decimal128 + Decimal128 with different precision/scale → use wider
         (Decimal128(p1, s1), Decimal128(p2, s2)) => {
             let scale = (*s1).max(*s2);
-            let precision = ((*p1 as i8 - *s1) .max(*p2 as i8 - *s2) + scale) as u8;
+            let precision = ((*p1 as i8 - *s1).max(*p2 as i8 - *s2) + scale) as u8;
             let precision = precision.min(38); // Decimal128 max precision
             Ok(Decimal128(precision, scale))
         }

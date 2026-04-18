@@ -5,5 +5,5 @@ SELECT
         / SUM(l_extendedprice * (1 - l_discount)) AS promo_revenue
 FROM lineitem
 JOIN part ON l_partkey = p_partkey
-WHERE l_shipdate >= '1995-09-01'
-    AND l_shipdate < '1995-10-01'
+WHERE l_shipdate >= CAST('1995-09-01' AS DATE)
+    AND l_shipdate < CAST('1995-10-01' AS DATE)

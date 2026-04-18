@@ -193,8 +193,11 @@ impl DataSource for ParquetDataSource {
             let column_names: Vec<String> =
                 self.column_schema.iter().map(|c| c.name.clone()).collect();
             let file_meta = builder.metadata().clone();
-            let selected =
-                crate::parquet_pushdown::prune_row_groups(file_meta.row_groups(), &ctx.filters, &column_names);
+            let selected = crate::parquet_pushdown::prune_row_groups(
+                file_meta.row_groups(),
+                &ctx.filters,
+                &column_names,
+            );
             if selected.len() < file_meta.row_groups().len() {
                 let selection = parquet::arrow::arrow_reader::RowSelection::from(
                     build_row_selection(file_meta.row_groups(), &selected),
@@ -205,10 +208,9 @@ impl DataSource for ParquetDataSource {
 
         // Apply predicate pushdown for within-row-group filtering.
         if !ctx.filters.is_empty() {
-            if let Some(row_filter) = crate::parquet_pushdown::build_row_filter(
-                &ctx.filters,
-                builder.parquet_schema(),
-            ) {
+            if let Some(row_filter) =
+                crate::parquet_pushdown::build_row_filter(&ctx.filters, builder.parquet_schema())
+            {
                 builder = builder.with_row_filter(row_filter);
             }
         }
@@ -1043,8 +1045,8 @@ mod tests {
 
     #[tokio::test]
     async fn parquet_filters_passed_to_scan() {
-        use arneb_planner::PlanExpr;
         use arneb_common::types::ScalarValue;
+        use arneb_planner::PlanExpr;
         use arneb_sql_parser::ast::BinaryOp;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1057,11 +1059,14 @@ mod tests {
         let path = dir.path().join("filtered.parquet");
         let file = std::fs::File::create(&path).unwrap();
         let props = parquet::file::properties::WriterProperties::builder()
-            .set_max_row_group_size(2) // force small row groups
+            .set_max_row_group_row_count(Some(2)) // force small row groups
             .build();
-        let mut writer =
-            parquet::arrow::arrow_writer::ArrowWriter::try_new(file, arrow_schema.clone(), Some(props))
-                .unwrap();
+        let mut writer = parquet::arrow::arrow_writer::ArrowWriter::try_new(
+            file,
+            arrow_schema.clone(),
+            Some(props),
+        )
+        .unwrap();
 
         // Write 6 rows → should create 3 row groups of 2 rows each
         let batch = RecordBatch::try_new(
@@ -1140,13 +1145,11 @@ mod tests {
             None,
         ));
 
-        let batch =
-            RecordBatch::try_new(arrow_schema.clone(), vec![ids, tags, names]).unwrap();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![ids, tags, names]).unwrap();
 
         let file = std::fs::File::create(&path).unwrap();
         let mut writer =
-            parquet::arrow::arrow_writer::ArrowWriter::try_new(file, arrow_schema, None)
-                .unwrap();
+            parquet::arrow::arrow_writer::ArrowWriter::try_new(file, arrow_schema, None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
 
@@ -1205,8 +1208,7 @@ mod tests {
             .set_compression(compression)
             .build();
         let file = std::fs::File::create(&path).unwrap();
-        let mut writer =
-            ArrowWriter::try_new(file, arrow_schema, Some(props)).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props)).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         path

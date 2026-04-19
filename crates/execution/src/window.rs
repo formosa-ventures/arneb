@@ -180,13 +180,7 @@ fn compute_window_function(
                     // Running aggregate up to current row
                     results[row] = match name_upper.as_str() {
                         "SUM" => running_sum,
-                        "AVG" => {
-                            if running_count > 0 {
-                                running_sum / running_count as f64
-                            } else {
-                                0.0
-                            }
-                        }
+                        "AVG" if running_count > 0 => running_sum / running_count as f64,
                         "COUNT" => running_count as f64,
                         "MIN" => running_min,
                         "MAX" => running_max,
@@ -219,13 +213,7 @@ fn compute_window_function(
                         if row > 0 {
                             let val = match name_upper.as_str() {
                                 "SUM" => psum,
-                                "AVG" => {
-                                    if pcount > 0 {
-                                        psum / pcount as f64
-                                    } else {
-                                        0.0
-                                    }
-                                }
+                                "AVG" if pcount > 0 => psum / pcount as f64,
                                 "COUNT" => pcount as f64,
                                 "MIN" => pmin,
                                 "MAX" => pmax,

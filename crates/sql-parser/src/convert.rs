@@ -464,6 +464,33 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 data_type: dt,
             })
         }
+        // Typed string literals (`DATE '...'`, `TIMESTAMP '...'`, `TIME '...'`)
+        // parse as Expr::TypedString in sqlparser-rs. Lower them to
+        // `CAST('...' AS <type>)` so the rest of the pipeline treats them
+        // identically to the explicit CAST form. This matches Trino/Postgres
+        // semantics for ANSI typed-string literals.
+        sp::Expr::TypedString(ts) => {
+            if ts.uses_odbc_syntax {
+                return Err(ParseError::UnsupportedFeature(
+                    "ODBC-style typed-string literal ({d '...'})".to_string(),
+                ));
+            }
+            let literal = match sp::Value::from(ts.value) {
+                sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => {
+                    ScalarValue::Utf8(s)
+                }
+                other => {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "typed-string literal expects a string value, got: {other}"
+                    )))
+                }
+            };
+            let dt = convert_data_type(ts.data_type)?;
+            Ok(ast::Expr::Cast {
+                expr: Box::new(ast::Expr::Literal(literal)),
+                data_type: dt,
+            })
+        }
         sp::Expr::Nested(expr) => {
             let e = convert_expr(*expr)?;
             Ok(ast::Expr::Nested(Box::new(e)))

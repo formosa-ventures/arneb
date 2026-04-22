@@ -68,13 +68,25 @@ docker compose exec trino trino --execute "SELECT COUNT(*) FROM hive.tpch.lineit
 
 ### Local Parquet files (alternative)
 
-For quick local development without Docker Compose:
+For quick local development without Docker Compose. Parquet files are
+regenerated from the dbgen `.tbl` files under `data/raw/`, producing
+TPC-H-correct column types (int64 keys, float64 numerics, `date32` dates)
+that match what Trino's tpch connector emits into Hive. Keeping local
+and Hive schemas aligned is required so the queries in `queries/` run
+identically against both sources.
 
 ```bash
-cargo run --release --bin arneb -- --config benchmarks/tpch/tpch-config.toml
+# 1. Generate SF0.01 Parquet files with correct types (one-off, ~1s)
+pip install pyarrow                                      # if not already
+python3 benchmarks/tpch/scripts/generate_sf001.py
+
+# 2. Start arneb against the local files
+cargo run --release --bin arneb -- --config benchmarks/tpch/tpch-sf001.toml
 ```
 
-This uses pre-generated Parquet files in `data/sf1/` (not suitable for Trino comparison).
+> `tpch-sf001.toml` uses repo-relative paths. Run `arneb` with the
+> repository root as the working directory, or edit the config to use
+> absolute paths.
 
 ### TPC-H Tables
 

@@ -10,9 +10,6 @@ ignore = [
     # paste v1.0.15 is unmaintained but no replacement available;
     # transitive dep via parquet -> arrow ecosystem
     "RUSTSEC-2024-0436",
-    # instant is unmaintained; transitive build-time dep
-    # via pilota-build -> salsa -> parking_lot 0.11
-    "RUSTSEC-2024-0384",
 ]
 
 [licenses]

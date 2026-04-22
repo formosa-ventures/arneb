@@ -47,7 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 
 # PostgreSQL wire protocol
-pgwire = "0.38"
+pgwire = "0.39"
 async-trait = "0.1"
 async-recursion = "1"
 futures = "0.3"

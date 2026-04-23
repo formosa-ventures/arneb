@@ -59,7 +59,7 @@ impl ExecutionContext {
         expr: &PlanExpr,
     ) -> Result<PlanExpr, ExecutionError> {
         match expr {
-            PlanExpr::ScalarSubquery { subplan } => {
+            PlanExpr::ScalarSubquery { subplan, span } => {
                 let exec = self.create_physical_plan(subplan)?;
                 let stream = exec.execute().await?;
                 let batches = arneb_common::stream::collect_stream(stream)
@@ -74,22 +74,37 @@ impl ExecutionContext {
                     ));
                 }
                 if total_rows == 0 || batches.is_empty() {
-                    return Ok(PlanExpr::Literal(arneb_common::types::ScalarValue::Null));
+                    return Ok(PlanExpr::Literal {
+                        value: arneb_common::types::ScalarValue::Null,
+                        span: *span,
+                    });
                 }
                 let col = batches[0].column(0);
                 if col.is_null(0) {
-                    return Ok(PlanExpr::Literal(arneb_common::types::ScalarValue::Null));
+                    return Ok(PlanExpr::Literal {
+                        value: arneb_common::types::ScalarValue::Null,
+                        span: *span,
+                    });
                 }
                 let val = arrow_to_scalar(col, 0);
-                Ok(PlanExpr::Literal(val))
+                Ok(PlanExpr::Literal {
+                    value: val,
+                    span: *span,
+                })
             }
-            PlanExpr::BinaryOp { left, op, right } => {
+            PlanExpr::BinaryOp {
+                left,
+                op,
+                right,
+                span,
+            } => {
                 let l = Box::pin(self.resolve_scalar_subqueries(left)).await?;
                 let r = Box::pin(self.resolve_scalar_subqueries(right)).await?;
                 Ok(PlanExpr::BinaryOp {
                     left: Box::new(l),
                     op: *op,
                     right: Box::new(r),
+                    span: *span,
                 })
             }
             _ => Ok(expr.clone()),
@@ -165,10 +180,11 @@ impl ExecutionContext {
                             .map(|(new_idx, _)| {
                                 let orig = &exprs[new_idx];
                                 match orig {
-                                    arneb_planner::PlanExpr::Column { name, .. } => {
+                                    arneb_planner::PlanExpr::Column { name, span, .. } => {
                                         arneb_planner::PlanExpr::Column {
                                             index: new_idx,
                                             name: name.clone(),
+                                            span: *span,
                                         }
                                     }
                                     other => other.clone(),
@@ -539,9 +555,14 @@ mod tests {
                 left: Box::new(PlanExpr::Column {
                     index: 0,
                     name: "id".to_string(),
+                    span: None,
                 }),
                 op: ast::BinaryOp::LtEq,
-                right: Box::new(PlanExpr::Literal(ScalarValue::Int32(3))),
+                right: Box::new(PlanExpr::Literal {
+                    value: ScalarValue::Int32(3),
+                    span: None,
+                }),
+                span: None,
             },
         };
         let exec = ctx.create_physical_plan(&plan).unwrap();
@@ -563,6 +584,7 @@ mod tests {
             exprs: vec![PlanExpr::Column {
                 index: 1,
                 name: "name".to_string(),
+                span: None,
             }],
             schema: vec![ColumnInfo {
                 name: "name".to_string(),
@@ -616,6 +638,7 @@ mod tests {
                 expr: PlanExpr::Column {
                     index: 0,
                     name: "id".to_string(),
+                    span: None,
                 },
                 asc: false,
                 nulls_first: false,
@@ -649,14 +672,17 @@ mod tests {
                     name: "COUNT".to_string(),
                     args: vec![],
                     distinct: false,
+                    span: None,
                 },
                 PlanExpr::Function {
                     name: "SUM".to_string(),
                     args: vec![PlanExpr::Column {
                         index: 2,
                         name: "value".to_string(),
+                        span: None,
                     }],
                     distinct: false,
+                    span: None,
                 },
             ],
             schema: vec![
@@ -736,6 +762,7 @@ mod tests {
                 exprs: vec![PlanExpr::Column {
                     index: 1,
                     name: "name".to_string(),
+                    span: None,
                 }],
                 schema: vec![ColumnInfo {
                     name: "name".to_string(),
@@ -747,9 +774,14 @@ mod tests {
                         left: Box::new(PlanExpr::Column {
                             index: 0,
                             name: "id".to_string(),
+                            span: None,
                         }),
                         op: ast::BinaryOp::Gt,
-                        right: Box::new(PlanExpr::Literal(ScalarValue::Int32(2))),
+                        right: Box::new(PlanExpr::Literal {
+                            value: ScalarValue::Int32(2),
+                            span: None,
+                        }),
+                        span: None,
                     },
                     input: Box::new(LogicalPlan::TableScan {
                         table: TableReference::table("users"),
@@ -825,9 +857,14 @@ mod tests {
                 left: Box::new(PlanExpr::Column {
                     index: 1,
                     name: "cnt".to_string(),
+                    span: None,
                 }),
                 op: ast::BinaryOp::Gt,
-                right: Box::new(PlanExpr::Literal(ScalarValue::Int64(1))),
+                right: Box::new(PlanExpr::Literal {
+                    value: ScalarValue::Int64(1),
+                    span: None,
+                }),
+                span: None,
             },
             input: Box::new(LogicalPlan::Aggregate {
                 input: Box::new(LogicalPlan::TableScan {
@@ -839,11 +876,13 @@ mod tests {
                 group_by: vec![PlanExpr::Column {
                     index: 0,
                     name: "name".to_string(),
+                    span: None,
                 }],
                 aggr_exprs: vec![PlanExpr::Function {
                     name: "COUNT".to_string(),
                     args: vec![],
                     distinct: false,
+                    span: None,
                 }],
                 schema: agg_schema,
             }),
@@ -931,10 +970,12 @@ mod tests {
             left_key: PlanExpr::Column {
                 index: 1,
                 name: "customer_id".into(),
+                span: None,
             },
             right_key: PlanExpr::Column {
                 index: 0,
                 name: "id".into(),
+                span: None,
             },
         };
 
@@ -1004,10 +1045,12 @@ mod tests {
             left_key: PlanExpr::Column {
                 index: 0,
                 name: "id".into(),
+                span: None,
             },
             right_key: PlanExpr::Column {
                 index: 0,
                 name: "id".into(),
+                span: None,
             },
         };
 
@@ -1150,8 +1193,10 @@ mod tests {
             args: vec![PlanExpr::Column {
                 index: 0,
                 name: "name".to_string(),
+                span: None,
             }],
             distinct: false,
+            span: None,
         };
         let result = expression::evaluate(&upper_expr, &batch, Some(&reg)).unwrap();
         let arr = result.as_any().downcast_ref::<StringArray>().unwrap();
@@ -1165,8 +1210,10 @@ mod tests {
             args: vec![PlanExpr::Column {
                 index: 1,
                 name: "value".to_string(),
+                span: None,
             }],
             distinct: false,
+            span: None,
         };
         let result = expression::evaluate(&abs_expr, &batch, Some(&reg)).unwrap();
         let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();

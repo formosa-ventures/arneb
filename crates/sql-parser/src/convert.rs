@@ -3,23 +3,37 @@
 //! This module provides functions to convert `sqlparser::ast` types into
 //! the arneb-specific AST types defined in [`crate::ast`]. Unsupported
 //! SQL constructs are rejected with [`ParseError::UnsupportedFeature`].
+//!
+//! Spans are harvested from sqlparser-rs's `Spanned::span()` at every
+//! conversion site so downstream diagnostics can point at source. Review
+//! any new call that drops a span — losing span information silently
+//! degrades error quality, even if the compiler does not catch it.
 
 use arneb_common::error::ParseError;
 use arneb_common::types::{DataType, ScalarValue, TableReference, TimeUnit};
 use sqlparser::ast as sp;
+use sqlparser::ast::Spanned;
+use sqlparser::tokenizer::Span;
 
 use crate::ast;
 
 /// Convert a `sqlparser` [`sp::Statement`] into a arneb [`ast::Statement`].
 pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, ParseError> {
+    let span = stmt.span();
     match stmt {
         sp::Statement::Query(query) => {
             let q = convert_query(*query)?;
-            Ok(ast::Statement::Query(Box::new(q)))
+            Ok(ast::Statement::Query {
+                query: Box::new(q),
+                span,
+            })
         }
         sp::Statement::Explain { statement, .. } => {
             let inner = convert_statement(*statement)?;
-            Ok(ast::Statement::Explain(Box::new(inner)))
+            Ok(ast::Statement::Explain {
+                stmt: Box::new(inner),
+                span,
+            })
         }
         sp::Statement::CreateTable(ct) => {
             let name = object_name_to_table_reference(&ct.name)?;
@@ -42,6 +56,7 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
                 return Ok(ast::Statement::CreateTableAsSelect {
                     name,
                     query: Box::new(q),
+                    span,
                 });
             }
 
@@ -49,6 +64,7 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
                 name,
                 columns,
                 if_not_exists: ct.if_not_exists,
+                span,
             })
         }
         sp::Statement::Drop {
@@ -64,8 +80,16 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
             }
             let name = object_name_to_table_reference(&names[0])?;
             match object_type {
-                sp::ObjectType::Table => Ok(ast::Statement::DropTable { name, if_exists }),
-                sp::ObjectType::View => Ok(ast::Statement::DropView { name, if_exists }),
+                sp::ObjectType::Table => Ok(ast::Statement::DropTable {
+                    name,
+                    if_exists,
+                    span,
+                }),
+                sp::ObjectType::View => Ok(ast::Statement::DropView {
+                    name,
+                    if_exists,
+                    span,
+                }),
                 _ => Err(ParseError::UnsupportedFeature(format!(
                     "DROP {object_type}"
                 ))),
@@ -122,6 +146,7 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
                 table,
                 columns,
                 source,
+                span,
             })
         }
         sp::Statement::Delete(delete) => {
@@ -150,6 +175,7 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
             Ok(ast::Statement::DeleteFrom {
                 table: table_ref,
                 predicate,
+                span,
             })
         }
         sp::Statement::CreateView(cv) => {
@@ -159,6 +185,7 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
                 name: view_name,
                 query: Box::new(q),
                 or_replace: cv.or_replace,
+                span,
             })
         }
         other => Err(ParseError::UnsupportedFeature(
@@ -354,28 +381,64 @@ fn qualified_wildcard_to_table_reference(
 
 /// Convert a `sqlparser` [`sp::Expr`] into a arneb [`ast::Expr`].
 pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
+    let span = expr.span();
     match expr {
-        sp::Expr::Identifier(ident) => Ok(ast::Expr::Column(ast::ColumnRef {
-            name: ident.value,
-            table: None,
-        })),
+        sp::Expr::Identifier(ident) => {
+            let ident_span = ident.span;
+            Ok(ast::Expr::Column {
+                col_ref: ast::ColumnRef {
+                    name: ident.value,
+                    table: None,
+                    span: ident_span,
+                },
+                span,
+            })
+        }
         sp::Expr::CompoundIdentifier(idents) => match idents.len() {
-            2 => Ok(ast::Expr::Column(ast::ColumnRef {
-                table: Some(idents[0].value.clone()),
-                name: idents[1].value.clone(),
-            })),
-            1 => Ok(ast::Expr::Column(ast::ColumnRef {
-                name: idents[0].value.clone(),
-                table: None,
-            })),
+            2 => {
+                let col_span = idents[0].span.union(&idents[1].span);
+                Ok(ast::Expr::Column {
+                    col_ref: ast::ColumnRef {
+                        table: Some(idents[0].value.clone()),
+                        name: idents[1].value.clone(),
+                        span: col_span,
+                    },
+                    span,
+                })
+            }
+            1 => {
+                let ident_span = idents[0].span;
+                Ok(ast::Expr::Column {
+                    col_ref: ast::ColumnRef {
+                        name: idents[0].value.clone(),
+                        table: None,
+                        span: ident_span,
+                    },
+                    span,
+                })
+            }
             _ => Err(ParseError::UnsupportedFeature(format!(
                 "compound identifier with {} parts",
                 idents.len()
             ))),
         },
         sp::Expr::Value(val_with_span) => {
+            // Recognise extended-query protocol placeholders
+            // (`$1`, `$2`, …) before falling through to scalar
+            // value conversion.
+            if let sp::Value::Placeholder(s) = &val_with_span.value {
+                if let Some(idx) = parse_param_index(s) {
+                    return Ok(ast::Expr::Parameter { index: idx, span });
+                }
+                return Err(ParseError::UnsupportedFeature(format!(
+                    "unrecognised placeholder: {s}"
+                )));
+            }
             let scalar = convert_value(val_with_span.value)?;
-            Ok(ast::Expr::Literal(scalar))
+            Ok(ast::Expr::Literal {
+                value: scalar,
+                span,
+            })
         }
         sp::Expr::BinaryOp { left, op, right } => {
             let l = convert_expr(*left)?;
@@ -385,6 +448,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 left: Box::new(l),
                 op: bin_op,
                 right: Box::new(r),
+                span,
             })
         }
         sp::Expr::UnaryOp { op, expr } => {
@@ -393,6 +457,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             Ok(ast::Expr::UnaryOp {
                 op: un_op,
                 expr: Box::new(e),
+                span,
             })
         }
         sp::Expr::Like {
@@ -412,15 +477,22 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 left: Box::new(l),
                 op,
                 right: Box::new(r),
+                span,
             })
         }
         sp::Expr::IsNull(expr) => {
             let e = convert_expr(*expr)?;
-            Ok(ast::Expr::IsNull(Box::new(e)))
+            Ok(ast::Expr::IsNull {
+                expr: Box::new(e),
+                span,
+            })
         }
         sp::Expr::IsNotNull(expr) => {
             let e = convert_expr(*expr)?;
-            Ok(ast::Expr::IsNotNull(Box::new(e)))
+            Ok(ast::Expr::IsNotNull {
+                expr: Box::new(e),
+                span,
+            })
         }
         sp::Expr::Between {
             expr,
@@ -436,6 +508,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 negated,
                 low: Box::new(lo),
                 high: Box::new(hi),
+                span,
             })
         }
         sp::Expr::InList {
@@ -452,6 +525,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 expr: Box::new(e),
                 list: items,
                 negated,
+                span,
             })
         }
         sp::Expr::Cast {
@@ -462,6 +536,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             Ok(ast::Expr::Cast {
                 expr: Box::new(e),
                 data_type: dt,
+                span,
             })
         }
         // Typed string literals (`DATE '...'`, `TIMESTAMP '...'`, `TIME '...'`)
@@ -487,19 +562,29 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             };
             let dt = convert_data_type(ts.data_type)?;
             Ok(ast::Expr::Cast {
-                expr: Box::new(ast::Expr::Literal(literal)),
+                expr: Box::new(ast::Expr::Literal {
+                    value: literal,
+                    span,
+                }),
                 data_type: dt,
+                span,
             })
         }
         sp::Expr::Nested(expr) => {
             let e = convert_expr(*expr)?;
-            Ok(ast::Expr::Nested(Box::new(e)))
+            Ok(ast::Expr::Nested {
+                expr: Box::new(e),
+                span,
+            })
         }
         sp::Expr::Subquery(query) => {
             let q = convert_query(*query)?;
-            Ok(ast::Expr::Subquery(Box::new(q)))
+            Ok(ast::Expr::Subquery {
+                query: Box::new(q),
+                span,
+            })
         }
-        sp::Expr::Function(func) => convert_function(func),
+        sp::Expr::Function(func) => convert_function(func, span),
         sp::Expr::InSubquery {
             expr,
             subquery,
@@ -511,6 +596,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 expr: Box::new(e),
                 subquery: Box::new(q),
                 negated,
+                span,
             })
         }
         sp::Expr::Exists { subquery, negated } => {
@@ -518,6 +604,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             Ok(ast::Expr::Exists {
                 subquery: Box::new(q),
                 negated,
+                span,
             })
         }
         sp::Expr::Case {
@@ -545,6 +632,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 conditions: conds,
                 results,
                 else_result: el,
+                span,
             })
         }
         sp::Expr::IsFalse(expr) => {
@@ -552,6 +640,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             Ok(ast::Expr::UnaryOp {
                 op: ast::UnaryOp::Not,
                 expr: Box::new(e),
+                span,
             })
         }
         sp::Expr::IsTrue(expr) => convert_expr(*expr),
@@ -562,7 +651,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
 }
 
 /// Convert a `sqlparser` [`sp::Function`] into a arneb [`ast::Expr::Function`].
-fn convert_function(func: sp::Function) -> Result<ast::Expr, ParseError> {
+fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseError> {
     let name = func.name.to_string();
     let name_upper = name.to_uppercase();
 
@@ -597,7 +686,11 @@ fn convert_function(func: sp::Function) -> Result<ast::Expr, ParseError> {
         let mut conditions = Vec::new();
         let mut results = Vec::new();
         for arg in &raw_args[..last] {
-            conditions.push(ast::Expr::IsNotNull(Box::new(arg.clone())));
+            let arg_span = arg.span();
+            conditions.push(ast::Expr::IsNotNull {
+                expr: Box::new(arg.clone()),
+                span: arg_span,
+            });
             results.push(arg.clone());
         }
         return Ok(ast::Expr::Case {
@@ -605,6 +698,7 @@ fn convert_function(func: sp::Function) -> Result<ast::Expr, ParseError> {
             conditions,
             results,
             else_result: Some(Box::new(raw_args.into_iter().last().unwrap())),
+            span,
         });
     }
 
@@ -635,15 +729,22 @@ fn convert_function(func: sp::Function) -> Result<ast::Expr, ParseError> {
         let mut args_iter = raw_args.into_iter();
         let a = args_iter.next().unwrap();
         let b = args_iter.next().unwrap();
+        let a_span = a.span();
+        let cmp_span = a_span.union(&b.span());
         return Ok(ast::Expr::Case {
             operand: None,
             conditions: vec![ast::Expr::BinaryOp {
                 left: Box::new(a.clone()),
                 op: ast::BinaryOp::Eq,
                 right: Box::new(b),
+                span: cmp_span,
             }],
-            results: vec![ast::Expr::Literal(ScalarValue::Null)],
+            results: vec![ast::Expr::Literal {
+                value: ScalarValue::Null,
+                span,
+            }],
             else_result: Some(Box::new(a)),
+            span,
         });
     }
 
@@ -692,6 +793,7 @@ fn convert_function(func: sp::Function) -> Result<ast::Expr, ParseError> {
                     args: plain_args,
                     partition_by,
                     order_by,
+                    span,
                 });
             }
             sp::WindowType::NamedWindow(_) => {
@@ -706,6 +808,7 @@ fn convert_function(func: sp::Function) -> Result<ast::Expr, ParseError> {
         name,
         args,
         distinct: is_distinct,
+        span,
     })
 }
 
@@ -859,6 +962,12 @@ fn convert_order_by_expr(ob: sp::OrderByExpr) -> Result<ast::OrderByExpr, ParseE
         asc,
         nulls_first,
     })
+}
+
+/// Parse a placeholder string like `"$1"` into its 1-based index.
+fn parse_param_index(s: &str) -> Option<usize> {
+    s.strip_prefix('$')
+        .and_then(|rest| rest.parse::<usize>().ok())
 }
 
 /// Convert a `sqlparser` [`sp::Value`] into a arneb [`ScalarValue`].

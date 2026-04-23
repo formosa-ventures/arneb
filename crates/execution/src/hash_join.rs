@@ -610,6 +610,7 @@ pub(crate) fn extract_equi_join_keys(
                     left: Box::new(acc),
                     op: ast::BinaryOp::And,
                     right: Box::new(e),
+                    span: None,
                 });
             Some((keys, residual))
         }
@@ -632,6 +633,7 @@ fn collect_equi_keys(
             left,
             op: ast::BinaryOp::And,
             right,
+            ..
         } => {
             collect_equi_keys(left, left_col_count, keys, residuals);
             collect_equi_keys(right, left_col_count, keys, residuals);
@@ -640,6 +642,7 @@ fn collect_equi_keys(
             left,
             op: ast::BinaryOp::Eq,
             right,
+            ..
         } => {
             if let (PlanExpr::Column { index: l_idx, .. }, PlanExpr::Column { index: r_idx, .. }) =
                 (left.as_ref(), right.as_ref())
@@ -857,12 +860,15 @@ mod tests {
             left: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "l.id".into(),
+                span: None,
             }),
             op: ast::BinaryOp::Eq,
             right: Box::new(PlanExpr::Column {
                 index: 2,
                 name: "r.id".into(),
+                span: None,
             }),
+            span: None,
         });
         let (keys, residual) = extract_equi_join_keys(&condition, 2).unwrap();
         assert_eq!(keys, vec![(0, 0)]);
@@ -876,25 +882,32 @@ mod tests {
                 left: Box::new(PlanExpr::Column {
                     index: 0,
                     name: "l.a".into(),
+                    span: None,
                 }),
                 op: ast::BinaryOp::Eq,
                 right: Box::new(PlanExpr::Column {
                     index: 2,
                     name: "r.a".into(),
+                    span: None,
                 }),
+                span: None,
             }),
             op: ast::BinaryOp::And,
             right: Box::new(PlanExpr::BinaryOp {
                 left: Box::new(PlanExpr::Column {
                     index: 1,
                     name: "l.b".into(),
+                    span: None,
                 }),
                 op: ast::BinaryOp::Eq,
                 right: Box::new(PlanExpr::Column {
                     index: 3,
                     name: "r.b".into(),
+                    span: None,
                 }),
+                span: None,
             }),
+            span: None,
         });
         let (keys, residual) = extract_equi_join_keys(&condition, 2).unwrap();
         assert_eq!(keys, vec![(0, 0), (1, 1)]);
@@ -907,12 +920,15 @@ mod tests {
             left: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "l.id".into(),
+                span: None,
             }),
             op: ast::BinaryOp::Gt,
             right: Box::new(PlanExpr::Column {
                 index: 2,
                 name: "r.id".into(),
+                span: None,
             }),
+            span: None,
         });
         assert!(extract_equi_join_keys(&condition, 2).is_none());
     }
@@ -927,24 +943,31 @@ mod tests {
                 left: Box::new(PlanExpr::Column {
                     index: 0,
                     name: "l.id".into(),
+                    span: None,
                 }),
                 op: ast::BinaryOp::Eq,
                 right: Box::new(PlanExpr::Column {
                     index: 2,
                     name: "r.id".into(),
+                    span: None,
                 }),
+                span: None,
             }),
             op: ast::BinaryOp::And,
             right: Box::new(PlanExpr::BinaryOp {
                 left: Box::new(PlanExpr::Column {
                     index: 3,
                     name: "r.comment".into(),
+                    span: None,
                 }),
                 op: ast::BinaryOp::NotEq,
-                right: Box::new(PlanExpr::Literal(arneb_common::types::ScalarValue::Utf8(
-                    "special".into(),
-                ))),
+                right: Box::new(PlanExpr::Literal {
+                    value: arneb_common::types::ScalarValue::Utf8("special".into()),
+                    span: None,
+                }),
+                span: None,
             }),
+            span: None,
         });
         let (keys, residual) = extract_equi_join_keys(&condition, 2).unwrap();
         assert_eq!(keys, vec![(0, 0)]);
@@ -1039,11 +1062,14 @@ mod tests {
             left: Box::new(PlanExpr::Column {
                 index: 3,
                 name: "note".into(),
+                span: None,
             }),
             op: ast::BinaryOp::NotEq,
-            right: Box::new(PlanExpr::Literal(arneb_common::types::ScalarValue::Utf8(
-                "skip".into(),
-            ))),
+            right: Box::new(PlanExpr::Literal {
+                value: arneb_common::types::ScalarValue::Utf8("skip".into()),
+                span: None,
+            }),
+            span: None,
         };
 
         let join = HashJoinExec {

@@ -42,7 +42,8 @@ pub trait DistributedExecutor: Send + Sync {
     /// Check if workers are available for distributed execution.
     fn has_workers(&self) -> bool;
 }
-use crate::error::arneb_error_to_pg_error;
+use crate::error::{arneb_error_to_pg_error, arneb_error_to_pg_error_with_source};
+use arneb_common::diagnostic::SourceFile;
 
 fn arrow_type_to_pg(dt: &arrow::datatypes::DataType) -> Type {
     use arrow::datatypes::DataType as ADT;
@@ -167,6 +168,12 @@ impl SimpleQueryHandler for ConnectionHandler {
             };
         }
 
+        // Capture the submitted SQL as a `SourceFile` so diagnostic
+        // rendering can point at the exact token that failed. pgwire
+        // error responses carry the rendered text in the message body;
+        // SQLSTATE codes are unaffected.
+        let source = SourceFile::new("<query>", trimmed);
+
         let result = execute_query(
             trimmed,
             &self.catalog_manager,
@@ -188,7 +195,7 @@ impl SimpleQueryHandler for ConnectionHandler {
 
                 Ok(vec![response])
             }
-            Err(err) => Err(arneb_error_to_pg_error(&err)),
+            Err(err) => Err(arneb_error_to_pg_error_with_source(&err, Some(&source))),
         }
     }
 }
@@ -239,6 +246,57 @@ async fn plan_for_schema(
         .await
         .map_err(|e| arneb_error_to_pg_error(&e.into()))?;
     Ok(column_info_to_field_info(&plan.schema()))
+}
+
+/// Plan a placeholder-bearing SQL string for the describe path and
+/// return both the output schema and the parameter-type map inferred
+/// by the analyzer. Called by `do_describe_statement` to report
+/// concrete `ParameterDescription` OIDs instead of the legacy TEXT
+/// fallback.
+async fn plan_for_describe(
+    sql: &str,
+    catalog_manager: &CatalogManager,
+) -> Result<
+    (
+        Vec<pgwire::api::results::FieldInfo>,
+        std::collections::HashMap<usize, arneb_common::types::DataType>,
+    ),
+    PgWireError,
+> {
+    let statement = arneb_sql_parser::parse(sql).map_err(|e| arneb_error_to_pg_error(&e.into()))?;
+    let planner = QueryPlanner::new(catalog_manager);
+    let (plan, ctx) = planner
+        .plan_statement_with_context(&statement)
+        .await
+        .map_err(|e| arneb_error_to_pg_error(&e.into()))?;
+    Ok((column_info_to_field_info(&plan.schema()), ctx.param_types))
+}
+
+/// Map an Arneb `DataType` to a PostgreSQL [`Type`] OID for
+/// `ParameterDescription`. Covers the types the analyzer infers
+/// today; anything unknown falls back to `Type::TEXT` (matching
+/// Postgres' `unknown` → `text` convention).
+fn arneb_type_to_pg_param_type(t: &arneb_common::types::DataType) -> Type {
+    use arneb_common::types::DataType as DT;
+    match t {
+        DT::Boolean => Type::BOOL,
+        DT::Int32 => Type::INT4,
+        DT::Int64 => Type::INT8,
+        DT::Float32 => Type::FLOAT4,
+        DT::Float64 => Type::FLOAT8,
+        DT::Utf8 | DT::LargeUtf8 => Type::VARCHAR,
+        DT::Date32 => Type::DATE,
+        DT::Timestamp { timezone, .. } => {
+            if timezone.is_some() {
+                Type::TIMESTAMPTZ
+            } else {
+                Type::TIMESTAMP
+            }
+        }
+        DT::Binary => Type::BYTEA,
+        DT::Decimal128 { .. } => Type::NUMERIC,
+        _ => Type::TEXT,
+    }
 }
 
 #[async_trait]
@@ -300,6 +358,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
             };
         }
 
+        let source = SourceFile::new("<query>", trimmed);
         let result = execute_query(
             trimmed,
             &self.catalog_manager,
@@ -317,7 +376,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
                 let data_row_stream = stream::iter(rows);
                 Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
             }
-            Err(err) => Err(arneb_error_to_pg_error(&err)),
+            Err(err) => Err(arneb_error_to_pg_error_with_source(&err, Some(&source))),
         }
     }
 
@@ -356,14 +415,24 @@ impl ExtendedQueryHandler for ConnectionHandler {
             return Ok(DescribeStatementResponse::no_data());
         }
 
-        // Count parameter placeholders to report parameter types
+        // Count parameter placeholders. The analyzer infers types
+        // during planning and returns them in `ctx.param_types` —
+        // we translate them to PG OIDs here. Any indices the
+        // analyzer didn't see (e.g., because planning failed)
+        // fall back to `Type::TEXT` to preserve the legacy behavior
+        // for clients that don't care about precise types.
         let param_count = count_placeholders(sql);
-        let param_types = vec![Type::TEXT; param_count];
-
-        // Try to plan for schema (may fail if params are needed for planning)
-        let fields = plan_for_schema(sql, &self.catalog_manager)
+        let (fields, param_type_map) = plan_for_describe(sql, &self.catalog_manager)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|_| (Vec::new(), std::collections::HashMap::new()));
+        let param_types: Vec<Type> = (1..=param_count)
+            .map(|i| {
+                param_type_map
+                    .get(&i)
+                    .map(arneb_type_to_pg_param_type)
+                    .unwrap_or(Type::TEXT)
+            })
+            .collect();
 
         Ok(DescribeStatementResponse::new(param_types, fields))
     }

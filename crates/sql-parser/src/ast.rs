@@ -3,10 +3,18 @@
 //! These types represent the subset of SQL supported by arneb's MVP.
 //! They are produced by converting `sqlparser-rs` AST nodes through
 //! the conversion layer in [`crate::convert`].
+//!
+//! Every [`Expr`], [`Statement`], and [`ColumnRef`] carries a
+//! [`Span`] pointing at the source range of the node in the original
+//! SQL text. Spans flow through to [`crate::PlanExpr`] and error
+//! rendering so diagnostics can surface `file:line:col` carets. Nodes
+//! synthesized outside the parser (tests, fixtures) should use
+//! [`Span::empty()`].
 
 use std::fmt;
 
 use arneb_common::types::{DataType, ScalarValue, TableReference};
+use sqlparser::tokenizer::Span;
 
 /// Column definition for CREATE TABLE.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,9 +40,19 @@ pub enum InsertSource {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     /// A SQL query (SELECT).
-    Query(Box<Query>),
+    Query {
+        /// The query payload.
+        query: Box<Query>,
+        /// Source span covering the whole statement.
+        span: Span,
+    },
     /// EXPLAIN followed by a statement.
-    Explain(Box<Statement>),
+    Explain {
+        /// The statement to explain.
+        stmt: Box<Statement>,
+        /// Source span covering the whole EXPLAIN statement.
+        span: Span,
+    },
     /// CREATE TABLE name (columns...) [IF NOT EXISTS]
     CreateTable {
         /// Table name.
@@ -43,6 +61,8 @@ pub enum Statement {
         columns: Vec<ColumnDef>,
         /// IF NOT EXISTS flag.
         if_not_exists: bool,
+        /// Source span.
+        span: Span,
     },
     /// DROP TABLE [IF EXISTS] name
     DropTable {
@@ -50,6 +70,8 @@ pub enum Statement {
         name: TableReference,
         /// IF EXISTS flag.
         if_exists: bool,
+        /// Source span.
+        span: Span,
     },
     /// CREATE TABLE name AS SELECT ...
     CreateTableAsSelect {
@@ -57,6 +79,8 @@ pub enum Statement {
         name: TableReference,
         /// Source query.
         query: Box<Query>,
+        /// Source span.
+        span: Span,
     },
     /// INSERT INTO table [(columns)] source
     InsertInto {
@@ -66,6 +90,8 @@ pub enum Statement {
         columns: Vec<String>,
         /// Values or subquery source.
         source: InsertSource,
+        /// Source span.
+        span: Span,
     },
     /// DELETE FROM table [WHERE predicate]
     DeleteFrom {
@@ -73,6 +99,8 @@ pub enum Statement {
         table: TableReference,
         /// Optional WHERE predicate.
         predicate: Option<Box<Expr>>,
+        /// Source span.
+        span: Span,
     },
     /// CREATE [OR REPLACE] VIEW name AS query
     CreateView {
@@ -82,6 +110,8 @@ pub enum Statement {
         query: Box<Query>,
         /// Whether OR REPLACE was specified.
         or_replace: bool,
+        /// Source span.
+        span: Span,
     },
     /// DROP VIEW [IF EXISTS] name
     DropView {
@@ -89,7 +119,26 @@ pub enum Statement {
         name: TableReference,
         /// IF EXISTS flag.
         if_exists: bool,
+        /// Source span.
+        span: Span,
     },
+}
+
+impl Statement {
+    /// Returns the source span of this statement.
+    pub fn span(&self) -> Span {
+        match self {
+            Statement::Query { span, .. }
+            | Statement::Explain { span, .. }
+            | Statement::CreateTable { span, .. }
+            | Statement::DropTable { span, .. }
+            | Statement::CreateTableAsSelect { span, .. }
+            | Statement::InsertInto { span, .. }
+            | Statement::DeleteFrom { span, .. }
+            | Statement::CreateView { span, .. }
+            | Statement::DropView { span, .. } => *span,
+        }
+    }
 }
 
 /// A Common Table Expression (CTE) definition.
@@ -183,12 +232,26 @@ pub enum SelectItem {
 }
 
 /// A SQL expression.
+///
+/// Every variant carries a `span` field pointing at its source location.
+/// For nodes synthesized outside the parser (unit tests, fixtures), use
+/// [`Span::empty()`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// A column reference, optionally qualified by a table name.
-    Column(ColumnRef),
+    Column {
+        /// The column reference.
+        col_ref: ColumnRef,
+        /// Source span.
+        span: Span,
+    },
     /// A literal value.
-    Literal(ScalarValue),
+    Literal {
+        /// The scalar value.
+        value: ScalarValue,
+        /// Source span.
+        span: Span,
+    },
     /// A binary operation (`left op right`).
     BinaryOp {
         /// Left operand.
@@ -197,6 +260,8 @@ pub enum Expr {
         op: BinaryOp,
         /// Right operand.
         right: Box<Expr>,
+        /// Source span covering the whole binary expression.
+        span: Span,
     },
     /// A unary operation (`op expr`).
     UnaryOp {
@@ -204,6 +269,8 @@ pub enum Expr {
         op: UnaryOp,
         /// Operand.
         expr: Box<Expr>,
+        /// Source span covering the whole unary expression.
+        span: Span,
     },
     /// A function call.
     Function {
@@ -213,11 +280,23 @@ pub enum Expr {
         args: Vec<FunctionArg>,
         /// Whether DISTINCT was specified (e.g., `COUNT(DISTINCT x)`).
         distinct: bool,
+        /// Source span covering the call.
+        span: Span,
     },
     /// `expr IS NULL`.
-    IsNull(Box<Expr>),
+    IsNull {
+        /// The expression being tested.
+        expr: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
     /// `expr IS NOT NULL`.
-    IsNotNull(Box<Expr>),
+    IsNotNull {
+        /// The expression being tested.
+        expr: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
     /// `expr [NOT] BETWEEN low AND high`.
     Between {
         /// The expression being tested.
@@ -228,6 +307,8 @@ pub enum Expr {
         low: Box<Expr>,
         /// Upper bound.
         high: Box<Expr>,
+        /// Source span.
+        span: Span,
     },
     /// `expr [NOT] IN (list)`.
     InList {
@@ -237,6 +318,8 @@ pub enum Expr {
         list: Vec<Expr>,
         /// Whether this is NOT IN.
         negated: bool,
+        /// Source span.
+        span: Span,
     },
     /// `CAST(expr AS data_type)`.
     Cast {
@@ -244,11 +327,23 @@ pub enum Expr {
         expr: Box<Expr>,
         /// The target data type.
         data_type: DataType,
+        /// Source span.
+        span: Span,
     },
     /// A parenthesized sub-expression.
-    Nested(Box<Expr>),
+    Nested {
+        /// The inner expression.
+        expr: Box<Expr>,
+        /// Source span (covers the parens as well).
+        span: Span,
+    },
     /// A subquery expression (scalar subquery).
-    Subquery(Box<Query>),
+    Subquery {
+        /// The subquery.
+        query: Box<Query>,
+        /// Source span.
+        span: Span,
+    },
     /// `expr [NOT] IN (subquery)`.
     InSubquery {
         /// The expression being tested.
@@ -257,6 +352,8 @@ pub enum Expr {
         subquery: Box<Query>,
         /// Whether this is NOT IN.
         negated: bool,
+        /// Source span.
+        span: Span,
     },
     /// `[NOT] EXISTS (subquery)`.
     Exists {
@@ -264,6 +361,8 @@ pub enum Expr {
         subquery: Box<Query>,
         /// Whether this is NOT EXISTS.
         negated: bool,
+        /// Source span.
+        span: Span,
     },
     /// A window function call: `func(...) OVER (PARTITION BY ... ORDER BY ...)`.
     WindowFunction {
@@ -275,6 +374,8 @@ pub enum Expr {
         partition_by: Vec<Expr>,
         /// ORDER BY expressions.
         order_by: Vec<OrderByExpr>,
+        /// Source span.
+        span: Span,
     },
     /// A CASE expression (both searched and simple forms).
     Case {
@@ -286,16 +387,79 @@ pub enum Expr {
         results: Vec<Expr>,
         /// The optional ELSE expression.
         else_result: Option<Box<Expr>>,
+        /// Source span.
+        span: Span,
+    },
+    /// An extended-query-protocol parameter placeholder (`$1`, `$2`, …).
+    ///
+    /// Parameters only appear when the query is submitted via the
+    /// pgwire extended-query protocol (Parse → Bind). Simple query
+    /// text with `$N` typically passes through unchanged here and is
+    /// resolved before the planner runs (see
+    /// `crates/protocol/src/handler.rs::bind_parameters`). The
+    /// planner's describe-statement path, which runs before Bind, is
+    /// the one that sees this variant.
+    Parameter {
+        /// 1-based placeholder index as it appeared in the SQL text.
+        index: usize,
+        /// Source span covering the placeholder literal.
+        span: Span,
     },
 }
 
+impl Expr {
+    /// Returns the source span of this expression.
+    pub fn span(&self) -> Span {
+        match self {
+            Expr::Column { span, .. }
+            | Expr::Literal { span, .. }
+            | Expr::BinaryOp { span, .. }
+            | Expr::UnaryOp { span, .. }
+            | Expr::Function { span, .. }
+            | Expr::IsNull { span, .. }
+            | Expr::IsNotNull { span, .. }
+            | Expr::Between { span, .. }
+            | Expr::InList { span, .. }
+            | Expr::Cast { span, .. }
+            | Expr::Nested { span, .. }
+            | Expr::Subquery { span, .. }
+            | Expr::InSubquery { span, .. }
+            | Expr::Exists { span, .. }
+            | Expr::WindowFunction { span, .. }
+            | Expr::Case { span, .. }
+            | Expr::Parameter { span, .. } => *span,
+        }
+    }
+}
+
 /// A reference to a column, optionally qualified by a table name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// The `span` field covers the identifier (including any table qualifier)
+/// in the original source. Synthetic column references (inserted by
+/// optimizer rewrites, tests, etc.) should use [`Span::empty()`].
+#[derive(Debug, Clone)]
 pub struct ColumnRef {
     /// The column name.
     pub name: String,
     /// Optional table qualifier.
     pub table: Option<String>,
+    /// Source span pointing at the column reference in the SQL text.
+    pub span: Span,
+}
+
+impl PartialEq for ColumnRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.table == other.table
+    }
+}
+
+impl Eq for ColumnRef {}
+
+impl std::hash::Hash for ColumnRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.table.hash(state);
+    }
 }
 
 /// A binary operator.
@@ -441,8 +605,8 @@ pub struct OrderByExpr {
 impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Statement::Query(_) => write!(f, "SELECT ..."),
-            Statement::Explain(stmt) => write!(f, "EXPLAIN {stmt}"),
+            Statement::Query { .. } => write!(f, "SELECT ..."),
+            Statement::Explain { stmt, .. } => write!(f, "EXPLAIN {stmt}"),
             Statement::CreateTable { name, .. } => write!(f, "CREATE TABLE {name}"),
             Statement::DropTable { name, .. } => write!(f, "DROP TABLE {name}"),
             Statement::CreateTableAsSelect { name, .. } => {
@@ -491,20 +655,23 @@ impl fmt::Display for UnaryOp {
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Expr::Column(col) => {
-                if let Some(table) = &col.table {
-                    write!(f, "{table}.{}", col.name)
+            Expr::Column { col_ref, .. } => {
+                if let Some(table) = &col_ref.table {
+                    write!(f, "{table}.{}", col_ref.name)
                 } else {
-                    write!(f, "{}", col.name)
+                    write!(f, "{}", col_ref.name)
                 }
             }
-            Expr::Literal(val) => write!(f, "{val}"),
-            Expr::BinaryOp { left, op, right } => write!(f, "{left} {op} {right}"),
-            Expr::UnaryOp { op, expr } => write!(f, "{op} {expr}"),
+            Expr::Literal { value, .. } => write!(f, "{value}"),
+            Expr::BinaryOp {
+                left, op, right, ..
+            } => write!(f, "{left} {op} {right}"),
+            Expr::UnaryOp { op, expr, .. } => write!(f, "{op} {expr}"),
             Expr::Function {
                 name,
                 args,
                 distinct,
+                ..
             } => {
                 write!(f, "{name}(")?;
                 if *distinct {
@@ -518,13 +685,14 @@ impl fmt::Display for Expr {
                 }
                 write!(f, ")")
             }
-            Expr::IsNull(expr) => write!(f, "{expr} IS NULL"),
-            Expr::IsNotNull(expr) => write!(f, "{expr} IS NOT NULL"),
+            Expr::IsNull { expr, .. } => write!(f, "{expr} IS NULL"),
+            Expr::IsNotNull { expr, .. } => write!(f, "{expr} IS NOT NULL"),
             Expr::Between {
                 expr,
                 negated,
                 low,
                 high,
+                ..
             } => {
                 if *negated {
                     write!(f, "{expr} NOT BETWEEN {low} AND {high}")
@@ -536,6 +704,7 @@ impl fmt::Display for Expr {
                 expr,
                 list,
                 negated,
+                ..
             } => {
                 write!(f, "{expr}")?;
                 if *negated {
@@ -550,9 +719,11 @@ impl fmt::Display for Expr {
                 }
                 write!(f, ")")
             }
-            Expr::Cast { expr, data_type } => write!(f, "CAST({expr} AS {data_type})"),
-            Expr::Nested(expr) => write!(f, "({expr})"),
-            Expr::Subquery(_) => write!(f, "(subquery)"),
+            Expr::Cast {
+                expr, data_type, ..
+            } => write!(f, "CAST({expr} AS {data_type})"),
+            Expr::Nested { expr, .. } => write!(f, "({expr})"),
+            Expr::Subquery { .. } => write!(f, "(subquery)"),
             Expr::InSubquery { expr, negated, .. } => {
                 if *negated {
                     write!(f, "{expr} NOT IN (subquery)")
@@ -565,6 +736,7 @@ impl fmt::Display for Expr {
                 args,
                 partition_by,
                 order_by,
+                ..
             } => {
                 write!(f, "{name}(")?;
                 for (i, arg) in args.iter().enumerate() {
@@ -609,6 +781,7 @@ impl fmt::Display for Expr {
                 conditions,
                 results,
                 else_result,
+                ..
             } => {
                 write!(f, "CASE")?;
                 if let Some(op) = operand {
@@ -622,6 +795,7 @@ impl fmt::Display for Expr {
                 }
                 write!(f, " END")
             }
+            Expr::Parameter { index, .. } => write!(f, "${index}"),
         }
     }
 }

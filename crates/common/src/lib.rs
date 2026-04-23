@@ -5,6 +5,7 @@
 //! Shared types, error handling, and configuration for arneb.
 
 pub mod config;
+pub mod diagnostic;
 pub mod error;
 pub mod identifiers;
 pub mod stream;

@@ -1095,9 +1095,14 @@ mod tests {
             left: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "id".to_string(),
+                span: None,
             }),
             op: BinaryOp::Gt,
-            right: Box::new(PlanExpr::Literal(ScalarValue::Int32(4))),
+            right: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int32(4),
+                span: None,
+            }),
+            span: None,
         };
         let ctx = ScanContext::default().with_filters(vec![filter]);
         let stream = ds.scan(&ctx).await.unwrap();

@@ -65,7 +65,9 @@ fn can_prune_row_group(rg: &RowGroupMetaData, filters: &[PlanExpr]) -> bool {
 /// Check if a single filter expression prunes the given row group.
 fn filter_prunes_row_group(rg: &RowGroupMetaData, filter: &PlanExpr) -> bool {
     match filter {
-        PlanExpr::BinaryOp { left, op, right } => {
+        PlanExpr::BinaryOp {
+            left, op, right, ..
+        } => {
             // AND conjunction: prune if either side proves no match
             if *op == BinaryOp::And {
                 return filter_prunes_row_group(rg, left) || filter_prunes_row_group(rg, right);
@@ -92,10 +94,10 @@ fn extract_column_literal_comparison(
     right: &PlanExpr,
 ) -> Option<(usize, ScalarValue, BinaryOp)> {
     match (left, right) {
-        (PlanExpr::Column { index, .. }, PlanExpr::Literal(value)) => {
+        (PlanExpr::Column { index, .. }, PlanExpr::Literal { value, .. }) => {
             Some((*index, value.clone(), *op))
         }
-        (PlanExpr::Literal(value), PlanExpr::Column { index, .. }) => {
+        (PlanExpr::Literal { value, .. }, PlanExpr::Column { index, .. }) => {
             // Reverse the operator: Literal op Column → Column reverse(op) Literal
             let reversed = match op {
                 BinaryOp::Lt => BinaryOp::Gt,
@@ -236,7 +238,9 @@ fn try_build_predicate(
     schema: &SchemaDescriptor,
 ) -> Option<Box<dyn parquet::arrow::arrow_reader::ArrowPredicate>> {
     match filter {
-        PlanExpr::BinaryOp { left, op, right } => {
+        PlanExpr::BinaryOp {
+            left, op, right, ..
+        } => {
             // AND: build predicates for both sides
             if *op == BinaryOp::And {
                 // Just return the left side — the caller will process both

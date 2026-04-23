@@ -375,7 +375,10 @@ mod tests {
     fn fragment_filter_scan() {
         let plan = LogicalPlan::Filter {
             input: Box::new(scan("t")),
-            predicate: PlanExpr::Literal(ScalarValue::Boolean(true)),
+            predicate: PlanExpr::Literal {
+                value: ScalarValue::Boolean(true),
+                span: None,
+            },
         };
         let mut frag = PlanFragmenter::new();
         let result = frag.fragment(plan);
@@ -417,11 +420,13 @@ mod tests {
             group_by: vec![PlanExpr::Column {
                 index: 0,
                 name: "key".into(),
+                span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
                 name: "COUNT".into(),
                 args: vec![],
                 distinct: false,
+                span: None,
             }],
             schema,
         };
@@ -447,6 +452,7 @@ mod tests {
                 name: "COUNT".into(),
                 args: vec![],
                 distinct: false,
+                span: None,
             }],
             schema: vec![ColumnInfo {
                 name: "count".into(),

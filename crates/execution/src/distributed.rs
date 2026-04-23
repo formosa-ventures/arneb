@@ -348,6 +348,7 @@ mod tests {
                 expr: arneb_planner::PlanExpr::Column {
                     index: 0,
                     name: "id".into(),
+                    span: None,
                 },
                 asc: true,
                 nulls_first: false,

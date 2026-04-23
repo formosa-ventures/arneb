@@ -7,6 +7,7 @@ use arneb_common::error::PlanError;
 use arneb_common::types::{ColumnInfo, DataType, ScalarValue};
 use arneb_sql_parser::ast;
 
+use crate::analyzer::{Analyzer, AnalyzerContext};
 use crate::plan::{JoinCondition, LogicalPlan, PlanExpr, SortExpr};
 
 /// Converts parsed SQL statements into logical query plans.
@@ -38,10 +39,17 @@ impl PlanningContext {
     }
 
     /// Resolve a column reference to a (global_index, ColumnInfo) pair.
+    ///
+    /// The optional `location` lets error variants carry the source
+    /// position of the column reference. Call sites that happen to have
+    /// an AST node handy (and therefore a `Span`) should thread its
+    /// `start` location through here so diagnostics can point at the
+    /// typo. Call sites with no position context pass `None`.
     fn resolve_column(
         &self,
         name: &str,
         table: Option<&str>,
+        location: Option<arneb_common::error::Location>,
     ) -> Result<(usize, ColumnInfo), PlanError> {
         let mut found = None;
         for (i, (qualifier, col)) in self.columns.iter().enumerate() {
@@ -53,14 +61,18 @@ impl PlanningContext {
             };
             if name_matches && qualifier_matches {
                 if found.is_some() {
-                    return Err(PlanError::InvalidExpression(format!(
-                        "ambiguous column reference: {name}"
-                    )));
+                    return Err(PlanError::AmbiguousReference {
+                        name: name.to_string(),
+                        location,
+                    });
                 }
                 found = Some((i, col.clone()));
             }
         }
-        found.ok_or_else(|| PlanError::ColumnNotFound(name.to_string()))
+        found.ok_or_else(|| PlanError::ColumnNotFound {
+            name: name.to_string(),
+            location,
+        })
     }
 
     /// Return all columns as ColumnInfo.
@@ -89,13 +101,43 @@ impl<'a> QueryPlanner<'a> {
         Self { catalog }
     }
 
-    /// Plan a top-level SQL statement.
-    #[async_recursion]
+    /// Plan a top-level SQL statement and return just the plan.
+    ///
+    /// This is the convenience entrypoint for code paths that don't
+    /// need the [`AnalyzerContext`] — query execution, fragmenters,
+    /// and tests. See [`Self::plan_statement_with_context`] when you
+    /// need the inferred parameter types (e.g., pgwire
+    /// `ParameterDescription`).
     pub async fn plan_statement(&self, stmt: &ast::Statement) -> Result<LogicalPlan, PlanError> {
+        let (plan, _ctx) = self.plan_statement_with_context(stmt).await?;
+        Ok(plan)
+    }
+
+    /// Plan a top-level SQL statement and return the plan plus the
+    /// [`AnalyzerContext`] produced while running the default analyzer
+    /// pipeline.
+    ///
+    /// The pipeline runs exactly once per top-level statement — not
+    /// once per recursive subquery — so the returned context reflects
+    /// the entire query.
+    pub async fn plan_statement_with_context(
+        &self,
+        stmt: &ast::Statement,
+    ) -> Result<(LogicalPlan, AnalyzerContext), PlanError> {
+        let plan = self.plan_statement_inner(stmt).await?;
+        let mut ctx = AnalyzerContext::new();
+        let plan = Analyzer::default_pipeline().run(plan, &mut ctx)?;
+        Ok((plan, ctx))
+    }
+
+    /// Raw AST → LogicalPlan translation. Runs the analyzer — callers
+    /// use [`Self::plan_statement`] or [`Self::plan_statement_with_context`].
+    #[async_recursion]
+    async fn plan_statement_inner(&self, stmt: &ast::Statement) -> Result<LogicalPlan, PlanError> {
         match stmt {
-            ast::Statement::Query(query) => self.plan_query(query).await,
-            ast::Statement::Explain(inner) => {
-                let plan = self.plan_statement(inner).await?;
+            ast::Statement::Query { query, .. } => self.plan_query(query).await,
+            ast::Statement::Explain { stmt: inner, .. } => {
+                let plan = self.plan_statement_inner(inner).await?;
                 Ok(LogicalPlan::Explain {
                     input: Box::new(plan),
                 })
@@ -104,6 +146,7 @@ impl<'a> QueryPlanner<'a> {
                 name,
                 columns,
                 if_not_exists: _,
+                ..
             } => {
                 let schema: Vec<ColumnInfo> = columns
                     .iter()
@@ -118,11 +161,13 @@ impl<'a> QueryPlanner<'a> {
                     schema,
                 })
             }
-            ast::Statement::DropTable { name, if_exists } => Ok(LogicalPlan::DropTable {
+            ast::Statement::DropTable {
+                name, if_exists, ..
+            } => Ok(LogicalPlan::DropTable {
                 name: name.clone(),
                 if_exists: *if_exists,
             }),
-            ast::Statement::CreateTableAsSelect { name, query } => {
+            ast::Statement::CreateTableAsSelect { name, query, .. } => {
                 let source = self.plan_query(query).await?;
                 Ok(LogicalPlan::CreateTableAsSelect {
                     name: name.clone(),
@@ -133,11 +178,12 @@ impl<'a> QueryPlanner<'a> {
                 table,
                 columns: _,
                 source,
+                ..
             } => {
                 let source_plan = match source {
                     ast::InsertSource::Query(q) => self.plan_query(q).await?,
                     ast::InsertSource::Values(_rows) => {
-                        return Err(PlanError::InvalidExpression(
+                        return Err(PlanError::invalid_expression(
                             "INSERT INTO ... VALUES not yet supported in planner; use INSERT INTO ... SELECT"
                                 .to_string(),
                         ));
@@ -148,7 +194,9 @@ impl<'a> QueryPlanner<'a> {
                     source: Box::new(source_plan),
                 })
             }
-            ast::Statement::DeleteFrom { table, predicate } => {
+            ast::Statement::DeleteFrom {
+                table, predicate, ..
+            } => {
                 let pred_str = predicate.as_ref().map(|p| format!("{p}"));
                 Ok(LogicalPlan::DeleteFrom {
                     table: table.clone(),
@@ -159,15 +207,24 @@ impl<'a> QueryPlanner<'a> {
                 name,
                 query,
                 or_replace: _,
+                ..
             } => {
                 let plan = self.plan_query(query).await?;
                 Ok(LogicalPlan::CreateView {
                     name: name.clone(),
-                    sql: format!("{}", ast::Statement::Query(query.clone())),
+                    sql: format!(
+                        "{}",
+                        ast::Statement::Query {
+                            query: query.clone(),
+                            span: stmt.span(),
+                        }
+                    ),
                     plan: Box::new(plan),
                 })
             }
-            ast::Statement::DropView { name, if_exists } => Ok(LogicalPlan::DropView {
+            ast::Statement::DropView {
+                name, if_exists, ..
+            } => Ok(LogicalPlan::DropView {
                 name: name.clone(),
                 if_exists: *if_exists,
             }),
@@ -340,7 +397,7 @@ impl<'a> QueryPlanner<'a> {
         from: &[ast::TableWithJoins],
     ) -> Result<(LogicalPlan, PlanningContext), PlanError> {
         if from.is_empty() {
-            return Err(PlanError::InvalidExpression(
+            return Err(PlanError::invalid_expression(
                 "SELECT without FROM is not supported".to_string(),
             ));
         }
@@ -379,7 +436,7 @@ impl<'a> QueryPlanner<'a> {
                     JoinCondition::On(plan_expr)
                 }
                 ast::JoinCondition::Using(_) => {
-                    return Err(PlanError::InvalidExpression(
+                    return Err(PlanError::invalid_expression(
                         "USING join condition not yet supported".to_string(),
                     ));
                 }
@@ -443,29 +500,42 @@ impl<'a> QueryPlanner<'a> {
         expr: &ast::Expr,
         ctx: &PlanningContext,
     ) -> Result<PlanExpr, PlanError> {
+        let node_span = Some(expr.span());
         match expr {
-            ast::Expr::Column(col_ref) => {
-                let (index, col_info) =
-                    ctx.resolve_column(&col_ref.name, col_ref.table.as_deref())?;
+            ast::Expr::Column { col_ref, .. } => {
+                let (index, col_info) = ctx.resolve_column(
+                    &col_ref.name,
+                    col_ref.table.as_deref(),
+                    Some(col_ref.span.start),
+                )?;
                 Ok(PlanExpr::Column {
                     index,
                     name: col_info.name,
+                    span: node_span,
                 })
             }
-            ast::Expr::Literal(val) => Ok(PlanExpr::Literal(val.clone())),
-            ast::Expr::BinaryOp { left, op, right } => Ok(PlanExpr::BinaryOp {
+            ast::Expr::Literal { value, .. } => Ok(PlanExpr::Literal {
+                value: value.clone(),
+                span: node_span,
+            }),
+            ast::Expr::BinaryOp {
+                left, op, right, ..
+            } => Ok(PlanExpr::BinaryOp {
                 left: Box::new(self.plan_expr(left, ctx).await?),
                 op: *op,
                 right: Box::new(self.plan_expr(right, ctx).await?),
+                span: node_span,
             }),
-            ast::Expr::UnaryOp { op, expr } => Ok(PlanExpr::UnaryOp {
+            ast::Expr::UnaryOp { op, expr, .. } => Ok(PlanExpr::UnaryOp {
                 op: *op,
                 expr: Box::new(self.plan_expr(expr, ctx).await?),
+                span: node_span,
             }),
             ast::Expr::Function {
                 name,
                 args,
                 distinct,
+                ..
             } => {
                 let mut plan_args = Vec::with_capacity(args.len());
                 for a in args {
@@ -479,27 +549,35 @@ impl<'a> QueryPlanner<'a> {
                     name: name.clone(),
                     args: plan_args,
                     distinct: *distinct,
+                    span: node_span,
                 })
             }
-            ast::Expr::IsNull(inner) => Ok(PlanExpr::IsNull(Box::new(self.plan_expr(inner, ctx).await?))),
-            ast::Expr::IsNotNull(inner) => {
-                Ok(PlanExpr::IsNotNull(Box::new(self.plan_expr(inner, ctx).await?)))
-            }
+            ast::Expr::IsNull { expr: inner, .. } => Ok(PlanExpr::IsNull {
+                expr: Box::new(self.plan_expr(inner, ctx).await?),
+                span: node_span,
+            }),
+            ast::Expr::IsNotNull { expr: inner, .. } => Ok(PlanExpr::IsNotNull {
+                expr: Box::new(self.plan_expr(inner, ctx).await?),
+                span: node_span,
+            }),
             ast::Expr::Between {
                 expr,
                 negated,
                 low,
                 high,
+                ..
             } => Ok(PlanExpr::Between {
                 expr: Box::new(self.plan_expr(expr, ctx).await?),
                 negated: *negated,
                 low: Box::new(self.plan_expr(low, ctx).await?),
                 high: Box::new(self.plan_expr(high, ctx).await?),
+                span: node_span,
             }),
             ast::Expr::InList {
                 expr,
                 list,
                 negated,
+                ..
             } => {
                 let mut plan_list = Vec::with_capacity(list.len());
                 for e in list {
@@ -509,17 +587,22 @@ impl<'a> QueryPlanner<'a> {
                     expr: Box::new(self.plan_expr(expr, ctx).await?),
                     list: plan_list,
                     negated: *negated,
+                    span: node_span,
                 })
             }
-            ast::Expr::Cast { expr, data_type } => Ok(PlanExpr::Cast {
+            ast::Expr::Cast {
+                expr, data_type, ..
+            } => Ok(PlanExpr::Cast {
                 expr: Box::new(self.plan_expr(expr, ctx).await?),
                 data_type: data_type.clone(),
+                span: node_span,
             }),
-            ast::Expr::Nested(inner) => self.plan_expr(inner, ctx).await,
-            ast::Expr::Subquery(query) => {
+            ast::Expr::Nested { expr: inner, .. } => self.plan_expr(inner, ctx).await,
+            ast::Expr::Subquery { query, .. } => {
                 let subplan = self.plan_query(query).await?;
                 Ok(PlanExpr::ScalarSubquery {
                     subplan: Box::new(subplan),
+                    span: node_span,
                 })
             }
             ast::Expr::Case {
@@ -527,6 +610,7 @@ impl<'a> QueryPlanner<'a> {
                 conditions,
                 results,
                 else_result,
+                ..
             } => {
                 let op = match operand {
                     Some(expr) => Some(Box::new(self.plan_expr(expr, ctx).await?)),
@@ -544,20 +628,26 @@ impl<'a> QueryPlanner<'a> {
                     operand: op,
                     when_clauses,
                     else_result: el,
+                    span: node_span,
                 })
             }
             ast::Expr::InSubquery { .. } | ast::Expr::Exists { .. } => {
-                Err(PlanError::InvalidExpression(
+                Err(PlanError::invalid_expression(
                     "IN/EXISTS subquery expressions are handled at the plan level, not in plan_expr"
                         .to_string(),
                 ))
             }
             ast::Expr::WindowFunction { .. } => {
                 // Window functions are handled at the plan level (Window node), not in plan_expr
-                Err(PlanError::InvalidExpression(
+                Err(PlanError::invalid_expression(
                     "window functions are handled at the plan level, not in plan_expr".to_string(),
                 ))
             }
+            ast::Expr::Parameter { index, .. } => Ok(PlanExpr::Parameter {
+                index: *index,
+                type_hint: None,
+                span: node_span,
+            }),
         }
     }
 
@@ -591,6 +681,7 @@ impl<'a> QueryPlanner<'a> {
                         exprs.push(PlanExpr::Column {
                             index: i,
                             name: col.name.clone(),
+                            span: None,
                         });
                         schema.push(col.clone());
                     }
@@ -605,6 +696,7 @@ impl<'a> QueryPlanner<'a> {
                         exprs.push(PlanExpr::Column {
                             index: i,
                             name: col.name.clone(),
+                            span: None,
                         });
                         schema.push(col);
                     }
@@ -653,6 +745,7 @@ impl<'a> QueryPlanner<'a> {
                         exprs.push(PlanExpr::Column {
                             index: agg_idx,
                             name: ci.name.clone(),
+                            span: None,
                         });
                         schema.push(ci);
                     } else if self.is_group_by_expr(expr, group_by_exprs) {
@@ -664,9 +757,9 @@ impl<'a> QueryPlanner<'a> {
                             Err(_) => {
                                 // Try matching by unqualified column name
                                 let col_name = match expr {
-                                    ast::Expr::Column(c) => &c.name,
+                                    ast::Expr::Column { col_ref, .. } => &col_ref.name,
                                     _ => {
-                                        return Err(PlanError::InvalidExpression(format!(
+                                        return Err(PlanError::invalid_expression(format!(
                                             "cannot resolve group-by expr: {expr}"
                                         )))
                                     }
@@ -677,11 +770,13 @@ impl<'a> QueryPlanner<'a> {
                                         found = Some(PlanExpr::Column {
                                             index: i,
                                             name: c.name.clone(),
+                                            span: None,
                                         });
                                         break;
                                     }
                                 }
-                                found.ok_or_else(|| PlanError::ColumnNotFound(col_name.clone()))?
+                                found
+                                    .ok_or_else(|| PlanError::column_not_found(col_name.clone()))?
                             }
                         };
                         let mut ci = self.expr_to_column_info(&plan_expr, ctx);
@@ -717,6 +812,7 @@ impl<'a> QueryPlanner<'a> {
                         exprs.push(PlanExpr::Column {
                             index: i,
                             name: col.name.clone(),
+                            span: None,
                         });
                         schema.push(col.clone());
                     }
@@ -731,6 +827,7 @@ impl<'a> QueryPlanner<'a> {
                         exprs.push(PlanExpr::Column {
                             index: i,
                             name: col.name.clone(),
+                            span: None,
                         });
                         schema.push(col);
                     }
@@ -782,10 +879,13 @@ impl<'a> QueryPlanner<'a> {
         }
         // For qualified column refs (e.g., n1.n_name), check if unqualified name
         // matches a group-by expression
-        if let ast::Expr::Column(ref col) = expr {
+        if let ast::Expr::Column { col_ref: col, .. } = expr {
             let unqualified = &col.name;
             return group_by_exprs.iter().any(|gb| {
-                if let ast::Expr::Column(gb_col) = gb {
+                if let ast::Expr::Column {
+                    col_ref: gb_col, ..
+                } = gb
+                {
                     gb_col.name.eq_ignore_ascii_case(unqualified)
                 } else {
                     false
@@ -803,7 +903,7 @@ impl<'a> QueryPlanner<'a> {
                 self.contains_aggregate(left) || self.contains_aggregate(right)
             }
             ast::Expr::UnaryOp { expr, .. } => self.contains_aggregate(expr),
-            ast::Expr::Nested(inner) => self.contains_aggregate(inner),
+            ast::Expr::Nested { expr: inner, .. } => self.contains_aggregate(inner),
             _ => false,
         }
     }
@@ -837,14 +937,18 @@ impl<'a> QueryPlanner<'a> {
                         return Some(PlanExpr::Column {
                             index: idx,
                             name: ctx.columns[idx].1.name.clone(),
+                            span: None,
                         });
                     }
                 }
                 // Also match by column name for aliased items
                 if let (
-                    ast::Expr::Column(col_ref),
+                    ast::Expr::Column { col_ref, .. },
                     ast::SelectItem::ExprWithAlias {
-                        expr: ast::Expr::Column(sel_col),
+                        expr:
+                            ast::Expr::Column {
+                                col_ref: sel_col, ..
+                            },
                         ..
                     },
                 ) = (expr, item)
@@ -853,6 +957,7 @@ impl<'a> QueryPlanner<'a> {
                         return Some(PlanExpr::Column {
                             index: idx,
                             name: ctx.columns[idx].1.name.clone(),
+                            span: None,
                         });
                     }
                 }
@@ -869,16 +974,18 @@ impl<'a> QueryPlanner<'a> {
                 return Some(PlanExpr::Column {
                     index: i,
                     name: col.name.clone(),
+                    span: None,
                 });
             }
         }
         // For column references, also match by unqualified name (handles aliased columns)
-        if let ast::Expr::Column(col_ref) = expr {
+        if let ast::Expr::Column { col_ref, .. } = expr {
             for (i, (_, col)) in ctx.columns.iter().enumerate() {
                 if col.name.eq_ignore_ascii_case(&col_ref.name) {
                     return Some(PlanExpr::Column {
                         index: i,
                         name: col.name.clone(),
+                        span: None,
                     });
                 }
             }
@@ -892,6 +999,7 @@ impl<'a> QueryPlanner<'a> {
                         return Some(PlanExpr::Column {
                             index: i,
                             name: col.name.clone(),
+                            span: None,
                         });
                     }
                 }
@@ -909,30 +1017,46 @@ impl<'a> QueryPlanner<'a> {
         num_group_by: usize,
     ) -> ast::Expr {
         match expr {
-            ast::Expr::Function { name, .. } if is_aggregate_function(name) => {
+            ast::Expr::Function { name, span, .. } if is_aggregate_function(name) => {
                 // Replace with a column reference to the aggregate output
                 if let Some(idx) = self.find_aggregate_index(expr, ctx, num_group_by) {
                     if let Some((_, col)) = ctx.columns.get(idx) {
-                        return ast::Expr::Column(ast::ColumnRef {
-                            name: col.name.clone(),
-                            table: None,
-                        });
+                        return ast::Expr::Column {
+                            col_ref: ast::ColumnRef {
+                                name: col.name.clone(),
+                                table: None,
+                                span: *span,
+                            },
+                            span: *span,
+                        };
                     }
                 }
                 expr.clone()
             }
-            ast::Expr::BinaryOp { left, op, right } => ast::Expr::BinaryOp {
+            ast::Expr::BinaryOp {
+                left,
+                op,
+                right,
+                span,
+            } => ast::Expr::BinaryOp {
                 left: Box::new(self.rewrite_aggregates_as_columns(left, ctx, num_group_by)),
                 op: *op,
                 right: Box::new(self.rewrite_aggregates_as_columns(right, ctx, num_group_by)),
+                span: *span,
             },
-            ast::Expr::UnaryOp { op, expr: inner } => ast::Expr::UnaryOp {
+            ast::Expr::UnaryOp {
+                op,
+                expr: inner,
+                span,
+            } => ast::Expr::UnaryOp {
                 op: *op,
                 expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
+                span: *span,
             },
-            ast::Expr::Nested(inner) => ast::Expr::Nested(Box::new(
-                self.rewrite_aggregates_as_columns(inner, ctx, num_group_by),
-            )),
+            ast::Expr::Nested { expr: inner, span } => ast::Expr::Nested {
+                expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
+                span: *span,
+            },
             _ => expr.clone(),
         }
     }
@@ -979,7 +1103,7 @@ impl<'a> QueryPlanner<'a> {
             ast::Expr::UnaryOp { expr, .. } => {
                 self.extract_aggregates(expr, ctx, out).await?;
             }
-            ast::Expr::Nested(inner) => {
+            ast::Expr::Nested { expr: inner, .. } => {
                 self.extract_aggregates(inner, ctx, out).await?;
             }
             _ => {}
@@ -990,7 +1114,7 @@ impl<'a> QueryPlanner<'a> {
     /// Derive a ColumnInfo from a PlanExpr (best effort name + type inference).
     fn expr_to_column_info(&self, expr: &PlanExpr, ctx: &PlanningContext) -> ColumnInfo {
         match expr {
-            PlanExpr::Column { index, name } => {
+            PlanExpr::Column { index, name, .. } => {
                 if let Some((_, col)) = ctx.columns.get(*index) {
                     ColumnInfo {
                         name: name.clone(),
@@ -1005,7 +1129,7 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
             }
-            PlanExpr::Literal(val) => ColumnInfo {
+            PlanExpr::Literal { value: val, .. } => ColumnInfo {
                 name: val.to_string(),
                 data_type: val.data_type(),
                 nullable: matches!(val, ScalarValue::Null),
@@ -1044,7 +1168,9 @@ impl<'a> QueryPlanner<'a> {
                     nullable: true,
                 }
             }
-            PlanExpr::BinaryOp { left, op, right } => {
+            PlanExpr::BinaryOp {
+                left, op, right, ..
+            } => {
                 let left_type = self.expr_to_column_info(left, ctx).data_type;
                 let right_type = self.expr_to_column_info(right, ctx).data_type;
                 let data_type = match (&left_type, &right_type) {
@@ -1082,7 +1208,9 @@ impl<'a> QueryPlanner<'a> {
                     nullable: true,
                 }
             }
-            PlanExpr::Cast { data_type, expr } => ColumnInfo {
+            PlanExpr::Cast {
+                data_type, expr, ..
+            } => ColumnInfo {
                 name: format!("CAST({expr} AS {data_type})"),
                 data_type: data_type.clone(),
                 nullable: true,
@@ -1108,23 +1236,29 @@ impl<'a> QueryPlanner<'a> {
     fn eval_limit_expr(&self, expr: Option<&ast::Expr>) -> Result<Option<usize>, PlanError> {
         match expr {
             None => Ok(None),
-            Some(ast::Expr::Literal(ScalarValue::Int64(n))) => {
+            Some(ast::Expr::Literal {
+                value: ScalarValue::Int64(n),
+                ..
+            }) => {
                 if *n < 0 {
-                    return Err(PlanError::InvalidExpression(
+                    return Err(PlanError::invalid_expression(
                         "LIMIT/OFFSET must be non-negative".to_string(),
                     ));
                 }
                 Ok(Some(*n as usize))
             }
-            Some(ast::Expr::Literal(ScalarValue::Int32(n))) => {
+            Some(ast::Expr::Literal {
+                value: ScalarValue::Int32(n),
+                ..
+            }) => {
                 if *n < 0 {
-                    return Err(PlanError::InvalidExpression(
+                    return Err(PlanError::invalid_expression(
                         "LIMIT/OFFSET must be non-negative".to_string(),
                     ));
                 }
                 Ok(Some(*n as usize))
             }
-            Some(_) => Err(PlanError::InvalidExpression(
+            Some(_) => Err(PlanError::invalid_expression(
                 "LIMIT/OFFSET must be an integer literal".to_string(),
             )),
         }
@@ -1212,9 +1346,14 @@ mod tests {
             left: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "a".into(),
+                span: None,
             }),
             op: ast::BinaryOp::Gt,
-            right: Box::new(PlanExpr::Literal(ScalarValue::Int64(1))),
+            right: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int64(1),
+                span: None,
+            }),
+            span: None,
         };
         assert_eq!(expr.to_string(), "a > 1");
     }
@@ -1225,6 +1364,7 @@ mod tests {
             name: "COUNT".into(),
             args: vec![PlanExpr::Wildcard],
             distinct: false,
+            span: None,
         };
         assert_eq!(expr.to_string(), "COUNT(*)");
     }
@@ -1235,10 +1375,18 @@ mod tests {
             expr: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "x".into(),
+                span: None,
             }),
             negated: false,
-            low: Box::new(PlanExpr::Literal(ScalarValue::Int64(1))),
-            high: Box::new(PlanExpr::Literal(ScalarValue::Int64(10))),
+            low: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int64(1),
+                span: None,
+            }),
+            high: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int64(10),
+                span: None,
+            }),
+            span: None,
         };
         assert_eq!(expr.to_string(), "x BETWEEN 1 AND 10");
     }
@@ -1401,6 +1549,25 @@ mod tests {
         }
     }
 
+    /// EXPLAIN output MUST be position-independent: two parses of the
+    /// same query with different whitespace should produce byte-identical
+    /// plan text (and JSON). This guards D7 — `#[serde(skip)]` on
+    /// `PlanExpr.span`.
+    #[tokio::test]
+    async fn explain_is_position_independent() {
+        let a = plan_sql("SELECT id FROM users WHERE id > 1").await.unwrap();
+        let b = plan_sql("SELECT id  FROM  users  WHERE  id > 1")
+            .await
+            .unwrap();
+        assert_eq!(a.to_string(), b.to_string(), "plan Display must be stable");
+
+        // Serde JSON must also be stable across whitespace differences;
+        // spans are skipped, so only logical fields serialize.
+        let ja = serde_json::to_string(&a).unwrap();
+        let jb = serde_json::to_string(&b).unwrap();
+        assert_eq!(ja, jb, "plan JSON must be stable");
+    }
+
     // ---------------------------------------------------------------
     // Error cases (task 4.10)
     // ---------------------------------------------------------------
@@ -1418,7 +1585,7 @@ mod tests {
     async fn test_column_not_found() {
         let err = plan_sql("SELECT nonexistent FROM users").await.unwrap_err();
         match err {
-            PlanError::ColumnNotFound(name) => assert_eq!(name, "nonexistent"),
+            PlanError::ColumnNotFound { name, .. } => assert_eq!(name, "nonexistent"),
             _ => panic!("expected ColumnNotFound, got: {err:?}"),
         }
     }

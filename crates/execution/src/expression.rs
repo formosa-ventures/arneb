@@ -40,32 +40,36 @@ pub(crate) fn evaluate(
             Ok(batch.column(*index).clone())
         }
 
-        PlanExpr::Literal(value) => scalar_to_array(value, batch.num_rows()),
+        PlanExpr::Literal { value, .. } => scalar_to_array(value, batch.num_rows()),
 
-        PlanExpr::BinaryOp { left, op, right } => {
+        PlanExpr::BinaryOp {
+            left, op, right, ..
+        } => {
             let left_arr = evaluate(left, batch, registry)?;
             let right_arr = evaluate(right, batch, registry)?;
             evaluate_binary_op(&left_arr, op, &right_arr)
         }
 
-        PlanExpr::UnaryOp { op, expr } => {
+        PlanExpr::UnaryOp { op, expr, .. } => {
             let arr = evaluate(expr, batch, registry)?;
             evaluate_unary_op(op, &arr)
         }
 
-        PlanExpr::IsNull(expr) => {
+        PlanExpr::IsNull { expr, .. } => {
             let arr = evaluate(expr, batch, registry)?;
             let result = kernels::boolean::is_null(&arr)?;
             Ok(Arc::new(result))
         }
 
-        PlanExpr::IsNotNull(expr) => {
+        PlanExpr::IsNotNull { expr, .. } => {
             let arr = evaluate(expr, batch, registry)?;
             let result = kernels::boolean::is_not_null(&arr)?;
             Ok(Arc::new(result))
         }
 
-        PlanExpr::Cast { expr, data_type } => {
+        PlanExpr::Cast {
+            expr, data_type, ..
+        } => {
             let arr = evaluate(expr, batch, registry)?;
             let arrow_type: ArrowDataType = data_type.clone().into();
             let result = arrow::compute::cast(&arr, &arrow_type)?;
@@ -77,6 +81,7 @@ pub(crate) fn evaluate(
             negated,
             low,
             high,
+            ..
         } => {
             // expr BETWEEN low AND high  ≡  expr >= low AND expr <= high
             let val = evaluate(expr, batch, registry)?;
@@ -99,6 +104,7 @@ pub(crate) fn evaluate(
             expr,
             list,
             negated,
+            ..
         } => {
             let val = evaluate(expr, batch, registry)?;
             // OR together equality checks for each list item
@@ -127,6 +133,7 @@ pub(crate) fn evaluate(
             name,
             args,
             distinct: _,
+            ..
         } => {
             // Try scalar function registry first
             if let Some(reg) = registry {
@@ -160,6 +167,7 @@ pub(crate) fn evaluate(
             operand,
             when_clauses,
             else_result,
+            ..
         } => evaluate_case(
             operand.as_deref(),
             when_clauses,
@@ -171,6 +179,15 @@ pub(crate) fn evaluate(
         PlanExpr::Wildcard => Err(ExecutionError::InvalidOperation(
             "wildcard should have been expanded during planning".to_string(),
         )),
+
+        // Parameters (`$1`, `$2`, …) must be substituted with
+        // literals before the plan reaches the evaluator. The
+        // extended-query handler in `crates/protocol` does this via
+        // `bind_parameters` before execution; a `Parameter` node
+        // reaching this point is an internal invariant violation.
+        PlanExpr::Parameter { index, .. } => Err(ExecutionError::InvalidOperation(format!(
+            "unbound parameter ${index}; extended-query protocol must Bind all parameters before Execute"
+        ))),
     }
 }
 
@@ -257,6 +274,13 @@ enum CompareOp {
 }
 
 /// Type-dispatch comparison producing a BooleanArray.
+///
+/// Operands MUST have the same Arrow type — the planner's
+/// [`arneb_planner::analyzer::TypeCoercion`] pass inserts `Cast`
+/// nodes so execution only ever sees pre-aligned inputs. A
+/// mismatched call here indicates the analyzer was bypassed or
+/// regressed; we fail loudly with a clear error rather than silently
+/// coercing (historical behavior).
 fn compare_op(
     left: &ArrayRef,
     right: &ArrayRef,
@@ -265,8 +289,15 @@ fn compare_op(
     use arrow::array::AsArray;
     use arrow::datatypes::*;
 
-    // Widen both sides to a common numeric type if they differ.
-    let (left, right) = coerce_numeric_pair(left, right)?;
+    if left.data_type() != right.data_type() {
+        return Err(ExecutionError::InvalidOperation(format!(
+            "internal: compare_op received mismatched types {lt:?} vs {rt:?}; analyzer should have inserted Cast",
+            lt = left.data_type(),
+            rt = right.data_type()
+        )));
+    }
+    let left = left.clone();
+    let right = right.clone();
 
     match left.data_type() {
         ArrowDataType::Int32 => {
@@ -450,20 +481,27 @@ enum ArithOp {
     Rem,
 }
 
+/// Arithmetic on two Arrow arrays. Like [`compare_op`], operands
+/// MUST have the same Arrow type — the analyzer inserts `Cast`
+/// nodes to guarantee this.
 fn arithmetic_op(
     left: &ArrayRef,
     right: &ArrayRef,
     op: ArithOp,
 ) -> Result<ArrayRef, ExecutionError> {
-    // Coerce to common numeric type before operating.
-    let (left, right) = coerce_numeric_pair(left, right)?;
-
+    if left.data_type() != right.data_type() {
+        return Err(ExecutionError::InvalidOperation(format!(
+            "internal: arithmetic_op received mismatched types {lt:?} vs {rt:?}; analyzer should have inserted Cast",
+            lt = left.data_type(),
+            rt = right.data_type()
+        )));
+    }
     let result: ArrayRef = match op {
-        ArithOp::Add => kernels::numeric::add(&left, &right)?,
-        ArithOp::Sub => kernels::numeric::sub(&left, &right)?,
-        ArithOp::Mul => kernels::numeric::mul(&left, &right)?,
-        ArithOp::Div => kernels::numeric::div(&left, &right)?,
-        ArithOp::Rem => kernels::numeric::rem(&left, &right)?,
+        ArithOp::Add => kernels::numeric::add(left, right)?,
+        ArithOp::Sub => kernels::numeric::sub(left, right)?,
+        ArithOp::Mul => kernels::numeric::mul(left, right)?,
+        ArithOp::Div => kernels::numeric::div(left, right)?,
+        ArithOp::Rem => kernels::numeric::rem(left, right)?,
     };
     Ok(result)
 }
@@ -482,81 +520,12 @@ fn evaluate_unary_op(op: &ast::UnaryOp, arr: &ArrayRef) -> Result<ArrayRef, Exec
     }
 }
 
-/// Coerce a pair of arrays to a common numeric type for arithmetic/comparison.
-///
-/// Rules (widening only):
-/// - Int32 + Int64 → both cast to Int64
-/// - Int32/Int64 + Float32 → both cast to Float64
-/// - Int32/Int64 + Float64 → both cast to Float64
-/// - Float32 + Float64 → both cast to Float64
-/// - Same type → no change
-fn coerce_numeric_pair(
-    left: &ArrayRef,
-    right: &ArrayRef,
-) -> Result<(ArrayRef, ArrayRef), ExecutionError> {
-    let lt = left.data_type();
-    let rt = right.data_type();
-
-    if lt == rt {
-        return Ok((left.clone(), right.clone()));
-    }
-
-    let target = wider_numeric_type(lt, rt)?;
-
-    let l = if lt != &target {
-        arrow::compute::cast(left, &target)?
-    } else {
-        left.clone()
-    };
-    let r = if rt != &target {
-        arrow::compute::cast(right, &target)?
-    } else {
-        right.clone()
-    };
-
-    Ok((l, r))
-}
-
-fn wider_numeric_type(
-    a: &ArrowDataType,
-    b: &ArrowDataType,
-) -> Result<ArrowDataType, ExecutionError> {
-    use ArrowDataType::*;
-    match (a, b) {
-        // Same type — no widening needed.
-        _ if a == b => Ok(a.clone()),
-
-        // Int32 ↔ Int64 → Int64
-        (Int32, Int64) | (Int64, Int32) => Ok(Int64),
-
-        // Any int + float → Float64
-        (Int32 | Int64, Float32 | Float64) | (Float32 | Float64, Int32 | Int64) => Ok(Float64),
-
-        // Float32 + Float64 → Float64
-        (Float32, Float64) | (Float64, Float32) => Ok(Float64),
-
-        // Decimal128 + integer → Decimal128 (cast integer to decimal)
-        (Decimal128(p, s), Int32 | Int64) => Ok(Decimal128(*p, *s)),
-        (Int32 | Int64, Decimal128(p, s)) => Ok(Decimal128(*p, *s)),
-
-        // Decimal128 + float → Float64
-        (Decimal128(_, _), Float32 | Float64) | (Float32 | Float64, Decimal128(_, _)) => {
-            Ok(Float64)
-        }
-
-        // Decimal128 + Decimal128 with different precision/scale → use wider
-        (Decimal128(p1, s1), Decimal128(p2, s2)) => {
-            let scale = (*s1).max(*s2);
-            let precision = ((*p1 as i8 - *s1).max(*p2 as i8 - *s2) + scale) as u8;
-            let precision = precision.min(38); // Decimal128 max precision
-            Ok(Decimal128(precision, scale))
-        }
-
-        _ => Err(ExecutionError::InvalidOperation(format!(
-            "cannot coerce {a:?} and {b:?} to a common type"
-        ))),
-    }
-}
+// The runtime coercion helpers `coerce_numeric_pair` and
+// `wider_numeric_type` have been deleted. Implicit type alignment is
+// now a planner concern — `arneb_planner::analyzer::TypeCoercion`
+// inserts `Cast` nodes so that every `compare_op` / `arithmetic_op`
+// call receives pre-aligned operands. See the `planner-type-coercion`
+// OpenSpec change for rationale and gated deletion plan.
 
 /// Evaluate a CASE expression.
 ///
@@ -741,6 +710,7 @@ mod tests {
         let expr = PlanExpr::Column {
             index: 0,
             name: "a".to_string(),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int32Array>().unwrap();
@@ -750,7 +720,10 @@ mod tests {
     #[test]
     fn eval_literal_int() {
         let batch = make_batch();
-        let expr = PlanExpr::Literal(ScalarValue::Int64(42));
+        let expr = PlanExpr::Literal {
+            value: ScalarValue::Int64(42),
+            span: None,
+        };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(arr.value(0), 42);
@@ -760,7 +733,10 @@ mod tests {
     #[test]
     fn eval_literal_string() {
         let batch = make_batch();
-        let expr = PlanExpr::Literal(ScalarValue::Utf8("test".to_string()));
+        let expr = PlanExpr::Literal {
+            value: ScalarValue::Utf8("test".to_string()),
+            span: None,
+        };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(arr.value(0), "test");
@@ -774,9 +750,14 @@ mod tests {
             left: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "a".to_string(),
+                span: None,
             }),
             op: ast::BinaryOp::Plus,
-            right: Box::new(PlanExpr::Literal(ScalarValue::Int32(1))),
+            right: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int32(1),
+                span: None,
+            }),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int32Array>().unwrap();
@@ -786,17 +767,51 @@ mod tests {
     #[test]
     fn eval_add_mixed_types() {
         let batch = make_batch();
-        // a + b (Int32 + Int64 → Int64)
+        // Int32 + Int64 with NO planner Cast inserted: the
+        // evaluator now treats this as an internal invariant
+        // violation (the analyzer must have inserted the Cast). This
+        // is Task 54 of the `planner-type-coercion` change: execution
+        // no longer silently coerces mismatched types.
         let expr = PlanExpr::BinaryOp {
             left: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "a".to_string(),
+                span: None,
             }),
             op: ast::BinaryOp::Plus,
             right: Box::new(PlanExpr::Column {
                 index: 1,
                 name: "b".to_string(),
+                span: None,
             }),
+            span: None,
+        };
+        let err = evaluate(&expr, &batch, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mismatched types") && msg.contains("analyzer should have inserted Cast"),
+            "got: {msg}"
+        );
+
+        // With an explicit Cast (as the analyzer would insert), the
+        // expression succeeds as before.
+        let expr = PlanExpr::BinaryOp {
+            left: Box::new(PlanExpr::Cast {
+                expr: Box::new(PlanExpr::Column {
+                    index: 0,
+                    name: "a".to_string(),
+                    span: None,
+                }),
+                data_type: arneb_common::types::DataType::Int64,
+                span: None,
+            }),
+            op: ast::BinaryOp::Plus,
+            right: Box::new(PlanExpr::Column {
+                index: 1,
+                name: "b".to_string(),
+                span: None,
+            }),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -811,9 +826,14 @@ mod tests {
             left: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "a".to_string(),
+                span: None,
             }),
             op: ast::BinaryOp::Gt,
-            right: Box::new(PlanExpr::Literal(ScalarValue::Int32(1))),
+            right: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int32(1),
+                span: None,
+            }),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -830,9 +850,14 @@ mod tests {
             left: Box::new(PlanExpr::Column {
                 index: 3,
                 name: "d".to_string(),
+                span: None,
             }),
             op: ast::BinaryOp::And,
-            right: Box::new(PlanExpr::Literal(ScalarValue::Boolean(true))),
+            right: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Boolean(true),
+                span: None,
+            }),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -849,7 +874,9 @@ mod tests {
             expr: Box::new(PlanExpr::Column {
                 index: 3,
                 name: "d".to_string(),
+                span: None,
             }),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -866,7 +893,9 @@ mod tests {
             expr: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "a".to_string(),
+                span: None,
             }),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int32Array>().unwrap();
@@ -886,10 +915,14 @@ mod tests {
         )
         .unwrap();
 
-        let expr = PlanExpr::IsNull(Box::new(PlanExpr::Column {
-            index: 0,
-            name: "x".to_string(),
-        }));
+        let expr = PlanExpr::IsNull {
+            expr: Box::new(PlanExpr::Column {
+                index: 0,
+                name: "x".to_string(),
+                span: None,
+            }),
+            span: None,
+        };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(!arr.value(0));
@@ -905,10 +938,18 @@ mod tests {
             expr: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "a".to_string(),
+                span: None,
             }),
             negated: false,
-            low: Box::new(PlanExpr::Literal(ScalarValue::Int32(1))),
-            high: Box::new(PlanExpr::Literal(ScalarValue::Int32(2))),
+            low: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int32(1),
+                span: None,
+            }),
+            high: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int32(2),
+                span: None,
+            }),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -925,12 +966,20 @@ mod tests {
             expr: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "a".to_string(),
+                span: None,
             }),
             list: vec![
-                PlanExpr::Literal(ScalarValue::Int32(1)),
-                PlanExpr::Literal(ScalarValue::Int32(3)),
+                PlanExpr::Literal {
+                    value: ScalarValue::Int32(1),
+                    span: None,
+                },
+                PlanExpr::Literal {
+                    value: ScalarValue::Int32(3),
+                    span: None,
+                },
             ],
             negated: false,
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -947,9 +996,14 @@ mod tests {
             left: Box::new(PlanExpr::Column {
                 index: 2,
                 name: "c".to_string(),
+                span: None,
             }),
             op: ast::BinaryOp::Like,
-            right: Box::new(PlanExpr::Literal(ScalarValue::Utf8("he%".to_string()))),
+            right: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Utf8("he%".to_string()),
+                span: None,
+            }),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -966,8 +1020,10 @@ mod tests {
             expr: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "a".to_string(),
+                span: None,
             }),
             data_type: arneb_common::types::DataType::Int64,
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -977,11 +1033,14 @@ mod tests {
     #[test]
     fn eval_decimal128_literal() {
         let batch = make_batch();
-        let expr = PlanExpr::Literal(ScalarValue::Decimal128 {
-            value: 12345,
-            precision: 10,
-            scale: 2,
-        });
+        let expr = PlanExpr::Literal {
+            value: ScalarValue::Decimal128 {
+                value: 12345,
+                precision: 10,
+                scale: 2,
+            },
+            span: None,
+        };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result
             .as_any()
@@ -1008,13 +1067,18 @@ mod tests {
             left: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "price".to_string(),
+                span: None,
             }),
             op: ast::BinaryOp::Gt,
-            right: Box::new(PlanExpr::Literal(ScalarValue::Decimal128 {
-                value: 2000,
-                precision: 10,
-                scale: 2,
-            })),
+            right: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Decimal128 {
+                    value: 2000,
+                    precision: 10,
+                    scale: 2,
+                },
+                span: None,
+            }),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let bool_arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -1040,13 +1104,18 @@ mod tests {
             left: Box::new(PlanExpr::Column {
                 index: 0,
                 name: "price".to_string(),
+                span: None,
             }),
             op: ast::BinaryOp::Plus,
-            right: Box::new(PlanExpr::Literal(ScalarValue::Decimal128 {
-                value: 500,
-                precision: 10,
-                scale: 2,
-            })),
+            right: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Decimal128 {
+                    value: 500,
+                    precision: 10,
+                    scale: 2,
+                },
+                span: None,
+            }),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let dec_arr = result
@@ -1061,11 +1130,14 @@ mod tests {
     #[test]
     fn eval_timestamp_literal() {
         let batch = make_batch();
-        let expr = PlanExpr::Literal(ScalarValue::Timestamp {
-            value: 1000000,
-            unit: arneb_common::types::TimeUnit::Microsecond,
-            timezone: None,
-        });
+        let expr = PlanExpr::Literal {
+            value: ScalarValue::Timestamp {
+                value: 1000000,
+                unit: arneb_common::types::TimeUnit::Microsecond,
+                timezone: None,
+            },
+            span: None,
+        };
         let result = evaluate(&expr, &batch, None).unwrap();
         assert_eq!(
             *result.data_type(),
@@ -1077,7 +1149,10 @@ mod tests {
     #[test]
     fn eval_binary_literal() {
         let batch = make_batch();
-        let expr = PlanExpr::Literal(ScalarValue::Binary(vec![0x01, 0x02, 0x03]));
+        let expr = PlanExpr::Literal {
+            value: ScalarValue::Binary(vec![0x01, 0x02, 0x03]),
+            span: None,
+        };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result
             .as_any()
@@ -1093,6 +1168,7 @@ mod tests {
         let expr = PlanExpr::Column {
             index: 99,
             name: "z".to_string(),
+            span: None,
         };
         assert!(evaluate(&expr, &batch, None).is_err());
     }
@@ -1111,27 +1187,45 @@ mod tests {
                         left: Box::new(PlanExpr::Column {
                             index: 0,
                             name: "a".into(),
+                            span: None,
                         }),
                         op: ast::BinaryOp::Gt,
-                        right: Box::new(PlanExpr::Literal(ScalarValue::Int32(2))),
+                        right: Box::new(PlanExpr::Literal {
+                            value: ScalarValue::Int32(2),
+                            span: None,
+                        }),
+                        span: None,
                     },
-                    PlanExpr::Literal(ScalarValue::Utf8("big".into())),
+                    PlanExpr::Literal {
+                        value: ScalarValue::Utf8("big".into()),
+                        span: None,
+                    },
                 ),
                 (
                     PlanExpr::BinaryOp {
                         left: Box::new(PlanExpr::Column {
                             index: 0,
                             name: "a".into(),
+                            span: None,
                         }),
                         op: ast::BinaryOp::Gt,
-                        right: Box::new(PlanExpr::Literal(ScalarValue::Int32(1))),
+                        right: Box::new(PlanExpr::Literal {
+                            value: ScalarValue::Int32(1),
+                            span: None,
+                        }),
+                        span: None,
                     },
-                    PlanExpr::Literal(ScalarValue::Utf8("medium".into())),
+                    PlanExpr::Literal {
+                        value: ScalarValue::Utf8("medium".into()),
+                        span: None,
+                    },
                 ),
             ],
-            else_result: Some(Box::new(PlanExpr::Literal(ScalarValue::Utf8(
-                "small".into(),
-            )))),
+            else_result: Some(Box::new(PlanExpr::Literal {
+                value: ScalarValue::Utf8("small".into()),
+                span: None,
+            })),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<StringArray>().unwrap();
@@ -1148,20 +1242,35 @@ mod tests {
             operand: Some(Box::new(PlanExpr::Column {
                 index: 0,
                 name: "a".into(),
+                span: None,
             })),
             when_clauses: vec![
                 (
-                    PlanExpr::Literal(ScalarValue::Int32(1)),
-                    PlanExpr::Literal(ScalarValue::Utf8("one".into())),
+                    PlanExpr::Literal {
+                        value: ScalarValue::Int32(1),
+                        span: None,
+                    },
+                    PlanExpr::Literal {
+                        value: ScalarValue::Utf8("one".into()),
+                        span: None,
+                    },
                 ),
                 (
-                    PlanExpr::Literal(ScalarValue::Int32(3)),
-                    PlanExpr::Literal(ScalarValue::Utf8("three".into())),
+                    PlanExpr::Literal {
+                        value: ScalarValue::Int32(3),
+                        span: None,
+                    },
+                    PlanExpr::Literal {
+                        value: ScalarValue::Utf8("three".into()),
+                        span: None,
+                    },
                 ),
             ],
-            else_result: Some(Box::new(PlanExpr::Literal(ScalarValue::Utf8(
-                "other".into(),
-            )))),
+            else_result: Some(Box::new(PlanExpr::Literal {
+                value: ScalarValue::Utf8("other".into()),
+                span: None,
+            })),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<StringArray>().unwrap();
@@ -1181,13 +1290,22 @@ mod tests {
                     left: Box::new(PlanExpr::Column {
                         index: 0,
                         name: "a".into(),
+                        span: None,
                     }),
                     op: ast::BinaryOp::Gt,
-                    right: Box::new(PlanExpr::Literal(ScalarValue::Int32(10))),
+                    right: Box::new(PlanExpr::Literal {
+                        value: ScalarValue::Int32(10),
+                        span: None,
+                    }),
+                    span: None,
                 },
-                PlanExpr::Literal(ScalarValue::Utf8("big".into())),
+                PlanExpr::Literal {
+                    value: ScalarValue::Utf8("big".into()),
+                    span: None,
+                },
             )],
             else_result: None,
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         assert!(result.is_null(0));
@@ -1213,16 +1331,25 @@ mod tests {
         let expr = PlanExpr::CaseExpr {
             operand: None,
             when_clauses: vec![(
-                PlanExpr::IsNotNull(Box::new(PlanExpr::Column {
-                    index: 0,
-                    name: "x".into(),
-                })),
+                PlanExpr::IsNotNull {
+                    expr: Box::new(PlanExpr::Column {
+                        index: 0,
+                        name: "x".into(),
+                        span: None,
+                    }),
+                    span: None,
+                },
                 PlanExpr::Column {
                     index: 0,
                     name: "x".into(),
+                    span: None,
                 },
             )],
-            else_result: Some(Box::new(PlanExpr::Literal(ScalarValue::Int32(0)))),
+            else_result: Some(Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int32(0),
+                span: None,
+            })),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int32Array>().unwrap();
@@ -1242,16 +1369,26 @@ mod tests {
                     left: Box::new(PlanExpr::Column {
                         index: 0,
                         name: "a".into(),
+                        span: None,
                     }),
                     op: ast::BinaryOp::Eq,
-                    right: Box::new(PlanExpr::Literal(ScalarValue::Int32(2))),
+                    right: Box::new(PlanExpr::Literal {
+                        value: ScalarValue::Int32(2),
+                        span: None,
+                    }),
+                    span: None,
                 },
-                PlanExpr::Literal(ScalarValue::Null),
+                PlanExpr::Literal {
+                    value: ScalarValue::Null,
+                    span: None,
+                },
             )],
             else_result: Some(Box::new(PlanExpr::Column {
                 index: 0,
                 name: "a".into(),
+                span: None,
             })),
+            span: None,
         };
         let result = evaluate(&expr, &batch, None).unwrap();
         let arr = result.as_any().downcast_ref::<Int32Array>().unwrap();

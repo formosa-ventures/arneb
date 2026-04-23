@@ -1,6 +1,16 @@
 //! Error types for the arneb query engine.
+//!
+//! Variants that reference a specific SQL source construct carry an
+//! optional `location: Option<Location>` field. The [`Display`] impl —
+//! produced by `thiserror` — emits only the message body; line/column
+//! prefixes and source snippets are the job of
+//! [`crate::diagnostic::render_plan_error`]. This keeps
+//! `err.to_string()` stable for log lines and test assertions that
+//! don't care about position.
 
 use thiserror::Error;
+
+pub use sqlparser::tokenizer::Location;
 
 use crate::types::DataType;
 
@@ -46,7 +56,23 @@ pub enum ParseError {
     UnsupportedFeature(String),
 }
 
+impl ParseError {
+    /// Returns the source location associated with this error, if any.
+    ///
+    /// `ParseError` variants currently do not carry location information —
+    /// syntax errors are sourced from the upstream parser and are kept
+    /// position-free at this layer. Wire location through here when a
+    /// future variant (e.g., `InvalidIdentifier { location }`) is added.
+    pub fn location(&self) -> Option<Location> {
+        None
+    }
+}
+
 /// Errors from query planning.
+///
+/// Variants that reference a specific source construct carry
+/// `location: Option<Location>`. Use [`PlanError::location`] to retrieve
+/// it without matching every variant.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum PlanError {
@@ -55,8 +81,13 @@ pub enum PlanError {
     TableNotFound(String),
 
     /// The referenced column does not exist in the table schema.
-    #[error("column not found: {0}")]
-    ColumnNotFound(String),
+    #[error("column not found: {name}")]
+    ColumnNotFound {
+        /// Column name that failed to resolve.
+        name: String,
+        /// Source position of the column reference, if known.
+        location: Option<Location>,
+    },
 
     /// An expression has incompatible types.
     #[error("type mismatch: expected {expected}, found {found}")]
@@ -65,11 +96,114 @@ pub enum PlanError {
         expected: DataType,
         /// The type that was actually found.
         found: DataType,
+        /// Source position of the offending expression, if known.
+        location: Option<Location>,
     },
 
     /// An expression is syntactically valid but semantically invalid.
-    #[error("invalid expression: {0}")]
-    InvalidExpression(String),
+    #[error("invalid expression: {message}")]
+    InvalidExpression {
+        /// Explanation of what went wrong.
+        message: String,
+        /// Source position of the offending expression, if known.
+        location: Option<Location>,
+    },
+
+    /// A referenced function name does not exist in the scalar or
+    /// aggregate registry.
+    #[error("function not found: {name}")]
+    FunctionNotFound {
+        /// Function name that failed to resolve.
+        name: String,
+        /// Source position of the call site, if known.
+        location: Option<Location>,
+    },
+
+    /// The planner does not support the requested expression construct.
+    #[error("unsupported expression: {message}")]
+    UnsupportedExpression {
+        /// Human-readable description of what is unsupported.
+        message: String,
+        /// Source position of the offending expression, if known.
+        location: Option<Location>,
+    },
+
+    /// A column name is ambiguous (matches more than one input relation).
+    #[error("ambiguous column reference: {name}")]
+    AmbiguousReference {
+        /// Column name that matched multiple sources.
+        name: String,
+        /// Source position of the column reference, if known.
+        location: Option<Location>,
+    },
+
+    /// A literal value is malformed for its declared target type —
+    /// detected at plan time by [`crate::diagnostic`] / constant
+    /// folding when converting `Cast(Literal)` (e.g., unparseable
+    /// `DATE '1998-13-45'`).
+    #[error("invalid literal: {message}")]
+    InvalidLiteral {
+        /// Human-readable explanation of the parse / conversion failure.
+        message: String,
+        /// Source position of the offending literal, if known.
+        location: Option<Location>,
+    },
+
+    /// Extended-query parameter inferred as two incompatible types at
+    /// different usage sites (e.g., `$1` used in `a <= $1` against a
+    /// Date column AND in `b = $1` against an Int column).
+    #[error("parameter ${index} inferred as incompatible types: {conflict_types}")]
+    ParameterTypeConflict {
+        /// 1-based placeholder index.
+        index: usize,
+        /// Human-readable list of the conflicting types.
+        conflict_types: String,
+        /// Source position of the second inference site, if known.
+        location: Option<Location>,
+    },
+
+    /// An internal planner invariant was violated. These errors carry no
+    /// location because they point at engine-internal state rather than
+    /// user SQL.
+    #[error("planner internal error: {0}")]
+    InternalError(String),
+}
+
+impl PlanError {
+    /// Returns the source location attached to this error, if the
+    /// variant carries one. This lets diagnostics render `file:line:col`
+    /// without matching every variant explicitly.
+    pub fn location(&self) -> Option<Location> {
+        match self {
+            PlanError::ColumnNotFound { location, .. }
+            | PlanError::TypeMismatch { location, .. }
+            | PlanError::InvalidExpression { location, .. }
+            | PlanError::FunctionNotFound { location, .. }
+            | PlanError::UnsupportedExpression { location, .. }
+            | PlanError::AmbiguousReference { location, .. }
+            | PlanError::InvalidLiteral { location, .. }
+            | PlanError::ParameterTypeConflict { location, .. } => *location,
+            PlanError::TableNotFound(_) | PlanError::InternalError(_) => None,
+        }
+    }
+
+    /// Short helper to construct `ColumnNotFound` without a location.
+    /// Keeps existing call sites `PlanError::ColumnNotFound(name)` working
+    /// with a tiny migration (`PlanError::column_not_found(name)`).
+    pub fn column_not_found(name: impl Into<String>) -> Self {
+        Self::ColumnNotFound {
+            name: name.into(),
+            location: None,
+        }
+    }
+
+    /// Short helper to construct `InvalidExpression` without a location.
+    pub fn invalid_expression(message: impl Into<String>) -> Self {
+        Self::InvalidExpression {
+            message: message.into(),
+            location: None,
+        }
+    }
 }
 
 /// Errors from query execution.
@@ -175,8 +309,25 @@ mod tests {
         let err = PlanError::TypeMismatch {
             expected: DataType::Int64,
             found: DataType::Utf8,
+            location: None,
         };
         assert_eq!(err.to_string(), "type mismatch: expected Int64, found Utf8");
+    }
+
+    #[test]
+    fn plan_error_location_accessor() {
+        let loc = Location {
+            line: 3,
+            column: 19,
+        };
+        let err = PlanError::ColumnNotFound {
+            name: "l_shipdate".to_string(),
+            location: Some(loc),
+        };
+        assert_eq!(err.location(), Some(loc));
+
+        let err = PlanError::TableNotFound("users".to_string());
+        assert_eq!(err.location(), None);
     }
 
     #[test]

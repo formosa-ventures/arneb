@@ -8,11 +8,21 @@ use std::fmt;
 
 use arneb_common::types::{ColumnInfo, DataType, ScalarValue, TableReference};
 use arneb_sql_parser::ast;
+use arneb_sql_parser::Span;
 
 /// An expression within a logical plan.
 ///
 /// Unlike AST expressions, column references here are resolved to their
 /// position (index) in the input schema.
+///
+/// Every variant carries an optional `span` pointing at the SQL source
+/// location that produced the node. Expressions synthesized by later
+/// analyzer or optimizer passes (inserted casts, rewritten conjuncts,
+/// etc.) use `None`. Consumers that need a position for diagnostics
+/// should call [`PlanExpr::best_span`] to fall back to the nearest
+/// user-visible descendant. The span field is excluded from `serde`
+/// serialization so `EXPLAIN (FORMAT JSON)` output stays
+/// position-independent.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PlanExpr {
     /// A column reference resolved to its index in the input schema.
@@ -21,9 +31,18 @@ pub enum PlanExpr {
         index: usize,
         /// Column name (for display purposes).
         name: String,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
     },
     /// A literal value.
-    Literal(ScalarValue),
+    Literal {
+        /// The scalar value.
+        value: ScalarValue,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
+    },
     /// A binary operation.
     BinaryOp {
         /// Left operand.
@@ -32,6 +51,9 @@ pub enum PlanExpr {
         op: ast::BinaryOp,
         /// Right operand.
         right: Box<PlanExpr>,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
     },
     /// A unary operation.
     UnaryOp {
@@ -39,6 +61,9 @@ pub enum PlanExpr {
         op: ast::UnaryOp,
         /// Operand.
         expr: Box<PlanExpr>,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
     },
     /// A function call.
     Function {
@@ -48,11 +73,26 @@ pub enum PlanExpr {
         args: Vec<PlanExpr>,
         /// Whether DISTINCT was specified.
         distinct: bool,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
     },
     /// `expr IS NULL`.
-    IsNull(Box<PlanExpr>),
+    IsNull {
+        /// Inner expression being tested.
+        expr: Box<PlanExpr>,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
+    },
     /// `expr IS NOT NULL`.
-    IsNotNull(Box<PlanExpr>),
+    IsNotNull {
+        /// Inner expression being tested.
+        expr: Box<PlanExpr>,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
+    },
     /// `expr [NOT] BETWEEN low AND high`.
     Between {
         /// The expression being tested.
@@ -63,6 +103,9 @@ pub enum PlanExpr {
         low: Box<PlanExpr>,
         /// Upper bound.
         high: Box<PlanExpr>,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
     },
     /// `expr [NOT] IN (list)`.
     InList {
@@ -72,6 +115,9 @@ pub enum PlanExpr {
         list: Vec<PlanExpr>,
         /// Whether this is NOT IN.
         negated: bool,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
     },
     /// `CAST(expr AS data_type)`.
     Cast {
@@ -79,6 +125,10 @@ pub enum PlanExpr {
         expr: Box<PlanExpr>,
         /// The target data type.
         data_type: DataType,
+        /// Source span, if derived from user SQL. Casts inserted by
+        /// type-coercion rewrites set this to `None`.
+        #[serde(skip)]
+        span: Option<Span>,
     },
     /// A wildcard (`*`) — only used temporarily before expansion.
     Wildcard,
@@ -86,6 +136,9 @@ pub enum PlanExpr {
     ScalarSubquery {
         /// The subquery's logical plan.
         subplan: Box<LogicalPlan>,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
     },
     /// A CASE expression (both searched and simple forms).
     CaseExpr {
@@ -95,12 +148,109 @@ pub enum PlanExpr {
         when_clauses: Vec<(PlanExpr, PlanExpr)>,
         /// Optional ELSE result.
         else_result: Option<Box<PlanExpr>>,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
     },
+    /// Extended-query-protocol placeholder (`$1`, `$2`, …).
+    ///
+    /// The analyzer's type-coercion pass walks surrounding operators
+    /// and records an inferred [`DataType`] in
+    /// [`crate::AnalyzerContext::param_types`]; when a sibling's
+    /// type is known, the `type_hint` field is also populated so the
+    /// same parameter node carries its type through subsequent passes
+    /// (e.g., downstream function-signature check). Placeholders
+    /// whose type cannot be inferred default to
+    /// [`DataType::Utf8`] at the end of analysis.
+    Parameter {
+        /// 1-based placeholder index as it appeared in the SQL text.
+        index: usize,
+        /// Inferred data type, once analyzed.
+        type_hint: Option<DataType>,
+        /// Source span.
+        #[serde(skip)]
+        span: Option<Span>,
+    },
+}
+
+impl PlanExpr {
+    /// Returns the source span attached directly to this node, or `None`
+    /// if it was synthesized by an analyzer/optimizer pass or is a
+    /// sentinel like `Wildcard`.
+    pub fn span(&self) -> Option<Span> {
+        match self {
+            PlanExpr::Column { span, .. }
+            | PlanExpr::Literal { span, .. }
+            | PlanExpr::BinaryOp { span, .. }
+            | PlanExpr::UnaryOp { span, .. }
+            | PlanExpr::Function { span, .. }
+            | PlanExpr::IsNull { span, .. }
+            | PlanExpr::IsNotNull { span, .. }
+            | PlanExpr::Between { span, .. }
+            | PlanExpr::InList { span, .. }
+            | PlanExpr::Cast { span, .. }
+            | PlanExpr::ScalarSubquery { span, .. }
+            | PlanExpr::CaseExpr { span, .. }
+            | PlanExpr::Parameter { span, .. } => *span,
+            PlanExpr::Wildcard => None,
+        }
+    }
+
+    /// Returns this node's own span if present, otherwise walks the
+    /// children to find the nearest descendant span. This lets error
+    /// reporters point at the nearest user-visible construct even when
+    /// the erroring node is synthetic (e.g., a `Cast` inserted by type
+    /// coercion).
+    pub fn best_span(&self) -> Option<Span> {
+        if let Some(s) = self.span() {
+            return Some(s);
+        }
+        match self {
+            PlanExpr::BinaryOp { left, right, .. } => {
+                left.best_span().or_else(|| right.best_span())
+            }
+            PlanExpr::UnaryOp { expr, .. }
+            | PlanExpr::IsNull { expr, .. }
+            | PlanExpr::IsNotNull { expr, .. }
+            | PlanExpr::Cast { expr, .. } => expr.best_span(),
+            PlanExpr::Function { args, .. } => args.iter().find_map(|a| a.best_span()),
+            PlanExpr::Between {
+                expr, low, high, ..
+            } => expr
+                .best_span()
+                .or_else(|| low.best_span())
+                .or_else(|| high.best_span()),
+            PlanExpr::InList { expr, list, .. } => expr
+                .best_span()
+                .or_else(|| list.iter().find_map(|e| e.best_span())),
+            PlanExpr::CaseExpr {
+                operand,
+                when_clauses,
+                else_result,
+                ..
+            } => operand
+                .as_deref()
+                .and_then(|o| o.best_span())
+                .or_else(|| {
+                    when_clauses
+                        .iter()
+                        .find_map(|(c, r)| c.best_span().or_else(|| r.best_span()))
+                })
+                .or_else(|| else_result.as_deref().and_then(|e| e.best_span())),
+            PlanExpr::Column { .. }
+            | PlanExpr::Literal { .. }
+            | PlanExpr::ScalarSubquery { .. }
+            | PlanExpr::Parameter { .. }
+            | PlanExpr::Wildcard => None,
+        }
+    }
 }
 
 impl PartialEq for PlanExpr {
     fn eq(&self, other: &Self) -> bool {
-        // Compare by display string — sufficient for optimizer tests and dedup
+        // Compare by display string — sufficient for optimizer tests and dedup.
+        // Spans are explicitly excluded so equality is position-independent
+        // (two parses of whitespace-different SQL compare equal).
         format!("{self}") == format!("{other}")
     }
 }
@@ -421,13 +571,16 @@ impl fmt::Display for PlanExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PlanExpr::Column { name, .. } => write!(f, "{name}"),
-            PlanExpr::Literal(val) => write!(f, "{val}"),
-            PlanExpr::BinaryOp { left, op, right } => write!(f, "{left} {op} {right}"),
-            PlanExpr::UnaryOp { op, expr } => write!(f, "{op} {expr}"),
+            PlanExpr::Literal { value, .. } => write!(f, "{value}"),
+            PlanExpr::BinaryOp {
+                left, op, right, ..
+            } => write!(f, "{left} {op} {right}"),
+            PlanExpr::UnaryOp { op, expr, .. } => write!(f, "{op} {expr}"),
             PlanExpr::Function {
                 name,
                 args,
                 distinct,
+                ..
             } => {
                 write!(f, "{name}(")?;
                 if *distinct {
@@ -441,13 +594,14 @@ impl fmt::Display for PlanExpr {
                 }
                 write!(f, ")")
             }
-            PlanExpr::IsNull(expr) => write!(f, "{expr} IS NULL"),
-            PlanExpr::IsNotNull(expr) => write!(f, "{expr} IS NOT NULL"),
+            PlanExpr::IsNull { expr, .. } => write!(f, "{expr} IS NULL"),
+            PlanExpr::IsNotNull { expr, .. } => write!(f, "{expr} IS NOT NULL"),
             PlanExpr::Between {
                 expr,
                 negated,
                 low,
                 high,
+                ..
             } => {
                 if *negated {
                     write!(f, "{expr} NOT BETWEEN {low} AND {high}")
@@ -459,6 +613,7 @@ impl fmt::Display for PlanExpr {
                 expr,
                 list,
                 negated,
+                ..
             } => {
                 write!(f, "{expr}")?;
                 if *negated {
@@ -473,13 +628,16 @@ impl fmt::Display for PlanExpr {
                 }
                 write!(f, ")")
             }
-            PlanExpr::Cast { expr, data_type } => write!(f, "CAST({expr} AS {data_type})"),
+            PlanExpr::Cast {
+                expr, data_type, ..
+            } => write!(f, "CAST({expr} AS {data_type})"),
             PlanExpr::Wildcard => write!(f, "*"),
             PlanExpr::ScalarSubquery { .. } => write!(f, "(scalar_subquery)"),
             PlanExpr::CaseExpr {
                 operand,
                 when_clauses,
                 else_result,
+                ..
             } => {
                 write!(f, "CASE")?;
                 if let Some(op) = operand {
@@ -493,6 +651,12 @@ impl fmt::Display for PlanExpr {
                 }
                 write!(f, " END")
             }
+            PlanExpr::Parameter {
+                index, type_hint, ..
+            } => match type_hint {
+                Some(t) => write!(f, "${index}::{t}"),
+                None => write!(f, "${index}"),
+            },
         }
     }
 }

@@ -239,6 +239,49 @@ async fn test_invalid_sql_returns_error() {
 }
 
 #[tokio::test]
+async fn test_plan_error_includes_source_location() {
+    // A typo'd column should produce an error whose body carries the
+    // `line X:Y:` prefix rendered by the diagnostic layer. This
+    // exercises the source-span plumbing end-to-end: parser → planner
+    // → render_plan_error → pgwire ErrorResponse.
+    let (cm, cr) = create_server_with_users_table();
+    let addr = start_test_server(cm, cr).await;
+
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(&build_startup_message("testuser", "testdb"))
+        .await
+        .unwrap();
+    let _ = read_response(&mut stream).await;
+
+    stream
+        .write_all(&build_query_message("SELECT nonexistent FROM users"))
+        .await
+        .unwrap();
+    let response = read_response(&mut stream).await;
+
+    assert!(
+        response_contains_message_type(&response, b'E'),
+        "expected ErrorResponse for unknown column"
+    );
+
+    // The M(essage) field of the ErrorResponse should include a
+    // `line X:Y:` marker or a caret '^'. We scan the whole response
+    // payload — pgwire ErrorResponse is a sequence of tagged fields and
+    // we don't need to parse it precisely for a presence check.
+    let body = String::from_utf8_lossy(&response);
+    assert!(
+        body.contains("line 1:") || body.contains('^'),
+        "expected line:col marker or caret in error body, got: {body}"
+    );
+    // And the column name itself should still be in the message.
+    assert!(
+        body.contains("nonexistent"),
+        "expected column name in error body, got: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_select_from_memory_table() {
     let (cm, cr) = create_server_with_users_table();
     let addr = start_test_server(cm, cr).await;

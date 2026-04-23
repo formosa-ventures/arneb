@@ -1183,9 +1183,14 @@ mod tests {
                 left: Box::new(PlanExpr::Column {
                     index: 0,
                     name: "id".to_string(),
+                    span: None,
                 }),
                 op: ast::BinaryOp::Gt,
-                right: Box::new(PlanExpr::Literal(ScalarValue::Int32(1))),
+                right: Box::new(PlanExpr::Literal {
+                    value: ScalarValue::Int32(1),
+                    span: None,
+                }),
+                span: None,
             },
         };
         let stream = filter.execute().await.unwrap();
@@ -1207,6 +1212,7 @@ mod tests {
             exprs: vec![PlanExpr::Column {
                 index: 1,
                 name: "name".to_string(),
+                span: None,
             }],
             output_schema: vec![ColumnInfo {
                 name: "name".to_string(),
@@ -1281,6 +1287,7 @@ mod tests {
                 expr: PlanExpr::Column {
                     index: 0,
                     name: "id".to_string(),
+                    span: None,
                 },
                 asc: false,
                 nulls_first: false,
@@ -1314,14 +1321,17 @@ mod tests {
                     name: "COUNT".to_string(),
                     args: vec![],
                     distinct: false,
+                    span: None,
                 },
                 PlanExpr::Function {
                     name: "SUM".to_string(),
                     args: vec![PlanExpr::Column {
                         index: 2,
                         name: "value".to_string(),
+                        span: None,
                     }],
                     distinct: false,
+                    span: None,
                 },
             ],
             output_schema: vec![

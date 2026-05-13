@@ -4,9 +4,12 @@
 //! scalar result. Used by [`super::operator::HashAggregateExec`].
 
 use arneb_common::error::ExecutionError;
-use arneb_common::types::ScalarValue;
-use arrow::array::{Array, ArrayRef, AsArray};
+use arneb_common::types::{ScalarValue, TimeUnit};
+use arrow::array::{Array, ArrayRef, AsArray, UInt32Array};
 use arrow::datatypes;
+
+use crate::fast_hash::FastHashSet;
+use crate::group_key::GroupKey;
 
 /// An accumulator that consumes array batches and produces a single scalar.
 pub trait Accumulator: Send + Sync {
@@ -492,24 +495,169 @@ fn extract_ordscalar(arr: &ArrayRef, index: usize) -> Result<OrdScalar, Executio
 }
 
 /// Creates an accumulator for the given aggregate function name.
+///
+/// When `distinct` is true, the returned accumulator deduplicates its
+/// inputs (by value) before feeding them to the underlying aggregate.
+/// `DISTINCT` is a no-op on `MIN`/`MAX` and on `COUNT(*)`, so we skip
+/// the wrapper in those cases.
 pub(crate) fn create_accumulator(
     func_name: &str,
     is_count_star: bool,
+    distinct: bool,
 ) -> Result<Box<dyn Accumulator>, ExecutionError> {
-    match func_name.to_uppercase().as_str() {
+    let upper = func_name.to_uppercase();
+    let inner: Box<dyn Accumulator> = match upper.as_str() {
         "COUNT" => {
             if is_count_star {
-                Ok(Box::new(CountAccumulator::count_star()))
+                Box::new(CountAccumulator::count_star())
             } else {
-                Ok(Box::new(CountAccumulator::new()))
+                Box::new(CountAccumulator::new())
             }
         }
-        "SUM" => Ok(Box::new(SumAccumulator::new())),
-        "AVG" => Ok(Box::new(AvgAccumulator::new())),
-        "MIN" => Ok(Box::new(MinAccumulator::new())),
-        "MAX" => Ok(Box::new(MaxAccumulator::new())),
-        other => Err(ExecutionError::InvalidOperation(format!(
-            "unknown aggregate function: {other}"
+        "SUM" => Box::new(SumAccumulator::new()),
+        "AVG" => Box::new(AvgAccumulator::new()),
+        "MIN" => Box::new(MinAccumulator::new()),
+        "MAX" => Box::new(MaxAccumulator::new()),
+        other => {
+            return Err(ExecutionError::InvalidOperation(format!(
+                "unknown aggregate function: {other}"
+            )))
+        }
+    };
+
+    if distinct && !is_count_star && upper != "MIN" && upper != "MAX" {
+        Ok(Box::new(DistinctAccumulator::new(inner)))
+    } else {
+        Ok(inner)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DISTINCT wrapper
+// ---------------------------------------------------------------------------
+
+/// Wraps another accumulator to deduplicate inputs before forwarding
+/// them. Used to implement `SUM/AVG/COUNT(DISTINCT expr)`.
+///
+/// Dedup keys are stringified (type-prefixed to avoid cross-type
+/// collisions such as `1_i64` vs `"1"`). NULL values are skipped so
+/// that `COUNT(DISTINCT x)` matches SQL semantics (NULLs never count).
+pub(crate) struct DistinctAccumulator {
+    inner: Box<dyn Accumulator>,
+    seen: FastHashSet<GroupKey>,
+}
+
+impl DistinctAccumulator {
+    pub(crate) fn new(inner: Box<dyn Accumulator>) -> Self {
+        Self {
+            inner,
+            seen: FastHashSet::default(),
+        }
+    }
+}
+
+impl Accumulator for DistinctAccumulator {
+    fn update_batch(&mut self, values: &ArrayRef) -> Result<(), ExecutionError> {
+        let mut new_indices: Vec<u32> = Vec::new();
+        for i in 0..values.len() {
+            if values.is_null(i) {
+                continue;
+            }
+            let scalar = scalar_from_array(values, i)?;
+            let key = GroupKey::single(scalar);
+            if self.seen.insert(key) {
+                new_indices.push(i as u32);
+            }
+        }
+
+        if new_indices.is_empty() {
+            return Ok(());
+        }
+
+        let indices = UInt32Array::from(new_indices);
+        let filtered = arrow::compute::take(values.as_ref(), &indices, None)
+            .map_err(|e| ExecutionError::InvalidOperation(format!("distinct take: {e}")))?;
+        self.inner.update_batch(&filtered)
+    }
+
+    fn evaluate(&self) -> Result<ScalarValue, ExecutionError> {
+        self.inner.evaluate()
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        self.seen.clear();
+    }
+}
+
+/// Extract a single `ScalarValue` at `index` from an Arrow array.
+/// Caller is responsible for null-checking; this function does not
+/// special-case NULL — pass a non-null index. Returns
+/// `InvalidOperation` for unsupported Arrow types so DISTINCT cannot
+/// silently accept rows it cannot deduplicate.
+fn scalar_from_array(arr: &ArrayRef, index: usize) -> Result<ScalarValue, ExecutionError> {
+    use arrow::datatypes::DataType::*;
+    match arr.data_type() {
+        Int32 => Ok(ScalarValue::Int32(
+            arr.as_primitive::<datatypes::Int32Type>().value(index),
+        )),
+        Int64 => Ok(ScalarValue::Int64(
+            arr.as_primitive::<datatypes::Int64Type>().value(index),
+        )),
+        Float32 => Ok(ScalarValue::Float32(
+            arr.as_primitive::<datatypes::Float32Type>().value(index),
+        )),
+        Float64 => Ok(ScalarValue::Float64(
+            arr.as_primitive::<datatypes::Float64Type>().value(index),
+        )),
+        Utf8 => Ok(ScalarValue::Utf8(
+            arr.as_string::<i32>().value(index).to_string(),
+        )),
+        LargeUtf8 => Ok(ScalarValue::Utf8(
+            arr.as_string::<i64>().value(index).to_string(),
+        )),
+        Boolean => Ok(ScalarValue::Boolean(arr.as_boolean().value(index))),
+        Date32 => Ok(ScalarValue::Date32(
+            arr.as_primitive::<datatypes::Date32Type>().value(index),
+        )),
+        // Date64 currently has no ScalarValue variant; degrade to a
+        // distinct GroupKey via the Timestamp/Date32 fallthrough is
+        // not safe. Reject for now — TPC-H doesn't exercise Date64
+        // under DISTINCT.
+        Decimal128(p, s) => Ok(ScalarValue::Decimal128 {
+            value: arr.as_primitive::<datatypes::Decimal128Type>().value(index),
+            precision: *p,
+            scale: *s,
+        }),
+        Timestamp(unit, tz) => {
+            let value = match unit {
+                arrow::datatypes::TimeUnit::Second => arr
+                    .as_primitive::<datatypes::TimestampSecondType>()
+                    .value(index),
+                arrow::datatypes::TimeUnit::Millisecond => arr
+                    .as_primitive::<datatypes::TimestampMillisecondType>()
+                    .value(index),
+                arrow::datatypes::TimeUnit::Microsecond => arr
+                    .as_primitive::<datatypes::TimestampMicrosecondType>()
+                    .value(index),
+                arrow::datatypes::TimeUnit::Nanosecond => arr
+                    .as_primitive::<datatypes::TimestampNanosecondType>()
+                    .value(index),
+            };
+            let common_unit = match unit {
+                arrow::datatypes::TimeUnit::Second => TimeUnit::Second,
+                arrow::datatypes::TimeUnit::Millisecond => TimeUnit::Millisecond,
+                arrow::datatypes::TimeUnit::Microsecond => TimeUnit::Microsecond,
+                arrow::datatypes::TimeUnit::Nanosecond => TimeUnit::Nanosecond,
+            };
+            Ok(ScalarValue::Timestamp {
+                value,
+                unit: common_unit,
+                timezone: tz.as_ref().map(|s| s.to_string()),
+            })
+        }
+        dt => Err(ExecutionError::InvalidOperation(format!(
+            "DISTINCT not supported for type {dt:?}"
         ))),
     }
 }
@@ -701,6 +849,48 @@ mod tests {
                 timezone: None,
             }
         );
+    }
+
+    // -------------------------------------------------------------------
+    // PB-003: COUNT(DISTINCT ...) deduplication
+    // -------------------------------------------------------------------
+
+    /// COUNT(DISTINCT x) must count each distinct non-null value once.
+    /// Historically the execution layer ignored the `distinct` flag and
+    /// degraded to plain COUNT(x), over-counting whenever a group saw
+    /// the same value more than once.
+    #[test]
+    fn count_distinct_over_arrays_drops_duplicates_and_nulls() {
+        let mut acc = DistinctAccumulator::new(Box::new(CountAccumulator::new()));
+
+        // First batch: 1, 1, 2, NULL, 3.
+        let a: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(1),
+            Some(1),
+            Some(2),
+            None,
+            Some(3),
+        ]));
+        acc.update_batch(&a).unwrap();
+
+        // Second batch: 2 (dup), 4 (new), NULL.
+        let b: ArrayRef = Arc::new(Int64Array::from(vec![Some(2), Some(4), None]));
+        acc.update_batch(&b).unwrap();
+
+        // Distinct non-null values: {1, 2, 3, 4} → 4.
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(4));
+    }
+
+    #[test]
+    fn count_distinct_resets_between_groups() {
+        let mut acc = DistinctAccumulator::new(Box::new(CountAccumulator::new()));
+        let a: ArrayRef = Arc::new(Int64Array::from(vec![1, 1, 2]));
+        acc.update_batch(&a).unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(2));
+        acc.reset();
+        let b: ArrayRef = Arc::new(Int64Array::from(vec![5, 5]));
+        acc.update_batch(&b).unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(1));
     }
 
     #[test]

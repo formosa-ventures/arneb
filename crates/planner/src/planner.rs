@@ -353,10 +353,22 @@ impl<'a> QueryPlanner<'a> {
                 schema: schema.clone(),
             };
 
-            // Update context to reflect aggregate output
+            // Update context to reflect aggregate output.
+            //
+            // For group-by columns, carry the source qualifier forward
+            // so that later `n1.n_name` vs `n2.n_name` references in
+            // the SELECT/HAVING list resolve to the correct slot. Without
+            // this, self-joins whose SELECT projects both aliases of a
+            // shared column (`SELECT n1.n_name, n2.n_name ...`) collapse
+            // onto the first group-by slot.
             ctx = PlanningContext::new();
-            for col in &schema {
-                ctx.columns.push((None, col.clone()));
+            for (i, col) in schema.iter().enumerate() {
+                let qualifier = if i < body.group_by.len() {
+                    group_by_qualifier(&body.group_by[i])
+                } else {
+                    None
+                };
+                ctx.columns.push((qualifier, col.clone()));
             }
 
             // HAVING (applied after aggregation)
@@ -839,6 +851,15 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Find the index in the post-aggregate context for an aggregate expression.
+    ///
+    /// Matches by display string, but strips any column qualifiers from
+    /// the AST first — the stored aggregate column names come from
+    /// `PlanExpr` Display which is always unqualified, so the AST's
+    /// `SUM(t.col)` must normalize to `SUM(col)` for the comparison to
+    /// work. Without this normalization, two aggregates sharing a
+    /// function name (e.g. `SUM(CASE..)` and `SUM(t.col)`) would both
+    /// collapse onto the first slot once the historical name-prefix
+    /// fallback kicked in.
     fn find_aggregate_index(
         &self,
         expr: &ast::Expr,
@@ -847,21 +868,14 @@ impl<'a> QueryPlanner<'a> {
     ) -> Option<usize> {
         if let ast::Expr::Function { name, .. } = expr {
             if is_aggregate_function(name) {
-                let expr_str = format!("{expr}");
-                // Search in aggregate output columns (after group-by columns)
+                let expr_str = format_ast_unqualified(expr);
                 for (i, (_, col)) in ctx.columns.iter().enumerate().skip(num_group_by) {
                     if col.name == expr_str || col.name.eq_ignore_ascii_case(&expr_str) {
                         return Some(i);
                     }
                 }
-                // Also try matching by function name pattern
-                let name_upper = name.to_uppercase();
-                for (i, (_, col)) in ctx.columns.iter().enumerate().skip(num_group_by) {
-                    if col.name.to_uppercase().starts_with(&name_upper) {
-                        return Some(i);
-                    }
-                }
-                // If there's exactly one aggregate after group_by columns, use it
+                // Last-ditch: exactly one aggregate slot — no ambiguity,
+                // safe to assume it is the target.
                 let agg_count = ctx.columns.len() - num_group_by;
                 if agg_count == 1 {
                     return Some(num_group_by);
@@ -1271,6 +1285,165 @@ fn is_aggregate_function(name: &str) -> bool {
         name.to_uppercase().as_str(),
         "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
     )
+}
+
+/// If a GROUP BY AST expression is a qualified column reference
+/// (`t.col`), return its table qualifier. Used when rebuilding the
+/// post-aggregate context so a subsequent `SELECT t.col` resolves to
+/// the correct slot even when two aliases share a column name (e.g.
+/// self-joined `nation n1` / `nation n2`).
+fn group_by_qualifier(expr: &ast::Expr) -> Option<String> {
+    match expr {
+        ast::Expr::Column { col_ref, .. } => col_ref.table.clone(),
+        _ => None,
+    }
+}
+
+/// Format an AST expression, stripping column qualifiers and unwrapping
+/// parenthesized `Nested` nodes. Produces a string that matches the
+/// Display of an equivalent `PlanExpr`:
+///
+/// - `PlanExpr::Column` carries only the column name, not a qualifier,
+///   so we drop the `table.` prefix.
+/// - `plan_expr` unwraps `ast::Expr::Nested` into its inner node (there
+///   is no `PlanExpr::Nested` variant), so its Display loses the
+///   parentheses. We mirror that here; otherwise a SELECT expression
+///   like `SUM(x * (1 - y))` formats differently from its stored
+///   aggregate column name (`SUM(x * 1 - y)`) and misses the
+///   exact-match loop in `find_aggregate_index`.
+fn format_ast_unqualified(expr: &ast::Expr) -> String {
+    let mut out = String::new();
+    write_ast_unqualified(&mut out, expr);
+    out
+}
+
+fn write_ast_unqualified(out: &mut String, expr: &ast::Expr) {
+    use std::fmt::Write;
+    match expr {
+        ast::Expr::Nested { expr: inner, .. } => {
+            write_ast_unqualified(out, inner);
+        }
+        ast::Expr::Column { col_ref, .. } => {
+            let _ = write!(out, "{}", col_ref.name);
+        }
+        ast::Expr::Literal { value, .. } => {
+            let _ = write!(out, "{value}");
+        }
+        ast::Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            write_ast_unqualified(out, left);
+            let _ = write!(out, " {op} ");
+            write_ast_unqualified(out, right);
+        }
+        ast::Expr::UnaryOp { op, expr, .. } => {
+            let _ = write!(out, "{op} ");
+            write_ast_unqualified(out, expr);
+        }
+        ast::Expr::Function {
+            name,
+            args,
+            distinct,
+            ..
+        } => {
+            let _ = write!(out, "{name}(");
+            if *distinct {
+                let _ = write!(out, "DISTINCT ");
+            }
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    let _ = write!(out, ", ");
+                }
+                match a {
+                    ast::FunctionArg::Unnamed(e) => write_ast_unqualified(out, e),
+                    ast::FunctionArg::Wildcard => {
+                        let _ = write!(out, "*");
+                    }
+                }
+            }
+            let _ = write!(out, ")");
+        }
+        ast::Expr::IsNull { expr, .. } => {
+            write_ast_unqualified(out, expr);
+            let _ = write!(out, " IS NULL");
+        }
+        ast::Expr::IsNotNull { expr, .. } => {
+            write_ast_unqualified(out, expr);
+            let _ = write!(out, " IS NOT NULL");
+        }
+        ast::Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+            ..
+        } => {
+            write_ast_unqualified(out, expr);
+            if *negated {
+                let _ = write!(out, " NOT BETWEEN ");
+            } else {
+                let _ = write!(out, " BETWEEN ");
+            }
+            write_ast_unqualified(out, low);
+            let _ = write!(out, " AND ");
+            write_ast_unqualified(out, high);
+        }
+        ast::Expr::InList {
+            expr,
+            list,
+            negated,
+            ..
+        } => {
+            write_ast_unqualified(out, expr);
+            if *negated {
+                let _ = write!(out, " NOT");
+            }
+            let _ = write!(out, " IN (");
+            for (i, item) in list.iter().enumerate() {
+                if i > 0 {
+                    let _ = write!(out, ", ");
+                }
+                write_ast_unqualified(out, item);
+            }
+            let _ = write!(out, ")");
+        }
+        ast::Expr::Cast {
+            expr, data_type, ..
+        } => {
+            let _ = write!(out, "CAST(");
+            write_ast_unqualified(out, expr);
+            let _ = write!(out, " AS {data_type})");
+        }
+        ast::Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            let _ = write!(out, "CASE");
+            if let Some(op) = operand {
+                let _ = write!(out, " ");
+                write_ast_unqualified(out, op);
+            }
+            for (cond, res) in conditions.iter().zip(results.iter()) {
+                let _ = write!(out, " WHEN ");
+                write_ast_unqualified(out, cond);
+                let _ = write!(out, " THEN ");
+                write_ast_unqualified(out, res);
+            }
+            if let Some(el) = else_result {
+                let _ = write!(out, " ELSE ");
+                write_ast_unqualified(out, el);
+            }
+            let _ = write!(out, " END");
+        }
+        // Fall back to Display for node kinds whose qualifiers we
+        // don't need to strip (subqueries, parameters, etc.).
+        other => {
+            let _ = write!(out, "{other}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1877,6 +2050,133 @@ mod tests {
         match &plan {
             LogicalPlan::Projection { exprs, .. } => {
                 assert_eq!(exprs.len(), 2);
+            }
+            _ => panic!("expected Projection"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // PB-001: self-join alias collapse in SELECT after GROUP BY
+    // ---------------------------------------------------------------
+
+    /// Regression for PB-001. When a self-join aliases the same table
+    /// twice (`users u1`, `users u2`) and the SELECT list projects both
+    /// aliases' instances of a shared column (`name`), the projection
+    /// must point at two *different* aggregate-output slots — one per
+    /// alias. Historically both collapsed to the first alias's slot.
+    #[tokio::test]
+    async fn test_self_join_alias_projection_does_not_collapse() {
+        let plan = plan_sql(
+            "SELECT u1.name, u2.name, COUNT(*) \
+             FROM users u1 JOIN users u2 ON u1.id = u2.id \
+             GROUP BY u1.name, u2.name",
+        )
+        .await
+        .unwrap();
+        match &plan {
+            LogicalPlan::Projection { exprs, schema, .. } => {
+                assert_eq!(exprs.len(), 3, "three projected columns");
+                // First two projections must resolve to *distinct* group-by
+                // slots (index 0 for u1.name, index 1 for u2.name). The
+                // historical bug collapsed both onto index 0.
+                let idx0 = match &exprs[0] {
+                    PlanExpr::Column { index, .. } => *index,
+                    other => panic!("expected Column at exprs[0], got {other:?}"),
+                };
+                let idx1 = match &exprs[1] {
+                    PlanExpr::Column { index, .. } => *index,
+                    other => panic!("expected Column at exprs[1], got {other:?}"),
+                };
+                assert_ne!(
+                    idx0, idx1,
+                    "u1.name and u2.name must project to different slots, got {idx0} and {idx1}",
+                );
+                assert_eq!(schema.len(), 3);
+            }
+            _ => panic!("expected Projection"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // PB-002: multiple same-function aggregates collide
+    // ---------------------------------------------------------------
+
+    /// Regression for PB-002. When a SELECT contains two aggregates
+    /// sharing the same function name (both `SUM`), each must resolve
+    /// to its own aggregate-output slot. Historically a name-prefix
+    /// fallback in `find_aggregate_index` returned the first slot for
+    /// *every* `SUM(...)` projection.
+    /// Regression: AST `Nested(...)` nodes (parenthesized sub-expressions)
+    /// must be unwrapped when normalizing the SELECT-list aggregate for
+    /// slot lookup, because `plan_expr` strips them and the stored
+    /// PlanExpr display has no parens. TPC-H Q08/Q14 use
+    /// `SUM(x * (1 - y))` which previously mismatched and fell into the
+    /// post-aggregate resolution branch, failing with `column not found`.
+    #[tokio::test]
+    async fn test_aggregate_with_nested_parens_resolves() {
+        let plan = plan_sql("SELECT SUM(id * (1 - id)) AS s, SUM(age) AS a FROM users")
+            .await
+            .unwrap();
+        match &plan {
+            LogicalPlan::Projection { exprs, .. } => {
+                assert_eq!(exprs.len(), 2);
+                // Both SELECT items must resolve to aggregate-output
+                // column references, not re-plan their arguments.
+                for (i, e) in exprs.iter().enumerate() {
+                    match e {
+                        PlanExpr::Column { .. } => {}
+                        other => panic!("exprs[{i}] expected Column, got {other:?}"),
+                    }
+                }
+            }
+            _ => panic!("expected Projection"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_two_same_function_aggregates_do_not_collide() {
+        // Qualified column reference inside the second SUM is the
+        // real trigger for PB-002: the AST Display of
+        // `SUM(users.id)` differs from the PlanExpr Display of the
+        // resolved aggregate (`SUM(id)`), so the exact-match loop in
+        // `find_aggregate_index` misses and the name-prefix fallback
+        // collapses onto the *first* SUM.
+        let plan = plan_sql(
+            "SELECT SUM(CASE WHEN age > 18 THEN id ELSE 0 END) AS guarded, \
+                    SUM(users.id) AS total \
+             FROM users",
+        )
+        .await
+        .unwrap();
+        match &plan {
+            LogicalPlan::Projection { exprs, input, .. } => {
+                assert_eq!(exprs.len(), 2);
+                let idx0 = match &exprs[0] {
+                    PlanExpr::Column { index, .. } => *index,
+                    other => panic!("expected Column at exprs[0], got {other:?}"),
+                };
+                let idx1 = match &exprs[1] {
+                    PlanExpr::Column { index, .. } => *index,
+                    other => panic!("expected Column at exprs[1], got {other:?}"),
+                };
+                assert_ne!(
+                    idx0, idx1,
+                    "SUM(CASE..) and SUM(id) must resolve to different aggregate slots",
+                );
+                // Underlying Aggregate must actually carry two distinct
+                // aggregate expressions — otherwise both projection
+                // indices point into a schema of only one aggregate.
+                match input.as_ref() {
+                    LogicalPlan::Aggregate { aggr_exprs, .. } => {
+                        assert_eq!(
+                            aggr_exprs.len(),
+                            2,
+                            "two SUM(...) aggregates should be preserved, got {}",
+                            aggr_exprs.len()
+                        );
+                    }
+                    other => panic!("expected Aggregate input, got {other:?}"),
+                }
             }
             _ => panic!("expected Projection"),
         }

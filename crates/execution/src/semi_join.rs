@@ -1,6 +1,5 @@
 //! Semi-join and anti-join physical operator.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -13,6 +12,7 @@ use arrow::datatypes::Schema;
 use async_trait::async_trait;
 
 use crate::expression;
+use crate::fast_hash::{FastHashSet, FastHasher};
 use crate::operator::ExecutionPlan;
 
 /// Semi-join (or anti-join) operator.
@@ -54,14 +54,13 @@ impl fmt::Display for SemiJoinExec {
 }
 
 fn hash_value(array: &ArrayRef, row: usize) -> Option<u64> {
-    use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     if array.is_null(row) {
         return None;
     }
 
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FastHasher::default();
     let s = arrow::util::display::array_value_to_string(array, row).ok()?;
     s.hash(&mut hasher);
     Some(hasher.finish())
@@ -88,7 +87,7 @@ impl ExecutionPlan for SemiJoinExec {
             ExecutionError::InvalidOperation(format!("failed to collect right input: {e}"))
         })?;
 
-        let mut right_set: HashSet<u64> = HashSet::new();
+        let mut right_set: FastHashSet<u64> = FastHashSet::default();
         for batch in &right_batches {
             let right_keys = expression::evaluate(&self.right_key, batch, None)?;
             for row in 0..batch.num_rows() {

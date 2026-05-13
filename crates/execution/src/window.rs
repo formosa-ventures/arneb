@@ -12,6 +12,7 @@ use arrow::datatypes::{Field, Schema};
 use async_trait::async_trait;
 
 use crate::expression;
+use crate::fast_hash::FastHasher;
 use crate::operator::ExecutionPlan;
 
 /// Window function operator.
@@ -266,12 +267,11 @@ fn compute_window_function(
 }
 
 fn compute_partition_ids(keys: &[ArrayRef], num_rows: usize) -> Vec<u64> {
-    use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     (0..num_rows)
         .map(|row| {
-            let mut hasher = DefaultHasher::new();
+            let mut hasher = FastHasher::default();
             for key in keys {
                 let s = arrow::util::display::array_value_to_string(key, row).unwrap_or_default();
                 s.hash(&mut hasher);

@@ -211,6 +211,7 @@ dependencies = [
 name = "arneb-execution"
 version = "0.1.0"
 dependencies = [
+ "ahash 0.8.12",
  "arneb-catalog",
  "arneb-common",
  "arneb-planner",

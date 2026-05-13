@@ -1,6 +1,5 @@
 //! Set operation physical operators: UNION ALL, DISTINCT, INTERSECT, EXCEPT.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -12,6 +11,7 @@ use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
 
+use crate::fast_hash::{FastHashSet, FastHasher};
 use crate::operator::ExecutionPlan;
 
 fn build_schema(cols: &[ColumnInfo]) -> Arc<Schema> {
@@ -23,8 +23,7 @@ fn build_schema(cols: &[ColumnInfo]) -> Arc<Schema> {
 }
 
 fn hash_row(batch: &RecordBatch, row: usize) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FastHasher::default();
     for col in 0..batch.num_columns() {
         let s =
             arrow::util::display::array_value_to_string(batch.column(col), row).unwrap_or_default();
@@ -112,7 +111,7 @@ impl ExecutionPlan for DistinctExec {
             .map_err(|e| ExecutionError::InvalidOperation(format!("distinct collect: {e}")))?;
 
         let output_schema = build_schema(&self.child.schema());
-        let mut seen: HashSet<u64> = HashSet::new();
+        let mut seen: FastHashSet<u64> = FastHashSet::default();
         let mut result_batches = Vec::new();
 
         for batch in &batches {
@@ -175,7 +174,7 @@ impl ExecutionPlan for IntersectExec {
             .await
             .map_err(|e| ExecutionError::InvalidOperation(format!("intersect right: {e}")))?;
 
-        let mut right_set: HashSet<u64> = HashSet::new();
+        let mut right_set: FastHashSet<u64> = FastHashSet::default();
         for batch in &right_batches {
             for row in 0..batch.num_rows() {
                 right_set.insert(hash_row(batch, row));
@@ -188,7 +187,7 @@ impl ExecutionPlan for IntersectExec {
             .map_err(|e| ExecutionError::InvalidOperation(format!("intersect left: {e}")))?;
 
         let output_schema = build_schema(&self.left.schema());
-        let mut seen: HashSet<u64> = HashSet::new();
+        let mut seen: FastHashSet<u64> = FastHashSet::default();
         let mut result_batches = Vec::new();
 
         for batch in &left_batches {
@@ -251,7 +250,7 @@ impl ExecutionPlan for ExceptExec {
             .await
             .map_err(|e| ExecutionError::InvalidOperation(format!("except right: {e}")))?;
 
-        let mut right_set: HashSet<u64> = HashSet::new();
+        let mut right_set: FastHashSet<u64> = FastHashSet::default();
         for batch in &right_batches {
             for row in 0..batch.num_rows() {
                 right_set.insert(hash_row(batch, row));
@@ -264,7 +263,7 @@ impl ExecutionPlan for ExceptExec {
             .map_err(|e| ExecutionError::InvalidOperation(format!("except left: {e}")))?;
 
         let output_schema = build_schema(&self.left.schema());
-        let mut seen: HashSet<u64> = HashSet::new();
+        let mut seen: FastHashSet<u64> = FastHashSet::default();
         let mut result_batches = Vec::new();
 
         for batch in &left_batches {

@@ -13,6 +13,7 @@ mod aggregate;
 mod datasource;
 pub mod distributed;
 mod expression;
+mod fast_hash;
 pub mod functions;
 mod hash_join;
 mod operator;

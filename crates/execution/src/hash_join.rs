@@ -1,6 +1,5 @@
 //! Hash join operator and supporting hash table.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arneb_common::error::ExecutionError;
@@ -14,6 +13,7 @@ use arrow::datatypes::{self, DataType as ArrowDataType, Field, Schema};
 use async_trait::async_trait;
 
 use crate::datasource::column_info_to_arrow_schema;
+use crate::fast_hash::{FastHashMap, FastHasher};
 use crate::operator::ExecutionPlan;
 
 // ===========================================================================
@@ -25,7 +25,7 @@ use crate::operator::ExecutionPlan;
 /// Each entry maps a `u64` hash to a list of `(batch_index, row_index)` pairs.
 #[derive(Debug)]
 pub(crate) struct JoinHashMap {
-    map: HashMap<u64, Vec<(usize, usize)>>,
+    map: FastHashMap<u64, Vec<(usize, usize)>>,
 }
 
 impl JoinHashMap {
@@ -34,7 +34,7 @@ impl JoinHashMap {
         batches: &[RecordBatch],
         key_indices: &[usize],
     ) -> Result<Self, ExecutionError> {
-        let mut map: HashMap<u64, Vec<(usize, usize)>> = HashMap::new();
+        let mut map: FastHashMap<u64, Vec<(usize, usize)>> = FastHashMap::default();
 
         for (batch_idx, batch) in batches.iter().enumerate() {
             for row in 0..batch.num_rows() {
@@ -63,7 +63,7 @@ impl JoinHashMap {
 /// Compute a hash for a single row's key columns.
 fn hash_row(batch: &RecordBatch, key_indices: &[usize], row: usize) -> Result<u64, ExecutionError> {
     use std::hash::Hasher;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = FastHasher::default();
 
     for &col_idx in key_indices {
         let col = batch.column(col_idx);
@@ -663,6 +663,8 @@ fn collect_equi_keys(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::datasource::InMemoryDataSource;
     use crate::operator::ScanExec;

@@ -4,7 +4,6 @@
 //! [`SendableRecordBatchStream`] from its children. Operators are assembled
 //! into a tree by the physical planner in [`super::planner`].
 
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,6 +28,7 @@ use futures::stream::Stream;
 use crate::aggregate::{self, Accumulator};
 use crate::datasource::DataSource;
 use crate::expression;
+use crate::fast_hash::FastHashMap;
 use crate::scan_context::ScanContext;
 
 /// A physical execution operator that produces a stream of record batches.
@@ -542,7 +542,7 @@ impl HashAggregateExec {
             return self.execute_no_grouping(batches, &aggr_info);
         }
 
-        let mut groups: HashMap<String, GroupState> = HashMap::new();
+        let mut groups: FastHashMap<String, GroupState> = FastHashMap::default();
 
         for batch in batches {
             let group_cols: Vec<ArrayRef> = self
@@ -632,7 +632,7 @@ impl HashAggregateExec {
 
     fn build_aggregate_output(
         &self,
-        groups: HashMap<String, GroupState>,
+        groups: FastHashMap<String, GroupState>,
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
         if groups.is_empty() {
             return Ok(vec![]);

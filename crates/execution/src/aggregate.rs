@@ -3,12 +3,12 @@
 //! Each accumulator processes batches of values and produces a single
 //! scalar result. Used by [`super::operator::HashAggregateExec`].
 
-use std::collections::HashSet;
-
 use arneb_common::error::ExecutionError;
 use arneb_common::types::ScalarValue;
 use arrow::array::{Array, ArrayRef, AsArray, UInt32Array};
 use arrow::datatypes;
+
+use crate::fast_hash::FastHashSet;
 
 /// An accumulator that consumes array batches and produces a single scalar.
 pub trait Accumulator: Send + Sync {
@@ -543,14 +543,14 @@ pub(crate) fn create_accumulator(
 /// that `COUNT(DISTINCT x)` matches SQL semantics (NULLs never count).
 pub(crate) struct DistinctAccumulator {
     inner: Box<dyn Accumulator>,
-    seen: HashSet<String>,
+    seen: FastHashSet<String>,
 }
 
 impl DistinctAccumulator {
     pub(crate) fn new(inner: Box<dyn Accumulator>) -> Self {
         Self {
             inner,
-            seen: HashSet::new(),
+            seen: FastHashSet::default(),
         }
     }
 }

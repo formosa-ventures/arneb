@@ -31,6 +31,10 @@ object_store = { version = "0.13", default-features = false, features = ["aws", 
 # Numeric utilities
 num_cpus = "1"
 
+# Non-cryptographic fast hashing for hot-path hash tables.
+# Used inside crates/execution; see openspec/changes/exec-ahash-hashtables/.
+ahash = "0.8"
+
 # SQL parsing
 sqlparser = { version = "0.61", default-features = false, features = ["std"] }
 

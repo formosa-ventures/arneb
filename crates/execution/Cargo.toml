@@ -12,6 +12,7 @@ serde_json.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+ahash.workspace = true
 
 [dev-dependencies]
 arneb-catalog = { path = "../catalog" }

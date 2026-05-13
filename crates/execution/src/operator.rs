@@ -506,6 +506,7 @@ struct AggrInfo {
     name: String,
     args: Vec<PlanExpr>,
     is_count_star: bool,
+    distinct: bool,
 }
 
 type GroupState = (Vec<ScalarValue>, Vec<Box<dyn Accumulator>>);
@@ -516,13 +517,19 @@ impl HashAggregateExec {
             .aggr_exprs
             .iter()
             .map(|e| match e {
-                PlanExpr::Function { name, args, .. } => {
+                PlanExpr::Function {
+                    name,
+                    args,
+                    distinct,
+                    ..
+                } => {
                     let is_count_star =
                         args.is_empty() || args.iter().any(|a| matches!(a, PlanExpr::Wildcard));
                     Ok(AggrInfo {
                         name: name.clone(),
                         args: args.clone(),
                         is_count_star,
+                        distinct: *distinct,
                     })
                 }
                 other => Err(ExecutionError::InvalidOperation(format!(
@@ -566,7 +573,12 @@ impl HashAggregateExec {
                     let accumulators: Vec<Box<dyn Accumulator>> = aggr_info
                         .iter()
                         .map(|info| {
-                            aggregate::create_accumulator(&info.name, info.is_count_star).unwrap()
+                            aggregate::create_accumulator(
+                                &info.name,
+                                info.is_count_star,
+                                info.distinct,
+                            )
+                            .unwrap()
                         })
                         .collect();
                     (group_values, accumulators)
@@ -590,7 +602,9 @@ impl HashAggregateExec {
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
         let mut accumulators: Vec<Box<dyn Accumulator>> = aggr_info
             .iter()
-            .map(|info| aggregate::create_accumulator(&info.name, info.is_count_star))
+            .map(|info| {
+                aggregate::create_accumulator(&info.name, info.is_count_star, info.distinct)
+            })
             .collect::<Result<_, _>>()?;
 
         for batch in batches {
@@ -1139,6 +1153,97 @@ mod tests {
         assert_eq!(extract_scalar(&arr, 0).unwrap(), ScalarValue::Date32(19000));
         assert_eq!(extract_scalar(&arr, 1).unwrap(), ScalarValue::Null);
         assert_eq!(extract_scalar(&arr, 2).unwrap(), ScalarValue::Date32(19500));
+    }
+
+    /// Regression for PB-003: `COUNT(DISTINCT ...)` must deduplicate
+    /// before counting. Historically the `distinct` flag was dropped
+    /// on the way from `PlanExpr::Function` into the accumulator, so
+    /// this test counted 6 (total rows) instead of 3 (distinct keys).
+    #[tokio::test]
+    async fn count_distinct_groups_deduplicates() {
+        // Two groups (k=0 / k=1), each with six rows where the
+        // distinct cardinality of `v` is 3 (values 10, 20, 30 appear
+        // twice each). COUNT(v) would return 6 for each group;
+        // COUNT(DISTINCT v) must return 3.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", ArrowDataType::Int32, false),
+            Field::new("v", ArrowDataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1])),
+                Arc::new(Int64Array::from(vec![
+                    10, 20, 10, 30, 20, 30, 10, 20, 10, 30, 20, 30,
+                ])),
+            ],
+        )
+        .unwrap();
+        let source: Arc<dyn DataSource> = Arc::new(InMemoryDataSource::new(
+            vec![
+                ColumnInfo {
+                    name: "k".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                },
+                ColumnInfo {
+                    name: "v".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+            ],
+            vec![batch],
+        ));
+
+        let scan: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
+            source,
+            _table_name: "t".to_string(),
+            scan_context: ScanContext::default(),
+        });
+        let agg = HashAggregateExec {
+            input: scan,
+            group_by: vec![PlanExpr::Column {
+                index: 0,
+                name: "k".to_string(),
+                span: None,
+            }],
+            aggr_exprs: vec![PlanExpr::Function {
+                name: "COUNT".to_string(),
+                args: vec![PlanExpr::Column {
+                    index: 1,
+                    name: "v".to_string(),
+                    span: None,
+                }],
+                distinct: true,
+                span: None,
+            }],
+            output_schema: vec![
+                ColumnInfo {
+                    name: "k".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                },
+                ColumnInfo {
+                    name: "cnt".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+            ],
+        };
+
+        let stream = agg.execute().await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+        let counts = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // Both groups must produce 3 distinct values.
+        for i in 0..counts.len() {
+            assert_eq!(counts.value(i), 3, "row {i} should see 3 distinct values");
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod distributed;
 mod expression;
 mod fast_hash;
 pub mod functions;
+mod group_key;
 mod hash_join;
 mod operator;
 mod optimizer;

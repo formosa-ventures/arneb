@@ -17,7 +17,7 @@ async-trait.workspace = true
 uuid.workspace = true
 # `Location` type for source-position-bearing errors. No heavy transitive deps.
 sqlparser.workspace = true
-codespan-reporting = "0.12"
+codespan-reporting = "0.13"
 
 [dev-dependencies]
 tempfile = "3"

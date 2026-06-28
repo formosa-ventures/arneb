@@ -6,7 +6,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85.0"
+rust-version = "1.89.0"
 license = "Apache-2.0"
 
 [workspace.dependencies]
@@ -21,9 +21,9 @@ toml = "1.0"
 tracing = "0.1"
 
 # Arrow columnar format
-arrow = { version = "58", default-features = false }
-arrow-csv = { version = "58", default-features = false }
-parquet = { version = "58", default-features = false, features = ["arrow", "snap", "object_store", "zstd", "lz4", "brotli", "flate2", "flate2-rust_backened"] }
+arrow = { version = "59", default-features = false }
+arrow-csv = { version = "59", default-features = false }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "object_store", "zstd", "lz4", "brotli", "flate2", "flate2-rust_backened"] }
 
 # Object store (S3, GCS, Azure, local filesystem)
 object_store = { version = "0.13", default-features = false, features = ["aws", "fs"] }
@@ -51,7 +51,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 
 # PostgreSQL wire protocol
-pgwire = "0.39"
+pgwire = "0.40"
 async-trait = "0.1"
 async-recursion = "1"
 futures = "0.3"
@@ -60,7 +60,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # HTTP framework
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 serde_json = "1"
 rust-embed = "8"
 mime_guess = "2"

@@ -78,7 +78,7 @@ pub fn render_plan_error(err: &PlanError, source: &SourceFile) -> String {
 
     let mut buffer = Buffer::no_color();
     let config = Config::default();
-    if term::emit(&mut buffer, &config, &file, &diag).is_err() {
+    if term::emit_to_write_style(&mut buffer, &config, &file, &diag).is_err() {
         // Fall back to plain display on any rendering error.
         return format!("error: {message}");
     }

@@ -9,7 +9,7 @@ description = "Arrow Flight RPC layer for inter-node data exchange in arneb"
 arneb-common = { path = "../common" }
 arneb-planner = { path = "../planner" }
 arrow = { workspace = true }
-arrow-flight = "58"
+arrow-flight = "59"
 tonic = "0.14"
 prost = "0.14"
 tokio = { workspace = true, features = ["sync"] }

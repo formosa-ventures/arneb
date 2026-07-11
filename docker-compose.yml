@@ -58,12 +58,28 @@ services:
       timeout: 5s
       retries: 10
 
+  # Trino coordinator. Distributed-mode (1 coord + 2 workers) is the
+  # bench default since R1; worker services below register against
+  # `trino-coord` (docker DNS alias). Single-node mode still works
+  # because workers are independent services — stopping them leaves
+  # coord with `node-scheduler.include-coordinator=true` semantics
+  # disabled, so single-node bench requires re-enabling that line.
   trino:
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_NODE_CPUS:-2}"
     image: trinodb/trino:latest
     ports:
       - "8080:8080"
     volumes:
       - ./docker/trino/catalog:/etc/trino/catalog
+      - ./docker/trino/etc/config.properties:/etc/trino/config.properties
+      - ./docker/trino/etc/jvm.config:/etc/trino/jvm.config
+    networks:
+      default:
+        aliases:
+          - trino-coord
     depends_on:
       hive-metastore:
         condition: service_healthy
@@ -73,6 +89,46 @@ services:
       timeout: 10s
       retries: 12
       start_period: 30s
+
+  trino-worker-1:
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_NODE_CPUS:-2}"
+    image: trinodb/trino:latest
+    volumes:
+      - ./docker/trino/catalog:/etc/trino/catalog
+      - ./docker/trino/etc/worker.properties:/etc/trino/config.properties
+      - ./docker/trino/etc/jvm.config:/etc/trino/jvm.config
+    depends_on:
+      trino:
+        # Coord healthcheck runs `SELECT 1` which needs a worker
+        # to be scheduled on — chicken-and-egg with workers waiting
+        # for healthy coord. Use service_started instead; the worker
+        # itself retries discovery via its own internal loop.
+        condition: service_started
+      hive-metastore:
+        condition: service_healthy
+
+  trino-worker-2:
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_NODE_CPUS:-2}"
+    image: trinodb/trino:latest
+    volumes:
+      - ./docker/trino/catalog:/etc/trino/catalog
+      - ./docker/trino/etc/worker.properties:/etc/trino/config.properties
+      - ./docker/trino/etc/jvm.config:/etc/trino/jvm.config
+    depends_on:
+      trino:
+        # Coord healthcheck runs `SELECT 1` which needs a worker
+        # to be scheduled on — chicken-and-egg with workers waiting
+        # for healthy coord. Use service_started instead; the worker
+        # itself retries discovery via its own internal loop.
+        condition: service_started
+      hive-metastore:
+        condition: service_healthy
 
   tpch-seed:
     image: trinodb/trino:latest

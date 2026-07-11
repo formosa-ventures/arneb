@@ -1,0 +1,246 @@
+# Override file that adds arneb as a docker-compose service so the
+# Trino-vs-arneb TPC-H benchmark runs both engines under identical
+# Docker isolation (no native-vs-container bias).
+#
+# Usage:
+#   docker compose --project-directory . \
+#                  -f docker-compose.yml \
+#                  -f docker/arneb-bench/docker-compose.bench.yml \
+#                  up -d arneb trino
+#
+# Docker Desktop on this host has 3.88 GB total memory. Don't set
+# mem_limit explicitly on the bench services — let them compete via
+# Docker's defaults so neither one gets starved when the other is
+# running. Arneb's Rust workload uses very little heap (~hundreds of
+# MB) while Trino's JVM takes ~3 GB.
+
+services:
+  # Coordinator: pgwire on 5432 (only port exposed to host), Flight
+  # RPC on 9090. Standalone-bench friendly name "arneb" is kept so
+  # existing bench scripts (bench runner connects to arneb:5432) work
+  # unchanged whether or not workers are present.
+  arneb:
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_NODE_CPUS:-2}"
+    build:
+      context: .
+      dockerfile: docker/arneb-bench/Dockerfile
+    image: arneb-bench:latest
+    container_name: arneb-arneb-1
+    ports:
+      - "5432:5432"
+    environment:
+      # jemalloc page-decay is set in-binary at startup (default 500 ms,
+      # knob ARNEB_DIRTY_DECAY_MS). Do NOT set MALLOC_CONF here — tikv-
+      # jemalloc ignores it (reads the _rjem_-prefixed name), so it's a
+      # silent no-op. To override decay for an experiment, set
+      # ARNEB_DIRTY_DECAY_MS. See docs/guide/configuration.md.
+      # Phase 3b.5d: opt into Grace Hash Join (probe-side partition
+      # spill) so the single-partition execute path partitions the
+      # build by hash and routes probe rows by matching partition,
+      # instead of collecting the full left side and re-scanning it
+      # per build chunk. Drops Q09 worker peak from ~3 GB to ~75 MB
+      # per partition. Default-off without this flag for backwards
+      # compatibility; flipped on in Phase 3b.5g once verified.
+      # Phase 3b.7 (2026-05-21): Re-enable Grace HJ. Pass 1 streams the
+      # probe input by hash partition — avoids execute_single's
+      # collect_stream(left_stream) ~600 MB left_combined for Q09.
+      # Combined with ExchangeClient + LimitExec streaming (3b.7a/c),
+      # this is the architectural path to bound Q09 worker RSS.
+      ARNEB_GRACE_HJ: "1"
+      # --- validated standing config (full-22 cell-diff 22/22 vs Trino @ SF30) ---
+      # All gated default-OFF in the engine; enabled here for the TPC-H bench.
+      ARNEB_SELECTIVE_DIM_FIRST: "1"
+      ARNEB_EAGER_AGG: "1"
+      ARNEB_PARALLEL_FINAL_AGG: "1"
+      ARNEB_FOLD_SEMIJOIN_HAVING: "1"
+      ARNEB_AGG_PRESIZE: "1"
+      # Adaptive agg pre-size (2026-06-26): exact final-from-partials + data-driven
+      # partial growth. Fixes the sqrt(child_size) NDV fallback under-sizing high-
+      # cardinality GROUP BY tables (q18 15M groups estimated ~13K -> ~10 rehashes).
+      # SF30-validated: q18/q20 -5-6% both axes; cell-diff 8/8 clean.
+      ARNEB_AGG_PRESIZE_ADAPTIVE: "1"
+      ARNEB_DATA_PARALLEL_SCAN: "1"
+      ARNEB_BROADCAST_BUILD_SIDE_SWAP: "1"
+      ARNEB_BROADCAST_MAX_BUILD_BYTES: "1000000000"
+      ARNEB_SCAN_BATCH_SIZE: "16384"
+      ARNEB_PROBE_PREFETCH: "1"
+      ARNEB_AGG_PREFETCH: "1"
+      # Compact semi/anti <> build + spill compression (2026-06-29): the
+      # complementary pair that lets q21 win on both latency and memory. compact-semi
+      # replaces q21's ~5 GB semi/anti build spill with a per-key {distinct,v0}
+      # map (no build spill, no multipass) — a latency win that also makes the
+      # next lever cheap; spill-comp (Arrow IPC LZ4) then compresses the residual
+      # read-once exchange spill at the source (no eviction, decompressed once).
+      # Together arneb runs the full 22-query SF30 set faster than Trino and
+      # uses less peak memory on every query, with cell-identical results.
+      ARNEB_COMPACT_SEMI_NE: "1"
+      ARNEB_SPILL_COMPRESSION: "lz4"
+      # CTE self-aggregate window rewrite: compute a multiply-referenced CTE
+      # once (q15's revenue0) instead of recomputing it for a `col >= (SELECT
+      # MAX(col) FROM cte)` self-aggregate subquery. q15 latency -42% @ SF30.
+      ARNEB_CTE_SELF_AGG_WINDOW: "1"
+      # NOTE: ARNEB_NARROW_KEYS is intentionally NOT set here. Its current
+      # ARNEB_NARROW_KEYS_COLUMNS allowlist is a TPC-H-specific stopgap for the
+      # Hive connector's missing plan-time column min/max stats. Proper fix:
+      # wire Hive column min/max into CatalogStats so narrowing is stats-driven.
+    # Distributed-mode coordinator command (overrides image CMD).
+    # Workers connect at arneb-coord:9090 via docker DNS. Keep
+    # network alias `arneb-coord` so worker configs don't need to
+    # know the compose-generated container name.
+    command: ["--config", "/etc/arneb/coord.toml", "--role", "coordinator"]
+    networks:
+      default:
+        aliases:
+          - arneb-coord
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+
+  arneb-worker-1:
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_NODE_CPUS:-2}"
+    image: arneb-bench:latest
+    container_name: arneb-worker-1
+    environment:
+      # jemalloc page-decay is set in-binary (knob ARNEB_DIRTY_DECAY_MS,
+      # default 500 ms). MALLOC_CONF is intentionally NOT set — tikv-
+      # jemalloc ignores it. See docs/guide/configuration.md.
+      # Phase 3b.5d: opt into Grace Hash Join (probe-side partition
+      # spill) so the single-partition execute path partitions the
+      # build by hash and routes probe rows by matching partition,
+      # instead of collecting the full left side and re-scanning it
+      # per build chunk. Drops Q09 worker peak from ~3 GB to ~75 MB
+      # per partition. Default-off without this flag for backwards
+      # compatibility; flipped on in Phase 3b.5g once verified.
+      # Phase 3b.7 (2026-05-21): Re-enable Grace HJ. Pass 1 streams the
+      # probe input by hash partition — avoids execute_single's
+      # collect_stream(left_stream) ~600 MB left_combined for Q09.
+      # Combined with ExchangeClient + LimitExec streaming (3b.7a/c),
+      # this is the architectural path to bound Q09 worker RSS.
+      ARNEB_GRACE_HJ: "1"
+      # --- validated standing config (full-22 cell-diff 22/22 vs Trino @ SF30) ---
+      # All gated default-OFF in the engine; enabled here for the TPC-H bench.
+      ARNEB_SELECTIVE_DIM_FIRST: "1"
+      ARNEB_EAGER_AGG: "1"
+      ARNEB_PARALLEL_FINAL_AGG: "1"
+      ARNEB_FOLD_SEMIJOIN_HAVING: "1"
+      ARNEB_AGG_PRESIZE: "1"
+      # Adaptive agg pre-size (2026-06-26): exact final-from-partials + data-driven
+      # partial growth. Fixes the sqrt(child_size) NDV fallback under-sizing high-
+      # cardinality GROUP BY tables (q18 15M groups estimated ~13K -> ~10 rehashes).
+      # SF30-validated: q18/q20 -5-6% both axes; cell-diff 8/8 clean.
+      ARNEB_AGG_PRESIZE_ADAPTIVE: "1"
+      ARNEB_DATA_PARALLEL_SCAN: "1"
+      ARNEB_BROADCAST_BUILD_SIDE_SWAP: "1"
+      ARNEB_BROADCAST_MAX_BUILD_BYTES: "1000000000"
+      ARNEB_SCAN_BATCH_SIZE: "16384"
+      ARNEB_PROBE_PREFETCH: "1"
+      ARNEB_AGG_PREFETCH: "1"
+      # Compact semi/anti <> build + spill compression (2026-06-29): the
+      # complementary pair that lets q21 win on both latency and memory. compact-semi
+      # replaces q21's ~5 GB semi/anti build spill with a per-key {distinct,v0}
+      # map (no build spill, no multipass) — a latency win that also makes the
+      # next lever cheap; spill-comp (Arrow IPC LZ4) then compresses the residual
+      # read-once exchange spill at the source (no eviction, decompressed once).
+      # Together arneb runs the full 22-query SF30 set faster than Trino and
+      # uses less peak memory on every query, with cell-identical results.
+      ARNEB_COMPACT_SEMI_NE: "1"
+      ARNEB_SPILL_COMPRESSION: "lz4"
+      # CTE self-aggregate window rewrite: compute a multiply-referenced CTE
+      # once (q15's revenue0) instead of recomputing it for a `col >= (SELECT
+      # MAX(col) FROM cte)` self-aggregate subquery. q15 latency -42% @ SF30.
+      ARNEB_CTE_SELF_AGG_WINDOW: "1"
+      # NOTE: ARNEB_NARROW_KEYS is intentionally NOT set here. Its current
+      # ARNEB_NARROW_KEYS_COLUMNS allowlist is a TPC-H-specific stopgap for the
+      # Hive connector's missing plan-time column min/max stats. Proper fix:
+      # wire Hive column min/max into CatalogStats so narrowing is stats-driven.
+    command: ["--config", "/etc/arneb/worker-1.toml", "--role", "worker"]
+    depends_on:
+      arneb:
+        condition: service_started
+      hive-metastore:
+        condition: service_healthy
+
+  arneb-worker-2:
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_NODE_CPUS:-2}"
+    image: arneb-bench:latest
+    container_name: arneb-worker-2
+    environment:
+      # jemalloc page-decay is set in-binary (knob ARNEB_DIRTY_DECAY_MS,
+      # default 500 ms). MALLOC_CONF is intentionally NOT set — tikv-
+      # jemalloc ignores it. See docs/guide/configuration.md.
+      # Phase 3b.5d: opt into Grace Hash Join (probe-side partition
+      # spill) so the single-partition execute path partitions the
+      # build by hash and routes probe rows by matching partition,
+      # instead of collecting the full left side and re-scanning it
+      # per build chunk. Drops Q09 worker peak from ~3 GB to ~75 MB
+      # per partition. Default-off without this flag for backwards
+      # compatibility; flipped on in Phase 3b.5g once verified.
+      # Phase 3b.7 (2026-05-21): Re-enable Grace HJ. Pass 1 streams the
+      # probe input by hash partition — avoids execute_single's
+      # collect_stream(left_stream) ~600 MB left_combined for Q09.
+      # Combined with ExchangeClient + LimitExec streaming (3b.7a/c),
+      # this is the architectural path to bound Q09 worker RSS.
+      ARNEB_GRACE_HJ: "1"
+      # --- validated standing config (full-22 cell-diff 22/22 vs Trino @ SF30) ---
+      # All gated default-OFF in the engine; enabled here for the TPC-H bench.
+      ARNEB_SELECTIVE_DIM_FIRST: "1"
+      ARNEB_EAGER_AGG: "1"
+      ARNEB_PARALLEL_FINAL_AGG: "1"
+      ARNEB_FOLD_SEMIJOIN_HAVING: "1"
+      ARNEB_AGG_PRESIZE: "1"
+      # Adaptive agg pre-size (2026-06-26): exact final-from-partials + data-driven
+      # partial growth. Fixes the sqrt(child_size) NDV fallback under-sizing high-
+      # cardinality GROUP BY tables (q18 15M groups estimated ~13K -> ~10 rehashes).
+      # SF30-validated: q18/q20 -5-6% both axes; cell-diff 8/8 clean.
+      ARNEB_AGG_PRESIZE_ADAPTIVE: "1"
+      ARNEB_DATA_PARALLEL_SCAN: "1"
+      ARNEB_BROADCAST_BUILD_SIDE_SWAP: "1"
+      ARNEB_BROADCAST_MAX_BUILD_BYTES: "1000000000"
+      ARNEB_SCAN_BATCH_SIZE: "16384"
+      ARNEB_PROBE_PREFETCH: "1"
+      ARNEB_AGG_PREFETCH: "1"
+      # Compact semi/anti <> build + spill compression (2026-06-29): the
+      # complementary pair that lets q21 win on both latency and memory. compact-semi
+      # replaces q21's ~5 GB semi/anti build spill with a per-key {distinct,v0}
+      # map (no build spill, no multipass) — a latency win that also makes the
+      # next lever cheap; spill-comp (Arrow IPC LZ4) then compresses the residual
+      # read-once exchange spill at the source (no eviction, decompressed once).
+      # Together arneb runs the full 22-query SF30 set faster than Trino and
+      # uses less peak memory on every query, with cell-identical results.
+      ARNEB_COMPACT_SEMI_NE: "1"
+      ARNEB_SPILL_COMPRESSION: "lz4"
+      # CTE self-aggregate window rewrite: compute a multiply-referenced CTE
+      # once (q15's revenue0) instead of recomputing it for a `col >= (SELECT
+      # MAX(col) FROM cte)` self-aggregate subquery. q15 latency -42% @ SF30.
+      ARNEB_CTE_SELF_AGG_WINDOW: "1"
+      # NOTE: ARNEB_NARROW_KEYS is intentionally NOT set here. Its current
+      # ARNEB_NARROW_KEYS_COLUMNS allowlist is a TPC-H-specific stopgap for the
+      # Hive connector's missing plan-time column min/max stats. Proper fix:
+      # wire Hive column min/max into CatalogStats so narrowing is stats-driven.
+    command: ["--config", "/etc/arneb/worker-2.toml", "--role", "worker"]
+    depends_on:
+      arneb:
+        condition: service_started
+      hive-metastore:
+        condition: service_healthy
+
+  # Override the default trino service to apply Phase-D bench tuning:
+  # the tuned config.properties (explicit query.max-memory + CBO,
+  # task.concurrency=16 power-of-2 for our 14-core host) is mounted
+  # over the image's bare-minimum default. jvm.config keeps the
+  # image default — MaxRAMPercentage=80 of Docker's 3.88 GB total
+  # gives a ~3 GB heap, which is enough once explicit per-query caps
+  # prevent any one query from eating the whole heap.
+  trino:
+    volumes:
+      - ./docker/trino/catalog:/etc/trino/catalog
+      - ./docker/trino/etc/config.properties:/etc/trino/config.properties

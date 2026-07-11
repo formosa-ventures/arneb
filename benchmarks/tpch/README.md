@@ -3,7 +3,62 @@
 Performance comparison of arneb against Trino using TPC-H queries.
 Both engines read the same Parquet data from MinIO via Hive Metastore.
 
-## Quick Start
+## Quickstart (Docker Compose — arneb vs Trino, dual-axis)
+
+The full benchmark environment — MinIO + Hive Metastore + Trino (coordinator +
+2 workers) **and** arneb (coordinator + 2 workers) — runs entirely from two
+compose files, so both engines execute under identical container isolation and
+read the same Parquet data. This is the recommended path for the dual-axis
+(latency **and** peak-memory) comparison.
+
+```bash
+# 1. Bring up the whole env (infra + Trino + arneb). --build compiles the arneb
+#    image from the current source; you can drop --build on later runs.
+docker compose -f docker-compose.yml \
+               -f docker/arneb-bench/docker-compose.bench.yml \
+               up -d --build
+
+# 2. Seed TPC-H data into MinIO via Trino CTAS. TPCH_SF: tiny | sf1 | sf10.
+TPCH_SF=sf10 docker compose run --rm tpch-seed
+
+# 3. Sanity-check both engines see the data. NOTE the different catalog names:
+#    arneb's Hive catalog is `datalake`, Trino's is `hive`.
+PGPASSWORD=x psql -h 127.0.0.1 -p 5432 -U arneb -d arneb \
+  -c "SELECT COUNT(*) FROM datalake.tpch.lineitem"
+docker exec arneb-trino-1 trino --catalog hive --schema tpch \
+  --execute "SELECT COUNT(*) FROM lineitem"
+
+# 4. Run the dual-axis benchmark (latency + sim_peak memory, all 22 queries,
+#    both engines). QUERIES="q01 q06" restricts the set. Writes a raw CSV to
+#    benchmarks/tpch/results/memory_total_<timestamp>.csv (the persisted artifact).
+./benchmarks/tpch/scripts/run_memory_bench.sh
+
+# 5. Print the comparison table — per-query latency and peak memory for both
+#    engines, the latency speedup (Trino / arneb) and arneb's memory as a
+#    fraction of Trino's, plus a geomean speedup. Goes to stdout (not saved);
+#    redirect (> report.md) to keep it.
+python3 benchmarks/tpch/scripts/bench_report.py \
+  "$(ls -t benchmarks/tpch/results/memory_total_*.csv | head -1)"
+
+# (optional) correctness gate — every query is deterministic AND cell-identical
+# to Trino. Run with the cluster up.
+python3 benchmarks/tpch/scripts/blast_radius_oracle.py --runs 2
+```
+
+**Notes**
+
+- **Never run `docker compose down`** — it removes the MinIO volume and you lose
+  the seeded data. Use `docker compose ... stop` to pause; the seed survives.
+- `run_memory_bench.sh` brings the arneb + Trino services up/down itself, so you
+  can re-run it repeatedly without disturbing MinIO/HMS.
+- The standing bench config (`docker/arneb-bench/docker-compose.bench.yml`)
+  enables the validated optimization gates. With it, arneb is faster than Trino
+  on every one of the 22 queries and uses less peak memory on each, with
+  cell-identical results — at SF10 (above) and at SF30.
+- macOS: `nproc`/`timeout` are absent; the scripts print a warning but fall back
+  safely (each arneb node defaults to 2 CPUs — override with `BENCH_NODE_CPUS`).
+
+## Quick Start (single-node)
 
 ```bash
 # 1. Start infrastructure (MinIO + HMS + Trino)

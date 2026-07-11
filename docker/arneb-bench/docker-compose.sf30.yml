@@ -1,0 +1,75 @@
+# 2026-06-03 #2 memory: per-node hard mem_limit + spill_budget headroom.
+# Bench previously set NO mem_limit ("let them compete" — for the old
+# 3.88GB host). On the 31GB host that let a worker balloon past the
+# spill budget into HOST swap-death (SF30 v2b clean run hit 23GB + SSH-
+# unresponsive). A per-node cap turns that into a clean CONTAINER OOM
+# (host survives) AND makes spill headroom real: spill_budget 6→5GB
+# leaves ~6GB for the ~3GB of untracked Arrow intermediates the pool
+# doesn't see, so actual peak (~8GB) stays under the 11GB cap.
+services:
+  arneb:
+    deploy:
+      resources:
+        limits:
+          memory: 11G
+    environment:
+      ARNEB_SPILL_BUDGET_BYTES: "5368709120"
+      # True broadcast join: broadcast a build under this many bytes (the small
+      # star-schema dims) so the big fact stays in place (data-parallel,
+      # probe-in-place) instead of hash-shuffling. With the INNER build-side
+      # swap (ARNEB_BROADCAST_BUILD_SIDE_SWAP, default on) this flips q08/q09/q17
+      # at SF30 (q09 mem 1.32->0.19) — the deep-join wall. Tunable; 1 GiB suits
+      # SF30 (broadcasts part/supplier/nation + the medium partsupp/orders).
+      ARNEB_BROADCAST_MAX_BUILD_BYTES: "1000000000"
+      # Bound the no-spill PROBE materialisation to 1 GiB (independent of the
+      # 5 GB pool). A probe over the cap streams via the direct
+      # single-build probe instead of collecting in full — q08's ~3.4 GB
+      # lineitem-derived probe drove its 3.79 GB peak; capping cuts it to
+      # ~1.16 GB with no latency loss (the streaming probe skips the
+      # per-row partition routing `execute_grace_inner` pays). See
+      # project_2026-06-09_q08_joinorder_ndv_fallback_rootcause.
+      ARNEB_PROBE_COLLECT_MAX_BYTES: "1073741824"
+  arneb-worker-1:
+    deploy:
+      resources:
+        limits:
+          memory: 11G
+    environment:
+      ARNEB_SPILL_BUDGET_BYTES: "5368709120"
+      # True broadcast join: broadcast a build under this many bytes (the small
+      # star-schema dims) so the big fact stays in place (data-parallel,
+      # probe-in-place) instead of hash-shuffling. With the INNER build-side
+      # swap (ARNEB_BROADCAST_BUILD_SIDE_SWAP, default on) this flips q08/q09/q17
+      # at SF30 (q09 mem 1.32->0.19) — the deep-join wall. Tunable; 1 GiB suits
+      # SF30 (broadcasts part/supplier/nation + the medium partsupp/orders).
+      ARNEB_BROADCAST_MAX_BUILD_BYTES: "1000000000"
+      # Bound the no-spill PROBE materialisation to 1 GiB (independent of the
+      # 5 GB pool). A probe over the cap streams via the direct
+      # single-build probe instead of collecting in full — q08's ~3.4 GB
+      # lineitem-derived probe drove its 3.79 GB peak; capping cuts it to
+      # ~1.16 GB with no latency loss (the streaming probe skips the
+      # per-row partition routing `execute_grace_inner` pays). See
+      # project_2026-06-09_q08_joinorder_ndv_fallback_rootcause.
+      ARNEB_PROBE_COLLECT_MAX_BYTES: "1073741824"
+  arneb-worker-2:
+    deploy:
+      resources:
+        limits:
+          memory: 11G
+    environment:
+      ARNEB_SPILL_BUDGET_BYTES: "5368709120"
+      # True broadcast join: broadcast a build under this many bytes (the small
+      # star-schema dims) so the big fact stays in place (data-parallel,
+      # probe-in-place) instead of hash-shuffling. With the INNER build-side
+      # swap (ARNEB_BROADCAST_BUILD_SIDE_SWAP, default on) this flips q08/q09/q17
+      # at SF30 (q09 mem 1.32->0.19) — the deep-join wall. Tunable; 1 GiB suits
+      # SF30 (broadcasts part/supplier/nation + the medium partsupp/orders).
+      ARNEB_BROADCAST_MAX_BUILD_BYTES: "1000000000"
+      # Bound the no-spill PROBE materialisation to 1 GiB (independent of the
+      # 5 GB pool). A probe over the cap streams via the direct
+      # single-build probe instead of collecting in full — q08's ~3.4 GB
+      # lineitem-derived probe drove its 3.79 GB peak; capping cuts it to
+      # ~1.16 GB with no latency loss (the streaming probe skips the
+      # per-row partition routing `execute_grace_inner` pays). See
+      # project_2026-06-09_q08_joinorder_ndv_fallback_rootcause.
+      ARNEB_PROBE_COLLECT_MAX_BYTES: "1073741824"

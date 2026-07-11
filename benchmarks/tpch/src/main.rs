@@ -148,6 +148,18 @@ impl BenchClient for TrinoClient {
                 Some(uri) => uri.to_string(),
                 None => break,
             };
+            // 50ms polling delay between `nextUri` round-trips.
+            // This is the rate Trino's HTTP layer can sustain under
+            // tight back-to-back bench loops. Reducing to 0 or 5ms
+            // was tried during Bench-C (2026-05-17) and crashed the
+            // Trino container silently (OOM kill from docker) on
+            // batches of ≥ 16 queries × 20+ warmup runs. The 50ms is
+            // measurable overhead that biases Trino numbers slightly
+            // slow (each poll pays 50ms), so the "arneb vs Trino"
+            // ratio is conservative against arneb — i.e., Trino's
+            // true server-side time is faster than what this client
+            // measures, by 50ms × poll_count per query. Documented
+            // here so the bench result is interpreted honestly.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let resp = self
                 .http

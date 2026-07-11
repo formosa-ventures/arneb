@@ -1,0 +1,3 @@
+# Kept minimal — the .dockerignore at the build context root (repo
+# root) governs what gets copied. This file documents intent for
+# anyone reading docker/arneb-bench/.

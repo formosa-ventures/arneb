@@ -1,0 +1,62 @@
+# arneb worker-1 config for distributed bench. Worker has no pgwire
+# port (queries land on coord); it serves Flight RPC at port 9090
+# inside its own container, registered with coord at arneb-coord:9090.
+
+bind_address = "0.0.0.0"
+
+[cluster]
+role = "worker"
+rpc_port = 9090
+coordinator_address = "arneb-coord:9090"
+worker_id = "worker-1"
+# Routable hostname for inbound task RPCs from coord (bind 0.0.0.0
+# alone isn't routable cross-container).
+advertised_address = "arneb-worker-1:9090"
+
+[storage.s3]
+region = "us-east-1"
+endpoint = "http://minio:9000"
+allow_http = true
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+
+[[catalogs]]
+name = "datalake"
+type = "hive"
+metastore_uri = "hive-metastore:9083"
+default_schema = "tpch"
+
+# Phase 2c (2026-05-21): cap spillable operator budget at 500 MB so
+# SemiJoinExec build phase spills to disk when right side > budget,
+# instead of growing unbounded until cgroup OOM-kills the worker
+# (exit 137). Leaves the rest of the container's slice for Arrow
+# scratch, hash tables outside the pool, and RPC buffers. OrbStack
+# VM is 3.88 GB total, shared with 2 trino workers + coord; 500 MB
+# per arneb worker fits comfortably inside that envelope.
+[memory]
+spill_budget_bytes = 6442450944
+query_max_memory_per_node = 6442450944
+# DEPRECATED (Phase A, 2026-05-23): the admission semaphore this
+# field used to configure was removed because it held a permit
+# across the entire task body and deadlocked downstream stream
+# back-pressure (see project_2026-05-23_streaming_refactor_deadlock).
+# Field is left in place purely so this config file still loads
+# without schema errors; the value has no runtime effect. Worker
+# concurrency is now bounded by tokio worker threads + MemoryPool +
+# `task_admission_threshold_bytes` (the RSS probe below). Server
+# emits a deprecation warning on startup when this is set.
+task_concurrency = 2
+# Phase 3b.6b (2026-05-21): RSS admission threshold. Refuses new task
+# admission when jemalloc's stats.resident reports the worker process
+# is above this byte count. None disables.
+#
+# Phase M.4 (2026-05-22): bumped 1.5 GB → 3 GB to match the 8 GB
+# OrbStack VM. Each worker's effective slice is ~4 GB (8 GB total
+# minus Trino's ~3 GB committed JVM heap minus ~0.5 GB other
+# services), so 3 GB leaves ~25% headroom before kernel OOM. The
+# fail-fast change (admission Err on timeout) means a stricter
+# threshold causes legitimate workloads to fail instead of getting
+# OOM-killed — pick a value that admits Q09's per-task working set
+# (~600 MB peak per fragment × task_concurrency=2 = 1.2 GB +
+# baseline 0.5 GB = 1.7 GB sustained, fitting under 3 GB).
+task_admission_threshold_bytes = 8589934592

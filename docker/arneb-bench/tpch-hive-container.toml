@@ -1,0 +1,25 @@
+# arneb config for running inside the bench Docker container.
+#
+# Differences from benchmarks/tpch/tpch-hive.toml:
+#   - bind_address 0.0.0.0 (was 127.0.0.1) so pgwire is reachable
+#     from the host when 5432 is published.
+#   - storage.s3.endpoint uses the `minio` service name on the
+#     docker network (was `localhost`).
+#   - catalogs[0].metastore_uri uses the `hive-metastore` service
+#     name (was 127.0.0.1).
+
+bind_address = "0.0.0.0"
+port = 5432
+
+[storage.s3]
+region = "us-east-1"
+endpoint = "http://minio:9000"
+allow_http = true
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+
+[[catalogs]]
+name = "datalake"
+type = "hive"
+metastore_uri = "hive-metastore:9083"
+default_schema = "tpch"

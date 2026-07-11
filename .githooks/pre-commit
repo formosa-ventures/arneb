@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Pre-commit hook for arneb.
+#
+# Runs a subset of the CI gate locally before accepting a commit:
+#   - cargo fmt -- --check
+#   - cargo clippy --workspace --all-targets -- -D warnings
+#
+# Skips entirely when no *.rs files are staged, so pure docs / config
+# / frontend commits remain fast. Tests are intentionally left to CI
+# and manual runs — the hook should stay under a few seconds on a
+# warm cache.
+#
+# Activate once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# Bypass for genuine emergencies (CI will still enforce the gate):
+#
+#     git commit --no-verify
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Detect staged Rust changes across add/copy/modify/rename.
+staged_rs=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs' || true)
+
+if [ -z "$staged_rs" ]; then
+    exit 0
+fi
+
+echo "pre-commit: staged Rust changes — running fmt + clippy"
+
+if ! cargo fmt -- --check; then
+    cat >&2 <<'MSG'
+
+pre-commit: cargo fmt check failed.
+  fix:      cargo fmt
+  bypass:   git commit --no-verify   (CI will still fail)
+MSG
+    exit 1
+fi
+
+if ! cargo clippy --workspace --all-targets -- -D warnings; then
+    cat >&2 <<'MSG'
+
+pre-commit: cargo clippy failed.
+  fix:      address the reported warnings
+  bypass:   git commit --no-verify   (CI will still fail)
+MSG
+    exit 1
+fi
+
+exit 0

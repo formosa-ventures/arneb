@@ -1,0 +1,18 @@
+# Required to keep `docker build` context small.
+# target/ alone is 100GB+ on a warm dev tree.
+target/
+.git/
+node_modules/
+benchmarks/*/target/
+benchmarks/*/results/
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# Editor / OS state
+*.swp
+*~
+
+# Bench artifacts that don't belong in any docker image
+/tmp/

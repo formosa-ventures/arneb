@@ -15,7 +15,7 @@ Trino (formerly PrestoSQL) lets users query data where it lives — across objec
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
 - **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC
 - **Web UI**: Dashboard with query monitoring, cluster overview, and worker status
-- **TPC-H Benchmark**: 16/22 queries passing with benchmark runner and comparison tooling
+- **TPC-H Benchmark**: 22/22 queries cell-identical to Trino, faster and lighter on peak memory across the board, with benchmark runner and comparison tooling
 
 ## Quick Start
 
@@ -145,8 +145,10 @@ docker compose down
 
 ## TPC-H Benchmark
 
-16 out of 22 TPC-H queries pass. Both arneb and Trino read the same
-Parquet data from MinIO via Hive Metastore for fair comparison.
+All 22 TPC-H queries return cell-identical results to Trino while running
+faster and using less peak memory on every query, at SF10 and SF30. Both
+engines read the same Parquet data from MinIO via Hive Metastore for fair
+comparison.
 
 ```bash
 # Start infrastructure and seed data

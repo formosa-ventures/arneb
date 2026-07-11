@@ -22,6 +22,7 @@ tokio = { workspace = true }
 # PostgreSQL wire protocol
 pgwire = { workspace = true }
 async-trait = { workspace = true }
+async-recursion = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 

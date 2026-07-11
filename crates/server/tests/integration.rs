@@ -26,6 +26,7 @@ async fn start_test_server(
         catalog_manager,
         connector_registry,
         distributed_executor: None,
+        memory_pool: Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new()),
     });
 
     tokio::spawn(async move {

@@ -5,7 +5,7 @@ use arrow::datatypes as arrow_types;
 use arrow::record_batch::RecordBatch;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
 use pgwire::api::Type;
-use pgwire::error::PgWireResult;
+use pgwire::error::{PgWireError, PgWireResult};
 
 use arneb_common::types::{ColumnInfo, DataType};
 
@@ -137,6 +137,10 @@ fn encode_value(array: &dyn Array, row: usize) -> Option<String> {
             let raw = arr.value(row);
             format_decimal128(raw, *precision, *scale)
         }
+        arrow_types::DataType::Dictionary(_, value_type) => {
+            let materialized = arrow::compute::cast(array, value_type.as_ref()).ok()?;
+            encode_value(materialized.as_ref(), row)
+        }
         _ => Some(format!("{array:?}")),
     }
 }
@@ -171,11 +175,22 @@ pub fn encode_record_batches(
         let num_rows = batch.num_rows();
         let num_cols = batch.num_columns();
         total_count += num_rows;
+        let columns: Vec<ArrayRef> = batch
+            .columns()
+            .iter()
+            .map(|array| match array.data_type() {
+                arrow_types::DataType::Dictionary(_, value_type) => {
+                    arrow::compute::cast(array, value_type.as_ref())
+                }
+                _ => Ok(array.clone()),
+            })
+            .collect::<Result<_, _>>()
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
 
         let mut encoder = DataRowEncoder::new(schema.clone());
         for row_idx in 0..num_rows {
             for col_idx in 0..num_cols {
-                let array = batch.column(col_idx);
+                let array = &columns[col_idx];
                 let value = encode_value(array.as_ref(), row_idx);
                 encoder.encode_field(&value)?;
             }

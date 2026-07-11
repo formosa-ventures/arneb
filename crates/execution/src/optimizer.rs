@@ -84,6 +84,13 @@ mod tests {
             source: Arc::new(ds),
             _table_name: "test".to_string(),
             scan_context: ScanContext::default(),
+            dynamic_filters: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
+            dynamic_filter_collector: None,
+            dynamic_filtering_enabled: false,
+            dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+            scan_task_index: 0,
+            scan_task_count: 1,
         })
     }
 

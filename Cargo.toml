@@ -23,7 +23,7 @@ tracing = "0.1"
 # Arrow columnar format
 arrow = { version = "59", default-features = false }
 arrow-csv = { version = "59", default-features = false }
-parquet = { version = "59", default-features = false, features = ["arrow", "snap", "object_store", "zstd", "lz4", "brotli", "flate2", "flate2-rust_backened"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "object_store", "zstd", "lz4", "brotli", "flate2", "flate2-zlib-rs"] }
 
 # Object store (S3, GCS, Azure, local filesystem)
 object_store = { version = "0.13", default-features = false, features = ["aws", "fs"] }
@@ -34,6 +34,9 @@ num_cpus = "1"
 # Non-cryptographic fast hashing for hot-path hash tables.
 # Used inside crates/execution; see openspec/changes/exec-ahash-hashtables/.
 ahash = "0.8"
+
+# CPU sampling profiler for per-core flamegraphs (gated ARNEB_PPROF, SIGUSR1 dump).
+pprof = { version = "0.13", features = ["flamegraph"] }
 
 # SQL parsing
 sqlparser = { version = "0.61", default-features = false, features = ["std"] }

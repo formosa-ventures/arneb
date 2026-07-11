@@ -54,8 +54,11 @@ impl ExecutionPlan for ScalarSubqueryExec {
         }
     }
 
-    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
-        let stream = self.child.execute().await?;
+    async fn execute(
+        &self,
+        _partition: usize,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let stream = self.child.execute(0).await?;
         let batches = collect_stream(stream).await.map_err(|e| {
             ExecutionError::InvalidOperation(format!("failed to collect subquery: {e}"))
         })?;

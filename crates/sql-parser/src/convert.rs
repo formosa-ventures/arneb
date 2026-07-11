@@ -28,10 +28,13 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
                 span,
             })
         }
-        sp::Statement::Explain { statement, .. } => {
+        sp::Statement::Explain {
+            statement, analyze, ..
+        } => {
             let inner = convert_statement(*statement)?;
             Ok(ast::Statement::Explain {
                 stmt: Box::new(inner),
+                analyze,
                 span,
             })
         }
@@ -441,6 +444,30 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             })
         }
         sp::Expr::BinaryOp { left, op, right } => {
+            // Constant-fold `DATE 'YYYY-MM-DD' ± INTERVAL 'N' UNIT`.
+            // TPC-H queries (Q12 etc.) commonly write
+            // `DATE '1994-01-01' + INTERVAL '1' YEAR` as the upper
+            // bound of a date range — for YEAR / MONTH intervals
+            // there's no clean runtime translation (calendar
+            // arithmetic depends on month/leap-year boundaries), so
+            // we evaluate the entire literal expression here using
+            // chrono and emit a single `Literal(Date32)`.
+            if matches!(op, sp::BinaryOperator::Plus | sp::BinaryOperator::Minus) {
+                let folded = match (left.as_ref(), right.as_ref()) {
+                    (sp::Expr::TypedString(ts), sp::Expr::Interval(iv)) => {
+                        try_fold_date_interval(ts, &op, iv, span)?
+                    }
+                    (sp::Expr::Interval(iv), sp::Expr::TypedString(ts))
+                        if matches!(op, sp::BinaryOperator::Plus) =>
+                    {
+                        try_fold_date_interval(ts, &op, iv, span)?
+                    }
+                    _ => None,
+                };
+                if let Some(folded) = folded {
+                    return Ok(folded);
+                }
+            }
             let l = convert_expr(*left)?;
             let r = convert_expr(*right)?;
             let bin_op = convert_binary_op(op)?;
@@ -644,10 +671,226 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             })
         }
         sp::Expr::IsTrue(expr) => convert_expr(*expr),
+        sp::Expr::Interval(interval) => convert_interval(interval, span),
+        sp::Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            special: _,
+            shorthand: _,
+        } => {
+            // SQL's `SUBSTRING(s FROM <start> FOR <len>)` lowers to the
+            // 3-arg comma form `SUBSTRING(s, <start>, <len>)` which the
+            // executor's scalar function already implements. The 2-arg
+            // `SUBSTRING(s FROM <start>)` form keeps the start argument
+            // only. Without a FROM (just `SUBSTRING(s)`) we fall through
+            // to a parse error — that shape isn't useful.
+            let src = convert_expr(*expr)?;
+            let from_e = substring_from
+                .ok_or_else(|| {
+                    ParseError::UnsupportedFeature("SUBSTRING without FROM clause".to_string())
+                })
+                .and_then(|e| convert_expr(*e))?;
+            let mut args = vec![
+                ast::FunctionArg::Unnamed(src),
+                ast::FunctionArg::Unnamed(from_e),
+            ];
+            if let Some(for_e) = substring_for {
+                args.push(ast::FunctionArg::Unnamed(convert_expr(*for_e)?));
+            }
+            Ok(ast::Expr::Function {
+                name: "SUBSTRING".to_string(),
+                args,
+                distinct: false,
+                span,
+            })
+        }
+        sp::Expr::Extract {
+            field,
+            syntax: _,
+            expr,
+        } => {
+            // SQL's `EXTRACT(YEAR FROM ts)` lowers to a 2-arg call
+            // `EXTRACT('YEAR', ts)` which arneb's date function
+            // registry already implements. We pass the field name as
+            // an uppercase string literal so the executor can branch
+            // on it without case-folding per row.
+            let field_name = format!("{:?}", field).to_uppercase();
+            let field_literal = ast::Expr::Literal {
+                value: arneb_common::types::ScalarValue::Utf8(field_name),
+                span,
+            };
+            let arg = convert_expr(*expr)?;
+            Ok(ast::Expr::Function {
+                name: "EXTRACT".to_string(),
+                args: vec![
+                    ast::FunctionArg::Unnamed(field_literal),
+                    ast::FunctionArg::Unnamed(arg),
+                ],
+                distinct: false,
+                span,
+            })
+        }
         other => Err(ParseError::UnsupportedFeature(format!(
             "expression: {other}"
         ))),
     }
+}
+
+/// Convert `INTERVAL '<n>' <unit>` into an integer literal whose
+/// value is the interval in `<unit>` natural units. Only supports
+/// constant integer-valued intervals with a single leading time
+/// unit (DAY / MONTH / YEAR / HOUR / MINUTE / SECOND), which covers
+/// every interval expression used by the TPC-H reference queries.
+///
+/// The folded integer then participates in arithmetic via Arrow's
+/// numeric kernels — `Date32 - Int32` yields a `Date32` shifted by
+/// that many days, matching SQL `DATE - INTERVAL 'n' DAY` semantics
+/// at the bit level (Date32 is days-since-epoch).
+///
+/// For non-DAY units the folded literal still has unit semantics
+/// (months / hours / etc.); downstream arithmetic must handle the
+/// unit through the typed expression evaluator. TPC-H only uses DAY,
+/// so non-DAY intervals are reported as `UnsupportedFeature` until a
+/// concrete query needs them.
+fn convert_interval(interval: sp::Interval, span: Span) -> Result<ast::Expr, ParseError> {
+    use sp::DateTimeField;
+
+    // Resolve the numeric value from the inner expression. TPC-H
+    // queries spell intervals as `INTERVAL '90' DAY`, where the
+    // value parses to a string literal. We also accept a plain
+    // numeric literal in case other queries use that form.
+    let value_str = match interval.value.as_ref() {
+        sp::Expr::Value(v) => match &v.value {
+            sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => s.clone(),
+            sp::Value::Number(n, _) => n.clone(),
+            other => {
+                return Err(ParseError::UnsupportedFeature(format!(
+                    "interval value: {other:?}"
+                )));
+            }
+        },
+        other => {
+            return Err(ParseError::UnsupportedFeature(format!(
+                "interval value expression: {other}"
+            )));
+        }
+    };
+    let n: i64 = value_str.trim().parse().map_err(|_| {
+        ParseError::UnsupportedFeature(format!("interval value not an integer: '{value_str}'"))
+    })?;
+
+    let unit = interval.leading_field.ok_or_else(|| {
+        ParseError::UnsupportedFeature("interval without leading unit".to_string())
+    })?;
+
+    match unit {
+        DateTimeField::Day | DateTimeField::Days => {
+            // Days fit in Int32 for all realistic ranges.
+            Ok(ast::Expr::Literal {
+                value: arneb_common::types::ScalarValue::Int32(n as i32),
+                span,
+            })
+        }
+        // Year / Month / Hour / Minute / Second intervals are not
+        // exercised by any TPC-H query in our set; until they are,
+        // surface as unsupported so we don't silently mis-evaluate
+        // a non-DAY interval as days.
+        other => Err(ParseError::UnsupportedFeature(format!(
+            "interval unit: {other:?}"
+        ))),
+    }
+}
+
+/// Constant-fold `DATE 'YYYY-MM-DD' ± INTERVAL 'N' UNIT` to a single
+/// `Literal(Date32)`. Returns `None` if the operands aren't both
+/// literals or the date string fails to parse — caller falls back to
+/// normal `BinaryOp` conversion (which will error if no runtime
+/// handler exists for the operand types).
+///
+/// Calendar arithmetic via `chrono`:
+/// - DAY: `NaiveDate ± Duration::days`
+/// - MONTH: `NaiveDate::checked_add/sub_months` (handles month-end
+///   clipping per ISO/SQL semantics).
+/// - YEAR: same as MONTH × 12.
+fn try_fold_date_interval(
+    ts: &sp::TypedString,
+    op: &sp::BinaryOperator,
+    iv: &sp::Interval,
+    span: Span,
+) -> Result<Option<ast::Expr>, ParseError> {
+    use chrono::{Months, NaiveDate};
+    use sp::DateTimeField;
+
+    // Only fold when the typed-string is a DATE literal.
+    if !matches!(ts.data_type, sp::DataType::Date) {
+        return Ok(None);
+    }
+    let date_str = match &ts.value.value {
+        sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => s.clone(),
+        _ => return Ok(None),
+    };
+    let date = match NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+
+    // Extract the interval value + unit.
+    let value_str = match iv.value.as_ref() {
+        sp::Expr::Value(v) => match &v.value {
+            sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => s.clone(),
+            sp::Value::Number(n, _) => n.clone(),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let n: i64 = match value_str.trim().parse() {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let unit = iv.leading_field.as_ref().ok_or_else(|| {
+        ParseError::UnsupportedFeature("interval without leading unit".to_string())
+    })?;
+
+    let new_date = match unit {
+        DateTimeField::Day | DateTimeField::Days => {
+            let delta = chrono::Duration::days(n);
+            match op {
+                sp::BinaryOperator::Plus => date.checked_add_signed(delta),
+                sp::BinaryOperator::Minus => date.checked_sub_signed(delta),
+                _ => return Ok(None),
+            }
+        }
+        DateTimeField::Month | DateTimeField::Months => {
+            let months = Months::new(n as u32);
+            match op {
+                sp::BinaryOperator::Plus => date.checked_add_months(months),
+                sp::BinaryOperator::Minus => date.checked_sub_months(months),
+                _ => return Ok(None),
+            }
+        }
+        DateTimeField::Year | DateTimeField::Years => {
+            let months = Months::new((n * 12) as u32);
+            match op {
+                sp::BinaryOperator::Plus => date.checked_add_months(months),
+                sp::BinaryOperator::Minus => date.checked_sub_months(months),
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    };
+    let new_date = new_date.ok_or_else(|| {
+        ParseError::UnsupportedFeature(format!(
+            "date interval arithmetic overflow: {date} {op:?} {n} {unit:?}"
+        ))
+    })?;
+
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch date");
+    let days = new_date.signed_duration_since(epoch).num_days() as i32;
+    Ok(Some(ast::Expr::Literal {
+        value: arneb_common::types::ScalarValue::Date32(days),
+        span,
+    }))
 }
 
 /// Convert a `sqlparser` [`sp::Function`] into a arneb [`ast::Expr::Function`].

@@ -2,20 +2,52 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::task::{Context, Poll};
 
-use arneb_catalog::{CatalogProvider, SchemaProvider, TableProvider};
-use arneb_common::error::{ConnectorError, ExecutionError};
-use arneb_common::stream::{stream_from_batches, SendableRecordBatchStream};
+use arneb_catalog::{CatalogProvider, SchemaProvider, TableProvider, TableStatistics};
+use arneb_common::error::{ArnebError, ConnectorError, ExecutionError};
+use arneb_common::stream::{stream_from_batches, RecordBatchStream, SendableRecordBatchStream};
 use arneb_common::types::{ColumnInfo, TableReference};
 use arneb_execution::{DataSource, ScanContext};
+use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
+use futures::Stream;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 
 use crate::storage::{StorageRegistry, StorageUri};
 use crate::ConnectorFactory;
+
+/// Default record-batch size for Parquet/CSV readers when
+/// [`ScanContext::batch_size`] is unset.
+///
+/// Defaults to 2048 — small per-partition in-flight Arrow batches keep scan
+/// memory low (the deliberate override of Parquet's built-in 8192). Tunable at
+/// runtime via `ARNEB_SCAN_BATCH_SIZE`: a larger value amortizes per-batch
+/// overhead across the whole pipeline (decode → filter → repartition → hash →
+/// exchange) at the cost of more in-flight Arrow memory. Read, applied, and
+/// logged once. Both the file and Hive connectors route through this helper so
+/// the knob is honored uniformly.
+pub fn scan_default_batch_size() -> usize {
+    static BATCH_SIZE: OnceLock<usize> = OnceLock::new();
+    *BATCH_SIZE.get_or_init(|| {
+        let value = std::env::var("ARNEB_SCAN_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(2048);
+        tracing::info!(
+            target: "arneb::config",
+            scan_batch_size = value,
+            "ARNEB_SCAN_BATCH_SIZE effective value (default 2048; larger amortizes \
+             per-batch overhead at the cost of higher scan memory)"
+        );
+        value
+    })
+}
 
 // ---------------------------------------------------------------------------
 // FileFormat
@@ -62,7 +94,17 @@ impl DataSource for CsvDataSource {
         self.column_schema.clone()
     }
 
-    async fn scan(&self, ctx: &ScanContext) -> Result<SendableRecordBatchStream, ExecutionError> {
+    async fn scan(
+        &self,
+        ctx: &ScanContext,
+        partition: usize,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        if partition != 0 {
+            return Err(ExecutionError::InvalidOperation(format!(
+                "single-file data source: partition {partition} out of range"
+            )));
+        }
+        let _ = partition;
         // Fetch the entire CSV content via ObjectStore.
         let result = self.store.get(&self.path).await.map_err(|e| {
             ExecutionError::InvalidOperation(format!("failed to read CSV '{}': {}", self.path, e))
@@ -167,7 +209,17 @@ impl DataSource for ParquetDataSource {
         self.column_schema.clone()
     }
 
-    async fn scan(&self, ctx: &ScanContext) -> Result<SendableRecordBatchStream, ExecutionError> {
+    async fn scan(
+        &self,
+        ctx: &ScanContext,
+        partition: usize,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        if partition != 0 {
+            return Err(ExecutionError::InvalidOperation(format!(
+                "single-file data source: partition {partition} out of range"
+            )));
+        }
+        let _ = partition;
         let meta = self.store.head(&self.path).await.map_err(|e| {
             ExecutionError::InvalidOperation(format!(
                 "failed to stat Parquet file '{}': {}",
@@ -207,10 +259,12 @@ impl DataSource for ParquetDataSource {
         }
 
         // Apply predicate pushdown for within-row-group filtering.
-        if !ctx.filters.is_empty() {
-            if let Some(row_filter) =
-                crate::parquet_pushdown::build_row_filter(&ctx.filters, builder.parquet_schema())
-            {
+        if !ctx.filters.is_empty() || !ctx.dynamic_filter_domains.is_empty() {
+            if let Some(row_filter) = crate::parquet_pushdown::build_row_filter_with_dynamic_domains(
+                &ctx.filters,
+                &ctx.dynamic_filter_domains,
+                builder.parquet_schema(),
+            ) {
                 builder = builder.with_row_filter(row_filter);
             }
         }
@@ -224,10 +278,12 @@ impl DataSource for ParquetDataSource {
             builder = builder.with_projection(mask);
         }
 
-        // Apply batch size if configured.
-        if let Some(batch_size) = ctx.batch_size {
-            builder = builder.with_batch_size(batch_size);
-        }
+        // Default 2048 (override Parquet's built-in 8192) to keep
+        // per-partition in-flight Arrow batches small. Matches the
+        // Hive connector; rationale lives there. Tunable via
+        // `ARNEB_SCAN_BATCH_SIZE` (see `scan_default_batch_size`).
+        let batch_size = ctx.batch_size.unwrap_or_else(scan_default_batch_size);
+        builder = builder.with_batch_size(batch_size);
 
         let arrow_schema = builder.schema().clone();
 
@@ -235,17 +291,55 @@ impl DataSource for ParquetDataSource {
             ExecutionError::InvalidOperation(format!("Parquet reader build error: {e}"))
         })?;
 
-        // Collect batches from the async stream.
-        use futures::StreamExt;
-        let mut batches = Vec::new();
-        let mut stream = stream;
-        while let Some(result) = stream.next().await {
-            let batch = result.map_err(|e| {
-                ExecutionError::InvalidOperation(format!("Parquet read error: {e}"))
-            })?;
-            batches.push(batch);
+        // Phase 3b.7b (2026-05-21): true streaming. Previously this
+        // collected every parquet batch into a `Vec<RecordBatch>`
+        // before returning, holding the whole partition's decoded
+        // Arrow batches in memory before the downstream operator saw
+        // the first row — for SF1 lineitem with 7 projected columns
+        // that's ~336 MB per query. Matches the hive datasource
+        // pattern (crates/hive/src/datasource.rs::ParquetBatchStream).
+        Ok(Box::pin(ParquetBatchStream {
+            schema: arrow_schema,
+            inner: Box::pin(stream),
+            file_path: self.path.as_ref().to_string(),
+        }))
+    }
+}
+
+/// Adapts a [`ParquetRecordBatchStream`] into a
+/// [`SendableRecordBatchStream`] without materialising the partition's
+/// batches up front. Mirrors `crates/hive/src/datasource.rs::ParquetBatchStream`.
+struct ParquetBatchStream {
+    schema: arrow::datatypes::SchemaRef,
+    inner: Pin<
+        Box<
+            parquet::arrow::async_reader::ParquetRecordBatchStream<
+                parquet::arrow::async_reader::ParquetObjectReader,
+            >,
+        >,
+    >,
+    file_path: String,
+}
+
+impl Stream for ParquetBatchStream {
+    type Item = Result<RecordBatch, ArnebError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(Ok(b))),
+            Poll::Ready(Some(Err(e))) => {
+                let msg = format!("Parquet read error for '{}': {e}", self.file_path);
+                Poll::Ready(Some(Err(ExecutionError::InvalidOperation(msg).into())))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
-        Ok(stream_from_batches(arrow_schema, batches))
+    }
+}
+
+impl RecordBatchStream for ParquetBatchStream {
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.schema.clone()
     }
 }
 
@@ -282,24 +376,60 @@ struct FileTableEntry {
     path: ObjectPath,
     format: FileFormat,
     schema: Vec<ColumnInfo>,
+    /// Total row count, populated at registration time for Parquet files
+    /// by summing `RowGroupMetaData::num_rows()` over the footer. `None`
+    /// for CSV (line counting is too expensive without a pre-scan).
+    row_count: Option<u64>,
+    /// On-disk byte size of the file, when known.
+    size_bytes: Option<u64>,
 }
 
 /// A file-backed table exposing schema metadata via [`TableProvider`].
 #[derive(Debug)]
 pub struct FileTable {
     schema: Vec<ColumnInfo>,
+    row_count: Option<u64>,
+    size_bytes: Option<u64>,
 }
 
 impl FileTable {
-    /// Creates a new file table with the given schema.
+    /// Creates a new file table with the given schema and no statistics.
     pub fn new(schema: Vec<ColumnInfo>) -> Self {
-        Self { schema }
+        Self {
+            schema,
+            row_count: None,
+            size_bytes: None,
+        }
+    }
+
+    /// Creates a new file table with the given schema and statistics.
+    pub fn with_statistics(
+        schema: Vec<ColumnInfo>,
+        row_count: Option<u64>,
+        size_bytes: Option<u64>,
+    ) -> Self {
+        Self {
+            schema,
+            row_count,
+            size_bytes,
+        }
     }
 }
 
 impl TableProvider for FileTable {
     fn schema(&self) -> Vec<ColumnInfo> {
         self.schema.clone()
+    }
+
+    fn statistics(&self) -> Option<TableStatistics> {
+        if self.row_count.is_none() && self.size_bytes.is_none() {
+            return None;
+        }
+        Some(TableStatistics {
+            row_count: self.row_count,
+            size_bytes: self.size_bytes,
+            columns: Default::default(),
+        })
     }
 }
 
@@ -338,12 +468,15 @@ impl FileConnectorFactory {
         let store = self.storage_registry.get_store(&uri)?;
         let obj_path = uri.object_path();
 
-        let schema = match (format, schema) {
-            (_, Some(s)) => s,
-            (FileFormat::Parquet, None) => {
+        let (schema, row_count, size_bytes) = match (format, schema) {
+            (FileFormat::Parquet, schema_opt) => {
+                // Open the file once for both schema (if needed) and stats.
                 let ds = ParquetDataSource::new(store.clone(), obj_path.clone()).await?;
-                ds.column_schema.clone()
+                let schema = schema_opt.unwrap_or_else(|| ds.column_schema.clone());
+                let stats = parquet_file_statistics(&store, &obj_path).await;
+                (schema, stats.row_count, stats.size_bytes)
             }
+            (FileFormat::Csv, Some(s)) => (s, None, None),
             (FileFormat::Csv, None) => {
                 return Err(ConnectorError::UnsupportedOperation(
                     "CSV tables require an explicit schema".to_string(),
@@ -357,10 +490,54 @@ impl FileConnectorFactory {
                 path: obj_path,
                 format,
                 schema,
+                row_count,
+                size_bytes,
             },
         );
         Ok(())
     }
+}
+
+/// Best-effort statistics for a Parquet file. Reads the footer once and
+/// sums `num_rows` across row groups; returns `None` for any field that
+/// fails to compute (the caller treats `None` as "no stats").
+struct ParquetFileStats {
+    row_count: Option<u64>,
+    size_bytes: Option<u64>,
+}
+
+async fn parquet_file_statistics(
+    store: &Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+) -> ParquetFileStats {
+    let mut out = ParquetFileStats {
+        row_count: None,
+        size_bytes: None,
+    };
+    let meta = match store.head(path).await {
+        Ok(m) => m,
+        Err(_) => return out,
+    };
+    out.size_bytes = Some(meta.size as u64);
+
+    let reader =
+        parquet::arrow::async_reader::ParquetObjectReader::new(store.clone(), meta.location)
+            .with_file_size(meta.size);
+    let builder =
+        match parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader).await {
+            Ok(b) => b,
+            Err(_) => return out,
+        };
+    let total_rows: i64 = builder
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|rg| rg.num_rows())
+        .sum();
+    if total_rows >= 0 {
+        out.row_count = Some(total_rows as u64);
+    }
+    out
 }
 
 impl fmt::Debug for FileConnectorFactory {
@@ -372,12 +549,13 @@ impl fmt::Debug for FileConnectorFactory {
     }
 }
 
+#[async_trait]
 impl ConnectorFactory for FileConnectorFactory {
     fn name(&self) -> &str {
         "file"
     }
 
-    fn create_data_source(
+    async fn create_data_source(
         &self,
         table: &TableReference,
         _schema: &[ColumnInfo],
@@ -431,7 +609,17 @@ impl DataSource for PreResolvedParquetDataSource {
         self.column_schema.clone()
     }
 
-    async fn scan(&self, ctx: &ScanContext) -> Result<SendableRecordBatchStream, ExecutionError> {
+    async fn scan(
+        &self,
+        ctx: &ScanContext,
+        partition: usize,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        if partition != 0 {
+            return Err(ExecutionError::InvalidOperation(format!(
+                "single-file data source: partition {partition} out of range"
+            )));
+        }
+        let _ = partition;
         let meta = self.store.head(&self.path).await.map_err(|e| {
             ExecutionError::InvalidOperation(format!(
                 "failed to stat Parquet file '{}': {}",
@@ -466,16 +654,13 @@ impl DataSource for PreResolvedParquetDataSource {
             ExecutionError::InvalidOperation(format!("Parquet reader build error: {e}"))
         })?;
 
-        use futures::StreamExt;
-        let mut batches = Vec::new();
-        let mut stream = stream;
-        while let Some(result) = stream.next().await {
-            let batch = result.map_err(|e| {
-                ExecutionError::InvalidOperation(format!("Parquet read error: {e}"))
-            })?;
-            batches.push(batch);
-        }
-        Ok(stream_from_batches(arrow_schema, batches))
+        // Phase 3b.7b (2026-05-21): true streaming. Same change as
+        // ParquetDataSource::scan above.
+        Ok(Box::pin(ParquetBatchStream {
+            schema: arrow_schema,
+            inner: Box::pin(stream),
+            file_path: self.path.to_string(),
+        }))
     }
 }
 
@@ -515,9 +700,13 @@ impl SchemaProvider for FileSchema {
 
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         let tables = self.factory.tables.read().unwrap();
-        tables
-            .get(name)
-            .map(|e| Arc::new(FileTable::new(e.schema.clone())) as Arc<dyn TableProvider>)
+        tables.get(name).map(|e| {
+            Arc::new(FileTable::with_statistics(
+                e.schema.clone(),
+                e.row_count,
+                e.size_bytes,
+            )) as Arc<dyn TableProvider>
+        })
     }
 }
 
@@ -666,7 +855,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_test_csv(dir.path());
         let ds = CsvDataSource::new(local_store(), to_object_path(&path), csv_schema());
-        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let stream = ds.scan(&ScanContext::default(), 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
@@ -679,7 +868,7 @@ mod tests {
             ObjectPath::from("nonexistent/path.csv"),
             csv_schema(),
         );
-        assert!(ds.scan(&ScanContext::default()).await.is_err());
+        assert!(ds.scan(&ScanContext::default(), 0).await.is_err());
     }
 
     // -- Parquet tests --
@@ -691,7 +880,7 @@ mod tests {
         let ds = ParquetDataSource::new(local_store(), to_object_path(&path))
             .await
             .unwrap();
-        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let stream = ds.scan(&ScanContext::default(), 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
@@ -739,8 +928,9 @@ mod tests {
         let table_ref = TableReference::table("sales");
         let ds = factory
             .create_data_source(&table_ref, &[], &Default::default())
+            .await
             .unwrap();
-        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let stream = ds.scan(&ScanContext::default(), 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         assert!(!batches.is_empty());
     }
@@ -759,19 +949,22 @@ mod tests {
         let table_ref = TableReference::table("events");
         let ds = factory
             .create_data_source(&table_ref, &[], &Default::default())
+            .await
             .unwrap();
-        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let stream = ds.scan(&ScanContext::default(), 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
 
-    #[test]
-    fn file_factory_table_not_found() {
+    #[tokio::test]
+    async fn file_factory_table_not_found() {
         let registry = Arc::new(StorageRegistry::new());
         let factory = FileConnectorFactory::new(registry);
         let table_ref = TableReference::table("nope");
-        let result = factory.create_data_source(&table_ref, &[], &Default::default());
+        let result = factory
+            .create_data_source(&table_ref, &[], &Default::default())
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not registered"));
     }
@@ -833,8 +1026,9 @@ mod tests {
         let factory = MemoryConnectorFactory::new(catalog, "default");
         let ds = factory
             .create_data_source(&TableReference::table("t"), &[], &Default::default())
+            .await
             .unwrap();
-        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let stream = ds.scan(&ScanContext::default(), 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_rows(), 2);
     }
@@ -844,7 +1038,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_test_csv(dir.path());
         let ds = CsvDataSource::new(local_store(), to_object_path(&path), csv_schema());
-        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let stream = ds.scan(&ScanContext::default(), 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
@@ -864,7 +1058,7 @@ mod tests {
         let ds = ParquetDataSource::new(local_store(), to_object_path(&path))
             .await
             .unwrap();
-        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let stream = ds.scan(&ScanContext::default(), 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
@@ -916,6 +1110,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parquet_registration_populates_row_count_statistics() {
+        use object_store::memory::InMemory;
+        use object_store::PutPayload;
+
+        let store = Arc::new(InMemory::new());
+        let obj_path = ObjectPath::from("data/stats.parquet");
+        let (parquet_bytes, _) = write_parquet_bytes();
+        let bytes_len = parquet_bytes.len() as u64;
+        store
+            .put(&obj_path, PutPayload::from_bytes(parquet_bytes.into()))
+            .await
+            .unwrap();
+
+        let registry = Arc::new(StorageRegistry::new());
+        registry.register_store("s3://test-bucket", store);
+
+        let factory = Arc::new(FileConnectorFactory::new(registry));
+        factory
+            .register_table(
+                "events",
+                "s3://test-bucket/data/stats.parquet",
+                FileFormat::Parquet,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let schema = Arc::new(FileSchema::new(factory));
+        let table = schema.table("events").await.expect("table registered");
+        let stats = table.statistics().expect("Parquet must expose statistics");
+        assert_eq!(stats.row_count, Some(3), "row_count should be 3");
+        assert_eq!(
+            stats.size_bytes,
+            Some(bytes_len),
+            "size_bytes from object_store::head()"
+        );
+    }
+
+    #[tokio::test]
+    async fn csv_registration_returns_no_statistics() {
+        use arneb_common::types::DataType;
+        use object_store::memory::InMemory;
+        use object_store::PutPayload;
+
+        let store = Arc::new(InMemory::new());
+        let obj_path = ObjectPath::from("data/x.csv");
+        store
+            .put(
+                &obj_path,
+                PutPayload::from_bytes(b"id,name\n1,a\n2,b\n".to_vec().into()),
+            )
+            .await
+            .unwrap();
+        let registry = Arc::new(StorageRegistry::new());
+        registry.register_store("s3://test-bucket", store);
+        let factory = Arc::new(FileConnectorFactory::new(registry));
+        factory
+            .register_table(
+                "csv_t",
+                "s3://test-bucket/data/x.csv",
+                FileFormat::Csv,
+                Some(vec![
+                    ColumnInfo {
+                        name: "id".into(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    },
+                    ColumnInfo {
+                        name: "name".into(),
+                        data_type: DataType::Utf8,
+                        nullable: false,
+                    },
+                ]),
+            )
+            .await
+            .unwrap();
+
+        let schema = Arc::new(FileSchema::new(factory));
+        let table = schema.table("csv_t").await.expect("table registered");
+        assert!(
+            table.statistics().is_none(),
+            "CSV statistics should be None — line counting is too expensive"
+        );
+    }
+
+    #[tokio::test]
     async fn parquet_via_inmemory_store() {
         use object_store::memory::InMemory;
         use object_store::PutPayload;
@@ -946,8 +1226,9 @@ mod tests {
         let table_ref = TableReference::table("remote_events");
         let ds = factory
             .create_data_source(&table_ref, &[], &Default::default())
+            .await
             .unwrap();
-        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let stream = ds.scan(&ScanContext::default(), 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
@@ -990,11 +1271,12 @@ mod tests {
         let table_ref = TableReference::table("users");
         let ds = factory
             .create_data_source(&table_ref, &[], &Default::default())
+            .await
             .unwrap();
 
         // Test with projection pushdown
         let ctx = ScanContext::default().with_projection(vec![1]); // only "name" column
-        let stream = ds.scan(&ctx).await.unwrap();
+        let stream = ds.scan(&ctx, 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         assert_eq!(batches[0].num_columns(), 1);
         let name_col = batches[0]
@@ -1035,7 +1317,7 @@ mod tests {
             .await
             .unwrap();
         let ctx = ScanContext::default().with_batch_size(1);
-        let stream = ds.scan(&ctx).await.unwrap();
+        let stream = ds.scan(&ctx, 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
@@ -1085,7 +1367,7 @@ mod tests {
             .unwrap();
 
         // Without filter: should read all 6 rows
-        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let stream = ds.scan(&ScanContext::default(), 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 6);
@@ -1105,7 +1387,7 @@ mod tests {
             span: None,
         };
         let ctx = ScanContext::default().with_filters(vec![filter]);
-        let stream = ds.scan(&ctx).await.unwrap();
+        let stream = ds.scan(&ctx, 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         // Row group [1,2] pruned (max=2 ≤ 4), row group [3,4] pruned (max=4 ≤ 4)
@@ -1163,7 +1445,7 @@ mod tests {
             .await
             .unwrap();
         let ctx = ScanContext::default().with_projection(vec![0, 2]);
-        let stream = ds.scan(&ctx).await.unwrap();
+        let stream = ds.scan(&ctx, 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
 
         assert_eq!(batches[0].num_columns(), 2);
@@ -1223,7 +1505,7 @@ mod tests {
         let ds = ParquetDataSource::new(local_store(), to_object_path(path))
             .await
             .unwrap();
-        let stream = ds.scan(&ScanContext::default()).await.unwrap();
+        let stream = ds.scan(&ScanContext::default(), 0).await.unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3, "expected 3 rows from {}", path.display());

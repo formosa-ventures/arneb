@@ -46,10 +46,16 @@ pub enum Statement {
         /// Source span covering the whole statement.
         span: Span,
     },
-    /// EXPLAIN followed by a statement.
+    /// EXPLAIN [ANALYZE] followed by a statement. With `analyze=true`,
+    /// the inner statement runs and per-stage actual row counts are
+    /// merged into the output; without it, only static plan/estimates
+    /// are rendered.
     Explain {
         /// The statement to explain.
         stmt: Box<Statement>,
+        /// `EXPLAIN ANALYZE` — execute the statement and annotate the
+        /// rendered plan with actual runtime stats.
+        analyze: bool,
         /// Source span covering the whole EXPLAIN statement.
         span: Span,
     },
@@ -606,7 +612,13 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Statement::Query { .. } => write!(f, "SELECT ..."),
-            Statement::Explain { stmt, .. } => write!(f, "EXPLAIN {stmt}"),
+            Statement::Explain { stmt, analyze, .. } => {
+                if *analyze {
+                    write!(f, "EXPLAIN ANALYZE {stmt}")
+                } else {
+                    write!(f, "EXPLAIN {stmt}")
+                }
+            }
             Statement::CreateTable { name, .. } => write!(f, "CREATE TABLE {name}"),
             Statement::DropTable { name, .. } => write!(f, "DROP TABLE {name}"),
             Statement::CreateTableAsSelect { name, .. } => {

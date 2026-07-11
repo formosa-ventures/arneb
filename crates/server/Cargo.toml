@@ -8,6 +8,14 @@ license.workspace = true
 name = "arneb"
 path = "src/main.rs"
 
+[features]
+# Diagnostic-only: build jemalloc with `--enable-prof` so a worker can emit
+# heap profiles (attribute the diffuse/untracked RSS the per-operator
+# MemoryPool can't see — see exec-memory-accounting §1.2). Zero effect unless
+# prof is activated at runtime via `_RJEM_MALLOC_CONF=prof:true,...`; not in
+# the default build. Enable for a profiling image:
+#   cargo build --release --features heap-profiling
+heap-profiling = ["tikv-jemallocator/profiling"]
 
 [dependencies]
 # Internal crates
@@ -19,9 +27,11 @@ arneb-planner = { path = "../planner" }
 arneb-protocol = { path = "../protocol" }
 arneb-scheduler = { path = "../scheduler" }
 arneb-rpc = { path = "../rpc" }
+arneb-sql-parser = { path = "../sql-parser" }
 arneb-hive = { path = "../hive" }
 arrow = { workspace = true }
 async-trait.workspace = true
+async-recursion = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "signal", "time"] }
@@ -34,9 +44,24 @@ clap = { workspace = true }
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+pprof = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
+
+# jemalloc as global allocator: glibc malloc retains freed buffers in
+# arena (dynamic mmap threshold ratchets up to 32MB → freed Arrow
+# buffers under high-water stay as RSS). jemalloc's dirty_decay /
+# muzzy_decay returns pages to OS via madvise, so cgroup memory.peak
+# reflects true working set after each query instead of allocator
+# high-water. Configure with MALLOC_CONF env var at runtime.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["stats"] }
+# Phase 3b.6b (2026-05-21): read jemalloc's `stats.resident` to back-pressure
+# task admission when the worker's actual RSS approaches the cgroup limit.
+# Catches the untracked Arrow allocations (FilterExec / Project / Repartition
+# channels / FlightDecoder) that the per-operator MemoryPool misses.
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
 # Config
 serde = { workspace = true }

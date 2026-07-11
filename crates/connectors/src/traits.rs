@@ -7,6 +7,7 @@ use std::sync::Arc;
 use arneb_common::error::ConnectorError;
 use arneb_common::types::{ColumnInfo, TableReference};
 use arneb_execution::DataSource;
+use async_trait::async_trait;
 
 /// A provider for DDL/DML operations (create, drop, insert, delete).
 ///
@@ -38,6 +39,7 @@ pub trait DDLProvider: Send + Sync + Debug {
 }
 
 /// Factory that creates [`DataSource`] instances for a connector type.
+#[async_trait]
 pub trait ConnectorFactory: Send + Sync + Debug {
     /// Returns the connector type name (e.g., "memory", "file").
     fn name(&self) -> &str;
@@ -47,7 +49,11 @@ pub trait ConnectorFactory: Send + Sync + Debug {
     /// `properties` contains connector-specific metadata from the catalog
     /// (e.g., storage location for Hive tables). Connectors that don't
     /// need extra properties can ignore this parameter.
-    fn create_data_source(
+    ///
+    /// `async` since multi-partition sources (Hive) must list their
+    /// underlying files before reporting their partition count to the
+    /// physical planner.
+    async fn create_data_source(
         &self,
         table: &TableReference,
         schema: &[ColumnInfo],
@@ -90,12 +96,13 @@ mod tests {
     #[derive(Debug)]
     struct DummyFactory;
 
+    #[async_trait]
     impl ConnectorFactory for DummyFactory {
         fn name(&self) -> &str {
             "dummy"
         }
 
-        fn create_data_source(
+        async fn create_data_source(
             &self,
             _table: &TableReference,
             _schema: &[ColumnInfo],

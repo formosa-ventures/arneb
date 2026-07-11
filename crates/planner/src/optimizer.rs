@@ -125,14 +125,17 @@ impl SimplifyFilters {
                 right,
                 join_type,
                 condition,
+                dynamic_filter_ids,
             } => Ok(LogicalPlan::Join {
                 left: Box::new(self.rewrite(*left)?),
                 right: Box::new(self.rewrite(*right)?),
                 join_type,
                 condition,
+                dynamic_filter_ids,
             }),
-            LogicalPlan::Explain { input } => Ok(LogicalPlan::Explain {
+            LogicalPlan::Explain { input, analyze } => Ok(LogicalPlan::Explain {
                 input: Box::new(self.rewrite(*input)?),
+                analyze,
             }),
             other => Ok(other),
         }
@@ -212,14 +215,17 @@ impl ConstantFolding {
                 right,
                 join_type,
                 condition,
+                dynamic_filter_ids,
             } => Ok(LogicalPlan::Join {
                 left: Box::new(self.rewrite(*left)?),
                 right: Box::new(self.rewrite(*right)?),
                 join_type,
                 condition,
+                dynamic_filter_ids,
             }),
-            LogicalPlan::Explain { input } => Ok(LogicalPlan::Explain {
+            LogicalPlan::Explain { input, analyze } => Ok(LogicalPlan::Explain {
                 input: Box::new(self.rewrite(*input)?),
+                analyze,
             }),
             other => Ok(other),
         }
@@ -582,6 +588,7 @@ mod tests {
             }],
             alias: None,
             properties: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
         }
     }
 
@@ -821,6 +828,7 @@ mod tests {
                 }],
                 alias: None,
                 properties: Default::default(),
+                dynamic_filters_consumed: Vec::new(),
             }),
             predicate: PlanExpr::BinaryOp {
                 left: Box::new(PlanExpr::Column {

@@ -150,14 +150,24 @@ faster and using less peak memory on every query, at SF10 and SF30. Both
 engines read the same Parquet data from MinIO via Hive Metastore for fair
 comparison.
 
-```bash
-# Start infrastructure and seed data
-docker compose up -d
-docker compose run --rm tpch-seed
+The full guide — prerequisites, the container-isolated dual-axis (latency
+**and** peak-memory) run, and the comparison report — is in
+[`benchmarks/tpch/README.md`](benchmarks/tpch/README.md). In short:
 
-# Run benchmark
-cd benchmarks/tpch && cargo run --release -- \
-  --engine arneb --port 5432
+```bash
+git clone https://github.com/formosa-ventures/arneb.git && cd arneb
+
+# Infra + Trino + arneb (6 engine containers); --build compiles arneb.
+docker compose -f docker-compose.yml \
+               -f docker/arneb-bench/docker-compose.bench.yml up -d --build
+
+# Seed TPC-H data into MinIO (tiny | sf1 | sf10).
+TPCH_SF=sf10 docker compose run --rm tpch-seed
+
+# Dual-axis benchmark, then the arneb-vs-Trino table.
+./benchmarks/tpch/scripts/run_memory_bench.sh
+python3 benchmarks/tpch/scripts/bench_report.py \
+  "$(ls -t benchmarks/tpch/results/memory_total_*.csv | head -1)"
 ```
 
 ## Development

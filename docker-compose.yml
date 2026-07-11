@@ -12,6 +12,14 @@
 #   docker compose run tpcds-seed           # seed TPC-DS data (SF1)
 #   docker compose down -v                  # tear down (delete volumes)
 
+# Pin the Compose project name so container names are deterministic regardless
+# of the directory the repo is cloned into. The benchmark scripts and oracles
+# reference Trino containers by their fully-qualified name (e.g. arneb-trino-1);
+# without this they would only resolve when the clone directory happens to be
+# named "arneb". The arneb services set an explicit container_name in the bench
+# overlay for the same reason.
+name: arneb
+
 services:
   minio:
     image: minio/minio:latest

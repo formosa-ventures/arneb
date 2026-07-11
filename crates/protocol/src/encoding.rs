@@ -173,7 +173,6 @@ pub fn encode_record_batches(
 
     for batch in batches {
         let num_rows = batch.num_rows();
-        let num_cols = batch.num_columns();
         total_count += num_rows;
         let columns: Vec<ArrayRef> = batch
             .columns()
@@ -189,8 +188,7 @@ pub fn encode_record_batches(
 
         let mut encoder = DataRowEncoder::new(schema.clone());
         for row_idx in 0..num_rows {
-            for col_idx in 0..num_cols {
-                let array = &columns[col_idx];
+            for array in &columns {
                 let value = encode_value(array.as_ref(), row_idx);
                 encoder.encode_field(&value)?;
             }

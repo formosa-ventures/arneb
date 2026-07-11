@@ -108,133 +108,6 @@ use clap::Parser;
 
 use crate::config::{parse_data_type, AppConfig, ServerRole};
 
-fn pprof_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let enabled = std::env::var("ARNEB_PPROF")
-            .map(|v| {
-                let v = v.trim();
-                !v.is_empty() && v != "0"
-            })
-            .unwrap_or(false);
-        tracing::info!(
-            target: "arneb::config",
-            pprof = enabled,
-            "ARNEB_PPROF effective value (default off; non-empty/non-zero to enable CPU flamegraph capture)"
-        );
-        enabled
-    })
-}
-
-fn role_name(role: ServerRole) -> &'static str {
-    match role {
-        ServerRole::Coordinator => "coordinator",
-        ServerRole::Worker => "worker",
-        ServerRole::Standalone => "standalone",
-    }
-}
-
-#[cfg(unix)]
-fn start_pprof_guard(role: &'static str) -> Option<pprof::ProfilerGuard<'static>> {
-    if !pprof_enabled() {
-        return None;
-    }
-
-    match pprof::ProfilerGuardBuilder::default()
-        .frequency(199)
-        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-        .build()
-    {
-        Ok(guard) => {
-            tracing::info!(
-                role,
-                frequency_hz = 199,
-                "pprof CPU profiler started; send SIGUSR1 to write a flamegraph"
-            );
-            Some(guard)
-        }
-        Err(e) => {
-            tracing::warn!(
-                role,
-                error = %e,
-                "failed to start pprof CPU profiler"
-            );
-            None
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn start_pprof_guard(_role: &'static str) -> Option<()> {
-    if pprof_enabled() {
-        tracing::warn!("ARNEB_PPROF is enabled, but SIGUSR1 flamegraph dumping requires Unix");
-    }
-    None
-}
-
-#[cfg(unix)]
-async fn pprof_signal_loop(role: &'static str, guard: Option<&pprof::ProfilerGuard<'_>>) {
-    let Some(guard) = guard else {
-        futures::future::pending::<()>().await;
-        return;
-    };
-
-    let mut signal =
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
-            Ok(signal) => signal,
-            Err(e) => {
-                tracing::warn!(
-                    role,
-                    error = %e,
-                    "failed to install SIGUSR1 handler for pprof flamegraph dumping"
-                );
-                futures::future::pending::<()>().await;
-                return;
-            }
-        };
-
-    loop {
-        if signal.recv().await.is_none() {
-            tracing::warn!(
-                role,
-                "SIGUSR1 stream ended; pprof flamegraph dumping disabled"
-            );
-            futures::future::pending::<()>().await;
-            return;
-        }
-
-        if let Err(e) = dump_pprof_flamegraph(role, guard) {
-            tracing::warn!(
-                role,
-                error = %e,
-                "failed to write pprof flamegraph"
-            );
-        }
-    }
-}
-
-#[cfg(not(unix))]
-async fn pprof_signal_loop(_role: &'static str, _guard: Option<&()>) {
-    futures::future::pending::<()>().await;
-}
-
-#[cfg(unix)]
-fn dump_pprof_flamegraph(role: &'static str, guard: &pprof::ProfilerGuard<'_>) -> Result<()> {
-    let pid = std::process::id();
-    let path = format!("/tmp/arneb-flamegraph-{role}-{pid}.svg");
-    let report = guard.report().build()?;
-    let file = std::fs::File::create(&path)
-        .with_context(|| format!("failed to create pprof flamegraph at {path}"))?;
-    report.flamegraph(file)?;
-    tracing::info!(
-        role,
-        pid,
-        path = %path,
-        "wrote pprof CPU flamegraph"
-    );
-    Ok(())
-}
-
 fn dfrpc_domain_variant(domain: &arneb_common::Domain) -> String {
     match domain {
         arneb_common::Domain::DistinctValues(values) => {
@@ -312,7 +185,6 @@ async fn run() -> Result<()> {
         .context("configuration validation failed")?;
 
     let role = ServerRole::parse(&config.cluster.role).context("invalid server role")?;
-    let role_name = role_name(role);
 
     // 4. Initialize tracing. `--profile` appends an `arneb::profile=info`
     // directive after the base filter (defaults to `RUST_LOG`, else
@@ -330,8 +202,6 @@ async fn run() -> Result<()> {
         env_filter
     };
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
-    let pprof_guard = start_pprof_guard(role_name);
-
     // 5. Create catalog manager + connector registry
     // Default catalog priority: first hive catalog > file (if tables configured) > memory
     let default_catalog = if let Some(first_catalog) = config.catalogs.first() {
@@ -800,8 +670,6 @@ async fn run() -> Result<()> {
         }
         // Worker heartbeat loop
         _ = worker_heartbeat_loop(role, &config, &rpc_addr) => {}
-        // Optional pprof CPU flamegraph dump on SIGUSR1.
-        _ = pprof_signal_loop(role_name, pprof_guard.as_ref()), if pprof_guard.is_some() => {}
         // Graceful shutdown
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");

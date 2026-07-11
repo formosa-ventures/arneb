@@ -216,12 +216,7 @@ impl<'a> QueryPlanner<'a> {
                     analyze: *analyze,
                 })
             }
-            ast::Statement::CreateTable {
-                name,
-                columns,
-                if_not_exists: _,
-                ..
-            } => {
+            ast::Statement::CreateTable { name, columns, .. } => {
                 let schema: Vec<ColumnInfo> = columns
                     .iter()
                     .map(|c| ColumnInfo {
@@ -277,12 +272,7 @@ impl<'a> QueryPlanner<'a> {
                     predicate: pred_str,
                 })
             }
-            ast::Statement::CreateView {
-                name,
-                query,
-                or_replace: _,
-                ..
-            } => {
+            ast::Statement::CreateView { name, query, .. } => {
                 let plan = self.plan_query(query).await?;
                 Ok(LogicalPlan::CreateView {
                     name: name.clone(),

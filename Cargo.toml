@@ -35,9 +35,6 @@ num_cpus = "1"
 # Used inside crates/execution; see openspec/changes/exec-ahash-hashtables/.
 ahash = "0.8"
 
-# CPU sampling profiler for per-core flamegraphs (gated ARNEB_PPROF, SIGUSR1 dump).
-pprof = { version = "0.13", features = ["flamegraph"] }
-
 # SQL parsing
 sqlparser = { version = "0.61", default-features = false, features = ["std"] }
 

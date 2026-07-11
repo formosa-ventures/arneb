@@ -10,6 +10,14 @@ ignore = [
     # paste v1.0.15 is unmaintained but no replacement available;
     # transitive dep via parquet -> arrow ecosystem
     "RUSTSEC-2024-0436",
+    # quick-xml 0.39.x DoS advisories, reachable only through object_store's
+    # S3/XML response parsing. No compatible fix is available yet: the patch is
+    # in quick-xml >= 0.40, but object_store 0.13 pins quick-xml ^0.39, and
+    # object_store 0.14 (which uses quick-xml 0.40) is incompatible with parquet
+    # 59 (no parquet release supports object_store 0.14 yet). Revisit once
+    # parquet gains object_store 0.14 support.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]

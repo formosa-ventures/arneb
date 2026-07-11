@@ -157,7 +157,6 @@ pub(crate) fn evaluate(
         PlanExpr::Function {
             name,
             args,
-            distinct: _,
             ..
         } => {
             // Try the caller-supplied registry first, then fall back

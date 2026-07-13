@@ -15,7 +15,7 @@ Trino (formerly PrestoSQL) lets users query data where it lives — across objec
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
 - **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC
 - **Web UI**: Dashboard with query monitoring, cluster overview, and worker status
-- **TPC-H Benchmark**: 16/22 queries passing with benchmark runner and comparison tooling
+- **TPC-H Benchmark**: 22/22 queries cell-identical to Trino, faster and lighter on peak memory across the board, with benchmark runner and comparison tooling
 
 ## Quick Start
 
@@ -145,17 +145,29 @@ docker compose down
 
 ## TPC-H Benchmark
 
-16 out of 22 TPC-H queries pass. Both arneb and Trino read the same
-Parquet data from MinIO via Hive Metastore for fair comparison.
+All 22 TPC-H queries return cell-identical results to Trino while running
+faster and using less peak memory on every query, at SF10 and SF30. Both
+engines read the same Parquet data from MinIO via Hive Metastore for fair
+comparison.
+
+The full guide — prerequisites, the container-isolated dual-axis (latency
+**and** peak-memory) run, and the comparison report — is in
+[`benchmarks/tpch/README.md`](benchmarks/tpch/README.md). In short:
 
 ```bash
-# Start infrastructure and seed data
-docker compose up -d
-docker compose run --rm tpch-seed
+git clone https://github.com/formosa-ventures/arneb.git && cd arneb
 
-# Run benchmark
-cd benchmarks/tpch && cargo run --release -- \
-  --engine arneb --port 5432
+# Infra + Trino + arneb (6 engine containers); --build compiles arneb.
+docker compose -f docker-compose.yml \
+               -f docker/arneb-bench/docker-compose.bench.yml up -d --build
+
+# Seed TPC-H data into MinIO (tiny | sf1 | sf10).
+TPCH_SF=sf10 docker compose run --rm tpch-seed
+
+# Dual-axis benchmark, then the arneb-vs-Trino table.
+./benchmarks/tpch/scripts/run_memory_bench.sh
+python3 benchmarks/tpch/scripts/bench_report.py \
+  "$(ls -t benchmarks/tpch/results/memory_total_*.csv | head -1)"
 ```
 
 ## Development

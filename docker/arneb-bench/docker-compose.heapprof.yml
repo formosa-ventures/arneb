@@ -1,0 +1,32 @@
+# Diagnostic overlay: enable jemalloc heap profiling on the arneb nodes so a
+# q18 SF30 run attributes the diffuse/untracked RSS the per-operator
+# MemoryPool can't see (exec-memory-accounting §1.2). Requires an image built
+# with the `heap-profiling` cargo feature (jemalloc --enable-prof):
+#   docker compose ... build --build-arg CARGO_FEATURES=heap-profiling arneb
+#
+# tikv-jemalloc reads `_RJEM_MALLOC_CONF` (NOT `MALLOC_CONF`). Settings:
+#   prof:true,prof_active:true  — collect from start
+#   lg_prof_sample:19           — sample ~every 512 KiB allocated (low overhead)
+#   lg_prof_interval:31         — auto-dump a profile each +2 GiB allocated, so
+#                                 the last dump before an OOM-kill (SIGKILL, no
+#                                 atexit) captures near-peak live set
+#   prof_prefix:/jeprof/<node>  — per-node prefix; host-mounted so dumps survive
+#                                 a worker container OOM-kill (Exited 137)
+#
+# Collect after the run: jeprof --text <arneb-binary> /extdrive/jeprof/<node>.*.heap
+services:
+  arneb:
+    environment:
+      _RJEM_MALLOC_CONF: "prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:31,prof_prefix:/jeprof/coord"
+    volumes:
+      - /extdrive/jeprof:/jeprof
+  arneb-worker-1:
+    environment:
+      _RJEM_MALLOC_CONF: "prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:31,prof_prefix:/jeprof/w1"
+    volumes:
+      - /extdrive/jeprof:/jeprof
+  arneb-worker-2:
+    environment:
+      _RJEM_MALLOC_CONF: "prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:31,prof_prefix:/jeprof/w2"
+    volumes:
+      - /extdrive/jeprof:/jeprof

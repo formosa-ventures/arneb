@@ -1,0 +1,33 @@
+# arneb worker-2 config (mirror of worker-1, differs only in worker_id).
+
+bind_address = "0.0.0.0"
+
+[cluster]
+role = "worker"
+rpc_port = 9090
+coordinator_address = "arneb-coord:9090"
+worker_id = "worker-2"
+advertised_address = "arneb-worker-2:9090"
+
+[storage.s3]
+region = "us-east-1"
+endpoint = "http://minio:9000"
+allow_http = true
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+
+[[catalogs]]
+name = "datalake"
+type = "hive"
+metastore_uri = "hive-metastore:9083"
+default_schema = "tpch"
+
+# Phase 2c (2026-05-21): see worker-1.toml comment for rationale.
+[memory]
+spill_budget_bytes = 6442450944
+query_max_memory_per_node = 6442450944
+# DEPRECATED (Phase A, 2026-05-23): see worker-1.toml. Field has
+# no runtime effect; left only so this config still loads.
+task_concurrency = 2
+# Phase 3b.6b / M.4: see worker-1.toml for 3 GB threshold rationale.
+task_admission_threshold_bytes = 8589934592

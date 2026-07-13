@@ -24,6 +24,180 @@ pub struct AppConfig {
     /// External catalog configurations (e.g., Hive Metastore).
     #[serde(default)]
     pub catalogs: Vec<CatalogConfig>,
+
+    /// Memory budget configuration for spillable operators.
+    #[serde(default)]
+    pub memory: MemoryConfig,
+}
+
+/// Memory budget for spillable operators (currently SemiJoinExec build
+/// side; HashJoinExec coming in Phase 3).
+///
+/// Default behavior is *unbounded* (matches single-node and standalone
+/// runs). In container deployments, set `spill_budget_bytes` to a
+/// fraction of the container's cgroup limit so the build phase will
+/// spill batches to disk instead of being OOM-killed by the kernel.
+///
+/// When `spill_budget_bytes` is `None` and cgroup auto-detection is
+/// enabled (default) the server tries to read the cgroup limit and
+/// applies `cgroup_ratio` to derive a budget. Set `cgroup_ratio = 0.0`
+/// to disable auto-detect entirely.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryConfig {
+    /// Hard byte budget for spillable operators. When set, overrides
+    /// cgroup auto-detection. `None` means "use cgroup auto-detect, or
+    /// unbounded if unavailable".
+    #[serde(default)]
+    pub spill_budget_bytes: Option<u64>,
+
+    /// Fraction of the cgroup memory limit reserved for spillable
+    /// operators when `spill_budget_bytes` is unset. Defaults to 0.5;
+    /// the other 50% goes to Arrow scratch, hash tables outside the
+    /// pool, RPC buffers, etc.
+    #[serde(default = "default_cgroup_ratio")]
+    pub cgroup_ratio: f64,
+
+    /// Trino-style per-task query memory cap. When set, each worker
+    /// task wraps the global spill pool with a [`QueryMemoryPool`]
+    /// that fails the query (structured `ResourceExhausted`) when the
+    /// task's cumulative allocation crosses this cap — covers the
+    /// swiss-cheese gap where untracked operators (Filter / Project /
+    /// scan buffers / Repartition queue / etc.) accumulate uncounted
+    /// allocations and OOM the worker before any single tracked
+    /// operator (SemiJoinExec / HashJoinExec) hits its own
+    /// `spill_budget_bytes`. Recommended ≥ `spill_budget_bytes`
+    /// (the SemiJoin/HashJoin build alone can take that much; the
+    /// query needs some headroom on top). `None` disables (no
+    /// query-level cap; only the operator-level spill budget fires).
+    #[serde(default)]
+    pub query_max_memory_per_node: Option<u64>,
+
+    /// DEPRECATED (Phase A, 2026-05-23): the per-worker admission
+    /// semaphore that this field configured was removed because it
+    /// held a permit across the entire task body, deadlocking
+    /// downstream stream back-pressure. The field is still
+    /// deserialised so existing config files don't fail to load, but
+    /// it has no runtime effect. `main.rs` emits a `tracing::warn!`
+    /// when this is set to a non-default value.
+    ///
+    /// History (kept for context): formerly Trino's `task.max-worker-
+    /// threads` equivalent (default `2 × cpu_cores`). For arneb on a
+    /// 6 GiB Docker quota with 5-way joins like TPC-H Q09, 10+
+    /// concurrent fragments each holding scan + outputbuffer +
+    /// in-flight join state used to overflow the cgroup before any
+    /// single task's spill path fired. Phase 3b.6a (2026-05-21) made
+    /// it tunable; Phase A (2026-05-23) removed the semaphore entirely
+    /// because it conflicted with per-batch streaming back-pressure.
+    #[serde(default = "default_task_concurrency")]
+    pub task_concurrency: usize,
+
+    /// Worker RSS threshold (bytes) above which `task_manager`
+    /// refuses new task admission until jemalloc's `stats.resident`
+    /// drops back below. `None` disables (count-based admission only).
+    ///
+    /// Phase 3b.6b (2026-05-21): catches the untracked Arrow
+    /// allocations (FilterExec / Project / Repartition channels /
+    /// FlightDecoder) that the per-operator `MemoryPool` doesn't
+    /// account for. Set this conservatively below the container's
+    /// memory limit (e.g. 70-80% of `cgroup memory.max`) so the
+    /// kernel OOM-killer never wins the race against arneb's
+    /// admission gate.
+    #[serde(default)]
+    pub task_admission_threshold_bytes: Option<u64>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            spill_budget_bytes: None,
+            cgroup_ratio: default_cgroup_ratio(),
+            query_max_memory_per_node: None,
+            task_concurrency: default_task_concurrency(),
+            task_admission_threshold_bytes: None,
+        }
+    }
+}
+
+fn default_cgroup_ratio() -> f64 {
+    0.5
+}
+
+pub(crate) fn default_task_concurrency() -> usize {
+    // DEPRECATED (Phase A, 2026-05-23): kept only so main.rs can
+    // detect "user explicitly set a non-default value" and warn.
+    // The value itself has no runtime effect now that the admission
+    // semaphore is gone.
+    16
+}
+
+impl MemoryConfig {
+    /// Resolve the effective budget in bytes. Order:
+    ///   1. `ARNEB_SPILL_BUDGET_BYTES` env var if set (runtime override)
+    ///   2. `spill_budget_bytes` config field if set
+    ///   3. cgroup-derived `limit × cgroup_ratio` if `cgroup_ratio > 0`
+    ///   4. None (unbounded)
+    ///
+    /// Returns `(Some(bytes), source)` for logging, where `source` is
+    /// "env", "config", "cgroup_v2", "cgroup_v1", or "unbounded".
+    ///
+    /// The env override exists because the bench config is COPYed into
+    /// the docker image at build time, so changing the config field
+    /// requires an image rebuild. `ARNEB_SPILL_BUDGET_BYTES` lets a
+    /// deployment or A/B experiment retune the budget without rebuilding
+    /// — per the runtime-tunable convention in docs/guide/configuration.md.
+    pub fn resolve_budget(&self) -> (Option<usize>, &'static str) {
+        if let Some(b) = std::env::var("ARNEB_SPILL_BUDGET_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            return (Some(b as usize), "env");
+        }
+        if let Some(b) = self.spill_budget_bytes {
+            return (Some(b as usize), "config");
+        }
+        if self.cgroup_ratio <= 0.0 {
+            return (None, "unbounded");
+        }
+        // cgroup v2 first, then v1.
+        for (path, source) in [
+            ("/sys/fs/cgroup/memory.max", "cgroup_v2"),
+            ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "cgroup_v1"),
+        ] {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                let s = s.trim();
+                // cgroup v2 writes "max" for unbounded.
+                if s == "max" {
+                    continue;
+                }
+                if let Ok(limit) = s.parse::<u64>() {
+                    // Treat absurdly large values (e.g. host-mode
+                    // unconstrained cgroup v1 returns ~2^63) as
+                    // unbounded — applying 50% would still be huge,
+                    // but the threshold here keeps the log honest.
+                    if limit > (1u64 << 60) {
+                        continue;
+                    }
+                    let budget = ((limit as f64) * self.cgroup_ratio) as usize;
+                    return (Some(budget), source);
+                }
+            }
+        }
+        (None, "unbounded")
+    }
+
+    /// Resolve the per-task query memory cap. `ARNEB_QUERY_MAX_MEMORY_BYTES`
+    /// env var overrides the `query_max_memory_per_node` config field —
+    /// same runtime-tunable rationale as `resolve_budget` (config is baked
+    /// into the docker image at build time).
+    pub fn resolve_query_cap(&self) -> Option<u64> {
+        if let Some(b) = std::env::var("ARNEB_QUERY_MAX_MEMORY_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            return Some(b);
+        }
+        self.query_max_memory_per_node
+    }
 }
 
 /// External catalog configuration.
@@ -157,6 +331,14 @@ pub struct ClusterConfig {
     /// Unique worker ID (auto-generated if not set).
     #[serde(default)]
     pub worker_id: Option<String>,
+
+    /// Address this node advertises to peers for incoming RPC (e.g.
+    /// `arneb-worker-1:9090` in docker). Workers send this in their
+    /// heartbeat so the coordinator knows how to route task RPCs back.
+    /// Defaults to `bind_address:rpc_port`, which only works when peers
+    /// share the same loopback (e.g. all on one host or k8s pod).
+    #[serde(default)]
+    pub advertised_address: Option<String>,
 }
 
 fn default_role() -> String {
@@ -174,6 +356,7 @@ impl Default for ClusterConfig {
             coordinator_address: None,
             rpc_port: default_rpc_port(),
             worker_id: None,
+            advertised_address: None,
         }
     }
 }
@@ -239,6 +422,7 @@ impl AppConfig {
                         cluster: ClusterConfig::default(),
                         storage: StorageConfig::default(),
                         catalogs: Vec::new(),
+                        memory: MemoryConfig::default(),
                     }
                 }
             }
@@ -254,8 +438,30 @@ impl AppConfig {
             cluster: config.cluster,
             storage: config.storage,
             catalogs: config.catalogs,
+            memory: config.memory,
         })
     }
+}
+
+/// Resolve the adaptive hash-partition policy (`dist-adaptive-partition`):
+/// `(target_rows_per_partition, max_partitions)`. Runtime-tunable per the
+/// build-time-vs-runtime convention (`docs/guide/configuration.md`):
+/// `ARNEB_HASH_PARTITION_TARGET_ROWS` overrides the rows-per-partition target
+/// and `ARNEB_MAX_HASH_PARTITIONS` overrides the fan-out cap. Both fall back to
+/// the planner defaults. The effective values are logged by the coordinator at
+/// fragmentation time.
+pub fn resolve_hash_partition_policy() -> (u64, usize) {
+    let target_rows = std::env::var("ARNEB_HASH_PARTITION_TARGET_ROWS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(arneb_planner::DEFAULT_HASH_PARTITION_TARGET_ROWS);
+    let max_partitions = std::env::var("ARNEB_MAX_HASH_PARTITIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 2)
+        .unwrap_or(arneb_planner::DEFAULT_MAX_HASH_PARTITIONS);
+    (target_rows, max_partitions)
 }
 
 pub fn parse_data_type(type_name: &str) -> Result<DataType> {

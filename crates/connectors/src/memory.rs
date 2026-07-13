@@ -313,6 +313,7 @@ impl DDLProvider for MemoryDDLProvider {
     }
 }
 
+#[async_trait::async_trait]
 impl ConnectorFactory for MemoryConnectorFactory {
     fn name(&self) -> &str {
         "memory"
@@ -325,7 +326,7 @@ impl ConnectorFactory for MemoryConnectorFactory {
         }))
     }
 
-    fn create_data_source(
+    async fn create_data_source(
         &self,
         table: &TableReference,
         _schema: &[ColumnInfo],
@@ -418,9 +419,10 @@ mod tests {
         let table_ref = TableReference::table("users");
         let ds = factory
             .create_data_source(&table_ref, &[], &Default::default())
+            .await
             .unwrap();
         let stream = ds
-            .scan(&arneb_execution::ScanContext::default())
+            .scan(&arneb_execution::ScanContext::default(), 0)
             .await
             .unwrap();
         let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
@@ -428,15 +430,17 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 3);
     }
 
-    #[test]
-    fn memory_factory_table_not_found() {
+    #[tokio::test]
+    async fn memory_factory_table_not_found() {
         let catalog = Arc::new(MemoryCatalog::new());
         let schema = Arc::new(MemorySchema::new());
         catalog.register_schema("default", schema);
 
         let factory = MemoryConnectorFactory::new(catalog, "default");
         let table_ref = TableReference::table("nonexistent");
-        let result = factory.create_data_source(&table_ref, &[], &Default::default());
+        let result = factory
+            .create_data_source(&table_ref, &[], &Default::default())
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }

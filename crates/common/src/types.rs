@@ -79,6 +79,13 @@ pub enum DataType {
         /// Number of digits after the decimal point.
         scale: i8,
     },
+    /// SQL DECIMAL carried in Arrow Decimal64 storage.
+    Decimal64 {
+        /// Total number of digits.
+        precision: u8,
+        /// Number of digits after the decimal point.
+        scale: i8,
+    },
     /// SQL VARCHAR / TEXT.
     Utf8,
     /// SQL VARCHAR for large strings.
@@ -115,6 +122,9 @@ impl fmt::Display for DataType {
             DataType::Float64 => write!(f, "Float64"),
             DataType::Decimal128 { precision, scale } => {
                 write!(f, "Decimal128({precision}, {scale})")
+            }
+            DataType::Decimal64 { precision, scale } => {
+                write!(f, "Decimal64({precision}, {scale})")
             }
             DataType::Utf8 => write!(f, "Utf8"),
             DataType::LargeUtf8 => write!(f, "LargeUtf8"),
@@ -153,6 +163,9 @@ impl From<DataType> for arrow::datatypes::DataType {
             DataType::Float64 => arrow::datatypes::DataType::Float64,
             DataType::Decimal128 { precision, scale } => {
                 arrow::datatypes::DataType::Decimal128(precision, scale)
+            }
+            DataType::Decimal64 { precision, scale } => {
+                arrow::datatypes::DataType::Decimal64(precision, scale)
             }
             DataType::Utf8 => arrow::datatypes::DataType::Utf8,
             DataType::LargeUtf8 => arrow::datatypes::DataType::LargeUtf8,
@@ -219,6 +232,9 @@ impl TryFrom<arrow::datatypes::DataType> for DataType {
             arrow::datatypes::DataType::Float64 => Ok(DataType::Float64),
             arrow::datatypes::DataType::Decimal128(precision, scale) => {
                 Ok(DataType::Decimal128 { precision, scale })
+            }
+            arrow::datatypes::DataType::Decimal64(precision, scale) => {
+                Ok(DataType::Decimal64 { precision, scale })
             }
             arrow::datatypes::DataType::Utf8 => Ok(DataType::Utf8),
             arrow::datatypes::DataType::LargeUtf8 => Ok(DataType::LargeUtf8),

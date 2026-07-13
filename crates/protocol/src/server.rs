@@ -4,6 +4,7 @@ use tokio::net::TcpListener;
 
 use arneb_catalog::CatalogManager;
 use arneb_connectors::ConnectorRegistry;
+use arneb_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
 
 use crate::handler::{DistributedExecutor, HandlerFactory};
 
@@ -30,6 +31,7 @@ pub struct ProtocolServer {
     catalog_manager: Arc<CatalogManager>,
     connector_registry: Arc<ConnectorRegistry>,
     distributed_executor: Option<Arc<dyn DistributedExecutor>>,
+    memory_pool: Arc<dyn MemoryPool>,
 }
 
 impl ProtocolServer {
@@ -43,12 +45,23 @@ impl ProtocolServer {
             catalog_manager,
             connector_registry,
             distributed_executor: None,
+            memory_pool: Arc::new(UnboundedMemoryPool::new()),
         }
     }
 
     /// Set the distributed executor for coordinator mode.
     pub fn with_distributed_executor(mut self, executor: Arc<dyn DistributedExecutor>) -> Self {
         self.distributed_executor = Some(executor);
+        self
+    }
+
+    /// Install a memory pool that spillable operators reserve from
+    /// (currently the SemiJoinExec build phase). The server creates a
+    /// `GreedyMemoryPool` sized from cgroup memory.max × ratio at
+    /// startup and threads it here; if unset, defaults to
+    /// [`UnboundedMemoryPool`] (no budget enforcement).
+    pub fn with_memory_pool(mut self, pool: Arc<dyn MemoryPool>) -> Self {
+        self.memory_pool = pool;
         self
     }
 
@@ -65,6 +78,7 @@ impl ProtocolServer {
             catalog_manager: Arc::clone(&self.catalog_manager),
             connector_registry: Arc::clone(&self.connector_registry),
             distributed_executor: self.distributed_executor.clone(),
+            memory_pool: Arc::clone(&self.memory_pool),
         });
 
         loop {

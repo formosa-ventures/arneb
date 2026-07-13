@@ -199,8 +199,9 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
             limit,
             offset,
         }),
-        LogicalPlan::Explain { input } => Ok(LogicalPlan::Explain {
+        LogicalPlan::Explain { input, analyze } => Ok(LogicalPlan::Explain {
             input: Box::new(analyze_plan(*input, ctx)?),
+            analyze,
         }),
         LogicalPlan::Distinct { input } => Ok(LogicalPlan::Distinct {
             input: Box::new(analyze_plan(*input, ctx)?),
@@ -210,6 +211,7 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
             right,
             join_type,
             condition,
+            ..
         } => {
             let left = analyze_plan(*left, ctx)?;
             let right = analyze_plan(*right, ctx)?;
@@ -224,6 +226,7 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
                 right: Box::new(right),
                 join_type,
                 condition,
+                dynamic_filter_ids: Vec::new(),
             })
         }
         LogicalPlan::SemiJoin {
@@ -231,6 +234,8 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
             right,
             left_key,
             right_key,
+            residual,
+            ..
         } => {
             let left = analyze_plan(*left, ctx)?;
             let right = analyze_plan(*right, ctx)?;
@@ -240,11 +245,21 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
             // we unify the PAIR's types via a synthetic binary site.
             let left_key = coerce_expr(left_key, &left_schema, ctx)?;
             let right_key = coerce_expr(right_key, &right_schema, ctx)?;
+            let residual = match residual {
+                Some(r) => {
+                    let mut combined = left_schema.clone();
+                    combined.extend(right_schema.iter().cloned());
+                    Some(coerce_expr(r, &combined, ctx)?)
+                }
+                None => None,
+            };
             Ok(LogicalPlan::SemiJoin {
                 left: Box::new(left),
                 right: Box::new(right),
                 left_key,
                 right_key,
+                residual,
+                dynamic_filter_ids: Vec::new(),
             })
         }
         LogicalPlan::AntiJoin {
@@ -252,6 +267,7 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
             right,
             left_key,
             right_key,
+            residual,
         } => {
             let left = analyze_plan(*left, ctx)?;
             let right = analyze_plan(*right, ctx)?;
@@ -259,11 +275,20 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
             let right_schema = right.schema();
             let left_key = coerce_expr(left_key, &left_schema, ctx)?;
             let right_key = coerce_expr(right_key, &right_schema, ctx)?;
+            let residual = match residual {
+                Some(r) => {
+                    let mut combined = left_schema.clone();
+                    combined.extend(right_schema.iter().cloned());
+                    Some(coerce_expr(r, &combined, ctx)?)
+                }
+                None => None,
+            };
             Ok(LogicalPlan::AntiJoin {
                 left: Box::new(left),
                 right: Box::new(right),
                 left_key,
                 right_key,
+                residual,
             })
         }
         LogicalPlan::ScalarSubquery { subplan } => Ok(LogicalPlan::ScalarSubquery {
@@ -319,13 +344,18 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
             input: Box::new(analyze_plan(*input, ctx)?),
             functions,
         }),
+        LogicalPlan::AssignUniqueId { input, id_column } => Ok(LogicalPlan::AssignUniqueId {
+            input: Box::new(analyze_plan(*input, ctx)?),
+            id_column,
+        }),
         // Leaf / opaque nodes: no expressions to walk.
         leaf @ (LogicalPlan::TableScan { .. }
         | LogicalPlan::ExchangeNode { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::DeleteFrom { .. }
-        | LogicalPlan::DropView { .. }) => Ok(leaf),
+        | LogicalPlan::DropView { .. }
+        | LogicalPlan::OneRow) => Ok(leaf),
     }
 }
 
@@ -527,6 +557,29 @@ fn unify_binary_operands(
     if lt == rt {
         return Ok((left, right));
     }
+
+    // Date ± integer-days arithmetic: SQL semantics yields a Date
+    // shifted by N days. We keep the operands at their declared
+    // types (Date32 and Int32 / Int64) so the executor calls Arrow's
+    // typed sub/add kernel which handles Date32 + Int → Date32
+    // directly. The TPC-H reference uses this in queries like Q01
+    // (`l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY`) — our
+    // sql-parser `convert_interval` folds the INTERVAL to an Int32
+    // literal, so the analyzer just needs to permit the mixed-type
+    // arithmetic. Only addition and subtraction are accepted; Date *
+    // Int / Date / Int / Date < Int etc. continue to fall through to
+    // the regular supertype-unification path (which will reject them).
+    let date_and_int = matches!(
+        (lt.clone(), rt.clone()),
+        (DataType::Date32, DataType::Int32)
+            | (DataType::Date32, DataType::Int64)
+            | (DataType::Int32, DataType::Date32)
+            | (DataType::Int64, DataType::Date32)
+    );
+    if date_and_int && matches!(op, ast::BinaryOp::Plus | ast::BinaryOp::Minus) {
+        return Ok((left, right));
+    }
+
     let site = CoercionSite::Binary {
         left_is_literal: is_literal_like(&left),
         right_is_literal: is_literal_like(&right),
@@ -973,6 +1026,7 @@ fn walk_plan_exprs(plan: LogicalPlan, f: &mut dyn FnMut(PlanExpr) -> PlanExpr) -
             right,
             join_type,
             condition,
+            ..
         } => LogicalPlan::Join {
             left: Box::new(walk_plan_exprs(*left, f)),
             right: Box::new(walk_plan_exprs(*right, f)),
@@ -981,9 +1035,11 @@ fn walk_plan_exprs(plan: LogicalPlan, f: &mut dyn FnMut(PlanExpr) -> PlanExpr) -
                 JoinCondition::On(e) => JoinCondition::On(walk_expr(e, f)),
                 JoinCondition::None => JoinCondition::None,
             },
+            dynamic_filter_ids: Vec::new(),
         },
-        LogicalPlan::Explain { input } => LogicalPlan::Explain {
+        LogicalPlan::Explain { input, analyze } => LogicalPlan::Explain {
             input: Box::new(walk_plan_exprs(*input, f)),
+            analyze,
         },
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(walk_plan_exprs(*input, f)),
@@ -1176,6 +1232,7 @@ mod tests {
             schema,
             alias: None,
             properties: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
         }
     }
 
@@ -1574,6 +1631,7 @@ mod tests {
                 right: Box::new(col(1, "id")),
                 span: None,
             }),
+            dynamic_filter_ids: Vec::new(),
         };
         let plan = run(plan).unwrap();
         let LogicalPlan::Join {

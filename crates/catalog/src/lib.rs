@@ -13,8 +13,43 @@ use std::fmt;
 use std::sync::{Arc, RwLock};
 
 use arneb_common::error::CatalogError;
-use arneb_common::types::{ColumnInfo, TableReference};
+use arneb_common::types::{ColumnInfo, ScalarValue, TableReference};
 use async_trait::async_trait;
+
+// ---------------------------------------------------------------------------
+// Statistics carriers
+// ---------------------------------------------------------------------------
+
+/// Per-table statistics used by the cost-based planner and join reorderer.
+///
+/// Every field is nullable. Connectors that cannot provide statistics return
+/// `TableStatistics::default()` (all `None`). The cost model and selectivity
+/// estimator fall back to conservative defaults when fields are missing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableStatistics {
+    /// Approximate total row count.
+    pub row_count: Option<u64>,
+    /// On-disk byte size (compressed for Parquet/ORC).
+    pub size_bytes: Option<u64>,
+    /// Per-column distributional summaries, keyed by column name.
+    pub columns: HashMap<String, ColumnStatistics>,
+}
+
+/// Per-column distributional summary.
+///
+/// All fields are best-effort approximations populated by the connector.
+/// Missing fields make the selectivity estimator use conservative defaults.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ColumnStatistics {
+    /// Approximate number of distinct values (NDV).
+    pub ndv: Option<u64>,
+    /// Fraction of NULL values in `[0.0, 1.0]`.
+    pub null_fraction: Option<f64>,
+    /// Smallest observed value (used by range selectivity).
+    pub min_value: Option<ScalarValue>,
+    /// Largest observed value (used by range selectivity).
+    pub max_value: Option<ScalarValue>,
+}
 
 // ---------------------------------------------------------------------------
 // Traits
@@ -56,6 +91,14 @@ pub trait TableProvider: fmt::Debug + Send + Sync {
     /// the connector factory at data source creation time. Default: empty.
     fn properties(&self) -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    /// Returns optional per-table statistics (row count, column NDV, min/max, etc.).
+    ///
+    /// Connectors that cannot provide statistics return `None`. The cost-based
+    /// planner falls back to conservative defaults in that case.
+    fn statistics(&self) -> Option<TableStatistics> {
+        None
     }
 }
 
@@ -562,5 +605,60 @@ mod tests {
         assert_send_sync::<MemorySchema>();
         assert_send_sync::<MemoryTable>();
         assert_send_sync::<CatalogManager>();
+    }
+
+    // -- Statistics tests --
+
+    #[test]
+    fn table_statistics_default_is_all_none() {
+        let stats = TableStatistics::default();
+        assert_eq!(stats.row_count, None);
+        assert_eq!(stats.size_bytes, None);
+        assert!(stats.columns.is_empty());
+    }
+
+    #[test]
+    fn column_statistics_default_is_all_none() {
+        let stats = ColumnStatistics::default();
+        assert_eq!(stats.ndv, None);
+        assert_eq!(stats.null_fraction, None);
+        assert_eq!(stats.min_value, None);
+        assert_eq!(stats.max_value, None);
+    }
+
+    #[test]
+    fn table_statistics_round_trips_through_clone() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "id".to_string(),
+            ColumnStatistics {
+                ndv: Some(1_000_000),
+                null_fraction: Some(0.0),
+                min_value: Some(ScalarValue::Int64(1)),
+                max_value: Some(ScalarValue::Int64(1_000_000)),
+            },
+        );
+        let stats = TableStatistics {
+            row_count: Some(1_000_000),
+            size_bytes: Some(64 * 1024 * 1024),
+            columns,
+        };
+        let cloned = stats.clone();
+        assert_eq!(stats, cloned);
+    }
+
+    #[test]
+    fn default_table_provider_returns_no_statistics() {
+        // MemoryTable does not override `statistics()`, so it picks up the
+        // default `None` implementation defined on `TableProvider`.
+        let table = MemoryTable::new(test_columns());
+        assert!(table.statistics().is_none());
+    }
+
+    #[test]
+    fn table_statistics_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TableStatistics>();
+        assert_send_sync::<ColumnStatistics>();
     }
 }

@@ -145,20 +145,21 @@ fn compute_window_function(
 
             // If ORDER BY is present, compute running aggregate; otherwise full partition
             let has_order = !func.order_by.is_empty();
-            let mut results = vec![0f64; num_rows];
+            let mut results = vec![None; num_rows];
+            let mut count_results = vec![0i64; num_rows];
             let mut prev_partition = u64::MAX;
             let mut running_sum = 0f64;
             let mut running_count = 0i64;
-            let mut running_min = f64::MAX;
-            let mut running_max = f64::MIN;
+            let mut running_min: Option<f64> = None;
+            let mut running_max: Option<f64> = None;
 
             for (row, &pid) in partition_ids.iter().enumerate().take(num_rows) {
                 if pid != prev_partition {
                     prev_partition = pid;
                     running_sum = 0.0;
                     running_count = 0;
-                    running_min = f64::MAX;
-                    running_max = f64::MIN;
+                    running_min = None;
+                    running_max = None;
                 }
 
                 if let Some(ref arr) = arg_arr {
@@ -166,12 +167,8 @@ fn compute_window_function(
                         let val = get_f64_value(arr, row);
                         running_sum += val;
                         running_count += 1;
-                        if val < running_min {
-                            running_min = val;
-                        }
-                        if val > running_max {
-                            running_max = val;
-                        }
+                        running_min = Some(running_min.map_or(val, |m| m.min(val)));
+                        running_max = Some(running_max.map_or(val, |m| m.max(val)));
                     }
                 } else {
                     running_count += 1;
@@ -179,16 +176,19 @@ fn compute_window_function(
 
                 if has_order {
                     // Running aggregate up to current row
-                    results[row] = match name_upper.as_str() {
-                        "SUM" => running_sum,
-                        "AVG" if running_count > 0 => running_sum / running_count as f64,
-                        "COUNT" => running_count as f64,
-                        "MIN" => running_min,
-                        "MAX" => running_max,
-                        _ => 0.0,
-                    };
+                    if name_upper == "COUNT" {
+                        count_results[row] = running_count;
+                    } else {
+                        results[row] = aggregate_float_value(
+                            name_upper.as_str(),
+                            running_sum,
+                            running_count,
+                            running_min,
+                            running_max,
+                        );
+                    }
                 } else {
-                    results[row] = 0.0; // placeholder, will fill after partition scan
+                    results[row] = None; // placeholder, will fill after partition scan
                 }
             }
 
@@ -199,8 +199,8 @@ fn compute_window_function(
                 let mut prev_pid = u64::MAX;
                 let mut psum = 0f64;
                 let mut pcount = 0i64;
-                let mut pmin = f64::MAX;
-                let mut pmax = f64::MIN;
+                let mut pmin: Option<f64> = None;
+                let mut pmax: Option<f64> = None;
                 let mut partition_start = 0usize;
 
                 #[allow(clippy::needless_range_loop)]
@@ -212,23 +212,29 @@ fn compute_window_function(
                     };
                     if pid != prev_pid {
                         if row > 0 {
-                            let val = match name_upper.as_str() {
-                                "SUM" => psum,
-                                "AVG" if pcount > 0 => psum / pcount as f64,
-                                "COUNT" => pcount as f64,
-                                "MIN" => pmin,
-                                "MAX" => pmax,
-                                _ => 0.0,
-                            };
-                            for item in results.iter_mut().take(row).skip(partition_start) {
-                                *item = val;
+                            if name_upper == "COUNT" {
+                                for item in count_results.iter_mut().take(row).skip(partition_start)
+                                {
+                                    *item = pcount;
+                                }
+                            } else {
+                                let val = aggregate_float_value(
+                                    name_upper.as_str(),
+                                    psum,
+                                    pcount,
+                                    pmin,
+                                    pmax,
+                                );
+                                for item in results.iter_mut().take(row).skip(partition_start) {
+                                    *item = val;
+                                }
                             }
                         }
                         prev_pid = pid;
                         psum = 0.0;
                         pcount = 0;
-                        pmin = f64::MAX;
-                        pmax = f64::MIN;
+                        pmin = None;
+                        pmax = None;
                         partition_start = row;
                     }
                     if row < num_rows {
@@ -237,12 +243,8 @@ fn compute_window_function(
                                 let val = get_f64_value(arr, row);
                                 psum += val;
                                 pcount += 1;
-                                if val < pmin {
-                                    pmin = val;
-                                }
-                                if val > pmax {
-                                    pmax = val;
-                                }
+                                pmin = Some(pmin.map_or(val, |m| m.min(val)));
+                                pmax = Some(pmax.map_or(val, |m| m.max(val)));
                             }
                         } else {
                             pcount += 1;
@@ -252,9 +254,7 @@ fn compute_window_function(
             }
 
             if name_upper == "COUNT" {
-                Ok(Arc::new(Int64Array::from(
-                    results.iter().map(|v| *v as i64).collect::<Vec<_>>(),
-                )))
+                Ok(Arc::new(Int64Array::from(count_results)))
             } else {
                 Ok(Arc::new(Float64Array::from(results)))
             }
@@ -279,6 +279,22 @@ fn compute_partition_ids(keys: &[ArrayRef], num_rows: usize) -> Vec<u64> {
             hasher.finish()
         })
         .collect()
+}
+
+fn aggregate_float_value(
+    name: &str,
+    sum: f64,
+    count: i64,
+    min: Option<f64>,
+    max: Option<f64>,
+) -> Option<f64> {
+    match name {
+        "SUM" if count > 0 => Some(sum),
+        "AVG" if count > 0 => Some(sum / count as f64),
+        "MIN" => min,
+        "MAX" => max,
+        _ => None,
+    }
 }
 
 fn same_order_values(order_vals: &[ArrayRef], row_a: usize, row_b: usize) -> bool {
@@ -328,8 +344,11 @@ impl ExecutionPlan for WindowExec {
         schema
     }
 
-    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
-        let stream = self.child.execute().await?;
+    async fn execute(
+        &self,
+        _partition: usize,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let stream = self.child.execute(0).await?;
         let batches = collect_stream(stream)
             .await
             .map_err(|e| ExecutionError::InvalidOperation(format!("window collect: {e}")))?;

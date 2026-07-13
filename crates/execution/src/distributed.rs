@@ -65,10 +65,10 @@ impl ExecutionPlan for ShuffleWriteExec {
         self.input.schema()
     }
 
-    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
+    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream, ExecutionError> {
         // Collect input and partition — actual writing to OutputBuffer is done
         // by the TaskManager that wraps this operator.
-        let stream = self.input.execute().await?;
+        let stream = self.input.execute(partition).await?;
         let batches = collect_stream(stream)
             .await
             .map_err(|e| ExecutionError::InvalidOperation(format!("shuffle collect: {e}")))?;
@@ -102,10 +102,10 @@ impl ExecutionPlan for BroadcastExec {
         self.input.schema()
     }
 
-    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
+    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream, ExecutionError> {
         // Just pass through — broadcasting (writing to all partitions) is
         // handled by the TaskManager.
-        self.input.execute().await
+        self.input.execute(partition).await
     }
 
     fn display_name(&self) -> &str {
@@ -134,12 +134,13 @@ impl ExecutionPlan for MergeExec {
         self.output_schema.clone()
     }
 
-    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
+    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream, ExecutionError> {
         // Collect all inputs into sorted batch lists.
         let mut all_batches: Vec<RecordBatch> = Vec::new();
 
+        let _ = partition; // MergeExec is single-output (partition always 0).
         for input in &self.inputs {
-            let stream = input.execute().await?;
+            let stream = input.execute(0).await?;
             let batches = collect_stream(stream)
                 .await
                 .map_err(|e| ExecutionError::InvalidOperation(format!("merge collect: {e}")))?;
@@ -218,9 +219,7 @@ fn hash_value(
     use std::hash::Hash;
     match arr.data_type() {
         ArrowDataType::Int32 => {
-            arr.as_primitive::<datatypes::Int32Type>()
-                .value(index)
-                .hash(hasher);
+            i64::from(arr.as_primitive::<datatypes::Int32Type>().value(index)).hash(hasher);
         }
         ArrowDataType::Int64 => {
             arr.as_primitive::<datatypes::Int64Type>()
@@ -304,6 +303,13 @@ mod tests {
             source: Arc::new(ds),
             _table_name: "test".into(),
             scan_context: ScanContext::default(),
+            dynamic_filters: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
+            dynamic_filter_collector: None,
+            dynamic_filtering_enabled: false,
+            dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+            scan_task_index: 0,
+            scan_task_count: 1,
         })
     }
 
@@ -316,7 +322,7 @@ mod tests {
             num_partitions: 3,
         };
 
-        let stream = shuffle.input.execute().await.unwrap();
+        let stream = shuffle.input.execute(0).await.unwrap();
         let batches = collect_stream(stream).await.unwrap();
         let partitions = shuffle.partition_batch(&batches[0]).unwrap();
 
@@ -331,7 +337,7 @@ mod tests {
         let source = make_source(vec![1, 2, 3], vec!["a", "b", "c"]);
         let broadcast = BroadcastExec { input: source };
 
-        let stream = broadcast.execute().await.unwrap();
+        let stream = broadcast.execute(0).await.unwrap();
         let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
@@ -367,7 +373,7 @@ mod tests {
             ],
         };
 
-        let stream = merge.execute().await.unwrap();
+        let stream = merge.execute(0).await.unwrap();
         let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 6);
@@ -395,7 +401,7 @@ mod tests {
             }],
         };
 
-        let stream = merge.execute().await.unwrap();
+        let stream = merge.execute(0).await.unwrap();
         let batches = collect_stream(stream).await.unwrap();
         assert!(batches.is_empty());
     }
@@ -475,13 +481,32 @@ impl ExecutionPlan for ExchangeExec {
         self.schema_info.clone()
     }
 
-    async fn execute(&self) -> Result<SendableRecordBatchStream, ExecutionError> {
-        // ExchangeExec requires the orchestration layer (QueryCoordinator in server crate)
-        // to inject pre-fetched data. This placeholder returns an error if called directly.
-        Err(ExecutionError::InvalidOperation(format!(
-            "ExchangeExec({}:{}) not yet wired to remote data source",
-            self.remote_address, self.task_id
-        )))
+    async fn execute(
+        &self,
+        _partition: usize,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        // Pull batches from the remote worker's OutputBuffer via Arrow
+        // Flight `do_get` with ticket `task_id:partition_id`. The
+        // worker registered its buffer on `flight_state` at the end
+        // of `task_manager::execute_task`; this call now produces the
+        // actual cross-node stream that distributed coord plans need.
+        let client = arneb_rpc::ExchangeClient::new(self.remote_address.clone());
+        let inner = client
+            .fetch_partition(&self.task_id, self.partition_id as usize)
+            .await?;
+        // N2-Q18 (2026-05-29): coalesce the tiny batches that arrive over
+        // Flight (a join→filter→exchange pipeline fragments lineitem-scale
+        // intermediates down to ~850 rows/batch). Without this, downstream
+        // ProjectionExec/Aggregate pay per-batch overhead on tens of
+        // thousands of micro-batches (Q18 SF10: 35257 batches, 7.2 s in
+        // ProjectionExec alone). Coalescing to ~8192 rows cuts the batch
+        // count ~10×. Pure batching transform — preserves order + content.
+        let coalesced = crate::operator::coalesce_stream(inner);
+        Ok(crate::operator::profile_stream(
+            "ExchangeExec",
+            self.partition_id as usize,
+            coalesced,
+        ))
     }
 
     fn display_name(&self) -> &str {

@@ -44,6 +44,25 @@ psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.nation;"
 docker compose down                                         # tear down
 ```
 
+### Build artifact housekeeping
+
+`target/` grows unbounded — cargo never GCs `target/debug/deps` (old hash-versioned `.rlib`s + test binaries), and `target/debug/incremental` is an unbounded cache. One long session pushed it to ~290 GB. Two guards are in place:
+
+- **`.cargo/config.toml` sets `incremental = false`** — removes the `incremental/` half at the source (release builds + docker already disable it; only local debug rebuilds are slightly slower).
+- **`scripts/target-housekeeping.sh`** — reports size with a verdict (🟢 <40 GB · 🟡 ≥40 GB · 🔴 ≥80 GB). Run `--sweep` (`cargo sweep --time 14`, keeps last 14 days) at 🟡, or `--clean` (`cargo clean`) at 🔴. Requires `cargo install cargo-sweep` (one-time).
+
+**For Claude Code:** at the start of a build-heavy session, run `./scripts/target-housekeeping.sh`; if it reports 🟡 or 🔴, run `./scripts/target-housekeeping.sh --sweep` before doing more builds. No cron/launchd — this report-then-sweep is the whole "when to clean" process.
+
+### Performance validation workflow (local-first; remote SF30 = numbers only)
+
+Perf/profiling work is validated in tiers. **Never burn an expensive remote SF30 cycle to discover broken plumbing or a correctness bug that a cheaper local tier would have caught.** Walk the tiers in order; only escalate when the current tier genuinely cannot answer the question.
+
+- **Tier 1 — local `cargo` (correctness + gate logic).** Compile + unit/integration tests. Prove the change is byte-identical / the gate toggles the right path / end-to-end-correct via `cargo test` (drive both code paths directly so the test is env-independent). No host, seconds.
+- **Tier 2 — local SF1/SF10 distributed (measurement plumbing).** Bring up the local distributed stack (coordinator + 2 workers) and confirm any *new* profiling / logging / metric actually **emits AND is captured** — RUST_LOG target string, the grep/parse harness, the field name — and that distributed results stay correct, BEFORE trusting it on the remote. This is mandatory for any new `tracing` event/target (past sessions wasted remote cycles on `WindowExec=0` / `split_ms`-style capture artifacts: wrong target, `--since` window, `grep -c` short-circuit). Skip Tier 2 ONLY when the code path genuinely cannot be triggered at SF1/SF10 (e.g. a spill/OOM path that needs SF30 volume) — and state that reason explicitly.
+- **Tier 3 — remote SF30 (a dedicated benchmark host): final performance numbers ONLY.** latency/memory ratios vs Trino + full-22 cell-diff. Reserved for the representative numbers because (a) the perf bottleneck only manifests at SF30 scale (at SF≤10 arneb already wins) and (b) the remote build+run cycle is expensive. It is not for finding bugs or broken instrumentation — those are Tier 1/2.
+
+**For Claude Code:** before any remote SF30 run for a new lever, confirm Tier 1 (always) and Tier 2 (plumbing, unless justified-skipped) are green. State which tier each claim rests on.
+
 ### Server Configuration
 
 The server loads config from `arneb.toml` (if present), env vars, and CLI args. Precedence: CLI > env > file > defaults.
@@ -101,6 +120,9 @@ See `benchmarks/tpch/tpch-hive.toml` for a Hive-backed benchmark config.
 - `standalone` (default) — single process, all-in-one
 - `coordinator` — accepts SQL, plans queries, dispatches tasks to workers via Flight RPC
 - `worker` — receives tasks from coordinator, executes plan fragments, serves data via Flight RPC
+
+**Diagnostic flags**:
+- `--profile` — emit one `arneb::profile`-target tracing event per operator on stream termination (op name, partition, elapsed ms, rows, retained bytes, batch count). Use to narrow down per-stage costs after `EXPLAIN ANALYZE` flags a suspect operator. Equivalent to setting `RUST_LOG=arneb::profile=info`; the two compose, so other `RUST_LOG` directives keep working.
 
 **Worker config** (no `port` needed — worker has no pgwire):
 ```toml
@@ -241,5 +263,6 @@ openspec/
 - Tests live in `#[cfg(test)] mod tests` within source files for unit tests; `tests/` directory for integration tests.
 - Use `tracing` (not `log`) for instrumentation.
 - Config: `serde` + `toml` for deserialization, `ARNEB_*` env vars for overrides.
+- Config knobs follow the build-time vs runtime split in `docs/guide/configuration.md`: never env-override a build-time parameter (change source/`Cargo.toml`/`.cargo/config.toml` instead); runtime-tunable knobs go through an `ARNEB_*` var that the binary reads, applies, and logs the effective value — never a third-party allocator/runtime env var like `MALLOC_CONF`/`_RJEM_MALLOC_CONF` (silent on typos/prefix mismatch).
 - Metadata queries (pg_catalog, information_schema) are intercepted in the protocol layer before the SQL parser.
 - Quoted identifiers are stripped during AST conversion (use `Ident.value`, not `to_string()`).

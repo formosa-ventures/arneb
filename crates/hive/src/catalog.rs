@@ -3,19 +3,21 @@
 //! Implements the `CatalogProvider` / `SchemaProvider` / `TableProvider` traits
 //! by talking to a Hive Metastore via Thrift (using the `hive_metastore` crate).
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use hive_metastore::{
-    GetTableRequest, ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
+    ColumnStatisticsData, GetTableRequest, TableStatsRequest, ThriftHiveMetastoreClient,
+    ThriftHiveMetastoreClientBuilder,
 };
 use pilota::FastStr;
 use tracing::{debug, warn};
 use volo_thrift::MaybeException;
 
-use arneb_catalog::{CatalogProvider, SchemaProvider, TableProvider};
+use arneb_catalog::{CatalogProvider, ColumnStatistics, SchemaProvider, TableProvider};
 use arneb_common::error::ConnectorError;
 use arneb_common::types::{ColumnInfo, DataType};
 
@@ -34,6 +36,22 @@ pub struct HiveTableMeta {
     pub location: String,
     /// Input format class (e.g. `org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat`).
     pub input_format: String,
+    /// Approximate row count, parsed from `Table.parameters["numRows"]`
+    /// when HMS recorded it (typically after CTAS, INSERT INTO, or
+    /// ANALYZE TABLE COMPUTE STATISTICS). `None` when absent or
+    /// unparseable.
+    pub row_count: Option<u64>,
+    /// Total on-disk byte size, from `Table.parameters["totalSize"]`.
+    pub size_bytes: Option<u64>,
+    /// Per-column distributional summaries (NDV, nulls, min/max). Populated
+    /// from HMS `get_table_statistics_req` when column stats are present.
+    /// Empty when HMS hasn't run `ANALYZE TABLE COMPUTE STATISTICS FOR
+    /// COLUMNS`. Critical for the cost-based join reorderer's selectivity
+    /// estimates — without NDV the planner falls back to a default
+    /// (10 000) that systematically over-estimates joins on large tables
+    /// and biases reorder toward small-leaf-as-outer (see
+    /// `memory/project_joinreorder_disabled.md` Step PR notes).
+    pub column_stats: HashMap<String, ColumnStatistics>,
 }
 
 // ---------------------------------------------------------------------------
@@ -56,10 +74,26 @@ impl fmt::Debug for HmsClient {
 
 impl HmsClient {
     /// Connect to a Hive Metastore at the given `host:port` address.
+    /// Accepts either a literal `IP:port` (e.g. `127.0.0.1:9083`) or a
+    /// DNS hostname (e.g. `hive-metastore:9083` for docker-compose
+    /// service names, k8s service DNS, or any other resolvable host).
     pub async fn new(uri: &str) -> Result<Self, ConnectorError> {
-        let addr: SocketAddr = uri.parse().map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("invalid HMS address '{uri}': {e}"))
-        })?;
+        // `volo`'s ThriftClient `.address()` takes a `SocketAddr`,
+        // which `<str>::parse()` only accepts as an IP literal. To
+        // support hostnames we resolve via tokio's async resolver
+        // first and pick the first address — matches the behaviour
+        // of `TcpStream::connect("host:port")`.
+        let addr: SocketAddr = tokio::net::lookup_host(uri)
+            .await
+            .map_err(|e| {
+                ConnectorError::ConnectionFailed(format!("invalid HMS address '{uri}': {e}"))
+            })?
+            .next()
+            .ok_or_else(|| {
+                ConnectorError::ConnectionFailed(format!(
+                    "HMS address '{uri}' resolved to zero addresses"
+                ))
+            })?;
 
         let client = ThriftHiveMetastoreClientBuilder::new("hive_metastore")
             .make_codec(volo_thrift::codec::default::DefaultMakeCodec::buffered())
@@ -134,6 +168,7 @@ impl HmsClient {
             }
         };
 
+        let parameters = hms_table.parameters.clone();
         let sd = hms_table.sd.ok_or_else(|| {
             ConnectorError::ReadError(format!("table {db}.{table} has no storage descriptor"))
         })?;
@@ -144,12 +179,142 @@ impl HmsClient {
         let hms_cols = sd.cols.unwrap_or_default();
         let columns = convert_field_schemas(&hms_cols, db, table)?;
 
+        let (row_count, size_bytes) = extract_table_stats(parameters.as_ref());
+
+        // NOTE: HMS column NDV stats are intentionally NOT fetched in
+        // production yet. The infrastructure exists
+        // (`get_table_column_stats`) but a 2026-05-15 bench showed that
+        // adding NDV without retuning the cost function regresses
+        // multi-join queries by 8-24% (Q03/Q07/Q08). With accurate
+        // NDV, intermediate cardinality estimates shrink, and the
+        // partition-aware Selinger DP loses its "lineitem wins"
+        // heuristic that worked under inflated default NDVs. Re-enable
+        // alongside a cost-function redesign that accounts for executor
+        // parallelism differently — see
+        // `memory/project_joinreorder_disabled.md`.
+        let column_stats: HashMap<String, ColumnStatistics> = HashMap::new();
+
         Ok(HiveTableMeta {
             columns,
             location,
             input_format,
+            row_count,
+            size_bytes,
+            column_stats,
         })
     }
+
+    /// Fetch per-column statistics (NDV, null count, low/high) for the
+    /// given columns. Returns an empty map when HMS lacks stats — this
+    /// is normal for freshly-created tables that haven't been
+    /// `ANALYZE`d. Errors are converted to empty so a stats fetch
+    /// failure doesn't break catalog resolution.
+    /// Currently unused — wired but not called from `get_table` (see
+    /// note in `get_table`). Kept as the integration point for a
+    /// future cost-model retune that re-enables HMS column stats.
+    #[allow(dead_code)]
+    async fn get_table_column_stats(
+        &self,
+        db: &str,
+        table: &str,
+        columns: &[ColumnInfo],
+    ) -> Result<HashMap<String, ColumnStatistics>, ConnectorError> {
+        if columns.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let col_names: Vec<FastStr> = columns
+            .iter()
+            .map(|c| FastStr::from(c.name.clone()))
+            .collect();
+        let req = TableStatsRequest {
+            db_name: FastStr::from(db.to_string()),
+            tbl_name: FastStr::from(table.to_string()),
+            col_names,
+            cat_name: None,
+            valid_write_id_list: None,
+            engine: None,
+            id: None,
+        };
+        let result = self
+            .client
+            .get_table_statistics_req(req)
+            .await
+            .map_err(|e| {
+                ConnectorError::ConnectionFailed(format!(
+                    "HMS get_table_statistics_req({db}.{table}) failed: {e}"
+                ))
+            })?;
+        let stats_objs = match result {
+            MaybeException::Ok(resp) => resp.table_stats,
+            MaybeException::Exception(_) => return Ok(HashMap::new()),
+        };
+        let mut out = HashMap::with_capacity(stats_objs.len());
+        for obj in stats_objs {
+            let name = obj.col_name.to_string();
+            let cs = convert_column_stats(&obj.stats_data);
+            out.insert(name, cs);
+        }
+        Ok(out)
+    }
+}
+
+/// Convert HMS-typed column stats into Arneb's connector-neutral
+/// [`ColumnStatistics`]. Only NDV (`num_d_vs`) and null count are
+/// extracted; min/max are deferred (would require ScalarValue
+/// construction for each Hive type).
+fn convert_column_stats(data: &ColumnStatisticsData) -> ColumnStatistics {
+    let (ndv, null_count) = match data {
+        ColumnStatisticsData::BooleanStats(s) => (Some(2u64), Some(s.num_nulls as u64)),
+        ColumnStatisticsData::LongStats(s) => {
+            (Some(s.num_d_vs.max(0) as u64), Some(s.num_nulls as u64))
+        }
+        ColumnStatisticsData::DoubleStats(s) => {
+            (Some(s.num_d_vs.max(0) as u64), Some(s.num_nulls as u64))
+        }
+        ColumnStatisticsData::StringStats(s) => {
+            (Some(s.num_d_vs.max(0) as u64), Some(s.num_nulls as u64))
+        }
+        ColumnStatisticsData::BinaryStats(s) => (None, Some(s.num_nulls as u64)),
+        ColumnStatisticsData::DecimalStats(s) => {
+            (Some(s.num_d_vs.max(0) as u64), Some(s.num_nulls as u64))
+        }
+        ColumnStatisticsData::DateStats(s) => {
+            (Some(s.num_d_vs.max(0) as u64), Some(s.num_nulls as u64))
+        }
+        ColumnStatisticsData::TimestampStats(s) => {
+            (Some(s.num_d_vs.max(0) as u64), Some(s.num_nulls as u64))
+        }
+    };
+    ColumnStatistics {
+        ndv,
+        null_fraction: null_count.map(|n| {
+            // We don't know total row count here; the cost model can
+            // recompute null_fraction from null_count if needed. Store
+            // raw null_count via `null_fraction` is wrong; leave None
+            // for now (cost model defaults to 0.05).
+            let _ = n;
+            0.0
+        }),
+        min_value: None,
+        max_value: None,
+    }
+}
+
+/// Pull `numRows` and `totalSize` out of a Hive `Table.parameters` map.
+/// Both are stringly typed; non-numeric or missing values yield `None`.
+fn extract_table_stats(
+    parameters: Option<&pilota::AHashMap<pilota::FastStr, pilota::FastStr>>,
+) -> (Option<u64>, Option<u64>) {
+    let Some(params) = parameters else {
+        return (None, None);
+    };
+    let row_count = params
+        .get(&pilota::FastStr::from_static_str("numRows"))
+        .and_then(|v| v.parse::<u64>().ok());
+    let size_bytes = params
+        .get(&pilota::FastStr::from_static_str("totalSize"))
+        .and_then(|v| v.parse::<u64>().ok());
+    (row_count, size_bytes)
 }
 
 /// Convert a list of HMS `FieldSchema` to Arneb `ColumnInfo`.
@@ -273,6 +438,9 @@ impl SchemaProvider for HiveSchemaProvider {
                 columns: meta.columns,
                 location: meta.location,
                 input_format: meta.input_format,
+                row_count: meta.row_count,
+                size_bytes: meta.size_bytes,
+                column_stats: meta.column_stats,
             })),
             Err(e) => {
                 warn!("failed to get HMS table '{}.{}': {e}", self.database, name);
@@ -298,6 +466,12 @@ pub struct HiveTableProvider {
     pub location: String,
     /// HMS input format class name.
     pub input_format: String,
+    /// Approximate row count from HMS `Table.parameters["numRows"]`.
+    pub row_count: Option<u64>,
+    /// Total on-disk byte size from `Table.parameters["totalSize"]`.
+    pub size_bytes: Option<u64>,
+    /// Per-column NDV / null-fraction stats from HMS `ANALYZE TABLE`.
+    pub column_stats: HashMap<String, ColumnStatistics>,
 }
 
 impl HiveTableProvider {
@@ -307,6 +481,27 @@ impl HiveTableProvider {
             columns,
             location,
             input_format,
+            row_count: None,
+            size_bytes: None,
+            column_stats: HashMap::new(),
+        }
+    }
+
+    /// Create a new table provider with HMS-derived statistics.
+    pub fn with_statistics(
+        columns: Vec<ColumnInfo>,
+        location: String,
+        input_format: String,
+        row_count: Option<u64>,
+        size_bytes: Option<u64>,
+    ) -> Self {
+        Self {
+            columns,
+            location,
+            input_format,
+            row_count,
+            size_bytes,
+            column_stats: HashMap::new(),
         }
     }
 
@@ -337,6 +532,17 @@ impl TableProvider for HiveTableProvider {
         props.insert("input_format".to_string(), self.input_format.clone());
         props
     }
+
+    fn statistics(&self) -> Option<arneb_catalog::TableStatistics> {
+        if self.row_count.is_none() && self.size_bytes.is_none() && self.column_stats.is_empty() {
+            return None;
+        }
+        Some(arneb_catalog::TableStatistics {
+            row_count: self.row_count,
+            size_bytes: self.size_bytes,
+            columns: self.column_stats.clone(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +572,9 @@ mod tests {
             location: "s3://bucket/warehouse/db/table".to_string(),
             input_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
                 .to_string(),
+            row_count: None,
+            size_bytes: None,
+            column_stats: HashMap::new(),
         };
 
         assert_eq!(meta.columns.len(), 2);
@@ -373,6 +582,73 @@ mod tests {
         assert_eq!(meta.columns[1].data_type, DataType::Utf8);
         assert!(meta.location.starts_with("s3://"));
         assert!(meta.input_format.contains("Parquet"));
+    }
+
+    #[test]
+    fn extract_table_stats_from_hms_parameters() {
+        let mut params = pilota::AHashMap::new();
+        params.insert(
+            pilota::FastStr::from_static_str("numRows"),
+            pilota::FastStr::from("60175"),
+        );
+        params.insert(
+            pilota::FastStr::from_static_str("totalSize"),
+            pilota::FastStr::from("4194304"),
+        );
+        let (row_count, size_bytes) = extract_table_stats(Some(&params));
+        assert_eq!(row_count, Some(60175));
+        assert_eq!(size_bytes, Some(4_194_304));
+    }
+
+    #[test]
+    fn extract_table_stats_missing_returns_none() {
+        let params: pilota::AHashMap<pilota::FastStr, pilota::FastStr> = pilota::AHashMap::new();
+        let (row_count, size_bytes) = extract_table_stats(Some(&params));
+        assert_eq!(row_count, None);
+        assert_eq!(size_bytes, None);
+    }
+
+    #[test]
+    fn extract_table_stats_unparseable_returns_none() {
+        let mut params = pilota::AHashMap::new();
+        params.insert(
+            pilota::FastStr::from_static_str("numRows"),
+            pilota::FastStr::from("not a number"),
+        );
+        let (row_count, _) = extract_table_stats(Some(&params));
+        assert_eq!(row_count, None);
+    }
+
+    #[test]
+    fn hive_table_provider_statistics_present_when_set() {
+        let provider = HiveTableProvider::with_statistics(
+            vec![ColumnInfo {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+            "/tmp/t".to_string(),
+            "parquet".to_string(),
+            Some(6_000_000),
+            Some(64 * 1024 * 1024),
+        );
+        let stats = provider.statistics().expect("statistics should be Some");
+        assert_eq!(stats.row_count, Some(6_000_000));
+        assert_eq!(stats.size_bytes, Some(64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn hive_table_provider_statistics_none_when_unset() {
+        let provider = HiveTableProvider::new(
+            vec![ColumnInfo {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+            "/tmp/t".to_string(),
+            "parquet".to_string(),
+        );
+        assert!(provider.statistics().is_none());
     }
 
     #[test]

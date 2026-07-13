@@ -8,12 +8,23 @@ license.workspace = true
 arneb-common = { path = "../common" }
 arneb-planner = { path = "../planner" }
 arneb-sql-parser = { path = "../sql-parser" }
+# rpc gives us the ExchangeClient + Flight do_get protocol so
+# `ExchangeExec::execute` can actually stream from remote workers
+# instead of returning the placeholder error.
+arneb-rpc = { path = "../rpc" }
 serde_json.workspace = true
-arrow.workspace = true
+arrow = { workspace = true, features = ["ipc", "ipc_compression"] }
 async-trait.workspace = true
 futures.workspace = true
+async-stream = "0.3"
 ahash.workspace = true
+hashbrown = "0.15"
+tokio = { workspace = true, features = ["rt", "sync"] }
+tracing = { workspace = true }
+num_cpus.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 arneb-catalog = { path = "../catalog" }
 tokio = { workspace = true, features = ["rt", "macros"] }
+tracing-subscriber = { workspace = true }

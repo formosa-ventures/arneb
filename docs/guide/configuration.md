@@ -32,6 +32,51 @@ cargo run --bin arneb -- --config /path/to/config.toml
 | Web UI | `port + 1000` | standalone, coordinator |
 | Flight RPC | `9090` | all roles |
 
+## Tuning Knobs: Build-Time vs Runtime
+
+Arneb separates configuration into two classes. Knowing which is which keeps
+builds reproducible and avoids silent misconfiguration.
+
+**Runtime-tunable** — anything that can change without recompiling (per-node
+memory budget, parallelism, log level, allocator decay). These are exposed as
+`ARNEB_*` environment variables / `arneb.toml` fields, follow the precedence
+above, and the effective value is logged at startup. Override freely per
+deployment or experiment.
+
+**Build-time** — anything that can only be decided at compile/link time (Cargo
+features, codegen flags). These live in version-controlled build config
+(`Cargo.toml`, `.cargo/config.toml`) and are changed in source, **never** via an
+environment variable. A binary's behaviour must be a pure function of its
+committed inputs.
+
+Two rules follow:
+
+- **Never override a build-time parameter with an environment variable.** To
+  experiment with a build-time setting, use an explicit `cargo --features` /
+  `--profile` invocation, then commit the chosen default.
+- **Never rely on a third-party allocator/runtime's own environment variable**
+  (e.g. jemalloc's `MALLOC_CONF` / `_RJEM_MALLOC_CONF`). Those are silent on
+  typos and prefix mismatches. Every runtime knob goes through an `ARNEB_*`
+  variable that Arneb reads, applies, and logs — so a wrong value is visible,
+  not silently ignored.
+
+### Memory / Allocator Tuning
+
+Arneb uses jemalloc and returns freed pages to the OS promptly so the cgroup
+memory peak reflects the engine's true working set, not allocator history. The
+page-decay interval is **runtime-tunable** and set in-binary at startup (default
+shown), with the effective value logged.
+
+| Knob | Default | Env Var | Description |
+|------|---------|---------|-------------|
+| dirty/muzzy page decay | `500` ms | `ARNEB_DIRTY_DECAY_MS` | How long jemalloc holds freed pages before `madvise`-ing them back to the OS. Lower = tighter RSS but more page re-faults; `0` returns immediately (slowest); higher lets RSS drift up. `500` ms is the measured sweet spot. Applied via `mallctl` — do **not** set `MALLOC_CONF`, it is ignored. |
+| spill budget | config / cgroup | `ARNEB_SPILL_BUDGET_BYTES` | Per-node budget (bytes) a spillable operator (SemiJoin/HashJoin build) reserves against before spilling to disk. Overrides the `[memory] spill_budget_bytes` config field. Exists as an env var because the bench config is COPYed into the docker image at build time — the env override retunes without an image rebuild. |
+| query memory cap | config | `ARNEB_QUERY_MAX_MEMORY_BYTES` | Per-task cumulative allocation cap (bytes). When the query's tracked `MemoryReservation` crosses it, the query fails cleanly with `ResourceExhausted` instead of OOM-killing the worker. Overrides `[memory] query_max_memory_per_node`. |
+
+The startup log line `memory pool installed … spill_budget_bytes=… spill_budget_source=…`
+confirms the resolved value and its source (`env` / `config` / `cgroup_v2` / `cgroup_v1`
+/ `unbounded`); a `source=env` line confirms the override took effect.
+
 ## Table Registration
 
 Register tables directly in the config file:

@@ -1,0 +1,12 @@
+# Cargo configuration for arneb.
+#
+# incremental = false: disable incremental compilation for local dev
+# builds. The `target/debug/incremental` cache grows unbounded (it hit
+# ~107 GB in one long session) because cargo never garbage-collects it.
+# Release builds already disable incremental, and arneb's primary
+# artifact is the docker image (built with incremental off), so the
+# only cost here is slightly slower local debug rebuilds in exchange
+# for ~half the target/ growth. See scripts/target-housekeeping.sh for
+# the periodic `cargo sweep` that GCs the other half (target/debug/deps).
+[build]
+incremental = false

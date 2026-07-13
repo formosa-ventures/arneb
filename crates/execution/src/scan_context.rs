@@ -1,6 +1,18 @@
 //! Scan context for pushdown hints to connectors.
 
+use arneb_common::Domain;
 use arneb_planner::PlanExpr;
+
+/// Resolved dynamic-filter domain bound to one source column.
+#[derive(Debug, Clone)]
+pub struct DynamicFilterDomain {
+    /// Source column index the domain applies to.
+    pub column_index: usize,
+    /// Source column name for diagnostics.
+    pub column_name: String,
+    /// Resolved dynamic-filter domain.
+    pub domain: Domain,
+}
 
 /// Pushdown hints passed to [`DataSource::scan()`](crate::DataSource::scan).
 ///
@@ -12,6 +24,10 @@ pub struct ScanContext {
     /// The connector should apply as many as it can; any remaining filters
     /// will still be evaluated by a `FilterExec` above the scan.
     pub filters: Vec<PlanExpr>,
+
+    /// Resolved cross-fragment dynamic-filter domains that cannot be
+    /// represented compactly as `PlanExpr` filters.
+    pub dynamic_filter_domains: Vec<DynamicFilterDomain>,
 
     /// Column indices to project — only these columns need to be returned.
     /// `None` means all columns.
@@ -40,6 +56,12 @@ impl ScanContext {
     /// Sets the filter predicates.
     pub fn with_filters(mut self, filters: Vec<PlanExpr>) -> Self {
         self.filters = filters;
+        self
+    }
+
+    /// Sets resolved dynamic-filter domains.
+    pub fn with_dynamic_filter_domains(mut self, domains: Vec<DynamicFilterDomain>) -> Self {
+        self.dynamic_filter_domains = domains;
         self
     }
 

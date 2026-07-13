@@ -17,7 +17,18 @@ use arrow::compute::kernels;
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow::record_batch::RecordBatch;
 
-use crate::functions::FunctionRegistry;
+use crate::functions::{default_registry, FunctionRegistry};
+
+/// Process-wide default registry, lazily initialised on first use.
+/// Acts as a fallback when `evaluate` is called with `registry: None`
+/// (most operators historically don't plumb the registry through).
+/// Built from `default_registry()` — identical contents to the
+/// per-query registry created by `ExecutionContext`.
+fn process_default_registry() -> &'static FunctionRegistry {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<FunctionRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(default_registry)
+}
 
 /// Evaluates a plan expression against a record batch, producing a columnar result.
 ///
@@ -106,6 +117,20 @@ pub(crate) fn evaluate(
             negated,
             ..
         } => {
+            // Fast path: when the list is moderately large AND every
+            // item is a Literal (the dynamic-filter shape from
+            // `inject_inlist_dynamic_filters`), build a typed
+            // `FastHashSet<T>` once and check membership O(1) per row.
+            // For small lists (≤ INLIST_HASHSET_THRESHOLD) the OR-of-
+            // kernels path below is faster because Arrow's vectorised
+            // `eq` plus `boolean::or` outperforms scalar set lookups
+            // when there are only a handful of literals.
+            if list.len() >= INLIST_HASHSET_THRESHOLD {
+                if let Some(literals) = try_collect_literals(list) {
+                    return evaluate_inlist_hashset(expr, &literals, *negated, batch, registry);
+                }
+            }
+
             let val = evaluate(expr, batch, registry)?;
             // OR together equality checks for each list item
             let mut result: Option<BooleanArray> = None;
@@ -132,21 +157,27 @@ pub(crate) fn evaluate(
         PlanExpr::Function {
             name,
             args,
-            distinct: _,
             ..
         } => {
-            // Try scalar function registry first
-            if let Some(reg) = registry {
-                if let Some(func) = reg.get(name) {
-                    let evaluated_args: Vec<ArrayRef> = args
-                        .iter()
-                        .map(|a| evaluate(a, batch, registry))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    return func.evaluate(&evaluated_args);
-                }
+            // Try the caller-supplied registry first, then fall back
+            // to the process-wide default registry. Many operators
+            // (ProjectionExec, FilterExec, SortExec, HashAggregateExec
+            // aggregate-input eval, etc.) historically called
+            // `expression::evaluate(_, _, None)` because the registry
+            // wasn't plumbed through them — leaving scalar functions
+            // like UPPER/LOWER/EXTRACT/DATE_TRUNC undiscoverable from
+            // those call sites. The default-registry fallback fixes
+            // every such call without invasive plumbing.
+            let func = registry
+                .and_then(|reg| reg.get(name).cloned())
+                .or_else(|| process_default_registry().get(name).cloned());
+            if let Some(func) = func {
+                let evaluated_args: Vec<ArrayRef> = args
+                    .iter()
+                    .map(|a| evaluate(a, batch, registry))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return func.evaluate(&evaluated_args);
             }
-            // Not a known scalar function — aggregate functions are handled by
-            // HashAggregateExec, not here.
             Err(ExecutionError::InvalidOperation(format!(
                 "unknown scalar function: {name}; aggregate functions are handled by the aggregate operator"
             )))
@@ -189,6 +220,145 @@ pub(crate) fn evaluate(
             "unbound parameter ${index}; extended-query protocol must Bind all parameters before Execute"
         ))),
     }
+}
+
+/// Threshold above which `InList` switches from `OR`-of-Arrow-`eq`-
+/// kernels to a typed `FastHashSet` per-row lookup. Empirically:
+/// small lists (≤ 16) benefit from Arrow's vectorised kernel and
+/// avoid the set-build overhead; bigger lists win on amortised
+/// O(1) lookup vs O(N) linear scan per row.
+const INLIST_HASHSET_THRESHOLD: usize = 16;
+
+/// Returns `Some(values)` if every item in `list` is a
+/// `PlanExpr::Literal`, else `None`. Used to decide whether the
+/// HashSet fast path is applicable.
+fn try_collect_literals(list: &[PlanExpr]) -> Option<Vec<ScalarValue>> {
+    let mut out = Vec::with_capacity(list.len());
+    for item in list {
+        match item {
+            PlanExpr::Literal { value, .. } => out.push(value.clone()),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Evaluate `expr IN (literals...)` (and optional NOT) via a typed
+/// `FastHashSet`. Specialised for Int32/Int64/Date32/Utf8 — the
+/// types `inject_inlist_dynamic_filters` produces, which covers all
+/// TPC-H join-key columns. For other types, falls back to building
+/// the boolean mask as all-false (caller-visible: the predicate is
+/// treated as "no match" rather than panicking; the optimizer
+/// should not produce such mixed-type lists in practice).
+fn evaluate_inlist_hashset(
+    expr: &PlanExpr,
+    literals: &[ScalarValue],
+    negated: bool,
+    batch: &RecordBatch,
+    registry: Option<&FunctionRegistry>,
+) -> Result<ArrayRef, ExecutionError> {
+    use crate::fast_hash::FastHashSet;
+    let arr = evaluate(expr, batch, registry)?;
+    let n = arr.len();
+
+    let mask: BooleanArray = match arr.data_type() {
+        ArrowDataType::Int64 => {
+            let mut set: FastHashSet<i64> = FastHashSet::default();
+            set.reserve(literals.len());
+            for v in literals {
+                if let ScalarValue::Int64(x) = v {
+                    set.insert(*x);
+                }
+            }
+            let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+            inlist_mask_primitive(n, |i| {
+                if a.is_null(i) {
+                    None
+                } else {
+                    Some(set.contains(&a.value(i)))
+                }
+            })
+        }
+        ArrowDataType::Int32 => {
+            let mut set: FastHashSet<i32> = FastHashSet::default();
+            set.reserve(literals.len());
+            for v in literals {
+                if let ScalarValue::Int32(x) = v {
+                    set.insert(*x);
+                }
+            }
+            let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+            inlist_mask_primitive(n, |i| {
+                if a.is_null(i) {
+                    None
+                } else {
+                    Some(set.contains(&a.value(i)))
+                }
+            })
+        }
+        ArrowDataType::Date32 => {
+            let mut set: FastHashSet<i32> = FastHashSet::default();
+            set.reserve(literals.len());
+            for v in literals {
+                if let ScalarValue::Date32(x) = v {
+                    set.insert(*x);
+                }
+            }
+            let a = arr
+                .as_any()
+                .downcast_ref::<arrow::array::Date32Array>()
+                .unwrap();
+            inlist_mask_primitive(n, |i| {
+                if a.is_null(i) {
+                    None
+                } else {
+                    Some(set.contains(&a.value(i)))
+                }
+            })
+        }
+        ArrowDataType::Utf8 => {
+            let mut set: FastHashSet<&str> = FastHashSet::default();
+            set.reserve(literals.len());
+            for v in literals {
+                if let ScalarValue::Utf8(s) = v {
+                    set.insert(s.as_str());
+                }
+            }
+            let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
+            inlist_mask_primitive(n, |i| {
+                if a.is_null(i) {
+                    None
+                } else {
+                    Some(set.contains(a.value(i)))
+                }
+            })
+        }
+        _ => BooleanArray::from(vec![false; n]),
+    };
+
+    if negated {
+        let negated_mask = kernels::boolean::not(&mask)?;
+        Ok(Arc::new(negated_mask))
+    } else {
+        Ok(Arc::new(mask))
+    }
+}
+
+/// Build a `BooleanArray` of length `n` from a per-row predicate that
+/// returns `None` for SQL NULL (propagated as NULL into the mask).
+fn inlist_mask_primitive<F>(n: usize, mut pred: F) -> BooleanArray
+where
+    F: FnMut(usize) -> Option<bool>,
+{
+    use arrow::array::BooleanBuilder;
+    let mut builder = BooleanBuilder::with_capacity(n);
+    for i in 0..n {
+        match pred(i) {
+            Some(b) => builder.append_value(b),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
 }
 
 /// Converts a [`ScalarValue`] to an Arrow array of the given length.
@@ -489,6 +659,46 @@ fn arithmetic_op(
     right: &ArrayRef,
     op: ArithOp,
 ) -> Result<ArrayRef, ExecutionError> {
+    // Date ± integer is a valid mismatched-type combination —
+    // Arrow's `numeric::add/sub` handles `Date32 + Int32 = Date32`
+    // (and Int64) directly at the kernel level, matching SQL
+    // `DATE - INTERVAL 'N' DAY` semantics after `convert_interval`
+    // folds the interval to an integer day count.
+    // Date ± integer-days arithmetic: Arrow's generic numeric kernel
+    // rejects `Date32 ± Int32` as ambiguous, so we route this case
+    // manually. Date32 is `days-since-epoch` stored as i32 — we cast
+    // the Date32 column to Int32, do the integer arithmetic, then
+    // cast back to Date32. Matches SQL `DATE - INTERVAL 'N' DAY`
+    // semantics after `convert_interval` folds the interval to an
+    // integer day count.
+    let date_int_mix = matches!(
+        (left.data_type(), right.data_type()),
+        (ArrowDataType::Date32, ArrowDataType::Int32)
+            | (ArrowDataType::Date32, ArrowDataType::Int64)
+            | (ArrowDataType::Int32, ArrowDataType::Date32)
+            | (ArrowDataType::Int64, ArrowDataType::Date32)
+    ) && matches!(op, ArithOp::Add | ArithOp::Sub);
+    if date_int_mix {
+        let cast_to_int = |arr: &ArrayRef| -> Result<ArrayRef, ExecutionError> {
+            if matches!(
+                arr.data_type(),
+                ArrowDataType::Date32 | ArrowDataType::Int64
+            ) {
+                Ok(arrow::compute::cast(arr, &ArrowDataType::Int32)?)
+            } else {
+                Ok(arr.clone())
+            }
+        };
+        let li = cast_to_int(left)?;
+        let ri = cast_to_int(right)?;
+        let raw = match op {
+            ArithOp::Add => kernels::numeric::add(&li, &ri)?,
+            ArithOp::Sub => kernels::numeric::sub(&li, &ri)?,
+            _ => unreachable!("date_int_mix only matches Add/Sub"),
+        };
+        return Ok(arrow::compute::cast(&raw, &ArrowDataType::Date32)?);
+    }
+
     if left.data_type() != right.data_type() {
         return Err(ExecutionError::InvalidOperation(format!(
             "internal: arithmetic_op received mismatched types {lt:?} vs {rt:?}; analyzer should have inserted Cast",

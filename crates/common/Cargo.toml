@@ -14,6 +14,7 @@ arrow.workspace = true
 num_cpus.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true
 # `Location` type for source-position-bearing errors. No heavy transitive deps.
 sqlparser.workspace = true
@@ -21,4 +22,4 @@ codespan-reporting = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }

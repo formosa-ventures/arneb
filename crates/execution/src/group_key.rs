@@ -31,13 +31,12 @@ impl GroupKey {
     }
 }
 
-// Type tags. Each variant of ScalarValue gets a distinct one-byte tag
+// Type tags. Most ScalarValue variants get a distinct one-byte tag
 // written before the payload so that cross-variant collisions are
-// impossible — `Int32(1)`, `Int64(1)`, `Utf8("1")`, `Float64(1.0)` all
-// hash to different slots.
+// impossible. Signed integer widths intentionally share the Int64 tag
+// and widened payload so `Int32(1)` and `Int64(1)` hash the same.
 const TAG_NULL: u8 = 0;
 const TAG_BOOLEAN: u8 = 1;
-const TAG_INT32: u8 = 2;
 const TAG_INT64: u8 = 3;
 const TAG_FLOAT32: u8 = 4;
 const TAG_FLOAT64: u8 = 5;
@@ -48,6 +47,44 @@ const TAG_DATE32: u8 = 9;
 const TAG_TIMESTAMP: u8 = 10;
 const TAG_UNKNOWN: u8 = 255;
 
+/// Tag bytes exposed for the typed-array hot path in `group_by_hash`
+/// so it can mint hash bytes identical to those produced for the
+/// equivalent `ScalarValue`.
+pub(crate) struct TypedTags {
+    pub null: u8,
+    pub boolean: u8,
+    pub int64: u8,
+    pub float32: u8,
+    pub float64: u8,
+    pub utf8: u8,
+    pub date32: u8,
+    pub decimal128: u8,
+}
+
+pub(crate) const TAG_FOR_TYPED: TypedTags = TypedTags {
+    null: TAG_NULL,
+    boolean: TAG_BOOLEAN,
+    int64: TAG_INT64,
+    float32: TAG_FLOAT32,
+    float64: TAG_FLOAT64,
+    utf8: TAG_UTF8,
+    date32: TAG_DATE32,
+    decimal128: TAG_DECIMAL128,
+};
+
+/// Hash a single `ScalarValue` into the given hasher using the same
+/// tag-prefixed wire format as [`GroupKey::hash`]. Re-exposed for the
+/// typed-array hot path in `group_by_hash` (rehash callback).
+pub(crate) fn hash_scalar_bytes<H: Hasher>(s: &ScalarValue, state: &mut H) {
+    hash_scalar(s, state)
+}
+
+/// Bit-equality on `ScalarValue` matching `GroupKey`'s `PartialEq`.
+/// Re-exposed for the typed-array hot path's `Generic` fallback.
+pub(crate) fn scalars_equal(a: &ScalarValue, b: &ScalarValue) -> bool {
+    scalar_eq(a, b)
+}
+
 fn hash_scalar<H: Hasher>(s: &ScalarValue, state: &mut H) {
     match s {
         ScalarValue::Null => state.write_u8(TAG_NULL),
@@ -56,8 +93,8 @@ fn hash_scalar<H: Hasher>(s: &ScalarValue, state: &mut H) {
             state.write_u8(*b as u8);
         }
         ScalarValue::Int32(v) => {
-            state.write_u8(TAG_INT32);
-            state.write_i32(*v);
+            state.write_u8(TAG_INT64);
+            state.write_i64(i64::from(*v));
         }
         ScalarValue::Int64(v) => {
             state.write_u8(TAG_INT64);
@@ -137,6 +174,8 @@ fn scalar_eq(a: &ScalarValue, b: &ScalarValue) -> bool {
         (Boolean(x), Boolean(y)) => x == y,
         (Int32(x), Int32(y)) => x == y,
         (Int64(x), Int64(y)) => x == y,
+        (Int32(x), Int64(y)) => i64::from(*x) == *y,
+        (Int64(x), Int32(y)) => *x == i64::from(*y),
         // Bit-equality on floats: NaN with same payload collapses;
         // NaN with different payload stays distinct.
         (Float32(x), Float32(y)) => x.to_bits() == y.to_bits(),
@@ -217,15 +256,15 @@ mod tests {
     }
 
     #[test]
-    fn cross_type_distinct() {
+    fn integer_widths_hash_and_compare_by_value() {
         let i32_one = GroupKey(vec![ScalarValue::Int32(1)]);
         let i64_one = GroupKey(vec![ScalarValue::Int64(1)]);
         let str_one = GroupKey(vec![ScalarValue::Utf8("1".to_string())]);
         let f64_one = GroupKey(vec![ScalarValue::Float64(1.0)]);
-        assert_ne!(i32_one, i64_one);
+        assert_eq!(i32_one, i64_one);
         assert_ne!(i32_one, str_one);
         assert_ne!(i64_one, f64_one);
-        assert_ne!(hash_one(&i32_one), hash_one(&i64_one));
+        assert_eq!(hash_one(&i32_one), hash_one(&i64_one));
     }
 
     #[test]

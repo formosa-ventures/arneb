@@ -7,8 +7,45 @@
 use std::fmt;
 
 use arneb_common::types::{ColumnInfo, DataType, ScalarValue, TableReference};
+use arneb_common::DynamicFilterId;
 use arneb_sql_parser::ast;
 use arneb_sql_parser::Span;
+
+/// Plan-time annotation linking a dynamic filter's build-side equi-key
+/// column to its matching probe-side column.
+///
+/// Attached to [`LogicalPlan::Join`] and [`LogicalPlan::SemiJoin`] to
+/// declare that this join PRODUCES a dynamic filter from `build_index`
+/// (a column position in the join's right child) that the probe-side
+/// scan CONSUMES at `probe_index` (a column position in the join's left
+/// child, which is downstream of a [`LogicalPlan::TableScan`] that
+/// lists this id under `dynamic_filters_consumed`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DynamicFilterProducer {
+    /// The id this join produces.
+    pub id: DynamicFilterId,
+    /// Column index in the join's right (build) child's output schema.
+    pub build_index: usize,
+    /// Column index in the join's left (probe) child's output schema.
+    pub probe_index: usize,
+    /// Display name of the column (for `EXPLAIN` / debug).
+    pub column_name: String,
+}
+
+/// Plan-time annotation declaring that a scan consumes a cross-fragment
+/// dynamic filter at runtime.
+///
+/// Attached to [`LogicalPlan::TableScan`] for each [`DynamicFilterId`]
+/// whose build side lives in an upstream fragment.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DynamicFilterConsumer {
+    /// The id this scan should wait on.
+    pub id: DynamicFilterId,
+    /// Column index in this scan's output schema where the filter applies.
+    pub column_index: usize,
+    /// Display name of the column.
+    pub column_name: String,
+}
 
 /// An expression within a logical plan.
 ///
@@ -283,6 +320,12 @@ pub enum LogicalPlan {
         /// Connector-specific properties from the table provider.
         #[serde(default)]
         properties: std::collections::HashMap<String, String>,
+        /// Cross-fragment dynamic filters this scan should await before
+        /// reading rows. Populated by `assign_dynamic_filter_ids` after
+        /// `JoinReorder`; empty when the feature is off or no producing
+        /// join exists for this scan.
+        #[serde(default)]
+        dynamic_filters_consumed: Vec<DynamicFilterConsumer>,
     },
     /// Selects/computes columns.
     Projection {
@@ -310,6 +353,12 @@ pub enum LogicalPlan {
         join_type: ast::JoinType,
         /// Join condition.
         condition: JoinCondition,
+        /// Cross-fragment dynamic filters this join produces from its
+        /// build (right) side, to be consumed by an upstream probe-side
+        /// scan. Empty for non-INNER/RIGHT joins or when the feature is
+        /// off. Populated by `assign_dynamic_filter_ids`.
+        #[serde(default)]
+        dynamic_filter_ids: Vec<DynamicFilterProducer>,
     },
     /// Groups and aggregates rows.
     Aggregate {
@@ -338,10 +387,14 @@ pub enum LogicalPlan {
         /// Number of rows to skip.
         offset: Option<usize>,
     },
-    /// Wraps a plan for EXPLAIN output.
+    /// Wraps a plan for EXPLAIN [ANALYZE] output.
     Explain {
         /// The plan to explain.
         input: Box<LogicalPlan>,
+        /// `EXPLAIN ANALYZE` — when `true`, the inner plan is executed
+        /// at render time and actual root-stream row count is emitted
+        /// alongside the static plan tree.
+        analyze: bool,
     },
     /// Exchange boundary between distributed fragments.
     ExchangeNode {
@@ -382,6 +435,20 @@ pub enum LogicalPlan {
         left_key: PlanExpr,
         /// Right key expression (evaluated against right input).
         right_key: PlanExpr,
+        /// Optional residual predicate evaluated on a joined
+        /// (left, right) row pair when an equi-key match is found.
+        /// Column indices reference the concatenated joined layout —
+        /// left columns first (0..left_width), then right columns
+        /// (left_width..left_width+right_width). The match counts as
+        /// a semi-match if at least one paired inner row passes this
+        /// residual. Used for correlated EXISTS with mixed equi +
+        /// non-equi correlation (e.g. TPC-H Q21's `l2.l_suppkey
+        /// <> l1.l_suppkey`).
+        residual: Option<PlanExpr>,
+        /// Cross-fragment dynamic filters this semi-join produces from
+        /// its build (right) side. Same semantics as `Join::dynamic_filter_ids`.
+        #[serde(default)]
+        dynamic_filter_ids: Vec<DynamicFilterProducer>,
     },
     /// Anti-join: returns left rows where NO match exists in right.
     AntiJoin {
@@ -393,6 +460,8 @@ pub enum LogicalPlan {
         left_key: PlanExpr,
         /// Right key expression (evaluated against right input).
         right_key: PlanExpr,
+        /// Optional residual predicate; see [`LogicalPlan::SemiJoin::residual`].
+        residual: Option<PlanExpr>,
     },
     /// Scalar subquery: executes subplan and returns a single scalar value.
     ScalarSubquery {
@@ -466,6 +535,25 @@ pub enum LogicalPlan {
         /// Window function definitions.
         functions: Vec<WindowFunctionDef>,
     },
+    /// Appends a per-row monotonically increasing Int64 column to the
+    /// input. Used by `CorrelatedExistsToLeftJoin` (F-Perf11) to give
+    /// each outer-side row a stable identity so we can recover its
+    /// per-row EXISTS result after a LEFT JOIN duplicates it.
+    /// Mirrors Trino's `AssignUniqueIdOperator`, but the counter is a
+    /// single coordinator-wide `AtomicI64` rather than Trino's
+    /// `(stageId<<54 | partitionId<<40 | rowId)` encoding.
+    AssignUniqueId {
+        /// Input plan.
+        input: Box<LogicalPlan>,
+        /// Name of the appended Int64 column (typically `__rowid`).
+        id_column: String,
+    },
+    /// Produces a single empty (zero-column) row. Used as the synthetic
+    /// FROM source for `SELECT <expr>, ...` queries without a FROM
+    /// clause (e.g. `SELECT 1`, `SELECT 1 + 1`, health checks). The
+    /// surrounding `Projection` evaluates literal/constant expressions
+    /// against this one-row batch to produce the actual output.
+    OneRow,
 }
 
 /// A window function definition within a Window plan node.
@@ -483,6 +571,23 @@ pub struct WindowFunctionDef {
     pub output_name: String,
 }
 
+fn window_function_output_type(func: &WindowFunctionDef, input_schema: &[ColumnInfo]) -> DataType {
+    match func.name.to_ascii_uppercase().as_str() {
+        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT" => DataType::Int64,
+        "SUM" | "AVG" => DataType::Float64,
+        "MIN" | "MAX" => func
+            .args
+            .first()
+            .and_then(|arg| match arg {
+                PlanExpr::Column { index, .. } => input_schema.get(*index),
+                _ => None,
+            })
+            .map(|c| c.data_type.clone())
+            .unwrap_or(DataType::Float64),
+        _ => DataType::Int64,
+    }
+}
+
 /// A join condition in a logical plan.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum JoinCondition {
@@ -493,6 +598,77 @@ pub enum JoinCondition {
 }
 
 impl LogicalPlan {
+    /// q21/q02 SF30 silent-truncation fix (2026-06-12): true if this operator
+    /// may legitimately stop reading its input *before* EOF, so a mid-stream
+    /// dropped receiver on its producer is a real early-stop (not a silent
+    /// truncation). The coordinator calls this on a consumer fragment's root
+    /// to set [`arneb_rpc::TaskDescriptor::must_drain`] on its producers: a
+    /// non-early-stopper that loses its receiver mid-stream was SILENTLY
+    /// truncated by an upstream stall/reset (q21), so it must fail loud
+    /// instead of returning `Ok` with missing rows.
+    ///
+    /// Only a **finite `Limit`** short-circuits — and ONLY when no blocking
+    /// operator sits between it and the source. This must be *structural*, not
+    /// just "is it a `Limit` node" (2026-06-12 hardening): the planner rewrites
+    /// `Limit(Sort)` (finite k, no offset) into a `TopKExec` that COLLECTS its
+    /// whole input (`operator.rs`), and a `Limit` over any blocking operator
+    /// (Sort, aggregate, join, distinct, window) drains the producer to EOF
+    /// before the limit ever sees a row. An offset-only / unbounded `Limit`
+    /// also reads to EOF. In all those cases the producer must_drain. (A
+    /// physical `ExecutionPlan::may_drop_input_early()` would be the ideal home
+    /// for this, but `must_drain` is computed at the coordinator on the logical
+    /// fragment root; the recursion below faithfully mirrors the physical TopK
+    /// rewrite + blocking-operator draining without building the physical plan.)
+    pub fn may_stop_input_early(&self) -> bool {
+        match self {
+            // Unbounded / offset-only Limit reads to EOF — not an early-stopper.
+            LogicalPlan::Limit { limit: None, .. } => false,
+            // A finite Limit short-circuits its producer UNLESS a blocking
+            // operator below it drains the input first.
+            LogicalPlan::Limit { input, .. } => !input.drains_input_to_eof(),
+            _ => false,
+        }
+    }
+
+    /// True if executing this plan reads its leaf input stream(s) to EOF
+    /// regardless of a downstream `Limit` short-circuit — i.e. a
+    /// pipeline-breaking (blocking) operator lies on the chain from this node
+    /// to the source. Used by [`Self::may_stop_input_early`] to tell a genuine
+    /// `LIMIT` early-stop (`must_drain=false`) from a `Limit` whose input is
+    /// fully consumed anyway (`must_drain=true`). See the q21/q02 SF30
+    /// silent-truncation fix.
+    fn drains_input_to_eof(&self) -> bool {
+        match self {
+            // Blocking: consume the whole input before/while emitting, so a
+            // downstream LIMIT cannot stop the input early. (`Limit(Sort)`
+            // becomes a TopKExec that likewise collects its whole input.)
+            LogicalPlan::Sort { .. }
+            | LogicalPlan::Aggregate { .. }
+            | LogicalPlan::PartialAggregate { .. }
+            | LogicalPlan::FinalAggregate { .. }
+            | LogicalPlan::Join { .. }
+            | LogicalPlan::SemiJoin { .. }
+            | LogicalPlan::AntiJoin { .. }
+            | LogicalPlan::Distinct { .. }
+            | LogicalPlan::Intersect { .. }
+            | LogicalPlan::Except { .. }
+            | LogicalPlan::Window { .. } => true,
+            // Pass-through: forward batches lazily — recurse to the real input
+            // so a non-blocking chain (Projection / Filter / nested Limit /
+            // AssignUniqueId / Explain) stays short-circuitable by an outer
+            // LIMIT.
+            LogicalPlan::Projection { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::AssignUniqueId { input, .. }
+            | LogicalPlan::Explain { input, .. } => input.drains_input_to_eof(),
+            // Leaves, lazy sources (TableScan / ExchangeNode / OneRow), and
+            // lazy multi-input (UnionAll): do not drain on their own — an outer
+            // LIMIT short-circuits the stream.
+            _ => false,
+        }
+    }
+
     /// Returns the output schema of this plan node.
     pub fn schema(&self) -> Vec<ColumnInfo> {
         match self {
@@ -507,7 +683,7 @@ impl LogicalPlan {
             LogicalPlan::Aggregate { schema, .. } => schema.clone(),
             LogicalPlan::Sort { input, .. } => input.schema(),
             LogicalPlan::Limit { input, .. } => input.schema(),
-            LogicalPlan::Explain { input } => input.schema(),
+            LogicalPlan::Explain { input, .. } => input.schema(),
             LogicalPlan::ExchangeNode { schema, .. } => schema.clone(),
             LogicalPlan::PartialAggregate { schema, .. } => schema.clone(),
             LogicalPlan::FinalAggregate { schema, .. } => schema.clone(),
@@ -551,14 +727,25 @@ impl LogicalPlan {
             LogicalPlan::Window { input, functions } => {
                 let mut schema = input.schema();
                 for f in functions {
+                    let data_type = window_function_output_type(f, &schema);
                     schema.push(ColumnInfo {
                         name: f.output_name.clone(),
-                        data_type: DataType::Int64, // default; actual type depends on function
+                        data_type,
                         nullable: true,
                     });
                 }
                 schema
             }
+            LogicalPlan::AssignUniqueId { input, id_column } => {
+                let mut schema = input.schema();
+                schema.push(ColumnInfo {
+                    name: id_column.clone(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                });
+                schema
+            }
+            LogicalPlan::OneRow => vec![],
         }
     }
 }
@@ -704,6 +891,7 @@ fn fmt_plan(plan: &LogicalPlan, f: &mut fmt::Formatter<'_>, indent: usize) -> fm
             right,
             join_type,
             condition,
+            ..
         } => {
             let jt = match join_type {
                 ast::JoinType::Inner => "Inner",
@@ -767,8 +955,12 @@ fn fmt_plan(plan: &LogicalPlan, f: &mut fmt::Formatter<'_>, indent: usize) -> fm
             writeln!(f)?;
             fmt_plan(input, f, indent + 1)
         }
-        LogicalPlan::Explain { input } => {
-            writeln!(f, "{pad}Explain:")?;
+        LogicalPlan::Explain { input, analyze } => {
+            if *analyze {
+                writeln!(f, "{pad}Explain ANALYZE:")?;
+            } else {
+                writeln!(f, "{pad}Explain:")?;
+            }
             fmt_plan(input, f, indent + 1)
         }
         LogicalPlan::ExchangeNode { stage_id, schema } => {
@@ -817,8 +1009,14 @@ fn fmt_plan(plan: &LogicalPlan, f: &mut fmt::Formatter<'_>, indent: usize) -> fm
             right,
             left_key,
             right_key,
+            residual,
+            ..
         } => {
-            writeln!(f, "{pad}SemiJoin: {left_key} = {right_key}")?;
+            write!(f, "{pad}SemiJoin: {left_key} = {right_key}")?;
+            if let Some(r) = residual {
+                write!(f, " AND {r}")?;
+            }
+            writeln!(f)?;
             fmt_plan(left, f, indent + 1)?;
             fmt_plan(right, f, indent + 1)
         }
@@ -827,8 +1025,13 @@ fn fmt_plan(plan: &LogicalPlan, f: &mut fmt::Formatter<'_>, indent: usize) -> fm
             right,
             left_key,
             right_key,
+            residual,
         } => {
-            writeln!(f, "{pad}AntiJoin: {left_key} = {right_key}")?;
+            write!(f, "{pad}AntiJoin: {left_key} = {right_key}")?;
+            if let Some(r) = residual {
+                write!(f, " AND {r}")?;
+            }
+            writeln!(f)?;
             fmt_plan(left, f, indent + 1)?;
             fmt_plan(right, f, indent + 1)
         }
@@ -878,5 +1081,123 @@ fn fmt_plan(plan: &LogicalPlan, f: &mut fmt::Formatter<'_>, indent: usize) -> fm
             writeln!(f, "{pad}Window: [{}]", fns.join(", "))?;
             fmt_plan(input, f, indent + 1)
         }
+        LogicalPlan::AssignUniqueId { input, id_column } => {
+            writeln!(f, "{pad}AssignUniqueId: {id_column}")?;
+            fmt_plan(input, f, indent + 1)
+        }
+        LogicalPlan::OneRow => writeln!(f, "{pad}OneRow"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_limit_may_stop_input_early() {
+        // Limit (LIMIT n / OFFSET) is the ONE operator that legitimately stops
+        // reading its input before EOF — its producers tolerate a mid-stream
+        // consumer drop (a real LIMIT short-circuit).
+        let limit = LogicalPlan::Limit {
+            input: Box::new(LogicalPlan::OneRow),
+            limit: Some(10),
+            offset: None,
+        };
+        assert!(limit.may_stop_input_early());
+
+        // Must-drain consumers: a mid-stream dropped receiver here means the
+        // partition was SILENTLY truncated by an upstream stall (q21), so they
+        // must NOT be treated as early-stoppers (the producer must fail loud).
+        let sort = LogicalPlan::Sort {
+            input: Box::new(LogicalPlan::OneRow),
+            order_by: vec![],
+        };
+        let projection = LogicalPlan::Projection {
+            input: Box::new(LogicalPlan::OneRow),
+            exprs: vec![],
+            schema: vec![],
+        };
+        assert!(!sort.may_stop_input_early());
+        assert!(!projection.may_stop_input_early());
+        assert!(!LogicalPlan::OneRow.may_stop_input_early());
+    }
+
+    #[test]
+    fn limit_early_stop_is_structural_not_just_the_limit_node() {
+        // q21/q02 SF30 hardening (2026-06-12): a `Limit` only legitimately
+        // stops its producer early when NO blocking operator below it drains
+        // the input first. `Limit(Sort)` is rewritten into a draining TopKExec,
+        // and `Limit` over any blocking op (aggregate / join / distinct /
+        // window) likewise reads the producer to EOF — so those producers
+        // must_drain (a mid-stream drop = silent truncation, not early-stop).
+        use arneb_common::identifiers::StageId;
+
+        let exchange = || LogicalPlan::ExchangeNode {
+            stage_id: StageId(7),
+            schema: vec![],
+        };
+        let finite_limit = |input: LogicalPlan| LogicalPlan::Limit {
+            input: Box::new(input),
+            limit: Some(10),
+            offset: None,
+        };
+
+        // Finite LIMIT directly over a lazy exchange — a real short-circuit.
+        assert!(finite_limit(exchange()).may_stop_input_early());
+
+        // Through pass-through operators (Projection / Filter) it still
+        // short-circuits the producer.
+        let projection = LogicalPlan::Projection {
+            input: Box::new(exchange()),
+            exprs: vec![],
+            schema: vec![],
+        };
+        assert!(finite_limit(projection).may_stop_input_early());
+        let filter = LogicalPlan::Filter {
+            input: Box::new(exchange()),
+            predicate: PlanExpr::Literal {
+                value: ScalarValue::Boolean(true),
+                span: None,
+            },
+        };
+        assert!(finite_limit(filter).may_stop_input_early());
+
+        // Over a BLOCKING operator the producer is drained to EOF regardless of
+        // the limit → NOT an early-stopper (must_drain).
+        let sort = LogicalPlan::Sort {
+            input: Box::new(exchange()),
+            order_by: vec![],
+        };
+        assert!(!finite_limit(sort).may_stop_input_early());
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(exchange()),
+            group_by: vec![],
+            aggr_exprs: vec![],
+            schema: vec![],
+        };
+        assert!(!finite_limit(aggregate).may_stop_input_early());
+        let distinct = LogicalPlan::Distinct {
+            input: Box::new(exchange()),
+        };
+        assert!(!finite_limit(distinct).may_stop_input_early());
+
+        // A blocking operator below a pass-through chain still drains.
+        let proj_over_sort = LogicalPlan::Projection {
+            input: Box::new(LogicalPlan::Sort {
+                input: Box::new(exchange()),
+                order_by: vec![],
+            }),
+            exprs: vec![],
+            schema: vec![],
+        };
+        assert!(!finite_limit(proj_over_sort).may_stop_input_early());
+
+        // Offset-only / unbounded LIMIT reads to EOF — not an early-stopper.
+        let offset_only = LogicalPlan::Limit {
+            input: Box::new(exchange()),
+            limit: None,
+            offset: Some(5),
+        };
+        assert!(!offset_only.may_stop_input_early());
     }
 }

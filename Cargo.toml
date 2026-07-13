@@ -26,7 +26,7 @@ arrow-csv = { version = "59", default-features = false }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap", "object_store", "zstd", "lz4", "brotli", "flate2", "flate2-zlib-rs"] }
 
 # Object store (S3, GCS, Azure, local filesystem)
-object_store = { version = "0.13", default-features = false, features = ["aws", "fs"] }
+object_store = { version = "0.14", default-features = false, features = ["aws", "fs"] }
 
 # Numeric utilities
 num_cpus = "1"

@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use tokio_postgres::types::Type;
 use tokio_postgres::Row;
 
@@ -88,75 +88,58 @@ fn convert_row(row: &Row) -> Vec<CanonicalValue> {
     (0..row.len()).map(|i| convert_cell(row, i)).collect()
 }
 
+/// Convert one cell, decoding from the **text** wire format.
+///
+/// Arneb declares `FieldFormat::Text` in its RowDescription, so tokio-postgres'
+/// typed getters — which decode the binary format for FLOAT8, INT8, DATE and
+/// friends — fail on every one of these columns. The previous implementation
+/// funnelled each of those failures through `.ok().flatten().unwrap_or(Null)`,
+/// so a decode error became a NULL value and the correctness check spent its
+/// time comparing fabricated NULLs against the other engines' real results.
+/// `SELECT SUM(...)` from arneb hashed to sha256("\N").
+///
+/// Reading the raw bytes and parsing per declared type keeps decode failures
+/// visible: anything unparseable stays as its text, which shows up as a real
+/// divergence instead of a silent NULL.
 fn convert_cell(row: &Row, idx: usize) -> CanonicalValue {
     let col_type = row.columns()[idx].type_().clone();
+    let raw = match row.try_get::<_, Option<RawWireText>>(idx) {
+        Ok(Some(RawWireText(s))) => s,
+        // A genuine SQL NULL.
+        Ok(None) => return CanonicalValue::Null,
+        // Should not happen — RawWireText accepts every type — but do not
+        // manufacture a NULL if it ever does.
+        Err(e) => return CanonicalValue::Str(format!("<decode error: {e}>")),
+    };
+
     match col_type {
-        Type::BOOL => row
-            .try_get::<_, Option<bool>>(idx)
-            .ok()
-            .flatten()
-            .map(CanonicalValue::Bool)
-            .unwrap_or(CanonicalValue::Null),
-        Type::INT2 => row
-            .try_get::<_, Option<i16>>(idx)
-            .ok()
-            .flatten()
-            .map(|v| CanonicalValue::Int(v as i64))
-            .unwrap_or(CanonicalValue::Null),
-        Type::INT4 => row
-            .try_get::<_, Option<i32>>(idx)
-            .ok()
-            .flatten()
-            .map(|v| CanonicalValue::Int(v as i64))
-            .unwrap_or(CanonicalValue::Null),
-        Type::INT8 => row
-            .try_get::<_, Option<i64>>(idx)
-            .ok()
-            .flatten()
-            .map(CanonicalValue::Int)
-            .unwrap_or(CanonicalValue::Null),
-        Type::FLOAT4 => row
-            .try_get::<_, Option<f32>>(idx)
-            .ok()
-            .flatten()
-            .map(|v| CanonicalValue::Float(v as f64))
-            .unwrap_or(CanonicalValue::Null),
-        Type::FLOAT8 => row
-            .try_get::<_, Option<f64>>(idx)
-            .ok()
-            .flatten()
-            .map(CanonicalValue::Float)
-            .unwrap_or(CanonicalValue::Null),
-        Type::NUMERIC => {
-            // tokio-postgres has no built-in NUMERIC parser without an extra
-            // crate. Read it as the wire-format string via the catch-all.
-            read_as_string(row, idx)
-        }
-        Type::DATE => row
-            .try_get::<_, Option<NaiveDate>>(idx)
-            .ok()
-            .flatten()
-            .map(|d| CanonicalValue::Timestamp(d.format("%Y-%m-%d").to_string()))
-            .unwrap_or(CanonicalValue::Null),
-        Type::TIMESTAMP => row
-            .try_get::<_, Option<NaiveDateTime>>(idx)
-            .ok()
-            .flatten()
-            .map(|t| CanonicalValue::Timestamp(format_naive_utc(t)))
-            .unwrap_or(CanonicalValue::Null),
-        Type::TIMESTAMPTZ => row
-            .try_get::<_, Option<DateTime<Utc>>>(idx)
-            .ok()
-            .flatten()
-            .map(|t| CanonicalValue::Timestamp(t.to_rfc3339()))
-            .unwrap_or(CanonicalValue::Null),
-        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => row
-            .try_get::<_, Option<String>>(idx)
-            .ok()
-            .flatten()
-            .map(CanonicalValue::Str)
-            .unwrap_or(CanonicalValue::Null),
-        _ => read_as_string(row, idx),
+        Type::BOOL => match raw.as_str() {
+            "t" | "true" | "TRUE" | "1" => CanonicalValue::Bool(true),
+            "f" | "false" | "FALSE" | "0" => CanonicalValue::Bool(false),
+            _ => CanonicalValue::Str(raw),
+        },
+        Type::INT2 | Type::INT4 | Type::INT8 => match raw.parse::<i64>() {
+            Ok(v) => CanonicalValue::Int(v),
+            Err(_) => CanonicalValue::Str(raw),
+        },
+        // NUMERIC is grouped with the floats on purpose: arneb types
+        // `SUM(double * double)` as NUMERIC where Trino and DataFusion call the
+        // same expression a double. Canonicalizing it as text would make every
+        // decimal column diverge on formatting alone.
+        Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => match raw.parse::<f64>() {
+            Ok(v) => CanonicalValue::Float(v),
+            Err(_) => CanonicalValue::Str(raw),
+        },
+        Type::DATE => CanonicalValue::Timestamp(raw),
+        Type::TIMESTAMP => match NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S%.f") {
+            Ok(t) => CanonicalValue::Timestamp(format_naive_utc(t)),
+            Err(_) => CanonicalValue::Timestamp(raw),
+        },
+        Type::TIMESTAMPTZ => match DateTime::parse_from_rfc3339(&raw) {
+            Ok(t) => CanonicalValue::Timestamp(t.with_timezone(&Utc).to_rfc3339()),
+            Err(_) => CanonicalValue::Timestamp(raw),
+        },
+        _ => CanonicalValue::Str(raw),
     }
 }
 
@@ -164,13 +147,27 @@ fn format_naive_utc(t: NaiveDateTime) -> String {
     DateTime::<Utc>::from_naive_utc_and_offset(t, Utc).to_rfc3339()
 }
 
-fn read_as_string(row: &Row, idx: usize) -> CanonicalValue {
-    // Try a few common text-like getters; fall back to Null on failure.
-    if let Ok(Some(s)) = row.try_get::<_, Option<String>>(idx) {
-        return CanonicalValue::Str(s);
+/// Reads any column as its raw wire bytes, whatever the declared type.
+///
+/// `String`'s `FromSql` only accepts the text-ish OIDs, so asking it for a
+/// NUMERIC fails — and the previous fallback turned that failure into
+/// `CanonicalValue::Null`. Every NUMERIC arneb returned was therefore recorded
+/// as NULL and compared against the other engines' real values, so the
+/// correctness check was reporting divergences it had manufactured itself.
+///
+/// Arneb declares `FieldFormat::Text` in its RowDescription, so these bytes are
+/// the value's ASCII text.
+struct RawWireText(String);
+
+impl<'a> tokio_postgres::types::FromSql<'a> for RawWireText {
+    fn from_sql(
+        _ty: &tokio_postgres::types::Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(RawWireText(String::from_utf8_lossy(raw).into_owned()))
     }
-    if let Ok(Some(s)) = row.try_get::<_, Option<&str>>(idx) {
-        return CanonicalValue::Str(s.to_string());
+
+    fn accepts(_ty: &tokio_postgres::types::Type) -> bool {
+        true
     }
-    CanonicalValue::Null
 }

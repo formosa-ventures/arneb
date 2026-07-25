@@ -83,15 +83,20 @@ fn write_per_query_table(out: &mut String, results: &[BenchmarkResult]) {
 
     let _ = writeln!(out, "## Per-query latency (p50)");
     let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "`A→B` columns are A's speedup over B: above 1.00x means A is that many times faster."
+    );
+    let _ = writeln!(out);
 
     let mut header = String::from("| Query | Status |");
     for e in &engines {
         let _ = write!(header, " {} (ms) |", e);
     }
     if engines.len() >= 2 {
-        // Add pairwise speedup columns: every pair where the first column is the
-        // baseline (left) and the second is the comparison (right). Convention:
-        // shown as `<left>/<right>` meaning right is N× faster than left when N>1.
+        // Pairwise speedup columns, one per engine pair. `A→B` is A's speedup
+        // over B — B's time divided by A's — so a value above 1 always means the
+        // left-hand engine is that many times faster.
         for i in 0..engines.len() {
             for j in (i + 1)..engines.len() {
                 let _ = write!(header, " {}→{} |", engines[i], engines[j]);
@@ -139,8 +144,12 @@ fn write_per_query_table(out: &mut String, results: &[BenchmarkResult]) {
         if engines.len() >= 2 {
             for i in 0..engines.len() {
                 for j in (i + 1)..engines.len() {
+                    // Speedup of `left` over `right`: how many times faster the
+                    // left engine is, so >1 always means left wins. Dividing the
+                    // other way round produces the reciprocal, which reads as
+                    // the exact opposite of what it means.
                     let speed = match (p50s[i], p50s[j]) {
-                        (Some(left), Some(right)) if right > 0.0 => Some(left / right),
+                        (Some(left), Some(right)) if left > 0.0 => Some(right / left),
                         _ => None,
                     };
                     match speed {
@@ -265,8 +274,10 @@ fn write_summary(out: &mut String, results: &[BenchmarkResult]) {
                     let left = p50_for(results, &engines[i], qid);
                     let right = p50_for(results, &engines[j], qid);
                     if let (Some(l), Some(r)) = (left, right) {
-                        if r > 0.0 {
-                            ratios.push(l / r);
+                        if l > 0.0 {
+                            // Same orientation as the per-query table: >1 means
+                            // the left engine is that many times faster.
+                            ratios.push(r / l);
                         }
                     }
                 }
@@ -403,4 +414,92 @@ pub fn load_inputs(
         results.push(r);
     }
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runner::{QueryResult, RunResult};
+    use crate::stats::QueryStats;
+
+    fn result(engine: &str, query: &str, p50_ms: f64) -> BenchmarkResult {
+        BenchmarkResult {
+            engine: engine.to_string(),
+            host: "test".into(),
+            port: None,
+            timestamp: "2026-07-26T00:00:00Z".into(),
+            warm_up: 1,
+            measurement_runs: 2,
+            queries: vec![QueryResult {
+                query_id: query.to_string(),
+                query_file: format!("/queries/{query}.sql"),
+                status: "ok".into(),
+                runs: vec![RunResult {
+                    run_number: 1,
+                    wall_clock_ms: p50_ms,
+                    rows_returned: 1,
+                    is_warmup: false,
+                }],
+                median_ms: Some(p50_ms),
+                error: None,
+                stats: Some(QueryStats {
+                    min_ms: p50_ms,
+                    p50_ms,
+                    p95_ms: p50_ms,
+                    p99_ms: p50_ms,
+                    stddev_ms: None,
+                    measurement_count: 2,
+                }),
+                result_hash: Some("deadbeef".into()),
+                skip_reason: None,
+            }],
+        }
+    }
+
+    /// `A→B` is A's speedup over B, so a faster left-hand engine must produce a
+    /// value above 1. Dividing the other way round yields the reciprocal, which
+    /// reads as the exact opposite of what it means — a 2x win rendered as
+    /// "0.50x" understates the result fourfold.
+    #[test]
+    fn speedup_is_above_one_when_the_left_engine_is_faster() {
+        // arneb takes 100ms, trino 400ms — arneb is 4x faster.
+        let results = vec![result("arneb", "q01", 100.0), result("trino", "q01", 400.0)];
+        let rendered = render(&results);
+
+        assert!(
+            rendered.contains("4.00x"),
+            "expected a 4.00x speedup for the faster left-hand engine, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("0.25x"),
+            "speedup is inverted — the reciprocal appeared:\n{rendered}"
+        );
+    }
+
+    /// And below 1 when the left-hand engine is the slower one.
+    #[test]
+    fn speedup_is_below_one_when_the_left_engine_is_slower() {
+        let results = vec![result("arneb", "q01", 400.0), result("trino", "q01", 100.0)];
+        let rendered = render(&results);
+        assert!(
+            rendered.contains("0.25x"),
+            "expected 0.25x when the left engine is 4x slower, got:\n{rendered}"
+        );
+    }
+
+    /// The geomean row must use the same orientation as the per-query columns,
+    /// or the summary contradicts the table above it.
+    #[test]
+    fn geomean_uses_the_same_orientation_as_the_table() {
+        let results = vec![result("arneb", "q01", 100.0), result("trino", "q01", 400.0)];
+        let rendered = render(&results);
+        let geomean_section = rendered
+            .split("### Pairwise geomean speedup")
+            .nth(1)
+            .expect("no geomean section");
+        assert!(
+            geomean_section.contains("4.00x"),
+            "geomean disagrees with the per-query table:\n{geomean_section}"
+        );
+    }
 }

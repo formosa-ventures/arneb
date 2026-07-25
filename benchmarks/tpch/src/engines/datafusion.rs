@@ -110,7 +110,12 @@ impl BenchmarkEngine for DataFusionEngine {
             let listing_url = ListingTableUrl::parse(&url)
                 .map_err(|e| EngineError::Connect(format!("listing url {url}: {e}")))?;
             let format = Arc::new(ParquetFormat::default());
-            let opts = ListingOptions::new(format).with_file_extension(".parquet");
+            // Empty extension, not ".parquet". Trino's CTAS writes extensionless
+            // object keys (`<query-id>_<uuid>`), and DataFusion's default
+            // extension filter would list zero files and fail schema inference
+            // with "Cannot infer schema from an empty location" — pointing at
+            // the directory rather than at the filter that hid its contents.
+            let opts = ListingOptions::new(format).with_file_extension("");
             let resolved_schema = opts
                 .infer_schema(&ctx.state(), &listing_url)
                 .await

@@ -34,7 +34,18 @@ impl CanonicalValue {
                 } else if f.is_infinite() {
                     out.push_str(if *f > 0.0 { "Infinity" } else { "-Infinity" });
                 } else {
-                    let _ = write!(out, "{f:.6}");
+                    // Significant digits, not fixed decimals. Fixed decimals are
+                    // not scale-invariant: `{:.6}` on a value near 5.7e10 asks
+                    // for 17 significant digits, past what f64 can represent, so
+                    // the last bit of float noise becomes a "divergence". Two
+                    // engines summing the same column in a different order —
+                    // which any difference in partitioning guarantees — differ by
+                    // one ULP and would be reported as disagreeing.
+                    //
+                    // 12 significant digits sits comfortably inside f64's ~15-17
+                    // and absorbs summation-order noise, while a genuine
+                    // computation error is far larger than one part in 1e12.
+                    let _ = write!(out, "{f:.11e}");
                 }
             }
             CanonicalValue::Str(s) => out.push_str(s),

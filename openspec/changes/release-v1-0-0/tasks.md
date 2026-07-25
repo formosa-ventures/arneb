@@ -28,7 +28,7 @@ The archived `tpch-comparison-harness` marked 37/41 tasks complete, but `benchma
 - [x] 2.2 Replace the `python3 "$SCRIPT_DIR/report.py"` calls at `run_benchmark.sh:130` and `:132` with a single `tpch-bench report --dir "$RESULTS_DIR"` invocation writing `comparison.md`.
 - [x] 2.3 Generalize the script's `--skip-trino` flag into an engine selector that forwards to the runner's `--engines`, so a reader can reproduce a subset without editing the script.
 - [x] 2.4 Delete `benchmarks/tpch/scripts/report.py` (tracked in git today). This satisfies the archived `tpch-benchmark-reporting` requirement "Removal of `report.py`" and is **BREAKING** for anyone invoking it directly.
-- [ ] 2.5 Verify `run_benchmark.sh` runs end-to-end with no `python3` on `PATH` (e.g. via a `PATH`-restricted shell), per the archived reporting spec's scenario.
+- [x] 2.5 Verify `run_benchmark.sh` runs end-to-end with no `python3` on `PATH` (e.g. via a `PATH`-restricted shell), per the archived reporting spec's scenario.
 
 ## 2b. Containerize the whole benchmark, runner included (design D10)
 
@@ -36,9 +36,9 @@ The archived `tpch-comparison-harness` marked 37/41 tasks complete, but `benchma
 - [x] 2b.2 Add a compose service for the runner: queries directory available, an output volume so result JSONs land on the host for publishing, and `depends_on` conditions for MinIO, Hive Metastore, Trino, and Arneb.
 - [x] 2b.3 Add a stock Arneb bench service that uses `docker/arneb-bench/Dockerfile` with `tpch-hive-container.toml` (both verified clean of tuning) and carries **no** `ARNEB_*` environment block, per design D9. Do not reuse `docker-compose.bench.yml`'s service definition — it exists for tuning work and sets 16 flags.
 - [x] 2b.4 Point the runner at service-name endpoints on the compose network: `arneb:5432`, `trino:8080`, `http://minio:9000`. Leave `benchmarks/tpch/src/engines/datafusion.rs:46`'s `http://127.0.0.1:9000` default host-oriented for native iteration and pass the service name explicitly from the container, so neither mode is a special case of the other.
-- [ ] 2b.5 Confirm DataFusion — which runs in-process inside the runner binary — is subject to the runner container's CPU and memory limits, and that those limits match what Arneb and Trino get. This is the whole reason the runner is containerized; verify it rather than assume it.
+- [x] 2b.5 Confirm DataFusion — which runs in-process inside the runner binary — is subject to the runner container's CPU and memory limits, and that those limits match what Arneb and Trino get. This is the whole reason the runner is containerized; verify it rather than assume it.
 - [x] 2b.6 Rewrite `run_benchmark.sh` as a compose driver: bring up the stack, seed, run the runner service, collect results and `comparison.md` from the output volume. It must no longer start any native host process.
-- [ ] 2b.7 Verify no engine's measured latency includes a host port-publishing hop the others avoid — all three are reached over the compose network from inside the runner container.
+- [x] 2b.7 Verify no engine's measured latency includes a host port-publishing hop the others avoid — all three are reached over the compose network from inside the runner container.
 
 ## 3. Reconcile the two benchmark front doors (spec: release-baseline-numbers)
 
@@ -52,7 +52,7 @@ The archived `tpch-comparison-harness` marked 37/41 tasks complete, but `benchma
 
 ## 4. Live verification of the three-engine path (inherited from `tpch-comparison-harness`)
 
-- [ ] 4.1 Start the stack (`docker compose up -d`, `docker compose run --rm tpch-seed`) and run the containerized runner with `--queries 1,6 --engines arneb,trino,datafusion` end-to-end. Confirm three result JSONs land on the host via the output volume. _(inherited task 9.2)_
+- [x] 4.1 Start the stack (`docker compose up -d`, `docker compose run --rm tpch-seed`) and run the containerized runner with `--queries 1,6 --engines arneb,trino,datafusion` end-to-end. Confirm three result JSONs land on the host via the output volume. _(inherited task 9.2)_
 - [ ] 4.2 Run each of `q15`, `q17`, `q18`, `q20`, `q21`, `q22` against Trino and DataFusion and confirm both produce results; record sample row counts for human verification. _(inherited task 5.2)_
 - [ ] 4.3 Confirm the skip list in `skip.rs` matches reality by running the same six queries against Arneb — every query Arneb actually fails must have a skip entry with a reason, and every skipped query must actually be unsupported. Correct the list where it diverges. _(closes the deferred half of inherited task 5.3)_
 - [ ] 4.4 Run `./benchmarks/tpch/scripts/run_benchmark.sh` with no arguments and confirm it produces all three engines' JSON files plus `comparison.md` without invoking Python. _(inherited task 9.4)_
@@ -91,7 +91,7 @@ The archived `tpch-comparison-harness` marked 37/41 tasks complete, but `benchma
 
 ## 8. Docs homepage (spec: docs-site-scaffold)
 
-- [ ] 8.1 Verify that VitePress's `layout: home` renders trailing Markdown beneath the generated features section — build locally with `pnpm docs:build` and inspect the output before writing the real content. If it does not render, resolve the mechanism before proceeding rather than falling back to a theme by default.
+- [x] 8.1 Verify that VitePress's `layout: home` renders trailing Markdown beneath the generated features section — build locally with `pnpm docs:build` and inspect the output before writing the real content. If it does not render, resolve the mechanism before proceeding rather than falling back to a theme by default.
 - [ ] 8.2 Append the comparison block to `docs/index.md` after the home-layout frontmatter: the suite-level figure vs Trino, the scale factor and run date, and a link to the reproduction tutorial.
 - [ ] 8.3 Confirm `docs/.vitepress/` still contains only `config.ts` (plus build artifacts) — no theme entry point or component was added.
 - [ ] 8.4 Run `pnpm docs:build` and `pnpm docs:preview` and confirm the homepage renders the hero, the features, and the comparison block, with the tutorial link resolving.

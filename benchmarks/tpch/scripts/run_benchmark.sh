@@ -69,6 +69,11 @@ echo ""
 # Step 1: bring up the engine stack
 # ---------------------------------------------------------------------------
 echo ">>> Step 1: Starting engines (building images as needed)..."
+# minio-init creates the `warehouse` bucket and exits. It has to run before the
+# seed, and naming only the engine services would skip it — leaving Trino to
+# fail later with "Invalid location URI" against a bucket that does not exist.
+"${COMPOSE[@]}" up -d --wait minio
+"${COMPOSE[@]}" up minio-init
 "${COMPOSE[@]}" up -d --build --wait "${ENGINE_SERVICES[@]}"
 echo ""
 

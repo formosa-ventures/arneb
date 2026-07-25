@@ -51,20 +51,41 @@ mod tests {
     }
 
     #[test]
-    fn floats_round_to_six_decimals() {
+    fn floats_differing_beyond_twelve_significant_digits_still_diverge() {
+        // A real computation error is far larger than float noise and must not
+        // be absorbed by the canonical form.
         let a = vec![vec![CanonicalValue::Float(1.123456789)]];
         let b = vec![vec![CanonicalValue::Float(1.123456111)]];
-        assert_eq!(canonicalize(&a), "1.123457");
-        assert_eq!(canonicalize(&b), "1.123456");
+        assert_ne!(canonicalize(&a), canonicalize(&b));
         assert_ne!(hash(&a), hash(&b));
     }
 
     #[test]
-    fn float_within_six_decimals_hashes_same() {
-        let a = vec![vec![CanonicalValue::Float(1.1234567)]];
-        let b = vec![vec![CanonicalValue::Float(1.1234568)]];
-        // 1.1234567 → 1.123457 ; 1.1234568 → 1.123457 (banker's rounding may differ;
-        // this test asserts the property at a tolerance-friendly pair).
-        assert_eq!(canonicalize(&a), canonicalize(&b));
+    fn one_ulp_of_summation_noise_does_not_count_as_divergence() {
+        // Real values observed running TPC-H q01's SUM(l_extendedprice) on two
+        // engines: identical except for the final ULP, because the two summed
+        // the column in a different order. Comparing at fixed decimals reported
+        // these as disagreeing; at 12 significant digits they agree, which is
+        // the honest reading — f64 cannot distinguish them.
+        let trino = vec![vec![CanonicalValue::Float(56586554400.72966)]];
+        let arneb = vec![vec![CanonicalValue::Float(56586554400.72965)]];
+        assert_eq!(canonicalize(&trino), canonicalize(&arneb));
+        assert_eq!(hash(&trino), hash(&arneb));
+    }
+
+    #[test]
+    fn canonical_form_is_scale_invariant() {
+        // The same relative error must be judged the same way at any magnitude.
+        // Fixed-decimal formatting fails this: it is strict on large values and
+        // lax on small ones.
+        let small_a = vec![vec![CanonicalValue::Float(1.000000000001)]];
+        let small_b = vec![vec![CanonicalValue::Float(1.000000000002)]];
+        let big_a = vec![vec![CanonicalValue::Float(1.000000000001e10)]];
+        let big_b = vec![vec![CanonicalValue::Float(1.000000000002e10)]];
+        assert_eq!(
+            canonicalize(&small_a) == canonicalize(&small_b),
+            canonicalize(&big_a) == canonicalize(&big_b),
+            "the same relative difference was judged differently at two magnitudes"
+        );
     }
 }

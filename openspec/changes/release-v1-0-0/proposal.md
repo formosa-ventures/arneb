@@ -55,6 +55,8 @@ Consequently `tpch-bench` today offers a single `--engine arneb|trino` with no `
 ### Modified Capabilities
 
 - `docs-site-scaffold`: Its hero-page requirement currently mandates only a tagline and call-to-action buttons. It changes to also require the homepage to present the official entry-level comparison figures with their provenance and a link to the reproduction tutorial.
+- `tpch-benchmark-runner`: Its canonicalization rule mandates formatting floats to six fractional digits. That rule is not scale-invariant and cannot be satisfied at TPC-H magnitudes — six decimals on a value near `5.7e10` demands seventeen significant digits, more than an f64 carries — so one ULP of summation-order noise between engines was reported as a correctness divergence. It changes to a significant-digit rule with explicit scale-invariance and noise-absorption requirements.
+- `tpch-benchmark-reporting`: Its speedup requirement gives `1.42x` as an example but never states the orientation, and the implementation computed the reciprocal — rendering a 2x win as `0.49x`. The requirement gains an explicit orientation, a rule that the geomean match the per-query columns, and a requirement that the orientation be covered by a test rather than left to review.
 - `tpch-benchmark-tutorial`: Two requirements change once the runner is containerized. The MinIO callout currently mandates telling readers the harness reads `127.0.0.1:9000` from the host — true only of a native invocation — and must instead distinguish the containerized endpoint from the native one. The reproduction-path requirement must mandate that the documented primary path is the fully containerized one, matching how official numbers are produced.
 
 ## Impact

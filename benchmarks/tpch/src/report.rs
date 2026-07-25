@@ -307,9 +307,11 @@ fn write_divergence(out: &mut String, results: &[BenchmarkResult]) {
     if engines.len() < 2 {
         return;
     }
-    type EngineEntry = (String, String, usize);
+    // (engine, strict hash, relaxed hash, row count)
+    type EngineEntry = (String, String, Option<String>, usize);
     type DivergentRow = (String, Vec<EngineEntry>);
     let mut divergent: Vec<DivergentRow> = Vec::new();
+    let mut boundary_only: Vec<String> = Vec::new();
     let query_ids: Vec<String> = results
         .iter()
         .flat_map(|r| r.queries.iter().map(|q| q.query_id.clone()))
@@ -322,18 +324,53 @@ fn write_divergence(out: &mut String, results: &[BenchmarkResult]) {
             if let Some(q) = find_query(results, e, qid) {
                 if let Some(h) = &q.result_hash {
                     let row_count = q.runs.first().map(|r| r.rows_returned).unwrap_or(0);
-                    entries.push((e.clone(), h.clone(), row_count));
+                    entries.push((
+                        e.clone(),
+                        h.clone(),
+                        q.result_hash_relaxed.clone(),
+                        row_count,
+                    ));
                 }
             }
         }
-        // Need at least two engines with hashes to compare.
-        if entries.len() >= 2 {
-            let first_hash = &entries[0].1;
-            if entries.iter().any(|(_, h, _)| h != first_hash) {
-                divergent.push((qid.clone(), entries));
-            }
+        if entries.len() < 2 {
+            continue;
+        }
+        let strict_agree = entries.iter().all(|(_, h, _, _)| *h == entries[0].1);
+        if strict_agree {
+            continue;
+        }
+        // The strict hashes differ. Before calling that a correctness problem,
+        // check the coarser hash: a rounding boundary in the last retained digit
+        // separates values that agree far beyond it, and every rounding-based
+        // comparison has such boundaries.
+        let relaxed: Vec<&String> = entries
+            .iter()
+            .filter_map(|(_, _, r, _)| r.as_ref())
+            .collect();
+        let relaxed_agree =
+            relaxed.len() == entries.len() && relaxed.iter().all(|r| *r == relaxed[0]);
+        if relaxed_agree {
+            boundary_only.push(qid.clone());
+        } else {
+            divergent.push((qid.clone(), entries));
         }
     }
+
+    if !boundary_only.is_empty() {
+        let _ = writeln!(out, "## Floating-point boundary notes");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "These queries agree across engines but sit on a rounding boundary in the last \
+             retained digit, so their strict hashes differ while the coarser comparison \
+             matches. Summation order differs whenever two engines partition an aggregate \
+             differently; this is that, not a correctness difference: {}",
+            boundary_only.join(", ")
+        );
+        let _ = writeln!(out);
+    }
+
     if divergent.is_empty() {
         return;
     }
@@ -341,7 +378,8 @@ fn write_divergence(out: &mut String, results: &[BenchmarkResult]) {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "Queries below produced canonically-different result sets across engines."
+        "Queries below produced different result sets across engines, at a difference \
+         larger than floating-point rounding accounts for."
     );
     let _ = writeln!(out);
     for (qid, entries) in &divergent {
@@ -349,7 +387,7 @@ fn write_divergence(out: &mut String, results: &[BenchmarkResult]) {
         let _ = writeln!(out);
         let _ = writeln!(out, "| Engine | Hash (first 8) | Rows |");
         let _ = writeln!(out, "|---|---|---:|");
-        for (e, h, rows) in entries {
+        for (e, h, _, rows) in entries {
             let short = h.chars().take(8).collect::<String>();
             let _ = writeln!(out, "| {} | {} | {} |", e, short, rows);
         }
@@ -451,6 +489,7 @@ mod tests {
                     measurement_count: 2,
                 }),
                 result_hash: Some("deadbeef".into()),
+                result_hash_relaxed: Some("deadbeef".into()),
                 skip_reason: None,
             }],
         }

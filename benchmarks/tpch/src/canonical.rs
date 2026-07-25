@@ -21,7 +21,7 @@ impl CanonicalValue {
     /// floats are rendered with 6 fractional digits, timestamps are passed
     /// through verbatim (the adapter is responsible for formatting them
     /// as RFC 3339 UTC before constructing the variant).
-    pub fn write_canonical(&self, out: &mut String) {
+    pub fn write_canonical(&self, out: &mut String, sig_digits: usize) {
         match self {
             CanonicalValue::Null => out.push_str("\\N"),
             CanonicalValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -45,7 +45,7 @@ impl CanonicalValue {
                     // 12 significant digits sits comfortably inside f64's ~15-17
                     // and absorbs summation-order noise, while a genuine
                     // computation error is far larger than one part in 1e12.
-                    let _ = write!(out, "{f:.11e}");
+                    let _ = write!(out, "{f:.*e}", sig_digits.saturating_sub(1));
                 }
             }
             CanonicalValue::Str(s) => out.push_str(s),
@@ -57,17 +57,19 @@ impl CanonicalValue {
 impl fmt::Display for CanonicalValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = String::new();
-        self.write_canonical(&mut s);
+        // Display is for diagnostics only; hashing always goes through
+        // `correctness`, which passes an explicit precision.
+        self.write_canonical(&mut s, crate::correctness::STRICT_SIG_DIGITS);
         f.write_str(&s)
     }
 }
 
 /// Render a single row's values joined by `\t` into the canonical row form.
-pub fn write_row(row: &[CanonicalValue], out: &mut String) {
+pub fn write_row(row: &[CanonicalValue], out: &mut String, sig_digits: usize) {
     for (i, v) in row.iter().enumerate() {
         if i > 0 {
             out.push('\t');
         }
-        v.write_canonical(out);
+        v.write_canonical(out, sig_digits);
     }
 }

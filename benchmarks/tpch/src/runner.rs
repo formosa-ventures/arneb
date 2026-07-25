@@ -36,6 +36,10 @@ pub struct QueryResult {
     /// New in this change. Old result files have this field absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_hash: Option<String>,
+    /// Coarser-precision hash, used only to adjudicate a `result_hash` mismatch
+    /// that is a rounding-boundary artifact rather than a real difference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_hash_relaxed: Option<String>,
     /// New in this change. Populated when an engine declared this query as skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,
@@ -94,6 +98,7 @@ pub async fn run_engine(engine: &mut dyn BenchmarkEngine, plan: &RunPlan<'_>) ->
                 error: None,
                 stats: None,
                 result_hash: None,
+                result_hash_relaxed: None,
                 skip_reason: Some(entry.reason.to_string()),
             });
             continue;
@@ -110,6 +115,7 @@ pub async fn run_engine(engine: &mut dyn BenchmarkEngine, plan: &RunPlan<'_>) ->
                 error: Some(err.clone()),
                 stats: None,
                 result_hash: None,
+                result_hash_relaxed: None,
                 skip_reason: None,
             });
             continue;
@@ -119,6 +125,7 @@ pub async fn run_engine(engine: &mut dyn BenchmarkEngine, plan: &RunPlan<'_>) ->
         let mut runs = Vec::new();
         let mut measured_durations = Vec::new();
         let mut hash: Option<String> = None;
+        let mut hash_relaxed: Option<String> = None;
         let mut error_msg: Option<String> = None;
 
         for run_idx in 0..plan.num_runs {
@@ -141,6 +148,7 @@ pub async fn run_engine(engine: &mut dyn BenchmarkEngine, plan: &RunPlan<'_>) ->
                         measured_durations.push(elapsed);
                         if hash.is_none() {
                             hash = Some(correctness::hash(&result.rows));
+                            hash_relaxed = Some(correctness::hash_relaxed(&result.rows));
                         }
                     }
                 }
@@ -168,6 +176,7 @@ pub async fn run_engine(engine: &mut dyn BenchmarkEngine, plan: &RunPlan<'_>) ->
                 error: Some(err),
                 stats: None,
                 result_hash: hash,
+                result_hash_relaxed: hash_relaxed,
                 skip_reason: None,
             });
             continue;
@@ -189,6 +198,7 @@ pub async fn run_engine(engine: &mut dyn BenchmarkEngine, plan: &RunPlan<'_>) ->
             error: None,
             stats,
             result_hash: hash,
+            result_hash_relaxed: hash_relaxed,
             skip_reason: None,
         });
     }

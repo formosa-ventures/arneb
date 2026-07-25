@@ -5,9 +5,9 @@
 The tutorial SHALL include a callout covering how the harness reaches MinIO in each of its two run modes, because those modes use different addresses and mixing them produces a connection failure with no obvious cause. The two modes are the fully containerized run, which is how official release numbers are produced, and a native run from the host, which is convenient for local iteration.
 
 The callout MUST:
-- states which MinIO endpoint applies to each mode: the `minio` service name on the compose network for the containerized run, and `127.0.0.1:9000` for a native run from the host,
-- warns that a reader running the harness natively must not have real AWS credentials exported in the same shell session, because DataFusion's S3 client picks them up via `AmazonS3Builder::from_env()` and silently bypasses MinIO,
-- notes that the containerized run is not exposed to that failure mode, because a container sees only the environment explicitly passed to it.
+- state which MinIO endpoint applies to each mode: the `minio` service name on the compose network for the containerized run, and `127.0.0.1:9000` for a native run from the host,
+- warn that a reader running the harness natively must not have real AWS credentials exported in the same shell session, because DataFusion's S3 client picks them up via `AmazonS3Builder::from_env()` and silently bypasses MinIO,
+- note that the containerized run is not exposed to that failure mode, because a container sees only the environment explicitly passed to it.
 
 #### Scenario: User has real AWS credentials exported
 

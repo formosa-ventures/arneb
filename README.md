@@ -15,7 +15,7 @@ Trino (formerly PrestoSQL) lets users query data where it lives — across objec
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
 - **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC
 - **Web UI**: Dashboard with query monitoring, cluster overview, and worker status
-- **TPC-H Benchmark**: 22/22 queries cell-identical to Trino, faster and lighter on peak memory across the board, with benchmark runner and comparison tooling
+- **TPC-H Benchmark**: 22/22 queries matching Trino's results and 1.59x faster by geomean at SF1 in the default configuration ([published run](benchmarks/tpch/official/v1.0.0/)), with a three-engine comparison harness
 
 ## Quick Start
 
@@ -145,10 +145,33 @@ docker compose down
 
 ## TPC-H Benchmark
 
-All 22 TPC-H queries return cell-identical results to Trino while running
-faster and using less peak memory on every query, at SF10 and SF30. Both
-engines read the same Parquet data from MinIO via Hive Metastore for fair
-comparison.
+Arneb runs the full 22-query TPC-H suite **1.59x faster than Trino by geometric
+mean** at SF1, and is ahead on all 22 queries individually (1.07x–2.60x). Both
+engines read the same Parquet from MinIO via Hive Metastore, run as a
+coordinator plus two workers with the same CPU allocation, and execute inside
+the same container stack.
+
+These are **default-configuration** numbers — a stock `cargo build --release`
+with no tuning options enabled — so following the tutorial reproduces the setup
+they came from.
+
+| | Arneb | Trino | DataFusion |
+|---|---:|---:|---:|
+| Queries completed | 22/22 | 22/22 | 22/22 |
+| Geomean p50 | 277.6 ms | 442.8 ms | 139.9 ms |
+| vs Arneb | — | 0.63x | 1.98x |
+
+Results agree across all three engines. DataFusion is roughly 2x ahead of Arneb
+here; it runs in-process with no distribution layer, and it is in the comparison
+as a correctness cross-check and an Arrow-native reference point rather than as
+the engine Arneb is positioned against.
+
+Measured 2026-07-25 on an Apple M1 Pro (10 cores, 32 GB, macOS 26.5.2, arm64).
+Full per-query figures, the raw result documents and the run's provenance are in
+[`benchmarks/tpch/official/v1.0.0/`](benchmarks/tpch/official/v1.0.0/) — see
+[`comparison.md`](benchmarks/tpch/official/v1.0.0/comparison.md). These are
+laptop numbers on arm64 macOS; they are reproducible on comparable hardware and
+do not generalize to Linux x86 servers.
 
 The full guide — prerequisites, the fully containerized three-engine run, and
 how to read the comparison report — is in the

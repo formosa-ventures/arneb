@@ -55,8 +55,8 @@ The archived `tpch-comparison-harness` marked 37/41 tasks complete, but `benchma
 - [x] 4.1 Start the stack (`docker compose up -d`, `docker compose run --rm tpch-seed`) and run the containerized runner with `--queries 1,6 --engines arneb,trino,datafusion` end-to-end. Confirm three result JSONs land on the host via the output volume. _(inherited task 9.2)_
 - [x] 4.2 Run each of `q15`, `q17`, `q18`, `q20`, `q21`, `q22` against Trino and DataFusion and confirm both produce results; record sample row counts for human verification. _(inherited task 5.2)_
 - [x] 4.3 Skip list was entirely wrong and is now empty. It declared arneb unable to run q15, q17, q20, q21 and q22, each citing unsupported correlated subqueries; all five execute successfully against a stock arneb build. The entries came from reading the SQL rather than running it (archived task 5.3 pre-populated them from static analysis and deferred verification to a task never done), so the harness silently dropped five queries from every comparison and published a fabricated reason for each. A test now asserts no query is skipped without a verified, quoted failure. _(closes the deferred half of inherited task 5.3)_
-- [ ] 4.4 Run `./benchmarks/tpch/scripts/run_benchmark.sh` with no arguments and confirm it produces all three engines' JSON files plus `comparison.md` without invoking Python. _(inherited task 9.4)_
-- [ ] 4.5 Follow `benchmarks/tpch/TUTORIAL.md` end-to-end in a fresh shell with `unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY` first, confirming no command has drifted from the runner and the documented report columns match what is emitted. _(inherited task 9.5)_
+- [x] 4.4 Run `./benchmarks/tpch/scripts/run_benchmark.sh` with no arguments and confirm it produces all three engines' JSON files plus `comparison.md` without invoking Python. _(inherited task 9.4)_
+- [x] 4.5 Follow `benchmarks/tpch/TUTORIAL.md` end-to-end in a fresh shell with `unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY` first, confirming no command has drifted from the runner and the documented report columns match what is emitted. _(inherited task 9.5)_
 
 ## 5. Version bump and release metadata (spec: release-versioning)
 
@@ -70,36 +70,36 @@ The archived `tpch-comparison-harness` marked 37/41 tasks complete, but `benchma
 
 ## 6. Produce and publish the official run (spec: release-baseline-numbers)
 
-- [ ] 6.1 On the host recorded in 1.1, execute the full official run: all 22 queries, all three engines, SF1, under the configuration decided in 1.4.
-- [ ] 6.1a Ensure the run controls for environment parity per design D9 and D10: all three engines and the runner execute inside the container stack, with a deliberately chosen CPU allocation rather than the bench override's default of 2. With the runner containerized there is no native-vs-container asymmetry left to disclose.
-- [ ] 6.1b Ensure the containerized Arneb for the official run carries **no** `ARNEB_*` tuning variables. `docker/arneb-bench/docker-compose.bench.yml` sets 16 of them; the official run uses the stock service from 2b.3 instead. Verify the running container's environment (`docker inspect`) before measuring, not just the compose file.
-- [ ] 6.1c Confirm each engine's resource allocation is equal and recorded (CPU count and memory limit per container, including the runner container that hosts DataFusion), so the comparison is not decided by an allocation asymmetry.
-- [ ] 6.2 Create `benchmarks/tpch/official/v1.0.0/` and confirm it is not matched by `.gitignore` (`benchmarks/tpch/results/` at `.gitignore:22` must keep ignoring scratch runs while leaving `official/` tracked).
-- [ ] 6.3 Copy the three result JSONs into the directory under stable names `arneb.json`, `trino.json`, `datafusion.json`, and the generated report as `comparison.md`, verbatim and unedited.
-- [ ] 6.4 Write `provenance.json` with the fields required by the spec: `arneb_version`, `git_commit` (SHA of the commit preceding the provenance commit, per 1.2), `rustc_version` (`1.94.1`), resolved `trino_version` / `datafusion_version` / `minio_version`, `scale_factor`, `queries_total`, `warm_up_runs`, `measurement_runs`, `host` (Apple M1 Pro, 10 physical cores, 32 GB, macOS 26.5.2, arm64, SSD), and `run_date` in RFC 3339.
-- [ ] 6.4a Record the engine configuration in `provenance.json`: the complete set of `ARNEB_*` environment variables in effect for the measured run (empty set if the default configuration was chosen), and the CPU and memory allocation each engine ran under. Configuration must never be implicit.
-- [ ] 6.5 Resolve the engine versions from what actually ran — container image digests via `docker inspect` and/or each engine's self-reported version — never transcribed from the `:latest` tags in `docker-compose.yml`.
-- [ ] 6.6 Record the outcome honestly: if any query failed, was skipped, or diverged across engines, confirm it appears as such in the published `comparison.md`. If the run is unusable, discard it entirely and rerun — do not patch individual query results.
+- [x] 6.1 On the host recorded in 1.1, execute the full official run: all 22 queries, all three engines, SF1, under the configuration decided in 1.4.
+- [x] 6.1a Ensure the run controls for environment parity per design D9 and D10: all three engines and the runner execute inside the container stack, with a deliberately chosen CPU allocation rather than the bench override's default of 2. With the runner containerized there is no native-vs-container asymmetry left to disclose.
+- [x] 6.1b Ensure the containerized Arneb for the official run carries **no** `ARNEB_*` tuning variables. `docker/arneb-bench/docker-compose.bench.yml` sets 16 of them; the official run uses the stock service from 2b.3 instead. Verify the running container's environment (`docker inspect`) before measuring, not just the compose file.
+- [x] 6.1c Confirm each engine's resource allocation is equal and recorded (CPU count and memory limit per container, including the runner container that hosts DataFusion), so the comparison is not decided by an allocation asymmetry.
+- [x] 6.2 Create `benchmarks/tpch/official/v1.0.0/` and confirm it is not matched by `.gitignore` (`benchmarks/tpch/results/` at `.gitignore:22` must keep ignoring scratch runs while leaving `official/` tracked).
+- [x] 6.3 Copy the three result JSONs into the directory under stable names `arneb.json`, `trino.json`, `datafusion.json`, and the generated report as `comparison.md`, verbatim and unedited.
+- [x] 6.4 Write `provenance.json` with the fields required by the spec: `arneb_version`, `git_commit` (SHA of the commit preceding the provenance commit, per 1.2), `rustc_version` (`1.94.1`), resolved `trino_version` / `datafusion_version` / `minio_version`, `scale_factor`, `queries_total`, `warm_up_runs`, `measurement_runs`, `host` (Apple M1 Pro, 10 physical cores, 32 GB, macOS 26.5.2, arm64, SSD), and `run_date` in RFC 3339.
+- [x] 6.4a Record the engine configuration in `provenance.json`: the complete set of `ARNEB_*` environment variables in effect for the measured run (empty set if the default configuration was chosen), and the CPU and memory allocation each engine ran under. Configuration must never be implicit.
+- [x] 6.5 Resolve the engine versions from what actually ran — container image digests via `docker inspect` and/or each engine's self-reported version — never transcribed from the `:latest` tags in `docker-compose.yml`.
+- [x] 6.6 Record the outcome honestly: if any query failed, was skipped, or diverged across engines, confirm it appears as such in the published `comparison.md`. If the run is unusable, discard it entirely and rerun — do not patch individual query results.
 
 ## 7. README rewrite (spec: release-baseline-numbers)
 
-- [ ] 7.1 Rewrite the `## TPC-H Benchmark` section (`README.md:146`) to state the SF1 suite-level geomean speedup vs Trino, the per-status query counts, and the correctness-agreement count, each sourced from `benchmarks/tpch/official/v1.0.0/`.
-- [ ] 7.2 State the run date and the path to the published run next to the figures, and link to `comparison.md` for per-query detail.
-- [ ] 7.3 Replace the reproduction snippet with the command sequence that actually reproduces the published run through `run_benchmark.sh`, dropping the `python3 bench_report.py` invocation.
-- [ ] 7.4 Audit the existing unsourced claims for survival: the feature bullet at `README.md:18` and the section text at `README.md:148-151` assert 22/22 cell-identical, faster on every query, at SF10 and SF30. Those figures came from the tuned configuration at scale factors this release does not publish, so under design D9 they cannot stand as written. Narrow them to what the SF1 default-configuration run actually shows, or remove them.
-- [ ] 7.5 State the configuration explicitly next to the published figures — that they are default-configuration numbers with no tuning flags — and note that a tuned path exists for readers who want it. Readers should not have to open `provenance.json` to learn which Arneb was measured.
+- [x] 7.1 Rewrite the `## TPC-H Benchmark` section (`README.md:146`) to state the SF1 suite-level geomean speedup vs Trino, the per-status query counts, and the correctness-agreement count, each sourced from `benchmarks/tpch/official/v1.0.0/`.
+- [x] 7.2 State the run date and the path to the published run next to the figures, and link to `comparison.md` for per-query detail.
+- [x] 7.3 Replace the reproduction snippet with the command sequence that actually reproduces the published run through `run_benchmark.sh`, dropping the `python3 bench_report.py` invocation.
+- [x] 7.4 Audit the existing unsourced claims for survival: the feature bullet at `README.md:18` and the section text at `README.md:148-151` assert 22/22 cell-identical, faster on every query, at SF10 and SF30. Those figures came from the tuned configuration at scale factors this release does not publish, so under design D9 they cannot stand as written. Narrow them to what the SF1 default-configuration run actually shows, or remove them.
+- [x] 7.5 State the configuration explicitly next to the published figures — that they are default-configuration numbers with no tuning flags — and note that a tuned path exists for readers who want it. Readers should not have to open `provenance.json` to learn which Arneb was measured.
 
 ## 8. Docs homepage (spec: docs-site-scaffold)
 
 - [x] 8.1 Verify that VitePress's `layout: home` renders trailing Markdown beneath the generated features section — build locally with `pnpm docs:build` and inspect the output before writing the real content. If it does not render, resolve the mechanism before proceeding rather than falling back to a theme by default.
-- [ ] 8.2 Append the comparison block to `docs/index.md` after the home-layout frontmatter: the suite-level figure vs Trino, the scale factor and run date, and a link to the reproduction tutorial.
-- [ ] 8.3 Confirm `docs/.vitepress/` still contains only `config.ts` (plus build artifacts) — no theme entry point or component was added.
-- [ ] 8.4 Run `pnpm docs:build` and `pnpm docs:preview` and confirm the homepage renders the hero, the features, and the comparison block, with the tutorial link resolving.
+- [x] 8.2 Append the comparison block to `docs/index.md` after the home-layout frontmatter: the suite-level figure vs Trino, the scale factor and run date, and a link to the reproduction tutorial.
+- [x] 8.3 Confirm `docs/.vitepress/` still contains only `config.ts` (plus build artifacts) — no theme entry point or component was added.
+- [x] 8.4 Run `pnpm docs:build` and `pnpm docs:preview` and confirm the homepage renders the hero, the features, and the comparison block, with the tutorial link resolving.
 
 ## 9. Consistency check and release (spec: release-versioning, release-baseline-numbers)
 
-- [ ] 9.1 Verify every figure quoted in `README.md` and `docs/index.md` appears in `benchmarks/tpch/official/v1.0.0/comparison.md`, and that both surfaces cite the run date and the published directory.
-- [ ] 9.2 Verify both reader-facing surfaces link to `benchmarks/tpch/TUTORIAL.md` as the single reproduction entry point, and that `benchmarks/tpch/README.md` links to it too.
-- [ ] 9.3 Run `cargo build --release`, `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt -- --check` on the release commit.
-- [ ] 9.4 Run `openspec validate release-v1-0-0` and confirm the change is valid.
+- [x] 9.1 Verify every figure quoted in `README.md` and `docs/index.md` appears in `benchmarks/tpch/official/v1.0.0/comparison.md`, and that both surfaces cite the run date and the published directory.
+- [x] 9.2 Verify both reader-facing surfaces link to `benchmarks/tpch/TUTORIAL.md` as the single reproduction entry point, and that `benchmarks/tpch/README.md` links to it too.
+- [x] 9.3 Run `cargo build --release`, `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt -- --check` on the release commit.
+- [x] 9.4 Run `openspec validate release-v1-0-0` and confirm the change is valid.
 - [ ] 9.5 Tag the release commit `v1.0.0` — the repository's first tag — and confirm `[workspace.package].version` at that commit is `1.0.0` and `CHANGELOG.md` has a `1.0.0` section.

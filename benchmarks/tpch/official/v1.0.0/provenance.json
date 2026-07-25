@@ -1,0 +1,71 @@
+{
+  "release": "1.0.0",
+  "run_date": "2026-07-25T20:04:42.022774158+00:00",
+  "git_commit": "38158fbc6bf98926c82c57db26db5b6121be58f4",
+  "git_commit_note": "The commit immediately preceding the one that adds this file — the tree that was actually built and measured. See benchmarks/tpch/RELEASE_CHECKLIST.md.",
+
+  "scale_factor": "sf1",
+  "queries_total": 22,
+  "warm_up_runs": 3,
+  "measurement_runs": 5,
+
+  "engines": {
+    "arneb": {
+      "version": "1.0.0",
+      "rustc_version": "1.94.1",
+      "isolation": "container",
+      "topology": "1 coordinator + 2 workers",
+      "cpus_per_node": 2,
+      "memory_limit": null,
+      "config": "default",
+      "arneb_env_var_count": 0
+    },
+    "trino": {
+      "version": "483",
+      "version_source": "trino --version inside the running container",
+      "image": "trinodb/trino:latest",
+      "image_digest": "sha256:112e5342bab79b5cf7db7b63d3271c26f5171872714a7a924c9428c92815befb",
+      "isolation": "container",
+      "topology": "1 coordinator + 2 workers",
+      "cpus_per_node": 2,
+      "memory_limit": null
+    },
+    "datafusion": {
+      "version": "54.1.0",
+      "version_source": "benchmarks/tpch/Cargo.lock",
+      "isolation": "container (in-process inside the benchmark runner)",
+      "topology": "single process",
+      "cpus": 6,
+      "memory_limit": null
+    }
+  },
+
+  "storage": {
+    "minio_image": "minio/minio:latest",
+    "minio_digest": "sha256:8f08aee614800a237906bd48114d733e5ac5bfac4ccdf731f141b0e880d7a253",
+    "minio_release": "RELEASE.2025-09-07T16-13-09Z",
+    "hive_metastore_digest": "sha256:398dee1e4140646f5de20c7dc4caa56b70d8fe275d1ee3bdf277f6095971d3d7",
+    "hive_metastore_base": "apache/hive:4.2.0 + hadoop-aws"
+  },
+
+  "host": {
+    "model": "MacBookPro18,3",
+    "cpu": "Apple M1 Pro",
+    "physical_cores": 10,
+    "logical_cores": 10,
+    "ram_gb": 32,
+    "os": "macOS 26.5.2 (25F84)",
+    "arch": "arm64",
+    "storage": "SSD",
+    "container_runtime": "OrbStack (Docker Engine 29.4.0)"
+  },
+
+  "notes": [
+    "Every engine and the benchmark runner ran inside the container stack. The runner is containerized because the DataFusion adapter executes in-process inside it; a host-side runner would measure DataFusion natively against containerized rivals.",
+    "arneb ran in its default configuration: zero ARNEB_* tuning variables, verified with docker inspect against the running container rather than the compose file.",
+    "arneb and Trino each received 3 nodes x 2 CPUs; the runner received 6 CPUs so DataFusion, a single process, had the same total budget.",
+    "No memory limits were set on any engine, matching the existing benchmark setup.",
+    "Numbers are arm64 macOS figures from one laptop. They are reproducible on comparable hardware; they do not generalize to Linux x86 servers.",
+    "q09 agrees across all three engines but sits on a rounding boundary in the twelfth significant digit, so its strict hashes differ while the coarser comparison matches. See the boundary note in comparison.md."
+  ]
+}

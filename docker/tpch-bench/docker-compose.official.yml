@@ -1,0 +1,135 @@
+# Official TPC-H comparison stack — the arrangement release numbers come from.
+#
+# Everything runs in a container, including the benchmark runner. That last part
+# is not tidiness: the DataFusion adapter executes in-process inside the runner
+# binary, so a native runner means a native DataFusion regardless of what the
+# other engines get. Containerizing the runner is the only way all three engines
+# sit under the same isolation.
+#
+# Differences from docker/arneb-bench/docker-compose.bench.yml, which exists for
+# tuning work and is NOT what official numbers use:
+#
+#   1. No ARNEB_* environment block. That overlay sets 16 options its own comment
+#      describes as "gated default-OFF in the engine". A headline number produced
+#      with those on is not the number a reader gets from a stock build, so the
+#      official run measures the default configuration.
+#   2. No published host ports for arneb. The runner reaches every engine over the
+#      compose network, so nothing needs to escape to the host — which also means
+#      the run is immune to host port collisions (5432 in particular is commonly
+#      occupied by an unrelated local Postgres).
+#
+# Topology mirrors Trino's: 1 coordinator + 2 workers per engine, each capped at
+# BENCH_NODE_CPUS, so neither engine wins on core count.
+#
+# Usage:
+#   docker compose -f docker-compose.yml \
+#                  -f docker/tpch-bench/docker-compose.official.yml \
+#                  up -d --build arneb arneb-worker-1 arneb-worker-2 trino \
+#                                trino-worker-1 trino-worker-2
+#   TPCH_SF=sf1 docker compose run --rm tpch-seed
+#   docker compose -f docker-compose.yml \
+#                  -f docker/tpch-bench/docker-compose.official.yml \
+#                  run --rm tpch-bench
+
+services:
+  # ---------------------------------------------------------------------------
+  # arneb — stock configuration, distributed (coord + 2 workers)
+  # ---------------------------------------------------------------------------
+  arneb:
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_NODE_CPUS:-2}"
+    build:
+      context: .
+      dockerfile: docker/arneb-bench/Dockerfile
+    image: arneb-bench:latest
+    # Intentionally no `environment:` block — see header note 1.
+    command: ["--config", "/etc/arneb/coord.toml", "--role", "coordinator"]
+    networks:
+      default:
+        aliases:
+          - arneb-coord
+    healthcheck:
+      test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/localhost/5432"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+
+  arneb-worker-1:
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_NODE_CPUS:-2}"
+    image: arneb-bench:latest
+    command: ["--config", "/etc/arneb/worker-1.toml", "--role", "worker"]
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+
+  arneb-worker-2:
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_NODE_CPUS:-2}"
+    image: arneb-bench:latest
+    command: ["--config", "/etc/arneb/worker-2.toml", "--role", "worker"]
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Benchmark runner — also hosts DataFusion in-process
+  # ---------------------------------------------------------------------------
+  tpch-bench:
+    build:
+      context: .
+      dockerfile: docker/tpch-bench/Dockerfile
+    image: tpch-bench:latest
+    deploy:
+      resources:
+        limits:
+          # DataFusion runs inside this container as a single process, while
+          # arneb and Trino each get a 3-node cluster of BENCH_NODE_CPUS. Give
+          # the runner the same total budget (3 x BENCH_NODE_CPUS) so no engine
+          # is decided by its core allocation. Keep these in step when tuning.
+          cpus: "${BENCH_RUNNER_CPUS:-6}"
+    volumes:
+      - ./benchmarks/tpch/results:/results
+      - ./benchmarks/tpch/queries:/queries:ro
+    command:
+      - "--engines"
+      - "arneb,trino,datafusion"
+      - "--arneb-host"
+      - "arneb"
+      - "--trino-host"
+      - "trino"
+      - "--arneb-port"
+      - "5432"
+      - "--trino-port"
+      - "8080"
+      - "--catalog"
+      - "hive"
+      - "--schema"
+      - "tpch"
+      - "--minio-endpoint"
+      - "http://minio:9000"
+      - "--queries-dir"
+      - "/queries"
+      - "--output-dir"
+      - "/results"
+    depends_on:
+      minio:
+        condition: service_healthy
+      hive-metastore:
+        condition: service_healthy
+      trino:
+        condition: service_healthy
+      arneb:
+        condition: service_healthy
+    profiles:
+      - bench

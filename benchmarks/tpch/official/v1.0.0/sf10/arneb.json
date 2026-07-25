@@ -1,0 +1,1484 @@
+{
+  "engine": "arneb",
+  "host": "arneb",
+  "port": 5432,
+  "timestamp": "2026-07-25T20:54:50.001272971+00:00",
+  "warm_up": 3,
+  "measurement_runs": 5,
+  "queries": [
+    {
+      "query_id": "q01",
+      "query_file": "/queries/q01.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 1944.740549,
+          "rows_returned": 4,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 1687.876078,
+          "rows_returned": 4,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 1677.3751109999998,
+          "rows_returned": 4,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 1657.531493,
+          "rows_returned": 4,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 1721.0552460000001,
+          "rows_returned": 4,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 1679.0275860000002,
+          "rows_returned": 4,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 1708.1189829999998,
+          "rows_returned": 4,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 1658.743933,
+          "rows_returned": 4,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 1679.0275860000002,
+      "error": null,
+      "stats": {
+        "min_ms": 1657.531493,
+        "p50_ms": 1679.0275860000002,
+        "p95_ms": 1721.0552460000001,
+        "p99_ms": 1721.0552460000001,
+        "stddev_ms": 28.7836027270099,
+        "measurement_count": 5
+      },
+      "result_hash": "226e04a30082943ae3696df62c496de859ccdbcf3356d370fd4224be413dcb3f",
+      "result_hash_relaxed": "0b36315456fff53daa8e3f02a5146fea5d0f14668662d3ec2142d6fb4164cd5b"
+    },
+    {
+      "query_id": "q02",
+      "query_file": "/queries/q02.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 8333.6259,
+          "rows_returned": 100,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 8386.708727000001,
+          "rows_returned": 100,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 7778.827858,
+          "rows_returned": 100,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 7902.025747,
+          "rows_returned": 100,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 7974.481575000001,
+          "rows_returned": 100,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 8287.963942999999,
+          "rows_returned": 100,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 8332.084614,
+          "rows_returned": 100,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 7776.6494250000005,
+          "rows_returned": 100,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 7974.481575000001,
+      "error": null,
+      "stats": {
+        "min_ms": 7776.6494250000005,
+        "p50_ms": 7974.481575000001,
+        "p95_ms": 8332.084614,
+        "p99_ms": 8332.084614,
+        "stddev_ms": 244.1366519570074,
+        "measurement_count": 5
+      },
+      "result_hash": "75be1a5436d1f65fd66d76138f1ca51fa9ae4d337dd0bedd5e0dc5d102b5ae3c",
+      "result_hash_relaxed": "9c75e07f104b259bd356f362575d45a19aba9852c16ce992c086553116c67244"
+    },
+    {
+      "query_id": "q03",
+      "query_file": "/queries/q03.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 2414.765477,
+          "rows_returned": 10,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 2303.8251450000002,
+          "rows_returned": 10,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 2495.312474,
+          "rows_returned": 10,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 2349.5499569999997,
+          "rows_returned": 10,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 2499.9880279999998,
+          "rows_returned": 10,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 2415.9646669999997,
+          "rows_returned": 10,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 2375.9010200000002,
+          "rows_returned": 10,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 2356.5580600000003,
+          "rows_returned": 10,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 2375.9010200000002,
+      "error": null,
+      "stats": {
+        "min_ms": 2349.5499569999997,
+        "p50_ms": 2375.9010200000002,
+        "p95_ms": 2499.9880279999998,
+        "p99_ms": 2499.9880279999998,
+        "stddev_ms": 61.77543050268345,
+        "measurement_count": 5
+      },
+      "result_hash": "2c6740e2af5b3e89c9b3253dcc86c55e382966e55d75029fba5e173e3ae63ab1",
+      "result_hash_relaxed": "b43eec151f426d7e9ef3c5992a2b2a7ee2b1c7deb8add63fdaae5776c536d083"
+    },
+    {
+      "query_id": "q04",
+      "query_file": "/queries/q04.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 2220.318526,
+          "rows_returned": 5,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 2107.1132700000003,
+          "rows_returned": 5,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 2133.900742,
+          "rows_returned": 5,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 2171.5850090000004,
+          "rows_returned": 5,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 2137.639186,
+          "rows_returned": 5,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 2135.298929,
+          "rows_returned": 5,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 2159.627231,
+          "rows_returned": 5,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 2141.572543,
+          "rows_returned": 5,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 2141.572543,
+      "error": null,
+      "stats": {
+        "min_ms": 2135.298929,
+        "p50_ms": 2141.572543,
+        "p95_ms": 2171.5850090000004,
+        "p99_ms": 2171.5850090000004,
+        "stddev_ms": 15.770785591801221,
+        "measurement_count": 5
+      },
+      "result_hash": "8166e48a24cc18ef66845352616856a2328a1528b4d2f5c67d82f0061416f837",
+      "result_hash_relaxed": "8166e48a24cc18ef66845352616856a2328a1528b4d2f5c67d82f0061416f837"
+    },
+    {
+      "query_id": "q05",
+      "query_file": "/queries/q05.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 4621.813161,
+          "rows_returned": 5,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 4486.375739,
+          "rows_returned": 5,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 4652.351327,
+          "rows_returned": 5,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 4611.694772,
+          "rows_returned": 5,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 4470.011568,
+          "rows_returned": 5,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 4496.650501,
+          "rows_returned": 5,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 4771.646033,
+          "rows_returned": 5,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 4851.122754,
+          "rows_returned": 5,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 4611.694772,
+      "error": null,
+      "stats": {
+        "min_ms": 4470.011568,
+        "p50_ms": 4611.694772,
+        "p95_ms": 4851.122754,
+        "p99_ms": 4851.122754,
+        "stddev_ms": 167.44370222779682,
+        "measurement_count": 5
+      },
+      "result_hash": "984f8fd83e8c45009a415e843737a4ee9eb97bd1b223855cd19bf09b0c3cca3c",
+      "result_hash_relaxed": "b8d659cf63e0107a87fac3737459d8f90cf3217b3ab4c69a10f182441c16f9ad"
+    },
+    {
+      "query_id": "q06",
+      "query_file": "/queries/q06.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 653.4210489999999,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 620.535835,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 594.859804,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 653.534213,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 616.584477,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 601.46908,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 622.947715,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 631.667042,
+          "rows_returned": 1,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 622.947715,
+      "error": null,
+      "stats": {
+        "min_ms": 601.46908,
+        "p50_ms": 622.947715,
+        "p95_ms": 653.534213,
+        "p99_ms": 653.534213,
+        "stddev_ms": 19.28145899208061,
+        "measurement_count": 5
+      },
+      "result_hash": "973b67e3f533dad0e04e765274664d2c55fe80df677943ea56cb115780993027",
+      "result_hash_relaxed": "ef1e81beca5d847ac4f5a9040c6a274fb32fdf83698e136d708f1252b8147083"
+    },
+    {
+      "query_id": "q07",
+      "query_file": "/queries/q07.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 2435.657788,
+          "rows_returned": 4,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 2562.134094,
+          "rows_returned": 4,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 2610.661818,
+          "rows_returned": 4,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 2454.215128,
+          "rows_returned": 4,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 2511.475559,
+          "rows_returned": 4,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 2506.5439659999997,
+          "rows_returned": 4,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 2500.881927,
+          "rows_returned": 4,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 2468.269834,
+          "rows_returned": 4,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 2500.881927,
+      "error": null,
+      "stats": {
+        "min_ms": 2454.215128,
+        "p50_ms": 2500.881927,
+        "p95_ms": 2511.475559,
+        "p99_ms": 2511.475559,
+        "stddev_ms": 25.45209807802207,
+        "measurement_count": 5
+      },
+      "result_hash": "732354f07b02099c9cb5f6308282022fa469e7ee4c3598df7634dfb59b8be03f",
+      "result_hash_relaxed": "c7f14f224ae05c93857e0728e60e1e8c9354f9c50c7eaf31fbf21b63d48f7f79"
+    },
+    {
+      "query_id": "q08",
+      "query_file": "/queries/q08.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 4822.186387000001,
+          "rows_returned": 2,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 4834.578159999999,
+          "rows_returned": 2,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 4617.043847999999,
+          "rows_returned": 2,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 5320.686057,
+          "rows_returned": 2,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 4729.206578,
+          "rows_returned": 2,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 4967.7780729999995,
+          "rows_returned": 2,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 5062.182986,
+          "rows_returned": 2,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 4689.35351,
+          "rows_returned": 2,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 4967.7780729999995,
+      "error": null,
+      "stats": {
+        "min_ms": 4689.35351,
+        "p50_ms": 4967.7780729999995,
+        "p95_ms": 5320.686057,
+        "p99_ms": 5320.686057,
+        "stddev_ms": 258.32236628501954,
+        "measurement_count": 5
+      },
+      "result_hash": "91509351daf45087aac490cbc85f805891a71c80f46a4781eb1712cee2af2fab",
+      "result_hash_relaxed": "005f663c618d071164b17d6e1c4f05553c1e55c3733c31ef7da8c91c024cb3d8"
+    },
+    {
+      "query_id": "q09",
+      "query_file": "/queries/q09.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 6728.376884,
+          "rows_returned": 25,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 6808.845215,
+          "rows_returned": 25,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 6567.283640000001,
+          "rows_returned": 25,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 7215.691554,
+          "rows_returned": 25,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 6646.926775,
+          "rows_returned": 25,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 7122.324043,
+          "rows_returned": 25,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 6784.140421,
+          "rows_returned": 25,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 6656.835209999999,
+          "rows_returned": 25,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 6784.140421,
+      "error": null,
+      "stats": {
+        "min_ms": 6646.926775,
+        "p50_ms": 6784.140421,
+        "p95_ms": 7215.691554,
+        "p99_ms": 7215.691554,
+        "stddev_ms": 266.73494487065307,
+        "measurement_count": 5
+      },
+      "result_hash": "e84b8d34c45f247cf40bcd53a0bb3a81edea5be5ef54f764f13d2a9c3a06ad4e",
+      "result_hash_relaxed": "9cf15d138bcefdaa6987698401047d8c6c57e5ee082d8bd8ddeab048e47b3101"
+    },
+    {
+      "query_id": "q10",
+      "query_file": "/queries/q10.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 2303.948347,
+          "rows_returned": 20,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 2164.327572,
+          "rows_returned": 20,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 2140.586054,
+          "rows_returned": 20,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 2189.288613,
+          "rows_returned": 20,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 2088.28859,
+          "rows_returned": 20,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 2184.222898,
+          "rows_returned": 20,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 2218.2540940000004,
+          "rows_returned": 20,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 2116.5955400000003,
+          "rows_returned": 20,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 2184.222898,
+      "error": null,
+      "stats": {
+        "min_ms": 2088.28859,
+        "p50_ms": 2184.222898,
+        "p95_ms": 2218.2540940000004,
+        "p99_ms": 2218.2540940000004,
+        "stddev_ms": 54.457184383028554,
+        "measurement_count": 5
+      },
+      "result_hash": "3ba8c379ed86a70aa34250b1fc6454dd316cc3b090362c627c44f5986666ca62",
+      "result_hash_relaxed": "c23252382a8646ef2d0e14a3db60e1f3108b759d13f3fd9ed50328ba3bfa7559"
+    },
+    {
+      "query_id": "q11",
+      "query_file": "/queries/q11.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 1425.860388,
+          "rows_returned": 0,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 1253.266484,
+          "rows_returned": 0,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 1179.5551770000002,
+          "rows_returned": 0,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 1212.12598,
+          "rows_returned": 0,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 1247.452448,
+          "rows_returned": 0,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 1245.620017,
+          "rows_returned": 0,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 1260.6603750000002,
+          "rows_returned": 0,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 1254.129348,
+          "rows_returned": 0,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 1247.452448,
+      "error": null,
+      "stats": {
+        "min_ms": 1212.12598,
+        "p50_ms": 1247.452448,
+        "p95_ms": 1260.6603750000002,
+        "p99_ms": 1260.6603750000002,
+        "stddev_ms": 18.779435303543337,
+        "measurement_count": 5
+      },
+      "result_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "result_hash_relaxed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "query_id": "q12",
+      "query_file": "/queries/q12.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 1525.524225,
+          "rows_returned": 2,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 1526.076092,
+          "rows_returned": 2,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 1557.6674910000002,
+          "rows_returned": 2,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 1635.4066970000001,
+          "rows_returned": 2,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 1552.420945,
+          "rows_returned": 2,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 1570.0628880000002,
+          "rows_returned": 2,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 1530.12453,
+          "rows_returned": 2,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 1565.531207,
+          "rows_returned": 2,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 1565.531207,
+      "error": null,
+      "stats": {
+        "min_ms": 1530.12453,
+        "p50_ms": 1565.531207,
+        "p95_ms": 1635.4066970000001,
+        "p99_ms": 1635.4066970000001,
+        "stddev_ms": 39.35279900691334,
+        "measurement_count": 5
+      },
+      "result_hash": "b606450e7ba4847dabadd242c04cd4b189040f2fee4e3c95a1af71a858a4ce5b",
+      "result_hash_relaxed": "b606450e7ba4847dabadd242c04cd4b189040f2fee4e3c95a1af71a858a4ce5b"
+    },
+    {
+      "query_id": "q13",
+      "query_file": "/queries/q13.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 3591.904275,
+          "rows_returned": 46,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 3539.850974,
+          "rows_returned": 46,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 3539.077652,
+          "rows_returned": 46,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 3438.182961,
+          "rows_returned": 46,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 3436.510195,
+          "rows_returned": 46,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 3548.688549,
+          "rows_returned": 46,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 3574.89628,
+          "rows_returned": 46,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 3506.224729,
+          "rows_returned": 46,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 3506.224729,
+      "error": null,
+      "stats": {
+        "min_ms": 3436.510195,
+        "p50_ms": 3506.224729,
+        "p95_ms": 3574.89628,
+        "p99_ms": 3574.89628,
+        "stddev_ms": 62.982183146663864,
+        "measurement_count": 5
+      },
+      "result_hash": "c8d242925e059c9f95ae5091df1a341164643faa7e46347a44d7e4c346024ed9",
+      "result_hash_relaxed": "c8d242925e059c9f95ae5091df1a341164643faa7e46347a44d7e4c346024ed9"
+    },
+    {
+      "query_id": "q14",
+      "query_file": "/queries/q14.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 1152.5761670000002,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 1165.9416330000001,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 1132.686049,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 1196.0150139999998,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 1146.202055,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 1155.1092540000002,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 1148.68885,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 1201.247477,
+          "rows_returned": 1,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 1155.1092540000002,
+      "error": null,
+      "stats": {
+        "min_ms": 1146.202055,
+        "p50_ms": 1155.1092540000002,
+        "p95_ms": 1201.247477,
+        "p99_ms": 1201.247477,
+        "stddev_ms": 26.897624301521716,
+        "measurement_count": 5
+      },
+      "result_hash": "62a1f35197d0533dfc0d2e5d8403c9b477f17df4b02dbd7173086b18f4e3c1fb",
+      "result_hash_relaxed": "d43b65687c5d4effeab2c855b5d365ed5b8cbd132e5a1b1dd99f50c8bc6eb6c4"
+    },
+    {
+      "query_id": "q15",
+      "query_file": "/queries/q15.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 1615.122878,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 1662.06588,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 1534.487715,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 1552.11195,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 1563.8791489999999,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 1563.19795,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 1478.9686749999998,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 1528.4560549999999,
+          "rows_returned": 1,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 1552.11195,
+      "error": null,
+      "stats": {
+        "min_ms": 1478.9686749999998,
+        "p50_ms": 1552.11195,
+        "p95_ms": 1563.8791489999999,
+        "p99_ms": 1563.8791489999999,
+        "stddev_ms": 35.627605479654726,
+        "measurement_count": 5
+      },
+      "result_hash": "1c57f0bfe3935d5e243a4faf627a122d2fe2ab7d5f36aa59c8c2ac435711074e",
+      "result_hash_relaxed": "9e7b09238609edbb34fa8cc17251fc68297513681d533ab8b39d2e54aafbd4f8"
+    },
+    {
+      "query_id": "q16",
+      "query_file": "/queries/q16.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 1008.839912,
+          "rows_returned": 27840,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 1024.580925,
+          "rows_returned": 27840,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 1036.177834,
+          "rows_returned": 27840,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 1035.802215,
+          "rows_returned": 27840,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 1202.198087,
+          "rows_returned": 27840,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 1041.587211,
+          "rows_returned": 27840,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 1080.309379,
+          "rows_returned": 27840,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 1046.846299,
+          "rows_returned": 27840,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 1046.846299,
+      "error": null,
+      "stats": {
+        "min_ms": 1035.802215,
+        "p50_ms": 1046.846299,
+        "p95_ms": 1202.198087,
+        "p99_ms": 1202.198087,
+        "stddev_ms": 69.73436832816881,
+        "measurement_count": 5
+      },
+      "result_hash": "8fc46c734ea4bb8671594512e028f8411cacf7b099f10e044f5d81adb41df24a",
+      "result_hash_relaxed": "8fc46c734ea4bb8671594512e028f8411cacf7b099f10e044f5d81adb41df24a"
+    },
+    {
+      "query_id": "q17",
+      "query_file": "/queries/q17.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 5459.898433,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 5365.688683,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 5511.452532,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 5452.188757,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 5128.825411,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 5335.657759,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 5338.486467,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 5484.532604,
+          "rows_returned": 1,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 5338.486467,
+      "error": null,
+      "stats": {
+        "min_ms": 5128.825411,
+        "p50_ms": 5338.486467,
+        "p95_ms": 5484.532604,
+        "p99_ms": 5484.532604,
+        "stddev_ms": 139.44243313115078,
+        "measurement_count": 5
+      },
+      "result_hash": "04c97e47579a2d3dbe93eac580dcfeeffed9121c929fc8b71e38dd6f7b4cd4ef",
+      "result_hash_relaxed": "06df2d4299f2fe0b3ef7921de3cbd47d76f93c890fc8316a8c03a6fb8655d329"
+    },
+    {
+      "query_id": "q18",
+      "query_file": "/queries/q18.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 7196.40458,
+          "rows_returned": 100,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 7088.026744999999,
+          "rows_returned": 100,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 7255.803265,
+          "rows_returned": 100,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 7088.675361,
+          "rows_returned": 100,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 7117.092683,
+          "rows_returned": 100,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 7131.944085,
+          "rows_returned": 100,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 7076.436461,
+          "rows_returned": 100,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 7668.874643,
+          "rows_returned": 100,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 7117.092683,
+      "error": null,
+      "stats": {
+        "min_ms": 7076.436461,
+        "p50_ms": 7117.092683,
+        "p95_ms": 7668.874643,
+        "p99_ms": 7668.874643,
+        "stddev_ms": 253.78692519618386,
+        "measurement_count": 5
+      },
+      "result_hash": "a3d1d50a1d39439f91c0093a62bf025f45e16c17d3940d1f61ae8dd9b721fbfb",
+      "result_hash_relaxed": "975fd701d0313b94f5a202dd27575fec2496f44c12eb65a28ef186617c065a07"
+    },
+    {
+      "query_id": "q19",
+      "query_file": "/queries/q19.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 1688.4465880000002,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 1748.194148,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 1841.4196220000001,
+          "rows_returned": 1,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 1666.981786,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 1651.3445199999999,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 1621.760632,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 1694.657119,
+          "rows_returned": 1,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 1679.187768,
+          "rows_returned": 1,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 1666.981786,
+      "error": null,
+      "stats": {
+        "min_ms": 1621.760632,
+        "p50_ms": 1666.981786,
+        "p95_ms": 1694.657119,
+        "p99_ms": 1694.657119,
+        "stddev_ms": 27.91226936069281,
+        "measurement_count": 5
+      },
+      "result_hash": "c80bdb3efaa295aa36a044fe455f16ac51b46fb7d00f8f33c00520dd150dcc6a",
+      "result_hash_relaxed": "37f53d9c633d73e19e0cf4977e2d8e6f1667ea90dd01f708121f906824919b89"
+    },
+    {
+      "query_id": "q20",
+      "query_file": "/queries/q20.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 3313.359922,
+          "rows_returned": 1804,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 3404.6697990000002,
+          "rows_returned": 1804,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 3308.112834,
+          "rows_returned": 1804,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 3278.198283,
+          "rows_returned": 1804,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 3256.841813,
+          "rows_returned": 1804,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 3292.559818,
+          "rows_returned": 1804,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 3352.8680780000004,
+          "rows_returned": 1804,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 3298.234232,
+          "rows_returned": 1804,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 3292.559818,
+      "error": null,
+      "stats": {
+        "min_ms": 3256.841813,
+        "p50_ms": 3292.559818,
+        "p95_ms": 3352.8680780000004,
+        "p99_ms": 3352.8680780000004,
+        "stddev_ms": 35.709707479209676,
+        "measurement_count": 5
+      },
+      "result_hash": "15a72c2e989974d4c2fdc782eb9e27cc87c72b21163e8aaaaf7b8cb259b1ebd3",
+      "result_hash_relaxed": "15a72c2e989974d4c2fdc782eb9e27cc87c72b21163e8aaaaf7b8cb259b1ebd3"
+    },
+    {
+      "query_id": "q21",
+      "query_file": "/queries/q21.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 10461.067395,
+          "rows_returned": 100,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 10437.87366,
+          "rows_returned": 100,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 10433.145487000002,
+          "rows_returned": 100,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 10498.227344,
+          "rows_returned": 100,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 11066.286638,
+          "rows_returned": 100,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 10502.286953,
+          "rows_returned": 100,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 10448.163475,
+          "rows_returned": 100,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 10374.851827,
+          "rows_returned": 100,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 10498.227344,
+      "error": null,
+      "stats": {
+        "min_ms": 10374.851827,
+        "p50_ms": 10498.227344,
+        "p95_ms": 11066.286638,
+        "p99_ms": 11066.286638,
+        "stddev_ms": 277.7798947207152,
+        "measurement_count": 5
+      },
+      "result_hash": "358dcabc00fea0736605484d90c49f2de2ae13226a580902db8d9c144c9ac964",
+      "result_hash_relaxed": "358dcabc00fea0736605484d90c49f2de2ae13226a580902db8d9c144c9ac964"
+    },
+    {
+      "query_id": "q22",
+      "query_file": "/queries/q22.sql",
+      "status": "ok",
+      "runs": [
+        {
+          "run_number": 1,
+          "wall_clock_ms": 985.350225,
+          "rows_returned": 7,
+          "is_warmup": true
+        },
+        {
+          "run_number": 2,
+          "wall_clock_ms": 965.3059430000001,
+          "rows_returned": 7,
+          "is_warmup": true
+        },
+        {
+          "run_number": 3,
+          "wall_clock_ms": 988.865338,
+          "rows_returned": 7,
+          "is_warmup": true
+        },
+        {
+          "run_number": 4,
+          "wall_clock_ms": 1144.767494,
+          "rows_returned": 7,
+          "is_warmup": false
+        },
+        {
+          "run_number": 5,
+          "wall_clock_ms": 972.796414,
+          "rows_returned": 7,
+          "is_warmup": false
+        },
+        {
+          "run_number": 6,
+          "wall_clock_ms": 988.493761,
+          "rows_returned": 7,
+          "is_warmup": false
+        },
+        {
+          "run_number": 7,
+          "wall_clock_ms": 1005.954207,
+          "rows_returned": 7,
+          "is_warmup": false
+        },
+        {
+          "run_number": 8,
+          "wall_clock_ms": 1000.263334,
+          "rows_returned": 7,
+          "is_warmup": false
+        }
+      ],
+      "median_ms": 1000.263334,
+      "error": null,
+      "stats": {
+        "min_ms": 972.796414,
+        "p50_ms": 1000.263334,
+        "p95_ms": 1144.767494,
+        "p99_ms": 1144.767494,
+        "stddev_ms": 69.54213348019697,
+        "measurement_count": 5
+      },
+      "result_hash": "40d42c46bd79bf23a5113197125cac650b71715075bdeb417d2064a00189363b",
+      "result_hash_relaxed": "d9c7224abbf7acb02f37e02a2dae2db77b2d1c22ce7f32d3486a072f180f7a9d"
+    }
+  ]
+}

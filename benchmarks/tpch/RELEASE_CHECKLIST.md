@@ -6,7 +6,7 @@ so the next release does not have to rediscover them.
 
 ## Where results go
 
-`benchmarks/tpch/official/v<version>/`, tracked in git. Do **not** publish from
+`benchmarks/tpch/official/v<version>/<scale-factor>/`, tracked in git — one directory per scale factor, since a release may publish more than one and their figures must not be conflated. Do **not** publish from
 `benchmarks/tpch/results/` — that path is gitignored scratch space for local
 runs. Each release gets its own directory; never overwrite a previous release's,
 because claims made by that release must stay verifiable after new numbers land.
@@ -15,7 +15,7 @@ Contents:
 
 | File | What it is |
 |---|---|
-| `provenance.json` | Machine-readable record of the run (below). Source of truth. |
+| `provenance.json` | Machine-readable record of the run (below), including its scale factor. Source of truth. |
 | `comparison.md` | Verbatim `tpch-bench report` output. Not hand-edited. |
 | `arneb.json` | Verbatim runner output, renamed from `arneb_<timestamp>.json`. |
 | `trino.json` | Likewise. |
@@ -39,6 +39,15 @@ directories readable.
   `BENCH_NODE_CPUS`; the runner gets `BENCH_RUNNER_CPUS` (three times
   `BENCH_NODE_CPUS`) because it hosts DataFusion as a single process. Keep these
   in step.
+- **One engine at a time.** Only the engine being measured runs; the others are
+  stopped, not left idle. An idle engine still holds its heap — three Trino JVMs
+  declare `-Xmx8G` each — so an all-up arrangement measures every engine under
+  memory pressure from its rivals, and at SF10 the combined ceiling exceeds what
+  a 16 GB container runtime has. Use `--no-deps` on the runner: its `depends_on`
+  names every engine and will otherwise restart the one you just stopped.
+- **Same arrangement at every scale factor.** Figures from different scale
+  factors are only comparable if they were produced the same way; do not compare
+  an all-up run against a rotated one.
 
 Verify the *running* containers rather than the compose file:
 

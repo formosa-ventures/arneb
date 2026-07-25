@@ -1,8 +1,8 @@
 {
-  "engine": "trino",
-  "host": "trino",
-  "port": 8080,
-  "timestamp": "2026-07-25T20:05:38.840252159+00:00",
+  "engine": "datafusion",
+  "host": "in-process",
+  "port": null,
+  "timestamp": "2026-07-25T21:12:23.709466658+00:00",
   "warm_up": 3,
   "measurement_runs": 5,
   "queries": [
@@ -13,65 +13,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 491.239023,
+          "wall_clock_ms": 1220.302483,
           "rows_returned": 4,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 677.843434,
+          "wall_clock_ms": 1132.170391,
           "rows_returned": 4,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 581.21017,
+          "wall_clock_ms": 1208.413537,
           "rows_returned": 4,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 561.846761,
+          "wall_clock_ms": 1196.081555,
           "rows_returned": 4,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 432.29695699999996,
+          "wall_clock_ms": 1128.751942,
           "rows_returned": 4,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 395.119379,
+          "wall_clock_ms": 1364.5793959999999,
           "rows_returned": 4,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 404.572041,
+          "wall_clock_ms": 1197.026457,
           "rows_returned": 4,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 391.04474,
+          "wall_clock_ms": 1191.49379,
           "rows_returned": 4,
           "is_warmup": false
         }
       ],
-      "median_ms": 404.572041,
+      "median_ms": 1196.081555,
       "error": null,
       "stats": {
-        "min_ms": 391.04474,
-        "p50_ms": 404.572041,
-        "p95_ms": 561.846761,
-        "p99_ms": 561.846761,
-        "stddev_ms": 71.63496758167571,
+        "min_ms": 1128.751942,
+        "p50_ms": 1196.081555,
+        "p95_ms": 1364.5793959999999,
+        "p99_ms": 1364.5793959999999,
+        "stddev_ms": 88.09724778930267,
         "measurement_count": 5
       },
-      "result_hash": "9d676d9ec655ddc40d5195015317aea7fa55d08ea308d82308ab0ae04ff3686c",
-      "result_hash_relaxed": "c215be19e462e5ae1531acdac1a40747fdce4f7dd8dc3631112908e887d286c8"
+      "result_hash": "632e9097a97bb82e281d4c547b1989bab161f943ff3b0223a659c57096684b37",
+      "result_hash_relaxed": "0b36315456fff53daa8e3f02a5146fea5d0f14668662d3ec2142d6fb4164cd5b"
     },
     {
       "query_id": "q02",
@@ -80,65 +80,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 484.681229,
+          "wall_clock_ms": 443.058254,
           "rows_returned": 100,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 380.05217400000004,
+          "wall_clock_ms": 411.950264,
           "rows_returned": 100,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 406.143985,
+          "wall_clock_ms": 378.55613999999997,
           "rows_returned": 100,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 398.577489,
+          "wall_clock_ms": 389.705015,
           "rows_returned": 100,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 387.209247,
+          "wall_clock_ms": 394.668773,
           "rows_returned": 100,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 377.179012,
+          "wall_clock_ms": 398.624422,
           "rows_returned": 100,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 385.59601599999996,
+          "wall_clock_ms": 389.269563,
           "rows_returned": 100,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 359.055911,
+          "wall_clock_ms": 375.51527,
           "rows_returned": 100,
           "is_warmup": false
         }
       ],
-      "median_ms": 385.59601599999996,
+      "median_ms": 389.705015,
       "error": null,
       "stats": {
-        "min_ms": 359.055911,
-        "p50_ms": 385.59601599999996,
-        "p95_ms": 398.577489,
-        "p99_ms": 398.577489,
-        "stddev_ms": 14.691994229675963,
+        "min_ms": 375.51527,
+        "p50_ms": 389.705015,
+        "p95_ms": 398.624422,
+        "p99_ms": 398.624422,
+        "stddev_ms": 8.741039326443639,
         "measurement_count": 5
       },
-      "result_hash": "9b3e44ae815e59cc354ede7377d5adcbeaef5ddf74b6ee43a27fc474b1e005ba",
-      "result_hash_relaxed": "2c2bfb4d8ec44a1bcc4dbbf692d201973a8e45295c5cb9f4b8ae645646fc6400"
+      "result_hash": "75be1a5436d1f65fd66d76138f1ca51fa9ae4d337dd0bedd5e0dc5d102b5ae3c",
+      "result_hash_relaxed": "9c75e07f104b259bd356f362575d45a19aba9852c16ce992c086553116c67244"
     },
     {
       "query_id": "q03",
@@ -147,65 +147,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 524.678016,
+          "wall_clock_ms": 903.7804080000001,
           "rows_returned": 10,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 447.44623900000005,
+          "wall_clock_ms": 913.979463,
           "rows_returned": 10,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 418.579799,
+          "wall_clock_ms": 909.2189520000001,
           "rows_returned": 10,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 468.91596000000004,
+          "wall_clock_ms": 921.0190660000001,
           "rows_returned": 10,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 449.101759,
+          "wall_clock_ms": 901.7186069999999,
           "rows_returned": 10,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 529.956298,
+          "wall_clock_ms": 896.7874300000001,
           "rows_returned": 10,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 420.27635699999996,
+          "wall_clock_ms": 900.2502949999999,
           "rows_returned": 10,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 502.09358599999996,
+          "wall_clock_ms": 888.611428,
           "rows_returned": 10,
           "is_warmup": false
         }
       ],
-      "median_ms": 468.91596000000004,
+      "median_ms": 900.2502949999999,
       "error": null,
       "stats": {
-        "min_ms": 420.27635699999996,
-        "p50_ms": 468.91596000000004,
-        "p95_ms": 529.956298,
-        "p99_ms": 529.956298,
-        "stddev_ms": 43.16344774029006,
+        "min_ms": 888.611428,
+        "p50_ms": 900.2502949999999,
+        "p95_ms": 921.0190660000001,
+        "p99_ms": 921.0190660000001,
+        "stddev_ms": 11.945394523131702,
         "measurement_count": 5
       },
-      "result_hash": "98e6c3385d70e503c345e58277fadefb73bac4b0437ecb67b100903d6c417a15",
-      "result_hash_relaxed": "38cca027d033c7cc81adbbc4db42e23ec370c396f8bf7388f6efe0e697002b68"
+      "result_hash": "2c6740e2af5b3e89c9b3253dcc86c55e382966e55d75029fba5e173e3ae63ab1",
+      "result_hash_relaxed": "b43eec151f426d7e9ef3c5992a2b2a7ee2b1c7deb8add63fdaae5776c536d083"
     },
     {
       "query_id": "q04",
@@ -214,65 +214,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 373.38375099999996,
+          "wall_clock_ms": 602.914391,
           "rows_returned": 5,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 334.051875,
+          "wall_clock_ms": 561.658304,
           "rows_returned": 5,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 481.315253,
+          "wall_clock_ms": 562.2671270000001,
           "rows_returned": 5,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 331.434253,
+          "wall_clock_ms": 588.408985,
           "rows_returned": 5,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 357.978054,
+          "wall_clock_ms": 558.618057,
           "rows_returned": 5,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 377.573637,
+          "wall_clock_ms": 553.768672,
           "rows_returned": 5,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 388.42141200000003,
+          "wall_clock_ms": 565.884156,
           "rows_returned": 5,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 358.36329700000005,
+          "wall_clock_ms": 565.362748,
           "rows_returned": 5,
           "is_warmup": false
         }
       ],
-      "median_ms": 358.36329700000005,
+      "median_ms": 565.362748,
       "error": null,
       "stats": {
-        "min_ms": 331.434253,
-        "p50_ms": 358.36329700000005,
-        "p95_ms": 388.42141200000003,
-        "p99_ms": 388.42141200000003,
-        "stddev_ms": 21.802821862532877,
+        "min_ms": 553.768672,
+        "p50_ms": 565.362748,
+        "p95_ms": 588.408985,
+        "p99_ms": 588.408985,
+        "stddev_ms": 13.283882415488641,
         "measurement_count": 5
       },
-      "result_hash": "5e2cbe1c9f2592742bd3bf74e23b39a536cf8517a20c9c39c29e13a2f218b00a",
-      "result_hash_relaxed": "5e2cbe1c9f2592742bd3bf74e23b39a536cf8517a20c9c39c29e13a2f218b00a"
+      "result_hash": "8166e48a24cc18ef66845352616856a2328a1528b4d2f5c67d82f0061416f837",
+      "result_hash_relaxed": "8166e48a24cc18ef66845352616856a2328a1528b4d2f5c67d82f0061416f837"
     },
     {
       "query_id": "q05",
@@ -281,65 +281,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 635.016312,
+          "wall_clock_ms": 1237.036688,
           "rows_returned": 5,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 585.0007860000001,
+          "wall_clock_ms": 1264.968518,
           "rows_returned": 5,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 631.013756,
+          "wall_clock_ms": 1236.057204,
           "rows_returned": 5,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 603.2740180000001,
+          "wall_clock_ms": 1240.282057,
           "rows_returned": 5,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 612.367738,
+          "wall_clock_ms": 1251.909007,
           "rows_returned": 5,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 567.8220779999999,
+          "wall_clock_ms": 1266.2701240000001,
           "rows_returned": 5,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 715.1049539999999,
+          "wall_clock_ms": 1248.6739730000002,
           "rows_returned": 5,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 638.157551,
+          "wall_clock_ms": 1235.7744989999999,
           "rows_returned": 5,
           "is_warmup": false
         }
       ],
-      "median_ms": 612.367738,
+      "median_ms": 1248.6739730000002,
       "error": null,
       "stats": {
-        "min_ms": 567.8220779999999,
-        "p50_ms": 612.367738,
-        "p95_ms": 715.1049539999999,
-        "p99_ms": 715.1049539999999,
-        "stddev_ms": 55.148503106907114,
+        "min_ms": 1235.7744989999999,
+        "p50_ms": 1248.6739730000002,
+        "p95_ms": 1266.2701240000001,
+        "p99_ms": 1266.2701240000001,
+        "stddev_ms": 11.799028571192768,
         "measurement_count": 5
       },
-      "result_hash": "92c7f08084bbbe838b8facc59476d279b052f13b675be773d87b18f41c742026",
-      "result_hash_relaxed": "7c126179f5a6a1f914a7a4c96c3c7634e9645dc10d75456b30e17ad3dfcc6abb"
+      "result_hash": "984f8fd83e8c45009a415e843737a4ee9eb97bd1b223855cd19bf09b0c3cca3c",
+      "result_hash_relaxed": "b8d659cf63e0107a87fac3737459d8f90cf3217b3ab4c69a10f182441c16f9ad"
     },
     {
       "query_id": "q06",
@@ -348,65 +348,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 249.969386,
+          "wall_clock_ms": 624.760772,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 284.73825400000004,
+          "wall_clock_ms": 636.595052,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 245.645083,
+          "wall_clock_ms": 607.393783,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 269.017312,
+          "wall_clock_ms": 597.650513,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 272.37417200000004,
+          "wall_clock_ms": 644.748971,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 254.721971,
+          "wall_clock_ms": 657.5664869999999,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 307.833987,
+          "wall_clock_ms": 593.934402,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 271.215441,
+          "wall_clock_ms": 614.351553,
           "rows_returned": 1,
           "is_warmup": false
         }
       ],
-      "median_ms": 271.215441,
+      "median_ms": 614.351553,
       "error": null,
       "stats": {
-        "min_ms": 254.721971,
-        "p50_ms": 271.215441,
-        "p95_ms": 307.833987,
-        "p99_ms": 307.833987,
-        "stddev_ms": 19.661347051270926,
+        "min_ms": 593.934402,
+        "p50_ms": 614.351553,
+        "p95_ms": 657.5664869999999,
+        "p99_ms": 657.5664869999999,
+        "stddev_ms": 28.376722750833522,
         "measurement_count": 5
       },
-      "result_hash": "58d56a30279422fbc224ad45f7cda90111945d73bc998c9c21bed16153cd7c95",
-      "result_hash_relaxed": "5c5df8de4e8e5179ca114a61409b3837222fbb5f74876bd46cda4d9d6d954460"
+      "result_hash": "973b67e3f533dad0e04e765274664d2c55fe80df677943ea56cb115780993027",
+      "result_hash_relaxed": "ef1e81beca5d847ac4f5a9040c6a274fb32fdf83698e136d708f1252b8147083"
     },
     {
       "query_id": "q07",
@@ -415,65 +415,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 610.258566,
+          "wall_clock_ms": 1679.3076629999998,
           "rows_returned": 4,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 583.7320569999999,
+          "wall_clock_ms": 1695.993995,
           "rows_returned": 4,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 504.65435700000006,
+          "wall_clock_ms": 1680.942138,
           "rows_returned": 4,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 564.653673,
+          "wall_clock_ms": 1657.451534,
           "rows_returned": 4,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 540.003674,
+          "wall_clock_ms": 1693.361744,
           "rows_returned": 4,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 527.7938819999999,
+          "wall_clock_ms": 1666.79956,
           "rows_returned": 4,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 540.4428340000001,
+          "wall_clock_ms": 1660.363864,
           "rows_returned": 4,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 513.329294,
+          "wall_clock_ms": 1691.950931,
           "rows_returned": 4,
           "is_warmup": false
         }
       ],
-      "median_ms": 540.003674,
+      "median_ms": 1666.79956,
       "error": null,
       "stats": {
-        "min_ms": 513.329294,
-        "p50_ms": 540.003674,
-        "p95_ms": 564.653673,
-        "p99_ms": 564.653673,
-        "stddev_ms": 18.910026471023475,
+        "min_ms": 1657.451534,
+        "p50_ms": 1666.79956,
+        "p95_ms": 1693.361744,
+        "p99_ms": 1693.361744,
+        "stddev_ms": 17.383571808240514,
         "measurement_count": 5
       },
-      "result_hash": "bdb63aa095bc34b7768184d06c18c9c1bde032e2e5ed8724d6f5de5247768ff1",
-      "result_hash_relaxed": "c86c2d16fb77931cbd238a9ef1c3f19eb6e7e5c37c000cb3b6f5818c9946beb0"
+      "result_hash": "732354f07b02099c9cb5f6308282022fa469e7ee4c3598df7634dfb59b8be03f",
+      "result_hash_relaxed": "c7f14f224ae05c93857e0728e60e1e8c9354f9c50c7eaf31fbf21b63d48f7f79"
     },
     {
       "query_id": "q08",
@@ -482,65 +482,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 660.279176,
+          "wall_clock_ms": 1381.6016399999999,
           "rows_returned": 2,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 747.4147399999999,
+          "wall_clock_ms": 1297.7598590000002,
           "rows_returned": 2,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 788.430294,
+          "wall_clock_ms": 1302.2422920000001,
           "rows_returned": 2,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 714.730919,
+          "wall_clock_ms": 1317.697851,
           "rows_returned": 2,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 734.482875,
+          "wall_clock_ms": 1289.8568109999999,
           "rows_returned": 2,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 763.2471790000001,
+          "wall_clock_ms": 1289.888144,
           "rows_returned": 2,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 742.243911,
+          "wall_clock_ms": 1263.668539,
           "rows_returned": 2,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 679.76722,
+          "wall_clock_ms": 1280.194498,
           "rows_returned": 2,
           "is_warmup": false
         }
       ],
-      "median_ms": 734.482875,
+      "median_ms": 1289.8568109999999,
       "error": null,
       "stats": {
-        "min_ms": 679.76722,
-        "p50_ms": 734.482875,
-        "p95_ms": 763.2471790000001,
-        "p99_ms": 763.2471790000001,
-        "stddev_ms": 31.558035215199936,
+        "min_ms": 1263.668539,
+        "p50_ms": 1289.8568109999999,
+        "p95_ms": 1317.697851,
+        "p99_ms": 1317.697851,
+        "stddev_ms": 19.631479819100782,
         "measurement_count": 5
       },
-      "result_hash": "f7c18f0d9dc1a26563a6de78d7bf5982b062beff8623e59201e795b48adcdfeb",
-      "result_hash_relaxed": "90dc080f588e23aa097bb8fa7dd12b0c28b8610e888b3f5ec39a9f17aa2b89ab"
+      "result_hash": "91509351daf45087aac490cbc85f805891a71c80f46a4781eb1712cee2af2fab",
+      "result_hash_relaxed": "005f663c618d071164b17d6e1c4f05553c1e55c3733c31ef7da8c91c024cb3d8"
     },
     {
       "query_id": "q09",
@@ -549,65 +549,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 724.98737,
+          "wall_clock_ms": 1705.763516,
           "rows_returned": 25,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 696.8085149999999,
+          "wall_clock_ms": 1708.98705,
           "rows_returned": 25,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 784.722315,
+          "wall_clock_ms": 1715.7762810000002,
           "rows_returned": 25,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 717.2463759999999,
+          "wall_clock_ms": 1702.685478,
           "rows_returned": 25,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 775.1640610000001,
+          "wall_clock_ms": 1681.461922,
           "rows_returned": 25,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 690.004713,
+          "wall_clock_ms": 1685.0524930000001,
           "rows_returned": 25,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 800.3644250000001,
+          "wall_clock_ms": 1656.061013,
           "rows_returned": 25,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 693.8824810000001,
+          "wall_clock_ms": 1720.848663,
           "rows_returned": 25,
           "is_warmup": false
         }
       ],
-      "median_ms": 717.2463759999999,
+      "median_ms": 1685.0524930000001,
       "error": null,
       "stats": {
-        "min_ms": 690.004713,
-        "p50_ms": 717.2463759999999,
-        "p95_ms": 800.3644250000001,
-        "p99_ms": 800.3644250000001,
-        "stddev_ms": 49.78836398101477,
+        "min_ms": 1656.061013,
+        "p50_ms": 1685.0524930000001,
+        "p95_ms": 1720.848663,
+        "p99_ms": 1720.848663,
+        "stddev_ms": 24.283562909601034,
         "measurement_count": 5
       },
-      "result_hash": "fa7a3ba63af6bb2067652386f2afb07900601c1a31b4cb4d6ca26351a455c8dc",
-      "result_hash_relaxed": "606ab4f76ae36b253d87602358f43b5a9f87bc37b217f23ef5e4d1a83c98ff82"
+      "result_hash": "e84b8d34c45f247cf40bcd53a0bb3a81edea5be5ef54f764f13d2a9c3a06ad4e",
+      "result_hash_relaxed": "9cf15d138bcefdaa6987698401047d8c6c57e5ee082d8bd8ddeab048e47b3101"
     },
     {
       "query_id": "q10",
@@ -616,65 +616,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 565.286912,
+          "wall_clock_ms": 1114.067538,
           "rows_returned": 20,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 525.715083,
+          "wall_clock_ms": 1111.8849879999998,
           "rows_returned": 20,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 541.484066,
+          "wall_clock_ms": 1137.015777,
           "rows_returned": 20,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 559.064976,
+          "wall_clock_ms": 1131.143157,
           "rows_returned": 20,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 660.3507320000001,
+          "wall_clock_ms": 1117.772649,
           "rows_returned": 20,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 579.493637,
+          "wall_clock_ms": 1121.099182,
           "rows_returned": 20,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 552.903876,
+          "wall_clock_ms": 1123.520646,
           "rows_returned": 20,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 531.059794,
+          "wall_clock_ms": 1110.033974,
           "rows_returned": 20,
           "is_warmup": false
         }
       ],
-      "median_ms": 559.064976,
+      "median_ms": 1121.099182,
       "error": null,
       "stats": {
-        "min_ms": 531.059794,
-        "p50_ms": 559.064976,
-        "p95_ms": 660.3507320000001,
-        "p99_ms": 660.3507320000001,
-        "stddev_ms": 49.91354711501667,
+        "min_ms": 1110.033974,
+        "p50_ms": 1121.099182,
+        "p95_ms": 1131.143157,
+        "p99_ms": 1131.143157,
+        "stddev_ms": 7.73801401698513,
         "measurement_count": 5
       },
-      "result_hash": "0fb7006e340d7a63ee41c53eb5b36651c2cad2a08637f94d5ef1fd8530c4c037",
-      "result_hash_relaxed": "7004bce467bf7bd02c441f8877f048c8560ec74c57db2a92415233638d5499d6"
+      "result_hash": "3ba8c379ed86a70aa34250b1fc6454dd316cc3b090362c627c44f5986666ca62",
+      "result_hash_relaxed": "c23252382a8646ef2d0e14a3db60e1f3108b759d13f3fd9ed50328ba3bfa7559"
     },
     {
       "query_id": "q11",
@@ -683,65 +683,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 268.69410700000003,
-          "rows_returned": 1048,
+          "wall_clock_ms": 305.244534,
+          "rows_returned": 0,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 291.446785,
-          "rows_returned": 1048,
+          "wall_clock_ms": 279.643337,
+          "rows_returned": 0,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 277.853768,
-          "rows_returned": 1048,
+          "wall_clock_ms": 280.58261400000004,
+          "rows_returned": 0,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 270.387718,
-          "rows_returned": 1048,
+          "wall_clock_ms": 289.712268,
+          "rows_returned": 0,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 288.784121,
-          "rows_returned": 1048,
+          "wall_clock_ms": 280.658029,
+          "rows_returned": 0,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 277.20708,
-          "rows_returned": 1048,
+          "wall_clock_ms": 298.202265,
+          "rows_returned": 0,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 270.016772,
-          "rows_returned": 1048,
+          "wall_clock_ms": 296.81174500000003,
+          "rows_returned": 0,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 273.78006700000003,
-          "rows_returned": 1048,
+          "wall_clock_ms": 284.48818,
+          "rows_returned": 0,
           "is_warmup": false
         }
       ],
-      "median_ms": 273.78006700000003,
+      "median_ms": 289.712268,
       "error": null,
       "stats": {
-        "min_ms": 270.016772,
-        "p50_ms": 273.78006700000003,
-        "p95_ms": 288.784121,
-        "p99_ms": 288.784121,
-        "stddev_ms": 7.699179221938623,
+        "min_ms": 280.658029,
+        "p50_ms": 289.712268,
+        "p95_ms": 298.202265,
+        "p99_ms": 298.202265,
+        "stddev_ms": 7.606068970619479,
         "measurement_count": 5
       },
-      "result_hash": "ac13e75d0b0124de36f3fdbee0532ed7153402e16f4467aac194b4f95f67f7b1",
-      "result_hash_relaxed": "bc68ef2dfab49759cecde9a33eafe72bf883bd0b0388b50fce76c6f9f5b1ac2c"
+      "result_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "result_hash_relaxed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     {
       "query_id": "q12",
@@ -750,65 +750,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 326.352776,
+          "wall_clock_ms": 966.760462,
           "rows_returned": 2,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 312.069448,
+          "wall_clock_ms": 1403.724432,
           "rows_returned": 2,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 331.658686,
+          "wall_clock_ms": 943.697017,
           "rows_returned": 2,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 314.97668699999997,
+          "wall_clock_ms": 976.252486,
           "rows_returned": 2,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 308.175824,
+          "wall_clock_ms": 985.026979,
           "rows_returned": 2,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 311.25059999999996,
+          "wall_clock_ms": 958.736916,
           "rows_returned": 2,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 366.26777100000004,
+          "wall_clock_ms": 1007.8915509999999,
           "rows_returned": 2,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 354.752478,
+          "wall_clock_ms": 967.696823,
           "rows_returned": 2,
           "is_warmup": false
         }
       ],
-      "median_ms": 314.97668699999997,
+      "median_ms": 976.252486,
       "error": null,
       "stats": {
-        "min_ms": 308.175824,
-        "p50_ms": 314.97668699999997,
-        "p95_ms": 366.26777100000004,
-        "p99_ms": 366.26777100000004,
-        "stddev_ms": 27.274935406183623,
+        "min_ms": 958.736916,
+        "p50_ms": 976.252486,
+        "p95_ms": 1007.8915509999999,
+        "p99_ms": 1007.8915509999999,
+        "stddev_ms": 18.820708448372876,
         "measurement_count": 5
       },
-      "result_hash": "18951f6d3ebd7894dfd44ae1e3ce7e3b9f52631cf8dc203921ffea0607dc0272",
-      "result_hash_relaxed": "18951f6d3ebd7894dfd44ae1e3ce7e3b9f52631cf8dc203921ffea0607dc0272"
+      "result_hash": "b606450e7ba4847dabadd242c04cd4b189040f2fee4e3c95a1af71a858a4ce5b",
+      "result_hash_relaxed": "b606450e7ba4847dabadd242c04cd4b189040f2fee4e3c95a1af71a858a4ce5b"
     },
     {
       "query_id": "q13",
@@ -817,65 +817,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 460.896448,
-          "rows_returned": 42,
+          "wall_clock_ms": 781.485498,
+          "rows_returned": 46,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 457.16869399999996,
-          "rows_returned": 42,
+          "wall_clock_ms": 795.96203,
+          "rows_returned": 46,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 458.055082,
-          "rows_returned": 42,
+          "wall_clock_ms": 780.340307,
+          "rows_returned": 46,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 451.56704199999996,
-          "rows_returned": 42,
+          "wall_clock_ms": 794.421637,
+          "rows_returned": 46,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 457.174235,
-          "rows_returned": 42,
+          "wall_clock_ms": 795.0807100000001,
+          "rows_returned": 46,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 448.37822900000003,
-          "rows_returned": 42,
+          "wall_clock_ms": 770.277458,
+          "rows_returned": 46,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 481.35186699999997,
-          "rows_returned": 42,
+          "wall_clock_ms": 784.305081,
+          "rows_returned": 46,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 468.699653,
-          "rows_returned": 42,
+          "wall_clock_ms": 782.649105,
+          "rows_returned": 46,
           "is_warmup": false
         }
       ],
-      "median_ms": 457.174235,
+      "median_ms": 784.305081,
       "error": null,
       "stats": {
-        "min_ms": 448.37822900000003,
-        "p50_ms": 457.174235,
-        "p95_ms": 481.35186699999997,
-        "p99_ms": 481.35186699999997,
-        "stddev_ms": 13.559745144811826,
+        "min_ms": 770.277458,
+        "p50_ms": 784.305081,
+        "p95_ms": 795.0807100000001,
+        "p99_ms": 795.0807100000001,
+        "stddev_ms": 10.155656989648728,
         "measurement_count": 5
       },
-      "result_hash": "50d5399b767d8bdb4790c81c2b5b1144ddc0d413c722c8d873ac918e6408b07c",
-      "result_hash_relaxed": "50d5399b767d8bdb4790c81c2b5b1144ddc0d413c722c8d873ac918e6408b07c"
+      "result_hash": "c8d242925e059c9f95ae5091df1a341164643faa7e46347a44d7e4c346024ed9",
+      "result_hash_relaxed": "c8d242925e059c9f95ae5091df1a341164643faa7e46347a44d7e4c346024ed9"
     },
     {
       "query_id": "q14",
@@ -884,65 +884,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 331.549649,
+          "wall_clock_ms": 764.8061240000001,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 337.82748699999996,
+          "wall_clock_ms": 787.282327,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 328.383376,
+          "wall_clock_ms": 753.037967,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 345.585151,
+          "wall_clock_ms": 779.187283,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 345.378449,
+          "wall_clock_ms": 764.525587,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 343.58755,
+          "wall_clock_ms": 755.7809669999999,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 348.926334,
+          "wall_clock_ms": 755.128727,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 321.96454400000005,
+          "wall_clock_ms": 758.97492,
           "rows_returned": 1,
           "is_warmup": false
         }
       ],
-      "median_ms": 345.378449,
+      "median_ms": 758.97492,
       "error": null,
       "stats": {
-        "min_ms": 321.96454400000005,
-        "p50_ms": 345.378449,
-        "p95_ms": 348.926334,
-        "p99_ms": 348.926334,
-        "stddev_ms": 10.863081036218906,
+        "min_ms": 755.128727,
+        "p50_ms": 758.97492,
+        "p95_ms": 779.187283,
+        "p99_ms": 779.187283,
+        "stddev_ms": 9.927673210433358,
         "measurement_count": 5
       },
-      "result_hash": "a02e1597f483b15f339bdf9940adfa2399d93d4f4a8be8f952c145e828958325",
-      "result_hash_relaxed": "cbcce54e03c0e8cab8c236cd3c93e73c468781d885314c5e6673bafe0dcf3081"
+      "result_hash": "62a1f35197d0533dfc0d2e5d8403c9b477f17df4b02dbd7173086b18f4e3c1fb",
+      "result_hash_relaxed": "d43b65687c5d4effeab2c855b5d365ed5b8cbd132e5a1b1dd99f50c8bc6eb6c4"
     },
     {
       "query_id": "q15",
@@ -951,65 +951,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 367.25194799999997,
+          "wall_clock_ms": 1063.482299,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 423.178214,
+          "wall_clock_ms": 1075.439911,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 381.12508,
+          "wall_clock_ms": 1031.836858,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 464.356752,
+          "wall_clock_ms": 1109.827769,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 449.348823,
+          "wall_clock_ms": 1056.210533,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 422.024085,
+          "wall_clock_ms": 1086.7320320000001,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 361.045024,
+          "wall_clock_ms": 1055.801373,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 410.68945299999996,
+          "wall_clock_ms": 1060.854255,
           "rows_returned": 1,
           "is_warmup": false
         }
       ],
-      "median_ms": 422.024085,
+      "median_ms": 1060.854255,
       "error": null,
       "stats": {
-        "min_ms": 361.045024,
-        "p50_ms": 422.024085,
-        "p95_ms": 464.356752,
-        "p99_ms": 464.356752,
-        "stddev_ms": 39.95060885622047,
+        "min_ms": 1055.801373,
+        "p50_ms": 1060.854255,
+        "p95_ms": 1109.827769,
+        "p99_ms": 1109.827769,
+        "stddev_ms": 23.80196178298936,
         "measurement_count": 5
       },
-      "result_hash": "d44e1b3440ef2e1d999b4b003cbff4250b24ed8911971a3555df2b83e0ac706c",
-      "result_hash_relaxed": "838ad2602b07c3365ba2eb47fc204c6233ec8f99cdc411298f7b07da61ff143f"
+      "result_hash": "1c57f0bfe3935d5e243a4faf627a122d2fe2ab7d5f36aa59c8c2ac435711074e",
+      "result_hash_relaxed": "9e7b09238609edbb34fa8cc17251fc68297513681d533ab8b39d2e54aafbd4f8"
     },
     {
       "query_id": "q16",
@@ -1018,65 +1018,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 311.876454,
-          "rows_returned": 18314,
+          "wall_clock_ms": 153.635356,
+          "rows_returned": 27840,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 285.85646599999995,
-          "rows_returned": 18314,
+          "wall_clock_ms": 150.70915,
+          "rows_returned": 27840,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 278.958482,
-          "rows_returned": 18314,
+          "wall_clock_ms": 140.7428,
+          "rows_returned": 27840,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 295.137206,
-          "rows_returned": 18314,
+          "wall_clock_ms": 158.761946,
+          "rows_returned": 27840,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 297.964781,
-          "rows_returned": 18314,
+          "wall_clock_ms": 150.819065,
+          "rows_returned": 27840,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 287.87115,
-          "rows_returned": 18314,
+          "wall_clock_ms": 151.830842,
+          "rows_returned": 27840,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 288.45471499999996,
-          "rows_returned": 18314,
+          "wall_clock_ms": 148.294353,
+          "rows_returned": 27840,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 299.54477099999997,
-          "rows_returned": 18314,
+          "wall_clock_ms": 143.539008,
+          "rows_returned": 27840,
           "is_warmup": false
         }
       ],
-      "median_ms": 295.137206,
+      "median_ms": 150.819065,
       "error": null,
       "stats": {
-        "min_ms": 287.87115,
-        "p50_ms": 295.137206,
-        "p95_ms": 299.54477099999997,
-        "p99_ms": 299.54477099999997,
-        "stddev_ms": 5.3818932231264425,
+        "min_ms": 143.539008,
+        "p50_ms": 150.819065,
+        "p95_ms": 158.761946,
+        "p99_ms": 158.761946,
+        "stddev_ms": 5.552970244419169,
         "measurement_count": 5
       },
-      "result_hash": "8608d52eb0488440a474aa6e0d2ea59385d0254c3f17f32f555409ca849d670c",
-      "result_hash_relaxed": "8608d52eb0488440a474aa6e0d2ea59385d0254c3f17f32f555409ca849d670c"
+      "result_hash": "8fc46c734ea4bb8671594512e028f8411cacf7b099f10e044f5d81adb41df24a",
+      "result_hash_relaxed": "8fc46c734ea4bb8671594512e028f8411cacf7b099f10e044f5d81adb41df24a"
     },
     {
       "query_id": "q17",
@@ -1085,65 +1085,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 530.9407980000001,
+          "wall_clock_ms": 2023.2137830000001,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 475.954625,
+          "wall_clock_ms": 1971.490519,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 508.280034,
+          "wall_clock_ms": 1966.532385,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 535.617938,
+          "wall_clock_ms": 1962.0050789999998,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 504.98568200000005,
+          "wall_clock_ms": 1957.693769,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 514.125177,
+          "wall_clock_ms": 2050.842451,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 452.697505,
+          "wall_clock_ms": 2006.1937470000003,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 524.0149389999999,
+          "wall_clock_ms": 1973.457405,
           "rows_returned": 1,
           "is_warmup": false
         }
       ],
-      "median_ms": 514.125177,
+      "median_ms": 1973.457405,
       "error": null,
       "stats": {
-        "min_ms": 452.697505,
-        "p50_ms": 514.125177,
-        "p95_ms": 535.617938,
-        "p99_ms": 535.617938,
-        "stddev_ms": 32.052878805705674,
+        "min_ms": 1957.693769,
+        "p50_ms": 1973.457405,
+        "p95_ms": 2050.842451,
+        "p99_ms": 2050.842451,
+        "stddev_ms": 38.93937432299591,
         "measurement_count": 5
       },
-      "result_hash": "d638a1ad24afe4d59f0fb00a22ca316b65fffa8faa3e99602e175ccca9217dca",
-      "result_hash_relaxed": "2b2dcf120f3f40ff8b74e06fc798d3543e3d8b5c7c7c9ebbf70d2a6af43ed01e"
+      "result_hash": "04c97e47579a2d3dbe93eac580dcfeeffed9121c929fc8b71e38dd6f7b4cd4ef",
+      "result_hash_relaxed": "06df2d4299f2fe0b3ef7921de3cbd47d76f93c890fc8316a8c03a6fb8655d329"
     },
     {
       "query_id": "q18",
@@ -1152,65 +1152,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 660.465633,
-          "rows_returned": 57,
+          "wall_clock_ms": 2727.72427,
+          "rows_returned": 100,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 569.8812829999999,
-          "rows_returned": 57,
+          "wall_clock_ms": 2450.452398,
+          "rows_returned": 100,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 559.313293,
-          "rows_returned": 57,
+          "wall_clock_ms": 2459.657302,
+          "rows_returned": 100,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 741.864155,
-          "rows_returned": 57,
+          "wall_clock_ms": 2427.2789970000003,
+          "rows_returned": 100,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 611.3732269999999,
-          "rows_returned": 57,
+          "wall_clock_ms": 2641.321112,
+          "rows_returned": 100,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 530.5991829999999,
-          "rows_returned": 57,
+          "wall_clock_ms": 2466.324785,
+          "rows_returned": 100,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 631.308038,
-          "rows_returned": 57,
+          "wall_clock_ms": 2453.143691,
+          "rows_returned": 100,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 514.940942,
-          "rows_returned": 57,
+          "wall_clock_ms": 2457.8969119999997,
+          "rows_returned": 100,
           "is_warmup": false
         }
       ],
-      "median_ms": 611.3732269999999,
+      "median_ms": 2457.8969119999997,
       "error": null,
       "stats": {
-        "min_ms": 514.940942,
-        "p50_ms": 611.3732269999999,
-        "p95_ms": 741.864155,
-        "p99_ms": 741.864155,
-        "stddev_ms": 90.97454417884222,
+        "min_ms": 2427.2789970000003,
+        "p50_ms": 2457.8969119999997,
+        "p95_ms": 2641.321112,
+        "p99_ms": 2641.321112,
+        "stddev_ms": 86.28189162403459,
         "measurement_count": 5
       },
-      "result_hash": "ae10cc09e1ee3bff8fc138521eae845d10c64363d9e8f04801982f8b28308446",
-      "result_hash_relaxed": "afc78a16dfc8fea6a9df8d8b4a15d702baca5e884c96780dc07fda8a89b350c6"
+      "result_hash": "a3d1d50a1d39439f91c0093a62bf025f45e16c17d3940d1f61ae8dd9b721fbfb",
+      "result_hash_relaxed": "975fd701d0313b94f5a202dd27575fec2496f44c12eb65a28ef186617c065a07"
     },
     {
       "query_id": "q19",
@@ -1219,65 +1219,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 511.088776,
+          "wall_clock_ms": 971.081771,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 402.849624,
+          "wall_clock_ms": 980.532296,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 410.24488399999996,
+          "wall_clock_ms": 955.658128,
           "rows_returned": 1,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 423.92760699999997,
+          "wall_clock_ms": 976.978141,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 430.76005200000003,
+          "wall_clock_ms": 990.364898,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 427.919852,
+          "wall_clock_ms": 960.942507,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 416.488473,
+          "wall_clock_ms": 1043.65568,
           "rows_returned": 1,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 447.488425,
+          "wall_clock_ms": 973.128741,
           "rows_returned": 1,
           "is_warmup": false
         }
       ],
-      "median_ms": 427.919852,
+      "median_ms": 976.978141,
       "error": null,
       "stats": {
-        "min_ms": 416.488473,
-        "p50_ms": 427.919852,
-        "p95_ms": 447.488425,
-        "p99_ms": 447.488425,
-        "stddev_ms": 11.48751245883498,
+        "min_ms": 960.942507,
+        "p50_ms": 976.978141,
+        "p95_ms": 1043.65568,
+        "p99_ms": 1043.65568,
+        "stddev_ms": 32.29841402159944,
         "measurement_count": 5
       },
-      "result_hash": "7a3df1c49b53563640c96c15d19b998498ff18898ba3f22749e0e9ab5e5d4718",
-      "result_hash_relaxed": "b301050565ac994902b6b2ff81ccf893ecb5d3d10ce5a9246c9066a5a59dfb9c"
+      "result_hash": "c80bdb3efaa295aa36a044fe455f16ac51b46fb7d00f8f33c00520dd150dcc6a",
+      "result_hash_relaxed": "37f53d9c633d73e19e0cf4977e2d8e6f1667ea90dd01f708121f906824919b89"
     },
     {
       "query_id": "q20",
@@ -1286,65 +1286,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 461.057192,
-          "rows_returned": 186,
+          "wall_clock_ms": 863.884967,
+          "rows_returned": 1804,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 432.933314,
-          "rows_returned": 186,
+          "wall_clock_ms": 849.525141,
+          "rows_returned": 1804,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 406.612211,
-          "rows_returned": 186,
+          "wall_clock_ms": 877.559761,
+          "rows_returned": 1804,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 398.827922,
-          "rows_returned": 186,
+          "wall_clock_ms": 864.171754,
+          "rows_returned": 1804,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 378.624119,
-          "rows_returned": 186,
+          "wall_clock_ms": 886.442294,
+          "rows_returned": 1804,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 478.09822299999996,
-          "rows_returned": 186,
+          "wall_clock_ms": 841.951672,
+          "rows_returned": 1804,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 417.626561,
-          "rows_returned": 186,
+          "wall_clock_ms": 842.635994,
+          "rows_returned": 1804,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 396.982607,
-          "rows_returned": 186,
+          "wall_clock_ms": 865.601274,
+          "rows_returned": 1804,
           "is_warmup": false
         }
       ],
-      "median_ms": 398.827922,
+      "median_ms": 864.171754,
       "error": null,
       "stats": {
-        "min_ms": 378.624119,
-        "p50_ms": 398.827922,
-        "p95_ms": 478.09822299999996,
-        "p99_ms": 478.09822299999996,
-        "stddev_ms": 38.38282696927304,
+        "min_ms": 841.951672,
+        "p50_ms": 864.171754,
+        "p95_ms": 886.442294,
+        "p99_ms": 886.442294,
+        "stddev_ms": 18.541134025862707,
         "measurement_count": 5
       },
-      "result_hash": "9337e821acceef213e69cc8fef5bc1ec2b7a7a309bf1fb713113888de31102dc",
-      "result_hash_relaxed": "9337e821acceef213e69cc8fef5bc1ec2b7a7a309bf1fb713113888de31102dc"
+      "result_hash": "15a72c2e989974d4c2fdc782eb9e27cc87c72b21163e8aaaaf7b8cb259b1ebd3",
+      "result_hash_relaxed": "15a72c2e989974d4c2fdc782eb9e27cc87c72b21163e8aaaaf7b8cb259b1ebd3"
     },
     {
       "query_id": "q21",
@@ -1353,65 +1353,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 1057.1337919999999,
+          "wall_clock_ms": 2491.218535,
           "rows_returned": 100,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 991.6036700000001,
+          "wall_clock_ms": 2407.087343,
           "rows_returned": 100,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 952.860011,
+          "wall_clock_ms": 2453.30673,
           "rows_returned": 100,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 971.760939,
+          "wall_clock_ms": 2615.473458,
           "rows_returned": 100,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 1014.017483,
+          "wall_clock_ms": 2410.2786699999997,
           "rows_returned": 100,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 980.625235,
+          "wall_clock_ms": 2385.1375890000004,
           "rows_returned": 100,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 928.545509,
+          "wall_clock_ms": 2404.581755,
           "rows_returned": 100,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 1014.4219699999999,
+          "wall_clock_ms": 2406.96797,
           "rows_returned": 100,
           "is_warmup": false
         }
       ],
-      "median_ms": 980.625235,
+      "median_ms": 2406.96797,
       "error": null,
       "stats": {
-        "min_ms": 928.545509,
-        "p50_ms": 980.625235,
-        "p95_ms": 1014.4219699999999,
-        "p99_ms": 1014.4219699999999,
-        "stddev_ms": 35.49765914601307,
+        "min_ms": 2385.1375890000004,
+        "p50_ms": 2406.96797,
+        "p95_ms": 2615.473458,
+        "p99_ms": 2615.473458,
+        "stddev_ms": 96.08464684007295,
         "measurement_count": 5
       },
-      "result_hash": "95d1d5b3a84d85f5c5cddd965b1bed97d966c52e8b6dcc43bc229d31ef61f989",
-      "result_hash_relaxed": "95d1d5b3a84d85f5c5cddd965b1bed97d966c52e8b6dcc43bc229d31ef61f989"
+      "result_hash": "358dcabc00fea0736605484d90c49f2de2ae13226a580902db8d9c144c9ac964",
+      "result_hash_relaxed": "358dcabc00fea0736605484d90c49f2de2ae13226a580902db8d9c144c9ac964"
     },
     {
       "query_id": "q22",
@@ -1420,65 +1420,65 @@
       "runs": [
         {
           "run_number": 1,
-          "wall_clock_ms": 232.663069,
+          "wall_clock_ms": 329.572835,
           "rows_returned": 7,
           "is_warmup": true
         },
         {
           "run_number": 2,
-          "wall_clock_ms": 265.799534,
+          "wall_clock_ms": 329.750083,
           "rows_returned": 7,
           "is_warmup": true
         },
         {
           "run_number": 3,
-          "wall_clock_ms": 217.11669799999999,
+          "wall_clock_ms": 313.74624,
           "rows_returned": 7,
           "is_warmup": true
         },
         {
           "run_number": 4,
-          "wall_clock_ms": 266.37668199999996,
+          "wall_clock_ms": 313.795864,
           "rows_returned": 7,
           "is_warmup": false
         },
         {
           "run_number": 5,
-          "wall_clock_ms": 286.24370300000004,
+          "wall_clock_ms": 307.49537599999996,
           "rows_returned": 7,
           "is_warmup": false
         },
         {
           "run_number": 6,
-          "wall_clock_ms": 234.51200799999998,
+          "wall_clock_ms": 310.04625400000003,
           "rows_returned": 7,
           "is_warmup": false
         },
         {
           "run_number": 7,
-          "wall_clock_ms": 272.952135,
+          "wall_clock_ms": 318.902037,
           "rows_returned": 7,
           "is_warmup": false
         },
         {
           "run_number": 8,
-          "wall_clock_ms": 228.788028,
+          "wall_clock_ms": 307.273879,
           "rows_returned": 7,
           "is_warmup": false
         }
       ],
-      "median_ms": 266.37668199999996,
+      "median_ms": 310.04625400000003,
       "error": null,
       "stats": {
-        "min_ms": 228.788028,
-        "p50_ms": 266.37668199999996,
-        "p95_ms": 286.24370300000004,
-        "p99_ms": 286.24370300000004,
-        "stddev_ms": 24.9810565822674,
+        "min_ms": 307.273879,
+        "p50_ms": 310.04625400000003,
+        "p95_ms": 318.902037,
+        "p99_ms": 318.902037,
+        "stddev_ms": 4.900805974806034,
         "measurement_count": 5
       },
-      "result_hash": "30d40d8af709499d43e0a32146a8524793a8db7de77f676f0396287b5731e272",
-      "result_hash_relaxed": "9c73ae8dd47c1c0ab9c8f6a79ef899a4aee87203e5771cb99ebc614b2cef4119"
+      "result_hash": "40d42c46bd79bf23a5113197125cac650b71715075bdeb417d2064a00189363b",
+      "result_hash_relaxed": "d9c7224abbf7acb02f37e02a2dae2db77b2d1c22ce7f32d3486a072f180f7a9d"
     }
   ]
 }

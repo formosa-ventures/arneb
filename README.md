@@ -15,7 +15,7 @@ Trino (formerly PrestoSQL) lets users query data where it lives — across objec
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
 - **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC
 - **Web UI**: Dashboard with query monitoring, cluster overview, and worker status
-- **TPC-H Benchmark**: 22/22 queries matching Trino's results and 1.59x faster by geomean at SF1 in the default configuration ([published run](benchmarks/tpch/official/v1.0.0/)), with a three-engine comparison harness
+- **TPC-H Benchmark**: 22/22 queries matching Trino's results; 1.76x faster than Trino by geomean at SF1 and 1.32x slower at SF10 in the default configuration ([published runs](benchmarks/tpch/official/v1.0.0/)), with a three-engine comparison harness
 
 ## Quick Start
 
@@ -145,33 +145,42 @@ docker compose down
 
 ## TPC-H Benchmark
 
-Arneb runs the full 22-query TPC-H suite **1.59x faster than Trino by geometric
-mean** at SF1, and is ahead on all 22 queries individually (1.07x–2.60x). Both
-engines read the same Parquet from MinIO via Hive Metastore, run as a
-coordinator plus two workers with the same CPU allocation, and execute inside
-the same container stack.
+Arneb completes all 22 TPC-H queries with results matching Trino and DataFusion,
+in its **default configuration** — a stock `cargo build --release` with no tuning
+options enabled. How it compares on latency depends on the scale factor, and the
+answer reverses between the two we publish:
 
-These are **default-configuration** numbers — a stock `cargo build --release`
-with no tuning options enabled — so following the tutorial reproduces the setup
-they came from.
+| | SF1 | SF10 |
+|---|---:|---:|
+| Arneb geomean p50 | 293.1 ms | 2566.6 ms |
+| Trino geomean p50 | 515.3 ms | 1954.8 ms |
+| **Arneb vs Trino** | **1.76x faster** | **1.32x slower** |
+| Queries where Arneb leads | 21 / 22 | 7 / 22 |
 
-| | Arneb | Trino | DataFusion |
-|---|---:|---:|---:|
-| Queries completed | 22/22 | 22/22 | 22/22 |
-| Geomean p50 | 277.6 ms | 442.8 ms | 139.9 ms |
-| vs Arneb | — | 0.63x | 1.98x |
+**Arneb wins at SF1 and loses at SF10, and the split is not random.** At SF10 it
+still leads on scans and simple aggregation — q06 (1.56x), q14 (1.47x), q10
+(1.35x) — while multi-table joins and correlated subqueries reverse hardest:
+q02 drops to 0.15x, q11 to 0.44x, q21 to 0.46x. Arneb's scan path scales; its
+join execution does not yet. That is the honest state of the engine at 1.0.0,
+and it is where the work goes next.
 
-Results agree across all three engines. DataFusion is roughly 2x ahead of Arneb
-here; it runs in-process with no distribution layer, and it is in the comparison
-as a correctness cross-check and an Arrow-native reference point rather than as
-the engine Arneb is positioned against.
+DataFusion is ahead of Arneb at both scales (0.48x at SF1, 0.34x at SF10). It
+runs in-process with no distribution layer, and it is in the comparison as a
+correctness cross-check and an Arrow-native reference point rather than as the
+engine Arneb is positioned against.
+
+Both engines read the same Parquet from MinIO via Hive Metastore and run as a
+coordinator plus two workers with the same CPU allocation. Only the engine being
+measured is running — an idle engine still holds its heap, so leaving them all up
+measures each under memory pressure from its rivals.
 
 Measured 2026-07-25 on an Apple M1 Pro (10 cores, 32 GB, macOS 26.5.2, arm64).
-Full per-query figures, the raw result documents and the run's provenance are in
-[`benchmarks/tpch/official/v1.0.0/`](benchmarks/tpch/official/v1.0.0/) — see
-[`comparison.md`](benchmarks/tpch/official/v1.0.0/comparison.md). These are
-laptop numbers on arm64 macOS; they are reproducible on comparable hardware and
-do not generalize to Linux x86 servers.
+Per-query figures, the raw result documents and each run's provenance are
+published in [`benchmarks/tpch/official/v1.0.0/`](benchmarks/tpch/official/v1.0.0/)
+— [SF1](benchmarks/tpch/official/v1.0.0/sf1/comparison.md) ·
+[SF10](benchmarks/tpch/official/v1.0.0/sf10/comparison.md). These are laptop
+numbers on arm64 macOS; they are reproducible on comparable hardware and do not
+generalize to Linux x86 servers.
 
 The full guide — prerequisites, the fully containerized three-engine run, and
 how to read the comparison report — is in the

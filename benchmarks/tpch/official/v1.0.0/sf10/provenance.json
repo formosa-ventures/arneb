@@ -1,14 +1,21 @@
 {
   "release": "1.0.0",
-  "run_date": "2026-07-25T20:04:42.022774158+00:00",
-  "git_commit": "38158fbc6bf98926c82c57db26db5b6121be58f4",
-  "git_commit_note": "The commit immediately preceding the one that adds this file — the tree that was actually built and measured. See benchmarks/tpch/RELEASE_CHECKLIST.md.",
-
-  "scale_factor": "sf1",
+  "scale_factor": "sf10",
+  "run_date": "2026-07-25T20:54:50.001272971+00:00",
+  "git_commit": "c4efe5b656d0f3c64c4d3477b38b281d48d5ea5c",
+  "git_commit_note": "The commit immediately preceding the one that adds this file \u2014 the tree that was actually built and measured. See benchmarks/tpch/RELEASE_CHECKLIST.md.",
+  "dataset": {
+    "lineitem_rows": 59986052,
+    "approx_parquet_size": "~10 GB"
+  },
   "queries_total": 22,
   "warm_up_runs": 3,
   "measurement_runs": 5,
-
+  "methodology": {
+    "engine_rotation": true,
+    "note": "Only the engine being measured was running; the others were stopped, not left idle. An idle engine still holds its heap \u2014 three Trino JVMs declare -Xmx8G each \u2014 so an all-up arrangement measures every engine under memory pressure from its rivals, and at sf10 the combined ceiling exceeds the 15.67 GiB the container runtime has. Both scale factors use this arrangement so their figures are comparable.",
+    "runner_isolation": "The benchmark runner is containerized because the DataFusion adapter runs in-process inside it; a host-side runner would measure DataFusion natively against containerized rivals."
+  },
   "engines": {
     "arneb": {
       "version": "1.0.0",
@@ -39,7 +46,6 @@
       "memory_limit": null
     }
   },
-
   "storage": {
     "minio_image": "minio/minio:latest",
     "minio_digest": "sha256:8f08aee614800a237906bd48114d733e5ac5bfac4ccdf731f141b0e880d7a253",
@@ -47,7 +53,6 @@
     "hive_metastore_digest": "sha256:398dee1e4140646f5de20c7dc4caa56b70d8fe275d1ee3bdf277f6095971d3d7",
     "hive_metastore_base": "apache/hive:4.2.0 + hadoop-aws"
   },
-
   "host": {
     "model": "MacBookPro18,3",
     "cpu": "Apple M1 Pro",
@@ -57,15 +62,11 @@
     "os": "macOS 26.5.2 (25F84)",
     "arch": "arm64",
     "storage": "SSD",
-    "container_runtime": "OrbStack (Docker Engine 29.4.0)"
+    "container_runtime": "OrbStack (Docker Engine 29.4.0)",
+    "container_runtime_memory_gib": 15.67
   },
-
   "notes": [
-    "Every engine and the benchmark runner ran inside the container stack. The runner is containerized because the DataFusion adapter executes in-process inside it; a host-side runner would measure DataFusion natively against containerized rivals.",
     "arneb ran in its default configuration: zero ARNEB_* tuning variables, verified with docker inspect against the running container rather than the compose file.",
-    "arneb and Trino each received 3 nodes x 2 CPUs; the runner received 6 CPUs so DataFusion, a single process, had the same total budget.",
-    "No memory limits were set on any engine, matching the existing benchmark setup.",
-    "Numbers are arm64 macOS figures from one laptop. They are reproducible on comparable hardware; they do not generalize to Linux x86 servers.",
-    "q09 agrees across all three engines but sits on a rounding boundary in the twelfth significant digit, so its strict hashes differ while the coarser comparison matches. See the boundary note in comparison.md."
+    "Numbers are arm64 macOS figures from one laptop. They are reproducible on comparable hardware; they do not generalize to Linux x86 servers."
   ]
 }

@@ -55,7 +55,18 @@ COMPOSE=(docker compose
          -f docker-compose.yml
          -f docker/tpch-bench/docker-compose.official.yml)
 
-ENGINE_SERVICES=(arneb arneb-worker-1 arneb-worker-2 trino trino-worker-1 trino-worker-2)
+ALL_ENGINE_SERVICES=(arneb arneb-worker-1 arneb-worker-2 trino trino-worker-1 trino-worker-2)
+
+# Services each engine needs while it is being measured. DataFusion needs none:
+# it runs in-process inside the runner container.
+services_for() {
+    case "$1" in
+        arneb)      echo "arneb arneb-worker-1 arneb-worker-2" ;;
+        trino)      echo "trino trino-worker-1 trino-worker-2" ;;
+        datafusion) echo "" ;;
+        *) echo "unknown engine: $1" >&2; exit 1 ;;
+    esac
+}
 
 echo "============================================"
 echo "TPC-H comparison (containerized, stock config)"
@@ -68,13 +79,15 @@ echo ""
 # ---------------------------------------------------------------------------
 # Step 1: bring up the engine stack
 # ---------------------------------------------------------------------------
-echo ">>> Step 1: Starting engines (building images as needed)..."
+echo ">>> Step 1: Preparing infrastructure and building images..."
 # minio-init creates the `warehouse` bucket and exits. It has to run before the
 # seed, and naming only the engine services would skip it — leaving Trino to
 # fail later with "Invalid location URI" against a bucket that does not exist.
 "${COMPOSE[@]}" up -d --wait minio
 "${COMPOSE[@]}" up minio-init
-"${COMPOSE[@]}" up -d --build --wait "${ENGINE_SERVICES[@]}"
+"${COMPOSE[@]}" up -d --wait hive-metastore
+# Build every engine image now so no image build lands inside a measured window.
+"${COMPOSE[@]}" build "${ALL_ENGINE_SERVICES[@]}" tpch-bench
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -84,28 +97,66 @@ if [ "${SKIP_SEED:-0}" = "1" ]; then
     echo ">>> Step 2: Skipping seed (SKIP_SEED=1)"
 else
     echo ">>> Step 2: Seeding TPC-H $TPCH_SF into MinIO via Trino..."
-    TPCH_SF="$TPCH_SF" "${COMPOSE[@]}" run --rm tpch-seed
+    # Trino performs the CTAS, so it has to be up — including its workers.
+    # `node-scheduler.include-coordinator=false` means a lone coordinator cannot
+    # execute anything, so its healthcheck (`SELECT 1`) never passes and the
+    # seed fails with "dependency failed to start ... is unhealthy". A previous
+    # engine rotation leaves everything stopped, so this cannot be assumed.
+    "${COMPOSE[@]}" up -d --wait trino trino-worker-1 trino-worker-2
+    TPCH_SF="$TPCH_SF" "${COMPOSE[@]}" run --rm --no-deps tpch-seed
 fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 3: run the benchmark from inside the runner container
+# Step 3: measure one engine at a time, with only that engine running
 # ---------------------------------------------------------------------------
-echo ">>> Step 3: Running benchmark..."
+# Engines take turns rather than all sitting up at once. Three Trino JVMs alone
+# declare -Xmx8G each, so at SF10 the combined ceiling exceeds what the container
+# runtime has; more importantly, an idle engine still holds its heap, so leaving
+# them all up means every engine is measured under memory pressure from its
+# rivals. One at a time gives each the whole machine, which is both survivable
+# and fairer.
+echo ">>> Step 3: Running benchmark, one engine at a time..."
 mkdir -p "$RESULTS_DIR"
 
-RUN_ARGS=(--engines "$ENGINES"
-          --arneb-host arneb --arneb-port 5432
-          --trino-host trino --trino-port 8080
-          --catalog hive --schema tpch
-          --minio-endpoint http://minio:9000
-          --queries-dir /queries
-          --output-dir /results
-          --num-runs "$NUM_RUNS"
-          --warm-up "$WARM_UP")
-[ -n "$QUERIES" ] && RUN_ARGS+=(--queries "$QUERIES")
+for engine in ${ENGINES//,/ }; do
+    echo ""
+    echo "--- $engine ---"
+    needed=$(services_for "$engine")
 
-"${COMPOSE[@]}" run --rm tpch-bench "${RUN_ARGS[@]}"
+    # Stop every engine service that this engine does not need, so its memory is
+    # actually released rather than merely idle.
+    to_stop=()
+    for svc in "${ALL_ENGINE_SERVICES[@]}"; do
+        case " $needed " in *" $svc "*) ;; *) to_stop+=("$svc") ;; esac
+    done
+    [ ${#to_stop[@]} -gt 0 ] && "${COMPOSE[@]}" stop "${to_stop[@]}" >/dev/null 2>&1
+
+    if [ -n "$needed" ]; then
+        # shellcheck disable=SC2086
+        "${COMPOSE[@]}" up -d --wait $needed
+    fi
+
+    RUN_ARGS=(--engines "$engine"
+              --arneb-host arneb --arneb-port 5432
+              --trino-host trino --trino-port 8080
+              --catalog hive --schema tpch
+              --minio-endpoint http://minio:9000
+              --queries-dir /queries
+              --output-dir /results
+              --num-runs "$NUM_RUNS"
+              --warm-up "$WARM_UP")
+    [ -n "$QUERIES" ] && RUN_ARGS+=(--queries "$QUERIES")
+
+    # --no-deps: the runner's depends_on names every engine, which would drag
+    # the stopped one back up and defeat the rotation. This loop has already
+    # brought up exactly what this engine needs, and Step 1 left MinIO and the
+    # metastore running.
+    "${COMPOSE[@]}" run --rm --no-deps tpch-bench "${RUN_ARGS[@]}"
+done
+
+# Leave the stack stopped so nothing lingers holding memory.
+"${COMPOSE[@]}" stop "${ALL_ENGINE_SERVICES[@]}" >/dev/null 2>&1
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -113,7 +164,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # Rendered by the same Rust binary — the harness has no Python dependency.
 echo ">>> Step 4: Generating comparison report..."
-"${COMPOSE[@]}" run --rm tpch-bench report --dir /results --output /results/comparison.md
+"${COMPOSE[@]}" run --rm --no-deps tpch-bench report --dir /results --output /results/comparison.md
 
 echo ""
 echo "Results:  $RESULTS_DIR"

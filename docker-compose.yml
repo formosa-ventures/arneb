@@ -92,9 +92,13 @@ services:
       hive-metastore:
         condition: service_healthy
     healthcheck:
+      # `trino --execute` starts a JVM CLI, connects, and runs a query. Under
+      # load that regularly exceeds 10s, which marked a perfectly healthy
+      # coordinator unhealthy and made `compose up --wait` bail. The probe was
+      # the slow part, not the service.
       test: ["CMD", "trino", "--execute", "SELECT 1"]
       interval: 10s
-      timeout: 10s
+      timeout: 30s
       retries: 12
       start_period: 30s
 

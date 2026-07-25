@@ -117,31 +117,62 @@ benchmarks/tpch/results/
 
 If you'd rather drive it yourself, these are the same steps:
 
+Engines take turns: only the engine being measured is running. An idle
+engine still holds its heap — three Trino JVMs alone declare `-Xmx8G`
+each — so leaving them all up means every engine is measured under
+memory pressure from its rivals, and at SF10 the combined ceiling
+exceeds what the container runtime has. One at a time gives each engine
+the whole machine.
+
 ```bash
 COMPOSE="docker compose -f docker-compose.yml \
                        -f docker/tpch-bench/docker-compose.official.yml"
 
-# 1. Start the six engine containers (1 coordinator + 2 workers each).
-$COMPOSE up -d --build --wait \
-    arneb arneb-worker-1 arneb-worker-2 \
-    trino trino-worker-1 trino-worker-2
+# 1. Infrastructure, and build every image up front so no image build
+#    lands inside a measured window.
+$COMPOSE up -d --wait minio
+$COMPOSE up minio-init                  # creates the `warehouse` bucket
+$COMPOSE up -d --wait hive-metastore
+$COMPOSE build arneb arneb-worker-1 arneb-worker-2 \
+               trino trino-worker-1 trino-worker-2 tpch-bench
 
 # 2. Seed ~1 GB of TPC-H SF1 Parquet into MinIO and register it in Hive
-#    Metastore. Takes ~2 minutes the first time.
+#    Metastore. Takes ~2 minutes the first time. Trino does the CTAS, so
+#    it has to be up for this step.
+$COMPOSE up -d --wait trino trino-worker-1 trino-worker-2
 TPCH_SF=sf1 $COMPOSE run --rm tpch-seed
 
-# 3. Run all three engines from inside the runner container.
-$COMPOSE run --rm tpch-bench \
-    --engines arneb,trino,datafusion \
-    --arneb-host arneb --trino-host trino \
+# 3a. arneb's turn — Trino stopped so its heap is released, not just idle.
+$COMPOSE stop trino trino-worker-1 trino-worker-2
+$COMPOSE up -d --wait arneb arneb-worker-1 arneb-worker-2
+$COMPOSE run --rm --no-deps tpch-bench \
+    --engines arneb --arneb-host arneb \
     --catalog hive --schema tpch \
-    --minio-endpoint http://minio:9000 \
+    --queries-dir /queries --output-dir /results
+
+# 3b. Trino's turn.
+$COMPOSE stop arneb arneb-worker-1 arneb-worker-2
+$COMPOSE up -d --wait trino trino-worker-1 trino-worker-2
+$COMPOSE run --rm --no-deps tpch-bench \
+    --engines trino --trino-host trino \
+    --catalog hive --schema tpch \
+    --queries-dir /queries --output-dir /results
+
+# 3c. DataFusion's turn — no engine containers at all; it runs in-process
+#     inside the runner.
+$COMPOSE stop trino trino-worker-1 trino-worker-2
+$COMPOSE run --rm --no-deps tpch-bench \
+    --engines datafusion --minio-endpoint http://minio:9000 \
     --queries-dir /queries --output-dir /results
 
 # 4. Render the report.
-$COMPOSE run --rm tpch-bench report \
+$COMPOSE run --rm --no-deps tpch-bench report \
     --dir /results --output /results/comparison.md
 ```
+
+`--no-deps` matters: the runner's `depends_on` names every engine, so
+without it Compose drags the stopped engine back up and the rotation
+achieves nothing.
 
 Verify the seed landed before benchmarking:
 

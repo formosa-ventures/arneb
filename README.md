@@ -15,7 +15,7 @@ Trino (formerly PrestoSQL) lets users query data where it lives — across objec
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
 - **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC
 - **Web UI**: Dashboard with query monitoring, cluster overview, and worker status
-- **TPC-H Benchmark**: 22/22 queries matching Trino's results; 1.76x faster than Trino by geomean at SF1 and 1.32x slower at SF10 in the default configuration ([published runs](benchmarks/tpch/official/v1.0.0/)), with a three-engine comparison harness
+- **TPC-H Benchmark**: 22/22 queries matching Trino's results and 1.76x faster by geomean at SF1 in the default configuration ([published run](benchmarks/tpch/official/v1.0.0/sf1/)), with a three-engine comparison harness
 
 ## Quick Start
 
@@ -147,27 +147,25 @@ docker compose down
 
 Arneb completes all 22 TPC-H queries with results matching Trino and DataFusion,
 in its **default configuration** — a stock `cargo build --release` with no tuning
-options enabled. How it compares on latency depends on the scale factor, and the
-answer reverses between the two we publish:
+options enabled.
 
-| | SF1 | SF10 |
-|---|---:|---:|
-| Arneb geomean p50 | 293.1 ms | 2566.6 ms |
-| Trino geomean p50 | 515.3 ms | 1954.8 ms |
-| **Arneb vs Trino** | **1.76x faster** | **1.32x slower** |
-| Queries where Arneb leads | 21 / 22 | 7 / 22 |
+**At TPC-H SF1**, Arneb is **1.76x faster than Trino by geometric mean** and
+leads on 21 of 22 queries:
 
-**Arneb wins at SF1 and loses at SF10, and the split is not random.** At SF10 it
-still leads on scans and simple aggregation — q06 (1.56x), q14 (1.47x), q10
-(1.35x) — while multi-table joins and correlated subqueries reverse hardest:
-q02 drops to 0.15x, q11 to 0.44x, q21 to 0.46x. Arneb's scan path scales; its
-join execution does not yet. That is the honest state of the engine at 1.0.0,
-and it is where the work goes next.
+| | Arneb | Trino | DataFusion |
+|---|---:|---:|---:|
+| Queries completed | 22/22 | 22/22 | 22/22 |
+| Geomean p50 | 293.1 ms | 515.3 ms | 141.5 ms |
+| vs Arneb | — | 0.57x | 2.07x |
 
-DataFusion is ahead of Arneb at both scales (0.48x at SF1, 0.34x at SF10). It
-runs in-process with no distribution layer, and it is in the comparison as a
-correctness cross-check and an Arrow-native reference point rather than as the
-engine Arneb is positioned against.
+This figure covers SF1 and nothing else. Larger scale factors are not published
+yet, and nothing here should be read as a claim about them — run the benchmark at
+the scale you care about rather than extrapolating.
+
+DataFusion is roughly 2x ahead of Arneb. It runs in-process with no distribution
+layer, and it is in the comparison as a correctness cross-check and an
+Arrow-native reference point rather than as the engine Arneb is positioned
+against.
 
 Both engines read the same Parquet from MinIO via Hive Metastore and run as a
 coordinator plus two workers with the same CPU allocation. Only the engine being
@@ -175,12 +173,12 @@ measured is running — an idle engine still holds its heap, so leaving them all
 measures each under memory pressure from its rivals.
 
 Measured 2026-07-25 on an Apple M1 Pro (10 cores, 32 GB, macOS 26.5.2, arm64).
-Per-query figures, the raw result documents and each run's provenance are
-published in [`benchmarks/tpch/official/v1.0.0/`](benchmarks/tpch/official/v1.0.0/)
-— [SF1](benchmarks/tpch/official/v1.0.0/sf1/comparison.md) ·
-[SF10](benchmarks/tpch/official/v1.0.0/sf10/comparison.md). These are laptop
-numbers on arm64 macOS; they are reproducible on comparable hardware and do not
-generalize to Linux x86 servers.
+Per-query figures, the raw result documents and the run's provenance are
+published in
+[`benchmarks/tpch/official/v1.0.0/sf1/`](benchmarks/tpch/official/v1.0.0/sf1/) —
+see [`comparison.md`](benchmarks/tpch/official/v1.0.0/sf1/comparison.md). These
+are laptop numbers on arm64 macOS; they are reproducible on comparable hardware
+and do not generalize to Linux x86 servers.
 
 The full guide — prerequisites, the fully containerized three-engine run, and
 how to read the comparison report — is in the

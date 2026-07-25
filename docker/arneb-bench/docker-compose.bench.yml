@@ -8,11 +8,20 @@
 #                  -f docker/arneb-bench/docker-compose.bench.yml \
 #                  up -d arneb trino
 #
-# Docker Desktop on this host has 3.88 GB total memory. Don't set
-# mem_limit explicitly on the bench services — let them compete via
-# Docker's defaults so neither one gets starved when the other is
-# running. Arneb's Rust workload uses very little heap (~hundreds of
-# MB) while Trino's JVM takes ~3 GB.
+# Don't set mem_limit explicitly on the bench services — let them
+# compete via Docker's defaults so neither one gets starved when the
+# other is running. Arneb's Rust workload uses very little heap
+# (~hundreds of MB) while Trino's JVM takes ~3 GB.
+#
+# Check the container runtime's actual memory allocation before tuning;
+# it varies per machine and per Docker Desktop / OrbStack setting:
+#   docker info --format '{{.MemTotal}}'
+#
+# NOTE: this overlay is for TUNING work. It enables 16 ARNEB_* options
+# that are gated default-OFF in the engine, so its numbers are not what
+# a stock build produces. Official release numbers come from
+# docker/tpch-bench/docker-compose.official.yml, which runs arneb in its
+# default configuration. See benchmarks/tpch/RELEASE_CHECKLIST.md.
 
 services:
   # Coordinator: pgwire on 5432 (only port exposed to host), Flight

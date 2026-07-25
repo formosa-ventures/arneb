@@ -17,3 +17,9 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
 async-trait = "0.1"
+datafusion = "54"
+sha2 = "0.10"
+url = "2"
+thiserror = "2"
+object_store = { version = "0.13", features = ["aws"] }
+hex = "0.4"

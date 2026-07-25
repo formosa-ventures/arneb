@@ -1,417 +1,358 @@
+//! TPC-H benchmark harness.
+//!
+//! Runs the TPC-H suite against any subset of {arneb, trino, datafusion} under
+//! one shared run plan, and renders a comparison report from the resulting JSON
+//! documents. All engine-specific logic lives behind the `engines` module's
+//! adapter trait; this file is CLI parsing and dispatch only.
+
+mod canonical;
+mod correctness;
+mod engines;
+mod report;
+mod runner;
+mod skip;
+mod stats;
+
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
-use clap::Parser;
-use serde::{Deserialize, Serialize};
+use clap::{Args, Parser, Subcommand};
 
-/// TPC-H Benchmark Runner for arneb and Trino
-///
-/// Supports two engines:
-/// - arneb: connects via PostgreSQL wire protocol
-/// - trino: connects via Trino REST API (/v1/statement)
+use engines::arneb::ArnebEngine;
+use engines::datafusion::{DataFusionConfig, DataFusionEngine};
+use engines::trino::TrinoEngine;
+use engines::BenchmarkEngine;
+use runner::{LoadedQuery, RunPlan};
+
+const ALL_ENGINES: &[&str] = &["arneb", "trino", "datafusion"];
+const DEFAULT_ARNEB_PORT: u16 = 5432;
+const DEFAULT_TRINO_PORT: u16 = 8080;
+
 #[derive(Parser)]
 #[command(name = "tpch-bench", version, about)]
-struct Args {
-    /// Engine to benchmark: "arneb" or "trino"
-    #[arg(long, default_value = "arneb")]
-    engine: String,
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
 
-    /// Host address of the database server
+    /// Flags for the default `run` behaviour when no subcommand is given.
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+// Constructed exactly once, at startup, from argv — the variant size gap costs
+// nothing, and boxing the payload fights clap's derive.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+enum Command {
+    /// Execute the query suite against one or more engines.
+    Run(RunArgs),
+    /// Render a comparison report from previously written result JSONs.
+    Report(ReportArgs),
+}
+
+#[derive(Args, Clone)]
+struct RunArgs {
+    /// Engines to benchmark, comma-separated (arneb,trino,datafusion).
+    /// Defaults to all three when neither this nor --engine is given.
+    #[arg(long)]
+    engines: Option<String>,
+
+    /// Single-engine alias for --engines, kept for backwards compatibility.
+    #[arg(long)]
+    engine: Option<String>,
+
+    /// Fallback host for the networked engines. Used when the per-engine host
+    /// flags are not given — on the compose network the engines have distinct
+    /// service names, so they must be addressed separately.
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
-    /// Port number (5432 for arneb, 8080 for trino)
+    /// Host for arneb's pgwire listener. Defaults to --host.
+    #[arg(long)]
+    arneb_host: Option<String>,
+
+    /// Host for Trino's HTTP endpoint. Defaults to --host.
+    #[arg(long)]
+    trino_host: Option<String>,
+
+    /// Port override. Only applies when exactly one engine is selected.
     #[arg(long)]
     port: Option<u16>,
 
-    /// Trino catalog (only for engine=trino)
+    /// Port for arneb's pgwire listener.
+    #[arg(long, default_value_t = DEFAULT_ARNEB_PORT)]
+    arneb_port: u16,
+
+    /// Port for Trino's HTTP endpoint.
+    #[arg(long, default_value_t = DEFAULT_TRINO_PORT)]
+    trino_port: u16,
+
+    /// Trino catalog.
     #[arg(long, default_value = "tpch")]
     catalog: String,
 
-    /// Trino schema (only for engine=trino)
+    /// Trino schema.
     #[arg(long, default_value = "sf1")]
     schema: String,
 
-    /// Directory containing query SQL files
+    /// S3/MinIO endpoint for the in-process DataFusion engine.
+    /// Precedence: this flag > AWS_ENDPOINT_URL > built-in default.
+    #[arg(long)]
+    minio_endpoint: Option<String>,
+
+    /// Bucket holding the TPC-H Parquet files.
+    #[arg(long, default_value = "warehouse")]
+    s3_bucket: String,
+
+    /// Key prefix under the bucket.
+    #[arg(long, default_value = "tpch")]
+    s3_prefix: String,
+
+    /// Directory containing query SQL files.
     #[arg(long, default_value = "benchmarks/tpch/queries")]
     queries_dir: PathBuf,
 
-    /// Number of runs per query (including warm-up)
-    #[arg(long, default_value = "5")]
+    /// Total runs per query, warm-up included.
+    #[arg(long, default_value_t = 8)]
     num_runs: usize,
 
-    /// Number of warm-up runs to discard
-    #[arg(long, default_value = "2")]
+    /// Leading runs discarded before measurement.
+    #[arg(long, default_value_t = 3)]
     warm_up: usize,
 
-    /// Output directory for JSON results
+    /// Output directory for result JSONs.
     #[arg(long, default_value = "benchmarks/tpch/results")]
     output_dir: PathBuf,
 
-    /// Only run specific queries (e.g., "1,3,6")
+    /// Restrict to specific queries, e.g. "1,3,6".
     #[arg(long)]
     queries: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct BenchmarkResult {
-    engine: String,
-    host: String,
-    port: u16,
-    timestamp: String,
-    queries: Vec<QueryResult>,
+#[derive(Args, Clone)]
+struct ReportArgs {
+    /// Result JSON files to compare.
+    files: Vec<PathBuf>,
+
+    /// Directory to scan; the most recent file per engine is used.
+    #[arg(long)]
+    dir: Option<PathBuf>,
+
+    /// Also write the report to this path.
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-struct QueryResult {
-    query_id: String,
-    query_file: String,
-    status: String,
-    runs: Vec<RunResult>,
-    median_ms: Option<f64>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RunResult {
-    run_number: usize,
-    wall_clock_ms: f64,
-    rows_returned: usize,
-    is_warmup: bool,
-}
-
-/// Trait for database clients — both pgwire and Trino REST use the same interface.
-#[async_trait::async_trait]
-trait BenchClient: Send + Sync {
-    async fn execute_query(&self, sql: &str) -> Result<usize, String>;
-}
-
-// ---------------------------------------------------------------------------
-// PostgreSQL wire protocol client (for arneb)
-// ---------------------------------------------------------------------------
-
-struct PgClient {
-    client: tokio_postgres::Client,
-}
-
-#[async_trait::async_trait]
-impl BenchClient for PgClient {
-    async fn execute_query(&self, sql: &str) -> Result<usize, String> {
-        let rows = self.client.query(sql, &[]).await.map_err(|e| e.to_string())?;
-        Ok(rows.len())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Trino REST API client
-// ---------------------------------------------------------------------------
-
-struct TrinoClient {
-    base_url: String,
-    catalog: String,
-    schema: String,
-    http: reqwest::Client,
-}
-
-#[async_trait::async_trait]
-impl BenchClient for TrinoClient {
-    async fn execute_query(&self, sql: &str) -> Result<usize, String> {
-        let url = format!("{}/v1/statement", self.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .header("X-Trino-User", "benchmark")
-            .header("X-Trino-Catalog", &self.catalog)
-            .header("X-Trino-Schema", &self.schema)
-            .body(sql.to_string())
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let mut result: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-        let mut total_rows = 0usize;
-
-        loop {
-            if let Some(data) = result.get("data") {
-                if let Some(arr) = data.as_array() {
-                    total_rows += arr.len();
-                }
-            }
-            if let Some(err) = result.get("error") {
-                let msg = err
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown error");
-                return Err(msg.to_string());
-            }
-            let next_uri = match result.get("nextUri").and_then(|u| u.as_str()) {
-                Some(uri) => uri.to_string(),
-                None => break,
-            };
-            // 50ms polling delay between `nextUri` round-trips.
-            // This is the rate Trino's HTTP layer can sustain under
-            // tight back-to-back bench loops. Reducing to 0 or 5ms
-            // was tried during Bench-C (2026-05-17) and crashed the
-            // Trino container silently (OOM kill from docker) on
-            // batches of ≥ 16 queries × 20+ warmup runs. The 50ms is
-            // measurable overhead that biases Trino numbers slightly
-            // slow (each poll pays 50ms), so the "arneb vs Trino"
-            // ratio is conservative against arneb — i.e., Trino's
-            // true server-side time is faster than what this client
-            // measures, by 50ms × poll_count per query. Documented
-            // here so the bench result is interpreted honestly.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let resp = self
-                .http
-                .get(&next_uri)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            result = resp.json().await.map_err(|e| e.to_string())?;
-        }
-
-        Ok(total_rows)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-    let port = args.port.unwrap_or(match args.engine.as_str() {
-        "trino" => 8080,
-        _ => 5432,
-    });
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Report(args)) => run_report(args),
+        Some(Command::Run(args)) => run_benchmark(args).await,
+        None => run_benchmark(cli.run).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// run
+// ---------------------------------------------------------------------------
+
+async fn run_benchmark(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let selected = resolve_engines(&args)?;
+
+    let mut queries = load_queries(&args.queries_dir, args.queries.as_deref())?;
+    queries.sort_by(|a, b| a.query_id.cmp(&b.query_id));
+    if queries.is_empty() {
+        return Err(format!("no .sql files found in {}", args.queries_dir.display()).into());
+    }
+
+    let measurement_runs = args.num_runs.saturating_sub(args.warm_up);
+    if measurement_runs == 0 {
+        return Err(format!(
+            "--num-runs ({}) must exceed --warm-up ({}) so at least one run is measured",
+            args.num_runs, args.warm_up
+        )
+        .into());
+    }
 
     println!("TPC-H Benchmark Runner");
     println!("======================");
-    println!("Engine: {}", args.engine);
-    println!("Target: {}:{}", args.host, port);
-    println!("Runs: {} (warm-up: {})", args.num_runs, args.warm_up);
-    println!();
+    println!("Engines: {}", selected.join(", "));
+    println!("Queries: {}", queries.len());
+    println!(
+        "Runs: {} ({} warm-up + {} measured)",
+        args.num_runs, args.warm_up, measurement_runs
+    );
 
-    // Create client based on engine type.
-    let client: Box<dyn BenchClient> = match args.engine.as_str() {
-        "trino" => {
-            let base_url = format!("http://{}:{}", args.host, port);
-            println!("Connecting to Trino at {base_url} (catalog={}, schema={})...", args.catalog, args.schema);
-
-            // Verify Trino is reachable
-            let http = reqwest::Client::new();
-            let info_url = format!("{base_url}/v1/info");
-            http.get(&info_url).send().await.map_err(|e| {
-                format!("Cannot connect to Trino at {base_url}: {e}")
-            })?;
-            println!("Connected!");
-
-            Box::new(TrinoClient {
-                base_url,
-                catalog: args.catalog.clone(),
-                schema: args.schema.clone(),
-                http,
-            })
-        }
-        _ => {
-            let conn_str = format!(
-                "host={} port={} user=test dbname=test",
-                args.host, port
-            );
-            let (pg_client, connection) =
-                tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await?;
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    eprintln!("connection error: {e}");
-                }
-            });
-            println!("Connected to arneb at {}:{}", args.host, port);
-            Box::new(PgClient { client: pg_client })
-        }
+    let skip_list = skip::default_skip_list();
+    let plan = RunPlan {
+        queries: &queries,
+        warm_up: args.warm_up,
+        num_runs: args.num_runs,
+        skip_list: &skip_list,
     };
 
-    println!();
-
-    // Discover query files.
-    let mut query_files = discover_queries(&args.queries_dir, args.queries.as_deref())?;
-    query_files.sort();
-
-    if query_files.is_empty() {
-        eprintln!("No query files found in {}", args.queries_dir.display());
-        return Ok(());
-    }
-
-    println!("Found {} queries", query_files.len());
-    println!();
-
-    // Run benchmarks.
-    let mut results = Vec::new();
-
-    for (query_file, query_id) in &query_files {
-        print!("Q{query_id}: ");
-
-        let sql = std::fs::read_to_string(query_file)?;
-        let sql = sql.trim();
-
-        if sql.is_empty() {
-            println!("SKIP (empty)");
-            results.push(QueryResult {
-                query_id: query_id.clone(),
-                query_file: query_file.display().to_string(),
-                status: "skipped".into(),
-                runs: vec![],
-                median_ms: None,
-                error: Some("empty query file".into()),
-            });
-            continue;
-        }
-
-        let mut runs = Vec::new();
-        let mut error_msg: Option<String> = None;
-
-        for run in 0..args.num_runs {
-            let is_warmup = run < args.warm_up;
-            let start = Instant::now();
-
-            match client.execute_query(sql).await {
-                Ok(row_count) => {
-                    let elapsed = start.elapsed();
-                    let ms = elapsed.as_secs_f64() * 1000.0;
-                    runs.push(RunResult {
-                        run_number: run + 1,
-                        wall_clock_ms: ms,
-                        rows_returned: row_count,
-                        is_warmup,
-                    });
-                    if is_warmup {
-                        print!("w");
-                    } else {
-                        print!(".");
-                    }
-                }
-                Err(e) => {
-                    println!("FAIL ({e})");
-                    error_msg = Some(e);
-                    break;
-                }
-            }
-        }
-
-        if let Some(err) = error_msg {
-            results.push(QueryResult {
-                query_id: query_id.clone(),
-                query_file: query_file.display().to_string(),
-                status: "failed".into(),
-                runs,
-                median_ms: None,
-                error: Some(err),
-            });
-            continue;
-        }
-
-        {
-            let mut timings: Vec<f64> = runs
-                .iter()
-                .filter(|r| !r.is_warmup)
-                .map(|r| r.wall_clock_ms)
-                .collect();
-            timings.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-            let median = if timings.is_empty() {
-                None
-            } else {
-                Some(timings[timings.len() / 2])
-            };
-
-            println!(" {:.1}ms", median.unwrap_or(0.0));
-
-            results.push(QueryResult {
-                query_id: query_id.clone(),
-                query_file: query_file.display().to_string(),
-                status: "ok".into(),
-                runs,
-                median_ms: median,
-                error: None,
-            });
-        }
-    }
-
-    // Write results.
     std::fs::create_dir_all(&args.output_dir)?;
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-    let engine_label = args.engine.replace('-', "_");
-    let output_path = args
-        .output_dir
-        .join(format!("{engine_label}_{timestamp}.json"));
 
-    let benchmark = BenchmarkResult {
-        engine: args.engine.clone(),
-        host: args.host,
-        port,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        queries: results,
-    };
+    // Engine-major: one engine connects, runs every query, and is dropped
+    // before the next starts, so no engine's warmup state bleeds into another's
+    // timings.
+    for name in &selected {
+        let mut engine = build_engine(name, &args)?;
+        let result = runner::run_engine(engine.as_mut(), &plan).await;
 
-    let json = serde_json::to_string_pretty(&benchmark)?;
-    std::fs::write(&output_path, &json)?;
-
-    println!();
-    println!("Results written to {}", output_path.display());
-
-    // Print summary table.
-    println!();
-    println!(
-        "{:<8} {:<10} {:<12} {:<8}",
-        "Query", "Status", "Median (ms)", "Rows"
-    );
-    println!("{}", "-".repeat(40));
-    for q in &benchmark.queries {
-        let median = q
-            .median_ms
-            .map(|m| format!("{m:.1}"))
-            .unwrap_or_else(|| "-".into());
-        let rows = q
-            .runs
-            .last()
-            .map(|r| r.rows_returned.to_string())
-            .unwrap_or_else(|| "-".into());
-        println!("{:<8} {:<10} {:<12} {:<8}", q.query_id, q.status, median, rows);
+        let path = args
+            .output_dir
+            .join(format!("{}_{timestamp}.json", name.replace('-', "_")));
+        std::fs::write(&path, serde_json::to_string_pretty(&result)?)?;
+        println!("-> {}", path.display());
     }
 
+    println!(
+        "\nRun `tpch-bench report --dir {}` to compare.",
+        args.output_dir.display()
+    );
     Ok(())
 }
 
-/// Find all .sql files in the queries directory, returning (path, query_id).
-fn discover_queries(
+/// Resolve the engine selection: `--engines` wins, then `--engine`, else all three.
+fn resolve_engines(args: &RunArgs) -> Result<Vec<String>, String> {
+    let raw = match (&args.engines, &args.engine) {
+        (Some(list), _) => list.clone(),
+        (None, Some(one)) => one.clone(),
+        (None, None) => ALL_ENGINES.join(","),
+    };
+
+    let mut selected = Vec::new();
+    for part in raw.split(',') {
+        let name = part.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        if !ALL_ENGINES.contains(&name.as_str()) {
+            return Err(format!(
+                "unknown engine `{name}` (expected one of: {})",
+                ALL_ENGINES.join(", ")
+            ));
+        }
+        if !selected.contains(&name) {
+            selected.push(name);
+        }
+    }
+
+    if selected.is_empty() {
+        return Err("no engines selected".into());
+    }
+    Ok(selected)
+}
+
+fn build_engine(
+    name: &str,
+    args: &RunArgs,
+) -> Result<Box<dyn BenchmarkEngine>, Box<dyn std::error::Error>> {
+    // A bare --port is only unambiguous when one engine was selected.
+    let single = args.engines.is_none() && args.engine.is_some();
+    let override_port = if single { args.port } else { None };
+
+    Ok(match name {
+        "arneb" => Box::new(ArnebEngine::new(
+            args.arneb_host.clone().unwrap_or_else(|| args.host.clone()),
+            override_port.unwrap_or(args.arneb_port),
+        )),
+        "trino" => Box::new(TrinoEngine::new(
+            args.trino_host.clone().unwrap_or_else(|| args.host.clone()),
+            override_port.unwrap_or(args.trino_port),
+            args.catalog.clone(),
+            args.schema.clone(),
+        )),
+        "datafusion" => Box::new(DataFusionEngine::new(datafusion_config(args))),
+        other => return Err(format!("unknown engine `{other}`").into()),
+    })
+}
+
+/// CLI flag > environment variable > built-in default, per engine spec.
+fn datafusion_config(args: &RunArgs) -> DataFusionConfig {
+    let defaults = DataFusionConfig::default();
+    let from_env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+
+    DataFusionConfig {
+        endpoint: args
+            .minio_endpoint
+            .clone()
+            .or_else(|| from_env("AWS_ENDPOINT_URL"))
+            .unwrap_or(defaults.endpoint),
+        region: from_env("AWS_REGION").unwrap_or(defaults.region),
+        access_key_id: from_env("AWS_ACCESS_KEY_ID").unwrap_or(defaults.access_key_id),
+        secret_access_key: from_env("AWS_SECRET_ACCESS_KEY").unwrap_or(defaults.secret_access_key),
+        bucket: args.s3_bucket.clone(),
+        prefix: args.s3_prefix.clone(),
+        allow_http: defaults.allow_http,
+    }
+}
+
+/// Load `.sql` files, optionally filtered to a comma-separated query number list.
+fn load_queries(
     dir: &Path,
     filter: Option<&str>,
-) -> Result<Vec<(PathBuf, String)>, Box<dyn std::error::Error>> {
-    let filter_set: Option<Vec<String>> = filter.map(|f| {
+) -> Result<Vec<LoadedQuery>, Box<dyn std::error::Error>> {
+    let wanted: Option<Vec<String>> = filter.map(|f| {
         f.split(',')
-            .map(|s| format!("q{:02}", s.trim().parse::<u32>().unwrap_or(0)))
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .map(|n| format!("q{n:02}"))
             .collect()
     });
 
     let mut queries = Vec::new();
-
     if !dir.exists() {
         return Ok(queries);
     }
 
     for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map_or(false, |e| e == "sql") {
-            let stem = path.file_stem().unwrap().to_string_lossy().to_string();
-            if let Some(ref filter) = filter_set {
-                if !filter.contains(&stem) {
-                    continue;
-                }
-            }
-            queries.push((path, stem));
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
         }
+        let query_id = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if let Some(ref wanted) = wanted {
+            if !wanted.contains(&query_id) {
+                continue;
+            }
+        }
+        let sql = std::fs::read_to_string(&path)?.trim().to_string();
+        if sql.is_empty() {
+            eprintln!("warning: skipping empty query file {}", path.display());
+            continue;
+        }
+        queries.push(LoadedQuery {
+            query_id,
+            path,
+            sql,
+        });
     }
 
     Ok(queries)
+}
+
+// ---------------------------------------------------------------------------
+// report
+// ---------------------------------------------------------------------------
+
+fn run_report(args: ReportArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let results = report::load_inputs(&args.files, args.dir.as_deref())?;
+    let rendered = report::render(&results);
+
+    print!("{rendered}");
+    if let Some(path) = &args.output {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(path, &rendered)?;
+        eprintln!("report written to {}", path.display());
+    }
+    Ok(())
 }

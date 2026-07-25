@@ -1,6 +1,8 @@
 [package]
 name = "tpch-bench"
-version = "0.1.0"
+# Excluded from the workspace (see `exclude` in the root Cargo.toml), so this
+# does NOT inherit [workspace.package].version — keep it in step by hand.
+version = "1.0.0"
 edition = "2021"
 publish = false
 

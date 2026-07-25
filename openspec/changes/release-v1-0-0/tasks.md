@@ -60,13 +60,13 @@ The archived `tpch-comparison-harness` marked 37/41 tasks complete, but `benchma
 
 ## 5. Version bump and release metadata (spec: release-versioning)
 
-- [ ] 5.1 Set `[workspace.package].version = "1.0.0"` in the root `Cargo.toml`.
-- [ ] 5.2 Set `version = "1.0.0"` in `benchmarks/tpch/Cargo.toml` (excluded from the workspace, so it does not inherit).
-- [ ] 5.3 Confirm no crate under `crates/` declares a literal `version` that would drift — all 13 currently use `version.workspace = true`; re-verify after the bump.
-- [ ] 5.4 Verify the three runtime surfaces report `1.0.0`: `arneb --version` (clap derives it at `crates/server/src/main.rs:124`), `SELECT version()` (`crates/protocol/src/metadata.rs:142`), and the Web UI server-info endpoint (`crates/server/src/web/api.rs:153`).
-- [ ] 5.5 Confirm `SHOW server_version` still returns `"14.0"` (`crates/protocol/src/metadata.rs:570`) — it is the PostgreSQL compatibility level advertised to clients, not Arneb's version, and must not track the release bump.
-- [ ] 5.6 Add a regression test asserting that `SELECT version()` reports the crate version while `SHOW server_version` reports the PostgreSQL compatibility level, so a future bump cannot silently conflate them.
-- [ ] 5.7 Create `CHANGELOG.md` at the repository root with a `1.0.0` section at the chosen granularity (task 1.3), including an explicitly labelled breaking-changes heading naming the `report.py` removal and its replacement.
+- [x] 5.1 Set `[workspace.package].version = "1.0.0"` in the root `Cargo.toml`.
+- [x] 5.2 Set `version = "1.0.0"` in `benchmarks/tpch/Cargo.toml` (excluded from the workspace, so it does not inherit).
+- [x] 5.3 Confirm no crate under `crates/` declares a literal `version` that would drift — all 13 currently use `version.workspace = true`; re-verify after the bump.
+- [x] 5.4 Verify the three runtime surfaces report `1.0.0`: `arneb --version` (clap derives it at `crates/server/src/main.rs:124`), `SELECT version()` (`crates/protocol/src/metadata.rs:142`), and the Web UI server-info endpoint (`crates/server/src/web/api.rs:153`).
+- [x] 5.5 Confirm `SHOW server_version` still returns `"14.0"` (`crates/protocol/src/metadata.rs:570`) — it is the PostgreSQL compatibility level advertised to clients, not Arneb's version, and must not track the release bump.
+- [x] 5.6 Add a regression test asserting that `SELECT version()` reports the crate version while `SHOW server_version` reports the PostgreSQL compatibility level, so a future bump cannot silently conflate them.
+- [x] 5.7 Create `CHANGELOG.md` at the repository root with a `1.0.0` section at the chosen granularity (task 1.3), including an explicitly labelled breaking-changes heading naming the `report.py` removal and its replacement.
 
 ## 6. Produce and publish the official run (spec: release-baseline-numbers)
 

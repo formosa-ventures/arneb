@@ -19,8 +19,8 @@ The archived `tpch-comparison-harness` marked 37/41 tasks complete, but `benchma
 - [x] 2a.7 Get the crate to compile. These 1,615 lines have never been through the compiler; expect real breakage, not just wiring. Resolve it in the modules where the fix belongs rather than by narrowing the interfaces the specs describe.
 - [x] 2a.8 Verify the wired binary against the archived specs' observable surface: `tpch-bench --help` shows both subcommands and both engine flags, `tpch-bench report --help` accepts `--dir` and explicit file paths, and a `--engines arneb` run still produces the backwards-compatible JSON shape.
 - [x] 2a.9 Correct the archived record: in `openspec/changes/archive/2026-07-26-tpch-comparison-harness/tasks.md`, uncheck the tasks that were marked complete without the code being wired, and add a note pointing at this change as where the work was actually completed. An archive that overstates completion is worse than no archive.
-- [ ] 2a.10 Commit the nine untracked module files together with the wiring, so the crate is never again in a state where the code exists but nothing compiles it.
-- [ ] 2a.11 Note for section 6: port 5432 on the release host is already held by an unrelated project's `postgres` container, so a native Arneb bench run would collide. Ports 8080, 9000, 9001, 9083, 9090, and 6432 are free. Containerizing the runner (2b) removes the collision entirely, since engines are reached over the compose network rather than published host ports — do not solve this by remapping host ports.
+- [x] 2a.10 Commit the nine untracked module files together with the wiring, so the crate is never again in a state where the code exists but nothing compiles it.
+- [x] 2a.11 Note for section 6: port 5432 on the release host is already held by an unrelated project's `postgres` container, so a native Arneb bench run would collide. Ports 8080, 9000, 9001, 9083, 9090, and 6432 are free. Containerizing the runner (2b) removes the collision entirely, since engines are reached over the compose network rather than published host ports — do not solve this by remapping host ports.
 
 ## 2. Close the harness gaps that block the official run (spec: release-baseline-numbers)
 
@@ -102,4 +102,4 @@ The archived `tpch-comparison-harness` marked 37/41 tasks complete, but `benchma
 - [x] 9.2 Verify both reader-facing surfaces link to `benchmarks/tpch/TUTORIAL.md` as the single reproduction entry point, and that `benchmarks/tpch/README.md` links to it too.
 - [x] 9.3 Run `cargo build --release`, `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt -- --check` on the release commit.
 - [x] 9.4 Run `openspec validate release-v1-0-0` and confirm the change is valid.
-- [ ] 9.5 Tag the release commit `v1.0.0` — the repository's first tag — and confirm `[workspace.package].version` at that commit is `1.0.0` and `CHANGELOG.md` has a `1.0.0` section.
+- [x] 9.5 Tag the release commit `v1.0.0` — the repository's first tag — and confirm `[workspace.package].version` at that commit is `1.0.0` and `CHANGELOG.md` has a `1.0.0` section.

@@ -15,7 +15,7 @@ Trino (formerly PrestoSQL) lets users query data where it lives — across objec
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
 - **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC
 - **Web UI**: Dashboard with query monitoring, cluster overview, and worker status
-- **TPC-H Benchmark**: 22/22 queries cell-identical to Trino, faster and lighter on peak memory across the board, with benchmark runner and comparison tooling
+- **TPC-H Benchmark**: 22/22 queries matching Trino's results and 1.76x faster by geomean at SF1 in the default configuration ([published run](benchmarks/tpch/official/v1.0.0/sf1/)), with a three-engine comparison harness
 
 ## Quick Start
 
@@ -145,30 +145,59 @@ docker compose down
 
 ## TPC-H Benchmark
 
-All 22 TPC-H queries return cell-identical results to Trino while running
-faster and using less peak memory on every query, at SF10 and SF30. Both
-engines read the same Parquet data from MinIO via Hive Metastore for fair
-comparison.
+Arneb completes all 22 TPC-H queries with results matching Trino and DataFusion,
+in its **default configuration** — a stock `cargo build --release` with no tuning
+options enabled.
 
-The full guide — prerequisites, the container-isolated dual-axis (latency
-**and** peak-memory) run, and the comparison report — is in
-[`benchmarks/tpch/README.md`](benchmarks/tpch/README.md). In short:
+**At TPC-H SF1**, Arneb is **1.76x faster than Trino by geometric mean** and
+leads on 21 of 22 queries:
+
+| | Arneb | Trino | DataFusion |
+|---|---:|---:|---:|
+| Queries completed | 22/22 | 22/22 | 22/22 |
+| Geomean p50 | 293.1 ms | 515.3 ms | 141.5 ms |
+| vs Arneb | — | 0.57x | 2.07x |
+
+This figure covers SF1 and nothing else. Larger scale factors are not published
+yet, and nothing here should be read as a claim about them — run the benchmark at
+the scale you care about rather than extrapolating.
+
+DataFusion is roughly 2x ahead of Arneb. It runs in-process with no distribution
+layer, and it is in the comparison as a correctness cross-check and an
+Arrow-native reference point rather than as the engine Arneb is positioned
+against.
+
+Both engines read the same Parquet from MinIO via Hive Metastore and run as a
+coordinator plus two workers with the same CPU allocation. Only the engine being
+measured is running — an idle engine still holds its heap, so leaving them all up
+measures each under memory pressure from its rivals.
+
+Measured 2026-07-25 on an Apple M1 Pro (10 cores, 32 GB, macOS 26.5.2, arm64).
+Per-query figures, the raw result documents and the run's provenance are
+published in
+[`benchmarks/tpch/official/v1.0.0/sf1/`](benchmarks/tpch/official/v1.0.0/sf1/) —
+see [`comparison.md`](benchmarks/tpch/official/v1.0.0/sf1/comparison.md). These
+are laptop numbers on arm64 macOS; they are reproducible on comparable hardware
+and do not generalize to Linux x86 servers.
+
+The full guide — prerequisites, the fully containerized three-engine run, and
+how to read the comparison report — is in the
+[**TPC-H comparison tutorial**](benchmarks/tpch/TUTORIAL.md). Everything runs
+in Docker, including the benchmark runner, so no host toolchain is needed and
+all engines are measured under the same isolation. In short:
 
 ```bash
 git clone https://github.com/formosa-ventures/arneb.git && cd arneb
 
-# Infra + Trino + arneb (6 engine containers); --build compiles arneb.
-docker compose -f docker-compose.yml \
-               -f docker/arneb-bench/docker-compose.bench.yml up -d --build
-
-# Seed TPC-H data into MinIO (tiny | sf1 | sf10).
-TPCH_SF=sf10 docker compose run --rm tpch-seed
-
-# Dual-axis benchmark, then the arneb-vs-Trino table.
-./benchmarks/tpch/scripts/run_memory_bench.sh
-python3 benchmarks/tpch/scripts/bench_report.py \
-  "$(ls -t benchmarks/tpch/results/memory_total_*.csv | head -1)"
+# Starts the engines, seeds TPC-H SF1, runs all three engines from inside the
+# runner container, and writes benchmarks/tpch/results/comparison.md.
+./benchmarks/tpch/scripts/run_benchmark.sh
 ```
+
+A separate [dual-axis harness](benchmarks/tpch/README.md) measures peak memory
+alongside latency under per-engine container isolation. It runs Arneb with
+tuning options that are off by default, so its numbers are not comparable with
+the default-configuration figures above.
 
 ## Development
 

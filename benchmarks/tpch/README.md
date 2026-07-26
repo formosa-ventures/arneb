@@ -1,7 +1,27 @@
-# TPC-H Benchmark
+# TPC-H Benchmark — dual-axis (latency + peak memory) harness
 
-Performance comparison of arneb against Trino using TPC-H queries.
-Both engines read the same Parquet data from MinIO via Hive Metastore.
+> **Looking for the latency comparison?** Read
+> **[TUTORIAL.md](TUTORIAL.md)** instead. That is the single entry point
+> for reproducing the published Arneb-vs-Trino-vs-DataFusion latency
+> figures, and it is where official release numbers come from. One
+> command, everything containerized, no host toolchain required.
+>
+> This document covers a *different* measurement: the dual-axis harness
+> that attributes **peak memory** as well as latency, by running each
+> engine in its own isolated container and sampling RSS. That attribution
+> needs a heavier setup than a latency comparison does, which is why the
+> two are kept apart — you should not have to stand up container-level
+> memory profiling just to find out which engine is faster.
+>
+> The two harnesses also differ in configuration: the dual-axis path uses
+> `docker/arneb-bench/docker-compose.bench.yml`, which enables 16 `ARNEB_*`
+> tuning options that are **off by default in the engine**. Numbers from
+> this harness are therefore tuned-configuration numbers and are not
+> comparable with the published defaults.
+
+Peak-memory and latency comparison of arneb against Trino using TPC-H
+queries. Both engines read the same Parquet data from MinIO via Hive
+Metastore.
 
 ## Quickstart (Docker Compose — arneb vs Trino, dual-axis)
 
@@ -89,12 +109,14 @@ docker compose run --rm tpch-seed
 # 3. Start arneb with Hive config
 cargo run --release --bin arneb -- --config benchmarks/tpch/tpch-hive.toml
 
-# 4. Run benchmark
+# 4. Run benchmark. tpch-bench is excluded from the workspace, so it builds
+#    from its own directory — `cargo run -p tpch-bench` from the repo root
+#    will not resolve it.
 cd benchmarks/tpch
-cargo run --release -- --host 127.0.0.1 --port 5432
+cargo run --release -- --engines arneb --catalog hive --schema tpch
 
 # 5. Generate report
-python3 scripts/report.py results/arneb_*.json
+cargo run --release -- report --dir results
 ```
 
 ## Architecture
@@ -217,32 +239,33 @@ cargo run --release -- --num-runs 10 --warm-up 3
 # Automated: runs both engines and generates report
 ./benchmarks/tpch/scripts/run_benchmark.sh
 
-# Skip Trino baseline
-./benchmarks/tpch/scripts/run_benchmark.sh --skip-trino
+# Restrict the engine set
+./benchmarks/tpch/scripts/run_benchmark.sh --engines=arneb,trino
 ```
+
+See [TUTORIAL.md](TUTORIAL.md) for the full walkthrough of that path.
 
 ## Report Generation
 
+Reports are rendered by the `tpch-bench` binary itself — the harness has
+no Python dependency.
+
 ```bash
-# arneb only
-python3 scripts/report.py results/arneb_*.json
+cd benchmarks/tpch
 
-# Comparison with Trino
-python3 scripts/report.py results/arneb_*.json results/trino_*.json
+# From a directory of results (most recent file per engine).
+cargo run --release -- report --dir results
+
+# From explicit files, written to a file as well as stdout.
+cargo run --release -- report \
+    results/arneb_*.json results/trino_*.json \
+    --output results/comparison.md
 ```
 
-Output format:
-
-```
-| Query    | arneb (ms)  |  Trino (ms)  |  Speedup |
-|----------|-----------------|--------------|----------|
-| q01      |           45.2  |       120.5  |    2.67x |
-| q03      |           82.1  |       195.3  |    2.38x |
-...
-
-Geometric mean speedup: 2.15x
-Queries tested: 7
-```
+The report contains a per-query p50 table with pairwise speedups, a suite
+summary with geomean, a correctness-divergence section, and a header
+disclosing the warmup and measurement counts. See §3 of
+[TUTORIAL.md](TUTORIAL.md) for an annotated example.
 
 ## Queries
 

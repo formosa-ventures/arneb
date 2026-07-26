@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-catalog"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arneb-common",
  "async-trait",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-common"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-connectors"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arneb-catalog",
  "arneb-common",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-execution"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ahash 0.8.12",
  "arneb-catalog",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-hive"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arneb-catalog",
  "arneb-common",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-planner"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arneb-catalog",
  "arneb-common",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arneb-catalog",
  "arneb-common",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-rpc"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arneb-common",
  "arneb-planner",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-scheduler"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arneb-common",
  "tokio",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arneb-catalog",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-sql-parser"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arneb-common",
  "chrono",
@@ -1700,7 +1700,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hive-metastore"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "hive-metastore-thrift-build"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "pilota-build",
  "volo-build",

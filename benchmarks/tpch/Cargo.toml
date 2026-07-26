@@ -1,6 +1,8 @@
 [package]
 name = "tpch-bench"
-version = "0.1.0"
+# Excluded from the workspace (see `exclude` in the root Cargo.toml), so this
+# does NOT inherit [workspace.package].version — keep it in step by hand.
+version = "1.0.0"
 edition = "2021"
 publish = false
 
@@ -17,3 +19,9 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
 async-trait = "0.1"
+datafusion = "54"
+sha2 = "0.10"
+url = "2"
+thiserror = "2"
+object_store = { version = "0.13", features = ["aws"] }
+hex = "0.4"

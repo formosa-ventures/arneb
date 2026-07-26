@@ -579,3 +579,68 @@ fn handle_show(lower: &str) -> MetaResult {
     .map_err(|e| e.to_string())?;
     make_result(schema, batch)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Extract the single string cell from a `Query` metadata response.
+    fn single_cell(result: MetadataResult) -> String {
+        match result.expect("metadata handler returned an error") {
+            MetadataResponse::Query(_, batches) => {
+                let batch = batches.first().expect("no record batch");
+                let col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("column 0 is not a StringArray");
+                col.value(0).to_string()
+            }
+            MetadataResponse::Command(tag) => panic!("expected a query result, got tag `{tag}`"),
+        }
+    }
+
+    /// `version()` reports Arneb's own release version, taken from the crate
+    /// version so a release bump propagates without a second constant to update.
+    #[test]
+    fn version_reports_the_release_version() {
+        let value = single_cell(handle_version());
+        assert!(
+            value.contains(env!("CARGO_PKG_VERSION")),
+            "version() returned `{value}`, which does not contain the crate version `{}`",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(
+            value.contains("Arneb"),
+            "version() returned `{value}`, which does not name Arneb"
+        );
+    }
+
+    /// `SHOW server_version` reports the PostgreSQL wire-protocol compatibility
+    /// level advertised to clients — NOT Arneb's release version. JDBC, psycopg2
+    /// and DBeaver branch on this value to choose catalog queries and protocol
+    /// features, so reporting an Arneb version here would be read as PostgreSQL
+    /// 1.x and break capability detection. A release bump must never move it.
+    #[test]
+    fn server_version_is_the_pg_compatibility_level_not_the_release_version() {
+        let value = single_cell(handle_show("show server_version"));
+        assert_eq!(
+            value, "14.0",
+            "SHOW server_version must stay at the advertised PostgreSQL \
+             compatibility level, not track Arneb's release version"
+        );
+        assert_ne!(
+            value,
+            env!("CARGO_PKG_VERSION"),
+            "SHOW server_version has been conflated with the crate version"
+        );
+    }
+
+    /// The two are reported independently and must not collapse into one value.
+    #[test]
+    fn release_version_and_compatibility_level_are_distinct() {
+        let release = single_cell(handle_version());
+        let compat = single_cell(handle_show("show server_version"));
+        assert_ne!(release, compat);
+    }
+}

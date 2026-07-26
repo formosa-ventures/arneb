@@ -1,141 +1,171 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# TPC-H Benchmark: Arneb vs Trino (Hive/MinIO)
-# ================================================
-# Both engines read the same Parquet data from MinIO via HMS.
+# TPC-H comparison: arneb vs Trino vs DataFusion
+# ==============================================
+# Every engine — and the runner itself — executes inside the container stack.
+# That is deliberate: the DataFusion adapter runs in-process inside the runner
+# binary, so a native runner would mean a native DataFusion no matter what
+# isolation the other engines got. Containerizing the runner is what puts all
+# three under the same CPU and memory limits.
 #
-# Prerequisites:
-#   docker compose up -d          # start MinIO + HMS + Trino
-#   docker compose run tpch-seed  # seed TPC-H SF1 data
+# arneb runs in its DEFAULT configuration here — no ARNEB_* tuning options. This
+# is the arrangement official release numbers come from, so the published figure
+# matches what a stock build does. For tuning experiments use
+# docker/arneb-bench/docker-compose.bench.yml instead.
 #
 # Usage:
-#   ./scripts/run_benchmark.sh [--skip-trino] [--runs=N]
+#   ./benchmarks/tpch/scripts/run_benchmark.sh
+#   ./benchmarks/tpch/scripts/run_benchmark.sh --engines=arneb,trino
+#   ./benchmarks/tpch/scripts/run_benchmark.sh --queries=1,6 --runs=4
+#
+# Environment:
+#   TPCH_SF           scale factor to seed (default sf1)
+#   NUM_RUNS          total runs per query, warm-up included (default 8)
+#   WARM_UP           leading runs discarded (default 3)
+#   BENCH_NODE_CPUS   CPUs per engine node (default 2; 3 nodes per engine)
+#   BENCH_RUNNER_CPUS CPUs for the runner, which hosts DataFusion (default 6)
+#   SKIP_SEED         set to 1 to reuse already-seeded data
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BENCH_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_DIR="$(cd "$BENCH_DIR/../.." && pwd)"
 
 RESULTS_DIR="$BENCH_DIR/results"
-NUM_RUNS="${NUM_RUNS:-5}"
-WARM_UP="${WARM_UP:-2}"
-SKIP_TRINO="${SKIP_TRINO:-false}"
-ARNEB_PORT=5432
-TRINO_PORT=8080
+ENGINES="${ENGINES:-arneb,trino,datafusion}"
+NUM_RUNS="${NUM_RUNS:-8}"
+WARM_UP="${WARM_UP:-3}"
+TPCH_SF="${TPCH_SF:-sf1}"
+QUERIES=""
 
-# Parse args
 for arg in "$@"; do
     case $arg in
-        --skip-trino) SKIP_TRINO=true ;;
-        --runs=*) NUM_RUNS="${arg#*=}" ;;
-        *) echo "Unknown arg: $arg"; exit 1 ;;
+        --engines=*) ENGINES="${arg#*=}" ;;
+        --queries=*) QUERIES="${arg#*=}" ;;
+        --runs=*)    NUM_RUNS="${arg#*=}" ;;
+        --warm-up=*) WARM_UP="${arg#*=}" ;;
+        -h|--help)   sed -n '2,30p' "$0"; exit 0 ;;
+        *) echo "Unknown arg: $arg" >&2; exit 1 ;;
     esac
 done
 
+cd "$PROJECT_DIR"
+
+COMPOSE=(docker compose
+         -f docker-compose.yml
+         -f docker/tpch-bench/docker-compose.official.yml)
+
+ALL_ENGINE_SERVICES=(arneb arneb-worker-1 arneb-worker-2 trino trino-worker-1 trino-worker-2)
+
+# Services each engine needs while it is being measured. DataFusion needs none:
+# it runs in-process inside the runner container.
+services_for() {
+    case "$1" in
+        arneb)      echo "arneb arneb-worker-1 arneb-worker-2" ;;
+        trino)      echo "trino trino-worker-1 trino-worker-2" ;;
+        datafusion) echo "" ;;
+        *) echo "unknown engine: $1" >&2; exit 1 ;;
+    esac
+}
+
 echo "============================================"
-echo "TPC-H Benchmark: Arneb vs Trino"
+echo "TPC-H comparison (containerized, stock config)"
 echo "============================================"
-echo "Data source: Hive/MinIO (hive.tpch.*)"
-echo "Runs:        $NUM_RUNS (warm-up: $WARM_UP)"
+echo "Engines:  $ENGINES"
+echo "Scale:    $TPCH_SF"
+echo "Runs:     $NUM_RUNS ($WARM_UP warm-up)"
 echo ""
 
-# ------------------------------------------------------------------
-# Step 1: Verify Docker Compose services are running
-# ------------------------------------------------------------------
-echo ">>> Step 1: Checking Docker Compose services..."
-cd "$PROJECT_DIR"
-
-if ! docker compose ps --status running 2>/dev/null | grep -q trino; then
-    echo "Trino is not running. Start services first:"
-    echo "  docker compose up -d"
-    echo "  docker compose run --rm tpch-seed"
-    exit 1
-fi
-
-# Quick check: verify seeded data exists
-ROW_COUNT=$(docker compose exec -T trino trino --execute "SELECT COUNT(*) FROM hive.tpch.nation" 2>/dev/null | tr -d '"' || echo "0")
-if [ "$ROW_COUNT" = "0" ]; then
-    echo "TPC-H data not seeded. Run: docker compose run --rm tpch-seed"
-    exit 1
-fi
-echo "Docker Compose services running. TPC-H data verified."
+# ---------------------------------------------------------------------------
+# Step 1: bring up the engine stack
+# ---------------------------------------------------------------------------
+echo ">>> Step 1: Preparing infrastructure and building images..."
+# minio-init creates the `warehouse` bucket and exits. It has to run before the
+# seed, and naming only the engine services would skip it — leaving Trino to
+# fail later with "Invalid location URI" against a bucket that does not exist.
+"${COMPOSE[@]}" up -d --wait minio
+"${COMPOSE[@]}" up minio-init
+"${COMPOSE[@]}" up -d --wait hive-metastore
+# Build every engine image now so no image build lands inside a measured window.
+"${COMPOSE[@]}" build "${ALL_ENGINE_SERVICES[@]}" tpch-bench
 echo ""
 
-# ------------------------------------------------------------------
-# Step 2: Build Arneb and benchmark runner
-# ------------------------------------------------------------------
-echo ">>> Step 2: Building Arneb and benchmark runner..."
-cd "$PROJECT_DIR"
-cargo build --release --bin arneb 2>&1 | tail -1
-cd "$BENCH_DIR"
-cargo build --release 2>&1 | tail -1
-echo ""
-
-# ------------------------------------------------------------------
-# Step 3: Start Arneb (Hive config) and run benchmark
-# ------------------------------------------------------------------
-echo ">>> Step 3: Running benchmark against Arneb..."
-
-cd "$PROJECT_DIR"
-./target/release/arneb --config "$BENCH_DIR/tpch-hive.toml" &
-ARNEB_PID=$!
-sleep 3
-
-cd "$BENCH_DIR"
-./target/release/tpch-bench \
-    --engine arneb \
-    --host 127.0.0.1 \
-    --port "$ARNEB_PORT" \
-    --queries-dir "$BENCH_DIR/queries" \
-    --num-runs "$NUM_RUNS" \
-    --warm-up "$WARM_UP" \
-    --output-dir "$RESULTS_DIR" || true
-
-kill $ARNEB_PID 2>/dev/null || true
-wait $ARNEB_PID 2>/dev/null || true
-echo ""
-
-# ------------------------------------------------------------------
-# Step 4: Run benchmark against Trino (Docker Compose)
-# ------------------------------------------------------------------
-if [ "$SKIP_TRINO" = "true" ]; then
-    echo ">>> Step 4: Skipping Trino benchmark (--skip-trino)"
+# ---------------------------------------------------------------------------
+# Step 2: seed TPC-H data
+# ---------------------------------------------------------------------------
+if [ "${SKIP_SEED:-0}" = "1" ]; then
+    echo ">>> Step 2: Skipping seed (SKIP_SEED=1)"
 else
-    echo ">>> Step 4: Running benchmark against Trino..."
+    echo ">>> Step 2: Seeding TPC-H $TPCH_SF into MinIO via Trino..."
+    # Trino performs the CTAS, so it has to be up — including its workers.
+    # `node-scheduler.include-coordinator=false` means a lone coordinator cannot
+    # execute anything, so its healthcheck (`SELECT 1`) never passes and the
+    # seed fails with "dependency failed to start ... is unhealthy". A previous
+    # engine rotation leaves everything stopped, so this cannot be assumed.
+    "${COMPOSE[@]}" up -d --wait trino trino-worker-1 trino-worker-2
+    TPCH_SF="$TPCH_SF" "${COMPOSE[@]}" run --rm --no-deps tpch-seed
+fi
+echo ""
 
-    cd "$BENCH_DIR"
-    ./target/release/tpch-bench \
-        --engine trino \
-        --host 127.0.0.1 \
-        --port "$TRINO_PORT" \
-        --catalog hive \
-        --schema tpch \
-        --queries-dir "$BENCH_DIR/queries" \
-        --num-runs "$NUM_RUNS" \
-        --warm-up "$WARM_UP" \
-        --output-dir "$RESULTS_DIR" || true
+# ---------------------------------------------------------------------------
+# Step 3: measure one engine at a time, with only that engine running
+# ---------------------------------------------------------------------------
+# Engines take turns rather than all sitting up at once. Three Trino JVMs alone
+# declare -Xmx8G each, so at SF10 the combined ceiling exceeds what the container
+# runtime has; more importantly, an idle engine still holds its heap, so leaving
+# them all up means every engine is measured under memory pressure from its
+# rivals. One at a time gives each the whole machine, which is both survivable
+# and fairer.
+echo ">>> Step 3: Running benchmark, one engine at a time..."
+mkdir -p "$RESULTS_DIR"
+
+for engine in ${ENGINES//,/ }; do
     echo ""
-fi
+    echo "--- $engine ---"
+    needed=$(services_for "$engine")
 
-# ------------------------------------------------------------------
-# Step 5: Generate comparison report
-# ------------------------------------------------------------------
-echo ">>> Step 5: Generating comparison report..."
-cd "$BENCH_DIR"
+    # Stop every engine service that this engine does not need, so its memory is
+    # actually released rather than merely idle.
+    to_stop=()
+    for svc in "${ALL_ENGINE_SERVICES[@]}"; do
+        case " $needed " in *" $svc "*) ;; *) to_stop+=("$svc") ;; esac
+    done
+    [ ${#to_stop[@]} -gt 0 ] && "${COMPOSE[@]}" stop "${to_stop[@]}" >/dev/null 2>&1
 
-ARNEB_RESULT=$(ls -t "$RESULTS_DIR"/arneb_*.json 2>/dev/null | head -1)
-TRINO_RESULT=$(ls -t "$RESULTS_DIR"/trino_*.json 2>/dev/null | grep -v arneb | head -1)
+    if [ -n "$needed" ]; then
+        # shellcheck disable=SC2086
+        "${COMPOSE[@]}" up -d --wait $needed
+    fi
 
-if [ -n "$ARNEB_RESULT" ] && [ -n "$TRINO_RESULT" ]; then
-    python3 "$SCRIPT_DIR/report.py" "$ARNEB_RESULT" "$TRINO_RESULT" | tee "$RESULTS_DIR/comparison.md"
-elif [ -n "$ARNEB_RESULT" ]; then
-    python3 "$SCRIPT_DIR/report.py" "$ARNEB_RESULT" | tee "$RESULTS_DIR/comparison.md"
-else
-    echo "No results found to generate report."
-fi
+    RUN_ARGS=(--engines "$engine"
+              --arneb-host arneb --arneb-port 5432
+              --trino-host trino --trino-port 8080
+              --catalog hive --schema tpch
+              --minio-endpoint http://minio:9000
+              --queries-dir /queries
+              --output-dir /results
+              --num-runs "$NUM_RUNS"
+              --warm-up "$WARM_UP")
+    [ -n "$QUERIES" ] && RUN_ARGS+=(--queries "$QUERIES")
+
+    # --no-deps: the runner's depends_on names every engine, which would drag
+    # the stopped one back up and defeat the rotation. This loop has already
+    # brought up exactly what this engine needs, and Step 1 left MinIO and the
+    # metastore running.
+    "${COMPOSE[@]}" run --rm --no-deps tpch-bench "${RUN_ARGS[@]}"
+done
+
+# Leave the stack stopped so nothing lingers holding memory.
+"${COMPOSE[@]}" stop "${ALL_ENGINE_SERVICES[@]}" >/dev/null 2>&1
+echo ""
+
+# ---------------------------------------------------------------------------
+# Step 4: render the comparison report
+# ---------------------------------------------------------------------------
+# Rendered by the same Rust binary — the harness has no Python dependency.
+echo ">>> Step 4: Generating comparison report..."
+"${COMPOSE[@]}" run --rm --no-deps tpch-bench report --dir /results --output /results/comparison.md
 
 echo ""
-echo "============================================"
-echo "Benchmark complete!"
-echo "Results in: $RESULTS_DIR/"
-echo "============================================"
+echo "Results:  $RESULTS_DIR"
+echo "Report:   $RESULTS_DIR/comparison.md"

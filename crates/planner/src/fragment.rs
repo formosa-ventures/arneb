@@ -595,6 +595,71 @@ fn partitioned_semi_join_enabled() -> bool {
 }
 
 #[cfg(test)]
+static BROADCAST_RELATIVE_TEST_OVERRIDE: OnceLock<std::sync::Mutex<Option<bool>>> = OnceLock::new();
+#[cfg(test)]
+static BROADCAST_RELATIVE_TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+struct BroadcastRelativeOverride {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for BroadcastRelativeOverride {
+    fn drop(&mut self) {
+        *BROADCAST_RELATIVE_TEST_OVERRIDE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("BROADCAST_RELATIVE_TEST_OVERRIDE mutex poisoned") = None;
+    }
+}
+
+#[cfg(test)]
+fn set_broadcast_relative_for_test(enabled: bool) -> BroadcastRelativeOverride {
+    let guard = BROADCAST_RELATIVE_TEST_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("BROADCAST_RELATIVE_TEST_LOCK mutex poisoned");
+    *BROADCAST_RELATIVE_TEST_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("BROADCAST_RELATIVE_TEST_OVERRIDE mutex poisoned") = Some(enabled);
+    BroadcastRelativeOverride { _guard: guard }
+}
+
+/// Whether the broadcast-eligibility check compares the build's replicated
+/// cost (`build_bytes * worker_count`) against the probe's shuffle cost
+/// (`probe_bytes`), instead of only checking the flat
+/// `ARNEB_BROADCAST_MAX_BUILD_BYTES` cap. A flat cap cannot separate builds
+/// that are the same size but have opposite correct decisions (q02's
+/// partsupp vs q08's orders) — see `broadcast_relative_gate_rejects_build_costlier_than_probe_shuffle`.
+fn broadcast_relative_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(override_value) = BROADCAST_RELATIVE_TEST_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("BROADCAST_RELATIVE_TEST_OVERRIDE mutex poisoned")
+        .as_ref()
+    {
+        return *override_value;
+    }
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    *ENABLED.get_or_init(|| {
+        let enabled = std::env::var("ARNEB_BROADCAST_RELATIVE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
+        tracing::info!(
+            target: "arneb::config",
+            broadcast_relative = enabled,
+            "ARNEB_BROADCAST_RELATIVE effective value (default off; =1 to gate broadcast on replicated-build-vs-probe-shuffle cost instead of a flat byte cap)"
+        );
+        enabled
+    })
+}
+
+#[cfg(test)]
 static SWAP_DF_REGEN_TEST_OVERRIDE: OnceLock<std::sync::Mutex<Option<bool>>> = OnceLock::new();
 #[cfg(test)]
 static SWAP_DF_REGEN_TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
@@ -1378,6 +1443,34 @@ pub const DEFAULT_HASH_PARTITION_TARGET_ROWS: u64 = 4_000_000;
 /// this to a real cap (e.g. 64) once nested-join N>2 is correct.
 pub const DEFAULT_MAX_HASH_PARTITIONS: usize = 2;
 
+/// `ARNEB_BROADCAST_RELATIVE`: true when `plan` is a base-table scan,
+/// optionally wrapped in Filter/Projection. Used to keep the relative
+/// broadcast rule from replicating a join intermediate, whose size estimate
+/// has no metastore-backed NDV to ground it.
+fn is_base_table_broadcast_candidate(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::TableScan { .. } => true,
+        LogicalPlan::Filter { input, .. } | LogicalPlan::Projection { input, .. } => {
+            is_base_table_broadcast_candidate(input)
+        }
+        _ => false,
+    }
+}
+
+/// Diagnostic-only: short label for a plan node, used by `[BCASTTRACE]`.
+fn plan_kind_label(plan: &LogicalPlan) -> String {
+    match plan {
+        LogicalPlan::TableScan { table, .. } => format!("TableScan({table})"),
+        LogicalPlan::ExchangeNode { stage_id, .. } => format!("ExchangeNode(stage={stage_id:?})"),
+        LogicalPlan::Projection { input, .. } => format!("Projection<{}>", plan_kind_label(input)),
+        LogicalPlan::Filter { input, .. } => format!("Filter<{}>", plan_kind_label(input)),
+        LogicalPlan::Join { .. } => "Join".to_string(),
+        LogicalPlan::FinalAggregate { .. } => "FinalAggregate".to_string(),
+        LogicalPlan::PartialAggregate { .. } => "PartialAggregate".to_string(),
+        other => format!("{:?}", std::mem::discriminant(other)),
+    }
+}
+
 pub struct PlanFragmenter {
     next_stage_id: u32,
     swap_df_allocator: DynamicFilterIdAllocator,
@@ -1459,14 +1552,54 @@ impl PlanFragmenter {
     /// `estimated_cardinality` returns `DEFAULT_TABLE_SIZE` (10 000),
     /// causing nearly every right side to look broadcast-eligible
     /// regardless of actual size.
-    fn is_broadcast_eligible(&self, build_plan: &LogicalPlan) -> bool {
+    ///
+    /// `ARNEB_BROADCAST_RELATIVE`: when enabled (default off), a build that
+    /// fits the flat cap must ALSO show that replicating it
+    /// (`build_bytes * worker_count`) is no more expensive than shuffling
+    /// `probe_plan` (`probe_bytes`). A flat cap alone can't separate two
+    /// builds of nearly the same size whose correct broadcast decisions are
+    /// opposite (q02's ~253 MB partsupp must not broadcast; q08's ~300 MB
+    /// orders must). With the gate off this falls through to the pre-A2.2
+    /// flat-cap-only behaviour, unchanged.
+    ///
+    /// Also under the relative gate: a build must be a base-table scan
+    /// (optionally wrapped in Filter/Projection), never a join intermediate.
+    /// Join-intermediate cardinality has no column NDV from the metastore, so
+    /// `estimated_bytes` can be off by two orders of magnitude (measured 252x
+    /// low at SF10) — replicating that guess onto every worker is an unpriced
+    /// bet the flat cap alone can't catch.
+    fn is_broadcast_eligible(&self, build_plan: &LogicalPlan, probe_plan: &LogicalPlan) -> bool {
         let Some(threshold) = self.broadcast_max_build_bytes else {
             return false;
         };
         let Some(stats) = self.stats.as_deref() else {
             return false;
         };
-        crate::cost::estimated_bytes(build_plan, stats) <= threshold
+        let build_bytes = crate::cost::estimated_bytes(build_plan, stats);
+        let probe_bytes = crate::cost::estimated_bytes(probe_plan, stats);
+        let relative = broadcast_relative_enabled();
+        let verdict = if build_bytes > threshold {
+            false
+        } else if relative {
+            (build_bytes as u64).saturating_mul(self.worker_count.max(1) as u64)
+                <= probe_bytes as u64
+                && is_base_table_broadcast_candidate(build_plan)
+        } else {
+            true
+        };
+        if std::env::var("ARNEB_TRACE_FRAGMENTS")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "[BCASTTRACE] verdict={verdict} relative={relative} workers={} \
+build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}",
+                self.worker_count,
+                plan_kind_label(build_plan),
+                plan_kind_label(probe_plan),
+            );
+        }
+        verdict
     }
 
     fn high_cardinality_aggregate_build(
@@ -1746,8 +1879,14 @@ impl PlanFragmenter {
                     && matches!(join_type, arneb_sql_parser::ast::JoinType::Inner)
                     && self.broadcast_max_build_bytes.is_some()
                     && self.stats.is_some()
-                    && !self.is_broadcast_eligible(&original_right_for_broadcast)
-                    && self.is_broadcast_eligible(&original_left_for_estimate)
+                    && !self.is_broadcast_eligible(
+                        &original_right_for_broadcast,
+                        &original_left_for_estimate,
+                    )
+                    && self.is_broadcast_eligible(
+                        &original_left_for_estimate,
+                        &original_right_for_broadcast,
+                    )
                 {
                     let old_left_width = original_left_for_estimate.schema().len();
                     let old_right_width = original_right_for_broadcast.schema().len();
@@ -1909,7 +2048,10 @@ impl PlanFragmenter {
                         left_frags[0].fragment_type,
                         FragmentType::HashPartitioned | FragmentType::Source
                     )
-                    && self.is_broadcast_eligible(&original_right_for_broadcast)
+                    && self.is_broadcast_eligible(
+                        &original_right_for_broadcast,
+                        &original_left_for_estimate,
+                    )
                 {
                     let mut build_frag = right_frags.pop().unwrap();
                     build_frag.output_partitioning = PartitioningScheme::Broadcast;
@@ -2094,7 +2236,10 @@ impl PlanFragmenter {
                     // 0.496× = exactly half). Keeping the probe N-way both
                     // fixes correctness and preserves parallelism. Dormant
                     // when `broadcast_max_build_bytes` / `stats` are None.
-                    if self.is_broadcast_eligible(&original_right_for_broadcast) {
+                    if self.is_broadcast_eligible(
+                        &original_right_for_broadcast,
+                        &original_left_for_estimate,
+                    ) {
                         eprintln!(
                             "[Q5_DF_REPRO] fragment_join_branch=v2a_broadcast df_regen=false left_child={} right_child={} partition_count={partition_count}",
                             left_frags[0].id,
@@ -6253,6 +6398,223 @@ mod tests {
         assert_eq!(
             choose_partition_count(2, Some(90_000_000), 4_000_000, 256),
             23
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Relative broadcast criterion (ARNEB_BROADCAST_RELATIVE)
+    // -----------------------------------------------------------------
+
+    fn any_broadcast_fragment(fragment: &PlanFragment) -> bool {
+        fragment.output_partitioning == PartitioningScheme::Broadcast
+            || fragment.source_fragments.iter().any(any_broadcast_fragment)
+    }
+
+    /// `scan()` schemas are a single Int32 column, and `estimated_bytes` is
+    /// `row_count * row_width`, so rows are the only knob that moves bytes.
+    fn stats_by_megabytes(left_mb: u64, right_mb: u64) -> crate::cost::CatalogStats {
+        let rows = |mb: u64| mb * 1024 * 1024 / 4;
+        let mut stats = crate::cost::CatalogStats::new();
+        for (name, mb) in [("left_t", left_mb), ("right_t", right_mb)] {
+            stats.insert(
+                TableReference::table(name),
+                arneb_catalog::TableStatistics {
+                    row_count: Some(rows(mb)),
+                    size_bytes: Some(rows(mb) * 4),
+                    columns: std::collections::HashMap::new(),
+                },
+            );
+        }
+        stats
+    }
+
+    fn fragment_with_relative_gate(
+        stats: crate::cost::CatalogStats,
+        workers: usize,
+    ) -> PlanFragment {
+        let mut frag = PlanFragmenter::new()
+            .with_worker_count(workers)
+            // Deliberately generous: the flat cap says "yes" to every build
+            // below, so anything this test observes comes from the relative
+            // rule, not from the cap.
+            .with_broadcast_threshold(Some(1024 * 1024 * 1024))
+            .with_stats(Some(std::sync::Arc::new(stats)));
+        frag.fragment(join_with_equi_keys("left_t", "right_t"))
+    }
+
+    /// A flat byte cap cannot separate q02 from q08.
+    ///
+    /// Measured at SF10 (2026-09-08, `memory_total_20260908_083020` vs
+    /// `_085925`): q02's `partsupp` build is ~253 MB and q08's `orders` build
+    /// is ~300 MB. Any flat `ARNEB_BROADCAST_MAX_BUILD_BYTES` therefore either
+    /// broadcasts both — q02 replicates partsupp twice per worker and peaks at
+    /// 1.71x Trino memory — or neither, at which point q08 hash-shuffles the
+    /// 60M-row lineitem probe (+167% latency, mem_x 0.33 -> 0.996).
+    ///
+    /// The decision has to be relative: replicating a build costs
+    /// `build_bytes * worker_count`, and that is only worth paying when it
+    /// beats shuffling the probe.
+    #[test]
+    fn broadcast_relative_gate_rejects_build_costlier_than_probe_shuffle() {
+        // --- q08-shaped: broadcasting is genuinely cheaper -------------
+        // build 300 MB x 2 workers = 600 MB replicated, versus shuffling a
+        // 2400 MB probe. Still broadcast.
+        {
+            let _gate = set_broadcast_relative_for_test(true);
+            let result = fragment_with_relative_gate(stats_by_megabytes(2400, 300), 2);
+            assert!(
+                any_broadcast_fragment(&result),
+                "q08-shaped join (probe 2400 MB, build 300 MB x 2 workers = 600 MB) \
+                 must still broadcast: replicating the build is cheaper than \
+                 shuffling the probe"
+            );
+        }
+
+        // --- q02-shaped: broadcasting costs more than the shuffle ------
+        // build 253 MB x 2 workers = 506 MB replicated, versus shuffling a
+        // 300 MB probe. Must NOT broadcast. Neither side is eligible under
+        // the relative rule (the probe would cost 600 MB replicated against a
+        // 253 MB build), so the build-side swap cannot fire either.
+        {
+            let _gate = set_broadcast_relative_for_test(true);
+            let result = fragment_with_relative_gate(stats_by_megabytes(300, 253), 2);
+            assert!(
+                !any_broadcast_fragment(&result),
+                "q02-shaped join (probe 300 MB, build 253 MB x 2 workers = 506 MB) \
+                 must NOT broadcast: replicating the build costs more than \
+                 shuffling the probe"
+            );
+        }
+
+        // --- gate off: today's flat-cap behaviour is untouched ---------
+        // The same q02-shaped join broadcasts, because 253 MB fits the 1 GB
+        // cap. This is what keeps the standing 21/22 config safe while the
+        // relative rule is being validated.
+        {
+            let _gate = set_broadcast_relative_for_test(false);
+            let result = fragment_with_relative_gate(stats_by_megabytes(300, 253), 2);
+            assert!(
+                any_broadcast_fragment(&result),
+                "with the gate off the flat cap must still decide: a 253 MB \
+                 build under a 1 GB cap broadcasts"
+            );
+        }
+    }
+    /// Peels Projection/Filter wrappers so a fragment rooted at a
+    /// `Projection` over a `Join` is still recognised as a join intermediate.
+    fn peels_to_join(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Join { .. } => true,
+            LogicalPlan::Projection { input, .. } | LogicalPlan::Filter { input, .. } => {
+                peels_to_join(input)
+            }
+            _ => false,
+        }
+    }
+
+    fn broadcast_join_intermediates(fragment: &PlanFragment) -> usize {
+        let here = usize::from(
+            fragment.output_partitioning == PartitioningScheme::Broadcast
+                && peels_to_join(&fragment.root),
+        );
+        here + fragment
+            .source_fragments
+            .iter()
+            .map(broadcast_join_intermediates)
+            .sum::<usize>()
+    }
+
+    /// `(tiny_a JOIN tiny_b) JOIN big_t` — the shape that q02's build-side
+    /// swap produces once the relative rule correctly refuses to replicate
+    /// the big base table.
+    fn left_deep_join_with_join_on_the_probe_side() -> LogicalPlan {
+        LogicalPlan::Join {
+            left: Box::new(join_with_equi_keys("tiny_a", "tiny_b")),
+            right: Box::new(scan("big_t")),
+            join_type: ast::JoinType::Inner,
+            condition: crate::plan::JoinCondition::On(PlanExpr::BinaryOp {
+                left: Box::new(PlanExpr::Column {
+                    index: 0,
+                    name: "id".into(),
+                    span: None,
+                }),
+                op: ast::BinaryOp::Eq,
+                right: Box::new(PlanExpr::Column {
+                    index: 2,
+                    name: "id".into(),
+                    span: None,
+                }),
+                span: None,
+            }),
+            dynamic_filter_ids: Vec::new(),
+        }
+    }
+
+    fn stats_for_join_intermediate_swap() -> crate::cost::CatalogStats {
+        let rows = |mb: u64| mb * 1024 * 1024 / 4;
+        let mut stats = crate::cost::CatalogStats::new();
+        for (name, mb) in [("tiny_a", 1u64), ("tiny_b", 1), ("big_t", 352)] {
+            stats.insert(
+                TableReference::table(name),
+                arneb_catalog::TableStatistics {
+                    row_count: Some(rows(mb)),
+                    size_bytes: Some(rows(mb) * 4),
+                    columns: std::collections::HashMap::new(),
+                },
+            );
+        }
+        stats
+    }
+
+    /// Only replicate something whose size we can actually bound.
+    ///
+    /// Measured at SF10 (2026-09-08, `[BCASTTRACE]` + the `HashJoinExec.build`
+    /// profile): with the relative rule on, q02 correctly refuses to broadcast
+    /// `partsupp` (352 MB x 2 workers > probe), the build-side swap then
+    /// promotes the join intermediate on the other side, and the fragmenter
+    /// sizes that intermediate at **3.52 MB** while the operator actually
+    /// builds **20,150,881 rows / 2.37 GB** — a 252x row under-estimate. q02's
+    /// peak went 5724 MB -> 9692 MB as a result.
+    ///
+    /// Join-intermediate cardinality is not trustworthy enough to decide what
+    /// to replicate onto every worker (no column NDV comes from the metastore,
+    /// so `best_effort_join_ndv` is guessing). A broadcast build must be a
+    /// base-table scan, optionally under Filter/Projection.
+    #[test]
+    fn broadcast_relative_gate_never_replicates_a_join_intermediate() {
+        let _gate = set_broadcast_relative_for_test(true);
+        let mut frag = PlanFragmenter::new()
+            .with_worker_count(2)
+            .with_broadcast_threshold(Some(1024 * 1024 * 1024))
+            .with_stats(Some(
+                std::sync::Arc::new(stats_for_join_intermediate_swap()),
+            ));
+        let result = frag.fragment(left_deep_join_with_join_on_the_probe_side());
+
+        assert_eq!(
+            broadcast_join_intermediates(&result),
+            0,
+            "a join intermediate must never be broadcast: its size estimate is \
+             unbounded (252x low on q02 at SF10), so replicating it to every \
+             worker is an unpriced bet"
+        );
+    }
+
+    /// The restriction above is about WHAT is being replicated, not how big it
+    /// is: a base-table build of the very same estimated size still broadcasts.
+    #[test]
+    fn broadcast_relative_gate_still_replicates_a_base_table_build() {
+        let _gate = set_broadcast_relative_for_test(true);
+        let mut frag = PlanFragmenter::new()
+            .with_worker_count(2)
+            .with_broadcast_threshold(Some(1024 * 1024 * 1024))
+            .with_stats(Some(std::sync::Arc::new(stats_by_megabytes(2400, 300))));
+        let result = frag.fragment(join_with_equi_keys("left_t", "right_t"));
+
+        assert!(
+            any_broadcast_fragment(&result),
+            "a base-table build (300 MB x 2 workers, probe 2400 MB) is bounded \
+             and must still broadcast"
         );
     }
 }

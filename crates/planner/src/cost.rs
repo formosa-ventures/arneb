@@ -352,9 +352,13 @@ pub fn selinger_cost(plan: &LogicalPlan, stats: &CatalogStats) -> Cost {
 }
 
 /// Enables a join-order scoring mode that charges each left-deep join's
-/// intermediate output at full cardinality. Default OFF.
+/// intermediate output at full cardinality. Default ON.
 pub fn selective_dim_first_enabled() -> bool {
-    std::env::var("ARNEB_SELECTIVE_DIM_FIRST").is_ok_and(|v| v == "1")
+    // Read per call, not cached: the suite flips this variable between tests
+    // and each call must observe the current value.
+    std::env::var("ARNEB_SELECTIVE_DIM_FIRST")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(true)
 }
 
 pub(crate) const SELECTIVE_DIM_TINY_FILTER_ROWS: Cost = 10.0;
@@ -1248,5 +1252,20 @@ mod tests {
         assert_eq!(clamp(f64::INFINITY), 1.0);
         assert_eq!(clamp(0.5), 1.0);
         assert_eq!(clamp(42.0), 42.0);
+    }
+
+    // Shipped defaults (2026-09-08). Every knob asserted here was validated on
+    // TPC-H and then carried ONLY by docker/arneb-bench/docker-compose.bench.yml,
+    // so a plain `cargo run --bin arneb` shipped an un-tuned engine: 12 of the 16
+    // knobs that config sets were default-off in code. An engine's default
+    // behaviour should be its validated behaviour; the env vars stay as opt-outs
+    // (`=0`), not as the only way to get the measured numbers.
+
+    #[test]
+    fn selective_dim_first_ships_enabled() {
+        assert!(
+            selective_dim_first_enabled(),
+            "ARNEB_SELECTIVE_DIM_FIRST must ship on; set it to 0 to opt out"
+        );
     }
 }

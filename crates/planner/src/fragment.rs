@@ -470,11 +470,11 @@ fn parallel_final_agg_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_PARALLEL_FINAL_AGG")
             .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             parallel_final_agg = enabled,
-            "ARNEB_PARALLEL_FINAL_AGG effective value (default off; =1 to enable hash-partitioned final aggregation)"
+            "ARNEB_PARALLEL_FINAL_AGG effective value (default on; =0 to disable)"
         );
         enabled
     })
@@ -4363,6 +4363,9 @@ mod tests {
 
     #[test]
     fn fragment_decomposable_aggregate_splits_into_partial_and_final() {
+        // ARNEB_PARALLEL_FINAL_AGG now ships ON; this test asserts the
+        // non-partitioned split shape, so pin the gate off explicitly.
+        let _pfa = set_parallel_final_agg_for_test(false);
         // 2026-05-26: COUNT is decomposable (partial COUNT -> final SUM),
         // so the fragmenter splits into PartialAggregate (worker) +
         // FinalAggregate (coord) with a new fragment in between.
@@ -4912,6 +4915,9 @@ mod tests {
 
     #[test]
     fn fragment_avg_aggregate_rewritten_to_sum_count_division_and_splits() {
+        // ARNEB_PARALLEL_FINAL_AGG now ships ON; this test asserts the
+        // non-partitioned split shape, so pin the gate off explicitly.
+        let _pfa = set_parallel_final_agg_for_test(false);
         // 2026-06-10: AVG is decomposed into SUM/COUNT before
         // fragmentation, so an aggregate that was previously single-phase
         // (AVG blocks `is_decomposable_for_split`) now splits into
@@ -5003,6 +5009,9 @@ mod tests {
 
     #[test]
     fn fragment_decomposable_aggregate_over_scan_fuses_partial_into_source() {
+        // ARNEB_PARALLEL_FINAL_AGG now ships ON; this test asserts the
+        // non-partitioned split shape, so pin the gate off explicitly.
+        let _pfa = set_parallel_final_agg_for_test(false);
         // A1 map-side (2026-06-10): when a decomposable aggregate sits
         // directly over a scan SOURCE fragment, the PartialAggregate is
         // FUSED INTO that source fragment (aggregates the scan in-process,

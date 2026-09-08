@@ -62,12 +62,12 @@ fn eager_aggregation_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_EAGER_AGG")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             ARNEB_EAGER_AGG = enabled,
-            "ARNEB_EAGER_AGG effective value (default off; =1 to enable eager aggregation)"
+            "ARNEB_EAGER_AGG effective value (default on; =0 to disable)"
         );
         enabled
     })

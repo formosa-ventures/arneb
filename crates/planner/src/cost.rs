@@ -436,7 +436,31 @@ fn estimate_join(
         // `(L * R) / max(ndv_l, ndv_r, 1)`.
         JoinCondition::On(expr) => {
             let ndv = best_effort_join_ndv(expr, left, right, stats).max(1.0);
-            (left_card * right_card) / ndv
+            let est = (left_card * right_card) / ndv;
+            if std::env::var("ARNEB_TRACE_FRAGMENTS")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+            {
+                let mut cols = Vec::new();
+                visit_columns(expr, &mut |name| cols.push(name.to_string()));
+                let owners: Vec<String> = cols
+                    .iter()
+                    .map(|c| {
+                        let owner = key_owner_unfiltered_card(c, left, stats)
+                            .or_else(|| key_owner_unfiltered_card(c, right, stats));
+                        match owner {
+                            Some(v) => format!("{c}={v:.0}"),
+                            None => format!("{c}=none"),
+                        }
+                    })
+                    .collect();
+                eprintln!(
+                    "[CARDTRACE] est={est:.0} left_card={left_card:.0} right_card={right_card:.0} \
+ndv={ndv:.0} keys=[{}]",
+                    owners.join(", ")
+                );
+            }
+            est
         }
     };
 
@@ -706,10 +730,27 @@ fn group_by_ndv_product(
             col_ndv = lookup_column_ndv(name, input, stats);
         });
         let ndv = col_ndv.map(|v| v as f64).unwrap_or_else(|| {
-            // Conservative default: roughly `sqrt(child_size)` so a
-            // grouped aggregate doesn't get estimated as "no rows" when
-            // stats are missing.
-            estimated_cardinality(input, stats).sqrt().max(1.0)
+            // No column NDV stat (e.g. HMS never supplies column
+            // statistics). Bound the group-by key's distinct-count by the
+            // row count of the table that OWNS it — the same technique
+            // `best_effort_join_ndv` uses for equi-join keys when column
+            // stats are unavailable. A guessed `sqrt(child)` badly
+            // under-estimates a GROUP BY on a high-cardinality key (e.g.
+            // TPC-H q02's `GROUP BY ps_partkey` over 1.6M rows): sqrt(1.6M)
+            // = 1265 groups when the real answer is ~1.6M, which then
+            // propagates into join/broadcast sizing. Falls back to the old
+            // sqrt heuristic only when no owning scan can be found (e.g. a
+            // computed grouping expression). The caller's `child.min(...)`
+            // still caps the final result, so an owner larger than the
+            // child (e.g. a filtered/joined-down input) can't inflate it.
+            let mut owner: Option<f64> = None;
+            visit_columns(expr, &mut |name| {
+                if owner.is_some() {
+                    return;
+                }
+                owner = key_owner_unfiltered_card(name, input, stats);
+            });
+            owner.unwrap_or_else(|| estimated_cardinality(input, stats).sqrt().max(1.0))
         });
         product = product.saturating_mul_f64(ndv);
     }
@@ -1267,5 +1308,73 @@ mod tests {
             selective_dim_first_enabled(),
             "ARNEB_SELECTIVE_DIM_FIRST must ship on; set it to 0 to opt out"
         );
+    }
+    /// A grouped aggregate with no column NDV must be bounded by the grouping
+    /// column's owning table, not guessed as `sqrt(child)`.
+    ///
+    /// Measured on q02 at SF10 (2026-09-08, `[CARDTRACE]`): the metastore
+    /// supplies no column statistics, so `GROUP BY ps_partkey` over the
+    /// ~1,600,000-row EUROPE partsupp fell back to `sqrt(1_600_000)` = 1265
+    /// groups. The real answer is ~1.6M — a 1265x under-estimate — and it
+    /// propagates: the fragmenter then sized a join intermediate at 3.52 MB
+    /// while the operator actually built 20,150,881 rows / 2.37 GB, and
+    /// broadcast it to every worker. Same `sqrt` fallback the June
+    /// `ARNEB_AGG_PRESIZE_ADAPTIVE` work had to defeat at runtime; the planner
+    /// side was never fixed.
+    ///
+    /// `best_effort_join_ndv` already resolves an unknown key NDV from the
+    /// table that OWNS the column. The group count wants the same rule, and
+    /// the second case below is what stops "just use the child cardinality"
+    /// from passing: a grouping column owned by a 25-row table must still
+    /// estimate 25 groups, however large the input.
+    #[test]
+    fn grouped_aggregate_without_column_ndv_is_bounded_by_the_key_owner() {
+        // --- q02 shape: high-cardinality key, no stats -----------------
+        {
+            let mut catalog_stats = CatalogStats::new();
+            catalog_stats.insert(TableReference::table("partsupp"), make_stats(1_600_000));
+            let plan = LogicalPlan::Aggregate {
+                input: Box::new(make_scan("partsupp", vec!["ps_partkey"])),
+                group_by: vec![col_expr(0, "ps_partkey")],
+                aggr_exprs: vec![],
+                schema: vec![col("ps_partkey")],
+            };
+            assert_eq!(
+                estimated_cardinality(&plan, &catalog_stats),
+                1_600_000.0,
+                "GROUP BY on a key of a 1.6M-row table must not be guessed as \
+                 sqrt(child) = 1265; nothing known about the column justifies \
+                 assuming it collapses"
+            );
+        }
+
+        // --- the over-correction guard: tiny owning table --------------
+        {
+            let mut catalog_stats = CatalogStats::new();
+            catalog_stats.insert(TableReference::table("orders"), make_stats(15_000_000));
+            catalog_stats.insert(TableReference::table("nation"), make_stats(25));
+            let join = LogicalPlan::Join {
+                left: Box::new(make_scan("orders", vec!["o_nationkey"])),
+                right: Box::new(make_scan("nation", vec!["n_nationkey"])),
+                join_type: JoinType::Inner,
+                condition: JoinCondition::On(eq(
+                    col_expr(0, "o_nationkey"),
+                    col_expr(1, "n_nationkey"),
+                )),
+                dynamic_filter_ids: Vec::new(),
+            };
+            let plan = LogicalPlan::Aggregate {
+                input: Box::new(join),
+                group_by: vec![col_expr(1, "n_nationkey")],
+                aggr_exprs: vec![],
+                schema: vec![col("n_nationkey")],
+            };
+            assert_eq!(
+                estimated_cardinality(&plan, &catalog_stats),
+                25.0,
+                "GROUP BY a column owned by a 25-row table can never exceed 25 \
+                 groups, no matter how large the aggregate's input"
+            );
+        }
     }
 }

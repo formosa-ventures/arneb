@@ -4,28 +4,116 @@ A Trino alternative built in Rust. Distributed SQL query engine for federated qu
 
 Trino (formerly PrestoSQL) lets users query data where it lives — across object stores, databases, and other systems — using standard SQL. This project aims to achieve similar goals with Rust's performance and safety guarantees.
 
-## Why Arneb
+## Arneb vs Trino — TPC-H SF10
 
-Measured against Trino on the full 22-query TPC-H suite at SF10 — both engines as a
-coordinator plus two workers, in containers with the same CPU allocation, reading the
-same Parquet from MinIO through the same Hive Metastore:
+Measured 2026-09-20 on the full 22-query suite. Both engines run as a coordinator
+plus two workers, in containers with the same per-node CPU cap, reading the same
+Snappy Parquet from MinIO through the same Hive Metastore. `lineitem` is
+59,986,052 rows. Host: 10 CPUs, 15.66 GiB of container-runtime memory.
 
 | | Arneb vs Trino |
 |---|---|
-| **Peak memory** | **0.16× on average — about a sixth of Trino's**, and lower on **all 22** queries (best 0.06×, worst 0.42×) |
+| **Peak memory** | **0.16× on average — about a sixth of Trino's**, lower on **all 22** queries (best 0.06×, worst 0.42×) |
 | **Latency** | **2.0× faster** (geomean), faster on **21 of 22** queries |
-| **Correctness** | **Cell-identical to Trino on all 22**, and deterministic run-to-run |
+| **Correctness** | **Cell-identical to Trino on all 22**, deterministic run-to-run |
 | **Footprint** | One self-contained binary (~60 MB). No JVM, no heap tuning, no GC pauses |
 
-The memory result is the one to notice: a Trino cluster that needs 9.3 GB to run q09
-is replaced by one that needs 1.8 GB, on identical hardware and identical data. That is
-the difference between a query that fits on your node and one that does not.
+### Every query, both protocols
 
-**The one query Arneb loses is q21**, the deepest correlated-join pipeline in the suite
-(0.78× and 0.68× across two runs) — it still uses 0.23× the memory there. Numbers are
-warm-run; the cold-run figures, the per-query tables, and the method are in
-[the benchmark section](#tpc-h-benchmark) below. Everything here is reproducible with one
-command on one machine.
+Latency in milliseconds, peak memory in MB. Latency ratios are Trino ÷ arneb
+(higher is better for arneb); memory ratios are arneb ÷ Trino (lower is better).
+Memory is the peak simultaneous resident set summed across all three cluster
+nodes, from the warm run.
+
+| Query | | cold arneb | cold Trino | cold | warm arneb | warm Trino | **warm** | mem arneb | mem Trino | **mem** |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `q01` | Pricing Summary | 1,894 | 6,283 | 3.3× | 1,818 | 3,039 | **1.7×** | 366 | 5,468 | **0.07×** |
+| `q02` | Minimum Cost Supplier | 671 | 5,991 | 8.9× | 506 | 2,122 | **4.2×** | 261 | 3,806 | **0.07×** |
+| `q03` | Shipping Priority | 2,543 | 9,047 | 3.6× | 2,184 | 3,832 | **1.8×** | 1,918 | 5,409 | **0.35×** |
+| `q04` | Order Priority Checking | 1,989 | 7,402 | 3.7× | 1,952 | 2,781 | **1.4×** | 1,704 | 6,923 | **0.25×** |
+| `q05` | Local Supplier Volume | 2,270 | 8,887 | 3.9× | 2,414 | 4,302 | **1.8×** | 1,048 | 6,559 | **0.16×** |
+| `q06` | Forecasting Revenue | 724 | 4,629 | 6.4× | 656 | 1,883 | **2.9×** | 349 | 4,670 | **0.07×** |
+| `q07` | Volume Shipping | 2,028 | 8,433 | 4.2× | 1,942 | 3,858 | **2.0×** | 1,217 | 5,537 | **0.22×** |
+| `q08` | National Market Share | 3,075 | 9,835 | 3.2× | 3,124 | 4,902 | **1.6×** | 1,558 | 7,380 | **0.21×** |
+| `q09` | Product Type Profit | 4,265 | 11,779 | 2.8× | 4,487 | 6,443 | **1.4×** | 1,849 | 9,338 | **0.20×** |
+| `q10` | Returned Item Reporting | 2,056 | 9,983 | 4.9× | 2,175 | 4,183 | **1.9×** | 1,009 | 5,593 | **0.18×** |
+| `q11` | Important Stock ID | 689 | 5,218 | 7.6× | 737 | 1,942 | **2.6×** | 319 | 3,277 | **0.10×** |
+| `q12` | Shipping Modes | 1,216 | 6,619 | 5.4× | 1,081 | 2,508 | **2.3×** | 330 | 5,054 | **0.07×** |
+| `q13` | Customer Distribution | 1,815 | 7,738 | 4.3× | 1,632 | 4,394 | **2.7×** | 414 | 6,478 | **0.06×** |
+| `q14` | Promotion Effect | 1,195 | 7,078 | 5.9× | 1,074 | 2,879 | **2.7×** | 691 | 4,904 | **0.14×** |
+| `q15` | Top Supplier | 1,037 | 6,975 | 6.7× | 997 | 3,314 | **3.3×** | 446 | 7,093 | **0.06×** |
+| `q16` | Parts/Supplier Relationship | 1,089 | 7,956 | 7.3× | 1,079 | 2,616 | **2.4×** | 414 | 4,533 | **0.09×** |
+| `q17` | Small-Quantity-Order Revenue | 3,337 | 11,353 | 3.4× | 3,032 | 5,300 | **1.7×** | 1,586 | 7,859 | **0.20×** |
+| `q18` | Large Volume Customer | 4,566 | 10,798 | 2.4× | 4,331 | 5,145 | **1.2×** | 3,827 | 9,180 | **0.42×** |
+| `q19` | Discounted Revenue | 1,453 | 7,419 | 5.1× | 1,279 | 3,239 | **2.5×** | 642 | 5,514 | **0.12×** |
+| `q20` | Potential Part Promotion | 3,037 | 8,465 | 2.8× | 2,939 | 3,942 | **1.3×** | 1,123 | 6,683 | **0.17×** |
+| `q21` | Suppliers Who Kept Orders Waiting | 7,936 | 15,185 | 1.9× | 8,262 | 6,442 | **0.78×** ⚠️ | 1,994 | 8,560 | **0.23×** |
+| `q22` | Global Sales Opportunity | 962 | 5,659 | 5.9× | 946 | 2,136 | **2.3×** | 740 | 4,710 | **0.16×** |
+| | **aggregate** | | | **4.4×** | | | **2.0×** | | | **0.16×** |
+
+Aggregate is the geometric mean for the latency ratios and the arithmetic mean
+for the memory ratios.
+
+### What the two protocols mean
+
+**Cold** times each query on a freshly restarted cluster. **Warm** runs one
+untimed query first, identically for both engines, then times the next one.
+
+That choice carries most of the headline, which is why both columns are here.
+Warming is worth a median 57% to Trino (43–67% across the 22) because a
+restarted JVM re-JITs and re-reads from MinIO, and 4% to arneb (−7% to +24%),
+which has no equivalent start-up cost. **The cold column is therefore largely a
+measurement of JVM start-up — quote the warm one.**
+
+### Memory, in absolute terms
+
+Ratios understate what this means for a deployment, so the five largest gaps:
+
+| Query | Arneb | Trino | Saved |
+|---|--:|--:|--:|
+| `q09` Product Type Profit | 1.8 GB | 9.3 GB | **7.5 GB** |
+| `q15` Top Supplier | 0.4 GB | 7.1 GB | **6.6 GB** |
+| `q21` Suppliers Who Kept Orders Waiting | 2.0 GB | 8.6 GB | **6.6 GB** |
+| `q17` Small-Quantity-Order Revenue | 1.6 GB | 7.9 GB | **6.3 GB** |
+| `q18` Large Volume Customer | 3.8 GB | 9.2 GB | **5.4 GB** |
+
+A Trino cluster that needs 9.3 GB to run q09 is replaced by one that needs
+1.8 GB, on identical hardware and identical data — the difference between a
+query that fits on your node and one that does not.
+
+Trino's floor is also high before any query runs: measured across the same
+restarts, its three-node cluster sits at **1.87 GB** of committed heap at idle
+(1.77–1.98 GB). Arneb allocates lazily — the same measurement puts its idle
+cluster at **0.03 GB** (0.01–0.05 GB), roughly sixty times less. Both are counted
+the way a container memory limit or `kubectl top` counts them.
+
+### The one query Arneb loses
+
+Warm, arneb loses `q21` — 8,262 ms and 9,852 ms across two runs against Trino's
+6,442 ms and 6,739 ms, a ratio of 0.78× and 0.68×. It reproduces; it is not
+noise. Memory there is still 0.23×. `q21` is the four-way correlated
+`EXISTS` / `NOT EXISTS` self-join over `lineitem`, the deepest join pipeline in
+the suite.
+
+### Reproduce it
+
+```bash
+git clone https://github.com/formosa-ventures/arneb.git && cd arneb
+
+# Build the engine images (first run only; compiles arneb in release mode).
+docker compose -f docker-compose.yml \
+               -f docker/arneb-bench/docker-compose.bench.yml build
+
+# One command: preflight the host, seed SF10, measure both engines, report.
+BENCH_WARMUP=1 ./benchmarks/tpch/scripts/run_benchmark.sh --scenario=sf10
+
+# Correctness gate: determinism + cell-diff vs Trino, all 22.
+python3 benchmarks/tpch/scripts/blast_radius_oracle.py --runs 2
+```
+
+Drop `BENCH_WARMUP=1` for the cold column. Method, host floors and what is *not*
+claimed are in [benchmark methodology](#benchmark-methodology);
+[`benchmarks/tpch/README.md`](benchmarks/tpch/README.md) has the full guide.
 
 ## Features
 
@@ -166,88 +254,52 @@ psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.nation;"
 docker compose down
 ```
 
-## TPC-H Benchmark
+## Benchmark methodology
 
-All 22 TPC-H queries return results **cell-identical to Trino**, and arneb's
-peak memory is lower than Trino's on **every one of the 22**. On latency the
-answer depends on whether the engines are measured cold or warm, and the
-difference is large enough that reporting only one of them would misrepresent
-the result.
+The numbers at the top of this README rest on these choices. They are the parts
+that decide whether a comparison is fair, so they are stated rather than left in
+the scripts.
 
-Measured 2026-09-20 at **SF10** (`lineitem` 59,986,052 rows), both engines as a
-coordinator + 2 workers in containers with the same per-node CPU cap, reading
-the same Snappy Parquet from MinIO via Hive Metastore. Host: 10 CPUs, 15.66 GiB
-of container-runtime memory.
+- **Identical isolation.** Both engines run as a coordinator plus two workers in
+  containers with the same per-node CPU cap, reading the same Parquet from the
+  same object store through the same metastore. Neither engine runs natively
+  against a containerized rival.
+- **Engine rotation.** Only the engine being measured is resident; the other is
+  stopped, not idle. Otherwise Trino's committed JVM heap counts against arneb's
+  memory reading, and arneb's footprint against Trino's.
+- **A clean baseline per query.** The cluster restarts before each query, so a
+  measurement starts from its own baseline rather than its predecessor's
+  high-water mark.
+- **Memory is simultaneous, not a sum of lifetime peaks.** Peak is sampled
+  during the query as the maximum of the summed cgroup RSS across all three
+  nodes — a footprint that actually existed at one instant. Summing each node's
+  lifetime peak would report a cluster total that never simultaneously existed.
+- **Correctness is a separate gate.** Each query runs twice and is compared
+  run-to-run and against Trino as an order-independent, float-tolerant multiset
+  at 6 significant figures
+  (`benchmarks/tpch/scripts/blast_radius_oracle.py`, 22/22 clean). Row-count
+  agreement is not this guarantee — a query can return the right number of wrong
+  rows, which is the failure this gate exists to catch.
+- **A scenario declares its host floors.** `--scenario=sf10` requires 15 GiB of
+  container-runtime memory, 6 CPUs and 40 GB free disk, and refuses the run
+  before starting anything if the host cannot meet them. The scale factor
+  travels with the measurement into the result document and the report header,
+  so a number cannot be read without the scale it was measured at.
 
-| | Cold | Warm |
-|---|---|---|
-| Geomean latency speedup | 4.4x | **2.0x** |
-| Mean peak memory vs Trino | 0.19x | **0.16x** |
-| Queries where arneb is faster | 22 / 22 | **21 / 22** |
-| Queries where arneb uses less memory | 22 / 22 | 22 / 22 |
+### What is not claimed
 
-Ratios understate what the memory result means in practice, so here it is in
-absolute terms — the five queries with the largest gap, warm run, peak
-simultaneous RSS summed across all three cluster nodes:
-
-| Query | Arneb | Trino | Saved | Ratio |
-|---|--:|--:|--:|--:|
-| q09 Product Type Profit Measure | 1.8 GB | 9.3 GB | **7.5 GB** | 0.20× |
-| q15 Top Supplier | 0.4 GB | 7.1 GB | **6.6 GB** | 0.06× |
-| q21 Suppliers Who Kept Orders Waiting | 2.0 GB | 8.6 GB | **6.6 GB** | 0.23× |
-| q17 Small-Quantity-Order Revenue | 1.6 GB | 7.9 GB | **6.3 GB** | 0.20× |
-| q18 Large Volume Customer | 3.8 GB | 9.2 GB | **5.4 GB** | 0.42× |
-
-Trino's floor is high before any query runs. Measured across the same restarts,
-its three-node cluster sits at **1.87 GB** of committed heap at idle (1.77–1.98
-GB) — a real deployment cost whether or not it is in use. Arneb allocates
-lazily: the same measurement puts its idle cluster at **0.03 GB** (0.01–0.05
-GB), roughly sixty times less. Both are counted the way a container memory limit
-or `kubectl top` counts them.
-
-**Read the warm column.** Cold means each query is timed on a freshly restarted
-cluster with nothing warmed; warm means one untimed run precedes the timed one,
-applied identically to both engines. Warming is worth 43–67% to Trino (median
-57%) because a restarted JVM re-JITs and re-reads from MinIO, and 4% to arneb,
-which has no equivalent start-up cost. The cold column is therefore mostly a
-measurement of JVM start-up, and the 4.4x it reports is not a claim about query
-execution.
-
-**q21 is the exception, and it is a real one.** Warm, arneb loses it — 8.3 s and
-9.9 s across two runs against Trino's 6.4 s and 6.7 s, a ratio of 0.78x and
-0.68x. It reproduces; it is not noise. arneb still uses 0.23x the peak memory on
-that query. q21 is the four-way correlated `EXISTS`/`NOT EXISTS` self-join over
-`lineitem`, the deepest join pipeline in the suite.
-
-Correctness is a separate gate and it passes outright: every query is
-deterministic run-to-run and cell-identical to Trino, compared as an
-order-independent multiset at 6 significant figures
-(`benchmarks/tpch/scripts/blast_radius_oracle.py`, 22/22).
+One host, one scale factor, one run per protocol per query — two for `q21`.
+Run-to-run variance under identical settings has not been characterised, so
+small differences in these tables are not results. Numbers from two different
+hosts are not comparable; a scenario makes a run repeatable, not
+hardware-independent.
 
 SF30 figures cited previously in this repository were produced under the cold
 protocol and have not been re-measured warm.
 
-The full guide — prerequisites, host floors, per-query tables, and the
-comparison report — is in
-[`benchmarks/tpch/README.md`](benchmarks/tpch/README.md). In short:
-
-```bash
-git clone https://github.com/formosa-ventures/arneb.git && cd arneb
-
-# Build the engine images (first run only; compiles arneb in release mode).
-docker compose -f docker-compose.yml \
-               -f docker/arneb-bench/docker-compose.bench.yml build
-
-# One command: preflight the host, seed SF10, measure both engines, report.
-BENCH_WARMUP=1 ./benchmarks/tpch/scripts/run_benchmark.sh --scenario=sf10
-
-# Correctness gate: determinism + cell-diff vs Trino, all 22.
-python3 benchmarks/tpch/scripts/blast_radius_oracle.py --runs 2
-```
-
-Drop `BENCH_WARMUP=1` to reproduce the cold column. The run writes its raw CSV,
-a provenance record naming the scale and warm-up state, and the rendered table
-into `benchmarks/tpch/results/`.
+The full guide — prerequisites, host floors, the scenario reference and the
+per-query report tooling — is in
+[`benchmarks/tpch/README.md`](benchmarks/tpch/README.md).
 
 ## Development
 

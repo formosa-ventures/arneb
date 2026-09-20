@@ -3681,10 +3681,14 @@ impl HashJoinExec {
 
     /// True when Grace Hash Join's partitioned-spill path should run
     /// instead of the chunk-multipass path. INNER + no-residual + the
-    /// env opt-in `ARNEB_GRACE_HJ=1`. Default-off until Phase 3b.5g
-    /// flips the switch.
+    /// env opt-out `ARNEB_GRACE_HJ=0`.
     fn grace_enabled(&self) -> bool {
-        self.multipass_supported() && std::env::var_os("ARNEB_GRACE_HJ").is_some()
+        // Read per call, not cached: the suite flips this variable between
+        // tests and each call must observe the current value.
+        let enabled = std::env::var("ARNEB_GRACE_HJ")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
+        self.multipass_supported() && enabled
     }
 
     /// Build `Vec<PlanExpr>` of column-references for the right-side
@@ -5335,18 +5339,20 @@ fn vec_probe_enabled() -> bool {
 /// Software-prefetch the build hash-slot for a look-ahead probe row to hide the
 /// random-access cache-miss latency of `head[hash & mask]` (flamegraph: the
 /// multi-batch probe's hash lookups are ~15% of q07 CPU, cache-miss-bound on the
-/// large build). Default off; enabled with `ARNEB_PROBE_PREFETCH=1`. Cell-safe:
+/// large build). Default on; disabled with `ARNEB_PROBE_PREFETCH=0`. Cell-safe:
 /// a prefetch is a CPU hint with zero effect on results.
 #[cfg(not(test))]
 fn probe_prefetch_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let enabled = std::env::var("ARNEB_PROBE_PREFETCH").is_ok_and(|v| v == "1");
+        let enabled = std::env::var("ARNEB_PROBE_PREFETCH")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             knob = "ARNEB_PROBE_PREFETCH",
             enabled,
-            "runtime config"
+            "ARNEB_PROBE_PREFETCH effective value (default on; =0 to disable)"
         );
         enabled
     })
@@ -5354,7 +5360,9 @@ fn probe_prefetch_enabled() -> bool {
 
 #[cfg(test)]
 fn probe_prefetch_enabled() -> bool {
-    std::env::var("ARNEB_PROBE_PREFETCH").is_ok_and(|v| v == "1")
+    std::env::var("ARNEB_PROBE_PREFETCH")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(true)
 }
 
 /// Stream the shared Single-build probe side batch-by-batch. Default off;
@@ -7026,9 +7034,15 @@ mod tests {
     #[tokio::test]
     async fn broadcast_df_gate_on_publishes_single_build_domain() {
         let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        // These tests execute joins, so they also depend on ARNEB_GRACE_HJ;
+        // take the same guard the grace tests use or the two lock families
+        // race on that variable.
+        let _grace = env_test_guard().await;
         std::env::set_var("ARNEB_BROADCAST_DF", "true");
         std::env::remove_var("ARNEB_DISABLE_DF");
-        std::env::remove_var("ARNEB_GRACE_HJ");
+        // ARNEB_GRACE_HJ now ships ON, so unsetting it no longer selects the
+        // non-grace path this test needs — pin it off explicitly.
+        std::env::set_var("ARNEB_GRACE_HJ", "0");
 
         let calls = Arc::new(Mutex::new(Vec::new()));
         let publisher = Arc::new(CapturingDynamicFilterPublisher {
@@ -7062,14 +7076,21 @@ mod tests {
         }
 
         std::env::remove_var("ARNEB_BROADCAST_DF");
+        std::env::remove_var("ARNEB_GRACE_HJ");
     }
 
     #[tokio::test]
     async fn broadcast_df_parallel_probe_publishes_once_per_task_with_task_partition_idx() {
         let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        // These tests execute joins, so they also depend on ARNEB_GRACE_HJ;
+        // take the same guard the grace tests use or the two lock families
+        // race on that variable.
+        let _grace = env_test_guard().await;
         std::env::set_var("ARNEB_BROADCAST_DF", "true");
         std::env::remove_var("ARNEB_DISABLE_DF");
-        std::env::remove_var("ARNEB_GRACE_HJ");
+        // ARNEB_GRACE_HJ now ships ON, so unsetting it no longer selects the
+        // non-grace path this test needs — pin it off explicitly.
+        std::env::set_var("ARNEB_GRACE_HJ", "0");
 
         let calls = Arc::new(Mutex::new(Vec::new()));
         let right_batch = broadcast_df_right_batch();
@@ -7106,6 +7127,7 @@ mod tests {
         }
 
         std::env::remove_var("ARNEB_BROADCAST_DF");
+        std::env::remove_var("ARNEB_GRACE_HJ");
     }
 
     fn right_source_key_second() -> Arc<dyn ExecutionPlan> {
@@ -7186,9 +7208,15 @@ mod tests {
         // (200,300,500); the fix publishes "id" (2,3,5). This was the
         // SF30 "domain published empty/wrong" gap for the broadcast DF path.
         let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        // These tests execute joins, so they also depend on ARNEB_GRACE_HJ;
+        // take the same guard the grace tests use or the two lock families
+        // race on that variable.
+        let _grace = env_test_guard().await;
         std::env::set_var("ARNEB_BROADCAST_DF", "true");
         std::env::remove_var("ARNEB_DISABLE_DF");
-        std::env::remove_var("ARNEB_GRACE_HJ");
+        // ARNEB_GRACE_HJ now ships ON, so unsetting it no longer selects the
+        // non-grace path this test needs — pin it off explicitly.
+        std::env::set_var("ARNEB_GRACE_HJ", "0");
 
         let calls = Arc::new(Mutex::new(Vec::new()));
         let publisher = Arc::new(CapturingDynamicFilterPublisher {
@@ -7222,11 +7250,16 @@ mod tests {
         }
 
         std::env::remove_var("ARNEB_BROADCAST_DF");
+        std::env::remove_var("ARNEB_GRACE_HJ");
     }
 
     #[tokio::test]
     async fn grace_df_collector_over_cap_with_bloom_yields_bloom_without_false_negatives() {
         let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        // These tests execute joins, so they also depend on ARNEB_GRACE_HJ;
+        // take the same guard the grace tests use or the two lock families
+        // race on that variable.
+        let _grace = env_test_guard().await;
 
         let mut collector = DfDistinctCollector::Int64 {
             set: crate::fast_hash::FastHashSet::default(),
@@ -7254,6 +7287,10 @@ mod tests {
     #[tokio::test]
     async fn grace_df_publish_uses_non_first_right_key_slot_and_never_skips_producer() {
         let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        // These tests execute joins, so they also depend on ARNEB_GRACE_HJ;
+        // take the same guard the grace tests use or the two lock families
+        // race on that variable.
+        let _grace = env_test_guard().await;
         std::env::remove_var("ARNEB_DISABLE_DF");
 
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -7309,9 +7346,15 @@ mod tests {
     #[tokio::test]
     async fn broadcast_df_gate_off_skips_single_build_publish() {
         let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        // These tests execute joins, so they also depend on ARNEB_GRACE_HJ;
+        // take the same guard the grace tests use or the two lock families
+        // race on that variable.
+        let _grace = env_test_guard().await;
         std::env::remove_var("ARNEB_BROADCAST_DF");
         std::env::remove_var("ARNEB_DISABLE_DF");
-        std::env::remove_var("ARNEB_GRACE_HJ");
+        // ARNEB_GRACE_HJ now ships ON, so unsetting it no longer selects the
+        // non-grace path this test needs — pin it off explicitly.
+        std::env::set_var("ARNEB_GRACE_HJ", "0");
 
         let calls = Arc::new(Mutex::new(Vec::new()));
         let publisher = Arc::new(CapturingDynamicFilterPublisher {
@@ -7324,6 +7367,8 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(calls.lock().unwrap().is_empty());
+
+        std::env::remove_var("ARNEB_GRACE_HJ");
     }
 
     // dynamic-filter-provenance-targeting: a build-key filter must reach ONLY
@@ -7927,7 +7972,9 @@ mod tests {
         // a concurrent test leaking ARNEB_GRACE_HJ would route execute(0)
         // to the grace path, which streams (no fail-fast) → flaky panic.
         let _g = env_test_guard().await;
-        std::env::remove_var("ARNEB_GRACE_HJ");
+        // ARNEB_GRACE_HJ now ships ON, so unsetting it no longer selects the
+        // non-grace path this test needs — pin it off explicitly.
+        std::env::set_var("ARNEB_GRACE_HJ", "0");
         let left = right_source_multi_batch(vec![(0..5000).collect()]); // big probe
         let right = right_source_multi_batch(vec![vec![1]]); // tiny build
         let pool: Arc<dyn crate::memory_pool::MemoryPool> =
@@ -7954,6 +8001,8 @@ mod tests {
                 panic!("expected fail-fast under tight pool, got Ok (probe collect untracked?)")
             }
         }
+
+        std::env::remove_var("ARNEB_GRACE_HJ");
     }
 
     /// Phase 3b.3 regression: `execute_single` without spill (budget

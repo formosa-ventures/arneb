@@ -25,10 +25,12 @@ fn cte_self_agg_window_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let enabled = std::env::var("ARNEB_CTE_SELF_AGG_WINDOW").is_ok_and(|v| v == "1");
+        let enabled = std::env::var("ARNEB_CTE_SELF_AGG_WINDOW")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         tracing::info!(
             ARNEB_CTE_SELF_AGG_WINDOW = enabled,
-            "ARNEB_CTE_SELF_AGG_WINDOW effective value (default off; =1 to rewrite CTE self-aggregate scalar subqueries to windows)"
+            "ARNEB_CTE_SELF_AGG_WINDOW effective value (default on; =0 to disable)"
         );
         enabled
     })

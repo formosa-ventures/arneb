@@ -553,11 +553,12 @@ fn agg_prefetch_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_AGG_PREFETCH")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             agg_prefetch = enabled,
-            "ARNEB_AGG_PREFETCH effective value (default off; =1/true to enable bigint aggregate hash prefetch)"
+            "ARNEB_AGG_PREFETCH effective value (default on; =0 to disable)"
         );
         enabled
     })
@@ -567,13 +568,13 @@ fn agg_presize_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_AGG_PRESIZE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             agg_presize = enabled,
             max_groups = AGG_PRESIZE_MAX_GROUPS,
-            "ARNEB_AGG_PRESIZE effective value (default off; =1 to pre-size aggregate group hash tables)"
+            "ARNEB_AGG_PRESIZE effective value (default on; =0 to disable)"
         );
         enabled
     })
@@ -600,13 +601,13 @@ pub(crate) fn agg_presize_adaptive_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_AGG_PRESIZE_ADAPTIVE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             agg_presize_adaptive = enabled,
             max_groups = AGG_PRESIZE_MAX_GROUPS,
-            "ARNEB_AGG_PRESIZE_ADAPTIVE effective value (default off; =1 to adaptively pre-size aggregate group hash tables)"
+            "ARNEB_AGG_PRESIZE_ADAPTIVE effective value (default on; =0 to disable)"
         );
         enabled
     })
@@ -1887,5 +1888,28 @@ mod tests {
                 mrows
             );
         }
+    }
+
+    // Shipped defaults (2026-09-08). Every knob asserted here was validated on
+    // TPC-H and then carried ONLY by docker/arneb-bench/docker-compose.bench.yml,
+    // so a plain `cargo run --bin arneb` shipped an un-tuned engine: 12 of the 16
+    // knobs that config sets were default-off in code. An engine's default
+    // behaviour should be its validated behaviour; the env vars stay as opt-outs
+    // (`=0`), not as the only way to get the measured numbers.
+
+    #[test]
+    fn aggregate_hash_knobs_ship_enabled() {
+        assert!(
+            agg_prefetch_enabled(),
+            "ARNEB_AGG_PREFETCH must ship on; set it to 0 to opt out"
+        );
+        assert!(
+            agg_presize_enabled(),
+            "ARNEB_AGG_PRESIZE must ship on; set it to 0 to opt out"
+        );
+        assert!(
+            agg_presize_adaptive_enabled(),
+            "ARNEB_AGG_PRESIZE_ADAPTIVE must ship on; set it to 0 to opt out"
+        );
     }
 }

@@ -618,12 +618,12 @@ async fn execute_query(
         // broadcast-eligible join to Fixed/Single — it keeps the probe
         // N-way and only broadcasts the build, so enabling this is now
         // correct + parallel. Runtime override `ARNEB_BROADCAST_MAX_BUILD_BYTES`
-        // (bytes) drives the A/B; default None (OFF) until measured.
-        .with_broadcast_max_build_bytes(
-            std::env::var("ARNEB_BROADCAST_MAX_BUILD_BYTES")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok()),
-        );
+        // (bytes) drives the A/B; defaults to the validated 1 GB cap, with
+        // an explicit zero disabling broadcast.
+        .with_broadcast_max_build_bytes(match std::env::var("ARNEB_BROADCAST_MAX_BUILD_BYTES") {
+            Ok(value) => value.parse::<usize>().ok().filter(|&bytes| bytes > 0),
+            Err(_) => Some(1_000_000_000),
+        });
     register_data_sources(
         &logical_plan,
         catalog_manager,

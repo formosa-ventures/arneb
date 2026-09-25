@@ -29,8 +29,18 @@ cargo run --bin arneb -- --config /path/to/config.toml
 | Service | Port | Roles |
 |---------|------|-------|
 | pgwire (PostgreSQL protocol) | `port` | standalone, coordinator |
+| Trino client protocol (HTTP) | `[trino] port` (default `8080`) | standalone, coordinator |
 | Web UI | `port + 1000` | standalone, coordinator |
 | Flight RPC | `9090` | all roles |
+
+## Trino Client Protocol
+
+| Field | Type | Default | Env Var | CLI | Description |
+|-------|------|---------|---------|-----|-------------|
+| `[trino] enabled` | bool | `true` | `ARNEB_TRINO_ENABLED` | `--no-trino` | Serve the Trino client REST protocol |
+| `[trino] port` | integer | `8080` | `ARNEB_TRINO_PORT` | `--trino-port` | HTTP port of the Trino listener |
+
+See [Trino Client Compatibility](./trino-clients.md) for what the listener supports.
 
 ## Tuning Knobs: Build-Time vs Runtime
 

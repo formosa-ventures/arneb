@@ -103,7 +103,7 @@ use arneb_connectors::{ConnectorRegistry, StorageRegistry};
 use arneb_execution::memory_pool::{
     GreedyMemoryPool, MemoryPool, QueryMemoryPool, TrackConsumersPool, UnboundedMemoryPool,
 };
-use arneb_protocol::{ProtocolConfig, ProtocolServer};
+use arneb_protocol::{ProtocolConfig, ProtocolServer, TrinoConfig, TrinoServer};
 use clap::Parser;
 
 use crate::config::{parse_data_type, AppConfig, ServerRole};
@@ -138,6 +138,15 @@ struct CliArgs {
     /// Server role: standalone (default), coordinator, or worker
     #[arg(long, default_value = "standalone")]
     role: String,
+
+    /// Trino client protocol HTTP port (overrides `[trino] port` and
+    /// `ARNEB_TRINO_PORT`; default 8080).
+    #[arg(long)]
+    trino_port: Option<u16>,
+
+    /// Disable the Trino client protocol listener.
+    #[arg(long)]
+    no_trino: bool,
 
     /// Emit per-operator wall-time tracing on the `arneb::profile`
     /// target. Equivalent to setting `arneb::profile=info` in
@@ -179,6 +188,12 @@ async fn run() -> Result<()> {
         config.server.port = port;
     }
     config.cluster.role = args.role;
+    if let Some(port) = args.trino_port {
+        config.trino.port = port;
+    }
+    if args.no_trino {
+        config.trino.enabled = false;
+    }
     config
         .server
         .validate()
@@ -608,6 +623,35 @@ async fn run() -> Result<()> {
         server = server.with_distributed_executor(Arc::clone(executor));
     }
 
+    // Trino client REST protocol: coordinator/standalone only, same engine
+    // state (catalogs, connectors, memory pool, distributed executor) as
+    // pgwire. Queries are registered with the tracker so they show in the
+    // Web UI.
+    let serves_clients = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
+    let trino_addr = format!("{}:{}", config.server.bind_address, config.trino.port);
+    tracing::info!(
+        target: "arneb::config",
+        trino_enabled = config.trino.enabled && serves_clients,
+        trino_address = %trino_addr,
+        "Trino client protocol effective settings ([trino] / ARNEB_TRINO_ENABLED / ARNEB_TRINO_PORT / --trino-port / --no-trino)"
+    );
+    let trino_server = (config.trino.enabled && serves_clients).then(|| {
+        let mut trino = TrinoServer::new(
+            TrinoConfig {
+                bind_address: trino_addr.clone(),
+                ..TrinoConfig::default()
+            },
+            catalog_manager.clone(),
+            connector_registry.clone(),
+        )
+        .with_memory_pool(Arc::clone(&memory_pool))
+        .with_query_tracker(query_tracker.clone());
+        if let Some(ref executor) = distributed_executor {
+            trino = trino.with_distributed_executor(Arc::clone(executor));
+        }
+        trino
+    });
+
     // 9. Startup banner
     match role {
         ServerRole::Worker => {
@@ -668,6 +712,22 @@ async fn run() -> Result<()> {
                 tracing::error!(error = %e, "web server error");
             }
         }
+        // Trino client protocol. A bind failure (e.g. a local Trino already
+        // on 8080) is logged but not fatal: pgwire keeps serving.
+        _ = async {
+            if let Some(trino) = &trino_server {
+                if let Err(e) = trino.start().await {
+                    tracing::error!(
+                        error = %e,
+                        address = %trino_addr,
+                        "Trino client protocol listener failed; continuing without it \
+                         (set [trino] port / ARNEB_TRINO_PORT / --trino-port, or --no-trino)"
+                    );
+                }
+            }
+            futures::future::pending::<()>().await
+        } => {}
+
         // Worker heartbeat loop
         _ = worker_heartbeat_loop(role, &config, &rpc_addr) => {}
         // Graceful shutdown

@@ -557,7 +557,7 @@ fn count_placeholders(sql: &str) -> usize {
 }
 
 /// Execute the full query pipeline asynchronously.
-async fn execute_query(
+pub(crate) async fn execute_query(
     sql: &str,
     catalog_manager: &CatalogManager,
     connector_registry: &ConnectorRegistry,

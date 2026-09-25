@@ -12,12 +12,13 @@ arneb-catalog = { path = "../catalog" }
 arneb-planner = { path = "../planner" }
 arneb-execution = { path = "../execution" }
 arneb-connectors = { path = "../connectors" }
+arneb-scheduler = { path = "../scheduler" }
 
 # Arrow columnar format
 arrow = { workspace = true }
 
 # Async runtime & networking
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync"] }
 
 # PostgreSQL wire protocol
 pgwire = { workspace = true }
@@ -25,6 +26,14 @@ async-trait = { workspace = true }
 async-recursion = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
+
+# Trino client REST protocol (HTTP listener + JSON bodies)
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+base64 = "0.22"
+percent-encoding = "2"
 
 # Error handling
 thiserror = { workspace = true }
@@ -38,4 +47,5 @@ hex = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 pgwire = { workspace = true }

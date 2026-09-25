@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 #
 # Seed Iceberg tables (HMS-backed) on MinIO via Trino, for exercising
-# Arneb's `type = "iceberg"` catalog. Covers the shapes the connector
-# must get right:
+# Arneb's Iceberg reader (reached through a `hive` catalog via table
+# redirection). Covers the shapes the reader must get right:
 #
 #   ice.nation          plain CTAS (format v2, Parquet)
 #   ice.orders          identity-partitioned on o_orderpriority
-#   ice.orders_month    partitioned by month(o_orderdate)
 #   ice.nation_evolved  schema evolution: int -> bigint promotion, column
 #                       rename, added column, multiple snapshots
 #   ice.orders_deletes  row-level DELETE -> position delete files
@@ -32,7 +31,7 @@ run_sql() {
 
 echo "=== Iceberg Seed (orders from tpch.${SF}) ==="
 
-for t in nation orders orders_month nation_evolved orders_deletes; do
+for t in nation orders nation_evolved orders_deletes; do
     run_sql "DROP TABLE IF EXISTS iceberg.ice.${t}"
 done
 run_sql "DROP SCHEMA IF EXISTS iceberg.ice"
@@ -43,8 +42,6 @@ ORDERS_SELECT="SELECT orderkey AS o_orderkey, custkey AS o_custkey, orderstatus 
 run_sql "CREATE TABLE iceberg.ice.nation AS SELECT nationkey AS n_nationkey, name AS n_name, regionkey AS n_regionkey, comment AS n_comment FROM tpch.tiny.nation"
 
 run_sql "CREATE TABLE iceberg.ice.orders WITH (partitioning = ARRAY['o_orderpriority']) AS ${ORDERS_SELECT}"
-
-run_sql "CREATE TABLE iceberg.ice.orders_month WITH (partitioning = ARRAY['month(o_orderdate)']) AS ${ORDERS_SELECT}"
 
 # Schema evolution. Snapshot 1 is written with an INTEGER key column and
 # the original column names; later snapshots see the evolved schema.
@@ -60,7 +57,7 @@ run_sql "DELETE FROM iceberg.ice.orders_deletes WHERE o_orderkey % 7 = 0"
 
 echo ""
 echo "=== Iceberg Seed Complete ==="
-for t in nation orders orders_month nation_evolved orders_deletes; do
+for t in nation orders nation_evolved orders_deletes; do
     count=$(trino --server "${SERVER}" --execute "SELECT COUNT(*) FROM iceberg.ice.${t}" 2>/dev/null | tr -d '"')
     echo "  ice.${t}: ${count} rows"
 done

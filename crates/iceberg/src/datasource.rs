@@ -1,62 +1,40 @@
-//! Iceberg scan planning, data source, and connector factory.
+//! Iceberg scan planning and data source.
 //!
 //! Scan planning resolves the pinned snapshot's manifest list and
 //! manifests into the set of live Parquet data files. Each file is then
-//! read through the same Parquet machinery the Hive connector uses
-//! (row-group pruning, row-filter pushdown, projection pushdown,
-//! intra-file splits), with one Iceberg-specific layer on top: columns are
-//! matched to the file **by field ID**, not by name or position, so
-//! renamed, reordered, added, and type-promoted columns read correctly.
+//! read through the shared split-based Parquet scan
+//! ([`arneb_connectors::parquet_scan`], also used by the Hive connector),
+//! with one Iceberg-specific layer on top: columns are matched to the file
+//! **by field ID**, not by name or position, so renamed, reordered, added,
+//! and type-promoted columns read correctly.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::pin::Pin;
-use std::sync::{Arc, RwLock};
-use std::task::{Context, Poll};
+use std::sync::Arc;
 
 use arrow::array::{new_null_array, ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
-use parquet::arrow::async_reader::{
-    ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
-};
-use parquet::arrow::ProjectionMask;
 use parquet::schema::types::SchemaDescriptor;
 use tracing::debug;
 
 use arneb_common::error::{ArnebError, ConnectorError, ExecutionError};
-use arneb_common::stream::{stream_from_batches, RecordBatchStream, SendableRecordBatchStream};
+use arneb_common::stream::{stream_from_batches, SendableRecordBatchStream};
 use arneb_common::types::{ColumnInfo, TableReference};
+use arneb_connectors::parquet_scan::{self, ParquetBatchStream};
 use arneb_connectors::storage::{StorageRegistry, StorageUri};
-use arneb_connectors::ConnectorFactory;
 use arneb_execution::{DataSource, ScanContext};
 use arneb_planner::PlanExpr;
 
+use crate::catalog::{METADATA_LOCATION_PARAM, SNAPSHOT_ID_PROP};
 use crate::manifest::{
     read_manifest, read_manifest_list, DataFile, DataFileContent, EntryStatus, ManifestContent,
-    ManifestFile,
 };
-use crate::metadata::{IcebergType, PartitionSpec, TableMetadata};
-use crate::pruning::file_can_be_skipped;
-
-/// Table property keys used to hand a resolved Iceberg table from the
-/// catalog to the connector factory (they travel inside the logical plan,
-/// so workers see the same pinned snapshot as the coordinator).
-pub mod props {
-    /// Marks a table as Iceberg (value `ICEBERG`).
-    pub const TABLE_TYPE: &str = "table_type";
-    /// Location of the metadata JSON the catalog resolved.
-    pub const METADATA_LOCATION: &str = "metadata_location";
-    /// Snapshot pinned at planning time (absent for an empty table).
-    pub const SNAPSHOT_ID: &str = "snapshot_id";
-    /// Set when the HMS entry is not an Iceberg table; the factory fails
-    /// the query with this message instead of reading anything.
-    pub const ERROR: &str = "iceberg_error";
-}
+use crate::metadata::TableMetadata;
 
 /// Manifests fetched concurrently during scan planning.
 const MANIFEST_FETCH_CONCURRENCY: usize = 8;
@@ -66,7 +44,7 @@ const MANIFEST_FETCH_CONCURRENCY: usize = 8;
 // ---------------------------------------------------------------------------
 
 /// Resolve a URI to its object store and path.
-pub(crate) fn resolve(
+fn resolve(
     storage: &StorageRegistry,
     uri: &str,
 ) -> Result<(Arc<dyn ObjectStore>, ObjectPath), ConnectorError> {
@@ -76,18 +54,16 @@ pub(crate) fn resolve(
 }
 
 /// Read a whole object.
-pub(crate) async fn read_object(
-    storage: &StorageRegistry,
-    uri: &str,
-) -> Result<Bytes, ConnectorError> {
+async fn read_object(storage: &StorageRegistry, uri: &str) -> Result<Bytes, ConnectorError> {
     let (store, path) = resolve(storage, uri)?;
-    let get = store
+    let read_err = |e| ConnectorError::ReadError(format!("failed to read '{uri}': {e}"));
+    store
         .get(&path)
         .await
-        .map_err(|e| ConnectorError::ReadError(format!("failed to read '{uri}': {e}")))?;
-    get.bytes()
+        .map_err(read_err)?
+        .bytes()
         .await
-        .map_err(|e| ConnectorError::ReadError(format!("failed to read '{uri}': {e}")))
+        .map_err(read_err)
 }
 
 /// Load and parse a table metadata file.
@@ -108,15 +84,6 @@ pub async fn load_metadata(
 // Scan planning
 // ---------------------------------------------------------------------------
 
-/// A live data file selected for the scan.
-#[derive(Debug, Clone)]
-pub struct ScanFile {
-    /// Partition spec the file was written with.
-    pub spec_id: i32,
-    /// Manifest metadata (path, bounds, partition tuple).
-    pub data_file: DataFile,
-}
-
 /// Resolve the live data files of `snapshot_id`.
 ///
 /// Fails with [`ConnectorError::UnsupportedOperation`] when the snapshot
@@ -128,51 +95,39 @@ pub async fn plan_files(
     metadata: &TableMetadata,
     snapshot_id: i64,
     table_name: &str,
-) -> Result<Vec<ScanFile>, ConnectorError> {
+) -> Result<Vec<DataFile>, ConnectorError> {
     let snapshot = metadata.snapshot(snapshot_id).ok_or_else(|| {
         ConnectorError::ReadError(format!(
             "Iceberg table {table_name}: snapshot {snapshot_id} not found in metadata"
         ))
     })?;
-
-    let manifests: Vec<ManifestFile> = match &snapshot.manifest_list {
-        Some(list) => read_manifest_list(&read_object(storage, list).await?)?,
-        None => snapshot
-            .manifests
-            .iter()
-            .map(|p| ManifestFile {
-                manifest_path: p.clone(),
-                partition_spec_id: 0,
-                content: ManifestContent::Data,
-                added_files_count: None,
-                existing_files_count: None,
-            })
-            .collect(),
-    };
-
-    let to_read: Vec<ManifestFile> = manifests
+    let list = snapshot.manifest_list.as_deref().ok_or_else(|| {
+        ConnectorError::UnsupportedOperation(format!(
+            "Iceberg table {table_name}: snapshot {snapshot_id} has no manifest list \
+             (legacy v1 inline manifests are not supported)"
+        ))
+    })?;
+    let to_read: Vec<_> = read_manifest_list(&read_object(storage, list).await?)?
         .into_iter()
         .filter(|m| !m.provably_empty())
         .collect();
 
-    let per_manifest: Vec<(ManifestFile, Vec<crate::manifest::ManifestEntry>)> =
-        futures::stream::iter(to_read.into_iter().map(|m| async move {
-            let bytes = read_object(storage, &m.manifest_path).await?;
-            let entries = read_manifest(&bytes)?;
-            Ok::<_, ConnectorError>((m, entries))
-        }))
-        .buffered(MANIFEST_FETCH_CONCURRENCY)
-        .try_collect()
-        .await?;
+    let per_manifest: Vec<_> = futures::stream::iter(to_read.into_iter().map(|m| async move {
+        let entries = read_manifest(&read_object(storage, &m.manifest_path).await?)?;
+        Ok::<_, ConnectorError>((m.content, entries))
+    }))
+    .buffered(MANIFEST_FETCH_CONCURRENCY)
+    .try_collect()
+    .await?;
 
     let mut files = Vec::new();
-    for (manifest, entries) in per_manifest {
+    for (manifest_content, entries) in per_manifest {
         for entry in entries {
             if entry.status == EntryStatus::Deleted {
                 continue;
             }
             let df = entry.data_file;
-            if manifest.content == ManifestContent::Deletes || df.content != DataFileContent::Data {
+            if manifest_content == ManifestContent::Deletes || df.content != DataFileContent::Data {
                 let kind = match df.content {
                     DataFileContent::EqualityDeletes => "equality",
                     _ => "position",
@@ -193,10 +148,7 @@ pub async fn plan_files(
                     df.file_format, df.file_path
                 )));
             }
-            files.push(ScanFile {
-                spec_id: manifest.partition_spec_id,
-                data_file: df,
-            });
+            files.push(df);
         }
     }
     debug!(
@@ -208,6 +160,37 @@ pub async fn plan_files(
     Ok(files)
 }
 
+/// Build the data source for an Iceberg table from the properties
+/// produced by [`crate::IcebergTableProvider`]: loads the metadata, plans
+/// the pinned snapshot, and returns an [`IcebergDataSource`].
+pub async fn create_data_source(
+    storage: &Arc<StorageRegistry>,
+    table: &TableReference,
+    properties: &HashMap<String, String>,
+) -> Result<Arc<dyn DataSource>, ConnectorError> {
+    let location = properties.get(METADATA_LOCATION_PARAM).ok_or_else(|| {
+        ConnectorError::TableNotFound(format!(
+            "Iceberg table '{table}' has no metadata_location property"
+        ))
+    })?;
+    let metadata = load_metadata(storage, location).await?;
+    let snapshot_id = match properties.get(SNAPSHOT_ID_PROP) {
+        Some(s) => Some(s.parse::<i64>().map_err(|_| {
+            ConnectorError::ReadError(format!("invalid snapshot_id property '{s}'"))
+        })?),
+        None => metadata.current_snapshot_id,
+    };
+    let files = match snapshot_id {
+        Some(id) => plan_files(storage, &metadata, id, &table.to_string()).await?,
+        None => Vec::new(),
+    };
+    Ok(Arc::new(IcebergDataSource::new(
+        storage.clone(),
+        &metadata,
+        files,
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // IcebergDataSource
 // ---------------------------------------------------------------------------
@@ -217,13 +200,11 @@ pub struct IcebergDataSource {
     storage: Arc<StorageRegistry>,
     /// Exposed schema (current Iceberg schema, supported columns only).
     columns: Vec<ColumnInfo>,
-    /// Field ID and Iceberg type of each exposed column (parallel to
-    /// `columns`).
-    column_fields: Vec<(i32, IcebergType)>,
+    /// Field ID of each exposed column (parallel to `columns`).
+    field_ids: Vec<i32>,
     /// Name → field ID fallback for files written without field IDs.
     name_mapping: HashMap<String, i32>,
-    partition_specs: HashMap<i32, PartitionSpec>,
-    files: Vec<ScanFile>,
+    files: Vec<DataFile>,
     splits_per_file: usize,
 }
 
@@ -232,34 +213,9 @@ impl IcebergDataSource {
     pub fn new(
         storage: Arc<StorageRegistry>,
         metadata: &TableMetadata,
-        files: Vec<ScanFile>,
+        files: Vec<DataFile>,
     ) -> Self {
-        let (cols, _) = metadata.current_schema.to_columns();
-        let column_fields = cols
-            .iter()
-            .map(|(id, _)| {
-                let ty = metadata
-                    .current_schema
-                    .field_by_id(*id)
-                    .map(|f| f.field_type.clone())
-                    .unwrap_or(IcebergType::Unsupported(String::new()));
-                (*id, ty)
-            })
-            .collect();
-        let columns = cols.into_iter().map(|(_, c)| c).collect();
-
-        // Same heuristic as the Hive connector: split files into row-range
-        // slices until there are enough partitions to occupy every core.
-        let n_files = files.len().max(1);
-        let target = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8);
-        let splits_per_file = if n_files >= target {
-            1
-        } else {
-            target.div_ceil(n_files)
-        };
-
+        let (field_ids, columns) = metadata.current_schema.to_columns().0.into_iter().unzip();
         let mut name_mapping = metadata.name_mapping();
         if name_mapping.is_empty() {
             // No explicit mapping: fall back to current column names.
@@ -267,29 +223,14 @@ impl IcebergDataSource {
                 name_mapping.insert(f.name.clone(), f.id);
             }
         }
-
         Self {
             storage,
             columns,
-            column_fields,
+            field_ids,
             name_mapping,
-            partition_specs: metadata.partition_specs.clone(),
+            splits_per_file: parquet_scan::splits_per_file(files.len()),
             files,
-            splits_per_file,
         }
-    }
-
-    /// Number of live data files.
-    pub fn file_count(&self) -> usize {
-        self.files.len()
-    }
-
-    fn output_schema(&self, projection: Option<&[usize]>) -> SchemaRef {
-        let fields: Vec<Field> = match projection {
-            Some(p) => p.iter().map(|&i| self.columns[i].clone().into()).collect(),
-            None => self.columns.iter().map(|c| c.clone().into()).collect(),
-        };
-        Arc::new(Schema::new(fields))
     }
 }
 
@@ -419,6 +360,50 @@ fn literal_types_match(e: &PlanExpr, columns: &[ColumnInfo]) -> bool {
     }
 }
 
+/// Assemble a table-schema batch from a projected file batch: cast
+/// promoted columns, null-fill columns the file does not have.
+fn adapt_batch(
+    schema: &SchemaRef,
+    sources: &[ColumnSource],
+    file_path: &str,
+    batch: RecordBatch,
+) -> Result<RecordBatch, ArnebError> {
+    let n = batch.num_rows();
+    let columns: Vec<ArrayRef> = sources
+        .iter()
+        .zip(schema.fields())
+        .map(|(src, field)| -> Result<ArrayRef, ArnebError> {
+            match src {
+                ColumnSource::Null => Ok(new_null_array(field.data_type(), n)),
+                ColumnSource::File(pos) => {
+                    let col = batch.column(*pos);
+                    if col.data_type() == field.data_type() {
+                        return Ok(col.clone());
+                    }
+                    arrow::compute::cast(col, field.data_type()).map_err(|e| {
+                        ExecutionError::InvalidOperation(format!(
+                            "Iceberg column '{}' in '{file_path}': cannot read {} as {}: {e}",
+                            field.name(),
+                            col.data_type(),
+                            field.data_type()
+                        ))
+                        .into()
+                    })
+                }
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    RecordBatch::try_new_with_options(
+        schema.clone(),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(n)),
+    )
+    .map_err(|e| {
+        ExecutionError::InvalidOperation(format!("Iceberg batch assembly for '{file_path}': {e}"))
+            .into()
+    })
+}
+
 #[async_trait]
 impl DataSource for IcebergDataSource {
     fn schema(&self) -> Vec<ColumnInfo> {
@@ -443,61 +428,45 @@ impl DataSource for IcebergDataSource {
                 "IcebergDataSource: projection index {bad} out of range"
             )));
         }
-        let output_schema = self.output_schema(Some(&projection));
+        let output_schema: SchemaRef = Arc::new(Schema::new(
+            projection
+                .iter()
+                .map(|&i| Field::from(self.columns[i].clone()))
+                .collect::<Vec<_>>(),
+        ));
 
         if self.files.is_empty() {
             return Ok(stream_from_batches(output_schema, vec![]));
         }
-        let total = self.files.len() * self.splits_per_file;
-        if partition >= total {
-            return Err(ExecutionError::InvalidOperation(format!(
-                "IcebergDataSource: partition {partition} out of range (have {total})"
-            )));
-        }
-        let file = &self.files[partition / self.splits_per_file];
-        let split_idx = partition % self.splits_per_file;
-
-        // File-level pruning from manifest bounds / partition values.
-        if file_can_be_skipped(
-            &file.data_file,
-            self.partition_specs.get(&file.spec_id),
-            &self.column_fields,
-            &ctx.filters,
-        ) {
-            debug!(file = %file.data_file.file_path, "Iceberg file pruned by manifest stats");
-            return Ok(stream_from_batches(output_schema, vec![]));
-        }
-
-        let uri = &file.data_file.file_path;
+        let (file_idx, split_idx) = parquet_scan::split_index(
+            "IcebergDataSource",
+            partition,
+            self.files.len(),
+            self.splits_per_file,
+        )?;
+        let uri = &self.files[file_idx].file_path;
         let (store, path) = resolve(&self.storage, uri)
             .map_err(|e| ExecutionError::InvalidOperation(e.to_string()))?;
-        let meta = store.head(&path).await.map_err(|e| {
-            ExecutionError::InvalidOperation(format!(
-                "failed to stat Iceberg data file '{uri}': {e}"
-            ))
-        })?;
-        let reader = ParquetObjectReader::new(store, meta.location).with_file_size(meta.size);
-        let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .map_err(|e| {
-                ExecutionError::InvalidOperation(format!("Parquet reader error for '{uri}': {e}"))
-            })?;
+        let builder = parquet_scan::open_parquet_builder(&store, &path).await?;
 
         let fmap = FileColumnMap::build(builder.parquet_schema(), &self.name_mapping);
         let file_arrow = builder.schema().clone();
 
         // Which file roots to read, and how to assemble output columns.
         let file_root_of = |table_idx: usize| -> Option<usize> {
-            let (field_id, _) = self.column_fields.get(table_idx)?;
+            let field_id = self.field_ids.get(table_idx)?;
             fmap.root_by_field.get(field_id).copied()
         };
-        let roots: BTreeSet<usize> = projection.iter().filter_map(|&i| file_root_of(i)).collect();
-        let root_pos: HashMap<usize, usize> =
-            roots.iter().enumerate().map(|(pos, &r)| (r, pos)).collect();
+        let roots: Vec<usize> = projection
+            .iter()
+            .filter_map(|&i| file_root_of(i))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let sources: Vec<ColumnSource> = projection
             .iter()
             .map(|&i| match file_root_of(i) {
-                Some(root) => ColumnSource::File(root_pos[&root]),
+                Some(root) => ColumnSource::File(roots.binary_search(&root).unwrap_or_default()),
                 None => ColumnSource::Null,
             })
             .collect();
@@ -520,227 +489,21 @@ impl DataSource for IcebergDataSource {
             .filter_map(|f| remap_filter(f, &leaf_for))
             .collect();
 
-        let total_rows: usize = builder
-            .metadata()
-            .row_groups()
-            .iter()
-            .map(|rg| rg.num_rows() as usize)
-            .sum();
-        let mut selection = None;
-        if !file_filters.is_empty() {
-            let rgs = builder.metadata().row_groups().to_vec();
-            let selected =
-                arneb_connectors::parquet_pushdown::prune_row_groups(&rgs, &file_filters, &[]);
-            if selected.len() < rgs.len() {
-                selection = Some(parquet::arrow::arrow_reader::RowSelection::from(
-                    arneb_hive::datasource::build_row_selection(&rgs, &selected),
-                ));
-            }
-        }
-        if self.splits_per_file > 1 {
-            let slice = arneb_hive::datasource::compute_split_selection(
-                total_rows,
-                split_idx,
-                self.splits_per_file,
-            );
-            selection = Some(match selection {
-                Some(s) => s.intersection(&slice),
-                None => slice,
-            });
-        }
-        if let Some(sel) = selection {
-            builder = builder.with_row_selection(sel);
-        }
-        if !file_filters.is_empty() {
-            if let Some(rf) = arneb_connectors::parquet_pushdown::build_row_filter(
-                &file_filters,
-                builder.parquet_schema(),
-            ) {
-                builder = builder.with_row_filter(rf);
-            }
-        }
-        let mask = ProjectionMask::roots(builder.parquet_schema(), roots.iter().copied());
-        builder = builder.with_projection(mask);
-        let batch_size = ctx
-            .batch_size
-            .unwrap_or_else(arneb_connectors::file::scan_default_batch_size);
-        builder = builder.with_batch_size(batch_size);
-        let inner = builder.build().map_err(|e| {
-            ExecutionError::InvalidOperation(format!("Parquet reader build error for '{uri}': {e}"))
-        })?;
-
-        Ok(Box::pin(IcebergBatchStream {
-            schema: output_schema,
-            inner: Box::pin(inner),
-            sources,
-            file_path: uri.clone(),
-        }))
-    }
-}
-
-/// Adapts the Parquet stream of one file to the table schema.
-struct IcebergBatchStream {
-    schema: SchemaRef,
-    inner: Pin<Box<ParquetRecordBatchStream<ParquetObjectReader>>>,
-    sources: Vec<ColumnSource>,
-    file_path: String,
-}
-
-impl IcebergBatchStream {
-    fn adapt(&self, batch: RecordBatch) -> Result<RecordBatch, ArnebError> {
-        let n = batch.num_rows();
-        let columns: Vec<ArrayRef> = self
-            .sources
-            .iter()
-            .zip(self.schema.fields())
-            .map(|(src, field)| -> Result<ArrayRef, ArnebError> {
-                match src {
-                    ColumnSource::Null => Ok(new_null_array(field.data_type(), n)),
-                    ColumnSource::File(pos) => {
-                        let col = batch.column(*pos);
-                        if col.data_type() == field.data_type() {
-                            Ok(col.clone())
-                        } else {
-                            arrow::compute::cast(col, field.data_type()).map_err(|e| {
-                                ExecutionError::InvalidOperation(format!(
-                                    "Iceberg column '{}' in '{}': cannot read {} as {}: {e}",
-                                    field.name(),
-                                    self.file_path,
-                                    col.data_type(),
-                                    field.data_type()
-                                ))
-                                .into()
-                            })
-                        }
-                    }
-                }
-            })
-            .collect::<Result<_, _>>()?;
-        RecordBatch::try_new_with_options(
-            self.schema.clone(),
-            columns,
-            &RecordBatchOptions::new().with_row_count(Some(n)),
-        )
-        .map_err(|e| {
-            ExecutionError::InvalidOperation(format!(
-                "Iceberg batch assembly for '{}': {e}",
-                self.file_path
-            ))
-            .into()
-        })
-    }
-}
-
-impl Stream for IcebergBatchStream {
-    type Item = Result<RecordBatch, ArnebError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(self.adapt(b))),
-            Poll::Ready(Some(Err(e))) => {
-                let msg = format!("Parquet read error for '{}': {e}", self.file_path);
-                Poll::Ready(Some(Err(ExecutionError::InvalidOperation(msg).into())))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl RecordBatchStream for IcebergBatchStream {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// IcebergConnectorFactory
-// ---------------------------------------------------------------------------
-
-/// Connector factory for Iceberg tables.
-///
-/// Reads the metadata location and pinned snapshot from the table
-/// properties produced by [`crate::catalog::IcebergTableProvider`], plans
-/// the scan, and returns an [`IcebergDataSource`]. Parsed metadata is
-/// cached by location (metadata files are immutable once written).
-pub struct IcebergConnectorFactory {
-    storage: Arc<StorageRegistry>,
-    metadata_cache: RwLock<HashMap<String, Arc<TableMetadata>>>,
-}
-
-/// Upper bound on cached metadata documents before the cache is reset.
-const METADATA_CACHE_CAPACITY: usize = 256;
-
-impl IcebergConnectorFactory {
-    /// Create a factory that reads through `storage`.
-    pub fn new(storage: Arc<StorageRegistry>) -> Self {
-        Self {
-            storage,
-            metadata_cache: RwLock::new(HashMap::new()),
-        }
-    }
-
-    /// Load metadata, consulting the cache first.
-    pub async fn metadata(&self, location: &str) -> Result<Arc<TableMetadata>, ConnectorError> {
-        if let Some(md) = self.metadata_cache.read().unwrap().get(location) {
-            return Ok(md.clone());
-        }
-        let md = Arc::new(load_metadata(&self.storage, location).await?);
-        let mut cache = self.metadata_cache.write().unwrap();
-        if cache.len() >= METADATA_CACHE_CAPACITY {
-            cache.clear();
-        }
-        cache.insert(location.to_string(), md.clone());
-        Ok(md)
-    }
-}
-
-impl fmt::Debug for IcebergConnectorFactory {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IcebergConnectorFactory")
-            .field(
-                "cached_metadata",
-                &self.metadata_cache.read().unwrap().len(),
-            )
-            .finish()
-    }
-}
-
-#[async_trait]
-impl ConnectorFactory for IcebergConnectorFactory {
-    fn name(&self) -> &str {
-        "iceberg"
-    }
-
-    async fn create_data_source(
-        &self,
-        table: &TableReference,
-        _schema: &[ColumnInfo],
-        properties: &HashMap<String, String>,
-    ) -> Result<Arc<dyn DataSource>, ConnectorError> {
-        if let Some(err) = properties.get(props::ERROR) {
-            return Err(ConnectorError::UnsupportedOperation(err.clone()));
-        }
-        let location = properties.get(props::METADATA_LOCATION).ok_or_else(|| {
-            ConnectorError::TableNotFound(format!(
-                "Iceberg table '{table}' has no metadata_location property"
-            ))
-        })?;
-        let metadata = self.metadata(location).await?;
-        let snapshot_id = match properties.get(props::SNAPSHOT_ID) {
-            Some(s) => Some(s.parse::<i64>().map_err(|_| {
-                ConnectorError::ReadError(format!("invalid snapshot_id property '{s}'"))
-            })?),
-            None => metadata.current_snapshot_id,
-        };
-        let files = match snapshot_id {
-            Some(id) => plan_files(&self.storage, &metadata, id, &table.to_string()).await?,
-            None => Vec::new(),
-        };
-        Ok(Arc::new(IcebergDataSource::new(
-            self.storage.clone(),
-            &metadata,
-            files,
-        )))
+        let stream = parquet_scan::build_split_stream(
+            builder,
+            uri,
+            &file_filters,
+            Some(&roots),
+            ctx.batch_size,
+            split_idx,
+            self.splits_per_file,
+        )?;
+        let schema = output_schema.clone();
+        let file_path = uri.clone();
+        Ok(Box::pin(
+            ParquetBatchStream::new(output_schema, stream, uri.clone()).with_adapter(Box::new(
+                move |batch| adapt_batch(&schema, &sources, &file_path, batch),
+            )),
+        ))
     }
 }

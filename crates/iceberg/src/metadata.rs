@@ -161,60 +161,35 @@ impl IcebergType {
 }
 
 /// A top-level field of an Iceberg schema.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct IcebergField {
     /// Stable field ID — the identity of the column across renames.
     pub id: i32,
     /// Current column name.
     pub name: String,
     /// `true` when the column is `required` (non-nullable).
+    #[serde(default)]
     pub required: bool,
     /// Field type.
+    #[serde(rename = "type", deserialize_with = "de_type")]
     pub field_type: IcebergType,
 }
 
+fn de_type<'de, D: serde::Deserializer<'de>>(d: D) -> Result<IcebergType, D::Error> {
+    Ok(IcebergType::from_json(&Value::deserialize(d)?))
+}
+
 /// An Iceberg schema (only top-level fields are modelled).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct IcebergSchema {
-    /// Schema ID (0 for v1 metadata without explicit IDs).
-    pub schema_id: i32,
+    /// Schema ID (absent in v1 metadata).
+    #[serde(rename = "schema-id")]
+    schema_id: Option<i32>,
     /// Top-level fields in declaration order.
     pub fields: Vec<IcebergField>,
 }
 
 impl IcebergSchema {
-    fn from_json(v: &Value) -> Result<Self, ConnectorError> {
-        let schema_id = v.get("schema-id").and_then(Value::as_i64).unwrap_or(0) as i32;
-        let fields = v
-            .get("fields")
-            .and_then(Value::as_array)
-            .ok_or_else(|| bad("schema has no 'fields' array"))?;
-        let mut out = Vec::with_capacity(fields.len());
-        for f in fields {
-            let id = f
-                .get("id")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| bad("schema field missing 'id'"))? as i32;
-            let name = f
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| bad("schema field missing 'name'"))?
-                .to_string();
-            let required = f.get("required").and_then(Value::as_bool).unwrap_or(false);
-            let field_type = IcebergType::from_json(f.get("type").unwrap_or(&Value::Null));
-            out.push(IcebergField {
-                id,
-                name,
-                required,
-                field_type,
-            });
-        }
-        Ok(Self {
-            schema_id,
-            fields: out,
-        })
-    }
-
     /// The columns Arneb exposes for this schema, paired with their field
     /// IDs. Columns of unsupported types are skipped (and reported via
     /// the second return value) rather than failing the whole table —
@@ -237,61 +212,20 @@ impl IcebergSchema {
         }
         (cols, skipped)
     }
-
-    /// Look up a field by ID.
-    pub fn field_by_id(&self, id: i32) -> Option<&IcebergField> {
-        self.fields.iter().find(|f| f.id == id)
-    }
-}
-
-/// One field of a partition spec.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PartitionField {
-    /// Source column field ID.
-    pub source_id: i32,
-    /// Partition field name (the key in the manifest's `partition` struct).
-    pub name: String,
-    /// Transform string, e.g. `identity`, `bucket[16]`, `day`.
-    pub transform: String,
-}
-
-/// A partition spec.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PartitionSpec {
-    /// Spec ID.
-    pub spec_id: i32,
-    /// Partition fields.
-    pub fields: Vec<PartitionField>,
-}
-
-impl PartitionSpec {
-    fn fields_from_json(v: &Value) -> Vec<PartitionField> {
-        v.as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|f| {
-                        Some(PartitionField {
-                            source_id: f.get("source-id")?.as_i64()? as i32,
-                            name: f.get("name")?.as_str()?.to_string(),
-                            transform: f.get("transform")?.as_str()?.to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
 }
 
 /// A table snapshot.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Snapshot {
     /// Snapshot ID.
+    #[serde(rename = "snapshot-id")]
     pub snapshot_id: i64,
-    /// Manifest list location (v2, and most v1 tables).
+    /// Manifest list location. Legacy v1 snapshots that list manifests
+    /// inline instead are not supported.
+    #[serde(rename = "manifest-list")]
     pub manifest_list: Option<String>,
-    /// Inline manifest paths (legacy v1 snapshots without a manifest list).
-    pub manifests: Vec<String>,
-    /// Snapshot summary (`total-records`, `total-delete-files`, ...).
+    /// Snapshot summary (`total-records`, `total-files-size`, ...).
+    #[serde(default)]
     pub summary: HashMap<String, String>,
 }
 
@@ -311,17 +245,11 @@ impl Snapshot {
     }
 }
 
-/// Parsed Iceberg table metadata.
+/// Parsed Iceberg table metadata (format v1 or v2; v3 best-effort).
 #[derive(Debug, Clone)]
 pub struct TableMetadata {
-    /// `format-version` (1 or 2; 3 is read on a best-effort basis).
-    pub format_version: u8,
-    /// Table base location.
-    pub location: String,
     /// The current schema.
     pub current_schema: IcebergSchema,
-    /// All partition specs, keyed by spec ID.
-    pub partition_specs: HashMap<i32, PartitionSpec>,
     /// All snapshots still referenced by the metadata.
     pub snapshots: Vec<Snapshot>,
     /// Current snapshot ID, `None` for a table with no data yet.
@@ -330,16 +258,31 @@ pub struct TableMetadata {
     pub properties: HashMap<String, String>,
 }
 
+/// The metadata JSON as written; unknown fields are ignored.
 #[derive(Deserialize)]
-struct RawSnapshot {
-    #[serde(rename = "snapshot-id")]
-    snapshot_id: i64,
-    #[serde(rename = "manifest-list")]
-    manifest_list: Option<String>,
+#[serde(rename_all = "kebab-case")]
+struct RawMetadata {
+    format_version: Option<u64>,
+    /// v2: all schemas plus `current-schema-id`.
     #[serde(default)]
-    manifests: Vec<String>,
+    schemas: Vec<IcebergSchema>,
+    current_schema_id: Option<i32>,
+    /// v1: the single schema.
+    schema: Option<IcebergSchema>,
     #[serde(default)]
-    summary: HashMap<String, Value>,
+    snapshots: Vec<Snapshot>,
+    current_snapshot_id: Option<i64>,
+    #[serde(default)]
+    properties: HashMap<String, String>,
+}
+
+/// One entry of the `schema.name-mapping.default` property.
+#[derive(Deserialize)]
+struct NameMappingEntry {
+    #[serde(rename = "field-id")]
+    field_id: Option<i32>,
+    #[serde(default)]
+    names: Vec<String>,
 }
 
 impl TableMetadata {
@@ -357,121 +300,38 @@ impl TableMetadata {
         } else {
             bytes
         };
-        let v: Value =
+        let raw: RawMetadata =
             serde_json::from_slice(json_bytes).map_err(|e| bad(&format!("invalid JSON: {e}")))?;
-        Self::from_json(&v)
-    }
 
-    fn from_json(v: &Value) -> Result<Self, ConnectorError> {
-        let format_version = v
-            .get("format-version")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| bad("missing 'format-version'"))?;
-        if format_version == 0 || format_version > 3 {
-            return Err(ConnectorError::UnsupportedOperation(format!(
-                "Iceberg format-version {format_version} is not supported"
-            )));
-        }
-        let location = v
-            .get("location")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-
-        // Current schema: v2 uses `schemas` + `current-schema-id`; v1 has
-        // `schema` and optionally the v2 fields as well.
-        let current_schema = match (
-            v.get("schemas").and_then(Value::as_array),
-            v.get("current-schema-id").and_then(Value::as_i64),
-        ) {
-            (Some(schemas), Some(cur)) => {
-                let raw = schemas
-                    .iter()
-                    .find(|s| s.get("schema-id").and_then(Value::as_i64) == Some(cur))
-                    .ok_or_else(|| bad(&format!("current-schema-id {cur} not in 'schemas'")))?;
-                IcebergSchema::from_json(raw)?
+        match raw.format_version {
+            None => return Err(bad("missing 'format-version'")),
+            Some(v @ (0 | 4..)) => {
+                return Err(ConnectorError::UnsupportedOperation(format!(
+                    "Iceberg format-version {v} is not supported"
+                )))
             }
-            _ => IcebergSchema::from_json(
-                v.get("schema")
-                    .ok_or_else(|| bad("missing 'schema' / 'schemas'"))?,
-            )?,
-        };
-
-        let mut partition_specs = HashMap::new();
-        if let Some(specs) = v.get("partition-specs").and_then(Value::as_array) {
-            for s in specs {
-                let spec_id = s.get("spec-id").and_then(Value::as_i64).unwrap_or(0) as i32;
-                let fields =
-                    PartitionSpec::fields_from_json(s.get("fields").unwrap_or(&Value::Null));
-                partition_specs.insert(spec_id, PartitionSpec { spec_id, fields });
-            }
-        } else if let Some(fields) = v.get("partition-spec") {
-            partition_specs.insert(
-                0,
-                PartitionSpec {
-                    spec_id: 0,
-                    fields: PartitionSpec::fields_from_json(fields),
-                },
-            );
+            Some(_) => {}
         }
 
-        let snapshots = match v.get("snapshots") {
-            Some(Value::Array(arr)) => arr
-                .iter()
-                .map(|s| {
-                    let raw: RawSnapshot = serde_json::from_value(s.clone())
-                        .map_err(|e| bad(&format!("invalid snapshot: {e}")))?;
-                    Ok(Snapshot {
-                        snapshot_id: raw.snapshot_id,
-                        manifest_list: raw.manifest_list,
-                        manifests: raw.manifests,
-                        summary: raw
-                            .summary
-                            .into_iter()
-                            .map(|(k, v)| {
-                                let s = match v {
-                                    Value::String(s) => s,
-                                    other => other.to_string(),
-                                };
-                                (k, s)
-                            })
-                            .collect(),
-                    })
-                })
-                .collect::<Result<Vec<_>, ConnectorError>>()?,
-            _ => Vec::new(),
+        // v2 uses `schemas` + `current-schema-id`; v1 has `schema` (and
+        // optionally the v2 fields as well).
+        let current_schema = match raw.current_schema_id {
+            Some(cur) if !raw.schemas.is_empty() => raw
+                .schemas
+                .into_iter()
+                .find(|s| s.schema_id == Some(cur))
+                .ok_or_else(|| bad(&format!("current-schema-id {cur} not in 'schemas'")))?,
+            _ => raw
+                .schema
+                .ok_or_else(|| bad("missing 'schema' / 'schemas'"))?,
         };
-
-        // `-1` (v1 convention) and `null` both mean "no current snapshot".
-        let current_snapshot_id = v
-            .get("current-snapshot-id")
-            .and_then(Value::as_i64)
-            .filter(|id| *id != -1);
-
-        let properties = v
-            .get("properties")
-            .and_then(Value::as_object)
-            .map(|o| {
-                o.iter()
-                    .map(|(k, v)| {
-                        let s = match v {
-                            Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        };
-                        (k.clone(), s)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
 
         Ok(Self {
-            format_version: format_version as u8,
-            location,
             current_schema,
-            partition_specs,
-            snapshots,
-            current_snapshot_id,
-            properties,
+            snapshots: raw.snapshots,
+            // `-1` (v1 convention) and `null` both mean "no current snapshot".
+            current_snapshot_id: raw.current_snapshot_id.filter(|id| *id != -1),
+            properties: raw.properties,
         })
     }
 
@@ -488,24 +348,15 @@ impl TableMetadata {
     /// Parse the table's default name mapping, if one is set:
     /// `name -> field id` for top-level fields.
     pub fn name_mapping(&self) -> HashMap<String, i32> {
-        let mut out = HashMap::new();
         let Some(raw) = self.properties.get(NAME_MAPPING_PROPERTY) else {
-            return out;
+            return HashMap::new();
         };
-        let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(raw) else {
-            return out;
-        };
-        for e in entries {
-            let Some(id) = e.get("field-id").and_then(Value::as_i64) else {
-                continue;
-            };
-            if let Some(names) = e.get("names").and_then(Value::as_array) {
-                for n in names.iter().filter_map(Value::as_str) {
-                    out.insert(n.to_string(), id as i32);
-                }
-            }
-        }
-        out
+        let entries: Vec<NameMappingEntry> = serde_json::from_str(raw).unwrap_or_default();
+        entries
+            .into_iter()
+            .filter_map(|e| Some((e.field_id?, e.names)))
+            .flat_map(|(id, names)| names.into_iter().map(move |n| (n, id)))
+            .collect()
     }
 }
 
@@ -576,9 +427,7 @@ pub(crate) mod tests {
     #[test]
     fn parse_v2_metadata() {
         let md = TableMetadata::parse(V2_METADATA.as_bytes()).unwrap();
-        assert_eq!(md.format_version, 2);
-        assert_eq!(md.location, "s3://warehouse/tpch/nation_ice");
-        assert_eq!(md.current_schema.schema_id, 1);
+        assert_eq!(md.current_schema.schema_id, Some(1));
         assert_eq!(md.current_schema.fields.len(), 7);
         assert_eq!(md.current_schema.fields[1].name, "nation_name");
         assert_eq!(md.current_schema.fields[1].id, 2);
@@ -597,9 +446,6 @@ pub(crate) mod tests {
         );
         assert_eq!(snap.total_records(), Some(25));
         assert_eq!(snap.total_files_size(), Some(4096));
-        let spec = &md.partition_specs[&1];
-        assert_eq!(spec.fields[0].transform, "identity");
-        assert_eq!(spec.fields[0].source_id, 3);
     }
 
     #[test]
@@ -658,10 +504,8 @@ pub(crate) mod tests {
           "snapshots": []
         }"#;
         let md = TableMetadata::parse(v1.as_bytes()).unwrap();
-        assert_eq!(md.format_version, 1);
         assert!(md.current_snapshot().is_none());
         assert_eq!(md.current_schema.fields.len(), 2);
-        assert_eq!(md.partition_specs[&0].fields[0].name, "d");
         let (cols, _) = md.current_schema.to_columns();
         assert_eq!(cols[1].1.data_type, DataType::Date32);
     }

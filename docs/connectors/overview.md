@@ -24,7 +24,7 @@ Connectors are registered through the `ConnectorFactory` and `ConnectorRegistry`
 - **File connector**: Activated for `[[tables]]` entries with local paths
 - **Object store connector**: Activated for `[[tables]]` entries with `s3://`, `gs://`, or `az://` paths
 - **Hive connector**: Activated for `[[catalogs]]` entries with `type = "hive"`
-- **Iceberg connector**: Activated for `[[catalogs]]` entries with `type = "iceberg"` (HMS-backed, read-only)
+- **Iceberg reader**: Used automatically by a `hive` catalog for tables with `table_type=ICEBERG` (read-only)
 
 ## Pushdown Optimization
 

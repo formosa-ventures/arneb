@@ -1,10 +1,10 @@
 ## ADDED Requirements
 
 ### Requirement: Resolve HMS-tracked Iceberg tables
-The `IcebergCatalogProvider` SHALL map HMS databases to schemas. It SHALL resolve a table whose HMS parameters include `table_type=ICEBERG` (case-insensitive) by reading the metadata file named by the `metadata_location` parameter.
+When a Hive catalog redirects a table whose HMS parameters include `table_type=ICEBERG` (case-insensitive), the Iceberg table provider SHALL resolve it by reading the metadata file named by the `metadata_location` parameter.
 
 #### Scenario: Resolve an Iceberg table
-- **WHEN** `lake.ice.orders` is queried and HMS reports `table_type=ICEBERG`, `metadata_location=s3://warehouse/ice/orders-…/metadata/00001-….metadata.json`
+- **WHEN** `datalake.ice.orders` is queried and HMS reports `table_type=ICEBERG`, `metadata_location=s3://warehouse/ice/orders-…/metadata/00001-….metadata.json`
 - **THEN** the system SHALL read and parse that metadata file (format v1 or v2, plain or gzip)
 - **AND** SHALL expose the columns of the table's current schema, in declaration order
 
@@ -36,10 +36,3 @@ The table provider SHALL report `row_count` from the current snapshot's `total-r
 #### Scenario: Statistics available
 - **WHEN** the current snapshot summary contains `total-records = 1500000`
 - **THEN** `statistics().row_count` SHALL be `Some(1500000)`
-
-### Requirement: Reject non-Iceberg tables
-An `iceberg` catalog SHALL NOT read HMS tables that are not Iceberg tables.
-
-#### Scenario: Query a Hive table through an Iceberg catalog
-- **WHEN** `lake.tpch.nation` is queried and the HMS table has no `table_type=ICEBERG`
-- **THEN** the query SHALL fail with an error stating that the table is not an Iceberg table and should be queried through a catalog with `type = "hive"`

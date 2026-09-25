@@ -10,8 +10,6 @@ arneb-catalog = { path = "../catalog" }
 arneb-connectors = { path = "../connectors" }
 arneb-execution = { path = "../execution" }
 arneb-planner = { path = "../planner" }
-arneb-sql-parser = { path = "../sql-parser" }
-arneb-hive = { path = "../hive" }
 arrow.workspace = true
 parquet.workspace = true
 object_store.workspace = true
@@ -30,4 +28,5 @@ apache-avro = { version = "0.22", default-features = false, features = ["snappy"
 flate2 = "1"
 
 [dev-dependencies]
+arneb-sql-parser = { path = "../sql-parser" }
 tokio = { workspace = true, features = ["rt", "macros"] }

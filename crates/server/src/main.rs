@@ -291,9 +291,10 @@ async fn run() -> Result<()> {
         connector_registry.register("file", file_factory);
     }
 
-    // 6.5. Register Hive / Iceberg (HMS-backed) catalogs from config
+    // 6.5. Register Hive catalogs from config (Iceberg tables in the same
+    // metastore are redirected to the Iceberg reader by the Hive catalog).
     for catalog_cfg in &config.catalogs {
-        if catalog_cfg.catalog_type != "hive" && catalog_cfg.catalog_type != "iceberg" {
+        if catalog_cfg.catalog_type != "hive" {
             tracing::warn!(
                 catalog = %catalog_cfg.name,
                 catalog_type = %catalog_cfg.catalog_type,
@@ -307,8 +308,7 @@ async fn run() -> Result<()> {
             None => {
                 tracing::warn!(
                     catalog = %catalog_cfg.name,
-                    catalog_type = %catalog_cfg.catalog_type,
-                    "catalog missing metastore_uri, skipping"
+                    "hive catalog missing metastore_uri, skipping"
                 );
                 continue;
             }
@@ -324,30 +324,20 @@ async fn run() -> Result<()> {
         match arneb_hive::catalog::HmsClient::new(&metastore_uri).await {
             Ok(hms_client) => {
                 let hms_client = Arc::new(hms_client);
-                if catalog_cfg.catalog_type == "iceberg" {
-                    let iceberg_catalog = Arc::new(arneb_iceberg::IcebergCatalogProvider::new(
-                        hms_client.clone(),
-                        catalog_storage_registry.clone(),
-                    ));
-                    catalog_manager.register_catalog(&catalog_cfg.name, iceberg_catalog);
-                    let iceberg_connector =
-                        arneb_iceberg::IcebergConnectorFactory::new(catalog_storage_registry);
-                    connector_registry.register(&catalog_cfg.name, Arc::new(iceberg_connector));
-                } else {
-                    let hive_catalog = Arc::new(arneb_hive::catalog::HiveCatalogProvider::new(
-                        hms_client.clone(),
-                    ));
-                    catalog_manager.register_catalog(&catalog_cfg.name, hive_catalog);
-                    let hive_connector =
-                        arneb_hive::datasource::HiveConnectorFactory::new(catalog_storage_registry);
-                    connector_registry.register(&catalog_cfg.name, Arc::new(hive_connector));
-                }
+                let hive_catalog = Arc::new(arneb_hive::catalog::HiveCatalogProvider::new(
+                    hms_client.clone(),
+                    catalog_storage_registry.clone(),
+                ));
+                catalog_manager.register_catalog(&catalog_cfg.name, hive_catalog);
+
+                let hive_connector =
+                    arneb_hive::datasource::HiveConnectorFactory::new(catalog_storage_registry);
+                connector_registry.register(&catalog_cfg.name, Arc::new(hive_connector));
 
                 tracing::info!(
                     catalog = %catalog_cfg.name,
-                    catalog_type = %catalog_cfg.catalog_type,
                     metastore = %metastore_uri,
-                    "registered catalog"
+                    "registered hive catalog"
                 );
             }
             Err(e) => {

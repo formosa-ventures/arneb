@@ -12,25 +12,23 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
 
+use arneb_catalog::TableProvider;
 use arneb_common::stream::collect_stream;
 use arneb_common::types::{ScalarValue, TableReference};
 use arneb_connectors::storage::StorageRegistry;
-use arneb_connectors::ConnectorFactory;
 use arneb_execution::{DataSource, ScanContext};
-use arneb_hive::catalog::HiveTableMeta;
 use arneb_planner::PlanExpr;
 use arneb_sql_parser::ast::BinaryOp;
 
-use crate::catalog::IcebergTableProvider;
-use crate::datasource::{props, IcebergConnectorFactory};
+use crate::catalog::{IcebergTableProvider, SNAPSHOT_ID_PROP};
+use crate::datasource::create_data_source;
 use crate::manifest::fixtures::*;
-use arneb_catalog::TableProvider;
 
 const BASE: &str = "s3://warehouse/db/t";
 
 /// Current schema: `id long` (files store it as `int` — promotion),
-/// `name string` (files call it `old_name` — rename), `region long`
-/// (identity partition), `note string` (added later — absent in files).
+/// `name string` (files call it `old_name` — rename), `region long`,
+/// `note string` (added later — absent in files).
 fn metadata_json(manifest_list: Option<&str>) -> String {
     let snapshot = match manifest_list {
         Some(ml) => format!(
@@ -55,10 +53,8 @@ fn metadata_json(manifest_list: Option<&str>) -> String {
         {{"id": 4, "name": "note", "required": false, "type": "string"}}
       ]}}],
       "default-spec-id": 0,
-      "partition-specs": [{{"spec-id": 0, "fields": [
-        {{"name": "n_regionkey", "transform": "identity", "source-id": 3, "field-id": 1000}}
-      ]}}],
-      "last-partition-id": 1000,
+      "partition-specs": [{{"spec-id": 0, "fields": []}}],
+      "last-partition-id": 999,
       "properties": {{}},
       {snapshot}
     }}"#
@@ -148,36 +144,21 @@ impl Fixture {
         )
         .await;
 
-        let long = |v: i64| v.to_le_bytes().to_vec();
-        let int = |v: i32| v.to_le_bytes().to_vec();
         let manifest = manifest_bytes(&[
             Entry {
                 status: 1,
                 content: 0,
                 path: &a,
-                region: Some(1),
-                rows: 3,
-                // Written while `id` was still an `int`: 4-byte bounds.
-                lower: vec![(1, int(1)), (3, long(1))],
-                upper: vec![(1, int(3)), (3, long(1))],
             },
             Entry {
                 status: 0,
                 content: 0,
                 path: &b,
-                region: Some(2),
-                rows: 3,
-                lower: vec![(1, long(10))],
-                upper: vec![(1, long(12))],
             },
             Entry {
                 status: 2,
                 content: 0,
                 path: "s3://warehouse/db/t/data/gone.parquet",
-                region: Some(9),
-                rows: 100,
-                lower: vec![],
-                upper: vec![],
             },
         ]);
         let m_path = format!("{BASE}/metadata/m0.avro");
@@ -190,10 +171,6 @@ impl Fixture {
                 status: 1,
                 content: 1,
                 path: "s3://warehouse/db/t/data/pos-deletes.parquet",
-                region: Some(1),
-                rows: 1,
-                lower: vec![],
-                upper: vec![],
             }]);
             f.put(&d_path, deletes).await;
             list_rows.push(manifest_list_row(&d_path, 1, 1, 0));
@@ -215,32 +192,23 @@ impl Fixture {
     }
 
     async fn provider(&self, metadata_file: &str) -> IcebergTableProvider {
-        let meta = HiveTableMeta {
-            columns: vec![],
-            location: BASE.into(),
-            input_format: String::new(),
-            row_count: None,
-            size_bytes: None,
-            column_stats: HashMap::new(),
-            parameters: HashMap::from([
-                ("table_type".to_string(), "ICEBERG".to_string()),
-                (
-                    "metadata_location".to_string(),
-                    format!("{BASE}/metadata/{metadata_file}"),
-                ),
-            ]),
-        };
-        IcebergTableProvider::resolve(&self.storage, "db.t", meta)
+        let params = HashMap::from([
+            ("table_type".to_string(), "ICEBERG".to_string()),
+            (
+                "metadata_location".to_string(),
+                format!("{BASE}/metadata/{metadata_file}"),
+            ),
+        ]);
+        IcebergTableProvider::resolve(&self.storage, "db.t", &params)
             .await
             .unwrap()
     }
 
-    async fn source(&self, metadata_file: &str) -> Arc<dyn DataSource> {
+    async fn source(&self, metadata_file: &str) -> Result<Arc<dyn DataSource>, String> {
         let p = self.provider(metadata_file).await;
-        IcebergConnectorFactory::new(self.storage.clone())
-            .create_data_source(&TableReference::table("t"), &p.schema(), &p.properties())
+        create_data_source(&self.storage, &TableReference::table("t"), &p.properties())
             .await
-            .unwrap()
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -296,7 +264,7 @@ async fn provider_exposes_current_schema_snapshot_and_stats() {
     let names: Vec<_> = p.schema().into_iter().map(|c| c.name).collect();
     assert_eq!(names, ["id", "name", "region", "note"]);
     assert_eq!(
-        p.properties().get(props::SNAPSHOT_ID).map(String::as_str),
+        p.properties().get(SNAPSHOT_ID_PROP).map(String::as_str),
         Some("7")
     );
     let stats = p.statistics().unwrap();
@@ -307,7 +275,7 @@ async fn provider_exposes_current_schema_snapshot_and_stats() {
 #[tokio::test]
 async fn full_scan_resolves_columns_by_field_id() {
     let f = Fixture::new(false).await;
-    let ds = f.source("00001.metadata.json").await;
+    let ds = f.source("00001.metadata.json").await.unwrap();
     // `id` is promoted int→long, `name` is read from `old_name`, file b
     // has reversed column order, `note` is null-filled; the tombstoned
     // file is never opened.
@@ -331,7 +299,7 @@ async fn full_scan_resolves_columns_by_field_id() {
 #[tokio::test]
 async fn projection_in_requested_order() {
     let f = Fixture::new(false).await;
-    let ds = f.source("00001.metadata.json").await;
+    let ds = f.source("00001.metadata.json").await.unwrap();
     let rows = scan_rows(&ds, ScanContext::default().with_projection(vec![3, 1])).await;
     assert_eq!(
         rows,
@@ -343,54 +311,29 @@ async fn projection_in_requested_order() {
 }
 
 #[tokio::test]
-async fn manifest_bounds_prune_files() {
-    let f = Fixture::new(false).await;
-    let ds = f.source("00001.metadata.json").await;
-    // id = 2 is outside file b's [10, 12] bounds, so only file a is read.
-    // File a stores `id` as `int`, so the predicate is not pushed into its
-    // Parquet reader (physical type differs) and all its rows come back;
-    // the engine's FilterExec above the scan does the rest.
-    let rows = scan_rows(
-        &ds,
-        ScanContext::default().with_filters(vec![eq(0, ScalarValue::Int64(2))]),
-    )
-    .await;
-    assert_eq!(rows, ["1|a|1|NULL", "2|b|1|NULL", "3|c|1|NULL"]);
-}
-
-#[tokio::test]
-async fn identity_partition_prunes_files() {
-    let f = Fixture::new(false).await;
-    let ds = f.source("00001.metadata.json").await;
-    let rows = scan_rows(
-        &ds,
-        ScanContext::default().with_filters(vec![eq(2, ScalarValue::Int64(1))]),
-    )
-    .await;
-    // Partition pruning drops file b; the `region` row filter keeps all
-    // of file a.
-    assert_eq!(rows, ["1|a|1|NULL", "2|b|1|NULL", "3|c|1|NULL"]);
-}
-
-#[tokio::test]
 async fn row_filter_pushdown_uses_file_column_index() {
     let f = Fixture::new(false).await;
-    let ds = f.source("00001.metadata.json").await;
-    // id = 11: file a (4-byte bounds [1, 3]) is pruned by manifest stats;
-    // file b stores `id` as its *last* physical column, so the pushed
-    // Parquet predicate must follow the field ID, not table position 0.
+    let ds = f.source("00001.metadata.json").await.unwrap();
+    // id = 11: file b stores `id` as its *last* physical column, so the
+    // pushed Parquet predicate must follow the field ID, not table
+    // position 0. File a stores `id` as `int`, so the predicate is not
+    // pushed into it (physical type differs) and all its rows come back;
+    // the engine's FilterExec above the scan does the rest.
     let rows = scan_rows(
         &ds,
         ScanContext::default().with_filters(vec![eq(0, ScalarValue::Int64(11))]),
     )
     .await;
-    assert_eq!(rows, ["11|y|2|NULL"]);
+    assert_eq!(
+        rows,
+        ["11|y|2|NULL", "1|a|1|NULL", "2|b|1|NULL", "3|c|1|NULL"]
+    );
 }
 
 #[tokio::test]
 async fn mismatched_literal_type_is_not_pushed() {
     let f = Fixture::new(false).await;
-    let ds = f.source("00001.metadata.json").await;
+    let ds = f.source("00001.metadata.json").await.unwrap();
     // An Int32 literal against a long column must not reach the Parquet
     // comparison kernel (which would fail on Int64 vs Int32); the scan
     // still succeeds and returns a superset.
@@ -399,18 +342,13 @@ async fn mismatched_literal_type_is_not_pushed() {
         ScanContext::default().with_filters(vec![eq(2, ScalarValue::Int32(2))]),
     )
     .await;
-    assert_eq!(rows, ["10|x|2|NULL", "11|y|2|NULL", "12|z|2|NULL"]);
+    assert_eq!(rows.len(), 6);
 }
 
 #[tokio::test]
 async fn delete_files_are_rejected() {
     let f = Fixture::new(true).await;
-    let p = f.provider("00001.metadata.json").await;
-    let err = IcebergConnectorFactory::new(f.storage.clone())
-        .create_data_source(&TableReference::table("t"), &p.schema(), &p.properties())
-        .await
-        .unwrap_err();
-    let msg = err.to_string();
+    let msg = f.source("00001.metadata.json").await.unwrap_err();
     assert!(msg.contains("position delete files"), "{msg}");
     assert!(msg.contains("not supported"), "{msg}");
 }
@@ -419,30 +357,8 @@ async fn delete_files_are_rejected() {
 async fn empty_table_scans_no_rows() {
     let f = Fixture::new(false).await;
     let p = f.provider("00000.metadata.json").await;
-    assert!(!p.properties().contains_key(props::SNAPSHOT_ID));
+    assert!(!p.properties().contains_key(SNAPSHOT_ID_PROP));
     assert_eq!(p.statistics().unwrap().row_count, Some(0));
-    let ds = f.source("00000.metadata.json").await;
+    let ds = f.source("00000.metadata.json").await.unwrap();
     assert!(scan_rows(&ds, ScanContext::default()).await.is_empty());
-}
-
-#[tokio::test]
-async fn non_iceberg_table_fails_with_clear_error() {
-    let f = Fixture::new(false).await;
-    let meta = HiveTableMeta {
-        columns: vec![],
-        location: BASE.into(),
-        input_format: String::new(),
-        row_count: None,
-        size_bytes: None,
-        column_stats: HashMap::new(),
-        parameters: HashMap::new(),
-    };
-    let p = IcebergTableProvider::resolve(&f.storage, "db.plain", meta)
-        .await
-        .unwrap();
-    let err = IcebergConnectorFactory::new(f.storage.clone())
-        .create_data_source(&TableReference::table("plain"), &[], &p.properties())
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("not an Iceberg table"), "{err}");
 }

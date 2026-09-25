@@ -1,12 +1,17 @@
 ## ADDED Requirements
 
-### Requirement: Reject Iceberg tables in Hive catalogs
-The Hive connector SHALL NOT read HMS tables whose `table_type` parameter is `ICEBERG`. Listing an Iceberg table's location would also read files from deleted snapshots and rows covered by delete files.
+### Requirement: Redirect Iceberg tables to the Iceberg reader
+A Hive catalog SHALL serve HMS tables whose `table_type` parameter is `ICEBERG` (case-insensitive) through the Iceberg reader, never by listing the table's location. Listing an Iceberg table's location would also read files from deleted snapshots and rows covered by delete files.
 
-#### Scenario: Query an Iceberg table through a Hive catalog
-- **WHEN** `datalake.ice.nation` is queried through a `type = "hive"` catalog and HMS reports `table_type=ICEBERG`
-- **THEN** the query SHALL fail with an error stating that the table is an Iceberg table and should be queried through a catalog with `type = "iceberg"`
+#### Scenario: Resolve an Iceberg table through a Hive catalog
+- **WHEN** `datalake.ice.nation` is resolved through a `type = "hive"` catalog and HMS reports `table_type=ICEBERG`
+- **THEN** the schema provider SHALL return the Iceberg table provider for it (current Iceberg schema, pinned snapshot), not a `HiveTableProvider`
 
-#### Scenario: Table type forwarded as a property
-- **WHEN** a Hive table is resolved and its HMS parameters contain `table_type`
-- **THEN** `HiveTableProvider::properties()` SHALL include `table_type` with that value
+#### Scenario: Scan an Iceberg table through a Hive catalog
+- **WHEN** the Hive connector factory creates a data source for a table whose properties contain `table_type=ICEBERG`
+- **THEN** it SHALL delegate to the Iceberg reader, which plans the pinned snapshot's live data files
+- **AND** it SHALL NOT list the table location
+
+#### Scenario: Plain Hive tables are unchanged
+- **WHEN** an HMS table has no `table_type=ICEBERG` parameter
+- **THEN** it SHALL be resolved and scanned exactly as before

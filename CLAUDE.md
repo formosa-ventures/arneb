@@ -39,7 +39,7 @@ cd benchmarks/tpch && cargo run --release -- --engine arneb --port 5432
 # Local Hive + S3 environment (HMS 4.2.0 + MinIO + Trino via docker-compose)
 docker compose up -d                                        # start HMS + MinIO + Trino
 docker compose run --rm tpch-seed                           # seed TPC-H SF1 data
-docker compose run --rm iceberg-seed                        # seed Iceberg tables (iceberg.ice.*)
+docker compose run --rm iceberg-seed                        # seed Iceberg tables (<hive catalog>.ice.*)
 cargo run --bin arneb -- --config benchmarks/tpch/tpch-hive.toml  # start Arneb with hive catalog
 psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.nation;"
 docker compose down                                         # tear down
@@ -103,19 +103,14 @@ name = "datalake"
 type = "hive"
 metastore_uri = "127.0.0.1:9083"   # host:port, no scheme
 default_schema = "default"
+# Iceberg tables in this HMS (table_type=ICEBERG) are read through the same
+# catalog via table redirection (read-only, current snapshot).
 
 # Per-catalog storage override (merges with global [storage])
 [catalogs.storage.s3]
 region = "us-east-1"
 endpoint = "http://localhost:9000"
 allow_http = true
-
-# Iceberg tables tracked by the same HMS (read-only, current snapshot)
-[[catalogs]]
-name = "lake"
-type = "iceberg"
-metastore_uri = "127.0.0.1:9083"
-default_schema = "default"
 ```
 
 See `benchmarks/tpch/tpch-hive.toml` for a Hive-backed benchmark config.
@@ -173,11 +168,11 @@ crates/
 ├── hive/          # Hive Metastore catalog provider + HiveDataSource,
 │                  # HMS Thrift client wrapper (HMS 4.x via _req API),
 │                  # HiveConnectorFactory wired through StorageRegistry
-├── iceberg/       # Read-only Iceberg connector over HMS (`type = "iceberg"`):
-│                  # metadata JSON (v1/v2), manifest list/manifests (Avro via
-│                  # apache-avro), field-ID column resolution, manifest-bound
-│                  # file pruning, reuses the Hive Parquet scan path. Delete
-│                  # files → clear unsupported error. See docs/connectors/iceberg.md.
+├── iceberg/       # Read-only Iceberg reader; hive catalogs redirect
+│                  # table_type=ICEBERG tables here. Metadata JSON (v1/v2),
+│                  # manifest list/manifests (Avro via apache-avro), field-ID
+│                  # column resolution over the shared connectors::parquet_scan.
+│                  # Delete files → clear unsupported error. See docs/connectors/iceberg.md.
 ├── hive-metastore/# Auto-generated Thrift bindings from Hive 4.2.0 IDL via volo-build.
 │                  # Rebuild with `cargo run -p hive-metastore-thrift-build` after
 │                  # editing `thrift_idl/hive_metastore.thrift`.

@@ -13,5 +13,5 @@ pub use handler::DistributedExecutor;
 // Re-export for integration testing
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::handler::HandlerFactory;
+    pub use crate::handler::{execute_query, HandlerFactory};
 }

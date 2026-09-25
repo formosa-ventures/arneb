@@ -470,6 +470,17 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             }
             let l = convert_expr(*left)?;
             let r = convert_expr(*right)?;
+            // `a || b` is Trino/ANSI string concatenation. Lower it to
+            // the 2-arg `CONCAT(a, b)` scalar function, which already
+            // has the SQL NULL-propagating semantics `||` requires.
+            if matches!(op, sp::BinaryOperator::StringConcat) {
+                return Ok(ast::Expr::Function {
+                    name: "CONCAT".to_string(),
+                    args: vec![ast::FunctionArg::Unnamed(l), ast::FunctionArg::Unnamed(r)],
+                    distinct: false,
+                    span,
+                });
+            }
             let bin_op = convert_binary_op(op)?;
             Ok(ast::Expr::BinaryOp {
                 left: Box::new(l),
@@ -731,10 +742,80 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 span,
             })
         }
+        // `CEIL(x)` / `FLOOR(x)` parse to dedicated sqlparser nodes
+        // rather than generic function calls. Lower the plain forms to
+        // the registry's CEIL / FLOOR scalar functions. The
+        // `CEIL(x TO <unit>)` datetime form and the `CEIL(x, scale)`
+        // form are not Trino syntax and stay unsupported.
+        sp::Expr::Ceil { expr, field } if is_plain_ceil_floor(&field) => {
+            unary_function_call("CEIL", *expr, span)
+        }
+        sp::Expr::Floor { expr, field } if is_plain_ceil_floor(&field) => {
+            unary_function_call("FLOOR", *expr, span)
+        }
+        // `POSITION(sub IN s)` → `POSITION(sub, s)`.
+        sp::Expr::Position { expr, r#in } => Ok(ast::Expr::Function {
+            name: "POSITION".to_string(),
+            args: vec![
+                ast::FunctionArg::Unnamed(convert_expr(*expr)?),
+                ast::FunctionArg::Unnamed(convert_expr(*r#in)?),
+            ],
+            distinct: false,
+            span,
+        }),
+        // `TRIM([BOTH|LEADING|TRAILING] [chars FROM] s)` and
+        // `TRIM(s, chars)` → `TRIM` / `LTRIM` / `RTRIM(s [, chars])`.
+        sp::Expr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => {
+            let name = match trim_where {
+                Some(sp::TrimWhereField::Leading) => "LTRIM",
+                Some(sp::TrimWhereField::Trailing) => "RTRIM",
+                Some(sp::TrimWhereField::Both) | None => "TRIM",
+            };
+            let mut args = vec![ast::FunctionArg::Unnamed(convert_expr(*expr)?)];
+            if let Some(what) = trim_what {
+                args.push(ast::FunctionArg::Unnamed(convert_expr(*what)?));
+            } else if let Some(mut chars) = trim_characters {
+                if chars.len() != 1 {
+                    return Err(ParseError::UnsupportedFeature(
+                        "TRIM with more than one character-set argument".to_string(),
+                    ));
+                }
+                args.push(ast::FunctionArg::Unnamed(convert_expr(chars.remove(0))?));
+            }
+            Ok(ast::Expr::Function {
+                name: name.to_string(),
+                args,
+                distinct: false,
+                span,
+            })
+        }
         other => Err(ParseError::UnsupportedFeature(format!(
             "expression: {other}"
         ))),
     }
+}
+
+/// True for the plain `CEIL(x)` / `FLOOR(x)` form (no `TO <unit>`, no scale).
+fn is_plain_ceil_floor(field: &sp::CeilFloorKind) -> bool {
+    matches!(
+        field,
+        sp::CeilFloorKind::DateTimeField(sp::DateTimeField::NoDateTime)
+    )
+}
+
+/// Build a single-argument scalar function call `name(expr)`.
+fn unary_function_call(name: &str, expr: sp::Expr, span: Span) -> Result<ast::Expr, ParseError> {
+    Ok(ast::Expr::Function {
+        name: name.to_string(),
+        args: vec![ast::FunctionArg::Unnamed(convert_expr(expr)?)],
+        distinct: false,
+        span,
+    })
 }
 
 /// Convert `INTERVAL '<n>' <unit>` into an integer literal whose
@@ -941,6 +1022,47 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
             conditions,
             results,
             else_result: Some(Box::new(raw_args.into_iter().last().unwrap())),
+            span,
+        });
+    }
+
+    // Desugar Trino's IF(cond, a [, b]) → CASE WHEN cond THEN a [ELSE b] END.
+    // Lowering to CASE keeps Trino's lazy evaluation (only the selected
+    // branch matters per row) and reuses CASE's branch type unification.
+    // A NULL condition selects the ELSE branch (or NULL), as in Trino.
+    if name_upper == "IF" && func.over.is_none() {
+        let raw_args = match func.args {
+            sp::FunctionArguments::List(arg_list) => arg_list
+                .args
+                .into_iter()
+                .map(|a| match a {
+                    sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => convert_expr(e),
+                    _ => Err(ParseError::UnsupportedFeature(
+                        "non-expression IF argument".to_string(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(ParseError::InvalidSyntax(
+                    "IF requires arguments".to_string(),
+                ))
+            }
+        };
+        if !(2..=3).contains(&raw_args.len()) {
+            return Err(ParseError::InvalidSyntax(
+                "IF requires two or three arguments: IF(condition, true_value [, false_value])"
+                    .to_string(),
+            ));
+        }
+        let mut args_iter = raw_args.into_iter();
+        let cond = args_iter.next().unwrap();
+        let then = args_iter.next().unwrap();
+        let else_result = args_iter.next().map(Box::new);
+        return Ok(ast::Expr::Case {
+            operand: None,
+            conditions: vec![cond],
+            results: vec![then],
+            else_result,
             span,
         });
     }

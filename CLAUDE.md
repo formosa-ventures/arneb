@@ -157,7 +157,7 @@ crates/
 │                  # PlanFragmenter for distributed execution
 ├── execution/     # Physical operators (scan, filter, project, join, aggregate,
 │                  # sort, limit, semi-join, set ops, window, explain),
-│                  # ScalarFunction trait + 19 built-in functions,
+│                  # ScalarFunction trait + 90 built-in functions,
 │                  # DataSource trait, ExecutionContext
 ├── connectors/    # ConnectorFactory/ConnectorRegistry/DDLProvider traits,
 │                  # memory + file (CSV/Parquet) connectors,
@@ -228,10 +228,15 @@ SELECT, EXPLAIN, CREATE TABLE, DROP TABLE, CREATE TABLE AS SELECT, INSERT INTO, 
 ### Advanced DQL
 CTEs (WITH), UNION ALL/UNION/INTERSECT/EXCEPT, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX OVER), GROUP BY with HAVING, ORDER BY on aggregates/aliases
 
-### Scalar Functions (19)
-String: UPPER, LOWER, SUBSTRING, TRIM, LTRIM, RTRIM, CONCAT, LENGTH, REPLACE, POSITION
-Math: ABS, ROUND, CEIL, FLOOR, MOD, POWER
-Date: EXTRACT, CURRENT_DATE, DATE_TRUNC
+### Scalar Functions (90, Trino semantics — full reference in `docs/sql/functions.md`)
+Conditional: IF (desugared to CASE in the parser), TRY (handled in `expression.rs`), GREATEST, LEAST
+String: UPPER, LOWER, SUBSTRING, TRIM, LTRIM, RTRIM, CONCAT (`||`), CONCAT_WS, LENGTH, REPLACE, POSITION, STRPOS, SPLIT_PART, STARTS_WITH, REVERSE, LPAD, RPAD, CHR, CODEPOINT, TRANSLATE, LEVENSHTEIN_DISTANCE, HAMMING_DISTANCE
+Regex: REGEXP_LIKE, REGEXP_EXTRACT, REGEXP_REPLACE, REGEXP_COUNT
+Math: ABS, ROUND, CEIL, FLOOR, TRUNCATE, MOD, POWER, SQRT, CBRT, EXP, LN, LOG2, LOG10, LOG, SIGN, PI, E, RANDOM, DEGREES, RADIANS, SIN/COS/TAN, ASIN/ACOS/ATAN/ATAN2, SINH/COSH/TANH, NAN, INFINITY, IS_NAN, IS_FINITE, IS_INFINITE
+Date: EXTRACT, CURRENT_DATE, NOW, DATE_TRUNC, DATE_ADD, DATE_DIFF, YEAR, QUARTER, MONTH, WEEK, DAY, DAY_OF_WEEK, DAY_OF_YEAR, YEAR_OF_WEEK, HOUR, MINUTE, SECOND, MILLISECOND, LAST_DAY_OF_MONTH, DATE, FROM_UNIXTIME, TO_UNIXTIME, DATE_FORMAT, DATE_PARSE, FORMAT_DATETIME
+Aliases: CEILING, POW, RAND, DAY_OF_MONTH, DOW, DOY, WEEK_OF_YEAR, YOW, CURRENT_TIMESTAMP, LOCALTIMESTAMP
+
+Adding a function: implement `ScalarFunction` in `crates/execution/src/functions/`, register it, and add its return type to `function_return_type` in `crates/planner/src/analyzer/mod.rs` (the `planner_and_registry_return_types_agree` test enforces they match — `ProjectionExec` casts results to the planned type).
 
 ## Phase Roadmap
 

@@ -1596,4 +1596,59 @@ mod tests {
         assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
         assert!(matches!(resolved, PlanExpr::ScalarSubquery { .. }));
     }
+
+    /// Regression: COUNT / MIN / MAX over a filter that matches nothing used
+    /// to fail with "expected Int64 but found Null".
+    #[tokio::test]
+    async fn global_aggregate_over_filter_matching_nothing_returns_typed_nulls() {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "o_orderkey",
+                ArrowDataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let table = MemoryTable::new(vec![col("o_orderkey", DataType::Int64)], vec![batch]);
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("orders", Arc::new(table));
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", schema);
+        let catalog_manager = CatalogManager::new("memory", "default");
+        catalog_manager.register_catalog("memory", catalog.clone());
+        let mut registry = ConnectorRegistry::new();
+        registry.register(
+            "memory",
+            Arc::new(MemoryConnectorFactory::new(catalog, "default")),
+        );
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+
+        let (_, batches) = execute_query(
+            "SELECT count(*), min(o_orderkey), max(o_orderkey) FROM orders \
+             WHERE o_orderkey > 99999999",
+            &catalog_manager,
+            &registry,
+            None,
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let rows: Vec<_> = batches.iter().filter(|b| b.num_rows() > 0).collect();
+        assert_eq!(rows.len(), 1);
+        let b = rows[0];
+        assert_eq!(b.num_rows(), 1);
+        let count = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(count.value(0), 0);
+        for i in [1, 2] {
+            assert_eq!(b.column(i).data_type(), &ArrowDataType::Int64);
+            assert!(b.column(i).is_null(0));
+        }
+    }
 }

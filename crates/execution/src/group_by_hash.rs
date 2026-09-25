@@ -1106,19 +1106,18 @@ fn build_generic_arrays(
     if n == 0 {
         return Ok(vec![]);
     }
-    let n_cols = keys[0].0.len();
-    let mut cols: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(n); n_cols];
+    // `types` is captured from the same group columns that produced every
+    // key, so it has exactly one entry per key column.
+    let mut cols: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(n); types.len()];
     for key in keys {
-        for (col_i, v) in key.0.iter().enumerate() {
-            cols[col_i].push(v.clone());
+        for (col, v) in cols.iter_mut().zip(&key.0) {
+            col.push(v.clone());
         }
     }
-    let mut arrays = Vec::with_capacity(n_cols);
-    for (col_i, col_vals) in cols.iter().enumerate() {
-        let data_type = types.get(col_i).unwrap_or(&ArrowDataType::Null);
-        arrays.push(crate::operator::scalars_to_array(col_vals, data_type)?);
-    }
-    Ok(arrays)
+    cols.iter()
+        .zip(types)
+        .map(|(col_vals, data_type)| crate::operator::scalars_to_array(col_vals, data_type))
+        .collect()
 }
 
 // ===========================================================================

@@ -26,6 +26,7 @@ async fn start_test_server(
         connector_registry,
         distributed_executor: None,
         memory_pool: Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new()),
+        auth: arneb_protocol::AuthMethod::None,
     });
 
     tokio::spawn(async move {

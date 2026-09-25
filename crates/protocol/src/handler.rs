@@ -18,10 +18,6 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::stream;
 use futures::Sink;
-use pgwire::api::auth::{
-    finish_authentication, save_startup_parameters_to_metadata, DefaultServerParameterProvider,
-    StartupHandler,
-};
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
@@ -32,8 +28,8 @@ use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, ClientPortalStore, NoopHandler, PgWireServerHandlers, Type};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::messages::PgWireFrontendMessage;
 
+use crate::auth::{AuthMethod, AuthStartupHandler};
 use crate::encoding::{column_info_to_field_info, encode_record_batches};
 
 /// Trait for distributed query execution. Implemented by QueryCoordinator
@@ -102,6 +98,10 @@ pub struct HandlerFactory {
     pub connector_registry: Arc<ConnectorRegistry>,
     pub distributed_executor: Option<Arc<dyn DistributedExecutor>>,
     pub memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool>,
+    /// Client authentication mode enforced during connection startup. Covers
+    /// both the Simple and Extended Query paths, which share one startup
+    /// handler.
+    pub auth: AuthMethod,
 }
 
 impl PgWireServerHandlers for HandlerFactory {
@@ -124,12 +124,9 @@ impl PgWireServerHandlers for HandlerFactory {
     }
 
     fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
-        Arc::new(ConnectionHandler {
-            distributed_executor: self.distributed_executor.clone(),
-            catalog_manager: Arc::clone(&self.catalog_manager),
-            connector_registry: Arc::clone(&self.connector_registry),
-            memory_pool: Arc::clone(&self.memory_pool),
-        })
+        // pgwire calls this once per connection, so the SCRAM exchange state
+        // inside the handler is never shared between clients.
+        Arc::new(AuthStartupHandler::new(self.auth.clone()))
     }
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {
@@ -147,26 +144,6 @@ pub struct ConnectionHandler {
     /// spillable operators (SemiJoinExec build) honour the configured
     /// per-task budget instead of growing unbounded.
     pub memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool>,
-}
-
-#[async_trait]
-impl StartupHandler for ConnectionHandler {
-    async fn on_startup<C>(
-        &self,
-        client: &mut C,
-        message: PgWireFrontendMessage,
-    ) -> PgWireResult<()>
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        if let PgWireFrontendMessage::Startup(ref startup) = message {
-            save_startup_parameters_to_metadata(client, startup);
-            finish_authentication(client, &DefaultServerParameterProvider::default()).await?;
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]

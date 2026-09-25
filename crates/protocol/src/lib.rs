@@ -1,3 +1,4 @@
+pub mod auth;
 mod encoding;
 mod error;
 mod handler;
@@ -5,6 +6,7 @@ mod metadata;
 mod server;
 mod session;
 
+pub use auth::{AuthConfigError, AuthMethod, ScramVerifier, UserCredentials};
 pub use server::{ProtocolConfig, ProtocolServer};
 
 // Re-export the distributed executor trait for server crate to implement

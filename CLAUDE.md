@@ -113,8 +113,9 @@ allow_http = true
 See `benchmarks/tpch/tpch-hive.toml` for a Hive-backed benchmark config.
 
 **Ports**:
-- Coordinator/Standalone: pgwire (configured port), Web UI (port + 1000), Flight RPC (9090)
-- Worker: Flight RPC only (no pgwire, no Web UI)
+- Coordinator/Standalone: pgwire (configured port), Trino client REST protocol (`[trino] port`, default 8080; `ARNEB_TRINO_PORT` / `--trino-port`, disable with `--no-trino`), Web UI (port + 1000), Flight RPC (9090)
+- Worker: Flight RPC only (no pgwire, no Trino HTTP, no Web UI)
+- The Trino listener's bind failure is non-fatal (logged; pgwire keeps serving) — `docker compose up` publishes the bundled Trino on 8080, so use `--trino-port` when both run locally. See `docs/guide/trino-clients.md`.
 
 **Roles**:
 - `standalone` (default) — single process, all-in-one
@@ -170,7 +171,10 @@ crates/
 │                  # editing `thrift_idl/hive_metastore.thrift`.
 ├── protocol/      # PostgreSQL wire protocol v3 (Simple + Extended Query) via pgwire,
 │                  # pg_catalog/information_schema metadata handler,
-│                  # type encoding (Arrow → PG), error mapping, SET/SHOW handling
+│                  # type encoding (Arrow → PG), error mapping, SET/SHOW handling;
+│                  # trino/: Trino client REST protocol v1 (axum) — /v1/statement
+│                  # paging/cancel, X-Trino-* sessions, SHOW/USE/PREPARE, virtual
+│                  # information_schema + system.jdbc, Trino JSON type encoding
 ├── scheduler/     # QueryTracker (state machine), NodeRegistry (worker heartbeat),
 │                  # ResourceGroupManager, NodeScheduler
 ├── rpc/           # Arrow Flight RPC server/client for distributed task execution,

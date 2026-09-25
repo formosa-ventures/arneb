@@ -4,8 +4,10 @@ mod handler;
 mod metadata;
 mod server;
 mod session;
+pub mod trino;
 
 pub use server::{ProtocolConfig, ProtocolServer};
+pub use trino::{TrinoConfig, TrinoServer};
 
 // Re-export the distributed executor trait for server crate to implement
 pub use handler::DistributedExecutor;

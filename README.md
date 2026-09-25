@@ -123,6 +123,7 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 - **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API)
 - **PostgreSQL Wire Protocol**: Compatible with psql, DBeaver, JDBC, psycopg2, node-postgres, and all standard PostgreSQL clients
 - **Extended Query Protocol**: Full prepared statement support (Parse/Bind/Describe/Execute/Sync)
+- **Trino Client Protocol**: Trino's REST protocol on port 8080, so the `trino` CLI, Trino JDBC, `trino-python-client` (Superset), Metabase's Trino driver and dbt-trino can connect unchanged — see [Trino client compatibility](docs/guide/trino-clients.md)
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
 - **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC
 - **Web UI**: Dashboard with query monitoring, cluster overview, and worker status
@@ -142,6 +143,9 @@ cargo build --release
 
 # Connect with psql
 psql -h 127.0.0.1 -p 5432
+
+# ...or with any Trino client (Trino REST protocol, port 8080)
+trino --server http://127.0.0.1:8080 --catalog memory --schema default
 
 # Open Web UI
 open http://127.0.0.1:6432
@@ -227,7 +231,7 @@ crates/
 ├── connectors/    # Memory + File connectors, object store abstraction (S3/GCS/Azure)
 ├── hive/          # Hive Metastore catalog provider + HiveDataSource
 ├── hive-metastore/# Auto-generated Thrift bindings from Hive 4.2.0 IDL
-├── protocol/      # PostgreSQL wire protocol (Simple + Extended Query)
+├── protocol/      # PostgreSQL wire protocol (Simple + Extended Query), Trino client REST protocol
 ├── scheduler/     # QueryTracker, NodeRegistry, resource groups
 ├── rpc/           # Arrow Flight RPC for distributed execution
 └── server/        # Main binary, CLI, config, Web UI

@@ -104,6 +104,9 @@ enum KeyStorage {
     /// `RowConverter`. `keys[group_id] = GroupKey` (Vec<ScalarValue>).
     Generic {
         keys: Vec<GroupKey>,
+        /// Arrow type of each key column, captured at storage selection so
+        /// an all-NULL key column materialises as a typed NULL array.
+        types: Vec<ArrowDataType>,
     },
 }
 
@@ -192,7 +195,7 @@ impl GroupByHash {
             KeyStorage::Uninit => 0,
             KeyStorage::Bigint { keys, .. } => keys.len(),
             KeyStorage::FlatRow { ranges, .. } => ranges.len(),
-            KeyStorage::Generic { keys } => keys.len(),
+            KeyStorage::Generic { keys, .. } => keys.len(),
         }
     }
 
@@ -234,7 +237,7 @@ impl GroupByHash {
                     hashes[gid as usize]
                 });
             }
-            KeyStorage::Generic { keys } => {
+            KeyStorage::Generic { keys, .. } => {
                 reserve_vec_to(keys, target);
                 reserve_table_to(&self.state, &mut self.table, target, |state, &gid| {
                     hash_generic_key(state, &keys[gid as usize])
@@ -293,7 +296,7 @@ impl GroupByHash {
                 .unwrap_or_else(|| self.table.capacity())
                 .max(keys.capacity()),
             KeyStorage::FlatRow { ranges, .. } => self.table.capacity().max(ranges.capacity()),
-            KeyStorage::Generic { keys } => self.table.capacity().max(keys.capacity()),
+            KeyStorage::Generic { keys, .. } => self.table.capacity().max(keys.capacity()),
         }
     }
 
@@ -342,7 +345,7 @@ impl GroupByHash {
             }
             // GroupKey is a Vec<ScalarValue>; estimate a flat ~32 B/group
             // (this fallback path is rare — RowConverter covers most types).
-            KeyStorage::Generic { keys } => keys.capacity() * 32,
+            KeyStorage::Generic { keys, .. } => keys.capacity() * 32,
         };
         table + storage
     }
@@ -414,7 +417,7 @@ impl GroupByHash {
                 hashes,
                 group_cols,
             ),
-            KeyStorage::Generic { keys } => {
+            KeyStorage::Generic { keys, .. } => {
                 get_group_ids_generic(&self.state, &mut self.table, keys, group_cols)
             }
             KeyStorage::Uninit => unreachable!(),
@@ -442,7 +445,7 @@ impl GroupByHash {
                 ranges,
                 ..
             } => build_flat_arrays(converter, parser, buffer, ranges),
-            KeyStorage::Generic { keys } => build_generic_arrays(keys),
+            KeyStorage::Generic { keys, types } => build_generic_arrays(keys, types),
         }
     }
 }
@@ -493,7 +496,10 @@ fn pick_storage(
     capacity_hint: Option<usize>,
 ) -> KeyStorage {
     if group_cols.is_empty() {
-        return KeyStorage::Generic { keys: Vec::new() };
+        return KeyStorage::Generic {
+            keys: Vec::new(),
+            types: Vec::new(),
+        };
     }
 
     // Fast path: single Int64 column → BigintGroupByHash analog.
@@ -531,6 +537,7 @@ fn pick_storage(
 
     KeyStorage::Generic {
         keys: vec_with_capacity_hint(capacity_hint),
+        types: group_cols.iter().map(|c| c.data_type().clone()).collect(),
     }
 }
 
@@ -1091,23 +1098,26 @@ fn get_group_ids_generic(
     Ok(out)
 }
 
-fn build_generic_arrays(keys: &[GroupKey]) -> Result<Vec<ArrayRef>, ExecutionError> {
+fn build_generic_arrays(
+    keys: &[GroupKey],
+    types: &[ArrowDataType],
+) -> Result<Vec<ArrayRef>, ExecutionError> {
     let n = keys.len();
     if n == 0 {
         return Ok(vec![]);
     }
-    let n_cols = keys[0].0.len();
-    let mut cols: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(n); n_cols];
+    // `types` is captured from the same group columns that produced every
+    // key, so it has exactly one entry per key column.
+    let mut cols: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(n); types.len()];
     for key in keys {
-        for (col_i, v) in key.0.iter().enumerate() {
-            cols[col_i].push(v.clone());
+        for (col, v) in cols.iter_mut().zip(&key.0) {
+            col.push(v.clone());
         }
     }
-    let mut arrays = Vec::with_capacity(n_cols);
-    for col_vals in cols {
-        arrays.push(crate::operator::scalars_to_array(&col_vals, n)?);
-    }
-    Ok(arrays)
+    cols.iter()
+        .zip(types)
+        .map(|(col_vals, data_type)| crate::operator::scalars_to_array(col_vals, data_type))
+        .collect()
 }
 
 // ===========================================================================

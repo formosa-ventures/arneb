@@ -1667,10 +1667,8 @@ impl HashAggregateExec {
         let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
         let columns: Vec<ArrayRef> = accumulators
             .iter()
-            .map(|acc| {
-                let val = acc.evaluate()?;
-                expression::scalar_to_array(&val, 1)
-            })
+            .enumerate()
+            .map(|(i, acc)| self.global_aggr_column(i, acc.evaluate()?))
             .collect::<Result<_, _>>()?;
 
         Ok(vec![RecordBatch::try_new(arrow_schema, columns)?])
@@ -1765,10 +1763,8 @@ impl HashAggregateExec {
             });
             let columns: Vec<ArrayRef> = accumulators
                 .iter()
-                .map(|acc| {
-                    let val = acc.evaluate()?;
-                    expression::scalar_to_array(&val, 1)
-                })
+                .enumerate()
+                .map(|(i, acc)| self.global_aggr_column(i, acc.evaluate()?))
                 .collect::<Result<_, _>>()?;
             return Ok(vec![RecordBatch::try_new(arrow_schema, columns)?]);
         }
@@ -2049,10 +2045,8 @@ impl HashAggregateExec {
         let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
         let columns: Vec<ArrayRef> = accs
             .iter()
-            .map(|acc| {
-                let val = acc.evaluate(0)?;
-                expression::scalar_to_array(&val, 1)
-            })
+            .enumerate()
+            .map(|(i, acc)| self.global_aggr_column(i, acc.evaluate(0)?))
             .collect::<Result<_, _>>()?;
         Ok(vec![RecordBatch::try_new(arrow_schema, columns)?])
     }
@@ -2087,7 +2081,8 @@ impl HashAggregateExec {
         }
         let aggr_columns: Vec<ArrayRef> = aggr_values
             .iter()
-            .map(|col_vals| scalars_to_array(col_vals, n))
+            .enumerate()
+            .map(|(i, col_vals)| scalars_to_array(col_vals, &self.aggr_output_type(i)))
             .collect::<Result<_, _>>()?;
         let columns = self.order_grouped_output_columns(group_columns, aggr_columns)?;
 
@@ -2170,10 +2165,8 @@ impl HashAggregateExec {
             let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
             let columns: Vec<ArrayRef> = final_accs
                 .iter()
-                .map(|acc| {
-                    let val = acc.evaluate(0)?;
-                    expression::scalar_to_array(&val, 1)
-                })
+                .enumerate()
+                .map(|(i, acc)| self.global_aggr_column(i, acc.evaluate(0)?))
                 .collect::<Result<_, _>>()?;
             return Ok(vec![RecordBatch::try_new(arrow_schema, columns)?]);
         }
@@ -2212,6 +2205,12 @@ impl HashAggregateExec {
         }
 
         for (partial_gbh, partial_accs) in partials {
+            // An input partition with zero rows never initialised its key
+            // storage, so it yields zero key columns; feeding that to the
+            // global hash errors (FlatRow expects one array per key).
+            if partial_gbh.num_groups() == 0 {
+                continue;
+            }
             // Re-hash the partial's keys (typed Array columns) into the
             // global GroupByHash. This goes through the same Bigint
             // fast path the partial used, with zero `ScalarValue`
@@ -2301,6 +2300,10 @@ impl HashAggregateExec {
         }
 
         for (partial_gbh, partial_accs) in partials {
+            // Empty input partition: no groups, no key columns — skip.
+            if partial_gbh.num_groups() == 0 {
+                continue;
+            }
             let partial_arrays = partial_gbh.build_group_arrays()?;
             let remap = global_gbh.get_group_ids(&partial_arrays)?;
             let n_global = global_gbh.num_groups();
@@ -2320,7 +2323,6 @@ impl HashAggregateExec {
             return Ok(vec![]);
         }
 
-        let num_groups = groups.len();
         let num_group_cols = self.group_by.len();
         let num_aggr_cols = self.aggr_exprs.len();
 
@@ -2339,11 +2341,13 @@ impl HashAggregateExec {
         let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
         let group_columns: Vec<ArrayRef> = group_values
             .iter()
-            .map(|col_vals| scalars_to_array(col_vals, num_groups))
+            .enumerate()
+            .map(|(i, col_vals)| scalars_to_array(col_vals, &self.group_output_type(i)))
             .collect::<Result<_, _>>()?;
         let aggr_columns: Vec<ArrayRef> = aggr_values
             .iter()
-            .map(|col_vals| scalars_to_array(col_vals, num_groups))
+            .enumerate()
+            .map(|(i, col_vals)| scalars_to_array(col_vals, &self.aggr_output_type(i)))
             .collect::<Result<_, _>>()?;
         let columns = self.order_grouped_output_columns(group_columns, aggr_columns)?;
 
@@ -2395,6 +2399,41 @@ impl HashAggregateExec {
             columns.push(col.clone());
         }
         Ok(columns)
+    }
+
+    /// Declared Arrow type of an output column, located by its source
+    /// (group key or aggregate) through `output_order` when present.
+    fn output_type_of(&self, source: AggregateOutputColumn) -> ArrowDataType {
+        let out_idx = match &self.output_order {
+            Some(order) => order.iter().position(|c| *c == source),
+            None => Some(match source {
+                AggregateOutputColumn::Group(i) => i,
+                AggregateOutputColumn::Aggregate(i) => self.group_by.len() + i,
+            }),
+        };
+        out_idx
+            .and_then(|i| self.output_schema.get(i))
+            .map(|c| c.data_type.clone().into())
+            .unwrap_or(ArrowDataType::Null)
+    }
+
+    fn aggr_output_type(&self, aggr_idx: usize) -> ArrowDataType {
+        self.output_type_of(AggregateOutputColumn::Aggregate(aggr_idx))
+    }
+
+    fn group_output_type(&self, group_idx: usize) -> ArrowDataType {
+        self.output_type_of(AggregateOutputColumn::Group(group_idx))
+    }
+
+    /// One-row output column for a global (no GROUP BY) aggregate. Over
+    /// empty input every non-COUNT accumulator evaluates to NULL; it must
+    /// be a NULL of the declared type, not an untyped `NullArray`.
+    fn global_aggr_column(
+        &self,
+        aggr_idx: usize,
+        val: ScalarValue,
+    ) -> Result<ArrayRef, ExecutionError> {
+        scalars_to_array(std::slice::from_ref(&val), &self.aggr_output_type(aggr_idx))
     }
 }
 
@@ -3295,9 +3334,11 @@ impl ExecutionPlan for StreamingHashAggregateExec {
         }
 
         // Aggregate outputs are small per-group ScalarValues — convert
-        // via `scalars_to_array`.
-        for col_vals in &aggr_out {
-            columns.push(scalars_to_array(col_vals, num_groups)?);
+        // via `scalars_to_array`, typed by the declared output column so an
+        // all-NULL aggregate column stays typed.
+        for (i, col_vals) in aggr_out.iter().enumerate() {
+            let data_type = arrow_schema.field(num_group_cols + i).data_type();
+            columns.push(scalars_to_array(col_vals, data_type)?);
         }
 
         let out_batch = if num_groups == 0 {
@@ -3662,16 +3703,23 @@ fn dictionary_values_for_group_key(arr: &ArrayRef) -> Result<ArrayRef, Execution
     }
 }
 
+/// Materialize a column of [`ScalarValue`]s as an Arrow array of
+/// `data_type` — the column's *declared* output type.
+///
+/// `data_type` matters when the column carries no non-NULL value (an
+/// aggregate over empty input, a group whose inputs are all NULL, an
+/// all-NULL group key): the result is a typed all-NULL array rather than
+/// an untyped `NullArray`, which `RecordBatch::try_new` would reject
+/// against the declared schema ("expected Int64 but found Null").
+/// Non-NULL values keep the type they carry; hot types take a direct
+/// builder path, everything else goes through [`expression::scalar_to_array`].
 pub(crate) fn scalars_to_array(
     values: &[ScalarValue],
-    _len: usize,
+    data_type: &ArrowDataType,
 ) -> Result<ArrayRef, ExecutionError> {
-    if values.is_empty() {
-        return Ok(Arc::new(array::NullArray::new(0)));
-    }
-
     let first_type = values.iter().find(|v| !matches!(v, ScalarValue::Null));
     match first_type {
+        None => Ok(array::new_null_array(data_type, values.len())),
         Some(ScalarValue::Int32(_)) => {
             let arr: Int32Array = values
                 .iter()
@@ -3749,7 +3797,21 @@ pub(crate) fn scalars_to_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        _ => Ok(Arc::new(array::NullArray::new(values.len()))),
+        // Decimal128 / Timestamp / Binary / ...: build per value and
+        // concatenate. Only small per-group aggregate outputs (MIN / MAX /
+        // SUM results) and rare generic group keys reach this arm.
+        Some(first) => {
+            let value_type = expression::scalar_to_array(first, 1)?.data_type().clone();
+            let parts: Vec<ArrayRef> = values
+                .iter()
+                .map(|v| match v {
+                    ScalarValue::Null => Ok(array::new_null_array(&value_type, 1)),
+                    v => expression::scalar_to_array(v, 1),
+                })
+                .collect::<Result<_, _>>()?;
+            let refs: Vec<&dyn Array> = parts.iter().map(|a| a.as_ref()).collect();
+            compute::concat(&refs).map_err(ExecutionError::from)
+        }
     }
 }
 
@@ -3834,7 +3896,7 @@ mod tests {
             ScalarValue::Null,
             ScalarValue::Date32(19500),
         ];
-        let arr = scalars_to_array(&values, 3).unwrap();
+        let arr = scalars_to_array(&values, &ArrowDataType::Date32).unwrap();
         let date_arr = arr.as_primitive::<datatypes::Date32Type>();
         assert_eq!(date_arr.value(0), 19000);
         assert!(date_arr.is_null(1));
@@ -5716,3 +5778,7 @@ mod tests {
         assert_eq!(all, vec![1, 2, 3, 4, 5, 6]);
     }
 }
+
+#[cfg(test)]
+#[path = "operator_empty_agg_tests.rs"]
+mod empty_agg_tests;

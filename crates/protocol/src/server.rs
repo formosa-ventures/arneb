@@ -6,6 +6,7 @@ use arneb_catalog::CatalogManager;
 use arneb_connectors::ConnectorRegistry;
 use arneb_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
 
+use crate::auth::AuthMethod;
 use crate::handler::{DistributedExecutor, HandlerFactory};
 
 /// Configuration for the PostgreSQL wire protocol server.
@@ -32,6 +33,7 @@ pub struct ProtocolServer {
     connector_registry: Arc<ConnectorRegistry>,
     distributed_executor: Option<Arc<dyn DistributedExecutor>>,
     memory_pool: Arc<dyn MemoryPool>,
+    auth: AuthMethod,
 }
 
 impl ProtocolServer {
@@ -46,7 +48,14 @@ impl ProtocolServer {
             connector_registry,
             distributed_executor: None,
             memory_pool: Arc::new(UnboundedMemoryPool::new()),
+            auth: AuthMethod::None,
         }
+    }
+
+    /// Set the client authentication mode (default: [`AuthMethod::None`]).
+    pub fn with_auth(mut self, auth: AuthMethod) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// Set the distributed executor for coordinator mode.
@@ -69,8 +78,17 @@ impl ProtocolServer {
     /// This method runs until the process is terminated.
     pub async fn start(&self) -> Result<(), std::io::Error> {
         let listener = TcpListener::bind(&self.config.bind_address).await?;
+        self.serve(listener).await
+    }
+
+    /// Accept connections on an already-bound listener. Useful when the
+    /// caller needs the actual address of an ephemeral (`:0`) port.
+    /// This method runs until the process is terminated.
+    pub async fn serve(&self, listener: TcpListener) -> Result<(), std::io::Error> {
+        let address = listener.local_addr()?;
         tracing::info!(
-            address = %self.config.bind_address,
+            address = %address,
+            auth = self.auth.name(),
             "protocol server listening"
         );
 
@@ -79,6 +97,7 @@ impl ProtocolServer {
             connector_registry: Arc::clone(&self.connector_registry),
             distributed_executor: self.distributed_executor.clone(),
             memory_pool: Arc::clone(&self.memory_pool),
+            auth: self.auth.clone(),
         });
 
         loop {

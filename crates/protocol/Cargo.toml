@@ -39,3 +39,5 @@ hex = "0.4"
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
 pgwire = { workspace = true }
+parquet = { workspace = true }
+tempfile = "3"

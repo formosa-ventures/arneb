@@ -22,7 +22,8 @@ export default defineConfig({
             { text: 'Introduction', link: '/guide/introduction' },
             { text: 'Quickstart', link: '/guide/quickstart' },
             { text: 'Configuration', link: '/guide/configuration' },
-            { text: 'Distributed Mode', link: '/guide/distributed' }
+            { text: 'Distributed Mode', link: '/guide/distributed' },
+            { text: 'Trino Clients', link: '/guide/trino-clients' }
           ]
         }
       ],

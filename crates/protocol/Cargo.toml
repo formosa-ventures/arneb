@@ -56,5 +56,3 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 pgwire = { workspace = true }
 tokio-postgres = "0.7"
 postgres-protocol = "0.6"
-parquet = { workspace = true }
-tempfile = "3"

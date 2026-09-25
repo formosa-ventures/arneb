@@ -524,6 +524,9 @@ fn probe_one_left_batch_multi_inner(
             let l: &dyn arrow::array::Datum = &left_key_values;
             let r: &dyn arrow::array::Datum = &right_key_values;
             let key_eq = cmp::eq(l, r)?;
+            // Plain (non-Kleene) `and` is correct here: the mask is only
+            // consumed as "is TRUE" below (NULL keys never match), and
+            // `and`/`and_kleene` agree on which rows are TRUE.
             eq_mask = Some(match eq_mask {
                 Some(prev) => boolean::and(&prev, &key_eq)?,
                 None => key_eq,

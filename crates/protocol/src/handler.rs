@@ -1596,4 +1596,100 @@ mod tests {
         assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
         assert!(matches!(resolved, PlanExpr::ScalarSubquery { .. }));
     }
+
+    // -- End-to-end three-valued (Kleene) boolean logic -------------------
+
+    /// Runs `sql` against a memory table `t(a INT NULL, b BOOLEAN NULL)` with
+    /// rows (1, TRUE), (NULL, FALSE), (3, NULL), (NULL, NULL), (5, FALSE) and
+    /// returns the first non-empty batch.
+    async fn kleene_query(sql: &str) -> arrow::record_batch::RecordBatch {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        use arrow::array::{BooleanArray, Int32Array};
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("a", arrow::datatypes::DataType::Int32, true),
+            Field::new("b", arrow::datatypes::DataType::Boolean, true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    None,
+                    Some(3),
+                    None,
+                    Some(5),
+                ])),
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    None,
+                    None,
+                    Some(false),
+                ])),
+            ],
+        )
+        .unwrap();
+        let table = Arc::new(MemoryTable::new(
+            vec![col("a", DataType::Int32), col("b", DataType::Boolean)],
+            vec![batch],
+        ));
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("t", table);
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", schema);
+        let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
+        let cm = CatalogManager::new("memory", "default");
+        cm.register_catalog("memory", catalog);
+        let mut reg = ConnectorRegistry::new();
+        reg.register("memory", Arc::new(factory));
+
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        let (_, batches) = execute_query(sql, &cm, &reg, None, &pool)
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {sql}: {e}"));
+        batches
+            .into_iter()
+            .find(|b| b.num_rows() > 0)
+            .unwrap_or_else(|| panic!("no rows: {sql}"))
+    }
+
+    #[tokio::test]
+    async fn where_is_null_or_uses_kleene_logic() {
+        // Rows 1, 2, 4 qualify. Row 4 is `TRUE OR NULL` = TRUE (non-Kleene
+        // OR returned NULL and dropped it). Row 3 is `FALSE OR NULL` = NULL.
+        let batch = kleene_query("SELECT count(*) FROM t WHERE a IS NULL OR b").await;
+        let n = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) should be Int64")
+            .value(0);
+        assert_eq!(n, 3);
+    }
+
+    #[tokio::test]
+    async fn select_null_boolean_literals_use_kleene_logic() {
+        use arrow::array::{Array, BooleanArray};
+        let batch =
+            kleene_query("SELECT NULL OR TRUE, NULL AND FALSE, NULL AND TRUE, NULL OR FALSE").await;
+        let cell = |i: usize| -> Option<bool> {
+            let c = batch.column(i);
+            if c.is_null(0) {
+                return None;
+            }
+            Some(
+                c.as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap_or_else(|| panic!("column {i} is {:?}", c.data_type()))
+                    .value(0),
+            )
+        };
+        assert_eq!(cell(0), Some(true), "NULL OR TRUE");
+        assert_eq!(cell(1), Some(false), "NULL AND FALSE");
+        assert_eq!(cell(2), None, "NULL AND TRUE");
+        assert_eq!(cell(3), None, "NULL OR FALSE");
+    }
 }

@@ -31,5 +31,5 @@ Arneb supports the following query features:
 ## Further Reading
 
 - [Expressions](/sql/expressions) — operators, CASE, CAST, LIKE, and more
-- [Functions](/sql/functions) — all 19 built-in scalar functions
+- [Functions](/sql/functions) — all 90 built-in scalar functions (Trino-compatible)
 - [Advanced](/sql/advanced) — CTEs, window functions, set operations

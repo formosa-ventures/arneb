@@ -159,6 +159,12 @@ pub(crate) fn evaluate(
             args,
             ..
         } => {
+            // TRY(expr) must observe its argument's evaluation errors,
+            // so it cannot be an ordinary registry function (those only
+            // see already-evaluated argument arrays).
+            if name.eq_ignore_ascii_case("TRY") {
+                return evaluate_try(args, batch, registry);
+            }
             // Try the caller-supplied registry first, then fall back
             // to the process-wide default registry. Many operators
             // (ProjectionExec, FilterExec, SortExec, HashAggregateExec
@@ -176,7 +182,7 @@ pub(crate) fn evaluate(
                     .iter()
                     .map(|a| evaluate(a, batch, registry))
                     .collect::<Result<Vec<_>, _>>()?;
-                return func.evaluate(&evaluated_args);
+                return func.invoke(&evaluated_args, batch.num_rows());
             }
             Err(ExecutionError::InvalidOperation(format!(
                 "unknown scalar function: {name}; aggregate functions are handled by the aggregate operator"
@@ -220,6 +226,47 @@ pub(crate) fn evaluate(
             "unbound parameter ${index}; extended-query protocol must Bind all parameters before Execute"
         ))),
     }
+}
+
+/// Trino's `TRY(expr)`: evaluate `expr`, turning evaluation errors into
+/// NULL for the offending rows only.
+///
+/// The whole batch is evaluated first (the fast, common path). Only if
+/// that fails is the batch re-evaluated one row at a time, so rows that
+/// succeed keep their value and rows that fail become NULL. Every
+/// evaluation error is caught (Trino catches only a fixed set of error
+/// codes — division by zero, invalid cast/argument, overflow — but in
+/// practice those are the errors scalar evaluation raises).
+fn evaluate_try(
+    args: &[PlanExpr],
+    batch: &RecordBatch,
+    registry: Option<&FunctionRegistry>,
+) -> Result<ArrayRef, ExecutionError> {
+    let [arg] = args else {
+        return Err(ExecutionError::InvalidOperation(format!(
+            "TRY expects exactly 1 argument, got {}",
+            args.len()
+        )));
+    };
+    if let Ok(arr) = evaluate(arg, batch, registry) {
+        return Ok(arr);
+    }
+    let rows: Vec<Option<ArrayRef>> = (0..batch.num_rows())
+        .map(|i| evaluate(arg, &batch.slice(i, 1), registry).ok())
+        .collect();
+    let Some(data_type) = rows.iter().flatten().map(|a| a.data_type().clone()).next() else {
+        return Ok(Arc::new(NullArray::new(batch.num_rows())));
+    };
+    let pieces: Vec<ArrayRef> = rows
+        .into_iter()
+        .map(|r| match r {
+            Some(a) if a.data_type() == &data_type => Ok(a),
+            Some(a) => kernels::cast::cast(&a, &data_type).map_err(ExecutionError::from),
+            None => Ok(arrow::array::new_null_array(&data_type, 1)),
+        })
+        .collect::<Result<_, _>>()?;
+    let refs: Vec<&dyn Array> = pieces.iter().map(|a| a.as_ref()).collect();
+    Ok(kernels::concat::concat(&refs)?)
 }
 
 /// Threshold above which `InList` switches from `OR`-of-Arrow-`eq`-
@@ -1605,5 +1652,76 @@ mod tests {
         assert_eq!(arr.value(0), 1);
         assert!(arr.is_null(1)); // NULLIF(2, 2) = NULL
         assert_eq!(arr.value(2), 3);
+    }
+
+    // -- TRY / nullary functions (trino-functions-batch1) --
+
+    fn func(name: &str, args: Vec<PlanExpr>) -> PlanExpr {
+        PlanExpr::Function {
+            name: name.to_string(),
+            args,
+            distinct: false,
+            span: None,
+        }
+    }
+
+    fn col(index: usize) -> PlanExpr {
+        PlanExpr::Column {
+            index,
+            name: format!("c{index}"),
+            span: None,
+        }
+    }
+
+    fn codepoint_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![65, -1, 66]))]).unwrap()
+    }
+
+    #[test]
+    fn try_nulls_only_failing_rows() {
+        let batch = codepoint_batch();
+        // CHR(-1) is an error; without TRY the whole batch fails.
+        assert!(evaluate(&func("CHR", vec![col(0)]), &batch, None).is_err());
+        let out = evaluate(&func("TRY", vec![func("CHR", vec![col(0)])]), &batch, None).unwrap();
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(out.value(0), "A");
+        assert!(out.is_null(1));
+        assert_eq!(out.value(2), "B");
+    }
+
+    #[test]
+    fn try_passes_through_successful_batches() {
+        let batch = make_batch();
+        let out = evaluate(&func("try", vec![col(1)]), &batch, None).unwrap();
+        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(out.values(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn try_all_rows_failing_yields_all_nulls() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![-1, -2]))]).unwrap();
+        let out = evaluate(&func("TRY", vec![func("CHR", vec![col(0)])]), &batch, None).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.logical_null_count(), 2);
+    }
+
+    #[test]
+    fn nullary_functions_produce_one_value_per_row() {
+        let batch = make_batch();
+        for name in ["PI", "CURRENT_DATE", "NOW", "CURRENT_TIMESTAMP", "RANDOM"] {
+            let out = evaluate(&func(name, vec![]), &batch, None).unwrap();
+            assert_eq!(out.len(), batch.num_rows(), "{name}");
+        }
     }
 }

@@ -9,6 +9,7 @@ arneb-common = { path = "../common" }
 arneb-catalog = { path = "../catalog" }
 arneb-connectors = { path = "../connectors" }
 arneb-execution = { path = "../execution" }
+arneb-iceberg = { path = "../iceberg" }
 arrow.workspace = true
 parquet.workspace = true
 object_store.workspace = true

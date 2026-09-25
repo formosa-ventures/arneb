@@ -291,7 +291,8 @@ async fn run() -> Result<()> {
         connector_registry.register("file", file_factory);
     }
 
-    // 6.5. Register Hive catalogs from config
+    // 6.5. Register Hive catalogs from config (Iceberg tables in the same
+    // metastore are redirected to the Iceberg reader by the Hive catalog).
     for catalog_cfg in &config.catalogs {
         if catalog_cfg.catalog_type != "hive" {
             tracing::warn!(
@@ -325,6 +326,7 @@ async fn run() -> Result<()> {
                 let hms_client = Arc::new(hms_client);
                 let hive_catalog = Arc::new(arneb_hive::catalog::HiveCatalogProvider::new(
                     hms_client.clone(),
+                    catalog_storage_registry.clone(),
                 ));
                 catalog_manager.register_catalog(&catalog_cfg.name, hive_catalog);
 

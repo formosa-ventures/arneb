@@ -1377,9 +1377,13 @@ async fn register_data_sources(
                 .unwrap_or(catalog_manager.default_catalog());
 
             if let Some(factory) = registry.get(connector_name) {
-                if let Ok(ds) = factory.create_data_source(table, schema, properties).await {
-                    ctx.register_data_source(key, ds);
-                }
+                // Surface connector errors (e.g. an Iceberg table with
+                // unsupported delete files) instead of degrading them to a
+                // generic "data source not found" later.
+                let ds = factory
+                    .create_data_source(table, schema, properties)
+                    .await?;
+                ctx.register_data_source(key, ds);
             }
         }
         LogicalPlan::Projection { input, .. }

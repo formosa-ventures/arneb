@@ -123,7 +123,7 @@ service_account_path = "/path/to/service-account.json"
 
 ## Catalog Configuration
 
-Register external catalogs (e.g., Hive Metastore):
+Register external catalogs (e.g., Hive Metastore; its Iceberg tables are read through the same catalog):
 
 ```toml
 [[catalogs]]
@@ -142,7 +142,7 @@ allow_http = true
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | yes | Catalog name (used as first part of `catalog.schema.table`) |
-| `type` | string | yes | Catalog type (currently `"hive"`) |
+| `type` | string | yes | Catalog type (currently `"hive"`; Iceberg tables in the metastore are included, see [Iceberg](/connectors/iceberg)) |
 | `metastore_uri` | string | yes | `host:port` of the Hive Metastore (no scheme prefix) |
 | `default_schema` | string | no | Default schema within the catalog |
 

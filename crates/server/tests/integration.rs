@@ -1037,6 +1037,7 @@ async fn test_hive_e2e_hms_s3_parquet() {
 
     let hive_catalog = Arc::new(arneb_hive::catalog::HiveCatalogProvider::new(
         hms_client.clone(),
+        storage_registry.clone(),
     ));
     let hive_factory = arneb_hive::datasource::HiveConnectorFactory::new(storage_registry);
     // No manual register_table_location() needed: HMS now stores the real

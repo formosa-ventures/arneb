@@ -20,6 +20,7 @@ use volo_thrift::MaybeException;
 use arneb_catalog::{CatalogProvider, ColumnStatistics, SchemaProvider, TableProvider};
 use arneb_common::error::ConnectorError;
 use arneb_common::types::{ColumnInfo, DataType};
+use arneb_connectors::storage::StorageRegistry;
 
 use crate::hive_type_to_arrow;
 
@@ -52,6 +53,9 @@ pub struct HiveTableMeta {
     /// and biases reorder toward small-leaf-as-outer (see
     /// `memory/project_joinreorder_disabled.md` Step PR notes).
     pub column_stats: HashMap<String, ColumnStatistics>,
+    /// Raw HMS table parameters (e.g. `table_type=ICEBERG`,
+    /// `metadata_location=...` for Iceberg tables).
+    pub parameters: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +184,13 @@ impl HmsClient {
         let columns = convert_field_schemas(&hms_cols, db, table)?;
 
         let (row_count, size_bytes) = extract_table_stats(parameters.as_ref());
+        let parameters: HashMap<String, String> = parameters
+            .map(|p| {
+                p.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // NOTE: HMS column NDV stats are intentionally NOT fetched in
         // production yet. The infrastructure exists
@@ -201,6 +212,7 @@ impl HmsClient {
             row_count,
             size_bytes,
             column_stats,
+            parameters,
         })
     }
 
@@ -369,16 +381,20 @@ fn convert_field_schemas(
 /// Catalog provider backed by a Hive Metastore.
 ///
 /// Each HMS database maps to a schema. Tables within a database are
-/// discovered lazily through [`HiveSchemaProvider`].
+/// discovered lazily through [`HiveSchemaProvider`]. Iceberg tables
+/// (`table_type=ICEBERG`) are redirected to the Iceberg reader, which
+/// needs the catalog's storage to load their metadata.
 #[derive(Debug)]
 pub struct HiveCatalogProvider {
     client: Arc<HmsClient>,
+    storage: Arc<StorageRegistry>,
 }
 
 impl HiveCatalogProvider {
-    /// Create a new provider from an existing [`HmsClient`].
-    pub fn new(client: Arc<HmsClient>) -> Self {
-        Self { client }
+    /// Create a new provider from an existing [`HmsClient`] and the
+    /// catalog's storage registry.
+    pub fn new(client: Arc<HmsClient>, storage: Arc<StorageRegistry>) -> Self {
+        Self { client, storage }
     }
 }
 
@@ -395,10 +411,11 @@ impl CatalogProvider for HiveCatalogProvider {
     }
 
     async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        Some(Arc::new(HiveSchemaProvider {
-            client: Arc::clone(&self.client),
-            database: name.to_string(),
-        }))
+        Some(Arc::new(HiveSchemaProvider::new(
+            Arc::clone(&self.client),
+            Arc::clone(&self.storage),
+            name.to_string(),
+        )))
     }
 }
 
@@ -410,13 +427,18 @@ impl CatalogProvider for HiveCatalogProvider {
 #[derive(Debug)]
 pub struct HiveSchemaProvider {
     client: Arc<HmsClient>,
+    storage: Arc<StorageRegistry>,
     database: String,
 }
 
 impl HiveSchemaProvider {
     /// Create a new schema provider for the given database.
-    pub fn new(client: Arc<HmsClient>, database: String) -> Self {
-        Self { client, database }
+    pub fn new(client: Arc<HmsClient>, storage: Arc<StorageRegistry>, database: String) -> Self {
+        Self {
+            client,
+            storage,
+            database,
+        }
     }
 }
 
@@ -434,6 +456,25 @@ impl SchemaProvider for HiveSchemaProvider {
 
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         match self.client.get_table(&self.database, name).await {
+            // Table redirection (as in Trino): Iceberg tables in HMS are
+            // served by the Iceberg reader. Listing their location as a
+            // plain Hive table would read deleted and orphaned files.
+            Ok(meta) if arneb_iceberg::is_iceberg_table(&meta.parameters) => {
+                let qualified = format!("{}.{}", self.database, name);
+                match arneb_iceberg::IcebergTableProvider::resolve(
+                    &self.storage,
+                    &qualified,
+                    &meta.parameters,
+                )
+                .await
+                {
+                    Ok(p) => Some(Arc::new(p)),
+                    Err(e) => {
+                        warn!("failed to load Iceberg table '{qualified}': {e}");
+                        None
+                    }
+                }
+            }
             Ok(meta) => Some(Arc::new(HiveTableProvider {
                 columns: meta.columns,
                 location: meta.location,
@@ -575,6 +616,7 @@ mod tests {
             row_count: None,
             size_bytes: None,
             column_stats: HashMap::new(),
+            parameters: HashMap::new(),
         };
 
         assert_eq!(meta.columns.len(), 2);
@@ -789,6 +831,7 @@ mod tests {
                     .address("127.0.0.1:9083".parse::<SocketAddr>().unwrap())
                     .build(),
             }),
+            storage: Arc::new(StorageRegistry::new()),
         };
         let debug_str = format!("{provider:?}");
         assert!(debug_str.contains("HiveCatalogProvider"));
@@ -802,6 +845,7 @@ mod tests {
                     .address("127.0.0.1:9083".parse::<SocketAddr>().unwrap())
                     .build(),
             }),
+            storage: Arc::new(StorageRegistry::new()),
             database: "default".to_string(),
         };
         let debug_str = format!("{provider:?}");

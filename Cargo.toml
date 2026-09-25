@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution", "crates/connectors", "crates/protocol", "crates/server", "crates/scheduler", "crates/rpc", "crates/hive", "crates/hive-metastore", "crates/hive-metastore/thrift_build"]
+members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution", "crates/connectors", "crates/protocol", "crates/server", "crates/scheduler", "crates/rpc", "crates/hive", "crates/iceberg", "crates/hive-metastore", "crates/hive-metastore/thrift_build"]
 exclude = ["benchmarks/tpch"]
 resolver = "2"
 

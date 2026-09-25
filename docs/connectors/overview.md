@@ -24,6 +24,7 @@ Connectors are registered through the `ConnectorFactory` and `ConnectorRegistry`
 - **File connector**: Activated for `[[tables]]` entries with local paths
 - **Object store connector**: Activated for `[[tables]]` entries with `s3://`, `gs://`, or `az://` paths
 - **Hive connector**: Activated for `[[catalogs]]` entries with `type = "hive"`
+- **Iceberg reader**: Used automatically by a `hive` catalog for tables with `table_type=ICEBERG` (read-only)
 
 ## Pushdown Optimization
 
@@ -42,3 +43,4 @@ Connectors apply as many pushdown hints as they support. The query engine always
 - [File Connector](/connectors/file) — CSV and Parquet from local filesystem
 - [Object Store](/connectors/object-store) — S3, GCS, and Azure Blob Storage
 - [Hive](/connectors/hive) — Hive Metastore catalog with automatic table discovery
+- [Iceberg](/connectors/iceberg) — Apache Iceberg tables tracked by a Hive Metastore (read-only, current snapshot)

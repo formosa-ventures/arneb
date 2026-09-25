@@ -1596,4 +1596,79 @@ mod tests {
         assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
         assert!(matches!(resolved, PlanExpr::ScalarSubquery { .. }));
     }
+
+    // -- End-to-end: comparisons with a NULL literal ----------------------
+
+    /// Memory table `t(a INT NULL)` with rows 1, NULL, 3.
+    fn null_cmp_memory_env() -> (CatalogManager, ConnectorRegistry) {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            arrow::datatypes::DataType::Int32,
+            true,
+        )]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(arrow::array::Int32Array::from(vec![
+                Some(1),
+                None,
+                Some(3),
+            ]))],
+        )
+        .unwrap();
+        let table = Arc::new(MemoryTable::new(
+            vec![col("a", DataType::Int32)],
+            vec![batch],
+        ));
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("t", table);
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", schema);
+        let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
+        let catalog_manager = CatalogManager::new("memory", "default");
+        catalog_manager.register_catalog("memory", catalog);
+        let mut registry = ConnectorRegistry::new();
+        registry.register("memory", Arc::new(factory));
+        (catalog_manager, registry)
+    }
+
+    async fn run_sql(
+        sql: &str,
+        cm: &CatalogManager,
+        reg: &ConnectorRegistry,
+    ) -> arrow::record_batch::RecordBatch {
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        let (_, batches) = execute_query(sql, cm, reg, None, &pool)
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {sql}: {e}"));
+        batches
+            .into_iter()
+            .find(|b| b.num_rows() > 0)
+            .unwrap_or_else(|| panic!("no rows: {sql}"))
+    }
+
+    #[tokio::test]
+    async fn comparison_with_null_literal_is_unknown_not_folded() {
+        use arrow::array::Array;
+        let (cm, reg) = null_cmp_memory_env();
+        // A comparison with NULL is NULL, so it never passes a WHERE clause.
+        for pred in ["NULL = NULL", "NULL <> NULL", "NULL < NULL", "NULL >= NULL"] {
+            let sql = format!("SELECT count(*) FROM t WHERE {pred}");
+            let batch = run_sql(&sql, &cm, &reg).await;
+            let n = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count(*) should be Int64")
+                .value(0);
+            assert_eq!(n, 0, "{pred}");
+        }
+        let batch = run_sql("SELECT NULL = NULL, NULL <> NULL, 1 = 1", &cm, &reg).await;
+        assert!(batch.column(0).is_null(0), "NULL = NULL");
+        assert!(batch.column(1).is_null(0), "NULL <> NULL");
+        assert!(!batch.column(2).is_null(0), "1 = 1");
+    }
 }

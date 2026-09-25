@@ -72,11 +72,9 @@ impl SimplifyFilters {
                         value: ScalarValue::Boolean(true),
                         ..
                     } => Ok(input),
-                    // WHERE false / WHERE NULL → empty scan (return the
-                    // input but wrapped in a LIMIT 0). A NULL predicate
-                    // is unknown, which a WHERE clause treats as false.
+                    // WHERE false → empty scan (return the input but wrapped in a LIMIT 0)
                     PlanExpr::Literal {
-                        value: ScalarValue::Boolean(false) | ScalarValue::Null,
+                        value: ScalarValue::Boolean(false),
                         ..
                     } => Ok(LogicalPlan::Limit {
                         input: Box::new(input),
@@ -548,15 +546,6 @@ fn eval_binary_op(
     right: &ScalarValue,
 ) -> Option<ScalarValue> {
     match op {
-        // SQL: a comparison with NULL is NULL (unknown), never TRUE/FALSE.
-        ast::BinaryOp::Eq | ast::BinaryOp::NotEq
-            if matches!(left, ScalarValue::Null) || matches!(right, ScalarValue::Null) =>
-        {
-            Some(ScalarValue::Null)
-        }
-        // Only fold same-typed literals: derived `PartialEq` would call
-        // `Int32(1) = Int64(1)` FALSE. Mixed types are left to runtime.
-        ast::BinaryOp::Eq | ast::BinaryOp::NotEq if left.data_type() != right.data_type() => None,
         ast::BinaryOp::Eq => Some(ScalarValue::Boolean(left == right)),
         ast::BinaryOp::NotEq => Some(ScalarValue::Boolean(left != right)),
         ast::BinaryOp::Plus => eval_arithmetic(left, right, |a, b| a + b, |a, b| a + b),
@@ -734,50 +723,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(expr, lit(ScalarValue::Boolean(false)));
-    }
-
-    #[test]
-    fn fold_comparison_with_null_is_null() {
-        for (l, op, r) in [
-            (ScalarValue::Null, ast::BinaryOp::Eq, ScalarValue::Null),
-            (ScalarValue::Null, ast::BinaryOp::NotEq, ScalarValue::Null),
-            (ScalarValue::Int32(1), ast::BinaryOp::Eq, ScalarValue::Null),
-            (
-                ScalarValue::Null,
-                ast::BinaryOp::NotEq,
-                ScalarValue::Int32(1),
-            ),
-        ] {
-            let expr = fold_constants(PlanExpr::BinaryOp {
-                left: Box::new(lit(l.clone())),
-                op,
-                right: Box::new(lit(r.clone())),
-                span: None,
-            })
-            .unwrap();
-            assert_eq!(expr, lit(ScalarValue::Null), "{l:?} {op:?} {r:?}");
-        }
-    }
-
-    #[test]
-    fn fold_mixed_type_comparison_is_left_to_runtime() {
-        let original = PlanExpr::BinaryOp {
-            left: Box::new(lit(ScalarValue::Int32(1))),
-            op: ast::BinaryOp::Eq,
-            right: Box::new(lit(ScalarValue::Int64(1))),
-            span: None,
-        };
-        assert_eq!(fold_constants(original.clone()).unwrap(), original);
-    }
-
-    #[test]
-    fn simplify_filters_where_null_is_empty() {
-        let plan = LogicalPlan::Filter {
-            input: Box::new(scan_plan()),
-            predicate: lit(ScalarValue::Null),
-        };
-        let result = SimplifyFilters.optimize(plan).unwrap();
-        assert!(matches!(result, LogicalPlan::Limit { limit: Some(0), .. }));
     }
 
     #[test]

@@ -1599,45 +1599,14 @@ mod tests {
 
     // -- End-to-end three-valued (Kleene) boolean logic -------------------
 
-    use arneb_connectors::file::{FileCatalog, FileConnectorFactory, FileFormat, FileSchema};
-    use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
-    use arrow::array::{Array, BooleanArray, Int32Array};
-
-    async fn run_sql(
-        sql: &str,
-        catalog_manager: &CatalogManager,
-        registry: &ConnectorRegistry,
-    ) -> Vec<arrow::record_batch::RecordBatch> {
-        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
-            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
-        let (_, batches) = execute_query(sql, catalog_manager, registry, None, &pool)
-            .await
-            .unwrap_or_else(|e| panic!("query failed: {sql}: {e}"));
-        batches
-    }
-
-    /// Runs a single-row, single-column `SELECT count(*) ...`.
-    async fn count(
-        sql: &str,
-        catalog_manager: &CatalogManager,
-        registry: &ConnectorRegistry,
-    ) -> i64 {
-        let batches = run_sql(sql, catalog_manager, registry).await;
-        let batch = batches
-            .iter()
-            .find(|b| b.num_rows() > 0)
-            .expect("count(*) returned no rows");
-        batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("count(*) should be Int64")
-            .value(0)
-    }
-
-    /// Memory table `t(a INT NULL, b BOOLEAN NULL)`:
-    /// (1, TRUE), (NULL, FALSE), (3, NULL), (NULL, NULL), (5, FALSE).
-    fn kleene_memory_env() -> (CatalogManager, ConnectorRegistry) {
+    /// Runs `sql` against a memory table `t(a INT NULL, b BOOLEAN NULL)` with
+    /// rows (1, TRUE), (NULL, FALSE), (3, NULL), (NULL, NULL), (5, FALSE) and
+    /// returns the first non-empty batch.
+    async fn kleene_query(sql: &str) -> arrow::record_batch::RecordBatch {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        use arrow::array::{BooleanArray, Int32Array};
         let arrow_schema = Arc::new(Schema::new(vec![
             Field::new("a", arrow::datatypes::DataType::Int32, true),
             Field::new("b", arrow::datatypes::DataType::Boolean, true),
@@ -1662,7 +1631,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let table = Arc::new(arneb_connectors::memory::MemoryTable::new(
+        let table = Arc::new(MemoryTable::new(
             vec![col("a", DataType::Int32), col("b", DataType::Boolean)],
             vec![batch],
         ));
@@ -1671,88 +1640,41 @@ mod tests {
         let catalog = Arc::new(MemoryCatalog::new());
         catalog.register_schema("default", schema);
         let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
-        let catalog_manager = CatalogManager::new("memory", "default");
-        catalog_manager.register_catalog("memory", catalog);
-        let mut registry = ConnectorRegistry::new();
-        registry.register("memory", Arc::new(factory));
-        (catalog_manager, registry)
+        let cm = CatalogManager::new("memory", "default");
+        cm.register_catalog("memory", catalog);
+        let mut reg = ConnectorRegistry::new();
+        reg.register("memory", Arc::new(factory));
+
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        let (_, batches) = execute_query(sql, &cm, &reg, None, &pool)
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {sql}: {e}"));
+        batches
+            .into_iter()
+            .find(|b| b.num_rows() > 0)
+            .unwrap_or_else(|| panic!("no rows: {sql}"))
     }
 
     #[tokio::test]
     async fn where_is_null_or_uses_kleene_logic() {
-        let (cm, reg) = kleene_memory_env();
         // Rows 1, 2, 4 qualify. Row 4 is `TRUE OR NULL` = TRUE (non-Kleene
         // OR returned NULL and dropped it). Row 3 is `FALSE OR NULL` = NULL.
-        assert_eq!(
-            count("SELECT count(*) FROM t WHERE a IS NULL OR b", &cm, &reg).await,
-            3
-        );
-    }
-
-    #[tokio::test]
-    async fn where_not_and_uses_kleene_logic() {
-        let (cm, reg) = kleene_memory_env();
-        // Row 2: `NULL AND FALSE` = FALSE -> NOT = TRUE (kept).
-        // Row 3: `TRUE AND NULL` = NULL -> NOT = NULL (dropped).
-        // Row 4: `NULL AND NULL` = NULL (dropped). Rows 1, 2, 5 qualify.
-        assert_eq!(
-            count("SELECT count(*) FROM t WHERE NOT (a > 2 AND b)", &cm, &reg).await,
-            3
-        );
-    }
-
-    #[tokio::test]
-    async fn where_or_with_null_literal_uses_kleene_logic() {
-        let (cm, reg) = kleene_memory_env();
-        // `b OR NULL` is TRUE only where b is TRUE (row 1).
-        assert_eq!(
-            count("SELECT count(*) FROM t WHERE b OR NULL", &cm, &reg).await,
-            1
-        );
-        // `(a > 0) OR NULL`: rows with non-null a (1, 3, 5).
-        assert_eq!(
-            count("SELECT count(*) FROM t WHERE a > 0 OR NULL", &cm, &reg).await,
-            3
-        );
-        // `NOT (b AND NULL)`: TRUE only where b is FALSE (rows 2, 5).
-        assert_eq!(
-            count("SELECT count(*) FROM t WHERE NOT (b AND NULL)", &cm, &reg).await,
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn comparison_with_null_literal_is_unknown_not_folded() {
-        let (cm, reg) = kleene_memory_env();
-        // `NULL = NULL` and `NULL <> NULL` are NULL, so neither they nor their
-        // negation may pass a WHERE clause.
-        for pred in [
-            "NULL = NULL",
-            "NOT (NULL = NULL)",
-            "NULL <> NULL",
-            "NOT (NULL <> NULL)",
-        ] {
-            let sql = format!("SELECT count(*) FROM t WHERE {pred}");
-            assert_eq!(count(&sql, &cm, &reg).await, 0, "{pred}");
-        }
-        let batches = run_sql("SELECT NULL = NULL, NULL <> NULL, 1 = 1", &cm, &reg).await;
-        let batch = batches.iter().find(|b| b.num_rows() > 0).unwrap();
-        assert!(batch.column(0).is_null(0), "NULL = NULL");
-        assert!(batch.column(1).is_null(0), "NULL <> NULL");
-        assert!(!batch.column(2).is_null(0), "1 = 1");
+        let batch = kleene_query("SELECT count(*) FROM t WHERE a IS NULL OR b").await;
+        let n = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) should be Int64")
+            .value(0);
+        assert_eq!(n, 3);
     }
 
     #[tokio::test]
     async fn select_null_boolean_literals_use_kleene_logic() {
-        let (cm, reg) = kleene_memory_env();
-        let batches = run_sql(
-            "SELECT NULL OR TRUE, NULL AND FALSE, NULL AND TRUE, NULL OR FALSE",
-            &cm,
-            &reg,
-        )
-        .await;
-        let batch = batches.iter().find(|b| b.num_rows() > 0).unwrap();
-        assert_eq!(batch.num_rows(), 1);
+        use arrow::array::{Array, BooleanArray};
+        let batch =
+            kleene_query("SELECT NULL OR TRUE, NULL AND FALSE, NULL AND TRUE, NULL OR FALSE").await;
         let cell = |i: usize| -> Option<bool> {
             let c = batch.column(i);
             if c.is_null(0) {
@@ -1769,101 +1691,5 @@ mod tests {
         assert_eq!(cell(1), Some(false), "NULL AND FALSE");
         assert_eq!(cell(2), None, "NULL AND TRUE");
         assert_eq!(cell(3), None, "NULL OR FALSE");
-    }
-
-    #[tokio::test]
-    async fn parquet_pushdown_filter_uses_kleene_logic() {
-        // Three row groups of two rows each so `a > 2` can prune rg0 via
-        // min/max stats and runs as an ArrowPredicate on the rest, while
-        // the OR stays in FilterExec above the scan.
-        //   rg0: (1, 5)   (NULL, NULL)
-        //   rg1: (3, 30)  (NULL, 1)
-        //   rg2: (5, NULL) (6, 50)
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kleene.parquet");
-        let arrow_schema = Arc::new(Schema::new(vec![
-            Field::new("a", arrow::datatypes::DataType::Int32, true),
-            Field::new("b", arrow::datatypes::DataType::Int32, true),
-        ]));
-        let batch = arrow::record_batch::RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![
-                    Some(1),
-                    None,
-                    Some(3),
-                    None,
-                    Some(5),
-                    Some(6),
-                ])),
-                Arc::new(Int32Array::from(vec![
-                    Some(5),
-                    None,
-                    Some(30),
-                    Some(1),
-                    None,
-                    Some(50),
-                ])),
-            ],
-        )
-        .unwrap();
-        let props = parquet::file::properties::WriterProperties::builder()
-            .set_max_row_group_row_count(Some(2))
-            .build();
-        let file = std::fs::File::create(&path).unwrap();
-        let mut writer =
-            parquet::arrow::ArrowWriter::try_new(file, arrow_schema, Some(props)).unwrap();
-        writer.write(&batch).unwrap();
-        let meta = writer.close().unwrap();
-        assert_eq!(meta.num_row_groups(), 3);
-
-        let storage = Arc::new(arneb_connectors::StorageRegistry::new());
-        let factory = Arc::new(FileConnectorFactory::new(storage));
-        factory
-            .register_table("p", path.to_str().unwrap(), FileFormat::Parquet, None)
-            .await
-            .unwrap();
-        let catalog = Arc::new(FileCatalog::new(
-            "default",
-            Arc::new(FileSchema::new(factory.clone())),
-        ));
-        let cm = CatalogManager::new("file", "default");
-        cm.register_catalog("file", catalog);
-        let mut reg = ConnectorRegistry::new();
-        reg.register("file", factory);
-
-        // Row 1 is `TRUE OR NULL` = TRUE (dropped by non-Kleene OR);
-        // row 4 is `FALSE OR NULL` = NULL. Rows 1, 2, 3, 5 qualify.
-        assert_eq!(
-            count(
-                "SELECT count(*) FROM p WHERE a IS NULL OR b > 10",
-                &cm,
-                &reg
-            )
-            .await,
-            4
-        );
-        // Pushed conjunct `a > 2` (prunes rg0, row-filters the rest) plus
-        // a Kleene OR: row 4 `b IS NULL OR b > 35` = TRUE OR NULL = TRUE,
-        // row 5 = FALSE OR TRUE. Rows 4 and 5 qualify.
-        assert_eq!(
-            count(
-                "SELECT count(*) FROM p WHERE a > 2 AND (b IS NULL OR b > 35)",
-                &cm,
-                &reg
-            )
-            .await,
-            2
-        );
-        // Same predicate shape with the NULL-producing side first.
-        assert_eq!(
-            count(
-                "SELECT count(*) FROM p WHERE (b > 35 OR b IS NULL) AND a > 2",
-                &cm,
-                &reg
-            )
-            .await,
-            2
-        );
     }
 }

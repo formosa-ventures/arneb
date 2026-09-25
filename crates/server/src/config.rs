@@ -206,7 +206,8 @@ impl MemoryConfig {
 pub struct CatalogConfig {
     /// Catalog name (used in SQL: `SELECT * FROM <name>.schema.table`).
     pub name: String,
-    /// Catalog type (currently only "hive" is supported).
+    /// Catalog type: `"hive"` (Hive tables) or `"iceberg"` (Iceberg tables
+    /// tracked by the same kind of Hive Metastore).
     #[serde(rename = "type")]
     pub catalog_type: String,
     /// Hive Metastore URI (e.g., "thrift://hms.internal:9083").

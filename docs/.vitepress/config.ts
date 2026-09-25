@@ -44,7 +44,8 @@ export default defineConfig({
             { text: 'Overview', link: '/connectors/overview' },
             { text: 'File Connector', link: '/connectors/file' },
             { text: 'Object Store', link: '/connectors/object-store' },
-            { text: 'Hive', link: '/connectors/hive' }
+            { text: 'Hive', link: '/connectors/hive' },
+            { text: 'Iceberg', link: '/connectors/iceberg' }
           ]
         }
       ],

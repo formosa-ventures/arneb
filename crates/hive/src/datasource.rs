@@ -322,7 +322,8 @@ async fn read_one_file_split(
 
 /// Build a `RowSelection` that picks rows `[split_idx*chunk, (split_idx+1)*chunk)`
 /// out of `total_rows` (clamped). `chunk = ceil(total_rows / splits)`.
-fn compute_split_selection(
+/// Shared with the Iceberg connector's intra-file splits.
+pub fn compute_split_selection(
     total_rows: usize,
     split_idx: usize,
     splits: usize,
@@ -479,7 +480,8 @@ async fn list_parquet_files(
 }
 
 /// Build a RowSelector list from selected row group indices.
-fn build_row_selection(
+/// Shared with the Iceberg connector's row-group pruning.
+pub fn build_row_selection(
     row_groups: &[parquet::file::metadata::RowGroupMetaData],
     selected: &[usize],
 ) -> Vec<parquet::arrow::arrow_reader::RowSelector> {
@@ -568,6 +570,20 @@ impl ConnectorFactory for HiveConnectorFactory {
         schema: &[ColumnInfo],
         properties: &std::collections::HashMap<String, String>,
     ) -> Result<Arc<dyn DataSource>, ConnectorError> {
+        // Iceberg tables share HMS with plain Hive tables, but listing their
+        // location would read orphaned / deleted / metadata files. Refuse
+        // rather than silently return wrong results.
+        if properties
+            .get(crate::catalog::TABLE_TYPE_PARAM)
+            .is_some_and(|t| t.eq_ignore_ascii_case("ICEBERG"))
+        {
+            return Err(ConnectorError::UnsupportedOperation(format!(
+                "table '{table}' is an Iceberg table; the Hive connector cannot read it. \
+                 Query it through a catalog with type = \"iceberg\" pointing at the same \
+                 metastore"
+            )));
+        }
+
         // Auto-register location from properties if present and not already registered.
         // Pre-registered entries (e.g., manual overrides in tests) take precedence.
         if let Some(location) = properties.get("location") {
@@ -930,6 +946,20 @@ mod tests {
             total_rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
         }
         assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn factory_rejects_iceberg_tables() {
+        let registry = Arc::new(StorageRegistry::new());
+        let factory = HiveConnectorFactory::new(registry);
+        let mut props = std::collections::HashMap::new();
+        props.insert("location".to_string(), "/tmp/ice".to_string());
+        props.insert("table_type".to_string(), "ICEBERG".to_string());
+        let err = factory
+            .create_data_source(&TableReference::table("ice"), &[], &props)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Iceberg table"), "{err}");
     }
 
     #[tokio::test]

@@ -120,7 +120,7 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 - **SQL Support**: SELECT, JOIN (INNER/LEFT/RIGHT/FULL/CROSS), GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, CASE/COALESCE/NULLIF, CTEs, UNION/INTERSECT/EXCEPT, window functions, subqueries (IN/EXISTS/scalar), DDL/DML (CREATE/DROP TABLE, INSERT, DELETE, views)
 - **19 Scalar Functions**: UPPER, LOWER, SUBSTRING, TRIM, CONCAT, LENGTH, REPLACE, POSITION, ABS, ROUND, CEIL, FLOOR, MOD, POWER, EXTRACT, CURRENT_DATE, DATE_TRUNC
 - **Arrow-native Execution**: Vectorized columnar processing using Apache Arrow
-- **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API)
+- **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API), Apache Iceberg tables via HMS (read-only; field-ID schema evolution, manifest-based file pruning)
 - **PostgreSQL Wire Protocol**: Compatible with psql, DBeaver, JDBC, psycopg2, node-postgres, and all standard PostgreSQL clients
 - **Extended Query Protocol**: Full prepared statement support (Parse/Bind/Describe/Execute/Sync)
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
@@ -226,6 +226,7 @@ crates/
 ├── execution/     # Physical operators, scalar functions, DataSource trait
 ├── connectors/    # Memory + File connectors, object store abstraction (S3/GCS/Azure)
 ├── hive/          # Hive Metastore catalog provider + HiveDataSource
+├── iceberg/       # Iceberg (HMS-backed) catalog + scan planning over manifests
 ├── hive-metastore/# Auto-generated Thrift bindings from Hive 4.2.0 IDL
 ├── protocol/      # PostgreSQL wire protocol (Simple + Extended Query)
 ├── scheduler/     # QueryTracker, NodeRegistry, resource groups
@@ -253,6 +254,10 @@ psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.nation;"
 # 5. Tear down
 docker compose down
 ```
+
+Iceberg tables in the same metastore are served by a `type = "iceberg"`
+catalog (`docker compose run --rm iceberg-seed` creates sample tables via
+Trino). See [docs/connectors/iceberg.md](docs/connectors/iceberg.md).
 
 ## Benchmark methodology
 

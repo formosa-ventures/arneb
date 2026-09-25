@@ -1,0 +1,33 @@
+[package]
+name = "arneb-iceberg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arneb-common = { path = "../common" }
+arneb-catalog = { path = "../catalog" }
+arneb-connectors = { path = "../connectors" }
+arneb-execution = { path = "../execution" }
+arneb-planner = { path = "../planner" }
+arneb-sql-parser = { path = "../sql-parser" }
+arneb-hive = { path = "../hive" }
+arrow.workspace = true
+parquet.workspace = true
+object_store.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+# Avro object-container reader for Iceberg manifest lists / manifests.
+# Deflate (Iceberg's default manifest codec) is built in; snappy and
+# zstandard cover the other codecs writers commonly pick.
+apache-avro = { version = "0.22", default-features = false, features = ["snappy", "zstandard"] }
+# gzip-compressed `*.gz.metadata.json` table metadata.
+flate2 = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

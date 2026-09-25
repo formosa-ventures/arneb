@@ -120,7 +120,7 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 - **SQL Support**: SELECT, JOIN (INNER/LEFT/RIGHT/FULL/CROSS), GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, CASE/COALESCE/NULLIF, CTEs, UNION/INTERSECT/EXCEPT, window functions, subqueries (IN/EXISTS/scalar), DDL/DML (CREATE/DROP TABLE, INSERT, DELETE, views)
 - **90 Trino-compatible Scalar Functions**: conditional (IF, TRY, GREATEST, LEAST), string (SPLIT_PART, STRPOS, LPAD/RPAD, CONCAT_WS, `||`, ...), regex (REGEXP_LIKE/EXTRACT/REPLACE/COUNT), math (SQRT, LN, LOG, TRUNCATE, RANDOM, trig, ...), date/time (DATE_ADD, DATE_DIFF, DATE_TRUNC, DATE_FORMAT, DATE_PARSE, FORMAT_DATETIME, YEAR/MONTH/DAY_OF_WEEK/..., FROM_UNIXTIME, NOW) — see [docs/sql/functions.md](docs/sql/functions.md)
 - **Arrow-native Execution**: Vectorized columnar processing using Apache Arrow
-- **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API)
+- **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API), Apache Iceberg tables via HMS (read-only; field-ID schema evolution, manifest-based file pruning)
 - **PostgreSQL Wire Protocol**: Compatible with psql, DBeaver, JDBC, psycopg2, node-postgres, and all standard PostgreSQL clients
 - **Extended Query Protocol**: Full prepared statement support (Parse/Bind/Describe/Execute/Sync)
 - **Trino Client Protocol**: Trino's REST protocol on port 8080, so the `trino` CLI, Trino JDBC, `trino-python-client` (Superset), Metabase's Trino driver and dbt-trino can connect unchanged — see [Trino client compatibility](docs/guide/trino-clients.md)
@@ -247,6 +247,7 @@ crates/
 ├── execution/     # Physical operators, scalar functions, DataSource trait
 ├── connectors/    # Memory + File connectors, object store abstraction (S3/GCS/Azure)
 ├── hive/          # Hive Metastore catalog provider + HiveDataSource
+├── iceberg/       # Iceberg (HMS-backed) catalog + scan planning over manifests
 ├── hive-metastore/# Auto-generated Thrift bindings from Hive 4.2.0 IDL
 ├── protocol/      # PostgreSQL wire protocol (Simple + Extended Query), Trino client REST protocol
 ├── scheduler/     # QueryTracker, NodeRegistry, resource groups
@@ -274,6 +275,10 @@ psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.nation;"
 # 5. Tear down
 docker compose down
 ```
+
+Iceberg tables in the same metastore are served by a `type = "iceberg"`
+catalog (`docker compose run --rm iceberg-seed` creates sample tables via
+Trino). See [docs/connectors/iceberg.md](docs/connectors/iceberg.md).
 
 ## Benchmark methodology
 

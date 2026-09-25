@@ -23,6 +23,10 @@ use arneb_common::types::{ColumnInfo, DataType};
 
 use crate::hive_type_to_arrow;
 
+/// HMS table parameter naming the table format (`ICEBERG` for Iceberg
+/// tables); also forwarded as a table property.
+pub const TABLE_TYPE_PARAM: &str = "table_type";
+
 // ---------------------------------------------------------------------------
 // HiveTableMeta
 // ---------------------------------------------------------------------------
@@ -52,6 +56,9 @@ pub struct HiveTableMeta {
     /// and biases reorder toward small-leaf-as-outer (see
     /// `memory/project_joinreorder_disabled.md` Step PR notes).
     pub column_stats: HashMap<String, ColumnStatistics>,
+    /// Raw HMS table parameters (e.g. `table_type=ICEBERG`,
+    /// `metadata_location=...` for Iceberg tables).
+    pub parameters: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +187,13 @@ impl HmsClient {
         let columns = convert_field_schemas(&hms_cols, db, table)?;
 
         let (row_count, size_bytes) = extract_table_stats(parameters.as_ref());
+        let parameters: HashMap<String, String> = parameters
+            .map(|p| {
+                p.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // NOTE: HMS column NDV stats are intentionally NOT fetched in
         // production yet. The infrastructure exists
@@ -201,6 +215,7 @@ impl HmsClient {
             row_count,
             size_bytes,
             column_stats,
+            parameters,
         })
     }
 
@@ -435,6 +450,7 @@ impl SchemaProvider for HiveSchemaProvider {
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         match self.client.get_table(&self.database, name).await {
             Ok(meta) => Some(Arc::new(HiveTableProvider {
+                table_type: meta.parameters.get(TABLE_TYPE_PARAM).cloned(),
                 columns: meta.columns,
                 location: meta.location,
                 input_format: meta.input_format,
@@ -472,6 +488,10 @@ pub struct HiveTableProvider {
     pub size_bytes: Option<u64>,
     /// Per-column NDV / null-fraction stats from HMS `ANALYZE TABLE`.
     pub column_stats: HashMap<String, ColumnStatistics>,
+    /// HMS `table_type` parameter (e.g. `ICEBERG`), when set. Tables whose
+    /// format the Hive connector cannot read correctly are rejected at
+    /// scan time based on this value.
+    pub table_type: Option<String>,
 }
 
 impl HiveTableProvider {
@@ -484,6 +504,7 @@ impl HiveTableProvider {
             row_count: None,
             size_bytes: None,
             column_stats: HashMap::new(),
+            table_type: None,
         }
     }
 
@@ -502,6 +523,7 @@ impl HiveTableProvider {
             row_count,
             size_bytes,
             column_stats: HashMap::new(),
+            table_type: None,
         }
     }
 
@@ -530,6 +552,9 @@ impl TableProvider for HiveTableProvider {
         let mut props = std::collections::HashMap::new();
         props.insert("location".to_string(), self.location.clone());
         props.insert("input_format".to_string(), self.input_format.clone());
+        if let Some(t) = &self.table_type {
+            props.insert(TABLE_TYPE_PARAM.to_string(), t.clone());
+        }
         props
     }
 
@@ -575,6 +600,7 @@ mod tests {
             row_count: None,
             size_bytes: None,
             column_stats: HashMap::new(),
+            parameters: HashMap::new(),
         };
 
         assert_eq!(meta.columns.len(), 2);

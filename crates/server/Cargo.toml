@@ -29,6 +29,7 @@ arneb-scheduler = { path = "../scheduler" }
 arneb-rpc = { path = "../rpc" }
 arneb-sql-parser = { path = "../sql-parser" }
 arneb-hive = { path = "../hive" }
+arneb-iceberg = { path = "../iceberg" }
 arrow = { workspace = true }
 async-trait.workspace = true
 async-recursion = { workspace = true }

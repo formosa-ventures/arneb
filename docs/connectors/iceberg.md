@@ -1,4 +1,4 @@
-# Iceberg Connector
+# Iceberg Tables
 
 Arneb reads [Apache Iceberg](https://iceberg.apache.org/) tables that are
 tracked by a Hive Metastore (HMS). This is the setup Trino calls
@@ -6,14 +6,19 @@ tracked by a Hive Metastore (HMS). This is the setup Trino calls
 with a `hive` Iceberg catalog. If Trino, Spark, or Flink already write your
 Iceberg tables through HMS, Arneb can query them in place.
 
-The connector is **read-only** and reads the table's **current snapshot**.
+Reads are **read-only** and use the table's **current snapshot**.
 
 ## Configuration
 
+There's nothing Iceberg-specific to configure. A [Hive](/connectors/hive)
+catalog serves both kinds of table from its metastore: when HMS marks a table
+with `table_type=ICEBERG`, Arneb redirects it to the Iceberg reader, the way
+Trino's table redirection does.
+
 ```toml
 [[catalogs]]
-name = "lake"
-type = "iceberg"
+name = "datalake"
+type = "hive"
 metastore_uri = "127.0.0.1:9083"   # host:port, no scheme
 default_schema = "default"
 
@@ -23,54 +28,13 @@ endpoint = "http://localhost:9000"
 allow_http = true
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `name` | string | yes | Catalog name used in 3-part table references (`catalog.schema.table`) |
-| `type` | string | yes | Must be `"iceberg"` |
-| `metastore_uri` | string | yes | `host:port` of the Hive Metastore Thrift service (no scheme) |
-| `default_schema` | string | no | Default schema when a query doesn't name one |
-| `storage` | table | no | Per-catalog object store settings. They merge with the global `[storage]` settings, as they do for [Hive](/connectors/hive) |
-
-A Hive catalog and an Iceberg catalog can point at the same metastore. That's
-the usual setup when a lake holds both kinds of table:
-
-```toml
-[[catalogs]]
-name = "hive"
-type = "hive"
-metastore_uri = "hms:9083"
-
-[[catalogs]]
-name = "iceberg"
-type = "iceberg"
-metastore_uri = "hms:9083"
+```sql
+SELECT count(*) FROM datalake.tpch.lineitem;   -- plain Hive table
+SELECT count(*) FROM datalake.ice.orders;      -- Iceberg table, same catalog
 ```
 
-Each catalog reads only its own kind of table. If you query an Iceberg table
-through a `hive` catalog, or a Hive table through an `iceberg` catalog, the
-query fails with a message that names the right catalog type. It never
-returns rows from the wrong format. Trino behaves the same way when table
-redirection is off.
-
-## How a Query Reads an Iceberg Table
-
-1. **Resolve** – HMS returns the table's parameters: `table_type=ICEBERG` and
-   `metadata_location=<uri>`. Arneb reads that metadata JSON (format v1 or
-   v2, gzip or plain) and exposes the table's **current schema**. Arneb
-   ignores the HMS storage-descriptor columns because they can be stale.
-2. **Pin a snapshot** – the current snapshot ID is fixed when the query is
-   planned. It travels with the plan, so the coordinator and every worker
-   read the same snapshot, even if a writer commits while the query runs.
-3. **Plan files** – Arneb reads the snapshot's manifest list and manifests
-   (Avro) to get the live data files. Deleted (tombstoned) entries are
-   skipped. Manifests are fetched in parallel.
-4. **Prune files** – before opening a data file, Arneb checks the file's
-   manifest column bounds (and its identity-partition values) against the
-   pushed-down filters. If no row in the file can match, Arneb skips the
-   file without making a single storage request.
-5. **Scan** – each file goes through Arneb's Parquet reader. It gets
-   row-group pruning, row-level predicate pushdown, projection pushdown, and
-   intra-file splits for parallelism.
+The catalog's storage settings are used for the metadata, manifest, and data
+files.
 
 ## Schema Evolution
 
@@ -108,21 +72,19 @@ property isn't set, it matches columns by their current names.
 
 | Feature | Status |
 |---------|--------|
-| HMS-backed Iceberg catalog | ✅ |
+| Iceberg tables in a Hive Metastore (via a `hive` catalog) | ✅ |
 | Format v1 and v2 metadata | ✅ |
-| Current-snapshot reads, pinned per query | ✅ |
+| Current-snapshot reads, pinned per query (consistent across workers) | ✅ |
 | Parquet data files | ✅ |
 | Schema evolution resolved by field ID | ✅ |
-| File pruning from manifest column bounds | ✅ |
-| File pruning from identity-partition values | ✅ |
-| Row-group pruning and predicate pushdown inside files | ✅ (shared with the Hive/File connectors) |
+| Row-group pruning and predicate pushdown inside files | ✅ (same Parquet scan as Hive tables) |
 | Table statistics for the planner (`total-records`, `total-files-size`) | ✅ |
+| File pruning from manifest column bounds / partition values | ❌ Planned follow-up |
 | **Row-level deletes** (position or equality delete files) | ❌ The query fails with an error (see below) |
 | ORC and Avro data files | ❌ The query fails with an error |
 | Writes (`INSERT`, `CTAS`, `DELETE`, `MERGE`) | ❌ Read-only |
 | Time travel (`FOR VERSION AS OF` / `FOR TIMESTAMP AS OF`) | ❌ Planned follow-up |
 | REST, Glue, Nessie, and JDBC catalogs | ❌ Planned follow-up |
-| Partition pruning through non-identity transforms (`bucket`, `truncate`) | ⚠️ Not used directly. Column bounds already prune most `day`/`month`/`year`-partitioned files |
 
 ### Row-level deletes
 
@@ -132,7 +94,7 @@ files alone, the result would include rows that were already deleted.
 Instead, when the pinned snapshot has any live delete file, the query fails:
 
 ```
-ERROR: unsupported operation: Iceberg table lake.ice.orders_deletes has position
+ERROR: unsupported operation: Iceberg table datalake.ice.orders_deletes has position
 delete files in snapshot 4518039616381... (row-level deletes / merge-on-read ...);
 reading tables with delete files is not supported yet. Compact the table
 (e.g. Trino `ALTER TABLE ... EXECUTE optimize`) or rewrite it with
@@ -147,57 +109,23 @@ delete-file removal, makes the table readable again.
 
 The Docker Compose stack includes an Iceberg catalog for Trino
 (`docker/trino/catalog/iceberg.properties`) that shares the same HMS and
-MinIO. A seed service creates sample Iceberg tables, including partitioned,
-schema-evolved, and delete-file cases:
+MinIO. A seed service uses it to create sample Iceberg tables in the `ice`
+schema, including partitioned, schema-evolved, and delete-file cases:
 
 ```bash
 docker compose up -d
 docker compose run --rm iceberg-seed            # TPCH_SF=sf1 for 1.5M-row orders
+cargo run --bin arneb -- --config benchmarks/tpch/tpch-hive.toml
+psql -h 127.0.0.1 -p 5432 -c "SELECT o_orderpriority, count(*) FROM datalake.ice.orders GROUP BY 1 ORDER BY 1"
+psql -h 127.0.0.1 -p 5432 -c "SELECT * FROM datalake.ice.nation_evolved ORDER BY n_nationkey"
 ```
-
-Then point Arneb at the metastore:
-
-```toml
-# ice.toml
-port = 5432
-
-[storage.s3]
-region = "us-east-1"
-endpoint = "http://localhost:9000"
-allow_http = true
-access_key_id = "minioadmin"
-secret_access_key = "minioadmin"
-
-[[catalogs]]
-name = "lake"
-type = "iceberg"
-metastore_uri = "127.0.0.1:9083"
-default_schema = "ice"
-```
-
-```bash
-cargo run --bin arneb -- --config ice.toml
-psql -h 127.0.0.1 -p 5432 -c "SELECT o_orderpriority, count(*) FROM lake.ice.orders GROUP BY 1 ORDER BY 1"
-psql -h 127.0.0.1 -p 5432 -c "SELECT * FROM lake.ice.nation_evolved ORDER BY n_nationkey"
-```
-
-The seeded tables:
 
 | Table | Shape |
 |-------|-------|
 | `ice.nation` | Plain CTAS |
 | `ice.orders` | Identity-partitioned on `o_orderpriority` |
-| `ice.orders_month` | Partitioned by `month(o_orderdate)` |
 | `ice.nation_evolved` | Promoted `int`→`bigint`, a renamed column, an added column, and several snapshots |
 | `ice.orders_deletes` | Has position delete files. Arneb rejects it until it's compacted |
 
-## Implementation Notes
-
-- The code lives in the `arneb-iceberg` crate (`crates/iceberg`). It reuses
-  the Hive connector's `HmsClient` and Parquet split helpers.
-- Arneb doesn't use the `iceberg` crate (apache/iceberg-rust). The latest
-  release pins arrow/parquet 58, while Arneb is on 59, and it uses OpenDAL
-  instead of `object_store`. Depending on it would put two copies of Arrow
-  in the dependency tree and bypass Arneb's tuned Parquet scan.
-  `openspec/changes/iceberg-connector/design.md` explains the decision in
-  full.
+Design notes (why a native reader instead of `iceberg-rust`, scan planning,
+field-ID resolution) are in `openspec/changes/iceberg-connector/design.md`.

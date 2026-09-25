@@ -153,8 +153,9 @@ services:
     profiles:
       - tpch-seed
 
-  # Iceberg tables (HMS-backed, Trino `iceberg` catalog) for exercising
-  # Arneb's `type = "iceberg"` catalog. See docker/iceberg-seed/seed.sh.
+  # Iceberg tables (HMS-backed, written by Trino's `iceberg` catalog) for
+  # exercising Arneb's Iceberg reader through a `hive` catalog. See
+  # docker/iceberg-seed/seed.sh.
   iceberg-seed:
     image: trinodb/trino:latest
     volumes:

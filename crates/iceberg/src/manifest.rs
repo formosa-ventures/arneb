@@ -5,8 +5,6 @@
 //! keeps the reader tolerant of v1 vs v2 layout differences and of
 //! optional fields that some writers omit.
 
-use std::collections::HashMap;
-
 use apache_avro::types::Value;
 use apache_avro::Reader;
 
@@ -26,8 +24,6 @@ pub enum ManifestContent {
 pub struct ManifestFile {
     /// Location of the manifest file.
     pub manifest_path: String,
-    /// Partition spec the manifest's files were written with.
-    pub partition_spec_id: i32,
     /// Data or deletes.
     pub content: ManifestContent,
     /// Number of `ADDED` entries, when recorded.
@@ -78,17 +74,6 @@ pub struct DataFile {
     pub file_path: String,
     /// File format (`PARQUET`, `ORC`, `AVRO`), upper-cased.
     pub file_format: String,
-    /// Row count.
-    pub record_count: i64,
-    /// File size in bytes.
-    pub file_size_in_bytes: i64,
-    /// Partition tuple, keyed by partition field name. `None` values are
-    /// null partition values.
-    pub partition: HashMap<String, Option<Value>>,
-    /// Per-column lower bounds (field ID → single-value serialization).
-    pub lower_bounds: HashMap<i32, Vec<u8>>,
-    /// Per-column upper bounds (field ID → single-value serialization).
-    pub upper_bounds: HashMap<i32, Vec<u8>>,
 }
 
 /// One manifest entry.
@@ -162,8 +147,6 @@ pub fn read_manifest_list(bytes: &[u8]) -> Result<Vec<ManifestFile>, ConnectorEr
             let manifest_path = field(&r, "manifest_path")
                 .and_then(as_string)
                 .ok_or_else(|| bad(WHAT, "entry missing manifest_path"))?;
-            let partition_spec_id =
-                field(&r, "partition_spec_id").and_then(as_i64).unwrap_or(0) as i32;
             // v1 manifest lists have no `content` column: always data.
             let content = match field(&r, "content").and_then(as_i64) {
                 None | Some(0) => ManifestContent::Data,
@@ -179,41 +162,12 @@ pub fn read_manifest_list(bytes: &[u8]) -> Result<Vec<ManifestFile>, ConnectorEr
                 .and_then(as_i64);
             Ok(ManifestFile {
                 manifest_path,
-                partition_spec_id,
                 content,
                 added_files_count,
                 existing_files_count,
             })
         })
         .collect()
-}
-
-/// Decode Iceberg's `map<int, binary>` column encoding (an Avro array of
-/// `{key, value}` records; also accepts a native Avro map).
-fn read_bounds(v: Option<&Value>) -> HashMap<i32, Vec<u8>> {
-    let mut out = HashMap::new();
-    match v {
-        Some(Value::Array(items)) => {
-            for item in items {
-                if let Value::Record(kv) = unwrap_union(item) {
-                    let key = field(kv, "key").and_then(as_i64);
-                    let value = field(kv, "value");
-                    if let (Some(k), Some(Value::Bytes(b))) = (key, value) {
-                        out.insert(k as i32, b.clone());
-                    }
-                }
-            }
-        }
-        Some(Value::Map(m)) => {
-            for (k, v) in m {
-                if let (Ok(k), Value::Bytes(b)) = (k.parse::<i32>(), unwrap_union(v)) {
-                    out.insert(k, b.clone());
-                }
-            }
-        }
-        _ => {}
-    }
-    out
 }
 
 /// Decode a manifest file (Avro object container file).
@@ -244,32 +198,12 @@ pub fn read_manifest(bytes: &[u8]) -> Result<Vec<ManifestEntry>, ConnectorError>
                 .and_then(as_string)
                 .unwrap_or_else(|| "PARQUET".to_string())
                 .to_ascii_uppercase();
-            let record_count = field(df, "record_count").and_then(as_i64).unwrap_or(-1);
-            let file_size_in_bytes = field(df, "file_size_in_bytes")
-                .and_then(as_i64)
-                .unwrap_or(-1);
-            let partition = match field(df, "partition") {
-                Some(Value::Record(p)) => p
-                    .iter()
-                    .map(|(k, v)| {
-                        let v = unwrap_union(v);
-                        let v = (!matches!(v, Value::Null)).then(|| v.clone());
-                        (k.clone(), v)
-                    })
-                    .collect(),
-                _ => HashMap::new(),
-            };
             Ok(ManifestEntry {
                 status,
                 data_file: DataFile {
                     content,
                     file_path,
                     file_format,
-                    record_count,
-                    file_size_in_bytes,
-                    partition,
-                    lower_bounds: read_bounds(field(df, "lower_bounds")),
-                    upper_bounds: read_bounds(field(df, "upper_bounds")),
                 },
             })
         })
@@ -301,8 +235,7 @@ pub(crate) mod fixtures {
         {"name": "deleted_files_count", "type": "int", "field-id": 506}
       ]}"#;
 
-    /// v2 manifest entry schema with an identity partition on
-    /// `n_regionkey` (a `long`).
+    /// v2 manifest entry schema (trimmed to the fields the reader uses).
     pub const MANIFEST_SCHEMA: &str = r#"{
       "type": "record", "name": "manifest_entry", "fields": [
         {"name": "status", "type": "int", "field-id": 0},
@@ -312,24 +245,7 @@ pub(crate) mod fixtures {
             {"name": "content", "type": "int", "field-id": 134},
             {"name": "file_path", "type": "string", "field-id": 100},
             {"name": "file_format", "type": "string", "field-id": 101},
-            {"name": "partition", "field-id": 102, "type": {
-              "type": "record", "name": "r102", "fields": [
-                {"name": "n_regionkey", "type": ["null", "long"], "default": null, "field-id": 1000}
-              ]}},
-            {"name": "record_count", "type": "long", "field-id": 103},
-            {"name": "file_size_in_bytes", "type": "long", "field-id": 104},
-            {"name": "lower_bounds", "default": null, "field-id": 125, "type": ["null", {
-              "type": "array", "logicalType": "map", "items": {
-                "type": "record", "name": "k126_v127", "fields": [
-                  {"name": "key", "type": "int", "field-id": 126},
-                  {"name": "value", "type": "bytes", "field-id": 127}
-                ]}}]},
-            {"name": "upper_bounds", "default": null, "field-id": 128, "type": ["null", {
-              "type": "array", "logicalType": "map", "items": {
-                "type": "record", "name": "k129_v130", "fields": [
-                  {"name": "key", "type": "int", "field-id": 129},
-                  {"name": "value", "type": "bytes", "field-id": 130}
-                ]}}]}
+            {"name": "record_count", "type": "long", "field-id": 103}
           ]}}
       ]}"#;
 
@@ -349,23 +265,6 @@ pub(crate) mod fixtures {
         ])
     }
 
-    /// Bounds as the Avro `array<{key,value}>` encoding.
-    fn bounds(b: &[(i32, Vec<u8>)]) -> Value {
-        Value::Union(
-            1,
-            Box::new(Value::Array(
-                b.iter()
-                    .map(|(k, v)| {
-                        Value::Record(vec![
-                            ("key".into(), Value::Int(*k)),
-                            ("value".into(), Value::Bytes(v.clone())),
-                        ])
-                    })
-                    .collect(),
-            )),
-        )
-    }
-
     /// Description of one manifest entry for [`manifest_bytes`].
     pub struct Entry<'a> {
         /// 0 existing, 1 added, 2 deleted.
@@ -374,22 +273,10 @@ pub(crate) mod fixtures {
         pub content: i32,
         /// File URI.
         pub path: &'a str,
-        /// Identity partition value for `n_regionkey`.
-        pub region: Option<i64>,
-        /// Row count.
-        pub rows: i64,
-        /// Lower bounds.
-        pub lower: Vec<(i32, Vec<u8>)>,
-        /// Upper bounds.
-        pub upper: Vec<(i32, Vec<u8>)>,
     }
 
     /// A manifest-entry row.
     pub fn manifest_row(e: &Entry<'_>) -> Value {
-        let region = match e.region {
-            Some(r) => Value::Union(1, Box::new(Value::Long(r))),
-            None => Value::Union(0, Box::new(Value::Null)),
-        };
         Value::Record(vec![
             ("status".into(), Value::Int(e.status)),
             (
@@ -402,14 +289,7 @@ pub(crate) mod fixtures {
                     ("content".into(), Value::Int(e.content)),
                     ("file_path".into(), Value::String(e.path.into())),
                     ("file_format".into(), Value::String("PARQUET".into())),
-                    (
-                        "partition".into(),
-                        Value::Record(vec![("n_regionkey".into(), region)]),
-                    ),
-                    ("record_count".into(), Value::Long(e.rows)),
-                    ("file_size_in_bytes".into(), Value::Long(1024)),
-                    ("lower_bounds".into(), bounds(&e.lower)),
-                    ("upper_bounds".into(), bounds(&e.upper)),
+                    ("record_count".into(), Value::Long(1)),
                 ]),
             ),
         ])
@@ -493,25 +373,17 @@ mod tests {
     }
 
     #[test]
-    fn decode_manifest_entries_with_bounds_and_partition() {
+    fn decode_manifest_entries() {
         let bytes = manifest_bytes(&[
             Entry {
                 status: 1,
                 content: 0,
                 path: "s3://b/t/data/a.parquet",
-                region: Some(3),
-                rows: 5,
-                lower: vec![(1, 10i64.to_le_bytes().to_vec())],
-                upper: vec![(1, 20i64.to_le_bytes().to_vec())],
             },
             Entry {
                 status: 2,
-                content: 0,
+                content: 1,
                 path: "s3://b/t/data/old.parquet",
-                region: None,
-                rows: 7,
-                lower: vec![],
-                upper: vec![],
             },
         ]);
         let entries = read_manifest(&bytes).unwrap();
@@ -521,17 +393,10 @@ mod tests {
         assert_eq!(e.data_file.content, DataFileContent::Data);
         assert_eq!(e.data_file.file_path, "s3://b/t/data/a.parquet");
         assert_eq!(e.data_file.file_format, "PARQUET");
-        assert_eq!(e.data_file.record_count, 5);
-        assert_eq!(
-            e.data_file.partition.get("n_regionkey"),
-            Some(&Some(Value::Long(3)))
-        );
-        assert_eq!(e.data_file.lower_bounds[&1], 10i64.to_le_bytes().to_vec());
-        assert_eq!(e.data_file.upper_bounds[&1], 20i64.to_le_bytes().to_vec());
         assert_eq!(entries[1].status, EntryStatus::Deleted);
         assert_eq!(
-            entries[1].data_file.partition.get("n_regionkey"),
-            Some(&None)
+            entries[1].data_file.content,
+            DataFileContent::PositionDeletes
         );
     }
 

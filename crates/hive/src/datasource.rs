@@ -9,20 +9,18 @@
 //! at that location.
 
 use std::fmt;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
-use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::ObjectStore;
 use tracing::debug;
 
-use arneb_common::error::{ArnebError, ConnectorError, ExecutionError};
-use arneb_common::stream::{stream_from_batches, RecordBatchStream, SendableRecordBatchStream};
+use arneb_common::error::{ConnectorError, ExecutionError};
+use arneb_common::stream::{stream_from_batches, SendableRecordBatchStream};
 use arneb_common::types::{ColumnInfo, TableReference};
+use arneb_connectors::parquet_scan::{self, ParquetBatchStream};
 use arneb_connectors::storage::{StorageRegistry, StorageUri};
 use arneb_connectors::ConnectorFactory;
 use arneb_execution::{DataSource, ScanContext};
@@ -66,20 +64,7 @@ impl HiveDataSource {
         column_schema: Vec<ColumnInfo>,
         file_paths: Vec<ObjectPath>,
     ) -> Self {
-        // Pick a `splits_per_file` so the resulting partition count
-        // saturates available CPU cores. For a 4-file table on a
-        // 14-core machine that's `ceil(14/4) = 4` splits per file →
-        // 16 scan partitions. For a 16-file table we already have
-        // enough — keep splits_per_file=1.
-        let n_files = file_paths.len().max(1);
-        let target = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8);
-        let splits_per_file = if n_files >= target {
-            1
-        } else {
-            target.div_ceil(n_files)
-        };
+        let splits_per_file = parquet_scan::splits_per_file(file_paths.len());
         Self {
             store,
             column_schema,
@@ -142,28 +127,23 @@ impl DataSource for HiveDataSource {
             return Ok(stream_from_batches(output_schema, vec![]));
         }
 
-        let total_partitions = self.file_paths.len() * self.splits_per_file;
-        if partition >= total_partitions {
-            return Err(ExecutionError::InvalidOperation(format!(
-                "HiveDataSource: partition {partition} out of range (have {total_partitions} \
-                 partitions = {} files × {} splits)",
-                self.file_paths.len(),
-                self.splits_per_file
-            )));
-        }
-
-        let file_idx = partition / self.splits_per_file;
-        let split_idx = partition % self.splits_per_file;
+        let (file_idx, split_idx) = parquet_scan::split_index(
+            "HiveDataSource",
+            partition,
+            self.file_paths.len(),
+            self.splits_per_file,
+        )?;
         let file_path = &self.file_paths[file_idx];
-        let stream = read_one_file_split(
-            &self.store,
+        let builder = parquet_scan::open_parquet_builder(&self.store, file_path).await?;
+        let stream = parquet_scan::build_split_stream(
+            builder,
             file_path,
-            ctx,
-            &self.column_schema,
+            &ctx.filters,
+            ctx.projection.as_deref(),
+            ctx.batch_size,
             split_idx,
             self.splits_per_file,
-        )
-        .await?;
+        )?;
 
         // True pipelined streaming: yield Parquet batches as they're
         // produced instead of collecting the whole partition's output
@@ -173,281 +153,12 @@ impl DataSource for HiveDataSource {
         // first row — for a 6M-row lineitem scan with 7 projected
         // columns that's ~336 MB per query, which dominated the
         // single-table-aggregate work-memory delta vs Trino.
-        Ok(Box::pin(ParquetBatchStream {
-            schema: output_schema,
-            inner: Box::pin(stream),
-            file_path: file_path.to_string(),
-        }))
+        Ok(Box::pin(ParquetBatchStream::new(
+            output_schema,
+            stream,
+            file_path.to_string(),
+        )))
     }
-}
-
-/// Adapts a [`ParquetRecordBatchStream`] into a
-/// [`SendableRecordBatchStream`] without materialising the partition's
-/// batches up front. Errors are converted to [`ExecutionError::InvalidOperation`]
-/// with file-path context.
-struct ParquetBatchStream {
-    schema: arrow::datatypes::SchemaRef,
-    inner: Pin<
-        Box<
-            parquet::arrow::async_reader::ParquetRecordBatchStream<
-                parquet::arrow::async_reader::ParquetObjectReader,
-            >,
-        >,
-    >,
-    file_path: String,
-}
-
-impl Stream for ParquetBatchStream {
-    type Item = Result<RecordBatch, ArnebError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(Ok(b))),
-            Poll::Ready(Some(Err(e))) => {
-                let msg = format!("Parquet read error for '{}': {e}", self.file_path);
-                Poll::Ready(Some(Err(ExecutionError::InvalidOperation(msg).into())))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl RecordBatchStream for ParquetBatchStream {
-    fn schema(&self) -> arrow::datatypes::SchemaRef {
-        self.schema.clone()
-    }
-}
-
-/// Single-file Parquet reader for one (split_idx, splits_per_file)
-/// sub-partition. When `splits_per_file == 1`, this behaves identically
-/// to the legacy `read_one_file` (no row-range slicing). Otherwise it
-/// caps the read to a contiguous `total_rows / splits_per_file` slice
-/// via `with_row_selection` so the file's CPU work spreads across
-/// `splits_per_file` parallel tasks.
-async fn read_one_file_split(
-    store: &Arc<dyn ObjectStore>,
-    file_path: &ObjectPath,
-    ctx: &ScanContext,
-    column_schema: &[ColumnInfo],
-    split_idx: usize,
-    splits_per_file: usize,
-) -> Result<
-    parquet::arrow::async_reader::ParquetRecordBatchStream<
-        parquet::arrow::async_reader::ParquetObjectReader,
-    >,
-    ExecutionError,
-> {
-    use parquet::arrow::arrow_reader::RowSelection;
-    let mut builder = open_parquet_builder(store, file_path).await?;
-    let total_rows: usize = builder
-        .metadata()
-        .row_groups()
-        .iter()
-        .map(|rg| rg.num_rows() as usize)
-        .sum();
-
-    // Apply row-group pruning (min/max) and predicate filters BEFORE
-    // building the slice — the slice should reflect the user-visible
-    // logical row count. Row-group pruning is OK because all splits
-    // see the same min/max-pruned row groups.
-    if !ctx.filters.is_empty() {
-        let column_names: Vec<String> = column_schema.iter().map(|c| c.name.clone()).collect();
-        let file_meta = builder.metadata().clone();
-        let selected = arneb_connectors::parquet_pushdown::prune_row_groups(
-            file_meta.row_groups(),
-            &ctx.filters,
-            &column_names,
-        );
-        if selected.len() < file_meta.row_groups().len() {
-            let selectors = build_row_selection(file_meta.row_groups(), &selected);
-            // For the slice path below we need to merge this pruning
-            // with the slice's RowSelection; simplest is to start
-            // from this and intersect.
-            let pruning_selection = RowSelection::from(selectors);
-            // If we'll also slice, intersect later; if not, apply directly.
-            if splits_per_file > 1 {
-                let slice = compute_split_selection(total_rows, split_idx, splits_per_file);
-                let combined = pruning_selection.intersection(&slice);
-                builder = builder.with_row_selection(combined);
-            } else {
-                builder = builder.with_row_selection(pruning_selection);
-            }
-        } else if splits_per_file > 1 {
-            let slice = compute_split_selection(total_rows, split_idx, splits_per_file);
-            builder = builder.with_row_selection(slice);
-        }
-    } else if splits_per_file > 1 {
-        let slice = compute_split_selection(total_rows, split_idx, splits_per_file);
-        builder = builder.with_row_selection(slice);
-    }
-
-    // Within-row-group predicate pushdown.
-    if !ctx.filters.is_empty() {
-        if let Some(row_filter) = arneb_connectors::parquet_pushdown::build_row_filter(
-            &ctx.filters,
-            builder.parquet_schema(),
-        ) {
-            builder = builder.with_row_filter(row_filter);
-        }
-    }
-
-    // Column projection pushdown.
-    if let Some(ref projection) = ctx.projection {
-        let mask = parquet::arrow::ProjectionMask::roots(
-            builder.parquet_schema(),
-            projection.iter().copied(),
-        );
-        builder = builder.with_projection(mask);
-    }
-
-    // Default 2048 (override Parquet's built-in 8192) to keep per-
-    // partition in-flight Arrow batches small. Per Trino architecture
-    // research + arrow-rs issue #623: in-flight working set scales
-    // linearly with batch_size × pipeline_depth × partition_count;
-    // smaller default = lower memory floor for small queries (TPC-H
-    // Q01/Q06/Q10/Q12/Q14 baseline). Override via `ctx.batch_size`, or
-    // tune the default at runtime via `ARNEB_SCAN_BATCH_SIZE`.
-    let batch_size = ctx
-        .batch_size
-        .unwrap_or_else(arneb_connectors::file::scan_default_batch_size);
-    builder = builder.with_batch_size(batch_size);
-
-    builder.build().map_err(|e| {
-        ExecutionError::InvalidOperation(format!(
-            "Parquet reader build error for '{file_path}': {e}"
-        ))
-    })
-}
-
-/// Build a `RowSelection` that picks rows `[split_idx*chunk, (split_idx+1)*chunk)`
-/// out of `total_rows` (clamped). `chunk = ceil(total_rows / splits)`.
-/// Shared with the Iceberg connector's intra-file splits.
-pub fn compute_split_selection(
-    total_rows: usize,
-    split_idx: usize,
-    splits: usize,
-) -> parquet::arrow::arrow_reader::RowSelection {
-    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
-    let chunk = total_rows.div_ceil(splits);
-    let start = (split_idx * chunk).min(total_rows);
-    let end = ((split_idx + 1) * chunk).min(total_rows);
-    let mut selectors = Vec::with_capacity(3);
-    if start > 0 {
-        selectors.push(RowSelector::skip(start));
-    }
-    if end > start {
-        selectors.push(RowSelector::select(end - start));
-    }
-    if total_rows > end {
-        selectors.push(RowSelector::skip(total_rows - end));
-    }
-    RowSelection::from(selectors)
-}
-
-/// Open the Parquet stream builder for a file; common entry point
-/// for `read_one_file_split` and the legacy `read_one_file` wrapper.
-async fn open_parquet_builder(
-    store: &Arc<dyn ObjectStore>,
-    file_path: &ObjectPath,
-) -> Result<
-    parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder<
-        parquet::arrow::async_reader::ParquetObjectReader,
-    >,
-    ExecutionError,
-> {
-    let meta = store.head(file_path).await.map_err(|e| {
-        ExecutionError::InvalidOperation(format!("failed to stat Parquet file '{file_path}': {e}"))
-    })?;
-    let reader =
-        parquet::arrow::async_reader::ParquetObjectReader::new(store.clone(), meta.location)
-            .with_file_size(meta.size);
-    parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
-        .await
-        .map_err(|e| {
-            ExecutionError::InvalidOperation(format!("Parquet reader error for '{file_path}': {e}"))
-        })
-}
-
-/// Legacy single-file reader; kept for tests/back-compat. Equivalent
-/// to `read_one_file_split(.., 0, 1)`.
-#[allow(dead_code)]
-async fn read_one_file(
-    store: &Arc<dyn ObjectStore>,
-    file_path: &ObjectPath,
-    ctx: &ScanContext,
-    column_schema: &[ColumnInfo],
-) -> Result<
-    parquet::arrow::async_reader::ParquetRecordBatchStream<
-        parquet::arrow::async_reader::ParquetObjectReader,
-    >,
-    ExecutionError,
-> {
-    let meta = store.head(file_path).await.map_err(|e| {
-        ExecutionError::InvalidOperation(format!("failed to stat Parquet file '{file_path}': {e}"))
-    })?;
-    let reader =
-        parquet::arrow::async_reader::ParquetObjectReader::new(store.clone(), meta.location)
-            .with_file_size(meta.size);
-    let mut builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
-        .await
-        .map_err(|e| {
-            ExecutionError::InvalidOperation(format!("Parquet reader error for '{file_path}': {e}"))
-        })?;
-
-    // Row-group pruning via min/max statistics.
-    if !ctx.filters.is_empty() {
-        let column_names: Vec<String> = column_schema.iter().map(|c| c.name.clone()).collect();
-        let file_meta = builder.metadata().clone();
-        let selected = arneb_connectors::parquet_pushdown::prune_row_groups(
-            file_meta.row_groups(),
-            &ctx.filters,
-            &column_names,
-        );
-        if selected.len() < file_meta.row_groups().len() {
-            let selectors = build_row_selection(file_meta.row_groups(), &selected);
-            let selection = parquet::arrow::arrow_reader::RowSelection::from(selectors);
-            builder = builder.with_row_selection(selection);
-        }
-    }
-
-    // Within-row-group predicate pushdown.
-    if !ctx.filters.is_empty() {
-        if let Some(row_filter) = arneb_connectors::parquet_pushdown::build_row_filter(
-            &ctx.filters,
-            builder.parquet_schema(),
-        ) {
-            builder = builder.with_row_filter(row_filter);
-        }
-    }
-
-    // Column projection pushdown.
-    if let Some(ref projection) = ctx.projection {
-        let mask = parquet::arrow::ProjectionMask::roots(
-            builder.parquet_schema(),
-            projection.iter().copied(),
-        );
-        builder = builder.with_projection(mask);
-    }
-
-    // Per-batch row-count tuning.
-    // Default 2048 (override Parquet's built-in 8192) to keep per-
-    // partition in-flight Arrow batches small. Per Trino architecture
-    // research + arrow-rs issue #623: in-flight working set scales
-    // linearly with batch_size × pipeline_depth × partition_count;
-    // smaller default = lower memory floor for small queries (TPC-H
-    // Q01/Q06/Q10/Q12/Q14 baseline). Override via `ctx.batch_size`, or
-    // tune the default at runtime via `ARNEB_SCAN_BATCH_SIZE`.
-    let batch_size = ctx
-        .batch_size
-        .unwrap_or_else(arneb_connectors::file::scan_default_batch_size);
-    builder = builder.with_batch_size(batch_size);
-
-    builder.build().map_err(|e| {
-        ExecutionError::InvalidOperation(format!(
-            "Parquet reader build error for '{file_path}': {e}"
-        ))
-    })
 }
 
 /// List all data files under a given prefix in an object store.
@@ -477,26 +188,6 @@ async fn list_parquet_files(
         }
     }
     Ok(paths)
-}
-
-/// Build a RowSelector list from selected row group indices.
-/// Shared with the Iceberg connector's row-group pruning.
-pub fn build_row_selection(
-    row_groups: &[parquet::file::metadata::RowGroupMetaData],
-    selected: &[usize],
-) -> Vec<parquet::arrow::arrow_reader::RowSelector> {
-    use parquet::arrow::arrow_reader::RowSelector;
-    let selected_set: std::collections::HashSet<usize> = selected.iter().copied().collect();
-    let mut selectors = Vec::new();
-    for (idx, rg) in row_groups.iter().enumerate() {
-        let num_rows = rg.num_rows() as usize;
-        if selected_set.contains(&idx) {
-            selectors.push(RowSelector::select(num_rows));
-        } else {
-            selectors.push(RowSelector::skip(num_rows));
-        }
-    }
-    selectors
 }
 
 /// Convert `ColumnInfo` slice to an Arrow schema.
@@ -570,18 +261,11 @@ impl ConnectorFactory for HiveConnectorFactory {
         schema: &[ColumnInfo],
         properties: &std::collections::HashMap<String, String>,
     ) -> Result<Arc<dyn DataSource>, ConnectorError> {
-        // Iceberg tables share HMS with plain Hive tables, but listing their
-        // location would read orphaned / deleted / metadata files. Refuse
-        // rather than silently return wrong results.
-        if properties
-            .get(crate::catalog::TABLE_TYPE_PARAM)
-            .is_some_and(|t| t.eq_ignore_ascii_case("ICEBERG"))
-        {
-            return Err(ConnectorError::UnsupportedOperation(format!(
-                "table '{table}' is an Iceberg table; the Hive connector cannot read it. \
-                 Query it through a catalog with type = \"iceberg\" pointing at the same \
-                 metastore"
-            )));
+        // Iceberg tables redirected by the Hive catalog: read the pinned
+        // snapshot's live files, never a listing of the table location.
+        if arneb_iceberg::is_iceberg_table(properties) {
+            return arneb_iceberg::create_data_source(&self.storage_registry, table, properties)
+                .await;
         }
 
         // Auto-register location from properties if present and not already registered.
@@ -644,7 +328,7 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use object_store::memory::InMemory;
-    use object_store::PutPayload;
+    use object_store::{ObjectStoreExt, PutPayload};
     use parquet::arrow::arrow_writer::ArrowWriter;
 
     /// Write a Parquet file to bytes with the given rows.
@@ -949,7 +633,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn factory_rejects_iceberg_tables() {
+    async fn factory_redirects_iceberg_tables() {
+        // An Iceberg table must be planned from its metadata, not by
+        // listing `location`: with no metadata_location it fails instead
+        // of scanning the directory.
         let registry = Arc::new(StorageRegistry::new());
         let factory = HiveConnectorFactory::new(registry);
         let mut props = std::collections::HashMap::new();
@@ -959,7 +646,7 @@ mod tests {
             .create_data_source(&TableReference::table("ice"), &[], &props)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Iceberg table"), "{err}");
+        assert!(err.to_string().contains("metadata_location"), "{err}");
     }
 
     #[tokio::test]

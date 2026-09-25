@@ -1,10 +1,11 @@
-//! Apache Iceberg connector for Arneb (read-only).
+//! Apache Iceberg reader for Arneb (read-only).
 //!
-//! Resolves Iceberg tables through a Hive Metastore (`table_type=ICEBERG`,
-//! `metadata_location=...`), plans scans from the current snapshot's
-//! manifest list and manifests, and reads the live Parquet data files
-//! with field-ID-based column resolution, manifest-level file pruning,
-//! and the shared Parquet row-group / predicate pushdown.
+//! Iceberg tables live in a Hive Metastore (`table_type=ICEBERG`,
+//! `metadata_location=...`); the Hive catalog redirects them here, the
+//! way Trino's Hive connector redirects to its Iceberg connector. Scans
+//! are planned from the pinned snapshot's manifest list and manifests,
+//! and the live Parquet data files are read through the shared Parquet
+//! scan with field-ID-based column resolution.
 //!
 //! Out of scope (fails clearly rather than returning wrong results):
 //! row-level delete files (merge-on-read), non-Parquet data files, writes.
@@ -13,10 +14,9 @@ pub mod catalog;
 pub mod datasource;
 pub mod manifest;
 pub mod metadata;
-pub mod pruning;
 
-pub use catalog::{is_iceberg_table, IcebergCatalogProvider, IcebergTableProvider};
-pub use datasource::{IcebergConnectorFactory, IcebergDataSource};
+pub use catalog::{is_iceberg_table, IcebergTableProvider, TABLE_TYPE_PARAM};
+pub use datasource::{create_data_source, IcebergDataSource};
 pub use metadata::TableMetadata;
 
 #[cfg(test)]

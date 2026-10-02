@@ -29,8 +29,18 @@ cargo run --bin arneb -- --config /path/to/config.toml
 | Service | Port | Roles |
 |---------|------|-------|
 | pgwire (PostgreSQL protocol) | `port` | standalone, coordinator |
+| Trino client protocol (HTTP) | `[trino] port` (default `8080`) | standalone, coordinator |
 | Web UI | `port + 1000` | standalone, coordinator |
 | Flight RPC | `9090` | all roles |
+
+## Trino Client Protocol
+
+| Field | Type | Default | Env Var | CLI | Description |
+|-------|------|---------|---------|-----|-------------|
+| `[trino] enabled` | bool | `true` | `ARNEB_TRINO_ENABLED` | `--no-trino` | Serve the Trino client REST protocol |
+| `[trino] port` | integer | `8080` | `ARNEB_TRINO_PORT` | `--trino-port` | HTTP port of the Trino listener |
+
+See [Trino Client Compatibility](./trino-clients.md) for what the listener supports.
 
 ## Tuning Knobs: Build-Time vs Runtime
 
@@ -167,7 +177,12 @@ See [Distributed Mode](/guide/distributed) for full setup instructions.
 
 ## Authentication
 
-By default the pgwire port accepts every connection without a password
+`[auth]` is the server's client authentication: one credential store
+intended for every client-facing listener. Today it is enforced on the
+pgwire port; the Trino listener will verify HTTP Basic passwords against the
+same `[[auth.users]]` in a follow-up (see [Limitations](#auth-limitations)).
+
+By default every connection is accepted without a password
 (`type = "none"`), so existing setups keep working. To require passwords,
 add an `[auth]` section:
 
@@ -212,11 +227,21 @@ Behavior:
   malformed hash, duplicate or empty user names, `type = "password"` with no
   users, and a plaintext `password` key.
 
-Limitations: this covers only the pgwire port. The Web UI (pgwire port +
-1000) and the Flight RPC port between the coordinator and its workers are
-not authenticated, so keep them on a trusted network. The pgwire port does
-not support TLS yet. SCRAM keeps the password itself off the wire, but
-query traffic is still plaintext. Channel binding (`SCRAM-SHA-256-PLUS`) is
+<a id="auth-limitations"></a>
+Limitations: `[auth]` is enforced only on the pgwire port. These listeners
+still accept anyone, so keep them on a trusted network:
+
+- the **Trino client protocol** port (`[trino] port`, default `8080`,
+  enabled by default): any `X-Trino-User` is accepted without a password.
+  Startup logs a WARN on `arneb::config` when `type = "password"` is set and
+  this listener is on. Where password protection is required, disable it
+  with `--no-trino` or `ARNEB_TRINO_ENABLED=false` until the follow-up
+  (HTTP Basic over TLS, checked against the same SCRAM verifiers) lands;
+- the **Web UI** (pgwire port + 1000);
+- the **Flight RPC** port between the coordinator and its workers.
+
+The pgwire port does not support TLS yet. SCRAM keeps the password itself
+off the wire, but query traffic is still plaintext. Channel binding (`SCRAM-SHA-256-PLUS`) is
 not offered.
 
 ## CLI Arguments

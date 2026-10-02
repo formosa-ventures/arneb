@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Authentication mode selection
-The system SHALL support two pgwire authentication modes: `none`, where every connection is accepted without a password (the default), and `password`, where the client must complete a SCRAM-SHA-256 SASL exchange. The mode SHALL apply to every connection, whether it goes on to use the Simple or the Extended Query protocol.
+The `[auth]` section SHALL describe client authentication for the server as a whole (one credential store for every client-facing listener); this change enforces it on the pgwire port. The system SHALL support two authentication modes: `none`, where every connection is accepted without a password (the default), and `password`, where the client must complete a SCRAM-SHA-256 SASL exchange. The mode SHALL apply to every connection, whether it goes on to use the Simple or the Extended Query protocol.
 
 #### Scenario: Default mode accepts any client
 - **WHEN** no `[auth]` section is configured and a client connects without a password

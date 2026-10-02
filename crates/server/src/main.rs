@@ -147,6 +147,33 @@ struct CliArgs {
     /// costs after `EXPLAIN ANALYZE` highlights a suspect operator.
     #[arg(long)]
     profile: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Read a password from stdin and print a SCRAM-SHA-256 verifier for
+    /// the `password_hash` field of an `[[auth.users]]` entry.
+    HashPassword,
+}
+
+/// `arneb hash-password`: read one line from stdin, print its verifier.
+fn hash_password() -> Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if std::io::stdin().is_terminal() {
+        eprint!("Password (input is echoed): ");
+        std::io::stderr().flush()?;
+    }
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    let password = line.trim_end_matches(['\r', '\n']);
+    if password.is_empty() {
+        bail!("password must not be empty");
+    }
+    println!("{}", arneb_protocol::ScramVerifier::generate(password)?);
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -166,6 +193,9 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
     // 1. Parse CLI args
     let args = CliArgs::parse();
+    if let Some(Command::HashPassword) = args.command {
+        return hash_password();
+    }
 
     // 2. Load config (file + env overrides)
     let mut config =
@@ -598,12 +628,30 @@ async fn run() -> Result<()> {
         ));
     }
 
+    let auth_method = config
+        .auth
+        .to_auth_method()
+        .context("invalid [auth] configuration")?;
+    if !matches!(role, ServerRole::Worker) {
+        let users = match &auth_method {
+            arneb_protocol::AuthMethod::ScramSha256(creds) => creds.len(),
+            arneb_protocol::AuthMethod::None => 0,
+        };
+        tracing::info!(
+            target: "arneb::config",
+            auth = auth_method.name(),
+            users,
+            "pgwire authentication effective mode"
+        );
+    }
+
     let mut server = ProtocolServer::new(
         protocol_config,
         catalog_manager.clone(),
         connector_registry.clone(),
     )
-    .with_memory_pool(Arc::clone(&memory_pool));
+    .with_memory_pool(Arc::clone(&memory_pool))
+    .with_auth(auth_method);
     if let Some(ref executor) = distributed_executor {
         server = server.with_distributed_executor(Arc::clone(executor));
     }

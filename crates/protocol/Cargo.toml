@@ -36,6 +36,14 @@ tracing = { workspace = true }
 chrono = "0.4"
 hex = "0.4"
 
+# Authentication (SCRAM-SHA-256). aws-lc-rs is already pulled in by pgwire's
+# default `server-api-aws-lc-rs` feature, so this adds no new crypto stack.
+aws-lc-rs = "1"
+base64 = "0.22"
+stringprep = "0.1"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
 pgwire = { workspace = true }
+tokio-postgres = "0.7"
+postgres-protocol = "0.6"

@@ -168,7 +168,17 @@ schema = [
     { name = "customer", type = "utf8" },
     { name = "total", type = "float64" },
 ]
+
+# Optional: require SCRAM-SHA-256 passwords on the pgwire port (default: type = "none")
+[auth]
+type = "password"
+
+[[auth.users]]
+name = "alice"
+password_hash = "SCRAM-SHA-256$4096:..."   # generate with: arneb hash-password
 ```
+
+See [docs/guide/configuration.md](docs/guide/configuration.md#authentication) for authentication details.
 
 ### Distributed Mode
 

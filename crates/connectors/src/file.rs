@@ -518,7 +518,7 @@ async fn parquet_file_statistics(
         Ok(m) => m,
         Err(_) => return out,
     };
-    out.size_bytes = Some(meta.size as u64);
+    out.size_bytes = Some(meta.size);
 
     let reader =
         parquet::arrow::async_reader::ParquetObjectReader::new(store.clone(), meta.location)

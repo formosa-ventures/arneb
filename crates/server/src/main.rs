@@ -165,11 +165,17 @@ struct CliArgs {
 enum Command {
     /// Read a password from stdin and print a SCRAM-SHA-256 verifier for
     /// the `password_hash` field of an `[[auth.users]]` entry.
-    HashPassword,
+    HashPassword {
+        /// PBKDF2 iteration count. The default (4096) matches PostgreSQL;
+        /// production deployments should use a much higher count.
+        #[arg(long, default_value_t = arneb_protocol::auth::DEFAULT_SCRAM_ITERATIONS,
+              value_parser = clap::value_parser!(u32).range(1..))]
+        iterations: u32,
+    },
 }
 
 /// `arneb hash-password`: read one line from stdin, print its verifier.
-fn hash_password() -> Result<()> {
+fn hash_password(iterations: u32) -> Result<()> {
     use std::io::{BufRead, IsTerminal, Write};
     if std::io::stdin().is_terminal() {
         eprint!("Password (input is echoed): ");
@@ -181,7 +187,10 @@ fn hash_password() -> Result<()> {
     if password.is_empty() {
         bail!("password must not be empty");
     }
-    println!("{}", arneb_protocol::ScramVerifier::generate(password)?);
+    println!(
+        "{}",
+        arneb_protocol::ScramVerifier::generate_with_iterations(password, iterations)?
+    );
     Ok(())
 }
 
@@ -202,8 +211,8 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
     // 1. Parse CLI args
     let args = CliArgs::parse();
-    if let Some(Command::HashPassword) = args.command {
-        return hash_password();
+    if let Some(Command::HashPassword { iterations }) = args.command {
+        return hash_password(iterations);
     }
 
     // 2. Load config (file + env overrides)

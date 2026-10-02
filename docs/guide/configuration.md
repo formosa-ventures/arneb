@@ -211,7 +211,14 @@ works as-is. To generate one:
 
 ```bash
 echo -n 'my-password' | arneb hash-password     # or run it and type at the prompt
+echo -n 'my-password' | arneb hash-password --iterations 100000
 ```
+
+`--iterations` sets the PBKDF2 iteration count stored in the verifier. The
+default, 4096, matches PostgreSQL. For production, use a much higher count
+(for example 100000 or more) to slow down offline guessing if the config
+file leaks. The cost is paid by the client on every connection, so measure
+connection latency for your clients before going very high.
 
 Behavior:
 

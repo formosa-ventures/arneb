@@ -121,13 +121,18 @@ impl ScramVerifier {
     /// Derive a verifier from a plaintext password using a fresh random salt
     /// and [`DEFAULT_SCRAM_ITERATIONS`].
     pub fn generate(password: &str) -> Result<Self, AuthConfigError> {
+        Self::generate_with_iterations(password, DEFAULT_SCRAM_ITERATIONS)
+    }
+
+    /// Like [`ScramVerifier::generate`], with an explicit PBKDF2 iteration
+    /// count. Clients pay this cost on every connection.
+    pub fn generate_with_iterations(
+        password: &str,
+        iterations: u32,
+    ) -> Result<Self, AuthConfigError> {
         let mut salt = [0u8; SALT_LEN];
         aws_lc_rs::rand::fill(&mut salt).map_err(|_| AuthConfigError::Random)?;
-        Ok(Self::from_password(
-            password,
-            &salt,
-            DEFAULT_SCRAM_ITERATIONS,
-        ))
+        Ok(Self::from_password(password, &salt, iterations))
     }
 
     /// PBKDF2 iteration count of this verifier.
@@ -677,6 +682,16 @@ mod tests {
         let text = v.to_string();
         assert!(text.starts_with("SCRAM-SHA-256$4096:"));
         let parsed: ScramVerifier = text.parse().unwrap();
+        assert_eq!(parsed, v);
+    }
+
+    #[test]
+    fn generate_with_iterations_keeps_the_count() {
+        let v = ScramVerifier::generate_with_iterations("s3cret", 100_000).unwrap();
+        let text = v.to_string();
+        assert!(text.starts_with("SCRAM-SHA-256$100000:"));
+        let parsed: ScramVerifier = text.parse().unwrap();
+        assert_eq!(parsed.iterations(), 100_000);
         assert_eq!(parsed, v);
     }
 

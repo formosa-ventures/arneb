@@ -8,7 +8,9 @@ use crate::datasource::InMemoryDataSource;
 use crate::partitioning::Partitioning;
 use arneb_common::stream::collect_stream;
 use arneb_common::types::DataType;
+use arrow::array::AsArray;
 use arrow::array::{new_null_array, Decimal128Array};
+use arrow::datatypes;
 use arrow::datatypes::DataType as A;
 
 fn col(index: usize, name: &str) -> PlanExpr {

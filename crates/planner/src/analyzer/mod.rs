@@ -259,17 +259,33 @@ pub fn is_literal_like(expr: &PlanExpr) -> bool {
 fn function_return_type(name: &str, args: &[PlanExpr], schema: &[ColumnInfo]) -> Option<DataType> {
     match name.to_uppercase().as_str() {
         "COUNT" => Some(DataType::Int64),
-        "SUM" | "AVG" => args
+        // Trino result types. The accumulators in
+        // `crates/execution/src/aggregate.rs` MUST produce exactly these
+        // (enforced by `planner_and_accumulator_types_agree` there):
+        // `AggregateExec` rejects a column whose type differs from the plan.
+        "SUM" => args
             .first()
             .and_then(|a| plan_expr_type(a, schema))
             .map(|t| match t {
-                DataType::Int32 | DataType::Int64 => DataType::Int64,
-                DataType::Float32 | DataType::Float64 => DataType::Float64,
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                    DataType::Int64
+                }
+                DataType::Decimal128 { scale, .. } => DataType::Decimal128 {
+                    precision: 38,
+                    scale,
+                },
+                DataType::Float32 | DataType::Float64 | DataType::Null => DataType::Float64,
+                other => other,
+            })
+            .or(Some(DataType::Float64)),
+        "AVG" => args
+            .first()
+            .and_then(|a| plan_expr_type(a, schema))
+            .map(|t| match t {
                 DataType::Decimal128 { precision, scale } => {
                     DataType::Decimal128 { precision, scale }
                 }
-                DataType::Null => DataType::Float64,
-                other => other,
+                _ => DataType::Float64,
             })
             .or(Some(DataType::Float64)),
         "MIN" | "MAX" => args.first().and_then(|a| plan_expr_type(a, schema)),

@@ -10,6 +10,7 @@
 #   docker compose up -d                    # start MinIO + HMS + Trino
 #   docker compose run tpch-seed            # seed TPC-H data (SF1)
 #   docker compose run tpcds-seed           # seed TPC-DS data (SF1)
+#   docker compose run iceberg-seed         # seed Iceberg tables (iceberg.ice.*)
 #   docker compose down -v                  # tear down (delete volumes)
 
 # Pin the Compose project name so container names are deterministic regardless
@@ -151,6 +152,23 @@ services:
         condition: service_healthy
     profiles:
       - tpch-seed
+
+  # Iceberg tables (HMS-backed, written by Trino's `iceberg` catalog) for
+  # exercising Arneb's Iceberg reader through a `hive` catalog. See
+  # docker/iceberg-seed/seed.sh.
+  iceberg-seed:
+    image: trinodb/trino:latest
+    volumes:
+      - ./docker/iceberg-seed:/seed
+    entrypoint: ["/bin/bash", "/seed/seed.sh"]
+    environment:
+      TPCH_SF: ${TPCH_SF:-tiny}
+      TRINO_SERVER: trino:8080
+    depends_on:
+      trino:
+        condition: service_healthy
+    profiles:
+      - iceberg-seed
 
   tpcds-seed:
     image: trinodb/trino:latest

@@ -203,6 +203,7 @@ impl<'a> QueryPlanner<'a> {
 
     /// Raw AST → LogicalPlan translation. Runs the analyzer — callers
     /// use [`Self::plan_statement`] or [`Self::plan_statement_with_context`].
+    #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
     async fn plan_statement_inner(&self, stmt: &ast::Statement) -> Result<LogicalPlan, PlanError> {
         match stmt {
@@ -298,6 +299,7 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Plan a Query (CTEs + body + ORDER BY + LIMIT/OFFSET).
+    #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
     async fn plan_query(&self, query: &ast::Query) -> Result<LogicalPlan, PlanError> {
         // Snapshot the CTE registry on entry and restore it on exit so
@@ -465,6 +467,7 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Plan a QueryBody (SELECT or set operation).
+    #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
     async fn plan_query_body(&self, body: &ast::QueryBody) -> Result<LogicalPlan, PlanError> {
         match body {
@@ -1327,6 +1330,7 @@ impl<'a> QueryPlanner<'a> {
 
     /// Convert an AST expression to a PlanExpr, resolving column references.
     #[allow(clippy::only_used_in_recursion)]
+    #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
     async fn plan_expr(
         &self,
@@ -1945,6 +1949,7 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Recursively extract aggregate functions from an expression.
+    #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
     async fn extract_aggregates(
         &self,

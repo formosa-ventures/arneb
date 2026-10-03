@@ -882,6 +882,7 @@ impl TaskManager {
 }
 
 /// Register data sources for a task's plan using actual connectors.
+#[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
 #[async_recursion::async_recursion]
 async fn register_task_data_sources(
     plan: &LogicalPlan,

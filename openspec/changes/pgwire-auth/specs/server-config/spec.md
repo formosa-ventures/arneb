@@ -20,8 +20,12 @@ The system SHALL accept an optional `[auth]` TOML section with `type` (`"none"` 
 - **THEN** the server starts in `none` mode and logs a warning that the users are ignored
 
 ### Requirement: hash-password subcommand
-The `arneb` binary SHALL provide a `hash-password` subcommand. It reads one password line from stdin and prints a SCRAM-SHA-256 verifier to stdout, using a random 16-byte salt and 4096 iterations. The output is suitable for `password_hash`.
+The `arneb` binary SHALL provide a `hash-password` subcommand. It reads one password line from stdin and prints a SCRAM-SHA-256 verifier to stdout, using a random 16-byte salt and 4096 iterations by default; `--iterations <n>` (n >= 1) overrides the count. The output is suitable for `password_hash`.
 
 #### Scenario: Generate a verifier
 - **WHEN** the user runs `echo -n 'pw' | arneb hash-password`
 - **THEN** stdout contains a single `SCRAM-SHA-256$4096:...` line that authenticates password `pw`
+
+#### Scenario: Custom iteration count
+- **WHEN** the user runs `echo -n 'pw' | arneb hash-password --iterations 100000`
+- **THEN** stdout contains a single `SCRAM-SHA-256$100000:...` line that authenticates password `pw`

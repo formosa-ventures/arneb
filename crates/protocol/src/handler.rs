@@ -1804,4 +1804,69 @@ mod tests {
         assert!(batch.column(1).is_null(0), "NULL <> NULL");
         assert!(!batch.column(2).is_null(0), "1 = 1");
     }
+
+    fn count_of(batch: &arrow::record_batch::RecordBatch) -> i64 {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) should be Int64")
+            .value(0)
+    }
+
+    #[tokio::test]
+    async fn untyped_null_operand_coerces_end_to_end() {
+        use arrow::array::Array;
+        let (cm, reg) = null_cmp_memory_env();
+        let batch = run_sql("SELECT 1 = NULL, NULL < 2, 1 + NULL", &cm, &reg).await;
+        for i in 0..3 {
+            assert!(batch.column(i).is_null(0), "column {i}");
+        }
+        // t.a is (1, NULL, 3).
+        for (pred, expected) in [
+            ("a = NULL", 0),
+            ("NULL <> a", 0),
+            ("a + NULL > 1", 0),
+            ("a IN (1, NULL)", 1),
+            ("a BETWEEN 0 AND NULL", 0),
+            ("a IS NULL", 1),
+        ] {
+            let sql = format!("SELECT count(*) FROM t WHERE {pred}");
+            assert_eq!(
+                count_of(&run_sql(&sql, &cm, &reg).await),
+                expected,
+                "{pred}"
+            );
+        }
+        let batch = run_sql(
+            "SELECT CASE WHEN a = 1 THEN a ELSE NULL END, COALESCE(NULL, a) FROM t",
+            &cm,
+            &reg,
+        )
+        .await;
+        assert_eq!(batch.column(0).null_count(), 2);
+        assert_eq!(batch.column(1).null_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn overflowing_constant_expression_errors_instead_of_panicking() {
+        let (cm, reg) = null_cmp_memory_env();
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        for sql in [
+            "SELECT 9223372036854775807 + 1",
+            "SELECT 9223372036854775807 * 2",
+            "SELECT 1 / 0",
+        ] {
+            let err = execute_query(sql, &cm, &reg, None, &pool)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("expected an error: {sql}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("overflow") || msg.contains("Divide by zero"),
+                "{sql}: {msg}"
+            );
+        }
+    }
 }

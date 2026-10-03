@@ -4,7 +4,7 @@
 //! before physical planning.
 
 use arneb_common::error::PlanError;
-use arneb_common::types::ScalarValue;
+use arneb_common::types::{DataType, ScalarValue};
 use arneb_sql_parser::ast;
 
 use crate::plan::{LogicalPlan, PlanExpr};
@@ -438,7 +438,17 @@ fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
             span,
         } => {
             let expr = fold_constants(*expr)?;
-            if let PlanExpr::Literal { value, .. } = &expr {
+            // `CAST(NULL AS T)` stays a cast: folding it would yield an
+            // untyped NULL literal, dropping the type the analyzer
+            // coerced it to and leaving mismatched operands at runtime.
+            let is_typed_null = matches!(
+                &expr,
+                PlanExpr::Literal {
+                    value: ScalarValue::Null,
+                    ..
+                }
+            ) && data_type != DataType::Null;
+            if let (PlanExpr::Literal { value, .. }, false) = (&expr, is_typed_null) {
                 // Fold the cast: Arrow's strict-mode cast surfaces
                 // parse errors (e.g., malformed DATE literal) as a
                 // `PlanError::InvalidLiteral`. Enrich the error with
@@ -575,24 +585,37 @@ fn eval_binary_op(
         ast::BinaryOp::Eq | ast::BinaryOp::NotEq if left.data_type() != right.data_type() => None,
         ast::BinaryOp::Eq => Some(ScalarValue::Boolean(left == right)),
         ast::BinaryOp::NotEq => Some(ScalarValue::Boolean(left != right)),
-        ast::BinaryOp::Plus => eval_arithmetic(left, right, |a, b| a + b, |a, b| a + b),
-        ast::BinaryOp::Minus => eval_arithmetic(left, right, |a, b| a - b, |a, b| a - b),
-        ast::BinaryOp::Multiply => eval_arithmetic(left, right, |a, b| a * b, |a, b| a * b),
+        ast::BinaryOp::Plus => {
+            eval_arithmetic(left, right, i32::checked_add, i64::checked_add, |a, b| {
+                a + b
+            })
+        }
+        ast::BinaryOp::Minus => {
+            eval_arithmetic(left, right, i32::checked_sub, i64::checked_sub, |a, b| {
+                a - b
+            })
+        }
+        ast::BinaryOp::Multiply => {
+            eval_arithmetic(left, right, i32::checked_mul, i64::checked_mul, |a, b| {
+                a * b
+            })
+        }
         _ => None,
     }
 }
 
+/// Fold integer arithmetic only when it does not overflow; an overflowing
+/// expression is left for the runtime kernel, which raises the error.
 fn eval_arithmetic(
     left: &ScalarValue,
     right: &ScalarValue,
-    int_op: impl Fn(i64, i64) -> i64,
+    i32_op: impl Fn(i32, i32) -> Option<i32>,
+    i64_op: impl Fn(i64, i64) -> Option<i64>,
     float_op: impl Fn(f64, f64) -> f64,
 ) -> Option<ScalarValue> {
     match (left, right) {
-        (ScalarValue::Int32(a), ScalarValue::Int32(b)) => {
-            Some(ScalarValue::Int64(int_op(*a as i64, *b as i64)))
-        }
-        (ScalarValue::Int64(a), ScalarValue::Int64(b)) => Some(ScalarValue::Int64(int_op(*a, *b))),
+        (ScalarValue::Int32(a), ScalarValue::Int32(b)) => i32_op(*a, *b).map(ScalarValue::Int32),
+        (ScalarValue::Int64(a), ScalarValue::Int64(b)) => i64_op(*a, *b).map(ScalarValue::Int64),
         (ScalarValue::Float64(a), ScalarValue::Float64(b)) => {
             Some(ScalarValue::Float64(float_op(*a, *b)))
         }
@@ -851,6 +874,77 @@ mod tests {
         })
         .unwrap();
         assert_eq!(expr, lit(ScalarValue::Int64(30)));
+    }
+
+    fn binop(l: ScalarValue, op: ast::BinaryOp, r: ScalarValue) -> PlanExpr {
+        PlanExpr::BinaryOp {
+            left: Box::new(lit(l)),
+            op,
+            right: Box::new(lit(r)),
+            span: None,
+        }
+    }
+
+    #[test]
+    fn fold_int_overflow_is_left_for_runtime() {
+        use ast::BinaryOp::{Minus, Multiply, Plus};
+        let cases = [
+            (ScalarValue::Int64(i64::MAX), Plus, ScalarValue::Int64(1)),
+            (ScalarValue::Int64(i64::MIN), Minus, ScalarValue::Int64(1)),
+            (
+                ScalarValue::Int64(i64::MAX),
+                Multiply,
+                ScalarValue::Int64(2),
+            ),
+            (ScalarValue::Int32(i32::MAX), Plus, ScalarValue::Int32(1)),
+            (ScalarValue::Int32(i32::MIN), Minus, ScalarValue::Int32(1)),
+            (
+                ScalarValue::Int32(i32::MAX),
+                Multiply,
+                ScalarValue::Int32(2),
+            ),
+        ];
+        for (l, op, r) in cases {
+            let expr = binop(l, op, r);
+            assert_eq!(fold_constants(expr.clone()).unwrap(), expr);
+        }
+    }
+
+    #[test]
+    fn fold_int32_arithmetic_keeps_int32() {
+        let expr = binop(
+            ScalarValue::Int32(2),
+            ast::BinaryOp::Multiply,
+            ScalarValue::Int32(3),
+        );
+        // `PlanExpr`'s `PartialEq` compares display strings, which hide
+        // the literal's type, so match on the value itself.
+        assert!(matches!(
+            fold_constants(expr).unwrap(),
+            PlanExpr::Literal {
+                value: ScalarValue::Int32(6),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fold_division_by_zero_is_left_for_runtime() {
+        use ast::BinaryOp::{Divide, Modulo};
+        for op in [Divide, Modulo] {
+            let expr = binop(ScalarValue::Int64(1), op, ScalarValue::Int64(0));
+            assert_eq!(fold_constants(expr.clone()).unwrap(), expr);
+        }
+    }
+
+    #[test]
+    fn fold_keeps_typed_null_cast() {
+        let expr = PlanExpr::Cast {
+            expr: Box::new(lit(ScalarValue::Null)),
+            data_type: DataType::Int32,
+            span: None,
+        };
+        assert_eq!(fold_constants(expr.clone()).unwrap(), expr);
     }
 
     #[test]

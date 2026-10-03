@@ -306,10 +306,14 @@ impl Accumulator for SumAccumulator {
 // AVG
 // ---------------------------------------------------------------------------
 
-/// Computes the average of numeric values.
+/// Computes the average of numeric values: DOUBLE for integer/float input,
+/// `DECIMAL(p, s)` (exact, rounded half-up) for `DECIMAL(p, s)` input.
 #[derive(Debug, Default)]
 pub struct AvgAccumulator {
     sum: f64,
+    sum_decimal: i128,
+    /// `(precision, scale)` of the input once a Decimal128 batch is seen.
+    decimal: Option<(u8, i8)>,
     count: i64,
 }
 
@@ -333,6 +337,8 @@ impl Accumulator for AvgAccumulator {
                 ExecutionError::InvalidOperation("AvgAccumulator::merge: type mismatch".to_string())
             })?;
         self.sum += other.sum;
+        self.sum_decimal += other.sum_decimal;
+        self.decimal = self.decimal.or(other.decimal);
         self.count += other.count;
         Ok(())
     }
@@ -377,11 +383,12 @@ impl Accumulator for AvgAccumulator {
                     }
                 }
             }
-            Decimal128(_, _) => {
+            Decimal128(p, s) => {
+                self.decimal = Some((*p, *s));
                 let arr = values.as_primitive::<datatypes::Decimal128Type>();
                 for i in 0..arr.len() {
                     if !arr.is_null(i) {
-                        self.sum += arr.value(i) as f64;
+                        self.sum_decimal += arr.value(i);
                         self.count += 1;
                     }
                 }
@@ -396,16 +403,41 @@ impl Accumulator for AvgAccumulator {
     }
 
     fn evaluate(&self) -> Result<ScalarValue, ExecutionError> {
-        if self.count == 0 {
-            Ok(ScalarValue::Null)
-        } else {
-            Ok(ScalarValue::Float64(self.sum / self.count as f64))
-        }
+        Ok(avg_value(
+            self.count,
+            self.sum,
+            self.sum_decimal,
+            self.decimal,
+        ))
     }
 
     fn reset(&mut self) {
-        self.sum = 0.0;
-        self.count = 0;
+        *self = Self::default();
+    }
+}
+
+/// Final AVG value shared by the single and grouped accumulators.
+fn avg_value(count: i64, sum: f64, sum_decimal: i128, decimal: Option<(u8, i8)>) -> ScalarValue {
+    if count == 0 {
+        return ScalarValue::Null;
+    }
+    match decimal {
+        Some((precision, scale)) => ScalarValue::Decimal128 {
+            value: div_round_half_up(sum_decimal, count as i128),
+            precision,
+            scale,
+        },
+        None => ScalarValue::Float64(sum / count as f64),
+    }
+}
+
+/// `n / d` rounded half away from zero (Trino's decimal AVG rounding).
+fn div_round_half_up(n: i128, d: i128) -> i128 {
+    let (q, r) = (n / d, n % d);
+    if 2 * r.abs() >= d {
+        q + n.signum()
+    } else {
+        q
     }
 }
 
@@ -1087,10 +1119,13 @@ impl GroupedAccumulator for GroupedSumAccumulator {
     }
 }
 
-/// AVG(col), with per-group `(sum_f64, count_i64)` state.
+/// AVG(col), with per-group `(sum_f64, count_i64)` state, plus an exact
+/// `i128` sum per group for `DECIMAL(p, s)` input (see [`AvgAccumulator`]).
 #[derive(Debug, Default)]
 pub struct GroupedAvgAccumulator {
     sums: Vec<f64>,
+    decimal_sums: Vec<i128>,
+    decimal: Option<(u8, i8)>,
     counts: Vec<i64>,
 }
 
@@ -1106,6 +1141,9 @@ impl GroupedAccumulator for GroupedAvgAccumulator {
         if self.sums.len() < n {
             self.sums.resize(n, 0.0);
             self.counts.resize(n, 0);
+            if self.decimal.is_some() {
+                self.decimal_sums.resize(n, 0);
+            }
         }
     }
 
@@ -1181,12 +1219,14 @@ impl GroupedAccumulator for GroupedAvgAccumulator {
                     }
                 }
             }
-            Decimal128(_, _) => {
+            Decimal128(p, s) => {
+                self.decimal = Some((*p, *s));
+                self.decimal_sums.resize(self.counts.len(), 0);
                 let arr = values.as_primitive::<datatypes::Decimal128Type>();
                 for (i, &g) in group_ids.iter().enumerate() {
                     if !arr.is_null(i) {
                         let g = g as usize;
-                        self.sums[g] += arr.value(i) as f64;
+                        self.decimal_sums[g] += arr.value(i);
                         self.counts[g] += 1;
                     }
                 }
@@ -1202,10 +1242,16 @@ impl GroupedAccumulator for GroupedAvgAccumulator {
 
     fn evaluate(&self, group_id: u32) -> Result<ScalarValue, ExecutionError> {
         let g = group_id as usize;
-        if g >= self.counts.len() || self.counts[g] == 0 {
+        if g >= self.counts.len() {
             return Ok(ScalarValue::Null);
         }
-        Ok(ScalarValue::Float64(self.sums[g] / self.counts[g] as f64))
+        let decimal_sum = self.decimal_sums.get(g).copied().unwrap_or(0);
+        Ok(avg_value(
+            self.counts[g],
+            self.sums[g],
+            decimal_sum,
+            self.decimal,
+        ))
     }
 
     fn num_groups(&self) -> usize {
@@ -1236,6 +1282,11 @@ impl GroupedAccumulator for GroupedAvgAccumulator {
             }
             self.sums[dest] += other.sums[g];
             self.counts[dest] += other.counts[g];
+            if other.decimal.is_some() {
+                self.decimal = other.decimal;
+                self.decimal_sums.resize(self.counts.len(), 0);
+                self.decimal_sums[dest] += other.decimal_sums[g];
+            }
         }
         Ok(())
     }
@@ -1639,8 +1690,12 @@ impl Accumulator for DistinctAccumulator {
 /// Caller is responsible for null-checking; this function does not
 /// special-case NULL — pass a non-null index. Returns
 /// `InvalidOperation` for unsupported Arrow types so DISTINCT cannot
-/// silently accept rows it cannot deduplicate.
-fn scalar_from_array(arr: &ArrayRef, index: usize) -> Result<ScalarValue, ExecutionError> {
+/// silently accept rows it cannot deduplicate. Also backs
+/// `operator::extract_scalar` (group keys).
+pub(crate) fn scalar_from_array(
+    arr: &ArrayRef,
+    index: usize,
+) -> Result<ScalarValue, ExecutionError> {
     use arrow::datatypes::DataType::*;
     match arr.data_type() {
         Int32 => Ok(ScalarValue::Int32(
@@ -1702,7 +1757,7 @@ fn scalar_from_array(arr: &ArrayRef, index: usize) -> Result<ScalarValue, Execut
             })
         }
         dt => Err(ExecutionError::InvalidOperation(format!(
-            "DISTINCT not supported for type {dt:?}"
+            "cannot extract scalar from type {dt:?}"
         ))),
     }
 }
@@ -1809,17 +1864,97 @@ mod tests {
         );
     }
 
+    /// AVG(DECIMAL(p, s)) is an exact DECIMAL(p, s), rounded half away
+    /// from zero (Trino): 1.00 / 1.01 -> 1.01 (1.005), negated -> -1.01.
     #[test]
-    fn avg_decimal128() {
+    fn avg_decimal128_rounds_half_up() {
+        let dec = |v: Vec<i128>| -> ArrayRef {
+            Arc::new(
+                arrow::array::Decimal128Array::from(v)
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            )
+        };
+        let expected = |value| ScalarValue::Decimal128 {
+            value,
+            precision: 10,
+            scale: 2,
+        };
         let mut acc = AvgAccumulator::new();
-        let arr: ArrayRef = Arc::new(
-            arrow::array::Decimal128Array::from(vec![1000, 2000, 3000])
-                .with_precision_and_scale(10, 2)
-                .unwrap(),
-        );
-        acc.update_batch(&arr).unwrap();
-        // AVG returns f64: (1000 + 2000 + 3000) / 3 = 2000.0
-        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Float64(2000.0));
+        acc.update_batch(&dec(vec![100, 101])).unwrap();
+        assert_eq!(acc.evaluate().unwrap(), expected(101));
+
+        let mut grouped = GroupedAvgAccumulator::new();
+        grouped.ensure_capacity(2);
+        grouped
+            .add_input(&[0, 0, 1, 1], &dec(vec![100, 101, -100, -101]))
+            .unwrap();
+        assert_eq!(grouped.evaluate(0).unwrap(), expected(101));
+        assert_eq!(grouped.evaluate(1).unwrap(), expected(-101));
+    }
+
+    /// The planner's declared SUM/AVG type (`function_return_type`), the
+    /// Trino result type, and what both accumulator flavours produce must
+    /// all agree — `AggregateExec` rejects any mismatch at runtime.
+    #[test]
+    fn planner_and_accumulator_types_agree() {
+        use arneb_common::types::{ColumnInfo, DataType};
+        use arneb_planner::analyzer::plan_expr_type;
+        use arneb_planner::PlanExpr;
+
+        let dec = DataType::Decimal128 {
+            precision: 15,
+            scale: 2,
+        };
+        let sum_dec = DataType::Decimal128 {
+            precision: 38,
+            scale: 2,
+        };
+        let (int, dbl) = (DataType::Int64, DataType::Float64);
+        let cases = [
+            ("SUM", DataType::Int32, int.clone()),
+            ("SUM", DataType::Int64, int.clone()),
+            ("SUM", dbl.clone(), dbl.clone()),
+            ("SUM", dec.clone(), sum_dec),
+            ("AVG", DataType::Int32, dbl.clone()),
+            ("AVG", DataType::Int64, dbl.clone()),
+            ("AVG", dbl.clone(), dbl.clone()),
+            ("AVG", dec.clone(), dec.clone()),
+        ];
+        for (func, input, expected) in cases {
+            let schema = [ColumnInfo {
+                name: "x".into(),
+                data_type: input.clone(),
+                nullable: true,
+            }];
+            let call = PlanExpr::Function {
+                name: func.into(),
+                args: vec![PlanExpr::Column {
+                    index: 0,
+                    name: "x".into(),
+                    span: None,
+                }],
+                distinct: false,
+                span: None,
+            };
+            let planned = plan_expr_type(&call, &schema);
+            assert_eq!(
+                planned.as_ref(),
+                Some(&expected),
+                "planner {func}({input:?})"
+            );
+
+            let three: ArrayRef = Arc::new(Int64Array::from(vec![3]));
+            let values = arrow::compute::cast(&three, &input.clone().into()).unwrap();
+            let mut single = create_accumulator(func, false, false).unwrap();
+            single.update_batch(&values).unwrap();
+            let mut grouped = create_grouped_accumulator(func, false, false).unwrap();
+            grouped.ensure_capacity(1);
+            grouped.add_input(&[0], &values).unwrap();
+            for got in [single.evaluate().unwrap(), grouped.evaluate(0).unwrap()] {
+                assert_eq!(got.data_type(), expected, "executor {func}({input:?})");
+            }
+        }
     }
 
     #[test]

@@ -24,11 +24,11 @@ use arneb_common::types::{ColumnInfo, ScalarValue};
 use arneb_planner::{LogicalPlan, PlanExpr, SortExpr};
 use arneb_sql_parser::ast;
 use arrow::array::{
-    self, Array, ArrayRef, AsArray, BooleanArray, Date32Array, DictionaryArray, Float32Array,
-    Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
+    self, Array, ArrayRef, BooleanArray, Date32Array, DictionaryArray, Float32Array, Float64Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
 use arrow::compute;
-use arrow::datatypes::{self, DataType as ArrowDataType, Field, Schema, UInt32Type};
+use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, UInt32Type};
 use async_trait::async_trait;
 use futures::stream::Stream;
 use futures::StreamExt;
@@ -3603,39 +3603,7 @@ pub(crate) fn extract_scalar(arr: &ArrayRef, index: usize) -> Result<ScalarValue
     if arr.is_null(index) {
         return Ok(ScalarValue::Null);
     }
-    match arr.data_type() {
-        ArrowDataType::Int32 => {
-            let a = arr.as_primitive::<datatypes::Int32Type>();
-            Ok(ScalarValue::Int32(a.value(index)))
-        }
-        ArrowDataType::Int64 => {
-            let a = arr.as_primitive::<datatypes::Int64Type>();
-            Ok(ScalarValue::Int64(a.value(index)))
-        }
-        ArrowDataType::Float32 => {
-            let a = arr.as_primitive::<datatypes::Float32Type>();
-            Ok(ScalarValue::Float32(a.value(index)))
-        }
-        ArrowDataType::Float64 => {
-            let a = arr.as_primitive::<datatypes::Float64Type>();
-            Ok(ScalarValue::Float64(a.value(index)))
-        }
-        ArrowDataType::Utf8 => {
-            let a = arr.as_string::<i32>();
-            Ok(ScalarValue::Utf8(a.value(index).to_string()))
-        }
-        ArrowDataType::Boolean => {
-            let a = arr.as_boolean();
-            Ok(ScalarValue::Boolean(a.value(index)))
-        }
-        ArrowDataType::Date32 => {
-            let a = arr.as_primitive::<datatypes::Date32Type>();
-            Ok(ScalarValue::Date32(a.value(index)))
-        }
-        dt => Err(ExecutionError::InvalidOperation(format!(
-            "cannot extract scalar from type {dt:?}"
-        ))),
-    }
+    crate::aggregate::scalar_from_array(arr, index)
 }
 
 pub(crate) fn materialize_dictionary_array(arr: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
@@ -3799,6 +3767,8 @@ mod tests {
     use crate::datasource::InMemoryDataSource;
     use arneb_common::stream::collect_stream;
     use arneb_common::types::DataType;
+    use arrow::array::AsArray;
+    use arrow::datatypes;
 
     #[test]
     fn strided_partition_count_covers_without_overlap() {
@@ -3865,6 +3835,33 @@ mod tests {
         assert_eq!(extract_scalar(&arr, 0).unwrap(), ScalarValue::Date32(19000));
         assert_eq!(extract_scalar(&arr, 1).unwrap(), ScalarValue::Null);
         assert_eq!(extract_scalar(&arr, 2).unwrap(), ScalarValue::Date32(19500));
+    }
+
+    #[test]
+    fn extract_scalar_supports_decimal_and_timestamp() {
+        let dec: ArrayRef = Arc::new(
+            arrow::array::Decimal128Array::from(vec![Some(150), None])
+                .with_precision_and_scale(15, 2)
+                .unwrap(),
+        );
+        assert_eq!(
+            extract_scalar(&dec, 0).unwrap(),
+            ScalarValue::Decimal128 {
+                value: 150,
+                precision: 15,
+                scale: 2,
+            }
+        );
+        assert_eq!(extract_scalar(&dec, 1).unwrap(), ScalarValue::Null);
+        let ts: ArrayRef = Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![7]));
+        assert_eq!(
+            extract_scalar(&ts, 0).unwrap(),
+            ScalarValue::Timestamp {
+                value: 7,
+                unit: arneb_common::types::TimeUnit::Microsecond,
+                timezone: None,
+            }
+        );
     }
 
     #[test]

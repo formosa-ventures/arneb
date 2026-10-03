@@ -1804,4 +1804,125 @@ mod tests {
         assert!(batch.column(1).is_null(0), "NULL <> NULL");
         assert!(!batch.column(2).is_null(0), "1 = 1");
     }
+
+    // -- End-to-end: aggregate result types (Trino semantics) -------------
+
+    /// Memory table `t(i BIGINT, d DECIMAL(15,2), f DOUBLE, dt DATE,
+    /// ts TIMESTAMP)` with three rows over two `dt` / `ts` / `d` groups.
+    fn agg_types_env() -> (CatalogManager, ConnectorRegistry) {
+        use arneb_common::types::TimeUnit;
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        use arrow::array::{Date32Array, Decimal128Array, Float64Array, TimestampMicrosecondArray};
+        let cols = vec![
+            col("i", DataType::Int64),
+            col(
+                "d",
+                DataType::Decimal128 {
+                    precision: 15,
+                    scale: 2,
+                },
+            ),
+            col("f", DataType::Float64),
+            col("dt", DataType::Date32),
+            col(
+                "ts",
+                DataType::Timestamp {
+                    unit: TimeUnit::Microsecond,
+                    timezone: None,
+                },
+            ),
+        ];
+        let arrow_schema = Arc::new(Schema::new(
+            cols.iter().cloned().map(Field::from).collect::<Vec<_>>(),
+        ));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 4])),
+                Arc::new(
+                    Decimal128Array::from(vec![100, 100, 450])
+                        .with_precision_and_scale(15, 2)
+                        .unwrap(),
+                ),
+                Arc::new(Float64Array::from(vec![1.5, 2.5, 4.0])),
+                Arc::new(Date32Array::from(vec![10, 10, 20])),
+                Arc::new(TimestampMicrosecondArray::from(vec![1_000, 1_000, 2_000])),
+            ],
+        )
+        .unwrap();
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("t", Arc::new(MemoryTable::new(cols, vec![batch])));
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", schema);
+        let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
+        let cm = CatalogManager::new("memory", "default");
+        cm.register_catalog("memory", catalog);
+        let mut reg = ConnectorRegistry::new();
+        reg.register("memory", Arc::new(factory));
+        (cm, reg)
+    }
+
+    fn decimal_cell(batch: &arrow::record_batch::RecordBatch, i: usize) -> (i128, u8, i8) {
+        let a = batch
+            .column(i)
+            .as_any()
+            .downcast_ref::<arrow::array::Decimal128Array>()
+            .unwrap_or_else(|| panic!("column {i} is {:?}", batch.column(i).data_type()));
+        (a.value(0), a.precision(), a.scale())
+    }
+
+    fn f64_cell(batch: &arrow::record_batch::RecordBatch, i: usize) -> f64 {
+        batch
+            .column(i)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap_or_else(|| panic!("column {i} is {:?}", batch.column(i).data_type()))
+            .value(0)
+    }
+
+    /// AVG(integer) / AVG(double) are DOUBLE; AVG(DECIMAL(p,s)) is an exact
+    /// DECIMAL(p,s). Used to fail: planner said Int64 / executor gave Float64.
+    #[tokio::test]
+    async fn avg_result_types_match_trino() {
+        let (cm, reg) = agg_types_env();
+        let b = run_sql("SELECT avg(i), avg(d), avg(f) FROM t", &cm, &reg).await;
+        assert!((f64_cell(&b, 0) - 7.0 / 3.0).abs() < 1e-12);
+        // (1.00 + 1.00 + 4.50) / 3 = 2.1666.. -> 2.17
+        assert_eq!(decimal_cell(&b, 1), (217, 15, 2));
+        assert!((f64_cell(&b, 2) - 8.0 / 3.0).abs() < 1e-12);
+    }
+
+    /// SUM(DECIMAL(p,s)) is DECIMAL(38,s) on both the planner and executor.
+    #[tokio::test]
+    async fn sum_decimal_is_decimal_38() {
+        let (cm, reg) = agg_types_env();
+        let b = run_sql(
+            "SELECT sum(i), sum(d), sum(CAST(i AS DECIMAL(15,2))), sum(f) FROM t",
+            &cm,
+            &reg,
+        )
+        .await;
+        let i = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(i.value(0), 7);
+        assert_eq!(decimal_cell(&b, 1), (650, 38, 2));
+        assert_eq!(decimal_cell(&b, 2), (700, 38, 2));
+        assert_eq!(f64_cell(&b, 3), 8.0);
+    }
+
+    /// DISTINCT aggregates grouped by DECIMAL and TIMESTAMP keys.
+    #[tokio::test]
+    async fn distinct_aggregate_groups_by_decimal_and_timestamp() {
+        let (cm, reg) = agg_types_env();
+        let b = run_sql(
+            "SELECT d, ts, count(DISTINCT i) FROM t GROUP BY d, ts ORDER BY d",
+            &cm,
+            &reg,
+        )
+        .await;
+        assert_eq!(b.num_rows(), 2);
+        let counts = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(counts.values(), &[2, 1]);
+    }
 }

@@ -1019,16 +1019,12 @@ impl ExecutionPlan for FilterExec {
         let stream: SendableRecordBatchStream =
             Box::pin(FilterMapStream::new(input_stream, schema, move |batch| {
                 let mask_arr = expression::evaluate(&predicate, &batch, None)?;
-                let mask = mask_arr
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| {
-                        ExecutionError::InvalidOperation(
-                            "filter predicate must produce a boolean array".to_string(),
-                        )
-                    })?;
+                // An untyped all-NULL predicate (e.g. `WHERE NULL`) is
+                // unknown for every row; `filter_record_batch` treats
+                // NULL mask slots as "drop", matching SQL.
+                let mask = expression::as_boolean_operand(&mask_arr, "filter predicate")?;
 
-                let filtered = compute::filter_record_batch(&batch, mask)?;
+                let filtered = compute::filter_record_batch(&batch, &mask)?;
                 if filtered.num_rows() > 0 {
                     Ok(Some(filtered))
                 } else {

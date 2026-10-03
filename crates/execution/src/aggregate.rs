@@ -1865,7 +1865,7 @@ mod tests {
     }
 
     /// AVG(DECIMAL(p, s)) is an exact DECIMAL(p, s), rounded half away
-    /// from zero (Trino): 1.00 / 1.01 -> 1.01 (1.005), negated -> -1.01.
+    /// from zero (Trino): avg(1.00, 1.01) = 1.005 -> 1.01; negated -> -1.01.
     #[test]
     fn avg_decimal128_rounds_half_up() {
         let dec = |v: Vec<i128>| -> ArrayRef {

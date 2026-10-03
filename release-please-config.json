@@ -14,7 +14,8 @@
           "path": "Cargo.toml",
           "jsonpath": "$.workspace.package.version"
         }
-      ]
+      ],
+      "include-component-in-tag": false
     }
   }
 }

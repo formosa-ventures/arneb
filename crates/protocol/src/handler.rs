@@ -1333,6 +1333,7 @@ fn arrow_to_scalar_value(array: &arrow::array::ArrayRef, row: usize) -> ScalarVa
 }
 
 /// Walk the logical plan to find all TableScan nodes and register data sources.
+#[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
 #[async_recursion]
 async fn register_data_sources(
     plan: &LogicalPlan,

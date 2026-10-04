@@ -176,9 +176,8 @@ impl ParquetDataSource {
             ConnectorError::ReadError(format!("failed to stat Parquet file '{}': {}", path, e))
         })?;
 
-        let reader =
-            parquet::arrow::async_reader::ParquetObjectReader::new(store.clone(), meta.location)
-                .with_file_size(meta.size);
+        let reader = crate::parquet_scan::ParquetObjectReader::new(store.clone(), meta.location)
+            .with_file_size(meta.size);
 
         let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -227,11 +226,9 @@ impl DataSource for ParquetDataSource {
             ))
         })?;
 
-        let reader = parquet::arrow::async_reader::ParquetObjectReader::new(
-            self.store.clone(),
-            meta.location,
-        )
-        .with_file_size(meta.size);
+        let reader =
+            crate::parquet_scan::ParquetObjectReader::new(self.store.clone(), meta.location)
+                .with_file_size(meta.size);
 
         let mut builder =
             parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
@@ -314,7 +311,7 @@ struct ParquetBatchStream {
     inner: Pin<
         Box<
             parquet::arrow::async_reader::ParquetRecordBatchStream<
-                parquet::arrow::async_reader::ParquetObjectReader,
+                crate::parquet_scan::ParquetObjectReader,
             >,
         >,
     >,
@@ -520,9 +517,8 @@ async fn parquet_file_statistics(
     };
     out.size_bytes = Some(meta.size);
 
-    let reader =
-        parquet::arrow::async_reader::ParquetObjectReader::new(store.clone(), meta.location)
-            .with_file_size(meta.size);
+    let reader = crate::parquet_scan::ParquetObjectReader::new(store.clone(), meta.location)
+        .with_file_size(meta.size);
     let builder =
         match parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader).await {
             Ok(b) => b,
@@ -627,11 +623,9 @@ impl DataSource for PreResolvedParquetDataSource {
             ))
         })?;
 
-        let reader = parquet::arrow::async_reader::ParquetObjectReader::new(
-            self.store.clone(),
-            meta.location,
-        )
-        .with_file_size(meta.size);
+        let reader =
+            crate::parquet_scan::ParquetObjectReader::new(self.store.clone(), meta.location)
+                .with_file_size(meta.size);
 
         let mut builder =
             parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)

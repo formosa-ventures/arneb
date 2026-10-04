@@ -24,8 +24,8 @@ use crate::ConnectorFactory;
 /// Default record-batch size for Parquet/CSV readers when
 /// [`ScanContext::batch_size`] is unset.
 ///
-/// Defaults to 2048 — small per-partition in-flight Arrow batches keep scan
-/// memory low (the deliberate override of Parquet's built-in 8192). Tunable at
+/// Defaults to 16384, allowing larger Arrow batches to amortize per-batch
+/// pipeline overhead. Tunable at
 /// runtime via `ARNEB_SCAN_BATCH_SIZE`: a larger value amortizes per-batch
 /// overhead across the whole pipeline (decode → filter → repartition → hash →
 /// exchange) at the cost of more in-flight Arrow memory. Read, applied, and
@@ -38,11 +38,11 @@ pub fn scan_default_batch_size() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(2048);
+            .unwrap_or(16384);
         tracing::info!(
             target: "arneb::config",
             scan_batch_size = value,
-            "ARNEB_SCAN_BATCH_SIZE effective value (default 2048; larger amortizes \
+            "ARNEB_SCAN_BATCH_SIZE effective value (default 16384; larger amortizes \
              per-batch overhead at the cost of higher scan memory)"
         );
         value
@@ -176,9 +176,8 @@ impl ParquetDataSource {
             ConnectorError::ReadError(format!("failed to stat Parquet file '{}': {}", path, e))
         })?;
 
-        let reader =
-            parquet::arrow::async_reader::ParquetObjectReader::new(store.clone(), meta.location)
-                .with_file_size(meta.size);
+        let reader = crate::parquet_scan::ParquetObjectReader::new(store.clone(), meta.location)
+            .with_file_size(meta.size);
 
         let builder = parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -227,11 +226,9 @@ impl DataSource for ParquetDataSource {
             ))
         })?;
 
-        let reader = parquet::arrow::async_reader::ParquetObjectReader::new(
-            self.store.clone(),
-            meta.location,
-        )
-        .with_file_size(meta.size);
+        let reader =
+            crate::parquet_scan::ParquetObjectReader::new(self.store.clone(), meta.location)
+                .with_file_size(meta.size);
 
         let mut builder =
             parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
@@ -314,7 +311,7 @@ struct ParquetBatchStream {
     inner: Pin<
         Box<
             parquet::arrow::async_reader::ParquetRecordBatchStream<
-                parquet::arrow::async_reader::ParquetObjectReader,
+                crate::parquet_scan::ParquetObjectReader,
             >,
         >,
     >,
@@ -518,11 +515,10 @@ async fn parquet_file_statistics(
         Ok(m) => m,
         Err(_) => return out,
     };
-    out.size_bytes = Some(meta.size as u64);
+    out.size_bytes = Some(meta.size);
 
-    let reader =
-        parquet::arrow::async_reader::ParquetObjectReader::new(store.clone(), meta.location)
-            .with_file_size(meta.size);
+    let reader = crate::parquet_scan::ParquetObjectReader::new(store.clone(), meta.location)
+        .with_file_size(meta.size);
     let builder =
         match parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader).await {
             Ok(b) => b,
@@ -627,11 +623,9 @@ impl DataSource for PreResolvedParquetDataSource {
             ))
         })?;
 
-        let reader = parquet::arrow::async_reader::ParquetObjectReader::new(
-            self.store.clone(),
-            meta.location,
-        )
-        .with_file_size(meta.size);
+        let reader =
+            crate::parquet_scan::ParquetObjectReader::new(self.store.clone(), meta.location)
+                .with_file_size(meta.size);
 
         let mut builder =
             parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
@@ -1586,4 +1580,20 @@ mod tests {
 
     // Need to re-import MemoryCatalog etc for integration tests
     use super::super::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable};
+
+    // Shipped defaults (2026-09-08). Every knob asserted here was validated on
+    // TPC-H and then carried ONLY by docker/arneb-bench/docker-compose.bench.yml,
+    // so a plain `cargo run --bin arneb` shipped an un-tuned engine: 12 of the 16
+    // knobs that config sets were default-off in code. An engine's default
+    // behaviour should be its validated behaviour; the env vars stay as opt-outs
+    // (`=0`), not as the only way to get the measured numbers.
+
+    #[test]
+    fn scan_batch_size_ships_at_16384() {
+        assert_eq!(
+            scan_default_batch_size(),
+            16384,
+            "ARNEB_SCAN_BATCH_SIZE must ship at 16384 (was 2048 in code, 16384 in the bench config)"
+        );
+    }
 }

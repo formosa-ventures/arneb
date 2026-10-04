@@ -104,6 +104,9 @@ enum KeyStorage {
     /// `RowConverter`. `keys[group_id] = GroupKey` (Vec<ScalarValue>).
     Generic {
         keys: Vec<GroupKey>,
+        /// Arrow type of each key column, captured at storage selection so
+        /// an all-NULL key column materialises as a typed NULL array.
+        types: Vec<ArrowDataType>,
     },
 }
 
@@ -192,7 +195,7 @@ impl GroupByHash {
             KeyStorage::Uninit => 0,
             KeyStorage::Bigint { keys, .. } => keys.len(),
             KeyStorage::FlatRow { ranges, .. } => ranges.len(),
-            KeyStorage::Generic { keys } => keys.len(),
+            KeyStorage::Generic { keys, .. } => keys.len(),
         }
     }
 
@@ -234,7 +237,7 @@ impl GroupByHash {
                     hashes[gid as usize]
                 });
             }
-            KeyStorage::Generic { keys } => {
+            KeyStorage::Generic { keys, .. } => {
                 reserve_vec_to(keys, target);
                 reserve_table_to(&self.state, &mut self.table, target, |state, &gid| {
                     hash_generic_key(state, &keys[gid as usize])
@@ -293,7 +296,7 @@ impl GroupByHash {
                 .unwrap_or_else(|| self.table.capacity())
                 .max(keys.capacity()),
             KeyStorage::FlatRow { ranges, .. } => self.table.capacity().max(ranges.capacity()),
-            KeyStorage::Generic { keys } => self.table.capacity().max(keys.capacity()),
+            KeyStorage::Generic { keys, .. } => self.table.capacity().max(keys.capacity()),
         }
     }
 
@@ -342,7 +345,7 @@ impl GroupByHash {
             }
             // GroupKey is a Vec<ScalarValue>; estimate a flat ~32 B/group
             // (this fallback path is rare — RowConverter covers most types).
-            KeyStorage::Generic { keys } => keys.capacity() * 32,
+            KeyStorage::Generic { keys, .. } => keys.capacity() * 32,
         };
         table + storage
     }
@@ -414,7 +417,7 @@ impl GroupByHash {
                 hashes,
                 group_cols,
             ),
-            KeyStorage::Generic { keys } => {
+            KeyStorage::Generic { keys, .. } => {
                 get_group_ids_generic(&self.state, &mut self.table, keys, group_cols)
             }
             KeyStorage::Uninit => unreachable!(),
@@ -442,7 +445,7 @@ impl GroupByHash {
                 ranges,
                 ..
             } => build_flat_arrays(converter, parser, buffer, ranges),
-            KeyStorage::Generic { keys } => build_generic_arrays(keys),
+            KeyStorage::Generic { keys, types } => build_generic_arrays(keys, types),
         }
     }
 }
@@ -493,7 +496,10 @@ fn pick_storage(
     capacity_hint: Option<usize>,
 ) -> KeyStorage {
     if group_cols.is_empty() {
-        return KeyStorage::Generic { keys: Vec::new() };
+        return KeyStorage::Generic {
+            keys: Vec::new(),
+            types: Vec::new(),
+        };
     }
 
     // Fast path: single Int64 column → BigintGroupByHash analog.
@@ -531,6 +537,7 @@ fn pick_storage(
 
     KeyStorage::Generic {
         keys: vec_with_capacity_hint(capacity_hint),
+        types: group_cols.iter().map(|c| c.data_type().clone()).collect(),
     }
 }
 
@@ -553,11 +560,12 @@ fn agg_prefetch_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_AGG_PREFETCH")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             agg_prefetch = enabled,
-            "ARNEB_AGG_PREFETCH effective value (default off; =1/true to enable bigint aggregate hash prefetch)"
+            "ARNEB_AGG_PREFETCH effective value (default on; =0 to disable)"
         );
         enabled
     })
@@ -567,13 +575,13 @@ fn agg_presize_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_AGG_PRESIZE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             agg_presize = enabled,
             max_groups = AGG_PRESIZE_MAX_GROUPS,
-            "ARNEB_AGG_PRESIZE effective value (default off; =1 to pre-size aggregate group hash tables)"
+            "ARNEB_AGG_PRESIZE effective value (default on; =0 to disable)"
         );
         enabled
     })
@@ -600,13 +608,13 @@ pub(crate) fn agg_presize_adaptive_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_AGG_PRESIZE_ADAPTIVE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             agg_presize_adaptive = enabled,
             max_groups = AGG_PRESIZE_MAX_GROUPS,
-            "ARNEB_AGG_PRESIZE_ADAPTIVE effective value (default off; =1 to adaptively pre-size aggregate group hash tables)"
+            "ARNEB_AGG_PRESIZE_ADAPTIVE effective value (default on; =0 to disable)"
         );
         enabled
     })
@@ -1090,23 +1098,26 @@ fn get_group_ids_generic(
     Ok(out)
 }
 
-fn build_generic_arrays(keys: &[GroupKey]) -> Result<Vec<ArrayRef>, ExecutionError> {
+fn build_generic_arrays(
+    keys: &[GroupKey],
+    types: &[ArrowDataType],
+) -> Result<Vec<ArrayRef>, ExecutionError> {
     let n = keys.len();
     if n == 0 {
         return Ok(vec![]);
     }
-    let n_cols = keys[0].0.len();
-    let mut cols: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(n); n_cols];
+    // `types` is captured from the same group columns that produced every
+    // key, so it has exactly one entry per key column.
+    let mut cols: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(n); types.len()];
     for key in keys {
-        for (col_i, v) in key.0.iter().enumerate() {
-            cols[col_i].push(v.clone());
+        for (col, v) in cols.iter_mut().zip(&key.0) {
+            col.push(v.clone());
         }
     }
-    let mut arrays = Vec::with_capacity(n_cols);
-    for col_vals in cols {
-        arrays.push(crate::operator::scalars_to_array(&col_vals, n)?);
-    }
-    Ok(arrays)
+    cols.iter()
+        .zip(types)
+        .map(|(col_vals, data_type)| crate::operator::scalars_to_array(col_vals, data_type))
+        .collect()
 }
 
 // ===========================================================================
@@ -1887,5 +1898,28 @@ mod tests {
                 mrows
             );
         }
+    }
+
+    // Shipped defaults (2026-09-08). Every knob asserted here was validated on
+    // TPC-H and then carried ONLY by docker/arneb-bench/docker-compose.bench.yml,
+    // so a plain `cargo run --bin arneb` shipped an un-tuned engine: 12 of the 16
+    // knobs that config sets were default-off in code. An engine's default
+    // behaviour should be its validated behaviour; the env vars stay as opt-outs
+    // (`=0`), not as the only way to get the measured numbers.
+
+    #[test]
+    fn aggregate_hash_knobs_ship_enabled() {
+        assert!(
+            agg_prefetch_enabled(),
+            "ARNEB_AGG_PREFETCH must ship on; set it to 0 to opt out"
+        );
+        assert!(
+            agg_presize_enabled(),
+            "ARNEB_AGG_PRESIZE must ship on; set it to 0 to opt out"
+        );
+        assert!(
+            agg_presize_adaptive_enabled(),
+            "ARNEB_AGG_PRESIZE_ADAPTIVE must ship on; set it to 0 to opt out"
+        );
     }
 }

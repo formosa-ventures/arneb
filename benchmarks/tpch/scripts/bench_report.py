@@ -13,9 +13,17 @@ Usage:
 The memory metric is `sim_peak` (simultaneous peak resident set summed across
 the cluster), the same value `run_memory_bench.sh` records; it falls back to
 `peak_kib` when `sim_peak_kib` is absent.
+
+If a sidecar `<csv-stem>.provenance.json` is present — written by
+`run_benchmark.sh` — its scale factor and scenario are printed above the table,
+so a number cannot be read without the scale it was measured at. A CSV with no
+sidecar still renders; the scale prints as `unrecorded` rather than being
+assumed.
 """
 import csv
+import json
 import sys
+from pathlib import Path
 
 
 def geomean(values: list[float]) -> float:
@@ -27,7 +35,42 @@ def geomean(values: list[float]) -> float:
     return prod ** (1.0 / len(values))
 
 
+def load_provenance(csv_path: str) -> dict:
+    """Read the sidecar provenance record, or {} when there is none.
+
+    Absence is a legitimate state — a CSV produced by running
+    `run_memory_bench.sh` directly has no sidecar — so this never raises. A
+    malformed sidecar is treated the same as an absent one rather than
+    aborting a report whose numbers are perfectly readable.
+    """
+    sidecar = Path(csv_path).with_suffix(".provenance.json")
+    try:
+        with open(sidecar) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def print_header(prov: dict) -> None:
+    scale = prov.get("scale_factor") or "unrecorded"
+    scenario = prov.get("scenario") or "unrecorded"
+    print(f"**Scale factor:** {scale}   ·   **Scenario:** {scenario}", end="")
+    if prov.get("bench_warmup") in (1, "1", True):
+        print("   ·   **Warm-up:** on", end="")
+    elif prov:
+        print("   ·   **Warm-up:** off", end="")
+    print()
+    if prov.get("preflight_bypassed"):
+        # A bypassed run must not be indistinguishable from a clean one.
+        print()
+        print("> **Preflight bypassed** (`SKIP_PREFLIGHT=1`) — the host did not "
+              "meet this scenario's declared floors.")
+    print()
+
+
 def main(path: str) -> int:
+    print_header(load_provenance(path))
+
     arneb: dict[str, dict] = {}
     trino: dict[str, dict] = {}
     with open(path, newline="") as f:

@@ -882,6 +882,7 @@ impl TaskManager {
 }
 
 /// Register data sources for a task's plan using actual connectors.
+#[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
 #[async_recursion::async_recursion]
 async fn register_task_data_sources(
     plan: &LogicalPlan,
@@ -903,9 +904,13 @@ async fn register_task_data_sources(
                 .unwrap_or(catalog_manager.default_catalog());
 
             if let Some(factory) = connector_registry.get(connector_name) {
-                if let Ok(ds) = factory.create_data_source(table, schema, properties).await {
-                    ctx.register_data_source(key, ds);
-                }
+                // Surface connector errors to the coordinator instead of
+                // degrading them to a generic "data source not found".
+                let ds = factory
+                    .create_data_source(table, schema, properties)
+                    .await
+                    .map_err(|e| format!("failed to create data source for '{key}': {e}"))?;
+                ctx.register_data_source(key, ds);
             }
             Ok(())
         }

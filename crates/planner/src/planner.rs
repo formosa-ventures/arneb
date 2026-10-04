@@ -25,10 +25,12 @@ fn cte_self_agg_window_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let enabled = std::env::var("ARNEB_CTE_SELF_AGG_WINDOW").is_ok_and(|v| v == "1");
+        let enabled = std::env::var("ARNEB_CTE_SELF_AGG_WINDOW")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
         tracing::info!(
             ARNEB_CTE_SELF_AGG_WINDOW = enabled,
-            "ARNEB_CTE_SELF_AGG_WINDOW effective value (default off; =1 to rewrite CTE self-aggregate scalar subqueries to windows)"
+            "ARNEB_CTE_SELF_AGG_WINDOW effective value (default on; =0 to disable)"
         );
         enabled
     })
@@ -201,6 +203,7 @@ impl<'a> QueryPlanner<'a> {
 
     /// Raw AST → LogicalPlan translation. Runs the analyzer — callers
     /// use [`Self::plan_statement`] or [`Self::plan_statement_with_context`].
+    #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
     async fn plan_statement_inner(&self, stmt: &ast::Statement) -> Result<LogicalPlan, PlanError> {
         match stmt {
@@ -296,6 +299,7 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Plan a Query (CTEs + body + ORDER BY + LIMIT/OFFSET).
+    #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
     async fn plan_query(&self, query: &ast::Query) -> Result<LogicalPlan, PlanError> {
         // Snapshot the CTE registry on entry and restore it on exit so
@@ -367,11 +371,18 @@ impl<'a> QueryPlanner<'a> {
             };
 
             let mut sort_exprs = Vec::with_capacity(query.order_by.len());
+            let mut unresolved = None;
             for ob in &query.order_by {
                 let expr =
                     match self.resolve_order_by_expr_with_select(&ob.expr, &ctx, select_items) {
                         Some(resolved) => resolved,
-                        None => self.plan_expr(&ob.expr, &ctx).await?,
+                        None => match self.plan_expr(&ob.expr, &ctx).await {
+                            Ok(expr) => expr,
+                            Err(e) => {
+                                unresolved = Some(e);
+                                break;
+                            }
+                        },
                     };
                 sort_exprs.push(SortExpr {
                     expr,
@@ -379,9 +390,32 @@ impl<'a> QueryPlanner<'a> {
                     nulls_first: ob.nulls_first.unwrap_or(false),
                 });
             }
-            plan = LogicalPlan::Sort {
-                input: Box::new(plan),
-                order_by: sort_exprs,
+            plan = match unresolved {
+                None => LogicalPlan::Sort {
+                    input: Box::new(plan),
+                    order_by: sort_exprs,
+                },
+                // ORDER BY a column that is not in the SELECT list (e.g.
+                // `SELECT name FROM t ORDER BY position`): sort beneath the
+                // projection, where every input column is still visible.
+                Some(err) => match plan {
+                    LogicalPlan::Projection {
+                        input,
+                        exprs,
+                        schema,
+                    } => {
+                        let order_by = self
+                            .order_by_below_projection(query, &ctx, select_items, &input, &exprs)
+                            .await
+                            .map_err(|_| err)?;
+                        LogicalPlan::Projection {
+                            input: Box::new(LogicalPlan::Sort { input, order_by }),
+                            exprs,
+                            schema,
+                        }
+                    }
+                    _ => return Err(err),
+                },
             };
         }
 
@@ -402,7 +436,38 @@ impl<'a> QueryPlanner<'a> {
         Ok(plan)
     }
 
+    /// Resolves ORDER BY keys against the input of the final projection.
+    /// Keys that name a SELECT output column are rewritten to that column's
+    /// projection expression, so aliases keep working below the projection.
+    async fn order_by_below_projection(
+        &self,
+        query: &ast::Query,
+        output_ctx: &PlanningContext,
+        select_items: Option<&Vec<ast::SelectItem>>,
+        input: &LogicalPlan,
+        exprs: &[PlanExpr],
+    ) -> Result<Vec<SortExpr>, PlanError> {
+        let input_ctx = self.context_from_plan(input);
+        let mut order_by = Vec::with_capacity(query.order_by.len());
+        for ob in &query.order_by {
+            let expr =
+                match self.resolve_order_by_expr_with_select(&ob.expr, output_ctx, select_items) {
+                    Some(PlanExpr::Column { index, .. }) if index < exprs.len() => {
+                        exprs[index].clone()
+                    }
+                    _ => self.plan_expr(&ob.expr, &input_ctx).await?,
+                };
+            order_by.push(SortExpr {
+                expr,
+                asc: ob.asc.unwrap_or(true),
+                nulls_first: ob.nulls_first.unwrap_or(false),
+            });
+        }
+        Ok(order_by)
+    }
+
     /// Plan a QueryBody (SELECT or set operation).
+    #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
     async fn plan_query_body(&self, body: &ast::QueryBody) -> Result<LogicalPlan, PlanError> {
         match body {
@@ -1239,8 +1304,12 @@ impl<'a> QueryPlanner<'a> {
                 ctx.add_table_columns(Some(qualifier), &schema);
 
                 let properties = table_provider.properties();
+                // Identity on the server's root catalog manager; on a
+                // per-session view (Trino `X-Trino-Catalog`/`-Schema`) the
+                // reference is fully qualified so connector lookup and
+                // workers resolve the table the session meant.
                 let plan = LogicalPlan::TableScan {
-                    table: name.clone(),
+                    table: self.catalog.qualify_table_reference(name),
                     schema,
                     alias: alias.clone(),
                     properties,
@@ -1261,6 +1330,7 @@ impl<'a> QueryPlanner<'a> {
 
     /// Convert an AST expression to a PlanExpr, resolving column references.
     #[allow(clippy::only_used_in_recursion)]
+    #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
     async fn plan_expr(
         &self,
@@ -1879,6 +1949,7 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Recursively extract aggregate functions from an expression.
+    #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
     async fn extract_aggregates(
         &self,
@@ -3548,6 +3619,66 @@ mod tests {
             }
             _ => panic!("expected Sort at top"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_order_by_column_not_in_select_list_sorts_below_projection() {
+        let plan = plan_sql("SELECT name FROM users ORDER BY id DESC")
+            .await
+            .unwrap();
+        match &plan {
+            LogicalPlan::Projection { input, schema, .. } => {
+                assert_eq!(schema.len(), 1);
+                assert_eq!(schema[0].name, "name");
+                match input.as_ref() {
+                    LogicalPlan::Sort { order_by, .. } => {
+                        assert_eq!(order_by.len(), 1);
+                        assert!(!order_by[0].asc);
+                    }
+                    other => panic!("expected Sort below Projection, got {other:?}"),
+                }
+            }
+            other => panic!("expected Projection at top, got {other:?}"),
+        }
+        // Aliased output columns still resolve when sorting below.
+        plan_sql("SELECT name AS n FROM users ORDER BY n, id")
+            .await
+            .unwrap();
+        // Genuinely unknown columns still fail.
+        assert!(plan_sql("SELECT name FROM users ORDER BY nope")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_table_scan_qualified_only_on_session_view() {
+        fn scan_ref(plan: &LogicalPlan) -> arneb_common::types::TableReference {
+            match plan {
+                LogicalPlan::TableScan { table, .. } => table.clone(),
+                LogicalPlan::Projection { input, .. } => scan_ref(input),
+                other => panic!("unexpected node {other:?}"),
+            }
+        }
+        let root = test_catalog();
+        let stmt = arneb_sql_parser::parse("SELECT id FROM users").unwrap();
+
+        let plan = QueryPlanner::new(&root)
+            .plan_statement(&stmt)
+            .await
+            .unwrap();
+        let table = scan_ref(&plan);
+        assert_eq!((table.catalog, table.schema), (None, None));
+
+        // Same defaults, but a session view: the reference is qualified.
+        let view = root.with_session_defaults("default", "public");
+        let plan = QueryPlanner::new(&view)
+            .plan_statement(&stmt)
+            .await
+            .unwrap();
+        let table = scan_ref(&plan);
+        assert_eq!(table.catalog.as_deref(), Some("default"));
+        assert_eq!(table.schema.as_deref(), Some("public"));
+        assert_eq!(table.table, "users");
     }
 
     #[tokio::test]

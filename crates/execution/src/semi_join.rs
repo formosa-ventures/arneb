@@ -87,14 +87,9 @@ fn compact_semi_ne_enabled() -> bool {
     #[cfg(test)]
     {
         let enabled = std::env::var("ARNEB_COMPACT_SEMI_NE")
-            .map(|v| {
-                matches!(
-                    v.as_str(),
-                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-                )
-            })
-            .unwrap_or(false);
-        tracing::info!(target: "arneb::config", enabled, "ARNEB_COMPACT_SEMI_NE");
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
+        tracing::info!(target: "arneb::config", enabled, "ARNEB_COMPACT_SEMI_NE effective value (default on; =0 to disable)");
         enabled
     }
 
@@ -103,14 +98,9 @@ fn compact_semi_ne_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
             let enabled = std::env::var("ARNEB_COMPACT_SEMI_NE")
-                .map(|v| {
-                    matches!(
-                        v.as_str(),
-                        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-                    )
-                })
-                .unwrap_or(false);
-            tracing::info!(target: "arneb::config", enabled, "ARNEB_COMPACT_SEMI_NE");
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(true);
+            tracing::info!(target: "arneb::config", enabled, "ARNEB_COMPACT_SEMI_NE effective value (default on; =0 to disable)");
             enabled
         })
     }

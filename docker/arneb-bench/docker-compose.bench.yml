@@ -55,7 +55,6 @@ services:
       ARNEB_SELECTIVE_DIM_FIRST: "1"
       ARNEB_EAGER_AGG: "1"
       ARNEB_PARALLEL_FINAL_AGG: "1"
-      ARNEB_FOLD_SEMIJOIN_HAVING: "1"
       ARNEB_AGG_PRESIZE: "1"
       # Adaptive agg pre-size (2026-06-26): exact final-from-partials + data-driven
       # partial growth. Fixes the sqrt(child_size) NDV fallback under-sizing high-
@@ -128,7 +127,6 @@ services:
       ARNEB_SELECTIVE_DIM_FIRST: "1"
       ARNEB_EAGER_AGG: "1"
       ARNEB_PARALLEL_FINAL_AGG: "1"
-      ARNEB_FOLD_SEMIJOIN_HAVING: "1"
       ARNEB_AGG_PRESIZE: "1"
       # Adaptive agg pre-size (2026-06-26): exact final-from-partials + data-driven
       # partial growth. Fixes the sqrt(child_size) NDV fallback under-sizing high-
@@ -195,7 +193,6 @@ services:
       ARNEB_SELECTIVE_DIM_FIRST: "1"
       ARNEB_EAGER_AGG: "1"
       ARNEB_PARALLEL_FINAL_AGG: "1"
-      ARNEB_FOLD_SEMIJOIN_HAVING: "1"
       ARNEB_AGG_PRESIZE: "1"
       # Adaptive agg pre-size (2026-06-26): exact final-from-partials + data-driven
       # partial growth. Fixes the sqrt(child_size) NDV fallback under-sizing high-

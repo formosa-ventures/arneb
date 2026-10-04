@@ -23,6 +23,11 @@ tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { workspace = true }
 num_cpus.workspace = true
 libc = "0.2"
+# Calendar math + datetime formatting/parsing for the Trino date/time
+# scalar functions (date_add, date_diff, date_format, date_parse, ...).
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# regexp_like / regexp_extract / regexp_replace / regexp_count.
+regex = "1"
 
 [dev-dependencies]
 arneb-catalog = { path = "../catalog" }

@@ -1,9 +1,11 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use arneb_common::types::DataType;
 use arneb_common::ServerConfig;
 use arneb_connectors::{CloudStorageConfig, S3StorageConfig};
+use arneb_protocol::{AuthMethod, ScramVerifier, UserCredentials};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +30,166 @@ pub struct AppConfig {
     /// Memory budget configuration for spillable operators.
     #[serde(default)]
     pub memory: MemoryConfig,
+
+    /// Client authentication for the PostgreSQL wire protocol.
+    #[serde(default)]
+    pub auth: AuthConfig,
+
+    /// Trino client REST protocol listener (coordinator/standalone only).
+    #[serde(default)]
+    pub trino: TrinoProtocolConfig,
+}
+
+/// `[auth]` section: client authentication for the server.
+///
+/// One credential store for every client-facing listener. Today it is
+/// enforced on the pgwire port; the Trino listener will verify HTTP Basic
+/// passwords against the same `[[auth.users]]` in a follow-up.
+///
+/// ```toml
+/// [auth]
+/// type = "password"            # "none" (default) | "password"
+///
+/// [[auth.users]]
+/// name = "alice"
+/// password_hash = "SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>"
+/// ```
+///
+/// `password` mode runs a SCRAM-SHA-256 exchange; only PostgreSQL-format
+/// SCRAM verifiers are stored (generate one with `arneb hash-password`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Authentication mode.
+    #[serde(rename = "type", default)]
+    pub auth_type: AuthType,
+    /// Users allowed to connect when `type = "password"`.
+    #[serde(default)]
+    pub users: Vec<AuthUserConfig>,
+}
+
+/// Authentication mode for pgwire connections.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthType {
+    /// No authentication: every connection is accepted (default).
+    #[default]
+    None,
+    /// SCRAM-SHA-256 password authentication.
+    Password,
+}
+
+/// One `[[auth.users]]` entry.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthUserConfig {
+    /// Login name (matched against the startup `user` parameter).
+    pub name: String,
+    /// PostgreSQL-format SCRAM-SHA-256 verifier.
+    pub password_hash: String,
+}
+
+impl std::fmt::Debug for AuthUserConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthUserConfig")
+            .field("name", &self.name)
+            .field("password_hash", &"<redacted>")
+            .finish()
+    }
+}
+
+impl AuthConfig {
+    /// Validate the section and build the protocol-layer [`AuthMethod`].
+    pub fn to_auth_method(&self) -> Result<AuthMethod> {
+        match self.auth_type {
+            AuthType::None => {
+                if !self.users.is_empty() {
+                    tracing::warn!(
+                        users = self.users.len(),
+                        "[auth] users are configured but type = \"none\"; they are ignored"
+                    );
+                }
+                Ok(AuthMethod::None)
+            }
+            AuthType::Password => {
+                let users = self
+                    .users
+                    .iter()
+                    .map(|u| {
+                        let verifier: ScramVerifier = u
+                            .password_hash
+                            .parse()
+                            .map_err(|e| anyhow::anyhow!("[auth] user '{}': {e}", u.name))?;
+                        Ok((u.name.clone(), verifier))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let creds =
+                    UserCredentials::new(users).map_err(|e| anyhow::anyhow!("[auth] {e}"))?;
+                Ok(AuthMethod::ScramSha256(Arc::new(creds)))
+            }
+        }
+    }
+}
+
+/// Trino client REST protocol (`POST /v1/statement`) listener.
+///
+/// ```toml
+/// [trino]
+/// enabled = true   # ARNEB_TRINO_ENABLED, CLI --no-trino
+/// port = 8080      # ARNEB_TRINO_PORT,    CLI --trino-port
+/// ```
+///
+/// Served on `bind_address:port` by coordinators and standalone nodes;
+/// workers never serve it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrinoProtocolConfig {
+    /// Whether to serve the Trino client protocol. Default: `true`.
+    #[serde(default = "default_trino_enabled")]
+    pub enabled: bool,
+    /// HTTP port. Default: `8080` (Trino's default, so clients connect
+    /// without extra configuration).
+    #[serde(default = "default_trino_port")]
+    pub port: u16,
+}
+
+fn default_trino_enabled() -> bool {
+    true
+}
+
+fn default_trino_port() -> u16 {
+    8080
+}
+
+impl Default for TrinoProtocolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_trino_enabled(),
+            port: default_trino_port(),
+        }
+    }
+}
+
+impl TrinoProtocolConfig {
+    /// Applies `ARNEB_TRINO_ENABLED` / `ARNEB_TRINO_PORT` (env > file).
+    pub fn apply_env_overrides(&mut self) -> Result<()> {
+        if let Ok(val) = std::env::var("ARNEB_TRINO_ENABLED") {
+            self.enabled = match val.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => true,
+                "0" | "false" | "off" | "no" => false,
+                other => bail!("invalid ARNEB_TRINO_ENABLED value '{other}' (expected true/false)"),
+            };
+        }
+        if let Ok(val) = std::env::var("ARNEB_TRINO_PORT") {
+            self.port = val
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid ARNEB_TRINO_PORT value '{val}'"))?;
+        }
+        if self.enabled && self.port == 0 {
+            bail!("trino.port must be > 0");
+        }
+        Ok(())
+    }
 }
 
 /// Memory budget for spillable operators (currently SemiJoinExec build
@@ -206,7 +368,8 @@ impl MemoryConfig {
 pub struct CatalogConfig {
     /// Catalog name (used in SQL: `SELECT * FROM <name>.schema.table`).
     pub name: String,
-    /// Catalog type (currently only "hive" is supported).
+    /// Catalog type (currently only "hive" is supported; Iceberg tables in
+    /// the metastore are read through it).
     #[serde(rename = "type")]
     pub catalog_type: String,
     /// Hive Metastore URI (e.g., "thrift://hms.internal:9083").
@@ -423,6 +586,8 @@ impl AppConfig {
                         storage: StorageConfig::default(),
                         catalogs: Vec::new(),
                         memory: MemoryConfig::default(),
+                        auth: AuthConfig::default(),
+                        trino: TrinoProtocolConfig::default(),
                     }
                 }
             }
@@ -431,6 +596,8 @@ impl AppConfig {
         let mut server = config.server;
         server.apply_env_overrides()?;
         server.validate()?;
+        let mut trino = config.trino;
+        trino.apply_env_overrides()?;
 
         Ok(AppConfig {
             server,
@@ -439,6 +606,8 @@ impl AppConfig {
             storage: config.storage,
             catalogs: config.catalogs,
             memory: config.memory,
+            auth: config.auth,
+            trino,
         })
     }
 }
@@ -522,6 +691,26 @@ schema = [
         assert_eq!(schema.len(), 2);
         assert_eq!(schema[0].name, "id");
         assert_eq!(schema[0].r#type, "int32");
+    }
+
+    #[test]
+    fn test_trino_config_defaults_and_overrides() {
+        let config: AppConfig = toml::from_str("port = 5432").unwrap();
+        assert!(config.trino.enabled);
+        assert_eq!(config.trino.port, 8080);
+
+        let config: AppConfig = toml::from_str(
+            r#"
+port = 5432
+
+[trino]
+enabled = false
+port = 18080
+"#,
+        )
+        .unwrap();
+        assert!(!config.trino.enabled);
+        assert_eq!(config.trino.port, 18080);
     }
 
     #[test]
@@ -686,5 +875,83 @@ format = "parquet"
         assert_eq!(config.server.max_worker_threads, 4);
         assert_eq!(config.server.max_memory_mb, 2048);
         assert_eq!(config.tables.len(), 1);
+    }
+
+    #[test]
+    fn test_auth_defaults_to_none() {
+        let config: AppConfig = toml::from_str("port = 5432\n").unwrap();
+        assert_eq!(config.auth.auth_type, AuthType::None);
+        assert!(matches!(
+            config.auth.to_auth_method().unwrap(),
+            AuthMethod::None
+        ));
+    }
+
+    #[test]
+    fn test_auth_password_section() {
+        let hash = ScramVerifier::generate("pw").unwrap().to_string();
+        let toml_str = format!(
+            r#"
+port = 5432
+
+[auth]
+type = "password"
+
+[[auth.users]]
+name = "alice"
+password_hash = "{hash}"
+
+[[auth.users]]
+name = "bob"
+password_hash = "{hash}"
+"#
+        );
+        let config: AppConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.auth.auth_type, AuthType::Password);
+        assert_eq!(config.auth.users.len(), 2);
+        match config.auth.to_auth_method().unwrap() {
+            AuthMethod::ScramSha256(creds) => assert_eq!(creds.len(), 2),
+            other => panic!("expected password auth, got {other:?}"),
+        }
+        // The Debug output must never contain the stored verifier.
+        assert!(!format!("{:?}", config.auth).contains(&hash));
+    }
+
+    #[test]
+    fn test_auth_password_requires_users() {
+        let config: AppConfig = toml::from_str("[auth]\ntype = \"password\"\n").unwrap();
+        let err = config.auth.to_auth_method().unwrap_err().to_string();
+        assert!(err.contains("at least one user"), "{err}");
+    }
+
+    #[test]
+    fn test_auth_rejects_bad_hash_and_unknown_fields() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[auth]
+type = "password"
+[[auth.users]]
+name = "alice"
+password_hash = "md5deadbeef"
+"#,
+        )
+        .unwrap();
+        let err = config.auth.to_auth_method().unwrap_err().to_string();
+        assert!(err.contains("alice"), "{err}");
+
+        // A plaintext `password` key is a misuse and must not parse.
+        let res: std::result::Result<AppConfig, _> = toml::from_str(
+            r#"
+[auth]
+type = "password"
+[[auth.users]]
+name = "alice"
+password = "hunter2"
+"#,
+        );
+        assert!(res.is_err());
+
+        let res: std::result::Result<AppConfig, _> = toml::from_str("[auth]\ntype = \"md5\"\n");
+        assert!(res.is_err());
     }
 }

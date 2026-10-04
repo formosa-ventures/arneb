@@ -18,9 +18,17 @@ use futures::Stream;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
-use parquet::arrow::async_reader::{
-    ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
-};
+use parquet::arrow::async_reader::{ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder};
+
+/// The object-store-backed Parquet reader used by every scan path.
+///
+/// parquet 59.2 deprecated `ParquetObjectReader` in favour of hand-written
+/// `AsyncFileReader` impls (apache/arrow-rs#10308). It still works, and it is
+/// the I/O path our benchmarks are measured on, so the dependency bump keeps it
+/// unchanged; replacing it is a separate, separately-benchmarked change. The
+/// alias keeps the deprecation allowance in this one place.
+#[allow(deprecated)]
+pub(crate) type ParquetObjectReader = parquet::arrow::async_reader::ParquetObjectReader;
 
 use arneb_common::error::{ArnebError, ExecutionError};
 use arneb_common::stream::RecordBatchStream;

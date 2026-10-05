@@ -52,7 +52,7 @@ stringprep = "0.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 pgwire = { workspace = true }
 tokio-postgres = "0.7"
 postgres-protocol = "0.6"

@@ -18,7 +18,7 @@ async-trait.workspace = true
 futures.workspace = true
 async-stream = "0.3"
 ahash.workspace = true
-hashbrown = "0.15"
+hashbrown = "0.17"
 tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { workspace = true }
 num_cpus.workspace = true

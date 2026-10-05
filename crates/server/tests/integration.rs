@@ -27,6 +27,7 @@ async fn start_test_server(
         connector_registry,
         distributed_executor: None,
         memory_pool: Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new()),
+        auth: arneb_protocol::AuthMethod::None,
     });
 
     tokio::spawn(async move {
@@ -1037,6 +1038,7 @@ async fn test_hive_e2e_hms_s3_parquet() {
 
     let hive_catalog = Arc::new(arneb_hive::catalog::HiveCatalogProvider::new(
         hms_client.clone(),
+        storage_registry.clone(),
     ));
     let hive_factory = arneb_hive::datasource::HiveConnectorFactory::new(storage_registry);
     // No manual register_table_location() needed: HMS now stores the real

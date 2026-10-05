@@ -29,8 +29,18 @@ cargo run --bin arneb -- --config /path/to/config.toml
 | Service | Port | Roles |
 |---------|------|-------|
 | pgwire (PostgreSQL protocol) | `port` | standalone, coordinator |
+| Trino client protocol (HTTP) | `[trino] port` (default `8080`) | standalone, coordinator |
 | Web UI | `port + 1000` | standalone, coordinator |
 | Flight RPC | `9090` | all roles |
+
+## Trino Client Protocol
+
+| Field | Type | Default | Env Var | CLI | Description |
+|-------|------|---------|---------|-----|-------------|
+| `[trino] enabled` | bool | `true` | `ARNEB_TRINO_ENABLED` | `--no-trino` | Serve the Trino client REST protocol |
+| `[trino] port` | integer | `8080` | `ARNEB_TRINO_PORT` | `--trino-port` | HTTP port of the Trino listener |
+
+See [Trino Client Compatibility](./trino-clients.md) for what the listener supports.
 
 ## Tuning Knobs: Build-Time vs Runtime
 
@@ -123,7 +133,7 @@ service_account_path = "/path/to/service-account.json"
 
 ## Catalog Configuration
 
-Register external catalogs (e.g., Hive Metastore):
+Register external catalogs (e.g., Hive Metastore; its Iceberg tables are read through the same catalog):
 
 ```toml
 [[catalogs]]
@@ -142,7 +152,7 @@ allow_http = true
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | yes | Catalog name (used as first part of `catalog.schema.table`) |
-| `type` | string | yes | Catalog type (currently `"hive"`) |
+| `type` | string | yes | Catalog type (currently `"hive"`; Iceberg tables in the metastore are included, see [Iceberg](/connectors/iceberg)) |
 | `metastore_uri` | string | yes | `host:port` of the Hive Metastore (no scheme prefix) |
 | `default_schema` | string | no | Default schema within the catalog |
 
@@ -165,10 +175,90 @@ worker_id = "worker-1"
 
 See [Distributed Mode](/guide/distributed) for full setup instructions.
 
+## Authentication
+
+`[auth]` is the server's client authentication: one credential store
+intended for every client-facing listener. Today it is enforced on the
+pgwire port; the Trino listener will verify HTTP Basic passwords against the
+same `[[auth.users]]` in a follow-up (see [Limitations](#auth-limitations)).
+
+By default every connection is accepted without a password
+(`type = "none"`), so existing setups keep working. To require passwords,
+add an `[auth]` section:
+
+```toml
+[auth]
+type = "password"   # "none" (default) | "password"
+
+[[auth.users]]
+name = "alice"
+password_hash = "SCRAM-SHA-256$4096:Mzusu25I7rTxxYUaRIIPag==$qQmyyOdRet5ULfbhSwiX8OP4QInk+Monhm0zSkWcgGs=:SgOFTmuXsLnO/AHKLu3a+BAiJ0Yx3JcIj/wNsJX1MxY="
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `type` | string | no | `"none"` (default) or `"password"` |
+| `users[].name` | string | yes | Login name, matched against the client's `user` |
+| `users[].password_hash` | string | yes | SCRAM-SHA-256 verifier (see below) |
+
+`password` mode uses **SCRAM-SHA-256**, the same mechanism as PostgreSQL's
+`password_encryption = scram-sha-256`. psql, JDBC, psycopg2/3, DBeaver,
+tokio-postgres and other modern clients support it. The password never
+crosses the network, and the config file holds only a salted verifier in
+PostgreSQL's `pg_authid.rolpassword` format, not the password. A verifier
+copied from PostgreSQL (`SELECT rolpassword FROM pg_authid WHERE rolname = '…'`)
+works as-is. To generate one:
+
+```bash
+echo -n 'my-password' | arneb hash-password     # or run it and type at the prompt
+echo -n 'my-password' | arneb hash-password --iterations 100000
+```
+
+`--iterations` sets the PBKDF2 iteration count stored in the verifier. The
+default, 4096, matches PostgreSQL. For production, use a much higher count
+(for example 100000 or more) to slow down offline guessing if the config
+file leaks. The cost is paid by the client on every connection, so measure
+connection latency for your clients before going very high.
+
+Behavior:
+
+- A wrong password or an unknown user is rejected with
+  `FATAL 28P01 password authentication failed for user "…"`. Unknown users
+  get the same challenge as real ones, so an attacker can't tell which user
+  names exist.
+- One startup handler serves both the Simple and Extended Query protocols,
+  so every client path gets the same check.
+- The effective mode is logged at startup on the `arneb::config` target
+  (`pgwire authentication effective mode auth="password (scram-sha-256)" users=N`).
+- Invalid `[auth]` config stops startup. This covers an unknown `type`, a
+  malformed hash, duplicate or empty user names, `type = "password"` with no
+  users, and a plaintext `password` key.
+
+<a id="auth-limitations"></a>
+Limitations: `[auth]` is enforced only on the pgwire port. These listeners
+still accept anyone, so keep them on a trusted network:
+
+- the **Trino client protocol** port (`[trino] port`, default `8080`,
+  enabled by default): any `X-Trino-User` is accepted without a password.
+  Startup logs a WARN on `arneb::config` when `type = "password"` is set and
+  this listener is on. Where password protection is required, disable it
+  with `--no-trino` or `ARNEB_TRINO_ENABLED=false` until the follow-up
+  (HTTP Basic over TLS, checked against the same SCRAM verifiers) lands;
+- the **Web UI** (pgwire port + 1000);
+- the **Flight RPC** port between the coordinator and its workers.
+
+The pgwire port does not support TLS yet. SCRAM keeps the password itself
+off the wire, but query traffic is still plaintext. Channel binding (`SCRAM-SHA-256-PLUS`) is
+not offered.
+
 ## CLI Arguments
 
 ```
-arneb [OPTIONS]
+arneb [OPTIONS] [COMMAND]
+
+Commands:
+  hash-password      Read a password from stdin and print a SCRAM-SHA-256
+                     verifier for [[auth.users]] password_hash
 
 Options:
   --config <PATH>    Path to configuration file

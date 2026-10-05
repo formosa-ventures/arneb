@@ -224,7 +224,8 @@ fn enable_selective_dim_first_for_test() {
 }
 
 fn disable_selective_dim_first_for_test() {
-    std::env::remove_var("ARNEB_SELECTIVE_DIM_FIRST");
+    // The knob now ships ON, so unsetting it no longer disables anything.
+    std::env::set_var("ARNEB_SELECTIVE_DIM_FIRST", "0");
 }
 
 #[derive(Debug)]

@@ -44,7 +44,9 @@ fn spill_compression_codec() -> Option<CompressionType> {
         let codec = match std::env::var("ARNEB_SPILL_COMPRESSION").as_deref() {
             Ok("lz4" | "1" | "true") => Some(CompressionType::LZ4_FRAME),
             Ok("zstd") => Some(CompressionType::ZSTD),
-            _ => None,
+            Ok("0" | "off" | "none" | "") => None,
+            Err(_) => Some(CompressionType::LZ4_FRAME),
+            Ok(_) => None,
         };
         let effective = match codec {
             Some(CompressionType::LZ4_FRAME) => "lz4",
@@ -54,7 +56,7 @@ fn spill_compression_codec() -> Option<CompressionType> {
         tracing::info!(
             target: "arneb::config",
             ARNEB_SPILL_COMPRESSION = effective,
-            "ARNEB_SPILL_COMPRESSION effective value (default off; lz4/1/true or zstd)"
+            "ARNEB_SPILL_COMPRESSION effective value (default lz4; =0/off/none/empty to disable; zstd to use Zstandard)"
         );
         codec
     })
@@ -908,5 +910,21 @@ mod tests {
         // After take, partition 0 is gone but partition 1 stays.
         assert!(!file.has_partition(0));
         assert!(file.has_partition(1));
+    }
+
+    // Shipped defaults (2026-09-08). Every knob asserted here was validated on
+    // TPC-H and then carried ONLY by docker/arneb-bench/docker-compose.bench.yml,
+    // so a plain `cargo run --bin arneb` shipped an un-tuned engine: 12 of the 16
+    // knobs that config sets were default-off in code. An engine's default
+    // behaviour should be its validated behaviour; the env vars stay as opt-outs
+    // (`=0`), not as the only way to get the measured numbers.
+
+    #[test]
+    fn spill_compression_ships_as_lz4() {
+        assert_eq!(
+            spill_compression_codec(),
+            Some(CompressionType::LZ4_FRAME),
+            "ARNEB_SPILL_COMPRESSION must ship as lz4; set it to 0 to opt out"
+        );
     }
 }

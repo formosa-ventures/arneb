@@ -22,7 +22,8 @@ export default defineConfig({
             { text: 'Introduction', link: '/guide/introduction' },
             { text: 'Quickstart', link: '/guide/quickstart' },
             { text: 'Configuration', link: '/guide/configuration' },
-            { text: 'Distributed Mode', link: '/guide/distributed' }
+            { text: 'Distributed Mode', link: '/guide/distributed' },
+            { text: 'Trino Clients', link: '/guide/trino-clients' }
           ]
         }
       ],
@@ -44,7 +45,8 @@ export default defineConfig({
             { text: 'Overview', link: '/connectors/overview' },
             { text: 'File Connector', link: '/connectors/file' },
             { text: 'Object Store', link: '/connectors/object-store' },
-            { text: 'Hive', link: '/connectors/hive' }
+            { text: 'Hive', link: '/connectors/hive' },
+            { text: 'Iceberg', link: '/connectors/iceberg' }
           ]
         }
       ],

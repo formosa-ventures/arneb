@@ -39,6 +39,7 @@ cd benchmarks/tpch && cargo run --release -- --engine arneb --port 5432
 # Local Hive + S3 environment (HMS 4.2.0 + MinIO + Trino via docker-compose)
 docker compose up -d                                        # start HMS + MinIO + Trino
 docker compose run --rm tpch-seed                           # seed TPC-H SF1 data
+docker compose run --rm iceberg-seed                        # seed Iceberg tables (<hive catalog>.ice.*)
 cargo run --bin arneb -- --config benchmarks/tpch/tpch-hive.toml  # start Arneb with hive catalog
 psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.nation;"
 docker compose down                                         # tear down
@@ -102,6 +103,8 @@ name = "datalake"
 type = "hive"
 metastore_uri = "127.0.0.1:9083"   # host:port, no scheme
 default_schema = "default"
+# Iceberg tables in this HMS (table_type=ICEBERG) are read through the same
+# catalog via table redirection (read-only, current snapshot).
 
 # Per-catalog storage override (merges with global [storage])
 [catalogs.storage.s3]
@@ -113,8 +116,9 @@ allow_http = true
 See `benchmarks/tpch/tpch-hive.toml` for a Hive-backed benchmark config.
 
 **Ports**:
-- Coordinator/Standalone: pgwire (configured port), Web UI (port + 1000), Flight RPC (9090)
-- Worker: Flight RPC only (no pgwire, no Web UI)
+- Coordinator/Standalone: pgwire (configured port), Trino client REST protocol (`[trino] port`, default 8080; `ARNEB_TRINO_PORT` / `--trino-port`, disable with `--no-trino`), Web UI (port + 1000), Flight RPC (9090)
+- Worker: Flight RPC only (no pgwire, no Trino HTTP, no Web UI)
+- The Trino listener's bind failure is non-fatal (logged; pgwire keeps serving) — `docker compose up` publishes the bundled Trino on 8080, so use `--trino-port` when both run locally. See `docs/guide/trino-clients.md`.
 
 **Roles**:
 - `standalone` (default) — single process, all-in-one
@@ -157,7 +161,7 @@ crates/
 │                  # PlanFragmenter for distributed execution
 ├── execution/     # Physical operators (scan, filter, project, join, aggregate,
 │                  # sort, limit, semi-join, set ops, window, explain),
-│                  # ScalarFunction trait + 19 built-in functions,
+│                  # ScalarFunction trait + 90 built-in functions,
 │                  # DataSource trait, ExecutionContext
 ├── connectors/    # ConnectorFactory/ConnectorRegistry/DDLProvider traits,
 │                  # memory + file (CSV/Parquet) connectors,
@@ -165,12 +169,20 @@ crates/
 ├── hive/          # Hive Metastore catalog provider + HiveDataSource,
 │                  # HMS Thrift client wrapper (HMS 4.x via _req API),
 │                  # HiveConnectorFactory wired through StorageRegistry
+├── iceberg/       # Read-only Iceberg reader; hive catalogs redirect
+│                  # table_type=ICEBERG tables here. Metadata JSON (v1/v2),
+│                  # manifest list/manifests (Avro via apache-avro), field-ID
+│                  # column resolution over the shared connectors::parquet_scan.
+│                  # Delete files → clear unsupported error. See docs/connectors/iceberg.md.
 ├── hive-metastore/# Auto-generated Thrift bindings from Hive 4.2.0 IDL via volo-build.
 │                  # Rebuild with `cargo run -p hive-metastore-thrift-build` after
 │                  # editing `thrift_idl/hive_metastore.thrift`.
 ├── protocol/      # PostgreSQL wire protocol v3 (Simple + Extended Query) via pgwire,
 │                  # pg_catalog/information_schema metadata handler,
-│                  # type encoding (Arrow → PG), error mapping, SET/SHOW handling
+│                  # type encoding (Arrow → PG), error mapping, SET/SHOW handling;
+│                  # trino/: Trino client REST protocol v1 (axum) — /v1/statement
+│                  # paging/cancel, X-Trino-* sessions, SHOW/USE/PREPARE, virtual
+│                  # information_schema + system.jdbc, Trino JSON type encoding
 ├── scheduler/     # QueryTracker (state machine), NodeRegistry (worker heartbeat),
 │                  # ResourceGroupManager, NodeScheduler
 ├── rpc/           # Arrow Flight RPC server/client for distributed task execution,
@@ -228,10 +240,15 @@ SELECT, EXPLAIN, CREATE TABLE, DROP TABLE, CREATE TABLE AS SELECT, INSERT INTO, 
 ### Advanced DQL
 CTEs (WITH), UNION ALL/UNION/INTERSECT/EXCEPT, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX OVER), GROUP BY with HAVING, ORDER BY on aggregates/aliases
 
-### Scalar Functions (19)
-String: UPPER, LOWER, SUBSTRING, TRIM, LTRIM, RTRIM, CONCAT, LENGTH, REPLACE, POSITION
-Math: ABS, ROUND, CEIL, FLOOR, MOD, POWER
-Date: EXTRACT, CURRENT_DATE, DATE_TRUNC
+### Scalar Functions (90, Trino semantics — full reference in `docs/sql/functions.md`)
+Conditional: IF (desugared to CASE in the parser), TRY (handled in `expression.rs`), GREATEST, LEAST
+String: UPPER, LOWER, SUBSTRING, TRIM, LTRIM, RTRIM, CONCAT (`||`), CONCAT_WS, LENGTH, REPLACE, POSITION, STRPOS, SPLIT_PART, STARTS_WITH, REVERSE, LPAD, RPAD, CHR, CODEPOINT, TRANSLATE, LEVENSHTEIN_DISTANCE, HAMMING_DISTANCE
+Regex: REGEXP_LIKE, REGEXP_EXTRACT, REGEXP_REPLACE, REGEXP_COUNT
+Math: ABS, ROUND, CEIL, FLOOR, TRUNCATE, MOD, POWER, SQRT, CBRT, EXP, LN, LOG2, LOG10, LOG, SIGN, PI, E, RANDOM, DEGREES, RADIANS, SIN/COS/TAN, ASIN/ACOS/ATAN/ATAN2, SINH/COSH/TANH, NAN, INFINITY, IS_NAN, IS_FINITE, IS_INFINITE
+Date: EXTRACT, CURRENT_DATE, NOW, DATE_TRUNC, DATE_ADD, DATE_DIFF, YEAR, QUARTER, MONTH, WEEK, DAY, DAY_OF_WEEK, DAY_OF_YEAR, YEAR_OF_WEEK, HOUR, MINUTE, SECOND, MILLISECOND, LAST_DAY_OF_MONTH, DATE, FROM_UNIXTIME, TO_UNIXTIME, DATE_FORMAT, DATE_PARSE, FORMAT_DATETIME
+Aliases: CEILING, POW, RAND, DAY_OF_MONTH, DOW, DOY, WEEK_OF_YEAR, YOW, CURRENT_TIMESTAMP, LOCALTIMESTAMP
+
+Adding a function: implement `ScalarFunction` in `crates/execution/src/functions/`, register it, and add its return type to `function_return_type` in `crates/planner/src/analyzer/mod.rs` (the `planner_and_registry_return_types_agree` test enforces they match — `ProjectionExec` casts results to the planned type).
 
 ## Phase Roadmap
 

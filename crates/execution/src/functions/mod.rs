@@ -1,7 +1,10 @@
 //! Scalar function registry and built-in function implementations.
 
+mod args;
+mod conditional;
 mod date;
 mod math;
+mod regexp;
 mod registry;
 mod string;
 

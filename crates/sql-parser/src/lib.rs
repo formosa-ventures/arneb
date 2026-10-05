@@ -541,6 +541,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_insert_with_column_list() {
+        let stmt = parse("INSERT INTO t (a, b) VALUES (1, 2), (3, 4)").unwrap();
+        match stmt {
+            Statement::InsertInto {
+                columns,
+                source: ast::InsertSource::Values(rows),
+                ..
+            } => {
+                assert_eq!(columns, vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(rows.len(), 2);
+                assert!(rows.iter().all(|row| row.len() == 2));
+            }
+            other => panic!("expected InsertInto with VALUES, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_qualified_column_is_unsupported() {
+        let result = parse("INSERT INTO t (t.a) VALUES (1)");
+        assert!(matches!(result, Err(ParseError::UnsupportedFeature(_))));
+    }
+
+    #[test]
+    fn parse_wildcard_options_in_function_arg_is_unsupported() {
+        let result = parse("SELECT count(* EXCLUDE (a)) FROM t");
+        assert!(matches!(result, Err(ParseError::UnsupportedFeature(_))));
+    }
+
+    #[test]
+    fn parse_multi_column_alias_is_unsupported() {
+        let result = parse("SELECT f(x) AS (a, b) FROM t");
+        assert!(matches!(result, Err(ParseError::UnsupportedFeature(_))));
+    }
+
+    #[test]
     fn parse_delete_from() {
         let stmt = parse("DELETE FROM t WHERE id = 1").unwrap();
         assert!(matches!(
@@ -1287,5 +1322,95 @@ mod tests {
         };
         assert_eq!(span.start.line, 1);
         assert_eq!(span.start.column, 8);
+    }
+
+    // -- Trino function-syntax lowering (trino-functions-batch1) --
+
+    fn first_projection(sql: &str) -> Expr {
+        let stmt = parse(sql).unwrap();
+        let Statement::Query { query, .. } = stmt else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(e) => e.clone(),
+            other => panic!("expected unnamed expr, got {other:?}"),
+        }
+    }
+
+    fn function_name_and_arity(e: &Expr) -> (String, usize) {
+        match e {
+            Expr::Function { name, args, .. } => (name.clone(), args.len()),
+            other => panic!("expected Function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_if_desugars_to_case() {
+        match first_projection("SELECT IF(a > 1, 'x', 'y') FROM t") {
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => {
+                assert!(operand.is_none());
+                assert_eq!(conditions.len(), 1);
+                assert_eq!(results.len(), 1);
+                assert!(else_result.is_some());
+            }
+            other => panic!("expected Case, got {other:?}"),
+        }
+        match first_projection("SELECT IF(a > 1, 'x') FROM t") {
+            Expr::Case { else_result, .. } => assert!(else_result.is_none()),
+            other => panic!("expected Case, got {other:?}"),
+        }
+        assert!(parse("SELECT IF(a) FROM t").is_err());
+    }
+
+    #[test]
+    fn parse_ceil_floor_lower_to_functions() {
+        assert_eq!(
+            function_name_and_arity(&first_projection("SELECT CEIL(x) FROM t")),
+            ("CEIL".to_string(), 1)
+        );
+        assert_eq!(
+            function_name_and_arity(&first_projection("SELECT FLOOR(x) FROM t")),
+            ("FLOOR".to_string(), 1)
+        );
+    }
+
+    #[test]
+    fn parse_position_in_lowers_to_function() {
+        assert_eq!(
+            function_name_and_arity(&first_projection("SELECT POSITION('a' IN s) FROM t")),
+            ("POSITION".to_string(), 2)
+        );
+    }
+
+    #[test]
+    fn parse_trim_forms_lower_to_functions() {
+        let cases = [
+            ("SELECT TRIM(s) FROM t", "TRIM", 1),
+            ("SELECT TRIM(BOTH 'x' FROM s) FROM t", "TRIM", 2),
+            ("SELECT TRIM(LEADING 'x' FROM s) FROM t", "LTRIM", 2),
+            ("SELECT TRIM(TRAILING 'x' FROM s) FROM t", "RTRIM", 2),
+            ("SELECT TRIM(s, 'xy') FROM t", "TRIM", 2),
+        ];
+        for (sql, name, arity) in cases {
+            assert_eq!(
+                function_name_and_arity(&first_projection(sql)),
+                (name.to_string(), arity),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_string_concat_operator_lowers_to_concat() {
+        assert_eq!(
+            function_name_and_arity(&first_projection("SELECT a || 'b' FROM t")),
+            ("CONCAT".to_string(), 2)
+        );
     }
 }

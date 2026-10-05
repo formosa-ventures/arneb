@@ -101,7 +101,7 @@ pub(crate) fn evaluate(
 
             let ge_low = compare_op(&val, &low_val, CompareOp::GtEq)?;
             let le_high = compare_op(&val, &high_val, CompareOp::LtEq)?;
-            let result = kernels::boolean::and(&ge_low, &le_high)?;
+            let result = kernels::boolean::and_kleene(&ge_low, &le_high)?;
 
             if *negated {
                 let negated_result = kernels::boolean::not(&result)?;
@@ -123,7 +123,7 @@ pub(crate) fn evaluate(
             // `FastHashSet<T>` once and check membership O(1) per row.
             // For small lists (≤ INLIST_HASHSET_THRESHOLD) the OR-of-
             // kernels path below is faster because Arrow's vectorised
-            // `eq` plus `boolean::or` outperforms scalar set lookups
+            // `eq` plus `boolean::or_kleene` outperforms scalar set lookups
             // when there are only a handful of literals.
             if list.len() >= INLIST_HASHSET_THRESHOLD {
                 if let Some(literals) = try_collect_literals(list) {
@@ -138,7 +138,7 @@ pub(crate) fn evaluate(
                 let item_val = evaluate(item, batch, registry)?;
                 let eq = compare_op(&val, &item_val, CompareOp::Eq)?;
                 result = Some(match result {
-                    Some(prev) => kernels::boolean::or(&prev, &eq)?,
+                    Some(prev) => kernels::boolean::or_kleene(&prev, &eq)?,
                     None => eq,
                 });
             }
@@ -159,6 +159,12 @@ pub(crate) fn evaluate(
             args,
             ..
         } => {
+            // TRY(expr) must observe its argument's evaluation errors,
+            // so it cannot be an ordinary registry function (those only
+            // see already-evaluated argument arrays).
+            if name.eq_ignore_ascii_case("TRY") {
+                return evaluate_try(args, batch, registry);
+            }
             // Try the caller-supplied registry first, then fall back
             // to the process-wide default registry. Many operators
             // (ProjectionExec, FilterExec, SortExec, HashAggregateExec
@@ -176,7 +182,7 @@ pub(crate) fn evaluate(
                     .iter()
                     .map(|a| evaluate(a, batch, registry))
                     .collect::<Result<Vec<_>, _>>()?;
-                return func.evaluate(&evaluated_args);
+                return func.invoke(&evaluated_args, batch.num_rows());
             }
             Err(ExecutionError::InvalidOperation(format!(
                 "unknown scalar function: {name}; aggregate functions are handled by the aggregate operator"
@@ -220,6 +226,47 @@ pub(crate) fn evaluate(
             "unbound parameter ${index}; extended-query protocol must Bind all parameters before Execute"
         ))),
     }
+}
+
+/// Trino's `TRY(expr)`: evaluate `expr`, turning evaluation errors into
+/// NULL for the offending rows only.
+///
+/// The whole batch is evaluated first (the fast, common path). Only if
+/// that fails is the batch re-evaluated one row at a time, so rows that
+/// succeed keep their value and rows that fail become NULL. Every
+/// evaluation error is caught (Trino catches only a fixed set of error
+/// codes — division by zero, invalid cast/argument, overflow — but in
+/// practice those are the errors scalar evaluation raises).
+fn evaluate_try(
+    args: &[PlanExpr],
+    batch: &RecordBatch,
+    registry: Option<&FunctionRegistry>,
+) -> Result<ArrayRef, ExecutionError> {
+    let [arg] = args else {
+        return Err(ExecutionError::InvalidOperation(format!(
+            "TRY expects exactly 1 argument, got {}",
+            args.len()
+        )));
+    };
+    if let Ok(arr) = evaluate(arg, batch, registry) {
+        return Ok(arr);
+    }
+    let rows: Vec<Option<ArrayRef>> = (0..batch.num_rows())
+        .map(|i| evaluate(arg, &batch.slice(i, 1), registry).ok())
+        .collect();
+    let Some(data_type) = rows.iter().flatten().map(|a| a.data_type().clone()).next() else {
+        return Ok(Arc::new(NullArray::new(batch.num_rows())));
+    };
+    let pieces: Vec<ArrayRef> = rows
+        .into_iter()
+        .map(|r| match r {
+            Some(a) if a.data_type() == &data_type => Ok(a),
+            Some(a) => kernels::cast::cast(&a, &data_type).map_err(ExecutionError::from),
+            None => Ok(arrow::array::new_null_array(&data_type, 1)),
+        })
+        .collect::<Result<_, _>>()?;
+    let refs: Vec<&dyn Array> = pieces.iter().map(|a| a.as_ref()).collect();
+    Ok(kernels::concat::concat(&refs)?)
 }
 
 /// Threshold above which `InList` switches from `OR`-of-Arrow-`eq`-
@@ -575,35 +622,19 @@ fn evaluate_binary_op(
         ast::BinaryOp::GtEq => Ok(Arc::new(compare_op(left, right, CompareOp::GtEq)?)),
 
         // Logical
+        // SQL three-valued logic: the `_kleene` kernels give
+        // `NULL AND FALSE = FALSE` and `NULL OR TRUE = TRUE`, whereas the
+        // plain `and`/`or` kernels propagate NULL whenever either side is
+        // NULL (wrong for SQL, silently drops rows in WHERE).
         ast::BinaryOp::And => {
-            let l = left
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    ExecutionError::InvalidOperation("AND requires boolean operands".to_string())
-                })?;
-            let r = right
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    ExecutionError::InvalidOperation("AND requires boolean operands".to_string())
-                })?;
-            Ok(Arc::new(kernels::boolean::and(l, r)?))
+            let l = as_boolean_operand(left, "AND")?;
+            let r = as_boolean_operand(right, "AND")?;
+            Ok(Arc::new(kernels::boolean::and_kleene(&l, &r)?))
         }
         ast::BinaryOp::Or => {
-            let l = left
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    ExecutionError::InvalidOperation("OR requires boolean operands".to_string())
-                })?;
-            let r = right
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    ExecutionError::InvalidOperation("OR requires boolean operands".to_string())
-                })?;
-            Ok(Arc::new(kernels::boolean::or(l, r)?))
+            let l = as_boolean_operand(left, "OR")?;
+            let r = as_boolean_operand(right, "OR")?;
+            Ok(Arc::new(kernels::boolean::or_kleene(&l, &r)?))
         }
 
         // String pattern matching
@@ -716,14 +747,29 @@ fn arithmetic_op(
     Ok(result)
 }
 
+/// View `arr` as a boolean operand of a logical operator. An untyped
+/// NULL (Arrow `Null` array, e.g. from a bare `NULL` literal — the
+/// analyzer does not coerce AND/OR/NOT operands) is treated as an
+/// all-NULL boolean column so three-valued logic applies to it.
+pub(crate) fn as_boolean_operand(arr: &ArrayRef, op: &str) -> Result<BooleanArray, ExecutionError> {
+    if let Some(b) = arr.as_any().downcast_ref::<BooleanArray>() {
+        return Ok(b.clone());
+    }
+    if arr.data_type() == &ArrowDataType::Null {
+        return Ok(BooleanArray::new_null(arr.len()));
+    }
+    Err(ExecutionError::InvalidOperation(format!(
+        "{op} requires boolean operands"
+    )))
+}
+
 /// Evaluates a unary operation.
 fn evaluate_unary_op(op: &ast::UnaryOp, arr: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
     match op {
         ast::UnaryOp::Not => {
-            let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-                ExecutionError::InvalidOperation("NOT requires boolean operand".to_string())
-            })?;
-            Ok(Arc::new(kernels::boolean::not(bool_arr)?))
+            // `not` maps NULL -> NULL, which is already the SQL semantics.
+            let bool_arr = as_boolean_operand(arr, "NOT")?;
+            Ok(Arc::new(kernels::boolean::not(&bool_arr)?))
         }
         ast::UnaryOp::Minus => Ok(kernels::numeric::neg(arr)?),
         ast::UnaryOp::Plus => Ok(arr.clone()),
@@ -1074,6 +1120,203 @@ mod tests {
         assert!(arr.value(0));
         assert!(!arr.value(1));
         assert!(arr.value(2));
+    }
+
+    // -- Three-valued (Kleene) boolean logic ------------------------------
+
+    /// Batch with every (l, r) pair from {TRUE, FALSE, NULL}^2: 9 rows.
+    fn kleene_batch() -> RecordBatch {
+        let vals = [Some(true), Some(false), None];
+        let mut l = Vec::new();
+        let mut r = Vec::new();
+        for a in vals {
+            for b in vals {
+                l.push(a);
+                r.push(b);
+            }
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l", ArrowDataType::Boolean, true),
+            Field::new("r", ArrowDataType::Boolean, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BooleanArray::from(l)),
+                Arc::new(BooleanArray::from(r)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn col_ref(index: usize, name: &str) -> PlanExpr {
+        PlanExpr::Column {
+            index,
+            name: name.to_string(),
+            span: None,
+        }
+    }
+
+    fn eval_bool(expr: &PlanExpr, batch: &RecordBatch) -> Vec<Option<bool>> {
+        let result = evaluate(expr, batch, None).unwrap();
+        let arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+        arr.iter().collect()
+    }
+
+    fn bin(left: PlanExpr, op: ast::BinaryOp, right: PlanExpr) -> PlanExpr {
+        PlanExpr::BinaryOp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+            span: None,
+        }
+    }
+
+    fn lit(value: ScalarValue) -> PlanExpr {
+        PlanExpr::Literal { value, span: None }
+    }
+
+    /// `CAST(NULL AS INTEGER)` — the shape the analyzer produces when an
+    /// untyped NULL meets an Int32 operand in a comparison.
+    fn typed_null_i32() -> PlanExpr {
+        PlanExpr::Cast {
+            expr: Box::new(lit(ScalarValue::Null)),
+            data_type: arneb_common::types::DataType::Int32,
+            span: None,
+        }
+    }
+
+    #[test]
+    fn and_full_kleene_truth_table() {
+        let batch = kleene_batch();
+        let expr = bin(col_ref(0, "l"), ast::BinaryOp::And, col_ref(1, "r"));
+        // Rows: (T,T) (T,F) (T,N) (F,T) (F,F) (F,N) (N,T) (N,F) (N,N)
+        assert_eq!(
+            eval_bool(&expr, &batch),
+            vec![
+                Some(true),
+                Some(false),
+                None,
+                Some(false),
+                Some(false),
+                Some(false),
+                None,
+                Some(false),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn or_full_kleene_truth_table() {
+        let batch = kleene_batch();
+        let expr = bin(col_ref(0, "l"), ast::BinaryOp::Or, col_ref(1, "r"));
+        // Rows: (T,T) (T,F) (T,N) (F,T) (F,F) (F,N) (N,T) (N,F) (N,N)
+        assert_eq!(
+            eval_bool(&expr, &batch),
+            vec![
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(false),
+                None,
+                Some(true),
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn not_kleene_truth_table() {
+        let batch = kleene_batch();
+        let expr = PlanExpr::UnaryOp {
+            op: ast::UnaryOp::Not,
+            expr: Box::new(col_ref(0, "l")),
+            span: None,
+        };
+        let got = eval_bool(&expr, &batch);
+        // Rows 0, 3, 6 carry l = TRUE, FALSE, NULL.
+        assert_eq!(got[0], Some(false));
+        assert_eq!(got[3], Some(true));
+        assert_eq!(got[6], None);
+    }
+
+    #[test]
+    fn untyped_null_literal_in_and_or_not() {
+        // `NULL OR TRUE` -> TRUE, `FALSE AND NULL` -> FALSE,
+        // `NULL AND TRUE` -> NULL, `NOT NULL` -> NULL, where the NULL
+        // literal evaluates to an untyped (Arrow `Null`) array.
+        let batch = kleene_batch();
+        let n = batch.num_rows();
+        let null = || lit(ScalarValue::Null);
+        let b = |v: bool| lit(ScalarValue::Boolean(v));
+        assert_eq!(
+            eval_bool(&bin(null(), ast::BinaryOp::Or, b(true)), &batch),
+            vec![Some(true); n]
+        );
+        assert_eq!(
+            eval_bool(&bin(b(false), ast::BinaryOp::And, null()), &batch),
+            vec![Some(false); n]
+        );
+        assert_eq!(
+            eval_bool(&bin(null(), ast::BinaryOp::And, b(true)), &batch),
+            vec![None; n]
+        );
+        assert_eq!(
+            eval_bool(&bin(null(), ast::BinaryOp::Or, null()), &batch),
+            vec![None; n]
+        );
+        let not_null = PlanExpr::UnaryOp {
+            op: ast::UnaryOp::Not,
+            expr: Box::new(null()),
+            span: None,
+        };
+        assert_eq!(eval_bool(&not_null, &batch), vec![None; n]);
+    }
+
+    #[test]
+    fn in_list_with_null_item_is_kleene() {
+        // `x IN (1, NULL)`: x=1 -> TRUE (not NULL), x=2 -> NULL.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            ArrowDataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![Some(1), Some(2), None]))],
+        )
+        .unwrap();
+        let expr = PlanExpr::InList {
+            expr: Box::new(col_ref(0, "x")),
+            list: vec![lit(ScalarValue::Int32(1)), typed_null_i32()],
+            negated: false,
+            span: None,
+        };
+        assert_eq!(eval_bool(&expr, &batch), vec![Some(true), None, None]);
+    }
+
+    #[test]
+    fn between_with_null_bound_is_kleene() {
+        // `x BETWEEN NULL AND 5`: x=10 -> (NULL AND FALSE) = FALSE,
+        // x=3 -> (NULL AND TRUE) = NULL.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            ArrowDataType::Int32,
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![10, 3]))]).unwrap();
+        let expr = PlanExpr::Between {
+            expr: Box::new(col_ref(0, "x")),
+            negated: false,
+            low: Box::new(typed_null_i32()),
+            high: Box::new(lit(ScalarValue::Int32(5))),
+            span: None,
+        };
+        assert_eq!(eval_bool(&expr, &batch), vec![Some(false), None]);
     }
 
     #[test]
@@ -1605,5 +1848,76 @@ mod tests {
         assert_eq!(arr.value(0), 1);
         assert!(arr.is_null(1)); // NULLIF(2, 2) = NULL
         assert_eq!(arr.value(2), 3);
+    }
+
+    // -- TRY / nullary functions (trino-functions-batch1) --
+
+    fn func(name: &str, args: Vec<PlanExpr>) -> PlanExpr {
+        PlanExpr::Function {
+            name: name.to_string(),
+            args,
+            distinct: false,
+            span: None,
+        }
+    }
+
+    fn col(index: usize) -> PlanExpr {
+        PlanExpr::Column {
+            index,
+            name: format!("c{index}"),
+            span: None,
+        }
+    }
+
+    fn codepoint_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![65, -1, 66]))]).unwrap()
+    }
+
+    #[test]
+    fn try_nulls_only_failing_rows() {
+        let batch = codepoint_batch();
+        // CHR(-1) is an error; without TRY the whole batch fails.
+        assert!(evaluate(&func("CHR", vec![col(0)]), &batch, None).is_err());
+        let out = evaluate(&func("TRY", vec![func("CHR", vec![col(0)])]), &batch, None).unwrap();
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(out.value(0), "A");
+        assert!(out.is_null(1));
+        assert_eq!(out.value(2), "B");
+    }
+
+    #[test]
+    fn try_passes_through_successful_batches() {
+        let batch = make_batch();
+        let out = evaluate(&func("try", vec![col(1)]), &batch, None).unwrap();
+        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(out.values(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn try_all_rows_failing_yields_all_nulls() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![-1, -2]))]).unwrap();
+        let out = evaluate(&func("TRY", vec![func("CHR", vec![col(0)])]), &batch, None).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.logical_null_count(), 2);
+    }
+
+    #[test]
+    fn nullary_functions_produce_one_value_per_row() {
+        let batch = make_batch();
+        for name in ["PI", "CURRENT_DATE", "NOW", "CURRENT_TIMESTAMP", "RANDOM"] {
+            let out = evaluate(&func(name, vec![]), &batch, None).unwrap();
+            assert_eq!(out.len(), batch.num_rows(), "{name}");
+        }
     }
 }

@@ -277,25 +277,58 @@ fn function_return_type(name: &str, args: &[PlanExpr], schema: &[ColumnInfo]) ->
 
         // Scalar built-ins. Return types here MUST match the
         // corresponding `ScalarFunction::return_type` impls in
-        // `crates/execution/src/functions/*.rs`. The analyzer needs
-        // them to type-check expressions like
+        // `crates/execution/src/functions/*.rs` (enforced by the
+        // `planner_and_registry_return_types_agree` test there). The
+        // analyzer needs them to type-check expressions like
         // `GROUP BY EXTRACT(YEAR FROM l_shipdate)` where the
         // post-aggregate schema is built before the executor's
-        // registry is consulted.
+        // registry is consulted, and `ProjectionExec` casts each
+        // evaluated column to the type recorded here.
         //
         // Date / time
         "EXTRACT" => Some(DataType::Int64),
-        "DATE_TRUNC" => Some(DataType::Date32),
-        "CURRENT_DATE" => Some(DataType::Date32),
+        // date_trunc / date_add return the type of their temporal
+        // argument (DATE stays DATE, TIMESTAMP stays TIMESTAMP).
+        "DATE_TRUNC" => args
+            .get(1)
+            .and_then(|a| plan_expr_type(a, schema))
+            .map(|t| match t {
+                DataType::Null | DataType::Utf8 | DataType::LargeUtf8 => DataType::Date32,
+                other => other,
+            }),
+        "DATE_ADD" => args
+            .get(2)
+            .and_then(|a| plan_expr_type(a, schema))
+            .map(|t| match t {
+                DataType::Null | DataType::Utf8 | DataType::LargeUtf8 => timestamp_us(),
+                other => other,
+            }),
+        "CURRENT_DATE" | "LAST_DAY_OF_MONTH" | "DATE" => Some(DataType::Date32),
+        "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "FROM_UNIXTIME" | "DATE_PARSE" => {
+            Some(timestamp_us())
+        }
+        "YEAR" | "QUARTER" | "MONTH" | "WEEK" | "WEEK_OF_YEAR" | "DAY" | "DAY_OF_MONTH"
+        | "DAY_OF_WEEK" | "DOW" | "DAY_OF_YEAR" | "DOY" | "YEAR_OF_WEEK" | "YOW" | "HOUR"
+        | "MINUTE" | "SECOND" | "MILLISECOND" | "DATE_DIFF" => Some(DataType::Int64),
+        "TO_UNIXTIME" => Some(DataType::Float64),
+        "DATE_FORMAT" | "FORMAT_DATETIME" => Some(DataType::Utf8),
 
         // String — Utf8 in, Utf8 out (except length/position which
         // return integer counts).
         "UPPER" | "LOWER" | "SUBSTRING" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "CONCAT"
-        | "REPLACE" => Some(DataType::Utf8),
-        "LENGTH" | "POSITION" => Some(DataType::Int64),
+        | "REPLACE" | "SPLIT_PART" | "REVERSE" | "LPAD" | "RPAD" | "CHR" | "CONCAT_WS"
+        | "TRANSLATE" | "REGEXP_EXTRACT" | "REGEXP_REPLACE" => Some(DataType::Utf8),
+        "LENGTH"
+        | "POSITION"
+        | "STRPOS"
+        | "REGEXP_COUNT"
+        | "LEVENSHTEIN_DISTANCE"
+        | "HAMMING_DISTANCE" => Some(DataType::Int64),
+        "CODEPOINT" => Some(DataType::Int32),
+        "STARTS_WITH" | "REGEXP_LIKE" => Some(DataType::Boolean),
 
         // Math — preserve integer-ness when the input is integral.
-        "ROUND" | "CEIL" | "FLOOR" | "POWER" | "ABS" => args
+        "ROUND" | "CEIL" | "CEILING" | "FLOOR" | "POWER" | "POW" | "ABS" => args
             .first()
             .and_then(|a| plan_expr_type(a, schema))
             .map(|t| match t {
@@ -307,9 +340,79 @@ fn function_return_type(name: &str, args: &[PlanExpr], schema: &[ColumnInfo]) ->
             .first()
             .and_then(|a| plan_expr_type(a, schema))
             .or(Some(DataType::Int64)),
+        "SIGN" | "TRUNCATE" => args
+            .first()
+            .and_then(|a| plan_expr_type(a, schema))
+            .map(|t| {
+                if is_integer_type(&t) {
+                    DataType::Int64
+                } else {
+                    DataType::Float64
+                }
+            })
+            .or(Some(DataType::Float64)),
+        "RANDOM" | "RAND" => Some(if args.is_empty() {
+            DataType::Float64
+        } else {
+            DataType::Int64
+        }),
+        "SQRT" | "CBRT" | "EXP" | "LN" | "LOG2" | "LOG10" | "LOG" | "PI" | "E" | "DEGREES"
+        | "RADIANS" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "ATAN2" | "SINH"
+        | "COSH" | "TANH" | "NAN" | "INFINITY" => Some(DataType::Float64),
+        "IS_NAN" | "IS_FINITE" | "IS_INFINITE" => Some(DataType::Boolean),
+
+        // Conditional
+        "GREATEST" | "LEAST" => {
+            let types = args
+                .iter()
+                .map(|a| plan_expr_type(a, schema))
+                .collect::<Option<Vec<_>>>()?;
+            variadic_supertype(&types)
+        }
+        "TRY" => args.first().and_then(|a| plan_expr_type(a, schema)),
 
         _ => None, // unknown / scalar built-in — defer.
     }
+}
+
+/// The canonical timestamp type produced by the date/time scalar
+/// functions (`now()`, `from_unixtime()`, `date_parse()`, ...):
+/// microsecond precision, no zone (UTC wall-clock).
+fn timestamp_us() -> DataType {
+    DataType::Timestamp {
+        unit: arneb_common::types::TimeUnit::Microsecond,
+        timezone: None,
+    }
+}
+
+fn is_integer_type(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
+}
+
+/// Common supertype of a variadic argument list (`GREATEST`, `LEAST`),
+/// ignoring untyped `NULL` arguments. Returns `Some(Null)` when every
+/// argument is `NULL`, and `None` when two arguments have no common
+/// type. Shared with the execution-side implementation so the planned
+/// and evaluated types always agree.
+pub fn variadic_supertype(types: &[DataType]) -> Option<DataType> {
+    let mut acc: Option<DataType> = None;
+    for t in types.iter().filter(|t| **t != DataType::Null) {
+        acc = Some(match acc {
+            None => t.clone(),
+            Some(a) => coercion_matrix::common_supertype(
+                &a,
+                t,
+                coercion_matrix::CoercionSite::CaseBranch {
+                    left_is_literal: false,
+                    right_is_literal: false,
+                },
+            )?,
+        });
+    }
+    Some(acc.unwrap_or(DataType::Null))
 }
 
 /// Per-query mutable state that analysis passes share. Created once per

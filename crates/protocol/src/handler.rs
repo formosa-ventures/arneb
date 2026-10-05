@@ -18,10 +18,6 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::stream;
 use futures::Sink;
-use pgwire::api::auth::{
-    finish_authentication, save_startup_parameters_to_metadata, DefaultServerParameterProvider,
-    StartupHandler,
-};
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
@@ -32,8 +28,8 @@ use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, ClientPortalStore, NoopHandler, PgWireServerHandlers, Type};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::messages::PgWireFrontendMessage;
 
+use crate::auth::{AuthMethod, AuthStartupHandler};
 use crate::encoding::{column_info_to_field_info, encode_record_batches};
 
 /// Trait for distributed query execution. Implemented by QueryCoordinator
@@ -102,6 +98,10 @@ pub struct HandlerFactory {
     pub connector_registry: Arc<ConnectorRegistry>,
     pub distributed_executor: Option<Arc<dyn DistributedExecutor>>,
     pub memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool>,
+    /// Client authentication mode enforced during connection startup. Covers
+    /// both the Simple and Extended Query paths, which share one startup
+    /// handler.
+    pub auth: AuthMethod,
 }
 
 impl PgWireServerHandlers for HandlerFactory {
@@ -124,12 +124,9 @@ impl PgWireServerHandlers for HandlerFactory {
     }
 
     fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
-        Arc::new(ConnectionHandler {
-            distributed_executor: self.distributed_executor.clone(),
-            catalog_manager: Arc::clone(&self.catalog_manager),
-            connector_registry: Arc::clone(&self.connector_registry),
-            memory_pool: Arc::clone(&self.memory_pool),
-        })
+        // pgwire calls this once per connection, so the SCRAM exchange state
+        // inside the handler is never shared between clients.
+        Arc::new(AuthStartupHandler::new(self.auth.clone()))
     }
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {
@@ -147,26 +144,6 @@ pub struct ConnectionHandler {
     /// spillable operators (SemiJoinExec build) honour the configured
     /// per-task budget instead of growing unbounded.
     pub memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool>,
-}
-
-#[async_trait]
-impl StartupHandler for ConnectionHandler {
-    async fn on_startup<C>(
-        &self,
-        client: &mut C,
-        message: PgWireFrontendMessage,
-    ) -> PgWireResult<()>
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        if let PgWireFrontendMessage::Startup(ref startup) = message {
-            save_startup_parameters_to_metadata(client, startup);
-            finish_authentication(client, &DefaultServerParameterProvider::default()).await?;
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -557,7 +534,7 @@ fn count_placeholders(sql: &str) -> usize {
 }
 
 /// Execute the full query pipeline asynchronously.
-async fn execute_query(
+pub async fn execute_query(
     sql: &str,
     catalog_manager: &CatalogManager,
     connector_registry: &ConnectorRegistry,
@@ -618,12 +595,12 @@ async fn execute_query(
         // broadcast-eligible join to Fixed/Single — it keeps the probe
         // N-way and only broadcasts the build, so enabling this is now
         // correct + parallel. Runtime override `ARNEB_BROADCAST_MAX_BUILD_BYTES`
-        // (bytes) drives the A/B; default None (OFF) until measured.
-        .with_broadcast_max_build_bytes(
-            std::env::var("ARNEB_BROADCAST_MAX_BUILD_BYTES")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok()),
-        );
+        // (bytes) drives the A/B; defaults to the validated 1 GB cap, with
+        // an explicit zero disabling broadcast.
+        .with_broadcast_max_build_bytes(match std::env::var("ARNEB_BROADCAST_MAX_BUILD_BYTES") {
+            Ok(value) => value.parse::<usize>().ok().filter(|&bytes| bytes > 0),
+            Err(_) => Some(1_000_000_000),
+        });
     register_data_sources(
         &logical_plan,
         catalog_manager,
@@ -1356,6 +1333,7 @@ fn arrow_to_scalar_value(array: &arrow::array::ArrayRef, row: usize) -> ScalarVa
 }
 
 /// Walk the logical plan to find all TableScan nodes and register data sources.
+#[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
 #[async_recursion]
 async fn register_data_sources(
     plan: &LogicalPlan,
@@ -1377,9 +1355,13 @@ async fn register_data_sources(
                 .unwrap_or(catalog_manager.default_catalog());
 
             if let Some(factory) = registry.get(connector_name) {
-                if let Ok(ds) = factory.create_data_source(table, schema, properties).await {
-                    ctx.register_data_source(key, ds);
-                }
+                // Surface connector errors (e.g. an Iceberg table with
+                // unsupported delete files) instead of degrading them to a
+                // generic "data source not found" later.
+                let ds = factory
+                    .create_data_source(table, schema, properties)
+                    .await?;
+                ctx.register_data_source(key, ds);
             }
         }
         LogicalPlan::Projection { input, .. }
@@ -1595,5 +1577,231 @@ mod tests {
 
         assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
         assert!(matches!(resolved, PlanExpr::ScalarSubquery { .. }));
+    }
+
+    /// Regression: COUNT / MIN / MAX over a filter that matches nothing used
+    /// to fail with "expected Int64 but found Null".
+    #[tokio::test]
+    async fn global_aggregate_over_filter_matching_nothing_returns_typed_nulls() {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "o_orderkey",
+                ArrowDataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let table = MemoryTable::new(vec![col("o_orderkey", DataType::Int64)], vec![batch]);
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("orders", Arc::new(table));
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", schema);
+        let catalog_manager = CatalogManager::new("memory", "default");
+        catalog_manager.register_catalog("memory", catalog.clone());
+        let mut registry = ConnectorRegistry::new();
+        registry.register(
+            "memory",
+            Arc::new(MemoryConnectorFactory::new(catalog, "default")),
+        );
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+
+        let (_, batches) = execute_query(
+            "SELECT count(*), min(o_orderkey), max(o_orderkey) FROM orders \
+             WHERE o_orderkey > 99999999",
+            &catalog_manager,
+            &registry,
+            None,
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let rows: Vec<_> = batches.iter().filter(|b| b.num_rows() > 0).collect();
+        assert_eq!(rows.len(), 1);
+        let b = rows[0];
+        assert_eq!(b.num_rows(), 1);
+        let count = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(count.value(0), 0);
+        for i in [1, 2] {
+            assert_eq!(b.column(i).data_type(), &ArrowDataType::Int64);
+            assert!(b.column(i).is_null(0));
+        }
+    }
+
+    // -- End-to-end three-valued (Kleene) boolean logic -------------------
+
+    /// Runs `sql` against a memory table `t(a INT NULL, b BOOLEAN NULL)` with
+    /// rows (1, TRUE), (NULL, FALSE), (3, NULL), (NULL, NULL), (5, FALSE) and
+    /// returns the first non-empty batch.
+    async fn kleene_query(sql: &str) -> arrow::record_batch::RecordBatch {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        use arrow::array::{BooleanArray, Int32Array};
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("a", arrow::datatypes::DataType::Int32, true),
+            Field::new("b", arrow::datatypes::DataType::Boolean, true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    None,
+                    Some(3),
+                    None,
+                    Some(5),
+                ])),
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    None,
+                    None,
+                    Some(false),
+                ])),
+            ],
+        )
+        .unwrap();
+        let table = Arc::new(MemoryTable::new(
+            vec![col("a", DataType::Int32), col("b", DataType::Boolean)],
+            vec![batch],
+        ));
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("t", table);
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", schema);
+        let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
+        let cm = CatalogManager::new("memory", "default");
+        cm.register_catalog("memory", catalog);
+        let mut reg = ConnectorRegistry::new();
+        reg.register("memory", Arc::new(factory));
+
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        let (_, batches) = execute_query(sql, &cm, &reg, None, &pool)
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {sql}: {e}"));
+        batches
+            .into_iter()
+            .find(|b| b.num_rows() > 0)
+            .unwrap_or_else(|| panic!("no rows: {sql}"))
+    }
+
+    #[tokio::test]
+    async fn where_is_null_or_uses_kleene_logic() {
+        // Rows 1, 2, 4 qualify. Row 4 is `TRUE OR NULL` = TRUE (non-Kleene
+        // OR returned NULL and dropped it). Row 3 is `FALSE OR NULL` = NULL.
+        let batch = kleene_query("SELECT count(*) FROM t WHERE a IS NULL OR b").await;
+        let n = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) should be Int64")
+            .value(0);
+        assert_eq!(n, 3);
+    }
+
+    #[tokio::test]
+    async fn select_null_boolean_literals_use_kleene_logic() {
+        use arrow::array::{Array, BooleanArray};
+        let batch =
+            kleene_query("SELECT NULL OR TRUE, NULL AND FALSE, NULL AND TRUE, NULL OR FALSE").await;
+        let cell = |i: usize| -> Option<bool> {
+            let c = batch.column(i);
+            if c.is_null(0) {
+                return None;
+            }
+            Some(
+                c.as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap_or_else(|| panic!("column {i} is {:?}", c.data_type()))
+                    .value(0),
+            )
+        };
+        assert_eq!(cell(0), Some(true), "NULL OR TRUE");
+        assert_eq!(cell(1), Some(false), "NULL AND FALSE");
+        assert_eq!(cell(2), None, "NULL AND TRUE");
+        assert_eq!(cell(3), None, "NULL OR FALSE");
+    }
+
+    // -- End-to-end: comparisons with a NULL literal ----------------------
+
+    /// Memory table `t(a INT NULL)` with rows 1, NULL, 3.
+    fn null_cmp_memory_env() -> (CatalogManager, ConnectorRegistry) {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            arrow::datatypes::DataType::Int32,
+            true,
+        )]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(arrow::array::Int32Array::from(vec![
+                Some(1),
+                None,
+                Some(3),
+            ]))],
+        )
+        .unwrap();
+        let table = Arc::new(MemoryTable::new(
+            vec![col("a", DataType::Int32)],
+            vec![batch],
+        ));
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("t", table);
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", schema);
+        let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
+        let catalog_manager = CatalogManager::new("memory", "default");
+        catalog_manager.register_catalog("memory", catalog);
+        let mut registry = ConnectorRegistry::new();
+        registry.register("memory", Arc::new(factory));
+        (catalog_manager, registry)
+    }
+
+    async fn run_sql(
+        sql: &str,
+        cm: &CatalogManager,
+        reg: &ConnectorRegistry,
+    ) -> arrow::record_batch::RecordBatch {
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        let (_, batches) = execute_query(sql, cm, reg, None, &pool)
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {sql}: {e}"));
+        batches
+            .into_iter()
+            .find(|b| b.num_rows() > 0)
+            .unwrap_or_else(|| panic!("no rows: {sql}"))
+    }
+
+    #[tokio::test]
+    async fn comparison_with_null_literal_is_unknown_not_folded() {
+        use arrow::array::Array;
+        let (cm, reg) = null_cmp_memory_env();
+        // A comparison with NULL is NULL, so it never passes a WHERE clause.
+        for pred in ["NULL = NULL", "NULL <> NULL", "NULL < NULL", "NULL >= NULL"] {
+            let sql = format!("SELECT count(*) FROM t WHERE {pred}");
+            let batch = run_sql(&sql, &cm, &reg).await;
+            let n = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count(*) should be Int64")
+                .value(0);
+            assert_eq!(n, 0, "{pred}");
+        }
+        let batch = run_sql("SELECT NULL = NULL, NULL <> NULL, 1 = 1", &cm, &reg).await;
+        assert!(batch.column(0).is_null(0), "NULL = NULL");
+        assert!(batch.column(1).is_null(0), "NULL <> NULL");
+        assert!(!batch.column(2).is_null(0), "1 = 1");
     }
 }

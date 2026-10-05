@@ -34,6 +34,13 @@ SELECT * FROM datalake.demo.cities;
 --            catalog  schema table
 ```
 
+## Iceberg Tables
+
+Iceberg tables registered in the same metastore (`table_type=ICEBERG`) are
+read through the Hive catalog automatically, using their current Iceberg
+snapshot rather than a listing of the table location. See
+[Iceberg](/connectors/iceberg).
+
 ## Storage Configuration
 
 Hive tables are typically stored in object stores. Configure storage credentials either globally or per-catalog:

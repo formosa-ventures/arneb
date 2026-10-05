@@ -223,18 +223,79 @@ impl CatalogProvider for MemoryCatalog {
 /// table references using configurable default catalog and schema names.
 #[derive(Debug)]
 pub struct CatalogManager {
-    catalogs: RwLock<HashMap<String, Arc<dyn CatalogProvider>>>,
+    /// Shared so that session views created by
+    /// [`CatalogManager::with_session_defaults`] observe catalogs registered
+    /// (or deregistered) on the root manager after the view was created.
+    catalogs: Arc<RwLock<HashMap<String, Arc<dyn CatalogProvider>>>>,
     default_catalog: String,
     default_schema: String,
+    /// When `true`, [`CatalogManager::qualify_table_reference`] fills in the
+    /// missing catalog/schema parts from this manager's defaults. Only set on
+    /// session views: the defaults of a session view differ from the ones the
+    /// rest of the system (connector lookup, workers) assumes, so a table
+    /// reference planned against a view must carry its resolved catalog and
+    /// schema explicitly.
+    qualify_references: bool,
 }
 
 impl CatalogManager {
     /// Creates a new `CatalogManager` with the given default catalog and schema names.
     pub fn new(default_catalog: impl Into<String>, default_schema: impl Into<String>) -> Self {
         Self {
-            catalogs: RwLock::new(HashMap::new()),
+            catalogs: Arc::new(RwLock::new(HashMap::new())),
             default_catalog: default_catalog.into(),
             default_schema: default_schema.into(),
+            qualify_references: false,
+        }
+    }
+
+    /// Returns a session view of this manager that shares every registered
+    /// catalog but resolves unqualified table references against
+    /// `default_catalog` / `default_schema` instead of the server defaults.
+    ///
+    /// Table references planned against a view are fully qualified by
+    /// [`CatalogManager::qualify_table_reference`], so downstream consumers
+    /// that only know the server defaults (connector lookup, distributed
+    /// workers) still resolve the table the session meant. Used by client
+    /// protocols with per-session catalog/schema (e.g. the Trino
+    /// `X-Trino-Catalog` / `X-Trino-Schema` headers).
+    pub fn with_session_defaults(
+        &self,
+        default_catalog: impl Into<String>,
+        default_schema: impl Into<String>,
+    ) -> Self {
+        Self {
+            catalogs: Arc::clone(&self.catalogs),
+            default_catalog: default_catalog.into(),
+            default_schema: default_schema.into(),
+            qualify_references: true,
+        }
+    }
+
+    /// Returns the reference the planner should record for a scanned table.
+    ///
+    /// On the root manager this is `reference` unchanged (planning output is
+    /// byte-identical to before session views existed). On a session view
+    /// (see [`CatalogManager::with_session_defaults`]) the missing catalog
+    /// and schema parts are filled in from the view's defaults.
+    pub fn qualify_table_reference(&self, reference: &TableReference) -> TableReference {
+        if !self.qualify_references {
+            return reference.clone();
+        }
+        TableReference {
+            catalog: Some(
+                reference
+                    .catalog
+                    .clone()
+                    .unwrap_or_else(|| self.default_catalog.clone()),
+            ),
+            schema: Some(
+                reference
+                    .schema
+                    .clone()
+                    .unwrap_or_else(|| self.default_schema.clone()),
+            ),
+            table: reference.table.clone(),
         }
     }
 
@@ -327,6 +388,37 @@ mod tests {
                 nullable: true,
             },
         ]
+    }
+
+    // -- Session view tests --
+
+    #[tokio::test]
+    async fn session_view_resolves_against_its_own_defaults() {
+        let root = CatalogManager::new("memory", "default");
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("t", Arc::new(MemoryTable::new(test_columns())));
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("sales", schema);
+        root.register_catalog("lake", catalog);
+
+        let unqualified = TableReference {
+            catalog: None,
+            schema: None,
+            table: "t".to_string(),
+        };
+        assert!(root.resolve_table(&unqualified).await.is_err());
+
+        let view = root.with_session_defaults("lake", "sales");
+        assert!(view.resolve_table(&unqualified).await.is_ok());
+        let qualified = view.qualify_table_reference(&unqualified);
+        assert_eq!(qualified.catalog.as_deref(), Some("lake"));
+        assert_eq!(qualified.schema.as_deref(), Some("sales"));
+        // Root manager never rewrites references.
+        assert_eq!(root.qualify_table_reference(&unqualified), unqualified);
+
+        // Catalogs registered on the root after the view exists are shared.
+        root.register_catalog("late", Arc::new(MemoryCatalog::new()));
+        assert!(view.catalog("late").is_some());
     }
 
     // -- MemoryTable tests --

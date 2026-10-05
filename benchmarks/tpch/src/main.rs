@@ -51,6 +51,23 @@ struct Args {
     /// Only run specific queries (e.g., "1,3,6")
     #[arg(long)]
     queries: Option<String>,
+
+    /// Name of the scenario this run was launched from (e.g. "sf10").
+    /// Recorded verbatim into the result document.
+    #[arg(long)]
+    scenario: Option<String>,
+
+    /// Scale factor of the dataset being measured (e.g. "sf10").
+    ///
+    /// Deliberately NOT inferred from the output directory or the file name: a
+    /// result document that names a scale it was not measured at is worse than
+    /// one that admits it does not know.
+    #[arg(long)]
+    scale_factor: Option<String>,
+
+    /// Record that a host-precondition floor was bypassed for this run.
+    #[arg(long)]
+    preflight_bypassed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,6 +76,17 @@ struct BenchmarkResult {
     host: String,
     port: u16,
     timestamp: String,
+    /// Scale factor of the measured dataset, absent when the run did not
+    /// declare one. `None` is a real answer — never a default scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scale_factor: Option<String>,
+    /// Scenario the run was launched from, absent for a bare invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scenario: Option<String>,
+    /// True when a declared host floor was unmet and the run proceeded anyway,
+    /// so a bypassed run is never indistinguishable from a clean one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preflight_bypassed: Option<bool>,
     queries: Vec<QueryResult>,
 }
 
@@ -350,6 +378,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         host: args.host,
         port,
         timestamp: chrono::Utc::now().to_rfc3339(),
+        scale_factor: args.scale_factor.clone(),
+        scenario: args.scenario.clone(),
+        preflight_bypassed: args.preflight_bypassed.then_some(true),
         queries: results,
     };
 
@@ -414,4 +445,72 @@ fn discover_queries(
     }
 
     Ok(queries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A result document written before scale factor was recorded must still
+    /// parse — and must report that it does not know its scale, rather than
+    /// acquiring a plausible default.
+    #[test]
+    fn result_without_scale_fields_parses_as_unrecorded() {
+        let legacy = r#"{
+            "engine": "arneb",
+            "host": "127.0.0.1",
+            "port": 5432,
+            "timestamp": "2026-07-26T14:23:27+00:00",
+            "queries": []
+        }"#;
+
+        let parsed: BenchmarkResult = serde_json::from_str(legacy).expect("legacy document parses");
+
+        assert_eq!(parsed.scale_factor, None);
+        assert_eq!(parsed.scenario, None);
+        assert_eq!(parsed.preflight_bypassed, None);
+        assert_eq!(parsed.engine, "arneb");
+    }
+
+    /// The three fields round-trip when present, and are omitted from the
+    /// serialized form when absent (so legacy readers see no new keys).
+    #[test]
+    fn scale_fields_round_trip_and_are_omitted_when_absent() {
+        let recorded = BenchmarkResult {
+            engine: "arneb".into(),
+            host: "127.0.0.1".into(),
+            port: 5432,
+            timestamp: "2026-09-20T11:23:32Z".into(),
+            scale_factor: Some("sf10".into()),
+            scenario: Some("sf10".into()),
+            preflight_bypassed: Some(true),
+            queries: vec![],
+        };
+
+        let json = serde_json::to_string(&recorded).expect("serializes");
+        let back: BenchmarkResult = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back.scale_factor.as_deref(), Some("sf10"));
+        assert_eq!(back.scenario.as_deref(), Some("sf10"));
+        assert_eq!(back.preflight_bypassed, Some(true));
+
+        let bare = BenchmarkResult {
+            scale_factor: None,
+            scenario: None,
+            preflight_bypassed: None,
+            ..recorded
+        };
+        let json = serde_json::to_string(&bare).expect("serializes");
+        assert!(
+            !json.contains("scale_factor"),
+            "absent scale must not be emitted: {json}"
+        );
+        assert!(
+            !json.contains("scenario"),
+            "absent scenario must not be emitted: {json}"
+        );
+        assert!(
+            !json.contains("preflight_bypassed"),
+            "absent flag must not be emitted: {json}"
+        );
+    }
 }

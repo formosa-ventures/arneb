@@ -162,6 +162,11 @@ impl Accumulator for CountAccumulator {
     }
 }
 
+fn checked_decimal_add(a: i128, b: i128) -> Result<i128, ExecutionError> {
+    a.checked_add(b)
+        .ok_or_else(|| ExecutionError::InvalidOperation("Decimal overflow".to_string()))
+}
+
 // ---------------------------------------------------------------------------
 // SUM
 // ---------------------------------------------------------------------------
@@ -200,7 +205,7 @@ impl Accumulator for SumAccumulator {
             })?;
         self.sum_i64 += other.sum_i64;
         self.sum_f64 += other.sum_f64;
-        self.sum_decimal += other.sum_decimal;
+        self.sum_decimal = checked_decimal_add(self.sum_decimal, other.sum_decimal)?;
         self.has_values |= other.has_values;
         self.is_float |= other.is_float;
         if other.is_decimal {
@@ -261,7 +266,7 @@ impl Accumulator for SumAccumulator {
                 let arr = values.as_primitive::<datatypes::Decimal128Type>();
                 for i in 0..arr.len() {
                     if !arr.is_null(i) {
-                        self.sum_decimal += arr.value(i);
+                        self.sum_decimal = checked_decimal_add(self.sum_decimal, arr.value(i))?;
                         self.has_values = true;
                     }
                 }
@@ -1038,7 +1043,8 @@ impl GroupedAccumulator for GroupedSumAccumulator {
                 for (i, &g) in group_ids.iter().enumerate() {
                     if !arr.is_null(i) {
                         let g = g as usize;
-                        self.sums_decimal[g] += arr.value(i);
+                        self.sums_decimal[g] =
+                            checked_decimal_add(self.sums_decimal[g], arr.value(i))?;
                         self.has_values[g] = true;
                     }
                 }
@@ -1108,7 +1114,8 @@ impl GroupedAccumulator for GroupedSumAccumulator {
             }
             self.sums_i64[dest] += other.sums_i64[g];
             self.sums_f64[dest] += other.sums_f64[g];
-            self.sums_decimal[dest] += other.sums_decimal[g];
+            self.sums_decimal[dest] =
+                checked_decimal_add(self.sums_decimal[dest], other.sums_decimal[g])?;
             self.has_values[dest] = true;
         }
         Ok(())
@@ -2154,6 +2161,45 @@ mod tests {
                 scale: 2,
             }
         );
+    }
+
+    fn max_decimal38(n: usize) -> ArrayRef {
+        Arc::new(
+            arrow::array::Decimal128Array::from(vec![10i128.pow(38) - 1; n])
+                .with_precision_and_scale(38, 0)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn sum_decimal_overflow_errors() {
+        let mut acc = SumAccumulator::new();
+        let err = acc.update_batch(&max_decimal38(2)).unwrap_err();
+        assert!(err.to_string().contains("Decimal overflow"), "{err}");
+
+        let mut a = SumAccumulator::new();
+        a.update_batch(&max_decimal38(1)).unwrap();
+        let mut b = SumAccumulator::new();
+        b.update_batch(&max_decimal38(1)).unwrap();
+        let err = a.merge(&b).unwrap_err();
+        assert!(err.to_string().contains("Decimal overflow"), "{err}");
+    }
+
+    #[test]
+    fn grouped_sum_decimal_overflow_errors() {
+        let mut acc = GroupedSumAccumulator::new();
+        acc.ensure_capacity(1);
+        let err = acc.add_input(&[0, 0], &max_decimal38(2)).unwrap_err();
+        assert!(err.to_string().contains("Decimal overflow"), "{err}");
+
+        let mut a = GroupedSumAccumulator::new();
+        a.ensure_capacity(1);
+        a.add_input(&[0], &max_decimal38(1)).unwrap();
+        let mut b = GroupedSumAccumulator::new();
+        b.ensure_capacity(1);
+        b.add_input(&[0], &max_decimal38(1)).unwrap();
+        let err = a.merge_from(&b, &[0]).unwrap_err();
+        assert!(err.to_string().contains("Decimal overflow"), "{err}");
     }
 
     #[test]

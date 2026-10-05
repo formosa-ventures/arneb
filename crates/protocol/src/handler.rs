@@ -1730,6 +1730,23 @@ mod tests {
         assert_eq!(cell(3), None, "NULL OR FALSE");
     }
 
+    #[tokio::test]
+    async fn nested_loop_join_null_condition_does_not_match() {
+        // a = (1, NULL, 3, NULL, 5): only (1,3), (1,5), (3,5) satisfy a < a.
+        let count = |b: arrow::record_batch::RecordBatch| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        let inner = kleene_query("SELECT count(*) FROM t t1 JOIN t t2 ON t1.a < t2.a").await;
+        assert_eq!(count(inner), 3);
+        // Plus one NULL-extended row each for 5 and the two NULLs.
+        let left = kleene_query("SELECT count(*) FROM t t1 LEFT JOIN t t2 ON t1.a < t2.a").await;
+        assert_eq!(count(left), 6);
+    }
+
     // -- End-to-end: comparisons with a NULL literal ----------------------
 
     /// Memory table `t(a INT NULL)` with rows 1, NULL, 3.

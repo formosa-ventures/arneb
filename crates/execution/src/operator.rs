@@ -1281,7 +1281,8 @@ impl NestedLoopJoinExec {
                             "join condition must produce boolean".to_string(),
                         )
                     })?;
-                Ok(bool_arr.value(0))
+                // A NULL (unknown) join condition does not match.
+                Ok(!bool_arr.is_null(0) && bool_arr.value(0))
             }
         }
     }

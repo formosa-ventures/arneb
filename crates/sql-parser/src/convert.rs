@@ -107,7 +107,11 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
                     ))
                 }
             };
-            let columns: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
+            let columns = insert
+                .columns
+                .iter()
+                .map(insert_column_name)
+                .collect::<Result<Vec<String>, ParseError>>()?;
             let source = if let Some(src) = insert.source {
                 match *src.body {
                     sp::SetExpr::Values(values) => {
@@ -115,7 +119,8 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
                             .rows
                             .into_iter()
                             .map(|row| {
-                                row.into_iter()
+                                row.content
+                                    .into_iter()
                                     .map(convert_expr)
                                     .collect::<Result<Vec<_>, _>>()
                             })
@@ -346,6 +351,21 @@ fn convert_select(select: sp::Select) -> Result<ast::SelectBody, ParseError> {
     })
 }
 
+/// Column name from an `INSERT INTO t (col, ...)` column list. sqlparser
+/// models each entry as an [`sp::ObjectName`]; only a bare identifier is a
+/// valid target column.
+fn insert_column_name(name: &sp::ObjectName) -> Result<String, ParseError> {
+    match name.0.as_slice() {
+        [part] => part
+            .as_ident()
+            .map(|ident| ident.value.clone())
+            .ok_or_else(|| ParseError::UnsupportedFeature(format!("INSERT target column {name}"))),
+        _ => Err(ParseError::UnsupportedFeature(format!(
+            "qualified INSERT target column {name}"
+        ))),
+    }
+}
+
 /// Convert a `sqlparser` [`sp::SelectItem`] into a arneb [`ast::SelectItem`].
 fn convert_select_item(item: sp::SelectItem) -> Result<ast::SelectItem, ParseError> {
     match item {
@@ -360,6 +380,9 @@ fn convert_select_item(item: sp::SelectItem) -> Result<ast::SelectItem, ParseErr
                 alias: alias.value,
             })
         }
+        sp::SelectItem::ExprWithAliases { .. } => Err(ParseError::UnsupportedFeature(
+            "multiple column aliases for one select item".to_string(),
+        )),
         sp::SelectItem::Wildcard(_) => Ok(ast::SelectItem::Wildcard),
         sp::SelectItem::QualifiedWildcard(kind, _) => {
             let table_ref = qualified_wildcard_to_table_reference(kind)?;
@@ -1188,6 +1211,9 @@ fn convert_function_arg(arg: sp::FunctionArg) -> Result<ast::FunctionArg, ParseE
             sp::FunctionArgExpr::Wildcard => Ok(ast::FunctionArg::Wildcard),
             sp::FunctionArgExpr::QualifiedWildcard(_) => Err(ParseError::UnsupportedFeature(
                 "qualified wildcard in function argument".to_string(),
+            )),
+            sp::FunctionArgExpr::WildcardWithOptions(_) => Err(ParseError::UnsupportedFeature(
+                "wildcard options in function argument".to_string(),
             )),
         },
         sp::FunctionArg::Named { .. } | sp::FunctionArg::ExprNamed { .. } => Err(

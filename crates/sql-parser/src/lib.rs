@@ -541,6 +541,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_insert_with_column_list() {
+        let stmt = parse("INSERT INTO t (a, b) VALUES (1, 2), (3, 4)").unwrap();
+        match stmt {
+            Statement::InsertInto {
+                columns,
+                source: ast::InsertSource::Values(rows),
+                ..
+            } => {
+                assert_eq!(columns, vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(rows.len(), 2);
+                assert!(rows.iter().all(|row| row.len() == 2));
+            }
+            other => panic!("expected InsertInto with VALUES, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_qualified_column_is_unsupported() {
+        let result = parse("INSERT INTO t (t.a) VALUES (1)");
+        assert!(matches!(result, Err(ParseError::UnsupportedFeature(_))));
+    }
+
+    #[test]
+    fn parse_wildcard_options_in_function_arg_is_unsupported() {
+        let result = parse("SELECT count(* EXCLUDE (a)) FROM t");
+        assert!(matches!(result, Err(ParseError::UnsupportedFeature(_))));
+    }
+
+    #[test]
+    fn parse_multi_column_alias_is_unsupported() {
+        let result = parse("SELECT f(x) AS (a, b) FROM t");
+        assert!(matches!(result, Err(ParseError::UnsupportedFeature(_))));
+    }
+
+    #[test]
     fn parse_delete_from() {
         let stmt = parse("DELETE FROM t WHERE id = 1").unwrap();
         assert!(matches!(

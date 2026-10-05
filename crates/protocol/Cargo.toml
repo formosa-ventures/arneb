@@ -47,7 +47,7 @@ hex = "0.4"
 # Authentication (SCRAM-SHA-256). aws-lc-rs is already pulled in by pgwire's
 # default `server-api-aws-lc-rs` feature, so this adds no new crypto stack.
 aws-lc-rs = "1"
-base64 = "0.22"
+base64 = "0.23"
 stringprep = "0.1"
 
 [dev-dependencies]

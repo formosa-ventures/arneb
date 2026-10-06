@@ -342,7 +342,7 @@ impl Accumulator for AvgAccumulator {
                 ExecutionError::InvalidOperation("AvgAccumulator::merge: type mismatch".to_string())
             })?;
         self.sum += other.sum;
-        self.sum_decimal += other.sum_decimal;
+        self.sum_decimal = checked_decimal_add(self.sum_decimal, other.sum_decimal)?;
         self.decimal = self.decimal.or(other.decimal);
         self.count += other.count;
         Ok(())
@@ -393,7 +393,7 @@ impl Accumulator for AvgAccumulator {
                 let arr = values.as_primitive::<datatypes::Decimal128Type>();
                 for i in 0..arr.len() {
                     if !arr.is_null(i) {
-                        self.sum_decimal += arr.value(i);
+                        self.sum_decimal = checked_decimal_add(self.sum_decimal, arr.value(i))?;
                         self.count += 1;
                     }
                 }
@@ -1233,7 +1233,8 @@ impl GroupedAccumulator for GroupedAvgAccumulator {
                 for (i, &g) in group_ids.iter().enumerate() {
                     if !arr.is_null(i) {
                         let g = g as usize;
-                        self.decimal_sums[g] += arr.value(i);
+                        self.decimal_sums[g] =
+                            checked_decimal_add(self.decimal_sums[g], arr.value(i))?;
                         self.counts[g] += 1;
                     }
                 }
@@ -1292,7 +1293,8 @@ impl GroupedAccumulator for GroupedAvgAccumulator {
             if other.decimal.is_some() {
                 self.decimal = other.decimal;
                 self.decimal_sums.resize(self.counts.len(), 0);
-                self.decimal_sums[dest] += other.decimal_sums[g];
+                self.decimal_sums[dest] =
+                    checked_decimal_add(self.decimal_sums[dest], other.decimal_sums[g])?;
             }
         }
         Ok(())
@@ -2182,6 +2184,34 @@ mod tests {
         let mut b = SumAccumulator::new();
         b.update_batch(&max_decimal38(1)).unwrap();
         let err = a.merge(&b).unwrap_err();
+        assert!(err.to_string().contains("Decimal overflow"), "{err}");
+    }
+
+    #[test]
+    fn avg_decimal_overflow_errors() {
+        let mut acc = AvgAccumulator::new();
+        let err = acc.update_batch(&max_decimal38(2)).unwrap_err();
+        assert!(err.to_string().contains("Decimal overflow"), "{err}");
+
+        let mut a = AvgAccumulator::new();
+        a.update_batch(&max_decimal38(1)).unwrap();
+        let mut b = AvgAccumulator::new();
+        b.update_batch(&max_decimal38(1)).unwrap();
+        let err = a.merge(&b).unwrap_err();
+        assert!(err.to_string().contains("Decimal overflow"), "{err}");
+
+        let mut acc = GroupedAvgAccumulator::new();
+        acc.ensure_capacity(1);
+        let err = acc.add_input(&[0, 0], &max_decimal38(2)).unwrap_err();
+        assert!(err.to_string().contains("Decimal overflow"), "{err}");
+
+        let mut a = GroupedAvgAccumulator::new();
+        a.ensure_capacity(1);
+        a.add_input(&[0], &max_decimal38(1)).unwrap();
+        let mut b = GroupedAvgAccumulator::new();
+        b.ensure_capacity(1);
+        b.add_input(&[0], &max_decimal38(1)).unwrap();
+        let err = a.merge_from(&b, &[0]).unwrap_err();
         assert!(err.to_string().contains("Decimal overflow"), "{err}");
     }
 

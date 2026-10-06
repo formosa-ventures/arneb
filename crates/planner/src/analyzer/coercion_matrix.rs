@@ -177,7 +177,9 @@ const MATRIX: &[CoercionRule] = &[
 /// The identity cast `T → T` is always allowed and returns
 /// `Some(Safety::AlwaysSafe)` without consulting the matrix.
 pub fn lookup_cast(from: &DataType, to: &DataType) -> Option<Safety> {
-    if from == to {
+    // An untyped NULL carries no value, so it casts to any type (Trino's
+    // `unknown` type coerces to everything).
+    if from == to || *from == DataType::Null {
         return Some(Safety::AlwaysSafe);
     }
     for rule in MATRIX {
@@ -257,7 +259,7 @@ impl CoercionSite {
 ///
 /// # Algorithm
 ///
-/// 1. Identity shortcut: `a == b → a`.
+/// 1. Identity shortcut: `a == b → a`; an untyped `Null` side yields the other type.
 /// 2. Decimal/Decimal: compute via [`decimal_supertype`] (Trino formula).
 /// 3. Otherwise, try both directions in the matrix: if `a → b` is
 ///    allowed (with any needed `LiteralOnly` gate satisfied), pick
@@ -268,6 +270,13 @@ impl CoercionSite {
 ///    for the well-known numeric-vs-decimal case.
 pub fn common_supertype(a: &DataType, b: &DataType, site: CoercionSite) -> Option<DataType> {
     if a == b {
+        return Some(a.clone());
+    }
+    // Untyped NULL unifies with any type: `x = NULL`, `CASE ... ELSE NULL`.
+    if *a == DataType::Null {
+        return Some(b.clone());
+    }
+    if *b == DataType::Null {
         return Some(a.clone());
     }
 
@@ -392,6 +401,19 @@ mod tests {
             lookup_cast(&DataType::Int32, &DataType::Int32),
             Some(Safety::AlwaysSafe)
         );
+    }
+
+    #[test]
+    fn untyped_null_unifies_with_any_type() {
+        let site = CoercionSite::Binary {
+            left_is_literal: false,
+            right_is_literal: true,
+        };
+        for t in [DataType::Int32, DataType::Utf8, dec(15, 2), ts_us()] {
+            assert_eq!(common_supertype(&t, &DataType::Null, site), Some(t.clone()));
+            assert_eq!(common_supertype(&DataType::Null, &t, site), Some(t.clone()));
+            assert_eq!(lookup_cast(&DataType::Null, &t), Some(Safety::AlwaysSafe));
+        }
     }
 
     #[test]

@@ -146,6 +146,7 @@ services:
     entrypoint: ["/bin/bash", "/seed/seed.sh"]
     environment:
       TPCH_SF: ${TPCH_SF:-sf1}
+      TPCH_DECIMAL: ${TPCH_DECIMAL:-0}
       TRINO_SERVER: trino:8080
     depends_on:
       trino:

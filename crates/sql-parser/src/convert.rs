@@ -1346,7 +1346,16 @@ fn convert_order_by_clause(order_by: sp::OrderBy) -> Result<Vec<ast::OrderByExpr
 /// Convert a `sqlparser` [`sp::OrderByExpr`] into a arneb [`ast::OrderByExpr`].
 fn convert_order_by_expr(ob: sp::OrderByExpr) -> Result<ast::OrderByExpr, ParseError> {
     let expr = convert_expr(ob.expr)?;
-    let asc = ob.options.asc;
+    let asc = match ob.options.sort {
+        Some(sp::OrderBySort::Asc) => Some(true),
+        Some(sp::OrderBySort::Desc) => Some(false),
+        Some(sp::OrderBySort::Using(op)) => {
+            return Err(ParseError::UnsupportedFeature(format!(
+                "ORDER BY ... USING {op}"
+            )))
+        }
+        None => None,
+    };
     let nulls_first = ob.options.nulls_first;
     Ok(ast::OrderByExpr {
         expr,

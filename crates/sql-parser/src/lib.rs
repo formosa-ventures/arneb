@@ -576,6 +576,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_order_by_directions() {
+        let stmt = parse("SELECT a FROM t ORDER BY a ASC, b DESC NULLS FIRST, c").unwrap();
+        let Statement::Query { query, .. } = stmt else {
+            panic!("expected query, got {stmt:?}");
+        };
+        let dirs: Vec<_> = query
+            .order_by
+            .iter()
+            .map(|ob| (ob.asc, ob.nulls_first))
+            .collect();
+        assert_eq!(
+            dirs,
+            vec![(Some(true), None), (Some(false), Some(true)), (None, None)]
+        );
+    }
+
+    #[test]
+    fn parse_order_by_using_is_rejected() {
+        // GenericDialect does not parse PostgreSQL's `ORDER BY ... USING <op>`;
+        // convert_order_by_expr also rejects `OrderBySort::Using` should it
+        // ever reach the AST conversion.
+        assert!(parse("SELECT a FROM t ORDER BY a USING <").is_err());
+    }
+
+    #[test]
     fn parse_delete_from() {
         let stmt = parse("DELETE FROM t WHERE id = 1").unwrap();
         assert!(matches!(

@@ -3148,9 +3148,8 @@ fn rewrite_avg_aggregate(
     for (j, agg) in aggr_exprs.iter().enumerate() {
         match rewritable_avg_arg(agg) {
             Some(_) => {
-                // AVG over an integer column is typed Int64 by the planner
-                // (a quirk vs the always-Float64 accumulator); skip it so
-                // the projection's Float64 division isn't truncated.
+                // AVG(decimal) is typed DECIMAL; only a DOUBLE AVG matches
+                // the projection's Float64 division.
                 if schema.get(n_group + j).map(|c| &c.data_type) != Some(&DataType::Float64) {
                     return rebuild_aggregate(input, group_by, aggr_exprs, schema);
                 }
@@ -3182,22 +3181,25 @@ fn rewrite_avg_aggregate(
         });
     }
 
+    let input_schema = input.schema();
     for (j, agg) in aggr_exprs.into_iter().enumerate() {
         let orig_col = schema[n_group + j].clone();
         match rewritable_avg_arg(&agg) {
             Some(arg) => {
-                // SUM(x) — same declared type as the AVG output (SUM and
-                // AVG share the planner's type-inference arm) → Float64.
+                // SUM(x) — BIGINT for integer x, DOUBLE for float x.
                 let sum_idx = n_group + inner_aggr_exprs.len();
-                inner_aggr_exprs.push(PlanExpr::Function {
+                let sum_expr = PlanExpr::Function {
                     name: "SUM".into(),
                     args: vec![arg.clone()],
                     distinct: false,
                     span: None,
-                });
+                };
+                let sum_type = crate::analyzer::plan_expr_type(&sum_expr, &input_schema)
+                    .unwrap_or(DataType::Float64);
+                inner_aggr_exprs.push(sum_expr);
                 inner_agg_cols.push(ColumnInfo {
                     name: format!("__avg_sum_{j}"),
-                    data_type: orig_col.data_type.clone(),
+                    data_type: sum_type,
                     nullable: true,
                 });
                 // COUNT(x) — non-null count of the same argument.
@@ -5132,14 +5134,14 @@ mod tests {
     }
 
     #[test]
-    fn fragment_avg_of_integer_stays_single_phase() {
-        // AVG over an integer column is typed Int64 by the planner (a
-        // quirk vs the Float64-producing accumulator); the rewrite gates
-        // on a Float64 AVG output type and leaves this case single-phase
-        // — no behavior change for the already-fragile int path.
+    fn fragment_avg_of_integer_splits_with_bigint_sum() {
+        let _pfa = set_parallel_final_agg_for_test(false);
+        // AVG(integer) is DOUBLE (Trino), so the SUM/COUNT rewrite applies;
+        // the partial SUM over the integer column must be typed BIGINT —
+        // that is what the SUM accumulator produces.
         let schema = vec![ColumnInfo {
             name: "avg_id".into(),
-            data_type: DataType::Int64,
+            data_type: DataType::Float64,
             nullable: true,
         }];
         let plan = LogicalPlan::Aggregate {
@@ -5159,7 +5161,11 @@ mod tests {
         };
         let mut frag = PlanFragmenter::new();
         let result = frag.fragment(plan);
-        assert!(matches!(result.root, LogicalPlan::Aggregate { .. }));
+        let LogicalPlan::PartialAggregate { schema, .. } = &result.source_fragments[0].root else {
+            panic!("expected PartialAggregate in child fragment");
+        };
+        let types: Vec<_> = schema.iter().map(|c| c.data_type.clone()).collect();
+        assert_eq!(types, vec![DataType::Int64, DataType::Int64]);
     }
 
     #[test]

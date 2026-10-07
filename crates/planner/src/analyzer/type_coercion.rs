@@ -1297,6 +1297,106 @@ mod tests {
         }
     }
 
+    fn null_lit() -> PlanExpr {
+        PlanExpr::Literal {
+            value: ScalarValue::Null,
+            span: None,
+        }
+    }
+
+    fn is_null_cast_to(expr: &PlanExpr, target: &DataType) -> bool {
+        matches!(
+            expr,
+            PlanExpr::Cast { expr, data_type, .. }
+                if data_type == target
+                    && matches!(expr.as_ref(), PlanExpr::Literal { value: ScalarValue::Null, .. })
+        )
+    }
+
+    #[test]
+    fn untyped_null_operand_coerces_to_other_side() {
+        let schema = vec![ColumnInfo {
+            name: "a".into(),
+            data_type: DataType::Int32,
+            nullable: true,
+        }];
+        for (op, null_on_left) in [
+            (ast::BinaryOp::Eq, false),
+            (ast::BinaryOp::Lt, true),
+            (ast::BinaryOp::Plus, false),
+        ] {
+            let (l, r) = if null_on_left {
+                (null_lit(), col(0, "a"))
+            } else {
+                (col(0, "a"), null_lit())
+            };
+            let plan = filter(
+                scan(schema.clone()),
+                PlanExpr::BinaryOp {
+                    left: Box::new(l),
+                    op,
+                    right: Box::new(r),
+                    span: None,
+                },
+            );
+            let LogicalPlan::Filter { predicate, .. } = run(plan).unwrap() else {
+                panic!("expected Filter")
+            };
+            let PlanExpr::BinaryOp { left, right, .. } = predicate else {
+                panic!("expected BinaryOp")
+            };
+            let (null_side, col_side) = if null_on_left {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            assert!(
+                is_null_cast_to(&null_side, &DataType::Int32),
+                "{null_side:?}"
+            );
+            assert!(matches!(col_side.as_ref(), PlanExpr::Column { .. }));
+        }
+    }
+
+    #[test]
+    fn untyped_null_case_arm_coerces_to_other_arm() {
+        let schema = vec![ColumnInfo {
+            name: "a".into(),
+            data_type: DataType::Int64,
+            nullable: true,
+        }];
+        let plan = LogicalPlan::Projection {
+            input: Box::new(scan(schema)),
+            exprs: vec![PlanExpr::CaseExpr {
+                operand: None,
+                when_clauses: vec![(
+                    PlanExpr::Literal {
+                        value: ScalarValue::Boolean(true),
+                        span: None,
+                    },
+                    col(0, "a"),
+                )],
+                else_result: Some(Box::new(null_lit())),
+                span: None,
+            }],
+            schema: vec![ColumnInfo {
+                name: "c".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+            }],
+        };
+        let LogicalPlan::Projection { exprs, .. } = run(plan).unwrap() else {
+            panic!("expected Projection")
+        };
+        let PlanExpr::CaseExpr { else_result, .. } = &exprs[0] else {
+            panic!("expected CaseExpr")
+        };
+        assert!(is_null_cast_to(
+            else_result.as_deref().unwrap(),
+            &DataType::Int64
+        ));
+    }
+
     #[test]
     fn decimal_mul_decimal_widens_via_trino_formula() {
         // Decimal(10,2) * Decimal(10,2) → per supertype rule, result

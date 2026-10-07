@@ -167,6 +167,23 @@ fn checked_decimal_add(a: i128, b: i128) -> Result<i128, ExecutionError> {
         .ok_or_else(|| ExecutionError::InvalidOperation("Decimal overflow".to_string()))
 }
 
+/// Largest unscaled value a DECIMAL(38, _) can hold.
+const MAX_DECIMAL38: i128 = 10i128.pow(38) - 1;
+
+/// [`checked_decimal_add`] that also rejects results outside DECIMAL(38):
+/// SUM's DECIMAL(38, s) output can't hold a value between 10^38 - 1 and
+/// `i128::MAX`. AVG keeps the plain i128 check, since its result is divided
+/// back into range.
+fn checked_decimal38_add(a: i128, b: i128) -> Result<i128, ExecutionError> {
+    let sum = checked_decimal_add(a, b)?;
+    if sum.unsigned_abs() > MAX_DECIMAL38 as u128 {
+        return Err(ExecutionError::InvalidOperation(
+            "Decimal overflow".to_string(),
+        ));
+    }
+    Ok(sum)
+}
+
 // ---------------------------------------------------------------------------
 // SUM
 // ---------------------------------------------------------------------------
@@ -205,7 +222,7 @@ impl Accumulator for SumAccumulator {
             })?;
         self.sum_i64 += other.sum_i64;
         self.sum_f64 += other.sum_f64;
-        self.sum_decimal = checked_decimal_add(self.sum_decimal, other.sum_decimal)?;
+        self.sum_decimal = checked_decimal38_add(self.sum_decimal, other.sum_decimal)?;
         self.has_values |= other.has_values;
         self.is_float |= other.is_float;
         if other.is_decimal {
@@ -266,7 +283,7 @@ impl Accumulator for SumAccumulator {
                 let arr = values.as_primitive::<datatypes::Decimal128Type>();
                 for i in 0..arr.len() {
                     if !arr.is_null(i) {
-                        self.sum_decimal = checked_decimal_add(self.sum_decimal, arr.value(i))?;
+                        self.sum_decimal = checked_decimal38_add(self.sum_decimal, arr.value(i))?;
                         self.has_values = true;
                     }
                 }
@@ -1044,7 +1061,7 @@ impl GroupedAccumulator for GroupedSumAccumulator {
                     if !arr.is_null(i) {
                         let g = g as usize;
                         self.sums_decimal[g] =
-                            checked_decimal_add(self.sums_decimal[g], arr.value(i))?;
+                            checked_decimal38_add(self.sums_decimal[g], arr.value(i))?;
                         self.has_values[g] = true;
                     }
                 }
@@ -1115,7 +1132,7 @@ impl GroupedAccumulator for GroupedSumAccumulator {
             self.sums_i64[dest] += other.sums_i64[g];
             self.sums_f64[dest] += other.sums_f64[g];
             self.sums_decimal[dest] =
-                checked_decimal_add(self.sums_decimal[dest], other.sums_decimal[g])?;
+                checked_decimal38_add(self.sums_decimal[dest], other.sums_decimal[g])?;
             self.has_values[dest] = true;
         }
         Ok(())
@@ -2171,6 +2188,52 @@ mod tests {
                 .with_precision_and_scale(38, 0)
                 .unwrap(),
         )
+    }
+
+    /// `n` DECIMAL(38,0) values of 5·10^37: two or more sum past
+    /// DECIMAL(38)'s 10^38 - 1 while still fitting in i128.
+    fn half_max_decimal38(n: usize) -> ArrayRef {
+        Arc::new(
+            arrow::array::Decimal128Array::from(vec![5 * 10i128.pow(37); n])
+                .with_precision_and_scale(38, 0)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn sum_decimal_beyond_precision_38_errors() {
+        let mut acc = SumAccumulator::new();
+        let err = acc.update_batch(&half_max_decimal38(3)).unwrap_err();
+        assert!(err.to_string().contains("Decimal overflow"), "{err}");
+
+        // 5·10^37 + 5·10^37 = 10^38: each partial is in range, the merge isn't.
+        let mut a = SumAccumulator::new();
+        a.update_batch(&half_max_decimal38(1)).unwrap();
+        let mut b = SumAccumulator::new();
+        b.update_batch(&half_max_decimal38(1)).unwrap();
+        let err = a.merge(&b).unwrap_err();
+        assert!(err.to_string().contains("Decimal overflow"), "{err}");
+
+        let mut acc = GroupedSumAccumulator::new();
+        acc.ensure_capacity(1);
+        let err = acc
+            .add_input(&[0, 0, 0], &half_max_decimal38(3))
+            .unwrap_err();
+        assert!(err.to_string().contains("Decimal overflow"), "{err}");
+
+        let mut a = GroupedSumAccumulator::new();
+        a.ensure_capacity(1);
+        a.add_input(&[0], &half_max_decimal38(1)).unwrap();
+        let mut b = GroupedSumAccumulator::new();
+        b.ensure_capacity(1);
+        b.add_input(&[0], &half_max_decimal38(1)).unwrap();
+        let err = a.merge_from(&b, &[0]).unwrap_err();
+        assert!(err.to_string().contains("Decimal overflow"), "{err}");
+
+        // Exactly 10^38 - 1 is still in range.
+        let mut acc = SumAccumulator::new();
+        acc.update_batch(&max_decimal38(1)).unwrap();
+        assert!(acc.evaluate().is_ok());
     }
 
     #[test]

@@ -321,6 +321,9 @@ fn get_f64_value(arr: &ArrayRef, row: usize) -> f64 {
     if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Float32Array>() {
         return a.value(row) as f64;
     }
+    if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Decimal128Array>() {
+        return a.value(row) as f64 / 10f64.powi(a.scale() as i32);
+    }
     0.0
 }
 

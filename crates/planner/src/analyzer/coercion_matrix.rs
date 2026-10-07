@@ -364,6 +364,56 @@ pub fn decimal_supertype(p1: u8, s1: i8, p2: u8, s2: i8) -> DataType {
     DataType::Decimal128 { precision, scale }
 }
 
+/// Trino's result `(precision, scale)` for `Decimal(p1, s1) op Decimal(p2, s2)`.
+/// Shared by the analyzer (declared type) and the executor (produced type)
+/// so the two cannot drift. `None` for non-arithmetic ops.
+///
+/// Rules as observed on Trino 483 (`typeof(...)`), with `int = p - s`:
+/// - `+ -`: `s = max(s1, s2)`, `p = max(p1 - s1, p2 - s2) + s + 1`; past 38
+///   the scale gives way to the integer digits: `s = min(s, 38 - int)`.
+/// - `*`: `p = p1 + p2`, `s = s1 + s2`, then [`reduce_to_38`].
+/// - `/`: `s = max(6, s1 + p2 + 1)`, `p = p1 - s1 + s2 + s`, then [`reduce_to_38`].
+/// - `%`: `s = max(s1, s2)`, `p = min(p1 - s1, p2 - s2) + s` (never past 38).
+pub fn decimal_arithmetic_type(
+    op: &arneb_sql_parser::ast::BinaryOp,
+    (p1, s1): (u8, i8),
+    (p2, s2): (u8, i8),
+) -> Option<(u8, i8)> {
+    use arneb_sql_parser::ast::BinaryOp;
+    let (p1, s1, p2, s2) = (p1 as i32, s1 as i32, p2 as i32, s2 as i32);
+    let (p, s) = match op {
+        BinaryOp::Plus | BinaryOp::Minus => {
+            let int = (p1 - s1).max(p2 - s2);
+            let s = s1.max(s2);
+            if int + s + 1 > 38 {
+                (38, s.min(38 - int).max(0))
+            } else {
+                (int + s + 1, s)
+            }
+        }
+        BinaryOp::Multiply => reduce_to_38(p1 + p2, s1 + s2),
+        BinaryOp::Divide => {
+            let s = (s1 + p2 + 1).max(6);
+            reduce_to_38(p1 - s1 + s2 + s, s)
+        }
+        BinaryOp::Modulo => {
+            let s = s1.max(s2);
+            ((p1 - s1).min(p2 - s2) + s, s)
+        }
+        _ => return None,
+    };
+    Some((p.clamp(1, 38) as u8, s as i8))
+}
+
+/// Fits a `* /` result wider than 38 digits: keep the integer digits and
+/// give up scale, but keep at least `min(s, 6)` of it.
+fn reduce_to_38(p: i32, s: i32) -> (i32, i32) {
+    if p <= 38 {
+        return (p, s);
+    }
+    (38, (38 - (p - s)).max(s.min(6)))
+}
+
 /// Returns true if the caller is allowed to apply a cast with the
 /// given safety from a source operand with the given "is literal"
 /// status.
@@ -625,5 +675,29 @@ mod tests {
         // Ensure the saturation branch is exercised.
         let got = decimal_supertype(38, 5, 38, 10);
         assert!(matches!(got, DataType::Decimal128 { precision: 38, .. }));
+    }
+
+    #[test]
+    fn decimal_arithmetic_types_follow_trino() {
+        use arneb_sql_parser::ast::BinaryOp::*;
+        let t = |op, l, r| decimal_arithmetic_type(&op, l, r).unwrap();
+        // Expected values are Trino 483's `typeof(...)`.
+        // TPC-H Q1: price * (1 - discount) * (1 + tax), `1` as DECIMAL(10,0).
+        assert_eq!(t(Minus, (10, 0), (15, 2)), (16, 2));
+        assert_eq!(t(Multiply, (15, 2), (16, 2)), (31, 4));
+        assert_eq!(t(Multiply, (31, 4), (16, 2)), (38, 6));
+        assert_eq!(t(Multiply, (38, 10), (1, 0)), (38, 9));
+        assert_eq!(t(Multiply, (38, 20), (38, 20)), (38, 6));
+        assert_eq!(t(Plus, (15, 2), (19, 0)), (22, 2));
+        assert_eq!(t(Plus, (36, 2), (36, 10)), (38, 4));
+        assert_eq!(t(Plus, (38, 0), (38, 10)), (38, 0));
+        assert_eq!(t(Divide, (15, 2), (15, 2)), (33, 18));
+        assert_eq!(t(Divide, (15, 2), (10, 0)), (26, 13));
+        assert_eq!(t(Divide, (1, 0), (1, 0)), (7, 6));
+        assert_eq!(t(Divide, (38, 4), (38, 4)), (38, 6)); // TPC-H Q8
+        assert_eq!(t(Divide, (38, 10), (2, 0)), (38, 10));
+        assert_eq!(t(Modulo, (15, 2), (10, 0)), (12, 2));
+        assert_eq!(t(Modulo, (38, 0), (38, 10)), (38, 10));
+        assert_eq!(decimal_arithmetic_type(&Eq, (15, 2), (15, 2)), None);
     }
 }

@@ -594,7 +594,7 @@ impl ExecutionContext {
                         span: *span,
                     });
                 }
-                let val = arrow_to_scalar(col, 0);
+                let val = crate::operator::extract_scalar(col, 0)?;
                 Ok(PlanExpr::Literal {
                     value: val,
                     span: *span,
@@ -2099,46 +2099,6 @@ fn find_assign_unique_id_column(plan: &arneb_planner::LogicalPlan) -> Option<Str
         // Aggregate, Distinct, set ops, etc. break the run-contiguity
         // property — bail out.
         _ => None,
-    }
-}
-
-/// Extract a scalar value from an Arrow array at a given row.
-fn arrow_to_scalar(array: &arrow::array::ArrayRef, row: usize) -> arneb_common::types::ScalarValue {
-    use arneb_common::types::ScalarValue;
-    use arrow::array::{Array, Float64Array, Int64Array, StringArray};
-    use arrow::datatypes::DataType as ArrowDT;
-
-    if array.is_null(row) {
-        return ScalarValue::Null;
-    }
-    match array.data_type() {
-        ArrowDT::Int64 => ScalarValue::Int64(
-            array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(row),
-        ),
-        ArrowDT::Float64 => ScalarValue::Float64(
-            array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(row),
-        ),
-        ArrowDT::Utf8 => ScalarValue::Utf8(
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(row)
-                .to_string(),
-        ),
-        _ => {
-            // Fallback: convert to string
-            let s = arrow::util::display::array_value_to_string(array, row).unwrap_or_default();
-            ScalarValue::Utf8(s)
-        }
     }
 }
 

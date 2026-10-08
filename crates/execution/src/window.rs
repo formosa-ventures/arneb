@@ -164,11 +164,13 @@ fn compute_window_function(
 
                 if let Some(ref arr) = arg_arr {
                     if !arr.is_null(row) {
-                        let val = get_f64_value(arr, row);
-                        running_sum += val;
                         running_count += 1;
-                        running_min = Some(running_min.map_or(val, |m| m.min(val)));
-                        running_max = Some(running_max.map_or(val, |m| m.max(val)));
+                        if name_upper != "COUNT" {
+                            let val = get_f64_value(arr, row)?;
+                            running_sum += val;
+                            running_min = Some(running_min.map_or(val, |m| m.min(val)));
+                            running_max = Some(running_max.map_or(val, |m| m.max(val)));
+                        }
                     }
                 } else {
                     running_count += 1;
@@ -240,11 +242,13 @@ fn compute_window_function(
                     if row < num_rows {
                         if let Some(ref arr) = arg_arr {
                             if !arr.is_null(row) {
-                                let val = get_f64_value(arr, row);
-                                psum += val;
                                 pcount += 1;
-                                pmin = Some(pmin.map_or(val, |m| m.min(val)));
-                                pmax = Some(pmax.map_or(val, |m| m.max(val)));
+                                if name_upper != "COUNT" {
+                                    let val = get_f64_value(arr, row)?;
+                                    psum += val;
+                                    pmin = Some(pmin.map_or(val, |m| m.min(val)));
+                                    pmax = Some(pmax.map_or(val, |m| m.max(val)));
+                                }
                             }
                         } else {
                             pcount += 1;
@@ -308,23 +312,26 @@ fn same_order_values(order_vals: &[ArrayRef], row_a: usize, row_b: usize) -> boo
     true
 }
 
-fn get_f64_value(arr: &ArrayRef, row: usize) -> f64 {
+fn get_f64_value(arr: &ArrayRef, row: usize) -> Result<f64, ExecutionError> {
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return a.value(row) as f64;
+        return Ok(a.value(row) as f64);
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return a.value(row);
+        return Ok(a.value(row));
     }
     if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
-        return a.value(row) as f64;
+        return Ok(a.value(row) as f64);
     }
     if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Float32Array>() {
-        return a.value(row) as f64;
+        return Ok(a.value(row) as f64);
     }
     if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Decimal128Array>() {
-        return a.value(row) as f64 / 10f64.powi(a.scale() as i32);
+        return Ok(a.value(row) as f64 / 10f64.powi(a.scale() as i32));
     }
-    0.0
+    Err(ExecutionError::InvalidOperation(format!(
+        "window aggregate not supported for type {}",
+        arr.data_type()
+    )))
 }
 
 #[async_trait]

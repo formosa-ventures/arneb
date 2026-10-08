@@ -2274,6 +2274,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn window_sum_avg_over_decimal() {
+        let schema = vec![
+            ColumnInfo {
+                name: "d".to_string(),
+                data_type: DataType::Decimal128 {
+                    precision: 10,
+                    scale: 2,
+                },
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "s".to_string(),
+                data_type: DataType::Utf8,
+                nullable: false,
+            },
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("d", ArrowDataType::Decimal128(10, 2), true),
+                Field::new("s", ArrowDataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(
+                    arrow::array::Decimal128Array::from(vec![Some(150), None, Some(300)])
+                        .with_precision_and_scale(10, 2)
+                        .unwrap(),
+                ),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let mut ctx = ExecutionContext::new();
+        ctx.register_data_source(
+            "t",
+            Arc::new(InMemoryDataSource::new(schema.clone(), vec![batch])),
+        );
+        let func = |name: &str, index: usize| WindowFunctionDef {
+            name: name.into(),
+            args: vec![PlanExpr::Column {
+                index,
+                name: schema[index].name.clone(),
+                span: None,
+            }],
+            partition_by: Vec::new(),
+            order_by: Vec::new(),
+            output_name: name.to_lowercase(),
+        };
+        let plan = LogicalPlan::Window {
+            input: Box::new(LogicalPlan::TableScan {
+                table: TableReference::table("t"),
+                schema: schema.clone(),
+                alias: None,
+                properties: Default::default(),
+                dynamic_filters_consumed: Vec::new(),
+            }),
+            functions: vec![func("SUM", 0), func("AVG", 0), func("COUNT", 1)],
+        };
+        let exec = ctx.create_physical_plan(&plan).unwrap();
+        let batches = collect_stream(exec.execute(0).await.unwrap())
+            .await
+            .unwrap();
+        let f64_at = |col: usize| {
+            batches[0]
+                .column(col)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(f64_at(2), 4.5);
+        assert_eq!(f64_at(3), 2.25);
+        let count = batches[0]
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(count.value(0), 3);
+    }
+
+    #[tokio::test]
     async fn cte_self_agg_window_plan_matches_scalar_subquery_boundary() {
         let (ctx, supplier_schema, revenue_schema) = revenue0_context();
         let scalar_plan = resolve_top_filter_scalar_subquery(

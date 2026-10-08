@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Date32Array, Decimal128Array, Int32Array, StringArray,
+    Array, ArrayRef, Date32Array, Decimal128Array, Int16Array, Int32Array, Int8Array, StringArray,
     TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, TimeUnit as ArrowTimeUnit};
@@ -37,11 +37,11 @@ fn micros(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
 
 /// Table `t`:
 ///
-/// | id | name      | price  | d          | ts                  |
-/// |----|-----------|--------|------------|---------------------|
-/// | 1  | 'a-b-c'   | 12.50  | 2024-01-31 | 2024-01-31 10:15:30 |
-/// | 2  | 'bob'     | 3.25   | 2024-02-29 | 2024-02-29 23:59:59 |
-/// | 3  | NULL      | 100.00 | 2023-12-25 | 2023-12-25 00:00:00 |
+/// | id | name      | price  | d          | ts                  | tiny | small |
+/// |----|-----------|--------|------------|---------------------|------|-------|
+/// | 1  | 'a-b-c'   | 12.50  | 2024-01-31 | 2024-01-31 10:15:30 | 127  | 32767 |
+/// | 2  | 'bob'     | 3.25   | 2024-02-29 | 2024-02-29 23:59:59 | 2    | NULL  |
+/// | 3  | NULL      | 100.00 | 2023-12-25 | 2023-12-25 00:00:00 | 127  | 32767 |
 fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
     let ts_type = ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, None);
     let arrow_schema = Arc::new(Schema::new(vec![
@@ -50,6 +50,8 @@ fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
         Field::new("price", ArrowDataType::Decimal128(12, 2), false),
         Field::new("d", ArrowDataType::Date32, false),
         Field::new("ts", ts_type, false),
+        Field::new("tiny", ArrowDataType::Int8, false),
+        Field::new("small", ArrowDataType::Int16, true),
     ]));
     let batch = RecordBatch::try_new(
         arrow_schema,
@@ -71,6 +73,8 @@ fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
                 micros(2024, 2, 29, 23, 59, 59),
                 micros(2023, 12, 25, 0, 0, 0),
             ])),
+            Arc::new(Int8Array::from(vec![127, 2, 127])),
+            Arc::new(Int16Array::from(vec![Some(32767), None, Some(32767)])),
         ],
     )
     .unwrap();
@@ -101,6 +105,8 @@ fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
                 },
                 false,
             ),
+            col("tiny", DataType::Int8, false),
+            col("small", DataType::Int16, true),
         ],
         vec![batch],
     ));
@@ -119,11 +125,26 @@ fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
 
 /// Run `sql` and render every cell as text (`NULL` for nulls).
 async fn query(sql: &str) -> Vec<Vec<String>> {
+    query_with_types(sql).await.1
+}
+
+/// Like [`query`], also returning the Arrow type of each result column.
+async fn query_with_types(sql: &str) -> (Vec<ArrowDataType>, Vec<Vec<String>>) {
     let (cm, cr) = setup();
     let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::new());
     let (_plan, batches) = arneb_protocol::__private::execute_query(sql, &cm, &cr, None, &pool)
         .await
         .unwrap_or_else(|e| panic!("query failed: {sql}\n{e}"));
+    let types = batches
+        .first()
+        .map(|b| {
+            b.schema()
+                .fields()
+                .iter()
+                .map(|f| f.data_type().clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut rows = Vec::new();
     for batch in &batches {
         for r in 0..batch.num_rows() {
@@ -142,7 +163,7 @@ async fn query(sql: &str) -> Vec<Vec<String>> {
             );
         }
     }
-    rows
+    (types, rows)
 }
 
 fn row(cells: &[&str]) -> Vec<String> {
@@ -332,4 +353,32 @@ async fn nullary_functions_produce_a_value_per_row() {
     for r in rows {
         assert_eq!(r, row(&["314.0", "true", "true", "true", "true"]));
     }
+}
+
+/// SUM/AVG over TINYINT/SMALLINT widen to BIGINT/DOUBLE (Trino), single
+/// and grouped; the sums exceed the input type's range. Issue #93.
+#[tokio::test]
+async fn sum_avg_over_small_ints() {
+    use ArrowDataType::{Float64, Int64};
+    let (types, rows) =
+        query_with_types("SELECT sum(tiny), avg(tiny), sum(small), avg(small) FROM t").await;
+    assert_eq!(types, [Int64, Float64, Int64, Float64]);
+    assert_eq!(
+        rows,
+        [row(&["256", "85.33333333333333", "65534", "32767.0"])]
+    );
+
+    let (types, rows) = query_with_types(
+        "SELECT id % 2 AS k, sum(tiny), avg(tiny), sum(small), avg(small) \
+         FROM t GROUP BY id % 2 ORDER BY k",
+    )
+    .await;
+    assert_eq!(types[1..], [Int64, Float64, Int64, Float64]);
+    assert_eq!(
+        rows,
+        [
+            row(&["0", "2", "2.0", "NULL", "NULL"]),
+            row(&["1", "254", "127.0", "65534", "32767.0"]),
+        ]
+    );
 }

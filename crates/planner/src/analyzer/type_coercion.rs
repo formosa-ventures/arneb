@@ -32,7 +32,7 @@
 //!   as-is.
 
 use arneb_common::error::PlanError;
-use arneb_common::types::{ColumnInfo, DataType};
+use arneb_common::types::{ColumnInfo, DataType, ScalarValue};
 use arneb_sql_parser::ast;
 
 use super::coercion_matrix::{common_supertype, lookup_cast, CoercionSite, Safety};
@@ -1200,6 +1200,21 @@ fn maybe_cast(
 ) -> Result<PlanExpr, PlanError> {
     if from == target {
         return Ok(expr);
+    }
+    // A decimal literal against a DOUBLE operand (`double_col > 0.05`)
+    // becomes a DOUBLE literal here rather than a `Cast`: the optimizer
+    // does not fold under every plan node, and connectors only push down
+    // plain `column op literal` predicates.
+    if let PlanExpr::Literal {
+        value: value @ ScalarValue::Decimal128 { .. },
+        span,
+    } = &expr
+    {
+        if *target == DataType::Float64 {
+            if let Ok(value) = super::cast_scalar::cast_scalar(value, target) {
+                return Ok(PlanExpr::Literal { value, span: *span });
+            }
+        }
     }
     match lookup_cast(from, target) {
         Some(Safety::AlwaysSafe) | Some(Safety::PrecisionLoss) => Ok(PlanExpr::Cast {

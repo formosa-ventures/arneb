@@ -151,11 +151,12 @@ fn format_decimal128(value: i128, _precision: u8, scale: i8) -> Option<String> {
         return Some((value * multiplier).to_string());
     }
     let scale = scale as u32;
-    let divisor = 10i128.pow(scale);
-    let integer_part = value / divisor;
-    let fractional_part = (value % divisor).abs();
+    let divisor = 10u128.pow(scale);
+    let sign = if value < 0 { "-" } else { "" };
+    let integer_part = value.unsigned_abs() / divisor;
+    let fractional_part = value.unsigned_abs() % divisor;
     Some(format!(
-        "{}.{:0>width$}",
+        "{sign}{}.{:0>width$}",
         integer_part,
         fractional_part,
         width = scale as usize

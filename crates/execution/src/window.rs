@@ -339,12 +339,7 @@ impl ExecutionPlan for WindowExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         let mut schema = self.child.schema();
         for f in &self.functions {
-            let data_type = match f.name.to_uppercase().as_str() {
-                "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT" => {
-                    arneb_common::types::DataType::Int64
-                }
-                _ => arneb_common::types::DataType::Float64,
-            };
+            let data_type = f.output_type(&schema);
             schema.push(ColumnInfo {
                 name: f.output_name.clone(),
                 data_type,
@@ -388,13 +383,22 @@ impl ExecutionPlan for WindowExec {
             .map(|i| combined.column(i).clone())
             .collect();
 
-        for func in &self.functions {
+        let output_columns = self.schema();
+        for (func, col) in self
+            .functions
+            .iter()
+            .zip(&output_columns[combined.num_columns()..])
+        {
+            // MIN/MAX are computed in f64 but typed as their argument
+            // (e.g. DECIMAL), matching the logical plan.
             let result = compute_window_function(func, &combined)?;
-            columns.push(result);
+            columns.push(arrow::compute::cast(
+                &result,
+                &col.data_type.clone().into(),
+            )?);
         }
 
-        let output_fields: Vec<Field> = self
-            .schema()
+        let output_fields: Vec<Field> = output_columns
             .iter()
             .map(|c| Field::new(&c.name, c.data_type.clone().into(), c.nullable))
             .collect();

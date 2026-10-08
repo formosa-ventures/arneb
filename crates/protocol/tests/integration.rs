@@ -320,3 +320,38 @@ async fn test_select_from_memory_table() {
         "expected ReadyForQuery (Z)"
     );
 }
+
+/// Decimal literals reach a PostgreSQL client as NUMERIC with exact text
+/// (sign kept below 1), and exponent literals as DOUBLE.
+#[tokio::test]
+async fn test_decimal_literal_is_numeric_over_pgwire() {
+    use tokio_postgres::types::Type;
+    use tokio_postgres::SimpleQueryMessage;
+
+    let (cm, cr) = create_empty_server_state();
+    let addr = start_test_server(cm, cr).await;
+    let port = addr.rsplit(':').next().unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=test"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(connection);
+
+    let msgs = client.simple_query("SELECT 1.5, -0.05, 1e3").await.unwrap();
+    let Some(SimpleQueryMessage::Row(row)) = msgs
+        .iter()
+        .find(|m| matches!(m, SimpleQueryMessage::Row(_)))
+    else {
+        panic!("no row: {msgs:?}");
+    };
+    assert_eq!(
+        (row.get(0), row.get(1), row.get(2)),
+        (Some("1.5"), Some("-0.05"), Some("1000"))
+    );
+
+    let stmt = client.prepare("SELECT 1.5, 1e3").await.unwrap();
+    let types: Vec<Type> = stmt.columns().iter().map(|c| c.type_().clone()).collect();
+    assert_eq!(types, vec![Type::NUMERIC, Type::FLOAT8]);
+}

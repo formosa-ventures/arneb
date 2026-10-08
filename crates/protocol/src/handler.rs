@@ -31,6 +31,7 @@ use pgwire::messages::PgWireBackendMessage;
 
 use crate::auth::{AuthMethod, AuthStartupHandler};
 use crate::encoding::{column_info_to_field_info, encode_record_batches};
+use crate::session::{handle_search_path, SearchPath};
 
 /// Trait for distributed query execution. Implemented by QueryCoordinator
 /// in the server crate and injected into the protocol handler.
@@ -146,9 +147,40 @@ pub struct ConnectionHandler {
     pub memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool>,
 }
 
+impl ConnectionHandler {
+    /// The catalog manager resolving unqualified names for this connection:
+    /// a session view when `SET search_path` chose a non-default schema.
+    fn session_catalog<C: ClientInfo>(&self, client: &C) -> Arc<CatalogManager> {
+        client.session_extensions().get::<SearchPath>().map_or_else(
+            || Arc::clone(&self.catalog_manager),
+            |p| Arc::clone(&p.catalog_manager),
+        )
+    }
+
+    /// Handle `SET`/`SHOW`/`RESET search_path` (updating the connection's
+    /// state), then fall back to metadata interception.
+    async fn intercept<C: ClientInfo + Sync>(
+        &self,
+        client: &C,
+        sql: &str,
+        catalog_manager: &CatalogManager,
+    ) -> Option<crate::metadata::MetadataResult> {
+        let current = client.session_extensions().get::<SearchPath>();
+        if let Some((result, new_path)) =
+            handle_search_path(sql, &self.catalog_manager, current.as_deref()).await
+        {
+            if let Some(path) = new_path {
+                client.session_extensions().insert(path);
+            }
+            return Some(result);
+        }
+        crate::metadata::try_handle_metadata(sql, catalog_manager).await
+    }
+}
+
 #[async_trait]
 impl SimpleQueryHandler for ConnectionHandler {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
@@ -161,10 +193,10 @@ impl SimpleQueryHandler for ConnectionHandler {
 
         tracing::debug!(query = trimmed, "processing simple query");
 
-        // Intercept metadata queries (pg_catalog, information_schema, version())
-        if let Some(meta_result) =
-            crate::metadata::try_handle_metadata(trimmed, &self.catalog_manager).await
-        {
+        // Intercept session commands and metadata queries (pg_catalog,
+        // information_schema, version()).
+        let catalog_manager = self.session_catalog(client);
+        if let Some(meta_result) = self.intercept(client, trimmed, &catalog_manager).await {
             return match meta_result {
                 Ok(crate::metadata::MetadataResponse::Query(fields, batches)) => {
                     let field_info: Vec<FieldInfo> = fields
@@ -201,7 +233,7 @@ impl SimpleQueryHandler for ConnectionHandler {
 
         let result = execute_query(
             trimmed,
-            &self.catalog_manager,
+            &catalog_manager,
             &self.connector_registry,
             self.distributed_executor.as_deref(),
             &self.memory_pool,
@@ -336,7 +368,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
 
     async fn do_query<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response>
@@ -357,10 +389,9 @@ impl ExtendedQueryHandler for ConnectionHandler {
 
         tracing::debug!(query = trimmed, "processing extended query");
 
-        // Intercept metadata queries
-        if let Some(meta_result) =
-            crate::metadata::try_handle_metadata(trimmed, &self.catalog_manager).await
-        {
+        // Intercept session commands and metadata queries
+        let catalog_manager = self.session_catalog(client);
+        if let Some(meta_result) = self.intercept(client, trimmed, &catalog_manager).await {
             return match meta_result {
                 Ok(crate::metadata::MetadataResponse::Query(fields, batches)) => {
                     let field_info: Vec<FieldInfo> = fields
@@ -387,7 +418,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
         let source = SourceFile::new("<query>", trimmed);
         let result = execute_query(
             trimmed,
-            &self.catalog_manager,
+            &catalog_manager,
             &self.connector_registry,
             self.distributed_executor.as_deref(),
             &self.memory_pool,
@@ -409,7 +440,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
 
     async fn do_describe_statement<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         target: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
@@ -422,10 +453,11 @@ impl ExtendedQueryHandler for ConnectionHandler {
         if sql.trim().is_empty() {
             return Ok(DescribeStatementResponse::no_data());
         }
+        let catalog_manager = self.session_catalog(client);
 
         // Intercept metadata queries for Describe too
         if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) =
-            crate::metadata::try_handle_metadata(sql.trim(), &self.catalog_manager).await
+            crate::metadata::try_handle_metadata(sql.trim(), &catalog_manager).await
         {
             let field_info: Vec<FieldInfo> = fields
                 .iter()
@@ -437,7 +469,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
             return Ok(DescribeStatementResponse::new(vec![], field_info));
         }
         if let Some(Ok(crate::metadata::MetadataResponse::Command(_))) =
-            crate::metadata::try_handle_metadata(sql.trim(), &self.catalog_manager).await
+            crate::metadata::try_handle_metadata(sql.trim(), &catalog_manager).await
         {
             return Ok(DescribeStatementResponse::no_data());
         }
@@ -449,7 +481,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
         // fall back to `Type::TEXT` to preserve the legacy behavior
         // for clients that don't care about precise types.
         let param_count = count_placeholders(sql);
-        let (fields, param_type_map) = plan_for_describe(sql, &self.catalog_manager)
+        let (fields, param_type_map) = plan_for_describe(sql, &catalog_manager)
             .await
             .unwrap_or_else(|_| (Vec::new(), std::collections::HashMap::new()));
         let param_types: Vec<Type> = (1..=param_count)
@@ -466,7 +498,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
 
     async fn do_describe_portal<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         target: &Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
@@ -483,10 +515,11 @@ impl ExtendedQueryHandler for ConnectionHandler {
         if trimmed.is_empty() {
             return Ok(DescribePortalResponse::no_data());
         }
+        let catalog_manager = self.session_catalog(client);
 
         // Intercept metadata queries
         if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) =
-            crate::metadata::try_handle_metadata(trimmed, &self.catalog_manager).await
+            crate::metadata::try_handle_metadata(trimmed, &catalog_manager).await
         {
             let field_info: Vec<FieldInfo> = fields
                 .iter()
@@ -498,12 +531,12 @@ impl ExtendedQueryHandler for ConnectionHandler {
             return Ok(DescribePortalResponse::new(field_info));
         }
         if let Some(Ok(crate::metadata::MetadataResponse::Command(_))) =
-            crate::metadata::try_handle_metadata(trimmed, &self.catalog_manager).await
+            crate::metadata::try_handle_metadata(trimmed, &catalog_manager).await
         {
             return Ok(DescribePortalResponse::no_data());
         }
 
-        let fields = plan_for_schema(trimmed, &self.catalog_manager)
+        let fields = plan_for_schema(trimmed, &catalog_manager)
             .await
             .unwrap_or_default();
         Ok(DescribePortalResponse::new(fields))

@@ -7,11 +7,12 @@ use std::sync::Arc;
 
 use arneb_common::error::ExecutionError;
 use arneb_common::types::ScalarValue;
+use arneb_planner::analyzer::coercion_matrix::decimal_arithmetic_type;
 use arneb_planner::PlanExpr;
 use arneb_sql_parser::ast;
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, NullArray,
-    StringArray,
+    Array, ArrayRef, AsArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    NullArray, StringArray,
 };
 use arrow::compute::kernels;
 use arrow::datatypes::DataType as ArrowDataType;
@@ -730,6 +731,12 @@ fn arithmetic_op(
         return Ok(arrow::compute::cast(&raw, &ArrowDataType::Date32)?);
     }
 
+    if let (ArrowDataType::Decimal128(p1, s1), ArrowDataType::Decimal128(p2, s2)) =
+        (left.data_type(), right.data_type())
+    {
+        return decimal_arithmetic(left, (*p1, *s1), right, (*p2, *s2), op);
+    }
+
     if left.data_type() != right.data_type() {
         return Err(ExecutionError::InvalidOperation(format!(
             "internal: arithmetic_op received mismatched types {lt:?} vs {rt:?}; analyzer should have inserted Cast",
@@ -746,6 +753,60 @@ fn arithmetic_op(
     };
     Ok(result)
 }
+
+/// Decimal arithmetic with Trino result types. Operands may differ in
+/// precision/scale (the analyzer leaves them as-is); the result is cast to
+/// [`decimal_arithmetic_type`], the same type the analyzer declares, and a
+/// value that does not fit it is an error rather than a wrap.
+fn decimal_arithmetic(
+    left: &ArrayRef,
+    l: (u8, i8),
+    right: &ArrayRef,
+    r: (u8, i8),
+    op: ArithOp,
+) -> Result<ArrayRef, ExecutionError> {
+    let ast_op = match op {
+        ArithOp::Add => ast::BinaryOp::Plus,
+        ArithOp::Sub => ast::BinaryOp::Minus,
+        ArithOp::Mul => ast::BinaryOp::Multiply,
+        ArithOp::Div => ast::BinaryOp::Divide,
+        ArithOp::Rem => ast::BinaryOp::Modulo,
+    };
+    let (precision, scale) =
+        decimal_arithmetic_type(&ast_op, l, r).expect("arithmetic op has a decimal type");
+    let raw = match op {
+        ArithOp::Add => kernels::numeric::add(left, right)?,
+        ArithOp::Sub => kernels::numeric::sub(left, right)?,
+        ArithOp::Mul => kernels::numeric::mul(left, right)?,
+        // Arrow divides at the dividend's scale + 4 (truncating); rescale the
+        // dividend to the result scale so the final cast rounds half up from
+        // exact digits.
+        ArithOp::Div if scale > l.1 => {
+            let p = (l.0 as i8 + scale - l.1).min(38) as u8;
+            let rescaled = ArrowDataType::Decimal128(p, scale);
+            let left = arrow::compute::cast_with_options(left, &rescaled, &CHECKED_CAST)?;
+            kernels::numeric::div(&left, right)?
+        }
+        ArithOp::Div => kernels::numeric::div(left, right)?,
+        ArithOp::Rem => kernels::numeric::rem(left, right)?,
+    };
+    let target = ArrowDataType::Decimal128(precision, scale);
+    let result = arrow::compute::cast_with_options(&raw, &target, &CHECKED_CAST)?;
+    // At the 38-digit clamp the kernels' i128 math can still hold a value
+    // wider than 38 digits that the cast does not re-check.
+    if precision == 38 {
+        result
+            .as_primitive::<arrow::datatypes::Decimal128Type>()
+            .validate_decimal_precision(precision)?;
+    }
+    Ok(result)
+}
+
+/// Casts that fail on overflow instead of yielding NULL.
+const CHECKED_CAST: arrow::compute::CastOptions<'static> = arrow::compute::CastOptions {
+    safe: false,
+    format_options: arrow::util::display::FormatOptions::new(),
+};
 
 /// View `arr` as a boolean operand of a logical operator. An untyped
 /// NULL (Arrow `Null` array, e.g. from a bare `NULL` literal — the

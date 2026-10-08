@@ -147,9 +147,14 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
             if is_boolean_result_op(op) {
                 Some(DataType::Boolean)
             } else {
-                // Arithmetic: widen to the common supertype.
                 let lt = plan_expr_type(left, schema)?;
                 let rt = plan_expr_type(right, schema)?;
+                // Decimal arithmetic has its own (Trino) result type.
+                if let Some((l, r)) = decimal_arithmetic_operands(left, &lt, right, &rt) {
+                    let (precision, scale) = coercion_matrix::decimal_arithmetic_type(op, l, r)?;
+                    return Some(DataType::Decimal128 { precision, scale });
+                }
+                // Other arithmetic: widen to the common supertype.
                 coercion_matrix::common_supertype(
                     &lt,
                     &rt,
@@ -213,6 +218,37 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
         }
         PlanExpr::Wildcard => None,
     }
+}
+
+/// `(precision, scale)` of each operand of decimal arithmetic, or `None`
+/// unless one side is DECIMAL and the other DECIMAL or an integer. As in
+/// Trino, INTEGER is DECIMAL(10,0) and BIGINT DECIMAL(19,0); an integer
+/// literal that fits INTEGER is typed INTEGER (our literals are all Int64).
+pub(crate) fn decimal_arithmetic_operands(
+    left: &PlanExpr,
+    lt: &DataType,
+    right: &PlanExpr,
+    rt: &DataType,
+) -> Option<((u8, i8), (u8, i8))> {
+    fn operand(expr: &PlanExpr, ty: &DataType) -> Option<(u8, i8)> {
+        match (ty, expr) {
+            (DataType::Decimal128 { precision, scale }, _) => Some((*precision, *scale)),
+            (DataType::Int32, _) => Some((10, 0)),
+            (
+                DataType::Int64,
+                PlanExpr::Literal {
+                    value: arneb_common::types::ScalarValue::Int64(v),
+                    ..
+                },
+            ) if i32::try_from(*v).is_ok() => Some((10, 0)),
+            (DataType::Int64, _) => Some((19, 0)),
+            _ => None,
+        }
+    }
+    if !matches!(lt, DataType::Decimal128 { .. }) && !matches!(rt, DataType::Decimal128 { .. }) {
+        return None;
+    }
+    Some((operand(left, lt)?, operand(right, rt)?))
 }
 
 /// True if `op` produces a Boolean result regardless of operand types.

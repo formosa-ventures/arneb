@@ -2007,4 +2007,148 @@ mod tests {
         let counts = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(counts.values(), &[2, 1]);
     }
+
+    // -- End-to-end: decimal arithmetic result types (Trino semantics) ----
+
+    /// Memory table `t(p, disc, tax, qty DECIMAL(15,2), i BIGINT)`, the
+    /// TPC-H lineitem types, with rows (1000.00, 0.05, 0.08, 17.00, 1) and
+    /// (2500.50, 0.10, 0.02, 36.00, 2).
+    fn decimal_arith_env() -> (CatalogManager, ConnectorRegistry) {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        use arrow::array::Decimal128Array;
+        let dec = DataType::Decimal128 {
+            precision: 15,
+            scale: 2,
+        };
+        let cols = vec![
+            col("p", dec.clone()),
+            col("disc", dec.clone()),
+            col("tax", dec.clone()),
+            col("qty", dec),
+            col("i", DataType::Int64),
+        ];
+        let arrow_schema = Arc::new(Schema::new(
+            cols.iter().cloned().map(Field::from).collect::<Vec<_>>(),
+        ));
+        let d = |v: Vec<i128>| -> arrow::array::ArrayRef {
+            Arc::new(
+                Decimal128Array::from(v)
+                    .with_precision_and_scale(15, 2)
+                    .unwrap(),
+            )
+        };
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                d(vec![100_000, 250_050]),
+                d(vec![5, 10]),
+                d(vec![8, 2]),
+                d(vec![1_700, 3_600]),
+                Arc::new(Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("t", Arc::new(MemoryTable::new(cols, vec![batch])));
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", schema);
+        let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
+        let cm = CatalogManager::new("memory", "default");
+        cm.register_catalog("memory", catalog);
+        let mut reg = ConnectorRegistry::new();
+        reg.register("memory", Arc::new(factory));
+        (cm, reg)
+    }
+
+    /// TPC-H Q1 expressions on DECIMAL(15,2). Used to fail with
+    /// "arithmetic_op received mismatched types Decimal128(21, 2) vs
+    /// Decimal128(22, 2)".
+    #[tokio::test]
+    async fn decimal_q1_expressions_have_trino_types() {
+        let (cm, reg) = decimal_arith_env();
+        let b = run_sql(
+            "SELECT p * (1 - disc), p * (1 - disc) * (1 + tax) FROM t WHERE i = 1",
+            &cm,
+            &reg,
+        )
+        .await;
+        assert_eq!(decimal_cell(&b, 0), (9_500_000, 31, 4)); // 950.0000
+        assert_eq!(decimal_cell(&b, 1), (1_026_000_000, 38, 6)); // 1026.000000
+
+        let b = run_sql(
+            "SELECT sum(p * (1 - disc)), avg(p * (1 - disc)), \
+             sum(p * (1 - disc) * (1 + tax)) FROM t",
+            &cm,
+            &reg,
+        )
+        .await;
+        assert_eq!(decimal_cell(&b, 0), (32_004_500, 38, 4)); // 950 + 2250.45
+        assert_eq!(decimal_cell(&b, 1), (16_002_250, 31, 4));
+        assert_eq!(decimal_cell(&b, 2), (3_321_459_000, 38, 6)); // 1026 + 2295.459
+    }
+
+    #[tokio::test]
+    async fn decimal_with_integer_and_division() {
+        let (cm, reg) = decimal_arith_env();
+        let b = run_sql(
+            "SELECT qty + i, qty + 1, qty * 2, p / qty, disc / 3, p % 7 FROM t WHERE i = 1",
+            &cm,
+            &reg,
+        )
+        .await;
+        assert_eq!(decimal_cell(&b, 0), (1_800, 22, 2)); // BIGINT -> DECIMAL(19,0)
+        assert_eq!(decimal_cell(&b, 1), (1_800, 16, 2)); // literal -> DECIMAL(10,0)
+        assert_eq!(decimal_cell(&b, 2), (3_400, 25, 2));
+        // 58.823529411764705882|35 (Trino: DECIMAL(33,18))
+        assert_eq!(decimal_cell(&b, 3), (58_823_529_411_764_705_882, 33, 18));
+        // 0.0166666666666|66 rounds half up (Trino: DECIMAL(26,13))
+        assert_eq!(decimal_cell(&b, 4), (166_666_666_667, 26, 13));
+        assert_eq!(decimal_cell(&b, 5), (600, 12, 2)); // 1000.00 % 7
+    }
+
+    /// TPC-H Q22 shape: a DECIMAL scalar subquery used to come back as a
+    /// Utf8 literal ("compare_op received mismatched types Decimal128 vs Utf8").
+    #[tokio::test]
+    async fn decimal_scalar_subquery_stays_decimal() {
+        let (cm, reg) = decimal_arith_env();
+        let b = run_sql(
+            "SELECT count(*) FROM t WHERE p > (SELECT avg(p) FROM t)",
+            &cm,
+            &reg,
+        )
+        .await;
+        let n = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(n.value(0), 1);
+    }
+
+    /// TPC-H Q15 shape: the CTE self-MAX is rewritten to a window MAX, which
+    /// used to read every DECIMAL as 0.0 and so kept every row.
+    #[tokio::test]
+    async fn decimal_cte_max_rewrite_keeps_only_the_max_row() {
+        let (cm, reg) = decimal_arith_env();
+        let b = run_sql(
+            "WITH r AS (SELECT i, p FROM t) \
+             SELECT i FROM r WHERE p >= (SELECT MAX(p) - 0.01 FROM r)",
+            &cm,
+            &reg,
+        )
+        .await;
+        let i = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(i.values(), &[2]);
+    }
+
+    #[tokio::test]
+    async fn decimal_overflow_is_an_error() {
+        let (cm, reg) = decimal_arith_env();
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        let sql =
+            "SELECT CAST('999999999999999999999999999999999999.99' AS DECIMAL(38,2)) + p FROM t";
+        let err = execute_query(sql, &cm, &reg, None, &pool)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
 }

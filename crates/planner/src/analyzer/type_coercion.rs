@@ -36,7 +36,10 @@ use arneb_common::types::{ColumnInfo, DataType};
 use arneb_sql_parser::ast;
 
 use super::coercion_matrix::{common_supertype, lookup_cast, CoercionSite, Safety};
-use super::{is_literal_like, plan_expr_type, AnalysisPass, AnalyzerContext};
+use super::{
+    decimal_arithmetic_operands, is_boolean_result_op, is_literal_like, plan_expr_type,
+    AnalysisPass, AnalyzerContext,
+};
 use crate::plan::{JoinCondition, LogicalPlan, PlanExpr, SortExpr};
 
 /// The type-coercion pass. Construct with [`TypeCoercion::new`] and
@@ -578,6 +581,27 @@ fn unify_binary_operands(
     );
     if date_and_int && matches!(op, ast::BinaryOp::Plus | ast::BinaryOp::Minus) {
         return Ok((left, right));
+    }
+
+    // Decimal arithmetic: operands keep their own precision/scale (an
+    // integer side becomes DECIMAL(10|19, 0)); the executor computes the
+    // Trino result type from them, so no common supertype is forced.
+    if !is_boolean_result_op(op) {
+        if let Some(((lp, ls), (rp, rs))) = decimal_arithmetic_operands(&left, &lt, &right, &rt) {
+            let ld = DataType::Decimal128 {
+                precision: lp,
+                scale: ls,
+            };
+            let rd = DataType::Decimal128 {
+                precision: rp,
+                scale: rs,
+            };
+            let (l_lit, r_lit) = (is_literal_like(&left), is_literal_like(&right));
+            return Ok((
+                maybe_cast(left, &lt, &ld, l_lit, location)?,
+                maybe_cast(right, &rt, &rd, r_lit, location)?,
+            ));
+        }
     }
 
     let site = CoercionSite::Binary {
@@ -1476,23 +1500,29 @@ mod tests {
         let LogicalPlan::Filter { predicate, .. } = plan else {
             panic!()
         };
-        // Look inside: the `1` should be wrapped in Cast to Decimal(x, 2).
-        let PlanExpr::BinaryOp { right, .. } = &predicate else {
+        // Look inside: the `1` becomes DECIMAL(10, 0) (Trino's INTEGER), the
+        // decimal operands are left alone, and the declared type is
+        // Trino's DECIMAL(15,2) * DECIMAL(16,2) = DECIMAL(31, 4).
+        let PlanExpr::BinaryOp { left, right, .. } = &predicate else {
             panic!()
         };
+        assert!(matches!(left.as_ref(), PlanExpr::Column { .. }));
         let PlanExpr::BinaryOp { left: inner_l, .. } = right.as_ref() else {
             panic!()
         };
         assert!(
             matches!(
                 inner_l.as_ref(),
-                PlanExpr::Cast {
-                    data_type: DataType::Decimal128 { scale: 2, .. },
-                    ..
-                }
+                PlanExpr::Cast { data_type, .. } if *data_type == dec(10, 0)
             ),
             "got: {inner_l:?}"
         );
+        let schema = [dec(15, 2), dec(15, 2)].map(|data_type| ColumnInfo {
+            name: "c".into(),
+            data_type,
+            nullable: false,
+        });
+        assert_eq!(plan_expr_type(&predicate, &schema), Some(dec(31, 4)));
     }
 
     #[test]

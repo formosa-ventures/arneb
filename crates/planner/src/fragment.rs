@@ -2757,23 +2757,24 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                     functions,
                 };
 
-                if window_plan_has_global_function(&window_plan) {
-                    let output_schema = window_plan.schema();
-                    let window_fragment = PlanFragment {
-                        id: self.next_id(),
-                        fragment_type: FragmentType::Fixed,
-                        root: window_plan,
-                        output_partitioning: PartitioningScheme::Single,
-                        source_fragments: input_frags,
-                    };
-                    let exchange = LogicalPlan::ExchangeNode {
-                        stage_id: window_fragment.id,
-                        schema: output_schema,
-                    };
-                    return (exchange, vec![window_fragment]);
-                }
-
-                (window_plan, input_frags)
+                // A window must see every row of each of its partitions, so
+                // it always runs in its own single-task fragment that gathers
+                // its whole input. Left in place, an ancestor (e.g. a hash
+                // partitioned join) could fold it into a multi-task fragment
+                // where each task sees only a slice of a window partition.
+                let output_schema = window_plan.schema();
+                let window_fragment = PlanFragment {
+                    id: self.next_id(),
+                    fragment_type: FragmentType::Fixed,
+                    root: window_plan,
+                    output_partitioning: PartitioningScheme::Single,
+                    source_fragments: input_frags,
+                };
+                let exchange = LogicalPlan::ExchangeNode {
+                    stage_id: window_fragment.id,
+                    schema: output_schema,
+                };
+                (exchange, vec![window_fragment])
             }
 
             LogicalPlan::Explain { input, analyze } => {
@@ -2791,15 +2792,6 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
             other => (other, vec![]),
         }
     }
-}
-
-fn window_plan_has_global_function(plan: &LogicalPlan) -> bool {
-    let LogicalPlan::Window { functions, .. } = plan else {
-        return false;
-    };
-    functions
-        .iter()
-        .any(|function| function.partition_by.is_empty())
 }
 
 impl Default for PlanFragmenter {
@@ -3605,7 +3597,7 @@ fn parent_projection_preserves_natural_aggregate_order(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{PlanExpr, WindowFunctionDef};
+    use crate::plan::{PlanExpr, SortExpr, WindowFunctionDef};
     use arneb_common::types::{ColumnInfo, DataType, ScalarValue, TableReference};
     use arneb_sql_parser::ast;
 
@@ -3957,6 +3949,71 @@ mod tests {
         assert_eq!(table.catalog.as_deref(), Some("datalake"));
         assert_eq!(table.schema.as_deref(), Some("tpch"));
         assert_eq!(table.table, "lineitem");
+    }
+
+    #[test]
+    fn fragment_partitioned_window_runs_in_its_own_single_fragment() {
+        // rank() OVER (PARTITION BY k ORDER BY v) over a scan, joined to
+        // another table: the window must not be folded into the join's
+        // (hash-partitioned) fragment, where a task sees a slice of a window
+        // partition.
+        let windowed = LogicalPlan::Window {
+            input: Box::new(LogicalPlan::Sort {
+                input: Box::new(scan_with_columns("facts", &["k", "v"])),
+                order_by: vec![
+                    SortExpr {
+                        expr: column(0, "k"),
+                        asc: true,
+                        nulls_first: false,
+                    },
+                    SortExpr {
+                        expr: column(1, "v"),
+                        asc: true,
+                        nulls_first: false,
+                    },
+                ],
+            }),
+            functions: vec![WindowFunctionDef {
+                name: "RANK".into(),
+                args: Vec::new(),
+                partition_by: vec![column(0, "k")],
+                order_by: vec![SortExpr {
+                    expr: column(1, "v"),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                output_name: "r".into(),
+            }],
+        };
+        let plan = LogicalPlan::Join {
+            left: Box::new(windowed),
+            right: Box::new(scan_with_columns("dims", &["d_k"])),
+            join_type: ast::JoinType::Inner,
+            condition: JoinCondition::On(PlanExpr::BinaryOp {
+                left: Box::new(column(0, "k")),
+                op: ast::BinaryOp::Eq,
+                right: Box::new(column(3, "d_k")),
+                span: None,
+            }),
+            dynamic_filter_ids: Vec::new(),
+        };
+
+        let result = PlanFragmenter::new().fragment(plan);
+
+        fn window_fragments(f: &PlanFragment, out: &mut Vec<(FragmentType, bool)>) {
+            if matches!(f.root, LogicalPlan::Window { .. }) {
+                out.push((
+                    f.fragment_type.clone(),
+                    matches!(f.output_partitioning, PartitioningScheme::Single),
+                ));
+            }
+            for s in &f.source_fragments {
+                window_fragments(s, out);
+            }
+        }
+        let mut found = Vec::new();
+        window_fragments(&result, &mut found);
+        assert_eq!(found, vec![(FragmentType::Fixed, true)]);
     }
 
     fn column(index: usize, name: &str) -> PlanExpr {

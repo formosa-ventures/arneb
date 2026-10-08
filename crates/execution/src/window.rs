@@ -7,7 +7,7 @@ use arneb_common::error::ExecutionError;
 use arneb_common::stream::{collect_stream, stream_from_batches, SendableRecordBatchStream};
 use arneb_common::types::ColumnInfo;
 use arneb_planner::WindowFunctionDef;
-use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{Field, Schema};
 use async_trait::async_trait;
 
@@ -17,8 +17,10 @@ use crate::operator::ExecutionPlan;
 
 /// Window function operator.
 ///
-/// Materializes all input, sorts by partition+order keys, computes window
-/// functions per partition, and appends result columns.
+/// Materializes all input, computes window functions per partition, and
+/// appends result columns. The input must arrive sorted by the PARTITION BY
+/// then ORDER BY keys (the SQL planner places a Sort below each Window);
+/// partitions and peer groups are detected as runs of adjacent rows.
 #[derive(Debug)]
 pub(crate) struct WindowExec {
     child: Arc<dyn ExecutionPlan>,
@@ -194,7 +196,24 @@ fn compute_window_function(
                 }
             }
 
-            if !has_order {
+            if has_order {
+                // Default frame is RANGE UNBOUNDED PRECEDING .. CURRENT ROW:
+                // peers (equal ORDER BY values) all see the running value of
+                // the last row in their peer group.
+                let order_vals: Vec<ArrayRef> = func
+                    .order_by
+                    .iter()
+                    .map(|s| expression::evaluate(&s.expr, batch, None))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for row in (0..num_rows.saturating_sub(1)).rev() {
+                    if partition_ids[row] == partition_ids[row + 1]
+                        && same_order_values(&order_vals, row, row + 1)
+                    {
+                        results[row] = results[row + 1];
+                        count_results[row] = count_results[row + 1];
+                    }
+                }
+            } else {
                 // Full partition aggregate — need a second pass
                 // First pass collected final values per partition; now fill all rows
                 // Re-scan to compute per-partition totals
@@ -277,6 +296,8 @@ fn compute_partition_ids(keys: &[ArrayRef], num_rows: usize) -> Vec<u64> {
         .map(|row| {
             let mut hasher = FastHasher::default();
             for key in keys {
+                // NULL is its own partition, distinct from an empty string.
+                key.is_null(row).hash(&mut hasher);
                 let s = arrow::util::display::array_value_to_string(key, row).unwrap_or_default();
                 s.hash(&mut hasher);
             }
@@ -303,6 +324,12 @@ fn aggregate_float_value(
 
 fn same_order_values(order_vals: &[ArrayRef], row_a: usize, row_b: usize) -> bool {
     for arr in order_vals {
+        if arr.is_null(row_a) || arr.is_null(row_b) {
+            if arr.is_null(row_a) != arr.is_null(row_b) {
+                return false;
+            }
+            continue;
+        }
         let a = arrow::util::display::array_value_to_string(arr, row_a).unwrap_or_default();
         let b = arrow::util::display::array_value_to_string(arr, row_b).unwrap_or_default();
         if a != b {
@@ -339,15 +366,9 @@ impl ExecutionPlan for WindowExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         let mut schema = self.child.schema();
         for f in &self.functions {
-            let data_type = match f.name.to_uppercase().as_str() {
-                "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT" => {
-                    arneb_common::types::DataType::Int64
-                }
-                _ => arneb_common::types::DataType::Float64,
-            };
             schema.push(ColumnInfo {
                 name: f.output_name.clone(),
-                data_type,
+                data_type: f.output_type(),
                 nullable: true,
             });
         }

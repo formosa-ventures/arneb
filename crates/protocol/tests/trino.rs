@@ -309,6 +309,38 @@ async fn select_encodes_trino_types() {
 }
 
 #[tokio::test]
+async fn window_functions_run_over_the_rest_protocol() {
+    let base = start_default().await;
+    let d = run(
+        &base,
+        "SELECT n, row_number() OVER (ORDER BY n DESC) AS rn, \
+         sum(n) OVER (PARTITION BY n % 2) AS s FROM numbers WHERE n <= 4 ORDER BY n",
+        &[],
+    )
+    .await;
+    assert!(d.error.is_none(), "{:?}", d.error);
+    let types: Vec<String> = d
+        .columns
+        .as_ref()
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["type"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(types, vec!["bigint", "bigint", "double"]);
+    assert_eq!(
+        d.rows,
+        vec![
+            json!([1, 4, 4.0]),
+            json!([2, 3, 6.0]),
+            json!([3, 2, 4.0]),
+            json!([4, 1, 6.0]),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn results_are_paged_in_bounded_chunks() {
     let base = start_default().await;
     let d = run(&base, "SELECT n FROM numbers ORDER BY n", &[]).await;

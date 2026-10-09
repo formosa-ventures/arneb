@@ -3,10 +3,10 @@
 # Run TPC-H queries against Trino for baseline comparison.
 #
 # By default, connects to the Docker Compose Trino instance reading
-# from Hive tables on MinIO (same data as arneb).
+# from Hive tables on RustFS (same data as arneb).
 #
 # Prerequisites:
-#   docker compose up -d          # start MinIO + HMS + Trino
+#   docker compose up -d          # start RustFS + HMS + Trino
 #   docker compose run tpch-seed  # seed TPC-H data
 #
 # Usage:

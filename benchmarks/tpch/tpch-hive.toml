@@ -1,7 +1,7 @@
-# TPC-H Benchmark Configuration for Arneb (Hive + MinIO)
+# TPC-H Benchmark Configuration for Arneb (Hive + RustFS)
 #
 # Prerequisites:
-#   docker compose up -d          # start MinIO + HMS + Trino
+#   docker compose up -d          # start RustFS + HMS + Trino
 #   docker compose run tpch-seed  # seed TPC-H SF1 data
 #
 # Usage:
@@ -17,8 +17,8 @@ port = 5432
 region = "us-east-1"
 endpoint = "http://localhost:9000"
 allow_http = true
-access_key_id = "minioadmin"
-secret_access_key = "minioadmin"
+access_key_id = "s3admin"
+secret_access_key = "s3adminsecret"
 
 [[catalogs]]
 name = "datalake"

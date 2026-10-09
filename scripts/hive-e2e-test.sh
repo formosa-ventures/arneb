@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# Hive + MinIO E2E test for Arneb.
+# Hive + RustFS E2E test for Arneb.
 #
 # Prerequisites:
-#   docker compose up -d   (starts HMS + MinIO)
+#   docker compose up -d   (starts HMS + RustFS)
 #   cargo build --release  (builds arneb binary)
 #
 # This script:
-#   1. Creates test Parquet data and uploads to MinIO
+#   1. Creates test Parquet data and uploads to RustFS
 #   2. Registers a table in Hive Metastore via beeline
 #   3. Starts Arneb with Hive catalog config
 #   4. Queries the Hive table through Arneb via psql
@@ -23,8 +23,8 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ARNEB_BIN="${PROJECT_DIR}/target/release/arneb"
 ARNEB_PORT=15432
 ARNEB_PID=""
-MINIO_ENDPOINT="http://localhost:9000"
-MINIO_BUCKET="warehouse"
+S3_ENDPOINT="http://localhost:9000"
+S3_BUCKET="warehouse"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -42,7 +42,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "============================================"
-echo " Arneb Hive + MinIO E2E Test"
+echo " Arneb Hive + RustFS E2E Test"
 echo "============================================"
 
 # --- Check prerequisites ---
@@ -65,8 +65,8 @@ if [ ! -f "$ARNEB_BIN" ]; then
 fi
 
 # Check docker services
-if ! docker compose ps --status running 2>/dev/null | grep -q minio; then
-    echo -e "${RED}Error: MinIO not running. Run: docker compose up -d${NC}"
+if ! docker compose ps --status running 2>/dev/null | grep -q -- '-s3-'; then
+    echo -e "${RED}Error: RustFS (s3) not running. Run: docker compose up -d${NC}"
     exit 1
 fi
 
@@ -100,12 +100,12 @@ except ImportError:
     exit(1)
 "
 
-# --- Upload to MinIO ---
-echo -e "\n${YELLOW}[3/6] Uploading Parquet to MinIO...${NC}"
+# --- Upload to RustFS ---
+echo -e "\n${YELLOW}[3/6] Uploading Parquet to RustFS...${NC}"
 
-mc alias set arneb-minio "$MINIO_ENDPOINT" minioadmin minioadmin --api S3v4 2>/dev/null
-mc cp /tmp/arneb-e2e-test.parquet arneb-minio/${MINIO_BUCKET}/default/students/data.parquet
-echo -e "${GREEN}Uploaded to s3://${MINIO_BUCKET}/default/students/data.parquet${NC}"
+mc alias set arneb-s3 "$S3_ENDPOINT" s3admin s3adminsecret --api S3v4 2>/dev/null
+mc cp /tmp/arneb-e2e-test.parquet arneb-s3/${S3_BUCKET}/default/students/data.parquet
+echo -e "${GREEN}Uploaded to s3://${S3_BUCKET}/default/students/data.parquet${NC}"
 
 # --- Register table in HMS ---
 echo -e "\n${YELLOW}[4/6] Registering table in Hive Metastore...${NC}"
@@ -120,7 +120,7 @@ CREATE EXTERNAL TABLE test_db.students (
     score DOUBLE
 )
 STORED AS PARQUET
-LOCATION 's3a://${MINIO_BUCKET}/default/students';
+LOCATION 's3a://${S3_BUCKET}/default/students';
 DESCRIBE test_db.students;
 " 2>&1 | tail -20
 
@@ -135,7 +135,7 @@ port = ${ARNEB_PORT}
 
 [storage.s3]
 region = "us-east-1"
-endpoint = "${MINIO_ENDPOINT}"
+endpoint = "${S3_ENDPOINT}"
 allow_http = true
 
 [[catalogs]]
@@ -145,8 +145,8 @@ metastore_uri = "127.0.0.1:9083"
 default_schema = "test_db"
 EOF
 
-AWS_ACCESS_KEY_ID=minioadmin \
-AWS_SECRET_ACCESS_KEY=minioadmin \
+AWS_ACCESS_KEY_ID=s3admin \
+AWS_SECRET_ACCESS_KEY=s3adminsecret \
 "$ARNEB_BIN" --config /tmp/arneb-e2e-config.toml &
 ARNEB_PID=$!
 

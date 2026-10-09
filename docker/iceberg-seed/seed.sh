@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Seed Iceberg tables (HMS-backed) on MinIO via Trino, for exercising
+# Seed Iceberg tables (HMS-backed) on RustFS via Trino, for exercising
 # Arneb's Iceberg reader (reached through a `hive` catalog via table
 # redirection). Covers the shapes the reader must get right:
 #

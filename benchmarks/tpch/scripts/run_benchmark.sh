@@ -187,13 +187,16 @@ preflight
 echo ""
 
 # ------------------------------------------------------------------
-# Step 1: Infrastructure — MinIO, Hive Metastore, Trino.
+# Step 1: Infrastructure — RustFS, Hive Metastore, Trino.
 # ------------------------------------------------------------------
-echo ">>> Step 1: Bringing up MinIO + Hive Metastore + Trino..."
+echo ">>> Step 1: Bringing up RustFS + Hive Metastore + Trino..."
 cd "$PROJECT_DIR"
 "${COMPOSE[@]}" up -d --wait --wait-timeout "${TRINO_WAIT_TIMEOUT:-300}" \
-    minio hive-metastore trino trino-worker-1 trino-worker-2 \
+    s3 hive-metastore trino trino-worker-1 trino-worker-2 \
     || die "infrastructure did not come up"
+# One-shot: create the warehouse bucket (idempotent). Not part of the --wait
+# above, which treats a service that exits — even successfully — as a failure.
+"${COMPOSE[@]}" run --rm s3-init || die "bucket init failed"
 echo ""
 
 # ------------------------------------------------------------------

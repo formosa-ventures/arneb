@@ -184,6 +184,16 @@ fn checked_decimal38_add(a: i128, b: i128) -> Result<i128, ExecutionError> {
     Ok(sum)
 }
 
+/// Widens TINYINT/SMALLINT input to BIGINT so SUM/AVG reuse the Int64 path
+/// (Trino types them BIGINT/DOUBLE; see `function_return_type`).
+fn widen_small_int(values: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+    use arrow::datatypes::DataType::{Int16, Int64, Int8};
+    match values.data_type() {
+        Int8 | Int16 => Ok(arrow::compute::cast(values, &Int64)?),
+        _ => Ok(std::sync::Arc::clone(values)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SUM
 // ---------------------------------------------------------------------------
@@ -236,6 +246,7 @@ impl Accumulator for SumAccumulator {
 
     fn update_batch(&mut self, values: &ArrayRef) -> Result<(), ExecutionError> {
         use arrow::datatypes::DataType::*;
+        let values = &widen_small_int(values)?;
 
         match values.data_type() {
             Int32 => {
@@ -367,6 +378,7 @@ impl Accumulator for AvgAccumulator {
 
     fn update_batch(&mut self, values: &ArrayRef) -> Result<(), ExecutionError> {
         use arrow::datatypes::DataType::*;
+        let values = &widen_small_int(values)?;
 
         match values.data_type() {
             Int32 => {
@@ -943,7 +955,7 @@ impl GroupedAccumulator for GroupedCountAccumulator {
     }
 }
 
-/// SUM(col), with per-group state. Supports `Int32/64`, `Float32/64`,
+/// SUM(col), with per-group state. Supports `Int8/16/32/64`, `Float32/64`,
 /// `Decimal128(p, s)` — matches the single-instance `SumAccumulator`.
 #[derive(Debug, Default)]
 pub struct GroupedSumAccumulator {
@@ -977,6 +989,7 @@ impl GroupedAccumulator for GroupedSumAccumulator {
     fn add_input(&mut self, group_ids: &[u32], values: &ArrayRef) -> Result<(), ExecutionError> {
         use arrow::datatypes::DataType::*;
         debug_assert_eq!(group_ids.len(), values.len());
+        let values = &widen_small_int(values)?;
 
         match values.data_type() {
             Int32 => {
@@ -1174,6 +1187,7 @@ impl GroupedAccumulator for GroupedAvgAccumulator {
     fn add_input(&mut self, group_ids: &[u32], values: &ArrayRef) -> Result<(), ExecutionError> {
         use arrow::datatypes::DataType::*;
         debug_assert_eq!(group_ids.len(), values.len());
+        let values = &widen_small_int(values)?;
 
         match values.data_type() {
             Int32 => {
@@ -1938,10 +1952,14 @@ mod tests {
         };
         let (int, dbl) = (DataType::Int64, DataType::Float64);
         let cases = [
+            ("SUM", DataType::Int8, int.clone()),
+            ("SUM", DataType::Int16, int.clone()),
             ("SUM", DataType::Int32, int.clone()),
             ("SUM", DataType::Int64, int.clone()),
             ("SUM", dbl.clone(), dbl.clone()),
             ("SUM", dec.clone(), sum_dec),
+            ("AVG", DataType::Int8, dbl.clone()),
+            ("AVG", DataType::Int16, dbl.clone()),
             ("AVG", DataType::Int32, dbl.clone()),
             ("AVG", DataType::Int64, dbl.clone()),
             ("AVG", dbl.clone(), dbl.clone()),
@@ -1980,6 +1998,35 @@ mod tests {
             for got in [single.evaluate().unwrap(), grouped.evaluate(0).unwrap()] {
                 assert_eq!(got.data_type(), expected, "executor {func}({input:?})");
             }
+        }
+    }
+
+    /// TINYINT/SMALLINT SUM widens to i64, so totals beyond the input
+    /// type's range are exact (issue #93).
+    #[test]
+    fn sum_avg_small_ints_widen() {
+        let tiny: ArrayRef = Arc::new(arrow::array::Int8Array::from(vec![
+            Some(127),
+            None,
+            Some(127),
+        ]));
+        let small: ArrayRef = Arc::new(arrow::array::Int16Array::from(vec![32767, 32767, -1]));
+        for (values, sum, avg) in [(tiny, 254, 127.0), (small, 65533, 65533.0 / 3.0)] {
+            let mut s = SumAccumulator::new();
+            s.update_batch(&values).unwrap();
+            assert_eq!(s.evaluate().unwrap(), ScalarValue::Int64(sum));
+            let mut a = AvgAccumulator::new();
+            a.update_batch(&values).unwrap();
+            assert_eq!(a.evaluate().unwrap(), ScalarValue::Float64(avg));
+
+            let mut gs = GroupedSumAccumulator::new();
+            gs.ensure_capacity(1);
+            gs.add_input(&[0, 0, 0], &values).unwrap();
+            assert_eq!(gs.evaluate(0).unwrap(), ScalarValue::Int64(sum));
+            let mut ga = GroupedAvgAccumulator::new();
+            ga.ensure_capacity(1);
+            ga.add_input(&[0, 0, 0], &values).unwrap();
+            assert_eq!(ga.evaluate(0).unwrap(), ScalarValue::Float64(avg));
         }
     }
 

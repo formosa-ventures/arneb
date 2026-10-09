@@ -320,3 +320,53 @@ async fn test_select_from_memory_table() {
         "expected ReadyForQuery (Z)"
     );
 }
+
+/// Run `sql` over a real pgwire client and return every cell as text
+/// (`None` for SQL NULL).
+async fn simple_query_cells(addr: &str, sql: &str) -> Vec<Vec<Option<String>>> {
+    let (host, port) = addr.rsplit_once(':').unwrap();
+    let (client, connection) = tokio_postgres::Config::new()
+        .host(host)
+        .port(port.parse().unwrap())
+        .user("testuser")
+        .dbname("testdb")
+        .connect(tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    client
+        .simple_query(sql)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                (0..row.len())
+                    .map(|i| row.get(i).map(str::to_string))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A NULL-typed column (`SELECT NULL`) is sent as SQL NULL, not as the
+/// debug text of the whole Arrow array (`NullArray(3)`).
+#[tokio::test]
+async fn test_null_typed_column_is_sql_null() {
+    let (cm, cr) = create_server_with_users_table();
+    let addr = start_test_server(cm, cr).await;
+
+    assert_eq!(
+        simple_query_cells(&addr, "SELECT NULL").await,
+        vec![vec![None]]
+    );
+    assert_eq!(
+        simple_query_cells(&addr, "SELECT id, NULL AS n FROM users ORDER BY id").await,
+        vec![
+            vec![Some("1".to_string()), None],
+            vec![Some("2".to_string()), None],
+            vec![Some("3".to_string()), None],
+        ]
+    );
+}

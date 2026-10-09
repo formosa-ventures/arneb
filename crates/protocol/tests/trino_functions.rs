@@ -232,6 +232,24 @@ async fn math_functions() {
     );
 }
 
+/// POWER returns DOUBLE even for integer arguments; planning it as BIGINT
+/// truncated `power(2, 0.5)` to 1.
+#[tokio::test]
+async fn power_returns_double() {
+    let (types, rows) =
+        query_with_types("SELECT id, power(id, 0.5), pow(2, id), power(id, 2) FROM t ORDER BY id")
+            .await;
+    assert_eq!(types[1..], vec![ArrowDataType::Float64; 3]);
+    assert_eq!(
+        rows,
+        vec![
+            row(&["1", "1.0", "2.0", "1.0"]),
+            row(&["2", "1.4142135623730951", "4.0", "4.0"]),
+            row(&["3", "1.7320508075688772", "8.0", "9.0"]),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn date_time_functions() {
     let rows = query(

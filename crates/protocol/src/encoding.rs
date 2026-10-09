@@ -47,6 +47,8 @@ fn encode_value(array: &dyn Array, row: usize) -> Option<String> {
 
     let dt = array.data_type();
     match dt {
+        // A NullArray has no validity buffer, so `is_null` reports false.
+        arrow_types::DataType::Null => None,
         arrow_types::DataType::Boolean => {
             let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
             Some(if arr.value(row) { "t" } else { "f" }.to_string())
@@ -141,7 +143,7 @@ fn encode_value(array: &dyn Array, row: usize) -> Option<String> {
             let materialized = arrow::compute::cast(array, value_type.as_ref()).ok()?;
             encode_value(materialized.as_ref(), row)
         }
-        _ => Some(format!("{array:?}")),
+        _ => arrow::util::display::array_value_to_string(array, row).ok(),
     }
 }
 
@@ -289,6 +291,28 @@ mod tests {
         assert_eq!(encode_value(arr.as_ref(), 0), Some("1".to_string()));
         assert_eq!(encode_value(arr.as_ref(), 1), None);
         assert_eq!(encode_value(arr.as_ref(), 2), Some("3".to_string()));
+    }
+
+    #[test]
+    fn test_encode_null_typed_array() {
+        // NullArray has no validity buffer: `is_null` is false for every row.
+        let arr: ArrayRef = Arc::new(NullArray::new(3));
+        assert_eq!(encode_value(arr.as_ref(), 0), None);
+        assert_eq!(encode_value(arr.as_ref(), 2), None);
+    }
+
+    #[test]
+    fn test_encode_unhandled_type_formats_one_cell() {
+        // Types without a dedicated arm (here a LIST) render the single
+        // cell, not the debug dump of the whole array.
+        let arr: ArrayRef = Arc::new(
+            ListArray::from_iter_primitive::<arrow_types::Int32Type, _, _>(vec![
+                Some(vec![Some(1), Some(2)]),
+                Some(vec![Some(3)]),
+            ]),
+        );
+        assert_eq!(encode_value(arr.as_ref(), 0), Some("[1, 2]".to_string()));
+        assert_eq!(encode_value(arr.as_ref(), 1), Some("[3]".to_string()));
     }
 
     #[test]

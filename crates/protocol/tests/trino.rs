@@ -328,14 +328,15 @@ async fn window_functions_run_over_the_rest_protocol() {
         .iter()
         .map(|c| c["type"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(types, vec!["bigint", "bigint", "double"]);
+    // sum(bigint) OVER is BIGINT, as in Trino.
+    assert_eq!(types, vec!["bigint", "bigint", "bigint"]);
     assert_eq!(
         d.rows,
         vec![
-            json!([1, 4, 4.0]),
-            json!([2, 3, 6.0]),
-            json!([3, 2, 4.0]),
-            json!([4, 1, 6.0]),
+            json!([1, 4, 4]),
+            json!([2, 3, 6]),
+            json!([3, 2, 4]),
+            json!([4, 1, 6]),
         ]
     );
 }

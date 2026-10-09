@@ -573,13 +573,18 @@ pub struct WindowFunctionDef {
 
 impl WindowFunctionDef {
     /// Result type of this window function — the type `WindowExec` produces:
-    /// BIGINT for the ranking functions and COUNT, DOUBLE for the
-    /// SUM/AVG/MIN/MAX aggregates (issue #93 tracks Trino's input-typed
-    /// aggregate results).
-    pub fn output_type(&self) -> DataType {
+    /// BIGINT for the ranking functions and COUNT; SUM/AVG/MIN/MAX use the
+    /// Trino result types of their GROUP BY form (`function_return_type`),
+    /// e.g. `SUM(bigint)` → BIGINT, `SUM(decimal(p,s))` → DECIMAL(38,s),
+    /// `AVG(decimal(p,s))` → DECIMAL(p,s), MIN/MAX → the argument type.
+    /// `input_schema` is the schema the arguments are evaluated against.
+    pub fn output_type(&self, input_schema: &[ColumnInfo]) -> DataType {
         match self.name.to_ascii_uppercase().as_str() {
             "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT" => DataType::Int64,
-            _ => DataType::Float64,
+            // Same Trino result types as the GROUP BY form; WindowExec
+            // evaluates them with the same accumulators.
+            name => crate::analyzer::function_return_type(name, &self.args, input_schema)
+                .unwrap_or(DataType::Float64),
         }
     }
 }
@@ -723,7 +728,7 @@ impl LogicalPlan {
             LogicalPlan::Window { input, functions } => {
                 let mut schema = input.schema();
                 for f in functions {
-                    let data_type = f.output_type();
+                    let data_type = f.output_type(&schema);
                     schema.push(ColumnInfo {
                         name: f.output_name.clone(),
                         data_type,

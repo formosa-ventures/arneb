@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Decimal128Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, Decimal128Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
+};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::array_value_to_string;
@@ -18,20 +20,22 @@ use arneb_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
 
 /// Table `t`:
 ///
-/// | id | grp | v    | d    |
-/// |----|-----|------|------|
-/// | 1  | a   | 10   | 1.50 |
-/// | 2  | a   | 20   | 2.00 |
-/// | 3  | a   | 20   | 3.00 |
-/// | 4  | b   | NULL | 4.00 |
-/// | 5  | b   | 5    | 5.25 |
-/// | 6  | c   | 7    | NULL |
+/// | id | grp | v    | d    | tiny | small |
+/// |----|-----|------|------|------|-------|
+/// | 1  | a   | 10   | 1.50 | 100  | 30000 |
+/// | 2  | a   | 20   | 2.00 | 100  | 30000 |
+/// | 3  | a   | 20   | 3.00 | 100  | 30000 |
+/// | 4  | b   | NULL | 4.00 | NULL | NULL  |
+/// | 5  | b   | 5    | 5.25 | -3   | -7    |
+/// | 6  | c   | 7    | NULL | NULL | NULL  |
 fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
     let arrow_schema = Arc::new(Schema::new(vec![
         Field::new("id", ArrowDataType::Int32, false),
         Field::new("grp", ArrowDataType::Utf8, false),
         Field::new("v", ArrowDataType::Int64, true),
         Field::new("d", ArrowDataType::Decimal128(10, 2), true),
+        Field::new("tiny", ArrowDataType::Int8, true),
+        Field::new("small", ArrowDataType::Int16, true),
     ]));
     let batch = RecordBatch::try_new(
         arrow_schema,
@@ -58,6 +62,22 @@ fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
                 .with_precision_and_scale(10, 2)
                 .unwrap(),
             ),
+            Arc::new(Int8Array::from(vec![
+                Some(100),
+                Some(100),
+                Some(100),
+                None,
+                Some(-3),
+                None,
+            ])),
+            Arc::new(Int16Array::from(vec![
+                Some(30000),
+                Some(30000),
+                Some(30000),
+                None,
+                Some(-7),
+                None,
+            ])),
         ],
     )
     .unwrap();
@@ -80,6 +100,8 @@ fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
                 },
                 true,
             ),
+            col("tiny", DataType::Int8, true),
+            col("small", DataType::Int16, true),
         ],
         vec![batch],
     ));
@@ -222,6 +244,35 @@ async fn running_decimal_sum_is_exact_and_includes_peers() {
             &["4", "9.25"],
             &["5", "5.25"],
             &["6", "NULL"],
+        ])
+    );
+}
+
+#[tokio::test]
+async fn small_int_sum_avg_widen() {
+    let (types, got) = query(
+        "SELECT id, sum(tiny) OVER (PARTITION BY grp), sum(small) OVER (PARTITION BY grp ORDER BY v), \
+         avg(small) OVER (PARTITION BY grp) FROM t ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        types[1..],
+        [
+            ArrowDataType::Int64,
+            ArrowDataType::Int64,
+            ArrowDataType::Float64,
+        ]
+    );
+    // Totals exceed the input type's range (300 > i8::MAX, 90000 > i16::MAX).
+    assert_eq!(
+        got,
+        rows(&[
+            &["1", "300", "30000", "30000.0"],
+            &["2", "300", "90000", "30000.0"],
+            &["3", "300", "90000", "30000.0"],
+            &["4", "-3", "-7", "-7.0"],
+            &["5", "-3", "-7", "-7.0"],
+            &["6", "NULL", "NULL", "NULL"],
         ])
     );
 }

@@ -36,8 +36,8 @@ cargo run --bin arneb -- --config worker.toml --role worker
 # Run TPC-H benchmark
 cd benchmarks/tpch && cargo run --release -- --engine arneb --port 5432
 
-# Local Hive + S3 environment (HMS 4.2.0 + MinIO + Trino via docker-compose)
-docker compose up -d                                        # start HMS + MinIO + Trino
+# Local Hive + S3 environment (HMS 4.2.0 + RustFS + Trino via docker-compose)
+docker compose up -d                                        # start HMS + RustFS + Trino
 docker compose run --rm tpch-seed                           # seed TPC-H SF1 data
 docker compose run --rm iceberg-seed                        # seed Iceberg tables (<hive catalog>.ice.*)
 cargo run --bin arneb -- --config benchmarks/tpch/tpch-hive.toml  # start Arneb with hive catalog
@@ -91,8 +91,8 @@ allow_http = true
 # access_key_id and secret_access_key are optional — if omitted,
 # AmazonS3Builder::from_env() picks up AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
 # Precedence: config file > env var > IAM role / instance profile.
-# access_key_id = "minioadmin"
-# secret_access_key = "minioadmin"
+# access_key_id = "s3admin"
+# secret_access_key = "s3adminsecret"
 
 # [storage.gcs]
 # service_account_path = "/path/to/sa.json"
@@ -190,7 +190,7 @@ crates/
 └── server/        # Main binary (arneb), CLI (clap), config loading,
                    # catalog/connector wiring, Web UI (axum + rust-embed),
                    # graceful shutdown, coordinator/worker startup.
-                   # Hive/MinIO seeding handled by docker compose seed services.
+                   # Hive/RustFS seeding handled by docker compose seed services.
 ```
 
 ### Key Data Flow

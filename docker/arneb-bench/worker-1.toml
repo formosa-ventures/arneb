@@ -15,10 +15,10 @@ advertised_address = "arneb-worker-1:9090"
 
 [storage.s3]
 region = "us-east-1"
-endpoint = "http://minio:9000"
+endpoint = "http://s3:9000"
 allow_http = true
-access_key_id = "minioadmin"
-secret_access_key = "minioadmin"
+access_key_id = "s3admin"
+secret_access_key = "s3adminsecret"
 
 [[catalogs]]
 name = "datalake"

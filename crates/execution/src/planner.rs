@@ -2335,16 +2335,17 @@ mod tests {
         let batches = collect_stream(exec.execute(0).await.unwrap())
             .await
             .unwrap();
-        let f64_at = |col: usize| {
-            batches[0]
+        // Trino types, as in GROUP BY: SUM -> DECIMAL(38, s), AVG -> DECIMAL(p, s).
+        let dec_at = |col: usize| {
+            let a = batches[0]
                 .column(col)
                 .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(0)
+                .downcast_ref::<arrow::array::Decimal128Array>()
+                .unwrap();
+            (a.value(0), a.precision(), a.scale())
         };
-        assert_eq!(f64_at(2), 4.5);
-        assert_eq!(f64_at(3), 2.25);
+        assert_eq!(dec_at(2), (450, 38, 2));
+        assert_eq!(dec_at(3), (225, 10, 2));
         let count = batches[0]
             .column(4)
             .as_any()

@@ -5,20 +5,23 @@ use std::sync::Arc;
 
 use arneb_common::error::ExecutionError;
 use arneb_common::stream::{collect_stream, stream_from_batches, SendableRecordBatchStream};
-use arneb_common::types::ColumnInfo;
+use arneb_common::types::{ColumnInfo, ScalarValue};
 use arneb_planner::WindowFunctionDef;
-use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
-use arrow::datatypes::{Field, Schema};
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, UInt32Array};
+use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use async_trait::async_trait;
 
+use crate::aggregate::create_accumulator;
 use crate::expression;
 use crate::fast_hash::FastHasher;
-use crate::operator::ExecutionPlan;
+use crate::operator::{scalars_to_array, ExecutionPlan};
 
 /// Window function operator.
 ///
-/// Materializes all input, sorts by partition+order keys, computes window
-/// functions per partition, and appends result columns.
+/// Materializes all input, computes window functions per partition, and
+/// appends result columns. The input must arrive sorted by the PARTITION BY
+/// then ORDER BY keys (the SQL planner places a Sort below each Window);
+/// partitions and peer groups are detected as runs of adjacent rows.
 #[derive(Debug)]
 pub(crate) struct WindowExec {
     child: Arc<dyn ExecutionPlan>,
@@ -53,6 +56,7 @@ fn concat_batches(
 fn compute_window_function(
     func: &WindowFunctionDef,
     batch: &RecordBatch,
+    output_type: &ArrowDataType,
 ) -> Result<ArrayRef, ExecutionError> {
     let num_rows = batch.num_rows();
     let name_upper = func.name.to_uppercase();
@@ -136,132 +140,70 @@ fn compute_window_function(
             Ok(Arc::new(Int64Array::from(results)))
         }
         "SUM" | "AVG" | "COUNT" | "MIN" | "MAX" => {
-            // Aggregate window function — compute per partition
-            let arg_arr = if func.args.is_empty() {
-                None
-            } else {
-                Some(expression::evaluate(&func.args[0], batch, None)?)
+            // Evaluated with the GROUP BY accumulators, so values and result
+            // types match the non-window aggregates (Trino types).
+            // COUNT(*) has no argument: any non-null column counts rows.
+            let is_count_star = func.args.is_empty();
+            let values: ArrayRef = match func.args.first() {
+                Some(arg) => expression::evaluate(arg, batch, None)?,
+                None => Arc::new(Int64Array::from(vec![0i64; num_rows])),
             };
+            let order_vals: Vec<ArrayRef> = func
+                .order_by
+                .iter()
+                .map(|s| expression::evaluate(&s.expr, batch, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            let has_order = !order_vals.is_empty();
 
-            // If ORDER BY is present, compute running aggregate; otherwise full partition
-            let has_order = !func.order_by.is_empty();
-            let mut results = vec![None; num_rows];
-            let mut count_results = vec![0i64; num_rows];
-            let mut prev_partition = u64::MAX;
-            let mut running_sum = 0f64;
-            let mut running_count = 0i64;
-            let mut running_min: Option<f64> = None;
-            let mut running_max: Option<f64> = None;
-
-            for (row, &pid) in partition_ids.iter().enumerate().take(num_rows) {
-                if pid != prev_partition {
-                    prev_partition = pid;
-                    running_sum = 0.0;
-                    running_count = 0;
-                    running_min = None;
-                    running_max = None;
-                }
-
-                if let Some(ref arr) = arg_arr {
-                    if !arr.is_null(row) {
-                        running_count += 1;
-                        if name_upper != "COUNT" {
-                            let val = get_f64_value(arr, row)?;
-                            running_sum += val;
-                            running_min = Some(running_min.map_or(val, |m| m.min(val)));
-                            running_max = Some(running_max.map_or(val, |m| m.max(val)));
-                        }
-                    }
-                } else {
-                    running_count += 1;
-                }
-
-                if has_order {
-                    // Running aggregate up to current row
-                    if name_upper == "COUNT" {
-                        count_results[row] = running_count;
+            // One value per peer group (or per partition without ORDER BY),
+            // expanded to every row with `take`.
+            let mut group_values: Vec<ScalarValue> = Vec::new();
+            let mut row_group: Vec<u32> = Vec::with_capacity(num_rows);
+            let mut acc = create_accumulator(&name_upper, is_count_star, false)?;
+            let mut start = 0;
+            while start < num_rows {
+                let end = (start + 1..num_rows)
+                    .find(|&i| partition_ids[i] != partition_ids[start])
+                    .unwrap_or(num_rows);
+                acc.reset();
+                // Without ORDER BY the whole partition is one peer group.
+                // With it, the default frame is RANGE UNBOUNDED PRECEDING ..
+                // CURRENT ROW: peers (equal ORDER BY values) share the
+                // running value after their whole peer group.
+                let mut peer = start;
+                while peer < end {
+                    let peer_end = if has_order {
+                        (peer + 1..end)
+                            .find(|&i| !same_order_values(&order_vals, i, peer))
+                            .unwrap_or(end)
                     } else {
-                        results[row] = aggregate_float_value(
-                            name_upper.as_str(),
-                            running_sum,
-                            running_count,
-                            running_min,
-                            running_max,
-                        );
-                    }
-                } else {
-                    results[row] = None; // placeholder, will fill after partition scan
-                }
-            }
-
-            if !has_order {
-                // Full partition aggregate — need a second pass
-                // First pass collected final values per partition; now fill all rows
-                // Re-scan to compute per-partition totals
-                let mut prev_pid = u64::MAX;
-                let mut psum = 0f64;
-                let mut pcount = 0i64;
-                let mut pmin: Option<f64> = None;
-                let mut pmax: Option<f64> = None;
-                let mut partition_start = 0usize;
-
-                #[allow(clippy::needless_range_loop)]
-                for row in 0..=num_rows {
-                    let pid = if row < num_rows {
-                        partition_ids[row]
-                    } else {
-                        u64::MAX
+                        end
                     };
-                    if pid != prev_pid {
-                        if row > 0 {
-                            if name_upper == "COUNT" {
-                                for item in count_results.iter_mut().take(row).skip(partition_start)
-                                {
-                                    *item = pcount;
-                                }
-                            } else {
-                                let val = aggregate_float_value(
-                                    name_upper.as_str(),
-                                    psum,
-                                    pcount,
-                                    pmin,
-                                    pmax,
-                                );
-                                for item in results.iter_mut().take(row).skip(partition_start) {
-                                    *item = val;
-                                }
-                            }
-                        }
-                        prev_pid = pid;
-                        psum = 0.0;
-                        pcount = 0;
-                        pmin = None;
-                        pmax = None;
-                        partition_start = row;
-                    }
-                    if row < num_rows {
-                        if let Some(ref arr) = arg_arr {
-                            if !arr.is_null(row) {
-                                pcount += 1;
-                                if name_upper != "COUNT" {
-                                    let val = get_f64_value(arr, row)?;
-                                    psum += val;
-                                    pmin = Some(pmin.map_or(val, |m| m.min(val)));
-                                    pmax = Some(pmax.map_or(val, |m| m.max(val)));
-                                }
-                            }
-                        } else {
-                            pcount += 1;
-                        }
-                    }
+                    acc.update_batch(&values.slice(peer, peer_end - peer))?;
+                    let group = u32::try_from(group_values.len()).map_err(|_| {
+                        ExecutionError::InvalidOperation(
+                            "window input has too many peer groups".to_string(),
+                        )
+                    })?;
+                    group_values.push(acc.evaluate()?);
+                    row_group.extend(std::iter::repeat_n(group, peer_end - peer));
+                    peer = peer_end;
                 }
+                start = end;
             }
-
-            if name_upper == "COUNT" {
-                Ok(Arc::new(Int64Array::from(count_results)))
-            } else {
-                Ok(Arc::new(Float64Array::from(results)))
+            let groups = scalars_to_array(&group_values, output_type)?;
+            if groups.data_type() != output_type {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "window {} produced {} but its declared type is {output_type}",
+                    func.name,
+                    groups.data_type()
+                )));
             }
+            Ok(arrow::compute::take(
+                &groups,
+                &UInt32Array::from(row_group),
+                None,
+            )?)
         }
         _ => Err(ExecutionError::InvalidOperation(format!(
             "unsupported window function: {}",
@@ -277,6 +219,8 @@ fn compute_partition_ids(keys: &[ArrayRef], num_rows: usize) -> Vec<u64> {
         .map(|row| {
             let mut hasher = FastHasher::default();
             for key in keys {
+                // NULL is its own partition, distinct from an empty string.
+                key.is_null(row).hash(&mut hasher);
                 let s = arrow::util::display::array_value_to_string(key, row).unwrap_or_default();
                 s.hash(&mut hasher);
             }
@@ -285,24 +229,14 @@ fn compute_partition_ids(keys: &[ArrayRef], num_rows: usize) -> Vec<u64> {
         .collect()
 }
 
-fn aggregate_float_value(
-    name: &str,
-    sum: f64,
-    count: i64,
-    min: Option<f64>,
-    max: Option<f64>,
-) -> Option<f64> {
-    match name {
-        "SUM" if count > 0 => Some(sum),
-        "AVG" if count > 0 => Some(sum / count as f64),
-        "MIN" => min,
-        "MAX" => max,
-        _ => None,
-    }
-}
-
 fn same_order_values(order_vals: &[ArrayRef], row_a: usize, row_b: usize) -> bool {
     for arr in order_vals {
+        if arr.is_null(row_a) || arr.is_null(row_b) {
+            if arr.is_null(row_a) != arr.is_null(row_b) {
+                return false;
+            }
+            continue;
+        }
         let a = arrow::util::display::array_value_to_string(arr, row_a).unwrap_or_default();
         let b = arrow::util::display::array_value_to_string(arr, row_b).unwrap_or_default();
         if a != b {
@@ -310,28 +244,6 @@ fn same_order_values(order_vals: &[ArrayRef], row_a: usize, row_b: usize) -> boo
         }
     }
     true
-}
-
-fn get_f64_value(arr: &ArrayRef, row: usize) -> Result<f64, ExecutionError> {
-    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return Ok(a.value(row) as f64);
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-        return Ok(a.value(row));
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
-        return Ok(a.value(row) as f64);
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Float32Array>() {
-        return Ok(a.value(row) as f64);
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Decimal128Array>() {
-        return Ok(a.value(row) as f64 / 10f64.powi(a.scale() as i32));
-    }
-    Err(ExecutionError::InvalidOperation(format!(
-        "window aggregate not supported for type {}",
-        arr.data_type()
-    )))
 }
 
 #[async_trait]
@@ -384,18 +296,13 @@ impl ExecutionPlan for WindowExec {
             .collect();
 
         let output_columns = self.schema();
-        for (func, col) in self
+        for (func, column) in self
             .functions
             .iter()
             .zip(&output_columns[combined.num_columns()..])
         {
-            // MIN/MAX are computed in f64 but typed as their argument
-            // (e.g. DECIMAL), matching the logical plan.
-            let result = compute_window_function(func, &combined)?;
-            columns.push(arrow::compute::cast(
-                &result,
-                &col.data_type.clone().into(),
-            )?);
+            let output_type: ArrowDataType = column.data_type.clone().into();
+            columns.push(compute_window_function(func, &combined, &output_type)?);
         }
 
         let output_fields: Vec<Field> = output_columns

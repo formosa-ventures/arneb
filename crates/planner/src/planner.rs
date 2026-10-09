@@ -373,17 +373,25 @@ impl<'a> QueryPlanner<'a> {
             let mut sort_exprs = Vec::with_capacity(query.order_by.len());
             let mut unresolved = None;
             for ob in &query.order_by {
-                let expr =
-                    match self.resolve_order_by_expr_with_select(&ob.expr, &ctx, select_items) {
-                        Some(resolved) => resolved,
-                        None => match self.plan_expr(&ob.expr, &ctx).await {
-                            Ok(expr) => expr,
-                            Err(e) => {
-                                unresolved = Some(e);
-                                break;
-                            }
-                        },
-                    };
+                let ordinal = select_ordinal(&ob.expr, ctx.columns.len(), "ORDER BY")?;
+                let resolved = match ordinal {
+                    Some(index) => Some(PlanExpr::Column {
+                        index,
+                        name: ctx.columns[index].1.name.clone(),
+                        span: None,
+                    }),
+                    None => self.resolve_order_by_expr_with_select(&ob.expr, &ctx, select_items),
+                };
+                let expr = match resolved {
+                    Some(resolved) => resolved,
+                    None => match self.plan_expr(&ob.expr, &ctx).await {
+                        Ok(expr) => expr,
+                        Err(e) => {
+                            unresolved = Some(e);
+                            break;
+                        }
+                    },
+                };
                 sort_exprs.push(SortExpr {
                     expr,
                     asc: ob.asc.unwrap_or(true),
@@ -413,6 +421,13 @@ impl<'a> QueryPlanner<'a> {
                             exprs,
                             schema,
                         }
+                    }
+                    // SELECT DISTINCT wraps the projection in an Aggregate,
+                    // so a key outside the select list can't be sorted on.
+                    _ if matches!(&query.body, ast::QueryBody::Select(b) if b.distinct) => {
+                        return Err(PlanError::invalid_expression(
+                            "For SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                        ))
                     }
                     _ => return Err(err),
                 },
@@ -450,13 +465,20 @@ impl<'a> QueryPlanner<'a> {
         let input_ctx = self.context_from_plan(input);
         let mut order_by = Vec::with_capacity(query.order_by.len());
         for ob in &query.order_by {
-            let expr =
-                match self.resolve_order_by_expr_with_select(&ob.expr, output_ctx, select_items) {
-                    Some(PlanExpr::Column { index, .. }) if index < exprs.len() => {
-                        exprs[index].clone()
+            let resolved = match select_ordinal(&ob.expr, exprs.len(), "ORDER BY")? {
+                Some(index) => Some(index),
+                None => {
+                    match self.resolve_order_by_expr_with_select(&ob.expr, output_ctx, select_items)
+                    {
+                        Some(PlanExpr::Column { index, .. }) if index < exprs.len() => Some(index),
+                        _ => None,
                     }
-                    _ => self.plan_expr(&ob.expr, &input_ctx).await?,
-                };
+                }
+            };
+            let expr = match resolved {
+                Some(index) => exprs[index].clone(),
+                None => self.plan_expr(&ob.expr, &input_ctx).await?,
+            };
             order_by.push(SortExpr {
                 expr,
                 asc: ob.asc.unwrap_or(true),
@@ -612,7 +634,8 @@ impl<'a> QueryPlanner<'a> {
 
         // 3. GROUP BY / HAVING → Aggregate
         // Also handle implicit aggregate: SELECT SUM(x) FROM t (no GROUP BY but has aggregates)
-        let has_group_by = !body.group_by.is_empty();
+        let group_by_ast = resolve_group_by_ordinals(body)?;
+        let has_group_by = !group_by_ast.is_empty();
         let mut aggr_exprs = self.collect_aggregates(&body.projection, &ctx).await?;
         // Aggregates can appear in HAVING without being in SELECT (e.g.
         // `... GROUP BY l_orderkey HAVING SUM(l_quantity) > 300`).
@@ -625,8 +648,8 @@ impl<'a> QueryPlanner<'a> {
         let has_aggregates = has_group_by || !aggr_exprs.is_empty();
 
         if has_aggregates {
-            let mut group_by = Vec::with_capacity(body.group_by.len());
-            for e in &body.group_by {
+            let mut group_by = Vec::with_capacity(group_by_ast.len());
+            for e in &group_by_ast {
                 group_by.push(self.plan_expr(e, &ctx).await?);
             }
 
@@ -656,8 +679,8 @@ impl<'a> QueryPlanner<'a> {
             // onto the first group-by slot.
             ctx = PlanningContext::new();
             for (i, col) in schema.iter().enumerate() {
-                let qualifier = if i < body.group_by.len() {
-                    group_by_qualifier(&body.group_by[i])
+                let qualifier = if i < group_by_ast.len() {
+                    group_by_qualifier(&group_by_ast[i])
                 } else {
                     None
                 };
@@ -667,7 +690,7 @@ impl<'a> QueryPlanner<'a> {
             // HAVING (applied after aggregation)
             // Rewrite aggregate expressions in HAVING to column references
             if let Some(having) = &body.having {
-                let num_group_by = body.group_by.len();
+                let num_group_by = group_by_ast.len();
                 let rewritten = self.rewrite_aggregates_as_columns(having, &ctx, num_group_by);
                 let predicate = self.plan_expr(&rewritten, &ctx).await?;
                 plan = LogicalPlan::Filter {
@@ -677,11 +700,28 @@ impl<'a> QueryPlanner<'a> {
             }
         }
 
+        // 3b. Window functions: computed after WHERE / GROUP BY / HAVING and
+        // before the projection (ORDER BY / LIMIT are applied above it).
+        let mut window_calls = Vec::new();
+        for item in &body.projection {
+            if let ast::SelectItem::UnnamedExpr(expr)
+            | ast::SelectItem::ExprWithAlias { expr, .. } = item
+            {
+                collect_window_calls(expr, &mut window_calls);
+            }
+        }
+        if !window_calls.is_empty() {
+            let num_group_by = has_aggregates.then_some(body.group_by.len());
+            plan = self
+                .plan_windows(plan, &mut ctx, &window_calls, num_group_by)
+                .await?;
+        }
+
         // 4. Projection (SELECT list)
         // After aggregate, SELECT expressions that ARE aggregate functions should reference
         // the aggregate output columns by index, not re-resolve their arguments.
         let (proj_exprs, proj_schema) = if has_aggregates {
-            self.plan_aggregate_projection(&body.projection, &ctx, &body.group_by)
+            self.plan_aggregate_projection(&body.projection, &ctx, &group_by_ast)
                 .await?
         } else {
             self.plan_projection(&body.projection, &ctx).await?
@@ -697,6 +737,150 @@ impl<'a> QueryPlanner<'a> {
             plan = rewrite_cte_self_agg_scalar_to_window(plan);
         }
 
+        // 5. SELECT DISTINCT → Aggregate grouping by every output column,
+        // planned and fragmented exactly like a GROUP BY.
+        if body.distinct {
+            let schema = plan.schema();
+            let group_by = schema
+                .iter()
+                .enumerate()
+                .map(|(index, c)| PlanExpr::Column {
+                    index,
+                    name: c.name.clone(),
+                    span: None,
+                })
+                .collect();
+            plan = LogicalPlan::Aggregate {
+                input: Box::new(plan),
+                group_by,
+                aggr_exprs: Vec::new(),
+                schema,
+            };
+        }
+
+        Ok(plan)
+    }
+
+    /// Plans the SELECT list's window-function calls above `plan`: one
+    /// `Sort` (PARTITION BY keys, then ORDER BY keys) + `Window` pair per
+    /// distinct OVER spec. Each result column is named by the call's display
+    /// string and appended to `ctx`, which is how `plan_expr` resolves the
+    /// call in the projection and in ORDER BY. `num_group_by` is set when the
+    /// SELECT aggregates, so `rank() OVER (ORDER BY sum(x))` reads the
+    /// Aggregate's output column.
+    async fn plan_windows(
+        &self,
+        mut plan: LogicalPlan,
+        ctx: &mut PlanningContext,
+        calls: &[ast::Expr],
+        num_group_by: Option<usize>,
+    ) -> Result<LogicalPlan, PlanError> {
+        // (OVER-spec key, functions sharing it), in first-seen order.
+        let mut specs: Vec<(String, Vec<WindowFunctionDef>)> = Vec::new();
+        for call in calls {
+            let ast::Expr::WindowFunction {
+                name,
+                args,
+                partition_by,
+                order_by,
+                ..
+            } = call
+            else {
+                continue;
+            };
+            let upper = name.to_ascii_uppercase();
+            let arity_ok = match upper.as_str() {
+                "ROW_NUMBER" | "RANK" | "DENSE_RANK" => args.is_empty(),
+                "COUNT" => args.len() <= 1,
+                "SUM" | "AVG" | "MIN" | "MAX" => args.len() == 1,
+                _ => {
+                    return Err(PlanError::UnsupportedExpression {
+                        message: format!(
+                            "window function {name} is not supported (supported: ROW_NUMBER, \
+                             RANK, DENSE_RANK, SUM, AVG, COUNT, MIN, MAX)"
+                        ),
+                        location: None,
+                    })
+                }
+            };
+            if !arity_ok {
+                return Err(PlanError::invalid_expression(format!(
+                    "wrong number of arguments to window function {name}"
+                )));
+            }
+
+            let operand = |e: &ast::Expr| match num_group_by {
+                Some(n) => self.rewrite_aggregates_as_columns(e, ctx, n),
+                None => e.clone(),
+            };
+            let mut fn_args = Vec::with_capacity(args.len());
+            for a in args {
+                fn_args.push(self.plan_expr(&operand(a), ctx).await?);
+            }
+            let mut fn_partition = Vec::with_capacity(partition_by.len());
+            for p in partition_by {
+                fn_partition.push(self.plan_expr(&operand(p), ctx).await?);
+            }
+            let mut fn_order = Vec::with_capacity(order_by.len());
+            for o in order_by {
+                fn_order.push(SortExpr {
+                    expr: self.plan_expr(&operand(&o.expr), ctx).await?,
+                    asc: o.asc.unwrap_or(true),
+                    nulls_first: o.nulls_first.unwrap_or(false),
+                });
+            }
+
+            let mut key = String::new();
+            for p in &fn_partition {
+                key.push_str(&format!("{p},"));
+            }
+            key.push('|');
+            for s in &fn_order {
+                key.push_str(&format!("{} {} {},", s.expr, s.asc, s.nulls_first));
+            }
+            let def = WindowFunctionDef {
+                name: upper,
+                args: fn_args,
+                partition_by: fn_partition,
+                order_by: fn_order,
+                output_name: call.to_string(),
+            };
+            match specs.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, functions)) => functions.push(def),
+                None => specs.push((key, vec![def])),
+            }
+        }
+
+        let base_width = plan.schema().len();
+        for (_, functions) in specs {
+            // WindowExec detects partitions and peers as runs of adjacent
+            // rows, so its input must be sorted by the spec's keys.
+            let sort_keys: Vec<SortExpr> = functions[0]
+                .partition_by
+                .iter()
+                .map(|e| SortExpr {
+                    expr: e.clone(),
+                    asc: true,
+                    nulls_first: false,
+                })
+                .chain(functions[0].order_by.iter().cloned())
+                .collect();
+            let input = if sort_keys.is_empty() {
+                plan
+            } else {
+                LogicalPlan::Sort {
+                    input: Box::new(plan),
+                    order_by: sort_keys,
+                }
+            };
+            plan = LogicalPlan::Window {
+                input: Box::new(input),
+                functions,
+            };
+        }
+        for col in plan.schema().into_iter().skip(base_width) {
+            ctx.columns.push((Some(WINDOW_QUALIFIER.to_string()), col));
+        }
         Ok(plan)
     }
 
@@ -1475,10 +1659,23 @@ impl<'a> QueryPlanner<'a> {
                 ))
             }
             ast::Expr::WindowFunction { .. } => {
-                // Window functions are handled at the plan level (Window node), not in plan_expr
-                Err(PlanError::invalid_expression(
-                    "window functions are handled at the plan level, not in plan_expr".to_string(),
-                ))
+                // Computed by a Window node below the projection
+                // (`plan_windows`), which exposes each call as a column
+                // named by the call's display string.
+                let (index, col_info) = ctx
+                    .resolve_column(&expr.to_string(), None, None)
+                    .map_err(|_| PlanError::UnsupportedExpression {
+                        message: format!(
+                            "window function {expr} is only supported in the SELECT list \
+                             (and in ORDER BY when it also appears in the SELECT list)"
+                        ),
+                        location: None,
+                    })?;
+                Ok(PlanExpr::Column {
+                    index,
+                    name: col_info.name,
+                    span: node_span,
+                })
             }
             ast::Expr::Parameter { index, .. } => Ok(PlanExpr::Parameter {
                 index: *index,
@@ -1513,8 +1710,11 @@ impl<'a> QueryPlanner<'a> {
                     schema.push(col_info);
                 }
                 ast::SelectItem::Wildcard => {
-                    // Expand * to all columns
-                    for (i, (_, col)) in ctx.columns.iter().enumerate() {
+                    // Expand * to all columns (not the window results)
+                    for (i, (q, col)) in ctx.columns.iter().enumerate() {
+                        if q.as_deref() == Some(WINDOW_QUALIFIER) {
+                            continue;
+                        }
                         exprs.push(PlanExpr::Column {
                             index: i,
                             name: col.name.clone(),
@@ -1674,7 +1874,10 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
                 ast::SelectItem::Wildcard => {
-                    for (i, (_, col)) in ctx.columns.iter().enumerate() {
+                    for (i, (q, col)) in ctx.columns.iter().enumerate() {
+                        if q.as_deref() == Some(WINDOW_QUALIFIER) {
+                            continue;
+                        }
                         exprs.push(PlanExpr::Column {
                             index: i,
                             name: col.name.clone(),
@@ -1730,7 +1933,12 @@ impl<'a> QueryPlanner<'a> {
                 }
                 // Last-ditch: exactly one aggregate slot — no ambiguity,
                 // safe to assume it is the target.
-                let agg_count = ctx.columns.len() - num_group_by;
+                let agg_count = ctx
+                    .columns
+                    .iter()
+                    .skip(num_group_by)
+                    .filter(|(q, _)| q.as_deref() != Some(WINDOW_QUALIFIER))
+                    .count();
                 if agg_count == 1 {
                     return Some(num_group_by);
                 }
@@ -1974,6 +2182,22 @@ impl<'a> QueryPlanner<'a> {
             }
             ast::Expr::Nested { expr: inner, .. } => {
                 self.extract_aggregates(inner, ctx, out).await?;
+            }
+            // `rank() OVER (ORDER BY sum(x))`: the inner aggregate is
+            // computed by the Aggregate node below the Window.
+            ast::Expr::WindowFunction {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for e in args
+                    .iter()
+                    .chain(partition_by)
+                    .chain(order_by.iter().map(|o| &o.expr))
+                {
+                    self.extract_aggregates(e, ctx, out).await?;
+                }
             }
             _ => {}
         }
@@ -2764,6 +2988,71 @@ fn references_outer(expr: &ast::Expr, inner_ctx: &PlanningContext) -> bool {
     found
 }
 
+/// Planning-context qualifier for window-function result columns. They are
+/// resolvable unqualified (by the call's display string) but are not user
+/// columns, so `*` expansion skips them.
+const WINDOW_QUALIFIER: &str = "\u{0}window";
+
+/// Collects the distinct (by display string) window-function calls in `expr`.
+fn collect_window_calls(expr: &ast::Expr, out: &mut Vec<ast::Expr>) {
+    use ast::Expr as E;
+    match expr {
+        E::WindowFunction { .. } => {
+            let s = expr.to_string();
+            if !out.iter().any(|e| e.to_string() == s) {
+                out.push(expr.clone());
+            }
+        }
+        E::BinaryOp { left, right, .. } => {
+            collect_window_calls(left, out);
+            collect_window_calls(right, out);
+        }
+        E::UnaryOp { expr, .. }
+        | E::IsNull { expr, .. }
+        | E::IsNotNull { expr, .. }
+        | E::Cast { expr, .. }
+        | E::Nested { expr, .. } => collect_window_calls(expr, out),
+        E::Between {
+            expr, low, high, ..
+        } => {
+            collect_window_calls(expr, out);
+            collect_window_calls(low, out);
+            collect_window_calls(high, out);
+        }
+        E::InList { expr, list, .. } => {
+            collect_window_calls(expr, out);
+            for e in list {
+                collect_window_calls(e, out);
+            }
+        }
+        E::Function { args, .. } => {
+            for a in args {
+                if let ast::FunctionArg::Unnamed(e) = a {
+                    collect_window_calls(e, out);
+                }
+            }
+        }
+        E::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            for e in operand
+                .iter()
+                .chain(else_result.iter())
+                .map(|b| &**b)
+                .chain(conditions)
+                .chain(results)
+            {
+                collect_window_calls(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn walk_columns(expr: &ast::Expr, cb: &mut impl FnMut(&ast::ColumnRef)) {
     use ast::Expr as E;
     match expr {
@@ -2871,6 +3160,62 @@ fn collect_table_scan_refs(
         | L::DropView { .. }
         | L::OneRow => {}
     }
+}
+
+/// `ORDER BY 2` / `GROUP BY 2`: an integer literal names a 1-based
+/// SELECT-list position (Trino semantics). Returns the 0-based index, or
+/// `None` when `expr` is not an integer literal.
+fn select_ordinal(
+    expr: &ast::Expr,
+    width: usize,
+    clause: &str,
+) -> Result<Option<usize>, PlanError> {
+    let ast::Expr::Literal {
+        value: ScalarValue::Int64(n),
+        ..
+    } = expr
+    else {
+        return Ok(None);
+    };
+    match usize::try_from(*n) {
+        Ok(pos) if (1..=width).contains(&pos) => Ok(Some(pos - 1)),
+        _ => Err(PlanError::invalid_expression(format!(
+            "{clause} position {n} is not in select list"
+        ))),
+    }
+}
+
+/// Replace `GROUP BY <ordinal>` items with the SELECT-list expression they
+/// name, leaving every other GROUP BY expression untouched.
+fn resolve_group_by_ordinals(body: &ast::SelectBody) -> Result<Vec<ast::Expr>, PlanError> {
+    // A wildcard expands to an unknown number of columns, so positions
+    // after it can't be mapped from the AST select list.
+    let has_wildcard = body.projection.iter().any(|item| {
+        matches!(
+            item,
+            ast::SelectItem::Wildcard | ast::SelectItem::QualifiedWildcard(_)
+        )
+    });
+    let mut out = Vec::with_capacity(body.group_by.len());
+    for e in &body.group_by {
+        let Some(index) = select_ordinal(e, body.projection.len(), "GROUP BY")? else {
+            out.push(e.clone());
+            continue;
+        };
+        match &body.projection[index] {
+            ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. }
+                if !has_wildcard =>
+            {
+                out.push(expr.clone())
+            }
+            _ => {
+                return Err(PlanError::invalid_expression(
+                    "GROUP BY position with SELECT * is not supported",
+                ))
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// If a GROUP BY AST expression is a qualified column reference
@@ -3587,6 +3932,35 @@ mod tests {
     // ---------------------------------------------------------------
     // SELECT with GROUP BY (task 4.7)
     // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_select_distinct_plans_as_group_by_all_columns() {
+        let plan = plan_sql("SELECT DISTINCT name FROM users").await.unwrap();
+        let LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } = &plan
+        else {
+            panic!("expected Aggregate, got {plan:?}");
+        };
+        assert!(matches!(input.as_ref(), LogicalPlan::Projection { .. }));
+        assert_eq!(group_by.len(), 1);
+        assert!(aggr_exprs.is_empty());
+        assert_eq!(schema[0].name, "name");
+
+        // Distributed: the dedup runs in the single-output root fragment,
+        // over rows gathered from every source partition (like a GROUP BY
+        // with no aggregate functions, which the fragmenter keeps single-phase).
+        let root = crate::fragment::PlanFragmenter::new().fragment(plan);
+        assert_eq!(
+            root.output_partitioning,
+            crate::fragment::PartitioningScheme::Single
+        );
+        assert!(matches!(root.root, LogicalPlan::Aggregate { .. }));
+        assert_eq!(root.source_fragments.len(), 1);
+    }
 
     #[tokio::test]
     async fn test_select_with_group_by() {

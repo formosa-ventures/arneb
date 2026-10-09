@@ -777,6 +777,16 @@ impl fmt::Display for Expr {
                             write!(f, ", ")?;
                         }
                         write!(f, "{}", o.expr)?;
+                        match o.asc {
+                            Some(true) => write!(f, " ASC")?,
+                            Some(false) => write!(f, " DESC")?,
+                            None => {}
+                        }
+                        match o.nulls_first {
+                            Some(true) => write!(f, " NULLS FIRST")?,
+                            Some(false) => write!(f, " NULLS LAST")?,
+                            None => {}
+                        }
                     }
                 }
                 write!(f, ")")

@@ -292,7 +292,11 @@ pub fn is_literal_like(expr: &PlanExpr) -> bool {
 /// return type differs from the argument; scalar built-ins either
 /// return the argument type (handled via `arg_types[0]`) or need
 /// execution-time resolution (returns `None`).
-fn function_return_type(name: &str, args: &[PlanExpr], schema: &[ColumnInfo]) -> Option<DataType> {
+pub(crate) fn function_return_type(
+    name: &str,
+    args: &[PlanExpr],
+    schema: &[ColumnInfo],
+) -> Option<DataType> {
     match name.to_uppercase().as_str() {
         "COUNT" => Some(DataType::Int64),
         // Trino result types. The accumulators in

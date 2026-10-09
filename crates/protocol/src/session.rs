@@ -72,7 +72,10 @@ async fn resolve(root: &Arc<CatalogManager>, entries: Vec<String>) -> SearchPath
             None => (root.default_catalog().to_string(), e.clone()),
         })
         .collect();
-    let mut chosen = candidates.first().cloned();
+    // The first entry naming an existing schema wins. If none does (e.g.
+    // PostgreSQL's `"$user", public`), keep the server default rather than
+    // pointing unqualified names at a schema that doesn't exist.
+    let mut chosen = None;
     for (catalog, schema) in &candidates {
         if let Some(provider) = root.catalog(catalog) {
             if provider.schema(schema).await.is_some() {

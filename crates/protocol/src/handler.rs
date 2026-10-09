@@ -176,6 +176,23 @@ impl ConnectionHandler {
         }
         crate::metadata::try_handle_metadata(sql, catalog_manager).await
     }
+
+    /// Like [`Self::intercept`] but without updating the connection's state,
+    /// for Describe: it must report the same columns Execute will return.
+    async fn describe_intercept<C: ClientInfo + Sync>(
+        &self,
+        client: &C,
+        sql: &str,
+        catalog_manager: &CatalogManager,
+    ) -> Option<crate::metadata::MetadataResult> {
+        let current = client.session_extensions().get::<SearchPath>();
+        if let Some((result, _)) =
+            handle_search_path(sql, &self.catalog_manager, current.as_deref()).await
+        {
+            return Some(result);
+        }
+        crate::metadata::try_handle_metadata(sql, catalog_manager).await
+    }
 }
 
 #[async_trait]
@@ -456,8 +473,9 @@ impl ExtendedQueryHandler for ConnectionHandler {
         let catalog_manager = self.session_catalog(client);
 
         // Intercept metadata queries for Describe too
-        if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) =
-            crate::metadata::try_handle_metadata(sql.trim(), &catalog_manager).await
+        if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) = self
+            .describe_intercept(client, sql.trim(), &catalog_manager)
+            .await
         {
             let field_info: Vec<FieldInfo> = fields
                 .iter()
@@ -468,8 +486,9 @@ impl ExtendedQueryHandler for ConnectionHandler {
                 .collect();
             return Ok(DescribeStatementResponse::new(vec![], field_info));
         }
-        if let Some(Ok(crate::metadata::MetadataResponse::Command(_))) =
-            crate::metadata::try_handle_metadata(sql.trim(), &catalog_manager).await
+        if let Some(Ok(crate::metadata::MetadataResponse::Command(_))) = self
+            .describe_intercept(client, sql.trim(), &catalog_manager)
+            .await
         {
             return Ok(DescribeStatementResponse::no_data());
         }
@@ -518,8 +537,9 @@ impl ExtendedQueryHandler for ConnectionHandler {
         let catalog_manager = self.session_catalog(client);
 
         // Intercept metadata queries
-        if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) =
-            crate::metadata::try_handle_metadata(trimmed, &catalog_manager).await
+        if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) = self
+            .describe_intercept(client, trimmed, &catalog_manager)
+            .await
         {
             let field_info: Vec<FieldInfo> = fields
                 .iter()
@@ -530,8 +550,9 @@ impl ExtendedQueryHandler for ConnectionHandler {
                 .collect();
             return Ok(DescribePortalResponse::new(field_info));
         }
-        if let Some(Ok(crate::metadata::MetadataResponse::Command(_))) =
-            crate::metadata::try_handle_metadata(trimmed, &catalog_manager).await
+        if let Some(Ok(crate::metadata::MetadataResponse::Command(_))) = self
+            .describe_intercept(client, trimmed, &catalog_manager)
+            .await
         {
             return Ok(DescribePortalResponse::no_data());
         }

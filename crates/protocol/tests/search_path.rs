@@ -165,13 +165,44 @@ async fn extended_query_protocol_honors_search_path() {
 }
 
 #[tokio::test]
-async fn unknown_schema_is_accepted_but_resolution_fails() {
+async fn search_path_without_an_existing_schema_keeps_the_default() {
     let port = start_server().await;
     let c = connect(port).await;
 
-    // PostgreSQL accepts nonexistent schemas in search_path.
-    c.simple_query("SET search_path = nope").await.unwrap();
-    assert!(c.simple_query("SELECT v FROM t").await.is_err());
-    // Qualified names still work.
-    assert_eq!(simple_value(&c, "SELECT v FROM alt.t").await, "alt");
+    // Common PostgreSQL forms (DBeaver, BI tools, pg_dump output) name
+    // `public`, which Arneb doesn't have. They must stay harmless.
+    for stmt in [
+        "SET search_path TO public",
+        "SET search_path = \"$user\", public",
+        "SET search_path = nope",
+    ] {
+        c.simple_query(stmt).await.expect(stmt);
+        assert_eq!(
+            simple_value(&c, "SELECT v FROM t").await,
+            "default",
+            "{stmt}"
+        );
+        assert_eq!(extended_marker(&c).await, "default", "{stmt}");
+    }
+    // An existing entry later in the list still wins.
+    c.simple_query("SET search_path = \"$user\", public, alt")
+        .await
+        .unwrap();
+    assert_eq!(simple_value(&c, "SELECT v FROM t").await, "alt");
+    // Qualified names always work.
+    assert_eq!(simple_value(&c, "SELECT v FROM default.t").await, "default");
+}
+
+#[tokio::test]
+async fn show_search_path_describe_matches_execute() {
+    let port = start_server().await;
+    let c = connect(port).await;
+    c.simple_query("SET search_path = alt").await.unwrap();
+    // Extended protocol: prepare (Describe) then query (Execute).
+    let stmt = c.prepare("SHOW search_path").await.unwrap();
+    assert_eq!(stmt.columns()[0].name(), "search_path");
+    let rows = c.query(&stmt, &[]).await.unwrap();
+    assert_eq!(rows[0].columns()[0].name(), "search_path");
+    let v: String = rows[0].get(0);
+    assert_eq!(v, "alt");
 }

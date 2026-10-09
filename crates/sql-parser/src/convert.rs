@@ -1392,11 +1392,14 @@ fn parse_param_index(s: &str) -> Option<usize> {
 pub(crate) fn convert_value(value: sp::Value) -> Result<ScalarValue, ParseError> {
     match value {
         sp::Value::Number(s, _) => {
-            if s.contains('.') {
+            if s.contains(['e', 'E']) {
+                // Exponent literals (`1e3`, `1.5E-2`) are DOUBLE in Trino.
                 let f: f64 = s.parse().map_err(|_| {
                     ParseError::InvalidSyntax(format!("invalid float literal: {s}"))
                 })?;
                 Ok(ScalarValue::Float64(f))
+            } else if let Some((int_part, frac_part)) = s.split_once('.') {
+                decimal_literal(&s, int_part, frac_part)
             } else {
                 let i: i64 = s.parse().map_err(|_| {
                     ParseError::InvalidSyntax(format!("invalid integer literal: {s}"))
@@ -1412,6 +1415,34 @@ pub(crate) fn convert_value(value: sp::Value) -> Result<ScalarValue, ParseError>
             "literal value: {other}"
         ))),
     }
+}
+
+/// Types a literal like `100.00` as Trino does: DECIMAL(p,s) where `s` is
+/// the number of fraction digits and `p` the digits left after stripping
+/// leading integral zeros (`0.05` is DECIMAL(2,2), `100.00` is DECIMAL(5,2)).
+/// Literals wider than 38 digits fall back to DOUBLE.
+fn decimal_literal(s: &str, int_part: &str, frac_part: &str) -> Result<ScalarValue, ParseError> {
+    let invalid = || ParseError::InvalidSyntax(format!("invalid decimal literal: {s}"));
+    let int_part = int_part.trim_start_matches('0');
+    let digits = format!("{int_part}{frac_part}");
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let precision = digits.len().max(1);
+    if precision > 38 {
+        let f: f64 = s.parse().map_err(|_| invalid())?;
+        return Ok(ScalarValue::Float64(f));
+    }
+    let value: i128 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().map_err(|_| invalid())?
+    };
+    Ok(ScalarValue::Decimal128 {
+        value,
+        precision: precision as u8,
+        scale: frac_part.len() as i8,
+    })
 }
 
 /// Convert a `sqlparser` [`sp::DataType`] into a arneb [`DataType`].

@@ -585,6 +585,11 @@ fn eval_binary_op(
         ast::BinaryOp::Eq | ast::BinaryOp::NotEq if left.data_type() != right.data_type() => None,
         ast::BinaryOp::Eq => Some(ScalarValue::Boolean(left == right)),
         ast::BinaryOp::NotEq => Some(ScalarValue::Boolean(left != right)),
+        ast::BinaryOp::Plus | ast::BinaryOp::Minus | ast::BinaryOp::Multiply
+            if matches!(left, ScalarValue::Decimal128 { .. }) =>
+        {
+            eval_decimal_arithmetic(left, op, right)
+        }
         ast::BinaryOp::Plus => {
             eval_arithmetic(left, right, i32::checked_add, i64::checked_add, |a, b| {
                 a + b
@@ -621,6 +626,52 @@ fn eval_arithmetic(
         }
         _ => None,
     }
+}
+
+/// Fold `DECIMAL + - * DECIMAL` literals (e.g. TPC-H Q6's `0.06 - 0.01`)
+/// to Trino's result type, so the result can still be pushed into a scan.
+/// Only exact cases fold: a result that would need rounding (scale reduced
+/// past 38 digits) or overflows its precision is left to the runtime kernel.
+fn eval_decimal_arithmetic(
+    left: &ScalarValue,
+    op: &ast::BinaryOp,
+    right: &ScalarValue,
+) -> Option<ScalarValue> {
+    let (
+        ScalarValue::Decimal128 {
+            value: a,
+            precision: p1,
+            scale: s1,
+        },
+        ScalarValue::Decimal128 {
+            value: b,
+            precision: p2,
+            scale: s2,
+        },
+    ) = (left, right)
+    else {
+        return None;
+    };
+    let (precision, scale) =
+        crate::analyzer::coercion_matrix::decimal_arithmetic_type(op, (*p1, *s1), (*p2, *s2))?;
+    let rescale = |v: i128, from: i8| -> Option<i128> {
+        let shift = u32::try_from(scale - from).ok()?;
+        v.checked_mul(10i128.checked_pow(shift)?)
+    };
+    let value = match op {
+        ast::BinaryOp::Plus => rescale(*a, *s1)?.checked_add(rescale(*b, *s2)?)?,
+        ast::BinaryOp::Minus => rescale(*a, *s1)?.checked_sub(rescale(*b, *s2)?)?,
+        ast::BinaryOp::Multiply if scale == s1 + s2 => a.checked_mul(*b)?,
+        _ => return None,
+    };
+    if value.unsigned_abs() >= 10u128.pow(precision as u32) {
+        return None;
+    }
+    Some(ScalarValue::Decimal128 {
+        value,
+        precision,
+        scale,
+    })
 }
 
 #[cfg(test)]
@@ -908,6 +959,30 @@ mod tests {
             let expr = binop(l, op, r);
             assert_eq!(fold_constants(expr.clone()).unwrap(), expr);
         }
+    }
+
+    /// `0.06 - 0.01` folds exactly with Trino's result type; a result that
+    /// overflows its precision is left for the runtime kernel.
+    #[test]
+    fn fold_decimal_arithmetic() {
+        use ast::BinaryOp::{Minus, Multiply, Plus};
+        let dec = |value, precision, scale| ScalarValue::Decimal128 {
+            value,
+            precision,
+            scale,
+        };
+        let fold = |l, op, r| match fold_constants(binop(l, op, r)).unwrap() {
+            PlanExpr::Literal { value, .. } => Some(value),
+            _ => None,
+        };
+        assert_eq!(fold(dec(6, 2, 2), Minus, dec(1, 2, 2)), Some(dec(5, 3, 2)));
+        assert_eq!(fold(dec(6, 2, 2), Plus, dec(1, 1, 1)), Some(dec(16, 3, 2)));
+        assert_eq!(
+            fold(dec(15, 2, 1), Multiply, dec(20, 2, 1)),
+            Some(dec(300, 4, 2))
+        );
+        let max = 10i128.pow(38) - 1;
+        assert_eq!(fold(dec(max, 38, 0), Plus, dec(1, 1, 0)), None);
     }
 
     #[test]

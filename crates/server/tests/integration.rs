@@ -221,6 +221,90 @@ async fn test_query_parquet_table() {
     );
 }
 
+/// Decimal literals (`0.05` is DECIMAL(2,2)) against DOUBLE and
+/// DECIMAL(15,2) Parquet columns split over several row groups: row-group
+/// pruning and the pushed-down predicate must keep every matching row.
+#[tokio::test]
+async fn test_parquet_pushdown_with_decimal_literals() {
+    use arrow::array::{Decimal128Array, Int64Array};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lineitem.parquet");
+    let arrow_schema = Arc::new(Schema::new(vec![
+        Field::new("f", ArrowDataType::Float64, false),
+        Field::new("d", ArrowDataType::Decimal128(15, 2), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Float64Array::from(vec![0.01, 0.02, 0.05, 0.06, 0.07, 0.08])),
+            Arc::new(
+                Decimal128Array::from(vec![1, 2, 5, 6, 7, 8])
+                    .with_precision_and_scale(15, 2)
+                    .unwrap(),
+            ),
+        ],
+    )
+    .unwrap();
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2))
+        .build();
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(file, arrow_schema, Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let file_factory = Arc::new(FileConnectorFactory::new(Arc::new(
+        arneb_connectors::StorageRegistry::new(),
+    )));
+    file_factory
+        .register_table("t", path.to_str().unwrap(), FileFormat::Parquet, None)
+        .await
+        .unwrap();
+    let catalog_manager = CatalogManager::new("file", "default");
+    catalog_manager.register_catalog(
+        "file",
+        Arc::new(FileCatalog::new(
+            "default",
+            Arc::new(FileSchema::new(file_factory.clone())),
+        )),
+    );
+    let mut registry = ConnectorRegistry::new();
+    registry.register("file", file_factory);
+    let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+        Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+
+    for (pred, want) in [
+        ("f BETWEEN 0.05 AND 0.07", 3),
+        // TPC-H Q6: as DOUBLE, 0.06 + 0.01 was 0.06999.. and dropped 0.07.
+        ("f BETWEEN 0.06 - 0.01 AND 0.06 + 0.01", 3),
+        ("d BETWEEN 0.06 - 0.01 AND 0.06 + 0.01", 3),
+        ("d BETWEEN 0.05 AND 0.07", 3),
+        ("f > 0.06", 2),
+        ("d > 0.06", 2),
+        ("d = 0.050", 1),
+        ("f < 0.020", 1),
+    ] {
+        let sql = format!("SELECT count(*) FROM t WHERE {pred}");
+        let (_, batches) = arneb_protocol::__private::execute_query(
+            &sql,
+            &catalog_manager,
+            &registry,
+            None,
+            &pool,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, want, "{pred}");
+    }
+}
+
 #[tokio::test]
 async fn test_query_parquet_via_object_store() {
     use object_store::memory::InMemory;

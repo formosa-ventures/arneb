@@ -654,22 +654,38 @@ mod tests {
         }
     }
 
-    #[test]
-    #[allow(clippy::approx_constant)]
-    fn parse_float_literal() {
-        let stmt = parse("SELECT 3.14").unwrap();
-        let Statement::Query { query, .. } = stmt else {
+    fn first_literal(sql: &str) -> ScalarValue {
+        let Statement::Query { query, .. } = parse(sql).unwrap() else {
             panic!("expected Query");
         };
         match &select_body(&query).projection[0] {
-            SelectItem::UnnamedExpr(Expr::Literal {
-                value: ScalarValue::Float64(v),
-                ..
-            }) => {
-                assert!((v - 3.14).abs() < f64::EPSILON);
-            }
-            other => panic!("expected float 3.14, got {other:?}"),
+            SelectItem::UnnamedExpr(Expr::Literal { value, .. }) => value.clone(),
+            other => panic!("expected literal, got {other:?}"),
         }
+    }
+
+    /// Trino types `1.5` as DECIMAL(p,s): s = fraction digits, p = digits
+    /// after stripping leading integral zeros. Exponent literals stay DOUBLE.
+    #[test]
+    fn decimal_literals_have_trino_types() {
+        let dec = |value, precision, scale| ScalarValue::Decimal128 {
+            value,
+            precision,
+            scale,
+        };
+        assert_eq!(first_literal("SELECT 100.00"), dec(10000, 5, 2));
+        assert_eq!(first_literal("SELECT 7.0"), dec(70, 2, 1));
+        assert_eq!(first_literal("SELECT 0.05"), dec(5, 2, 2));
+        assert_eq!(first_literal("SELECT 007.50"), dec(750, 3, 2));
+        assert_eq!(first_literal("SELECT .5"), dec(5, 1, 1));
+        assert_eq!(first_literal("SELECT 0.0"), dec(0, 1, 1));
+        assert_eq!(first_literal("SELECT 1e3"), ScalarValue::Float64(1000.0));
+        assert_eq!(first_literal("SELECT 1.5E-1"), ScalarValue::Float64(0.15));
+        // Wider than DECIMAL(38) falls back to DOUBLE.
+        assert!(matches!(
+            first_literal("SELECT 1234567890123456789012345678901234567890.5"),
+            ScalarValue::Float64(_)
+        ));
     }
 
     #[test]

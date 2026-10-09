@@ -308,6 +308,23 @@ async fn select_encodes_trino_types() {
     assert!(last["infoUri"].as_str().unwrap().contains("/v1/query/"));
 }
 
+/// Like Trino, `1.5` is DECIMAL(2,1) and `1e3` is DOUBLE.
+#[tokio::test]
+async fn decimal_literals_are_trino_decimals() {
+    let base = start_default().await;
+    let d = run(&base, "SELECT 1.5, -0.05, 1e3", &[]).await;
+    assert!(d.error.is_none(), "{:?}", d.error);
+    let cols = d.columns.clone().unwrap();
+    let types: Vec<&str> = cols
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, vec!["decimal(2,1)", "decimal(2,2)", "double"]);
+    assert_eq!(d.rows, vec![json!(["1.5", "-0.05", 1000.0])]);
+}
+
 #[tokio::test]
 async fn window_functions_run_over_the_rest_protocol() {
     let base = start_default().await;

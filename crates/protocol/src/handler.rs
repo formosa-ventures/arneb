@@ -2139,6 +2139,68 @@ mod tests {
         assert_eq!(i.values(), &[2]);
     }
 
+    // -- End-to-end: decimal literals are DECIMAL(p,s) (Trino) -----------
+
+    #[tokio::test]
+    async fn decimal_literal_is_decimal() {
+        let (cm, reg) = decimal_arith_env();
+        let b = run_sql("SELECT 1.5, 0.05, 1e3, -0.05", &cm, &reg).await;
+        assert_eq!(decimal_cell(&b, 0), (15, 2, 1));
+        assert_eq!(decimal_cell(&b, 1), (5, 2, 2));
+        assert_eq!(f64_cell(&b, 2), 1000.0);
+        assert_eq!(decimal_cell(&b, 3), (-5, 2, 2));
+    }
+
+    /// TPC-H Q14 (`100.00 * sum(..)`) and Q17 (`sum(..) / 7.0`) shapes are
+    /// exact on DECIMAL data, with Trino's result types.
+    #[tokio::test]
+    async fn decimal_literal_q14_q17_shapes_are_exact() {
+        let (cm, reg) = decimal_arith_env();
+        let b = run_sql(
+            "SELECT 100.00 * sum(p * (1 - disc)), sum(p) / 7.0, \
+             100.00 * sum(p * (1 - disc)) / sum(p) FROM t",
+            &cm,
+            &reg,
+        )
+        .await;
+        // 100.00 * 3200.4500 = 320045.000000
+        assert_eq!(decimal_cell(&b, 0), (320_045_000_000, 38, 6));
+        // 3500.50 / 7.0 = 500.07142857.. (Trino: DECIMAL(38,6))
+        assert_eq!(decimal_cell(&b, 1), (500_071_429, 38, 6));
+        // 320045.000000 / 3500.50 = 91.428367376...
+        let (v, _, s) = decimal_cell(&b, 2);
+        assert_eq!((v, s), (91_428_367, 6));
+    }
+
+    /// DECIMAL op DOUBLE is DOUBLE (Trino), so a decimal literal against a
+    /// DOUBLE column keeps DOUBLE semantics; comparisons work on both types.
+    #[tokio::test]
+    async fn decimal_literal_with_double_and_decimal_columns() {
+        let (cm, reg) = agg_types_env();
+        let b = run_sql("SELECT f * 0.5, f + 0.25 FROM t WHERE i = 1", &cm, &reg).await;
+        assert_eq!(f64_cell(&b, 0), 0.75);
+        assert_eq!(f64_cell(&b, 1), 1.75);
+        for (pred, want) in [
+            ("f BETWEEN 1.5 AND 2.5", 2),
+            ("f > 2.49", 2),
+            ("d BETWEEN 1.00 AND 1.0", 2),
+            ("d BETWEEN 0.5 AND 4.495", 2),
+            ("d = 4.5", 1),
+            ("d > 1", 1),
+        ] {
+            let sql = format!("SELECT count(*) FROM t WHERE {pred}");
+            assert_eq!(count_of(&run_sql(&sql, &cm, &reg).await), want, "{pred}");
+        }
+        let b = run_sql(
+            "SELECT CAST('1.5' AS DECIMAL(3,1)), CAST('1.5' AS DOUBLE)",
+            &cm,
+            &reg,
+        )
+        .await;
+        assert_eq!(decimal_cell(&b, 0), (15, 3, 1));
+        assert_eq!(f64_cell(&b, 1), 1.5);
+    }
+
     #[tokio::test]
     async fn decimal_overflow_is_an_error() {
         let (cm, reg) = decimal_arith_env();

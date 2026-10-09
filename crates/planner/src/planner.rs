@@ -700,6 +700,23 @@ impl<'a> QueryPlanner<'a> {
             }
         }
 
+        // 3b. Window functions: computed after WHERE / GROUP BY / HAVING and
+        // before the projection (ORDER BY / LIMIT are applied above it).
+        let mut window_calls = Vec::new();
+        for item in &body.projection {
+            if let ast::SelectItem::UnnamedExpr(expr)
+            | ast::SelectItem::ExprWithAlias { expr, .. } = item
+            {
+                collect_window_calls(expr, &mut window_calls);
+            }
+        }
+        if !window_calls.is_empty() {
+            let num_group_by = has_aggregates.then_some(body.group_by.len());
+            plan = self
+                .plan_windows(plan, &mut ctx, &window_calls, num_group_by)
+                .await?;
+        }
+
         // 4. Projection (SELECT list)
         // After aggregate, SELECT expressions that ARE aggregate functions should reference
         // the aggregate output columns by index, not re-resolve their arguments.
@@ -741,6 +758,129 @@ impl<'a> QueryPlanner<'a> {
             };
         }
 
+        Ok(plan)
+    }
+
+    /// Plans the SELECT list's window-function calls above `plan`: one
+    /// `Sort` (PARTITION BY keys, then ORDER BY keys) + `Window` pair per
+    /// distinct OVER spec. Each result column is named by the call's display
+    /// string and appended to `ctx`, which is how `plan_expr` resolves the
+    /// call in the projection and in ORDER BY. `num_group_by` is set when the
+    /// SELECT aggregates, so `rank() OVER (ORDER BY sum(x))` reads the
+    /// Aggregate's output column.
+    async fn plan_windows(
+        &self,
+        mut plan: LogicalPlan,
+        ctx: &mut PlanningContext,
+        calls: &[ast::Expr],
+        num_group_by: Option<usize>,
+    ) -> Result<LogicalPlan, PlanError> {
+        // (OVER-spec key, functions sharing it), in first-seen order.
+        let mut specs: Vec<(String, Vec<WindowFunctionDef>)> = Vec::new();
+        for call in calls {
+            let ast::Expr::WindowFunction {
+                name,
+                args,
+                partition_by,
+                order_by,
+                ..
+            } = call
+            else {
+                continue;
+            };
+            let upper = name.to_ascii_uppercase();
+            let arity_ok = match upper.as_str() {
+                "ROW_NUMBER" | "RANK" | "DENSE_RANK" => args.is_empty(),
+                "COUNT" => args.len() <= 1,
+                "SUM" | "AVG" | "MIN" | "MAX" => args.len() == 1,
+                _ => {
+                    return Err(PlanError::UnsupportedExpression {
+                        message: format!(
+                            "window function {name} is not supported (supported: ROW_NUMBER, \
+                             RANK, DENSE_RANK, SUM, AVG, COUNT, MIN, MAX)"
+                        ),
+                        location: None,
+                    })
+                }
+            };
+            if !arity_ok {
+                return Err(PlanError::invalid_expression(format!(
+                    "wrong number of arguments to window function {name}"
+                )));
+            }
+
+            let operand = |e: &ast::Expr| match num_group_by {
+                Some(n) => self.rewrite_aggregates_as_columns(e, ctx, n),
+                None => e.clone(),
+            };
+            let mut fn_args = Vec::with_capacity(args.len());
+            for a in args {
+                fn_args.push(self.plan_expr(&operand(a), ctx).await?);
+            }
+            let mut fn_partition = Vec::with_capacity(partition_by.len());
+            for p in partition_by {
+                fn_partition.push(self.plan_expr(&operand(p), ctx).await?);
+            }
+            let mut fn_order = Vec::with_capacity(order_by.len());
+            for o in order_by {
+                fn_order.push(SortExpr {
+                    expr: self.plan_expr(&operand(&o.expr), ctx).await?,
+                    asc: o.asc.unwrap_or(true),
+                    nulls_first: o.nulls_first.unwrap_or(false),
+                });
+            }
+
+            let mut key = String::new();
+            for p in &fn_partition {
+                key.push_str(&format!("{p},"));
+            }
+            key.push('|');
+            for s in &fn_order {
+                key.push_str(&format!("{} {} {},", s.expr, s.asc, s.nulls_first));
+            }
+            let def = WindowFunctionDef {
+                name: upper,
+                args: fn_args,
+                partition_by: fn_partition,
+                order_by: fn_order,
+                output_name: call.to_string(),
+            };
+            match specs.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, functions)) => functions.push(def),
+                None => specs.push((key, vec![def])),
+            }
+        }
+
+        let base_width = plan.schema().len();
+        for (_, functions) in specs {
+            // WindowExec detects partitions and peers as runs of adjacent
+            // rows, so its input must be sorted by the spec's keys.
+            let sort_keys: Vec<SortExpr> = functions[0]
+                .partition_by
+                .iter()
+                .map(|e| SortExpr {
+                    expr: e.clone(),
+                    asc: true,
+                    nulls_first: false,
+                })
+                .chain(functions[0].order_by.iter().cloned())
+                .collect();
+            let input = if sort_keys.is_empty() {
+                plan
+            } else {
+                LogicalPlan::Sort {
+                    input: Box::new(plan),
+                    order_by: sort_keys,
+                }
+            };
+            plan = LogicalPlan::Window {
+                input: Box::new(input),
+                functions,
+            };
+        }
+        for col in plan.schema().into_iter().skip(base_width) {
+            ctx.columns.push((Some(WINDOW_QUALIFIER.to_string()), col));
+        }
         Ok(plan)
     }
 
@@ -1519,10 +1659,23 @@ impl<'a> QueryPlanner<'a> {
                 ))
             }
             ast::Expr::WindowFunction { .. } => {
-                // Window functions are handled at the plan level (Window node), not in plan_expr
-                Err(PlanError::invalid_expression(
-                    "window functions are handled at the plan level, not in plan_expr".to_string(),
-                ))
+                // Computed by a Window node below the projection
+                // (`plan_windows`), which exposes each call as a column
+                // named by the call's display string.
+                let (index, col_info) = ctx
+                    .resolve_column(&expr.to_string(), None, None)
+                    .map_err(|_| PlanError::UnsupportedExpression {
+                        message: format!(
+                            "window function {expr} is only supported in the SELECT list \
+                             (and in ORDER BY when it also appears in the SELECT list)"
+                        ),
+                        location: None,
+                    })?;
+                Ok(PlanExpr::Column {
+                    index,
+                    name: col_info.name,
+                    span: node_span,
+                })
             }
             ast::Expr::Parameter { index, .. } => Ok(PlanExpr::Parameter {
                 index: *index,
@@ -1557,8 +1710,11 @@ impl<'a> QueryPlanner<'a> {
                     schema.push(col_info);
                 }
                 ast::SelectItem::Wildcard => {
-                    // Expand * to all columns
-                    for (i, (_, col)) in ctx.columns.iter().enumerate() {
+                    // Expand * to all columns (not the window results)
+                    for (i, (q, col)) in ctx.columns.iter().enumerate() {
+                        if q.as_deref() == Some(WINDOW_QUALIFIER) {
+                            continue;
+                        }
                         exprs.push(PlanExpr::Column {
                             index: i,
                             name: col.name.clone(),
@@ -1718,7 +1874,10 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
                 ast::SelectItem::Wildcard => {
-                    for (i, (_, col)) in ctx.columns.iter().enumerate() {
+                    for (i, (q, col)) in ctx.columns.iter().enumerate() {
+                        if q.as_deref() == Some(WINDOW_QUALIFIER) {
+                            continue;
+                        }
                         exprs.push(PlanExpr::Column {
                             index: i,
                             name: col.name.clone(),
@@ -1774,7 +1933,12 @@ impl<'a> QueryPlanner<'a> {
                 }
                 // Last-ditch: exactly one aggregate slot — no ambiguity,
                 // safe to assume it is the target.
-                let agg_count = ctx.columns.len() - num_group_by;
+                let agg_count = ctx
+                    .columns
+                    .iter()
+                    .skip(num_group_by)
+                    .filter(|(q, _)| q.as_deref() != Some(WINDOW_QUALIFIER))
+                    .count();
                 if agg_count == 1 {
                     return Some(num_group_by);
                 }
@@ -2018,6 +2182,22 @@ impl<'a> QueryPlanner<'a> {
             }
             ast::Expr::Nested { expr: inner, .. } => {
                 self.extract_aggregates(inner, ctx, out).await?;
+            }
+            // `rank() OVER (ORDER BY sum(x))`: the inner aggregate is
+            // computed by the Aggregate node below the Window.
+            ast::Expr::WindowFunction {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for e in args
+                    .iter()
+                    .chain(partition_by)
+                    .chain(order_by.iter().map(|o| &o.expr))
+                {
+                    self.extract_aggregates(e, ctx, out).await?;
+                }
             }
             _ => {}
         }
@@ -2806,6 +2986,71 @@ fn references_outer(expr: &ast::Expr, inner_ctx: &PlanningContext) -> bool {
         }
     });
     found
+}
+
+/// Planning-context qualifier for window-function result columns. They are
+/// resolvable unqualified (by the call's display string) but are not user
+/// columns, so `*` expansion skips them.
+const WINDOW_QUALIFIER: &str = "\u{0}window";
+
+/// Collects the distinct (by display string) window-function calls in `expr`.
+fn collect_window_calls(expr: &ast::Expr, out: &mut Vec<ast::Expr>) {
+    use ast::Expr as E;
+    match expr {
+        E::WindowFunction { .. } => {
+            let s = expr.to_string();
+            if !out.iter().any(|e| e.to_string() == s) {
+                out.push(expr.clone());
+            }
+        }
+        E::BinaryOp { left, right, .. } => {
+            collect_window_calls(left, out);
+            collect_window_calls(right, out);
+        }
+        E::UnaryOp { expr, .. }
+        | E::IsNull { expr, .. }
+        | E::IsNotNull { expr, .. }
+        | E::Cast { expr, .. }
+        | E::Nested { expr, .. } => collect_window_calls(expr, out),
+        E::Between {
+            expr, low, high, ..
+        } => {
+            collect_window_calls(expr, out);
+            collect_window_calls(low, out);
+            collect_window_calls(high, out);
+        }
+        E::InList { expr, list, .. } => {
+            collect_window_calls(expr, out);
+            for e in list {
+                collect_window_calls(e, out);
+            }
+        }
+        E::Function { args, .. } => {
+            for a in args {
+                if let ast::FunctionArg::Unnamed(e) = a {
+                    collect_window_calls(e, out);
+                }
+            }
+        }
+        E::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            for e in operand
+                .iter()
+                .chain(else_result.iter())
+                .map(|b| &**b)
+                .chain(conditions)
+                .chain(results)
+            {
+                collect_window_calls(e, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn walk_columns(expr: &ast::Expr, cb: &mut impl FnMut(&ast::ColumnRef)) {

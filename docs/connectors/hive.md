@@ -55,15 +55,15 @@ region = "us-east-1"
 region = "us-east-1"
 endpoint = "http://localhost:9000"
 allow_http = true
-access_key_id = "minioadmin"
-secret_access_key = "minioadmin"
+access_key_id = "s3admin"
+secret_access_key = "s3adminsecret"
 ```
 
 Per-catalog settings merge with and override global `[storage]` settings.
 
 ## Local Demo Walkthrough
 
-Arneb includes a Docker Compose setup with HMS 4.2.0 and MinIO for local development.
+Arneb includes a Docker Compose setup with HMS 4.2.0 and RustFS for local development.
 
 ### Prerequisites
 
@@ -77,7 +77,7 @@ docker compose up -d
 ```
 
 This starts:
-- **MinIO** — S3-compatible object store on port `9000` (API) and `9001` (console)
+- **RustFS** — S3-compatible object store on port `9000` (API) and `9001` (console)
 - **Hive Metastore** — HMS 4.2.0 on port `9083`
 
 ### Step 2: Seed TPC-H Data
@@ -86,7 +86,7 @@ This starts:
 docker compose run --rm tpch-seed
 ```
 
-This creates 8 TPC-H tables in the `tpch` schema on MinIO via Trino CTAS.
+This creates 8 TPC-H tables in the `tpch` schema on RustFS via Trino CTAS.
 
 ### Step 3: Start Arneb
 
@@ -94,7 +94,7 @@ This creates 8 TPC-H tables in the `tpch` schema on MinIO via Trino CTAS.
 cargo run --bin arneb -- --config benchmarks/tpch/tpch-hive.toml
 ```
 
-The config (`benchmarks/tpch/tpch-hive.toml`) connects to the local HMS and MinIO:
+The config (`benchmarks/tpch/tpch-hive.toml`) connects to the local HMS and RustFS:
 
 ```toml
 bind_address = "127.0.0.1"
@@ -104,8 +104,8 @@ port = 5432
 region = "us-east-1"
 endpoint = "http://localhost:9000"
 allow_http = true
-access_key_id = "minioadmin"
-secret_access_key = "minioadmin"
+access_key_id = "s3admin"
+secret_access_key = "s3adminsecret"
 
 [[catalogs]]
 name = "datalake"

@@ -58,8 +58,8 @@ For local development with S3-compatible services, set the `endpoint` and `allow
 region = "us-east-1"
 endpoint = "http://localhost:9000"
 allow_http = true
-access_key_id = "minioadmin"
-secret_access_key = "minioadmin"
+access_key_id = "s3admin"
+secret_access_key = "s3adminsecret"
 
 [[tables]]
 name = "events"

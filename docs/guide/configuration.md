@@ -118,8 +118,8 @@ format = "csv"
 region = "us-east-1"
 endpoint = "http://localhost:9000"   # For MinIO/LocalStack; omit for AWS
 allow_http = true                     # Required when endpoint uses HTTP
-# access_key_id = "minioadmin"       # Optional: falls back to env/IAM
-# secret_access_key = "minioadmin"
+# access_key_id = "s3admin"       # Optional: falls back to env/IAM
+# secret_access_key = "s3adminsecret"
 ```
 
 Credential precedence: config file → `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars → IAM role / instance profile.
@@ -291,7 +291,7 @@ port = 5432
 
 [storage.s3]
 region = "us-east-1"
-endpoint = "http://minio:9000"
+endpoint = "http://s3:9000"
 allow_http = true
 
 [[catalogs]]
@@ -302,6 +302,6 @@ default_schema = "default"
 
 [catalogs.storage.s3]
 region = "us-east-1"
-endpoint = "http://minio:9000"
+endpoint = "http://s3:9000"
 allow_http = true
 ```

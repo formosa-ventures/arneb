@@ -1,13 +1,13 @@
 # Arneb Benchmark & E2E Test Environment
 #
 # Provides:
-#   - MinIO (S3-compatible object storage)
+#   - RustFS (S3-compatible object storage)
 #   - Hive Metastore (standalone mode with embedded Derby)
 #   - Trino (query engine for data generation and baseline benchmarks)
 #   - TPC-H / TPC-DS seed services (Trino CTAS into Hive tables)
 #
 # Usage:
-#   docker compose up -d                    # start MinIO + HMS + Trino
+#   docker compose up -d                    # start RustFS + HMS + Trino
 #   docker compose run tpch-seed            # seed TPC-H data (SF1)
 #   docker compose run tpcds-seed           # seed TPC-DS data (SF1)
 #   docker compose run iceberg-seed         # seed Iceberg tables (iceberg.ice.*)
@@ -22,32 +22,39 @@
 name: arneb
 
 services:
-  minio:
-    image: quay.io/minio/minio:latest
+  # S3-compatible object storage: RustFS (Apache-2.0). MinIO's community images
+  # are no longer publicly pullable (Docker Hub removed, quay.io requires auth).
+  s3:
+    image: rustfs/rustfs:1.0.1
     ports:
       - "9000:9000"
       - "9001:9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
+      RUSTFS_ACCESS_KEY: s3admin
+      RUSTFS_SECRET_KEY: s3adminsecret
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "true"
+    command: ["/data"]
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "nc", "-z", "localhost", "9000"]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  minio-init:
-    image: quay.io/minio/mc:latest
+  s3-init:
+    image: amazon/aws-cli:2.37.11
     depends_on:
-      minio:
+      s3:
         condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: s3admin
+      AWS_SECRET_ACCESS_KEY: s3adminsecret
+      AWS_DEFAULT_REGION: us-east-1
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb local/warehouse --ignore-existing &&
-      mc anonymous set download local/warehouse &&
-      exit 0
+      aws --endpoint-url http://s3:9000 s3 mb s3://warehouse ||
+      aws --endpoint-url http://s3:9000 s3 ls s3://warehouse
       "
 
   hive-metastore:
@@ -59,7 +66,7 @@ services:
     environment:
       SERVICE_NAME: metastore
     depends_on:
-      minio:
+      s3:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/localhost/9083"]

@@ -1,7 +1,7 @@
 # TPC-H Benchmark
 
 Performance comparison of arneb against Trino using TPC-H queries.
-Both engines read the same Parquet data from MinIO via Hive Metastore.
+Both engines read the same Parquet data from RustFS via Hive Metastore.
 
 ## Quickstart (scenario — the single entry point)
 
@@ -141,7 +141,7 @@ of wrong rows, which is exactly the failure this gate was written to catch.
 The scenario entry point above wraps this. Use it directly when you want to
 drive the steps yourself.
 
-The full benchmark environment — MinIO + Hive Metastore + Trino (coordinator +
+The full benchmark environment — RustFS + Hive Metastore + Trino (coordinator +
 2 workers) **and** arneb (coordinator + 2 workers) — runs entirely from two
 compose files, so both engines execute under identical container isolation and
 read the same Parquet data. The scenario entry point drives exactly these steps;
@@ -154,7 +154,7 @@ run them by hand when you want to vary something a scenario does not express.
 - **Host tools:** `psql` (PostgreSQL client, used to query arneb) and `python3`
   (the report + oracle scripts use only the standard library — no `pip install`).
 - **Docker VM resources:** the benchmark runs six engine containers (arneb and
-  Trino each as a coordinator + 2 workers) plus MinIO/HMS. Give the Docker VM at
+  Trino each as a coordinator + 2 workers) plus RustFS/HMS. Give the Docker VM at
   least **16 GB RAM** for SF10 — 15.66 GiB is the smallest allocation a full
   22-query suite has completed on. Disk: the seeded SF10 dataset is **2.0 GiB**
   of Snappy Parquet (not the ~10 GB the raw TPC-H text size suggests), but a
@@ -178,7 +178,7 @@ docker compose -f docker-compose.yml \
                -f docker/arneb-bench/docker-compose.bench.yml \
                up -d --build
 
-# 2. Seed TPC-H data into MinIO via Trino CTAS. TPCH_SF: tiny | sf1 | sf10.
+# 2. Seed TPC-H data into RustFS via Trino CTAS. TPCH_SF: tiny | sf1 | sf10.
 TPCH_SF=sf10 docker compose run --rm tpch-seed
 
 # 3. Sanity-check both engines see the data. NOTE the different catalog names:
@@ -207,10 +207,10 @@ python3 benchmarks/tpch/scripts/blast_radius_oracle.py --runs 2
 
 **Notes**
 
-- **Never run `docker compose down`** — it removes the MinIO volume and you lose
+- **Never run `docker compose down`** — it removes the RustFS volume and you lose
   the seeded data. Use `docker compose ... stop` to pause; the seed survives.
 - `run_memory_bench.sh` brings the arneb + Trino services up/down itself, so you
-  can re-run it repeatedly without disturbing MinIO/HMS.
+  can re-run it repeatedly without disturbing RustFS/HMS.
 - The optimization gates the measured numbers rest on are **engine defaults**
   since #74; `docker/arneb-bench/docker-compose.bench.yml` no longer has to set
   them, and a run without any `ARNEB_*` environment behaves identically. The
@@ -223,7 +223,7 @@ python3 benchmarks/tpch/scripts/blast_radius_oracle.py --runs 2
 ## Quick Start (single-node)
 
 ```bash
-# 1. Start infrastructure (MinIO + HMS + Trino)
+# 1. Start infrastructure (RustFS + HMS + Trino)
 docker compose up -d
 
 # 2. Seed TPC-H data (SF1, ~1GB, takes ~2 minutes)
@@ -246,7 +246,7 @@ python3 scripts/report.py results/arneb_*.json
 ┌─────────────────────────────────────────────────┐
 │              docker compose up -d                │
 │                                                  │
-│  MinIO (:9000)   HMS (:9083)   Trino (:8080)    │
+│  RustFS (:9000)  HMS (:9083)   Trino (:8080)     │
 │       │               │              │           │
 │       └───────┬───────┘              │           │
 │               │                      │           │
@@ -405,5 +405,5 @@ Adapted TPC-H queries for arneb's SQL dialect:
 
 | File | Description |
 |------|-------------|
-| `tpch-hive.toml` | Arneb config reading from Hive/MinIO (for benchmarks) |
+| `tpch-hive.toml` | Arneb config reading from Hive/RustFS (for benchmarks) |
 | `tpch-config.toml` | Arneb config reading local Parquet files (for dev) |

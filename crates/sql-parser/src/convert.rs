@@ -1159,6 +1159,24 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
     if let Some(over) = func.over {
         match over {
             sp::WindowType::WindowSpec(spec) => {
+                // The window operator only implements the SQL default frame
+                // (whole partition, or RANGE UNBOUNDED PRECEDING .. CURRENT
+                // ROW with ORDER BY); reject what it would silently ignore.
+                if spec.window_frame.is_some() {
+                    return Err(ParseError::UnsupportedFeature(
+                        "window frame clause (ROWS/RANGE/GROUPS ...)".to_string(),
+                    ));
+                }
+                if spec.window_name.is_some() {
+                    return Err(ParseError::UnsupportedFeature(
+                        "named window references".to_string(),
+                    ));
+                }
+                if is_distinct {
+                    return Err(ParseError::UnsupportedFeature(
+                        "DISTINCT in window function arguments".to_string(),
+                    ));
+                }
                 let partition_by = spec
                     .partition_by
                     .into_iter()

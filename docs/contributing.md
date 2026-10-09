@@ -63,7 +63,7 @@ Make sure an Arneb instance is running with the TPC-H data loaded before running
 ## Running the Hive Demo
 
 ```bash
-# Start MinIO + HMS + Trino
+# Start RustFS + HMS + Trino
 docker compose up -d
 
 # Seed TPC-H data

@@ -48,11 +48,6 @@ echo "============================================"
 # --- Check prerequisites ---
 echo -e "\n${YELLOW}[1/6] Checking prerequisites...${NC}"
 
-if ! command -v mc &>/dev/null; then
-    echo -e "${RED}Error: MinIO client (mc) not found. Install: brew install minio/stable/mc${NC}"
-    exit 1
-fi
-
 if ! command -v psql &>/dev/null; then
     echo -e "${RED}Error: psql not found. Install: brew install postgresql${NC}"
     exit 1
@@ -103,8 +98,12 @@ except ImportError:
 # --- Upload to RustFS ---
 echo -e "\n${YELLOW}[3/6] Uploading Parquet to RustFS...${NC}"
 
-mc alias set arneb-s3 "$S3_ENDPOINT" s3admin s3adminsecret --api S3v4 2>/dev/null
-mc cp /tmp/arneb-e2e-test.parquet arneb-s3/${S3_BUCKET}/default/students/data.parquet
+# Reuse the compose aws-cli service (credentials + network already set), so no
+# S3 client is needed on the host.
+docker compose run --rm --no-deps --entrypoint aws \
+    -v /tmp/arneb-e2e-test.parquet:/tmp/data.parquet:ro \
+    s3-init --endpoint-url http://s3:9000 \
+    s3 cp /tmp/data.parquet s3://${S3_BUCKET}/default/students/data.parquet
 echo -e "${GREEN}Uploaded to s3://${S3_BUCKET}/default/students/data.parquet${NC}"
 
 # --- Register table in HMS ---

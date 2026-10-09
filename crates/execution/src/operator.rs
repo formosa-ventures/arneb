@@ -3743,9 +3743,21 @@ pub(crate) fn scalars_to_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        // Decimal128 / Timestamp / Binary / ...: build per value and
-        // concatenate. Only small per-group aggregate outputs (MIN / MAX /
-        // SUM results) and rare generic group keys reach this arm.
+        Some(ScalarValue::Decimal128 {
+            precision, scale, ..
+        }) => {
+            let arr: array::Decimal128Array = values
+                .iter()
+                .map(|v| match v {
+                    ScalarValue::Decimal128 { value, .. } => Some(*value),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr.with_precision_and_scale(*precision, *scale)?))
+        }
+        // Timestamp / Binary / ...: build per value and concatenate. Only
+        // small per-group aggregate outputs (MIN / MAX results) and rare
+        // generic group keys reach this arm.
         // There is no ScalarValue -> array builder for these types, so each
         // value becomes a 1-row array; NULL slots take the declared type.
         Some(_) => {
@@ -3836,6 +3848,25 @@ mod tests {
         assert_eq!(extract_scalar(&arr, 0).unwrap(), ScalarValue::Date32(19000));
         assert_eq!(extract_scalar(&arr, 1).unwrap(), ScalarValue::Null);
         assert_eq!(extract_scalar(&arr, 2).unwrap(), ScalarValue::Date32(19500));
+    }
+
+    #[test]
+    fn scalars_to_array_supports_decimal128() {
+        let dec = |value| ScalarValue::Decimal128 {
+            value,
+            precision: 38,
+            scale: 2,
+        };
+        let arr = scalars_to_array(
+            &[dec(150), ScalarValue::Null, dec(-5)],
+            &ArrowDataType::Decimal128(38, 2),
+        )
+        .unwrap();
+        assert_eq!(arr.data_type(), &ArrowDataType::Decimal128(38, 2));
+        let arr = arr.as_primitive::<datatypes::Decimal128Type>();
+        assert_eq!(arr.value(0), 150);
+        assert!(arr.is_null(1));
+        assert_eq!(arr.value(2), -5);
     }
 
     #[test]

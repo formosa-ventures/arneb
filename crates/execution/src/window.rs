@@ -7,7 +7,7 @@ use arneb_common::error::ExecutionError;
 use arneb_common::stream::{collect_stream, stream_from_batches, SendableRecordBatchStream};
 use arneb_common::types::{ColumnInfo, ScalarValue};
 use arneb_planner::WindowFunctionDef;
-use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, UInt32Array};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use async_trait::async_trait;
 
@@ -155,38 +155,55 @@ fn compute_window_function(
                 .collect::<Result<Vec<_>, _>>()?;
             let has_order = !order_vals.is_empty();
 
-            let mut out: Vec<ScalarValue> = Vec::with_capacity(num_rows);
+            // One value per peer group (or per partition without ORDER BY),
+            // expanded to every row with `take`.
+            let mut group_values: Vec<ScalarValue> = Vec::new();
+            let mut row_group: Vec<u32> = Vec::with_capacity(num_rows);
+            let mut acc = create_accumulator(&name_upper, is_count_star, false)?;
             let mut start = 0;
             while start < num_rows {
                 let end = (start + 1..num_rows)
                     .find(|&i| partition_ids[i] != partition_ids[start])
                     .unwrap_or(num_rows);
-                let mut acc = create_accumulator(&name_upper, is_count_star, false)?;
-                if has_order {
-                    // Default frame is RANGE UNBOUNDED PRECEDING .. CURRENT
-                    // ROW: peers (equal ORDER BY values) share the running
-                    // value after their whole peer group.
-                    let mut peer = start;
-                    while peer < end {
-                        let peer_end = (peer + 1..end)
+                acc.reset();
+                // Without ORDER BY the whole partition is one peer group.
+                // With it, the default frame is RANGE UNBOUNDED PRECEDING ..
+                // CURRENT ROW: peers (equal ORDER BY values) share the
+                // running value after their whole peer group.
+                let mut peer = start;
+                while peer < end {
+                    let peer_end = if has_order {
+                        (peer + 1..end)
                             .find(|&i| !same_order_values(&order_vals, i, peer))
-                            .unwrap_or(end);
-                        acc.update_batch(&values.slice(peer, peer_end - peer))?;
-                        out.extend(std::iter::repeat_n(acc.evaluate()?, peer_end - peer));
-                        peer = peer_end;
-                    }
-                } else {
-                    acc.update_batch(&values.slice(start, end - start))?;
-                    out.extend(std::iter::repeat_n(acc.evaluate()?, end - start));
+                            .unwrap_or(end)
+                    } else {
+                        end
+                    };
+                    acc.update_batch(&values.slice(peer, peer_end - peer))?;
+                    let group = u32::try_from(group_values.len()).map_err(|_| {
+                        ExecutionError::InvalidOperation(
+                            "window input has too many peer groups".to_string(),
+                        )
+                    })?;
+                    group_values.push(acc.evaluate()?);
+                    row_group.extend(std::iter::repeat_n(group, peer_end - peer));
+                    peer = peer_end;
                 }
                 start = end;
             }
-            let array = scalars_to_array(&out, output_type)?;
-            if array.data_type() == output_type {
-                Ok(array)
-            } else {
-                Ok(arrow::compute::cast(&array, output_type)?)
+            let groups = scalars_to_array(&group_values, output_type)?;
+            if groups.data_type() != output_type {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "window {} produced {} but its declared type is {output_type}",
+                    func.name,
+                    groups.data_type()
+                )));
             }
+            Ok(arrow::compute::take(
+                &groups,
+                &UInt32Array::from(row_group),
+                None,
+            )?)
         }
         _ => Err(ExecutionError::InvalidOperation(format!(
             "unsupported window function: {}",

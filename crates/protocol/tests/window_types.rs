@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Decimal128Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
+    Array, ArrayRef, Date32Array, Decimal128Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    StringArray,
 };
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -20,14 +21,14 @@ use arneb_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
 
 /// Table `t`:
 ///
-/// | id | grp | v    | d    | tiny | small |
-/// |----|-----|------|------|------|-------|
-/// | 1  | a   | 10   | 1.50 | 100  | 30000 |
-/// | 2  | a   | 20   | 2.00 | 100  | 30000 |
-/// | 3  | a   | 20   | 3.00 | 100  | 30000 |
-/// | 4  | b   | NULL | 4.00 | NULL | NULL  |
-/// | 5  | b   | 5    | 5.25 | -3   | -7    |
-/// | 6  | c   | 7    | NULL | NULL | NULL  |
+/// | id | grp | v    | d    | tiny | small | day        |
+/// |----|-----|------|------|------|-------|------------|
+/// | 1  | a   | 10   | 1.50 | 100  | 30000 | 2024-01-03 |
+/// | 2  | a   | 20   | 2.00 | 100  | 30000 | 2024-01-01 |
+/// | 3  | a   | 20   | 3.00 | 100  | 30000 | 2024-01-02 |
+/// | 4  | b   | NULL | 4.00 | NULL | NULL  | NULL       |
+/// | 5  | b   | 5    | 5.25 | -3   | -7    | 2024-02-01 |
+/// | 6  | c   | 7    | NULL | NULL | NULL  | NULL       |
 fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
     let arrow_schema = Arc::new(Schema::new(vec![
         Field::new("id", ArrowDataType::Int32, false),
@@ -36,6 +37,7 @@ fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
         Field::new("d", ArrowDataType::Decimal128(10, 2), true),
         Field::new("tiny", ArrowDataType::Int8, true),
         Field::new("small", ArrowDataType::Int16, true),
+        Field::new("day", ArrowDataType::Date32, true),
     ]));
     let batch = RecordBatch::try_new(
         arrow_schema,
@@ -78,6 +80,15 @@ fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
                 Some(-7),
                 None,
             ])),
+            // Days since 1970-01-01: 2024-01-03, 01-01, 01-02, NULL, 02-01, NULL.
+            Arc::new(Date32Array::from(vec![
+                Some(19725),
+                Some(19723),
+                Some(19724),
+                None,
+                Some(19754),
+                None,
+            ])),
         ],
     )
     .unwrap();
@@ -102,6 +113,7 @@ fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
             ),
             col("tiny", DataType::Int8, true),
             col("small", DataType::Int16, true),
+            col("day", DataType::Date32, true),
         ],
         vec![batch],
     ));
@@ -273,6 +285,39 @@ async fn small_int_sum_avg_widen() {
             &["4", "-3", "-7", "-7.0"],
             &["5", "-3", "-7", "-7.0"],
             &["6", "NULL", "NULL", "NULL"],
+        ])
+    );
+}
+
+#[tokio::test]
+async fn running_min_max_keep_date_and_varchar_types() {
+    let (types, got) = query(
+        "SELECT id, min(day) OVER (PARTITION BY grp ORDER BY id), \
+         max(day) OVER (PARTITION BY grp ORDER BY v), \
+         max(grp) OVER (ORDER BY id DESC), min(grp) OVER (ORDER BY day) \
+         FROM t ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        types[1..],
+        [
+            ArrowDataType::Date32,
+            ArrowDataType::Date32,
+            ArrowDataType::Utf8,
+            ArrowDataType::Utf8,
+        ]
+    );
+    // max(day) ORDER BY v: ids 2 and 3 tie on v = 20, so both see all of `a`.
+    // min(grp) ORDER BY day: NULL days sort last, so ids 4 and 6 are peers.
+    assert_eq!(
+        got,
+        rows(&[
+            &["1", "2024-01-03", "2024-01-03", "c", "a"],
+            &["2", "2024-01-01", "2024-01-03", "c", "a"],
+            &["3", "2024-01-01", "2024-01-03", "c", "a"],
+            &["4", "NULL", "2024-02-01", "c", "a"],
+            &["5", "2024-02-01", "2024-02-01", "c", "a"],
+            &["6", "NULL", "NULL", "c", "a"],
         ])
     );
 }

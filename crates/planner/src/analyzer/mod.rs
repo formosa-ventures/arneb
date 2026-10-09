@@ -384,7 +384,7 @@ pub(crate) fn function_return_type(
         "STARTS_WITH" | "REGEXP_LIKE" => Some(DataType::Boolean),
 
         // Math — preserve integer-ness when the input is integral.
-        "ROUND" | "CEIL" | "CEILING" | "FLOOR" | "POWER" | "POW" | "ABS" => args
+        "ROUND" | "CEIL" | "CEILING" | "FLOOR" | "ABS" => args
             .first()
             .and_then(|a| plan_expr_type(a, schema))
             .map(|t| match t {
@@ -412,9 +412,10 @@ pub(crate) fn function_return_type(
         } else {
             DataType::Int64
         }),
-        "SQRT" | "CBRT" | "EXP" | "LN" | "LOG2" | "LOG10" | "LOG" | "PI" | "E" | "DEGREES"
-        | "RADIANS" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "ATAN2" | "SINH"
-        | "COSH" | "TANH" | "NAN" | "INFINITY" => Some(DataType::Float64),
+        // POWER is DOUBLE in Trino even for integer arguments (`power(2, 0.5)`).
+        "POWER" | "POW" | "SQRT" | "CBRT" | "EXP" | "LN" | "LOG2" | "LOG10" | "LOG" | "PI"
+        | "E" | "DEGREES" | "RADIANS" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN"
+        | "ATAN2" | "SINH" | "COSH" | "TANH" | "NAN" | "INFINITY" => Some(DataType::Float64),
         "IS_NAN" | "IS_FINITE" | "IS_INFINITE" => Some(DataType::Boolean),
 
         // Conditional

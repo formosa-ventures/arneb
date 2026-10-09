@@ -3,7 +3,7 @@
 # The official apache/hive:4.2.0 image does NOT bundle hadoop-aws or
 # aws-java-sdk-bundle, so HMS cannot validate or work with `s3a://` table
 # locations out of the box. This Dockerfile adds the matching jars from
-# Maven Central plus a metastore-site.xml configured for MinIO.
+# Maven Central plus a metastore-site.xml configured for RustFS.
 #
 # Used by docker-compose.yml's `hive-metastore` service.
 #

@@ -726,26 +726,26 @@ async fn test_hive_connector_query_via_object_store() {
 }
 
 // ===========================================================================
-// MinIO S3 Integration Test (requires Docker: docker compose up -d)
+// Local S3 (RustFS) Integration Test (requires Docker: docker compose up -d)
 // ===========================================================================
 
 /// Integration test that verifies the full S3 lazy-creation path:
-/// `StorageRegistry::with_config(s3_config)` → MinIO → read Parquet.
+/// `StorageRegistry::with_config(s3_config)` → RustFS → read Parquet.
 ///
-/// Requires: `docker compose up -d` (starts MinIO on localhost:9000).
-/// Run with: `cargo test -p arneb-server -- --ignored test_s3_read_via_minio`
+/// Requires: `docker compose up -d` (starts RustFS on localhost:9000).
+/// Run with: `cargo test -p arneb-server -- --ignored test_s3_read_via_local_s3`
 #[tokio::test]
 #[ignore]
-async fn test_s3_read_via_minio() {
+async fn test_s3_read_via_local_s3() {
     use arneb_connectors::{CloudStorageConfig, S3StorageConfig, StorageRegistry};
     use object_store::aws::AmazonS3Builder;
     use object_store::path::Path as ObjectPath;
     use object_store::{ObjectStoreExt, PutPayload};
 
-    let minio_endpoint = "http://localhost:9000";
+    let s3_endpoint = "http://localhost:9000";
     let bucket = "warehouse";
 
-    // 1. Write test Parquet data to MinIO using a direct S3 client
+    // 1. Write test Parquet data to RustFS using a direct S3 client
     let arrow_schema = Arc::new(Schema::new(vec![
         Field::new("city", ArrowDataType::Utf8, false),
         Field::new("population", ArrowDataType::Int32, false),
@@ -770,12 +770,12 @@ async fn test_s3_read_via_minio() {
     let upload_store = AmazonS3Builder::new()
         .with_bucket_name(bucket)
         .with_region("us-east-1")
-        .with_endpoint(minio_endpoint)
+        .with_endpoint(s3_endpoint)
         .with_allow_http(true)
-        .with_access_key_id("minioadmin")
-        .with_secret_access_key("minioadmin")
+        .with_access_key_id("s3admin")
+        .with_secret_access_key("s3adminsecret")
         .build()
-        .expect("failed to create S3 client for MinIO");
+        .expect("failed to create S3 client for RustFS");
 
     upload_store
         .put(
@@ -783,16 +783,16 @@ async fn test_s3_read_via_minio() {
             PutPayload::from(buf),
         )
         .await
-        .expect("failed to upload Parquet to MinIO");
+        .expect("failed to upload Parquet to RustFS");
 
     // 2. Read back via StorageRegistry lazy creation (the code path under test)
     let config = CloudStorageConfig {
         s3: Some(S3StorageConfig {
             region: Some("us-east-1".to_string()),
-            endpoint: Some(minio_endpoint.to_string()),
+            endpoint: Some(s3_endpoint.to_string()),
             allow_http: true,
-            access_key_id: Some("minioadmin".to_string()),
-            secret_access_key: Some("minioadmin".to_string()),
+            access_key_id: Some("s3admin".to_string()),
+            secret_access_key: Some("s3adminsecret".to_string()),
         }),
     };
     let registry = Arc::new(StorageRegistry::with_config(config));
@@ -844,24 +844,24 @@ async fn test_s3_read_via_minio() {
 
     assert!(
         response_contains_message_type(&response, b'T'),
-        "expected RowDescription (T) — is MinIO running? (docker compose up -d)"
+        "expected RowDescription (T) — is RustFS running? (docker compose up -d)"
     );
     assert!(
         response_contains_message_type(&response, b'D'),
-        "expected DataRow (D) from MinIO Parquet"
+        "expected DataRow (D) from RustFS Parquet"
     );
     let row_count = count_data_rows(&response);
-    assert_eq!(row_count, 3, "should return 3 city rows from MinIO");
+    assert_eq!(row_count, 3, "should return 3 city rows from RustFS");
 
-    // Cleanup: remove test data from MinIO
+    // Cleanup: remove test data from RustFS
     let _ = upload_store
         .delete(&ObjectPath::from("test/cities/data.parquet"))
         .await;
 }
 
-/// Full E2E test: HMS Thrift → table metadata → MinIO S3 → Parquet read → pgwire query.
+/// Full E2E test: HMS Thrift → table metadata → RustFS S3 → Parquet read → pgwire query.
 ///
-/// Requires: `docker compose up -d` (HMS on localhost:9083, MinIO on localhost:9000).
+/// Requires: `docker compose up -d` (HMS on localhost:9083, RustFS on localhost:9000).
 /// Run with: `cargo test -p arneb-server -- --ignored test_hive_e2e_hms_s3_parquet --nocapture`
 #[tokio::test]
 #[ignore]
@@ -874,13 +874,13 @@ async fn test_hive_e2e_hms_s3_parquet() {
     use pilota::FastStr;
     use volo_thrift::MaybeException;
 
-    let minio_endpoint = "http://localhost:9000";
+    let s3_endpoint = "http://localhost:9000";
     let hms_addr = "127.0.0.1:9083";
     let bucket = "warehouse";
     let db_name = "arneb_e2e_test";
     let table_name = "students";
 
-    // === Phase 1: Setup — create test data in HMS + MinIO ===
+    // === Phase 1: Setup — create test data in HMS + RustFS ===
 
     // 1a. Create Parquet data
     let arrow_schema = Arc::new(Schema::new(vec![
@@ -905,16 +905,16 @@ async fn test_hive_e2e_hms_s3_parquet() {
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 
-    // 1b. Upload Parquet to MinIO
+    // 1b. Upload Parquet to RustFS
     let s3_store = AmazonS3Builder::new()
         .with_bucket_name(bucket)
         .with_region("us-east-1")
-        .with_endpoint(minio_endpoint)
+        .with_endpoint(s3_endpoint)
         .with_allow_http(true)
-        .with_access_key_id("minioadmin")
-        .with_secret_access_key("minioadmin")
+        .with_access_key_id("s3admin")
+        .with_secret_access_key("s3adminsecret")
         .build()
-        .expect("failed to create S3 client for MinIO");
+        .expect("failed to create S3 client for RustFS");
 
     let parquet_path = format!("{db_name}/{table_name}/data.parquet");
     s3_store
@@ -923,7 +923,7 @@ async fn test_hive_e2e_hms_s3_parquet() {
             PutPayload::from(buf),
         )
         .await
-        .expect("failed to upload Parquet to MinIO");
+        .expect("failed to upload Parquet to RustFS");
 
     // 1c. Create database + table in HMS via Thrift
     let hms_setup_client = ThriftHiveMetastoreClientBuilder::new("hive_metastore")
@@ -957,7 +957,7 @@ async fn test_hive_e2e_hms_s3_parquet() {
 
     // Create external table — store the real S3 location in HMS.
     // The custom HMS image (docker/hive-metastore/) bundles hadoop-aws,
-    // so HMS can validate s3a:// paths against MinIO directly.
+    // so HMS can validate s3a:// paths against RustFS directly.
     let hms_location = format!("s3a://{bucket}/{db_name}/{table_name}");
 
     let serde = hive_metastore::SerDeInfo {
@@ -1017,15 +1017,15 @@ async fn test_hive_e2e_hms_s3_parquet() {
         Err(e) => panic!("HMS create_table_req failed: {e}"),
     }
 
-    // === Phase 2: Wire Arneb with real HMS + MinIO ===
+    // === Phase 2: Wire Arneb with real HMS + RustFS ===
 
     let s3_config = CloudStorageConfig {
         s3: Some(S3StorageConfig {
             region: Some("us-east-1".to_string()),
-            endpoint: Some(minio_endpoint.to_string()),
+            endpoint: Some(s3_endpoint.to_string()),
             allow_http: true,
-            access_key_id: Some("minioadmin".to_string()),
-            secret_access_key: Some("minioadmin".to_string()),
+            access_key_id: Some("s3admin".to_string()),
+            secret_access_key: Some("s3adminsecret".to_string()),
         }),
     };
     let storage_registry = Arc::new(StorageRegistry::with_config(s3_config));
@@ -1073,12 +1073,12 @@ async fn test_hive_e2e_hms_s3_parquet() {
     );
     assert!(
         response_contains_message_type(&response, b'D'),
-        "expected DataRow (D) — Hive table via HMS metadata + MinIO Parquet"
+        "expected DataRow (D) — Hive table via HMS metadata + RustFS Parquet"
     );
     let row_count = count_data_rows(&response);
     assert_eq!(
         row_count, 3,
-        "Hive E2E: expected 3 rows from HMS table backed by MinIO Parquet"
+        "Hive E2E: expected 3 rows from HMS table backed by RustFS Parquet"
     );
 
     // === Phase 4: Cleanup ===

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Seed TPC-H data into Hive tables on MinIO via Trino CTAS.
+# Seed TPC-H data into Hive tables on RustFS via Trino CTAS.
 #
 # Environment:
 #   TPCH_SF       - Scale factor (default: sf1). Options: tiny, sf1, sf10

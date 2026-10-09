@@ -109,7 +109,7 @@ delete-file removal, makes the table readable again.
 
 The Docker Compose stack includes an Iceberg catalog for Trino
 (`docker/trino/catalog/iceberg.properties`) that shares the same HMS and
-MinIO. A seed service uses it to create sample Iceberg tables in the `ice`
+RustFS. A seed service uses it to create sample Iceberg tables in the `ice`
 schema, including partitioned, schema-evolved, and delete-file cases:
 
 ```bash

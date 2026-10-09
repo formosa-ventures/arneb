@@ -260,10 +260,10 @@ crates/
 Run Arneb against a real Hive Metastore backed by S3-compatible storage:
 
 ```bash
-# 1. Start MinIO + HMS + Trino
+# 1. Start RustFS + HMS + Trino
 docker compose up -d
 
-# 2. Seed TPC-H data (Parquet on MinIO, tables registered in HMS)
+# 2. Seed TPC-H data (Parquet on RustFS, tables registered in HMS)
 docker compose run --rm tpch-seed
 
 # 3. Start Arneb with Hive catalog config

@@ -373,17 +373,25 @@ impl<'a> QueryPlanner<'a> {
             let mut sort_exprs = Vec::with_capacity(query.order_by.len());
             let mut unresolved = None;
             for ob in &query.order_by {
-                let expr =
-                    match self.resolve_order_by_expr_with_select(&ob.expr, &ctx, select_items) {
-                        Some(resolved) => resolved,
-                        None => match self.plan_expr(&ob.expr, &ctx).await {
-                            Ok(expr) => expr,
-                            Err(e) => {
-                                unresolved = Some(e);
-                                break;
-                            }
-                        },
-                    };
+                let ordinal = select_ordinal(&ob.expr, ctx.columns.len(), "ORDER BY")?;
+                let resolved = match ordinal {
+                    Some(index) => Some(PlanExpr::Column {
+                        index,
+                        name: ctx.columns[index].1.name.clone(),
+                        span: None,
+                    }),
+                    None => self.resolve_order_by_expr_with_select(&ob.expr, &ctx, select_items),
+                };
+                let expr = match resolved {
+                    Some(resolved) => resolved,
+                    None => match self.plan_expr(&ob.expr, &ctx).await {
+                        Ok(expr) => expr,
+                        Err(e) => {
+                            unresolved = Some(e);
+                            break;
+                        }
+                    },
+                };
                 sort_exprs.push(SortExpr {
                     expr,
                     asc: ob.asc.unwrap_or(true),
@@ -413,6 +421,13 @@ impl<'a> QueryPlanner<'a> {
                             exprs,
                             schema,
                         }
+                    }
+                    // SELECT DISTINCT wraps the projection in an Aggregate,
+                    // so a key outside the select list can't be sorted on.
+                    _ if matches!(&query.body, ast::QueryBody::Select(b) if b.distinct) => {
+                        return Err(PlanError::invalid_expression(
+                            "For SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                        ))
                     }
                     _ => return Err(err),
                 },
@@ -450,13 +465,20 @@ impl<'a> QueryPlanner<'a> {
         let input_ctx = self.context_from_plan(input);
         let mut order_by = Vec::with_capacity(query.order_by.len());
         for ob in &query.order_by {
-            let expr =
-                match self.resolve_order_by_expr_with_select(&ob.expr, output_ctx, select_items) {
-                    Some(PlanExpr::Column { index, .. }) if index < exprs.len() => {
-                        exprs[index].clone()
+            let resolved = match select_ordinal(&ob.expr, exprs.len(), "ORDER BY")? {
+                Some(index) => Some(index),
+                None => {
+                    match self.resolve_order_by_expr_with_select(&ob.expr, output_ctx, select_items)
+                    {
+                        Some(PlanExpr::Column { index, .. }) if index < exprs.len() => Some(index),
+                        _ => None,
                     }
-                    _ => self.plan_expr(&ob.expr, &input_ctx).await?,
-                };
+                }
+            };
+            let expr = match resolved {
+                Some(index) => exprs[index].clone(),
+                None => self.plan_expr(&ob.expr, &input_ctx).await?,
+            };
             order_by.push(SortExpr {
                 expr,
                 asc: ob.asc.unwrap_or(true),
@@ -612,7 +634,8 @@ impl<'a> QueryPlanner<'a> {
 
         // 3. GROUP BY / HAVING → Aggregate
         // Also handle implicit aggregate: SELECT SUM(x) FROM t (no GROUP BY but has aggregates)
-        let has_group_by = !body.group_by.is_empty();
+        let group_by_ast = resolve_group_by_ordinals(body)?;
+        let has_group_by = !group_by_ast.is_empty();
         let mut aggr_exprs = self.collect_aggregates(&body.projection, &ctx).await?;
         // Aggregates can appear in HAVING without being in SELECT (e.g.
         // `... GROUP BY l_orderkey HAVING SUM(l_quantity) > 300`).
@@ -625,8 +648,8 @@ impl<'a> QueryPlanner<'a> {
         let has_aggregates = has_group_by || !aggr_exprs.is_empty();
 
         if has_aggregates {
-            let mut group_by = Vec::with_capacity(body.group_by.len());
-            for e in &body.group_by {
+            let mut group_by = Vec::with_capacity(group_by_ast.len());
+            for e in &group_by_ast {
                 group_by.push(self.plan_expr(e, &ctx).await?);
             }
 
@@ -656,8 +679,8 @@ impl<'a> QueryPlanner<'a> {
             // onto the first group-by slot.
             ctx = PlanningContext::new();
             for (i, col) in schema.iter().enumerate() {
-                let qualifier = if i < body.group_by.len() {
-                    group_by_qualifier(&body.group_by[i])
+                let qualifier = if i < group_by_ast.len() {
+                    group_by_qualifier(&group_by_ast[i])
                 } else {
                     None
                 };
@@ -667,7 +690,7 @@ impl<'a> QueryPlanner<'a> {
             // HAVING (applied after aggregation)
             // Rewrite aggregate expressions in HAVING to column references
             if let Some(having) = &body.having {
-                let num_group_by = body.group_by.len();
+                let num_group_by = group_by_ast.len();
                 let rewritten = self.rewrite_aggregates_as_columns(having, &ctx, num_group_by);
                 let predicate = self.plan_expr(&rewritten, &ctx).await?;
                 plan = LogicalPlan::Filter {
@@ -698,7 +721,7 @@ impl<'a> QueryPlanner<'a> {
         // After aggregate, SELECT expressions that ARE aggregate functions should reference
         // the aggregate output columns by index, not re-resolve their arguments.
         let (proj_exprs, proj_schema) = if has_aggregates {
-            self.plan_aggregate_projection(&body.projection, &ctx, &body.group_by)
+            self.plan_aggregate_projection(&body.projection, &ctx, &group_by_ast)
                 .await?
         } else {
             self.plan_projection(&body.projection, &ctx).await?
@@ -712,6 +735,27 @@ impl<'a> QueryPlanner<'a> {
 
         if cte_self_agg_window_enabled() {
             plan = rewrite_cte_self_agg_scalar_to_window(plan);
+        }
+
+        // 5. SELECT DISTINCT → Aggregate grouping by every output column,
+        // planned and fragmented exactly like a GROUP BY.
+        if body.distinct {
+            let schema = plan.schema();
+            let group_by = schema
+                .iter()
+                .enumerate()
+                .map(|(index, c)| PlanExpr::Column {
+                    index,
+                    name: c.name.clone(),
+                    span: None,
+                })
+                .collect();
+            plan = LogicalPlan::Aggregate {
+                input: Box::new(plan),
+                group_by,
+                aggr_exprs: Vec::new(),
+                schema,
+            };
         }
 
         Ok(plan)
@@ -3118,6 +3162,62 @@ fn collect_table_scan_refs(
     }
 }
 
+/// `ORDER BY 2` / `GROUP BY 2`: an integer literal names a 1-based
+/// SELECT-list position (Trino semantics). Returns the 0-based index, or
+/// `None` when `expr` is not an integer literal.
+fn select_ordinal(
+    expr: &ast::Expr,
+    width: usize,
+    clause: &str,
+) -> Result<Option<usize>, PlanError> {
+    let ast::Expr::Literal {
+        value: ScalarValue::Int64(n),
+        ..
+    } = expr
+    else {
+        return Ok(None);
+    };
+    match usize::try_from(*n) {
+        Ok(pos) if (1..=width).contains(&pos) => Ok(Some(pos - 1)),
+        _ => Err(PlanError::invalid_expression(format!(
+            "{clause} position {n} is not in select list"
+        ))),
+    }
+}
+
+/// Replace `GROUP BY <ordinal>` items with the SELECT-list expression they
+/// name, leaving every other GROUP BY expression untouched.
+fn resolve_group_by_ordinals(body: &ast::SelectBody) -> Result<Vec<ast::Expr>, PlanError> {
+    // A wildcard expands to an unknown number of columns, so positions
+    // after it can't be mapped from the AST select list.
+    let has_wildcard = body.projection.iter().any(|item| {
+        matches!(
+            item,
+            ast::SelectItem::Wildcard | ast::SelectItem::QualifiedWildcard(_)
+        )
+    });
+    let mut out = Vec::with_capacity(body.group_by.len());
+    for e in &body.group_by {
+        let Some(index) = select_ordinal(e, body.projection.len(), "GROUP BY")? else {
+            out.push(e.clone());
+            continue;
+        };
+        match &body.projection[index] {
+            ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. }
+                if !has_wildcard =>
+            {
+                out.push(expr.clone())
+            }
+            _ => {
+                return Err(PlanError::invalid_expression(
+                    "GROUP BY position with SELECT * is not supported",
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// If a GROUP BY AST expression is a qualified column reference
 /// (`t.col`), return its table qualifier. Used when rebuilding the
 /// post-aggregate context so a subsequent `SELECT t.col` resolves to
@@ -3832,6 +3932,35 @@ mod tests {
     // ---------------------------------------------------------------
     // SELECT with GROUP BY (task 4.7)
     // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_select_distinct_plans_as_group_by_all_columns() {
+        let plan = plan_sql("SELECT DISTINCT name FROM users").await.unwrap();
+        let LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } = &plan
+        else {
+            panic!("expected Aggregate, got {plan:?}");
+        };
+        assert!(matches!(input.as_ref(), LogicalPlan::Projection { .. }));
+        assert_eq!(group_by.len(), 1);
+        assert!(aggr_exprs.is_empty());
+        assert_eq!(schema[0].name, "name");
+
+        // Distributed: the dedup runs in the single-output root fragment,
+        // over rows gathered from every source partition (like a GROUP BY
+        // with no aggregate functions, which the fragmenter keeps single-phase).
+        let root = crate::fragment::PlanFragmenter::new().fragment(plan);
+        assert_eq!(
+            root.output_partitioning,
+            crate::fragment::PartitioningScheme::Single
+        );
+        assert!(matches!(root.root, LogicalPlan::Aggregate { .. }));
+        assert_eq!(root.source_fragments.len(), 1);
+    }
 
     #[tokio::test]
     async fn test_select_with_group_by() {

@@ -2445,4 +2445,213 @@ mod tests {
             assert!(msg.contains(needle), "{sql}: {msg}");
         }
     }
+
+    // -- End-to-end: SELECT DISTINCT and ORDER BY / GROUP BY ordinals -----
+
+    /// `nation(n_nationkey, n_name, n_regionkey)`: 10 rows split over two
+    /// batches in non-sorted order. Rows per region: 0→2, 1→3, 2→2, 3→2, 4→1.
+    fn nation_env() -> (CatalogManager, ConnectorRegistry) {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        use arrow::array::StringArray;
+        let rows: [(i64, &str, i64); 10] = [
+            (9, "INDONESIA", 2),
+            (3, "CANADA", 1),
+            (0, "ALGERIA", 0),
+            (6, "FRANCE", 3),
+            (1, "ARGENTINA", 1),
+            (8, "INDIA", 2),
+            (4, "EGYPT", 4),
+            (2, "BRAZIL", 1),
+            (7, "GERMANY", 3),
+            (5, "ETHIOPIA", 0),
+        ];
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("n_nationkey", ArrowDataType::Int64, false),
+            Field::new("n_name", ArrowDataType::Utf8, false),
+            Field::new("n_regionkey", ArrowDataType::Int64, false),
+        ]));
+        let batches = rows
+            .chunks(5)
+            .map(|chunk| {
+                arrow::record_batch::RecordBatch::try_new(
+                    arrow_schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from_iter_values(chunk.iter().map(|r| r.0))),
+                        Arc::new(StringArray::from_iter_values(chunk.iter().map(|r| r.1))),
+                        Arc::new(Int64Array::from_iter_values(chunk.iter().map(|r| r.2))),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let table = Arc::new(MemoryTable::new(
+            vec![
+                col("n_nationkey", DataType::Int64),
+                col("n_name", DataType::Utf8),
+                col("n_regionkey", DataType::Int64),
+            ],
+            batches,
+        ));
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("nation", table);
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", schema);
+        let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
+        let cm = CatalogManager::new("memory", "default");
+        cm.register_catalog("memory", catalog);
+        let mut reg = ConnectorRegistry::new();
+        reg.register("memory", Arc::new(factory));
+        (cm, reg)
+    }
+
+    /// Runs `sql` against [`nation_env`]; each row is its cells joined by `|`.
+    async fn nation_rows(sql: &str) -> Result<Vec<String>, String> {
+        use arrow::util::display::ArrayFormatter;
+        let (cm, reg) = nation_env();
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        let (_, batches) = execute_query(sql, &cm, &reg, None, &pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        let opts = arrow::util::display::FormatOptions::default().with_null("NULL");
+        let mut out = Vec::new();
+        for b in &batches {
+            let fmts: Vec<_> = b
+                .columns()
+                .iter()
+                .map(|c| ArrayFormatter::try_new(c.as_ref(), &opts).unwrap())
+                .collect();
+            for r in 0..b.num_rows() {
+                let cells: Vec<String> = fmts.iter().map(|f| f.value(r).to_string()).collect();
+                out.push(cells.join("|"));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn assert_rows(sql: &str, expected: &[&str]) {
+        let rows = nation_rows(sql)
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {sql}: {e}"));
+        assert_eq!(rows, expected, "{sql}");
+    }
+
+    async fn assert_query_error(sql: &str, needle: &str) {
+        let err = nation_rows(sql)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected an error: {sql}"));
+        assert!(err.contains(needle), "{sql}: {err}");
+    }
+
+    #[tokio::test]
+    async fn select_distinct_removes_duplicates() {
+        let mut rows = nation_rows("SELECT DISTINCT n_regionkey FROM nation")
+            .await
+            .unwrap();
+        rows.sort();
+        assert_eq!(rows, ["0", "1", "2", "3", "4"]);
+        assert_rows(
+            "SELECT count(*) FROM (SELECT DISTINCT n_regionkey FROM nation) t",
+            &["5"],
+        )
+        .await;
+        assert_rows(
+            "SELECT DISTINCT n_regionkey, n_regionkey * 10 AS r10 FROM nation ORDER BY r10",
+            &["0|0", "1|10", "2|20", "3|30", "4|40"],
+        )
+        .await;
+        assert_rows(
+            "SELECT DISTINCT n_regionkey FROM nation ORDER BY n_regionkey DESC LIMIT 2",
+            &["4", "3"],
+        )
+        .await;
+        assert_rows(
+            "SELECT DISTINCT NULLIF(n_regionkey, 0) AS r FROM nation ORDER BY 1 DESC NULLS FIRST",
+            &["NULL", "4", "3", "2", "1"],
+        )
+        .await;
+        // DISTINCT over a GROUP BY result.
+        assert_rows(
+            "SELECT DISTINCT count(*) FROM nation GROUP BY n_regionkey ORDER BY 1",
+            &["1", "2", "3"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn select_distinct_rejects_order_by_outside_select_list_and_distinct_on() {
+        assert_query_error(
+            "SELECT DISTINCT n_regionkey FROM nation ORDER BY n_name",
+            "ORDER BY expressions must appear in select list",
+        )
+        .await;
+        assert_query_error(
+            "SELECT DISTINCT ON (n_regionkey) n_name FROM nation",
+            "DISTINCT ON",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn union_distinct_dedups_and_sorts_by_ordinal() {
+        assert_rows(
+            "SELECT n_regionkey FROM nation UNION SELECT n_regionkey FROM nation ORDER BY 1",
+            &["0", "1", "2", "3", "4"],
+        )
+        .await;
+        assert_rows(
+            "SELECT n_name FROM nation WHERE n_regionkey = 1 \
+             UNION ALL SELECT n_name FROM nation WHERE n_regionkey = 0 ORDER BY 1 DESC",
+            &["ETHIOPIA", "CANADA", "BRAZIL", "ARGENTINA", "ALGERIA"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn order_by_ordinal_sorts_by_select_list_position() {
+        assert_rows(
+            "SELECT n_name FROM nation ORDER BY 1 LIMIT 3",
+            &["ALGERIA", "ARGENTINA", "BRAZIL"],
+        )
+        .await;
+        assert_rows(
+            "SELECT n_name, n_regionkey FROM nation ORDER BY 2 DESC, n_name LIMIT 4",
+            &["EGYPT|4", "FRANCE|3", "GERMANY|3", "INDIA|2"],
+        )
+        .await;
+        assert_rows(
+            "SELECT n_regionkey, count(*) AS c FROM nation GROUP BY n_regionkey \
+             ORDER BY 2 DESC, 1 LIMIT 3",
+            &["1|3", "0|2", "2|2"],
+        )
+        .await;
+        for sql in [
+            "SELECT n_name FROM nation ORDER BY 0",
+            "SELECT n_name FROM nation ORDER BY 2",
+        ] {
+            assert_query_error(sql, "ORDER BY position").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn group_by_ordinal_groups_by_select_list_position() {
+        assert_rows(
+            "SELECT n_regionkey, count(*) FROM nation GROUP BY 1 ORDER BY 1",
+            &["0|2", "1|3", "2|2", "3|2", "4|1"],
+        )
+        .await;
+        assert_rows(
+            "SELECT n_regionkey * 10 AS r, count(*) FROM nation GROUP BY 1 ORDER BY r DESC LIMIT 2",
+            &["40|1", "30|2"],
+        )
+        .await;
+        assert_query_error(
+            "SELECT n_regionkey FROM nation GROUP BY 2",
+            "GROUP BY position",
+        )
+        .await;
+    }
 }

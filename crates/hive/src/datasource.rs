@@ -1,16 +1,23 @@
 //! Hive data source and connector factory.
 //!
-//! [`HiveDataSource`] reads Parquet files from an object store location
-//! (as discovered from Hive Metastore metadata) and implements the
-//! [`DataSource`] trait for the execution engine.
+//! [`HiveDataSource`] reads the Parquet or ORC data files of a Hive table
+//! from an object store location (as discovered from Hive Metastore
+//! metadata) and implements the [`DataSource`] trait for the execution
+//! engine. The file format is taken from the table's HMS storage
+//! descriptor (see [`HiveFileFormat`]); everything else — file listing,
+//! partition values, splits, projection — is shared by both formats.
 //!
 //! [`HiveConnectorFactory`] creates [`HiveDataSource`] instances by
-//! resolving the table location from the catalog and listing Parquet files
-//! at that location.
+//! resolving the table location from the catalog and listing the data
+//! files at that location.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use arrow::array::{new_null_array, ArrayRef, StringArray};
+use arrow::compute::{cast_with_options, CastOptions};
+use arrow::datatypes::DataType as ArrowDataType;
 use async_trait::async_trait;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
@@ -21,76 +28,248 @@ use arneb_common::error::{ConnectorError, ExecutionError};
 use arneb_common::stream::{stream_from_batches, SendableRecordBatchStream};
 use arneb_common::types::{ColumnInfo, TableReference};
 use arneb_connectors::parquet_scan::{self, ParquetBatchStream};
+use arneb_connectors::scan_adapter::{adapt_batch, remap_filter, ColumnSource};
 use arneb_connectors::storage::{StorageRegistry, StorageUri};
 use arneb_connectors::ConnectorFactory;
 use arneb_execution::{DataSource, ScanContext};
+use arneb_planner::PlanExpr;
+
+use crate::orc;
+
+/// Table-scan property keys set by
+/// [`HiveTableProvider`](crate::catalog::HiveTableProvider) and read by
+/// [`HiveConnectorFactory`]. They travel with the plan to workers.
+pub mod props {
+    /// Object-store URI of the table's data directory.
+    pub const LOCATION: &str = "location";
+    /// HMS storage descriptor input format class.
+    pub const INPUT_FORMAT: &str = "input_format";
+    /// HMS storage descriptor SerDe class.
+    pub const SERDE_LIB: &str = "serde_lib";
+    /// Number of partition key columns; they are the last columns of the
+    /// table schema.
+    pub const PARTITION_COLUMNS: &str = "partition_columns";
+    /// `"true"` for Hive ACID (transactional) tables.
+    pub const TRANSACTIONAL: &str = "transactional";
+}
+
+/// Hive's marker directory value for a NULL partition key.
+const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
+
+/// Data file format of a Hive table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiveFileFormat {
+    /// Apache Parquet (`MapredParquetInputFormat` / `ParquetHiveSerDe`).
+    Parquet,
+    /// Apache ORC (`OrcInputFormat` / `OrcSerde`).
+    Orc,
+}
+
+impl HiveFileFormat {
+    /// Detect the format from the HMS input format and SerDe classes.
+    /// Tables without either (e.g. registered by hand in tests) are read as
+    /// Parquet; any other format (text, Avro, RCFile, ...) is rejected.
+    pub fn detect(input_format: &str, serde_lib: &str) -> Result<Self, ConnectorError> {
+        let classes = format!("{input_format} {serde_lib}").to_ascii_lowercase();
+        if classes.contains("orcinputformat") || classes.contains("orcserde") {
+            Ok(Self::Orc)
+        } else if classes.contains("parquet") || classes.trim().is_empty() {
+            Ok(Self::Parquet)
+        } else {
+            Err(ConnectorError::UnsupportedOperation(format!(
+                "unsupported Hive storage format (input format '{input_format}', \
+                 serde '{serde_lib}'): only Parquet and ORC tables can be read"
+            )))
+        }
+    }
+}
+
+/// One data file and the values of the table's partition columns for it.
+#[derive(Debug, Clone)]
+struct HiveFile {
+    path: ObjectPath,
+    /// One-row array per partition column, in the column's table type.
+    partition_values: Vec<ArrayRef>,
+}
 
 // ---------------------------------------------------------------------------
 // HiveDataSource
 // ---------------------------------------------------------------------------
 
-/// Data source that reads Parquet files from a Hive table location.
+/// Data source that reads the data files of a Hive table.
 ///
 /// The file list is computed once at construction time (by
-/// [`HiveConnectorFactory::create_data_source`]) and stored in
-/// `file_paths`. Each value of [`partition_count`](DataSource::partition_count)
-/// corresponds to one file; [`scan`](DataSource::scan) for partition `i`
-/// reads `file_paths[i]` only.
+/// [`HiveConnectorFactory::create_data_source`]). Each file is exposed as
+/// `splits_per_file` scan partitions; [`scan`](DataSource::scan) for
+/// partition `i` reads one split of one file.
+///
+/// The schema is the table's data columns followed by its partition
+/// columns, whose values come from the `key=value` directories each file
+/// lives under.
 pub struct HiveDataSource {
     /// Object store backend (local, S3, GCS, Azure, etc.).
     store: Arc<dyn ObjectStore>,
-    /// Column schema from HMS metadata.
+    /// Column schema from HMS metadata: data columns, then partition columns.
     column_schema: Vec<ColumnInfo>,
-    /// Pre-listed Parquet files under the table's storage prefix.
-    file_paths: Vec<ObjectPath>,
+    /// Number of trailing partition columns in `column_schema`.
+    partition_column_count: usize,
+    /// Data file format.
+    format: HiveFileFormat,
+    /// Pre-listed data files under the table's storage prefix.
+    files: Vec<HiveFile>,
     /// Number of logical sub-partitions per file (1 = legacy
-    /// one-partition-per-file). Each sub-partition reads a row-range
-    /// slice via `with_row_selection`, exposing more parallel scan
-    /// tasks than the raw file count when the workload has many CPU
-    /// cores and few files.
+    /// one-partition-per-file). Each sub-partition reads a slice of the
+    /// file (Parquet: a row range; ORC: a stripe or row range), exposing
+    /// more parallel scan tasks than the raw file count when the workload
+    /// has many CPU cores and few files.
     splits_per_file: usize,
 }
 
 impl HiveDataSource {
-    /// Create a new Hive data source with a pre-listed file set.
+    /// Create an unpartitioned Parquet data source with a pre-listed file set.
     ///
     /// - `store`: the object store for the table location.
     /// - `column_schema`: column metadata from HMS.
-    /// - `file_paths`: pre-listed Parquet files (one per partition). The
-    ///   caller (usually [`HiveConnectorFactory::create_data_source`])
-    ///   resolves this via [`list_parquet_files`] during async construction.
+    /// - `file_paths`: pre-listed Parquet files.
     pub fn new(
         store: Arc<dyn ObjectStore>,
         column_schema: Vec<ColumnInfo>,
         file_paths: Vec<ObjectPath>,
     ) -> Self {
-        let splits_per_file = parquet_scan::splits_per_file(file_paths.len());
+        let files = file_paths
+            .into_iter()
+            .map(|path| HiveFile {
+                path,
+                partition_values: Vec::new(),
+            })
+            .collect();
+        Self::with_files(store, column_schema, 0, HiveFileFormat::Parquet, files)
+    }
+
+    fn with_files(
+        store: Arc<dyn ObjectStore>,
+        column_schema: Vec<ColumnInfo>,
+        partition_column_count: usize,
+        format: HiveFileFormat,
+        files: Vec<HiveFile>,
+    ) -> Self {
+        let splits_per_file = parquet_scan::splits_per_file(files.len());
         Self {
             store,
             column_schema,
-            file_paths,
+            partition_column_count,
+            format,
+            files,
             splits_per_file,
         }
     }
 
     /// Async constructor that lists the Parquet files under `prefix`
-    /// before building the source. Convenience for callers and tests
-    /// that don't already have the file list in hand.
+    /// before building an unpartitioned Parquet source. Convenience for
+    /// callers and tests that don't already have the file list in hand.
     pub async fn from_prefix(
         store: Arc<dyn ObjectStore>,
         prefix: ObjectPath,
         column_schema: Vec<ColumnInfo>,
     ) -> Result<Self, ExecutionError> {
-        let file_paths = list_parquet_files(&store, &prefix).await?;
-        Ok(Self::new(store, column_schema, file_paths))
+        Self::open(store, prefix, column_schema, HiveFileFormat::Parquet, 0).await
+    }
+
+    /// List the data files under `prefix` and resolve each file's partition
+    /// values from its `key=value` directories.
+    ///
+    /// `column_schema` is the table's data columns followed by its
+    /// `partition_column_count` partition columns. Fails on Hive ACID
+    /// directory layouts (`base_N` / `delta_N_M`) and on files that are not
+    /// under a directory for every partition column.
+    pub async fn open(
+        store: Arc<dyn ObjectStore>,
+        prefix: ObjectPath,
+        column_schema: Vec<ColumnInfo>,
+        format: HiveFileFormat,
+        partition_column_count: usize,
+    ) -> Result<Self, ExecutionError> {
+        if partition_column_count > column_schema.len() {
+            return Err(ExecutionError::InvalidOperation(format!(
+                "Hive table has {partition_column_count} partition columns but only {} columns",
+                column_schema.len()
+            )));
+        }
+        let partition_columns = &column_schema[column_schema.len() - partition_column_count..];
+        let files = list_data_files(&store, &prefix)
+            .await?
+            .into_iter()
+            .map(|path| {
+                let partition_values = partition_values(&prefix, &path, partition_columns)?;
+                Ok(HiveFile {
+                    path,
+                    partition_values,
+                })
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        Ok(Self::with_files(
+            store,
+            column_schema,
+            partition_column_count,
+            format,
+            files,
+        ))
+    }
+
+    /// Scan one split of a Parquet file of a partitioned table: read the
+    /// projected data columns, append the file's partition values.
+    async fn scan_partitioned_parquet(
+        &self,
+        ctx: &ScanContext,
+        file: &HiveFile,
+        projection: &[usize],
+        output_schema: arrow::datatypes::SchemaRef,
+        split_idx: usize,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let n_data = self.column_schema.len() - self.partition_column_count;
+        let mut roots: Vec<usize> = projection.iter().copied().filter(|&i| i < n_data).collect();
+        roots.sort_unstable();
+        roots.dedup();
+        let sources: Vec<ColumnSource> = projection
+            .iter()
+            .map(|&i| match i.checked_sub(n_data) {
+                None => ColumnSource::File(roots.binary_search(&i).unwrap_or_default()),
+                Some(p) => ColumnSource::Constant(file.partition_values[p].clone()),
+            })
+            .collect();
+        // Filters on partition columns stay above the scan.
+        let data_filters: Vec<PlanExpr> = ctx
+            .filters
+            .iter()
+            .filter_map(|f| remap_filter(f, &|i| (i < n_data).then_some(i)))
+            .collect();
+        let builder = parquet_scan::open_parquet_builder(&self.store, &file.path).await?;
+        let stream = parquet_scan::build_split_stream(
+            builder,
+            &file.path,
+            &data_filters,
+            Some(&roots),
+            ctx.batch_size,
+            split_idx,
+            self.splits_per_file,
+        )?;
+        let schema = output_schema.clone();
+        let path = file.path.to_string();
+        Ok(Box::pin(
+            ParquetBatchStream::new(output_schema, stream, path.clone()).with_adapter(Box::new(
+                move |batch| adapt_batch(&schema, &sources, &path, batch),
+            )),
+        ))
     }
 }
 
 impl fmt::Debug for HiveDataSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HiveDataSource")
-            .field("files", &self.file_paths.len())
+            .field("format", &self.format)
+            .field("files", &self.files.len())
             .field("columns", &self.column_schema.len())
+            .field("partition_columns", &self.partition_column_count)
             .finish()
     }
 }
@@ -102,7 +281,7 @@ impl DataSource for HiveDataSource {
     }
 
     fn partition_count(&self) -> usize {
-        (self.file_paths.len() * self.splits_per_file).max(1)
+        (self.files.len() * self.splits_per_file).max(1)
     }
 
     async fn scan(
@@ -110,66 +289,115 @@ impl DataSource for HiveDataSource {
         ctx: &ScanContext,
         partition: usize,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
-        // Determine output schema from projection or full schema.
-        let output_schema = if let Some(ref projection) = ctx.projection {
-            let full_schema = column_info_to_arrow_schema(&self.column_schema);
-            let fields: Vec<arrow::datatypes::FieldRef> = projection
-                .iter()
-                .map(|&i| full_schema.field(i).clone().into())
-                .collect();
-            Arc::new(arrow::datatypes::Schema::new(fields))
-        } else {
-            column_info_to_arrow_schema(&self.column_schema)
+        let full_schema = column_info_to_arrow_schema(&self.column_schema);
+        let projection: Vec<usize> = match &ctx.projection {
+            Some(p) => p.clone(),
+            None => (0..self.column_schema.len()).collect(),
         };
+        if let Some(bad) = projection
+            .iter()
+            .find(|&&i| i >= full_schema.fields().len())
+        {
+            return Err(ExecutionError::InvalidOperation(format!(
+                "HiveDataSource: projection index {bad} out of range"
+            )));
+        }
+        let output_schema = Arc::new(arrow::datatypes::Schema::new(
+            projection
+                .iter()
+                .map(|&i| full_schema.field(i).clone())
+                .collect::<Vec<_>>(),
+        ));
 
-        if self.file_paths.is_empty() {
-            debug!("no Parquet files registered on HiveDataSource");
+        if self.files.is_empty() {
+            debug!("no data files registered on HiveDataSource");
             return Ok(stream_from_batches(output_schema, vec![]));
         }
 
         let (file_idx, split_idx) = parquet_scan::split_index(
             "HiveDataSource",
             partition,
-            self.file_paths.len(),
+            self.files.len(),
             self.splits_per_file,
         )?;
-        let file_path = &self.file_paths[file_idx];
-        let builder = parquet_scan::open_parquet_builder(&self.store, file_path).await?;
-        let stream = parquet_scan::build_split_stream(
-            builder,
-            file_path,
-            &ctx.filters,
-            ctx.projection.as_deref(),
-            ctx.batch_size,
-            split_idx,
-            self.splits_per_file,
-        )?;
+        let file = &self.files[file_idx];
 
-        // True pipelined streaming: yield Parquet batches as they're
-        // produced instead of collecting the whole partition's output
-        // into a Vec first. The earlier `collect → stream_from_batches`
-        // path held an entire partition's worth of decoded Arrow
-        // batches in memory before the downstream operator saw the
-        // first row — for a 6M-row lineitem scan with 7 projected
-        // columns that's ~336 MB per query, which dominated the
-        // single-table-aggregate work-memory delta vs Trino.
-        Ok(Box::pin(ParquetBatchStream::new(
-            output_schema,
-            stream,
-            file_path.to_string(),
-        )))
+        match self.format {
+            HiveFileFormat::Orc => {
+                let n_data = self.column_schema.len() - self.partition_column_count;
+                orc::scan(orc::OrcScan {
+                    store: &self.store,
+                    path: &file.path,
+                    data_columns: &self.column_schema[..n_data],
+                    projection: &projection,
+                    partition_values: &file.partition_values,
+                    output_schema,
+                    batch_size: ctx
+                        .batch_size
+                        .unwrap_or_else(arneb_connectors::file::scan_default_batch_size),
+                    split_idx,
+                    splits_per_file: self.splits_per_file,
+                })
+                .await
+            }
+            HiveFileFormat::Parquet if self.partition_column_count > 0 => {
+                self.scan_partitioned_parquet(ctx, file, &projection, output_schema, split_idx)
+                    .await
+            }
+            HiveFileFormat::Parquet => {
+                let file_path = &file.path;
+                let builder = parquet_scan::open_parquet_builder(&self.store, file_path).await?;
+                let stream = parquet_scan::build_split_stream(
+                    builder,
+                    file_path,
+                    &ctx.filters,
+                    ctx.projection.as_deref(),
+                    ctx.batch_size,
+                    split_idx,
+                    self.splits_per_file,
+                )?;
+
+                // True pipelined streaming: yield Parquet batches as they're
+                // produced instead of collecting the whole partition's output
+                // into a Vec first. The earlier `collect → stream_from_batches`
+                // path held an entire partition's worth of decoded Arrow
+                // batches in memory before the downstream operator saw the
+                // first row — for a 6M-row lineitem scan with 7 projected
+                // columns that's ~336 MB per query, which dominated the
+                // single-table-aggregate work-memory delta vs Trino.
+                Ok(Box::pin(ParquetBatchStream::new(
+                    output_schema,
+                    stream,
+                    file_path.to_string(),
+                )))
+            }
+        }
     }
+}
+
+/// `true` for a Hive ACID directory name: `base_N`, `delta_N_M[_S]`,
+/// `delete_delta_N_M[_S]` (optionally with a `_vN` visibility suffix).
+fn is_acid_dir(name: &str) -> bool {
+    let rest = name
+        .strip_prefix("base_")
+        .or_else(|| name.strip_prefix("delete_delta_"))
+        .or_else(|| name.strip_prefix("delta_"));
+    rest.is_some_and(|r| {
+        r.split('_')
+            .next()
+            .is_some_and(|n| n.parse::<u64>().is_ok())
+    })
 }
 
 /// List all data files under a given prefix in an object store.
 ///
-/// Skips hidden files following the Hadoop/Hive convention: any filename
-/// whose first character is `.` or `_` is treated as hidden (e.g. `_SUCCESS`,
-/// `_committed_*`, `.part-xxx.parquet.crc`). This matches Trino's
-/// `HiveFileIterator`. No extension-based filtering is applied — the Hive
-/// table's `InputFormat` (currently Parquet-only in arneb) decides how to
-/// read the remaining files.
-async fn list_parquet_files(
+/// Skips hidden entries following the Hadoop/Hive convention: any file or
+/// directory whose name starts with `.` or `_` is hidden (e.g. `_SUCCESS`,
+/// `_committed_*`, `.part-xxx.parquet.crc`, `.trino-staging/`). This
+/// matches Trino's `HiveFileIterator`. No extension-based filtering is
+/// applied — the table's storage format decides how to read the remaining
+/// files. Hive ACID layouts are rejected rather than misread.
+async fn list_data_files(
     store: &Arc<dyn ObjectStore>,
     prefix: &ObjectPath,
 ) -> Result<Vec<ObjectPath>, ExecutionError> {
@@ -179,15 +407,104 @@ async fn list_parquet_files(
         let meta = result.map_err(|e| {
             ExecutionError::InvalidOperation(format!("failed to list files at '{}': {}", prefix, e))
         })?;
-        let filename = meta.location.filename().unwrap_or_default();
-        if filename.starts_with('.') || filename.starts_with('_') {
+        let parts: Vec<String> = relative_parts(prefix, &meta.location);
+        if parts
+            .iter()
+            .any(|p| p.starts_with('.') || p.starts_with('_'))
+        {
             continue;
+        }
+        let dirs = &parts[..parts.len().saturating_sub(1)];
+        if let Some(acid) = dirs.iter().find(|d| is_acid_dir(d)) {
+            return Err(ExecutionError::InvalidOperation(format!(
+                "Hive ACID (transactional) tables are not supported: found '{acid}' \
+                 directory under '{prefix}'"
+            )));
         }
         if meta.size > 0 {
             paths.push(meta.location);
         }
     }
     Ok(paths)
+}
+
+/// Path segments of `path` below `prefix` (directories, then the file name).
+fn relative_parts(prefix: &ObjectPath, path: &ObjectPath) -> Vec<String> {
+    match path.prefix_match(prefix) {
+        Some(parts) => parts.map(|p| p.as_ref().to_string()).collect(),
+        None => path.parts().map(|p| p.as_ref().to_string()).collect(),
+    }
+}
+
+/// Undo Hive's partition-path escaping (`%XX` hex escapes).
+fn unescape_path_name(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| (b as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Resolve the partition column values of one data file from its
+/// `key=value` directories (keys matched case-insensitively). Each value
+/// is returned as a one-row array in the column's table type.
+fn partition_values(
+    prefix: &ObjectPath,
+    path: &ObjectPath,
+    partition_columns: &[ColumnInfo],
+) -> Result<Vec<ArrayRef>, ExecutionError> {
+    if partition_columns.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parts = relative_parts(prefix, path);
+    let dirs = &parts[..parts.len().saturating_sub(1)];
+    let kv: HashMap<String, String> = dirs
+        .iter()
+        .filter_map(|d| d.split_once('='))
+        .map(|(k, v)| {
+            (
+                unescape_path_name(k).to_ascii_lowercase(),
+                unescape_path_name(v),
+            )
+        })
+        .collect();
+    partition_columns
+        .iter()
+        .map(|col| {
+            let target: ArrowDataType = col.data_type.clone().into();
+            let raw = kv.get(&col.name.to_ascii_lowercase()).ok_or_else(|| {
+                ExecutionError::InvalidOperation(format!(
+                    "Hive data file '{path}' is not under a '{}=<value>' partition directory",
+                    col.name
+                ))
+            })?;
+            if raw == HIVE_DEFAULT_PARTITION {
+                return Ok(new_null_array(&target, 1));
+            }
+            let strict = CastOptions {
+                safe: false,
+                ..Default::default()
+            };
+            let text: ArrayRef = Arc::new(StringArray::from(vec![raw.as_str()]));
+            cast_with_options(&text, &target, &strict).map_err(|e| {
+                ExecutionError::InvalidOperation(format!(
+                    "partition value '{raw}' of column '{}' in '{path}' is not a valid {}: {e}",
+                    col.name, col.data_type
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Convert `ColumnInfo` slice to an Arrow schema.
@@ -204,8 +521,9 @@ fn column_info_to_arrow_schema(columns: &[ColumnInfo]) -> Arc<arrow::datatypes::
 ///
 /// Creates [`HiveDataSource`] instances from the HMS `location` that
 /// `HiveTableProvider::properties()` attaches to each `TableScan` (and that
-/// travels to workers with the serialized plan), listing the Parquet files
-/// at that location.
+/// travels to workers with the serialized plan), listing the data files at
+/// that location. The storage format, partitioning and ACID flag come from
+/// the scan's properties too.
 ///
 /// Nothing is cached per table: the scan's own properties are the source of
 /// truth. A former cache keyed by bare table name made same-named tables in
@@ -248,7 +566,23 @@ impl ConnectorFactory for HiveConnectorFactory {
                 .await;
         }
 
-        let location = properties.get("location").ok_or_else(|| {
+        let prop = |key: &str| properties.get(key).map(String::as_str).unwrap_or_default();
+        if prop(props::TRANSACTIONAL).eq_ignore_ascii_case("true") {
+            return Err(ConnectorError::UnsupportedOperation(format!(
+                "Hive table '{table}' is transactional (ACID); reading Hive ACID tables \
+                 is not supported"
+            )));
+        }
+        let format = HiveFileFormat::detect(prop(props::INPUT_FORMAT), prop(props::SERDE_LIB))?;
+        let partition_column_count: usize = match prop(props::PARTITION_COLUMNS) {
+            "" => 0,
+            n => n.parse().map_err(|_| {
+                ConnectorError::ReadError(format!(
+                    "Hive table '{table}': invalid partition column count '{n}'"
+                ))
+            })?,
+        };
+        let location = properties.get(props::LOCATION).ok_or_else(|| {
             ConnectorError::TableNotFound(format!(
                 "Hive table '{table}' has no location in its properties"
             ))
@@ -258,17 +592,18 @@ impl ConnectorFactory for HiveConnectorFactory {
         let store = self.storage_registry.get_store(&uri)?;
         let prefix = uri.object_path();
 
-        // Pre-list the Parquet files under this prefix so the resulting
-        // HiveDataSource exposes one partition per file (phase 3.3).
-        let file_paths = list_parquet_files(&store, &prefix)
-            .await
-            .map_err(|e| ConnectorError::ReadError(format!("hive list files: {e}")))?;
-
-        Ok(Arc::new(HiveDataSource::new(
+        // Pre-list the data files under this prefix so the resulting
+        // HiveDataSource exposes `files × splits_per_file` partitions.
+        let ds = HiveDataSource::open(
             store,
+            prefix,
             schema.to_vec(),
-            file_paths,
-        )))
+            format,
+            partition_column_count,
+        )
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("hive table '{table}': {e}")))?;
+        Ok(Arc::new(ds))
     }
 }
 

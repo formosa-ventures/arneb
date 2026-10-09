@@ -87,3 +87,4 @@ tempfile = "3"
 arneb-catalog = { path = "../catalog" }
 arneb-hive = { path = "../hive" }
 arneb-connectors = { path = "../connectors" }
+orc-rust = { workspace = true }

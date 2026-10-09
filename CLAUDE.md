@@ -168,7 +168,9 @@ crates/
 │                  # StorageRegistry (S3/GCS/Azure/local object store abstraction)
 ├── hive/          # Hive Metastore catalog provider + HiveDataSource,
 │                  # HMS Thrift client wrapper (HMS 4.x via _req API),
-│                  # HiveConnectorFactory wired through StorageRegistry
+│                  # HiveConnectorFactory wired through StorageRegistry.
+│                  # Parquet + ORC (orc-rust, git-pinned until orc-rust#91
+│                  # ships), partition columns from key=value paths, ACID rejected.
 ├── iceberg/       # Read-only Iceberg reader; hive catalogs redirect
 │                  # table_type=ICEBERG tables here. Metadata JSON (v1/v2),
 │                  # manifest list/manifests (Avro via apache-avro), field-ID

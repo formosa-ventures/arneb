@@ -37,6 +37,12 @@ pub struct HiveTableMeta {
     pub location: String,
     /// Input format class (e.g. `org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat`).
     pub input_format: String,
+    /// SerDe class from the storage descriptor (e.g.
+    /// `org.apache.hadoop.hive.ql.io.orc.OrcSerde`).
+    pub serde_lib: String,
+    /// Partition key columns (`PARTITIONED BY`), in declaration order.
+    /// Their values come from the `key=value` partition directory names.
+    pub partition_columns: Vec<ColumnInfo>,
     /// Approximate row count, parsed from `Table.parameters["numRows"]`
     /// when HMS recorded it (typically after CTAS, INSERT INTO, or
     /// ANALYZE TABLE COMPUTE STATISTICS). `None` when absent or
@@ -179,9 +185,16 @@ impl HmsClient {
 
         let location = sd.location.map(|s| s.to_string()).unwrap_or_default();
         let input_format = sd.input_format.map(|s| s.to_string()).unwrap_or_default();
+        let serde_lib = sd
+            .serde_info
+            .and_then(|s| s.serialization_lib)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
 
         let hms_cols = sd.cols.unwrap_or_default();
         let columns = convert_field_schemas(&hms_cols, db, table)?;
+        let partition_columns =
+            convert_field_schemas(&hms_table.partition_keys.unwrap_or_default(), db, table)?;
 
         let (row_count, size_bytes) = extract_table_stats(parameters.as_ref());
         let parameters: HashMap<String, String> = parameters
@@ -209,6 +222,8 @@ impl HmsClient {
             columns,
             location,
             input_format,
+            serde_lib,
+            partition_columns,
             row_count,
             size_bytes,
             column_stats,
@@ -476,9 +491,12 @@ impl SchemaProvider for HiveSchemaProvider {
                 }
             }
             Ok(meta) => Some(Arc::new(HiveTableProvider {
+                transactional: is_transactional(&meta.parameters),
                 columns: meta.columns,
+                partition_columns: meta.partition_columns,
                 location: meta.location,
                 input_format: meta.input_format,
+                serde_lib: meta.serde_lib,
                 row_count: meta.row_count,
                 size_bytes: meta.size_bytes,
                 column_stats: meta.column_stats,
@@ -495,18 +513,31 @@ impl SchemaProvider for HiveSchemaProvider {
 // HiveTableProvider
 // ---------------------------------------------------------------------------
 
+/// `true` when HMS marks the table as a Hive ACID (transactional) table.
+fn is_transactional(parameters: &HashMap<String, String>) -> bool {
+    parameters
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("transactional") && v.eq_ignore_ascii_case("true"))
+}
+
 /// Table provider holding metadata for a single Hive table.
 ///
-/// Exposes the column schema derived from the HMS storage descriptor.
-/// The `location` and `input_format` are available for downstream
-/// connectors (e.g. Parquet reader) to use when scanning data.
+/// Exposes the column schema derived from the HMS storage descriptor,
+/// followed by the partition key columns (Hive's `SELECT *` order).
+/// The location, storage format and partitioning are passed to the scan
+/// through [`TableProvider::properties`] (see `crate::datasource::props`).
 #[derive(Debug, Clone)]
 pub struct HiveTableProvider {
     columns: Vec<ColumnInfo>,
+    partition_columns: Vec<ColumnInfo>,
     /// Object-store path for the table data.
     pub location: String,
     /// HMS input format class name.
     pub input_format: String,
+    /// HMS SerDe class name.
+    pub serde_lib: String,
+    /// Hive ACID table (`transactional=true`); scans of these are rejected.
+    pub transactional: bool,
     /// Approximate row count from HMS `Table.parameters["numRows"]`.
     pub row_count: Option<u64>,
     /// Total on-disk byte size from `Table.parameters["totalSize"]`.
@@ -518,14 +549,7 @@ pub struct HiveTableProvider {
 impl HiveTableProvider {
     /// Create a new table provider from pre-computed metadata.
     pub fn new(columns: Vec<ColumnInfo>, location: String, input_format: String) -> Self {
-        Self {
-            columns,
-            location,
-            input_format,
-            row_count: None,
-            size_bytes: None,
-            column_stats: HashMap::new(),
-        }
+        Self::with_statistics(columns, location, input_format, None, None)
     }
 
     /// Create a new table provider with HMS-derived statistics.
@@ -538,12 +562,34 @@ impl HiveTableProvider {
     ) -> Self {
         Self {
             columns,
+            partition_columns: Vec::new(),
             location,
             input_format,
+            serde_lib: String::new(),
+            transactional: false,
             row_count,
             size_bytes,
             column_stats: HashMap::new(),
         }
+    }
+
+    /// Set the SerDe class name (used with the input format to detect the
+    /// file format).
+    pub fn with_serde_lib(mut self, serde_lib: impl Into<String>) -> Self {
+        self.serde_lib = serde_lib.into();
+        self
+    }
+
+    /// Set the partition key columns; they are appended to the schema.
+    pub fn with_partition_columns(mut self, partition_columns: Vec<ColumnInfo>) -> Self {
+        self.partition_columns = partition_columns;
+        self
+    }
+
+    /// Mark the table as Hive ACID (`transactional=true`).
+    pub fn with_transactional(mut self, transactional: bool) -> Self {
+        self.transactional = transactional;
+        self
     }
 
     /// Return the object-store location of this table.
@@ -564,14 +610,29 @@ impl HiveTableProvider {
 
 impl TableProvider for HiveTableProvider {
     fn schema(&self) -> Vec<ColumnInfo> {
-        self.columns.clone()
+        let mut schema = self.columns.clone();
+        schema.extend(self.partition_columns.iter().cloned());
+        schema
     }
 
     fn properties(&self) -> std::collections::HashMap<String, String> {
-        let mut props = std::collections::HashMap::new();
-        props.insert("location".to_string(), self.location.clone());
-        props.insert("input_format".to_string(), self.input_format.clone());
-        props
+        use crate::datasource::props;
+        let mut p = std::collections::HashMap::new();
+        p.insert(props::LOCATION.to_string(), self.location.clone());
+        p.insert(props::INPUT_FORMAT.to_string(), self.input_format.clone());
+        if !self.serde_lib.is_empty() {
+            p.insert(props::SERDE_LIB.to_string(), self.serde_lib.clone());
+        }
+        if !self.partition_columns.is_empty() {
+            p.insert(
+                props::PARTITION_COLUMNS.to_string(),
+                self.partition_columns.len().to_string(),
+            );
+        }
+        if self.transactional {
+            p.insert(props::TRANSACTIONAL.to_string(), "true".to_string());
+        }
+        p
     }
 
     fn statistics(&self) -> Option<arneb_catalog::TableStatistics> {
@@ -613,6 +674,8 @@ mod tests {
             location: "s3://bucket/warehouse/db/table".to_string(),
             input_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
                 .to_string(),
+            serde_lib: "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe".to_string(),
+            partition_columns: vec![],
             row_count: None,
             size_bytes: None,
             column_stats: HashMap::new(),

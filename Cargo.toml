@@ -25,6 +25,11 @@ arrow = { version = "60", default-features = false }
 arrow-csv = { version = "60", default-features = false }
 parquet = { version = "60", default-features = false, features = ["arrow", "snap", "object_store", "zstd", "lz4", "brotli", "flate2", "flate2-zlib-rs"] }
 
+# ORC reader for Hive tables. TEMPORARY git pin: orc-rust 0.9 is on arrow 59;
+# the arrow 60 bump is upstream PR datafusion-contrib/orc-rust#91. Switch to the
+# crates.io release once it is published (and drop the deny.toml allow-git entry).
+orc-rust = { git = "https://github.com/jackypan1989/orc-rust", rev = "ba7af4c5fc87b6235d0001928a87104ddb06b699", default-features = false, features = ["async"] }
+
 # Object store (S3, GCS, Azure, local filesystem)
 object_store = { version = "0.14", default-features = false, features = ["aws", "fs"] }
 

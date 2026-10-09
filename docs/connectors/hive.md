@@ -34,6 +34,55 @@ SELECT * FROM datalake.demo.cities;
 --            catalog  schema table
 ```
 
+## Storage Formats
+
+The file format comes from the table's HMS storage descriptor:
+
+| Input format / SerDe | Read as |
+|----------------------|---------|
+| `MapredParquetInputFormat` / `ParquetHiveSerDe` | Parquet |
+| `OrcInputFormat` / `OrcSerde` | ORC (Trino's default Hive storage format) |
+| anything else (text, Avro, RCFile, ...) | error: `unsupported Hive storage format` |
+
+Both formats are read-only and share the same file listing, splitting and
+projection. Hidden files and directories (names starting with `.` or `_`, e.g.
+`_SUCCESS`, `.trino-staging/`) are skipped.
+
+### ORC
+
+- **Column mapping** is by name, case-insensitively. Files written by old Hive
+  versions with positional names (`_col0`, `_col1`, ...) are mapped by position.
+- **Missing columns** (added to the table after a file was written) read as NULL.
+- **Type differences** that Hive allows are widened: `tinyint`→`smallint`→`int`→`bigint`,
+  integers to `float`/`double`/`decimal`, `float`→`double`, decimal precision/scale
+  changes (a value that no longer fits is an error, never NULL). Any other mismatch
+  fails the query with an error naming the column, the ORC type and the table type.
+- **Types**: `boolean`, `tinyint`, `smallint`, `int`, `bigint`, `float`, `double`,
+  `decimal`, `string`/`varchar`/`char`, `binary`, `date`, `timestamp`.
+- **Timestamps** are the wall-clock values in the writer time zone recorded in each
+  stripe, which is what Hive and Trino return for `timestamp` columns.
+- **Compression**: ZLIB, Snappy, LZO, LZ4, Zstd.
+- Filters are evaluated above the scan; ORC row-index (min/max) pruning is not
+  used yet.
+
+## Partitioned Tables
+
+Partition key columns follow the data columns (`SELECT *` order, as in Hive and
+Trino). Their values come from the `key=value` directories between the table
+location and each data file: Hive path escapes (`%2F`, `%3A`, ...) are decoded and
+`__HIVE_DEFAULT_PARTITION__` reads as NULL. A file that is not under a directory
+for every partition key fails the query. Partitions registered in HMS at custom
+locations outside the table directory are not read, and filters on partition
+columns do not yet prune directories.
+
+## Unsupported Tables
+
+Hive ACID (transactional) tables are rejected with a clear error rather than
+misread: tables with `transactional=true`, locations containing `base_N` /
+`delta_N_M` / `delete_delta_N_M` directories, and ACID-layout ORC files.
+Complex column types (`array`, `map`, `struct`, `uniontype`) are skipped when the
+table is loaded.
+
 ## Iceberg Tables
 
 Iceberg tables registered in the same metastore (`table_type=ICEBERG`) are

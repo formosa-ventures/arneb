@@ -10,8 +10,11 @@ arneb-catalog = { path = "../catalog" }
 arneb-connectors = { path = "../connectors" }
 arneb-execution = { path = "../execution" }
 arneb-iceberg = { path = "../iceberg" }
+arneb-planner = { path = "../planner" }
 arrow.workspace = true
 parquet.workspace = true
+orc-rust.workspace = true
+bytes.workspace = true
 object_store.workspace = true
 async-trait.workspace = true
 futures.workspace = true
@@ -24,3 +27,4 @@ pilota = "0.13"
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = "3"
+arneb-sql-parser = { path = "../sql-parser" }

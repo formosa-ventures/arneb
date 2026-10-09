@@ -665,12 +665,8 @@ async fn test_hive_connector_query_via_object_store() {
             nullable: false,
         },
     ];
+    // The location reaches the factory via HiveTableProvider::properties().
     let hive_factory = arneb_hive::datasource::HiveConnectorFactory::new(storage_registry);
-    hive_factory.register_table_location(
-        "students",
-        "s3://test-lake/warehouse/default/students",
-        hive_columns.clone(),
-    );
 
     // 4. Create a catalog using HiveTableProvider (no HMS connection needed)
     let hive_table = Arc::new(arneb_hive::catalog::HiveTableProvider::new(

@@ -571,20 +571,16 @@ pub struct WindowFunctionDef {
     pub output_name: String,
 }
 
-fn window_function_output_type(func: &WindowFunctionDef, input_schema: &[ColumnInfo]) -> DataType {
-    match func.name.to_ascii_uppercase().as_str() {
-        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT" => DataType::Int64,
-        "SUM" | "AVG" => DataType::Float64,
-        "MIN" | "MAX" => func
-            .args
-            .first()
-            .and_then(|arg| match arg {
-                PlanExpr::Column { index, .. } => input_schema.get(*index),
-                _ => None,
-            })
-            .map(|c| c.data_type.clone())
-            .unwrap_or(DataType::Float64),
-        _ => DataType::Int64,
+impl WindowFunctionDef {
+    /// Result type of this window function — the type `WindowExec` produces:
+    /// BIGINT for the ranking functions and COUNT, DOUBLE for the
+    /// SUM/AVG/MIN/MAX aggregates (issue #93 tracks Trino's input-typed
+    /// aggregate results).
+    pub fn output_type(&self) -> DataType {
+        match self.name.to_ascii_uppercase().as_str() {
+            "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT" => DataType::Int64,
+            _ => DataType::Float64,
+        }
     }
 }
 
@@ -727,7 +723,7 @@ impl LogicalPlan {
             LogicalPlan::Window { input, functions } => {
                 let mut schema = input.schema();
                 for f in functions {
-                    let data_type = window_function_output_type(f, &schema);
+                    let data_type = f.output_type();
                     schema.push(ColumnInfo {
                         name: f.output_name.clone(),
                         data_type,

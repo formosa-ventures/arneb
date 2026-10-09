@@ -2151,4 +2151,298 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
     }
+
+    // -- End-to-end: SQL window functions (issue #104) --------------------
+
+    /// Memory table `w(id BIGINT, grp VARCHAR NULL, v BIGINT NULL)`:
+    /// (1,a,10) (2,a,20) (3,a,20) (4,b,5) (5,b,NULL) (6,NULL,7) — ties on
+    /// `v` within `a`, a NULL `v`, and a NULL partition key.
+    fn window_env() -> (CatalogManager, ConnectorRegistry) {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        use arrow::array::StringArray;
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", ArrowDataType::Int64, false),
+                Field::new("grp", ArrowDataType::Utf8, true),
+                Field::new("v", ArrowDataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("a"),
+                    Some("a"),
+                    Some("b"),
+                    Some("b"),
+                    None,
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    Some(10),
+                    Some(20),
+                    Some(20),
+                    Some(5),
+                    None,
+                    Some(7),
+                ])),
+            ],
+        )
+        .unwrap();
+        let table = MemoryTable::new(
+            vec![
+                col("id", DataType::Int64),
+                col("grp", DataType::Utf8),
+                col("v", DataType::Int64),
+            ],
+            vec![batch],
+        );
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("w", Arc::new(table));
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", schema);
+        let cm = CatalogManager::new("memory", "default");
+        cm.register_catalog("memory", catalog.clone());
+        let mut reg = ConnectorRegistry::new();
+        reg.register(
+            "memory",
+            Arc::new(MemoryConnectorFactory::new(catalog, "default")),
+        );
+        (cm, reg)
+    }
+
+    /// Runs `sql` against [`window_env`] and renders every cell as a string
+    /// (`NULL` for nulls), checking the declared plan schema agrees with the
+    /// produced batch types.
+    async fn window_rows(sql: &str) -> Vec<Vec<String>> {
+        use arrow::array::Array;
+        use arrow::util::display::array_value_to_string;
+        let (cm, reg) = window_env();
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        let (plan, batches) = execute_query(sql, &cm, &reg, None, &pool)
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {sql}: {e}"));
+        let declared: Vec<ArrowDataType> = plan
+            .schema()
+            .iter()
+            .map(|c| c.data_type.clone().into())
+            .collect();
+        let mut rows = Vec::new();
+        for b in batches.iter().filter(|b| b.num_rows() > 0) {
+            let produced: Vec<ArrowDataType> =
+                b.columns().iter().map(|c| c.data_type().clone()).collect();
+            assert_eq!(declared, produced, "declared vs produced types: {sql}");
+            for r in 0..b.num_rows() {
+                rows.push(
+                    b.columns()
+                        .iter()
+                        .map(|c| {
+                            if c.is_null(r) {
+                                "NULL".to_string()
+                            } else {
+                                array_value_to_string(c, r).unwrap()
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
+        rows
+    }
+
+    fn rows(expected: &[&[&str]]) -> Vec<Vec<String>> {
+        expected
+            .iter()
+            .map(|r| r.iter().map(|c| c.to_string()).collect())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn window_ranking_functions_without_partition() {
+        // v ascending, NULLS LAST: 5(id4) 7(id6) 10(id1) 20(id2) 20(id3) NULL(id5).
+        let got = window_rows(
+            "SELECT id, row_number() OVER (ORDER BY v, id), rank() OVER (ORDER BY v), \
+             dense_rank() OVER (ORDER BY v) FROM w ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            got,
+            rows(&[
+                &["1", "3", "3", "3"],
+                &["2", "4", "4", "4"],
+                &["3", "5", "4", "4"],
+                &["4", "1", "1", "1"],
+                &["5", "6", "6", "5"],
+                &["6", "2", "2", "2"],
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn window_ranking_functions_with_partition() {
+        let got = window_rows(
+            "SELECT id, row_number() OVER (PARTITION BY grp ORDER BY v, id) AS rn, \
+             rank() OVER (PARTITION BY grp ORDER BY v) AS r, \
+             dense_rank() OVER (PARTITION BY grp ORDER BY v DESC) AS dr \
+             FROM w ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            got,
+            rows(&[
+                &["1", "1", "1", "2"],
+                &["2", "2", "2", "1"],
+                &["3", "3", "2", "1"],
+                &["4", "1", "1", "1"],
+                &["5", "2", "2", "2"],
+                &["6", "1", "1", "1"],
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn window_running_aggregates_include_peers() {
+        // Default frame with ORDER BY is RANGE UNBOUNDED PRECEDING .. CURRENT
+        // ROW: the tied v=20 rows (and the NULL peer group) share one value.
+        let got = window_rows(
+            "SELECT id, sum(v) OVER (ORDER BY v), count(v) OVER (ORDER BY v), \
+             count(*) OVER (ORDER BY v) FROM w ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            got,
+            rows(&[
+                &["1", "22.0", "3", "3"],
+                &["2", "62.0", "5", "5"],
+                &["3", "62.0", "5", "5"],
+                &["4", "5.0", "1", "1"],
+                &["5", "62.0", "5", "6"],
+                &["6", "12.0", "2", "2"],
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn window_aggregates_without_order_cover_whole_partition() {
+        let got = window_rows(
+            "SELECT id, sum(v) OVER (PARTITION BY grp), max(v) OVER (PARTITION BY grp), \
+             count(*) OVER () FROM w ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            got,
+            rows(&[
+                &["1", "50.0", "20.0", "6"],
+                &["2", "50.0", "20.0", "6"],
+                &["3", "50.0", "20.0", "6"],
+                &["4", "5.0", "5.0", "6"],
+                &["5", "5.0", "5.0", "6"],
+                &["6", "7.0", "7.0", "6"],
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn window_two_specs_and_expression_over_window() {
+        let got = window_rows(
+            "SELECT id, row_number() OVER (ORDER BY id DESC) * 10 AS x, \
+             sum(v) OVER (PARTITION BY grp) AS s FROM w ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            got,
+            rows(&[
+                &["1", "60", "50.0"],
+                &["2", "50", "50.0"],
+                &["3", "40", "50.0"],
+                &["4", "30", "5.0"],
+                &["5", "20", "5.0"],
+                &["6", "10", "7.0"],
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn window_with_where_order_by_and_limit() {
+        // WHERE runs before the window: ids 1..5, v DESC NULLS LAST =
+        // 20(id2) 20(id3) 10(id1) 5(id4) NULL(id5).
+        let got = window_rows(
+            "SELECT id, rank() OVER (ORDER BY v DESC) AS r FROM w WHERE id <= 5 \
+             ORDER BY r, id LIMIT 3",
+        )
+        .await;
+        assert_eq!(got, rows(&[&["2", "1"], &["3", "1"], &["1", "3"]]));
+
+        // ORDER BY the window call itself (unaliased in the select list).
+        let got = window_rows(
+            "SELECT id, rank() OVER (ORDER BY v DESC) FROM w WHERE id <= 5 \
+             ORDER BY rank() OVER (ORDER BY v DESC) DESC, id LIMIT 2",
+        )
+        .await;
+        assert_eq!(got, rows(&[&["5", "5"], &["4", "4"]]));
+    }
+
+    #[tokio::test]
+    async fn window_over_aggregate_with_group_by() {
+        // Group sums: a=50, b=5, NULL=7.
+        let got = window_rows(
+            "SELECT grp, sum(v) AS s, rank() OVER (ORDER BY sum(v) DESC) AS r \
+             FROM w GROUP BY grp ORDER BY grp",
+        )
+        .await;
+        assert_eq!(
+            got,
+            rows(&[&["a", "50", "1"], &["b", "5", "3"], &["NULL", "7", "2"]])
+        );
+    }
+
+    #[tokio::test]
+    async fn window_filtered_in_outer_query() {
+        let got = window_rows(
+            "SELECT id FROM (SELECT id, row_number() OVER (PARTITION BY grp ORDER BY id DESC) \
+             AS rn FROM w) t WHERE rn = 1 ORDER BY id",
+        )
+        .await;
+        assert_eq!(got, rows(&[&["3"], &["5"], &["6"]]));
+    }
+
+    #[tokio::test]
+    async fn window_with_wildcard_expands_only_table_columns() {
+        let got = window_rows(
+            "SELECT *, row_number() OVER (PARTITION BY grp ORDER BY id) AS rn FROM w \
+             WHERE id >= 4 ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            got,
+            rows(&[
+                &["4", "b", "5", "1"],
+                &["5", "b", "NULL", "2"],
+                &["6", "NULL", "7", "1"],
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn window_unsupported_shapes_error_clearly() {
+        let (cm, reg) = window_env();
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        for (sql, needle) in [
+            (
+                "SELECT sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w",
+                "window frame",
+            ),
+            ("SELECT lag(v) OVER (ORDER BY id) FROM w", "not supported"),
+            ("SELECT id FROM w WHERE row_number() OVER () > 1", "window"),
+        ] {
+            let err = execute_query(sql, &cm, &reg, None, &pool)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("expected an error: {sql}"));
+            let msg = err.to_string();
+            assert!(msg.contains(needle), "{sql}: {msg}");
+        }
+    }
 }

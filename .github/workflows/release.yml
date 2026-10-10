@@ -3,10 +3,15 @@ name: Release
 on:
   push:
     branches: [main]
+  # Manual re-run, e.g. to re-sync Cargo.lock on the open release PR.
+  workflow_dispatch:
 
 permissions:
   contents: write
   pull-requests: write
+
+env:
+  RELEASE_BRANCH: release-please--branches--main--components--arneb
 
 jobs:
   release-please:
@@ -20,17 +25,28 @@ jobs:
           manifest-file: .release-please-manifest.json
 
       # release-please bumps `workspace.package.version` in Cargo.toml but not
-      # Cargo.lock. Sync the workspace entries onto the release PR branch here:
+      # Cargo.lock. Sync the workspace entries onto the open release PR here:
       # a separate `on: push` workflow wouldn't fire for GITHUB_TOKEN pushes,
       # and release-please force-pushes the branch on every regeneration.
+      # Look the PR up directly rather than using `outputs.pr`, which is only
+      # set when this run changed the PR.
+      - name: Find open release PR
+        id: release_pr
+        if: ${{ !steps.release.outputs.release_created }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$RELEASE_BRANCH" \
+            --state open --json headRefName --jq '.[0].headRefName // empty')
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
-        if: ${{ steps.release.outputs.pr }}
+        if: ${{ steps.release_pr.outputs.branch }}
         with:
-          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          ref: ${{ steps.release_pr.outputs.branch }}
       - uses: dtolnay/rust-toolchain@stable
-        if: ${{ steps.release.outputs.pr }}
+        if: ${{ steps.release_pr.outputs.branch }}
       - name: Sync Cargo.lock with release version
-        if: ${{ steps.release.outputs.pr }}
+        if: ${{ steps.release_pr.outputs.branch }}
         run: |
           # --workspace only rewrites workspace members' versions; dependency
           # versions stay pinned.

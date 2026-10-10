@@ -24,7 +24,11 @@
           "type": "toml",
           "path": "Cargo.toml",
           "jsonpath": "$.workspace.package.version"
-        }
+        },
+        { "type": "generic", "path": "README.md" },
+        { "type": "generic", "path": "docs/.vitepress/config.ts" },
+        { "type": "generic", "path": "docs/guide/introduction.md" },
+        { "type": "generic", "path": "docs/guide/quickstart.md" }
       ],
       "include-component-in-tag": false
     }

@@ -6,7 +6,8 @@ Arneb is a distributed SQL query engine built in Rust — a Trino alternative de
 
 - **Arrow-Native**: All intermediate data uses [Apache Arrow](https://arrow.apache.org/) columnar format. No row-by-row processing.
 - **PostgreSQL Compatible**: Full Simple and Extended Query wire protocol (v3). Connect with `psql`, DBeaver, JDBC drivers, or `psycopg2` — no special client needed.
-- **Federated Queries**: Query data across CSV files, Parquet files, S3/GCS/Azure object stores, and Hive Metastore catalogs from a single SQL interface.
+- **Trino Client Compatible**: Trino's client REST protocol, so the `trino` CLI, Trino JDBC, `trino-python-client`, Metabase and dbt-trino connect unchanged. See [Trino Clients](/guide/trino-clients).
+- **Federated Queries**: Query data across CSV files, Parquet files, S3/GCS/Azure object stores, and Hive Metastore catalogs (including Iceberg tables) from a single SQL interface.
 - **Distributed Execution**: Coordinator-worker architecture with [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html) RPC for high-throughput data exchange between nodes.
 - **Async Streaming**: Operators return async record batch streams, enabling pipelined execution without materializing full intermediate results.
 - **Pushdown Optimization**: Filters, projections, and limits are pushed into connectors when supported.
@@ -19,11 +20,14 @@ Arneb is a distributed SQL query engine built in Rust — a Trino alternative de
 | S3 | CSV, Parquet | Amazon S3 and S3-compatible stores (MinIO, LocalStack) |
 | GCS | CSV, Parquet | Google Cloud Storage |
 | Azure | CSV, Parquet | Azure Blob Storage |
-| Hive Metastore | Parquet | HMS 4.x catalog with automatic table discovery |
+| Hive Metastore | Parquet, ORC | HMS 4.x catalog with automatic table discovery; partitioned tables read the partitions registered in HMS. See [Hive](/connectors/hive) |
+| Iceberg (via HMS) | Parquet | Read-only, current snapshot, through the Hive catalog. See [Iceberg](/connectors/iceberg) |
 
 ## Current Status
 
-Arneb has completed Phase 1 (single-node) and Phase 2 (distributed execution). The engine passes 16 out of 22 TPC-H benchmark queries. SQL support includes SELECT, DDL/DML, CTEs, window functions, subqueries, and set operations.
+The latest release is **v0.1.1** <!-- x-release-please-version --> ([release notes](https://github.com/formosa-ventures/arneb/releases/latest), [changelog](https://github.com/formosa-ventures/arneb/blob/main/CHANGELOG.md)). Releases are source releases; see [Quickstart](/guide/quickstart#build-a-release).
+
+All 22 TPC-H queries return results cell-identical to Trino, single-node and distributed. SQL support includes SELECT, DDL/DML, CTEs, window functions, subqueries, set operations and 90 Trino-compatible scalar functions.
 
 ## Next Steps
 

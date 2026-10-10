@@ -2,7 +2,7 @@
 
 - [x] 1.1 Add `orc-rust` (git fork pinned to `ba7af4c`, arrow 60) to the workspace; allow the git source in `deny.toml` with a pointer to orc-rust#91
 - [x] 1.2 Confirm `cargo tree -d` has no duplicate `arrow`/`parquet` and `cargo deny --all-features check` passes
-- [ ] 1.3 Switch to the crates.io release once orc-rust publishes arrow 60 support; drop the `allow-git` entry
+- [ ] 1.3 Switch to the crates.io release once orc-rust publishes arrow 60 support; drop the `allow-git` entry (#116)
 
 ## 2. Metadata
 

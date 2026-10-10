@@ -47,6 +47,6 @@ allow-git = [
     # TEMPORARY: orc-rust with the arrow 60 bump (Cargo.toml version bumps only),
     # pinned by rev in the workspace Cargo.toml. Upstream PR:
     # https://github.com/datafusion-contrib/orc-rust/pull/91 — switch back to
-    # the crates.io release once it is published and remove this entry.
+    # the crates.io release once it is published and remove this entry (#116).
     "https://github.com/jackypan1989/orc-rust",
 ]

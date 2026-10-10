@@ -4,7 +4,7 @@ Get Arneb running and execute your first query.
 
 ## Prerequisites
 
-- **Rust toolchain** — version 1.85.0 or later ([install](https://rustup.rs/))
+- **Rust toolchain** — version 1.89.0 or later ([install](https://rustup.rs/))
 - **PostgreSQL client** — `psql` or any PostgreSQL-compatible client
 - **Sample data** (optional) — a Parquet or CSV file to query
 
@@ -19,6 +19,16 @@ cargo build
 For an optimized build:
 
 ```bash
+cargo build --release
+```
+
+### Build a release
+
+`main` moves faster than releases. To build the latest release instead, check out its tag ([all releases](https://github.com/formosa-ventures/arneb/releases)):
+
+```bash
+git clone --branch v0.1.1 https://github.com/formosa-ventures/arneb.git  # x-release-please-version
+cd arneb
 cargo build --release
 ```
 

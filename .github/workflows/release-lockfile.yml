@@ -1,0 +1,37 @@
+name: Release Lockfile
+
+# release-please bumps `workspace.package.version` in Cargo.toml but can't
+# update Cargo.lock, so the release PR would leave the workspace crates at the
+# old version and the first build after a release would dirty the lockfile.
+# Refresh the workspace entries on every push to the release PR branch.
+#
+# The commit is pushed with GITHUB_TOKEN, which doesn't trigger workflows, so
+# this can't loop.
+
+on:
+  push:
+    branches: [release-please--branches--main--components--arneb]
+
+permissions:
+  contents: write
+
+jobs:
+  lockfile:
+    name: Sync Cargo.lock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # --workspace only rewrites workspace members' versions; dependency
+      # versions stay pinned.
+      - run: cargo update --workspace
+      - name: Commit if changed
+        run: |
+          if git diff --quiet Cargo.lock; then
+            echo "Cargo.lock already in sync"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: sync Cargo.lock with release version"
+          git push

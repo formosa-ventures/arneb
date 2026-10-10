@@ -70,7 +70,7 @@ pub(crate) async fn try_handle_metadata(
         || lower.contains("current_schema()")
         || lower.contains("current_user")
     {
-        return Some(handle_current_info(catalog_manager));
+        return Some(handle_current_info(&lower, catalog_manager));
     }
 
     // SET / SHOW / RESET — silently accept session commands
@@ -535,17 +535,22 @@ async fn handle_info_schemata(catalog_manager: &CatalogManager) -> MetaResult {
 // current_database() / current_schema() / current_user
 // ---------------------------------------------------------------------------
 
-fn handle_current_info(catalog_manager: &CatalogManager) -> MetaResult {
+fn handle_current_info(lower: &str, catalog_manager: &CatalogManager) -> MetaResult {
+    // current_schema() reflects the connection's search_path; everything
+    // else reports the default catalog as before.
+    let (name, value) = if lower.contains("current_schema()") {
+        ("current_schema", catalog_manager.default_schema())
+    } else {
+        ("current_database", catalog_manager.default_catalog())
+    };
     let schema = Arc::new(Schema::new(vec![Field::new(
-        "current_database",
+        name,
         ArrowDataType::Utf8,
         false,
     )]));
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(StringArray::from(vec![catalog_manager
-            .default_catalog()
-            .to_string()]))],
+        vec![Arc::new(StringArray::from(vec![value.to_string()]))],
     )
     .map_err(|e| e.to_string())?;
     make_result(schema, batch)
@@ -565,9 +570,8 @@ fn handle_show(lower: &str) -> MetaResult {
         ArrowDataType::Utf8,
         false,
     )]));
-    let value = if lower.contains("search_path") {
-        "\"$user\", public"
-    } else if lower.contains("server_version") {
+    // `SHOW search_path` is answered per connection in `crate::session`.
+    let value = if lower.contains("server_version") {
         "14.0"
     } else {
         ""

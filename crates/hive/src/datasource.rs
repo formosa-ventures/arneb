@@ -202,50 +202,30 @@ fn column_info_to_arrow_schema(columns: &[ColumnInfo]) -> Arc<arrow::datatypes::
 
 /// Connector factory for Hive tables.
 ///
-/// Creates [`HiveDataSource`] instances by resolving the table location
-/// from a pre-populated location map (filled during catalog resolution)
-/// and listing Parquet files at that location.
+/// Creates [`HiveDataSource`] instances from the HMS `location` that
+/// `HiveTableProvider::properties()` attaches to each `TableScan` (and that
+/// travels to workers with the serialized plan), listing the Parquet files
+/// at that location.
 ///
-/// Since [`ConnectorFactory::create_data_source`] is synchronous, the
-/// factory stores a map of table name to location string. The actual
-/// file listing happens lazily inside [`HiveDataSource::scan()`].
+/// Nothing is cached per table: the scan's own properties are the source of
+/// truth. A former cache keyed by bare table name made same-named tables in
+/// different schemas read each other's files (#111).
 pub struct HiveConnectorFactory {
     /// Storage registry for resolving object stores.
     storage_registry: Arc<StorageRegistry>,
-    /// Map of table name → location URI string, populated during catalog resolution.
-    locations: std::sync::RwLock<std::collections::HashMap<String, (String, Vec<ColumnInfo>)>>,
 }
 
 impl HiveConnectorFactory {
     /// Create a new Hive connector factory.
     pub fn new(storage_registry: Arc<StorageRegistry>) -> Self {
-        Self {
-            storage_registry,
-            locations: std::sync::RwLock::new(std::collections::HashMap::new()),
-        }
-    }
-
-    /// Register a table location for later data source creation.
-    ///
-    /// Called during catalog resolution when `HiveTableProvider` metadata
-    /// is available (it carries the HMS location and column schema).
-    pub fn register_table_location(
-        &self,
-        table_name: &str,
-        location: &str,
-        schema: Vec<ColumnInfo>,
-    ) {
-        let mut locations = self.locations.write().unwrap();
-        locations.insert(table_name.to_string(), (location.to_string(), schema));
+        Self { storage_registry }
     }
 }
 
 impl fmt::Debug for HiveConnectorFactory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let locations = self.locations.read().unwrap();
         f.debug_struct("HiveConnectorFactory")
-            .field("tables", &locations.keys().collect::<Vec<_>>())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -268,39 +248,15 @@ impl ConnectorFactory for HiveConnectorFactory {
                 .await;
         }
 
-        // Auto-register location from properties if present and not already registered.
-        // Pre-registered entries (e.g., manual overrides in tests) take precedence.
-        if let Some(location) = properties.get("location") {
-            let already_registered = self.locations.read().unwrap().contains_key(&table.table);
-            if !already_registered {
-                self.register_table_location(&table.table, location, schema.to_vec());
-            }
-        }
+        let location = properties.get("location").ok_or_else(|| {
+            ConnectorError::TableNotFound(format!(
+                "Hive table '{table}' has no location in its properties"
+            ))
+        })?;
 
-        // Look up the registered location for this table.
-        let (location, column_schema) = {
-            let locations = self.locations.read().unwrap();
-            match locations.get(&table.table) {
-                Some(entry) => entry.clone(),
-                None => {
-                    return Err(ConnectorError::TableNotFound(format!(
-                        "Hive table '{}' location not available in properties or pre-registered map",
-                        table.table
-                    )));
-                }
-            }
-        };
-
-        let uri = StorageUri::parse(&location)?;
+        let uri = StorageUri::parse(location)?;
         let store = self.storage_registry.get_store(&uri)?;
         let prefix = uri.object_path();
-
-        // Use the HMS schema if available, otherwise fall back to planner schema.
-        let effective_schema = if column_schema.is_empty() {
-            schema.to_vec()
-        } else {
-            column_schema
-        };
 
         // Pre-list the Parquet files under this prefix so the resulting
         // HiveDataSource exposes one partition per file (phase 3.3).
@@ -310,7 +266,7 @@ impl ConnectorFactory for HiveConnectorFactory {
 
         Ok(Arc::new(HiveDataSource::new(
             store,
-            effective_schema,
+            schema.to_vec(),
             file_paths,
         )))
     }
@@ -594,6 +550,11 @@ mod tests {
 
     // -- HiveConnectorFactory tests --
 
+    /// Table properties as `HiveTableProvider::properties()` produces them.
+    fn location_props(location: &str) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([("location".to_string(), location.to_string())])
+    }
+
     #[tokio::test]
     async fn factory_creates_data_source() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -611,15 +572,11 @@ mod tests {
         registry.register_store("s3://test-bucket", store);
 
         let factory = HiveConnectorFactory::new(registry);
-        factory.register_table_location(
-            "my_table",
-            "s3://test-bucket/data/table",
-            test_column_schema(),
-        );
+        let props = location_props("s3://test-bucket/data/table");
 
         let table_ref = TableReference::table("my_table");
         let ds = factory
-            .create_data_source(&table_ref, &[], &Default::default())
+            .create_data_source(&table_ref, &test_column_schema(), &props)
             .await
             .unwrap();
 
@@ -630,6 +587,63 @@ mod tests {
             total_rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
         }
         assert_eq!(total_rows, 2);
+    }
+
+    /// Regression for #111: same-named tables in different schemas must each
+    /// read their own location, whichever is created first.
+    #[tokio::test]
+    async fn factory_same_table_name_in_two_schemas() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for (dir, ids) in [
+            ("tpch/orders", vec![1, 2]),
+            ("tpch_decimal/orders", vec![7]),
+        ] {
+            let names = vec!["x"; ids.len()];
+            store
+                .put(
+                    &ObjectPath::from(format!("wh/{dir}/part.parquet")),
+                    PutPayload::from_bytes(write_parquet_bytes(ids, names).into()),
+                )
+                .await
+                .unwrap();
+        }
+        let registry = Arc::new(StorageRegistry::new());
+        registry.register_store("s3://lake", store);
+
+        async fn ids(factory: &HiveConnectorFactory, schema: &str) -> Vec<i32> {
+            let table = TableReference {
+                catalog: Some("datalake".to_string()),
+                schema: Some(schema.to_string()),
+                table: "orders".to_string(),
+            };
+            let props = location_props(&format!("s3://lake/wh/{schema}/orders"));
+            let ds = factory
+                .create_data_source(&table, &test_column_schema(), &props)
+                .await
+                .unwrap();
+            let mut out = Vec::new();
+            for p in 0..ds.partition_count() {
+                let stream = ds.scan(&ScanContext::default(), p).await.unwrap();
+                for b in collect_stream(stream).await.unwrap() {
+                    let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                    out.extend(col.values().iter().copied());
+                }
+            }
+            out.sort();
+            out
+        }
+
+        for order in [["tpch", "tpch_decimal"], ["tpch_decimal", "tpch"]] {
+            let factory = HiveConnectorFactory::new(registry.clone());
+            for schema in order {
+                let want = if schema == "tpch" {
+                    vec![1, 2]
+                } else {
+                    vec![7]
+                };
+                assert_eq!(ids(&factory, schema).await, want, "schema {schema}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -673,10 +687,8 @@ mod tests {
     fn factory_debug() {
         let registry = Arc::new(StorageRegistry::new());
         let factory = HiveConnectorFactory::new(registry);
-        factory.register_table_location("tbl", "s3://bucket/path", vec![]);
         let debug_str = format!("{factory:?}");
         assert!(debug_str.contains("HiveConnectorFactory"));
-        assert!(debug_str.contains("tbl"));
     }
 
     // -- Compression codec tests --
@@ -772,15 +784,11 @@ mod tests {
     async fn factory_with_local_filesystem() {
         let registry = Arc::new(StorageRegistry::new());
         let factory = HiveConnectorFactory::new(registry);
-        factory.register_table_location(
-            "local_table",
-            "/data/warehouse/db/tbl",
-            test_column_schema(),
-        );
+        let props = location_props("/data/warehouse/db/tbl");
 
         let table_ref = TableReference::table("local_table");
         let ds = factory
-            .create_data_source(&table_ref, &[], &Default::default())
+            .create_data_source(&table_ref, &test_column_schema(), &props)
             .await
             .unwrap();
 

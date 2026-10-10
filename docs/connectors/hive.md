@@ -68,12 +68,20 @@ projection. Hidden files and directories (names starting with `.` or `_`, e.g.
 ## Partitioned Tables
 
 Partition key columns follow the data columns (`SELECT *` order, as in Hive and
-Trino). Their values come from the `key=value` directories between the table
-location and each data file: Hive path escapes (`%2F`, `%3A`, ...) are decoded and
-`__HIVE_DEFAULT_PARTITION__` reads as NULL. A file that is not under a directory
-for every partition key fails the query. Partitions registered in HMS at custom
-locations outside the table directory are not read, and filters on partition
-columns do not yet prune directories.
+Trino). As in Trino and Hive, a partitioned table reads exactly the partitions
+registered in HMS, each at its own location:
+
+- The partitions (values and locations) are fetched from HMS when the query is
+  planned and travel with the plan to workers.
+- A partition registered at a custom location, even outside the table directory
+  or in another bucket (`ALTER TABLE ... ADD PARTITION ... LOCATION`), is read.
+- Directories under the table location that are not registered partitions (files
+  written before `ADD PARTITION` / `MSCK REPAIR`, or left behind by a drop) and
+  stray files at the table root are ignored.
+- `__HIVE_DEFAULT_PARTITION__` reads as NULL. A partition without a location in
+  HMS uses Hive's default `key=value` layout under the table location.
+
+Filters on partition columns do not yet prune partitions.
 
 ## Unsupported Tables
 

@@ -20,6 +20,8 @@ async-trait.workspace = true
 futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 hive-metastore = { path = "../hive-metastore" }
 volo-thrift = "0.12"
 pilota = "0.13"

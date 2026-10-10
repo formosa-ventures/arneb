@@ -21,9 +21,10 @@ Trino-written Hive tables. This is the ORC slice of the broader
   widenings (int→bigint, float→double, int→decimal/double, decimal
   precision/scale) are cast; any other type mismatch is an error naming the column.
 - Hive partitioned tables (both formats): partition key columns are appended to
-  the table schema and filled from the `key=value` directories (Hive path
-  unescaping, `__HIVE_DEFAULT_PARTITION__` → NULL). Hidden directories
-  (`.trino-staging`, `_temporary`) are skipped.
+  the table schema. The partitions registered in HMS (values and locations) are
+  read, each at its own location, as in Trino; unregistered directories and
+  stray files are ignored. `__HIVE_DEFAULT_PARTITION__` → NULL. Hidden
+  directories (`.trino-staging`, `_temporary`) are skipped.
 - Hive ACID tables are rejected with a clear error: `transactional=true` in HMS,
   `base_N` / `delta_N_M` directories, or ACID-layout ORC files.
 - The table-schema batch adapter (`ColumnSource`, `adapt_batch`, `remap_filter`)

@@ -24,7 +24,7 @@ use arneb_planner::PlanExpr;
 use arneb_sql_parser::ast::BinaryOp;
 
 use crate::catalog::HiveTableProvider;
-use crate::datasource::{props, HiveConnectorFactory};
+use crate::datasource::{props, HiveConnectorFactory, HivePartition};
 use arneb_catalog::TableProvider;
 
 const ORC_INPUT: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
@@ -112,26 +112,29 @@ fn people_columns() -> Vec<ColumnInfo> {
 }
 
 struct Table {
+    /// `s3://lake`, where the tables live.
     store: Arc<dyn ObjectStore>,
+    /// `s3://other`, for partitions stored outside the table's bucket.
+    other: Arc<dyn ObjectStore>,
     factory: HiveConnectorFactory,
 }
 
 impl Table {
     fn new() -> Self {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let other: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let registry = Arc::new(StorageRegistry::new());
         registry.register_store("s3://lake", store.clone());
+        registry.register_store("s3://other", other.clone());
         Self {
             store,
+            other,
             factory: HiveConnectorFactory::new(registry),
         }
     }
 
     async fn put(&self, path: &str, bytes: Vec<u8>) {
-        self.store
-            .put(&ObjectPath::parse(path).unwrap(), PutPayload::from(bytes))
-            .await
-            .unwrap();
+        put(&self.store, path, bytes).await;
     }
 
     /// Create the data source the way the planner does: schema and
@@ -153,6 +156,20 @@ impl Table {
             )
             .await
             .map_err(|e| e.to_string())
+    }
+}
+
+async fn put(store: &Arc<dyn ObjectStore>, path: &str, bytes: Vec<u8>) {
+    store
+        .put(&ObjectPath::parse(path).unwrap(), PutPayload::from(bytes))
+        .await
+        .unwrap();
+}
+
+fn partition(values: &[&str], location: &str) -> HivePartition {
+    HivePartition {
+        values: values.iter().map(|v| v.to_string()).collect(),
+        location: location.to_string(),
     }
 }
 
@@ -464,13 +481,131 @@ async fn parquet_partitioned_table_reads_values_from_paths() {
 }
 
 #[tokio::test]
-async fn file_outside_partition_directory_is_an_error() {
+async fn without_hms_partitions_files_outside_partition_directories_are_skipped() {
+    // Directory discovery (no HMS partitions): a stray file at the table
+    // root must not make the table unreadable; Trino ignores it.
     let t = Table::new();
     t.put("w/pt/stray.orc", orc_bytes(&[people(&[1])])).await;
-    let table = orc_table("s3://lake/w/pt", people_columns())
-        .with_partition_columns(vec![col("ds", DataType::Utf8)]);
-    let err = t.try_open("pt", table).await.unwrap_err();
-    assert!(err.contains("'ds=<value>' partition directory"), "{err}");
+    t.put("w/pt/ds=a/f.orc", orc_bytes(&[people(&[2])])).await;
+    let table = orc_table(
+        "s3://lake/w/pt",
+        people_columns().into_iter().take(1).collect(),
+    )
+    .with_partition_columns(vec![col("ds", DataType::Utf8)]);
+    let ds = t.open("pt", table).await;
+    assert_eq!(scan_rows(&ds, ScanContext::default()).await, vec!["2|a"]);
+}
+
+/// A table partitioned by `ds` (varchar), one ORC file per directory.
+async fn ds_partitioned(t: &Table, root: &str, dirs: &[(&str, i32)]) -> HiveTableProvider {
+    for (dir, id) in dirs {
+        t.put(&format!("{root}/{dir}/f.orc"), orc_bytes(&[people(&[*id])]))
+            .await;
+    }
+    orc_table(
+        &format!("s3://lake/{root}"),
+        people_columns().into_iter().take(1).collect(),
+    )
+    .with_partition_columns(vec![col("ds", DataType::Utf8)])
+}
+
+#[tokio::test]
+async fn hms_partitions_ignore_unregistered_directories_and_stray_files() {
+    let t = Table::new();
+    let table = ds_partitioned(&t, "w/hp", &[("ds=a", 1), ("ds=b", 2), ("ds=ghost", 3)]).await;
+    // Files at the table root belong to no partition.
+    t.put("w/hp/strayfile", orc_bytes(&[people(&[4])])).await;
+    let table = table.with_partitions(vec![
+        partition(&["a"], "s3://lake/w/hp/ds=a"),
+        partition(&["b"], "s3://lake/w/hp/ds=b"),
+    ]);
+    let ds = t.open("hp", table).await;
+    assert_eq!(
+        scan_rows(&ds, ScanContext::default()).await,
+        vec!["1|a", "2|b"]
+    );
+}
+
+#[tokio::test]
+async fn hms_partition_outside_the_table_directory_is_read() {
+    let t = Table::new();
+    let table = ds_partitioned(&t, "w/hp", &[("ds=a", 1)]).await;
+    // `ALTER TABLE ... ADD PARTITION ... LOCATION` in another bucket, under
+    // a directory name that says nothing about the partition.
+    put(&t.other, "elsewhere/data/f.orc", orc_bytes(&[people(&[5])])).await;
+    let table = table.with_partitions(vec![
+        partition(&["a"], "s3://lake/w/hp/ds=a"),
+        partition(&["z"], "s3://other/elsewhere/data"),
+    ]);
+    let ds = t.open("hp", table).await;
+    assert_eq!(
+        scan_rows(&ds, ScanContext::default()).await,
+        vec!["1|a", "5|z"]
+    );
+}
+
+#[tokio::test]
+async fn hms_partition_without_location_uses_the_default_layout() {
+    let t = Table::new();
+    // Hive escapes '/' and ':' in partition directory names.
+    t.put("w/dl/ds=x%2Fy%3Az/f.orc", orc_bytes(&[people(&[6])]))
+        .await;
+    t.put(
+        "w/dl/ds=__HIVE_DEFAULT_PARTITION__/f.orc",
+        orc_bytes(&[people(&[7])]),
+    )
+    .await;
+    let table = orc_table(
+        "s3://lake/w/dl/",
+        people_columns().into_iter().take(1).collect(),
+    )
+    .with_partition_columns(vec![col("ds", DataType::Utf8)])
+    .with_partitions(vec![
+        partition(&["x/y:z"], ""),
+        partition(&["__HIVE_DEFAULT_PARTITION__"], ""),
+    ]);
+    let ds = t.open("dl", table).await;
+    assert_eq!(
+        scan_rows(&ds, ScanContext::default()).await,
+        vec!["6|x/y:z", "7|NULL"]
+    );
+}
+
+#[tokio::test]
+async fn hms_partitions_empty_or_missing_data_read_as_empty() {
+    let t = Table::new();
+    let table = ds_partitioned(&t, "w/hp", &[("ds=a", 1)]).await;
+    // A table with no registered partitions is empty, whatever its
+    // directory holds; a registered partition with no files adds no rows.
+    let ds = t.open("hp", table.clone().with_partitions(vec![])).await;
+    assert!(scan_rows(&ds, ScanContext::default()).await.is_empty());
+    let ds = t
+        .open(
+            "hp",
+            table.with_partitions(vec![partition(&["b"], "s3://lake/w/hp/ds=b")]),
+        )
+        .await;
+    assert!(scan_rows(&ds, ScanContext::default()).await.is_empty());
+}
+
+#[tokio::test]
+async fn hms_partition_values_are_typed_and_validated() {
+    let t = Table::new();
+    t.put("w/ty/p=1/f.orc", orc_bytes(&[people(&[1])])).await;
+    let table = |values: &[&str]| {
+        orc_table(
+            "s3://lake/w/ty",
+            people_columns().into_iter().take(1).collect(),
+        )
+        .with_partition_columns(vec![col("p", DataType::Int32)])
+        .with_partitions(vec![partition(values, "s3://lake/w/ty/p=1")])
+    };
+    let ds = t.open("ty", table(&["1"])).await;
+    assert_eq!(scan_rows(&ds, ScanContext::default()).await, vec!["1|1"]);
+    let err = t.try_open("ty", table(&["x"])).await.unwrap_err();
+    assert!(err.contains("not a valid"), "{err}");
+    let err = t.try_open("ty", table(&["1", "2"])).await.unwrap_err();
+    assert!(err.contains("has 2 values"), "{err}");
 }
 
 #[tokio::test]
@@ -559,8 +694,18 @@ async fn provider_properties_carry_format_and_partitioning() {
     assert_eq!(p[props::INPUT_FORMAT], ORC_INPUT);
     assert_eq!(p[props::SERDE_LIB], ORC_SERDE);
     assert_eq!(p[props::PARTITION_COLUMNS], "1");
+    assert!(!p.contains_key(props::PARTITIONS));
     assert!(!p.contains_key(props::TRANSACTIONAL));
     assert_eq!(table.schema().last().unwrap().name, "ds");
+
+    // HMS partitions travel as JSON, distinguishing "none registered" from
+    // "not fetched".
+    let p = table.clone().with_partitions(vec![]).properties();
+    assert_eq!(p[props::PARTITIONS], "[]");
+    let parts = vec![partition(&["2024-01-01"], "s3://lake/w/pt/ds=2024-01-01")];
+    let p = table.with_partitions(parts.clone()).properties();
+    let decoded: Vec<HivePartition> = serde_json::from_str(&p[props::PARTITIONS]).unwrap();
+    assert_eq!(decoded, parts);
 }
 
 /// Trino-written ORC file (Hive connector, default ZLIB), produced by

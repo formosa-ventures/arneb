@@ -16,11 +16,13 @@
 - [x] 3.3 ORC reader (`crates/hive/src/orc.rs`): object-store chunk reader, name/positional column mapping, widening checks, stripe/row-slice splits
 - [x] 3.4 Partition values from `key=value` paths for both formats; skip hidden directories
 - [x] 3.5 Reject ACID tables (HMS flag, directory layout, ORC envelope)
+- [x] 3.6 Read partitions from HMS (`get_partitions_req`) at each partition's own location, carried in the scan properties; unregistered directories and stray files are ignored (review on #113)
 
 ## 4. Validation
 
 - [x] 4.1 Tier 1: unit/integration tests (orc-rust-written files, a Trino-written all-types fixture, partitioned ORC + Parquet, projection, filters, NULLs, case-insensitive names, splits, ACID and format errors, SQL end-to-end)
 - [x] 4.2 Tier 2: TPC-H SF1 ORC (DOUBLE + DECIMAL) 22/22 cell-diff vs Trino, standalone and coordinator + 2 workers; Parquet re-run unchanged; partitioned / escaped / timestamp ORC tables vs Trino
+- [x] 4.3 Tier 2 (HMS partitions): unregistered `9-GHOST` directory, stray root file, partition registered in another directory, and escaped varchar values (`a/b`, `x=y%z`, spaces, NULL) cell-diffed vs Trino, standalone and coordinator + 2 workers
 
 ## 5. Docs
 

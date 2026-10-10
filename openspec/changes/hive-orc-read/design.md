@@ -65,13 +65,32 @@ generated timestamps (Tier 2).
 
 ### 7. Partitioned tables
 
-Partition keys are appended to the schema (Hive `SELECT *` order). Values are
-parsed per file from `key=value` directory names relative to the table
-location, `%XX`-unescaped, `__HIVE_DEFAULT_PARTITION__` → NULL, then cast from
-text to the column type at construction (invalid values fail the scan). A file
-not under a directory for every key is an error. Filters on partition columns
-are not pushed into Parquet (they still run in `FilterExec`). This applies to
-Parquet too, which previously dropped partition columns entirely.
+Partition keys are appended to the schema (Hive `SELECT *` order). The
+partitions come from HMS, not from a listing of the table directory, so Arneb
+reads the same data as Trino and Hive (review on #113):
+
+- When a partitioned table is resolved, `HmsClient::get_partitions`
+  (`get_partitions_req`, column schemas skipped) fetches every partition's
+  values and `sd.location`. `HiveTableProvider::properties()` carries them as a
+  JSON `partitions` property, so they reach workers with the plan, like
+  `location`.
+- `HiveDataSource::open_partitions` lists the data files of each partition at
+  its own location, resolving the object store per partition (a partition may
+  live in another bucket). A partition without a location uses Hive's default
+  `<table>/<key>=<value>` layout with Hive's path escaping. Locations are used
+  as literal object keys: Hive writes `ds=a%2Fb` as is, so the `%` must not be
+  re-encoded.
+- Values are cast from text to the column type at construction
+  (`__HIVE_DEFAULT_PARTITION__` → NULL; invalid values fail the scan).
+- Unregistered `key=value` directories and stray files are never read.
+- Without the `partitions` property (tables built without HMS, e.g. in tests),
+  partitions are discovered from `key=value` directories, and files not under a
+  directory for every key are skipped, as Trino ignores them.
+
+Filters on partition columns are not pushed into Parquet (they still run in
+`FilterExec`). This applies to Parquet too, which previously dropped partition
+columns entirely. Partition pruning can later filter the HMS partition list
+before any listing.
 
 ### 8. ACID
 
@@ -87,6 +106,7 @@ files whose root columns are the ACID envelope
 - **Performance**: ORC is ~1.35–1.6× slower than Parquet at SF1 (no row-index
   predicate pushdown; one GET per stream; row-slice splits re-fetch the shared
   stripe). Follow-ups: `with_predicate` row-index pruning, coalesced stream reads.
-- Partition values come from the directory listing, not HMS partition metadata:
-  partitions registered at custom locations outside the table directory are not
-  read.
+- The full partition list is fetched from HMS and shipped in the plan, so tables
+  with very many partitions cost one large HMS call and a larger plan. Partition
+  pruning (filtering the list by partition predicates before listing) is the
+  follow-up.

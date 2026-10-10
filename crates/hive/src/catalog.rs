@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hive_metastore::{
-    ColumnStatisticsData, GetTableRequest, TableStatsRequest, ThriftHiveMetastoreClient,
-    ThriftHiveMetastoreClientBuilder,
+    ColumnStatisticsData, GetTableRequest, PartitionsRequest, TableStatsRequest,
+    ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
 };
 use pilota::FastStr;
 use tracing::{debug, warn};
@@ -22,6 +22,7 @@ use arneb_common::error::ConnectorError;
 use arneb_common::types::{ColumnInfo, DataType};
 use arneb_connectors::storage::StorageRegistry;
 
+use crate::datasource::HivePartition;
 use crate::hive_type_to_arrow;
 
 // ---------------------------------------------------------------------------
@@ -41,7 +42,8 @@ pub struct HiveTableMeta {
     /// `org.apache.hadoop.hive.ql.io.orc.OrcSerde`).
     pub serde_lib: String,
     /// Partition key columns (`PARTITIONED BY`), in declaration order.
-    /// Their values come from the `key=value` partition directory names.
+    /// The partitions themselves (values and locations) are fetched
+    /// separately with [`HmsClient::get_partitions`].
     pub partition_columns: Vec<ColumnInfo>,
     /// Approximate row count, parsed from `Table.parameters["numRows"]`
     /// when HMS recorded it (typically after CTAS, INSERT INTO, or
@@ -229,6 +231,58 @@ impl HmsClient {
             column_stats,
             parameters,
         })
+    }
+
+    /// Fetch every registered partition of a table: its values (one per
+    /// partition column, in order) and its storage location.
+    ///
+    /// Uses `get_partitions_req`, the request form HMS 4.x serves, and skips
+    /// the per-partition column schema to keep the response small.
+    pub async fn get_partitions(
+        &self,
+        db: &str,
+        table: &str,
+    ) -> Result<Vec<HivePartition>, ConnectorError> {
+        let req = PartitionsRequest {
+            cat_name: None,
+            db_name: FastStr::from(db.to_string()),
+            tbl_name: FastStr::from(table.to_string()),
+            max_parts: Some(-1),
+            valid_write_id_list: None,
+            id: None,
+            skip_column_schema_for_partition: Some(true),
+            include_param_key_pattern: None,
+            exclude_param_key_pattern: None,
+        };
+        let result = self.client.get_partitions_req(req).await.map_err(|e| {
+            ConnectorError::ConnectionFailed(format!(
+                "HMS get_partitions_req({db}.{table}) failed: {e}"
+            ))
+        })?;
+        let partitions = match result {
+            MaybeException::Ok(resp) => resp.partitions,
+            MaybeException::Exception(ex) => {
+                return Err(ConnectorError::ReadError(format!(
+                    "HMS get_partitions_req({db}.{table}) exception: {ex:?}"
+                )));
+            }
+        };
+        Ok(partitions
+            .into_iter()
+            .map(|p| HivePartition {
+                values: p
+                    .values
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|v| v.to_string())
+                    .collect(),
+                location: p
+                    .sd
+                    .and_then(|sd| sd.location)
+                    .map(|l| l.to_string())
+                    .unwrap_or_default(),
+            })
+            .collect())
     }
 
     /// Fetch per-column statistics (NDV, null count, low/high) for the
@@ -490,17 +544,37 @@ impl SchemaProvider for HiveSchemaProvider {
                     }
                 }
             }
-            Ok(meta) => Some(Arc::new(HiveTableProvider {
-                transactional: is_transactional(&meta.parameters),
-                columns: meta.columns,
-                partition_columns: meta.partition_columns,
-                location: meta.location,
-                input_format: meta.input_format,
-                serde_lib: meta.serde_lib,
-                row_count: meta.row_count,
-                size_bytes: meta.size_bytes,
-                column_stats: meta.column_stats,
-            })),
+            Ok(meta) => {
+                // A partitioned table reads exactly the partitions registered
+                // in HMS, each at its own location (as Trino and Hive do), not
+                // whatever `key=value` directories sit under the table root.
+                let partitions = if meta.partition_columns.is_empty() {
+                    None
+                } else {
+                    match self.client.get_partitions(&self.database, name).await {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            warn!(
+                                "failed to get HMS partitions of '{}.{}': {e}",
+                                self.database, name
+                            );
+                            return None;
+                        }
+                    }
+                };
+                Some(Arc::new(HiveTableProvider {
+                    transactional: is_transactional(&meta.parameters),
+                    columns: meta.columns,
+                    partition_columns: meta.partition_columns,
+                    partitions,
+                    location: meta.location,
+                    input_format: meta.input_format,
+                    serde_lib: meta.serde_lib,
+                    row_count: meta.row_count,
+                    size_bytes: meta.size_bytes,
+                    column_stats: meta.column_stats,
+                }))
+            }
             Err(e) => {
                 warn!("failed to get HMS table '{}.{}': {e}", self.database, name);
                 None
@@ -530,6 +604,10 @@ fn is_transactional(parameters: &HashMap<String, String>) -> bool {
 pub struct HiveTableProvider {
     columns: Vec<ColumnInfo>,
     partition_columns: Vec<ColumnInfo>,
+    /// Registered partitions of a partitioned table, from HMS. `None` for an
+    /// unpartitioned table, or a partitioned one built without HMS (tests),
+    /// whose scan then falls back to `key=value` directory discovery.
+    partitions: Option<Vec<HivePartition>>,
     /// Object-store path for the table data.
     pub location: String,
     /// HMS input format class name.
@@ -563,6 +641,7 @@ impl HiveTableProvider {
         Self {
             columns,
             partition_columns: Vec::new(),
+            partitions: None,
             location,
             input_format,
             serde_lib: String::new(),
@@ -583,6 +662,12 @@ impl HiveTableProvider {
     /// Set the partition key columns; they are appended to the schema.
     pub fn with_partition_columns(mut self, partition_columns: Vec<ColumnInfo>) -> Self {
         self.partition_columns = partition_columns;
+        self
+    }
+
+    /// Set the table's registered partitions (values and locations).
+    pub fn with_partitions(mut self, partitions: Vec<HivePartition>) -> Self {
+        self.partitions = Some(partitions);
         self
     }
 
@@ -627,6 +712,12 @@ impl TableProvider for HiveTableProvider {
             p.insert(
                 props::PARTITION_COLUMNS.to_string(),
                 self.partition_columns.len().to_string(),
+            );
+        }
+        if let Some(partitions) = &self.partitions {
+            p.insert(
+                props::PARTITIONS.to_string(),
+                crate::datasource::encode_partitions(partitions),
             );
         }
         if self.transactional {

@@ -285,6 +285,8 @@ dependencies = [
  "orc-rust",
  "parquet",
  "pilota",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

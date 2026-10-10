@@ -35,19 +35,27 @@ scan partitioning and projection as Parquet tables.
 - **THEN** the system SHALL return the wall-clock value in the writer time zone recorded in the file, matching Trino
 
 ### Requirement: Read partitioned Hive tables
-The `HiveDataSource` SHALL expose a partitioned table's partition key columns after its data columns and fill them for each file from the `key=value` directories between the table location and the file.
+The `HiveDataSource` SHALL expose a partitioned table's partition key columns after its data columns, SHALL read exactly the partitions registered in Hive Metastore, each at its own location, and SHALL fill the partition columns from each partition's HMS values.
 
-#### Scenario: Partition values from paths
-- **WHEN** a file lives under `k=a%2Fb/day=2024-01-01/`
-- **THEN** its rows SHALL have `k = 'a/b'` and `day = DATE '2024-01-01'`
+#### Scenario: Partition values from HMS
+- **WHEN** a partition is registered with values `('a/b', '2024-01-01')` for keys `k varchar, day date`
+- **THEN** the rows of its files SHALL have `k = 'a/b'` and `day = DATE '2024-01-01'`
 
 #### Scenario: Default partition
-- **WHEN** a partition directory value is `__HIVE_DEFAULT_PARTITION__`
-- **THEN** the partition column SHALL be NULL for that file's rows
+- **WHEN** a partition value is `__HIVE_DEFAULT_PARTITION__`
+- **THEN** the partition column SHALL be NULL for that partition's rows
 
-#### Scenario: File outside the partition layout
-- **WHEN** a data file is not under a directory for every partition key
-- **THEN** creating the data source SHALL fail with an error naming the file and the missing key
+#### Scenario: Partition outside the table directory
+- **WHEN** a partition is registered at a location outside the table directory
+- **THEN** its files SHALL be read
+
+#### Scenario: Unregistered partition directory
+- **WHEN** a `key=value` directory under the table location is not a registered partition
+- **THEN** its files SHALL NOT be read
+
+#### Scenario: Stray file
+- **WHEN** a data file sits under the table location but in no registered partition
+- **THEN** it SHALL be ignored and the table SHALL remain readable
 
 ### Requirement: Reject unsupported Hive tables
 The `HiveDataSource` SHALL fail with a clear error, and SHALL NOT attempt a best-effort read, for Hive ACID tables and for storage formats other than Parquet and ORC.

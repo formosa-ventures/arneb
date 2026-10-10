@@ -7,9 +7,10 @@
 //! descriptor (see [`HiveFileFormat`]); everything else — file listing,
 //! partition values, splits, projection — is shared by both formats.
 //!
-//! [`HiveConnectorFactory`] creates [`HiveDataSource`] instances by
-//! resolving the table location from the catalog and listing the data
-//! files at that location.
+//! [`HiveConnectorFactory`] creates [`HiveDataSource`] instances from the
+//! scan's properties: an unpartitioned table lists the files at its
+//! location; a partitioned table lists the files of each partition
+//! registered in HMS, at that partition's own location.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -22,6 +23,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use arneb_common::error::{ConnectorError, ExecutionError};
@@ -49,6 +51,11 @@ pub mod props {
     /// Number of partition key columns; they are the last columns of the
     /// table schema.
     pub const PARTITION_COLUMNS: &str = "partition_columns";
+    /// The partitions registered in HMS, as a JSON array of
+    /// [`HivePartition`](super::HivePartition). Absent on a partitioned
+    /// table built without HMS, whose scan then discovers partitions from
+    /// `key=value` directories under the table location.
+    pub const PARTITIONS: &str = "partitions";
     /// `"true"` for Hive ACID (transactional) tables.
     pub const TRANSACTIONAL: &str = "transactional";
 }
@@ -84,9 +91,33 @@ impl HiveFileFormat {
     }
 }
 
+/// A partition registered in Hive Metastore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HivePartition {
+    /// Raw partition values, one per partition column, in column order.
+    pub values: Vec<String>,
+    /// Object-store URI of the partition's data directory. Empty when HMS
+    /// recorded none, in which case Hive's default layout under the table
+    /// location applies.
+    pub location: String,
+}
+
+/// Encode partitions for the [`props::PARTITIONS`] scan property.
+pub fn encode_partitions(partitions: &[HivePartition]) -> String {
+    serde_json::to_string(partitions).expect("HivePartition serializes to JSON")
+}
+
+fn decode_partitions(json: &str) -> Result<Vec<HivePartition>, ConnectorError> {
+    serde_json::from_str(json)
+        .map_err(|e| ConnectorError::ReadError(format!("invalid Hive partitions property: {e}")))
+}
+
 /// One data file and the values of the table's partition columns for it.
 #[derive(Debug, Clone)]
 struct HiveFile {
+    /// Store holding the file: a partition may live in another bucket than
+    /// the table.
+    store: Arc<dyn ObjectStore>,
     path: ObjectPath,
     /// One-row array per partition column, in the column's table type.
     partition_values: Vec<ArrayRef>,
@@ -104,18 +135,16 @@ struct HiveFile {
 /// partition `i` reads one split of one file.
 ///
 /// The schema is the table's data columns followed by its partition
-/// columns, whose values come from the `key=value` directories each file
-/// lives under.
+/// columns, whose values come from each file's HMS partition (or, without
+/// HMS partitions, from the `key=value` directories it lives under).
 pub struct HiveDataSource {
-    /// Object store backend (local, S3, GCS, Azure, etc.).
-    store: Arc<dyn ObjectStore>,
     /// Column schema from HMS metadata: data columns, then partition columns.
     column_schema: Vec<ColumnInfo>,
     /// Number of trailing partition columns in `column_schema`.
     partition_column_count: usize,
     /// Data file format.
     format: HiveFileFormat,
-    /// Pre-listed data files under the table's storage prefix.
+    /// Pre-listed data files of the table.
     files: Vec<HiveFile>,
     /// Number of logical sub-partitions per file (1 = legacy
     /// one-partition-per-file). Each sub-partition reads a slice of the
@@ -139,15 +168,15 @@ impl HiveDataSource {
         let files = file_paths
             .into_iter()
             .map(|path| HiveFile {
+                store: store.clone(),
                 path,
                 partition_values: Vec::new(),
             })
             .collect();
-        Self::with_files(store, column_schema, 0, HiveFileFormat::Parquet, files)
+        Self::with_files(column_schema, 0, HiveFileFormat::Parquet, files)
     }
 
     fn with_files(
-        store: Arc<dyn ObjectStore>,
         column_schema: Vec<ColumnInfo>,
         partition_column_count: usize,
         format: HiveFileFormat,
@@ -155,7 +184,6 @@ impl HiveDataSource {
     ) -> Self {
         let splits_per_file = parquet_scan::splits_per_file(files.len());
         Self {
-            store,
             column_schema,
             partition_column_count,
             format,
@@ -180,8 +208,10 @@ impl HiveDataSource {
     ///
     /// `column_schema` is the table's data columns followed by its
     /// `partition_column_count` partition columns. Fails on Hive ACID
-    /// directory layouts (`base_N` / `delta_N_M`) and on files that are not
-    /// under a directory for every partition column.
+    /// directory layouts (`base_N` / `delta_N_M`). For a partitioned table,
+    /// files not under a directory for every partition column are skipped,
+    /// as Trino ignores them. Partitioned tables from HMS use
+    /// [`open_partitions`](Self::open_partitions) instead.
     pub async fn open(
         store: Arc<dyn ObjectStore>,
         prefix: ObjectPath,
@@ -189,26 +219,79 @@ impl HiveDataSource {
         format: HiveFileFormat,
         partition_column_count: usize,
     ) -> Result<Self, ExecutionError> {
-        if partition_column_count > column_schema.len() {
-            return Err(ExecutionError::InvalidOperation(format!(
-                "Hive table has {partition_column_count} partition columns but only {} columns",
-                column_schema.len()
-            )));
+        let partition_columns = partition_columns(&column_schema, partition_column_count)?;
+        let mut files = Vec::new();
+        for path in list_data_files(&store, &prefix).await? {
+            let Some(raw) = directory_partition_values(&prefix, &path, partition_columns) else {
+                debug!("skipping '{path}': not under a directory for every partition column");
+                continue;
+            };
+            let partition_values = typed_partition_values(&raw, partition_columns, &path)?;
+            files.push(HiveFile {
+                store: store.clone(),
+                path,
+                partition_values,
+            });
         }
-        let partition_columns = &column_schema[column_schema.len() - partition_column_count..];
-        let files = list_data_files(&store, &prefix)
-            .await?
-            .into_iter()
-            .map(|path| {
-                let partition_values = partition_values(&prefix, &path, partition_columns)?;
-                Ok(HiveFile {
-                    path,
-                    partition_values,
-                })
-            })
-            .collect::<Result<Vec<_>, ExecutionError>>()?;
         Ok(Self::with_files(
-            store,
+            column_schema,
+            partition_column_count,
+            format,
+            files,
+        ))
+    }
+
+    /// List the data files of each registered partition, at that
+    /// partition's own location, the way Trino and Hive read a partitioned
+    /// table. Files under the table location that belong to no registered
+    /// partition are never read.
+    ///
+    /// A partition without a location falls back to Hive's default layout,
+    /// `<table location>/<key>=<value>/...`.
+    pub async fn open_partitions(
+        registry: &StorageRegistry,
+        table_location: &str,
+        column_schema: Vec<ColumnInfo>,
+        format: HiveFileFormat,
+        partition_column_count: usize,
+        partitions: &[HivePartition],
+    ) -> Result<Self, ConnectorError> {
+        let partition_columns = partition_columns(&column_schema, partition_column_count)
+            .map_err(|e| ConnectorError::ReadError(e.to_string()))?;
+        let mut files = Vec::new();
+        for partition in partitions {
+            if partition.values.len() != partition_columns.len() {
+                return Err(ConnectorError::ReadError(format!(
+                    "Hive partition {:?} has {} values but the table has {} partition columns",
+                    partition.values,
+                    partition.values.len(),
+                    partition_columns.len()
+                )));
+            }
+            let location = if partition.location.is_empty() {
+                default_partition_location(table_location, partition_columns, &partition.values)
+            } else {
+                partition.location.clone()
+            };
+            let uri = StorageUri::parse(&location)?;
+            let store = registry.get_store(&uri)?;
+            let prefix = literal_object_path(&uri);
+            let paths = list_data_files(&store, &prefix)
+                .await
+                .map_err(|e| ConnectorError::ReadError(e.to_string()))?;
+            if paths.is_empty() {
+                continue;
+            }
+            let raw: Vec<&str> = partition.values.iter().map(String::as_str).collect();
+            let partition_values = typed_partition_values(&raw, partition_columns, &location)
+                .map_err(|e| ConnectorError::ReadError(e.to_string()))?;
+            files.extend(paths.into_iter().map(|path| HiveFile {
+                store: store.clone(),
+                path,
+                partition_values: partition_values.clone(),
+            }));
+        }
+        Ok(Self::with_files(
             column_schema,
             partition_column_count,
             format,
@@ -243,7 +326,7 @@ impl HiveDataSource {
             .iter()
             .filter_map(|f| remap_filter(f, &|i| (i < n_data).then_some(i)))
             .collect();
-        let builder = parquet_scan::open_parquet_builder(&self.store, &file.path).await?;
+        let builder = parquet_scan::open_parquet_builder(&file.store, &file.path).await?;
         let stream = parquet_scan::build_split_stream(
             builder,
             &file.path,
@@ -326,7 +409,7 @@ impl DataSource for HiveDataSource {
             HiveFileFormat::Orc => {
                 let n_data = self.column_schema.len() - self.partition_column_count;
                 orc::scan(orc::OrcScan {
-                    store: &self.store,
+                    store: &file.store,
                     path: &file.path,
                     data_columns: &self.column_schema[..n_data],
                     projection: &projection,
@@ -346,7 +429,7 @@ impl DataSource for HiveDataSource {
             }
             HiveFileFormat::Parquet => {
                 let file_path = &file.path;
-                let builder = parquet_scan::open_parquet_builder(&self.store, file_path).await?;
+                let builder = parquet_scan::open_parquet_builder(&file.store, file_path).await?;
                 let stream = parquet_scan::build_split_stream(
                     builder,
                     file_path,
@@ -456,16 +539,30 @@ fn unescape_path_name(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Resolve the partition column values of one data file from its
-/// `key=value` directories (keys matched case-insensitively). Each value
-/// is returned as a one-row array in the column's table type.
-fn partition_values(
+/// The trailing `count` partition columns of a table schema.
+fn partition_columns(
+    column_schema: &[ColumnInfo],
+    count: usize,
+) -> Result<&[ColumnInfo], ExecutionError> {
+    if count > column_schema.len() {
+        return Err(ExecutionError::InvalidOperation(format!(
+            "Hive table has {count} partition columns but only {} columns",
+            column_schema.len()
+        )));
+    }
+    Ok(&column_schema[column_schema.len() - count..])
+}
+
+/// Raw partition values of one data file from its `key=value` directories
+/// (keys matched case-insensitively), or `None` when a partition column
+/// has no directory.
+fn directory_partition_values(
     prefix: &ObjectPath,
     path: &ObjectPath,
     partition_columns: &[ColumnInfo],
-) -> Result<Vec<ArrayRef>, ExecutionError> {
+) -> Option<Vec<String>> {
     if partition_columns.is_empty() {
-        return Ok(Vec::new());
+        return Some(Vec::new());
     }
     let parts = relative_parts(prefix, path);
     let dirs = &parts[..parts.len().saturating_sub(1)];
@@ -481,14 +578,23 @@ fn partition_values(
         .collect();
     partition_columns
         .iter()
-        .map(|col| {
+        .map(|col| kv.get(&col.name.to_ascii_lowercase()).cloned())
+        .collect()
+}
+
+/// Convert raw partition values to one-row arrays in the columns' table
+/// types. `__HIVE_DEFAULT_PARTITION__` is NULL. `source` names the file or
+/// partition location in errors.
+fn typed_partition_values(
+    raw: &[impl AsRef<str>],
+    partition_columns: &[ColumnInfo],
+    source: &dyn fmt::Display,
+) -> Result<Vec<ArrayRef>, ExecutionError> {
+    raw.iter()
+        .zip(partition_columns)
+        .map(|(raw, col)| {
+            let raw = raw.as_ref();
             let target: ArrowDataType = col.data_type.clone().into();
-            let raw = kv.get(&col.name.to_ascii_lowercase()).ok_or_else(|| {
-                ExecutionError::InvalidOperation(format!(
-                    "Hive data file '{path}' is not under a '{}=<value>' partition directory",
-                    col.name
-                ))
-            })?;
             if raw == HIVE_DEFAULT_PARTITION {
                 return Ok(new_null_array(&target, 1));
             }
@@ -496,15 +602,73 @@ fn partition_values(
                 safe: false,
                 ..Default::default()
             };
-            let text: ArrayRef = Arc::new(StringArray::from(vec![raw.as_str()]));
+            let text: ArrayRef = Arc::new(StringArray::from(vec![raw]));
             cast_with_options(&text, &target, &strict).map_err(|e| {
                 ExecutionError::InvalidOperation(format!(
-                    "partition value '{raw}' of column '{}' in '{path}' is not a valid {}: {e}",
+                    "partition value '{raw}' of column '{}' in '{source}' is not a valid {}: {e}",
                     col.name, col.data_type
                 ))
             })
         })
         .collect()
+}
+
+/// Escape a partition key or value the way Hive's `FileUtils.escapePathName`
+/// does when it lays out partition directories.
+fn escape_path_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let escape = matches!(
+            c,
+            '\u{01}'
+                ..='\u{1F}'
+                    | '"'
+                    | '#'
+                    | '%'
+                    | '\''
+                    | '*'
+                    | '/'
+                    | ':'
+                    | '='
+                    | '?'
+                    | '\\'
+                    | '\u{7F}'
+                    | '{'
+                    | '['
+                    | ']'
+                    | '^'
+        );
+        if escape {
+            out.push_str(&format!("%{:02X}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The object key prefix of a partition location, taken literally. Hive
+/// writes escaped partition directories (`ds=a%2Fb`) as literal keys and
+/// records the location the same way, so the `%` must not be re-encoded
+/// (as [`StorageUri::object_path`] does).
+fn literal_object_path(uri: &StorageUri) -> ObjectPath {
+    ObjectPath::parse(&uri.path).unwrap_or_else(|_| uri.object_path())
+}
+
+/// Hive's default location of a partition: `<table>/<k1>=<v1>/<k2>=<v2>`.
+fn default_partition_location(
+    table_location: &str,
+    partition_columns: &[ColumnInfo],
+    values: &[String],
+) -> String {
+    let mut location = table_location.trim_end_matches('/').to_string();
+    for (col, value) in partition_columns.iter().zip(values) {
+        location.push('/');
+        location.push_str(&escape_path_name(&col.name.to_ascii_lowercase()));
+        location.push('=');
+        location.push_str(&escape_path_name(value));
+    }
+    location
 }
 
 /// Convert `ColumnInfo` slice to an Arrow schema.
@@ -591,6 +755,24 @@ impl ConnectorFactory for HiveConnectorFactory {
         let uri = StorageUri::parse(location)?;
         let store = self.storage_registry.get_store(&uri)?;
         let prefix = uri.object_path();
+
+        // A partitioned table from HMS reads its registered partitions.
+        if partition_column_count > 0 {
+            if let Some(json) = properties.get(props::PARTITIONS) {
+                let partitions = decode_partitions(json)?;
+                let ds = HiveDataSource::open_partitions(
+                    &self.storage_registry,
+                    location,
+                    schema.to_vec(),
+                    format,
+                    partition_column_count,
+                    &partitions,
+                )
+                .await
+                .map_err(|e| ConnectorError::ReadError(format!("hive table '{table}': {e}")))?;
+                return Ok(Arc::new(ds));
+            }
+        }
 
         // Pre-list the data files under this prefix so the resulting
         // HiveDataSource exposes `files × splits_per_file` partitions.

@@ -14,6 +14,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v5
+        id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # release-please bumps `workspace.package.version` in Cargo.toml but not
+      # Cargo.lock. Sync the workspace entries onto the release PR branch here:
+      # a separate `on: push` workflow wouldn't fire for GITHUB_TOKEN pushes,
+      # and release-please force-pushes the branch on every regeneration.
+      - uses: actions/checkout@v7
+        if: ${{ steps.release.outputs.pr }}
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ steps.release.outputs.pr }}
+      - name: Sync Cargo.lock with release version
+        if: ${{ steps.release.outputs.pr }}
+        run: |
+          # --workspace only rewrites workspace members' versions; dependency
+          # versions stay pinned.
+          cargo update --workspace
+          if git diff --quiet Cargo.lock; then
+            echo "Cargo.lock already in sync"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: sync Cargo.lock with release version"
+          git push

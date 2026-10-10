@@ -87,6 +87,22 @@ docker compose down
 4. Run `cargo test` and verify all tests pass
 5. Submit a pull request against `main`
 
+PRs are squash-merged, so the PR title becomes the commit message. Write it as a [Conventional Commit](https://www.conventionalcommits.org/) (`feat: …`, `fix(planner): …`), because the release changelog is generated from it.
+
+## Releases
+
+Releases are managed by [release-please](https://github.com/googleapis/release-please). Every push to `main` updates an open release PR (`chore(main): release X.Y.Z`) with the next version, the `CHANGELOG.md` entries and the synced `Cargo.lock`. Merging that PR tags `vX.Y.Z` and publishes the GitHub Release.
+
+- **Versioning:** before 1.0, every release is a patch bump (`always-bump-patch`), including `feat` and breaking changes.
+- **Changelog:** only `feat`, `fix`, `perf` and `revert` commits are listed; `docs`, `refactor`, `test`, `build`, `ci`, `chore` and `style` are hidden.
+- **Minor (or any specific) version:** bump it deliberately by merging a commit whose body has a `Release-As` footer:
+
+  ```bash
+  git commit --allow-empty -m "chore: release 0.2.0" -m "Release-As: 0.2.0"
+  ```
+
+  For a squash-merged PR, put `Release-As: 0.2.0` on its own line at the end of the squash commit message. release-please then retitles the release PR to that version.
+
 ## Code Conventions
 
 - Use `thiserror` for library error types, `anyhow` only in the server binary

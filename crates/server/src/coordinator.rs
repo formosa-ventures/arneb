@@ -388,29 +388,22 @@ async fn execute_child_on_worker(
     // gate (step 4) populates non-empty columns on a HashPartitioned
     // fragment's output_partitioning; today only Source fragments get
     // non-empty hash columns on their output.
-    let (mut task_count, output_partitions) =
-        match (&fragment.fragment_type, &fragment.output_partitioning) {
-            (
-                arneb_planner::FragmentType::Source | arneb_planner::FragmentType::Fixed,
-                arneb_planner::PartitioningScheme::Hash {
-                    partition_count, ..
-                },
-            ) => (1, *partition_count), // β producer
-            (
-                arneb_planner::FragmentType::HashPartitioned,
-                arneb_planner::PartitioningScheme::Hash {
-                    partition_count,
-                    columns,
-                },
-            ) if !columns.is_empty() => (*partition_count, *partition_count), // M×N α producer-AND-consumer
-            (
-                arneb_planner::FragmentType::HashPartitioned,
-                arneb_planner::PartitioningScheme::Hash {
-                    partition_count, ..
-                },
-            ) => (*partition_count, 1), // α consumer only
-            _ => (1, 1),
-        };
+    let output_partitions = match (&fragment.fragment_type, &fragment.output_partitioning) {
+        (
+            arneb_planner::FragmentType::Source | arneb_planner::FragmentType::Fixed,
+            arneb_planner::PartitioningScheme::Hash {
+                partition_count, ..
+            },
+        ) => *partition_count, // β producer
+        (
+            arneb_planner::FragmentType::HashPartitioned,
+            arneb_planner::PartitioningScheme::Hash {
+                partition_count,
+                columns,
+            },
+        ) if !columns.is_empty() => *partition_count, // M×N α producer-AND-consumer
+        _ => 1,
+    };
 
     // Multi-worker scan (2026-06-10): a SOURCE fragment whose root is a
     // PartialAggregate is an A1-fused scan-direct aggregate. Run it as one
@@ -425,9 +418,9 @@ async fn execute_child_on_worker(
         workers.len(),
         data_parallel_scan_enabled(),
     );
-    if scan_task_count > 1 {
-        task_count = scan_task_count;
-    }
+    let task_count =
+        effective_task_count_for_fragment(fragment, workers.len(), data_parallel_scan_enabled())
+            as usize;
 
     // dist-mxn-nested-joins T2 (2026-06-05): log how each fragment is
     // classified so the trace shows which join fragments land on the
@@ -526,8 +519,11 @@ async fn execute_child_on_worker(
             // A2.2 (2026-05-28): broadcast flag from this fragment's
             // output partitioning. When true, `task_manager` allocates
             // a `BroadcastOutputBuffer` instead of a partitioned one
-            // and runs a single pumper. Coord schedules broadcast
-            // fragments as 1 task (per `task_count_for_fragment`).
+            // and runs a single pumper per task. A SOURCE broadcast
+            // fragment runs as 1 task (or M striped scan tasks); a
+            // HashPartitioned broadcast fragment runs one task per
+            // upstream hash bucket (per `task_count_for_fragment`), and
+            // consumers union every task's broadcast output.
             broadcast: matches!(
                 fragment.output_partitioning,
                 arneb_planner::PartitioningScheme::Broadcast
@@ -823,6 +819,28 @@ fn task_count_for_fragment(fragment: &arneb_planner::PlanFragment) -> u32 {
                 partition_count, ..
             },
         ) => *partition_count as u32, // α consumer (or α producer-and-consumer)
+        (
+            arneb_planner::FragmentType::HashPartitioned,
+            arneb_planner::PartitioningScheme::Broadcast,
+        ) => {
+            let Some(bucket_count) = fragment
+                .source_fragments
+                .first()
+                .and_then(hash_output_bucket_count)
+            else {
+                return 1;
+            };
+            // Every source must expose the same buckets for task k to read only bucket k.
+            if fragment
+                .source_fragments
+                .iter()
+                .all(|source| hash_output_bucket_count(source) == Some(bucket_count))
+            {
+                bucket_count as u32
+            } else {
+                1
+            }
+        }
         _ => 1,
     }
 }
@@ -1245,5 +1263,132 @@ mod tests {
             exchange_partition_ids_for_consumer(&producer, 2, 4),
             vec![2]
         );
+    }
+
+    // L2 fixtures: mirror q18's `stage=3 type=HASH_PARTITIONED
+    // output=Broadcast sources=[2]` (Tier-2 FRAGTRACE, 2026-10-10) where the
+    // source stage=2 is a PartialAggregate with `Hash { columns: [0],
+    // partition_count: 2 }`.
+    fn hash_source(id: u32, columns: Vec<usize>, partition_count: usize) -> PlanFragment {
+        PlanFragment {
+            id: StageId(id),
+            fragment_type: FragmentType::Source,
+            root: partial_aggregate(),
+            output_partitioning: PartitioningScheme::Hash {
+                columns,
+                partition_count,
+            },
+            source_fragments: Vec::new(),
+        }
+    }
+
+    fn broadcast_final_aggregate_over(sources: Vec<PlanFragment>) -> PlanFragment {
+        let input = match sources.first() {
+            Some(src) => LogicalPlan::ExchangeNode {
+                stage_id: src.id,
+                schema: schema(),
+            },
+            None => scan(),
+        };
+        PlanFragment {
+            id: StageId(3),
+            fragment_type: FragmentType::HashPartitioned,
+            root: LogicalPlan::FinalAggregate {
+                input: Box::new(input),
+                group_by: vec![PlanExpr::Column {
+                    index: 0,
+                    name: "c0".to_string(),
+                    span: None,
+                }],
+                aggr_exprs: Vec::new(),
+                schema: schema(),
+            },
+            output_partitioning: PartitioningScheme::Broadcast,
+            source_fragments: sources,
+        }
+    }
+
+    #[test]
+    fn hash_partitioned_broadcast_fragment_runs_one_task_per_source_bucket() {
+        let source = hash_source(2, vec![0], 2);
+        let fragment = broadcast_final_aggregate_over(vec![source]);
+
+        // One task per upstream hash bucket, so each task finalises a
+        // disjoint slice of the groups instead of one task gathering all.
+        assert_eq!(task_count_for_fragment(&fragment), 2);
+        assert_eq!(effective_task_count_for_fragment(&fragment, 2, false), 2);
+
+        // Wiring that already holds and makes the split correct: task k pulls
+        // only bucket k from every upstream task, and every downstream
+        // consumer pulls the (single) broadcast partition of EVERY task.
+        let source = &fragment.source_fragments[0];
+        assert_eq!(exchange_partition_ids_for_consumer(source, 0, 2), vec![0]);
+        assert_eq!(exchange_partition_ids_for_consumer(source, 1, 2), vec![1]);
+        assert_eq!(
+            exchange_partition_ids_for_consumer(&fragment, 0, 2),
+            vec![0]
+        );
+        assert_eq!(
+            exchange_partition_ids_for_consumer(&fragment, 1, 2),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn hash_partitioned_broadcast_fragment_follows_wider_source_bucket_count() {
+        let fragment = broadcast_final_aggregate_over(vec![hash_source(2, vec![0], 4)]);
+
+        assert_eq!(task_count_for_fragment(&fragment), 4);
+    }
+
+    #[test]
+    fn hash_partitioned_broadcast_fragment_stays_single_task_without_source_hash_columns() {
+        // Failure path: a source with NO hash columns exposes a single
+        // partition per task (`exchange_partition_ids_for_consumer` → [0]),
+        // so N tasks would each re-read the whole input and the broadcast
+        // union downstream would carry N copies of every row.
+        let fragment = broadcast_final_aggregate_over(vec![hash_source(2, Vec::new(), 2)]);
+
+        assert_eq!(task_count_for_fragment(&fragment), 1);
+        assert_eq!(
+            exchange_partition_ids_for_consumer(&fragment.source_fragments[0], 1, 2),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn hash_partitioned_broadcast_fragment_stays_single_task_without_sources() {
+        let fragment = broadcast_final_aggregate_over(Vec::new());
+
+        assert_eq!(task_count_for_fragment(&fragment), 1);
+    }
+
+    #[test]
+    fn hash_partitioned_broadcast_fragment_stays_single_task_on_mismatched_source_buckets() {
+        // Failure path: two sources that disagree on bucket count have no
+        // common task index → bucket mapping; fall back to one gather task.
+        let fragment = broadcast_final_aggregate_over(vec![
+            hash_source(2, vec![0], 2),
+            hash_source(9, vec![0], 4),
+        ]);
+
+        assert_eq!(task_count_for_fragment(&fragment), 1);
+    }
+
+    #[test]
+    fn source_broadcast_fragment_task_count_is_unchanged() {
+        // A SOURCE broadcast fragment (q18 stage=4, customer scan) keeps its
+        // existing derivation: base 1, scan striding supplies the M tasks.
+        let fragment = PlanFragment {
+            id: StageId(4),
+            fragment_type: FragmentType::Source,
+            root: scan(),
+            output_partitioning: PartitioningScheme::Broadcast,
+            source_fragments: Vec::new(),
+        };
+
+        assert_eq!(task_count_for_fragment(&fragment), 1);
+        assert_eq!(effective_task_count_for_fragment(&fragment, 2, false), 1);
+        assert_eq!(effective_task_count_for_fragment(&fragment, 2, true), 2);
     }
 }

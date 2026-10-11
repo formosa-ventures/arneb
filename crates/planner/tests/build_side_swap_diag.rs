@@ -26,7 +26,7 @@ const Q08_SQL: &str = include_str!("../../../benchmarks/tpch/queries/q08.sql");
 const Q21_SQL: &str = include_str!("../../../benchmarks/tpch/queries/q21.sql");
 const Q05_SQL: &str = include_str!("../../../benchmarks/tpch/queries/q05.sql");
 
-const FACTOR: f64 = 100.0; // ARNEB_PARTITIONED_BUILD_SIDE_SWAP_FACTOR default
+const FACTOR: f64 = 100.0; // Historical diagnostic threshold
 
 #[derive(Debug)]
 struct StatsTable {

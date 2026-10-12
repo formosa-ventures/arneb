@@ -11,15 +11,15 @@ Trino (formerly PrestoSQL) lets users query data where it lives — across objec
 
 ## Arneb vs Trino — TPC-H SF10
 
-Measured 2026-09-20 on the full 22-query suite. Both engines run as a coordinator
+Measured 2026-10-13 on the full 22-query suite. Both engines run as a coordinator
 plus two workers, in containers with the same per-node CPU cap, reading the same
-Snappy Parquet from MinIO through the same Hive Metastore. `lineitem` is
+Snappy Parquet from RustFS through the same Hive Metastore. `lineitem` is
 59,986,052 rows. Host: 10 CPUs, 15.66 GiB of container-runtime memory.
 
 | | Arneb vs Trino |
 |---|---|
-| **Peak memory** | **0.16× on average — about a sixth of Trino's**, lower on **all 22** queries (best 0.06×, worst 0.42×) |
-| **Latency** | **2.0× faster** (geomean), faster on **21 of 22** queries |
+| **Peak memory** | **0.18× on average — about a sixth of Trino's**, lower on **all 22** queries (best 0.07×, worst 0.50×) |
+| **Latency** | **2.0× faster** warm (geomean), faster on **21 of 22** queries |
 | **Correctness** | **Cell-identical to Trino on all 22**, deterministic run-to-run |
 | **Footprint** | One self-contained binary (~60 MB). No JVM, no heap tuning, no GC pauses |
 
@@ -32,43 +32,48 @@ nodes, from the warm run.
 
 | Query | | cold arneb | cold Trino | cold | warm arneb | warm Trino | **warm** | mem arneb | mem Trino | **mem** |
 |---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| `q01` | Pricing Summary | 1,894 | 6,283 | 3.3× | 1,818 | 3,039 | **1.7×** | 366 | 5,468 | **0.07×** |
-| `q02` | Minimum Cost Supplier | 671 | 5,991 | 8.9× | 506 | 2,122 | **4.2×** | 261 | 3,806 | **0.07×** |
-| `q03` | Shipping Priority | 2,543 | 9,047 | 3.6× | 2,184 | 3,832 | **1.8×** | 1,918 | 5,409 | **0.35×** |
-| `q04` | Order Priority Checking | 1,989 | 7,402 | 3.7× | 1,952 | 2,781 | **1.4×** | 1,704 | 6,923 | **0.25×** |
-| `q05` | Local Supplier Volume | 2,270 | 8,887 | 3.9× | 2,414 | 4,302 | **1.8×** | 1,048 | 6,559 | **0.16×** |
-| `q06` | Forecasting Revenue | 724 | 4,629 | 6.4× | 656 | 1,883 | **2.9×** | 349 | 4,670 | **0.07×** |
-| `q07` | Volume Shipping | 2,028 | 8,433 | 4.2× | 1,942 | 3,858 | **2.0×** | 1,217 | 5,537 | **0.22×** |
-| `q08` | National Market Share | 3,075 | 9,835 | 3.2× | 3,124 | 4,902 | **1.6×** | 1,558 | 7,380 | **0.21×** |
-| `q09` | Product Type Profit | 4,265 | 11,779 | 2.8× | 4,487 | 6,443 | **1.4×** | 1,849 | 9,338 | **0.20×** |
-| `q10` | Returned Item Reporting | 2,056 | 9,983 | 4.9× | 2,175 | 4,183 | **1.9×** | 1,009 | 5,593 | **0.18×** |
-| `q11` | Important Stock ID | 689 | 5,218 | 7.6× | 737 | 1,942 | **2.6×** | 319 | 3,277 | **0.10×** |
-| `q12` | Shipping Modes | 1,216 | 6,619 | 5.4× | 1,081 | 2,508 | **2.3×** | 330 | 5,054 | **0.07×** |
-| `q13` | Customer Distribution | 1,815 | 7,738 | 4.3× | 1,632 | 4,394 | **2.7×** | 414 | 6,478 | **0.06×** |
-| `q14` | Promotion Effect | 1,195 | 7,078 | 5.9× | 1,074 | 2,879 | **2.7×** | 691 | 4,904 | **0.14×** |
-| `q15` | Top Supplier | 1,037 | 6,975 | 6.7× | 997 | 3,314 | **3.3×** | 446 | 7,093 | **0.06×** |
-| `q16` | Parts/Supplier Relationship | 1,089 | 7,956 | 7.3× | 1,079 | 2,616 | **2.4×** | 414 | 4,533 | **0.09×** |
-| `q17` | Small-Quantity-Order Revenue | 3,337 | 11,353 | 3.4× | 3,032 | 5,300 | **1.7×** | 1,586 | 7,859 | **0.20×** |
-| `q18` | Large Volume Customer | 4,566 | 10,798 | 2.4× | 4,331 | 5,145 | **1.2×** | 3,827 | 9,180 | **0.42×** |
-| `q19` | Discounted Revenue | 1,453 | 7,419 | 5.1× | 1,279 | 3,239 | **2.5×** | 642 | 5,514 | **0.12×** |
-| `q20` | Potential Part Promotion | 3,037 | 8,465 | 2.8× | 2,939 | 3,942 | **1.3×** | 1,123 | 6,683 | **0.17×** |
-| `q21` | Suppliers Who Kept Orders Waiting | 7,936 | 15,185 | 1.9× | 8,262 | 6,442 | **0.78×** ⚠️ | 1,994 | 8,560 | **0.23×** |
-| `q22` | Global Sales Opportunity | 962 | 5,659 | 5.9× | 946 | 2,136 | **2.3×** | 740 | 4,710 | **0.16×** |
-| | **aggregate** | | | **4.4×** | | | **2.0×** | | | **0.16×** |
+| `q01` | Pricing Summary | 2,055 | 6,758 | 3.3× | 1,773 | 2,604 | **1.5×** | 349 | 4,461 | **0.08×** |
+| `q02` | Minimum Cost Supplier | 600 | 5,950 | 9.9× | 580 | 2,134 | **3.7×** | 371 | 3,890 | **0.10×** |
+| `q03` | Shipping Priority | 2,324 | 8,539 | 3.7× | 2,167 | 3,863 | **1.8×** | 2,037 | 5,685 | **0.36×** |
+| `q04` | Order Priority Checking | 2,163 | 7,115 | 3.3× | 1,927 | 3,060 | **1.6×** | 1,724 | 6,925 | **0.25×** |
+| `q05` | Local Supplier Volume | 2,261 | 7,815 | 3.5× | 2,043 | 3,945 | **1.9×** | 1,034 | 7,040 | **0.15×** |
+| `q06` | Forecasting Revenue | 764 | 4,748 | 6.2× | 688 | 1,853 | **2.7×** | 334 | 4,649 | **0.07×** |
+| `q07` | Volume Shipping | 1,891 | 7,658 | 4.1× | 1,882 | 3,772 | **2.0×** | 1,288 | 5,823 | **0.22×** |
+| `q08` | National Market Share | 2,937 | 9,080 | 3.1× | 2,831 | 4,478 | **1.6×** | 1,715 | 6,448 | **0.27×** |
+| `q09` | Product Type Profit | 4,260 | 11,400 | 2.7× | 4,186 | 5,819 | **1.4×** | 1,836 | 8,306 | **0.22×** |
+| `q10` | Returned Item Reporting | 2,602 | 9,472 | 3.6× | 1,861 | 4,088 | **2.2×** | 1,053 | 4,580 | **0.23×** |
+| `q11` | Important Stock ID | 794 | 5,591 | 7.0× | 683 | 1,908 | **2.8×** | 405 | 3,951 | **0.10×** |
+| `q12` | Shipping Modes | 1,192 | 6,379 | 5.4× | 1,084 | 2,158 | **2.0×** | 429 | 4,390 | **0.10×** |
+| `q13` | Customer Distribution | 1,504 | 7,471 | 5.0× | 1,516 | 3,601 | **2.4×** | 444 | 5,799 | **0.08×** |
+| `q14` | Promotion Effect | 1,188 | 6,786 | 5.7× | 1,117 | 2,838 | **2.5×** | 877 | 5,238 | **0.17×** |
+| `q15` | Top Supplier | 1,052 | 6,638 | 6.3× | 1,002 | 3,101 | **3.1×** | 486 | 5,851 | **0.08×** |
+| `q16` | Parts/Supplier Relationship | 1,460 | 7,456 | 5.1× | 1,000 | 2,503 | **2.5×** | 426 | 4,405 | **0.10×** |
+| `q17` | Small-Quantity-Order Revenue | 2,942 | 11,737 | 4.0× | 2,897 | 5,262 | **1.8×** | 1,643 | 8,201 | **0.20×** |
+| `q18` | Large Volume Customer | 4,161 | 10,944 | 2.6× | 4,335 | 5,140 | **1.2×** | 4,786 | 9,521 | **0.50×** |
+| `q19` | Discounted Revenue | 1,407 | 7,322 | 5.2× | 1,278 | 3,037 | **2.4×** | 809 | 5,473 | **0.15×** |
+| `q20` | Potential Part Promotion | 3,004 | 8,195 | 2.7× | 3,088 | 3,781 | **1.2×** | 1,093 | 6,956 | **0.16×** |
+| `q21` | Suppliers Who Kept Orders Waiting | 8,344 | 14,800 | 1.8× | 8,232 | 6,954 | **0.84×** ⚠️ | 1,735 | 8,906 | **0.19×** |
+| `q22` | Global Sales Opportunity | 1,029 | 5,555 | 5.4× | 894 | 2,095 | **2.3×** | 795 | 4,823 | **0.16×** |
+| | **aggregate** | | | **4.2×** | | | **2.0×** | | | **0.18×** |
 
 Aggregate is the geometric mean for the latency ratios and the arithmetic mean
 for the memory ratios.
 
 ### What the two protocols mean
 
-**Cold** times each query on a freshly restarted cluster. **Warm** runs one
+**Cold** times each query on a freshly recreated cluster with the storage side
+flushed too: RustFS restarted and the container VM's page cache dropped, so
+every byte is re-read from disk. **Warm** recreates the cluster, runs one
 untimed query first, identically for both engines, then times the next one.
 
 That choice carries most of the headline, which is why both columns are here.
-Warming is worth a median 57% to Trino (43–67% across the 22) because a
-restarted JVM re-JITs and re-reads from MinIO, and 4% to arneb (−7% to +24%),
-which has no equivalent start-up cost. **The cold column is therefore largely a
-measurement of JVM start-up — quote the warm one.**
+Warming is worth a median 56% to Trino (49–66% across the 22) because a
+recreated JVM re-JITs, and 6% to arneb (−4% to +32%), which has no equivalent
+start-up cost. Flushing storage barely moves either engine at SF10 — the
+2026-09-20 run, which left RustFS and the page cache warm, got 4.4× cold /
+2.0× warm against this run's 4.2× / 2.0×. **The cold
+column is therefore largely a measurement of JVM start-up — quote the warm
+one.**
 
 ### Memory, in absolute terms
 
@@ -76,27 +81,28 @@ Ratios understate what this means for a deployment, so the five largest gaps:
 
 | Query | Arneb | Trino | Saved |
 |---|--:|--:|--:|
-| `q09` Product Type Profit | 1.8 GB | 9.3 GB | **7.5 GB** |
-| `q15` Top Supplier | 0.4 GB | 7.1 GB | **6.6 GB** |
-| `q21` Suppliers Who Kept Orders Waiting | 2.0 GB | 8.6 GB | **6.6 GB** |
-| `q17` Small-Quantity-Order Revenue | 1.6 GB | 7.9 GB | **6.3 GB** |
-| `q18` Large Volume Customer | 3.8 GB | 9.2 GB | **5.4 GB** |
+| `q21` Suppliers Who Kept Orders Waiting | 1.7 GB | 8.7 GB | **7.0 GB** |
+| `q17` Small-Quantity-Order Revenue | 1.6 GB | 8.0 GB | **6.4 GB** |
+| `q09` Product Type Profit | 1.8 GB | 8.1 GB | **6.3 GB** |
+| `q05` Local Supplier Volume | 1.0 GB | 6.9 GB | **5.9 GB** |
+| `q20` Potential Part Promotion | 1.1 GB | 6.8 GB | **5.7 GB** |
 
-A Trino cluster that needs 9.3 GB to run q09 is replaced by one that needs
-1.8 GB, on identical hardware and identical data — the difference between a
+A Trino cluster that needs 8.7 GB to run q21 is replaced by one that needs
+1.7 GB, on identical hardware and identical data — the difference between a
 query that fits on your node and one that does not.
 
 Trino's floor is also high before any query runs: measured across the same
-restarts, its three-node cluster sits at **1.87 GB** of committed heap at idle
-(1.77–1.98 GB). Arneb allocates lazily — the same measurement puts its idle
-cluster at **0.03 GB** (0.01–0.05 GB), roughly sixty times less. Both are counted
+restarts, its three-node cluster sits at **2.00 GB** of committed heap at idle
+(1.83–2.17 GB across 44 restarts). Arneb allocates lazily — the same
+measurement puts its idle cluster at **0.07 GB** (0.06–0.07 GB), roughly thirty
+times less. Both are counted
 the way a container memory limit or `kubectl top` counts them.
 
 ### The one query Arneb loses
 
-Warm, arneb loses `q21` — 8,262 ms and 9,852 ms across two runs against Trino's
-6,442 ms and 6,739 ms, a ratio of 0.78× and 0.68×. It reproduces; it is not
-noise. Memory there is still 0.23×. `q21` is the four-way correlated
+Warm, arneb loses `q21` — 8,232 ms against Trino's 6,954 ms, 0.84×. It has
+lost `q21` warm in all four runs so far (0.78× and 0.68× on 2026-09-20, 0.80×
+and 0.84× on 2026-10-13); it is not noise. Memory there is still 0.19×. `q21` is the four-way correlated
 `EXISTS` / `NOT EXISTS` self-join over `lineitem`, the deepest join pipeline in
 the suite.
 
@@ -109,14 +115,15 @@ git clone https://github.com/formosa-ventures/arneb.git && cd arneb
 docker compose -f docker-compose.yml \
                -f docker/arneb-bench/docker-compose.bench.yml build
 
-# One command: preflight the host, seed SF10, measure both engines, report.
-BENCH_WARMUP=1 ./benchmarks/tpch/scripts/run_benchmark.sh --scenario=sf10
+# One command: preflight the host, seed SF10, measure both engines cold and
+# warm, report both side by side.
+./benchmarks/tpch/scripts/run_benchmark.sh --scenario=sf10 --mode=both
 
 # Correctness gate: determinism + cell-diff vs Trino, all 22.
 python3 benchmarks/tpch/scripts/blast_radius_oracle.py --runs 2
 ```
 
-Drop `BENCH_WARMUP=1` for the cold column. Method, host floors and what is *not*
+`--mode=warm` or `--mode=cold` measures one protocol only. Method, host floors and what is *not*
 claimed are in [benchmark methodology](#benchmark-methodology);
 [`benchmarks/tpch/README.md`](benchmarks/tpch/README.md) has the full guide.
 
@@ -309,9 +316,11 @@ the scripts.
 - **Engine rotation.** Only the engine being measured is resident; the other is
   stopped, not idle. Otherwise Trino's committed JVM heap counts against arneb's
   memory reading, and arneb's footprint against Trino's.
-- **A clean baseline per query.** The cluster restarts before each query, so a
-  measurement starts from its own baseline rather than its predecessor's
-  high-water mark.
+- **A clean baseline per query.** The cluster is recreated before each
+  measurement, so it starts from its own baseline rather than its
+  predecessor's high-water mark. A cold measurement also restarts the object
+  store and drops the container VM's page cache, so neither engine reads
+  bytes the other — or its own previous run — left cached.
 - **Memory is simultaneous, not a sum of lifetime peaks.** Peak is sampled
   during the query as the maximum of the summed cgroup RSS across all three
   nodes — a footprint that actually existed at one instant. Summing each node's
@@ -330,14 +339,21 @@ the scripts.
 
 ### What is not claimed
 
-One host, one scale factor, one run per protocol per query — two for `q21`.
-Run-to-run variance under identical settings has not been characterised, so
-small differences in these tables are not results. Numbers from two different
+One host, one scale factor, one run per protocol per query in the table. A
+second full run under identical settings the same day moved per-query
+speedups by a median of 5–6% (worst 29%, `q16` cold) and the geomeans by at
+most 0.1×; arneb's `q18` peak memory was the one unstable figure (3.0 GB vs
+4.7 GB). Single-query differences under ~30% are not results. Numbers from two different
 hosts are not comparable; a scenario makes a run repeatable, not
 hardware-independent.
 
 SF30 figures cited previously in this repository were produced under the cold
 protocol and have not been re-measured warm.
+
+`q11` numbers measured at SF10 before 2026-10-13 timed an empty result: the
+query hard-coded the SF1 threshold fraction, so above SF1 both engines filtered
+out every row. It now scales with SF; see
+[`benchmarks/tpch/README.md`](benchmarks/tpch/README.md#q11).
 
 The full guide — prerequisites, host floors, the scenario reference and the
 per-query report tooling — is in

@@ -10,6 +10,10 @@ ignore = [
     # paste v1.0.15 is unmaintained but no replacement available;
     # transitive dep via parquet -> arrow ecosystem
     "RUSTSEC-2024-0436",
+    # unsafe-libyaml is unmaintained with no safe upgrade; it reaches us only
+    # through serde_yaml <- pilota-build/volo-build <- hive-metastore-thrift-build,
+    # the offline Thrift codegen tool, so it is never linked into arneb.
+    "RUSTSEC-2024-0449",
 ]
 
 [licenses]

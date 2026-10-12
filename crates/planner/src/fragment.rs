@@ -262,98 +262,6 @@ fn broadcast_build_side_swap_enabled() -> bool {
     })
 }
 
-#[cfg(test)]
-static PARTITIONED_BUILD_SIDE_SWAP_TEST_OVERRIDE: OnceLock<std::sync::Mutex<Option<(bool, f64)>>> =
-    OnceLock::new();
-#[cfg(test)]
-static PARTITIONED_BUILD_SIDE_SWAP_TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-
-#[cfg(test)]
-struct PartitionedBuildSideSwapOverride {
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(test)]
-impl Drop for PartitionedBuildSideSwapOverride {
-    fn drop(&mut self) {
-        *PARTITIONED_BUILD_SIDE_SWAP_TEST_OVERRIDE
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .expect("PARTITIONED_BUILD_SIDE_SWAP_TEST_OVERRIDE mutex poisoned") = None;
-    }
-}
-
-#[cfg(test)]
-fn set_partitioned_build_side_swap_for_test(
-    enabled: bool,
-    factor: f64,
-) -> PartitionedBuildSideSwapOverride {
-    let guard = PARTITIONED_BUILD_SIDE_SWAP_TEST_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .expect("PARTITIONED_BUILD_SIDE_SWAP_TEST_LOCK mutex poisoned");
-    *PARTITIONED_BUILD_SIDE_SWAP_TEST_OVERRIDE
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .expect("PARTITIONED_BUILD_SIDE_SWAP_TEST_OVERRIDE mutex poisoned") =
-        Some((enabled, factor));
-    PartitionedBuildSideSwapOverride { _guard: guard }
-}
-
-fn partitioned_build_side_swap_enabled() -> bool {
-    #[cfg(test)]
-    if let Some((enabled, _)) = PARTITIONED_BUILD_SIDE_SWAP_TEST_OVERRIDE
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .expect("PARTITIONED_BUILD_SIDE_SWAP_TEST_OVERRIDE mutex poisoned")
-        .as_ref()
-    {
-        return *enabled;
-    }
-
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-
-    *ENABLED.get_or_init(|| {
-        let enabled = std::env::var("ARNEB_PARTITIONED_BUILD_SIDE_SWAP")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
-        tracing::info!(
-            target: "arneb::config",
-            partitioned_build_side_swap = enabled,
-            "ARNEB_PARTITIONED_BUILD_SIDE_SWAP effective value (default off; set non-zero to enable)"
-        );
-        enabled
-    })
-}
-
-fn partitioned_build_side_swap_factor() -> f64 {
-    #[cfg(test)]
-    if let Some((_, factor)) = PARTITIONED_BUILD_SIDE_SWAP_TEST_OVERRIDE
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .expect("PARTITIONED_BUILD_SIDE_SWAP_TEST_OVERRIDE mutex poisoned")
-        .as_ref()
-    {
-        return *factor;
-    }
-
-    static FACTOR: OnceLock<f64> = OnceLock::new();
-
-    *FACTOR.get_or_init(|| {
-        let factor = std::env::var("ARNEB_PARTITIONED_BUILD_SIDE_SWAP_FACTOR")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 1.0)
-            .unwrap_or(100.0);
-        tracing::info!(
-            target: "arneb::config",
-            partitioned_build_side_swap_factor = factor,
-            "ARNEB_PARTITIONED_BUILD_SIDE_SWAP_FACTOR effective value (default 100)"
-        );
-        factor
-    })
-}
-
 fn all_scans_have_row_count(plan: &LogicalPlan, stats: &crate::cost::CatalogStats) -> bool {
     match plan {
         LogicalPlan::TableScan { table, .. } => {
@@ -397,7 +305,6 @@ fn partitioned_build_side_swap_estimates(
     left: &LogicalPlan,
     right: &LogicalPlan,
     stats: &crate::cost::CatalogStats,
-    factor: f64,
 ) -> Option<(f64, f64)> {
     if !all_scans_have_row_count(left, stats) || !all_scans_have_row_count(right, stats) {
         return None;
@@ -408,7 +315,7 @@ fn partitioned_build_side_swap_estimates(
         && right_rows.is_finite()
         && left_rows > 0.0
         && right_rows > 0.0
-        && right_rows >= left_rows * factor
+        && left_rows < right_rows
     {
         Some((left_rows, right_rows))
     } else {
@@ -1859,21 +1766,24 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                     }
                 }
 
-                if partitioned_build_side_swap_enabled()
+                // Preserve an eligible broadcast build before considering a row-based swap.
+                if restore_swapped_output.is_none()
                     && matches!(join_type, arneb_sql_parser::ast::JoinType::Inner)
                     && self.stats.is_some()
+                    && !self.is_broadcast_eligible(
+                        &original_right_for_broadcast,
+                        &original_left_for_estimate,
+                    )
                 {
                     let old_left_width = original_left_for_estimate.schema().len();
                     let old_right_width = original_right_for_broadcast.schema().len();
                     let pure_equi =
                         extract_pure_equi_join_keys(&condition, old_left_width).is_some();
-                    let factor = partitioned_build_side_swap_factor();
                     let estimates = self.stats.as_deref().and_then(|stats| {
                         partitioned_build_side_swap_estimates(
                             &original_left_for_estimate,
                             &original_right_for_broadcast,
                             stats,
-                            factor,
                         )
                     });
                     if pure_equi {
@@ -1911,7 +1821,6 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                                 target: "arneb::planner",
                                 left_rows,
                                 right_rows,
-                                factor,
                                 "partitioned build-side swap applied"
                             );
                         }
@@ -6059,29 +5968,83 @@ mod tests {
         );
     }
 
-    #[test]
-    fn partitioned_build_side_swap_default_off_keeps_original_build() {
-        let _swap = set_partitioned_build_side_swap_for_test(false, 100.0);
-        let plan = LogicalPlan::Join {
-            left: Box::new(scan_with_columns("small_left", &["l_id", "l_payload"])),
-            right: Box::new(scan_with_columns("big_right", &["r_id"])),
+    fn stats_for_equal_build_side_estimates() -> crate::cost::CatalogStats {
+        let mut stats = crate::cost::CatalogStats::new();
+        for name in ["peer_a", "peer_b"] {
+            stats.insert(
+                TableReference::table(name),
+                arneb_catalog::TableStatistics {
+                    row_count: Some(1_000),
+                    size_bytes: Some(4_000),
+                    columns: std::collections::HashMap::new(),
+                },
+            );
+        }
+        stats
+    }
+
+    fn stats_for_byte_small_but_row_large_left() -> crate::cost::CatalogStats {
+        // narrow_left: MORE rows but FEWER bytes (1 Int32 column) than
+        // wide_right (8 Int32 columns). Bytes decide broadcast; rows decide
+        // the partitioned rule — the two rules disagree on this shape.
+        let mut stats = crate::cost::CatalogStats::new();
+        stats.insert(
+            TableReference::table("narrow_left"),
+            arneb_catalog::TableStatistics {
+                row_count: Some(2_000),
+                size_bytes: Some(8_000),
+                columns: std::collections::HashMap::new(),
+            },
+        );
+        stats.insert(
+            TableReference::table("wide_right"),
+            arneb_catalog::TableStatistics {
+                row_count: Some(1_000),
+                size_bytes: Some(32_000),
+                columns: std::collections::HashMap::new(),
+            },
+        );
+        stats
+    }
+
+    fn equi_join_on(
+        left: LogicalPlan,
+        right: LogicalPlan,
+        left_col: (usize, &str),
+        right_col: (usize, &str),
+    ) -> LogicalPlan {
+        LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
             join_type: ast::JoinType::Inner,
             condition: crate::plan::JoinCondition::On(PlanExpr::BinaryOp {
                 left: Box::new(PlanExpr::Column {
-                    index: 0,
-                    name: "l_id".into(),
+                    index: left_col.0,
+                    name: left_col.1.into(),
                     span: None,
                 }),
                 op: ast::BinaryOp::Eq,
                 right: Box::new(PlanExpr::Column {
-                    index: 2,
-                    name: "r_id".into(),
+                    index: right_col.0,
+                    name: right_col.1.into(),
                     span: None,
                 }),
                 span: None,
             }),
             dynamic_filter_ids: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn partitioned_build_side_swap_keeps_build_when_right_is_estimated_smaller() {
+        // Reverse orientation of the firing case: the right (build) side is
+        // already the estimated-smaller one, so the rule must not touch it.
+        let plan = equi_join_on(
+            scan_with_columns("big_right", &["r_id"]),
+            scan_with_columns("small_left", &["l_id", "l_payload"]),
+            (0, "r_id"),
+            (1, "l_id"),
+        );
 
         let mut frag = PlanFragmenter::new()
             .with_stats(Some(std::sync::Arc::new(stats_for_build_side_swap())));
@@ -6089,23 +6052,213 @@ mod tests {
         let join_frag = &result.source_fragments[0];
 
         let LogicalPlan::Join { left, right, .. } = &join_frag.root else {
-            panic!("default-off partitioned swap should leave root as Join");
+            panic!("smaller right side must leave root as an unswapped Join");
         };
         assert!(matches!(left.as_ref(), LogicalPlan::ExchangeNode { .. }));
         assert!(matches!(right.as_ref(), LogicalPlan::ExchangeNode { .. }));
         assert!(matches!(
             join_frag.source_fragments[0].root,
-            LogicalPlan::TableScan { ref table, .. } if table.table == "small_left"
+            LogicalPlan::TableScan { ref table, .. } if table.table == "big_right"
         ));
         assert!(matches!(
             join_frag.source_fragments[1].root,
-            LogicalPlan::TableScan { ref table, .. } if table.table == "big_right"
+            LogicalPlan::TableScan { ref table, .. } if table.table == "small_left"
         ));
     }
 
     #[test]
+    fn partitioned_build_side_swap_keeps_original_on_equal_estimates() {
+        // Tie: no evidence either side is smaller, so keep the SQL order.
+        let plan = equi_join_on(
+            scan_with_columns("peer_a", &["a_id"]),
+            scan_with_columns("peer_b", &["b_id"]),
+            (0, "a_id"),
+            (1, "b_id"),
+        );
+
+        let mut frag = PlanFragmenter::new().with_stats(Some(std::sync::Arc::new(
+            stats_for_equal_build_side_estimates(),
+        )));
+        let result = frag.fragment(plan);
+        let join_frag = &result.source_fragments[0];
+
+        assert!(
+            matches!(join_frag.root, LogicalPlan::Join { .. }),
+            "equal estimates must not swap (got {:?})",
+            join_frag.root
+        );
+        assert!(matches!(
+            join_frag.source_fragments[0].root,
+            LogicalPlan::TableScan { ref table, .. } if table.table == "peer_a"
+        ));
+        assert!(matches!(
+            join_frag.source_fragments[1].root,
+            LogicalPlan::TableScan { ref table, .. } if table.table == "peer_b"
+        ));
+    }
+
+    #[test]
+    fn broadcast_swapped_join_is_not_swapped_again_by_partitioned_rule() {
+        // q18 SF30 shape (observed 2026-10-10 with the partitioned swap at
+        // factor 1 → query returned 0 rows): the broadcast rule (bytes) swaps
+        // the join, then the partitioned rule (rows) sees the swapped
+        // children and swaps AGAIN. A join may be swapped at most once; the
+        // byte-smaller side stays the broadcast build and the output keeps
+        // the original column order.
+        let narrow_left = scan_with_columns("narrow_left", &["n_id"]);
+        let wide_right = scan_with_columns(
+            "wide_right",
+            &["w_id", "w1", "w2", "w3", "w4", "w5", "w6", "w7"],
+        );
+        let original_schema = {
+            let mut schema = narrow_left.schema();
+            schema.extend(wide_right.schema());
+            schema
+        };
+        let plan = equi_join_on(narrow_left, wide_right, (0, "n_id"), (1, "w_id"));
+
+        let mut frag = PlanFragmenter::new()
+            .with_broadcast_threshold(Some(10_000))
+            .with_stats(Some(std::sync::Arc::new(
+                stats_for_byte_small_but_row_large_left(),
+            )));
+        let result = frag.fragment(plan);
+        let probe_frag = &result.source_fragments[0];
+
+        assert_eq!(
+            probe_frag.root.schema(),
+            original_schema,
+            "output column order must survive the swap"
+        );
+        let broadcast_sources: Vec<_> = probe_frag
+            .source_fragments
+            .iter()
+            .filter(|fragment| fragment.output_partitioning == PartitioningScheme::Broadcast)
+            .collect();
+        assert_eq!(broadcast_sources.len(), 1, "exactly one broadcast build");
+        assert!(matches!(
+            broadcast_sources[0].root,
+            LogicalPlan::TableScan { ref table, .. } if table.table == "narrow_left"
+        ));
+
+        let LogicalPlan::Projection { input, exprs, .. } = &probe_frag.root else {
+            panic!("swapped join root should be the output-restore Projection");
+        };
+        let projected_indices: Vec<_> = exprs
+            .iter()
+            .map(|expr| match expr {
+                PlanExpr::Column { index, .. } => *index,
+                other => panic!("restore projection should contain only columns, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(projected_indices, vec![8, 0, 1, 2, 3, 4, 5, 6, 7]);
+
+        let LogicalPlan::Join { condition, .. } = input.as_ref() else {
+            panic!("restore projection should wrap the swapped Join");
+        };
+        let crate::plan::JoinCondition::On(PlanExpr::BinaryOp { left, right, .. }) = condition
+        else {
+            panic!("expected remapped equi-join condition");
+        };
+        assert!(matches!(left.as_ref(), PlanExpr::Column { index: 8, .. }));
+        assert!(matches!(right.as_ref(), PlanExpr::Column { index: 0, .. }));
+    }
+
+    fn stats_for_broadcast_eligible_narrow_right() -> crate::cost::CatalogStats {
+        // wide_left: FEWER rows but MORE bytes (250 Int32 columns, ~1 MB)
+        // than narrow_right (100K rows x 1 Int32 column, 400 KB). With two
+        // workers and a 2 MB threshold the right side is broadcast-eligible
+        // (400 KB x 2 <= 1 MB) and the left side is not (1 MB x 2 > 400 KB).
+        let mut stats = crate::cost::CatalogStats::new();
+        stats.insert(
+            TableReference::table("wide_left"),
+            arneb_catalog::TableStatistics {
+                row_count: Some(1_000),
+                size_bytes: Some(1_000_000),
+                columns: std::collections::HashMap::new(),
+            },
+        );
+        stats.insert(
+            TableReference::table("narrow_right"),
+            arneb_catalog::TableStatistics {
+                row_count: Some(100_000),
+                size_bytes: Some(400_000),
+                columns: std::collections::HashMap::new(),
+            },
+        );
+        stats
+    }
+
+    #[test]
+    fn partitioned_build_side_swap_keeps_broadcast_eligible_right_as_build() {
+        // The row-based rule must not undo a broadcast the byte-based rule
+        // left in place: when the ORIGINAL right side is already
+        // broadcast-eligible, swapping on row count alone would move the
+        // wider left side to the build position, where it is no longer
+        // broadcast-eligible, and the join would degrade to a two-sided
+        // hash shuffle that builds the side with MORE bytes.
+        let wide_columns: Vec<String> = (0..250).map(|i| format!("w{i}")).collect();
+        let wide_column_refs: Vec<&str> = wide_columns.iter().map(String::as_str).collect();
+        let wide_left = scan_with_columns("wide_left", &wide_column_refs);
+        let narrow_right = scan_with_columns("narrow_right", &["n_id"]);
+        let original_schema = {
+            let mut schema = wide_left.schema();
+            schema.extend(narrow_right.schema());
+            schema
+        };
+        let plan = equi_join_on(wide_left, narrow_right, (0, "w0"), (250, "n_id"));
+
+        let mut frag = PlanFragmenter::new()
+            .with_worker_count(2)
+            .with_broadcast_threshold(Some(2_000_000))
+            .with_stats(Some(std::sync::Arc::new(
+                stats_for_broadcast_eligible_narrow_right(),
+            )));
+        let result = frag.fragment(plan);
+
+        assert_eq!(result.source_fragments.len(), 1, "one probe fragment");
+        let probe_frag = &result.source_fragments[0];
+        assert_eq!(
+            probe_frag.root.schema(),
+            original_schema,
+            "output column order must be untouched"
+        );
+        assert!(
+            matches!(probe_frag.root, LogicalPlan::Join { .. }),
+            "join must stay unswapped (no restore Projection), got {:?}",
+            plan_kind_label(&probe_frag.root)
+        );
+        let broadcast_sources: Vec<_> = probe_frag
+            .source_fragments
+            .iter()
+            .filter(|fragment| fragment.output_partitioning == PartitioningScheme::Broadcast)
+            .collect();
+        assert_eq!(
+            broadcast_sources.len(),
+            1,
+            "the broadcast-eligible right side must remain the broadcast build"
+        );
+        assert!(matches!(
+            broadcast_sources[0].root,
+            LogicalPlan::TableScan { ref table, .. } if table.table == "narrow_right"
+        ));
+        assert!(
+            !result_has_hash_output(&result),
+            "neither side may be hash-shuffled when the right side broadcasts"
+        );
+    }
+
+    fn result_has_hash_output(fragment: &PlanFragment) -> bool {
+        matches!(
+            fragment.output_partitioning,
+            PartitioningScheme::Hash { .. }
+        ) || fragment.source_fragments.iter().any(result_has_hash_output)
+    }
+
+    #[test]
     fn partitioned_build_side_swap_fires_and_restores_output_order() {
-        let _swap = set_partitioned_build_side_swap_for_test(true, 100.0);
+        // Default behaviour, no env knob: an inner pure-equi partitioned join
+        // builds the estimated-smaller side.
         let left = scan_with_columns("small_left", &["l_id", "l_payload"]);
         let right = scan_with_columns("big_right", &["r_id"]);
         let original_schema = {

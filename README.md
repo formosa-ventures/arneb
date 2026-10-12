@@ -1,5 +1,10 @@
 # Arneb
 
+[![Latest release](https://img.shields.io/github/v/release/formosa-ventures/arneb?sort=semver)](https://github.com/formosa-ventures/arneb/releases/latest)
+[![CI](https://github.com/formosa-ventures/arneb/actions/workflows/ci.yml/badge.svg)](https://github.com/formosa-ventures/arneb/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
+[![Docs](https://img.shields.io/badge/docs-arneb.io-blue)](https://arneb.io)
+
 A Trino alternative built in Rust. Distributed SQL query engine for federated queries across heterogeneous data sources.
 
 Trino (formerly PrestoSQL) lets users query data where it lives — across object stores, databases, and other systems — using standard SQL. This project aims to achieve similar goals with Rust's performance and safety guarantees.
@@ -120,14 +125,25 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 - **SQL Support**: SELECT, JOIN (INNER/LEFT/RIGHT/FULL/CROSS), GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, CASE/COALESCE/NULLIF, CTEs, UNION/INTERSECT/EXCEPT, window functions, subqueries (IN/EXISTS/scalar), DDL/DML (CREATE/DROP TABLE, INSERT, DELETE, views)
 - **90 Trino-compatible Scalar Functions**: conditional (IF, TRY, GREATEST, LEAST), string (SPLIT_PART, STRPOS, LPAD/RPAD, CONCAT_WS, `||`, ...), regex (REGEXP_LIKE/EXTRACT/REPLACE/COUNT), math (SQRT, LN, LOG, TRUNCATE, RANDOM, trig, ...), date/time (DATE_ADD, DATE_DIFF, DATE_TRUNC, DATE_FORMAT, DATE_PARSE, FORMAT_DATETIME, YEAR/MONTH/DAY_OF_WEEK/..., FROM_UNIXTIME, NOW) — see [docs/sql/functions.md](docs/sql/functions.md)
 - **Arrow-native Execution**: Vectorized columnar processing using Apache Arrow
-- **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API), Apache Iceberg tables in the same HMS via table redirection (read-only; field-ID schema evolution)
-- **PostgreSQL Wire Protocol**: Compatible with psql, DBeaver, JDBC, psycopg2, node-postgres, and all standard PostgreSQL clients
+- **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API) with Parquet and ORC tables and partitioned tables (partitions read from HMS, as in Trino), Apache Iceberg tables in the same HMS via table redirection (read-only; field-ID schema evolution) — see [Hive](docs/connectors/hive.md)
+- **PostgreSQL Wire Protocol**: Compatible with psql, DBeaver, JDBC, psycopg2, node-postgres, and all standard PostgreSQL clients; per-connection `SET search_path`; SCRAM-SHA-256 password authentication
 - **Extended Query Protocol**: Full prepared statement support (Parse/Bind/Describe/Execute/Sync)
 - **Trino Client Protocol**: Trino's REST protocol on port 8080, so the `trino` CLI, Trino JDBC, `trino-python-client` (Superset), Metabase's Trino driver and dbt-trino can connect unchanged — see [Trino client compatibility](docs/guide/trino-clients.md)
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
 - **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC
 - **Web UI**: Dashboard with query monitoring, cluster overview, and worker status
 - **TPC-H Benchmark**: 22/22 queries cell-identical to Trino, ~6× lower peak memory on all 22 and faster on 21 of 22 at SF10, with a one-command benchmark harness and comparison tooling
+
+## Releases
+
+The latest release is **v0.1.1** <!-- x-release-please-version --> — see the [release notes](https://github.com/formosa-ventures/arneb/releases/latest) and [`CHANGELOG.md`](CHANGELOG.md). Releases are source releases (no prebuilt binaries yet); build one from its tag:
+
+```bash
+git clone --branch v0.1.1 https://github.com/formosa-ventures/arneb.git  # x-release-please-version
+cd arneb && cargo build --release
+```
+
+`main` moves faster than releases. How releases are cut and versioned is described in [Contributing → Releases](docs/contributing.md#releases).
 
 ## Quick Start
 

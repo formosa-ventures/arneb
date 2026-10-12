@@ -28,6 +28,23 @@ Arneb supports the following query features:
 - **Window Functions**: ROW_NUMBER, RANK, DENSE_RANK, and aggregate window functions with PARTITION BY and ORDER BY
 - **Ordering and Limiting**: ORDER BY (including on aliases and aggregates), LIMIT, OFFSET
 
+## Session Settings
+
+PostgreSQL clients can set the schema used for unqualified table names, per connection:
+
+```sql
+SET search_path = tpch;             -- a schema in the default catalog
+SET search_path TO datalake.tpch;   -- catalog.schema
+SHOW search_path;
+RESET search_path;                  -- back to the server default
+```
+
+- Like Trino, Arneb has one current schema: the first entry that names an existing schema is used. If none does — for example PostgreSQL's default `"$user", public`, or `public`, which Arneb doesn't have — the server's default schema is kept, so tools that send these keep working.
+- The setting lasts for the rest of the connection, including `SET LOCAL`.
+- Fully qualified names (`catalog.schema.table`) are always resolved as written.
+
+Trino clients set the catalog and schema with `USE` instead; see [Trino Clients](/guide/trino-clients#session-statements).
+
 ## Further Reading
 
 - [Expressions](/sql/expressions) — operators, CASE, CAST, LIKE, and more

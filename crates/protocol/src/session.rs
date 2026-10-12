@@ -6,10 +6,11 @@
 //!
 //! Arneb (like Trino) has a single current schema, so only one entry of the
 //! search path is used to resolve unqualified names: the first entry naming
-//! an existing schema, or — matching PostgreSQL, which accepts nonexistent
-//! schemas in `search_path` — the first entry when none exists, so
-//! resolution fails later with a table-not-found error. An entry may be
-//! `schema` (in the server's default catalog) or `catalog.schema`.
+//! an existing schema. When none does (e.g. PostgreSQL's `"$user", public`,
+//! which clients and `pg_dump` output send), the server default schema is
+//! kept. `SET` still accepts nonexistent schemas, as PostgreSQL does, and
+//! `SHOW` reports the value as set. An entry may be `schema` (in the server's
+//! default catalog) or `catalog.schema`.
 
 use std::sync::Arc;
 

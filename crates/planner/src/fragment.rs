@@ -1766,9 +1766,14 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                     }
                 }
 
+                // Preserve an eligible broadcast build before considering a row-based swap.
                 if restore_swapped_output.is_none()
                     && matches!(join_type, arneb_sql_parser::ast::JoinType::Inner)
                     && self.stats.is_some()
+                    && !self.is_broadcast_eligible(
+                        &original_right_for_broadcast,
+                        &original_left_for_estimate,
+                    )
                 {
                     let old_left_width = original_left_for_estimate.schema().len();
                     let old_right_width = original_right_for_broadcast.schema().len();
@@ -6157,6 +6162,97 @@ mod tests {
         };
         assert!(matches!(left.as_ref(), PlanExpr::Column { index: 8, .. }));
         assert!(matches!(right.as_ref(), PlanExpr::Column { index: 0, .. }));
+    }
+
+    fn stats_for_broadcast_eligible_narrow_right() -> crate::cost::CatalogStats {
+        // wide_left: FEWER rows but MORE bytes (250 Int32 columns, ~1 MB)
+        // than narrow_right (100K rows x 1 Int32 column, 400 KB). With two
+        // workers and a 2 MB threshold the right side is broadcast-eligible
+        // (400 KB x 2 <= 1 MB) and the left side is not (1 MB x 2 > 400 KB).
+        let mut stats = crate::cost::CatalogStats::new();
+        stats.insert(
+            TableReference::table("wide_left"),
+            arneb_catalog::TableStatistics {
+                row_count: Some(1_000),
+                size_bytes: Some(1_000_000),
+                columns: std::collections::HashMap::new(),
+            },
+        );
+        stats.insert(
+            TableReference::table("narrow_right"),
+            arneb_catalog::TableStatistics {
+                row_count: Some(100_000),
+                size_bytes: Some(400_000),
+                columns: std::collections::HashMap::new(),
+            },
+        );
+        stats
+    }
+
+    #[test]
+    fn partitioned_build_side_swap_keeps_broadcast_eligible_right_as_build() {
+        // The row-based rule must not undo a broadcast the byte-based rule
+        // left in place: when the ORIGINAL right side is already
+        // broadcast-eligible, swapping on row count alone would move the
+        // wider left side to the build position, where it is no longer
+        // broadcast-eligible, and the join would degrade to a two-sided
+        // hash shuffle that builds the side with MORE bytes.
+        let wide_columns: Vec<String> = (0..250).map(|i| format!("w{i}")).collect();
+        let wide_column_refs: Vec<&str> = wide_columns.iter().map(String::as_str).collect();
+        let wide_left = scan_with_columns("wide_left", &wide_column_refs);
+        let narrow_right = scan_with_columns("narrow_right", &["n_id"]);
+        let original_schema = {
+            let mut schema = wide_left.schema();
+            schema.extend(narrow_right.schema());
+            schema
+        };
+        let plan = equi_join_on(wide_left, narrow_right, (0, "w0"), (250, "n_id"));
+
+        let mut frag = PlanFragmenter::new()
+            .with_worker_count(2)
+            .with_broadcast_threshold(Some(2_000_000))
+            .with_stats(Some(std::sync::Arc::new(
+                stats_for_broadcast_eligible_narrow_right(),
+            )));
+        let result = frag.fragment(plan);
+
+        assert_eq!(result.source_fragments.len(), 1, "one probe fragment");
+        let probe_frag = &result.source_fragments[0];
+        assert_eq!(
+            probe_frag.root.schema(),
+            original_schema,
+            "output column order must be untouched"
+        );
+        assert!(
+            matches!(probe_frag.root, LogicalPlan::Join { .. }),
+            "join must stay unswapped (no restore Projection), got {:?}",
+            plan_kind_label(&probe_frag.root)
+        );
+        let broadcast_sources: Vec<_> = probe_frag
+            .source_fragments
+            .iter()
+            .filter(|fragment| fragment.output_partitioning == PartitioningScheme::Broadcast)
+            .collect();
+        assert_eq!(
+            broadcast_sources.len(),
+            1,
+            "the broadcast-eligible right side must remain the broadcast build"
+        );
+        assert!(matches!(
+            broadcast_sources[0].root,
+            LogicalPlan::TableScan { ref table, .. } if table.table == "narrow_right"
+        ));
+        assert!(
+            !result_has_hash_output(&result),
+            "neither side may be hash-shuffled when the right side broadcasts"
+        );
+    }
+
+    fn result_has_hash_output(fragment: &PlanFragment) -> bool {
+        matches!(
+            fragment.output_partitioning,
+            PartitioningScheme::Hash { .. }
+        ) || fragment.source_fragments.iter().any(result_has_hash_output)
     }
 
     #[test]

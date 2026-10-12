@@ -12,7 +12,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{new_null_array, ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -22,10 +21,13 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::schema::types::SchemaDescriptor;
 use tracing::debug;
 
-use arneb_common::error::{ArnebError, ConnectorError, ExecutionError};
+use arneb_common::error::{ConnectorError, ExecutionError};
 use arneb_common::stream::{stream_from_batches, SendableRecordBatchStream};
 use arneb_common::types::{ColumnInfo, TableReference};
 use arneb_connectors::parquet_scan::{self, ParquetBatchStream};
+use arneb_connectors::scan_adapter::{
+    adapt_batch, literal_types_match, remap_filter, ColumnSource,
+};
 use arneb_connectors::storage::{StorageRegistry, StorageUri};
 use arneb_execution::{DataSource, ScanContext};
 use arneb_planner::PlanExpr;
@@ -244,16 +246,6 @@ impl fmt::Debug for IcebergDataSource {
     }
 }
 
-/// How one output column is produced from a file batch.
-#[derive(Debug, Clone)]
-enum ColumnSource {
-    /// Column at this position of the (projected) file batch, cast to the
-    /// table type when the file type differs (e.g. `int` → `long`).
-    File(usize),
-    /// Column absent from the file (added after the file was written).
-    Null,
-}
-
 /// Per-file mapping from the table schema to the physical file schema.
 struct FileColumnMap {
     /// Field ID → root column index in the file.
@@ -290,118 +282,6 @@ impl FileColumnMap {
             leaf_by_root,
         }
     }
-}
-
-/// Rewrite column references in a pushed-down filter from table column
-/// indices to file leaf indices. Returns `None` when the filter touches a
-/// column that cannot be pushed into this file (missing, nested, or with a
-/// different physical type) or uses an expression shape the Parquet
-/// pushdown does not understand; the filter still runs above the scan.
-fn remap_filter(e: &PlanExpr, map: &dyn Fn(usize) -> Option<usize>) -> Option<PlanExpr> {
-    Some(match e {
-        PlanExpr::Column { index, name, span } => PlanExpr::Column {
-            index: map(*index)?,
-            name: name.clone(),
-            span: *span,
-        },
-        PlanExpr::Literal { .. } => e.clone(),
-        PlanExpr::BinaryOp {
-            left,
-            op,
-            right,
-            span,
-        } => PlanExpr::BinaryOp {
-            left: Box::new(remap_filter(left, map)?),
-            op: *op,
-            right: Box::new(remap_filter(right, map)?),
-            span: *span,
-        },
-        PlanExpr::InList {
-            expr,
-            list,
-            negated,
-            span,
-        } => PlanExpr::InList {
-            expr: Box::new(remap_filter(expr, map)?),
-            list: list
-                .iter()
-                .map(|x| remap_filter(x, map))
-                .collect::<Option<Vec<_>>>()?,
-            negated: *negated,
-            span: *span,
-        },
-        _ => return None,
-    })
-}
-
-/// `true` when every `column <op> literal` comparison in `e` compares
-/// against a literal of exactly the column's type. The shared Parquet
-/// predicate kernels compare Arrow arrays directly and error on mixed
-/// types (e.g. `Int64` column vs `Int32` scalar), so anything else stays
-/// above the scan.
-fn literal_types_match(e: &PlanExpr, columns: &[ColumnInfo]) -> bool {
-    let col_type = |c: &PlanExpr| match c {
-        PlanExpr::Column { index, .. } => columns.get(*index).map(|c| &c.data_type),
-        _ => None,
-    };
-    let lit_ok = |c: &PlanExpr, l: &PlanExpr| match (col_type(c), l) {
-        (Some(ct), PlanExpr::Literal { value, .. }) => &value.data_type() == ct,
-        _ => true,
-    };
-    match e {
-        PlanExpr::BinaryOp { left, right, .. } => {
-            lit_ok(left, right)
-                && lit_ok(right, left)
-                && literal_types_match(left, columns)
-                && literal_types_match(right, columns)
-        }
-        PlanExpr::InList { expr, list, .. } => list.iter().all(|l| lit_ok(expr, l)),
-        _ => true,
-    }
-}
-
-/// Assemble a table-schema batch from a projected file batch: cast
-/// promoted columns, null-fill columns the file does not have.
-fn adapt_batch(
-    schema: &SchemaRef,
-    sources: &[ColumnSource],
-    file_path: &str,
-    batch: RecordBatch,
-) -> Result<RecordBatch, ArnebError> {
-    let n = batch.num_rows();
-    let columns: Vec<ArrayRef> = sources
-        .iter()
-        .zip(schema.fields())
-        .map(|(src, field)| -> Result<ArrayRef, ArnebError> {
-            match src {
-                ColumnSource::Null => Ok(new_null_array(field.data_type(), n)),
-                ColumnSource::File(pos) => {
-                    let col = batch.column(*pos);
-                    if col.data_type() == field.data_type() {
-                        return Ok(col.clone());
-                    }
-                    arrow::compute::cast(col, field.data_type()).map_err(|e| {
-                        ExecutionError::InvalidOperation(format!(
-                            "Iceberg column '{}' in '{file_path}': cannot read {} as {}: {e}",
-                            field.name(),
-                            col.data_type(),
-                            field.data_type()
-                        ))
-                        .into()
-                    })
-                }
-            }
-        })
-        .collect::<Result<_, _>>()?;
-    RecordBatch::try_new_with_options(
-        schema.clone(),
-        columns,
-        &RecordBatchOptions::new().with_row_count(Some(n)),
-    )
-    .map_err(|e| {
-        ExecutionError::InvalidOperation(format!("Iceberg batch assembly for '{file_path}': {e}"))
-            .into()
-    })
 }
 
 #[async_trait]

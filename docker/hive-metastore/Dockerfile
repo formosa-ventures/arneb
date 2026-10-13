@@ -30,4 +30,10 @@ RUN chmod 644 /opt/hive/lib/hadoop-aws-${HADOOP_VERSION}.jar \
 
 COPY metastore-site.xml /opt/hive/conf/metastore-site.xml
 
+# Pre-create the embedded Derby directory owned by `hive` so a fresh named
+# volume mounted there (docker-compose.yml `hms-db`) inherits that ownership;
+# a volume on a path absent from the image would be root-owned and Derby
+# could not create the database.
+RUN mkdir -p /opt/hive/metastore_db && chown hive:hive /opt/hive/metastore_db
+
 USER hive

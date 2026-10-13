@@ -11,7 +11,11 @@
 #   docker compose run tpch-seed            # seed TPC-H data (SF1)
 #   docker compose run tpcds-seed           # seed TPC-DS data (SF1)
 #   docker compose run iceberg-seed         # seed Iceberg tables (iceberg.ice.*)
-#   docker compose down -v                  # tear down (delete volumes)
+#   docker compose down                     # tear down (keeps seeded data)
+#   docker compose down -v                  # tear down AND delete seeded data
+#
+# Seeded data lives in two named volumes so that `down` / container recreate
+# never loses it: `s3-data` (RustFS objects) and `hms-db` (HMS embedded Derby).
 
 # Pin the Compose project name so container names are deterministic regardless
 # of the directory the repo is cloned into. The benchmark scripts and oracles
@@ -36,6 +40,8 @@ services:
       RUSTFS_ADDRESS: ":9000"
       RUSTFS_CONSOLE_ENABLE: "true"
     command: ["/data"]
+    volumes:
+      - s3-data:/data
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "9000"]
       interval: 5s
@@ -65,6 +71,8 @@ services:
       - "9083:9083"
     environment:
       SERVICE_NAME: metastore
+    volumes:
+      - hms-db:/opt/hive/metastore_db
     depends_on:
       s3:
         condition: service_healthy
@@ -191,3 +199,7 @@ services:
         condition: service_healthy
     profiles:
       - tpcds-seed
+
+volumes:
+  s3-data:
+  hms-db:

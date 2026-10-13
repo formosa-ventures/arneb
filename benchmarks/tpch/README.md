@@ -49,13 +49,13 @@ The 40 GB sizes a *first* run, which builds the engine images from source
 (~18 GB of BuildKit cache); the seeded SF10 dataset itself is 2.0 GiB of
 Snappy Parquet.
 
-## Results — SF10, 2026-10-13
+## Results — SF10, 2026-10-14
 
 Host: 10 CPUs, 15.66 GiB container-runtime memory (OrbStack), 2.7 CPUs per
 engine node. Both engines as coordinator + 2 workers, rotated so only the
 measured engine is resident, cluster recreated before every measurement.
 Dataset: `lineitem` 59,986,052 rows, 2.0 GiB Snappy Parquet on RustFS via HMS.
-arneb built from `main` at 142205f. Produced by
+arneb built from `main` at 7afe347. Produced by
 `run_benchmark.sh --scenario=sf10 --mode=both`, all 22 queries in one run.
 
 Latency, cold vs warm, both applied identically to both engines:
@@ -67,62 +67,67 @@ Latency, cold vs warm, both applied identically to both engines:
 
 | Query | cold arneb | cold Trino | cold | warm arneb | warm Trino | warm |
 |-------|----------:|----------:|-----:|----------:|----------:|-----:|
-| q01 | 2055 | 6758 | 3.3x | 1773 | 2604 | 1.5x |
-| q02 | 600 | 5950 | 9.9x | 580 | 2134 | 3.7x |
-| q03 | 2324 | 8539 | 3.7x | 2167 | 3863 | 1.8x |
-| q04 | 2163 | 7115 | 3.3x | 1927 | 3060 | 1.6x |
-| q05 | 2261 | 7815 | 3.5x | 2043 | 3945 | 1.9x |
-| q06 | 764 | 4748 | 6.2x | 688 | 1853 | 2.7x |
-| q07 | 1891 | 7658 | 4.1x | 1882 | 3772 | 2.0x |
-| q08 | 2937 | 9080 | 3.1x | 2831 | 4478 | 1.6x |
-| q09 | 4260 | 11400 | 2.7x | 4186 | 5819 | 1.4x |
-| q10 | 2602 | 9472 | 3.6x | 1861 | 4088 | 2.2x |
-| q11 | 794 | 5591 | 7.0x | 683 | 1908 | 2.8x |
-| q12 | 1192 | 6379 | 5.4x | 1084 | 2158 | 2.0x |
-| q13 | 1504 | 7471 | 5.0x | 1516 | 3601 | 2.4x |
-| q14 | 1188 | 6786 | 5.7x | 1117 | 2838 | 2.5x |
-| q15 | 1052 | 6638 | 6.3x | 1002 | 3101 | 3.1x |
-| q16 | 1460 | 7456 | 5.1x | 1000 | 2503 | 2.5x |
-| q17 | 2942 | 11737 | 4.0x | 2897 | 5262 | 1.8x |
-| q18 | 4161 | 10944 | 2.6x | 4335 | 5140 | 1.2x |
-| q19 | 1407 | 7322 | 5.2x | 1278 | 3037 | 2.4x |
-| q20 | 3004 | 8195 | 2.7x | 3088 | 3781 | 1.2x |
-| q21 | 8344 | 14800 | 1.8x | **8232** | **6954** | **0.8x** |
-| q22 | 1029 | 5555 | 5.4x | 894 | 2095 | 2.3x |
+| q01 | 2019 | 6098 | 3.0x | 1870 | 2730 | 1.5x |
+| q02 | 603 | 5879 | 9.7x | 601 | 2227 | 3.7x |
+| q03 | 2251 | 8752 | 3.9x | 2258 | 3584 | 1.6x |
+| q04 | 2111 | 7046 | 3.3x | 1958 | 2873 | 1.5x |
+| q05 | 2290 | 8037 | 3.5x | 2001 | 3920 | 2.0x |
+| q06 | 817 | 4580 | 5.6x | 712 | 1872 | 2.6x |
+| q07 | 1910 | 7780 | 4.1x | 1859 | 3960 | 2.1x |
+| q08 | 2951 | 9396 | 3.2x | 2736 | 4682 | 1.7x |
+| q09 | 4654 | 11752 | 2.5x | 4717 | 5289 | 1.1x |
+| q10 | 2074 | 9434 | 4.5x | 2057 | 4262 | 2.1x |
+| q11 | 715 | 5168 | 7.2x | 638 | 2053 | 3.2x |
+| q12 | 1261 | 6652 | 5.3x | 1104 | 2291 | 2.1x |
+| q13 | 1585 | 7750 | 4.9x | 1528 | 3945 | 2.6x |
+| q14 | 1253 | 6743 | 5.4x | 1154 | 2769 | 2.4x |
+| q15 | 1127 | 6586 | 5.8x | 1147 | 3460 | 3.0x |
+| q16 | 1280 | 7677 | 6.0x | 955 | 2475 | 2.6x |
+| q17 | 3026 | 11507 | 3.8x | 3005 | 5300 | 1.8x |
+| q18 | 3868 | 10776 | 2.8x | 3982 | 4883 | 1.2x |
+| q19 | 1426 | 6849 | 4.8x | 1304 | 3040 | 2.3x |
+| q20 | 1340 | 8166 | 6.1x | 1257 | 3744 | 3.0x |
+| q21 | 8280 | 14232 | 1.7x | **8011** | **6705** | **0.8x** |
+| q22 | 1075 | 5411 | 5.0x | 914 | 2152 | 2.4x |
 
-**Geomean: cold 4.2x, warm 2.0x.** All times in milliseconds, one timed run per cell.
+**Geomean: cold 4.3x, warm 2.0x.** All times in milliseconds, one timed run per cell.
 
 Peak memory (simultaneous cluster RSS, warm run):
 
 | Query | arneb MB | Trino MB | ratio | | Query | arneb MB | Trino MB | ratio |
 |---|--:|--:|--:|---|---|--:|--:|--:|
-| q01 | 349 | 4461 | 0.08x | | q12 | 429 | 4390 | 0.10x |
-| q02 | 371 | 3890 | 0.10x | | q13 | 444 | 5799 | 0.08x |
-| q03 | 2037 | 5685 | 0.36x | | q14 | 877 | 5238 | 0.17x |
-| q04 | 1724 | 6925 | 0.25x | | q15 | 486 | 5851 | 0.08x |
-| q05 | 1034 | 7040 | 0.15x | | q16 | 426 | 4405 | 0.10x |
-| q06 | 334 | 4649 | 0.07x | | q17 | 1643 | 8201 | 0.20x |
-| q07 | 1288 | 5823 | 0.22x | | q18 | 4786 | 9521 | 0.50x |
-| q08 | 1715 | 6448 | 0.27x | | q19 | 809 | 5473 | 0.15x |
-| q09 | 1836 | 8306 | 0.22x | | q20 | 1093 | 6956 | 0.16x |
-| q10 | 1053 | 4580 | 0.23x | | q21 | 1735 | 8906 | 0.19x |
-| q11 | 405 | 3951 | 0.10x | | q22 | 795 | 4823 | 0.16x |
+| q01 | 371 | 5032 | 0.07x | | q12 | 449 | 4902 | 0.09x |
+| q02 | 297 | 3752 | 0.08x | | q13 | 440 | 5396 | 0.08x |
+| q03 | 1900 | 5305 | 0.36x | | q14 | 865 | 5688 | 0.15x |
+| q04 | 1727 | 6853 | 0.25x | | q15 | 449 | 6230 | 0.07x |
+| q05 | 1039 | 6436 | 0.16x | | q16 | 594 | 4401 | 0.13x |
+| q06 | 370 | 5013 | 0.07x | | q17 | 1476 | 8674 | 0.17x |
+| q07 | 1176 | 6032 | 0.19x | | q18 | 2057 | 8762 | 0.23x |
+| q08 | 1658 | 6739 | 0.25x | | q19 | 780 | 5773 | 0.14x |
+| q09 | 1718 | 8467 | 0.20x | | q20 | 861 | 6076 | 0.14x |
+| q10 | 940 | 5069 | 0.19x | | q21 | 1794 | 7333 | 0.24x |
+| q11 | 359 | 3542 | 0.10x | | q22 | 812 | 4678 | 0.17x |
 
-**Mean ratio 0.18x**, and arneb is lower on all 22.
+**Mean ratio 0.16x**, and arneb is lower on all 22.
 
 ### Run-to-run variance
 
-A second full run earlier the same day, under identical settings, gives a
-first measure of noise. Per-query speedups moved by a median of 5–6% between
-the two (worst: q16 cold, 29%); the geomeans moved by at most 0.1x (4.3x cold /
-1.9x warm / 0.17x memory in the other run). The one unstable memory figure is
-arneb's q18 peak: 3.0 GB in one run, 4.7 GB in the other. A single-query
-difference under ~30% in these tables is therefore not a result.
+Two full runs on 2026-10-13 (on 142205f) and this one, all under identical
+settings, give a first measure of noise. Per-query speedups moved by a median
+of 4–6% between consecutive runs (worst: q16 cold, 29%); the geomeans moved by
+at most 0.1x (4.3x / 1.9x / 0.17x and 4.2x / 2.0x / 0.18x cold / warm / memory
+in the two earlier runs). The one unstable memory figure is arneb's q18 peak:
+2.0, 3.0 and 4.7 GB across the three. A single-query difference under ~30% in
+these tables is therefore not a result.
+
+The exception is q20, which is a real change: 7afe347 (#123) pre-filters the
+decorrelated aggregate by the outer semi-join key set, and arneb's q20 went
+from 3004 / 3088 ms cold / warm to 1340 / 1257 ms (warm 1.2x → 3.0x).
 
 ### What the two columns mean
 
-Warming is worth a median 56% to Trino (49–66% across the 22) and 6% to arneb
-(−4% to +32%, the top of that range being q16's noisy cold run). A recreated
+Warming is worth a median 55% to Trino (47–68% across the 22) and 7% to arneb
+(−3% to +25%). A recreated
 JVM re-JITs; arneb has no comparable start-up cost. So most of the gap between
 the cold and warm columns is Trino's start-up, not query execution — **the
 warm column is the one to quote.** The cold column is kept because it is what
@@ -131,17 +136,17 @@ warm numbers would be choosing the flattering protocol after the fact.
 
 Storage-side cold barely moves either engine at this scale. The 2026-09-20
 run recreated the engines but left RustFS and the page cache warm, and got
-geomeans of 4.4x cold / 2.0x warm against this run's 4.2x / 2.0x: on this
+geomeans of 4.4x cold / 2.0x warm against this run's 4.3x / 2.0x: on this
 host, re-reading 2 GiB of Parquet from local NVMe is cheap next to JVM
 start-up. Cold does not reach below the container VM — on macOS the VM's disk
 image can still sit in the host's file cache, which only `sudo purge` drops.
 
 ### q21
 
-Warm, arneb loses q21: 8232 ms against Trino's 6954 ms (0.84x). It has lost
-q21 warm in all four runs so far (0.78x and 0.68x on 2026-09-20, 0.80x and
-0.84x on 2026-10-13), so it reproduces. arneb still uses 0.19x the peak memory
-on it. q21 is the four-way correlated `EXISTS` / `NOT EXISTS` self-join over
+Warm, arneb loses q21: 8011 ms against Trino's 6705 ms (0.84x). It has lost
+q21 warm in all five runs so far (0.78x and 0.68x on 2026-09-20, 0.80x and
+0.84x on 2026-10-13, 0.84x on 2026-10-14), so it reproduces. arneb still uses
+0.24x the peak memory on it. q21 is the four-way correlated `EXISTS` / `NOT EXISTS` self-join over
 `lineitem`, the deepest join pipeline in the suite; the
 `ARNEB_COMPACT_SEMI_NE` path that makes its memory cheap is not making its
 latency competitive once Trino is warm.
@@ -161,7 +166,7 @@ query.
 
 Separate gate, and it passes outright: all 22 queries deterministic run-to-run
 and cell-identical to Trino, compared as an order-independent multiset at 6
-significant figures. Last run 2026-10-13 at SF10 on the same build as the
+significant figures. Last run 2026-10-14 at SF10 on the same build as the
 numbers above, with the fixed q11 (8,685 rows on both engines).
 
 ```bash

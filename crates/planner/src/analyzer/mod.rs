@@ -40,6 +40,7 @@ pub mod narrow_keys;
 pub mod predicate_pushdown;
 pub mod pullup_semi_anti;
 pub mod semi_join_dedup;
+pub mod semi_join_reduction;
 pub mod semi_join_to_inner;
 pub mod type_coercion;
 
@@ -54,6 +55,7 @@ pub use narrow_keys::{narrow_keys_enabled, NarrowKeys};
 pub use predicate_pushdown::PredicatePushdown;
 pub use pullup_semi_anti::PullupSemiAnti;
 pub use semi_join_dedup::SemiJoinDedupBuild;
+pub use semi_join_reduction::SemiJoinReduction;
 pub use semi_join_to_inner::SemiJoinToInnerJoin;
 pub use type_coercion::TypeCoercion;
 
@@ -686,6 +688,7 @@ impl Analyzer {
         let mut passes: Vec<Box<dyn AnalysisPass>> = vec![
             Box::new(TypeCoercion::new()),
             Box::new(PredicatePushdown::new()),
+            Box::new(SemiJoinReduction::new()),
             Box::new(EagerAggregation::new()),
             Box::new(SemiJoinToInnerJoin::new()),
             Box::new(JoinReorder::new()),

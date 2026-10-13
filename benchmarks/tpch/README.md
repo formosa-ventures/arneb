@@ -117,7 +117,8 @@ settings, give a first measure of noise. Per-query speedups moved by a median
 of 4–6% between consecutive runs (worst: q16 cold, 29%); the geomeans moved by
 at most 0.1x (4.3x / 1.9x / 0.17x and 4.2x / 2.0x / 0.18x cold / warm / memory
 in the two earlier runs). The one unstable memory figure is arneb's q18 peak:
-2.0, 3.0 and 4.7 GB across the three. A single-query difference under ~30% in
+2.0, 3.0 and 4.7 GB across the three
+([#126](https://github.com/formosa-ventures/arneb/issues/126)). A single-query difference under ~30% in
 these tables is therefore not a result.
 
 The exception is q20, which is a real change: 7afe347 (#123) pre-filters the

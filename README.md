@@ -344,7 +344,8 @@ One host, one scale factor, one run per protocol per query in the table.
 Three full runs under identical settings on 2026-10-13/14 put the
 run-to-run noise at a median of 4–6% per-query speedup (worst 29%, `q16`
 cold) and at most 0.1× on the geomeans; arneb's `q18` peak memory is the one
-unstable figure (2.0, 3.0 and 4.7 GB across the three). Single-query
+unstable figure (2.0, 3.0 and 4.7 GB across the three; tracked in
+[#126](https://github.com/formosa-ventures/arneb/issues/126)). Single-query
 differences under ~30% are not results. Numbers from two different
 hosts are not comparable; a scenario makes a run repeatable, not
 hardware-independent.

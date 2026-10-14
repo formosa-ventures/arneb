@@ -491,11 +491,11 @@ fn partitioned_semi_join_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_PARTITIONED_SEMI_JOIN")
             .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             partitioned_semi_join = enabled,
-            "ARNEB_PARTITIONED_SEMI_JOIN effective value (default off; =1 to enable hash-partitioned semi/anti joins)"
+            "ARNEB_PARTITIONED_SEMI_JOIN effective value (default on; =0 to disable hash-partitioned semi/anti joins)"
         );
         enabled
     })

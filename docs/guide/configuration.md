@@ -83,6 +83,12 @@ shown), with the effective value logged.
 | spill budget | config / cgroup | `ARNEB_SPILL_BUDGET_BYTES` | Per-node budget (bytes) a spillable operator (SemiJoin/HashJoin build) reserves against before spilling to disk. Overrides the `[memory] spill_budget_bytes` config field. Exists as an env var because the bench config is COPYed into the docker image at build time — the env override retunes without an image rebuild. |
 | query memory cap | config | `ARNEB_QUERY_MAX_MEMORY_BYTES` | Per-task cumulative allocation cap (bytes). When the query's tracked `MemoryReservation` crosses it, the query fails cleanly with `ResourceExhausted` instead of OOM-killing the worker. Overrides `[memory] query_max_memory_per_node`. |
 
+### Query Execution
+
+| Knob | Default | Env Var | Description |
+|------|---------|---------|-------------|
+| hash-partitioned semi/anti joins | on | `ARNEB_PARTITIONED_SEMI_JOIN` | Distributes `SemiJoin`/`AntiJoin` fragments by hash-partitioning both sides on the join key across workers, instead of running each on a single worker that receives the whole probe and build. Set `=0` to fall back to the single-partition path. Measured on TPC-H: SF10 warm q21 −21%, q04 −22%, q22 −20%; SF30 cold q04 −33%, q22 −14%; oracle 22/22 identical to Trino. The effective value is logged on target `arneb::config`. |
+
 The startup log line `memory pool installed … spill_budget_bytes=… spill_budget_source=…`
 confirms the resolved value and its source (`env` / `config` / `cgroup_v2` / `cgroup_v1`
 / `unbounded`); a `source=env` line confirms the override took effect.

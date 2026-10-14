@@ -38,6 +38,7 @@ set -euo pipefail
 #   ./scripts/run_benchmark.sh --scenario=sf10
 #   ./scripts/run_benchmark.sh --scenario=sf1 --queries="q01 q06"
 #   ./scripts/run_benchmark.sh --scenario=sf10 --skip-trino
+#   ./scripts/run_benchmark.sh --scenario=sf10 --mode=warm
 #   TPCH_SF=sf1 ./scripts/run_benchmark.sh          # bare path, no scenario
 #
 # Environment:
@@ -45,8 +46,12 @@ set -euo pipefail
 #                     recorded as bypassed so it is not mistaken for a clean one
 #   SKIP_SEED=1       measure the resident dataset instead of re-seeding; the
 #                     run is refused if that dataset is not this scale's data
-#   BENCH_WARMUP=1    one untimed warm-up run per query per engine before the
-#                     timed one (applied identically to both engines)
+#   BENCH_MODE=...    cold | warm | both (default both; --mode wins over it).
+#                     cold = fresh cluster + RustFS restarted + page cache
+#                     dropped; warm = fresh cluster + one untimed run first;
+#                     both = cold then warm per query, one CSV, side-by-side
+#                     report. See run_memory_bench.sh for the details.
+#   BENCH_WARMUP=1    older spelling of BENCH_MODE=warm
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BENCH_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -65,11 +70,14 @@ ENV_TPCH_SF="${TPCH_SF:-}"
 ENV_NUM_RUNS="${NUM_RUNS:-}"
 ENV_WARM_UP="${WARM_UP:-}"
 ENV_NODE_CPUS="${BENCH_NODE_CPUS:-}"
+ENV_MODE="${BENCH_MODE:-}"
+[[ -z "$ENV_MODE" && "${BENCH_WARMUP:-0}" == "1" ]] && ENV_MODE=warm
 
 CLI_SCENARIO=""
 CLI_TPCH_SF=""
 CLI_NUM_RUNS=""
 CLI_QUERIES=""
+CLI_MODE=""
 SKIP_TRINO="${SKIP_TRINO:-0}"
 
 for arg in "$@"; do
@@ -78,8 +86,9 @@ for arg in "$@"; do
         --sf=*)        CLI_TPCH_SF="${arg#*=}" ;;
         --runs=*)      CLI_NUM_RUNS="${arg#*=}" ;;
         --queries=*)   CLI_QUERIES="${arg#*=}" ;;
+        --mode=*)      CLI_MODE="${arg#*=}" ;;
         --skip-trino)  SKIP_TRINO=1 ;;
-        -h|--help)     sed -n '4,47p' "$0"; exit 0 ;;
+        -h|--help)     sed -n '4,54p' "$0"; exit 0 ;;
         *)             die "unknown argument: $arg" ;;
     esac
 done
@@ -111,6 +120,11 @@ fi
 TPCH_SF="${CLI_TPCH_SF:-${ENV_TPCH_SF:-${SCENARIO_TPCH_SF:-sf1}}}"
 NUM_RUNS="${CLI_NUM_RUNS:-${ENV_NUM_RUNS:-${SCENARIO_NUM_RUNS:-5}}}"
 WARM_UP="${ENV_WARM_UP:-${SCENARIO_WARM_UP:-2}}"
+BENCH_MODE="${CLI_MODE:-${ENV_MODE:-${SCENARIO_MODE:-both}}}"
+case "$BENCH_MODE" in
+    cold|warm|both) ;;
+    *) die "--mode must be cold, warm or both (got '$BENCH_MODE')" ;;
+esac
 LINEITEM_ROWS="${SCENARIO_LINEITEM_ROWS:-}"
 FLOOR_MEM_GIB="${SCENARIO_FLOOR_MEM_GIB:-0}"
 FLOOR_CPUS="${SCENARIO_FLOOR_CPUS:-0}"
@@ -180,7 +194,7 @@ echo "TPC-H Benchmark: arneb vs Trino"
 echo "============================================"
 echo "Scenario:  ${SCENARIO_NAME:-none (bare TPCH_SF path)}"
 echo "Scale:     $TPCH_SF"
-echo "Warm-up:   ${BENCH_WARMUP:-0}"
+echo "Mode:      $BENCH_MODE"
 echo ""
 
 preflight
@@ -258,8 +272,7 @@ latest_csv() {
 
 before=$(latest_csv)
 
-measure_env=(SKIP_TRINO="$SKIP_TRINO")
-[[ -n "${BENCH_WARMUP:-}" ]] && measure_env+=(BENCH_WARMUP="$BENCH_WARMUP")
+measure_env=(SKIP_TRINO="$SKIP_TRINO" BENCH_MODE="$BENCH_MODE" BENCH_WARMUP=)
 [[ -n "${BENCH_NODE_CPUS:-}" ]] && measure_env+=(BENCH_NODE_CPUS="$BENCH_NODE_CPUS")
 
 if [[ -n "$CLI_QUERIES" ]]; then
@@ -284,7 +297,8 @@ cat >"$PROV" <<JSON
   "scale_factor": "$TPCH_SF",
   "num_runs": $NUM_RUNS,
   "warm_up": $WARM_UP,
-  "bench_warmup": ${BENCH_WARMUP:-0},
+  "mode": "$BENCH_MODE",
+  "bench_warmup": $( [[ "$BENCH_MODE" == "warm" ]] && echo 1 || echo 0 ),
   "preflight_bypassed": $PREFLIGHT_BYPASSED,
   "node_cpus": "${BENCH_NODE_CPUS:-auto}",
   "lineitem_rows": ${rows:-0},

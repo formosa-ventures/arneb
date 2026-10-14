@@ -95,7 +95,9 @@ services:
           cpus: "${BENCH_NODE_CPUS:-2}"
     image: trinodb/trino:latest
     ports:
-      - "8080:8080"
+      # Host side overridable for hosts where 8080 is already taken; the bench
+      # scripts reach Trino from inside its container, so they never use it.
+      - "${TRINO_HOST_PORT:-8080}:8080"
     volumes:
       - ./docker/trino/catalog:/etc/trino/catalog
       - ./docker/trino/etc/config.properties:/etc/trino/config.properties

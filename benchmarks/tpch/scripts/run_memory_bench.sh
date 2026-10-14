@@ -40,6 +40,21 @@
 #   QUERIES="q01 q02" ./benchmarks/tpch/scripts/run_memory_bench.sh
 #   SKIP_TRINO=1 ./benchmarks/tpch/scripts/run_memory_bench.sh     # arneb only
 #   SKIP_ARNEB=1 ./benchmarks/tpch/scripts/run_memory_bench.sh     # trino only
+#   BENCH_MODE=both ./benchmarks/tpch/scripts/run_memory_bench.sh  # cold + warm
+#
+# BENCH_MODE — what state each timed run starts from (recorded per CSV row):
+#   cold  (default) the engine cluster is recreated AND the storage side is
+#         flushed: RustFS is restarted and the container VM's page cache is
+#         dropped, so the timed run re-reads every byte from disk. This is the
+#         first-query-on-a-fresh-cluster number.
+#   warm  the engine cluster is recreated, then one untimed run of the same
+#         query precedes the timed one: JIT, metadata caches and page cache are
+#         all populated. This is the steady-state number to quote.
+#   both  per query: cold then warm, for each engine, into the same CSV.
+# BENCH_WARMUP=1 is the older spelling of BENCH_MODE=warm and still works.
+#
+# Cold does NOT reach below the container VM: on macOS the VM's disk image can
+# still sit in the host's own file cache, which only `sudo purge` drops.
 
 set -u
 
@@ -70,6 +85,23 @@ fi
 
 SKIP_TRINO=${SKIP_TRINO:-0}
 SKIP_ARNEB=${SKIP_ARNEB:-0}
+
+if [[ -z "${BENCH_MODE:-}" && "${BENCH_WARMUP:-0}" == "1" ]]; then
+    BENCH_MODE=warm
+fi
+if [[ "$SKIP_ARNEB" != "1" ]] && ! command -v psql >/dev/null; then
+    # Without this, every arneb measurement waits out the 180s readiness gate
+    # and lands as RESTART_FAIL, which reads like an engine fault.
+    echo "psql not on PATH (Homebrew: export PATH=\"\$(brew --prefix libpq)/bin:\$PATH\")" >&2
+    exit 2
+fi
+
+BENCH_MODE=${BENCH_MODE:-cold}
+case "$BENCH_MODE" in
+    cold|warm) MODES=("$BENCH_MODE") ;;
+    both)      MODES=(cold warm) ;;
+    *) echo "BENCH_MODE must be cold, warm or both (got '$BENCH_MODE')" >&2; exit 2 ;;
+esac
 
 # Include coordinator in the cluster list. The coordinator does real
 # query work (final aggregation, sort, root fragment in arneb; query
@@ -195,10 +227,27 @@ stop_arneb() {
     docker compose "${COMPOSE_FILES[@]}" stop arneb arneb-worker-1 arneb-worker-2 >/dev/null 2>&1
 }
 
+# Cold storage: restart RustFS (drops its in-process caches) and drop the
+# container VM's page cache (the Parquet bytes RustFS serves from its disk).
+# Runs while both engines are stopped, so nothing re-warms it before the
+# measured engine starts. sysctl vm.* is not namespaced, so a privileged
+# throwaway container writes the VM-wide knob.
+flush_storage() {
+    docker compose "${COMPOSE_FILES[@]}" restart s3 >/dev/null 2>&1 || return 1
+    docker compose "${COMPOSE_FILES[@]}" up -d --wait --wait-timeout 60 s3 >/dev/null 2>&1 || return 1
+    docker run --rm --privileged alpine:3.20 \
+        sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches' >/dev/null 2>&1 || return 1
+}
+
 restart_arneb() {
+    # $1 = mode (cold|warm)
     stop_trino  # Free Trino JVM heap before arneb measurement.
     docker compose "${COMPOSE_FILES[@]}" stop arneb arneb-worker-1 arneb-worker-2 >/dev/null 2>&1
     docker compose "${COMPOSE_FILES[@]}" rm -f arneb arneb-worker-1 arneb-worker-2 >/dev/null 2>&1
+    if [[ "$1" == "cold" ]] && ! flush_storage; then
+        echo "  [arneb] storage flush failed" >&2
+        return 1
+    fi
     docker compose "${COMPOSE_FILES[@]}" up -d arneb arneb-worker-1 arneb-worker-2 >/dev/null 2>&1
     # Readiness gate: poll pgwire until the coordinator responds. D1's
     # liveness check handles worker-registration races, so a simple
@@ -218,9 +267,14 @@ restart_arneb() {
 }
 
 restart_trino() {
+    # $1 = mode (cold|warm)
     stop_arneb  # Free arneb footprint before Trino measurement.
     docker compose "${COMPOSE_FILES[@]}" stop trino trino-worker-1 trino-worker-2 >/dev/null 2>&1
     docker compose "${COMPOSE_FILES[@]}" rm -f trino trino-worker-1 trino-worker-2 >/dev/null 2>&1
+    if [[ "$1" == "cold" ]] && ! flush_storage; then
+        echo "  [trino] storage flush failed" >&2
+        return 1
+    fi
     # --wait blocks until the compose healthcheck passes. Trino coord
     # healthcheck runs `trino --execute "SELECT 1"`, which only succeeds
     # once it is past "still initializing" and a worker is registered —
@@ -239,20 +293,19 @@ restart_trino() {
 # --- query execution --------------------------------------------------
 
 run_arneb_query() {
-    # $1 = query id (e.g., q05)
-    local q=$1
+    # $1 = query id (e.g., q05), $2 = mode (cold|warm)
+    local q=$1 mode=$2
     local sql_file="$QDIR/$q.sql"
-    local out="$LOG_DIR/arneb_${q}.csv"
-    local err="$LOG_DIR/arneb_${q}.err"
+    local out="$LOG_DIR/arneb_${q}_${mode}.csv"
+    local err="$LOG_DIR/arneb_${q}_${mode}.err"
     local start end elapsed_ms
 
-    # BENCH_WARMUP=1: one untimed warm-up run BEFORE the timed run so the
-    # measured latency reflects warm data (OS page cache populated) + warm JIT,
-    # not a cold re-read+gzip-redecompress of lineitem from MinIO. Default off
-    # (unchanged metric). The warm-up's peak ~= the timed run's peak (same query)
-    # so memory.peak is unaffected; baseline stays clean from the cluster restart.
-    # Applied identically to Trino below (fair to both engines).
-    if [[ "${BENCH_WARMUP:-0}" == "1" ]]; then
+    # warm: one untimed run BEFORE the timed run so the measured latency
+    # reflects warm data (page cache populated) + warm caches, not a cold
+    # re-read of lineitem from RustFS. The warm-up's peak ~= the timed run's
+    # peak (same query) so memory.peak is unaffected; baseline stays clean from
+    # the cluster restart. Applied identically to Trino below.
+    if [[ "$mode" == "warm" ]]; then
         psql -h 127.0.0.1 -p 5432 -t -A -F',' -q \
             -c "SET search_path TO datalake.tpch" -f "$sql_file" >/dev/null 2>&1
     fi
@@ -273,15 +326,16 @@ run_arneb_query() {
 }
 
 run_trino_query() {
-    local q=$1
+    # $1 = query id, $2 = mode (cold|warm)
+    local q=$1 mode=$2
     local sql_file="$QDIR/$q.sql"
-    local out="$LOG_DIR/trino_${q}.csv"
-    local err="$LOG_DIR/trino_${q}.err"
+    local out="$LOG_DIR/trino_${q}_${mode}.csv"
+    local err="$LOG_DIR/trino_${q}_${mode}.err"
     local start end elapsed_ms
 
-    # BENCH_WARMUP=1: untimed warm-up before the timed run (see run_arneb_query).
-    # Warms Trino's JVM JIT + the OS page cache equally → fair, stable latency.
-    if [[ "${BENCH_WARMUP:-0}" == "1" ]]; then
+    # warm: untimed warm-up before the timed run (see run_arneb_query).
+    # Warms Trino's JVM JIT + the page cache equally → fair, stable latency.
+    if [[ "$mode" == "warm" ]]; then
         docker exec arneb-trino-1 trino --server localhost:8080 --catalog hive --schema tpch \
             --execute "$(cat "$sql_file")" --output-format CSV_UNQUOTED >/dev/null 2>&1
     fi
@@ -301,88 +355,67 @@ run_trino_query() {
     fi
 }
 
+# --- measurement -------------------------------------------------------
+
+measure() {
+    # $1 = query id, $2 = engine (arneb|trino), $3 = mode (cold|warm)
+    local q=$1 engine=$2 mode=$3
+    local cluster
+    if [[ "$engine" == "arneb" ]]; then
+        cluster=("${ARNEB_CLUSTER[@]}")
+    else
+        cluster=("${TRINO_CLUSTER[@]}")
+    fi
+
+    if ! "restart_$engine" "$mode"; then
+        printf "%-5s %-7s %-5s %-8s %-12s %-6s %-12s\n" "$q" "$engine" "$mode" "-" "-" "-" "RESTART_FAIL"
+        echo "$q,$engine,restart_fail,0,0,0,0,0,0,0,0,0,0,$mode" >>"$CSV"
+        return
+    fi
+
+    sleep 1  # post-health quiescence
+    local baseline peak res status rest latency rows delta peak_mb
+    baseline=$(sum_field current "${cluster[@]}")
+    start_sampler "${cluster[@]}"
+    res=$("run_${engine}_query" "$q" "$mode")
+    stop_sampler  # → SIM_CUR (sim_peak), SIM_ANON (sim_anon)
+    sleep 1  # GC / decay settle
+    peak=$(sum_field peak "${cluster[@]}")
+    local node_peaks=()
+    for c in "${cluster[@]}"; do
+        node_peaks+=("$(( $(read_cgroup_field "$c" peak) / 1024 ))")
+    done
+    status=${res%%:*}
+    rest=${res#*:}
+    latency=${rest%%:*}
+    rows=${rest#*:}
+    delta=$(( peak - baseline ))
+    (( delta < 0 )) && delta=0
+    peak_mb=$(( peak / 1024 / 1024 ))
+    printf "%-5s %-7s %-5s %-8s %-12s %-6s %-12s\n" "$q" "$engine" "$mode" "$latency" "$peak_mb" "$rows" "$status"
+    echo "$q,$engine,$status,$latency,$(( baseline / 1024 )),$(( peak / 1024 )),$(( delta / 1024 )),$rows,${node_peaks[0]},${node_peaks[1]},${node_peaks[2]},$(( SIM_CUR / 1024 )),$(( SIM_ANON / 1024 )),$mode" >>"$CSV"
+}
+
 # --- main loop --------------------------------------------------------
 
-echo "query,engine,status,latency_ms,baseline_kib,peak_kib,delta_kib,rows,node0_peak_kib,node1_peak_kib,node2_peak_kib,sim_peak_kib,sim_anon_kib" >"$CSV"
+echo "query,engine,status,latency_ms,baseline_kib,peak_kib,delta_kib,rows,node0_peak_kib,node1_peak_kib,node2_peak_kib,sim_peak_kib,sim_anon_kib,mode" >"$CSV"
 echo "Total-cluster-memory bench started: $TIMESTAMP"
 echo "CSV: $CSV"
 echo "Queries: ${QUERIES[*]}"
+echo "Mode: $BENCH_MODE"
 echo
 
-printf "%-5s %-7s %-8s %-12s %-6s %-12s\n" "query" "engine" "lat(ms)" "peak(MB)" "rows" "status"
-echo "---------------------------------------------------------------"
+printf "%-5s %-7s %-5s %-8s %-12s %-6s %-12s\n" "query" "engine" "mode" "lat(ms)" "peak(MB)" "rows" "status"
+echo "---------------------------------------------------------------------"
 
 for q in "${QUERIES[@]}"; do
     sql_file="$QDIR/$q.sql"
     [[ -f "$sql_file" ]] || { echo "$q: skip (no SQL)"; continue; }
 
-    # ---- arneb ----
-    if [[ "$SKIP_ARNEB" != "1" ]]; then
-        if ! restart_arneb; then
-            printf "%-5s %-7s %-8s %-12s %-6s %-12s\n" "$q" "arneb" "-" "-" "-" "RESTART_FAIL"
-            echo "$q,arneb,restart_fail,0,0,0,0,0" >>"$CSV"
-        else
-            sleep 1  # post-health quiescence
-            baseline=$(sum_field current "${ARNEB_CLUSTER[@]}")
-            start_sampler "${ARNEB_CLUSTER[@]}"
-            res=$(run_arneb_query "$q")
-            stop_sampler  # → SIM_CUR (sim_peak), SIM_ANON (sim_anon)
-            sleep 1  # GC / decay settle
-            peak=$(sum_field peak "${ARNEB_CLUSTER[@]}")
-            node_peaks=()
-            for c in "${ARNEB_CLUSTER[@]}"; do
-                node_peaks+=("$(( $(read_cgroup_field "$c" peak) / 1024 ))")
-            done
-            status=${res%%:*}
-            rest=${res#*:}
-            latency=${rest%%:*}
-            rows=${rest#*:}
-            delta=$(( peak - baseline ))
-            (( delta < 0 )) && delta=0
-            baseline_kib=$(( baseline / 1024 ))
-            peak_kib=$(( peak / 1024 ))
-            delta_kib=$(( delta / 1024 ))
-            sim_peak_kib=$(( SIM_CUR / 1024 ))
-            sim_anon_kib=$(( SIM_ANON / 1024 ))
-            peak_mb=$(( peak_kib / 1024 ))
-            printf "%-5s %-7s %-8s %-12s %-6s %-12s\n" "$q" "arneb" "$latency" "$peak_mb" "$rows" "$status"
-            echo "$q,arneb,$status,$latency,$baseline_kib,$peak_kib,$delta_kib,$rows,${node_peaks[0]},${node_peaks[1]},${node_peaks[2]},$sim_peak_kib,$sim_anon_kib" >>"$CSV"
-        fi
-    fi
-
-    # ---- trino ----
-    if [[ "$SKIP_TRINO" != "1" ]]; then
-        if ! restart_trino; then
-            printf "%-5s %-7s %-8s %-12s %-6s %-12s\n" "$q" "trino" "-" "-" "-" "RESTART_FAIL"
-            echo "$q,trino,restart_fail,0,0,0,0,0" >>"$CSV"
-        else
-            sleep 1
-            baseline=$(sum_field current "${TRINO_CLUSTER[@]}")
-            start_sampler "${TRINO_CLUSTER[@]}"
-            res=$(run_trino_query "$q")
-            stop_sampler  # → SIM_CUR (sim_peak), SIM_ANON (sim_anon)
-            sleep 1
-            peak=$(sum_field peak "${TRINO_CLUSTER[@]}")
-            node_peaks=()
-            for c in "${TRINO_CLUSTER[@]}"; do
-                node_peaks+=("$(( $(read_cgroup_field "$c" peak) / 1024 ))")
-            done
-            status=${res%%:*}
-            rest=${res#*:}
-            latency=${rest%%:*}
-            rows=${rest#*:}
-            delta=$(( peak - baseline ))
-            (( delta < 0 )) && delta=0
-            baseline_kib=$(( baseline / 1024 ))
-            peak_kib=$(( peak / 1024 ))
-            delta_kib=$(( delta / 1024 ))
-            sim_peak_kib=$(( SIM_CUR / 1024 ))
-            sim_anon_kib=$(( SIM_ANON / 1024 ))
-            peak_mb=$(( peak_kib / 1024 ))
-            printf "%-5s %-7s %-8s %-12s %-6s %-12s\n" "$q" "trino" "$latency" "$peak_mb" "$rows" "$status"
-            echo "$q,trino,$status,$latency,$baseline_kib,$peak_kib,$delta_kib,$rows,${node_peaks[0]},${node_peaks[1]},${node_peaks[2]},$sim_peak_kib,$sim_anon_kib" >>"$CSV"
-        fi
-    fi
+    for mode in "${MODES[@]}"; do
+        [[ "$SKIP_ARNEB" != "1" ]] && measure "$q" arneb "$mode"
+        [[ "$SKIP_TRINO" != "1" ]] && measure "$q" trino "$mode"
+    done
 done
 
 echo

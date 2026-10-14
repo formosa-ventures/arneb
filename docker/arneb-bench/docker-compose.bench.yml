@@ -81,14 +81,6 @@ services:
       # once (q15's revenue0) instead of recomputing it for a `col >= (SELECT
       # MAX(col) FROM cte)` self-aggregate subquery. q15 latency -42% @ SF30.
       ARNEB_CTE_SELF_AGG_WINDOW: "1"
-      # Hash-partitioned semi/anti joins (2026-10-14): without this, every
-      # SemiJoin/AntiJoin fragment is Fixed/Single, so one worker receives the
-      # whole probe and build — on q21 all ~98M rows of l2 + l3 (~3.2 GB) land
-      # on one worker while the other idles. Partitioning both sides by the
-      # join key splits that across workers. SF10 local, warm median of 3:
-      # q21 -21%, q04 -22%, q22 -20%, no query slower beyond noise (<=4%);
-      # oracle 22/22 clean. Not yet re-measured at SF30.
-      ARNEB_PARTITIONED_SEMI_JOIN: "1"
       # NOTE: ARNEB_NARROW_KEYS is intentionally NOT set here. Its current
       # ARNEB_NARROW_KEYS_COLUMNS allowlist is a TPC-H-specific stopgap for the
       # Hive connector's missing plan-time column min/max stats. Proper fix:
@@ -161,14 +153,6 @@ services:
       # once (q15's revenue0) instead of recomputing it for a `col >= (SELECT
       # MAX(col) FROM cte)` self-aggregate subquery. q15 latency -42% @ SF30.
       ARNEB_CTE_SELF_AGG_WINDOW: "1"
-      # Hash-partitioned semi/anti joins (2026-10-14): without this, every
-      # SemiJoin/AntiJoin fragment is Fixed/Single, so one worker receives the
-      # whole probe and build — on q21 all ~98M rows of l2 + l3 (~3.2 GB) land
-      # on one worker while the other idles. Partitioning both sides by the
-      # join key splits that across workers. SF10 local, warm median of 3:
-      # q21 -21%, q04 -22%, q22 -20%, no query slower beyond noise (<=4%);
-      # oracle 22/22 clean. Not yet re-measured at SF30.
-      ARNEB_PARTITIONED_SEMI_JOIN: "1"
       # NOTE: ARNEB_NARROW_KEYS is intentionally NOT set here. Its current
       # ARNEB_NARROW_KEYS_COLUMNS allowlist is a TPC-H-specific stopgap for the
       # Hive connector's missing plan-time column min/max stats. Proper fix:
@@ -235,14 +219,6 @@ services:
       # once (q15's revenue0) instead of recomputing it for a `col >= (SELECT
       # MAX(col) FROM cte)` self-aggregate subquery. q15 latency -42% @ SF30.
       ARNEB_CTE_SELF_AGG_WINDOW: "1"
-      # Hash-partitioned semi/anti joins (2026-10-14): without this, every
-      # SemiJoin/AntiJoin fragment is Fixed/Single, so one worker receives the
-      # whole probe and build — on q21 all ~98M rows of l2 + l3 (~3.2 GB) land
-      # on one worker while the other idles. Partitioning both sides by the
-      # join key splits that across workers. SF10 local, warm median of 3:
-      # q21 -21%, q04 -22%, q22 -20%, no query slower beyond noise (<=4%);
-      # oracle 22/22 clean. Not yet re-measured at SF30.
-      ARNEB_PARTITIONED_SEMI_JOIN: "1"
       # NOTE: ARNEB_NARROW_KEYS is intentionally NOT set here. Its current
       # ARNEB_NARROW_KEYS_COLUMNS allowlist is a TPC-H-specific stopgap for the
       # Hive connector's missing plan-time column min/max stats. Proper fix:

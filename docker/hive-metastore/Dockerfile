@@ -30,10 +30,13 @@ RUN chmod 644 /opt/hive/lib/hadoop-aws-${HADOOP_VERSION}.jar \
 
 COPY metastore-site.xml /opt/hive/conf/metastore-site.xml
 
-# Pre-create the embedded Derby directory owned by `hive` so a fresh named
-# volume mounted there (docker-compose.yml `hms-db`) inherits that ownership;
-# a volume on a path absent from the image would be root-owned and Derby
-# could not create the database.
-RUN mkdir -p /opt/hive/metastore_db && chown hive:hive /opt/hive/metastore_db
-
 USER hive
+
+# Create the embedded Derby database at build time, owned by `hive`. A fresh
+# named volume mounted there (docker-compose.yml `hms-db`) is populated from
+# the image, so it starts as a valid database the entrypoint's
+# -initOrUpgradeSchema accepts. An empty pre-created directory is not enough:
+# Derby refuses to create a database in a directory that already exists
+# (ERROR XBM0J), and a volume on a path absent from the image is root-owned.
+RUN cd /opt/hive && /opt/hive/bin/schematool -dbType derby -initSchema \
+    && test -f /opt/hive/metastore_db/service.properties

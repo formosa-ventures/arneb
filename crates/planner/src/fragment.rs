@@ -534,7 +534,7 @@ fn set_probe_side_filter_for_test(enabled: bool) -> ProbeSideFilterOverride {
     ProbeSideFilterOverride { _guard: guard }
 }
 
-/// `ARNEB_SEMI_PROBE_FILTER` (default off): on the partitioned semi/anti
+/// `ARNEB_SEMI_PROBE_FILTER` (default on; `=0` disables): on the partitioned semi/anti
 /// path, let a small probe side prune the build-side scan through a
 /// reverse-direction dynamic filter. Works without the general distributed
 /// dynamic-filter runtime (`ARNEB_DISTRIBUTED_DF`) and without
@@ -555,11 +555,11 @@ fn probe_side_filter_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_SEMI_PROBE_FILTER")
             .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             semi_probe_filter = enabled,
-            "ARNEB_SEMI_PROBE_FILTER effective value (default off; =1 to let a small semi/anti probe side prune the build-side scan)"
+            "ARNEB_SEMI_PROBE_FILTER effective value (default on; =0 to stop a small semi/anti probe side from pruning the build-side scan)"
         );
         enabled
     })

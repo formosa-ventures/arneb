@@ -88,6 +88,7 @@ shown), with the effective value logged.
 | Knob | Default | Env Var | Description |
 |------|---------|---------|-------------|
 | hash-partitioned semi/anti joins | on | `ARNEB_PARTITIONED_SEMI_JOIN` | Distributes `SemiJoin`/`AntiJoin` fragments by hash-partitioning both sides on the join key across workers, instead of running each on a single worker that receives the whole probe and build. Set `=0` to fall back to the single-partition path. Measured on TPC-H: SF10 warm q21 −21%, q04 −22%, q22 −20%; SF30 cold q04 −33%, q22 −14%; oracle 22/22 identical to Trino. The effective value is logged on target `arneb::config`. |
+| probe-side semi/anti filters | on | `ARNEB_SEMI_PROBE_FILTER` | On a hash-partitioned semi/anti join whose build side is estimated at ≥ 20M rows and ≥ 4× its probe side, each join task drains the small probe side first and publishes its key set (a Bloom filter above 20K keys) to the build-side scan, which waits for it and drops non-matching rows before the shuffle. Needs `ARNEB_PARTITIONED_SEMI_JOIN`; independent of `ARNEB_DISTRIBUTED_DF` and `ARNEB_BLOOM_DF`. Set `=0` to disable. Measured on TPC-H SF10 warm: q21 −51%, q04 −23%. The effective value is logged on target `arneb::config`. |
 
 The startup log line `memory pool installed … spill_budget_bytes=… spill_budget_source=…`
 confirms the resolved value and its source (`env` / `config` / `cgroup_v2` / `cgroup_v1`

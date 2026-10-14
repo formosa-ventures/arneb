@@ -103,6 +103,7 @@ fn rewrite(plan: LogicalPlan) -> LogicalPlan {
             right_key,
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
     }
     plan
@@ -215,6 +216,7 @@ fn recurse_children<F: FnMut(LogicalPlan) -> LogicalPlan>(
             right_key,
             residual,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         },
         L::AntiJoin {
             left,
@@ -222,12 +224,14 @@ fn recurse_children<F: FnMut(LogicalPlan) -> LogicalPlan>(
             left_key,
             right_key,
             residual,
+            ..
         } => L::AntiJoin {
             left: Box::new(f(*left)),
             right: Box::new(f(*right)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids: Vec::new(),
         },
         L::ScalarSubquery { subplan } => L::ScalarSubquery {
             subplan: Box::new(f(*subplan)),
@@ -547,6 +551,7 @@ mod tests {
             right_key: col_ref(0, "l_orderkey"),
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         }
     }
 
@@ -600,6 +605,7 @@ mod tests {
             right_key: col_ref(0, "x"),
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
         let after = rewrite(plan);
         assert!(
@@ -631,6 +637,7 @@ mod tests {
                 span: None,
             }),
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
         let after = rewrite(plan);
         assert!(
@@ -663,6 +670,7 @@ mod tests {
             right_key: col_ref(0, "l_orderkey"),
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
         let after = rewrite(plan);
         assert!(

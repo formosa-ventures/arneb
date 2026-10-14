@@ -373,6 +373,9 @@ impl DataSource for IcebergDataSource {
             builder,
             uri,
             &file_filters,
+            // Domains are indexed by table column; Iceberg resolves file
+            // columns by field id, so they are not applied here.
+            &[],
             Some(&roots),
             ctx.batch_size,
             split_idx,

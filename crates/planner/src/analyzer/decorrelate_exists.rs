@@ -122,6 +122,7 @@ fn rewrite(plan: LogicalPlan) -> LogicalPlan {
                 right_key,
                 residual: Some(residual),
                 dynamic_filter_ids: Vec::new(),
+                probe_side_filter_ids: Vec::new(),
             },
         },
         LogicalPlan::AntiJoin {
@@ -130,6 +131,7 @@ fn rewrite(plan: LogicalPlan) -> LogicalPlan {
             left_key,
             right_key,
             residual: Some(residual),
+            ..
         } => match try_rewrite(&left, &right, &left_key, &right_key, &residual, true) {
             Some(rewritten) => rewritten,
             None => LogicalPlan::AntiJoin {
@@ -138,6 +140,7 @@ fn rewrite(plan: LogicalPlan) -> LogicalPlan {
                 left_key,
                 right_key,
                 residual: Some(residual),
+                probe_side_filter_ids: Vec::new(),
             },
         },
         other => other,
@@ -657,6 +660,7 @@ where
             right_key,
             residual,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         },
         L::AntiJoin {
             left,
@@ -664,12 +668,14 @@ where
             left_key,
             right_key,
             residual,
+            ..
         } => L::AntiJoin {
             left: Box::new(f(*left)),
             right: Box::new(f(*right)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids: Vec::new(),
         },
         L::ScalarSubquery { subplan } => L::ScalarSubquery {
             subplan: Box::new(f(*subplan)),
@@ -745,6 +751,7 @@ mod tests {
             right_key: col(0, "l_orderkey"),
             residual: Some(ne(col(5, "l_suppkey"), col(1, "l_suppkey"))),
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         }
     }
 
@@ -763,6 +770,7 @@ mod tests {
             left_key: col(0, "l_orderkey"),
             right_key: col(0, "l_orderkey"),
             residual: Some(ne(col(5, "l_suppkey"), col(1, "l_suppkey"))),
+            probe_side_filter_ids: Vec::new(),
         }
     }
 

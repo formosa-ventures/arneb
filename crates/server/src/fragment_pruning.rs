@@ -294,6 +294,7 @@ fn collapse_exchange_projections(
             right_key,
             residual,
             dynamic_filter_ids,
+            probe_side_filter_ids,
         } => L::SemiJoin {
             left: Box::new(collapse_exchange_projections(*left, pushed)),
             right: Box::new(collapse_exchange_projections(*right, pushed)),
@@ -301,6 +302,7 @@ fn collapse_exchange_projections(
             right_key,
             residual,
             dynamic_filter_ids,
+            probe_side_filter_ids,
         },
         L::AntiJoin {
             left,
@@ -308,12 +310,14 @@ fn collapse_exchange_projections(
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids,
         } => L::AntiJoin {
             left: Box::new(collapse_exchange_projections(*left, pushed)),
             right: Box::new(collapse_exchange_projections(*right, pushed)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids,
         },
         L::UnionAll { inputs } => L::UnionAll {
             inputs: inputs

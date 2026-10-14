@@ -93,16 +93,45 @@ impl BloomFilter {
 
     /// Returns true when the scalar may have been inserted.
     pub fn contains(&self, value: &ScalarValue) -> bool {
-        let bytes = scalar_canonical_bytes(value);
-        let contains = bloom_positions(&bytes, self.num_bits, self.k, self.seed).all(|bit| {
+        self.contains_bytes(&scalar_canonical_bytes(value))
+    }
+
+    /// Allocation-free `contains(&ScalarValue::Int32(v))`, for per-row scan
+    /// filtering.
+    pub fn contains_int32(&self, v: i32) -> bool {
+        self.contains_tagged(2, &v.to_le_bytes())
+    }
+
+    /// Allocation-free `contains(&ScalarValue::Int64(v))`, for per-row scan
+    /// filtering.
+    pub fn contains_int64(&self, v: i64) -> bool {
+        self.contains_tagged(3, &v.to_le_bytes())
+    }
+
+    /// Allocation-free `contains(&ScalarValue::Date32(v))`, for per-row scan
+    /// filtering.
+    pub fn contains_date32(&self, v: i32) -> bool {
+        self.contains_tagged(9, &v.to_le_bytes())
+    }
+
+    /// Builds the canonical bytes (type tag + little-endian value, as in
+    /// `scalar_canonical_bytes`) on the stack.
+    fn contains_tagged<const N: usize>(&self, tag: u8, value_le: &[u8; N]) -> bool {
+        let mut buf = [0u8; 9];
+        buf[0] = tag;
+        buf[1..=N].copy_from_slice(value_le);
+        self.contains_bytes(&buf[..=N])
+    }
+
+    fn contains_bytes(&self, bytes: &[u8]) -> bool {
+        bloom_positions(bytes, self.num_bits, self.k, self.seed).all(|bit| {
             let word = (bit / 64) as usize;
             let offset = bit % 64;
             self.bits
                 .get(word)
                 .map(|w| (w & (1u64 << offset)) != 0)
                 .unwrap_or(false)
-        });
-        contains
+        })
     }
 
     fn union_with(&mut self, other: &BloomFilter) {
@@ -381,19 +410,17 @@ fn scalar_canonical_bytes(value: &ScalarValue) -> Vec<u8> {
 /// O(n²) for tiny n; acceptable here because per-partition DF inputs are
 /// bounded by `DEFAULT_MAX_DISTINCT_VALUES` (20K) and the cost is dwarfed
 /// by the build phase itself.
+/// Removes duplicate values, keeping each value's first occurrence.
+///
+/// Keys on the same canonical bytes the bloom filter hashes, so it is linear
+/// in the number of values. The previous pairwise scan was quadratic, which
+/// stalled the coordinator merge for hundreds of thousands of values. Values
+/// that compare equal always share canonical bytes, so nothing equal survives
+/// twice; the only values merged that `PartialEq` keeps apart are bit-identical
+/// NaNs, which is harmless for a filter domain.
 fn dedupe_in_place(v: &mut Vec<ScalarValue>) {
-    let mut i = 0;
-    while i < v.len() {
-        let mut j = i + 1;
-        while j < v.len() {
-            if v[i] == v[j] {
-                v.swap_remove(j);
-            } else {
-                j += 1;
-            }
-        }
-        i += 1;
-    }
+    let mut seen = std::collections::HashSet::with_capacity(v.len());
+    v.retain(|value| seen.insert(scalar_canonical_bytes(value)));
 }
 
 /// Returns the smaller of two ScalarValues using `partial_cmp`. Returns
@@ -637,5 +664,51 @@ mod tests {
                 ScalarValue::Int64(3),
             ]
         );
+    }
+
+    #[test]
+    fn bloom_typed_contains_matches_scalar_contains() {
+        let mut bloom = BloomFilter::with_fixed_params();
+        for v in [1_i64, 42, -7, i64::MAX] {
+            bloom.insert(&ScalarValue::Int64(v));
+        }
+        for v in [3_i32, -9] {
+            bloom.insert(&ScalarValue::Int32(v));
+            bloom.insert(&ScalarValue::Date32(v + 100));
+        }
+        for v in [1_i64, 42, -7, i64::MAX, 2, 43, 0, i64::MIN] {
+            assert_eq!(
+                bloom.contains_int64(v),
+                bloom.contains(&ScalarValue::Int64(v))
+            );
+        }
+        for v in [3_i32, -9, 4, 0, 103, 91] {
+            assert_eq!(
+                bloom.contains_int32(v),
+                bloom.contains(&ScalarValue::Int32(v))
+            );
+            assert_eq!(
+                bloom.contains_date32(v),
+                bloom.contains(&ScalarValue::Date32(v))
+            );
+        }
+        assert!(bloom.contains_int64(42));
+        assert!(bloom.contains_int32(3));
+        assert!(bloom.contains_date32(103));
+    }
+
+    #[test]
+    fn union_dedupes_large_distinct_sets_in_linear_time() {
+        // Two overlapping 300K-value sets: the old pairwise dedupe took
+        // minutes here; the canonical-bytes dedupe is linear.
+        let a: Vec<ScalarValue> = (0..300_000).map(ScalarValue::Int64).collect();
+        let b: Vec<ScalarValue> = (150_000..450_000).map(ScalarValue::Int64).collect();
+        let merged = Domain::DistinctValues(a).union(Domain::DistinctValues(b), 1_000_000);
+        let Domain::DistinctValues(values) = merged else {
+            panic!("expected DistinctValues under the cap");
+        };
+        assert_eq!(values.len(), 450_000);
+        assert_eq!(values[0], ScalarValue::Int64(0));
+        assert_eq!(values[449_999], ScalarValue::Int64(449_999));
     }
 }

@@ -96,10 +96,12 @@ pub async fn open_parquet_builder(
 /// the read is capped to a contiguous `total_rows / splits_per_file` slice
 /// via `with_row_selection` so the file's CPU work spreads across
 /// `splits_per_file` parallel tasks.
+#[allow(clippy::too_many_arguments)]
 pub fn build_split_stream(
     mut builder: ParquetRecordBatchStreamBuilder<ParquetObjectReader>,
     file_path: &dyn fmt::Display,
     filters: &[PlanExpr],
+    dynamic_domains: &[arneb_execution::DynamicFilterDomain],
     projection_roots: Option<&[usize]>,
     batch_size: Option<usize>,
     split_idx: usize,
@@ -140,11 +142,14 @@ pub fn build_split_stream(
         builder = builder.with_row_selection(slice);
     }
 
-    // Within-row-group predicate pushdown.
-    if !filters.is_empty() {
-        if let Some(row_filter) =
-            crate::parquet_pushdown::build_row_filter(filters, builder.parquet_schema())
-        {
+    // Within-row-group predicate pushdown, including cross-fragment dynamic
+    // filter domains (Bloom) resolved by the scan before it started.
+    if !filters.is_empty() || !dynamic_domains.is_empty() {
+        if let Some(row_filter) = crate::parquet_pushdown::build_row_filter_with_dynamic_domains(
+            filters,
+            dynamic_domains,
+            builder.parquet_schema(),
+        ) {
             builder = builder.with_row_filter(row_filter);
         }
     }

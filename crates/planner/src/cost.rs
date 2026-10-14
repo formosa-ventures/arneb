@@ -1217,6 +1217,7 @@ mod tests {
             right_key: col_expr(0, "k"),
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
         let cost = estimated_cardinality(&plan, &catalog_stats);
         assert_eq!(cost, 500.0);

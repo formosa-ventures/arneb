@@ -160,6 +160,7 @@ fn push_down(plan: LogicalPlan) -> LogicalPlan {
             right_key,
             residual,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         },
         L::AntiJoin {
             left,
@@ -167,12 +168,14 @@ fn push_down(plan: LogicalPlan) -> LogicalPlan {
             left_key,
             right_key,
             residual,
+            ..
         } => L::AntiJoin {
             left: Box::new(push_down(*left)),
             right: Box::new(push_down(*right)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids: Vec::new(),
         },
         L::PartialAggregate {
             input,
@@ -358,6 +361,7 @@ fn try_push_into(
                 right_key,
                 residual,
                 dynamic_filter_ids: Vec::new(),
+                probe_side_filter_ids: Vec::new(),
             }),
             Err((unchanged_left, c)) => Err((
                 L::SemiJoin {
@@ -367,6 +371,7 @@ fn try_push_into(
                     right_key,
                     residual,
                     dynamic_filter_ids: Vec::new(),
+                    probe_side_filter_ids: Vec::new(),
                 },
                 c,
             )),
@@ -377,6 +382,7 @@ fn try_push_into(
             left_key,
             right_key,
             residual,
+            ..
         } => match try_push_into(*left, conjunct) {
             Ok(new_left) => Ok(L::AntiJoin {
                 left: Box::new(new_left),
@@ -384,6 +390,7 @@ fn try_push_into(
                 left_key,
                 right_key,
                 residual,
+                probe_side_filter_ids: Vec::new(),
             }),
             Err((unchanged_left, c)) => Err((
                 L::AntiJoin {
@@ -392,6 +399,7 @@ fn try_push_into(
                     left_key,
                     right_key,
                     residual,
+                    probe_side_filter_ids: Vec::new(),
                 },
                 c,
             )),

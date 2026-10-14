@@ -77,6 +77,7 @@ fn rewrite(plan: LogicalPlan) -> LogicalPlan {
                     right_key,
                     residual: None,
                     dynamic_filter_ids: Vec::new(),
+                    probe_side_filter_ids: Vec::new(),
                 },
                 Some(r) => {
                     let (new_right, new_right_key, new_residual) =
@@ -88,6 +89,7 @@ fn rewrite(plan: LogicalPlan) -> LogicalPlan {
                         right_key: new_right_key,
                         residual: Some(new_residual),
                         dynamic_filter_ids: Vec::new(),
+                        probe_side_filter_ids: Vec::new(),
                     }
                 }
             }
@@ -98,6 +100,7 @@ fn rewrite(plan: LogicalPlan) -> LogicalPlan {
             left_key,
             right_key,
             residual,
+            ..
         } => {
             let left = Box::new(rewrite(*left));
             let right = Box::new(rewrite(*right));
@@ -108,6 +111,7 @@ fn rewrite(plan: LogicalPlan) -> LogicalPlan {
                     left_key,
                     right_key,
                     residual: None,
+                    probe_side_filter_ids: Vec::new(),
                 },
                 Some(r) => {
                     let (new_right, new_right_key, new_residual) =
@@ -118,6 +122,7 @@ fn rewrite(plan: LogicalPlan) -> LogicalPlan {
                         left_key,
                         right_key: new_right_key,
                         residual: Some(new_residual),
+                        probe_side_filter_ids: Vec::new(),
                     }
                 }
             }

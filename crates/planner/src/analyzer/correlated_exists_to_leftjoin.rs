@@ -120,6 +120,7 @@ fn rewrite(plan: LogicalPlan) -> LogicalPlan {
             left_key,
             right_key,
             residual: Some(r),
+            ..
         } => rewrite_one(*left, *right, left_key, right_key, r, /* anti */ true),
         other => other,
     }
@@ -243,6 +244,7 @@ where
             right_key,
             residual,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         },
         L::AntiJoin {
             left,
@@ -250,12 +252,14 @@ where
             left_key,
             right_key,
             residual,
+            ..
         } => L::AntiJoin {
             left: Box::new(f(*left)),
             right: Box::new(f(*right)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids: Vec::new(),
         },
         L::ScalarSubquery { subplan } => L::ScalarSubquery {
             subplan: Box::new(f(*subplan)),
@@ -812,6 +816,7 @@ mod tests {
             right_key: col_ref(0, "x"), // right.x (right-relative index)
             residual: Some(residual),
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         }
     }
 
@@ -909,6 +914,7 @@ mod tests {
             left_key: col_ref(0, "a"),
             right_key: col_ref(0, "x"),
             residual: Some(residual),
+            probe_side_filter_ids: Vec::new(),
         };
         let rewritten = rewrite(plan);
         let proj = match &rewritten {
@@ -934,6 +940,7 @@ mod tests {
             right_key: col_ref(0, "x"),
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
         let rewritten = rewrite(plan);
         assert!(

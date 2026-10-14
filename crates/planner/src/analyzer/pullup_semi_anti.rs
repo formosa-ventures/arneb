@@ -237,6 +237,7 @@ where
             right_key,
             residual,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         },
         L::AntiJoin {
             left,
@@ -244,12 +245,14 @@ where
             left_key,
             right_key,
             residual,
+            ..
         } => L::AntiJoin {
             left: Box::new(f(*left)),
             right: Box::new(f(*right)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids: Vec::new(),
         },
         L::ScalarSubquery { subplan } => L::ScalarSubquery {
             subplan: Box::new(f(*subplan)),
@@ -319,6 +322,7 @@ fn try_pullup(plan: LogicalPlan, stats: &CatalogStats) -> Option<LogicalPlan> {
                 right_key,
                 residual,
                 dynamic_filter_ids: Vec::new(),
+                probe_side_filter_ids: Vec::new(),
             })
         }
         SemiAnti::Anti {
@@ -337,6 +341,7 @@ fn try_pullup(plan: LogicalPlan, stats: &CatalogStats) -> Option<LogicalPlan> {
                 left_key,
                 right_key,
                 residual,
+                probe_side_filter_ids: Vec::new(),
             })
         }
     }
@@ -385,6 +390,7 @@ fn extract_left_deep(
             left_key,
             right_key,
             residual,
+            ..
         } => {
             if matches!(left.as_ref(), LogicalPlan::Join { .. }) {
                 return None;
@@ -778,6 +784,7 @@ mod tests {
             left_key: col_ref(0, "l_orderkey"),
             right_key: col_ref(0, "l_orderkey"),
             residual: Some(ne(col_ref(1, "l_suppkey"), col_ref(3, "l_suppkey"))),
+            probe_side_filter_ids: Vec::new(),
         };
         let orders = scan("orders", &["o_orderkey", "o_custkey"]);
         let nation = scan("nation", &["n_nationkey", "n_name"]);
@@ -838,6 +845,7 @@ mod tests {
             right_key: col_ref(0, "l_orderkey"),
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
         let orders = scan("orders", &["o_orderkey", "o_custkey"]);
         let plan = inner(
@@ -867,6 +875,7 @@ mod tests {
             right_key: col_ref(0, "l_orderkey"),
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
         let many = scan("many", &["m_orderkey"]);
         let plan = inner(
@@ -889,6 +898,7 @@ mod tests {
             right_key: col_ref(0, "l_orderkey"),
             residual: Some(eq(col_ref(2, "not_in_left_or_sub"), lit_bool(true))),
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
         let orders = scan("orders", &["o_orderkey"]);
         let plan = inner(

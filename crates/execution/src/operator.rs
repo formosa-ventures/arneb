@@ -644,15 +644,23 @@ impl ScanExec {
     /// plus any other DFs that did arrive. This matches the
     /// soundness contract spelled out in design.md D4.
     pub(crate) async fn collect_cross_fragment_filters(&self) -> Vec<DynamicFilterDomain> {
-        if !self.dynamic_filtering_enabled || self.dynamic_filters_consumed.is_empty() {
+        // Probe-side (reverse-direction) filters are awaited even with the
+        // general runtime flag off: their semi/anti join producers always
+        // publish, so the wait cannot strand on a producer that never runs.
+        let awaited: Vec<_> = self
+            .dynamic_filters_consumed
+            .iter()
+            .filter(|c| self.dynamic_filtering_enabled || c.probe_side)
+            .collect();
+        if awaited.is_empty() {
             return Vec::new();
         }
         let Some(collector) = &self.dynamic_filter_collector else {
             return Vec::new();
         };
         let timeout = self.dynamic_filtering_wait_timeout;
-        let mut domains = Vec::with_capacity(self.dynamic_filters_consumed.len());
-        for consumer in &self.dynamic_filters_consumed {
+        let mut domains = Vec::with_capacity(awaited.len());
+        for consumer in awaited {
             eprintln!(
                 "[DFRPC] scan subscribe df_id={} column_index={} column_name={}",
                 consumer.id, consumer.column_index, consumer.column_name
@@ -5463,6 +5471,7 @@ mod tests {
             id: arneb_common::DynamicFilterId(df_id),
             column_index: col_index,
             column_name: col_name.to_string(),
+            probe_side: false,
         }
     }
 
@@ -5485,6 +5494,27 @@ mod tests {
         let stream = scan.execute(0).await.unwrap();
         let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    }
+
+    #[tokio::test]
+    async fn df_flag_off_still_awaits_probe_side_consumers() {
+        // A probe-side consumer is awaited with the flag off; a regular
+        // consumer on the same scan is still skipped.
+        let collector = crate::dynamic_filter_collector::DynamicFilterCollector::with_pending([
+            (arneb_common::DynamicFilterId(0), arneb_common::Domain::All),
+            (arneb_common::DynamicFilterId(1), arneb_common::Domain::All),
+        ]);
+        let mut probe_side = consumer(1, 0, "id");
+        probe_side.probe_side = true;
+        let scan = build_scan_with_df(
+            vec![consumer(0, 0, "id"), probe_side],
+            Some(collector),
+            false, // flag OFF
+            std::time::Duration::from_millis(50),
+        );
+        let filters = scan.collect_cross_fragment_filters().await;
+        assert_eq!(filters.len(), 1, "only the probe-side consumer is awaited");
+        assert_eq!(filters[0].domain, arneb_common::Domain::All);
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ Snappy Parquet from RustFS through the same Hive Metastore. `lineitem` is
 
 | | Arneb vs Trino |
 |---|---|
-| **Peak memory** | **0.15× on average — about a seventh of Trino's**, lower on **all 22** queries (best 0.07×, worst 0.29×) |
+| **Peak memory** | **0.14× on average — about a seventh of Trino's**, lower on **all 22** queries (best 0.06×, worst 0.31×) |
 | **Latency** | **2.3× faster** warm (geomean), faster on **all 22** queries |
 | **Correctness** | **Cell-identical to Trino on all 22**, deterministic run-to-run |
 | **Footprint** | One self-contained binary (~60 MB). No JVM, no heap tuning, no GC pauses |
@@ -32,29 +32,29 @@ nodes, from the warm run.
 
 | Query | | cold arneb | cold Trino | cold | warm arneb | warm Trino | **warm** | mem arneb | mem Trino | **mem** |
 |---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| `q01` | Pricing Summary | 2,043 | 6,657 | 3.3× | 1,927 | 2,899 | **1.5×** | 382 | 4,972 | **0.08×** |
-| `q02` | Minimum Cost Supplier | 673 | 6,256 | 9.3× | 553 | 2,241 | **4.0×** | 336 | 3,899 | **0.09×** |
-| `q03` | Shipping Priority | 2,594 | 8,620 | 3.3× | 2,472 | 4,395 | **1.8×** | 1,953 | 6,646 | **0.29×** |
-| `q04` | Order Priority Checking | 1,443 | 7,541 | 5.2× | 1,334 | 3,495 | **2.6×** | 606 | 6,591 | **0.09×** |
-| `q05` | Local Supplier Volume | 2,284 | 8,912 | 3.9× | 2,150 | 4,178 | **1.9×** | 1,055 | 6,563 | **0.16×** |
-| `q06` | Forecasting Revenue | 806 | 5,214 | 6.5× | 731 | 1,906 | **2.6×** | 354 | 4,863 | **0.07×** |
-| `q07` | Volume Shipping | 2,062 | 8,101 | 3.9× | 2,091 | 3,981 | **1.9×** | 1,107 | 5,444 | **0.20×** |
-| `q08` | National Market Share | 3,079 | 9,791 | 3.2× | 2,825 | 5,413 | **1.9×** | 1,517 | 7,570 | **0.20×** |
-| `q09` | Product Type Profit | 4,947 | 11,734 | 2.4× | 4,813 | 6,638 | **1.4×** | 1,706 | 9,097 | **0.19×** |
-| `q10` | Returned Item Reporting | 2,061 | 9,775 | 4.7× | 2,034 | 4,283 | **2.1×** | 846 | 5,292 | **0.16×** |
-| `q11` | Important Stock ID | 770 | 5,296 | 6.9× | 668 | 2,305 | **3.5×** | 522 | 3,380 | **0.15×** |
-| `q12` | Shipping Modes | 1,208 | 6,339 | 5.2× | 1,137 | 2,473 | **2.2×** | 418 | 4,261 | **0.10×** |
-| `q13` | Customer Distribution | 1,648 | 7,596 | 4.6× | 1,492 | 4,125 | **2.8×** | 457 | 6,053 | **0.08×** |
-| `q14` | Promotion Effect | 1,310 | 6,903 | 5.3× | 1,185 | 2,671 | **2.3×** | 907 | 4,795 | **0.19×** |
-| `q15` | Top Supplier | 1,136 | 6,910 | 6.1× | 1,011 | 3,304 | **3.3×** | 515 | 5,461 | **0.09×** |
-| `q16` | Parts/Supplier Relationship | 1,109 | 6,991 | 6.3× | 989 | 2,438 | **2.5×** | 548 | 4,690 | **0.12×** |
-| `q17` | Small-Quantity-Order Revenue | 3,100 | 10,280 | 3.3× | 2,939 | 5,282 | **1.8×** | 1,692 | 8,796 | **0.19×** |
-| `q18` | Large Volume Customer | 4,154 | 10,080 | 2.4× | 4,001 | 5,272 | **1.3×** | 2,103 | 9,273 | **0.23×** |
-| `q19` | Discounted Revenue | 1,478 | 7,052 | 4.8× | 1,344 | 3,139 | **2.3×** | 807 | 5,347 | **0.15×** |
-| `q20` | Potential Part Promotion | 1,365 | 8,568 | 6.3× | 1,326 | 4,130 | **3.1×** | 855 | 6,697 | **0.13×** |
-| `q21` | Suppliers Who Kept Orders Waiting | 3,346 | 15,156 | 4.5× | 3,264 | 6,894 | **2.1×** | 1,157 | 7,629 | **0.15×** |
-| `q22` | Global Sales Opportunity | 835 | 5,517 | 6.6× | 789 | 2,137 | **2.7×** | 327 | 4,138 | **0.08×** |
-| | **aggregate** | | | **4.6×** | | | **2.3×** | | | **0.15×** |
+| `q01` | Pricing Summary | 2,068 | 6,309 | 3.1× | 1,852 | 2,678 | **1.4×** | 357 | 6,089 | **0.06×** |
+| `q02` | Minimum Cost Supplier | 638 | 5,749 | 9.0× | 492 | 2,017 | **4.1×** | 346 | 3,812 | **0.09×** |
+| `q03` | Shipping Priority | 2,338 | 8,276 | 3.5× | 2,147 | 4,001 | **1.9×** | 1,905 | 6,126 | **0.31×** |
+| `q04` | Order Priority Checking | 1,425 | 7,014 | 4.9× | 1,264 | 3,157 | **2.5×** | 669 | 6,607 | **0.10×** |
+| `q05` | Local Supplier Volume | 2,363 | 7,983 | 3.4× | 1,997 | 3,829 | **1.9×** | 1,115 | 5,761 | **0.19×** |
+| `q06` | Forecasting Revenue | 765 | 4,595 | 6.0× | 698 | 1,890 | **2.7×** | 321 | 4,525 | **0.07×** |
+| `q07` | Volume Shipping | 2,041 | 8,052 | 3.9× | 1,889 | 4,574 | **2.4×** | 1,202 | 7,590 | **0.16×** |
+| `q08` | National Market Share | 2,930 | 9,285 | 3.2× | 2,759 | 5,212 | **1.9×** | 1,585 | 7,101 | **0.22×** |
+| `q09` | Product Type Profit | 4,909 | 11,184 | 2.3× | 4,625 | 6,193 | **1.3×** | 1,732 | 8,489 | **0.20×** |
+| `q10` | Returned Item Reporting | 2,180 | 10,307 | 4.7× | 2,188 | 4,477 | **2.0×** | 939 | 5,976 | **0.16×** |
+| `q11` | Important Stock ID | 762 | 5,355 | 7.0× | 694 | 2,192 | **3.2×** | 265 | 3,349 | **0.08×** |
+| `q12` | Shipping Modes | 1,202 | 6,311 | 5.3× | 1,078 | 2,575 | **2.4×** | 436 | 5,504 | **0.08×** |
+| `q13` | Customer Distribution | 1,657 | 7,418 | 4.5× | 1,454 | 4,020 | **2.8×** | 447 | 5,668 | **0.08×** |
+| `q14` | Promotion Effect | 1,463 | 6,909 | 4.7× | 1,201 | 3,008 | **2.5×** | 924 | 5,034 | **0.18×** |
+| `q15` | Top Supplier | 1,145 | 6,846 | 6.0× | 1,033 | 3,351 | **3.2×** | 403 | 6,680 | **0.06×** |
+| `q16` | Parts/Supplier Relationship | 1,056 | 7,220 | 6.8× | 988 | 2,283 | **2.3×** | 534 | 4,088 | **0.13×** |
+| `q17` | Small-Quantity-Order Revenue | 3,042 | 10,746 | 3.5× | 2,969 | 5,559 | **1.9×** | 1,377 | 8,746 | **0.16×** |
+| `q18` | Large Volume Customer | 4,174 | 10,818 | 2.6× | 4,094 | 6,070 | **1.5×** | 2,221 | 10,889 | **0.20×** |
+| `q19` | Discounted Revenue | 1,587 | 7,577 | 4.8× | 1,339 | 3,209 | **2.4×** | 671 | 5,302 | **0.13×** |
+| `q20` | Potential Part Promotion | 1,384 | 8,651 | 6.2× | 1,254 | 3,738 | **3.0×** | 806 | 5,532 | **0.15×** |
+| `q21` | Suppliers Who Kept Orders Waiting | 3,255 | 15,275 | 4.7× | 3,413 | 6,976 | **2.0×** | 1,067 | 7,624 | **0.14×** |
+| `q22` | Global Sales Opportunity | 878 | 5,558 | 6.3× | 803 | 2,186 | **2.7×** | 320 | 4,638 | **0.07×** |
+| | **aggregate** | | | **4.6×** | | | **2.3×** | | | **0.14×** |
 
 Aggregate is the geometric mean for the latency ratios and the arithmetic mean
 for the memory ratios.
@@ -67,10 +67,10 @@ every byte is re-read from disk. **Warm** recreates the cluster, runs one
 untimed query first, identically for both engines, then times the next one.
 
 That choice carries most of the headline, which is why both columns are here.
-Warming is worth a median 54% to Trino (43–65% across the 22) because a
-recreated JVM re-JITs, and 6% to arneb (−1% to +18%), which has no equivalent
+Warming is worth a median 56% to Trino (43–68% across the 22) because a
+recreated JVM re-JITs, and 9% to arneb (−5% to +23%), which has no equivalent
 start-up cost. Flushing storage barely moves either engine at SF10 — an earlier
-run of the same build that left RustFS and the page cache warm got 4.7× cold /
+run of these changes that left RustFS and the page cache warm got 4.7× cold /
 2.2× warm against this run's 4.6× / 2.3×. **The cold
 column is therefore largely a measurement of JVM start-up — quote the warm
 one.**
@@ -81,19 +81,19 @@ Ratios understate what this means for a deployment, so the five largest gaps:
 
 | Query | Arneb | Trino | Saved |
 |---|--:|--:|--:|
-| `q09` Product Type Profit | 1.7 GB | 8.9 GB | **7.2 GB** |
-| `q18` Large Volume Customer | 2.1 GB | 9.1 GB | **7.0 GB** |
-| `q17` Small-Quantity-Order Revenue | 1.7 GB | 8.6 GB | **6.9 GB** |
-| `q21` Suppliers Who Kept Orders Waiting | 1.1 GB | 7.4 GB | **6.3 GB** |
-| `q08` National Market Share | 1.5 GB | 7.4 GB | **5.9 GB** |
+| `q18` Large Volume Customer | 2.2 GB | 10.6 GB | **8.5 GB** |
+| `q17` Small-Quantity-Order Revenue | 1.3 GB | 8.5 GB | **7.2 GB** |
+| `q09` Product Type Profit | 1.7 GB | 8.3 GB | **6.6 GB** |
+| `q21` Suppliers Who Kept Orders Waiting | 1.0 GB | 7.4 GB | **6.4 GB** |
+| `q07` Volume Shipping | 1.2 GB | 7.4 GB | **6.2 GB** |
 
-A Trino cluster that needs 8.9 GB to run q09 is replaced by one that needs
-1.7 GB, on identical hardware and identical data — the difference between a
+A Trino cluster that needs 10.6 GB to run q18 is replaced by one that needs
+2.2 GB, on identical hardware and identical data — the difference between a
 query that fits on your node and one that does not.
 
 Trino's floor is also high before any query runs: measured across the same
-restarts, its three-node cluster sits at **2.01 GB** of committed heap at idle
-(1.81–2.12 GB across 44 restarts). Arneb allocates lazily — the same
+restarts, its three-node cluster sits at **1.99 GB** of committed heap at idle
+(1.84–2.15 GB across 44 restarts). Arneb allocates lazily — the same
 measurement puts its idle cluster at **0.07 GB**, roughly thirty
 times less. Both are counted
 the way a container memory limit or `kubectl top` counts them.
@@ -103,10 +103,13 @@ the way a container memory limit or `kubectl top` counts them.
 `q21` is the four-way correlated `EXISTS` / `NOT EXISTS` self-join over
 `lineitem`, the deepest join pipeline in the suite. Warm, arneb lost it in all
 five runs through the morning of 2026-10-14 (0.68×–0.84×). It now takes
-3,264 ms against Trino's 6,894 ms, **2.1×**, at 0.15× the memory. The semi and
+3,413 ms against Trino's 6,976 ms, **2.0×**, at 0.14× the memory. The semi and
 anti joins are hash-partitioned across both workers, and the small outer side
 publishes its key set to the `lineitem` scans under `EXISTS` and `NOT EXISTS`,
-so about 1.7M matching rows are shuffled instead of all 60M and 38M.
+so about 1.7M matching rows are shuffled instead of all 60M and 38M. That key
+set only helps while it arrives before the scans give up waiting for it: at
+SF30 the outer side scans 225M rows first, so the planner does not attach it
+there and q21 runs as it did before.
 
 ### Reproduce it
 

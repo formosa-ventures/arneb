@@ -628,22 +628,187 @@ fn strided_partition_count(n: usize, task_index: usize, task_count: usize) -> us
     (n - task_index).div_ceil(task_count)
 }
 
+/// Cross-fragment dynamic filters a scan collected before it started.
+#[derive(Debug, Default)]
+pub(crate) struct CrossFragmentFilters {
+    /// Domains that arrived in time; pushed down into the connector.
+    pub(crate) resolved: Vec<DynamicFilterDomain>,
+    /// Probe-side domains still pending when the wait ran out.
+    pub(crate) late: Vec<LateFilter>,
+}
+
+/// A probe-side dynamic filter that arrived after the scan started.
+#[derive(Debug)]
+pub(crate) struct LateFilter {
+    /// Source-schema column the filter applies to.
+    pub(crate) source_index: usize,
+    pub(crate) domain: Arc<LateDomain>,
+}
+
+/// A dynamic-filter domain that may resolve after the scan has started.
+///
+/// [`LateDomain::get`] never blocks: it polls the producer's channel and
+/// returns `None` until the domain arrives (or forever, if the producer
+/// goes away).
+#[derive(Debug)]
+pub(crate) struct LateDomain {
+    df_id: arneb_common::DynamicFilterId,
+    rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<arneb_common::Domain>>>,
+    resolved: std::sync::OnceLock<Option<arneb_common::Domain>>,
+}
+
+impl LateDomain {
+    pub(crate) fn new(
+        df_id: arneb_common::DynamicFilterId,
+        rx: tokio::sync::oneshot::Receiver<arneb_common::Domain>,
+    ) -> Self {
+        Self {
+            df_id,
+            rx: std::sync::Mutex::new(Some(rx)),
+            resolved: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The domain once it has arrived; `None` while pending, after the
+    /// producer went away, or when it resolved to `Domain::All`.
+    pub(crate) fn get(&self) -> Option<&arneb_common::Domain> {
+        use tokio::sync::oneshot::error::TryRecvError;
+        if let Some(resolved) = self.resolved.get() {
+            return resolved.as_ref();
+        }
+        let mut guard = self.rx.lock().ok()?;
+        let outcome = match guard.as_mut()?.try_recv() {
+            Ok(arneb_common::Domain::All) | Err(TryRecvError::Closed) => None,
+            Ok(domain) => Some(domain),
+            Err(TryRecvError::Empty) => return None,
+        };
+        *guard = None;
+        eprintln!(
+            "[DFRPC] scan late_resolved subscribed_df_id={} applied={}",
+            self.df_id,
+            outcome.is_some()
+        );
+        self.resolved.get_or_init(|| outcome).as_ref()
+    }
+}
+
+/// Drops output rows whose key is outside a late dynamic filter, from the
+/// first batch after the filter arrives. Earlier batches pass unfiltered.
+struct LateFilterStream {
+    inner: SendableRecordBatchStream,
+    /// (output column position, filter).
+    filters: Vec<(usize, Arc<LateDomain>)>,
+}
+
+impl LateFilterStream {
+    fn apply(&self, batch: RecordBatch) -> Result<RecordBatch, arneb_common::ArnebError> {
+        let mut keep: Option<arrow::array::BooleanArray> = None;
+        for (position, late) in &self.filters {
+            let Some(domain) = late.get() else {
+                continue;
+            };
+            let Some(mask) = domain_mask(domain, batch.column(*position)) else {
+                continue;
+            };
+            keep = Some(match keep {
+                None => mask,
+                Some(prev) => arrow::compute::and(&prev, &mask).map_err(arrow_to_arneb)?,
+            });
+        }
+        match keep {
+            Some(mask) => {
+                arrow::compute::filter_record_batch(&batch, &mask).map_err(arrow_to_arneb)
+            }
+            None => Ok(batch),
+        }
+    }
+}
+
+fn arrow_to_arneb(e: arrow::error::ArrowError) -> arneb_common::ArnebError {
+    arneb_common::ArnebError::Execution(ExecutionError::from(e))
+}
+
+impl futures::Stream for LateFilterStream {
+    type Item = Result<RecordBatch, arneb_common::ArnebError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(batch))) => {
+                std::task::Poll::Ready(Some(self.apply(batch)))
+            }
+            other => other,
+        }
+    }
+}
+
+impl arneb_common::stream::RecordBatchStream for LateFilterStream {
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.inner.schema()
+    }
+}
+
+/// Rows of `column` that may match `domain` (NULL never matches), or `None`
+/// for a key type the filter cannot check — the caller then keeps every row.
+fn domain_mask(
+    domain: &arneb_common::Domain,
+    column: &ArrayRef,
+) -> Option<arrow::array::BooleanArray> {
+    use arrow::array::AsArray;
+    use arrow::datatypes::DataType as A;
+    if let arneb_common::Domain::Bloom(bloom) = domain {
+        let mask = match column.data_type() {
+            A::Int32 => column
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .iter()
+                .map(|v| Some(v.is_some_and(|x| bloom.contains_int32(x))))
+                .collect(),
+            A::Int64 => column
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .iter()
+                .map(|v| Some(v.is_some_and(|x| bloom.contains_int64(x))))
+                .collect(),
+            A::Date32 => column
+                .as_primitive::<arrow::datatypes::Date32Type>()
+                .iter()
+                .map(|v| Some(v.is_some_and(|x| bloom.contains_date32(x))))
+                .collect(),
+            _ => return None,
+        };
+        return Some(mask);
+    }
+    (0..column.len())
+        .map(|i| {
+            if column.is_null(i) {
+                return Some(Some(false));
+            }
+            let value = crate::aggregate::scalar_from_array(column, i).ok()?;
+            Some(Some(domain.contains(&value)))
+        })
+        .collect::<Option<arrow::array::BooleanArray>>()
+}
+
 impl ScanExec {
     /// A1.4 helper: gather any cross-fragment DF Domains that have
     /// arrived (or wait up to the configured timeout for them) and
     /// convert each into pushdown state ready to merge with
     /// `scan_context`.
     ///
-    /// Returns an empty Vec when:
-    /// - the feature flag is off,
+    /// Returns nothing when:
+    /// - the feature flag is off and no probe-side DFs are declared,
     /// - no consumed DFs are declared on this scan,
     /// - or the collector is absent (coord / tests).
     ///
     /// On `recv` error or timeout for an individual DF, that DF is
-    /// silently skipped — the scan proceeds with the static filters
-    /// plus any other DFs that did arrive. This matches the
-    /// soundness contract spelled out in design.md D4.
-    pub(crate) async fn collect_cross_fragment_filters(&self) -> Vec<DynamicFilterDomain> {
+    /// skipped — the scan proceeds with the static filters plus any
+    /// other DFs that did arrive. This matches the soundness contract
+    /// spelled out in design.md D4. A probe-side DF that times out is
+    /// kept as a [`LateFilter`] instead: the scan starts unfiltered and
+    /// drops non-matching rows from its output once the DF arrives.
+    pub(crate) async fn collect_cross_fragment_filters(&self) -> CrossFragmentFilters {
+        let mut out = CrossFragmentFilters::default();
         // Probe-side (reverse-direction) filters are awaited even with the
         // general runtime flag off: their semi/anti join producers always
         // publish, so the wait cannot strand on a producer that never runs.
@@ -653,20 +818,22 @@ impl ScanExec {
             .filter(|c| self.dynamic_filtering_enabled || c.probe_side)
             .collect();
         if awaited.is_empty() {
-            return Vec::new();
+            return out;
         }
         let Some(collector) = &self.dynamic_filter_collector else {
-            return Vec::new();
+            return out;
         };
         let timeout = self.dynamic_filtering_wait_timeout;
-        let mut domains = Vec::with_capacity(awaited.len());
         for consumer in awaited {
             eprintln!(
                 "[DFRPC] scan subscribe df_id={} column_index={} column_name={}",
                 consumer.id, consumer.column_index, consumer.column_name
             );
-            let recv = collector.take_receiver(consumer.id).await;
-            match tokio::time::timeout(timeout, recv).await {
+            let Some(column_name) = self.consumer_source_column(consumer) else {
+                continue;
+            };
+            let mut recv = collector.take_receiver(consumer.id).await;
+            match tokio::time::timeout(timeout, &mut recv).await {
                 Ok(Ok(domain)) => {
                     let domain_variant = match &domain {
                         arneb_common::Domain::DistinctValues(values) => {
@@ -680,23 +847,8 @@ impl ScanExec {
                         "[DFRPC] scan resolved subscribed_df_id={} domain={}",
                         consumer.id, domain_variant
                     );
-                    let src_index = consumer.column_index;
-                    let our_schema = self.source.schema();
-                    if src_index >= our_schema.len() {
-                        tracing::warn!(
-                            df_id = %consumer.id,
-                            column_index = consumer.column_index,
-                            column_name = %consumer.column_name,
-                            "dynamic filter consumer column is outside source schema"
-                        );
-                        continue;
-                    }
-                    let column_name = our_schema
-                        .get(src_index)
-                        .map(|c| c.name.clone())
-                        .unwrap_or_else(|| consumer.column_name.clone());
-                    domains.push(DynamicFilterDomain {
-                        column_index: src_index,
+                    out.resolved.push(DynamicFilterDomain {
+                        column_index: consumer.column_index,
                         column_name,
                         domain,
                     });
@@ -713,9 +865,10 @@ impl ScanExec {
                 }
                 Err(_) => {
                     eprintln!(
-                        "[DFRPC] scan timeout subscribed_df_id={} timeout_ms={}",
+                        "[DFRPC] scan timeout subscribed_df_id={} timeout_ms={} deferred={}",
                         consumer.id,
-                        timeout.as_millis()
+                        timeout.as_millis(),
+                        consumer.probe_side
                     );
                     // Timeout. Treat as "no filter" — the scan reads
                     // every row that passes static filters, which is
@@ -725,10 +878,43 @@ impl ScanExec {
                         timeout_ms = timeout.as_millis() as u64,
                         "dynamic filter wait timed out"
                     );
+                    if consumer.probe_side {
+                        out.late.push(LateFilter {
+                            source_index: consumer.column_index,
+                            domain: Arc::new(LateDomain::new(consumer.id, recv)),
+                        });
+                    }
                 }
             }
         }
-        domains
+        out
+    }
+
+    /// Source-schema name of the column `consumer` filters on.
+    ///
+    /// The planner tags consumers in `TableScan` column space (it remaps
+    /// the key through any `Projection` above the scan), which is the
+    /// source schema — not this scan's pushed-down projection. Logs and
+    /// returns `None` for an index outside the source schema, so a bad
+    /// mapping is visible instead of silently dropping the filter.
+    fn consumer_source_column(
+        &self,
+        consumer: &arneb_planner::DynamicFilterConsumer,
+    ) -> Option<String> {
+        let schema = self.source.schema();
+        match schema.get(consumer.column_index) {
+            Some(column) => Some(column.name.clone()),
+            None => {
+                tracing::warn!(
+                    df_id = %consumer.id,
+                    column_index = consumer.column_index,
+                    column_name = %consumer.column_name,
+                    source_columns = schema.len(),
+                    "dynamic filter consumer column is outside the scan's source schema; filter dropped"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -743,7 +929,10 @@ impl ExecutionPlan for ScanExec {
         // awaiting on `oneshot::Receiver<Domain>`s with timeout).
         // No-op when the feature flag is off or no annotations exist,
         // so the pre-A1 fast path stays a single mutex lock + clone.
-        let cross_fragment = self.collect_cross_fragment_filters().await;
+        let CrossFragmentFilters {
+            resolved: cross_fragment,
+            late,
+        } = self.collect_cross_fragment_filters().await;
 
         let ctx = {
             let dynamic = self.dynamic_filters.lock().unwrap();
@@ -767,7 +956,26 @@ impl ExecutionPlan for ScanExec {
         // {index, index+count, …}; local output partition `p` maps to the
         // global partition `index + p*count`. Default (0, 1) → identity.
         let global_partition = self.scan_task_index + partition * self.scan_task_count;
-        let stream = self.source.scan(&ctx, global_partition).await?;
+        let mut stream = self.source.scan(&ctx, global_partition).await?;
+        // Late filters apply to the scan's output columns: map each source
+        // index through the pushed-down projection. One whose column is not
+        // projected cannot be applied here and is dropped (it only prunes).
+        let late: Vec<(usize, Arc<LateDomain>)> = late
+            .into_iter()
+            .filter_map(|f| {
+                let position = match &self.scan_context.projection {
+                    Some(proj) => proj.iter().position(|&s| s == f.source_index)?,
+                    None => f.source_index,
+                };
+                Some((position, f.domain))
+            })
+            .collect();
+        if !late.is_empty() {
+            stream = Box::pin(LateFilterStream {
+                inner: stream,
+                filters: late,
+            });
+        }
         Ok(profile_stream(
             "ScanExec",
             partition,
@@ -5488,7 +5696,7 @@ mod tests {
             false, // flag OFF
             std::time::Duration::from_millis(50),
         );
-        let filters = scan.collect_cross_fragment_filters().await;
+        let filters = scan.collect_cross_fragment_filters().await.resolved;
         assert!(filters.is_empty(), "flag off must skip the wait");
         // Scan still executes successfully — feature is inert.
         let stream = scan.execute(0).await.unwrap();
@@ -5512,9 +5720,103 @@ mod tests {
             false, // flag OFF
             std::time::Duration::from_millis(50),
         );
-        let filters = scan.collect_cross_fragment_filters().await;
+        let filters = scan.collect_cross_fragment_filters().await.resolved;
         assert_eq!(filters.len(), 1, "only the probe-side consumer is awaited");
         assert_eq!(filters[0].domain, arneb_common::Domain::All);
+    }
+
+    #[tokio::test]
+    async fn df_probe_side_timeout_becomes_late_filter() {
+        // A probe-side filter that misses the wait is kept as a late
+        // filter that resolves once published, instead of being dropped.
+        let collector = crate::dynamic_filter_collector::DynamicFilterCollector::new();
+        let mut probe_side = consumer(0, 0, "id");
+        probe_side.probe_side = true;
+        let scan = build_scan_with_df(
+            vec![probe_side],
+            Some(collector.clone()),
+            false,
+            std::time::Duration::from_millis(20),
+        );
+        let filters = scan.collect_cross_fragment_filters().await;
+        assert!(filters.resolved.is_empty());
+        assert_eq!(filters.late.len(), 1);
+        let late = filters.late[0].domain.clone();
+        assert_eq!(late.get(), None);
+
+        let domain = arneb_common::Domain::DistinctValues(vec![ScalarValue::Int32(2)]);
+        collector
+            .insert(arneb_common::DynamicFilterId(0), domain.clone())
+            .await;
+        assert_eq!(late.get(), Some(&domain));
+    }
+
+    #[tokio::test]
+    async fn df_regular_timeout_is_not_kept_late() {
+        let collector = crate::dynamic_filter_collector::DynamicFilterCollector::new();
+        let scan = build_scan_with_df(
+            vec![consumer(0, 0, "id")],
+            Some(collector),
+            true,
+            std::time::Duration::from_millis(20),
+        );
+        let filters = scan.collect_cross_fragment_filters().await;
+        assert!(filters.resolved.is_empty());
+        assert!(filters.late.is_empty());
+    }
+
+    #[tokio::test]
+    async fn df_late_filter_prunes_scan_output_after_it_arrives() {
+        // Projection [2, 0] puts source column `id` at output position 1.
+        let collector = crate::dynamic_filter_collector::DynamicFilterCollector::new();
+        let mut probe_side = consumer(0, 0, "id");
+        probe_side.probe_side = true;
+        let mut scan = build_scan_with_df(
+            vec![probe_side],
+            Some(collector.clone()),
+            false,
+            std::time::Duration::from_millis(20),
+        );
+        scan.scan_context = ScanContext::default().with_projection(vec![2, 0]);
+        let stream = scan.execute(0).await.unwrap();
+        collector
+            .insert(
+                arneb_common::DynamicFilterId(0),
+                arneb_common::Domain::DistinctValues(vec![ScalarValue::Int32(2)]),
+            )
+            .await;
+        let batches = collect_stream(stream).await.unwrap();
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![2]);
+    }
+
+    #[test]
+    fn domain_mask_bloom_and_values_never_match_null() {
+        let mut bloom = arneb_common::BloomFilter::with_fixed_params();
+        bloom.insert(&ScalarValue::Int64(10));
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![Some(10), Some(11), None]));
+        let mask = domain_mask(&arneb_common::Domain::Bloom(bloom), &column).unwrap();
+        assert_eq!(
+            mask.iter().collect::<Vec<_>>(),
+            vec![Some(true), Some(false), Some(false)]
+        );
+
+        let values = arneb_common::Domain::DistinctValues(vec![ScalarValue::Int64(11)]);
+        let mask = domain_mask(&values, &column).unwrap();
+        assert_eq!(
+            mask.iter().collect::<Vec<_>>(),
+            vec![Some(false), Some(true), Some(false)]
+        );
     }
 
     #[tokio::test]
@@ -5525,7 +5827,7 @@ mod tests {
             true, // flag ON, but nothing to wait on
             std::time::Duration::from_millis(50),
         );
-        let filters = scan.collect_cross_fragment_filters().await;
+        let filters = scan.collect_cross_fragment_filters().await.resolved;
         assert!(filters.is_empty());
     }
 
@@ -5542,7 +5844,7 @@ mod tests {
             true,
             std::time::Duration::from_millis(50),
         );
-        let domains = scan.collect_cross_fragment_filters().await;
+        let domains = scan.collect_cross_fragment_filters().await.resolved;
         assert_eq!(domains.len(), 1, "one domain expected, got {domains:?}");
         assert_eq!(domains[0].column_index, 0);
         assert_eq!(domains[0].column_name, "id");
@@ -5562,7 +5864,7 @@ mod tests {
             std::time::Duration::from_millis(50),
         );
         let started = std::time::Instant::now();
-        let filters = scan.collect_cross_fragment_filters().await;
+        let filters = scan.collect_cross_fragment_filters().await.resolved;
         let elapsed = started.elapsed();
         assert!(
             filters.is_empty(),
@@ -5600,7 +5902,7 @@ mod tests {
             true,
             std::time::Duration::from_millis(500),
         );
-        let filters = scan.collect_cross_fragment_filters().await;
+        let filters = scan.collect_cross_fragment_filters().await.resolved;
         assert_eq!(filters.len(), 1);
     }
 
@@ -5627,7 +5929,7 @@ mod tests {
             std::time::Duration::from_millis(50),
         );
         scan.scan_context.projection = Some(vec![0, 2]);
-        let domains = scan.collect_cross_fragment_filters().await;
+        let domains = scan.collect_cross_fragment_filters().await.resolved;
         assert_eq!(domains.len(), 1, "domain must not be dropped: {domains:?}");
         assert_eq!(domains[0].column_index, 2, "source index must be preserved");
         assert_eq!(domains[0].column_name, "value");
@@ -5651,7 +5953,7 @@ mod tests {
             std::time::Duration::from_millis(50),
         );
         scan.scan_context.projection = Some(vec![1]);
-        let domains = scan.collect_cross_fragment_filters().await;
+        let domains = scan.collect_cross_fragment_filters().await.resolved;
         assert_eq!(domains.len(), 1, "domain must not be dropped: {domains:?}");
         assert_eq!(domains[0].column_index, 1);
         assert_eq!(domains[0].column_name, "name");
@@ -5673,7 +5975,7 @@ mod tests {
             std::time::Duration::from_millis(50),
         );
         scan.scan_context.projection = Some(vec![0]);
-        let domains = scan.collect_cross_fragment_filters().await;
+        let domains = scan.collect_cross_fragment_filters().await.resolved;
         assert!(
             domains.is_empty(),
             "out-of-range consumer must be dropped: {domains:?}"

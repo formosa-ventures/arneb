@@ -579,6 +579,15 @@ const PROBE_SIDE_FILTER_MIN_RATIO: f64 = 4.0;
 /// and q21's 60M-row `lineitem` builds gained 0.3 s and 2 s.
 const PROBE_SIDE_FILTER_MIN_BUILD_ROWS: f64 = 20_000_000.0;
 
+/// Maximum base-table rows the probe side may scan before it can publish.
+/// The build-side scan waits for that drain (up to the dynamic-filter wait
+/// timeout, 10 s by default), so a probe side that cannot finish within the
+/// wait only costs time. Calibrated on two-worker clusters draining roughly
+/// 10M rows/s: TPC-H q21's probe side (`lineitem ⋈ orders ⋈ supplier`)
+/// scans 75M rows at SF10 and publishes within the wait, but 225M at SF30
+/// and publishes 22–32 s in, after every `lineitem` scan has timed out.
+const PROBE_SIDE_FILTER_MAX_PROBE_SCAN_ROWS: f64 = 100_000_000.0;
+
 #[cfg(test)]
 static SWAP_DF_REGEN_TEST_OVERRIDE: OnceLock<std::sync::Mutex<Option<bool>>> = OnceLock::new();
 #[cfg(test)]
@@ -1525,8 +1534,8 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
     /// `probe_side_filter_ids`. The join tasks publish a Domain of their
     /// left keys, so the right scan drops rows that cannot match before
     /// they are shuffled. Returns no producer when the gate is off, stats
-    /// are missing, the ratio is not met, or the key does not trace to a
-    /// scan.
+    /// are missing, the ratio is not met, the probe side scans too much to
+    /// publish within the wait, or the key does not trace to a scan.
     fn attach_probe_side_filter(
         &self,
         left: &LogicalPlan,
@@ -1543,14 +1552,17 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
         };
         let left_rows = crate::cost::estimated_cardinality(left, stats);
         let right_rows = crate::cost::estimated_cardinality(right, stats);
+        let left_scanned_rows = crate::cost::total_scanned_rows(left, stats);
         let attach = left_rows.is_finite()
             && right_rows.is_finite()
             && right_rows >= PROBE_SIDE_FILTER_MIN_BUILD_ROWS
-            && left_rows * PROBE_SIDE_FILTER_MIN_RATIO < right_rows;
+            && left_rows * PROBE_SIDE_FILTER_MIN_RATIO < right_rows
+            && left_scanned_rows <= PROBE_SIDE_FILTER_MAX_PROBE_SCAN_ROWS;
         tracing::info!(
             target: "arneb::planner",
             left_rows,
             right_rows,
+            left_scanned_rows,
             attach,
             "partitioned semi/anti probe-side filter decision"
         );
@@ -7011,6 +7023,18 @@ mod tests {
     fn probe_side_filter_skipped_when_build_is_not_large() {
         for plan in [semi_join_plan(), anti_join_plan()] {
             let result = fragment_with_probe_side_filter(plan, 1_000, 10_000_000, true);
+            let join_frag = &result.source_fragments[0];
+            assert!(probe_side_producers(&join_frag.root).is_empty());
+            assert!(scan_consumers(&join_frag.source_fragments[1].root).is_empty());
+        }
+    }
+
+    #[test]
+    fn probe_side_filter_skipped_when_probe_scans_too_much_to_publish_in_time() {
+        // The ratio holds (150M * 4 < 1B), but draining 150M probe rows
+        // takes longer than the build scan's wait.
+        for plan in [semi_join_plan(), anti_join_plan()] {
+            let result = fragment_with_probe_side_filter(plan, 150_000_000, 1_000_000_000, true);
             let join_frag = &result.source_fragments[0];
             assert!(probe_side_producers(&join_frag.root).is_empty());
             assert!(scan_consumers(&join_frag.source_fragments[1].root).is_empty());

@@ -614,6 +614,41 @@ fn unfiltered_scan_card(plan: &LogicalPlan, stats: &CatalogStats) -> f64 {
     }
 }
 
+/// Total rows of every base table `plan` scans, before any filter: a proxy
+/// for how long the subtree takes to drain, since each of those rows is
+/// read whatever the filters keep.
+pub fn total_scanned_rows(plan: &LogicalPlan, stats: &CatalogStats) -> f64 {
+    match plan {
+        LogicalPlan::TableScan { table, .. } => stats
+            .get(table)
+            .and_then(|s| s.row_count)
+            .unwrap_or(DEFAULT_TABLE_SIZE) as f64,
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Projection { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Explain { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::PartialAggregate { input, .. }
+        | LogicalPlan::FinalAggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::AssignUniqueId { input, .. } => total_scanned_rows(input, stats),
+        LogicalPlan::Join { left, right, .. }
+        | LogicalPlan::SemiJoin { left, right, .. }
+        | LogicalPlan::AntiJoin { left, right, .. }
+        | LogicalPlan::Intersect { left, right }
+        | LogicalPlan::Except { left, right } => {
+            total_scanned_rows(left, stats) + total_scanned_rows(right, stats)
+        }
+        LogicalPlan::UnionAll { inputs } => {
+            inputs.iter().map(|i| total_scanned_rows(i, stats)).sum()
+        }
+        LogicalPlan::ScalarSubquery { subplan } => total_scanned_rows(subplan, stats),
+        _ => 0.0,
+    }
+}
+
 fn lookup_column_ndv(name: &str, plan: &LogicalPlan, stats: &CatalogStats) -> Option<u64> {
     walk_scans(plan, &mut |scan_table| {
         stats

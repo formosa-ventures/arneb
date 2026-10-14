@@ -87,6 +87,36 @@ The startup log line `memory pool installed … spill_budget_bytes=… spill_bud
 confirms the resolved value and its source (`env` / `config` / `cgroup_v2` / `cgroup_v1`
 / `unbounded`); a `source=env` line confirms the override took effect.
 
+### Query Engine Levers
+
+Every planner/executor optimisation that has been validated at TPC-H SF30
+(cell-identical to Trino, lower latency and peak memory) ships **on by default**.
+The `ARNEB_*` variable exists only as a kill switch for A/B experiments; the
+effective value is logged at startup on the `arneb::config` target. Nothing in
+`docker/arneb-bench/docker-compose.bench.yml` needs to set these — the bench
+runs the in-binary defaults.
+
+| Knob | Default | Disable with | What it does |
+|------|---------|--------------|--------------|
+| Grace hash join | on | `ARNEB_GRACE_HJ=0` | An inner join without a residual predicate that has to spill partitions both sides by hash instead of re-scanning the probe side once per build chunk. |
+| Selective-dim-first join order | on | `ARNEB_SELECTIVE_DIM_FIRST=0` | Join-order scoring charges each left-deep intermediate at full cardinality, so filtered dimensions join before the fact table. |
+| Eager aggregation | on | `ARNEB_EAGER_AGG=0` | Pre-aggregates below a join when the group keys are the join keys (q13: orders 45M → 4.5M rows before the join). |
+| Parallel final aggregate | on | `ARNEB_PARALLEL_FINAL_AGG=0` | Hash-partitions the final aggregate across workers instead of a single-partition merge. |
+| Aggregate pre-size | on | `ARNEB_AGG_PRESIZE=0` | Sizes hash-aggregate tables from the planner's group estimate (capped) to avoid rehash cascades. |
+| Adaptive aggregate pre-size | on | `ARNEB_AGG_PRESIZE_ADAPTIVE=0` | Exact final-from-partials sizing plus data-driven partial growth for high-cardinality `GROUP BY`. |
+| Data-parallel scan | on | `ARNEB_DATA_PARALLEL_SCAN=0` | Splits a fact-table scan across all workers (M×N fan-out) instead of one worker per table. |
+| Broadcast build-side swap | on | `ARNEB_BROADCAST_BUILD_SIDE_SWAP=0` | Builds the estimated-smaller side of a broadcast join and streams the larger side. |
+| Broadcast build cap | `1000000000` bytes | `ARNEB_BROADCAST_MAX_BUILD_BYTES=<bytes>` (`0` disables broadcast) | Largest estimated build side that is broadcast rather than hash-partitioned. |
+| Scan batch size | `16384` rows | `ARNEB_SCAN_BATCH_SIZE=<rows>` | Arrow batch size for file and Hive scans; larger amortises per-batch overhead at the cost of in-flight memory. |
+| Probe prefetch | on | `ARNEB_PROBE_PREFETCH=0` | Hash-join probe prefetches the bucket a few rows ahead (CPU hint, no effect on results). |
+| Aggregate prefetch | on | `ARNEB_AGG_PREFETCH=0` | Same prefetch hint for hash-aggregate lookups. |
+| Compact semi/anti `<>` build | on | `ARNEB_COMPACT_SEMI_NE=0` | Semi/anti joins with a `<>` residual keep a per-key `{distinct, first value}` map instead of the full build rows (q21: no build spill). |
+| Spill compression | `lz4` | `ARNEB_SPILL_COMPRESSION=0` (`zstd` for Zstandard) | Arrow IPC compression for exchange/build spill files. |
+| CTE self-aggregate window | on | `ARNEB_CTE_SELF_AGG_WINDOW=0` | A CTE referenced both directly and in a `col >= (SELECT MAX(col) FROM cte)` subquery is computed once as a window (q15). |
+
+`ARNEB_NARROW_KEYS` is deliberately **not** a default: its column allowlist is a
+TPC-H-specific stopgap for the Hive connector's missing plan-time min/max stats.
+
 ## Table Registration
 
 Register tables directly in the config file:

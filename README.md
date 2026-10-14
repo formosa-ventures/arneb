@@ -109,7 +109,7 @@ publishes its key set to the `lineitem` scans under `EXISTS` and `NOT EXISTS`,
 so about 1.7M matching rows are shuffled instead of all 60M and 38M. That key
 set only helps while it arrives before the scans give up waiting for it: at
 SF30 the outer side scans 225M rows first, so the planner does not attach it
-there and q21 runs as it did before.
+there and q21 runs with the partitioned joins alone.
 
 ### Reproduce it
 

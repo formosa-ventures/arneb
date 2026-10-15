@@ -171,7 +171,9 @@
 ## 6. Validate & ship
 
 - [x] 6.1 Single-node 22/22 unit + doc tests + `clippy --all-targets` green (2026-10-16: `cargo test --workspace` 0 failures; `clippy --workspace --all-targets -D warnings` clean)
-- [ ] 6.2 trino-diff full suite at SF1 cell-parity (1e-9) — no correctness regression
+- [x] 6.2 trino-diff full suite at SF1 cell-parity (1e-9) — no correctness regression
+  - 2026-10-16, after 4.2 (Tier 2, local distributed coordinator + 2 workers, **SF10** rather than SF1): `blast_radius_oracle.py --runs 2` → **22/22 deterministic + cell-identical to Trino**.
+  - Same build, `run_benchmark.sh --scenario=sf10 --mode=both` vs the 2026-10-14 run (`memory_total_20261014_221743`): 22/22 OK with identical row counts; arneb latency geomean 1.023× cold / 1.030× warm, peak memory 1.006× / 1.009×. Trino (unchanged) drifted 1.018× / 1.009× on the same host, so the residual is within single-run noise — no regression attributable to scan accounting. Results: `memory_total_20261016_044149`.
 - [ ] 6.3 Distributed-mode validation on the constrained host: **q21 SF30 completes** within the bound; q09/q21 SF30 stable (N repeats); record worker peak (tracked & RSS) + per-query latency vs Trino; no latency regression on the SF10 winning set beyond a documented bound
 - [ ] 6.4 SF100 degrade-to-disk smoke on a suitably-resourced host (or documented as a follow-up if seeding/capacity is a separate exercise)
 - [ ] 6.5 Update memory + resumption with the outcome: tracked-vs-RSS convergence, q21 SF30 status, which alloc sites dominated, and the SF30 stability result

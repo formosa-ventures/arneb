@@ -4,6 +4,12 @@
 [![CI](https://github.com/formosa-ventures/arneb/actions/workflows/ci.yml/badge.svg)](https://github.com/formosa-ventures/arneb/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
 [![Docs](https://img.shields.io/badge/docs-arneb.io-blue)](https://arneb.io)
+[![GitHub stars](https://img.shields.io/github/stars/formosa-ventures/arneb?style=social)](https://github.com/formosa-ventures/arneb/stargazers)
+[![Dependency audit](https://img.shields.io/github/actions/workflow/status/formosa-ventures/arneb/deny.yml?branch=main&label=cargo-deny)](https://github.com/formosa-ventures/arneb/actions/workflows/deny.yml)
+[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange?logo=rust)](https://arneb.io/guide/quickstart)
+[![TPC-H 22/22 vs Trino](https://img.shields.io/badge/TPC--H-22%2F22%20vs%20Trino-brightgreen)](#arneb-vs-trino--tpc-h-sf10)
+[![SF10 vs Trino](https://img.shields.io/badge/SF10%20vs%20Trino-2.3%C3%97%20faster%20%C2%B7%200.14%C3%97%20memory-brightgreen)](https://arneb.io/guide/performance)
+[![Last commit](https://img.shields.io/github/last-commit/formosa-ventures/arneb)](https://github.com/formosa-ventures/arneb/commits/main)
 
 A Trino alternative built in Rust. Distributed SQL query engine for federated queries across heterogeneous data sources.
 

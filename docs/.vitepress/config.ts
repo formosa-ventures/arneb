@@ -5,6 +5,8 @@ export default defineConfig({
   title: 'Arneb',
   description: 'A distributed SQL query engine built in Rust',
   base: '/',
+  // Internal planning docs, not part of the site.
+  srcExclude: ['superpowers/**'],
 
   themeConfig: {
     nav: [

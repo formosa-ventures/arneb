@@ -263,6 +263,13 @@ Adding a function: implement `ScalarFunction` in `crates/execution/src/functions
 ### Phase 2.5 (SQL completeness + client compat) — complete
 8 changes: ansi-expressions, scalar-functions, subquery-support, advanced-dql, ddl-dml-connector-delegated, coordinator-web-ui, extended-query-protocol, pg-catalog-metadata
 
+### Phase 3 (production readiness + federation) — planned
+4 milestones, each work item its own OpenSpec change — full design in `docs/superpowers/specs/2026-10-16-phase3-roadmap-design.md`:
+- M1 safe to share: memory accounting + spill, admission control, TLS/auth
+- M2 federation MVP: RDBMS connector framework, PostgreSQL connector, cross-source join
+- M3 survives failure: fault tolerance, Prometheus metrics + query history, GHCR images + Helm
+- M4 wider federation: MySQL connector, aggregate/TopN/join pushdown
+
 ### OpenSpec Structure
 
 ```

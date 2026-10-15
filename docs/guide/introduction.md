@@ -25,7 +25,7 @@ Arneb is a distributed SQL query engine built in Rust — a Trino alternative de
 
 ## Current Status
 
-The latest release is **v0.1.1** <!-- x-release-please-version --> ([release notes](https://github.com/formosa-ventures/arneb/releases/latest), [changelog](https://github.com/formosa-ventures/arneb/blob/main/CHANGELOG.md)). Releases are source releases; see [Quickstart](/guide/quickstart#build-a-release).
+The latest release is **v0.1.2** <!-- x-release-please-version --> ([release notes](https://github.com/formosa-ventures/arneb/releases/latest), [changelog](https://github.com/formosa-ventures/arneb/blob/main/CHANGELOG.md)). Releases are source releases; see [Quickstart](/guide/quickstart#build-a-release).
 
 All 22 TPC-H queries return results cell-identical to Trino, single-node and distributed. SQL support includes SELECT, DDL/DML, CTEs, window functions, subqueries, set operations and 90 Trino-compatible scalar functions.
 

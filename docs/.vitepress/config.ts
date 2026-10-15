@@ -13,7 +13,7 @@ export default defineConfig({
       { text: 'Connectors', link: '/connectors/overview' },
       { text: 'Architecture', link: '/architecture/overview' },
       {
-        text: 'v0.1.1', // x-release-please-version
+        text: 'v0.1.2', // x-release-please-version
         items: [
           { text: 'Release notes', link: 'https://github.com/formosa-ventures/arneb/releases' },
           { text: 'Changelog', link: 'https://github.com/formosa-ventures/arneb/blob/main/CHANGELOG.md' },

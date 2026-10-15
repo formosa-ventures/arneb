@@ -1,6 +1,6 @@
 # Architecture Overview
 
-Arneb is organized as a Rust workspace with 12 crates, each responsible for a distinct layer of the query engine.
+Arneb is organized as a Rust workspace with 13 crates, each responsible for a distinct layer of the query engine.
 
 ## Crate Map
 
@@ -13,8 +13,10 @@ crates/
 ├── execution/       Physical operators, scalar functions, DataSource trait
 ├── connectors/      ConnectorFactory/Registry, file + object store connectors
 ├── hive/            Hive Metastore catalog provider and HiveDataSource
+├── iceberg/         Read-only Iceberg reader (Hive catalogs redirect Iceberg tables here)
 ├── hive-metastore/  Auto-generated Thrift bindings for HMS 4.x
-├── protocol/        PostgreSQL wire protocol (pgwire), pg_catalog, type encoding
+├── protocol/        PostgreSQL wire protocol (pgwire), pg_catalog, type encoding,
+│                    Trino client REST protocol
 ├── scheduler/       Query state machine, node registry, resource groups
 ├── rpc/             Arrow Flight RPC server/client, heartbeat, output buffers
 └── server/          Main binary, CLI, config loading, Web UI, shutdown
@@ -30,7 +32,7 @@ SQL String
   → Metadata interception      → pg_catalog, information_schema, SET/SHOW
   → ExecutionContext (execution)→ PhysicalPlan (Arc<dyn ExecutionPlan>)
   → execute()                  → SendableRecordBatchStream (async)
-  → Protocol (protocol)        → PostgreSQL wire format response
+  → Protocol (protocol)        → PostgreSQL wire or Trino JSON response
 ```
 
 ### Stage Details
@@ -47,7 +49,7 @@ SQL String
 
 6. **Execution**: Physical operators return `SendableRecordBatchStream` — an async stream of Arrow `RecordBatch` values. Execution is pipelined; operators pull data from their children on demand.
 
-7. **Wire Protocol**: The `protocol` crate encodes Arrow batches into PostgreSQL wire format (v3) and sends them to the client.
+7. **Wire Protocol**: The `protocol` crate encodes Arrow batches into PostgreSQL wire format (v3), or into Trino's JSON for clients on the Trino REST protocol, and sends them to the client.
 
 ### Distributed Execution
 
@@ -57,6 +59,16 @@ In distributed mode, additional stages are inserted:
 - The `NodeScheduler` assigns fragments to available workers based on the `NodeRegistry`
 - Workers execute fragments and return results via Arrow Flight RPC
 - The coordinator assembles partial results into the final output
+
+Fragments exchange data in a few shapes. A large fact-table scan is split
+across all workers. A join whose build side fits under the broadcast cap
+broadcasts it; otherwise both sides are hash-partitioned on the join key, and
+semi/anti joins and final aggregates are partitioned the same way. When the
+build side of a partitioned semi/anti join is much larger than its probe side,
+each join task reads the probe side first and publishes its key set to the
+build-side scans, which drop non-matching rows before they are shuffled. Each
+of these is on by default and can be switched off for comparison; see
+[Query Engine Levers](/guide/configuration#query-engine-levers).
 
 ## Design Principles
 
@@ -87,13 +99,13 @@ Arneb speaks the PostgreSQL wire protocol v3, including both Simple Query and Ex
 
 | Dependency | Version | Purpose |
 |------------|---------|---------|
-| `arrow` | v54 | Apache Arrow columnar format |
-| `sqlparser` | v0.61 | SQL parsing |
+| `arrow` / `parquet` | v60 | Apache Arrow columnar format, Parquet reader |
+| `sqlparser` | v0.63 | SQL parsing |
 | `tokio` | v1 | Async runtime |
-| `pgwire` | v0.25 | PostgreSQL wire protocol |
-| `axum` | v0.8 | HTTP framework (Web UI) |
-| `object_store` | v0.11 | S3/GCS/Azure abstraction |
-| `volo-thrift` | v0.10 | Async Thrift runtime (HMS) |
+| `pgwire` | v0.41 | PostgreSQL wire protocol |
+| `axum` | v0.8 | HTTP framework (Web UI, Trino REST protocol) |
+| `object_store` | v0.14 | S3/GCS/Azure abstraction |
+| `volo-thrift` | v0.12 | Async Thrift runtime (HMS) |
 | `clap` | v4 | CLI argument parsing |
 | `tracing` | — | Structured logging |
 | `thiserror` | v2 | Error types (library crates) |

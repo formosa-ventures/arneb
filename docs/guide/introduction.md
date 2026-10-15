@@ -11,6 +11,7 @@ Arneb is a distributed SQL query engine built in Rust — a Trino alternative de
 - **Distributed Execution**: Coordinator-worker architecture with [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html) RPC for high-throughput data exchange between nodes.
 - **Async Streaming**: Operators return async record batch streams, enabling pipelined execution without materializing full intermediate results.
 - **Pushdown Optimization**: Filters, projections, and limits are pushed into connectors when supported.
+- **Low Memory**: No JVM and no committed heap; an idle three-node cluster holds about 70 MB, and TPC-H peaks average 0.14× of Trino's at SF10.
 
 ## Supported Data Sources
 
@@ -27,10 +28,11 @@ Arneb is a distributed SQL query engine built in Rust — a Trino alternative de
 
 The latest release is **v0.1.1** <!-- x-release-please-version --> ([release notes](https://github.com/formosa-ventures/arneb/releases/latest), [changelog](https://github.com/formosa-ventures/arneb/blob/main/CHANGELOG.md)). Releases are source releases; see [Quickstart](/guide/quickstart#build-a-release).
 
-All 22 TPC-H queries return results cell-identical to Trino, single-node and distributed. SQL support includes SELECT, DDL/DML, CTEs, window functions, subqueries, set operations and 90 Trino-compatible scalar functions.
+All 22 TPC-H queries return results cell-identical to Trino, single-node and distributed. Against Trino on the same hardware, Arneb is faster on all 22 at SF10 (2.3× warm, geomean) at about a seventh of the peak memory, and faster on all 22 at SF30 cold (3.7×); see [Performance](/guide/performance). SQL support includes SELECT, DDL/DML, CTEs, window functions, subqueries, set operations and 90 Trino-compatible scalar functions.
 
 ## Next Steps
 
 - [Quickstart](/guide/quickstart) — get Arneb running and execute your first query
 - [Configuration](/guide/configuration) — learn about all configuration options
+- [Performance](/guide/performance) — TPC-H results against Trino at SF10 and SF30
 - [SQL Reference](/sql/overview) — see supported SQL statements and functions

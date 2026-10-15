@@ -17,6 +17,10 @@ hero:
       link: https://github.com/formosa-ventures/arneb/releases/latest
 
 features:
+  - title: Faster and Leaner than Trino
+    details: On all 22 TPC-H queries at SF10, cell-identical results, 2.3× faster warm and about a seventh of Trino's peak memory; faster on all 22 at SF30 too.
+    link: /guide/performance
+    linkText: See the numbers
   - title: Arrow-Native
     details: All intermediate data in Apache Arrow columnar format. No row-by-row processing.
   - title: PostgreSQL Compatible

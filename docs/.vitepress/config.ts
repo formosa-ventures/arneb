@@ -12,6 +12,7 @@ export default defineConfig({
       { text: 'SQL Reference', link: '/sql/overview' },
       { text: 'Connectors', link: '/connectors/overview' },
       { text: 'Architecture', link: '/architecture/overview' },
+      { text: 'Performance', link: '/guide/performance' },
       {
         text: 'v0.1.1', // x-release-please-version
         items: [
@@ -31,6 +32,7 @@ export default defineConfig({
             { text: 'Quickstart', link: '/guide/quickstart' },
             { text: 'Configuration', link: '/guide/configuration' },
             { text: 'Distributed Mode', link: '/guide/distributed' },
+            { text: 'Performance', link: '/guide/performance' },
             { text: 'Trino Clients', link: '/guide/trino-clients' }
           ]
         }

@@ -45,6 +45,14 @@ pub struct DynamicFilterConsumer {
     pub column_index: usize,
     /// Display name of the column.
     pub column_name: String,
+    /// True for a probe-side (reverse-direction) filter published by a
+    /// semi/anti join's probe side; see
+    /// [`LogicalPlan::SemiJoin::probe_side_filter_ids`]. Scans wait on these
+    /// even when the general distributed dynamic-filter runtime
+    /// (`ARNEB_DISTRIBUTED_DF`) is off, because their producers always
+    /// publish.
+    #[serde(default)]
+    pub probe_side: bool,
 }
 
 /// An expression within a logical plan.
@@ -449,6 +457,16 @@ pub enum LogicalPlan {
         /// its build (right) side. Same semantics as `Join::dynamic_filter_ids`.
         #[serde(default)]
         dynamic_filter_ids: Vec<DynamicFilterProducer>,
+        /// Cross-fragment dynamic filters this join produces in the
+        /// reverse direction: the Domain is built from its PROBE (left) key
+        /// column at `probe_index` once the left input is fully drained, and
+        /// is consumed by a scan under its build (right) child at
+        /// `build_index`. Lets a small probe side prune a large build-side
+        /// scan before it is shuffled. Exact for semi and anti joins: a right
+        /// row whose key is absent from every left row can never match.
+        /// Assigned by the fragmenter on the partitioned semi/anti path only.
+        #[serde(default)]
+        probe_side_filter_ids: Vec<DynamicFilterProducer>,
     },
     /// Anti-join: returns left rows where NO match exists in right.
     AntiJoin {
@@ -462,6 +480,10 @@ pub enum LogicalPlan {
         right_key: PlanExpr,
         /// Optional residual predicate; see [`LogicalPlan::SemiJoin::residual`].
         residual: Option<PlanExpr>,
+        /// Reverse-direction dynamic filters; see
+        /// [`LogicalPlan::SemiJoin::probe_side_filter_ids`].
+        #[serde(default)]
+        probe_side_filter_ids: Vec<DynamicFilterProducer>,
     },
     /// Scalar subquery: executes subplan and returns a single scalar value.
     ScalarSubquery {
@@ -1027,6 +1049,7 @@ fn fmt_plan(plan: &LogicalPlan, f: &mut fmt::Formatter<'_>, indent: usize) -> fm
             left_key,
             right_key,
             residual,
+            ..
         } => {
             write!(f, "{pad}AntiJoin: {left_key} = {right_key}")?;
             if let Some(r) = residual {

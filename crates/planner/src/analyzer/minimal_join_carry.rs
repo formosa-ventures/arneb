@@ -513,6 +513,7 @@ fn prune_for_columns(
             right_key,
             residual,
             dynamic_filter_ids,
+            ..
         } => {
             let (new_left, new_right, left_map, right_map, residual) =
                 prune_semi_anti_inputs(left, right, left_key, right_key, residual, needed);
@@ -534,6 +535,7 @@ fn prune_for_columns(
                 right_key: rewrite_expr(right_key, &right_map),
                 residual,
                 dynamic_filter_ids,
+                probe_side_filter_ids: Vec::new(),
             };
             project_to_needed(rewritten, &left_map, needed)
         }
@@ -543,6 +545,7 @@ fn prune_for_columns(
             left_key,
             right_key,
             residual,
+            ..
         } => {
             let (new_left, new_right, left_map, right_map, residual) =
                 prune_semi_anti_inputs(left, right, left_key, right_key, residual, needed);
@@ -552,6 +555,7 @@ fn prune_for_columns(
                 left_key: rewrite_expr(left_key, &left_map),
                 right_key: rewrite_expr(right_key, &right_map),
                 residual,
+                probe_side_filter_ids: Vec::new(),
             };
             project_to_needed(rewritten, &left_map, needed)
         }
@@ -781,6 +785,7 @@ where
             right_key,
             residual,
             dynamic_filter_ids,
+            ..
         } => L::SemiJoin {
             left: Box::new(f(*left)),
             right: Box::new(f(*right)),
@@ -788,6 +793,7 @@ where
             right_key,
             residual,
             dynamic_filter_ids,
+            probe_side_filter_ids: Vec::new(),
         },
         L::AntiJoin {
             left,
@@ -795,12 +801,14 @@ where
             left_key,
             right_key,
             residual,
+            ..
         } => L::AntiJoin {
             left: Box::new(f(*left)),
             right: Box::new(f(*right)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids: Vec::new(),
         },
         L::ScalarSubquery { subplan } => L::ScalarSubquery {
             subplan: Box::new(f(*subplan)),

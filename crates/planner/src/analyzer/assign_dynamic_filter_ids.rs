@@ -129,6 +129,7 @@ fn rewrite(plan: LogicalPlan, alloc: &DynamicFilterIdAllocator) -> LogicalPlan {
             right_key,
             residual,
             dynamic_filter_ids,
+            ..
         } if dynamic_filter_ids.is_empty() && residual.is_none() => {
             assign_for_semi_join(*left, *right, left_key, right_key, alloc)
         }
@@ -234,6 +235,7 @@ fn recurse_children(plan: LogicalPlan, alloc: &DynamicFilterIdAllocator) -> Logi
             right_key,
             residual,
             dynamic_filter_ids,
+            ..
         } => L::SemiJoin {
             left: Box::new(rewrite(*left, alloc)),
             right: Box::new(rewrite(*right, alloc)),
@@ -241,6 +243,7 @@ fn recurse_children(plan: LogicalPlan, alloc: &DynamicFilterIdAllocator) -> Logi
             right_key,
             residual,
             dynamic_filter_ids,
+            probe_side_filter_ids: Vec::new(),
         },
         L::AntiJoin {
             left,
@@ -248,12 +251,14 @@ fn recurse_children(plan: LogicalPlan, alloc: &DynamicFilterIdAllocator) -> Logi
             left_key,
             right_key,
             residual,
+            ..
         } => L::AntiJoin {
             left: Box::new(rewrite(*left, alloc)),
             right: Box::new(rewrite(*right, alloc)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids: Vec::new(),
         },
         L::ScalarSubquery { subplan } => L::ScalarSubquery {
             subplan: Box::new(rewrite(*subplan, alloc)),
@@ -367,6 +372,7 @@ fn assign_for_semi_join(
             right_key,
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
     };
     let (left_idx, right_idx, name) = (*left_idx, *right_idx, name.clone());
@@ -392,6 +398,7 @@ fn assign_for_semi_join(
         right_key,
         residual: None,
         dynamic_filter_ids: producers,
+        probe_side_filter_ids: Vec::new(),
     }
 }
 
@@ -428,7 +435,7 @@ fn df_through_joins_enabled() -> bool {
 /// when the column traces through a node we don't yet know how to
 /// remap (Aggregate, UnionAll, Join, ExchangeNode, etc.).
 #[allow(clippy::result_large_err)]
-fn tag_consumer(
+pub(crate) fn tag_consumer(
     plan: LogicalPlan,
     idx: usize,
     id: arneb_common::DynamicFilterId,
@@ -447,6 +454,7 @@ fn tag_consumer(
                 id,
                 column_index: idx,
                 column_name,
+                probe_side: false,
             });
             Ok(L::TableScan {
                 table,
@@ -553,6 +561,45 @@ fn tag_consumer(
         // Operators we can't trace through cleanly — give up and
         // return the unmodified plan.
         other => Err(other),
+    }
+}
+
+/// [`tag_consumer`] for a probe-side (reverse-direction) filter: the tagged
+/// scan's consumer is marked `probe_side` so it waits even with the general
+/// distributed dynamic-filter runtime off.
+#[allow(clippy::result_large_err)]
+pub(crate) fn tag_probe_side_consumer(
+    plan: LogicalPlan,
+    idx: usize,
+    id: arneb_common::DynamicFilterId,
+    column_name: String,
+) -> Result<LogicalPlan, LogicalPlan> {
+    let mut tagged = tag_consumer(plan, idx, id, column_name)?;
+    mark_probe_side(&mut tagged, id);
+    Ok(tagged)
+}
+
+/// Marks the consumer `id` as probe-side on every scan reachable through the
+/// nodes [`tag_consumer`] traces through.
+fn mark_probe_side(plan: &mut LogicalPlan, id: arneb_common::DynamicFilterId) {
+    use LogicalPlan as L;
+    match plan {
+        L::TableScan {
+            dynamic_filters_consumed,
+            ..
+        } => {
+            for consumer in dynamic_filters_consumed.iter_mut().filter(|c| c.id == id) {
+                consumer.probe_side = true;
+            }
+        }
+        L::Filter { input, .. } | L::Sort { input, .. } | L::Projection { input, .. } => {
+            mark_probe_side(input, id)
+        }
+        L::Join { left, right, .. } => {
+            mark_probe_side(left, id);
+            mark_probe_side(right, id);
+        }
+        _ => {}
     }
 }
 

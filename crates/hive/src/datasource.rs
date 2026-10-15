@@ -326,11 +326,20 @@ impl HiveDataSource {
             .iter()
             .filter_map(|f| remap_filter(f, &|i| (i < n_data).then_some(i)))
             .collect();
+        // Same for dynamic filter domains: data columns keep their index in
+        // the file, partition columns are not in it.
+        let data_domains: Vec<_> = ctx
+            .dynamic_filter_domains
+            .iter()
+            .filter(|d| d.column_index < n_data)
+            .cloned()
+            .collect();
         let builder = parquet_scan::open_parquet_builder(&file.store, &file.path).await?;
         let stream = parquet_scan::build_split_stream(
             builder,
             &file.path,
             &data_filters,
+            &data_domains,
             Some(&roots),
             ctx.batch_size,
             split_idx,
@@ -434,6 +443,7 @@ impl DataSource for HiveDataSource {
                     builder,
                     file_path,
                     &ctx.filters,
+                    &ctx.dynamic_filter_domains,
                     ctx.projection.as_deref(),
                     ctx.batch_size,
                     split_idx,

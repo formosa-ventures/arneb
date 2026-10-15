@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use arneb_common::identifiers::StageId;
 use arneb_common::types::{ColumnInfo, DataType};
 
-use crate::analyzer::assign_dynamic_filter_ids::assign_for_join;
+use crate::analyzer::assign_dynamic_filter_ids::{assign_for_join, tag_probe_side_consumer};
 use crate::dynamic_filter::DynamicFilterIdAllocator;
 use crate::plan::{DynamicFilterProducer, JoinCondition, LogicalPlan, PlanExpr};
 use arneb_sql_parser::ast::BinaryOp;
@@ -502,6 +502,93 @@ fn partitioned_semi_join_enabled() -> bool {
 }
 
 #[cfg(test)]
+static PROBE_SIDE_FILTER_TEST_OVERRIDE: OnceLock<std::sync::Mutex<Option<bool>>> = OnceLock::new();
+#[cfg(test)]
+static PROBE_SIDE_FILTER_TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+struct ProbeSideFilterOverride {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for ProbeSideFilterOverride {
+    fn drop(&mut self) {
+        *PROBE_SIDE_FILTER_TEST_OVERRIDE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("PROBE_SIDE_FILTER_TEST_OVERRIDE mutex poisoned") = None;
+    }
+}
+
+#[cfg(test)]
+fn set_probe_side_filter_for_test(enabled: bool) -> ProbeSideFilterOverride {
+    let guard = PROBE_SIDE_FILTER_TEST_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("PROBE_SIDE_FILTER_TEST_LOCK mutex poisoned");
+    *PROBE_SIDE_FILTER_TEST_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("PROBE_SIDE_FILTER_TEST_OVERRIDE mutex poisoned") = Some(enabled);
+    ProbeSideFilterOverride { _guard: guard }
+}
+
+/// `ARNEB_SEMI_PROBE_FILTER` (default on; `=0` disables): on the partitioned semi/anti
+/// path, let a small probe side prune the build-side scan through a
+/// reverse-direction dynamic filter. Works without the general distributed
+/// dynamic-filter runtime (`ARNEB_DISTRIBUTED_DF`) and without
+/// `ARNEB_BLOOM_DF`: large key sets are published as Bloom filters directly.
+fn probe_side_filter_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(override_value) = PROBE_SIDE_FILTER_TEST_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("PROBE_SIDE_FILTER_TEST_OVERRIDE mutex poisoned")
+        .as_ref()
+    {
+        return *override_value;
+    }
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    *ENABLED.get_or_init(|| {
+        let enabled = std::env::var("ARNEB_SEMI_PROBE_FILTER")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
+        tracing::info!(
+            target: "arneb::config",
+            semi_probe_filter = enabled,
+            "ARNEB_SEMI_PROBE_FILTER effective value (default on; =0 to stop a small semi/anti probe side from pruning the build-side scan)"
+        );
+        enabled
+    })
+}
+
+/// The probe side must be estimated at least this many times smaller than
+/// the build side before a probe-side filter is attached: the build-side
+/// scan waits for the whole probe side to drain, which only pays off when
+/// the key set is small next to the rows it prunes.
+const PROBE_SIDE_FILTER_MIN_RATIO: f64 = 4.0;
+
+/// Minimum estimated build-side rows before a probe-side filter is attached.
+/// The filter has a roughly fixed cost — the build scan waits for the probe
+/// side to drain, plus a coordinator round trip — while what it saves grows
+/// with the rows it keeps off the shuffle. Calibrated on local SF10: TPC-H
+/// q22's 15M-row `orders` build lost ~0.15 s with the filter, q04's 30M-row
+/// and q21's 60M-row `lineitem` builds gained 0.3 s and 2 s.
+const PROBE_SIDE_FILTER_MIN_BUILD_ROWS: f64 = 20_000_000.0;
+
+/// Maximum base-table rows the probe side may scan before it can publish.
+/// The build-side scan waits for that drain (up to the dynamic-filter wait
+/// timeout, 10 s by default), so a probe side that cannot finish within the
+/// wait only costs time. Calibrated on two-worker clusters draining roughly
+/// 10M rows/s: TPC-H q21's probe side (`lineitem ⋈ orders ⋈ supplier`)
+/// scans 75M rows at SF10 and publishes within the wait, but 225M at SF30
+/// and publishes 22–32 s in, after every `lineitem` scan has timed out.
+const PROBE_SIDE_FILTER_MAX_PROBE_SCAN_ROWS: f64 = 100_000_000.0;
+
+#[cfg(test)]
 static SWAP_DF_REGEN_TEST_OVERRIDE: OnceLock<std::sync::Mutex<Option<bool>>> = OnceLock::new();
 #[cfg(test)]
 static SWAP_DF_REGEN_TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
@@ -905,6 +992,7 @@ fn remove_dynamic_filter_consumers_for_join(
             right_key,
             residual,
             dynamic_filter_ids,
+            probe_side_filter_ids,
         } => L::SemiJoin {
             left: Box::new(remove_dynamic_filter_consumers_for_join(*left, producers)),
             right: Box::new(remove_dynamic_filter_consumers_for_join(*right, producers)),
@@ -912,6 +1000,7 @@ fn remove_dynamic_filter_consumers_for_join(
             right_key,
             residual,
             dynamic_filter_ids,
+            probe_side_filter_ids,
         },
         L::AntiJoin {
             left,
@@ -919,12 +1008,14 @@ fn remove_dynamic_filter_consumers_for_join(
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids,
         } => L::AntiJoin {
             left: Box::new(remove_dynamic_filter_consumers_for_join(*left, producers)),
             right: Box::new(remove_dynamic_filter_consumers_for_join(*right, producers)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids,
         },
         L::ScalarSubquery { subplan } => L::ScalarSubquery {
             subplan: Box::new(remove_dynamic_filter_consumers_for_join(
@@ -1434,6 +1525,124 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
 
         let estimated_groups = crate::cost::estimated_cardinality(aggregate_plan, stats);
         estimated_groups > self.hash_partition_target_rows as f64
+    }
+
+    /// Attaches a reverse-direction dynamic filter to a partitioned
+    /// semi/anti join when its build (right) side is estimated large and its
+    /// probe (left) side much smaller: tags the scan under `right_fragment` as
+    /// the consumer, and returns the producer for the join's
+    /// `probe_side_filter_ids`. The join tasks publish a Domain of their
+    /// left keys, so the right scan drops rows that cannot match before
+    /// they are shuffled. Returns no producer when the gate is off, stats
+    /// are missing, the ratio is not met, the probe side scans too much to
+    /// publish within the wait, or the key does not trace to a scan.
+    fn attach_probe_side_filter(
+        &self,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        left_key_index: usize,
+        right_key_index: usize,
+        right_fragment: &mut PlanFragment,
+    ) -> Vec<DynamicFilterProducer> {
+        if !probe_side_filter_enabled() {
+            return Vec::new();
+        }
+        let Some(stats) = self.stats.as_deref() else {
+            return Vec::new();
+        };
+        let left_rows = crate::cost::estimated_cardinality(left, stats);
+        let right_rows = crate::cost::estimated_cardinality(right, stats);
+        let left_scanned_rows = crate::cost::total_scanned_rows(left, stats);
+        let attach = left_rows.is_finite()
+            && right_rows.is_finite()
+            && right_rows >= PROBE_SIDE_FILTER_MIN_BUILD_ROWS
+            && left_rows * PROBE_SIDE_FILTER_MIN_RATIO < right_rows
+            && left_scanned_rows <= PROBE_SIDE_FILTER_MAX_PROBE_SCAN_ROWS;
+        tracing::info!(
+            target: "arneb::planner",
+            left_rows,
+            right_rows,
+            left_scanned_rows,
+            attach,
+            "partitioned semi/anti probe-side filter decision"
+        );
+        if !attach {
+            return Vec::new();
+        }
+        let column_name = right_fragment
+            .root
+            .schema()
+            .get(right_key_index)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let id = self.swap_df_allocator.allocate();
+        let root = std::mem::replace(&mut right_fragment.root, LogicalPlan::OneRow);
+        match tag_probe_side_consumer(root, right_key_index, id, column_name.clone()) {
+            Ok(tagged) => {
+                right_fragment.root = tagged;
+                vec![DynamicFilterProducer {
+                    id,
+                    build_index: right_key_index,
+                    probe_index: left_key_index,
+                    column_name,
+                }]
+            }
+            Err(untagged) => {
+                right_fragment.root = untagged;
+                Vec::new()
+            }
+        }
+    }
+
+    /// Lets a partitioned anti join's build-side scan subscribe to the
+    /// probe-side filter its left input already publishes, when that left
+    /// input is a partitioned semi join keyed on the same column (TPC-H q21:
+    /// `NOT EXISTS l3` over `EXISTS l2`). The semi join's left keys are a
+    /// superset of the anti join's left keys, so the filter stays exact, and
+    /// it resolves as soon as the semi join's left drains — the anti join's
+    /// build scan then runs alongside the semi join's instead of after it.
+    /// Returns false (and tags nothing) when the shape does not match.
+    fn inherit_probe_side_filter(
+        left_fragment: &PlanFragment,
+        left_key_index: usize,
+        right_key_index: usize,
+        right_fragment: &mut PlanFragment,
+    ) -> bool {
+        if !probe_side_filter_enabled() {
+            return false;
+        }
+        // A semi join's output is its left input, so the anti join's left key
+        // column is the semi join's left column at the same index.
+        let LogicalPlan::SemiJoin {
+            probe_side_filter_ids,
+            ..
+        } = &left_fragment.root
+        else {
+            return false;
+        };
+        let Some(producer) = probe_side_filter_ids
+            .iter()
+            .find(|p| p.probe_index == left_key_index)
+        else {
+            return false;
+        };
+        let column_name = right_fragment
+            .root
+            .schema()
+            .get(right_key_index)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let root = std::mem::replace(&mut right_fragment.root, LogicalPlan::OneRow);
+        match tag_probe_side_consumer(root, right_key_index, producer.id, column_name) {
+            Ok(tagged) => {
+                right_fragment.root = tagged;
+                true
+            }
+            Err(untagged) => {
+                right_fragment.root = untagged;
+                false
+            }
+        }
     }
 
     fn next_id(&mut self) -> StageId {
@@ -2179,6 +2388,7 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                 right_key,
                 residual,
                 dynamic_filter_ids,
+                ..
             } => {
                 let original_left_for_estimate = left.as_ref().clone();
                 let original_right_for_estimate = right.as_ref().clone();
@@ -2252,6 +2462,13 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                             &dynamic_filter_ids,
                         );
                     }
+                    let probe_side_filter_ids = self.attach_probe_side_filter(
+                        &original_left_for_estimate,
+                        &original_right_for_estimate,
+                        left_key_index,
+                        right_key_index,
+                        &mut right_frags[0],
+                    );
                     left_frags.append(&mut right_frags);
 
                     // Partitioned semi joins are exact by key colocation, but
@@ -2271,6 +2488,7 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                         right_key,
                         residual,
                         dynamic_filter_ids: Vec::new(),
+                        probe_side_filter_ids,
                     };
                     let output_schema = join_plan.schema();
 
@@ -2301,6 +2519,7 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                     right_key,
                     residual,
                     dynamic_filter_ids,
+                    probe_side_filter_ids: Vec::new(),
                 };
                 let output_schema = join_plan.schema();
 
@@ -2325,6 +2544,7 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                 left_key,
                 right_key,
                 residual,
+                ..
             } => {
                 let original_left_for_estimate = left.as_ref().clone();
                 let original_right_for_estimate = right.as_ref().clone();
@@ -2386,6 +2606,22 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                         columns: vec![right_key_index],
                         partition_count,
                     };
+                    let probe_side_filter_ids = if Self::inherit_probe_side_filter(
+                        &left_frags[0],
+                        left_key_index,
+                        right_key_index,
+                        &mut right_frags[0],
+                    ) {
+                        Vec::new()
+                    } else {
+                        self.attach_probe_side_filter(
+                            &original_left_for_estimate,
+                            &original_right_for_estimate,
+                            left_key_index,
+                            right_key_index,
+                            &mut right_frags[0],
+                        )
+                    };
                     left_frags.append(&mut right_frags);
 
                     let join_plan = LogicalPlan::AntiJoin {
@@ -2394,6 +2630,7 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                         left_key,
                         right_key,
                         residual,
+                        probe_side_filter_ids,
                     };
                     let output_schema = join_plan.schema();
 
@@ -2423,6 +2660,7 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                     left_key,
                     right_key,
                     residual,
+                    probe_side_filter_ids: Vec::new(),
                 };
                 let output_schema = join_plan.schema();
 
@@ -2959,6 +3197,7 @@ fn recurse_avg_children(plan: LogicalPlan) -> LogicalPlan {
             right_key,
             residual,
             dynamic_filter_ids,
+            probe_side_filter_ids,
         } => L::SemiJoin {
             left: Box::new(rewrite_avg_for_split(*left)),
             right: Box::new(rewrite_avg_for_split(*right)),
@@ -2966,6 +3205,7 @@ fn recurse_avg_children(plan: LogicalPlan) -> LogicalPlan {
             right_key,
             residual,
             dynamic_filter_ids,
+            probe_side_filter_ids,
         },
         L::AntiJoin {
             left,
@@ -2973,12 +3213,14 @@ fn recurse_avg_children(plan: LogicalPlan) -> LogicalPlan {
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids,
         } => L::AntiJoin {
             left: Box::new(rewrite_avg_for_split(*left)),
             right: Box::new(rewrite_avg_for_split(*right)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids,
         },
         L::ScalarSubquery { subplan } => L::ScalarSubquery {
             subplan: Box::new(rewrite_avg_for_split(*subplan)),
@@ -3941,6 +4183,7 @@ mod tests {
             right_key: column(1, "r_id"),
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         }
     }
 
@@ -3951,6 +4194,7 @@ mod tests {
             left_key: column(0, "l_id"),
             right_key: column(1, "r_id"),
             residual: None,
+            probe_side_filter_ids: Vec::new(),
         }
     }
 
@@ -3984,6 +4228,7 @@ mod tests {
             right_key: column(0, "r_id"),
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         }
     }
 
@@ -5485,6 +5730,7 @@ mod tests {
                         id,
                         column_index: 0,
                         column_name: "old_mis_sided".into(),
+                        probe_side: false,
                     });
                 }
                 LogicalPlan::TableScan {
@@ -6679,5 +6925,162 @@ mod tests {
             "a few-MB join intermediate must be replicated rather than shuffled \
              against a 352 MB probe"
         );
+    }
+
+    fn stats_for_semi_sides(left_rows: u64, right_rows: u64) -> crate::cost::CatalogStats {
+        let mut stats = crate::cost::CatalogStats::new();
+        for (table, rows) in [("left_table", left_rows), ("right_table", right_rows)] {
+            stats.insert(
+                TableReference::table(table),
+                arneb_catalog::TableStatistics {
+                    row_count: Some(rows),
+                    size_bytes: Some(rows * 16),
+                    columns: std::collections::HashMap::new(),
+                },
+            );
+        }
+        stats
+    }
+
+    fn probe_side_producers(plan: &LogicalPlan) -> Vec<DynamicFilterProducer> {
+        match plan {
+            LogicalPlan::SemiJoin {
+                probe_side_filter_ids,
+                ..
+            }
+            | LogicalPlan::AntiJoin {
+                probe_side_filter_ids,
+                ..
+            } => probe_side_filter_ids.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn scan_consumers(plan: &LogicalPlan) -> Vec<crate::plan::DynamicFilterConsumer> {
+        match plan {
+            LogicalPlan::TableScan {
+                dynamic_filters_consumed,
+                ..
+            } => dynamic_filters_consumed.clone(),
+            LogicalPlan::Projection { input, .. } | LogicalPlan::Filter { input, .. } => {
+                scan_consumers(input)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn fragment_with_probe_side_filter(
+        plan: LogicalPlan,
+        left_rows: u64,
+        right_rows: u64,
+        gate: bool,
+    ) -> PlanFragment {
+        let _partitioned = set_partitioned_semi_join_for_test(true);
+        let _probe_side = set_probe_side_filter_for_test(gate);
+        PlanFragmenter::new()
+            .with_worker_count(2)
+            .with_stats(Some(std::sync::Arc::new(stats_for_semi_sides(
+                left_rows, right_rows,
+            ))))
+            .fragment(plan)
+    }
+
+    #[test]
+    fn probe_side_filter_tags_build_scan_when_probe_is_small() {
+        for plan in [semi_join_plan(), anti_join_plan()] {
+            let result = fragment_with_probe_side_filter(plan, 1_000, 100_000_000, true);
+            let join_frag = &result.source_fragments[0];
+            assert_eq!(join_frag.fragment_type, FragmentType::HashPartitioned);
+
+            let producers = probe_side_producers(&join_frag.root);
+            assert_eq!(producers.len(), 1);
+            let producer = &producers[0];
+            // build_index is the right key (r_id), probe_index the left key (l_id).
+            assert_eq!(producer.build_index, 1);
+            assert_eq!(producer.probe_index, 0);
+
+            // The consumer sits on the build-side (right) scan, at the key
+            // column, and nowhere on the probe side.
+            let right_consumers = scan_consumers(&join_frag.source_fragments[1].root);
+            assert_eq!(right_consumers.len(), 1);
+            assert_eq!(right_consumers[0].id, producer.id);
+            assert_eq!(right_consumers[0].column_index, 1);
+            assert!(scan_consumers(&join_frag.source_fragments[0].root).is_empty());
+        }
+    }
+
+    #[test]
+    fn probe_side_filter_skipped_when_probe_is_not_small() {
+        for plan in [semi_join_plan(), anti_join_plan()] {
+            let result = fragment_with_probe_side_filter(plan, 30_000_000, 100_000_000, true);
+            let join_frag = &result.source_fragments[0];
+            assert!(probe_side_producers(&join_frag.root).is_empty());
+            assert!(scan_consumers(&join_frag.source_fragments[1].root).is_empty());
+        }
+    }
+
+    #[test]
+    fn probe_side_filter_skipped_when_build_is_not_large() {
+        for plan in [semi_join_plan(), anti_join_plan()] {
+            let result = fragment_with_probe_side_filter(plan, 1_000, 10_000_000, true);
+            let join_frag = &result.source_fragments[0];
+            assert!(probe_side_producers(&join_frag.root).is_empty());
+            assert!(scan_consumers(&join_frag.source_fragments[1].root).is_empty());
+        }
+    }
+
+    #[test]
+    fn probe_side_filter_skipped_when_probe_scans_too_much_to_publish_in_time() {
+        // The ratio holds (150M * 4 < 1B), but draining 150M probe rows
+        // takes longer than the build scan's wait.
+        for plan in [semi_join_plan(), anti_join_plan()] {
+            let result = fragment_with_probe_side_filter(plan, 150_000_000, 1_000_000_000, true);
+            let join_frag = &result.source_fragments[0];
+            assert!(probe_side_producers(&join_frag.root).is_empty());
+            assert!(scan_consumers(&join_frag.source_fragments[1].root).is_empty());
+        }
+    }
+
+    #[test]
+    fn probe_side_filter_skipped_when_gate_off() {
+        for plan in [semi_join_plan(), anti_join_plan()] {
+            let result = fragment_with_probe_side_filter(plan, 1_000, 100_000_000, false);
+            let join_frag = &result.source_fragments[0];
+            assert_eq!(join_frag.fragment_type, FragmentType::HashPartitioned);
+            assert!(probe_side_producers(&join_frag.root).is_empty());
+            assert!(scan_consumers(&join_frag.source_fragments[1].root).is_empty());
+        }
+    }
+
+    #[test]
+    fn anti_join_over_semi_join_inherits_the_semi_probe_side_filter() {
+        // Anti(Semi(left, right), right): the q21 EXISTS / NOT EXISTS shape.
+        let plan = LogicalPlan::AntiJoin {
+            left: Box::new(semi_join_plan()),
+            right: Box::new(scan_with_columns("right_table", &["r_payload", "r_id"])),
+            left_key: column(0, "l_id"),
+            right_key: column(1, "r_id"),
+            residual: None,
+            probe_side_filter_ids: Vec::new(),
+        };
+        let result = fragment_with_probe_side_filter(plan, 1_000, 100_000_000, true);
+        let anti_frag = &result.source_fragments[0];
+        assert!(matches!(anti_frag.root, LogicalPlan::AntiJoin { .. }));
+        // No filter of its own: it reuses the semi join's.
+        assert!(probe_side_producers(&anti_frag.root).is_empty());
+
+        let semi_frag = &anti_frag.source_fragments[0];
+        let semi_producers = probe_side_producers(&semi_frag.root);
+        assert_eq!(semi_producers.len(), 1);
+        let semi_id = semi_producers[0].id;
+
+        // Both build scans wait on the same filter.
+        let semi_build = scan_consumers(&semi_frag.source_fragments[1].root);
+        let anti_build = scan_consumers(&anti_frag.source_fragments[1].root);
+        assert_eq!(semi_build.len(), 1);
+        assert_eq!(anti_build.len(), 1);
+        assert_eq!(semi_build[0].id, semi_id);
+        assert_eq!(anti_build[0].id, semi_id);
+        assert_eq!(anti_build[0].column_index, 1);
     }
 }

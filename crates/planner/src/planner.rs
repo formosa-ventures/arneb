@@ -551,6 +551,7 @@ impl<'a> QueryPlanner<'a> {
                         right_key: spec.right_key,
                         residual: spec.residual,
                         dynamic_filter_ids: Vec::new(),
+                        probe_side_filter_ids: Vec::new(),
                     },
                     SemiJoinKind::Anti => LogicalPlan::AntiJoin {
                         left: Box::new(plan),
@@ -558,6 +559,7 @@ impl<'a> QueryPlanner<'a> {
                         left_key: spec.left_key,
                         right_key: spec.right_key,
                         residual: spec.residual,
+                        probe_side_filter_ids: Vec::new(),
                     },
                 };
             }

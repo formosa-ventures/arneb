@@ -281,6 +281,7 @@ fn try_rewrite_aggregate(
         right_key,
         residual: None,
         dynamic_filter_ids,
+        ..
     } = input.clone()
     {
         return try_rewrite_semijoin_left_aggregate(
@@ -378,6 +379,7 @@ fn try_rewrite_semijoin_left_aggregate(
             right_key,
             residual: None,
             dynamic_filter_ids,
+            probe_side_filter_ids: Vec::new(),
         }),
         group_by: final_group_by,
         aggr_exprs: final_aggr_exprs,

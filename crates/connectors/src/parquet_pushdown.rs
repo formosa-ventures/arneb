@@ -331,6 +331,9 @@ fn try_build_dynamic_domain_predicate(
     let Domain::Bloom(domain) = &dynamic_domain.domain else {
         return None;
     };
+    if dynamic_domain.column_index >= schema.num_columns() {
+        return None;
+    }
     let mask = ProjectionMask::leaves(schema, [dynamic_domain.column_index]);
     let domain = Domain::Bloom(domain.clone());
     let predicate =
@@ -345,6 +348,37 @@ fn build_domain_filter_mask(
     column: &ArrayRef,
 ) -> Result<BooleanArray, arrow::error::ArrowError> {
     use arrow::array::{Array, BooleanBuilder};
+
+    // Bloom fast path for the integer key types: probe the bitmap without
+    // building a `ScalarValue` (and a canonical-bytes Vec) per row. NULL
+    // never matches.
+    if let Domain::Bloom(bloom) = domain {
+        use arrow::array::AsArray;
+        match column.data_type() {
+            arrow::datatypes::DataType::Int32 => {
+                return Ok(column
+                    .as_primitive::<arrow::datatypes::Int32Type>()
+                    .iter()
+                    .map(|v| Some(v.is_some_and(|x| bloom.contains_int32(x))))
+                    .collect());
+            }
+            arrow::datatypes::DataType::Int64 => {
+                return Ok(column
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .iter()
+                    .map(|v| Some(v.is_some_and(|x| bloom.contains_int64(x))))
+                    .collect());
+            }
+            arrow::datatypes::DataType::Date32 => {
+                return Ok(column
+                    .as_primitive::<arrow::datatypes::Date32Type>()
+                    .iter()
+                    .map(|v| Some(v.is_some_and(|x| bloom.contains_date32(x))))
+                    .collect());
+            }
+            _ => {}
+        }
+    }
 
     let n = column.len();
     let mut builder = BooleanBuilder::with_capacity(n);

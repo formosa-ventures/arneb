@@ -359,6 +359,7 @@ fn rewrite_plan(plan: LogicalPlan, candidates: &HashSet<ColumnSource>) -> Logica
             right_key,
             residual,
             dynamic_filter_ids,
+            ..
         } => LogicalPlan::SemiJoin {
             left: Box::new(rewrite_plan(*left, candidates)),
             right: Box::new(rewrite_plan(*right, candidates)),
@@ -366,6 +367,7 @@ fn rewrite_plan(plan: LogicalPlan, candidates: &HashSet<ColumnSource>) -> Logica
             right_key,
             residual,
             dynamic_filter_ids,
+            probe_side_filter_ids: Vec::new(),
         },
         LogicalPlan::AntiJoin {
             left,
@@ -373,12 +375,14 @@ fn rewrite_plan(plan: LogicalPlan, candidates: &HashSet<ColumnSource>) -> Logica
             left_key,
             right_key,
             residual,
+            ..
         } => LogicalPlan::AntiJoin {
             left: Box::new(rewrite_plan(*left, candidates)),
             right: Box::new(rewrite_plan(*right, candidates)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids: Vec::new(),
         },
         LogicalPlan::UnionAll { inputs } => LogicalPlan::UnionAll {
             inputs: inputs

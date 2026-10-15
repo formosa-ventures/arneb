@@ -1179,6 +1179,7 @@ fn rewrite_plan(
             right_key,
             residual,
             dynamic_filter_ids,
+            ..
         } => {
             let left = rewrite_plan(*left, stats, root_outputs, blocked);
             let right = rewrite_plan(*right, stats, root_outputs, blocked);
@@ -1189,6 +1190,7 @@ fn rewrite_plan(
                 right_key: rewrite_expr(right_key, stats, root_outputs, blocked),
                 residual: residual.map(|expr| rewrite_expr(expr, stats, root_outputs, blocked)),
                 dynamic_filter_ids,
+                probe_side_filter_ids: Vec::new(),
             }
         }
         LogicalPlan::AntiJoin {
@@ -1197,6 +1199,7 @@ fn rewrite_plan(
             left_key,
             right_key,
             residual,
+            ..
         } => {
             let left = rewrite_plan(*left, stats, root_outputs, blocked);
             let right = rewrite_plan(*right, stats, root_outputs, blocked);
@@ -1206,6 +1209,7 @@ fn rewrite_plan(
                 left_key: rewrite_expr(left_key, stats, root_outputs, blocked),
                 right_key: rewrite_expr(right_key, stats, root_outputs, blocked),
                 residual: residual.map(|expr| rewrite_expr(expr, stats, root_outputs, blocked)),
+                probe_side_filter_ids: Vec::new(),
             }
         }
         LogicalPlan::UnionAll { inputs } => LogicalPlan::UnionAll {
@@ -3016,6 +3020,7 @@ mod tests {
             left_key: col(1, "ps_suppkey"),
             right_key: col(0, "s_suppkey"),
             residual: None,
+            probe_side_filter_ids: Vec::new(),
         };
         let join = LogicalPlan::Join {
             left: Box::new(part),
@@ -3138,6 +3143,7 @@ mod tests {
             right_key: col(0, "o_orderkey"),
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
         let plan = project(semi, 1, "l_suppkey");
 
@@ -3186,6 +3192,7 @@ mod tests {
             left_key: col(0, "l_orderkey"),
             right_key: col(0, "o_orderkey"),
             residual: None,
+            probe_side_filter_ids: Vec::new(),
         };
         let plan = project_many(
             anti,
@@ -3634,6 +3641,7 @@ mod tests {
                 span: None,
             }),
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
         let anti = LogicalPlan::AntiJoin {
             left: Box::new(semi),
@@ -3646,6 +3654,7 @@ mod tests {
                 right: Box::new(col(4, "l_suppkey")),
                 span: None,
             }),
+            probe_side_filter_ids: Vec::new(),
         };
         let plan = project_many(
             anti,

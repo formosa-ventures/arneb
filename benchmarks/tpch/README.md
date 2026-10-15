@@ -55,7 +55,8 @@ Host: 10 CPUs, 15.66 GiB container-runtime memory (OrbStack), 2.7 CPUs per
 engine node. Both engines as coordinator + 2 workers, rotated so only the
 measured engine is resident, cluster recreated before every measurement.
 Dataset: `lineitem` 59,986,052 rows, 2.0 GiB Snappy Parquet on RustFS via HMS.
-arneb built from `main` at 7afe347. Produced by
+arneb built from `main` at a2cf420 plus #129 (probe-side filters on the
+hash-partitioned semi/anti joins from #127, both default on). Produced by
 `run_benchmark.sh --scenario=sf10 --mode=both`, all 22 queries in one run.
 
 Latency, cold vs warm, both applied identically to both engines:
@@ -67,57 +68,58 @@ Latency, cold vs warm, both applied identically to both engines:
 
 | Query | cold arneb | cold Trino | cold | warm arneb | warm Trino | warm |
 |-------|----------:|----------:|-----:|----------:|----------:|-----:|
-| q01 | 2019 | 6098 | 3.0x | 1870 | 2730 | 1.5x |
-| q02 | 603 | 5879 | 9.7x | 601 | 2227 | 3.7x |
-| q03 | 2251 | 8752 | 3.9x | 2258 | 3584 | 1.6x |
-| q04 | 2111 | 7046 | 3.3x | 1958 | 2873 | 1.5x |
-| q05 | 2290 | 8037 | 3.5x | 2001 | 3920 | 2.0x |
-| q06 | 817 | 4580 | 5.6x | 712 | 1872 | 2.6x |
-| q07 | 1910 | 7780 | 4.1x | 1859 | 3960 | 2.1x |
-| q08 | 2951 | 9396 | 3.2x | 2736 | 4682 | 1.7x |
-| q09 | 4654 | 11752 | 2.5x | 4717 | 5289 | 1.1x |
-| q10 | 2074 | 9434 | 4.5x | 2057 | 4262 | 2.1x |
-| q11 | 715 | 5168 | 7.2x | 638 | 2053 | 3.2x |
-| q12 | 1261 | 6652 | 5.3x | 1104 | 2291 | 2.1x |
-| q13 | 1585 | 7750 | 4.9x | 1528 | 3945 | 2.6x |
-| q14 | 1253 | 6743 | 5.4x | 1154 | 2769 | 2.4x |
-| q15 | 1127 | 6586 | 5.8x | 1147 | 3460 | 3.0x |
-| q16 | 1280 | 7677 | 6.0x | 955 | 2475 | 2.6x |
-| q17 | 3026 | 11507 | 3.8x | 3005 | 5300 | 1.8x |
-| q18 | 3868 | 10776 | 2.8x | 3982 | 4883 | 1.2x |
-| q19 | 1426 | 6849 | 4.8x | 1304 | 3040 | 2.3x |
-| q20 | 1340 | 8166 | 6.1x | 1257 | 3744 | 3.0x |
-| q21 | 8280 | 14232 | 1.7x | **8011** | **6705** | **0.8x** |
-| q22 | 1075 | 5411 | 5.0x | 914 | 2152 | 2.4x |
+| q01 | 2068 | 6309 | 3.1x | 1852 | 2678 | 1.4x |
+| q02 | 638 | 5749 | 9.0x | 492 | 2017 | 4.1x |
+| q03 | 2338 | 8276 | 3.5x | 2147 | 4001 | 1.9x |
+| q04 | 1425 | 7014 | 4.9x | 1264 | 3157 | 2.5x |
+| q05 | 2363 | 7983 | 3.4x | 1997 | 3829 | 1.9x |
+| q06 | 765 | 4595 | 6.0x | 698 | 1890 | 2.7x |
+| q07 | 2041 | 8052 | 3.9x | 1889 | 4574 | 2.4x |
+| q08 | 2930 | 9285 | 3.2x | 2759 | 5212 | 1.9x |
+| q09 | 4909 | 11184 | 2.3x | 4625 | 6193 | 1.3x |
+| q10 | 2180 | 10307 | 4.7x | 2188 | 4477 | 2.0x |
+| q11 | 762 | 5355 | 7.0x | 694 | 2192 | 3.2x |
+| q12 | 1202 | 6311 | 5.3x | 1078 | 2575 | 2.4x |
+| q13 | 1657 | 7418 | 4.5x | 1454 | 4020 | 2.8x |
+| q14 | 1463 | 6909 | 4.7x | 1201 | 3008 | 2.5x |
+| q15 | 1145 | 6846 | 6.0x | 1033 | 3351 | 3.2x |
+| q16 | 1056 | 7220 | 6.8x | 988 | 2283 | 2.3x |
+| q17 | 3042 | 10746 | 3.5x | 2969 | 5559 | 1.9x |
+| q18 | 4174 | 10818 | 2.6x | 4094 | 6070 | 1.5x |
+| q19 | 1587 | 7577 | 4.8x | 1339 | 3209 | 2.4x |
+| q20 | 1384 | 8651 | 6.2x | 1254 | 3738 | 3.0x |
+| q21 | 3255 | 15275 | 4.7x | 3413 | 6976 | 2.0x |
+| q22 | 878 | 5558 | 6.3x | 803 | 2186 | 2.7x |
 
-**Geomean: cold 4.3x, warm 2.0x.** All times in milliseconds, one timed run per cell.
+**Geomean: cold 4.6x, warm 2.3x.** All times in milliseconds, one timed run per cell.
 
 Peak memory (simultaneous cluster RSS, warm run):
 
 | Query | arneb MB | Trino MB | ratio | | Query | arneb MB | Trino MB | ratio |
 |---|--:|--:|--:|---|---|--:|--:|--:|
-| q01 | 371 | 5032 | 0.07x | | q12 | 449 | 4902 | 0.09x |
-| q02 | 297 | 3752 | 0.08x | | q13 | 440 | 5396 | 0.08x |
-| q03 | 1900 | 5305 | 0.36x | | q14 | 865 | 5688 | 0.15x |
-| q04 | 1727 | 6853 | 0.25x | | q15 | 449 | 6230 | 0.07x |
-| q05 | 1039 | 6436 | 0.16x | | q16 | 594 | 4401 | 0.13x |
-| q06 | 370 | 5013 | 0.07x | | q17 | 1476 | 8674 | 0.17x |
-| q07 | 1176 | 6032 | 0.19x | | q18 | 2057 | 8762 | 0.23x |
-| q08 | 1658 | 6739 | 0.25x | | q19 | 780 | 5773 | 0.14x |
-| q09 | 1718 | 8467 | 0.20x | | q20 | 861 | 6076 | 0.14x |
-| q10 | 940 | 5069 | 0.19x | | q21 | 1794 | 7333 | 0.24x |
-| q11 | 359 | 3542 | 0.10x | | q22 | 812 | 4678 | 0.17x |
+| q01 | 357 | 6089 | 0.06x | | q12 | 436 | 5504 | 0.08x |
+| q02 | 346 | 3812 | 0.09x | | q13 | 447 | 5668 | 0.08x |
+| q03 | 1905 | 6126 | 0.31x | | q14 | 924 | 5034 | 0.18x |
+| q04 | 669 | 6607 | 0.10x | | q15 | 403 | 6680 | 0.06x |
+| q05 | 1115 | 5761 | 0.19x | | q16 | 534 | 4088 | 0.13x |
+| q06 | 321 | 4525 | 0.07x | | q17 | 1377 | 8746 | 0.16x |
+| q07 | 1202 | 7590 | 0.16x | | q18 | 2221 | 10889 | 0.20x |
+| q08 | 1585 | 7101 | 0.22x | | q19 | 671 | 5302 | 0.13x |
+| q09 | 1732 | 8489 | 0.20x | | q20 | 806 | 5532 | 0.15x |
+| q10 | 939 | 5976 | 0.16x | | q21 | 1067 | 7624 | 0.14x |
+| q11 | 265 | 3349 | 0.08x | | q22 | 320 | 4638 | 0.07x |
 
-**Mean ratio 0.16x**, and arneb is lower on all 22.
+**Mean ratio 0.14x**, and arneb is lower on all 22.
 
 ### Run-to-run variance
 
-Two full runs on 2026-10-13 (on 142205f) and this one, all under identical
-settings, give a first measure of noise. Per-query speedups moved by a median
-of 4–6% between consecutive runs (worst: q16 cold, 29%); the geomeans moved by
-at most 0.1x (4.3x / 1.9x / 0.17x and 4.2x / 2.0x / 0.18x cold / warm / memory
-in the two earlier runs). The one unstable memory figure is arneb's q18 peak:
-2.0, 3.0 and 4.7 GB across the three
+Two full runs on 2026-10-13 (on 142205f) and one on the morning of 2026-10-14
+(on 7afe347), all under identical settings, give a first measure of noise.
+Per-query speedups moved by a median of 4–6% between consecutive runs (worst:
+q16 cold, 29%); the geomeans moved by at most 0.1x (4.3x / 1.9x / 0.17x,
+4.2x / 2.0x / 0.18x and 4.3x / 2.0x / 0.16x cold / warm / memory). The one
+unstable memory figure is arneb's q18 peak: 2.0, 3.0 and 4.7 GB across those
+three, 2.2 GB in this one
 ([#126](https://github.com/formosa-ventures/arneb/issues/126)). A single-query difference under ~30% in
 these tables is therefore not a result.
 
@@ -125,32 +127,48 @@ The exception is q20, which is a real change: 7afe347 (#123) pre-filters the
 decorrelated aggregate by the outer semi-join key set, and arneb's q20 went
 from 3004 / 3088 ms cold / warm to 1340 / 1257 ms (warm 1.2x → 3.0x).
 
+The semi/anti-join queries are the other real change, from #127 and #129,
+against the 7afe347 run: q21 warm 8011 → 3413 ms (0.8x → 2.0x) at 1794 → 1067
+MB, q04 warm 1958 → 1264 ms (1.5x → 2.5x) at 1727 → 669 MB, and q22 warm
+914 → 803 ms. The other 19 moved within the noise above.
+
 ### What the two columns mean
 
-Warming is worth a median 55% to Trino (47–68% across the 22) and 7% to arneb
-(−3% to +25%). A recreated
+Warming is worth a median 56% to Trino (43–68% across the 22) and 9% to arneb
+(−5% to +23%). A recreated
 JVM re-JITs; arneb has no comparable start-up cost. So most of the gap between
 the cold and warm columns is Trino's start-up, not query execution — **the
 warm column is the one to quote.** The cold column is kept because it is what
 an operator sees on a cold cluster, and because dropping it after seeing the
 warm numbers would be choosing the flattering protocol after the fact.
 
-Storage-side cold barely moves either engine at this scale. The 2026-09-20
-run recreated the engines but left RustFS and the page cache warm, and got
-geomeans of 4.4x cold / 2.0x warm against this run's 4.3x / 2.0x: on this
+Storage-side cold barely moves either engine at this scale. An earlier run of
+these changes recreated the engines but left RustFS and the page cache warm,
+and got geomeans of 4.7x cold / 2.2x warm against this run's 4.6x / 2.3x: on this
 host, re-reading 2 GiB of Parquet from local NVMe is cheap next to JVM
 start-up. Cold does not reach below the container VM — on macOS the VM's disk
 image can still sit in the host's file cache, which only `sudo purge` drops.
 
 ### q21
 
-Warm, arneb loses q21: 8011 ms against Trino's 6705 ms (0.84x). It has lost
-q21 warm in all five runs so far (0.78x and 0.68x on 2026-09-20, 0.80x and
-0.84x on 2026-10-13, 0.84x on 2026-10-14), so it reproduces. arneb still uses
-0.24x the peak memory on it. q21 is the four-way correlated `EXISTS` / `NOT EXISTS` self-join over
-`lineitem`, the deepest join pipeline in the suite; the
-`ARNEB_COMPACT_SEMI_NE` path that makes its memory cheap is not making its
-latency competitive once Trino is warm.
+q21 is the four-way correlated `EXISTS` / `NOT EXISTS` self-join over
+`lineitem`, the deepest join pipeline in the suite. Warm, arneb lost it in all
+five runs through the morning of 2026-10-14 (0.78x and 0.68x on 2026-09-20,
+0.80x and 0.84x on 2026-10-13, 0.84x on 7afe347). It now takes 3413 ms against
+Trino's 6976 ms (2.0x) at 0.14x the peak memory.
+
+Two changes did it. #127 hash-partitions semi and anti joins on the join key
+(`ARNEB_PARTITIONED_SEMI_JOIN`), so the ~98M rows of `l2` and `l3` no longer
+land on a single worker. #129 then has each join task drain its small outer
+side first and publish that key set to the `lineitem` scans under `EXISTS` and
+`NOT EXISTS` (`ARNEB_SEMI_PROBE_FILTER`), so about 1.7M matching rows are
+shuffled per worker instead of all 60M and 38M.
+
+The key set only pays off when it arrives within the scans' 10 s dynamic-filter
+wait. The planner therefore attaches it only when the outer side scans at most
+100M base rows (q21's scans 75M at SF10 and 225M at SF30), and a key set that
+still misses the wait is applied to the scan's remaining output instead of
+being dropped. At SF30, q21 runs without it.
 
 ### q11
 
@@ -257,8 +275,7 @@ python3 benchmarks/tpch/scripts/blast_radius_oracle.py --runs 2
   since #74; `docker/arneb-bench/docker-compose.bench.yml` no longer has to set
   them, and a run without any `ARNEB_*` environment behaves identically. The
   results those gates produce are in *Results* above: cell-identical to Trino on
-  all 22, lower peak memory on all 22, and faster on 21 of 22 warm — q21 is the
-  exception.
+  all 22, lower peak memory on all 22, and faster on all 22 warm.
 - macOS: `nproc`/`timeout` are absent; the scripts print a warning but fall back
   safely (each arneb node defaults to 2 CPUs — override with `BENCH_NODE_CPUS`).
 

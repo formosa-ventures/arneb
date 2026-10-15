@@ -474,6 +474,7 @@ fn recurse_remap(
                     right_key,
                     residual,
                     dynamic_filter_ids: Vec::new(),
+                    probe_side_filter_ids: Vec::new(),
                 },
                 lt,
             )
@@ -485,6 +486,7 @@ fn recurse_remap(
             left_key,
             right_key,
             residual,
+            ..
         } => {
             let (left, lt) = tr(*left);
             let (right, rt) = tr(*right);
@@ -500,6 +502,7 @@ fn recurse_remap(
                     left_key,
                     right_key,
                     residual,
+                    probe_side_filter_ids: Vec::new(),
                 },
                 lt,
             )
@@ -700,6 +703,7 @@ where
             right_key,
             residual,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         },
         L::AntiJoin {
             left,
@@ -707,12 +711,14 @@ where
             left_key,
             right_key,
             residual,
+            ..
         } => L::AntiJoin {
             left: Box::new(f(*left)),
             right: Box::new(f(*right)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids: Vec::new(),
         },
         L::ScalarSubquery { subplan } => L::ScalarSubquery {
             subplan: Box::new(f(*subplan)),
@@ -1882,6 +1888,7 @@ fn indices_consistent(plan: &LogicalPlan) -> bool {
             left_key,
             right_key,
             residual,
+            ..
         } => {
             let ls = left.schema();
             let rs = right.schema();

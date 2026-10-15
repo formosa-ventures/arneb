@@ -263,6 +263,7 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
                 right_key,
                 residual,
                 dynamic_filter_ids: Vec::new(),
+                probe_side_filter_ids: Vec::new(),
             })
         }
         LogicalPlan::AntiJoin {
@@ -271,6 +272,7 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
             left_key,
             right_key,
             residual,
+            ..
         } => {
             let left = analyze_plan(*left, ctx)?;
             let right = analyze_plan(*right, ctx)?;
@@ -292,6 +294,7 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
                 left_key,
                 right_key,
                 residual,
+                probe_side_filter_ids: Vec::new(),
             })
         }
         LogicalPlan::ScalarSubquery { subplan } => Ok(LogicalPlan::ScalarSubquery {

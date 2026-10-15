@@ -220,32 +220,38 @@ impl QueryCoordinator {
         // parallel; soundness fallback at the scan side (timeout →
         // no filter) preserves correctness if a pusher fails.
         for (df_id, rx) in pre_receivers {
-            let Some(consumer) = consumers.iter().find(|c| c.df_id == df_id) else {
-                // Producer-only DF (no probe-side annotation reachable
-                // from this fragment tree). Drop the receiver — service
-                // still merges reports but nobody waits on the result.
-                continue;
-            };
-            let consumer_stage_id = consumer.stage_id;
-            // Resolve the consumer-stage tasks to (worker_addr, task_id).
-            // The dispatch loop pushed one entry per `consumer_k` in
-            // ascending order, so `index == partition_id`.
-            let Some(entries) = stage_results.get(&consumer_stage_id.0) else {
-                continue;
-            };
-            let targets: Vec<(String, TaskId)> = entries
+            // Resolve every consumer stage's tasks to (worker_addr, task_id).
+            // A DF can have several consumer stages (a probe-side filter
+            // shared by a semi join's and an anti join's build scans). The
+            // dispatch loop pushed one entry per `consumer_k` in ascending
+            // order, so `index == partition_id`. A producer-only DF (no
+            // scan annotation reachable from this fragment tree) gets no
+            // targets: the service still merges reports, nobody waits.
+            let consumer_stages: std::collections::BTreeSet<u32> = consumers
                 .iter()
-                .enumerate()
-                .map(|(k, (addr, _, _))| {
-                    (
-                        addr.clone(),
-                        TaskId {
-                            stage_id: consumer_stage_id,
-                            partition_id: k as u32,
-                        },
-                    )
-                })
+                .filter(|c| c.df_id == df_id)
+                .map(|c| c.stage_id.0)
                 .collect();
+            let targets: Vec<(String, TaskId)> = consumer_stages
+                .into_iter()
+                .filter_map(|stage| {
+                    let consumer_stage_id = StageId(stage);
+                    let entries = stage_results.get(&stage)?;
+                    Some(entries.iter().enumerate().map(move |(k, (addr, _, _))| {
+                        (
+                            addr.clone(),
+                            TaskId {
+                                stage_id: consumer_stage_id,
+                                partition_id: k as u32,
+                            },
+                        )
+                    }))
+                })
+                .flatten()
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
             let query_id_for_push = query_id;
             tokio::spawn(async move {
                 let domain = match rx.await {
@@ -723,6 +729,7 @@ fn collect_producers_from_plan(
         }
         L::SemiJoin {
             dynamic_filter_ids,
+            probe_side_filter_ids,
             left,
             right,
             ..
@@ -732,6 +739,32 @@ fn collect_producers_from_plan(
                     df_id: p.id,
                     stage_id,
                     task_count,
+                });
+            }
+            // Probe-side filters are published once per join task, after
+            // that task drains its slice of the left input, so the
+            // coordinator expects one report per hash partition.
+            for p in probe_side_filter_ids {
+                out.push(DfProducer {
+                    df_id: p.id,
+                    stage_id,
+                    task_count: join_task_count,
+                });
+            }
+            collect_producers_from_plan(left, stage_id, task_count, join_task_count, out);
+            collect_producers_from_plan(right, stage_id, task_count, join_task_count, out);
+        }
+        L::AntiJoin {
+            probe_side_filter_ids,
+            left,
+            right,
+            ..
+        } => {
+            for p in probe_side_filter_ids {
+                out.push(DfProducer {
+                    df_id: p.id,
+                    stage_id,
+                    task_count: join_task_count,
                 });
             }
             collect_producers_from_plan(left, stage_id, task_count, join_task_count, out);
@@ -750,9 +783,7 @@ fn collect_producers_from_plan(
         | L::AssignUniqueId { input, .. } => {
             collect_producers_from_plan(input, stage_id, task_count, join_task_count, out);
         }
-        L::AntiJoin { left, right, .. }
-        | L::Intersect { left, right, .. }
-        | L::Except { left, right, .. } => {
+        L::Intersect { left, right, .. } | L::Except { left, right, .. } => {
             collect_producers_from_plan(left, stage_id, task_count, join_task_count, out);
             collect_producers_from_plan(right, stage_id, task_count, join_task_count, out);
         }
@@ -1153,6 +1184,7 @@ mod tests {
                 probe_index: 0,
                 column_name: "c0".to_string(),
             }],
+            probe_side_filter_ids: Vec::new(),
         };
         let fragment = PlanFragment {
             id: StageId(42),
@@ -1202,6 +1234,61 @@ mod tests {
         assert_eq!(producers[0].df_id, df_id);
         assert_eq!(producers[0].stage_id, StageId(43));
         assert_eq!(producers[0].task_count, 8);
+    }
+
+    #[test]
+    fn collect_df_producers_registers_probe_side_filters_per_join_partition() {
+        let df_id = DynamicFilterId(789);
+        let producer = arneb_planner::DynamicFilterProducer {
+            id: df_id,
+            build_index: 0,
+            probe_index: 0,
+            column_name: "c0".to_string(),
+        };
+        let key = PlanExpr::Column {
+            index: 0,
+            name: "c0".to_string(),
+            span: None,
+        };
+        let roots = [
+            LogicalPlan::SemiJoin {
+                left: Box::new(scan()),
+                right: Box::new(scan()),
+                left_key: key.clone(),
+                right_key: key.clone(),
+                residual: None,
+                dynamic_filter_ids: Vec::new(),
+                probe_side_filter_ids: vec![producer.clone()],
+            },
+            LogicalPlan::AntiJoin {
+                left: Box::new(scan()),
+                right: Box::new(scan()),
+                left_key: key.clone(),
+                right_key: key,
+                residual: None,
+                probe_side_filter_ids: vec![producer],
+            },
+        ];
+        for root in roots {
+            let fragment = PlanFragment {
+                id: StageId(44),
+                fragment_type: FragmentType::HashPartitioned,
+                root,
+                output_partitioning: PartitioningScheme::Hash {
+                    columns: Vec::new(),
+                    partition_count: 4,
+                },
+                source_fragments: Vec::new(),
+            };
+
+            let producers = collect_df_producers(&fragment, 2);
+
+            // Every join task publishes once after draining its left slice.
+            assert_eq!(producers.len(), 1);
+            assert_eq!(producers[0].df_id, df_id);
+            assert_eq!(producers[0].stage_id, StageId(44));
+            assert_eq!(producers[0].task_count, 4);
+        }
     }
 
     #[test]

@@ -1091,7 +1091,7 @@ impl ExecutionContext {
                 right_key,
                 residual,
                 dynamic_filter_ids,
-                ..
+                probe_side_filter_ids,
             } => {
                 let left_exec = coalesce_if_multi(self.create_physical_plan(left)?);
                 let right_exec = coalesce_if_multi(self.create_physical_plan(right)?);
@@ -1122,6 +1122,7 @@ impl ExecutionContext {
                         self.dynamic_filter_publisher.clone(),
                         self.dynamic_filtering_enabled,
                     )
+                    .with_probe_side_filters(probe_side_filter_ids.clone())
                     .with_df_targets(df_targets),
                 ))
             }
@@ -1132,6 +1133,7 @@ impl ExecutionContext {
                 left_key,
                 right_key,
                 residual,
+                probe_side_filter_ids,
             } => {
                 let left_exec = coalesce_if_multi(self.create_physical_plan(left)?);
                 let right_exec = coalesce_if_multi(self.create_physical_plan(right)?);
@@ -1146,7 +1148,15 @@ impl ExecutionContext {
                         true,
                         self.memory_pool.clone(),
                     )
-                    .with_build_left(build_left),
+                    .with_build_left(build_left)
+                    // Anti joins produce no forward (build→probe) filters,
+                    // only probe-side ones.
+                    .with_dynamic_filters(
+                        Vec::new(),
+                        self.dynamic_filter_publisher.clone(),
+                        self.dynamic_filtering_enabled,
+                    )
+                    .with_probe_side_filters(probe_side_filter_ids.clone()),
                 ))
             }
 
@@ -1890,6 +1900,7 @@ pub fn prune_for_columns(
             left_key,
             right_key,
             residual,
+            ..
         } => {
             // SemiJoin/AntiJoin output schema = left schema. Right side
             // is purely consumed by `right_key` (equi-match) and the
@@ -1939,6 +1950,37 @@ pub fn prune_for_columns(
                 rewrite_column_indices(res, &combined)
             });
 
+            // Reverse-direction (probe-side) DF producers carry the same
+            // `build_index` (right) / `probe_index` (left) layout; remap them
+            // the same way. One whose key column was pruned drops out and the
+            // build-side scan times out to an unfiltered read.
+            let remap_producers = |producers: &[arneb_planner::DynamicFilterProducer]| {
+                producers
+                    .iter()
+                    .filter_map(|p| {
+                        let new_build = right_mapping.get(&p.build_index)?;
+                        let new_probe = left_mapping.get(&p.probe_index)?;
+                        Some(arneb_planner::DynamicFilterProducer {
+                            id: p.id,
+                            build_index: *new_build,
+                            probe_index: *new_probe,
+                            column_name: p.column_name.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let preserved_probe_side = match plan {
+                L::SemiJoin {
+                    probe_side_filter_ids,
+                    ..
+                }
+                | L::AntiJoin {
+                    probe_side_filter_ids,
+                    ..
+                } => remap_producers(probe_side_filter_ids),
+                _ => Vec::new(),
+            };
+
             let new_plan = if matches!(plan, L::AntiJoin { .. }) {
                 L::AntiJoin {
                     left: Box::new(new_left),
@@ -1946,6 +1988,7 @@ pub fn prune_for_columns(
                     left_key: new_left_key,
                     right_key: new_right_key,
                     residual: new_residual,
+                    probe_side_filter_ids: preserved_probe_side,
                 }
             } else {
                 // A1.5 (2026-05-27): preserve cross-fragment DF
@@ -1958,19 +2001,7 @@ pub fn prune_for_columns(
                         dynamic_filter_ids, ..
                     } = plan
                     {
-                        dynamic_filter_ids
-                            .iter()
-                            .filter_map(|p| {
-                                let new_build = right_mapping.get(&p.build_index)?;
-                                let new_probe = left_mapping.get(&p.probe_index)?;
-                                Some(arneb_planner::DynamicFilterProducer {
-                                    id: p.id,
-                                    build_index: *new_build,
-                                    probe_index: *new_probe,
-                                    column_name: p.column_name.clone(),
-                                })
-                            })
-                            .collect()
+                        remap_producers(dynamic_filter_ids)
                     } else {
                         Vec::new()
                     };
@@ -1981,6 +2012,7 @@ pub fn prune_for_columns(
                     right_key: new_right_key,
                     residual: new_residual,
                     dynamic_filter_ids: preserved_dfs,
+                    probe_side_filter_ids: preserved_probe_side,
                 }
             };
 
@@ -3447,6 +3479,7 @@ mod tests {
             },
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
 
         let exec = ctx.create_physical_plan(&plan).unwrap();
@@ -3525,6 +3558,7 @@ mod tests {
                 span: None,
             },
             residual: None,
+            probe_side_filter_ids: Vec::new(),
         };
 
         let exec = ctx.create_physical_plan(&plan).unwrap();

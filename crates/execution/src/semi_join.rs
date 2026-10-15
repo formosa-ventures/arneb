@@ -289,6 +289,13 @@ pub(crate) struct SemiJoinExec {
     dynamic_filter_publisher: Option<crate::DynamicFilterPublisherRef>,
     /// A1.5: feature flag mirroring `ExecutionContext::dynamic_filtering_enabled`.
     dynamic_filtering_enabled: bool,
+    /// Reverse-direction DF producers from
+    /// `LogicalPlan::{SemiJoin,AntiJoin}::probe_side_filter_ids`: the left
+    /// (probe) input is drained first and a Domain of its keys is published
+    /// for a build-side scan in another fragment to prune with. Uses the same
+    /// publisher as `dynamic_filter_producers`, but publishes even when
+    /// `dynamic_filtering_enabled` is off.
+    probe_side_filters: Vec<arneb_planner::DynamicFilterProducer>,
     /// Z (2026-06-05): optional override for the per-chunk build-spill cap
     /// (bytes). `None` → resolve from `ARNEB_SPILL_CHUNK_BYTES` env / the
     /// 512 MiB default at execute time. Bounding chunk size bounds the
@@ -328,6 +335,7 @@ impl SemiJoinExec {
             dynamic_filter_producers: Vec::new(),
             dynamic_filter_publisher: None,
             dynamic_filtering_enabled: false,
+            probe_side_filters: Vec::new(),
             spill_chunk_bytes: None,
             df_targets: Vec::new(),
         }
@@ -369,6 +377,145 @@ impl SemiJoinExec {
         self.dynamic_filter_publisher = publisher;
         self.dynamic_filtering_enabled = enabled;
         self
+    }
+
+    /// Install reverse-direction (probe-side) DF producers. Publishing needs
+    /// the publisher from [`Self::with_dynamic_filters`], but not its feature
+    /// flag.
+    pub(crate) fn with_probe_side_filters(
+        mut self,
+        producers: Vec<arneb_planner::DynamicFilterProducer>,
+    ) -> Self {
+        self.probe_side_filters = producers;
+        self
+    }
+
+    /// Drains the left input, publishes a Domain of its keys for every
+    /// probe-side producer, then runs the join unchanged over the buffered
+    /// left. The Domain is a superset of this partition's left keys (Bloom
+    /// false positives only add rows), so the build-side scan never drops a
+    /// row that could match; an empty left publishes an empty Domain.
+    async fn execute_with_probe_side_filters(
+        &self,
+        publisher: crate::DynamicFilterPublisherRef,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let left_schema = self.left.schema();
+        let left_stream = self.left.execute(0).await?;
+        let (left_batches, left_reservation) = crate::operator::collect_stream_pool_tracked(
+            left_stream,
+            self.memory_pool.clone(),
+            if self.anti {
+                "AntiJoinExec.probe_side_filter"
+            } else {
+                "SemiJoinExec.probe_side_filter"
+            },
+        )
+        .await?;
+        let domain = probe_key_domain(&self.left_key, &left_schema, &left_batches);
+        tracing::info!(
+            target: "arneb::profile",
+            op = if self.anti { "AntiJoinExec" } else { "SemiJoinExec" },
+            left_rows = left_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            producers = self.probe_side_filters.len(),
+            domain = domain_kind(&domain),
+            "probe-side dynamic filter published"
+        );
+        for producer in &self.probe_side_filters {
+            publisher.publish(producer.id, domain.clone()).await;
+        }
+
+        // The buffered left is re-read by the inner join, which accounts for
+        // what it retains itself; release this reservation to avoid counting
+        // the batches twice.
+        drop(left_reservation);
+        let inner = SemiJoinExec {
+            left: Arc::new(BufferedBatchesExec {
+                schema: left_schema,
+                batches: left_batches,
+            }),
+            right: self.right.clone(),
+            left_key: self.left_key.clone(),
+            right_key: self.right_key.clone(),
+            residual: self.residual.clone(),
+            anti: self.anti,
+            build_left: self.build_left,
+            peak_build_bytes: std::sync::atomic::AtomicUsize::new(0),
+            memory_pool: self.memory_pool.clone(),
+            dynamic_filter_producers: self.dynamic_filter_producers.clone(),
+            dynamic_filter_publisher: self.dynamic_filter_publisher.clone(),
+            dynamic_filtering_enabled: self.dynamic_filtering_enabled,
+            probe_side_filters: Vec::new(),
+            spill_chunk_bytes: self.spill_chunk_bytes,
+            // The left has already run; same-fragment injection into it is moot.
+            df_targets: Vec::new(),
+        };
+        inner.execute(0).await
+    }
+}
+
+/// Domain of the probe key over a drained left input, for a probe-side
+/// dynamic filter. A non-column key, or a type the publisher cannot collect,
+/// resolves to `Domain::All` so the build-side scan reads everything.
+fn probe_key_domain(
+    left_key: &PlanExpr,
+    left_schema: &[ColumnInfo],
+    batches: &[RecordBatch],
+) -> arneb_common::Domain {
+    let PlanExpr::Column { index, .. } = left_key else {
+        return arneb_common::Domain::All;
+    };
+    let index = *index;
+    let column = if batches.is_empty() {
+        let schema = arrow_schema_from_cols(left_schema);
+        if index >= schema.fields().len() {
+            return arneb_common::Domain::All;
+        }
+        arrow::array::new_empty_array(schema.field(index).data_type())
+    } else {
+        let arrays: Vec<&dyn Array> = batches.iter().map(|b| b.column(index).as_ref()).collect();
+        match compute::concat(&arrays) {
+            Ok(array) => array,
+            Err(_) => return arneb_common::Domain::All,
+        }
+    };
+    crate::dynamic_filter_publisher::build_probe_side_domain_for_column(&column)
+}
+
+fn domain_kind(domain: &arneb_common::Domain) -> &'static str {
+    match domain {
+        arneb_common::Domain::DistinctValues(_) => "DistinctValues",
+        arneb_common::Domain::Range { .. } => "Range",
+        arneb_common::Domain::Bloom(_) => "Bloom",
+        arneb_common::Domain::All => "All",
+    }
+}
+
+/// Replays an already-collected input. Used after a probe-side filter has
+/// drained the left side, so the join can run over it unchanged.
+#[derive(Debug)]
+struct BufferedBatchesExec {
+    schema: Vec<ColumnInfo>,
+    batches: Vec<RecordBatch>,
+}
+
+#[async_trait]
+impl ExecutionPlan for BufferedBatchesExec {
+    fn schema(&self) -> Vec<ColumnInfo> {
+        self.schema.clone()
+    }
+
+    async fn execute(
+        &self,
+        _partition: usize,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        Ok(stream_from_batches(
+            arrow_schema_from_cols(&self.schema),
+            self.batches.clone(),
+        ))
+    }
+
+    fn display_name(&self) -> &str {
+        "BufferedBatchesExec"
     }
 }
 
@@ -729,6 +876,15 @@ impl ExecutionPlan for SemiJoinExec {
         &self,
         _partition: usize,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        // Probe-side filters publish whenever a publisher is wired, regardless
+        // of `dynamic_filtering_enabled`: their consumer scans wait on them
+        // unconditionally (see `ScanExec::collect_cross_fragment_filters`).
+        if !self.probe_side_filters.is_empty() {
+            if let Some(publisher) = self.dynamic_filter_publisher.clone() {
+                return self.execute_with_probe_side_filters(publisher).await;
+            }
+        }
+
         let output_schema = arrow_schema_from_cols(&self.left.schema());
 
         if self.build_left && semi_mark_join_enabled() {
@@ -5220,6 +5376,124 @@ mod tests {
                 baseline, partitioned,
                 "multi-bucket dense keys mismatch (anti={anti})"
             );
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CapturingProbeSidePublisher {
+        calls: std::sync::Mutex<Vec<(arneb_common::DynamicFilterId, arneb_common::Domain)>>,
+    }
+
+    #[async_trait]
+    impl crate::DynamicFilterPublisher for CapturingProbeSidePublisher {
+        async fn publish(
+            &self,
+            df_id: arneb_common::DynamicFilterId,
+            domain: arneb_common::Domain,
+        ) {
+            self.calls.lock().unwrap().push((df_id, domain));
+        }
+    }
+
+    async fn run_probe_side_filter_case(
+        left_batches: Vec<RecordBatch>,
+        right_batches: Vec<RecordBatch>,
+        residual: Option<PlanExpr>,
+        anti: bool,
+        publisher: Option<Arc<CapturingProbeSidePublisher>>,
+    ) -> Vec<Option<i32>> {
+        let left = scan_of_batches_with_nullable("L", left_batches, true);
+        let right = scan_of_batches_with_nullable("R", right_batches, true);
+        let pool: Arc<dyn MemoryPool> = Arc::new(crate::memory_pool::UnboundedMemoryPool::new());
+        let key = key_expr();
+        let mut semi = SemiJoinExec::new(left, right, key.clone(), key, residual, anti, pool);
+        if let Some(publisher) = publisher {
+            semi = semi
+                .with_dynamic_filters(
+                    Vec::new(),
+                    Some(publisher as crate::DynamicFilterPublisherRef),
+                    // Off: probe-side filters publish regardless.
+                    false,
+                )
+                .with_probe_side_filters(vec![arneb_planner::DynamicFilterProducer {
+                    id: arneb_common::DynamicFilterId(7),
+                    build_index: 0,
+                    probe_index: 0,
+                    column_name: "k".to_string(),
+                }]);
+        }
+        let stream = semi.execute(0).await.expect("execute ok");
+        let out = collect_stream(stream).await.expect("collect ok");
+        optional_rows_from_batches(&out)
+    }
+
+    #[tokio::test]
+    async fn probe_side_filter_publishes_left_keys_and_preserves_results() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        std::env::remove_var("ARNEB_STREAM_SEMI_PROBE");
+        std::env::remove_var("ARNEB_PARTITIONED_SEMI_SPILL");
+        std::env::remove_var("ARNEB_SEMI_MARK_JOIN");
+        for anti in [false, true] {
+            for residual in [None, Some(eq_residual())] {
+                let expected = run_probe_side_filter_case(
+                    mark_join_left_small_batches(),
+                    mark_join_right_large_batches(),
+                    residual.clone(),
+                    anti,
+                    None,
+                )
+                .await;
+                let publisher = Arc::new(CapturingProbeSidePublisher::default());
+                let got = run_probe_side_filter_case(
+                    mark_join_left_small_batches(),
+                    mark_join_right_large_batches(),
+                    residual,
+                    anti,
+                    Some(publisher.clone()),
+                )
+                .await;
+                assert_eq!(got, expected, "anti={anti}");
+
+                let calls = publisher.calls.lock().unwrap();
+                assert_eq!(calls.len(), 1, "one publish per producer");
+                assert_eq!(calls[0].0, arneb_common::DynamicFilterId(7));
+                let arneb_common::Domain::DistinctValues(values) = &calls[0].1 else {
+                    panic!("expected DistinctValues, got {:?}", calls[0].1);
+                };
+                // The left keys {NULL, 1, 2, 2, 3, 4}: distinct, NULL dropped.
+                let mut keys: Vec<i32> = values
+                    .iter()
+                    .map(|v| match v {
+                        arneb_common::types::ScalarValue::Int32(k) => *k,
+                        other => panic!("unexpected key {other:?}"),
+                    })
+                    .collect();
+                keys.sort_unstable();
+                assert_eq!(keys, vec![1, 2, 3, 4]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_side_filter_publishes_empty_domain_for_empty_left() {
+        let _guard = ENV_TEST_LOCK.lock().await;
+        std::env::remove_var("ARNEB_STREAM_SEMI_PROBE");
+        std::env::remove_var("ARNEB_PARTITIONED_SEMI_SPILL");
+        std::env::remove_var("ARNEB_SEMI_MARK_JOIN");
+        for anti in [false, true] {
+            let publisher = Arc::new(CapturingProbeSidePublisher::default());
+            let got = run_probe_side_filter_case(
+                Vec::new(),
+                mark_join_right_large_batches(),
+                None,
+                anti,
+                Some(publisher.clone()),
+            )
+            .await;
+            assert!(got.is_empty());
+            let calls = publisher.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].1.is_empty(), "got {:?}", calls[0].1);
         }
     }
 }

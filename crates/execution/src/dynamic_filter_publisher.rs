@@ -78,6 +78,28 @@ pub fn build_partition_domain_for_column(arr: &arrow::array::ArrayRef) -> Domain
     }
 }
 
+/// Build a [`Domain`] for a probe-side (reverse-direction) filter from one
+/// partition's probe keys.
+///
+/// Small key sets stay [`Domain::DistinctValues`]. Above the coordinator's
+/// merge cap ([`arneb_common::DEFAULT_MAX_DISTINCT_VALUES`]) the partition
+/// emits a [`Domain::Bloom`] directly, independent of `ARNEB_BLOOM_DF`: the
+/// coordinator would otherwise merge the values into a min/max range the
+/// scan cannot row-filter by, and `ARNEB_BLOOM_DF` also switches the
+/// same-fragment hash-join filters to blooms, which costs more than it
+/// prunes on several TPC-H queries.
+pub fn build_probe_side_domain_for_column(arr: &arrow::array::ArrayRef) -> Domain {
+    let Some(cap) = dynamic_filter_cap(arr.data_type()) else {
+        return Domain::All;
+    };
+    match distinct_scalar_values(arr, cap) {
+        Some(values) if values.len() <= arneb_common::DEFAULT_MAX_DISTINCT_VALUES => {
+            Domain::DistinctValues(values)
+        }
+        _ => build_bloom_domain_for_column(arr),
+    }
+}
+
 fn build_bloom_domain_for_column(arr: &arrow::array::ArrayRef) -> Domain {
     use arneb_common::types::ScalarValue;
     use arrow::array::{Array, AsArray};
@@ -176,5 +198,36 @@ mod tests {
             other => panic!("expected Bloom, got {other:?}"),
         }
         std::env::remove_var("ARNEB_BLOOM_DF");
+    }
+
+    #[test]
+    fn probe_side_domain_is_distinct_values_under_the_merge_cap() {
+        let arr: arrow::array::ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![
+            Some(3),
+            None,
+            Some(1),
+            Some(3),
+        ]));
+        let Domain::DistinctValues(mut values) = build_probe_side_domain_for_column(&arr) else {
+            panic!("expected DistinctValues");
+        };
+        values.sort_by_key(|v| match v {
+            ScalarValue::Int64(x) => *x,
+            other => panic!("unexpected {other:?}"),
+        });
+        assert_eq!(values, vec![ScalarValue::Int64(1), ScalarValue::Int64(3)]);
+    }
+
+    #[test]
+    fn probe_side_domain_is_bloom_above_the_merge_cap() {
+        // Above the coordinator's 20K cap the partition emits a Bloom itself,
+        // whatever ARNEB_BLOOM_DF says.
+        let n = arneb_common::DEFAULT_MAX_DISTINCT_VALUES as i64 + 1_000;
+        let arr: arrow::array::ArrayRef =
+            Arc::new(arrow::array::Int64Array::from_iter_values(0..n));
+        let Domain::Bloom(bloom) = build_probe_side_domain_for_column(&arr) else {
+            panic!("expected Bloom");
+        };
+        assert!((0..n).all(|v| bloom.contains_int64(v)));
     }
 }

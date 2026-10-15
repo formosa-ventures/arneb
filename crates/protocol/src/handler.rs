@@ -808,6 +808,7 @@ async fn resolve_plan_subqueries(
             right_key,
             residual,
             dynamic_filter_ids,
+            ..
         } => {
             // Recurse into BOTH children — without this, scalar
             // subqueries pushed into SemiJoin.left by PredicatePushdown
@@ -825,6 +826,7 @@ async fn resolve_plan_subqueries(
                 residual,
                 // A1.5 (2026-05-27): preserve (see Join arm above).
                 dynamic_filter_ids,
+                probe_side_filter_ids: Vec::new(),
             })
         }
         LogicalPlan::AntiJoin {
@@ -833,6 +835,7 @@ async fn resolve_plan_subqueries(
             left_key,
             right_key,
             residual,
+            ..
         } => {
             let left = Box::pin(resolve_plan_subqueries(ctx, distributed_executor, *left)).await?;
             let right =
@@ -843,6 +846,7 @@ async fn resolve_plan_subqueries(
                 left_key,
                 right_key,
                 residual,
+                probe_side_filter_ids: Vec::new(),
             })
         }
         // For other plan types, return as-is
@@ -1168,6 +1172,7 @@ fn plan_columns_in_range(plan: &LogicalPlan) -> bool {
             left_key,
             right_key,
             residual,
+            ..
         } => {
             let left_width = left.schema().len();
             let right_width = right.schema().len();

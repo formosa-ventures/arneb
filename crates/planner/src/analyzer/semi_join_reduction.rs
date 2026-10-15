@@ -390,6 +390,7 @@ fn recurse_children<F: FnMut(LogicalPlan) -> LogicalPlan>(
             right_key,
             residual,
             dynamic_filter_ids,
+            ..
         } => L::SemiJoin {
             left: Box::new(f(*left)),
             right: Box::new(f(*right)),
@@ -397,6 +398,7 @@ fn recurse_children<F: FnMut(LogicalPlan) -> LogicalPlan>(
             right_key,
             residual,
             dynamic_filter_ids,
+            probe_side_filter_ids: Vec::new(),
         },
         L::AntiJoin {
             left,
@@ -404,12 +406,14 @@ fn recurse_children<F: FnMut(LogicalPlan) -> LogicalPlan>(
             left_key,
             right_key,
             residual,
+            ..
         } => L::AntiJoin {
             left: Box::new(f(*left)),
             right: Box::new(f(*right)),
             left_key,
             right_key,
             residual,
+            probe_side_filter_ids: Vec::new(),
         },
         L::ScalarSubquery { subplan } => L::ScalarSubquery {
             subplan: Box::new(f(*subplan)),
@@ -828,6 +832,7 @@ ORDER BY s_name";
             right_key: col(0, "p_partkey"),
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         }
     }
 
@@ -953,6 +958,7 @@ ORDER BY s_name";
             right_key: col(0, "s_suppkey"),
             residual: None,
             dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
         };
         let before = LogicalPlan::Join {
             left: Box::new(outer),

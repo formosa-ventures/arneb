@@ -83,13 +83,6 @@ shown), with the effective value logged.
 | spill budget | config / cgroup | `ARNEB_SPILL_BUDGET_BYTES` | Per-node budget (bytes) a spillable operator (SemiJoin/HashJoin build) reserves against before spilling to disk. Overrides the `[memory] spill_budget_bytes` config field. Exists as an env var because the bench config is COPYed into the docker image at build time — the env override retunes without an image rebuild. |
 | query memory cap | config | `ARNEB_QUERY_MAX_MEMORY_BYTES` | Per-task cumulative allocation cap (bytes). When the query's tracked `MemoryReservation` crosses it, the query fails cleanly with `ResourceExhausted` instead of OOM-killing the worker. Overrides `[memory] query_max_memory_per_node`. |
 
-### Query Execution
-
-| Knob | Default | Env Var | Description |
-|------|---------|---------|-------------|
-| hash-partitioned semi/anti joins | on | `ARNEB_PARTITIONED_SEMI_JOIN` | Distributes `SemiJoin`/`AntiJoin` fragments by hash-partitioning both sides on the join key across workers, instead of running each on a single worker that receives the whole probe and build. Set `=0` to fall back to the single-partition path. Measured on TPC-H: SF10 warm q21 −21%, q04 −22%, q22 −20%; SF30 cold q04 −33%, q22 −14%; oracle 22/22 identical to Trino. The effective value is logged on target `arneb::config`. |
-| probe-side semi/anti filters | on | `ARNEB_SEMI_PROBE_FILTER` | On a hash-partitioned semi/anti join whose build side is estimated at ≥ 20M rows and ≥ 4× its probe side, each join task drains the small probe side first and publishes its key set (a Bloom filter above 20K keys) to the build-side scan, which waits for it and drops non-matching rows before the shuffle. Needs `ARNEB_PARTITIONED_SEMI_JOIN`; independent of `ARNEB_DISTRIBUTED_DF` and `ARNEB_BLOOM_DF`. Set `=0` to disable. Measured on TPC-H SF10 warm: q21 −51%, q04 −23%. The effective value is logged on target `arneb::config`. |
-
 The startup log line `memory pool installed … spill_budget_bytes=… spill_budget_source=…`
 confirms the resolved value and its source (`env` / `config` / `cgroup_v2` / `cgroup_v1`
 / `unbounded`); a `source=env` line confirms the override took effect.
@@ -118,6 +111,8 @@ runs the in-binary defaults.
 | Probe prefetch | on | `ARNEB_PROBE_PREFETCH=0` | Hash-join probe prefetches the bucket a few rows ahead (CPU hint, no effect on results). |
 | Aggregate prefetch | on | `ARNEB_AGG_PREFETCH=0` | Same prefetch hint for hash-aggregate lookups. |
 | Compact semi/anti `<>` build | on | `ARNEB_COMPACT_SEMI_NE=0` | Semi/anti joins with a `<>` residual keep a per-key `{distinct, first value}` map instead of the full build rows (q21: no build spill). |
+| Hash-partitioned semi/anti joins | on | `ARNEB_PARTITIONED_SEMI_JOIN=0` | Hash-partitions both sides of a `SemiJoin`/`AntiJoin` on the join key across workers instead of running it on one worker that receives the whole probe and build (SF10 warm: q21 −21%, q04 −22%, q22 −20%). |
+| Probe-side semi/anti filters | on | `ARNEB_SEMI_PROBE_FILTER=0` | On a partitioned semi/anti join whose build side is estimated at ≥ 20M rows and ≥ 4× the probe side, and whose probe side scans ≤ 100M rows, each join task drains the probe side first and publishes its key set (Bloom above 20K keys) to the build-side scan, which drops non-matching rows before the shuffle. If the set misses the wait it is applied to the scan output once it arrives. Needs partitioned semi/anti joins (SF10 warm: q21 −51%, q04 −23%). |
 | Spill compression | `lz4` | `ARNEB_SPILL_COMPRESSION=0` (`zstd` for Zstandard) | Arrow IPC compression for exchange/build spill files. |
 | CTE self-aggregate window | on | `ARNEB_CTE_SELF_AGG_WINDOW=0` | A CTE referenced both directly and in a `col >= (SELECT MAX(col) FROM cte)` subquery is computed once as a window (q15). |
 

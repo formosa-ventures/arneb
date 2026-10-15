@@ -142,9 +142,9 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 - **Extended Query Protocol**: Full prepared statement support (Parse/Bind/Describe/Execute/Sync)
 - **Trino Client Protocol**: Trino's REST protocol on port 8080, so the `trino` CLI, Trino JDBC, `trino-python-client` (Superset), Metabase's Trino driver and dbt-trino can connect unchanged — see [Trino client compatibility](docs/guide/trino-clients.md)
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
-- **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC
+- **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC; data-parallel scans, hash-partitioned joins, semi/anti joins and final aggregates, and key-set filters published from the small side of a large semi/anti join to the scans on the big side
 - **Web UI**: Dashboard with query monitoring, cluster overview, and worker status
-- **TPC-H Benchmark**: 22/22 queries cell-identical to Trino, ~7× lower peak memory and faster on all 22 at SF10, with a one-command benchmark harness and comparison tooling
+- **TPC-H Benchmark**: 22/22 queries cell-identical to Trino, ~7× lower peak memory and faster on all 22 at SF10 (and on all 22 at SF30 cold), with a one-command benchmark harness and comparison tooling
 
 ## Releases
 
@@ -354,8 +354,18 @@ differences under ~30% are not results. Numbers from two different
 hosts are not comparable; a scenario makes a run repeatable, not
 hardware-independent.
 
-SF30 figures cited previously in this repository were produced under the cold
-protocol and have not been re-measured warm.
+### SF30, cold, on a separate host
+
+The reviewer of #129 reran all 22 at SF30 cold on a separate benchmark host
+(2026-10-15, the `main` that became v0.1.2), same harness, one run per query.
+Arneb was faster on **all 22**: **3.7×** on the geomean, slowest `q21` at 1.9×,
+fastest `q02` at 7.9×. Peak memory averaged **0.21×** of Trino's (best 0.06×
+`q06`, worst 0.56× `q17`), and the oracle was 22/22 clean. The second half of
+that run was slowed for both engines by the host (Trino's own `q21` took 207 s
+against 151–199 s in earlier runs), so the later queries understate arneb a
+little. These are cold numbers only; SF30 has not been measured warm, and a
+different host means they are not comparable with the SF10 table above. Per
+query figures are on the [Performance](https://arneb.io/guide/performance) page.
 
 `q11` numbers measured at SF10 before 2026-10-13 timed an empty result: the
 query hard-coded the SF1 threshold fraction, so above SF1 both engines filtered

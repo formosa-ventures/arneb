@@ -672,15 +672,15 @@ impl ScanExec {
                         "[DFRPC] scan resolved subscribed_df_id={} domain={}",
                         consumer.id, domain_variant
                     );
-                    let src_index = match &self.scan_context.projection {
-                        Some(proj) => match proj.get(consumer.column_index) {
-                            Some(&s) => s,
-                            None => continue,
-                        },
-                        None => consumer.column_index,
-                    };
+                    let src_index = consumer.column_index;
                     let our_schema = self.source.schema();
                     if src_index >= our_schema.len() {
+                        tracing::warn!(
+                            df_id = %consumer.id,
+                            column_index = consumer.column_index,
+                            column_name = %consumer.column_name,
+                            "dynamic filter consumer column is outside source schema"
+                        );
                         continue;
                     }
                     let column_name = our_schema
@@ -5572,6 +5572,85 @@ mod tests {
         );
         let filters = scan.collect_cross_fragment_filters().await;
         assert_eq!(filters.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn df_consumer_index_is_source_space_under_projection_pushdown() {
+        // The planner tags a cross-fragment consumer on the logical TableScan
+        // after remapping through Projection nodes (`tag_consumer`), so
+        // `column_index` is a SOURCE column index. Projection pushdown then
+        // narrows the physical scan to a subset of columns; a consumer on a
+        // column that is not the first projected one (or whose source index
+        // is not its position in the projection) must still land on that
+        // source column — not be dropped because the index does not fit the
+        // projection list.
+        let domain = arneb_common::Domain::DistinctValues(vec![ScalarValue::Int64(2)]);
+        let collector = crate::dynamic_filter_collector::DynamicFilterCollector::with_pending([(
+            arneb_common::DynamicFilterId(0),
+            domain.clone(),
+        )]);
+        // `value` is source column 2; the scan only reads [0, 2].
+        let mut scan = build_scan_with_df(
+            vec![consumer(0, 2, "value")],
+            Some(collector),
+            true,
+            std::time::Duration::from_millis(50),
+        );
+        scan.scan_context.projection = Some(vec![0, 2]);
+        let domains = scan.collect_cross_fragment_filters().await;
+        assert_eq!(domains.len(), 1, "domain must not be dropped: {domains:?}");
+        assert_eq!(domains[0].column_index, 2, "source index must be preserved");
+        assert_eq!(domains[0].column_name, "value");
+        assert_eq!(domains[0].domain, domain);
+    }
+
+    #[tokio::test]
+    async fn df_consumer_index_single_column_projection_not_first() {
+        // q22 shape: orders scan projected to [o_custkey] only, consumer on
+        // source column 1. `proj.get(1)` on a one-element projection is None,
+        // which used to drop the domain silently.
+        let domain = arneb_common::Domain::DistinctValues(vec![ScalarValue::Utf8("b".into())]);
+        let collector = crate::dynamic_filter_collector::DynamicFilterCollector::with_pending([(
+            arneb_common::DynamicFilterId(0),
+            domain.clone(),
+        )]);
+        let mut scan = build_scan_with_df(
+            vec![consumer(0, 1, "name")],
+            Some(collector),
+            true,
+            std::time::Duration::from_millis(50),
+        );
+        scan.scan_context.projection = Some(vec![1]);
+        let domains = scan.collect_cross_fragment_filters().await;
+        assert_eq!(domains.len(), 1, "domain must not be dropped: {domains:?}");
+        assert_eq!(domains[0].column_index, 1);
+        assert_eq!(domains[0].column_name, "name");
+    }
+
+    #[tokio::test]
+    async fn df_consumer_index_beyond_source_schema_is_dropped_and_scan_runs() {
+        // Failure path: a consumer whose source index does not exist in this
+        // scan's schema is dropped (never applied to the wrong column) and
+        // the scan still executes with every row.
+        let collector = crate::dynamic_filter_collector::DynamicFilterCollector::with_pending([(
+            arneb_common::DynamicFilterId(0),
+            arneb_common::Domain::DistinctValues(vec![ScalarValue::Int32(1)]),
+        )]);
+        let mut scan = build_scan_with_df(
+            vec![consumer(0, 7, "ghost")],
+            Some(collector),
+            true,
+            std::time::Duration::from_millis(50),
+        );
+        scan.scan_context.projection = Some(vec![0]);
+        let domains = scan.collect_cross_fragment_filters().await;
+        assert!(
+            domains.is_empty(),
+            "out-of-range consumer must be dropped: {domains:?}"
+        );
+        let stream = scan.execute(0).await.unwrap();
+        let batches = collect_stream(stream).await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
     }
 
     // ---- CoalescingStream (N2-Q18) ----

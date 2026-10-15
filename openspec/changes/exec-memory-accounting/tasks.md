@@ -155,9 +155,12 @@
   peak, COMPLETES robustly (3.6 GB cgroup margin), 100 rows, 100/100 cell-identical to Trino,
   ~5m44s, NO deadlock/hang.** The stale deadlock comment (3175-3184) does NOT apply post-Phase-A —
   confirmed empirically (`collect_probe_within_budget` shows in the heap profile bounding the probe).
-- [ ] 4.2 Bring Parquet scan decode buffers under reservation (`crates/connectors`); first verify the double-count risk (does the produced `RecordBatch` already get counted downstream?) per the design Open Question
+- [x] 4.2 Bring Parquet scan decode buffers under reservation (`crates/connectors`); first verify the double-count risk (does the produced `RecordBatch` already get counted downstream?) per the design Open Question
+  - **Double-count: none (code-level, 2026-10-16).** The async reader fetches a row group's projected column chunks into an `InMemoryRowGroup` (raw `Bytes`), and decoding copies into fresh Arrow buffers, so the decode buffer and the yielded `RecordBatch` are disjoint allocations.
+  - `parquet_scan::row_group_buffer_bytes` = compressed size of the projected columns of the largest row group (row groups are read one at a time). `ParquetBatchStream::with_memory_pool` reserves it from the first poll until end / error / drop, best-effort (a scan cannot spill, so a declined reservation never fails the scan — D1 semantics).
+  - Pool plumbed via a new `ScanContext::memory_pool`, set centrally in `ExecutionContext::build_scan_exec`; wired in Hive (plain + partitioned), Iceberg, and the file connector (whose private copy of `ParquetBatchStream` is replaced by the shared one).
 - [ ] 4.3 After each audited batch, re-measure SF30 worker peak: tracked bytes climb toward true RSS; record the converging ratio
-- [ ] 4.4 Tests: reservation grows/releases correctly for each newly-tracked site; no leak under error/cancel paths
+- [x] 4.4 Tests: reservation grows/releases correctly for each newly-tracked site; no leak under error/cancel paths — `parquet_scan::tests`: projected-only estimate, reserve-while-open/release-at-end, release-on-drop mid-stream (cancel path), best-effort under a full pool. (Exchange/aggregate/join sites covered by 2.3/3.4/4.1 tests.)
 
 ## 5. D4 — Diagnostics: name the largest consumers on OOM
 
@@ -167,7 +170,7 @@
 
 ## 6. Validate & ship
 
-- [ ] 6.1 Single-node 22/22 unit + doc tests + `clippy --all-targets` green
+- [x] 6.1 Single-node 22/22 unit + doc tests + `clippy --all-targets` green (2026-10-16: `cargo test --workspace` 0 failures; `clippy --workspace --all-targets -D warnings` clean)
 - [ ] 6.2 trino-diff full suite at SF1 cell-parity (1e-9) — no correctness regression
 - [ ] 6.3 Distributed-mode validation on the constrained host: **q21 SF30 completes** within the bound; q09/q21 SF30 stable (N repeats); record worker peak (tracked & RSS) + per-query latency vs Trino; no latency regression on the SF10 winning set beyond a documented bound
 - [ ] 6.4 SF100 degrade-to-disk smoke on a suitably-resourced host (or documented as a follow-up if seeding/capacity is a separate exercise)

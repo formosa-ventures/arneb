@@ -2,19 +2,15 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
-use std::task::{Context, Poll};
 
 use arneb_catalog::{CatalogProvider, SchemaProvider, TableProvider, TableStatistics};
-use arneb_common::error::{ArnebError, ConnectorError, ExecutionError};
-use arneb_common::stream::{stream_from_batches, RecordBatchStream, SendableRecordBatchStream};
+use arneb_common::error::{ConnectorError, ExecutionError};
+use arneb_common::stream::{stream_from_batches, SendableRecordBatchStream};
 use arneb_common::types::{ColumnInfo, TableReference};
 use arneb_execution::{DataSource, ScanContext};
-use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
-use futures::Stream;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 
@@ -283,6 +279,10 @@ impl DataSource for ParquetDataSource {
         builder = builder.with_batch_size(batch_size);
 
         let arrow_schema = builder.schema().clone();
+        let buffer_bytes = crate::parquet_scan::row_group_buffer_bytes(
+            builder.metadata(),
+            ctx.projection.as_deref(),
+        );
 
         let stream = builder.build().map_err(|e| {
             ExecutionError::InvalidOperation(format!("Parquet reader build error: {e}"))
@@ -295,48 +295,15 @@ impl DataSource for ParquetDataSource {
         // the first row — for SF1 lineitem with 7 projected columns
         // that's ~336 MB per query. Matches the hive datasource
         // pattern (crates/hive/src/datasource.rs::ParquetBatchStream).
-        Ok(Box::pin(ParquetBatchStream {
-            schema: arrow_schema,
-            inner: Box::pin(stream),
-            file_path: self.path.as_ref().to_string(),
+        let stream = crate::parquet_scan::ParquetBatchStream::new(
+            arrow_schema,
+            stream,
+            self.path.as_ref().to_string(),
+        );
+        Ok(Box::pin(match &ctx.memory_pool {
+            Some(pool) => stream.with_memory_pool(pool, buffer_bytes),
+            None => stream,
         }))
-    }
-}
-
-/// Adapts a [`ParquetRecordBatchStream`] into a
-/// [`SendableRecordBatchStream`] without materialising the partition's
-/// batches up front. Mirrors `crates/hive/src/datasource.rs::ParquetBatchStream`.
-struct ParquetBatchStream {
-    schema: arrow::datatypes::SchemaRef,
-    inner: Pin<
-        Box<
-            parquet::arrow::async_reader::ParquetRecordBatchStream<
-                crate::parquet_scan::ParquetObjectReader,
-            >,
-        >,
-    >,
-    file_path: String,
-}
-
-impl Stream for ParquetBatchStream {
-    type Item = Result<RecordBatch, ArnebError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(Ok(b))),
-            Poll::Ready(Some(Err(e))) => {
-                let msg = format!("Parquet read error for '{}': {e}", self.file_path);
-                Poll::Ready(Some(Err(ExecutionError::InvalidOperation(msg).into())))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl RecordBatchStream for ParquetBatchStream {
-    fn schema(&self) -> arrow::datatypes::SchemaRef {
-        self.schema.clone()
     }
 }
 
@@ -643,6 +610,10 @@ impl DataSource for PreResolvedParquetDataSource {
         }
 
         let arrow_schema = builder.schema().clone();
+        let buffer_bytes = crate::parquet_scan::row_group_buffer_bytes(
+            builder.metadata(),
+            ctx.projection.as_deref(),
+        );
 
         let stream = builder.build().map_err(|e| {
             ExecutionError::InvalidOperation(format!("Parquet reader build error: {e}"))
@@ -650,10 +621,14 @@ impl DataSource for PreResolvedParquetDataSource {
 
         // Phase 3b.7b (2026-05-21): true streaming. Same change as
         // ParquetDataSource::scan above.
-        Ok(Box::pin(ParquetBatchStream {
-            schema: arrow_schema,
-            inner: Box::pin(stream),
-            file_path: self.path.to_string(),
+        let stream = crate::parquet_scan::ParquetBatchStream::new(
+            arrow_schema,
+            stream,
+            self.path.to_string(),
+        );
+        Ok(Box::pin(match &ctx.memory_pool {
+            Some(pool) => stream.with_memory_pool(pool, buffer_bytes),
+            None => stream,
         }))
     }
 }

@@ -31,8 +31,10 @@ use parquet::arrow::async_reader::{ParquetRecordBatchStream, ParquetRecordBatchS
 pub(crate) type ParquetObjectReader = parquet::arrow::async_reader::ParquetObjectReader;
 
 use arneb_common::error::{ArnebError, ExecutionError};
+use arneb_common::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use arneb_common::stream::RecordBatchStream;
 use arneb_planner::PlanExpr;
+use parquet::file::metadata::ParquetMetaData;
 
 /// Pick a `splits_per_file` so the resulting partition count saturates
 /// available CPU cores. For a 4-file table on a 14-core machine that's
@@ -178,6 +180,36 @@ pub fn build_split_stream(
     })
 }
 
+/// Bytes a scan of this file holds in its decode buffer: the compressed
+/// size of the projected columns of its largest row group.
+///
+/// The async reader fetches a whole row group's projected column chunks
+/// into memory before decoding it, and decoding copies into fresh Arrow
+/// buffers, so this memory is separate from the batches the scan yields.
+/// Row groups are read one at a time, so the largest one bounds the scan.
+pub fn row_group_buffer_bytes(
+    metadata: &ParquetMetaData,
+    projection_roots: Option<&[usize]>,
+) -> usize {
+    let schema = metadata.file_metadata().schema_descr();
+    let projected = |leaf: usize| {
+        projection_roots.is_none_or(|roots| roots.contains(&schema.get_column_root_idx(leaf)))
+    };
+    metadata
+        .row_groups()
+        .iter()
+        .map(|rg| {
+            rg.columns()
+                .iter()
+                .enumerate()
+                .filter(|(leaf, _)| projected(*leaf))
+                .map(|(_, col)| col.compressed_size().max(0) as usize)
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Build a `RowSelection` that picks rows `[split_idx*chunk, (split_idx+1)*chunk)`
 /// out of `total_rows` (clamped). `chunk = ceil(total_rows / splits)`.
 pub fn compute_split_selection(total_rows: usize, split_idx: usize, splits: usize) -> RowSelection {
@@ -227,6 +259,14 @@ pub struct ParquetBatchStream {
     inner: Pin<Box<ParquetRecordBatchStream<ParquetObjectReader>>>,
     file_path: String,
     adapter: Option<BatchAdapter>,
+    memory: Option<ScanMemory>,
+}
+
+/// Decode-buffer accounting for one scan stream.
+struct ScanMemory {
+    reservation: MemoryReservation,
+    bytes: usize,
+    started: bool,
 }
 
 impl ParquetBatchStream {
@@ -241,7 +281,25 @@ impl ParquetBatchStream {
             inner: Box::pin(inner),
             file_path,
             adapter: None,
+            memory: None,
         }
+    }
+
+    /// Account the scan's decode buffer (`bytes`, see
+    /// [`row_group_buffer_bytes`]) against `pool` from the first poll until
+    /// the stream ends, fails, or is dropped.
+    ///
+    /// Best-effort: a scan cannot spill, so when the pool declines the
+    /// reservation the scan proceeds untracked rather than failing.
+    pub fn with_memory_pool(mut self, pool: &Arc<dyn MemoryPool>, bytes: usize) -> Self {
+        if bytes > 0 {
+            self.memory = Some(ScanMemory {
+                reservation: MemoryConsumer::new("ParquetScan").register(pool.clone()),
+                bytes,
+                started: false,
+            });
+        }
+        self
     }
 
     /// Transform every batch with `adapter` before yielding it.
@@ -255,7 +313,17 @@ impl Stream for ParquetBatchStream {
     type Item = Result<RecordBatch, ArnebError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.as_mut().poll_next(cx) {
+        if let Some(mem) = self.memory.as_mut().filter(|m| !m.started) {
+            mem.started = true;
+            let _ = mem.reservation.try_grow(mem.bytes);
+        }
+        let polled = self.inner.as_mut().poll_next(cx);
+        if matches!(polled, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            if let Some(mem) = self.memory.as_mut() {
+                mem.reservation.free();
+            }
+        }
+        match polled {
             Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(match &self.adapter {
                 Some(adapt) => adapt(b),
                 None => Ok(b),
@@ -273,5 +341,128 @@ impl Stream for ParquetBatchStream {
 impl RecordBatchStream for ParquetBatchStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arneb_common::memory_pool::{GreedyMemoryPool, MemoryPool};
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use futures::StreamExt;
+    use object_store::memory::InMemory;
+    use object_store::PutPayload;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    /// Write a 3-column file with `rows` rows in row groups of `rg_rows`
+    /// into an in-memory store.
+    async fn store_with_parquet(rows: i64, rg_rows: usize) -> (Arc<dyn ObjectStore>, ObjectPath) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("c", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..rows)),
+                Arc::new(Int64Array::from_iter_values((0..rows).map(|i| i * 7))),
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|i| format!("row-{i}")),
+                )),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rg_rows))
+            .build();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = ObjectPath::from("t.parquet");
+        store.put(&path, PutPayload::from(buf)).await.unwrap();
+        (store, path)
+    }
+
+    #[tokio::test]
+    async fn row_group_buffer_bytes_counts_only_projected_columns() {
+        let (store, path) = store_with_parquet(10_000, 2_500).await;
+        let builder = open_parquet_builder(&store, &path).await.unwrap();
+        let all = row_group_buffer_bytes(builder.metadata(), None);
+        let one = row_group_buffer_bytes(builder.metadata(), Some(&[0]));
+        assert!(one > 0);
+        assert!(
+            one < all,
+            "projecting 1 of 3 columns must shrink the estimate"
+        );
+        // The estimate is one row group, not the whole file.
+        let file_bytes: i64 = builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|rg| rg.compressed_size())
+            .sum();
+        assert!((all as i64) < file_bytes);
+    }
+
+    #[tokio::test]
+    async fn scan_stream_reserves_while_open_and_releases_at_end() {
+        let (store, path) = store_with_parquet(10_000, 2_500).await;
+        let builder = open_parquet_builder(&store, &path).await.unwrap();
+        let bytes = row_group_buffer_bytes(builder.metadata(), None);
+        let schema = builder.schema().clone();
+        let inner = build_split_stream(builder, &path, &[], &[], None, None, 0, 1).unwrap();
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 30));
+        let mut stream =
+            ParquetBatchStream::new(schema, inner, path.to_string()).with_memory_pool(&pool, bytes);
+        assert_eq!(pool.reserved(), 0, "nothing reserved before the first poll");
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert!(first.num_rows() > 0);
+        assert_eq!(pool.reserved(), bytes);
+
+        let mut rows = first.num_rows();
+        while let Some(b) = stream.next().await {
+            rows += b.unwrap().num_rows();
+        }
+        assert_eq!(rows, 10_000);
+        assert_eq!(pool.reserved(), 0, "released once the stream is exhausted");
+    }
+
+    #[tokio::test]
+    async fn scan_stream_releases_on_drop_mid_stream() {
+        let (store, path) = store_with_parquet(10_000, 2_500).await;
+        let builder = open_parquet_builder(&store, &path).await.unwrap();
+        let bytes = row_group_buffer_bytes(builder.metadata(), None);
+        let schema = builder.schema().clone();
+        let inner = build_split_stream(builder, &path, &[], &[], None, None, 0, 1).unwrap();
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 30));
+        let mut stream =
+            ParquetBatchStream::new(schema, inner, path.to_string()).with_memory_pool(&pool, bytes);
+        stream.next().await.unwrap().unwrap();
+        assert_eq!(pool.reserved(), bytes);
+        drop(stream);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn scan_stream_is_best_effort_when_pool_is_full() {
+        let (store, path) = store_with_parquet(10_000, 2_500).await;
+        let builder = open_parquet_builder(&store, &path).await.unwrap();
+        let bytes = row_group_buffer_bytes(builder.metadata(), None);
+        let schema = builder.schema().clone();
+        let inner = build_split_stream(builder, &path, &[], &[], None, None, 0, 1).unwrap();
+        // A pool too small for the row group: the scan must still succeed.
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes / 2));
+        let stream =
+            ParquetBatchStream::new(schema, inner, path.to_string()).with_memory_pool(&pool, bytes);
+        let batches: Vec<_> = stream.collect().await;
+        let rows: usize = batches.into_iter().map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(rows, 10_000);
+        assert_eq!(pool.reserved(), 0);
     }
 }

@@ -467,7 +467,7 @@ impl ExecutionContext {
         ScanExec {
             source,
             _table_name: table_name,
-            scan_context,
+            scan_context: scan_context.with_memory_pool(self.memory_pool.clone()),
             dynamic_filters: Default::default(),
             dynamic_filters_consumed,
             dynamic_filter_collector: self.dynamic_filter_collector.clone(),

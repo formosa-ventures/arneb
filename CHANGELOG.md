@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.2](https://github.com/formosa-ventures/arneb/compare/v0.1.1...v0.1.2) (2026-10-15)
+
+
+### Bug Fixes
+
+* **compose:** initialize HMS Derby at build time for fresh hms-db volumes ([#125](https://github.com/formosa-ventures/arneb/issues/125)) ([1a12cd8](https://github.com/formosa-ventures/arneb/commit/1a12cd83ca76395549b1088dcf447ca8ae51ab35))
+* **execution:** map cross-fragment filter consumers by source column ([#131](https://github.com/formosa-ventures/arneb/issues/131)) ([55a776f](https://github.com/formosa-ventures/arneb/commit/55a776f0ead63a9f769b336e03be01a7c6b41ab2))
+
+
+### Performance Improvements
+
+* **planner,server:** flip TPC-H q18 by building the smaller join side and parallelizing the IN-subquery final aggregate ([#118](https://github.com/formosa-ventures/arneb/issues/118)) ([6499e68](https://github.com/formosa-ventures/arneb/commit/6499e68b3b7c6ccd7c25e55e72724cfa8fa92b09))
+* **planner:** default hash-partitioned semi/anti joins on (q21 -21%, q04 -22%, q22 -20% @ SF10) ([#127](https://github.com/formosa-ventures/arneb/issues/127)) ([fd4d292](https://github.com/formosa-ventures/arneb/commit/fd4d292bc0bee3a141c3a44934b014658d15fd91))
+* **planner:** pre-filter decorrelated aggregates by the outer semi-join key set ([#123](https://github.com/formosa-ventures/arneb/issues/123)) ([7afe347](https://github.com/formosa-ventures/arneb/commit/7afe347639813b2b62a92be6da83ad0f0124430b))
+* probe-side dynamic filters for partitioned semi/anti joins (q21 0.8x → 2.0x vs Trino @ SF10) ([#129](https://github.com/formosa-ventures/arneb/issues/129)) ([07adde7](https://github.com/formosa-ventures/arneb/commit/07adde7507ec7423331f58768b21b758a3245478))
+
 ## [0.1.1](https://github.com/formosa-ventures/arneb/compare/v0.1.0...v0.1.1) (2026-10-10)
 
 

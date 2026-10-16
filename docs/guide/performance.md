@@ -134,8 +134,10 @@ off for A/B comparisons; see
 - One host and one run per protocol per query for each table. Repeated SF10
   runs put run-to-run noise at a median of 4–6% per query (worst 29%), so
   single-query differences under about 30% are not results.
-- `q18`'s peak memory at SF10 varies between 2.0 and 4.7 GB across identical
-  runs ([#126](https://github.com/formosa-ventures/arneb/issues/126)).
+- `q18`'s peak memory at SF10 varied between 2.0 and 4.7 GB across the runs
+  above (one worker peaked at about twice the other); it has not recurred since
+  the dataset was re-seeded, and the seed now writes a fixed layout
+  ([#126](https://github.com/formosa-ventures/arneb/issues/126)).
 - SF30 has not been measured warm.
 
 ## Reproduce it

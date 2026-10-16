@@ -80,6 +80,22 @@ run_sql() {
     trino --server "${SERVER}" --execute "$1"
 }
 
+# Fixed writer layout so every seed produces the same file split: with writer
+# scaling on (Trino's default) the file count and sizes depend on runtime
+# load, and a skewed layout skews arneb's per-worker split assignment — the
+# bimodal q18 peak memory in #126 tracked a re-seed, not a code change.
+# 2 Trino workers × 4 writers = 8 near-equal files per table.
+WRITER_SESSION=(
+    --session scale_writers=false
+    --session task_scale_writers_enabled=false
+    --session task_min_writer_count=4
+    --session task_max_writer_count=4
+)
+
+run_ctas() {
+    trino --server "${SERVER}" "${WRITER_SESSION[@]}" --execute "$1"
+}
+
 # Drop and recreate schema for idempotency.
 echo "[1/3] Dropping existing hive.${SCHEMA} schema (if any)..."
 run_sql "DROP SCHEMA IF EXISTS hive.${SCHEMA} CASCADE" || true
@@ -91,7 +107,7 @@ echo "[3/3] Creating tables via CTAS from tpch.${SF}..."
 for table in "${TABLES[@]}"; do
     echo "  Creating ${table}..."
     select_sql=$(select_for_table "${table}")
-    run_sql "CREATE TABLE hive.${SCHEMA}.${table} WITH (format = 'PARQUET') AS ${select_sql}"
+    run_ctas "CREATE TABLE hive.${SCHEMA}.${table} WITH (format = 'PARQUET') AS ${select_sql}"
 done
 
 echo ""

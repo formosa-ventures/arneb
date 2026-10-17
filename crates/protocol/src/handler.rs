@@ -99,6 +99,10 @@ pub struct HandlerFactory {
     pub connector_registry: Arc<ConnectorRegistry>,
     pub distributed_executor: Option<Arc<dyn DistributedExecutor>>,
     pub memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool>,
+    /// Per-query memory limit on this node (`query_max_memory_per_node`);
+    /// each statement runs under its own `QueryMemoryPool` over
+    /// `memory_pool`. `None`: limited only by the node pool.
+    pub query_memory_limit: Option<usize>,
     /// Client authentication mode enforced during connection startup. Covers
     /// both the Simple and Extended Query paths, which share one startup
     /// handler.
@@ -115,6 +119,7 @@ impl PgWireServerHandlers for HandlerFactory {
             catalog_manager: Arc::clone(&self.catalog_manager),
             connector_registry: Arc::clone(&self.connector_registry),
             memory_pool: Arc::clone(&self.memory_pool),
+            query_memory_limit: self.query_memory_limit,
         })
     }
 
@@ -124,6 +129,7 @@ impl PgWireServerHandlers for HandlerFactory {
             catalog_manager: Arc::clone(&self.catalog_manager),
             connector_registry: Arc::clone(&self.connector_registry),
             memory_pool: Arc::clone(&self.memory_pool),
+            query_memory_limit: self.query_memory_limit,
         })
     }
 
@@ -151,6 +157,8 @@ pub struct ConnectionHandler {
     /// spillable operators (SemiJoinExec build) honour the configured
     /// per-task budget instead of growing unbounded.
     pub memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool>,
+    /// Per-query memory limit; see [`HandlerFactory::query_memory_limit`].
+    pub query_memory_limit: Option<usize>,
 }
 
 impl ConnectionHandler {
@@ -254,12 +262,13 @@ impl SimpleQueryHandler for ConnectionHandler {
         // SQLSTATE codes are unaffected.
         let source = SourceFile::new("<query>", trimmed);
 
-        let result = execute_query(
+        let result = execute_query_with_limit(
             trimmed,
             &catalog_manager,
             &self.connector_registry,
             self.distributed_executor.as_deref(),
             &self.memory_pool,
+            self.query_memory_limit,
         )
         .await;
 
@@ -439,12 +448,13 @@ impl ExtendedQueryHandler for ConnectionHandler {
         }
 
         let source = SourceFile::new("<query>", trimmed);
-        let result = execute_query(
+        let result = execute_query_with_limit(
             trimmed,
             &catalog_manager,
             &self.connector_registry,
             self.distributed_executor.as_deref(),
             &self.memory_pool,
+            self.query_memory_limit,
         )
         .await;
 
@@ -593,7 +603,8 @@ fn count_placeholders(sql: &str) -> usize {
     max_idx
 }
 
-/// Execute the full query pipeline asynchronously.
+/// Execute the full query pipeline asynchronously, with no per-query memory
+/// limit beyond `memory_pool` itself.
 pub async fn execute_query(
     sql: &str,
     catalog_manager: &CatalogManager,
@@ -607,6 +618,43 @@ pub async fn execute_query(
     ),
     ArnebError,
 > {
+    execute_query_with_limit(
+        sql,
+        catalog_manager,
+        connector_registry,
+        distributed_executor,
+        memory_pool,
+        None,
+    )
+    .await
+}
+
+/// [`execute_query`] under a per-query memory limit: the statement's local
+/// execution (a standalone plan, or the coordinator's own fragments) reserves
+/// from a `QueryMemoryPool` of `query_memory_limit` bytes over
+/// `memory_pool`, dropped when the statement ends.
+pub async fn execute_query_with_limit(
+    sql: &str,
+    catalog_manager: &CatalogManager,
+    connector_registry: &ConnectorRegistry,
+    distributed_executor: Option<&dyn DistributedExecutor>,
+    memory_pool: &Arc<dyn arneb_execution::memory_pool::MemoryPool>,
+    query_memory_limit: Option<usize>,
+) -> Result<
+    (
+        Arc<dyn ExecutionPlan>,
+        Vec<arrow::record_batch::RecordBatch>,
+    ),
+    ArnebError,
+> {
+    let memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> = match query_memory_limit {
+        Some(limit) => Arc::new(arneb_execution::memory_pool::QueryMemoryPool::new(
+            Arc::clone(memory_pool),
+            limit,
+        )),
+        None => Arc::clone(memory_pool),
+    };
+    let memory_pool = &memory_pool;
     // Step 1: Parse SQL
     let statement = arneb_sql_parser::parse(sql)?;
 

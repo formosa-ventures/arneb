@@ -118,13 +118,18 @@ impl ExchangeClient {
                     continue;
                 }
 
-                // Task failed — propagate the worker's error immediately.
-                Err(status) if status.code() == tonic::Code::Internal => {
-                    return Err(ExecutionError::InvalidOperation(format!(
-                        "remote task {ticket_text} on {} failed: {}",
-                        self.address,
-                        status.message()
-                    )));
+                // Task failed — propagate the worker's error immediately,
+                // keeping a memory-limit failure's class.
+                Err(status)
+                    if matches!(
+                        status.code(),
+                        tonic::Code::Internal | tonic::Code::ResourceExhausted
+                    ) =>
+                {
+                    return Err(crate::task_error::remote_error(
+                        format!("remote task {ticket_text} on {} failed", self.address),
+                        status.message(),
+                    ));
                 }
 
                 Err(e) => {
@@ -167,9 +172,10 @@ impl ExchangeClient {
         let first = match flight_stream.next().await {
             Some(Ok(batch)) => Some(batch),
             Some(Err(e)) => {
-                return Err(ExecutionError::InvalidOperation(format!(
-                    "Flight stream error: {e}"
-                )));
+                return Err(crate::task_error::remote_error(
+                    "Flight stream error".to_owned(),
+                    &e.to_string(),
+                ));
             }
             None => None,
         };
@@ -252,7 +258,10 @@ impl Stream for FlightPassthroughStream {
                     );
                 }
                 Poll::Ready(Some(Err(ArnebError::Execution(
-                    ExecutionError::InvalidOperation(format!("Flight stream error: {e}")),
+                    crate::task_error::remote_error(
+                        "Flight stream error".to_owned(),
+                        &e.to_string(),
+                    ),
                 ))))
             }
             Poll::Ready(None) => {

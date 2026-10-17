@@ -379,18 +379,15 @@ pub struct MemoryConfig {
     #[serde(default = "default_cgroup_ratio")]
     pub cgroup_ratio: f64,
 
-    /// Trino-style per-task query memory cap. When set, each worker
-    /// task wraps the global spill pool with a [`QueryMemoryPool`]
-    /// that fails the query (structured `ResourceExhausted`) when the
-    /// task's cumulative allocation crosses this cap — covers the
-    /// swiss-cheese gap where untracked operators (Filter / Project /
-    /// scan buffers / Repartition queue / etc.) accumulate uncounted
-    /// allocations and OOM the worker before any single tracked
-    /// operator (SemiJoinExec / HashJoinExec) hits its own
-    /// `spill_budget_bytes`. Recommended ≥ `spill_budget_bytes`
-    /// (the SemiJoin/HashJoin build alone can take that much; the
-    /// query needs some headroom on top). `None` disables (no
-    /// query-level cap; only the operator-level spill budget fires).
+    /// Trino-style per-query memory limit on each node
+    /// (`query.max-memory-per-node`). Every query gets its own
+    /// `QueryMemoryPool` of this many bytes over the node pool — per
+    /// statement on the coordinator / standalone, per query id on a worker —
+    /// so one query fails with `ResourceExhausted` (pgwire `53200`, Trino
+    /// `EXCEEDED_LOCAL_MEMORY_LIMIT`) instead of taking the node's memory
+    /// from the others. It is per node, not cluster-wide: a query on 2
+    /// workers can use up to 2× this. Recommended 0.5–0.8 × the node spill
+    /// budget. `None` (default): a query is limited only by the node pool.
     #[serde(default)]
     pub query_max_memory_per_node: Option<u64>,
 
@@ -507,7 +504,7 @@ impl MemoryConfig {
         (None, "unbounded")
     }
 
-    /// Resolve the per-task query memory cap. `ARNEB_QUERY_MAX_MEMORY_BYTES`
+    /// Resolve the per-query memory limit. `ARNEB_QUERY_MAX_MEMORY_BYTES`
     /// env var overrides the `query_max_memory_per_node` config field —
     /// same runtime-tunable rationale as `resolve_budget` (config is baked
     /// into the docker image at build time).

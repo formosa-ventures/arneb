@@ -37,6 +37,7 @@ pub struct ProtocolServer {
     auth: AuthMethod,
     tls: Option<PgwireTls>,
     query_memory_limit: Option<usize>,
+    admission: Option<arneb_scheduler::AdmissionController>,
 }
 
 impl ProtocolServer {
@@ -54,6 +55,7 @@ impl ProtocolServer {
             auth: AuthMethod::None,
             tls: None,
             query_memory_limit: None,
+            admission: None,
         }
     }
 
@@ -93,6 +95,16 @@ impl ProtocolServer {
         self
     }
 
+    /// Queue statements through this admission controller (shared with the
+    /// Trino listener). Default: none, every statement runs at once.
+    pub fn with_admission(
+        mut self,
+        admission: Option<arneb_scheduler::AdmissionController>,
+    ) -> Self {
+        self.admission = admission;
+        self
+    }
+
     /// Start the server and begin accepting connections.
     /// This method runs until the process is terminated.
     pub async fn start(&self) -> Result<(), std::io::Error> {
@@ -129,6 +141,7 @@ impl ProtocolServer {
                 })
             ),
             query_memory_limit: self.query_memory_limit,
+            admission: self.admission.clone(),
         });
         let acceptor = self.tls.as_ref().map(|t| t.acceptor.clone());
 

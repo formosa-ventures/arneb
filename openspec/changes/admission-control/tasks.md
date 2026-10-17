@@ -36,14 +36,14 @@ Sections 1–4 land as four PRs, in order: A (memory), B (cancellation), C (admi
 
 ## 3. PR C — admission control (D5, D6)
 
-- [ ] 3.1 `scheduler/src/admission.rs`: `AdmissionController::admit(query_id) -> Result<AdmissionPermit, AdmissionError>` with FIFO hand-off on `Drop`, dropped-waiter skipping, `QueueFull`, `snapshot()`, and `0` = unlimited. Remove the unused `ResourceGroup` and its tests.
-- [ ] 3.2 Config: an `[admission]` section with `max_running_queries`, `max_queued_queries` and `statement_timeout` (the latter used in PR D), `ARNEB_*` overrides through an `env` closure, validation, and the startup log on `arneb::config`.
-- [ ] 3.3 pgwire: acquire the permit after interception and before planning, in both the Simple and Extended paths. Session and metadata statements and `EXPLAIN` (without `ANALYZE`) bypass it. Hold the permit until execution completes.
-- [ ] 3.4 Trino: acquire the permit inside the statement task, report `QUEUED` until it is granted, and release it when the statement task completes (not after paging).
-- [ ] 3.5 Tracker and Web UI: create the tracker entry in `Queued` and move it to `Planning` on admission. Add `running_queries`, `queued_queries`, `max_running_queries` and `max_queued_queries` to `/api/v1/cluster`, and show them on the dashboard.
-- [ ] 3.6 Errors: queue full → pgwire `53000` / Trino `QUERY_QUEUE_FULL` (131074, `INSUFFICIENT_RESOURCES`).
-- [ ] 3.7 Logging: `arneb::admission` INFO lines on queue (with position) and admit (with wait time), and a DEBUG snapshot every 10 s while anything is queued.
-- [ ] 3.8 Tests:
+- [x] 3.1 `scheduler/src/admission.rs`: `AdmissionController::admit(query_id) -> Result<AdmissionPermit, AdmissionError>` with FIFO hand-off on `Drop`, dropped-waiter skipping, `QueueFull`, `snapshot()`, and `0` = unlimited. Remove the unused `ResourceGroup` and its tests.
+- [x] 3.2 Config: an `[admission]` section with `max_running_queries`, `max_queued_queries` and `statement_timeout` (the latter used in PR D), `ARNEB_*` overrides through an `env` closure, validation, and the startup log on `arneb::config`.
+- [x] 3.3 pgwire: acquire the permit after interception and before planning, in both the Simple and Extended paths. Session and metadata statements and `EXPLAIN` (without `ANALYZE`) bypass it. Hold the permit until execution completes.
+- [x] 3.4 Trino: acquire the permit inside the statement task, report `QUEUED` until it is granted, and release it when the statement task completes (not after paging).
+- [x] 3.5 Tracker and Web UI: create the tracker entry in `Queued` and move it to `Planning` on admission. Add `running_queries`, `queued_queries`, `max_running_queries` and `max_queued_queries` to `/api/v1/cluster`, and show them on the dashboard. (As implemented: the Trino listener's tracker entry stays `Queued` until admission. A queued pgwire statement has no tracker entry yet — the coordinator creates one when it plans — so pgwire queuing shows in the `/api/v1/cluster` counters and the dashboard's "N queued" line, not in the query list.)
+- [x] 3.6 Errors: queue full → pgwire `53000` / Trino `QUERY_QUEUE_FULL` (131074, `INSUFFICIENT_RESOURCES`).
+- [x] 3.7 Logging: `arneb::admission` INFO lines on queue (with position) and admit (with wait time), and a DEBUG snapshot every 10 s while anything is queued.
+- [x] 3.8 Tests:
   - Controller unit tests: cap, FIFO order, dropped-waiter skipping, queue full, unlimited.
   - pgwire and Trino integration tests with `max_running_queries = 1`: the second query waits and shows `QUEUED`, then completes; a third with `max_queued = 1` gets the queue-full error; `SET` and metadata bypass.
 

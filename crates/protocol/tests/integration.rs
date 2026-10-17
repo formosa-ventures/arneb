@@ -29,6 +29,7 @@ async fn start_test_server(
         auth: arneb_protocol::AuthMethod::None,
         tls_required: false,
         query_memory_limit: None,
+        admission: None,
     });
 
     tokio::spawn(async move {

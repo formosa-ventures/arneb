@@ -7,6 +7,7 @@
 pub mod config;
 pub mod diagnostic;
 pub mod domain;
+pub mod duration;
 pub mod dynamic_filter;
 pub mod error;
 pub mod identifiers;

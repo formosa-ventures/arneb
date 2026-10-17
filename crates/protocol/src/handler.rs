@@ -103,6 +103,9 @@ pub struct HandlerFactory {
     /// each statement runs under its own `QueryMemoryPool` over
     /// `memory_pool`. `None`: limited only by the node pool.
     pub query_memory_limit: Option<usize>,
+    /// Admission control shared with the Trino listener; `None` admits
+    /// every statement at once.
+    pub admission: Option<arneb_scheduler::AdmissionController>,
     /// Client authentication mode enforced during connection startup. Covers
     /// both the Simple and Extended Query paths, which share one startup
     /// handler.
@@ -120,6 +123,7 @@ impl PgWireServerHandlers for HandlerFactory {
             connector_registry: Arc::clone(&self.connector_registry),
             memory_pool: Arc::clone(&self.memory_pool),
             query_memory_limit: self.query_memory_limit,
+            admission: self.admission.clone(),
         })
     }
 
@@ -130,6 +134,7 @@ impl PgWireServerHandlers for HandlerFactory {
             connector_registry: Arc::clone(&self.connector_registry),
             memory_pool: Arc::clone(&self.memory_pool),
             query_memory_limit: self.query_memory_limit,
+            admission: self.admission.clone(),
         })
     }
 
@@ -159,9 +164,33 @@ pub struct ConnectionHandler {
     pub memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool>,
     /// Per-query memory limit; see [`HandlerFactory::query_memory_limit`].
     pub query_memory_limit: Option<usize>,
+    /// Admission control; see [`HandlerFactory::admission`].
+    pub admission: Option<arneb_scheduler::AdmissionController>,
 }
 
 impl ConnectionHandler {
+    /// Wait for an admission slot when `sql` executes a plan. The permit is
+    /// held until the statement's results are produced; a full queue is
+    /// `ERROR 53000`.
+    async fn admit(&self, sql: &str) -> PgWireResult<Option<arneb_scheduler::AdmissionPermit>> {
+        let Some(controller) = &self.admission else {
+            return Ok(None);
+        };
+        if !needs_admission(sql) {
+            return Ok(None);
+        }
+        match controller.admit(&admission_label(sql)) {
+            Ok(pending) => Ok(Some(pending.wait().await)),
+            Err(e) => Err(PgWireError::UserError(Box::new(
+                pgwire::error::ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "53000".to_owned(),
+                    e.to_string(),
+                ),
+            ))),
+        }
+    }
+
     /// The catalog manager resolving unqualified names for this connection:
     /// a session view when `SET search_path` chose a non-default schema.
     fn session_catalog<C: ClientInfo>(&self, client: &C) -> Arc<CatalogManager> {
@@ -262,6 +291,7 @@ impl SimpleQueryHandler for ConnectionHandler {
         // SQLSTATE codes are unaffected.
         let source = SourceFile::new("<query>", trimmed);
 
+        let _admission = self.admit(trimmed).await?;
         let result = execute_query_with_limit(
             trimmed,
             &catalog_manager,
@@ -448,6 +478,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
         }
 
         let source = SourceFile::new("<query>", trimmed);
+        let _admission = self.admit(trimmed).await?;
         let result = execute_query_with_limit(
             trimmed,
             &catalog_manager,
@@ -601,6 +632,36 @@ fn count_placeholders(sql: &str) -> usize {
         }
     }
     max_idx
+}
+
+/// Whether `sql` executes a plan and so takes an admission slot
+/// (admission-control D5): queries, `INSERT`, `DELETE`, CTAS and
+/// `EXPLAIN ANALYZE`. Catalog-only DDL and plain `EXPLAIN` never queue, and
+/// neither does SQL that fails to parse (it fails right away instead).
+/// Session and metadata statements are intercepted before this point.
+pub fn needs_admission(sql: &str) -> bool {
+    use arneb_sql_parser::ast::Statement;
+    match arneb_sql_parser::parse(sql) {
+        Ok(Statement::Explain { analyze, .. }) => analyze,
+        Ok(
+            Statement::CreateTable { .. }
+            | Statement::DropTable { .. }
+            | Statement::CreateView { .. }
+            | Statement::DropView { .. },
+        ) => false,
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+/// A short, single-line form of `sql` for admission logs.
+pub(crate) fn admission_label(sql: &str) -> String {
+    let flat: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > 80 {
+        format!("{}…", flat.chars().take(80).collect::<String>())
+    } else {
+        flat
+    }
 }
 
 /// Execute the full query pipeline asynchronously, with no per-query memory

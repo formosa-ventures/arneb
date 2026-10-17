@@ -53,6 +53,15 @@ pub struct AppConfig {
     /// Web UI listener (coordinator/standalone only).
     #[serde(default)]
     pub web: WebConfig,
+
+    /// Admission control (coordinator/standalone only). Raw file values;
+    /// the effective settings are in [`AppConfig::admission_settings`].
+    #[serde(default)]
+    pub admission: AdmissionConfig,
+
+    /// Effective admission settings (env applied, validated).
+    #[serde(skip)]
+    pub admission_settings: AdmissionSettings,
 }
 
 /// `[web]` section.
@@ -183,6 +192,101 @@ impl TlsConfig {
                 "[tls] cert_path and key_path are required (or ARNEB_TLS_CERT_PATH / ARNEB_TLS_KEY_PATH)"
             ),
         }
+    }
+}
+
+/// `[admission]` section: how many queries run at once, how many may wait,
+/// and the server-wide statement timeout.
+///
+/// ```toml
+/// [admission]
+/// max_running_queries = 8     # ARNEB_MAX_RUNNING_QUERIES; 0 = unlimited
+/// max_queued_queries  = 256   # ARNEB_MAX_QUEUED_QUERIES
+/// statement_timeout   = "0"   # ARNEB_STATEMENT_TIMEOUT; e.g. "30s", "5min", 30000 (ms)
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionConfig {
+    #[serde(default)]
+    pub max_running_queries: Option<usize>,
+    #[serde(default)]
+    pub max_queued_queries: Option<usize>,
+    #[serde(default)]
+    pub statement_timeout: Option<TimeLimitValue>,
+}
+
+/// A time limit written as milliseconds (`30000`) or a string (`"30s"`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum TimeLimitValue {
+    Millis(u64),
+    Text(String),
+}
+
+/// Default `max_running_queries` (admission-control decisions log #1).
+pub const DEFAULT_MAX_RUNNING_QUERIES: usize = 8;
+/// Default `max_queued_queries` (decisions log #2).
+pub const DEFAULT_MAX_QUEUED_QUERIES: usize = 256;
+
+/// Validated `[admission]` settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionSettings {
+    /// `0` = unlimited.
+    pub max_running_queries: usize,
+    pub max_queued_queries: usize,
+    /// Server default for sessions that set no timeout; `None` = off.
+    pub statement_timeout: Option<std::time::Duration>,
+}
+
+impl Default for AdmissionSettings {
+    fn default() -> Self {
+        Self {
+            max_running_queries: DEFAULT_MAX_RUNNING_QUERIES,
+            max_queued_queries: DEFAULT_MAX_QUEUED_QUERIES,
+            statement_timeout: None,
+        }
+    }
+}
+
+impl AdmissionConfig {
+    /// Apply `ARNEB_MAX_RUNNING_QUERIES`, `ARNEB_MAX_QUEUED_QUERIES` and
+    /// `ARNEB_STATEMENT_TIMEOUT` (looked up through `env`) over the file
+    /// values and validate.
+    pub fn resolve(&self, env: impl Fn(&str) -> Option<String>) -> Result<AdmissionSettings> {
+        let count = |var: &str, file: Option<usize>, default: usize| -> Result<usize> {
+            match env(var) {
+                Some(v) => v.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("invalid {var} value '{v}' (expected a non-negative integer)")
+                }),
+                None => Ok(file.unwrap_or(default)),
+            }
+        };
+        let max_running_queries = count(
+            "ARNEB_MAX_RUNNING_QUERIES",
+            self.max_running_queries,
+            DEFAULT_MAX_RUNNING_QUERIES,
+        )?;
+        let max_queued_queries = count(
+            "ARNEB_MAX_QUEUED_QUERIES",
+            self.max_queued_queries,
+            DEFAULT_MAX_QUEUED_QUERIES,
+        )?;
+        let timeout_text = match (env("ARNEB_STATEMENT_TIMEOUT"), &self.statement_timeout) {
+            (Some(v), _) => Some(v),
+            (None, Some(TimeLimitValue::Millis(ms))) => Some(ms.to_string()),
+            (None, Some(TimeLimitValue::Text(t))) => Some(t.clone()),
+            (None, None) => None,
+        };
+        let statement_timeout = match timeout_text {
+            None => None,
+            Some(t) => arneb_common::duration::parse_time_limit(&t)
+                .map_err(|e| anyhow::anyhow!("[admission] statement_timeout: {e}"))?,
+        };
+        Ok(AdmissionSettings {
+            max_running_queries,
+            max_queued_queries,
+            statement_timeout,
+        })
     }
 }
 
@@ -847,6 +951,8 @@ impl AppConfig {
                         tls: None,
                         tls_settings: None,
                         web: WebConfig::default(),
+                        admission: AdmissionConfig::default(),
+                        admission_settings: AdmissionSettings::default(),
                     }
                 }
             }
@@ -860,6 +966,7 @@ impl AppConfig {
         let tls_settings = TlsConfig::resolve(config.tls.as_ref(), |k| std::env::var(k).ok())?;
         let mut web = config.web;
         web.apply_env_overrides(|k| std::env::var(k).ok());
+        let admission_settings = config.admission.resolve(|k| std::env::var(k).ok())?;
 
         Ok(AppConfig {
             server,
@@ -873,6 +980,8 @@ impl AppConfig {
             tls: config.tls,
             tls_settings,
             web,
+            admission: config.admission,
+            admission_settings,
         })
     }
 }
@@ -1143,6 +1252,63 @@ pgwire = "required"
             .to_string();
         assert!(err.contains("key_path") && err.contains("ca_path"), "{err}");
         assert!(toml::from_str::<AppConfig>("[cluster.tls]\ncert = \"/x\"\n").is_err());
+    }
+
+    #[test]
+    fn test_admission_defaults_file_and_env() {
+        let none: AppConfig = toml::from_str("port = 5432").unwrap();
+        assert_eq!(
+            none.admission.resolve(env_from(&[])).unwrap(),
+            AdmissionSettings::default()
+        );
+
+        let file: AppConfig = toml::from_str(
+            "[admission]\nmax_running_queries = 2\nmax_queued_queries = 5\nstatement_timeout = \"30s\"\n",
+        )
+        .unwrap();
+        let s = file.admission.resolve(env_from(&[])).unwrap();
+        assert_eq!(s.max_running_queries, 2);
+        assert_eq!(s.max_queued_queries, 5);
+        assert_eq!(
+            s.statement_timeout,
+            Some(std::time::Duration::from_secs(30))
+        );
+
+        let s = file
+            .admission
+            .resolve(env_from(&[
+                ("ARNEB_MAX_RUNNING_QUERIES", "0"),
+                ("ARNEB_STATEMENT_TIMEOUT", "2min"),
+            ]))
+            .unwrap();
+        assert_eq!(s.max_running_queries, 0);
+        assert_eq!(
+            s.statement_timeout,
+            Some(std::time::Duration::from_secs(120))
+        );
+
+        let ms: AppConfig = toml::from_str("[admission]\nstatement_timeout = 1500\n").unwrap();
+        assert_eq!(
+            ms.admission
+                .resolve(env_from(&[]))
+                .unwrap()
+                .statement_timeout,
+            Some(std::time::Duration::from_millis(1500))
+        );
+    }
+
+    #[test]
+    fn test_admission_validation() {
+        let none: AppConfig = toml::from_str("port = 5432").unwrap();
+        assert!(none
+            .admission
+            .resolve(env_from(&[("ARNEB_MAX_RUNNING_QUERIES", "-1")]))
+            .is_err());
+        assert!(none
+            .admission
+            .resolve(env_from(&[("ARNEB_STATEMENT_TIMEOUT", "soon")]))
+            .is_err());
+        assert!(toml::from_str::<AppConfig>("[admission]\nmax_running = 1\n").is_err());
     }
 
     #[test]

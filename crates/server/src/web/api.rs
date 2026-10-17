@@ -36,6 +36,12 @@ pub struct ListQueryParams {
 struct ClusterResponse {
     worker_count: usize,
     role: String,
+    /// Admission counters (admission-control D5); `max_running_queries`
+    /// 0 means unlimited.
+    running_queries: usize,
+    queued_queries: usize,
+    max_running_queries: usize,
+    max_queued_queries: usize,
 }
 
 /// JSON response for a worker.
@@ -126,9 +132,21 @@ async fn cancel_query(
 }
 
 async fn cluster_overview(State(state): State<WebState>) -> Json<ClusterResponse> {
+    let admission = state.admission.as_ref().map(|a| a.snapshot()).unwrap_or(
+        arneb_scheduler::AdmissionSnapshot {
+            running: 0,
+            queued: 0,
+            max_running: 0,
+            max_queued: 0,
+        },
+    );
     Json(ClusterResponse {
         worker_count: state.node_registry.alive_count(),
         role: state.role.clone(),
+        running_queries: admission.running,
+        queued_queries: admission.queued,
+        max_running_queries: admission.max_running,
+        max_queued_queries: admission.max_queued,
     })
 }
 

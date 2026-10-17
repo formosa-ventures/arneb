@@ -288,8 +288,63 @@ pub enum ConfigError {
 /// Convenience type alias for Results using ArnebError.
 pub type Result<T> = std::result::Result<T, ArnebError>;
 
+/// Marker a worker puts on a memory-limit failure so its class survives
+/// the trip back across exchanges (admission-control D3). Operators wrap
+/// upstream errors in their own message (`aggregate input stream: …`), so
+/// the tag is kept wherever the text goes and classified only at the
+/// client-facing edge.
+pub const RESOURCE_EXHAUSTED_TAG: &str = "[resource exhausted] ";
+
+/// Whether `err` is, or wraps, a memory-limit failure.
+pub fn is_resource_exhausted(err: &ArnebError) -> bool {
+    matches!(
+        err,
+        ArnebError::Execution(ExecutionError::ResourceExhausted(_))
+    ) || err.to_string().contains(RESOURCE_EXHAUSTED_TAG)
+}
+
+/// The client-facing message for a memory-limit failure: the innermost
+/// tagged cause (without the tag and the escaping that nested gRPC
+/// messages add), or the whole message when it carries no tag.
+pub fn resource_exhausted_message(err: &ArnebError) -> String {
+    let text = err.to_string();
+    match text.rfind(RESOURCE_EXHAUSTED_TAG) {
+        None => text,
+        Some(i) => text[i + RESOURCE_EXHAUSTED_TAG.len()..]
+            .trim_end_matches(['\\', '"', '\'', ' '])
+            .to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resource_exhausted_survives_wrapping() {
+        let inner = format!(
+            "{RESOURCE_EXHAUSTED_TAG}stream error during execution: query memory limit exceeded: \\\"x\\\""
+        );
+        let wrapped = ArnebError::Execution(ExecutionError::InvalidOperation(format!(
+            "aggregate input stream: Flight stream error: message: \"{inner}\\\"\""
+        )));
+        assert!(is_resource_exhausted(&wrapped));
+        let msg = resource_exhausted_message(&wrapped);
+        assert!(
+            msg.starts_with("stream error during execution: query memory limit exceeded"),
+            "{msg}"
+        );
+        assert!(!msg.ends_with('"') && !msg.ends_with('\\'), "{msg}");
+
+        let local = ArnebError::Execution(ExecutionError::ResourceExhausted("limit".into()));
+        assert!(is_resource_exhausted(&local));
+        assert_eq!(
+            resource_exhausted_message(&local),
+            "resource exhausted: limit"
+        );
+
+        let other = ArnebError::Execution(ExecutionError::InvalidOperation("boom".into()));
+        assert!(!is_resource_exhausted(&other));
+    }
+
     use super::*;
 
     #[test]

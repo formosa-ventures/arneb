@@ -81,7 +81,7 @@ shown), with the effective value logged.
 |------|---------|---------|-------------|
 | dirty/muzzy page decay | `500` ms | `ARNEB_DIRTY_DECAY_MS` | How long jemalloc holds freed pages before `madvise`-ing them back to the OS. Lower = tighter RSS but more page re-faults; `0` returns immediately (slowest); higher lets RSS drift up. `500` ms is the measured sweet spot. Applied via `mallctl` — do **not** set `MALLOC_CONF`, it is ignored. |
 | spill budget | config / cgroup | `ARNEB_SPILL_BUDGET_BYTES` | Per-node budget (bytes) a spillable operator (SemiJoin/HashJoin build) reserves against before spilling to disk. Overrides the `[memory] spill_budget_bytes` config field. Exists as an env var because the bench config is COPYed into the docker image at build time — the env override retunes without an image rebuild. |
-| query memory cap | config | `ARNEB_QUERY_MAX_MEMORY_BYTES` | Per-task cumulative allocation cap (bytes). When the query's tracked `MemoryReservation` crosses it, the query fails cleanly with `ResourceExhausted` instead of OOM-killing the worker. Overrides `[memory] query_max_memory_per_node`. |
+| query memory limit | config | `ARNEB_QUERY_MAX_MEMORY_BYTES` | Per-query limit on each node (bytes), see [Admission control](#admission-control). Overrides `[memory] query_max_memory_per_node`. |
 
 The startup log line `memory pool installed … spill_budget_bytes=… spill_budget_source=…`
 confirms the resolved value and its source (`env` / `config` / `cgroup_v2` / `cgroup_v1`
@@ -118,6 +118,64 @@ runs the in-binary defaults.
 
 `ARNEB_NARROW_KEYS` is deliberately **not** a default: its column allowlist is a
 TPC-H-specific stopgap for the Hive connector's missing plan-time min/max stats.
+
+## Admission Control
+
+The coordinator (or standalone node) caps how many queries run at once,
+queues the rest, and can limit each query's memory and run time.
+
+```toml
+[admission]
+max_running_queries = 8      # ARNEB_MAX_RUNNING_QUERIES; 0 = unlimited
+max_queued_queries  = 256    # ARNEB_MAX_QUEUED_QUERIES
+statement_timeout   = "0"    # ARNEB_STATEMENT_TIMEOUT; "30s", "5min", 30000 (ms); 0 = off
+
+[memory]
+query_max_memory_per_node = 4294967296   # ARNEB_QUERY_MAX_MEMORY_BYTES; unset = no per-query limit
+```
+
+| Setting | Default | Description |
+|---|---|---|
+| `max_running_queries` | `8` | Statements that execute a plan at the same time, across pgwire and the Trino listener. `0` disables the cap. |
+| `max_queued_queries` | `256` | Statements waiting for a slot. Beyond that a statement fails at once with SQLSTATE `53000` (pgwire) or `QUERY_QUEUE_FULL` (Trino). |
+| `statement_timeout` | `0` (off) | Server default for sessions that set no timeout of their own; it counts queue time. |
+| `query_max_memory_per_node` | unset | Each query's memory limit **on each node**. |
+
+**Queue.** A statement takes a slot after session and metadata handling and
+before planning, so a queued query holds no plan, memory or workers. Slots
+go to waiters in arrival order. Only statements that execute a plan queue
+(queries, `INSERT`, `DELETE`, `CREATE TABLE AS`, `EXPLAIN ANALYZE`); `SET`,
+`SHOW`, metadata queries, catalog DDL and plain `EXPLAIN` never wait. A Trino
+query reports `QUEUED` while it waits. The counters are on
+`/api/v1/cluster` (`running_queries`, `queued_queries`,
+`max_running_queries`, `max_queued_queries`) and the Web UI dashboard, and
+`arneb::admission` logs each queued and admitted query (with its position
+and wait time). Workers have no queue; the coordinator's cap bounds what
+reaches them.
+
+**Memory limit.** With `query_max_memory_per_node` set, every query gets its
+own budget of that many bytes on each node it runs on (per statement on the
+coordinator, per query on each worker), on top of the node's spill budget.
+A query that exceeds it fails with SQLSTATE `53200` (pgwire) or
+`EXCEEDED_LOCAL_MEMORY_LIMIT` (Trino), and the other queries on that node
+keep running. The limit is per node, not cluster-wide: a query on two
+workers can use up to twice the limit in total, and a skewed query hits it
+first on the node with the most data. Start around 0.5–0.8 × the node's
+spill budget.
+
+**Timeouts and cancellation.** pgwire sessions use `SET statement_timeout`,
+and Trino sessions use the `query_max_execution_time` (excludes queue time)
+and `query_max_run_time` (includes it) session properties; see
+[SQL Overview](/sql/overview#session-settings) and
+[Trino Clients](/guide/trino-clients#time-limits-and-queuing). A query that
+times out, is cancelled (Trino `DELETE`), fails in one fragment or loses its
+client is cancelled on every worker: its tasks stop and their memory and
+output buffers are released. `arneb::cluster` logs `cancelling query on
+workers` on the coordinator and `query cancelled on worker` on each worker.
+
+The effective values are logged at startup on `arneb::config`. Set
+`max_running_queries = 0` and leave the other two unset to turn admission
+off.
 
 ## Table Registration
 

@@ -320,10 +320,10 @@ impl TaskManager {
             return Arc::clone(&self.memory_pool);
         };
         let mut pools = self.query_pools.lock().unwrap_or_else(|e| e.into_inner());
-        pools.retain(|_, pool| pool.strong_count() > 0);
         if let Some(pool) = pools.get(&query_id).and_then(Weak::upgrade) {
             return pool;
         }
+        pools.retain(|_, pool| pool.strong_count() > 0);
         let pool = Arc::new(QueryMemoryPool::new(Arc::clone(&self.memory_pool), limit));
         pools.insert(query_id, Arc::downgrade(&pool));
         pool

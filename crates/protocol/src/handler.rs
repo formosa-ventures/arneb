@@ -363,27 +363,7 @@ impl SimpleQueryHandler for ConnectionHandler {
         let catalog_manager = self.session_catalog(client);
         if let Some(meta_result) = self.intercept(client, trimmed, &catalog_manager).await {
             return match meta_result {
-                Ok(crate::metadata::MetadataResponse::Query(fields, batches)) => {
-                    let field_info: Vec<FieldInfo> = fields
-                        .iter()
-                        .map(|f| {
-                            let pg_type = arrow_type_to_pg(f.data_type());
-                            FieldInfo::new(f.name().clone(), None, None, pg_type, FieldFormat::Text)
-                        })
-                        .collect();
-                    let schema = Arc::new(field_info);
-                    let (rows, _) = encode_record_batches(&schema, &batches)?;
-                    let data_row_stream = stream::iter(rows);
-                    Ok(vec![Response::Query(QueryResponse::new(
-                        schema,
-                        data_row_stream,
-                    ))])
-                }
-                Ok(crate::metadata::MetadataResponse::Command(tag)) => {
-                    Ok(vec![Response::Execution(pgwire::api::results::Tag::new(
-                        &tag,
-                    ))])
-                }
+                Ok(resp) => metadata_to_response(resp).map(|r| vec![r]),
                 Err(e) => Err(arneb_error_to_pg_error(&ArnebError::Execution(
                     arneb_common::error::ExecutionError::InvalidOperation(e),
                 ))),
@@ -567,22 +547,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
         let catalog_manager = self.session_catalog(client);
         if let Some(meta_result) = self.intercept(client, trimmed, &catalog_manager).await {
             return match meta_result {
-                Ok(crate::metadata::MetadataResponse::Query(fields, batches)) => {
-                    let field_info: Vec<FieldInfo> = fields
-                        .iter()
-                        .map(|f| {
-                            let pg_type = arrow_type_to_pg(f.data_type());
-                            FieldInfo::new(f.name().clone(), None, None, pg_type, FieldFormat::Text)
-                        })
-                        .collect();
-                    let schema = Arc::new(field_info);
-                    let (rows, _) = encode_record_batches(&schema, &batches)?;
-                    let data_row_stream = stream::iter(rows);
-                    Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
-                }
-                Ok(crate::metadata::MetadataResponse::Command(tag)) => {
-                    Ok(Response::Execution(pgwire::api::results::Tag::new(&tag)))
-                }
+                Ok(resp) => metadata_to_response(resp),
                 Err(e) => Err(arneb_error_to_pg_error(&ArnebError::Execution(
                     arneb_common::error::ExecutionError::InvalidOperation(e),
                 ))),

@@ -118,8 +118,10 @@ Two full runs on 2026-10-13 (on 142205f) and one on the morning of 2026-10-14
 Per-query speedups moved by a median of 4–6% between consecutive runs (worst:
 q16 cold, 29%); the geomeans moved by at most 0.1x (4.3x / 1.9x / 0.17x,
 4.2x / 2.0x / 0.18x and 4.3x / 2.0x / 0.16x cold / warm / memory). The one
-unstable memory figure is arneb's q18 peak: 2.0, 3.0 and 4.7 GB across those
-three, 2.2 GB in this one
+unstable memory figure was arneb's q18 peak: 2.0, 3.0 and 4.7 GB across those
+three, 2.2 GB in this one. One worker peaked at about twice the other; every
+run since the dataset was re-seeded has both workers at ~1.4 GB, and the seed
+now writes a fixed layout (8 near-equal files per table, Trino pinned)
 ([#126](https://github.com/formosa-ventures/arneb/issues/126)). A single-query difference under ~30% in
 these tables is therefore not a result.
 

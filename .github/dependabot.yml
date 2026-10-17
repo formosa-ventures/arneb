@@ -22,3 +22,22 @@ updates:
         update-types:
           - minor
           - patch
+
+  # Image tags in docker-compose.yml. Dependabot ignores floating tags, so
+  # this only works because the Trino services are pinned (483 at the time
+  # of writing). A Trino bump changes the bench baseline and the seed
+  # layout, so merge it together with a re-seed and a fresh bench run.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+
+  # Base images of the two Dockerfiles (rust, debian, apache/hive).
+  - package-ecosystem: docker
+    directories:
+      - /docker/arneb-bench
+      - /docker/hive-metastore
+    schedule:
+      interval: weekly
+      day: monday

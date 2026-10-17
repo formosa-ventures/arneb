@@ -106,6 +106,8 @@ pub struct HandlerFactory {
     /// Admission control shared with the Trino listener; `None` admits
     /// every statement at once.
     pub admission: Option<arneb_scheduler::AdmissionController>,
+    /// Server default `statement_timeout` for sessions that set none.
+    pub statement_timeout: Option<std::time::Duration>,
     /// Client authentication mode enforced during connection startup. Covers
     /// both the Simple and Extended Query paths, which share one startup
     /// handler.
@@ -124,6 +126,7 @@ impl PgWireServerHandlers for HandlerFactory {
             memory_pool: Arc::clone(&self.memory_pool),
             query_memory_limit: self.query_memory_limit,
             admission: self.admission.clone(),
+            statement_timeout: self.statement_timeout,
         })
     }
 
@@ -135,6 +138,7 @@ impl PgWireServerHandlers for HandlerFactory {
             memory_pool: Arc::clone(&self.memory_pool),
             query_memory_limit: self.query_memory_limit,
             admission: self.admission.clone(),
+            statement_timeout: self.statement_timeout,
         })
     }
 
@@ -166,9 +170,96 @@ pub struct ConnectionHandler {
     pub query_memory_limit: Option<usize>,
     /// Admission control; see [`HandlerFactory::admission`].
     pub admission: Option<arneb_scheduler::AdmissionController>,
+    /// Server default timeout; see [`HandlerFactory::statement_timeout`].
+    pub statement_timeout: Option<std::time::Duration>,
 }
 
 impl ConnectionHandler {
+    /// The connection's effective `statement_timeout`.
+    fn effective_timeout<C: ClientInfo>(&self, client: &C) -> Option<std::time::Duration> {
+        client
+            .session_extensions()
+            .get::<crate::timeout::SessionTimeout>()
+            .map_or(self.statement_timeout, |t| {
+                t.effective(self.statement_timeout)
+            })
+    }
+
+    /// Handle `SET` / `SHOW` / `RESET statement_timeout`, and reset it on
+    /// `RESET ALL` (which then falls through to `search_path`). An invalid
+    /// value is `ERROR 22023`.
+    fn timeout_command<C: ClientInfo>(
+        &self,
+        client: &C,
+        sql: &str,
+    ) -> Option<PgWireResult<Response>> {
+        use crate::timeout::{Command, SessionTimeout};
+        if crate::timeout::is_reset_all(sql) {
+            client
+                .session_extensions()
+                .insert(SessionTimeout::default());
+            return None;
+        }
+        let command = match crate::timeout::parse(sql)? {
+            Ok(c) => c,
+            Err(msg) => {
+                return Some(Err(PgWireError::UserError(Box::new(
+                    pgwire::error::ErrorInfo::new("ERROR".to_owned(), "22023".to_owned(), msg),
+                ))))
+            }
+        };
+        let response = match command {
+            Command::Show => crate::timeout::show_result(self.effective_timeout(client)),
+            Command::Set(value) => {
+                client.session_extensions().insert(SessionTimeout {
+                    explicit: Some(value),
+                });
+                Ok(crate::metadata::MetadataResponse::Command("SET".to_owned()))
+            }
+            Command::Reset => {
+                client
+                    .session_extensions()
+                    .insert(SessionTimeout::default());
+                Ok(crate::metadata::MetadataResponse::Command(
+                    "RESET".to_owned(),
+                ))
+            }
+        };
+        Some(
+            response
+                .map_err(|e| {
+                    arneb_error_to_pg_error(&ArnebError::Execution(
+                        ExecutionError::InvalidOperation(e),
+                    ))
+                })
+                .and_then(metadata_to_response),
+        )
+    }
+
+    /// Run `work` (admission wait plus execution) under the connection's
+    /// `statement_timeout`, timed from statement receipt. On expiry the
+    /// work future is dropped, which cancels the query on its workers, and
+    /// the client gets `ERROR 57014`.
+    async fn with_timeout<C: ClientInfo, T>(
+        &self,
+        client: &C,
+        work: impl std::future::Future<Output = PgWireResult<T>>,
+    ) -> PgWireResult<T> {
+        match self.effective_timeout(client) {
+            None => work.await,
+            Some(limit) => match tokio::time::timeout(limit, work).await {
+                Ok(result) => result,
+                Err(_) => Err(PgWireError::UserError(Box::new(
+                    pgwire::error::ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "57014".to_owned(),
+                        "canceling statement due to statement timeout".to_owned(),
+                    ),
+                ))),
+            },
+        }
+    }
+
     /// Wait for an admission slot when `sql` executes a plan. The permit is
     /// held until the statement's results are produced; a full queue is
     /// `ERROR 53000`.
@@ -228,6 +319,17 @@ impl ConnectionHandler {
         sql: &str,
         catalog_manager: &CatalogManager,
     ) -> Option<crate::metadata::MetadataResult> {
+        match crate::timeout::parse(sql) {
+            Some(Ok(crate::timeout::Command::Show)) => {
+                return Some(crate::timeout::show_result(self.effective_timeout(client)));
+            }
+            Some(_) => {
+                return Some(Ok(crate::metadata::MetadataResponse::Command(
+                    "SET".to_owned(),
+                )))
+            }
+            None => {}
+        }
         let current = client.session_extensions().get::<SearchPath>();
         if let Some((result, _)) =
             handle_search_path(sql, &self.catalog_manager, current.as_deref()).await
@@ -252,6 +354,9 @@ impl SimpleQueryHandler for ConnectionHandler {
         }
 
         tracing::debug!(query = trimmed, "processing simple query");
+        if let Some(response) = self.timeout_command(client, trimmed) {
+            return response.map(|r| vec![r]);
+        }
 
         // Intercept session commands and metadata queries (pg_catalog,
         // information_schema, version()).
@@ -291,16 +396,20 @@ impl SimpleQueryHandler for ConnectionHandler {
         // SQLSTATE codes are unaffected.
         let source = SourceFile::new("<query>", trimmed);
 
-        let _admission = self.admit(trimmed).await?;
-        let result = execute_query_with_limit(
-            trimmed,
-            &catalog_manager,
-            &self.connector_registry,
-            self.distributed_executor.as_deref(),
-            &self.memory_pool,
-            self.query_memory_limit,
-        )
-        .await;
+        let result = self
+            .with_timeout(client, async {
+                let _admission = self.admit(trimmed).await?;
+                Ok(execute_query_with_limit(
+                    trimmed,
+                    &catalog_manager,
+                    &self.connector_registry,
+                    self.distributed_executor.as_deref(),
+                    &self.memory_pool,
+                    self.query_memory_limit,
+                )
+                .await)
+            })
+            .await?;
 
         match result {
             Ok((plan, batches)) => {
@@ -450,6 +559,9 @@ impl ExtendedQueryHandler for ConnectionHandler {
         }
 
         tracing::debug!(query = trimmed, "processing extended query");
+        if let Some(response) = self.timeout_command(client, trimmed) {
+            return response;
+        }
 
         // Intercept session commands and metadata queries
         let catalog_manager = self.session_catalog(client);
@@ -478,16 +590,20 @@ impl ExtendedQueryHandler for ConnectionHandler {
         }
 
         let source = SourceFile::new("<query>", trimmed);
-        let _admission = self.admit(trimmed).await?;
-        let result = execute_query_with_limit(
-            trimmed,
-            &catalog_manager,
-            &self.connector_registry,
-            self.distributed_executor.as_deref(),
-            &self.memory_pool,
-            self.query_memory_limit,
-        )
-        .await;
+        let result = self
+            .with_timeout(client, async {
+                let _admission = self.admit(trimmed).await?;
+                Ok(execute_query_with_limit(
+                    trimmed,
+                    &catalog_manager,
+                    &self.connector_registry,
+                    self.distributed_executor.as_deref(),
+                    &self.memory_pool,
+                    self.query_memory_limit,
+                )
+                .await)
+            })
+            .await?;
 
         match result {
             Ok((plan, batches)) => {
@@ -632,6 +748,35 @@ fn count_placeholders(sql: &str) -> usize {
         }
     }
     max_idx
+}
+
+/// A session command's result as a pgwire response.
+fn metadata_to_response(resp: crate::metadata::MetadataResponse) -> PgWireResult<Response> {
+    match resp {
+        crate::metadata::MetadataResponse::Query(fields, batches) => {
+            let field_info: Vec<FieldInfo> = fields
+                .iter()
+                .map(|f| {
+                    FieldInfo::new(
+                        f.name().clone(),
+                        None,
+                        None,
+                        arrow_type_to_pg(f.data_type()),
+                        FieldFormat::Text,
+                    )
+                })
+                .collect();
+            let schema = Arc::new(field_info);
+            let (rows, _) = encode_record_batches(&schema, &batches)?;
+            Ok(Response::Query(QueryResponse::new(
+                schema,
+                stream::iter(rows),
+            )))
+        }
+        crate::metadata::MetadataResponse::Command(tag) => {
+            Ok(Response::Execution(pgwire::api::results::Tag::new(&tag)))
+        }
+    }
 }
 
 /// Whether `sql` executes a plan and so takes an admission slot

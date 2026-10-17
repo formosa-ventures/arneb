@@ -784,6 +784,7 @@ async fn run() -> Result<()> {
     .with_memory_pool(Arc::clone(&memory_pool))
     .with_query_memory_limit(query_memory_limit)
     .with_admission(admission.clone())
+    .with_statement_timeout(config.admission_settings.statement_timeout)
     .with_auth(auth_method)
     .with_tls(pgwire_tls);
     if let Some(ref executor) = distributed_executor {
@@ -824,6 +825,7 @@ async fn run() -> Result<()> {
         .with_memory_pool(Arc::clone(&memory_pool))
         .with_query_memory_limit(query_memory_limit)
         .with_admission(admission.clone())
+        .with_statement_timeout(config.admission_settings.statement_timeout)
         .with_query_tracker(query_tracker.clone())
         .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
         .with_password_auth(password_users.clone())

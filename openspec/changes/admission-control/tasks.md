@@ -49,11 +49,11 @@ Sections 1–4 land as four PRs, in order: A (memory), B (cancellation), C (admi
 
 ## 4. PR D — statement timeouts (D7, D8)
 
-- [ ] 4.1 pgwire session: handle `SET` / `SHOW` / `RESET statement_timeout` in `session.rs` next to `search_path`, with PostgreSQL value parsing and an invalid value → `22023`.
-- [ ] 4.2 pgwire enforcement: wrap admission plus execution in `tokio::time::timeout` from statement receipt. On expiry, drop the future (PR B cancels the workers) and return `57014 canceling statement due to statement timeout`.
-- [ ] 4.3 Trino: parse `query_max_execution_time` (timer from admission) and `query_max_run_time` (timer from submission) from the session as Trino durations. On expiry, fail with `EXCEEDED_TIME_LIMIT` (131075) through `cancel_query`. A bad duration → `INVALID_SESSION_PROPERTY`.
-- [ ] 4.4 Server default `[admission] statement_timeout` / `ARNEB_STATEMENT_TIMEOUT` applies to both protocols when the session sets none.
-- [ ] 4.5 Tests:
+- [x] 4.1 pgwire session: handle `SET` / `SHOW` / `RESET statement_timeout` in `session.rs` next to `search_path`, with PostgreSQL value parsing and an invalid value → `22023`.
+- [x] 4.2 pgwire enforcement: wrap admission plus execution in `tokio::time::timeout` from statement receipt. On expiry, drop the future (PR B cancels the workers) and return `57014 canceling statement due to statement timeout`.
+- [x] 4.3 Trino: parse `query_max_execution_time` (timer from admission) and `query_max_run_time` (timer from submission) from the session as Trino durations. On expiry, fail with `EXCEEDED_TIME_LIMIT` (131075) through `cancel_query`. A bad duration → `INVALID_SESSION_PROPERTY`.
+- [x] 4.4 Server default `[admission] statement_timeout` / `ARNEB_STATEMENT_TIMEOUT` applies to both protocols when the session sets none.
+- [x] 4.5 Tests:
   - Duration parsing (PostgreSQL and Trino forms).
   - pgwire: `SET`/`SHOW`/`RESET`, a timeout fires `57014`, and the connection stays usable.
   - Trino: `EXCEEDED_TIME_LIMIT`, and queue time is excluded from `query_max_execution_time`.

@@ -30,6 +30,23 @@ impl TrinoError {
         }
     }
 
+    /// A query ran past `query_max_execution_time` / `query_max_run_time`
+    /// (Trino `EXCEEDED_TIME_LIMIT`).
+    pub(crate) fn exceeded_time_limit(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: 131075,
+            name: "EXCEEDED_TIME_LIMIT",
+            kind: INSUFFICIENT_RESOURCES,
+        }
+    }
+
+    /// A session property has an invalid value (Trino
+    /// `INVALID_SESSION_PROPERTY`).
+    pub(crate) fn invalid_session_property(message: impl Into<String>) -> Self {
+        Self::user(14, "INVALID_SESSION_PROPERTY", message)
+    }
+
     /// The admission queue is full (Trino `QUERY_QUEUE_FULL`).
     pub(crate) fn queue_full(message: impl Into<String>) -> Self {
         Self {

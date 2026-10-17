@@ -30,6 +30,7 @@ async fn start_test_server(
         tls_required: false,
         query_memory_limit: None,
         admission: None,
+        statement_timeout: None,
     });
 
     tokio::spawn(async move {

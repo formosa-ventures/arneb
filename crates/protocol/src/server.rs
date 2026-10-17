@@ -38,6 +38,7 @@ pub struct ProtocolServer {
     tls: Option<PgwireTls>,
     query_memory_limit: Option<usize>,
     admission: Option<arneb_scheduler::AdmissionController>,
+    statement_timeout: Option<std::time::Duration>,
 }
 
 impl ProtocolServer {
@@ -56,6 +57,7 @@ impl ProtocolServer {
             tls: None,
             query_memory_limit: None,
             admission: None,
+            statement_timeout: None,
         }
     }
 
@@ -105,6 +107,13 @@ impl ProtocolServer {
         self
     }
 
+    /// Server default `statement_timeout` for sessions that set none
+    /// (`[admission] statement_timeout`; default: off).
+    pub fn with_statement_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.statement_timeout = timeout;
+        self
+    }
+
     /// Start the server and begin accepting connections.
     /// This method runs until the process is terminated.
     pub async fn start(&self) -> Result<(), std::io::Error> {
@@ -142,6 +151,7 @@ impl ProtocolServer {
             ),
             query_memory_limit: self.query_memory_limit,
             admission: self.admission.clone(),
+            statement_timeout: self.statement_timeout,
         });
         let acceptor = self.tls.as_ref().map(|t| t.acceptor.clone());
 

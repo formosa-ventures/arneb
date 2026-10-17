@@ -369,6 +369,7 @@ impl DataSource for IcebergDataSource {
             .filter_map(|f| remap_filter(f, &leaf_for))
             .collect();
 
+        let buffer_bytes = parquet_scan::row_group_buffer_bytes(builder.metadata(), Some(&roots));
         let stream = parquet_scan::build_split_stream(
             builder,
             uri,
@@ -383,10 +384,9 @@ impl DataSource for IcebergDataSource {
         )?;
         let schema = output_schema.clone();
         let file_path = uri.clone();
-        Ok(Box::pin(
-            ParquetBatchStream::new(output_schema, stream, uri.clone()).with_adapter(Box::new(
-                move |batch| adapt_batch(&schema, &sources, &file_path, batch),
-            )),
-        ))
+        let stream = ParquetBatchStream::new(output_schema, stream, uri.clone()).with_adapter(
+            Box::new(move |batch| adapt_batch(&schema, &sources, &file_path, batch)),
+        );
+        Ok(Box::pin(stream.with_scan_memory(ctx, buffer_bytes)))
     }
 }

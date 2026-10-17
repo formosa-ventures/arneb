@@ -10,12 +10,19 @@ use arneb_common::stream::{stream_from_batches, RecordBatchStream, SendableRecor
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
 use arrow_flight::Ticket;
 use futures::stream::Stream;
 use futures::TryStreamExt;
 
 use crate::security::{cluster_security, ClusterSecurity};
 
+/// Decoded batches of one `do_get` response.
+type FlightBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, FlightError>> + Send>>;
+
+/// How many times a stream that broke on a transport error is reopened
+/// before the error is surfaced (#139).
+const MAX_RESUME_ATTEMPTS: usize = 3;
 /// Client that fetches RecordBatches from a remote Arrow Flight server.
 #[derive(Debug, Clone)]
 pub struct ExchangeClient {
@@ -79,9 +86,7 @@ impl ExchangeClient {
         let safety_deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(safety_secs);
 
-        let mut client = crate::security::connect(&self.address, &self.security)
-            .await
-            .map_err(|e| ExecutionError::InvalidOperation(format!("Flight server: {e}")))?;
+        let mut client = self.connect().await?;
 
         loop {
             let ticket = Ticket::new(ticket_text.clone());
@@ -139,11 +144,105 @@ impl ExchangeClient {
                 }
             };
 
-            return Self::collect_response(response, ticket_text).await;
+            return self.clone().collect_response(response, ticket_text).await;
         }
     }
 
+    /// A Flight connection with this client's cluster security (bearer
+    /// secret, TLS), for the first `do_get` and for every reopen.
+    async fn connect(&self) -> Result<crate::security::FlightClient, ExecutionError> {
+        crate::security::connect(&self.address, &self.security)
+            .await
+            .map_err(|e| ExecutionError::InvalidOperation(format!("Flight server: {e}")))
+    }
+
+    /// Open `ticket` again after its stream broke. `Err(true)`: worth
+    /// another attempt (transport trouble); `Err(false)`: the output can't
+    /// be read again (a partitioned buffer is consumed once, or is gone).
+    async fn reopen(&self, ticket: &str) -> Result<FlightBatchStream, bool> {
+        let mut client = self.connect().await.map_err(|_| true)?;
+        match client.do_get(Ticket::new(ticket.to_owned())).await {
+            Ok(response) => Ok(decode(response)),
+            Err(status) => Err(is_transport_status(&status)),
+        }
+    }
+
+    /// Wrap a response so a transport break mid-stream (#139) reopens the
+    /// ticket and skips the rows already delivered. Only broadcast output
+    /// can be read again: it replays the same batches in the same order to
+    /// every `do_get`. A partitioned ticket answers the reopen with
+    /// `AlreadyExists`, and the original error is surfaced as before.
+    fn resumable(self, ticket: String, first: FlightBatchStream) -> FlightBatchStream {
+        Box::pin(async_stream::stream! {
+            use futures::StreamExt;
+            let mut stream = first;
+            let mut delivered = 0usize;
+            let mut to_skip = 0usize;
+            let mut attempts = 0usize;
+            loop {
+                match stream.next().await {
+                    Some(Ok(batch)) => {
+                        let rows = batch.num_rows();
+                        if to_skip > 0 && to_skip >= rows {
+                            to_skip -= rows;
+                            continue;
+                        }
+                        let batch = if to_skip > 0 {
+                            let rest = batch.slice(to_skip, rows - to_skip);
+                            to_skip = 0;
+                            rest
+                        } else {
+                            batch
+                        };
+                        delivered += batch.num_rows();
+                        yield Ok(batch);
+                    }
+                    Some(Err(err)) if is_transport_error(&err) && attempts < MAX_RESUME_ATTEMPTS => {
+                        loop {
+                            attempts += 1;
+                            tracing::warn!(
+                                target: "arneb::exchange",
+                                ticket = %ticket,
+                                address = %self.address,
+                                delivered_rows = delivered,
+                                attempt = attempts,
+                                error = %err,
+                                "exchange stream broke, reopening"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(50 << attempts)).await;
+                            match self.reopen(&ticket).await {
+                                Ok(reopened) => {
+                                    stream = reopened;
+                                    to_skip = delivered;
+                                    break;
+                                }
+                                Err(true) if attempts < MAX_RESUME_ATTEMPTS => continue,
+                                Err(_) => {
+                                    yield Err(err);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(err)) => {
+                        yield Err(err);
+                        return;
+                    }
+                    None => {
+                        if to_skip > 0 {
+                            yield Err(FlightError::ProtocolError(format!(
+                                "reopened stream for {ticket} ended {to_skip} rows short"
+                            )));
+                        }
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
     async fn collect_response(
+        self,
         response: tonic::Response<tonic::Streaming<arrow_flight::FlightData>>,
         ticket_text: String,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
@@ -154,11 +253,7 @@ impl ExchangeClient {
         let traced = std::env::var("ARNEB_TRACE_FRAGMENTS")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
-        let mut flight_stream = FlightRecordBatchStream::new_from_flight_data(
-            response
-                .into_inner()
-                .map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
-        );
+        let mut flight_stream = self.resumable(ticket_text.clone(), decode(response));
 
         // Phase 3b.7a (2026-05-21): true streaming. Peek the first batch
         // only (so we have a schema before returning a typed stream), then
@@ -216,7 +311,7 @@ struct FlightPassthroughStream {
     schema: SchemaRef,
     first: Option<RecordBatch>,
     first_live: Option<LiveBytesGuard>,
-    inner: FlightRecordBatchStream,
+    inner: FlightBatchStream,
     // [EXCHTRACE] per-ticket consumer-side row tally (gated by ARNEB_TRACE_FRAGMENTS).
     ticket: String,
     traced: bool,
@@ -277,6 +372,30 @@ impl Stream for FlightPassthroughStream {
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+fn decode(
+    response: tonic::Response<tonic::Streaming<arrow_flight::FlightData>>,
+) -> FlightBatchStream {
+    Box::pin(FlightRecordBatchStream::new_from_flight_data(
+        response
+            .into_inner()
+            .map_err(|e| FlightError::Tonic(Box::new(e))),
+    ))
+}
+
+/// A status the transport produced (connection closed or reset, h2
+/// error), as opposed to one the producer sent: producer failures arrive
+/// as `Internal` / `ResourceExhausted`.
+fn is_transport_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unknown | tonic::Code::Unavailable
+    )
+}
+
+fn is_transport_error(err: &FlightError) -> bool {
+    matches!(err, FlightError::Tonic(status) if is_transport_status(status))
 }
 
 fn exchange_receive_batch_bytes(batch: &RecordBatch) -> u64 {

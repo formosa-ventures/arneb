@@ -10,7 +10,7 @@
 # Build: docker compose build hive-metastore
 # Run:   docker compose up -d
 
-FROM apache/hive:4.2.0
+FROM apache/hive:4.2.1
 
 # Hive 4.2.0 ships with Hadoop 3.4.1. hadoop-aws 3.4.x uses AWS SDK v2
 # (software.amazon.awssdk:bundle), NOT v1 (com.amazonaws:aws-java-sdk-bundle).

@@ -1,7 +1,7 @@
 //! Mapping from [`ArnebError`] to the Trino `QueryError` JSON object.
 
 use arneb_common::diagnostic::{render_plan_error, SourceFile};
-use arneb_common::error::{ArnebError, CatalogError, ConnectorError, ExecutionError, PlanError};
+use arneb_common::error::{ArnebError, CatalogError, ConnectorError, PlanError};
 use serde_json::{json, Value};
 
 /// A Trino `QueryError`: the `(errorCode, errorName, errorType)` triple
@@ -27,6 +27,33 @@ impl TrinoError {
             code,
             name,
             kind: USER_ERROR,
+        }
+    }
+
+    /// A query ran past `query_max_execution_time` / `query_max_run_time`
+    /// (Trino `EXCEEDED_TIME_LIMIT`).
+    pub(crate) fn exceeded_time_limit(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: 131075,
+            name: "EXCEEDED_TIME_LIMIT",
+            kind: INSUFFICIENT_RESOURCES,
+        }
+    }
+
+    /// A session property has an invalid value (Trino
+    /// `INVALID_SESSION_PROPERTY`).
+    pub(crate) fn invalid_session_property(message: impl Into<String>) -> Self {
+        Self::user(14, "INVALID_SESSION_PROPERTY", message)
+    }
+
+    /// The admission queue is full (Trino `QUERY_QUEUE_FULL`).
+    pub(crate) fn queue_full(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: 131074,
+            name: "QUERY_QUEUE_FULL",
+            kind: INSUFFICIENT_RESOURCES,
         }
     }
 
@@ -59,10 +86,20 @@ impl TrinoError {
     /// planner diagnostics already used by the pgwire path.
     pub(crate) fn from_arneb(err: &ArnebError, source: Option<&SourceFile>) -> Self {
         let message = match (err, source) {
+            _ if arneb_common::error::is_resource_exhausted(err) => {
+                arneb_common::error::resource_exhausted_message(err)
+            }
             (ArnebError::Plan(e), Some(src)) => render_plan_error(e, src),
             _ => err.to_string(),
         };
         let (code, name, kind) = match err {
+            // A memory-limit failure, possibly re-wrapped by operators on its
+            // way back from a worker (admission-control D3).
+            _ if arneb_common::error::is_resource_exhausted(err) => (
+                131079,
+                "EXCEEDED_LOCAL_MEMORY_LIMIT",
+                INSUFFICIENT_RESOURCES,
+            ),
             ArnebError::Parse(_) => (1, "SYNTAX_ERROR", USER_ERROR),
             ArnebError::Plan(e) => match e {
                 PlanError::TableNotFound(_) => (46, "TABLE_NOT_FOUND", USER_ERROR),
@@ -80,11 +117,6 @@ impl TrinoError {
                 #[allow(unreachable_patterns)]
                 _ => (0, "GENERIC_USER_ERROR", USER_ERROR),
             },
-            ArnebError::Execution(ExecutionError::ResourceExhausted(_)) => (
-                131079,
-                "EXCEEDED_LOCAL_MEMORY_LIMIT",
-                INSUFFICIENT_RESOURCES,
-            ),
             ArnebError::Connector(ConnectorError::TableNotFound(_)) => {
                 (46, "TABLE_NOT_FOUND", USER_ERROR)
             }

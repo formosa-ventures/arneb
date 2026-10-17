@@ -15,6 +15,9 @@ pub struct WebState {
     pub node_registry: NodeRegistry,
     pub start_time: std::time::Instant,
     pub role: String,
+    /// Admission controller shared with pgwire and Trino (coordinator /
+    /// standalone); `None` on workers or when admission is off.
+    pub admission: Option<arneb_scheduler::AdmissionController>,
 }
 
 /// Build the axum Router with API and frontend routes.

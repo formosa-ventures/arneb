@@ -203,7 +203,26 @@ Failures come back as a Trino `QueryError` (`message`, `errorCode`,
 `errorName`, `errorType`, `failureInfo`), with the query in state `FAILED`.
 Common classifications: `SYNTAX_ERROR`, `TABLE_NOT_FOUND`, `COLUMN_NOT_FOUND`,
 `CATALOG_NOT_FOUND`, `SCHEMA_NOT_FOUND`, `FUNCTION_NOT_FOUND`, `NOT_SUPPORTED`,
-`USER_CANCELED`, `EXCEEDED_LOCAL_MEMORY_LIMIT`, `GENERIC_INTERNAL_ERROR`.
+`USER_CANCELED`, `EXCEEDED_LOCAL_MEMORY_LIMIT`, `EXCEEDED_TIME_LIMIT`,
+`QUERY_QUEUE_FULL`, `INVALID_SESSION_PROPERTY`, `GENERIC_INTERNAL_ERROR`.
+
+### Time limits and queuing
+
+- `query_max_execution_time` (for example `SET SESSION
+  query_max_execution_time = '5m'`, or `--session
+  query_max_execution_time=5m` on the CLI) limits a query's time from the
+  moment it is admitted; time spent queued does not count.
+- `query_max_run_time` limits the time from submission, queue included.
+  Without either, the server's `[admission] statement_timeout` applies the
+  same way.
+- Values are Trino durations (`500ms`, `30s`, `5m`, `1.5h`, `1d`); a bad
+  value fails the query with `INVALID_SESSION_PROPERTY`.
+- A query past its limit fails with `EXCEEDED_TIME_LIMIT` and is cancelled
+  on every worker.
+- When the server's `max_running_queries` is reached, a new query reports
+  `QUEUED` until a slot frees up; when the queue is full it fails with
+  `QUERY_QUEUE_FULL`. See
+  [Admission Control](/guide/configuration#admission-control).
 
 ## Known limitations
 
@@ -215,16 +234,16 @@ Common classifications: `SYNTAX_ERROR`, `TABLE_NOT_FOUND`, `COLUMN_NOT_FOUND`,
 - **Results are materialized before the first page.** The query runs to
   completion, then pages are served from memory, as with pgwire. There is no
   streaming of the first rows while the query is still running.
-- **Session properties are not interpreted.** `SET SESSION` round-trips to the
-  client correctly but does not change engine behavior.
+- **Session properties are mostly not interpreted.** `SET SESSION` round-trips
+  to the client correctly, but only `query_max_execution_time` and
+  `query_max_run_time` change engine behavior (see
+  [Time limits and queuing](#time-limits-and-queuing)).
 - **`DESCRIBE INPUT` / `DESCRIBE OUTPUT`** are not supported, so JDBC
   `PreparedStatement.getMetaData()` before execution fails.
 - **Transactions** are accepted as no-ops; every statement autocommits.
 - **Progress stats** in `stats` are minimal (state, elapsed time, rows
   returned); split counts and CPU time are reported as `0`.
 - **`LIKE … ESCAPE`** in metadata queries ignores the escape character.
-- Cancelling a distributed query drops the coordinator side immediately;
-  worker tasks that are already running may continue until they finish.
 - On a coordinator, a distributed query appears twice in the Web UI: once as
   the submitted SQL (Trino listener) and once as the plan the coordinator
   schedules.

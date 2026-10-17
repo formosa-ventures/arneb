@@ -36,6 +36,9 @@ pub struct ProtocolServer {
     memory_pool: Arc<dyn MemoryPool>,
     auth: AuthMethod,
     tls: Option<PgwireTls>,
+    query_memory_limit: Option<usize>,
+    admission: Option<arneb_scheduler::AdmissionController>,
+    statement_timeout: Option<std::time::Duration>,
 }
 
 impl ProtocolServer {
@@ -52,6 +55,9 @@ impl ProtocolServer {
             memory_pool: Arc::new(UnboundedMemoryPool::new()),
             auth: AuthMethod::None,
             tls: None,
+            query_memory_limit: None,
+            admission: None,
+            statement_timeout: None,
         }
     }
 
@@ -81,6 +87,30 @@ impl ProtocolServer {
     /// [`UnboundedMemoryPool`] (no budget enforcement).
     pub fn with_memory_pool(mut self, pool: Arc<dyn MemoryPool>) -> Self {
         self.memory_pool = pool;
+        self
+    }
+
+    /// Limit each statement to `limit` bytes of the memory pool on this node
+    /// (`query_max_memory_per_node`; default: no per-query limit).
+    pub fn with_query_memory_limit(mut self, limit: Option<usize>) -> Self {
+        self.query_memory_limit = limit;
+        self
+    }
+
+    /// Queue statements through this admission controller (shared with the
+    /// Trino listener). Default: none, every statement runs at once.
+    pub fn with_admission(
+        mut self,
+        admission: Option<arneb_scheduler::AdmissionController>,
+    ) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// Server default `statement_timeout` for sessions that set none
+    /// (`[admission] statement_timeout`; default: off).
+    pub fn with_statement_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.statement_timeout = timeout;
         self
     }
 
@@ -119,6 +149,9 @@ impl ProtocolServer {
                     ..
                 })
             ),
+            query_memory_limit: self.query_memory_limit,
+            admission: self.admission.clone(),
+            statement_timeout: self.statement_timeout,
         });
         let acceptor = self.tls.as_ref().map(|t| t.acceptor.clone());
 

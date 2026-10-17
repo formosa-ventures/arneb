@@ -8,8 +8,9 @@ description = "Query/stage/task state machines and scheduling for arneb"
 [dependencies]
 arneb-common = { path = "../common" }
 uuid = { version = "1", features = ["v4"] }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
 tracing.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "sync"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }

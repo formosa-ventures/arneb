@@ -99,6 +99,15 @@ pub struct HandlerFactory {
     pub connector_registry: Arc<ConnectorRegistry>,
     pub distributed_executor: Option<Arc<dyn DistributedExecutor>>,
     pub memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool>,
+    /// Per-query memory limit on this node (`query_max_memory_per_node`);
+    /// each statement runs under its own `QueryMemoryPool` over
+    /// `memory_pool`. `None`: limited only by the node pool.
+    pub query_memory_limit: Option<usize>,
+    /// Admission control shared with the Trino listener; `None` admits
+    /// every statement at once.
+    pub admission: Option<arneb_scheduler::AdmissionController>,
+    /// Server default `statement_timeout` for sessions that set none.
+    pub statement_timeout: Option<std::time::Duration>,
     /// Client authentication mode enforced during connection startup. Covers
     /// both the Simple and Extended Query paths, which share one startup
     /// handler.
@@ -115,6 +124,9 @@ impl PgWireServerHandlers for HandlerFactory {
             catalog_manager: Arc::clone(&self.catalog_manager),
             connector_registry: Arc::clone(&self.connector_registry),
             memory_pool: Arc::clone(&self.memory_pool),
+            query_memory_limit: self.query_memory_limit,
+            admission: self.admission.clone(),
+            statement_timeout: self.statement_timeout,
         })
     }
 
@@ -124,6 +136,9 @@ impl PgWireServerHandlers for HandlerFactory {
             catalog_manager: Arc::clone(&self.catalog_manager),
             connector_registry: Arc::clone(&self.connector_registry),
             memory_pool: Arc::clone(&self.memory_pool),
+            query_memory_limit: self.query_memory_limit,
+            admission: self.admission.clone(),
+            statement_timeout: self.statement_timeout,
         })
     }
 
@@ -151,9 +166,122 @@ pub struct ConnectionHandler {
     /// spillable operators (SemiJoinExec build) honour the configured
     /// per-task budget instead of growing unbounded.
     pub memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool>,
+    /// Per-query memory limit; see [`HandlerFactory::query_memory_limit`].
+    pub query_memory_limit: Option<usize>,
+    /// Admission control; see [`HandlerFactory::admission`].
+    pub admission: Option<arneb_scheduler::AdmissionController>,
+    /// Server default timeout; see [`HandlerFactory::statement_timeout`].
+    pub statement_timeout: Option<std::time::Duration>,
 }
 
 impl ConnectionHandler {
+    /// The connection's effective `statement_timeout`.
+    fn effective_timeout<C: ClientInfo>(&self, client: &C) -> Option<std::time::Duration> {
+        client
+            .session_extensions()
+            .get::<crate::timeout::SessionTimeout>()
+            .map_or(self.statement_timeout, |t| {
+                t.effective(self.statement_timeout)
+            })
+    }
+
+    /// Handle `SET` / `SHOW` / `RESET statement_timeout`, and reset it on
+    /// `RESET ALL` (which then falls through to `search_path`). An invalid
+    /// value is `ERROR 22023`.
+    fn timeout_command<C: ClientInfo>(
+        &self,
+        client: &C,
+        sql: &str,
+    ) -> Option<PgWireResult<Response>> {
+        use crate::timeout::{Command, SessionTimeout};
+        if crate::timeout::is_reset_all(sql) {
+            client
+                .session_extensions()
+                .insert(SessionTimeout::default());
+            return None;
+        }
+        let command = match crate::timeout::parse(sql)? {
+            Ok(c) => c,
+            Err(msg) => {
+                return Some(Err(PgWireError::UserError(Box::new(
+                    pgwire::error::ErrorInfo::new("ERROR".to_owned(), "22023".to_owned(), msg),
+                ))))
+            }
+        };
+        let response = match command {
+            Command::Show => crate::timeout::show_result(self.effective_timeout(client)),
+            Command::Set(value) => {
+                client.session_extensions().insert(SessionTimeout {
+                    explicit: Some(value),
+                });
+                Ok(crate::metadata::MetadataResponse::Command("SET".to_owned()))
+            }
+            Command::Reset => {
+                client
+                    .session_extensions()
+                    .insert(SessionTimeout::default());
+                Ok(crate::metadata::MetadataResponse::Command(
+                    "RESET".to_owned(),
+                ))
+            }
+        };
+        Some(
+            response
+                .map_err(|e| {
+                    arneb_error_to_pg_error(&ArnebError::Execution(
+                        ExecutionError::InvalidOperation(e),
+                    ))
+                })
+                .and_then(metadata_to_response),
+        )
+    }
+
+    /// Run `work` (admission wait plus execution) under the connection's
+    /// `statement_timeout`, timed from statement receipt. On expiry the
+    /// work future is dropped, which cancels the query on its workers, and
+    /// the client gets `ERROR 57014`.
+    async fn with_timeout<C: ClientInfo, T>(
+        &self,
+        client: &C,
+        work: impl std::future::Future<Output = PgWireResult<T>>,
+    ) -> PgWireResult<T> {
+        match self.effective_timeout(client) {
+            None => work.await,
+            Some(limit) => match tokio::time::timeout(limit, work).await {
+                Ok(result) => result,
+                Err(_) => Err(PgWireError::UserError(Box::new(
+                    pgwire::error::ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "57014".to_owned(),
+                        "canceling statement due to statement timeout".to_owned(),
+                    ),
+                ))),
+            },
+        }
+    }
+
+    /// Wait for an admission slot when `sql` executes a plan. The permit is
+    /// held until the statement's results are produced; a full queue is
+    /// `ERROR 53000`.
+    async fn admit(&self, sql: &str) -> PgWireResult<Option<arneb_scheduler::AdmissionPermit>> {
+        let Some(controller) = &self.admission else {
+            return Ok(None);
+        };
+        if !needs_admission(sql) {
+            return Ok(None);
+        }
+        match controller.admit(&admission_label(sql)) {
+            Ok(pending) => Ok(Some(pending.wait().await)),
+            Err(e) => Err(PgWireError::UserError(Box::new(
+                pgwire::error::ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "53000".to_owned(),
+                    e.to_string(),
+                ),
+            ))),
+        }
+    }
+
     /// The catalog manager resolving unqualified names for this connection:
     /// a session view when `SET search_path` chose a non-default schema.
     fn session_catalog<C: ClientInfo>(&self, client: &C) -> Arc<CatalogManager> {
@@ -191,6 +319,17 @@ impl ConnectionHandler {
         sql: &str,
         catalog_manager: &CatalogManager,
     ) -> Option<crate::metadata::MetadataResult> {
+        match crate::timeout::parse(sql) {
+            Some(Ok(crate::timeout::Command::Show)) => {
+                return Some(crate::timeout::show_result(self.effective_timeout(client)));
+            }
+            Some(_) => {
+                return Some(Ok(crate::metadata::MetadataResponse::Command(
+                    "SET".to_owned(),
+                )))
+            }
+            None => {}
+        }
         let current = client.session_extensions().get::<SearchPath>();
         if let Some((result, _)) =
             handle_search_path(sql, &self.catalog_manager, current.as_deref()).await
@@ -215,33 +354,16 @@ impl SimpleQueryHandler for ConnectionHandler {
         }
 
         tracing::debug!(query = trimmed, "processing simple query");
+        if let Some(response) = self.timeout_command(client, trimmed) {
+            return response.map(|r| vec![r]);
+        }
 
         // Intercept session commands and metadata queries (pg_catalog,
         // information_schema, version()).
         let catalog_manager = self.session_catalog(client);
         if let Some(meta_result) = self.intercept(client, trimmed, &catalog_manager).await {
             return match meta_result {
-                Ok(crate::metadata::MetadataResponse::Query(fields, batches)) => {
-                    let field_info: Vec<FieldInfo> = fields
-                        .iter()
-                        .map(|f| {
-                            let pg_type = arrow_type_to_pg(f.data_type());
-                            FieldInfo::new(f.name().clone(), None, None, pg_type, FieldFormat::Text)
-                        })
-                        .collect();
-                    let schema = Arc::new(field_info);
-                    let (rows, _) = encode_record_batches(&schema, &batches)?;
-                    let data_row_stream = stream::iter(rows);
-                    Ok(vec![Response::Query(QueryResponse::new(
-                        schema,
-                        data_row_stream,
-                    ))])
-                }
-                Ok(crate::metadata::MetadataResponse::Command(tag)) => {
-                    Ok(vec![Response::Execution(pgwire::api::results::Tag::new(
-                        &tag,
-                    ))])
-                }
+                Ok(resp) => metadata_to_response(resp).map(|r| vec![r]),
                 Err(e) => Err(arneb_error_to_pg_error(&ArnebError::Execution(
                     arneb_common::error::ExecutionError::InvalidOperation(e),
                 ))),
@@ -254,14 +376,20 @@ impl SimpleQueryHandler for ConnectionHandler {
         // SQLSTATE codes are unaffected.
         let source = SourceFile::new("<query>", trimmed);
 
-        let result = execute_query(
-            trimmed,
-            &catalog_manager,
-            &self.connector_registry,
-            self.distributed_executor.as_deref(),
-            &self.memory_pool,
-        )
-        .await;
+        let result = self
+            .with_timeout(client, async {
+                let _admission = self.admit(trimmed).await?;
+                Ok(execute_query_with_limit(
+                    trimmed,
+                    &catalog_manager,
+                    &self.connector_registry,
+                    self.distributed_executor.as_deref(),
+                    &self.memory_pool,
+                    self.query_memory_limit,
+                )
+                .await)
+            })
+            .await?;
 
         match result {
             Ok((plan, batches)) => {
@@ -411,27 +539,15 @@ impl ExtendedQueryHandler for ConnectionHandler {
         }
 
         tracing::debug!(query = trimmed, "processing extended query");
+        if let Some(response) = self.timeout_command(client, trimmed) {
+            return response;
+        }
 
         // Intercept session commands and metadata queries
         let catalog_manager = self.session_catalog(client);
         if let Some(meta_result) = self.intercept(client, trimmed, &catalog_manager).await {
             return match meta_result {
-                Ok(crate::metadata::MetadataResponse::Query(fields, batches)) => {
-                    let field_info: Vec<FieldInfo> = fields
-                        .iter()
-                        .map(|f| {
-                            let pg_type = arrow_type_to_pg(f.data_type());
-                            FieldInfo::new(f.name().clone(), None, None, pg_type, FieldFormat::Text)
-                        })
-                        .collect();
-                    let schema = Arc::new(field_info);
-                    let (rows, _) = encode_record_batches(&schema, &batches)?;
-                    let data_row_stream = stream::iter(rows);
-                    Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
-                }
-                Ok(crate::metadata::MetadataResponse::Command(tag)) => {
-                    Ok(Response::Execution(pgwire::api::results::Tag::new(&tag)))
-                }
+                Ok(resp) => metadata_to_response(resp),
                 Err(e) => Err(arneb_error_to_pg_error(&ArnebError::Execution(
                     arneb_common::error::ExecutionError::InvalidOperation(e),
                 ))),
@@ -439,14 +555,20 @@ impl ExtendedQueryHandler for ConnectionHandler {
         }
 
         let source = SourceFile::new("<query>", trimmed);
-        let result = execute_query(
-            trimmed,
-            &catalog_manager,
-            &self.connector_registry,
-            self.distributed_executor.as_deref(),
-            &self.memory_pool,
-        )
-        .await;
+        let result = self
+            .with_timeout(client, async {
+                let _admission = self.admit(trimmed).await?;
+                Ok(execute_query_with_limit(
+                    trimmed,
+                    &catalog_manager,
+                    &self.connector_registry,
+                    self.distributed_executor.as_deref(),
+                    &self.memory_pool,
+                    self.query_memory_limit,
+                )
+                .await)
+            })
+            .await?;
 
         match result {
             Ok((plan, batches)) => {
@@ -593,7 +715,67 @@ fn count_placeholders(sql: &str) -> usize {
     max_idx
 }
 
-/// Execute the full query pipeline asynchronously.
+/// A session command's result as a pgwire response.
+fn metadata_to_response(resp: crate::metadata::MetadataResponse) -> PgWireResult<Response> {
+    match resp {
+        crate::metadata::MetadataResponse::Query(fields, batches) => {
+            let field_info: Vec<FieldInfo> = fields
+                .iter()
+                .map(|f| {
+                    FieldInfo::new(
+                        f.name().clone(),
+                        None,
+                        None,
+                        arrow_type_to_pg(f.data_type()),
+                        FieldFormat::Text,
+                    )
+                })
+                .collect();
+            let schema = Arc::new(field_info);
+            let (rows, _) = encode_record_batches(&schema, &batches)?;
+            Ok(Response::Query(QueryResponse::new(
+                schema,
+                stream::iter(rows),
+            )))
+        }
+        crate::metadata::MetadataResponse::Command(tag) => {
+            Ok(Response::Execution(pgwire::api::results::Tag::new(&tag)))
+        }
+    }
+}
+
+/// Whether `sql` executes a plan and so takes an admission slot
+/// (admission-control D5): queries, `INSERT`, `DELETE`, CTAS and
+/// `EXPLAIN ANALYZE`. Catalog-only DDL and plain `EXPLAIN` never queue, and
+/// neither does SQL that fails to parse (it fails right away instead).
+/// Session and metadata statements are intercepted before this point.
+pub fn needs_admission(sql: &str) -> bool {
+    use arneb_sql_parser::ast::Statement;
+    match arneb_sql_parser::parse(sql) {
+        Ok(Statement::Explain { analyze, .. }) => analyze,
+        Ok(
+            Statement::CreateTable { .. }
+            | Statement::DropTable { .. }
+            | Statement::CreateView { .. }
+            | Statement::DropView { .. },
+        ) => false,
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+/// A short, single-line form of `sql` for admission logs.
+pub(crate) fn admission_label(sql: &str) -> String {
+    let flat: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > 80 {
+        format!("{}…", flat.chars().take(80).collect::<String>())
+    } else {
+        flat
+    }
+}
+
+/// Execute the full query pipeline asynchronously, with no per-query memory
+/// limit beyond `memory_pool` itself.
 pub async fn execute_query(
     sql: &str,
     catalog_manager: &CatalogManager,
@@ -607,6 +789,43 @@ pub async fn execute_query(
     ),
     ArnebError,
 > {
+    execute_query_with_limit(
+        sql,
+        catalog_manager,
+        connector_registry,
+        distributed_executor,
+        memory_pool,
+        None,
+    )
+    .await
+}
+
+/// [`execute_query`] under a per-query memory limit: the statement's local
+/// execution (a standalone plan, or the coordinator's own fragments) reserves
+/// from a `QueryMemoryPool` of `query_memory_limit` bytes over
+/// `memory_pool`, dropped when the statement ends.
+pub async fn execute_query_with_limit(
+    sql: &str,
+    catalog_manager: &CatalogManager,
+    connector_registry: &ConnectorRegistry,
+    distributed_executor: Option<&dyn DistributedExecutor>,
+    memory_pool: &Arc<dyn arneb_execution::memory_pool::MemoryPool>,
+    query_memory_limit: Option<usize>,
+) -> Result<
+    (
+        Arc<dyn ExecutionPlan>,
+        Vec<arrow::record_batch::RecordBatch>,
+    ),
+    ArnebError,
+> {
+    let memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> = match query_memory_limit {
+        Some(limit) => Arc::new(arneb_execution::memory_pool::QueryMemoryPool::new(
+            Arc::clone(memory_pool),
+            limit,
+        )),
+        None => Arc::clone(memory_pool),
+    };
+    let memory_pool = &memory_pool;
     // Step 1: Parse SQL
     let statement = arneb_sql_parser::parse(sql)?;
 

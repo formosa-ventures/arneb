@@ -36,6 +36,7 @@ pub struct ProtocolServer {
     memory_pool: Arc<dyn MemoryPool>,
     auth: AuthMethod,
     tls: Option<PgwireTls>,
+    query_memory_limit: Option<usize>,
 }
 
 impl ProtocolServer {
@@ -52,6 +53,7 @@ impl ProtocolServer {
             memory_pool: Arc::new(UnboundedMemoryPool::new()),
             auth: AuthMethod::None,
             tls: None,
+            query_memory_limit: None,
         }
     }
 
@@ -81,6 +83,13 @@ impl ProtocolServer {
     /// [`UnboundedMemoryPool`] (no budget enforcement).
     pub fn with_memory_pool(mut self, pool: Arc<dyn MemoryPool>) -> Self {
         self.memory_pool = pool;
+        self
+    }
+
+    /// Limit each statement to `limit` bytes of the memory pool on this node
+    /// (`query_max_memory_per_node`; default: no per-query limit).
+    pub fn with_query_memory_limit(mut self, limit: Option<usize>) -> Self {
+        self.query_memory_limit = limit;
         self
     }
 
@@ -119,6 +128,7 @@ impl ProtocolServer {
                     ..
                 })
             ),
+            query_memory_limit: self.query_memory_limit,
         });
         let acceptor = self.tls.as_ref().map(|t| t.acceptor.clone());
 

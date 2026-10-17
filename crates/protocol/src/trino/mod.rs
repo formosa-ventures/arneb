@@ -106,6 +106,7 @@ pub struct TrinoServer {
     tls: Option<TlsAcceptor>,
     auth: Option<Authenticator>,
     verifications: Arc<AtomicU64>,
+    query_memory_limit: Option<usize>,
 }
 
 impl TrinoServer {
@@ -126,6 +127,7 @@ impl TrinoServer {
             tls: None,
             auth: None,
             verifications: Arc::new(AtomicU64::new(0)),
+            query_memory_limit: None,
         }
     }
 
@@ -150,6 +152,13 @@ impl TrinoServer {
     /// Serve HTTPS only with this acceptor (default: plain HTTP).
     pub fn with_tls(mut self, tls: Option<TlsAcceptor>) -> Self {
         self.tls = tls;
+        self
+    }
+
+    /// Limit each statement to `limit` bytes of the memory pool on this node
+    /// (`query_max_memory_per_node`; default: no per-query limit).
+    pub fn with_query_memory_limit(mut self, limit: Option<usize>) -> Self {
+        self.query_memory_limit = limit;
         self
     }
 
@@ -178,6 +187,7 @@ impl TrinoServer {
                 connector_registry: Arc::clone(&self.connector_registry),
                 distributed_executor: self.distributed_executor.clone(),
                 memory_pool: Arc::clone(&self.memory_pool),
+                query_memory_limit: self.query_memory_limit,
             }),
             queries: Arc::new(Mutex::new(HashMap::new())),
             config: Arc::new(self.config.clone()),

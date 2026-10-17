@@ -13,6 +13,7 @@ mod heartbeat;
 mod output_buffer;
 mod security;
 pub mod task_descriptor;
+mod task_error;
 mod task_submission;
 
 /// Max Arrow Flight gRPC message size (encode + decode) for the
@@ -39,6 +40,10 @@ pub use security::{
     ClusterTls, FlightClient, MIN_CLUSTER_SECRET_LEN,
 };
 pub use task_descriptor::{SourceExchange, TaskDescriptor};
+pub use task_error::{
+    describe_execution_failure, describe_task_failure, tag_resource_exhausted,
+    RESOURCE_EXHAUSTED_TAG,
+};
 pub use task_submission::{
     notify_dynamic_filter, report_dynamic_filters, submit_task, submit_task_with,
 };

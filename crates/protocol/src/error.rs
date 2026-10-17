@@ -1,5 +1,5 @@
 use arneb_common::diagnostic::{render_plan_error, SourceFile};
-use arneb_common::error::ArnebError;
+use arneb_common::error::{ArnebError, ExecutionError};
 use pgwire::error::{ErrorInfo, PgWireError};
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +48,11 @@ pub fn arneb_error_to_pg_error_with_source(
                 None => e.to_string(),
             };
             (code.to_string(), message)
+        }
+        // A query over its memory limit is `out_of_memory`, which clients
+        // can tell apart from an internal error (admission-control D3).
+        ArnebError::Execution(e @ ExecutionError::ResourceExhausted(_)) => {
+            ("53200".to_string(), e.to_string())
         }
         ArnebError::Execution(e) => ("XX000".to_string(), e.to_string()),
         ArnebError::Connector(e) => ("58030".to_string(), e.to_string()),
@@ -116,6 +121,20 @@ mod tests {
                 assert_eq!(info.code, "XX000");
             }
             _ => panic!("expected UserError"),
+        }
+    }
+
+    #[test]
+    fn test_resource_exhausted_maps_to_53200() {
+        let err = ArnebError::Execution(ExecutionError::ResourceExhausted(
+            "query memory limit exceeded".into(),
+        ));
+        match arneb_error_to_pg_error(&err) {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "53200");
+                assert!(info.message.contains("memory limit"), "{}", info.message);
+            }
+            other => panic!("expected UserError, got {other:?}"),
         }
     }
 

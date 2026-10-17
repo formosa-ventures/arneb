@@ -328,7 +328,7 @@ impl FlightService for TrinoFlightService {
                             )));
                         }
                         Some(TaskStatusResponse::Failed(reason)) => {
-                            return Err(Status::internal(format!(
+                            return Err(crate::task_error::failure_status(format!(
                                 "task '{task_id}' failed: {reason}"
                             )));
                         }
@@ -518,7 +518,7 @@ fn async_stream(
     // Convert FlightError to tonic::Status.
     #[allow(clippy::result_large_err)]
     let mapped = futures::StreamExt::map(encoder, |result| {
-        result.map_err(|e| Status::internal(format!("flight encoding error: {e}")))
+        result.map_err(|e| crate::task_error::failure_status(format!("flight encoding error: {e}")))
     });
 
     Box::pin(mapped)
@@ -553,7 +553,7 @@ fn async_stream_broadcast(
 
     #[allow(clippy::result_large_err)]
     let mapped = futures::StreamExt::map(encoder, |result| {
-        result.map_err(|e| Status::internal(format!("flight encoding error: {e}")))
+        result.map_err(|e| crate::task_error::failure_status(format!("flight encoding error: {e}")))
     });
 
     Box::pin(mapped)

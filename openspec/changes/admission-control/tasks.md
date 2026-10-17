@@ -10,12 +10,12 @@ Sections 1–4 land as four PRs, in order: A (memory), B (cancellation), C (admi
 
 ## 1. PR A — per-query memory pools and typed resource errors (D1–D3)
 
-- [ ] 1.1 `TaskManager`: add `HashMap<QueryId, QueryEntry { pool: Arc<QueryMemoryPool>, tasks: HashMap<TaskId, AbortHandle> }>`. `execute_task` gets or creates the entry and builds `ExecutionContext` with the query's pool. Remove the entry when the last task's buffers are cleaned up.
-- [ ] 1.2 `main.rs`: remove the process-wide `QueryMemoryPool` wrap. Pass the node pool plus the resolved `query_max_memory_per_node` into `TaskManager`, `ProtocolServer` and `TrinoServer`. Reword the startup log to say "per-query limit".
-- [ ] 1.3 Coordinator / standalone: `execute_query` (pgwire) and `run_statement` (Trino) create a per-query pool for local execution and the coordinator's own fragments, and drop it at the end of the query.
-- [ ] 1.4 Typed errors: the worker records `ResourceExhausted` task failures and `do_get` returns `Status::resource_exhausted`. `ExchangeClient` and the task-status path map that status back to `ExecutionError::ResourceExhausted`. The message names the node and the limit.
-- [ ] 1.5 pgwire SQLSTATE: map `ExecutionError::ResourceExhausted` to `53200` in `protocol/src/error.rs`. Keep Trino's `EXCEEDED_LOCAL_MEMORY_LIMIT` and add a test for it on the distributed path.
-- [ ] 1.6 Tests:
+- [x] 1.1 `TaskManager`: add `HashMap<QueryId, QueryEntry { pool: Arc<QueryMemoryPool>, tasks: HashMap<TaskId, AbortHandle> }>`. `execute_task` gets or creates the entry and builds `ExecutionContext` with the query's pool. Remove the entry when the last task's buffers are cleaned up.
+- [x] 1.2 `main.rs`: remove the process-wide `QueryMemoryPool` wrap. Pass the node pool plus the resolved `query_max_memory_per_node` into `TaskManager`, `ProtocolServer` and `TrinoServer`. Reword the startup log to say "per-query limit".
+- [x] 1.3 Coordinator / standalone: `execute_query` (pgwire) and `run_statement` (Trino) create a per-query pool for local execution and the coordinator's own fragments, and drop it at the end of the query.
+- [x] 1.4 Typed errors: the worker records `ResourceExhausted` task failures and `do_get` returns `Status::resource_exhausted`. `ExchangeClient` and the task-status path map that status back to `ExecutionError::ResourceExhausted`. The message names the node and the limit.
+- [x] 1.5 pgwire SQLSTATE: map `ExecutionError::ResourceExhausted` to `53200` in `protocol/src/error.rs`. Keep Trino's `EXCEEDED_LOCAL_MEMORY_LIMIT` and add a test for it on the distributed path.
+- [x] 1.6 Tests:
   - `QueryMemoryPool` per query: two queries on one pool, one over its limit, the other unaffected.
   - The entry is dropped after the last task, and node reserved bytes return to the baseline.
   - The Flight round trip keeps the `ResourceExhausted` class (rpc integration test).

@@ -101,7 +101,7 @@ use arneb_connectors::file::{FileCatalog, FileConnectorFactory, FileFormat, File
 use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
 use arneb_connectors::{ConnectorRegistry, StorageRegistry};
 use arneb_execution::memory_pool::{
-    GreedyMemoryPool, MemoryPool, QueryMemoryPool, TrackConsumersPool, UnboundedMemoryPool,
+    GreedyMemoryPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool,
 };
 use arneb_protocol::{
     PgwireTls, ProtocolConfig, ProtocolServer, ServerTls, TrinoConfig, TrinoServer,
@@ -532,30 +532,25 @@ async fn run() -> Result<()> {
         )),
         None => Arc::new(UnboundedMemoryPool::new()),
     };
-    // Phase 4 (2026-05-21): wrap the global pool with a per-task
-    // QueryMemoryPool when `query_max_memory_per_node` is set. This
-    // closes the swiss-cheese gap where untracked operators
-    // (Filter / Project / scan buffers / Repartition queue) accumulate
-    // uncounted allocations and OOM the worker before any single
-    // spillable operator hits its own `spill_budget_bytes`. With this
-    // wrap, the QUERY's cumulative `MemoryReservation` total fails
-    // the query cleanly instead.
+    // admission-control D1: `query_max_memory_per_node` is enforced per
+    // query. The node pool stays shared; each query gets its own
+    // `QueryMemoryPool` over it — per statement on the coordinator /
+    // standalone (`ProtocolServer`, `TrinoServer`) and per query id on a
+    // worker (`TaskManager`). A query over its limit fails with
+    // `ResourceExhausted` without starving the other queries on the node.
     let query_cap_resolved = config.memory.resolve_query_cap();
-    let memory_pool: Arc<dyn MemoryPool> = match query_cap_resolved {
-        Some(query_cap) => Arc::new(QueryMemoryPool::new(global_pool, query_cap as usize)),
-        None => global_pool,
-    };
+    let query_memory_limit = query_cap_resolved.map(|b| b as usize);
     let memory_pool: Arc<dyn MemoryPool> = if memory_profile::mem_profile_enabled() {
-        Arc::new(memory_profile::MemoryProfilePool::new(memory_pool))
+        Arc::new(memory_profile::MemoryProfilePool::new(global_pool))
     } else {
-        memory_pool
+        global_pool
     };
     match (budget, query_cap_resolved) {
         (Some(bytes), Some(qcap)) => tracing::info!(
             spill_budget_bytes = bytes,
             spill_budget_source = budget_source,
             query_max_memory_per_node = qcap,
-            "memory pool installed (per-task query cap on top of global spill budget)"
+            "memory pool installed (per-query limit on top of the node spill budget)"
         ),
         (Some(bytes), None) => tracing::info!(
             spill_budget_bytes = bytes,
@@ -564,7 +559,7 @@ async fn run() -> Result<()> {
         ),
         (None, Some(qcap)) => tracing::info!(
             query_max_memory_per_node = qcap,
-            "memory pool installed (per-task query cap only; no global spill budget)"
+            "memory pool installed (per-query limit only; no node spill budget)"
         ),
         (None, None) => tracing::info!(
             spill_budget_source = budget_source,
@@ -643,7 +638,8 @@ async fn run() -> Result<()> {
             Arc::clone(&memory_pool),
             memory_probe,
             coord_address_for_publisher,
-        );
+        )
+        .with_query_memory_limit(query_memory_limit);
         let tm_for_task = tm.clone();
         flight_state.set_task_callback(Arc::new(move |descriptor| {
             tm_for_task.handle_task(descriptor);
@@ -746,6 +742,7 @@ async fn run() -> Result<()> {
         connector_registry.clone(),
     )
     .with_memory_pool(Arc::clone(&memory_pool))
+    .with_query_memory_limit(query_memory_limit)
     .with_auth(auth_method)
     .with_tls(pgwire_tls);
     if let Some(ref executor) = distributed_executor {
@@ -784,6 +781,7 @@ async fn run() -> Result<()> {
             connector_registry.clone(),
         )
         .with_memory_pool(Arc::clone(&memory_pool))
+        .with_query_memory_limit(query_memory_limit)
         .with_query_tracker(query_tracker.clone())
         .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
         .with_password_auth(password_users.clone())

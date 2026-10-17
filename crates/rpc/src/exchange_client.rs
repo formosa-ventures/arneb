@@ -10,17 +10,19 @@ use arneb_common::stream::{stream_from_batches, RecordBatchStream, SendableRecor
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow_flight::decode::FlightRecordBatchStream;
-use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Ticket;
 use futures::stream::Stream;
 use futures::TryStreamExt;
-use tonic::transport::Channel;
+
+use crate::security::{cluster_security, ClusterSecurity};
 
 /// Client that fetches RecordBatches from a remote Arrow Flight server.
 #[derive(Debug, Clone)]
 pub struct ExchangeClient {
     /// Address of the remote Flight server (e.g., "http://host:9090").
     address: String,
+    /// Cluster credentials; the process-wide installed ones by default.
+    security: ClusterSecurity,
 }
 
 impl ExchangeClient {
@@ -28,7 +30,14 @@ impl ExchangeClient {
     pub fn new(address: impl Into<String>) -> Self {
         Self {
             address: address.into(),
+            security: cluster_security().clone(),
         }
+    }
+
+    /// Use explicit cluster security instead of the installed one.
+    pub fn with_security(mut self, security: ClusterSecurity) -> Self {
+        self.security = security;
+        self
     }
 
     /// Fetch a partition from a remote task as a stream of RecordBatches.
@@ -70,22 +79,9 @@ impl ExchangeClient {
         let safety_deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(safety_secs);
 
-        let channel = Channel::from_shared(self.address.clone())
-            .map_err(|e| {
-                ExecutionError::InvalidOperation(format!(
-                    "invalid Flight server address {}: {e}",
-                    self.address
-                ))
-            })?
-            .connect()
+        let mut client = crate::security::connect(&self.address, &self.security)
             .await
-            .map_err(|e| {
-                ExecutionError::InvalidOperation(format!(
-                    "failed to connect to Flight server at {}: {e}",
-                    self.address
-                ))
-            })?;
-        let mut client = FlightServiceClient::new(channel);
+            .map_err(|e| ExecutionError::InvalidOperation(format!("Flight server: {e}")))?;
 
         loop {
             let ticket = Ticket::new(ticket_text.clone());

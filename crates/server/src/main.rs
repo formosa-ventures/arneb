@@ -103,7 +103,9 @@ use arneb_connectors::{ConnectorRegistry, StorageRegistry};
 use arneb_execution::memory_pool::{
     GreedyMemoryPool, MemoryPool, QueryMemoryPool, TrackConsumersPool, UnboundedMemoryPool,
 };
-use arneb_protocol::{ProtocolConfig, ProtocolServer, TrinoConfig, TrinoServer};
+use arneb_protocol::{
+    PgwireTls, ProtocolConfig, ProtocolServer, ServerTls, TrinoConfig, TrinoServer,
+};
 use clap::Parser;
 
 use crate::config::{parse_data_type, AppConfig, ServerRole};
@@ -417,6 +419,32 @@ async fn run() -> Result<()> {
     // 8. Set up Flight RPC server + heartbeat handling
     let node_registry = arneb_scheduler::NodeRegistry::default();
     let rpc_addr = format!("{}:{}", config.server.bind_address, config.cluster.rpc_port);
+
+    // Cluster RPC security ([cluster] secret / [cluster.tls] / ARNEB_CLUSTER_*):
+    // installed once, before any Flight connection, for every outbound call
+    // and for this node's Flight server.
+    let cluster_security = config
+        .cluster
+        .security(|k| std::env::var(k).ok())
+        .context("invalid [cluster] security configuration")?;
+    tracing::info!(
+        target: "arneb::config",
+        cluster_auth = if cluster_security.secret.is_some() { "secret" } else { "off" },
+        cluster_tls = if cluster_security.tls.is_some() { "on" } else { "off" },
+        "cluster RPC security effective mode ([cluster] secret / [cluster.tls] / ARNEB_CLUSTER_*)"
+    );
+    if cluster_security.secret.is_some()
+        && cluster_security.tls.is_none()
+        && !config::is_loopback_host(&config.server.bind_address)
+    {
+        tracing::warn!(
+            target: "arneb::config",
+            bind_address = %config.server.bind_address,
+            "[cluster] secret is set without [cluster.tls]: the secret and all exchange data \
+             cross the network unencrypted"
+        );
+    }
+    arneb_rpc::install_cluster_security(cluster_security);
     let query_tracker = Arc::new(arneb_scheduler::QueryTracker::new());
     // A1.3 (2026-05-27): per-query dynamic-filter service registry,
     // shared between QueryCoordinator (registers on execute) and the
@@ -671,13 +699,50 @@ async fn run() -> Result<()> {
         );
     }
 
+    // Client-facing TLS ([tls] / ARNEB_TLS_*): one certificate for pgwire and
+    // the Trino listener. Workers serve neither, so they skip loading it.
+    let server_tls = match (&config.tls_settings, role) {
+        (Some(t), ServerRole::Coordinator | ServerRole::Standalone) => Some(
+            ServerTls::load(&t.cert_path, &t.key_path).context("invalid [tls] configuration")?,
+        ),
+        _ => None,
+    };
+    if !matches!(role, ServerRole::Worker) {
+        match &config.tls_settings {
+            Some(t) => tracing::info!(
+                target: "arneb::config",
+                tls_pgwire = t.pgwire.name(),
+                tls_cert_path = %t.cert_path.display(),
+                "client TLS effective mode ([tls] / ARNEB_TLS_*)"
+            ),
+            None => tracing::info!(
+                target: "arneb::config",
+                tls = "off",
+                "client TLS effective mode ([tls] / ARNEB_TLS_*)"
+            ),
+        }
+    }
+    let pgwire_tls = server_tls
+        .as_ref()
+        .zip(config.tls_settings.as_ref())
+        .map(|(tls, t)| PgwireTls {
+            acceptor: tls.pgwire_acceptor(),
+            mode: t.pgwire,
+        });
+
+    let password_users = match &auth_method {
+        arneb_protocol::AuthMethod::ScramSha256(creds) => Some(Arc::clone(creds)),
+        arneb_protocol::AuthMethod::None => None,
+    };
+
     let mut server = ProtocolServer::new(
         protocol_config,
         catalog_manager.clone(),
         connector_registry.clone(),
     )
     .with_memory_pool(Arc::clone(&memory_pool))
-    .with_auth(auth_method);
+    .with_auth(auth_method)
+    .with_tls(pgwire_tls);
     if let Some(ref executor) = distributed_executor {
         server = server.with_distributed_executor(Arc::clone(executor));
     }
@@ -687,26 +752,24 @@ async fn run() -> Result<()> {
     // pgwire. Queries are registered with the tracker so they show in the
     // Web UI.
     let serves_clients = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
+    let trino_enabled = config.trino.enabled && serves_clients;
     let trino_addr = format!("{}:{}", config.server.bind_address, config.trino.port);
+    // Fail closed: Trino clients only send passwords over HTTPS, so password
+    // auth on a plain-HTTP listener would be unusable or a bypass.
+    config::check_trino_transport(
+        trino_enabled,
+        password_users.is_some(),
+        server_tls.is_some(),
+    )?;
     tracing::info!(
         target: "arneb::config",
-        trino_enabled = config.trino.enabled && serves_clients,
+        trino_enabled,
         trino_address = %trino_addr,
+        tls_trino = if server_tls.is_some() { "https" } else { "http" },
+        trino_auth = if password_users.is_some() { "password (basic)" } else { "none" },
         "Trino client protocol effective settings ([trino] / ARNEB_TRINO_ENABLED / ARNEB_TRINO_PORT / --trino-port / --no-trino)"
     );
-    if config.trino.enabled
-        && serves_clients
-        && !matches!(config.auth.auth_type, config::AuthType::None)
-    {
-        tracing::warn!(
-            target: "arneb::config",
-            trino_address = %trino_addr,
-            "[auth] type = \"password\" does not yet apply to the Trino listener: it accepts \
-             any X-Trino-User without a password. Disable it with --no-trino or \
-             ARNEB_TRINO_ENABLED=false where password protection is required"
-        );
-    }
-    let trino_server = (config.trino.enabled && serves_clients).then(|| {
+    let trino_server = if trino_enabled {
         let mut trino = TrinoServer::new(
             TrinoConfig {
                 bind_address: trino_addr.clone(),
@@ -716,12 +779,17 @@ async fn run() -> Result<()> {
             connector_registry.clone(),
         )
         .with_memory_pool(Arc::clone(&memory_pool))
-        .with_query_tracker(query_tracker.clone());
+        .with_query_tracker(query_tracker.clone())
+        .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
+        .with_password_auth(password_users.clone())
+        .context("Trino listener authentication")?;
         if let Some(ref executor) = distributed_executor {
             trino = trino.with_distributed_executor(Arc::clone(executor));
         }
-        trino
-    });
+        Some(trino)
+    } else {
+        None
+    };
 
     // 9. Startup banner
     match role {
@@ -752,7 +820,28 @@ async fn run() -> Result<()> {
     };
     let web_router = web::build_router(web_state);
     let web_port = config.server.port + 1000; // default: pgwire port + 1000 (e.g., 5432 → 6432)
-    let web_addr = format!("{}:{}", config.server.bind_address, web_port);
+    let (web_host, web_reason) = config::resolve_web_bind(
+        config.auth.auth_type,
+        &config.server.bind_address,
+        config.web.bind_address.as_deref(),
+    )?;
+    let web_addr = format!("{web_host}:{web_port}");
+    if serves_clients {
+        tracing::info!(
+            target: "arneb::config",
+            web_bind_address = %web_addr,
+            reason = web_reason,
+            "Web UI effective bind ([web] bind_address / ARNEB_WEB_BIND_ADDRESS)"
+        );
+        if password_users.is_some() && !config::is_loopback_host(&web_host) {
+            tracing::warn!(
+                target: "arneb::config",
+                web_bind_address = %web_addr,
+                "the Web UI has no login and shows query text; it is reachable beyond \
+                 loopback while [auth] type = \"password\""
+            );
+        }
+    }
 
     // 11. Run services based on role
     let flight_state_clone = flight_state.clone();
@@ -855,9 +944,25 @@ async fn worker_heartbeat_loop(role: ServerRole, config: &AppConfig, my_rpc_addr
     );
 
     loop {
-        match arneb_rpc::send_heartbeat(&coordinator_address, &message).await {
+        match arneb_rpc::send_heartbeat_with(
+            &coordinator_address,
+            &message,
+            arneb_rpc::cluster_security(),
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::debug!(worker_id = %worker_id, "heartbeat sent");
+            }
+            Err(e @ arneb_rpc::HeartbeatError::Unauthenticated(_)) => {
+                // Keep retrying: fixing the secret and restarting the
+                // coordinator recovers without restarting workers.
+                tracing::error!(
+                    target: "arneb::cluster",
+                    worker_id = %worker_id,
+                    error = %e,
+                    "heartbeat rejected"
+                );
             }
             Err(e) => {
                 tracing::warn!(

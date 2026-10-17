@@ -66,6 +66,45 @@ print(cur.fetchall())
 #   jdbc:trino://127.0.0.1:8080/datalake/tpch
 ```
 
+### With TLS and a password
+
+When the server has [`[tls]`](/guide/configuration#tls) and
+[`[auth] type = "password"`](/guide/configuration#authentication), the
+listener is HTTPS-only and every request needs HTTP Basic credentials from
+`[[auth.users]]`. Point clients at `https://` and give them the CA that
+signed the server certificate (skip the CA option for a publicly trusted
+certificate):
+
+```bash
+# trino CLI (prompts for the password; or set TRINO_PASSWORD)
+trino --server https://arneb.example.com:8080 --truststore-path ca.crt \
+      --user alice --password --catalog datalake --schema tpch
+
+# Python
+python -c "
+import trino
+conn = trino.dbapi.connect(
+    host='arneb.example.com', port=8080, http_scheme='https',
+    user='alice', auth=trino.auth.BasicAuthentication('alice', 'secret'),
+    verify='ca.crt', catalog='datalake', schema='tpch')
+cur = conn.cursor()
+cur.execute('SELECT count(*) FROM nation')
+print(cur.fetchall())
+"
+
+# JDBC
+#   jdbc:trino://arneb.example.com:8080/datalake/tpch?SSL=true&SSLTrustStorePath=ca.crt
+#   user=alice, password=secret
+```
+
+The authenticated user is the query's user. Sending a different
+`X-Trino-User` (for example `--session-user`) gets `403`, and only the user
+who submitted a query can page through, cancel or inspect it. `/v1/info`,
+`/v1/info/state` and `/v1/status` stay open for health checks. Password
+auth without `[tls]` is a startup error, because Trino clients will not send
+a password over plain HTTP; disable the listener with `--no-trino` if you
+only need pgwire.
+
 Catalog names are the ones Arneb registers: `memory`, `file` (tables from
 `[[tables]]`), and each `[[catalogs]]` entry (e.g. `datalake`). A virtual
 `system` catalog provides `system.jdbc.*` and `system.metadata.*` for drivers.
@@ -92,7 +131,7 @@ the final page still succeeds. Trino queries appear in the Web UI query list.
 
 | Header | Behavior |
 |---|---|
-| `X-Trino-User` | Recorded with the query (no authentication, see below). |
+| `X-Trino-User` | The query's user. Under password auth it must match the Basic-auth user (otherwise `403`) and may be omitted. |
 | `X-Trino-Catalog`, `X-Trino-Schema` | Session defaults for unqualified table names. |
 | `X-Trino-Source`, `X-Trino-Client-Info` | Recorded, shown in `/v1/query/{id}`. |
 | `X-Trino-Session` | Accepted and listed by `SHOW SESSION`; properties are not interpreted. |
@@ -168,17 +207,11 @@ Common classifications: `SYNTAX_ERROR`, `TABLE_NOT_FOUND`, `COLUMN_NOT_FOUND`,
 
 ## Known limitations
 
-- **No authentication or TLS.** The server's
-  [`[auth]` section](/guide/configuration#authentication) does not yet apply
-  to this listener: `X-Trino-User` is trusted as-is, even when
-  `[auth] type = "password"` protects the pgwire port (startup logs a WARN in
-  that case), and the listener speaks plain HTTP. A follow-up will add HTTP
-  Basic authentication over TLS, verified against the same SCRAM verifiers in
-  `[[auth.users]]`. Until then, disable the listener with `--no-trino` or
-  `ARNEB_TRINO_ENABLED=false` where password protection is required, or bind
-  it to a trusted network / put it behind a TLS-terminating proxy that
-  authenticates users (the server honors `X-Forwarded-Proto` /
-  `X-Forwarded-Host` when building `nextUri`).
+- **Basic authentication only.** Under password auth the listener accepts
+  HTTP Basic credentials checked against `[[auth.users]]`. OAuth2, JWT,
+  Kerberos, client certificates and impersonation (`--session-user`) are not
+  supported. Behind a TLS-terminating proxy, the server honors
+  `X-Forwarded-Proto` / `X-Forwarded-Host` when building `nextUri`.
 - **Results are materialized before the first page.** The query runs to
   completion, then pages are served from memory, as with pgwire. There is no
   streaming of the first rows while the query is still running.

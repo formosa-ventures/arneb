@@ -559,25 +559,45 @@ fn async_stream_broadcast(
     Box::pin(mapped)
 }
 
-/// Start the Arrow Flight server on the given address.
+/// Start the Arrow Flight server on the given address, secured with the
+/// installed [`crate::ClusterSecurity`].
 pub async fn start_flight_server(
     addr: &str,
     state: FlightState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = addr.parse()?;
-    let service = TrinoFlightService::new(state);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_flight(listener, state, crate::cluster_security()).await
+}
 
-    tracing::info!(%addr, "starting Arrow Flight server");
-
-    Server::builder()
-        .add_service(
-            FlightServiceServer::new(service)
-                .max_decoding_message_size(crate::MAX_FLIGHT_MESSAGE_BYTES)
-                .max_encoding_message_size(crate::MAX_FLIGHT_MESSAGE_BYTES),
-        )
-        .serve(addr)
+/// Serve Flight on an already-bound listener with explicit security: the
+/// bearer-secret check runs before every handler, and `[cluster.tls]`
+/// adds TLS.
+pub async fn serve_flight(
+    listener: tokio::net::TcpListener,
+    state: FlightState,
+    security: &crate::ClusterSecurity,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = listener.local_addr()?;
+    tracing::info!(
+        %addr,
+        cluster_auth = if security.secret.is_some() { "secret" } else { "off" },
+        cluster_tls = security.tls.is_some(),
+        "starting Arrow Flight server"
+    );
+    let service = FlightServiceServer::new(TrinoFlightService::new(state))
+        .max_decoding_message_size(crate::MAX_FLIGHT_MESSAGE_BYTES)
+        .max_encoding_message_size(crate::MAX_FLIGHT_MESSAGE_BYTES);
+    let check = crate::security::SecretCheck::new(security.secret.as_ref());
+    let mut builder = Server::builder();
+    if let Some(tls) = security.server_tls() {
+        builder = builder.tls_config(tls)?;
+    }
+    builder
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            service, check,
+        ))
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
         .await?;
-
     Ok(())
 }
 

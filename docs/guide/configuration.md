@@ -29,8 +29,8 @@ cargo run --bin arneb -- --config /path/to/config.toml
 | Service | Port | Roles |
 |---------|------|-------|
 | pgwire (PostgreSQL protocol) | `port` | standalone, coordinator |
-| Trino client protocol (HTTP) | `[trino] port` (default `8080`) | standalone, coordinator |
-| Web UI | `port + 1000` | standalone, coordinator |
+| Trino client protocol (HTTP, or HTTPS with [`[tls]`](#tls)) | `[trino] port` (default `8080`) | standalone, coordinator |
+| Web UI (binds to loopback under password auth, see [Web UI](#web-ui)) | `port + 1000` | standalone, coordinator |
 | Flight RPC | `9090` | all roles |
 
 ## Trino Client Protocol
@@ -204,15 +204,59 @@ worker_id = "worker-1"
 | `rpc_port` | integer | yes | Flight RPC port for this worker |
 | `coordinator_address` | string | yes | `host:port` of the coordinator's Flight RPC |
 | `worker_id` | string | yes | Unique identifier for this worker |
+| `secret` | string | no | Shared cluster secret, see [Cluster security](#cluster-security) |
 
 See [Distributed Mode](/guide/distributed) for full setup instructions.
 
+### Cluster security
+
+By default the Flight RPC port accepts any peer: anyone who can reach it can
+register a worker, submit tasks, or read another task's output. Two
+independent settings close that, and you should use both:
+
+```toml
+[cluster]
+secret = "…"                          # >= 32 characters; prefer ARNEB_CLUSTER_SECRET
+
+[cluster.tls]
+cert_path = "/etc/arneb/node.crt"     # this node's certificate (PEM)
+key_path  = "/etc/arneb/node.key"     # its private key (PEM)
+ca_path   = "/etc/arneb/ca.crt"       # CA that signed every node's certificate
+```
+
+| Field | Env var | Description |
+|-------|---------|-------------|
+| `[cluster] secret` | `ARNEB_CLUSTER_SECRET` | Every Flight call carries `authorization: Bearer <secret>`; every node checks it before any handler runs. Minimum 32 characters, printable ASCII. |
+| `[cluster.tls] cert_path` | `ARNEB_CLUSTER_TLS_CERT_PATH` | This node's certificate chain |
+| `[cluster.tls] key_path` | `ARNEB_CLUSTER_TLS_KEY_PATH` | This node's private key |
+| `[cluster.tls] ca_path` | `ARNEB_CLUSTER_TLS_CA_PATH` | The cluster CA; peers must present a certificate it signed |
+
+- **Secret.** A call with a missing or wrong secret gets `UNAUTHENTICATED`,
+  so a worker with the wrong secret is never registered. The coordinator
+  logs a WARN on `arneb::cluster` (at most once per peer per minute), and
+  the worker logs an ERROR naming `[cluster] secret` on every heartbeat and
+  keeps retrying, so fixing the secret recovers without restarting it. The
+  secret never appears in logs or `Debug` output; prefer the environment
+  variable (for example from a Kubernetes Secret) to keep it out of files.
+- **TLS.** Flight servers serve TLS with the node certificate, and clients
+  verify peers against `ca_path`. Peer addresses in `coordinator_address` /
+  `advertised_address` stay `host:port`; they are upgraded to `https://`
+  automatically. Every node must agree: a plaintext node cannot talk to a
+  TLS node. The certificate must name the host peers dial (for example the
+  `advertised_address` host).
+- **Without TLS, the secret crosses the network in the clear.** Startup logs
+  a WARN when a secret is set without `[cluster.tls]` and `bind_address` is
+  not loopback.
+- The effective mode is logged on `arneb::config`
+  (`cluster_auth="secret"|"off" cluster_tls="on"|"off"`). A short secret, a
+  missing `[cluster.tls]` path, or an unreadable file stops startup.
+
 ## Authentication
 
-`[auth]` is the server's client authentication: one credential store
-intended for every client-facing listener. Today it is enforced on the
-pgwire port; the Trino listener will verify HTTP Basic passwords against the
-same `[[auth.users]]` in a follow-up (see [Limitations](#auth-limitations)).
+`[auth]` is the server's client authentication: one credential store for
+both client-facing listeners. pgwire runs a SCRAM-SHA-256 exchange, and the
+Trino listener checks HTTP Basic credentials against the same
+`[[auth.users]]` (see [Trino clients](#trino-listener-under-password-auth)).
 
 By default every connection is accepted without a password
 (`type = "none"`), so existing setups keep working. To require passwords,
@@ -266,22 +310,94 @@ Behavior:
   malformed hash, duplicate or empty user names, `type = "password"` with no
   users, and a plaintext `password` key.
 
+<a id="trino-listener-under-password-auth"></a>
+**Trino listener under password auth.** Every endpoint except the
+`/v1/info`, `/v1/info/state` and `/v1/status` health checks requires
+`Authorization: Basic`, verified against the same verifiers in constant
+time. A wrong password, an unknown user or a missing header gets `401` with
+`WWW-Authenticate: Basic realm="arneb"`. The authenticated user is the
+query's user: a different `X-Trino-User` gets `403`, and a query's paging,
+cancel and info URIs only work for its owner. Successful checks are cached
+for 5 minutes, so a changed password keeps working until the cache entry
+expires or the server restarts.
+
+**Fail closed.** Trino clients refuse to send a password over plain HTTP, so
+`type = "password"` with the Trino listener enabled and no [`[tls]`](#tls)
+**stops startup** with an error naming both fixes: configure `[tls]`, or
+disable the listener with `--no-trino` / `ARNEB_TRINO_ENABLED=false`.
+
 <a id="auth-limitations"></a>
-Limitations: `[auth]` is enforced only on the pgwire port. These listeners
-still accept anyone, so keep them on a trusted network:
+Limitations:
 
-- the **Trino client protocol** port (`[trino] port`, default `8080`,
-  enabled by default): any `X-Trino-User` is accepted without a password.
-  Startup logs a WARN on `arneb::config` when `type = "password"` is set and
-  this listener is on. Where password protection is required, disable it
-  with `--no-trino` or `ARNEB_TRINO_ENABLED=false` until the follow-up
-  (HTTP Basic over TLS, checked against the same SCRAM verifiers) lands;
-- the **Web UI** (pgwire port + 1000);
-- the **Flight RPC** port between the coordinator and its workers.
+- The **Web UI** has no login. Under password auth it binds to `127.0.0.1`
+  by default; see [Web UI](#web-ui).
+- The **Flight RPC** port is protected by [Cluster security](#cluster-security),
+  not by `[auth]`.
+- Channel binding (`SCRAM-SHA-256-PLUS`), client-certificate authentication
+  and per-user permissions are not supported.
 
-The pgwire port does not support TLS yet. SCRAM keeps the password itself
-off the wire, but query traffic is still plaintext. Channel binding (`SCRAM-SHA-256-PLUS`) is
-not offered.
+## TLS
+
+`[tls]` turns on TLS for both client-facing listeners with one
+certificate:
+
+```toml
+[tls]
+cert_path = "/etc/arneb/server.crt"   # PEM chain, leaf first
+key_path  = "/etc/arneb/server.key"   # PEM private key (PKCS#8, PKCS#1 or SEC1)
+pgwire    = "required"                # "required" (default) | "optional"
+```
+
+| Field | Env var | Description |
+|-------|---------|-------------|
+| `cert_path` | `ARNEB_TLS_CERT_PATH` | Certificate chain. Required. |
+| `key_path` | `ARNEB_TLS_KEY_PATH` | Private key matching the certificate. Required. |
+| `pgwire` | `ARNEB_TLS_PGWIRE` | `required`: plaintext pgwire connections are rejected with `FATAL 28000 SSL connection is required`. `optional`: both are accepted (for migrations). |
+
+Setting both path variables enables TLS without a `[tls]` section.
+
+- **pgwire** answers `SSLRequest` with `S` and also accepts PostgreSQL 17
+  direct TLS, so `sslmode=require` and `verify-full` work. The `required`
+  check applies in every `[auth]` mode.
+- **Trino** serves **HTTPS only** on the same port (HTTP/1.1 or HTTP/2). A
+  plain-HTTP request to it fails the handshake and only that connection is
+  closed.
+- The certificate is read once at startup; a missing file, an empty chain,
+  or a key that does not match the certificate stops startup. Restart to
+  pick up a new certificate.
+- The effective mode is logged on `arneb::config`
+  (`tls_pgwire="required"` / `tls="off"`, and `tls_trino="https"|"http"`).
+
+For local testing, `./scripts/dev-certs.sh` writes a throwaway CA and a
+`localhost` certificate to `.dev-certs/`:
+
+```bash
+./scripts/dev-certs.sh
+psql "host=localhost sslmode=verify-full sslrootcert=.dev-certs/ca.crt user=alice"
+trino --server https://localhost:8080 --truststore-path .dev-certs/ca.crt --user alice --password
+```
+
+## Web UI
+
+The Web UI (pgwire port + 1000) has no login and shows query text and
+cluster state, so where it listens depends on `[auth]`:
+
+```toml
+[web]
+bind_address = "0.0.0.0"   # optional; ARNEB_WEB_BIND_ADDRESS
+```
+
+| `[auth] type` | `[web] bind_address` | Web UI binds to |
+|---|---|---|
+| `none` | unset | the server's `bind_address` (unchanged) |
+| `password` | unset | `127.0.0.1` |
+| any | set | the configured address |
+
+Startup logs the effective address and the reason (`default`,
+`loopback (auth=password)` or `explicit`) on `arneb::config`, and a WARN
+when an explicit non-loopback address is used under password auth. In
+docker or Kubernetes, set `[web] bind_address` (or reach the Web UI through
+a port-forward) if you need it from outside the container.
 
 ## CLI Arguments
 

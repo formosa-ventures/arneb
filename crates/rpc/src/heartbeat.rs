@@ -4,9 +4,9 @@
 //! to register themselves and report health.
 
 use arneb_common::error::ExecutionError;
-use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Action;
-use tonic::transport::Channel;
+
+use crate::security::{cluster_security, ClusterSecurity};
 
 /// Heartbeat message sent from worker to coordinator.
 #[derive(Debug, Clone)]
@@ -57,30 +57,52 @@ pub async fn send_heartbeat(
     coordinator_address: &str,
     message: &HeartbeatMessage,
 ) -> Result<(), ExecutionError> {
-    let channel = Channel::from_shared(coordinator_address.to_string())
-        .map_err(|e| {
-            ExecutionError::InvalidOperation(format!(
-                "invalid coordinator address {coordinator_address}: {e}"
-            ))
-        })?
-        .connect()
+    Ok(send_heartbeat_with(coordinator_address, message, cluster_security()).await?)
+}
+
+/// Why a heartbeat failed.
+#[derive(Debug, thiserror::Error)]
+pub enum HeartbeatError {
+    /// The coordinator rejected this node's cluster secret.
+    #[error(
+        "coordinator {0} rejected the cluster secret; check [cluster] secret / \
+         ARNEB_CLUSTER_SECRET on this worker and the coordinator"
+    )]
+    Unauthenticated(String),
+    /// Any other failure (connect, transport, server error).
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<HeartbeatError> for ExecutionError {
+    fn from(e: HeartbeatError) -> Self {
+        ExecutionError::InvalidOperation(e.to_string())
+    }
+}
+
+/// [`send_heartbeat`] with explicit cluster security, keeping the
+/// rejected-secret case distinct.
+pub async fn send_heartbeat_with(
+    coordinator_address: &str,
+    message: &HeartbeatMessage,
+    security: &ClusterSecurity,
+) -> Result<(), HeartbeatError> {
+    let mut client = crate::security::connect(coordinator_address, security)
         .await
-        .map_err(|e| {
-            ExecutionError::InvalidOperation(format!(
-                "failed to connect to coordinator at {coordinator_address}: {e}"
-            ))
-        })?;
-    let mut client = FlightServiceClient::new(channel);
+        .map_err(|e| HeartbeatError::Other(format!("coordinator at {coordinator_address}: {e}")))?;
 
     let action = Action {
         r#type: "heartbeat".to_string(),
         body: message.encode().into(),
     };
 
-    let _response = client
-        .do_action(action)
-        .await
-        .map_err(|e| ExecutionError::InvalidOperation(format!("heartbeat failed: {e}")))?;
+    let _response = client.do_action(action).await.map_err(|status| {
+        if status.code() == tonic::Code::Unauthenticated {
+            HeartbeatError::Unauthenticated(coordinator_address.to_owned())
+        } else {
+            HeartbeatError::Other(format!("heartbeat failed: {status}"))
+        }
+    })?;
 
     Ok(())
 }

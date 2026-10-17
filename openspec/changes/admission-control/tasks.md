@@ -24,15 +24,15 @@ Sections 1–4 land as four PRs, in order: A (memory), B (cancellation), C (admi
 
 ## 2. PR B — cluster-wide cancellation (D4)
 
-- [ ] 2.1 `rpc`: add the `cancel_query` action (body: query id), a `CancelQueryCallback` on `FlightState`, and the client helper `cancel_query(addr, query_id)` through `rpc::connect`.
-- [ ] 2.2 Worker: the callback aborts the query's tasks through the stored `AbortHandle`s, removes their buffers from `FlightState`, drops the `QueryEntry`, and logs `query cancelled on worker` (`arneb::cluster`, with the task count). It is idempotent.
-- [ ] 2.3 Coordinator: a `CancelGuard` in `coordinator.execute` records the workers that received tasks, is disarmed on success, and on any other exit (including `Drop`) sends `cancel_query` from a detached task. Failed deliveries are logged.
-- [ ] 2.4 The first fragment error fails the query and fires the guard, so the remaining fragments are cancelled.
-- [ ] 2.5 Tests:
+- [x] 2.1 `rpc`: add the `cancel_query` action (body: query id), a `CancelQueryCallback` on `FlightState`, and the client helper `cancel_query(addr, query_id)` through `rpc::connect`.
+- [x] 2.2 Worker: the callback aborts the query's tasks through the stored `AbortHandle`s, removes their buffers from `FlightState`, drops the `QueryEntry`, and logs `query cancelled on worker` (`arneb::cluster`, with the task count). It is idempotent.
+- [x] 2.3 Coordinator: a `CancelGuard` in `coordinator.execute` records the workers that received tasks, is disarmed on success, and on any other exit (including `Drop`) sends `cancel_query` from a detached task. Failed deliveries are logged.
+- [x] 2.4 The first fragment error fails the query and fires the guard, so the remaining fragments are cancelled.
+- [x] 2.5 Tests:
   - An rpc integration test: `cancel_query` aborts a long task, removes its buffer and is idempotent.
   - A server test: dropping the coordinator future sends `cancel_query` to every worker that received a task.
-  - A fragment failure cancels its sibling tasks.
-- [ ] 2.6 Docs: remove the "worker tasks that are already running may continue" limitation from `docs/guide/trino-clients.md`.
+  - A fragment failure cancels its sibling tasks. (Covered by the guard: every early `return Err` / `?` in `execute` drops the still-armed guard, which is the drop path `cancel_guard_cancels_on_drop_unless_disarmed` and `dropping_the_query_future_cancels_on_workers` test; the end-to-end case is in Tier 2 6.4.)
+- [x] 2.6 Docs: remove the "worker tasks that are already running may continue" limitation from `docs/guide/trino-clients.md`.
 
 ## 3. PR C — admission control (D5, D6)
 

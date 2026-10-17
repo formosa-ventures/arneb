@@ -223,8 +223,6 @@ Common classifications: `SYNTAX_ERROR`, `TABLE_NOT_FOUND`, `COLUMN_NOT_FOUND`,
 - **Progress stats** in `stats` are minimal (state, elapsed time, rows
   returned); split counts and CPU time are reported as `0`.
 - **`LIKE … ESCAPE`** in metadata queries ignores the escape character.
-- Cancelling a distributed query drops the coordinator side immediately;
-  worker tasks that are already running may continue until they finish.
 - On a coordinator, a distributed query appears twice in the Web UI: once as
   the submitted SQL (Trino listener) and once as the plan the coordinator
   schedules.

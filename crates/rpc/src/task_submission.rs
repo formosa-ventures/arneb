@@ -99,3 +99,22 @@ pub async fn notify_dynamic_filter(
         .into_inner();
     drain_ack(stream, "notify_dynamic_filter").await
 }
+
+/// Coord → worker: cancel every task of `query_id` on that worker
+/// (admission-control D4). Idempotent; an unknown query is a no-op ack.
+pub async fn cancel_query(
+    worker_address: &str,
+    query_id: arneb_common::QueryId,
+) -> Result<(), String> {
+    let mut client = connect(worker_address, cluster_security()).await?;
+    let action = Action {
+        r#type: "cancel_query".to_string(),
+        body: query_id.0.to_string().into_bytes().into(),
+    };
+    let stream = client
+        .do_action(action)
+        .await
+        .map_err(|e| format!("cancel_query RPC failed: {e}"))?
+        .into_inner();
+    drain_ack(stream, "cancel_query").await
+}

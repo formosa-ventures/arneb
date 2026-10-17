@@ -643,6 +643,12 @@ async fn run() -> Result<()> {
         flight_state.set_task_status_callback(Arc::new(move |task_id| {
             tm_for_status.task_status_as_response(task_id)
         }));
+        // admission-control D4: the coordinator's cancel guard stops a
+        // query's tasks here when the query ends early anywhere.
+        let tm_for_cancel = tm.clone();
+        flight_state.set_cancel_query_callback(Arc::new(move |query_id| {
+            tm_for_cancel.cancel_query(query_id)
+        }));
         // A1.3 (2026-05-27): route coord-pushed Domains into the
         // per-task `DynamicFilterCollector` (populated at handle_task
         // time). Sync callback wraps an async spawn — the notify

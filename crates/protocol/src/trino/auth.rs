@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aws_lc_rs::hmac;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -26,7 +25,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde_json::json;
 
-use crate::auth::{AuthConfigError, UserCredentials};
+use crate::auth::{hmac_sha256, AuthConfigError, UserCredentials};
 
 const CACHE_TTL: Duration = Duration::from_secs(300);
 const CACHE_CAPACITY: usize = 1024;
@@ -45,7 +44,7 @@ pub(crate) struct AuthUser(pub(crate) String);
 #[derive(Clone)]
 pub(crate) struct Authenticator {
     creds: Arc<UserCredentials>,
-    cache_key: hmac::Key,
+    cache_key: [u8; 32],
     cache: Arc<Mutex<VerifyCache>>,
     /// Number of full (PBKDF2) verifications; read by tests.
     verifications: Arc<AtomicU64>,
@@ -60,15 +59,14 @@ impl Authenticator {
         aws_lc_rs::rand::fill(&mut key).map_err(|_| AuthConfigError::Random)?;
         Ok(Self {
             creds,
-            cache_key: hmac::Key::new(hmac::HMAC_SHA256, &key),
+            cache_key: key,
             cache: Arc::new(Mutex::new(HashMap::new())),
             verifications,
         })
     }
 
     fn verify(&self, user: &str, password: &str) -> bool {
-        let mut digest = [0u8; 32];
-        digest.copy_from_slice(hmac::sign(&self.cache_key, password.as_bytes()).as_ref());
+        let digest = hmac_sha256(&self.cache_key, password.as_bytes());
         let key = (user.to_owned(), digest);
         let now = Instant::now();
         {

@@ -188,9 +188,9 @@ impl TlsConfig {
 
 /// `[auth]` section: client authentication for the server.
 ///
-/// One credential store for every client-facing listener. Today it is
-/// enforced on the pgwire port; the Trino listener will verify HTTP Basic
-/// passwords against the same `[[auth.users]]` in a follow-up.
+/// One credential store for every client-facing listener. Password auth is
+/// enforced on pgwire (SCRAM) and on the Trino listener (HTTP Basic against
+/// the same verifiers).
 ///
 /// ```toml
 /// [auth]

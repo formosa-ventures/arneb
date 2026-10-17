@@ -667,7 +667,7 @@ fn sha256(data: &[u8]) -> [u8; KEY_LEN] {
     out
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; KEY_LEN] {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; KEY_LEN] {
     let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data);
     let mut out = [0u8; KEY_LEN];
     out.copy_from_slice(tag.as_ref());

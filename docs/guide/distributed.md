@@ -86,6 +86,56 @@ worker_id = "worker-2"
 
 Workers register with the coordinator automatically via a heartbeat protocol on startup.
 
+## Securing the Cluster
+
+Out of the box, the Flight RPC port trusts every peer, and the client-facing
+ports are plaintext. For anything beyond a trusted single host, turn on both
+cluster settings on **every node**, plus client TLS and passwords on the
+coordinator:
+
+```toml
+# every node (coordinator and workers)
+[cluster]
+secret = "…"        # or ARNEB_CLUSTER_SECRET — same value on every node, >= 32 chars
+
+[cluster.tls]
+cert_path = "/etc/arneb/node.crt"
+key_path  = "/etc/arneb/node.key"
+ca_path   = "/etc/arneb/ca.crt"
+
+# coordinator only: client-facing TLS and passwords
+[tls]
+cert_path = "/etc/arneb/server.crt"
+key_path  = "/etc/arneb/server.key"
+
+[auth]
+type = "password"
+[[auth.users]]
+name = "alice"
+password_hash = "SCRAM-SHA-256$…"   # arneb hash-password
+```
+
+- The **secret** authenticates every Flight call: heartbeat registration,
+  task submission, data exchange and status. A worker with a wrong or
+  missing secret is rejected and never registered; it logs an ERROR naming
+  `[cluster] secret` and keeps retrying. The coordinator logs the rejection
+  on `arneb::cluster`.
+- **Cluster TLS** encrypts exchange traffic and keeps the secret off the
+  wire. Without it, the secret is sent in the clear, and startup logs a
+  WARN on non-loopback binds. Each node's certificate must name the host its
+  peers dial (the `advertised_address` host for workers, the
+  `coordinator_address` host for the coordinator). Keep `host:port` in those
+  settings; nodes switch to `https://` automatically.
+- Every node must use the same mode: a plaintext node cannot talk to a TLS
+  node, and the failure shows up as heartbeat errors on the worker.
+- With password auth, the coordinator's Web UI binds to `127.0.0.1` unless
+  `[web] bind_address` is set.
+
+`./scripts/dev-certs.sh` creates a throwaway CA and a `localhost`
+certificate that every node on one host can share. See
+[Cluster security](/guide/configuration#cluster-security) and
+[TLS](/guide/configuration#tls) for every setting.
+
 ## How It Works
 
 1. A SQL query arrives at the coordinator via pgwire

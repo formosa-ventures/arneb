@@ -49,6 +49,68 @@ pub struct AppConfig {
     /// means TLS is off.
     #[serde(skip)]
     pub tls_settings: Option<TlsSettings>,
+
+    /// Web UI listener (coordinator/standalone only).
+    #[serde(default)]
+    pub web: WebConfig,
+}
+
+/// `[web]` section.
+///
+/// ```toml
+/// [web]
+/// bind_address = "0.0.0.0"   # ARNEB_WEB_BIND_ADDRESS
+/// ```
+///
+/// The Web UI has no login and shows query text, so under
+/// `[auth] type = "password"` it binds to `127.0.0.1` unless this is set.
+/// The port stays at the pgwire port + 1000.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    #[serde(default)]
+    pub bind_address: Option<String>,
+}
+
+impl WebConfig {
+    /// Apply `ARNEB_WEB_BIND_ADDRESS` (env > file).
+    pub fn apply_env_overrides(&mut self, env: impl Fn(&str) -> Option<String>) {
+        if let Some(v) = env("ARNEB_WEB_BIND_ADDRESS") {
+            self.bind_address = Some(v);
+        }
+    }
+}
+
+/// Why the Web UI binds where it does (logged on `arneb::config`).
+pub const WEB_BIND_DEFAULT: &str = "default";
+pub const WEB_BIND_LOOPBACK: &str = "loopback (auth=password)";
+pub const WEB_BIND_EXPLICIT: &str = "explicit";
+
+/// Resolve the Web UI bind host: an explicit `[web] bind_address` wins;
+/// otherwise `127.0.0.1` under password auth and the server's
+/// `bind_address` without it. Returns `(host, reason)`.
+pub fn resolve_web_bind(
+    auth: AuthType,
+    server_bind: &str,
+    web_bind: Option<&str>,
+) -> Result<(String, &'static str)> {
+    let (host, reason) = match (web_bind.map(str::trim), auth) {
+        (Some(explicit), _) => (explicit.to_owned(), WEB_BIND_EXPLICIT),
+        (None, AuthType::Password) => ("127.0.0.1".to_owned(), WEB_BIND_LOOPBACK),
+        (None, AuthType::None) => (server_bind.to_owned(), WEB_BIND_DEFAULT),
+    };
+    if host != "localhost" && host.parse::<std::net::IpAddr>().is_err() {
+        bail!("invalid [web] bind_address '{host}' (expected an IP address)");
+    }
+    Ok((host, reason))
+}
+
+/// Whether a bind host only listens on loopback.
+pub fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// `[tls]` section: one certificate for both client-facing listeners.
@@ -213,6 +275,20 @@ impl AuthConfig {
             }
         }
     }
+}
+
+/// Fail closed: password auth on an enabled Trino listener needs `[tls]`.
+/// Trino clients only send passwords over HTTPS, so a plain-HTTP listener
+/// under password auth would be either unusable or a bypass.
+pub fn check_trino_transport(trino_enabled: bool, password_auth: bool, tls: bool) -> Result<()> {
+    if trino_enabled && password_auth && !tls {
+        bail!(
+            "[auth] type = \"password\" requires TLS on the Trino listener: configure [tls] \
+             (or ARNEB_TLS_CERT_PATH / ARNEB_TLS_KEY_PATH), or disable the listener with \
+             --no-trino / ARNEB_TRINO_ENABLED=false"
+        );
+    }
+    Ok(())
 }
 
 /// Trino client REST protocol (`POST /v1/statement`) listener.
@@ -674,6 +750,7 @@ impl AppConfig {
                         trino: TrinoProtocolConfig::default(),
                         tls: None,
                         tls_settings: None,
+                        web: WebConfig::default(),
                     }
                 }
             }
@@ -685,6 +762,8 @@ impl AppConfig {
         let mut trino = config.trino;
         trino.apply_env_overrides()?;
         let tls_settings = TlsConfig::resolve(config.tls.as_ref(), |k| std::env::var(k).ok())?;
+        let mut web = config.web;
+        web.apply_env_overrides(|k| std::env::var(k).ok());
 
         Ok(AppConfig {
             server,
@@ -697,6 +776,7 @@ impl AppConfig {
             trino,
             tls: config.tls,
             tls_settings,
+            web,
         })
     }
 }
@@ -889,6 +969,48 @@ pgwire = "required"
         let err =
             TlsConfig::resolve(None, env_from(&[("ARNEB_TLS_PGWIRE", "optional")])).unwrap_err();
         assert!(err.to_string().contains("cert_path"), "{err}");
+    }
+
+    #[test]
+    fn test_trino_password_auth_fails_closed_without_tls() {
+        let err = check_trino_transport(true, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[tls]") && err.contains("--no-trino"), "{err}");
+        check_trino_transport(true, true, true).unwrap();
+        check_trino_transport(false, true, false).unwrap();
+        check_trino_transport(true, false, false).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_web_bind() {
+        assert_eq!(
+            resolve_web_bind(AuthType::None, "0.0.0.0", None).unwrap(),
+            ("0.0.0.0".to_owned(), WEB_BIND_DEFAULT)
+        );
+        assert_eq!(
+            resolve_web_bind(AuthType::Password, "0.0.0.0", None).unwrap(),
+            ("127.0.0.1".to_owned(), WEB_BIND_LOOPBACK)
+        );
+        for auth in [AuthType::None, AuthType::Password] {
+            assert_eq!(
+                resolve_web_bind(auth, "127.0.0.1", Some("0.0.0.0")).unwrap(),
+                ("0.0.0.0".to_owned(), WEB_BIND_EXPLICIT)
+            );
+        }
+        assert!(resolve_web_bind(AuthType::Password, "0.0.0.0", Some("not an ip")).is_err());
+        assert!(is_loopback_host("127.0.0.1") && is_loopback_host("::1"));
+        assert!(!is_loopback_host("0.0.0.0"));
+    }
+
+    #[test]
+    fn test_web_bind_env_overrides_file() {
+        let config: AppConfig = toml::from_str("[web]\nbind_address = \"10.0.0.5\"\n").unwrap();
+        let mut web = config.web;
+        assert_eq!(web.bind_address.as_deref(), Some("10.0.0.5"));
+        web.apply_env_overrides(env_from(&[("ARNEB_WEB_BIND_ADDRESS", "0.0.0.0")]));
+        assert_eq!(web.bind_address.as_deref(), Some("0.0.0.0"));
+        assert!(toml::from_str::<AppConfig>("[web]\nport = 1\n").is_err());
     }
 
     #[test]

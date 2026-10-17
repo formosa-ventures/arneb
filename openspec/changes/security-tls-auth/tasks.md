@@ -19,17 +19,17 @@ Sections 1–2, 3–4b and 5 can land as three separate PRs, in that order. Sect
 
 ## 3. Trino HTTPS
 
-- [ ] 3.1 `TrinoServer::with_tls(Option<TlsAcceptor>)`. In `serve()`, run a rustls accept loop feeding `hyper_util` `auto::Builder::serve_connection` with the router when TLS is set, and keep `axum::serve` unchanged otherwise. A handshake error logs at `debug` and drops only that connection.
-- [ ] 3.2 Integration test: reqwest with the test CA posts `SELECT 1` over https and pages to completion. Plain HTTP to the TLS port fails without killing the listener.
+- [x] 3.1 `TrinoServer::with_tls(Option<TlsAcceptor>)`. In `serve()`, run a rustls accept loop feeding `hyper_util` `auto::Builder::serve_connection` with the router when TLS is set, and keep `axum::serve` unchanged otherwise. A handshake error logs at `debug` and drops only that connection.
+- [x] 3.2 Integration test: reqwest with the test CA posts `SELECT 1` over https and pages to completion. Plain HTTP to the TLS port fails without killing the listener.
 
 ## 4. Trino Basic auth (closes #85)
 
-- [ ] 4.1 `ScramVerifier::verify_password(&str) -> bool` in `crates/protocol/src/auth.rs`: SASLprep, then PBKDF2 with the stored salt and iterations, then a constant-time StoredKey compare. Unknown users use the decoy verifier. Unit tests: right password, wrong password, unknown user, and a verifier from `postgres-protocol`.
-- [ ] 4.2 `trino/auth.rs`: an axum middleware that requires Basic auth in password mode, except on `/v1/info`, `/v1/info/state` and `/v1/status`. On failure it returns `401` with `WWW-Authenticate: Basic realm="arneb"`. It puts the authenticated user in request extensions.
-- [ ] 4.3 Verification cache: a bounded (1024 entries) TTL (5 min) map keyed by `(user, HMAC-SHA256(per-process key, password))`. Successes only.
-- [ ] 4.4 User binding: the authenticated user overrides the session user. A differing `X-Trino-User` / `X-Presto-User` gets `403`. `Query` gets an `owner`; `fetch`, `cancel`, `query_info` and `kill` by a non-owner get `403`; `/v1/query` is filtered by owner. In `none` mode, the behavior is unchanged.
-- [ ] 4.5 Fail closed: `[auth] type = "password"` with the Trino listener enabled and no `[tls]` is a startup error naming `[tls]` and `--no-trino`. Remove the WARN at `main.rs` (around line 697).
-- [ ] 4.6 Integration tests (`crates/protocol/tests/trino_auth.rs`):
+- [x] 4.1 `ScramVerifier::verify_password(&str) -> bool` in `crates/protocol/src/auth.rs`: SASLprep, then PBKDF2 with the stored salt and iterations, then a constant-time StoredKey compare. Unknown users use the decoy verifier. Unit tests: right password, wrong password, unknown user, and a verifier from `postgres-protocol`.
+- [x] 4.2 `trino/auth.rs`: an axum middleware that requires Basic auth in password mode, except on `/v1/info`, `/v1/info/state` and `/v1/status`. On failure it returns `401` with `WWW-Authenticate: Basic realm="arneb"`. It puts the authenticated user in request extensions.
+- [x] 4.3 Verification cache: a bounded (1024 entries) TTL (5 min) map keyed by `(user, HMAC-SHA256(per-process key, password))`. Successes only.
+- [x] 4.4 User binding: the authenticated user overrides the session user. A differing `X-Trino-User` / `X-Presto-User` gets `403`. `Query` gets an `owner`; `fetch`, `cancel`, `query_info` and `kill` by a non-owner get `403`; `/v1/query` is filtered by owner. In `none` mode, the behavior is unchanged.
+- [x] 4.5 Fail closed: `[auth] type = "password"` with the Trino listener enabled and no `[tls]` is a startup error naming `[tls]` and `--no-trino`. Remove the WARN at `main.rs` (around line 697).
+- [x] 4.6 Integration tests (`crates/protocol/tests/trino_auth.rs`):
   - Right password, wrong password, missing header and unknown user each produce the expected status.
   - `/v1/info` works without credentials.
   - Impersonation gets `403`.
@@ -39,8 +39,8 @@ Sections 1–2, 3–4b and 5 can land as three separate PRs, in that order. Sect
 
 ## 4b. Web UI loopback default (design D8)
 
-- [ ] 4b.1 Config: `[web] bind_address` and `ARNEB_WEB_BIND_ADDRESS`. Add a pure `resolve_web_bind(auth_type, server_bind, web_bind) -> (addr, reason)` in `crates/server/src/config.rs`. Use it at the Web UI bind in `main.rs` (around line 755), log the effective address and reason on `arneb::config`, and WARN when an explicit non-loopback address is used under password auth.
-- [ ] 4b.2 Unit tests for `resolve_web_bind`:
+- [x] 4b.1 Config: `[web] bind_address` and `ARNEB_WEB_BIND_ADDRESS`. Add a pure `resolve_web_bind(auth_type, server_bind, web_bind) -> (addr, reason)` in `crates/server/src/config.rs`. Use it at the Web UI bind in `main.rs` (around line 755), log the effective address and reason on `arneb::config`, and WARN when an explicit non-loopback address is used under password auth.
+- [x] 4b.2 Unit tests for `resolve_web_bind`:
   - `none` + unset keeps `server.bind_address` (`default`).
   - `password` + unset gives `127.0.0.1` (`loopback (auth=password)`).
   - An explicit value wins in both modes (`explicit`).

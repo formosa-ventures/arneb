@@ -153,6 +153,14 @@ impl ScramVerifier {
         constant_time::verify_slices_are_equal(&sha256(&client_key), &self.stored_key).is_ok()
     }
 
+    /// Check a plaintext password (e.g. from HTTP Basic auth) against this
+    /// verifier: SASLprep + PBKDF2 with the stored salt and iterations, then
+    /// a constant-time StoredKey compare.
+    pub fn verify_password(&self, password: &str) -> bool {
+        let candidate = Self::from_password(password, &self.salt, self.iterations);
+        constant_time::verify_slices_are_equal(&candidate.stored_key, &self.stored_key).is_ok()
+    }
+
     fn server_signature(&self, auth_message: &[u8]) -> [u8; KEY_LEN] {
         hmac_sha256(&self.server_key, auth_message)
     }
@@ -272,6 +280,15 @@ impl UserCredentials {
     /// Whether no users are configured (never true for a constructed store).
     pub fn is_empty(&self) -> bool {
         self.users.is_empty()
+    }
+
+    /// Check `user` / `password` (HTTP Basic auth). An unknown user runs the
+    /// same PBKDF2 against a decoy verifier, so timing does not reveal which
+    /// users exist.
+    pub fn verify_password(&self, user: &str, password: &str) -> bool {
+        let (verifier, known) = self.lookup(user);
+        let ok = verifier.verify_password(password);
+        ok && known
     }
 
     /// Verifier for `user`, or a deterministic decoy verifier (and `false`)
@@ -660,6 +677,30 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; KEY_LEN] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_password_checks_the_stored_key() {
+        let alice = ScramVerifier::generate("alice-pw").unwrap();
+        assert!(alice.verify_password("alice-pw"));
+        assert!(!alice.verify_password("alice-PW"));
+        assert!(!alice.verify_password(""));
+
+        // A verifier produced by postgres-protocol (rust-postgres' ALTER ROLE
+        // ... PASSWORD implementation) verifies too.
+        let bob: ScramVerifier = postgres_protocol::password::scram_sha_256(b"bob-pw")
+            .parse()
+            .unwrap();
+        assert!(bob.verify_password("bob-pw"));
+        assert!(!bob.verify_password("alice-pw"));
+
+        let creds =
+            UserCredentials::new(vec![("alice".to_owned(), alice), ("bob".to_owned(), bob)])
+                .unwrap();
+        assert!(creds.verify_password("alice", "alice-pw"));
+        assert!(!creds.verify_password("alice", "bob-pw"));
+        assert!(!creds.verify_password("mallory", "alice-pw"));
+        assert!(!creds.verify_password("mallory", ""));
+    }
 
     /// Client side of SCRAM-SHA-256, used to drive the verifier in tests.
     fn client_proof(password: &str, salt: &[u8], iterations: u32, auth_message: &str) -> Vec<u8> {

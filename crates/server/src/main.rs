@@ -704,6 +704,11 @@ async fn run() -> Result<()> {
             mode: t.pgwire,
         });
 
+    let password_users = match &auth_method {
+        arneb_protocol::AuthMethod::ScramSha256(creds) => Some(Arc::clone(creds)),
+        arneb_protocol::AuthMethod::None => None,
+    };
+
     let mut server = ProtocolServer::new(
         protocol_config,
         catalog_manager.clone(),
@@ -721,26 +726,24 @@ async fn run() -> Result<()> {
     // pgwire. Queries are registered with the tracker so they show in the
     // Web UI.
     let serves_clients = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
+    let trino_enabled = config.trino.enabled && serves_clients;
     let trino_addr = format!("{}:{}", config.server.bind_address, config.trino.port);
+    // Fail closed: Trino clients only send passwords over HTTPS, so password
+    // auth on a plain-HTTP listener would be unusable or a bypass.
+    config::check_trino_transport(
+        trino_enabled,
+        password_users.is_some(),
+        server_tls.is_some(),
+    )?;
     tracing::info!(
         target: "arneb::config",
-        trino_enabled = config.trino.enabled && serves_clients,
+        trino_enabled,
         trino_address = %trino_addr,
+        tls_trino = if server_tls.is_some() { "https" } else { "http" },
+        trino_auth = if password_users.is_some() { "password (basic)" } else { "none" },
         "Trino client protocol effective settings ([trino] / ARNEB_TRINO_ENABLED / ARNEB_TRINO_PORT / --trino-port / --no-trino)"
     );
-    if config.trino.enabled
-        && serves_clients
-        && !matches!(config.auth.auth_type, config::AuthType::None)
-    {
-        tracing::warn!(
-            target: "arneb::config",
-            trino_address = %trino_addr,
-            "[auth] type = \"password\" does not yet apply to the Trino listener: it accepts \
-             any X-Trino-User without a password. Disable it with --no-trino or \
-             ARNEB_TRINO_ENABLED=false where password protection is required"
-        );
-    }
-    let trino_server = (config.trino.enabled && serves_clients).then(|| {
+    let trino_server = if trino_enabled {
         let mut trino = TrinoServer::new(
             TrinoConfig {
                 bind_address: trino_addr.clone(),
@@ -750,12 +753,17 @@ async fn run() -> Result<()> {
             connector_registry.clone(),
         )
         .with_memory_pool(Arc::clone(&memory_pool))
-        .with_query_tracker(query_tracker.clone());
+        .with_query_tracker(query_tracker.clone())
+        .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
+        .with_password_auth(password_users.clone())
+        .context("Trino listener authentication")?;
         if let Some(ref executor) = distributed_executor {
             trino = trino.with_distributed_executor(Arc::clone(executor));
         }
-        trino
-    });
+        Some(trino)
+    } else {
+        None
+    };
 
     // 9. Startup banner
     match role {
@@ -786,7 +794,28 @@ async fn run() -> Result<()> {
     };
     let web_router = web::build_router(web_state);
     let web_port = config.server.port + 1000; // default: pgwire port + 1000 (e.g., 5432 → 6432)
-    let web_addr = format!("{}:{}", config.server.bind_address, web_port);
+    let (web_host, web_reason) = config::resolve_web_bind(
+        config.auth.auth_type,
+        &config.server.bind_address,
+        config.web.bind_address.as_deref(),
+    )?;
+    let web_addr = format!("{web_host}:{web_port}");
+    if serves_clients {
+        tracing::info!(
+            target: "arneb::config",
+            web_bind_address = %web_addr,
+            reason = web_reason,
+            "Web UI effective bind ([web] bind_address / ARNEB_WEB_BIND_ADDRESS)"
+        );
+        if password_users.is_some() && !config::is_loopback_host(&web_host) {
+            tracing::warn!(
+                target: "arneb::config",
+                web_bind_address = %web_addr,
+                "the Web UI has no login and shows query text; it is reachable beyond \
+                 loopback while [auth] type = \"password\""
+            );
+        }
+    }
 
     // 11. Run services based on role
     let flight_state_clone = flight_state.clone();

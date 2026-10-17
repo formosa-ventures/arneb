@@ -157,6 +157,10 @@ query_max_memory_per_node = 4294967296   # existing field; ARNEB_QUERY_MAX_MEMOR
 
 Docs land with each PR. Rollback: unset the memory limit, set `max_running_queries = 0` and leave `statement_timeout` at `0`, and behavior matches today apart from the typed error codes.
 
-## Decisions log
+## Decisions log (resolved review questions, 2026-10-17)
 
-Open questions for review are listed in `tasks.md` section 0 and are resolved before implementation starts.
+1. **`max_running_queries` defaults to `8`.** Admission is on by default. `0` (unlimited) and a worker-derived cap were rejected: unlimited leaves the acceptance scenario (20 concurrent SF10 queries) unprotected out of the box, and a derived cap moves as workers join and leave.
+2. **`max_queued_queries` defaults to `256`; a full queue rejects with `53000` / `QUERY_QUEUE_FULL`.** The alternative, an unbounded queue with a `max_queued_time`, was rejected because it hides overload until clients time out.
+3. **The memory limit is per node only** (D1/D2). A cluster-wide `query_max_memory` (a coordinator-side sum fed by task status) is a follow-up.
+4. **`query_max_memory_per_node` is unset by default** (opt-in) until Tier 2 gives numbers. Defaulting it to 0.8 × the spill budget was rejected for now as unmeasured.
+5. **`statement_timeout` defaults to `0`** (off, PostgreSQL's default). A `1h` server default was rejected so that existing long-running workloads do not change behavior.

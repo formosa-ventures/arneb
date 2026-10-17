@@ -387,9 +387,6 @@ impl DataSource for IcebergDataSource {
         let stream = ParquetBatchStream::new(output_schema, stream, uri.clone()).with_adapter(
             Box::new(move |batch| adapt_batch(&schema, &sources, &file_path, batch)),
         );
-        Ok(Box::pin(match &ctx.memory_pool {
-            Some(pool) => stream.with_memory_pool(pool, buffer_bytes),
-            None => stream,
-        }))
+        Ok(Box::pin(stream.with_scan_memory(ctx, buffer_bytes)))
     }
 }

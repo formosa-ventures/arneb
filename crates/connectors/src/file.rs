@@ -300,10 +300,7 @@ impl DataSource for ParquetDataSource {
             stream,
             self.path.as_ref().to_string(),
         );
-        Ok(Box::pin(match &ctx.memory_pool {
-            Some(pool) => stream.with_memory_pool(pool, buffer_bytes),
-            None => stream,
-        }))
+        Ok(Box::pin(stream.with_scan_memory(ctx, buffer_bytes)))
     }
 }
 
@@ -626,10 +623,7 @@ impl DataSource for PreResolvedParquetDataSource {
             stream,
             self.path.to_string(),
         );
-        Ok(Box::pin(match &ctx.memory_pool {
-            Some(pool) => stream.with_memory_pool(pool, buffer_bytes),
-            None => stream,
-        }))
+        Ok(Box::pin(stream.with_scan_memory(ctx, buffer_bytes)))
     }
 }
 

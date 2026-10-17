@@ -265,8 +265,7 @@ pub struct ParquetBatchStream {
 /// Decode-buffer accounting for one scan stream.
 struct ScanMemory {
     reservation: MemoryReservation,
-    bytes: usize,
-    started: bool,
+    pending: Option<usize>,
 }
 
 impl ParquetBatchStream {
@@ -295,11 +294,19 @@ impl ParquetBatchStream {
         if bytes > 0 {
             self.memory = Some(ScanMemory {
                 reservation: MemoryConsumer::new("ParquetScan").register(pool.clone()),
-                bytes,
-                started: false,
+                pending: Some(bytes),
             });
         }
         self
+    }
+
+    /// Account the decode buffer against the scan context's memory pool, if
+    /// any; see [`Self::with_memory_pool`].
+    pub fn with_scan_memory(self, ctx: &arneb_execution::ScanContext, bytes: usize) -> Self {
+        match &ctx.memory_pool {
+            Some(pool) => self.with_memory_pool(pool, bytes),
+            None => self,
+        }
     }
 
     /// Transform every batch with `adapter` before yielding it.
@@ -313,9 +320,10 @@ impl Stream for ParquetBatchStream {
     type Item = Result<RecordBatch, ArnebError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(mem) = self.memory.as_mut().filter(|m| !m.started) {
-            mem.started = true;
-            let _ = mem.reservation.try_grow(mem.bytes);
+        if let Some(mem) = self.memory.as_mut() {
+            if let Some(bytes) = mem.pending.take() {
+                let _ = mem.reservation.try_grow(bytes);
+            }
         }
         let polled = self.inner.as_mut().poll_next(cx);
         if matches!(polled, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {

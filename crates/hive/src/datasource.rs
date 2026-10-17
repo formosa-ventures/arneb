@@ -351,7 +351,7 @@ impl HiveDataSource {
         let stream = ParquetBatchStream::new(output_schema, stream, path.clone()).with_adapter(
             Box::new(move |batch| adapt_batch(&schema, &sources, &path, batch)),
         );
-        Ok(Box::pin(with_scan_memory(stream, ctx, buffer_bytes)))
+        Ok(Box::pin(stream.with_scan_memory(ctx, buffer_bytes)))
     }
 }
 
@@ -463,21 +463,9 @@ impl DataSource for HiveDataSource {
                 // columns that's ~336 MB per query, which dominated the
                 // single-table-aggregate work-memory delta vs Trino.
                 let stream = ParquetBatchStream::new(output_schema, stream, file_path.to_string());
-                Ok(Box::pin(with_scan_memory(stream, ctx, buffer_bytes)))
+                Ok(Box::pin(stream.with_scan_memory(ctx, buffer_bytes)))
             }
         }
-    }
-}
-
-/// Account the stream's decode buffer against the scan's memory pool, if any.
-fn with_scan_memory(
-    stream: ParquetBatchStream,
-    ctx: &ScanContext,
-    buffer_bytes: usize,
-) -> ParquetBatchStream {
-    match &ctx.memory_pool {
-        Some(pool) => stream.with_memory_pool(pool, buffer_bytes),
-        None => stream,
     }
 }
 

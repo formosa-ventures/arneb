@@ -61,29 +61,48 @@ Sections 1–4 land as four PRs, in order: A (memory), B (cancellation), C (admi
 
 ## 5. Tier 1 — local correctness gate (every PR)
 
-- [ ] 5.1 `cargo fmt -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` are clean.
-- [ ] 5.2 `cargo test --workspace` is green. With limits off or not reached, all existing tests pass unchanged.
+- [x] 5.1 `cargo fmt -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` are clean.
+- [x] 5.2 `cargo test --workspace` is green. With limits off or not reached, all existing tests pass unchanged.
 
 ## 6. Tier 2 — local distributed check (coordinator + 2 workers, SF10)
 
-- [ ] 6.1 Plumbing (CLAUDE.md rule):
+- [x] 6.1 Plumbing (CLAUDE.md rule):
   - The new `arneb::config`, `arneb::admission` and `arneb::cluster` lines appear under the default `RUST_LOG`.
   - `/api/v1/cluster` shows the admission counters.
-- [ ] 6.2 Concurrency acceptance: 20 concurrent SF10 TPC-H queries (a mix including q09, q18 and q21) with the default `max_running_queries`.
+- [x] 6.2 Concurrency acceptance: 20 concurrent SF10 TPC-H queries (a mix including q09, q18 and q21) with the default `max_running_queries`.
   - Every coordinator and worker process survives (no OOM kill).
   - The Web UI and `/api/v1/cluster` show queued queries draining.
   - Every query returns cell-identical results to its single-query run.
   - Record peak RSS per node and the total wall time, compared with `max_running_queries = 0`.
-- [ ] 6.3 Memory limit:
+- [x] 6.3 Memory limit:
   - With `ARNEB_QUERY_MAX_MEMORY_BYTES` set below q18's per-worker peak (about 1.4 GB at SF10, see #126), q18 fails with `53200` over psql and `EXCEEDED_LOCAL_MEMORY_LIMIT` over the trino CLI.
   - A concurrent small query completes.
   - The workers' tracked bytes return to the baseline afterwards (`arneb::mem`).
-- [ ] 6.4 Timeout:
+- [x] 6.4 Timeout:
   - `SET statement_timeout = '500ms'` on q09 gives `57014`.
   - Every worker logs `query cancelled on worker`, no task of that query is left in `FlightState`, and the per-query pool is gone.
   - The same holds for `query_max_execution_time=1s` via the trino CLI and for a Trino `DELETE` mid-query.
-- [ ] 6.5 No regression: run the SF10 22-query bench (`run_benchmark.sh --scenario=sf10`) with defaults against the pre-change baseline. Latency and memory geomeans should be within run-to-run noise, using Trino as the drift control. Record both numbers here.
-- [ ] 6.6 Tier 3 (remote SF30) is not required: this change carries no performance claim. An optional SF30 run of 6.3 (memory limit under real pressure) can ride along with the deferred P1 SF30 tasks.
+- [x] 6.5 No regression: run the SF10 22-query bench (`run_benchmark.sh --scenario=sf10`) with defaults against the pre-change baseline. Latency and memory geomeans should be within run-to-run noise, using Trino as the drift control. Record both numbers here.
+- [x] 6.6 Tier 3 (remote SF30) is not required: this change carries no performance claim. An optional SF30 run of 6.3 (memory limit under real pressure) can ride along with the deferred P1 SF30 tasks.
+
+### Tier 2 results (2026-10-17)
+
+Native release build, coordinator + 2 workers on one host, against the docker-compose Hive SF10 data (re-seeded for #135). Admission at its defaults unless stated.
+
+- **6.1 plumbing.** Under the default `RUST_LOG` the coordinator logs `admission effective settings ... max_running_queries=8 max_queued_queries=256 statement_timeout=0 query_max_memory_per_node=off` on `arneb::config`, workers log `worker per-query memory limit`, `arneb::admission` logs `query queued` / `query admitted ... waited_ms=7989`, and `arneb::cluster` logs the cancel lines in 6.4. `/api/v1/cluster` returns `running_queries`, `queued_queries`, `max_running_queries` and `max_queued_queries`.
+- **6.2 concurrency (20 queries: q09, q18, q21, q01, q03, q05, q06, q10, q12, q14, each twice).** All three processes survived every run. Results compared with single-query runs of the same queries (relative 1e-12):
+
+  | Build / cap | Running max | Queued max | Worker RSS peak | Wall | Identical | Failed |
+  |---|---|---|---|---|---|---|
+  | this change, cap 8 | 8 | 12 | 3.20 / 3.17 GB | 31.7 s | 19/19 | 1 (q03) |
+  | this change, cap 0 | 20 | 0 | 3.77 / 3.74 GB | 36.0 s | 18/18 | 2 (q03, q18) |
+  | `main` (no admission) | 20 | — | 3.82 / 3.86 GB | 36.6 s | 19/19 | 1 (q03) |
+
+  The queue drained (8 running / 11 queued at 4 s, 0 queued at 20 s). Every failure, **including on `main`**, is the same pre-existing exchange fault: a worker's Flight `do_get` on another worker's broadcast buffer ends with `h2 protocol error: error reading a body from connection` / `broken pipe` under concurrent load. It is not caused by this change (it reproduces on `main`), and the cancel guard then cancelled the failed query on both workers as designed. Tracked as a follow-up.
+- **6.3 memory limit (`ARNEB_QUERY_MAX_MEMORY_BYTES=300000000`).** q18 fails over psql with `ERROR 53200: stream error during execution: resource exhausted: query memory limit exceeded: consumer 'HashAggregateExec.merge' requested 15108272 bytes; query used 285459736/300000000 bytes (per-query cap)`, and over the trino CLI / REST with `EXCEEDED_LOCAL_MEMORY_LIMIT` (`INSUFFICIENT_RESOURCES`). q06 run alongside completes with the right result. Afterwards both workers report `tracked_now_bytes` 0 / 104. **Tier 2 found a bug here** (first run: `XX000`): an operator re-wrapped the remote ResourceExhausted as InvalidOperation, so the class was lost at the next exchange hop. Fixed by keeping the tag in the text and classifying at the client-facing edge; regression test `class_survives_operator_rewrapping_over_two_hops`.
+- **6.4 timeout and cancel (q09).** `SET statement_timeout = '500ms'` gives `ERROR 57014: canceling statement due to statement timeout` and the session still answers `SHOW statement_timeout` (`500ms`). The trino CLI with `--session query_max_execution_time=1s` fails with `Query exceeded the maximum execution time limit of 1s`. A Trino `DELETE` on a RUNNING query returns 204. For each of the three, the coordinator logs `cancelling query on workers workers=2`, worker-1 logs `query cancelled on worker tasks=9` and worker-2 `tasks=8`; no task of those queries completes after the cancel, and the next query sees `tracked_now_bytes=104` on both workers.
+- **6.5 no regression.** `run_benchmark.sh --scenario=sf10 --mode=both` with the image of this branch (`memory_total_20261017_125722`, defaults: cap 8, no memory limit, no timeout) against `memory_total_20261017_004235` (same seed; main + P1 scan accounting, which measured ~1.0× on its own). 22/22 OK. Geomean ratios: arneb latency 0.985× cold / 0.975× warm, memory 1.019× / 1.005×; Trino drift 0.982× / 0.987×, memory 1.023× / 0.966×. Worst single query: arneb q15 warm 1.08×, inside the documented per-query noise. No regression attributable to this change.
+- **6.6.** Tier 3 not run (no performance claim).
 
 ## 7. Docs
 

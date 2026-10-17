@@ -2,20 +2,20 @@ Sections 1–2, 3–4b and 5 can land as three separate PRs, in that order. Sect
 
 ## 1. Shared TLS config and loading
 
-- [ ] 1.1 `[tls]` config in `crates/server/src/config.rs`: a `TlsConfig { cert_path, key_path, pgwire: PgwireTlsMode }` with `deny_unknown_fields`, overridden by `ARNEB_TLS_CERT_PATH`, `ARNEB_TLS_KEY_PATH` and `ARNEB_TLS_PGWIRE`. Validation: both paths required; reject an unknown mode.
-- [ ] 1.2 `crates/protocol/src/tls.rs`: load the PEM chain and key into a `rustls::ServerConfig` (aws-lc-rs provider). Reject an empty chain, a missing key, or a key that does not match the cert. Build two configs, with ALPN `postgresql` for pgwire and `h2, http/1.1` for Trino. Make `tokio-rustls` and `rustls` direct dependencies of `protocol`, at the versions already in `Cargo.lock`.
-- [ ] 1.3 Unit tests with an `rcgen`-generated test CA and leaf (dev-dependency): a valid pair loads; a missing file, an empty PEM and a mismatched key each produce a named error; the env override wins over the file; an unknown `pgwire` mode is rejected.
+- [x] 1.1 `[tls]` config in `crates/server/src/config.rs`: a `TlsConfig { cert_path, key_path, pgwire: PgwireTlsMode }` with `deny_unknown_fields`, overridden by `ARNEB_TLS_CERT_PATH`, `ARNEB_TLS_KEY_PATH` and `ARNEB_TLS_PGWIRE`. Validation: both paths required; reject an unknown mode.
+- [x] 1.2 `crates/protocol/src/tls.rs`: load the PEM chain and key into a `rustls::ServerConfig` (aws-lc-rs provider). Reject an empty chain, a missing key, or a key that does not match the cert. Build two configs, with ALPN `postgresql` for pgwire and `h2, http/1.1` for Trino. Make `tokio-rustls` and `rustls` direct dependencies of `protocol`, at the versions already in `Cargo.lock`.
+- [x] 1.3 Unit tests with an `rcgen`-generated test CA and leaf (dev-dependency): a valid pair loads; a missing file, an empty PEM and a mismatched key each produce a named error; the env override wins over the file; an unknown `pgwire` mode is rejected.
 
 ## 2. pgwire TLS
 
-- [ ] 2.1 `ProtocolServer::with_tls(Option<TlsAcceptor>)`, passed to `pgwire::tokio::process_socket` in `serve()`. Log `tls=required|optional|off` in the "listening" line.
-- [ ] 2.2 `AuthStartupHandler`: in `required` mode, reject a StartupMessage with `!client.is_secure()` with `FATAL 28000 "SSL connection is required"` before any SASL exchange. This applies in both `none` and `password` auth modes.
-- [ ] 2.3 Integration tests (`crates/protocol/tests/tls.rs`, ephemeral port, tokio-postgres plus `tokio-postgres-rustls` with the test CA):
+- [x] 2.1 `ProtocolServer::with_tls(Option<TlsAcceptor>)`, passed to `pgwire::tokio::process_socket` in `serve()`. Log `tls=required|optional|off` in the "listening" line.
+- [x] 2.2 `AuthStartupHandler`: in `required` mode, reject a StartupMessage with `!client.is_secure()` with `FATAL 28000 "SSL connection is required"` before any SASL exchange. This applies in both `none` and `password` auth modes.
+- [x] 2.3 Integration tests (`crates/protocol/tests/tls.rs`, ephemeral port, tokio-postgres plus `tokio-postgres-rustls` with the test CA):
   - `sslmode=require` and verify-full connect and run queries.
   - Plaintext is rejected with `28000` in `required` mode and accepted in `optional` mode.
   - TLS combined with SCRAM password auth works.
   - Without `[tls]`, the server still answers `N` (regression).
-- [ ] 2.4 `main.rs`: build the acceptor from config (failure is a startup error) and log the effective mode on `arneb::config`.
+- [x] 2.4 `main.rs`: build the acceptor from config (failure is a startup error) and log the effective mode on `arneb::config`.
 
 ## 3. Trino HTTPS
 

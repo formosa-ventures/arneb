@@ -352,6 +352,16 @@ fn protocol_violation(msg: impl Into<String>) -> PgWireError {
     )))
 }
 
+/// `FATAL 28000`, the code PostgreSQL uses when `hostssl` rejects a
+/// plaintext connection.
+fn ssl_required() -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "FATAL".to_owned(),
+        "28000".to_owned(),
+        "SSL connection is required".to_owned(),
+    )))
+}
+
 fn invalid_password(user: &str) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "FATAL".to_owned(),
@@ -454,13 +464,15 @@ fn parse_client_final(data: &[u8], exchange: &ScramExchange) -> PgWireResult<(St
 /// [`AuthMethod`]. A fresh instance is created for every connection.
 pub(crate) struct AuthStartupHandler {
     method: AuthMethod,
+    tls_required: bool,
     state: Mutex<ScramState>,
 }
 
 impl AuthStartupHandler {
-    pub(crate) fn new(method: AuthMethod) -> Self {
+    pub(crate) fn new(method: AuthMethod, tls_required: bool) -> Self {
         Self {
             method,
+            tls_required,
             state: Mutex::new(ScramState::Start),
         }
     }
@@ -602,6 +614,18 @@ impl StartupHandler for AuthStartupHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // Transport check first: `[tls] pgwire = "required"` applies in every
+        // auth mode, before any SASL exchange starts.
+        if self.tls_required
+            && matches!(message, PgWireFrontendMessage::Startup(_))
+            && !client.is_secure()
+        {
+            tracing::debug!(
+                peer = %client.socket_addr(),
+                "pgwire plaintext connection rejected (tls required)"
+            );
+            return Err(ssl_required());
+        }
         match &self.method {
             AuthMethod::None => {
                 if let PgWireFrontendMessage::Startup(ref startup) = message {

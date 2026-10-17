@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: [tls] config section
-The system SHALL accept an optional `[tls]` TOML section with `cert_path` and `key_path` (both required when the section is present), plus `pgwire` (`"required"` by default, or `"optional"`). Unknown keys SHALL be rejected. `ARNEB_TLS_CERT_PATH`, `ARNEB_TLS_KEY_PATH` and `ARNEB_TLS_PGWIRE` SHALL override the file values, and setting both path variables SHALL enable TLS without a `[tls]` section. The effective TLS mode SHALL be logged at startup on the `arneb::config` target, for example `tls.pgwire="required" tls.trino="https"`, or `tls="off"`.
+The system SHALL accept an optional `[tls]` TOML section with `cert_path` and `key_path` (both required when the section is present), plus `pgwire` (`"required"` by default, or `"optional"`). Unknown keys SHALL be rejected. `ARNEB_TLS_CERT_PATH`, `ARNEB_TLS_KEY_PATH` and `ARNEB_TLS_PGWIRE` SHALL override the file values, and setting both path variables SHALL enable TLS without a `[tls]` section. The effective TLS mode SHALL be logged at startup on the `arneb::config` target, for example `tls_pgwire="required" tls_trino="https"`, or `tls="off"`.
 
 #### Scenario: Section omitted
 - **WHEN** the config has no `[tls]` section and no `ARNEB_TLS_*` variables are set

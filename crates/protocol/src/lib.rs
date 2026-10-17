@@ -5,10 +5,12 @@ mod handler;
 mod metadata;
 mod server;
 mod session;
+pub mod tls;
 pub mod trino;
 
 pub use auth::{AuthConfigError, AuthMethod, ScramVerifier, UserCredentials};
 pub use server::{ProtocolConfig, ProtocolServer};
+pub use tls::{PgwireTls, PgwireTlsMode, ServerTls, TlsConfigError};
 pub use trino::{TrinoConfig, TrinoServer};
 
 // Re-export the distributed executor trait for server crate to implement

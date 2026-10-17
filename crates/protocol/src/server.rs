@@ -8,6 +8,7 @@ use arneb_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
 
 use crate::auth::AuthMethod;
 use crate::handler::{DistributedExecutor, HandlerFactory};
+use crate::tls::{PgwireTls, PgwireTlsMode};
 
 /// Configuration for the PostgreSQL wire protocol server.
 #[derive(Debug, Clone)]
@@ -34,6 +35,7 @@ pub struct ProtocolServer {
     distributed_executor: Option<Arc<dyn DistributedExecutor>>,
     memory_pool: Arc<dyn MemoryPool>,
     auth: AuthMethod,
+    tls: Option<PgwireTls>,
 }
 
 impl ProtocolServer {
@@ -49,12 +51,20 @@ impl ProtocolServer {
             distributed_executor: None,
             memory_pool: Arc::new(UnboundedMemoryPool::new()),
             auth: AuthMethod::None,
+            tls: None,
         }
     }
 
     /// Set the client authentication mode (default: [`AuthMethod::None`]).
     pub fn with_auth(mut self, auth: AuthMethod) -> Self {
         self.auth = auth;
+        self
+    }
+
+    /// Serve TLS with the given acceptor and mode (default: no TLS; every
+    /// `SSLRequest` is answered with `N`).
+    pub fn with_tls(mut self, tls: Option<PgwireTls>) -> Self {
+        self.tls = tls;
         self
     }
 
@@ -89,6 +99,10 @@ impl ProtocolServer {
         tracing::info!(
             address = %address,
             auth = self.auth.name(),
+            tls = match &self.tls {
+                None => "off",
+                Some(t) => t.mode.name(),
+            },
             "protocol server listening"
         );
 
@@ -98,15 +112,28 @@ impl ProtocolServer {
             distributed_executor: self.distributed_executor.clone(),
             memory_pool: Arc::clone(&self.memory_pool),
             auth: self.auth.clone(),
+            tls_required: matches!(
+                self.tls,
+                Some(PgwireTls {
+                    mode: PgwireTlsMode::Required,
+                    ..
+                })
+            ),
         });
+        let acceptor = self.tls.as_ref().map(|t| t.acceptor.clone());
 
         loop {
             match listener.accept().await {
                 Ok((socket, addr)) => {
                     tracing::debug!(peer = %addr, "accepted connection");
                     let handler = handler_factory.clone();
+                    let acceptor = acceptor.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = pgwire::tokio::process_socket(socket, None, handler).await {
+                        // A failed TLS handshake surfaces here and only ends
+                        // this connection.
+                        if let Err(e) =
+                            pgwire::tokio::process_socket(socket, acceptor, handler).await
+                        {
                             tracing::debug!(error = %e, peer = %addr, "connection closed");
                         }
                     });

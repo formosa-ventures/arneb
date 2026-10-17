@@ -103,7 +103,9 @@ use arneb_connectors::{ConnectorRegistry, StorageRegistry};
 use arneb_execution::memory_pool::{
     GreedyMemoryPool, MemoryPool, QueryMemoryPool, TrackConsumersPool, UnboundedMemoryPool,
 };
-use arneb_protocol::{ProtocolConfig, ProtocolServer, TrinoConfig, TrinoServer};
+use arneb_protocol::{
+    PgwireTls, ProtocolConfig, ProtocolServer, ServerTls, TrinoConfig, TrinoServer,
+};
 use clap::Parser;
 
 use crate::config::{parse_data_type, AppConfig, ServerRole};
@@ -671,13 +673,45 @@ async fn run() -> Result<()> {
         );
     }
 
+    // Client-facing TLS ([tls] / ARNEB_TLS_*): one certificate for pgwire and
+    // the Trino listener. Workers serve neither, so they skip loading it.
+    let server_tls = match (&config.tls_settings, role) {
+        (Some(t), ServerRole::Coordinator | ServerRole::Standalone) => Some(
+            ServerTls::load(&t.cert_path, &t.key_path).context("invalid [tls] configuration")?,
+        ),
+        _ => None,
+    };
+    if !matches!(role, ServerRole::Worker) {
+        match &config.tls_settings {
+            Some(t) => tracing::info!(
+                target: "arneb::config",
+                tls_pgwire = t.pgwire.name(),
+                tls_cert_path = %t.cert_path.display(),
+                "client TLS effective mode ([tls] / ARNEB_TLS_*)"
+            ),
+            None => tracing::info!(
+                target: "arneb::config",
+                tls = "off",
+                "client TLS effective mode ([tls] / ARNEB_TLS_*)"
+            ),
+        }
+    }
+    let pgwire_tls = server_tls
+        .as_ref()
+        .zip(config.tls_settings.as_ref())
+        .map(|(tls, t)| PgwireTls {
+            acceptor: tls.pgwire_acceptor(),
+            mode: t.pgwire,
+        });
+
     let mut server = ProtocolServer::new(
         protocol_config,
         catalog_manager.clone(),
         connector_registry.clone(),
     )
     .with_memory_pool(Arc::clone(&memory_pool))
-    .with_auth(auth_method);
+    .with_auth(auth_method)
+    .with_tls(pgwire_tls);
     if let Some(ref executor) = distributed_executor {
         server = server.with_distributed_executor(Arc::clone(executor));
     }

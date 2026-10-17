@@ -1,11 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use arneb_common::types::DataType;
 use arneb_common::ServerConfig;
 use arneb_connectors::{CloudStorageConfig, S3StorageConfig};
-use arneb_protocol::{AuthMethod, ScramVerifier, UserCredentials};
+use arneb_protocol::{AuthMethod, PgwireTlsMode, ScramVerifier, UserCredentials};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +38,90 @@ pub struct AppConfig {
     /// Trino client REST protocol listener (coordinator/standalone only).
     #[serde(default)]
     pub trino: TrinoProtocolConfig,
+
+    /// TLS for the client-facing listeners (pgwire, Trino). Raw file values;
+    /// the effective settings (env applied, validated) are in
+    /// [`AppConfig::tls_settings`].
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+
+    /// Effective TLS settings after env overrides and validation; `None`
+    /// means TLS is off.
+    #[serde(skip)]
+    pub tls_settings: Option<TlsSettings>,
+}
+
+/// `[tls]` section: one certificate for both client-facing listeners.
+///
+/// ```toml
+/// [tls]
+/// cert_path = "/etc/arneb/server.crt"   # PEM chain, leaf first  (ARNEB_TLS_CERT_PATH)
+/// key_path  = "/etc/arneb/server.key"   # PEM private key        (ARNEB_TLS_KEY_PATH)
+/// pgwire    = "required"                # "required" (default) | "optional" (ARNEB_TLS_PGWIRE)
+/// ```
+///
+/// Setting both `ARNEB_TLS_*_PATH` variables enables TLS without the section.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub pgwire: Option<String>,
+}
+
+/// Validated `[tls]` settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsSettings {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    pub pgwire: PgwireTlsMode,
+}
+
+impl TlsConfig {
+    /// Apply `ARNEB_TLS_*` overrides (looked up through `env`) on top of the
+    /// file section and validate. `Ok(None)` means TLS is off.
+    pub fn resolve(
+        file: Option<&TlsConfig>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<TlsSettings>> {
+        let mut c = file.cloned().unwrap_or_default();
+        let section = file.is_some();
+        if let Some(v) = env("ARNEB_TLS_CERT_PATH") {
+            c.cert_path = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env("ARNEB_TLS_KEY_PATH") {
+            c.key_path = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env("ARNEB_TLS_PGWIRE") {
+            c.pgwire = Some(v);
+        }
+        let pgwire = match c.pgwire.as_deref() {
+            None => PgwireTlsMode::default(),
+            Some(m) => m
+                .parse()
+                .map_err(|e| anyhow::anyhow!("[tls] pgwire: {e}"))?,
+        };
+        match (c.cert_path, c.key_path) {
+            (Some(cert_path), Some(key_path)) => Ok(Some(TlsSettings {
+                cert_path,
+                key_path,
+                pgwire,
+            })),
+            (None, None) if !section && c.pgwire.is_none() => Ok(None),
+            (Some(_), None) => {
+                bail!("[tls] key_path is required when cert_path is set (or ARNEB_TLS_KEY_PATH)")
+            }
+            (None, Some(_)) => {
+                bail!("[tls] cert_path is required when key_path is set (or ARNEB_TLS_CERT_PATH)")
+            }
+            (None, None) => bail!(
+                "[tls] cert_path and key_path are required (or ARNEB_TLS_CERT_PATH / ARNEB_TLS_KEY_PATH)"
+            ),
+        }
+    }
 }
 
 /// `[auth]` section: client authentication for the server.
@@ -588,6 +672,8 @@ impl AppConfig {
                         memory: MemoryConfig::default(),
                         auth: AuthConfig::default(),
                         trino: TrinoProtocolConfig::default(),
+                        tls: None,
+                        tls_settings: None,
                     }
                 }
             }
@@ -598,6 +684,7 @@ impl AppConfig {
         server.validate()?;
         let mut trino = config.trino;
         trino.apply_env_overrides()?;
+        let tls_settings = TlsConfig::resolve(config.tls.as_ref(), |k| std::env::var(k).ok())?;
 
         Ok(AppConfig {
             server,
@@ -608,6 +695,8 @@ impl AppConfig {
             memory: config.memory,
             auth: config.auth,
             trino,
+            tls: config.tls,
+            tls_settings,
         })
     }
 }
@@ -711,6 +800,95 @@ port = 18080
         .unwrap();
         assert!(!config.trino.enabled);
         assert_eq!(config.trino.port, 18080);
+    }
+
+    fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    #[test]
+    fn test_tls_section_omitted_is_off() {
+        let config: AppConfig = toml::from_str("port = 5432").unwrap();
+        assert!(config.tls.is_none());
+        assert_eq!(TlsConfig::resolve(None, env_from(&[])).unwrap(), None);
+    }
+
+    #[test]
+    fn test_tls_section_defaults_to_required() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[tls]
+cert_path = "/c.pem"
+key_path = "/k.pem"
+"#,
+        )
+        .unwrap();
+        let tls = TlsConfig::resolve(config.tls.as_ref(), env_from(&[]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(tls.cert_path, PathBuf::from("/c.pem"));
+        assert_eq!(tls.key_path, PathBuf::from("/k.pem"));
+        assert_eq!(tls.pgwire, PgwireTlsMode::Required);
+    }
+
+    #[test]
+    fn test_tls_env_overrides_file() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[tls]
+cert_path = "/c.pem"
+key_path = "/k.pem"
+pgwire = "required"
+"#,
+        )
+        .unwrap();
+        let tls = TlsConfig::resolve(
+            config.tls.as_ref(),
+            env_from(&[
+                ("ARNEB_TLS_CERT_PATH", "/env.pem"),
+                ("ARNEB_TLS_PGWIRE", "optional"),
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tls.cert_path, PathBuf::from("/env.pem"));
+        assert_eq!(tls.key_path, PathBuf::from("/k.pem"));
+        assert_eq!(tls.pgwire, PgwireTlsMode::Optional);
+
+        // Both path variables enable TLS without a [tls] section.
+        let tls = TlsConfig::resolve(
+            None,
+            env_from(&[("ARNEB_TLS_CERT_PATH", "/c"), ("ARNEB_TLS_KEY_PATH", "/k")]),
+        )
+        .unwrap();
+        assert!(tls.is_some());
+    }
+
+    #[test]
+    fn test_tls_validation_errors() {
+        let only_cert: AppConfig = toml::from_str("[tls]\ncert_path = \"/c.pem\"\n").unwrap();
+        let err = TlsConfig::resolve(only_cert.tls.as_ref(), env_from(&[])).unwrap_err();
+        assert!(err.to_string().contains("key_path"), "{err}");
+
+        let bad_mode: AppConfig =
+            toml::from_str("[tls]\ncert_path = \"/c\"\nkey_path = \"/k\"\npgwire = \"prefer\"\n")
+                .unwrap();
+        let err = TlsConfig::resolve(bad_mode.tls.as_ref(), env_from(&[])).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("required") && msg.contains("optional"),
+            "{msg}"
+        );
+
+        assert!(toml::from_str::<AppConfig>("[tls]\ncert = \"/c\"\n").is_err());
+
+        let err =
+            TlsConfig::resolve(None, env_from(&[("ARNEB_TLS_PGWIRE", "optional")])).unwrap_err();
+        assert!(err.to_string().contains("cert_path"), "{err}");
     }
 
     #[test]

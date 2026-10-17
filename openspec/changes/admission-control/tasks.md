@@ -1,12 +1,12 @@
 Sections 1–4 land as four PRs, in order: A (memory), B (cancellation), C (admission), D (timeouts). Section 5 is the Tier 1 gate for every PR, section 6 is the Tier 2 check (run per PR for its slice, and in full before D merges), and section 7 is the docs, landed with each PR.
 
-## 0. Open decisions (resolve before implementation)
+## 0. Decisions (resolved 2026-10-17, see design.md "Decisions log")
 
-- [ ] 0.1 Default `max_running_queries`. Recommended: `8`. Alternatives: `0` (unlimited, opt-in admission), or derived from the number of workers (for example 4 × alive workers, recomputed as workers join).
-- [ ] 0.2 Default `max_queued_queries` and queue-full behavior. Recommended: `256`, then reject with `53000` / `QUERY_QUEUE_FULL`. Alternative: an unbounded queue with a `max_queued_time`.
-- [ ] 0.3 Memory limit scope. Recommended: per node only now (D1/D2), with a cluster-wide limit as a follow-up. Alternative: also ship a coordinator-side cluster-wide sum check, enforced by polling task status (laggy, see D1).
-- [ ] 0.4 Default `query_max_memory_per_node`. Recommended: unset (opt-in) until Tier 2 numbers exist. Alternative: default to a fraction (for example 0.8) of the node spill budget when one is set.
-- [ ] 0.5 Default `statement_timeout`. Recommended: `0` (off, PostgreSQL's default). Alternative: a generous server default such as `1h`.
+- [x] 0.1 Default `max_running_queries`. Recommended: `8`. Alternatives: `0` (unlimited, opt-in admission), or derived from the number of workers (for example 4 × alive workers, recomputed as workers join).
+- [x] 0.2 Default `max_queued_queries` and queue-full behavior. Recommended: `256`, then reject with `53000` / `QUERY_QUEUE_FULL`. Alternative: an unbounded queue with a `max_queued_time`.
+- [x] 0.3 Memory limit scope. Recommended: per node only now (D1/D2), with a cluster-wide limit as a follow-up. Alternative: also ship a coordinator-side cluster-wide sum check, enforced by polling task status (laggy, see D1).
+- [x] 0.4 Default `query_max_memory_per_node`. Recommended: unset (opt-in) until Tier 2 numbers exist. Alternative: default to a fraction (for example 0.8) of the node spill budget when one is set.
+- [x] 0.5 Default `statement_timeout`. Recommended: `0` (off, PostgreSQL's default). Alternative: a generous server default such as `1h`.
 
 ## 1. PR A — per-query memory pools and typed resource errors (D1–D3)
 

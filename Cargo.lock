@@ -401,6 +401,7 @@ name = "arneb-scheduler"
 version = "0.1.2"
 dependencies = [
  "arneb-common",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "uuid",

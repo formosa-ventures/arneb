@@ -63,6 +63,13 @@ export function Dashboard() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">{running}</div>
+            {cluster && (
+              <p className="text-xs text-muted-foreground">
+                {cluster.queued_queries} queued · admitted {cluster.running_queries}
+                {' / '}
+                {cluster.max_running_queries === 0 ? '∞' : cluster.max_running_queries}
+              </p>
+            )}
           </CardContent>
         </Card>
 

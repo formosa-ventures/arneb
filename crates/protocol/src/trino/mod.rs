@@ -107,6 +107,7 @@ pub struct TrinoServer {
     auth: Option<Authenticator>,
     verifications: Arc<AtomicU64>,
     query_memory_limit: Option<usize>,
+    admission: Option<arneb_scheduler::AdmissionController>,
 }
 
 impl TrinoServer {
@@ -128,6 +129,7 @@ impl TrinoServer {
             auth: None,
             verifications: Arc::new(AtomicU64::new(0)),
             query_memory_limit: None,
+            admission: None,
         }
     }
 
@@ -152,6 +154,16 @@ impl TrinoServer {
     /// Serve HTTPS only with this acceptor (default: plain HTTP).
     pub fn with_tls(mut self, tls: Option<TlsAcceptor>) -> Self {
         self.tls = tls;
+        self
+    }
+
+    /// Queue statements through this admission controller (shared with
+    /// pgwire). Default: none, every statement runs at once.
+    pub fn with_admission(
+        mut self,
+        admission: Option<arneb_scheduler::AdmissionController>,
+    ) -> Self {
+        self.admission = admission;
         self
     }
 
@@ -196,6 +208,7 @@ impl TrinoServer {
             counter: Arc::new(AtomicU64::new(0)),
             scheme: if self.tls.is_some() { "https" } else { "http" },
             auth: self.auth.clone(),
+            admission: self.admission.clone(),
         }
     }
 
@@ -285,6 +298,7 @@ struct AppState {
     /// `X-Forwarded-Proto`: `https` when the listener serves TLS.
     scheme: &'static str,
     auth: Option<Authenticator>,
+    admission: Option<arneb_scheduler::AdmissionController>,
 }
 
 fn router(state: AppState) -> Router {
@@ -371,11 +385,14 @@ struct Query {
     done: watch::Sender<bool>,
     abort: Mutex<Option<AbortHandle>>,
     tracker_id: Option<QueryId>,
+    /// Waiting for an admission slot: reported as `QUEUED`.
+    queued: std::sync::atomic::AtomicBool,
 }
 
 impl Query {
     fn state_name(&self, inner: &Inner) -> &'static str {
         match &inner.phase {
+            Phase::Running if self.queued.load(Ordering::Relaxed) => "QUEUED",
             Phase::Running => "RUNNING",
             Phase::Finished(r) if r.batch < r.output.batches.len() => "RUNNING",
             Phase::Finished(_) => "FINISHED",
@@ -445,6 +462,7 @@ async fn submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         done,
         abort: Mutex::new(None),
         tracker_id,
+        queued: std::sync::atomic::AtomicBool::new(false),
     });
     state
         .queries
@@ -456,6 +474,16 @@ async fn submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     let task_state = state.clone();
     let task_query = Arc::clone(&query);
     let handle = tokio::spawn(async move {
+        // admission-control D5: wait for a slot before planning; the permit
+        // is held until the statement task completes (paging out the
+        // materialized results does not hold it).
+        let _admission = match admit(&task_state, &task_query).await {
+            Ok(permit) => permit,
+            Err(err) => {
+                complete(&task_state, &task_query, Err(err));
+                return;
+            }
+        };
         tracker_transition(
             &task_state,
             task_query.tracker_id,
@@ -486,6 +514,29 @@ async fn submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         doc
     };
     json_response(StatusCode::OK, body, &[], query.family)
+}
+
+/// Take an admission slot for a statement that executes a plan, reporting
+/// the query as `QUEUED` while it waits.
+async fn admit(
+    state: &AppState,
+    query: &Query,
+) -> Result<Option<arneb_scheduler::AdmissionPermit>, TrinoError> {
+    let Some(controller) = &state.admission else {
+        return Ok(None);
+    };
+    if !crate::handler::needs_admission(&query.sql) {
+        return Ok(None);
+    }
+    let pending = controller
+        .admit(&crate::handler::admission_label(&query.sql))
+        .map_err(|e| TrinoError::queue_full(e.to_string()))?;
+    if pending.queue_position().is_some() {
+        query.queued.store(true, Ordering::Relaxed);
+    }
+    let permit = pending.wait().await;
+    query.queued.store(false, Ordering::Relaxed);
+    Ok(Some(permit))
 }
 
 fn complete(state: &AppState, query: &Query, result: Result<QueryOutput, TrinoError>) {

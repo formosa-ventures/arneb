@@ -30,6 +30,16 @@ impl TrinoError {
         }
     }
 
+    /// The admission queue is full (Trino `QUERY_QUEUE_FULL`).
+    pub(crate) fn queue_full(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: 131074,
+            name: "QUERY_QUEUE_FULL",
+            kind: INSUFFICIENT_RESOURCES,
+        }
+    }
+
     pub(crate) fn not_supported(message: impl Into<String>) -> Self {
         Self::user(13, "NOT_SUPPORTED", message)
     }

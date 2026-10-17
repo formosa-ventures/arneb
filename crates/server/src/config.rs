@@ -662,6 +662,103 @@ pub struct ClusterConfig {
     /// share the same loopback (e.g. all on one host or k8s pod).
     #[serde(default)]
     pub advertised_address: Option<String>,
+
+    /// Shared secret every node sends as `authorization: Bearer` on cluster
+    /// RPC (`ARNEB_CLUSTER_SECRET`, preferred). At least 32 characters.
+    #[serde(default)]
+    pub secret: Option<RedactedString>,
+
+    /// TLS between nodes (`[cluster.tls]`).
+    #[serde(default)]
+    pub tls: Option<ClusterTlsConfig>,
+}
+
+/// A string that never appears in `Debug` output.
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct RedactedString(pub String);
+
+impl std::fmt::Debug for RedactedString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// `[cluster.tls]`: this node's certificate and key, plus the CA that
+/// signed every node's certificate (all PEM).
+///
+/// ```toml
+/// [cluster.tls]
+/// cert_path = "/etc/arneb/node.crt"   # ARNEB_CLUSTER_TLS_CERT_PATH
+/// key_path  = "/etc/arneb/node.key"   # ARNEB_CLUSTER_TLS_KEY_PATH
+/// ca_path   = "/etc/arneb/ca.crt"     # ARNEB_CLUSTER_TLS_CA_PATH
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterTlsConfig {
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub ca_path: Option<PathBuf>,
+}
+
+impl ClusterConfig {
+    /// Build the cluster RPC security from `[cluster] secret` /
+    /// `[cluster.tls]` with `ARNEB_CLUSTER_*` overrides (looked up through
+    /// `env`). Reads the PEM files.
+    pub fn security(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<arneb_rpc::ClusterSecurity> {
+        let secret = env("ARNEB_CLUSTER_SECRET")
+            .or_else(|| self.secret.as_ref().map(|s| s.0.clone()))
+            .map(arneb_rpc::ClusterSecret::new)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let mut tls = self.tls.clone();
+        for (var, field) in [
+            ("ARNEB_CLUSTER_TLS_CERT_PATH", 0),
+            ("ARNEB_CLUSTER_TLS_KEY_PATH", 1),
+            ("ARNEB_CLUSTER_TLS_CA_PATH", 2),
+        ] {
+            if let Some(v) = env(var) {
+                let t = tls.get_or_insert_with(ClusterTlsConfig::default);
+                let slot = match field {
+                    0 => &mut t.cert_path,
+                    1 => &mut t.key_path,
+                    _ => &mut t.ca_path,
+                };
+                *slot = Some(PathBuf::from(v));
+            }
+        }
+        let tls = match tls {
+            None => None,
+            Some(ClusterTlsConfig {
+                cert_path: Some(cert),
+                key_path: Some(key),
+                ca_path: Some(ca),
+            }) => {
+                let read = |name: &str, p: &Path| -> Result<Vec<u8>> {
+                    std::fs::read(p).map_err(|e| {
+                        anyhow::anyhow!("[cluster.tls] cannot read {name} {}: {e}", p.display())
+                    })
+                };
+                Some(arneb_rpc::ClusterTls {
+                    cert_pem: read("cert_path", &cert)?,
+                    key_pem: read("key_path", &key)?,
+                    ca_pem: read("ca_path", &ca)?,
+                })
+            }
+            Some(_) => bail!(
+                "[cluster.tls] needs cert_path, key_path and ca_path (or \
+                 ARNEB_CLUSTER_TLS_CERT_PATH / _KEY_PATH / _CA_PATH)"
+            ),
+        };
+        Ok(arneb_rpc::ClusterSecurity { secret, tls })
+    }
 }
 
 fn default_role() -> String {
@@ -680,6 +777,8 @@ impl Default for ClusterConfig {
             rpc_port: default_rpc_port(),
             worker_id: None,
             advertised_address: None,
+            secret: None,
+            tls: None,
         }
     }
 }
@@ -1011,6 +1110,42 @@ pgwire = "required"
         web.apply_env_overrides(env_from(&[("ARNEB_WEB_BIND_ADDRESS", "0.0.0.0")]));
         assert_eq!(web.bind_address.as_deref(), Some("0.0.0.0"));
         assert!(toml::from_str::<AppConfig>("[web]\nport = 1\n").is_err());
+    }
+
+    #[test]
+    fn test_cluster_secret_from_env_and_validation() {
+        let config: AppConfig = toml::from_str("[cluster]\nrole = \"worker\"\n").unwrap();
+        let sec = config
+            .cluster
+            .security(env_from(&[("ARNEB_CLUSTER_SECRET", &"k".repeat(40))]))
+            .unwrap();
+        assert!(sec.secret.is_some() && sec.tls.is_none());
+
+        let short: AppConfig = toml::from_str("[cluster]\nsecret = \"tooshort\"\n").unwrap();
+        let err = short
+            .cluster
+            .security(env_from(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("32"), "{err}");
+        assert!(!format!("{:?}", short.cluster).contains("tooshort"));
+
+        let none: AppConfig = toml::from_str("port = 5432").unwrap();
+        let sec = none.cluster.security(env_from(&[])).unwrap();
+        assert!(sec.secret.is_none() && sec.tls.is_none());
+    }
+
+    #[test]
+    fn test_cluster_tls_requires_all_paths() {
+        let config: AppConfig =
+            toml::from_str("[cluster.tls]\ncert_path = \"/nope.crt\"\n").unwrap();
+        let err = config
+            .cluster
+            .security(env_from(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("key_path") && err.contains("ca_path"), "{err}");
+        assert!(toml::from_str::<AppConfig>("[cluster.tls]\ncert = \"/x\"\n").is_err());
     }
 
     #[test]

@@ -419,6 +419,32 @@ async fn run() -> Result<()> {
     // 8. Set up Flight RPC server + heartbeat handling
     let node_registry = arneb_scheduler::NodeRegistry::default();
     let rpc_addr = format!("{}:{}", config.server.bind_address, config.cluster.rpc_port);
+
+    // Cluster RPC security ([cluster] secret / [cluster.tls] / ARNEB_CLUSTER_*):
+    // installed once, before any Flight connection, for every outbound call
+    // and for this node's Flight server.
+    let cluster_security = config
+        .cluster
+        .security(|k| std::env::var(k).ok())
+        .context("invalid [cluster] security configuration")?;
+    tracing::info!(
+        target: "arneb::config",
+        cluster_auth = if cluster_security.secret.is_some() { "secret" } else { "off" },
+        cluster_tls = if cluster_security.tls.is_some() { "on" } else { "off" },
+        "cluster RPC security effective mode ([cluster] secret / [cluster.tls] / ARNEB_CLUSTER_*)"
+    );
+    if cluster_security.secret.is_some()
+        && cluster_security.tls.is_none()
+        && !config::is_loopback_host(&config.server.bind_address)
+    {
+        tracing::warn!(
+            target: "arneb::config",
+            bind_address = %config.server.bind_address,
+            "[cluster] secret is set without [cluster.tls]: the secret and all exchange data \
+             cross the network unencrypted"
+        );
+    }
+    arneb_rpc::install_cluster_security(cluster_security);
     let query_tracker = Arc::new(arneb_scheduler::QueryTracker::new());
     // A1.3 (2026-05-27): per-query dynamic-filter service registry,
     // shared between QueryCoordinator (registers on execute) and the
@@ -918,9 +944,25 @@ async fn worker_heartbeat_loop(role: ServerRole, config: &AppConfig, my_rpc_addr
     );
 
     loop {
-        match arneb_rpc::send_heartbeat(&coordinator_address, &message).await {
+        match arneb_rpc::send_heartbeat_with(
+            &coordinator_address,
+            &message,
+            arneb_rpc::cluster_security(),
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::debug!(worker_id = %worker_id, "heartbeat sent");
+            }
+            Err(e @ arneb_rpc::HeartbeatError::Unauthenticated(_)) => {
+                // Keep retrying: fixing the secret and restarting the
+                // coordinator recovers without restarting workers.
+                tracing::error!(
+                    target: "arneb::cluster",
+                    worker_id = %worker_id,
+                    error = %e,
+                    "heartbeat rejected"
+                );
             }
             Err(e) => {
                 tracing::warn!(

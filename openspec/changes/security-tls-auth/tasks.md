@@ -49,12 +49,12 @@ Sections 1–2, 3–4b and 5 can land as three separate PRs, in that order. Sect
 
 ## 5. Cluster RPC auth and TLS
 
-- [ ] 5.1 Config: `[cluster] secret` and `ARNEB_CLUSTER_SECRET` (minimum 32 characters, redacted in `Debug`); `[cluster.tls] { cert_path, key_path, ca_path }` and `ARNEB_CLUSTER_TLS_*`. Log `cluster.auth` and `cluster.tls` on `arneb::config`. WARN when there is a secret, no TLS, and a non-loopback bind.
-- [ ] 5.2 `crates/rpc/src/channel.rs`: `ClusterSecurity { secret: Option<..>, tls: Option<ClientTlsConfig> }` and `connect(address, &ClusterSecurity)`, which returns an intercepted `FlightServiceClient`. Replace the three `Channel::from_shared` sites (`task_submission.rs`, `heartbeat.rs`, `exchange_client.rs`).
-- [ ] 5.3 Server: `FlightServiceServer::with_interceptor` with a constant-time bearer check when a secret is set. Add `ServerTlsConfig` to `start_flight_server` when `[cluster.tls]` is set. Enable tonic's `tls-aws-lc` feature.
-- [ ] 5.4 Scheme handling: address normalization in `main.rs` (the `http://` sites around lines 597, 822 and 847) uses `https://` when `[cluster.tls]` is set.
-- [ ] 5.5 Rejection handling: the coordinator logs a rate-limited WARN (one per peer per minute) on `arneb::cluster` for `UNAUTHENTICATED` heartbeats. A worker that receives `UNAUTHENTICATED` logs an ERROR naming `[cluster] secret` and keeps its heartbeat loop running.
-- [ ] 5.6 Tests (`crates/rpc`, ephemeral ports):
+- [x] 5.1 Config: `[cluster] secret` and `ARNEB_CLUSTER_SECRET` (minimum 32 characters, redacted in `Debug`); `[cluster.tls] { cert_path, key_path, ca_path }` and `ARNEB_CLUSTER_TLS_*`. Log `cluster.auth` and `cluster.tls` on `arneb::config`. WARN when there is a secret, no TLS, and a non-loopback bind.
+- [x] 5.2 `crates/rpc/src/channel.rs`: `ClusterSecurity { secret: Option<..>, tls: Option<ClientTlsConfig> }` and `connect(address, &ClusterSecurity)`, which returns an intercepted `FlightServiceClient`. Replace the three `Channel::from_shared` sites (`task_submission.rs`, `heartbeat.rs`, `exchange_client.rs`).
+- [x] 5.3 Server: `FlightServiceServer::with_interceptor` with a constant-time bearer check when a secret is set. Add `ServerTlsConfig` to `start_flight_server` when `[cluster.tls]` is set. Enable tonic's `tls-aws-lc` feature.
+- [x] 5.4 Scheme handling: `rpc::connect` upgrades `http://` peer addresses to `https://` when `[cluster.tls]` is set (one place instead of the `http://` normalization sites in `main.rs` / `coordinator.rs`; see D6).
+- [x] 5.5 Rejection handling: the coordinator logs a rate-limited WARN (one per peer per minute) on `arneb::cluster` for `UNAUTHENTICATED` heartbeats. A worker that receives `UNAUTHENTICATED` logs an ERROR naming `[cluster] secret` and keeps its heartbeat loop running.
+- [x] 5.6 Tests (`crates/rpc`, ephemeral ports):
   - With the matching secret, heartbeat, `submit_task` and `do_get` succeed.
   - With a wrong or missing secret, each returns `UNAUTHENTICATED` and the heartbeat callback is never invoked, so the worker is not registered.
   - With no secret on either side, behavior is unchanged.
@@ -62,9 +62,9 @@ Sections 1–2, 3–4b and 5 can land as three separate PRs, in that order. Sect
 
 ## 6. Tier 1 — local correctness gate (every PR)
 
-- [ ] 6.1 `cargo fmt -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` are clean.
-- [ ] 6.2 `cargo test -p arneb-protocol -p arneb-rpc -p arneb-server` passes, including all new integration tests.
-- [ ] 6.3 The full `cargo test` workspace run is green. With no security config, there are no behavior diffs, so all existing tests pass unchanged.
+- [x] 6.1 `cargo fmt -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` are clean.
+- [x] 6.2 `cargo test -p arneb-protocol -p arneb-rpc -p arneb-server` passes, including all new integration tests.
+- [x] 6.3 The full `cargo test` workspace run is green. With no security config, there are no behavior diffs, so all existing tests pass unchanged.
 
 ## 7. Tier 2 — local distributed check (real clients, real cluster)
 

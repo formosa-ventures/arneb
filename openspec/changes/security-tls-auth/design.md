@@ -79,6 +79,8 @@ secret = "…"     # >= 32 chars; ARNEB_CLUSTER_SECRET (preferred: keeps it out 
 - **Coordinator logging**: rejected heartbeats are logged at WARN on `arneb::cluster` with the peer address, rate-limited to one per peer per minute.
 - **Worker behavior**: a worker that gets `UNAUTHENTICATED` on its heartbeat logs an ERROR naming `[cluster] secret` and keeps retrying on the normal heartbeat interval. It does not exit, so fixing the secret and restarting the coordinator recovers the cluster.
 
+**As implemented:** the call sites keep their signatures. The binary installs one process-wide `ClusterSecurity` at startup (`arneb_rpc::install_cluster_security`), and `submit_task`, `send_heartbeat`, the dynamic-filter RPCs and `ExchangeClient::new` read it, so the execution crate's `RemoteExchange` needs no new plumbing. Explicit `_with` variants (`submit_task_with`, `send_heartbeat_with`, `ExchangeClient::with_security`, `serve_flight`) take a `ClusterSecurity` directly; the tests use them to run mismatched secrets in one process. Without a secret, the server interceptor passes every call through, which is behavior-identical to having no interceptor.
+
 A bearer secret was chosen over mTLS-only authentication. mTLS needs a per-node CA workflow, while a shared secret is one value in a Kubernetes Secret, which is what P6's Helm chart can ship. Optional TLS (D6) handles confidentiality. A secret sent without TLS is visible to anyone sniffing the network, and the docs say so.
 
 The standalone role also runs a Flight server. When a secret is set, the check applies there too. When no secret is set anywhere, there is no interceptor at all, so behavior is unchanged.
@@ -97,7 +99,7 @@ ca_path   = "..."   # CA that signed every node's cert (ARNEB_CLUSTER_TLS_CA_PAT
 ```
 
 - Flight servers use `ServerTlsConfig::identity(...)`, and clients use `ClientTlsConfig::ca_certificate(...)` with the domain taken from the peer address.
-- Address normalization (`main.rs` around lines 597 and 822) and the heartbeat's `flight_address` switch to `https://` when `[cluster.tls]` is present.
+- `rpc::connect` upgrades an `http://` peer address to `https://` when `[cluster.tls]` is present. This one place covers the coordinator's worker addresses, the heartbeat target and the advertised `flight_address`, so the `http://` normalization sites in `main.rs` and `coordinator.rs` stay unchanged.
 - Every node in a cluster must agree. A plaintext node talking to a TLS node fails the connection, and the worker logs the error on its heartbeat.
 - It is independent of D5, so an operator can enable either or both. The docs recommend both.
 

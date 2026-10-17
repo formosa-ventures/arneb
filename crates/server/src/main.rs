@@ -624,13 +624,11 @@ async fn run() -> Result<()> {
         // `FlightDynamicFilterPublisher`. We mirror the heartbeat
         // address normalisation (add `http://` when the config omits
         // it) so the publisher and heartbeats use the same wire form.
-        let coord_address_for_publisher = config.cluster.coordinator_address.as_ref().map(|addr| {
-            if addr.starts_with("http") {
-                addr.clone()
-            } else {
-                format!("http://{addr}")
-            }
-        });
+        let coord_address_for_publisher = config
+            .cluster
+            .coordinator_address
+            .as_ref()
+            .map(|addr| coordinator::flight_address(addr));
         let tm = task_manager::TaskManager::with_admission_gate(
             flight_state.clone(),
             catalog_manager.clone(),

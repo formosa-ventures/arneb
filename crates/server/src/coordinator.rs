@@ -358,7 +358,7 @@ impl QueryCoordinator {
 }
 
 /// A worker's Flight address with its scheme.
-fn flight_address(address: &str) -> String {
+pub(crate) fn flight_address(address: &str) -> String {
     if address.starts_with("http") {
         address.to_owned()
     } else {

@@ -5,14 +5,12 @@
 //! `'5s'`, `'2min'`; `0` is off). A session that never sets it, or resets
 //! it, uses the server default (`[admission] statement_timeout`).
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use arneb_common::duration::{format_pg_time_limit, parse_time_limit};
-use arrow::array::{RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
 
-use crate::metadata::{MetadataResponse, MetadataResult};
+use crate::metadata::MetadataResult;
+use crate::session::keyword;
 
 /// A connection's `statement_timeout`. `explicit: None` means "not set in
 /// this session": the server default applies.
@@ -33,18 +31,6 @@ pub(crate) enum Command {
     Set(Option<Duration>),
     Reset,
     Show,
-}
-
-/// Strip a leading case-insensitive keyword followed by a word boundary.
-fn keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
-    let s = s.trim_start();
-    let head = s.get(..kw.len())?;
-    let rest = &s[kw.len()..];
-    let boundary = rest
-        .chars()
-        .next()
-        .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-    (head.eq_ignore_ascii_case(kw) && boundary).then_some(rest)
 }
 
 /// Parse a `statement_timeout` command. `None`: not one. `Some(Err)`: an
@@ -90,22 +76,7 @@ pub(crate) fn is_reset_all(sql: &str) -> bool {
 
 /// `SHOW statement_timeout` result, in PostgreSQL's display form.
 pub(crate) fn show_result(effective: Option<Duration>) -> MetadataResult {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "statement_timeout",
-        DataType::Utf8,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(StringArray::from(vec![format_pg_time_limit(
-            effective,
-        )]))],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(MetadataResponse::Query(
-        schema.fields().to_vec(),
-        vec![batch],
-    ))
+    crate::session::show_result("statement_timeout", &format_pg_time_limit(effective))
 }
 
 #[cfg(test)]

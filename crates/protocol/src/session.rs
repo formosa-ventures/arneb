@@ -47,7 +47,7 @@ pub(crate) async fn handle_search_path(
     match parse(sql)? {
         Command::Show => {
             let value = current.map_or(root.default_schema(), |p| p.display.as_str());
-            Some((show_result(value), None))
+            Some((show_result("search_path", value), None))
         }
         Command::Reset => Some((set_ok(), Some(default_path(root)))),
         Command::Set(entries) => {
@@ -98,12 +98,8 @@ async fn resolve(root: &Arc<CatalogManager>, entries: Vec<String>) -> SearchPath
     }
 }
 
-fn show_result(value: &str) -> MetadataResult {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "search_path",
-        DataType::Utf8,
-        false,
-    )]));
+pub(crate) fn show_result(column: &str, value: &str) -> MetadataResult {
+    let schema = Arc::new(Schema::new(vec![Field::new(column, DataType::Utf8, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(StringArray::from(vec![value]))],
@@ -116,7 +112,7 @@ fn show_result(value: &str) -> MetadataResult {
 }
 
 /// Strip a leading case-insensitive keyword followed by a word boundary.
-fn keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+pub(crate) fn keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     let s = s.trim_start();
     let head = s.get(..kw.len())?;
     let rest = &s[kw.len()..];

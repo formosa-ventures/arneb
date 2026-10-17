@@ -106,7 +106,16 @@ pub async fn cancel_query(
     worker_address: &str,
     query_id: arneb_common::QueryId,
 ) -> Result<(), String> {
-    let mut client = connect(worker_address, cluster_security()).await?;
+    cancel_query_with(worker_address, query_id, cluster_security()).await
+}
+
+/// [`cancel_query`] with explicit cluster security instead of the installed one.
+pub async fn cancel_query_with(
+    worker_address: &str,
+    query_id: arneb_common::QueryId,
+    security: &ClusterSecurity,
+) -> Result<(), String> {
+    let mut client = connect(worker_address, security).await?;
     let action = Action {
         r#type: "cancel_query".to_string(),
         body: query_id.0.to_string().into_bytes().into(),

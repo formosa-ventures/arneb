@@ -120,6 +120,10 @@ pub enum TaskStatus {
     Failed(String),
 }
 
+/// Abort handles of running task bodies and pumpers: query → task buffer
+/// key → handles.
+type QueryTasks = HashMap<QueryId, HashMap<String, Vec<tokio::task::AbortHandle>>>;
+
 /// Manages task execution on a worker node.
 #[derive(Clone)]
 pub struct TaskManager {
@@ -166,6 +170,10 @@ pub struct TaskManager {
     /// node reserves from the same `QueryMemoryPool`; the pool goes away
     /// with the query's last reservation, so entries are `Weak`.
     query_pools: Arc<Mutex<HashMap<QueryId, Weak<QueryMemoryPool>>>>,
+    /// Abort handles of every running task body and pumper, per query and
+    /// task buffer key, so `cancel_query` can stop a query on this node
+    /// (admission-control D4). Entries are removed by the task's cleanup.
+    query_tasks: Arc<Mutex<QueryTasks>>,
 }
 
 impl TaskManager {
@@ -221,7 +229,80 @@ impl TaskManager {
             memory_probe,
             query_memory_limit: None,
             query_pools: Arc::new(Mutex::new(HashMap::new())),
+            query_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Remember `handle` as part of task `task_key` of `query_id`.
+    fn track(&self, query_id: QueryId, task_key: &str, handle: tokio::task::AbortHandle) {
+        let mut tasks = self.query_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks
+            .entry(query_id)
+            .or_default()
+            .entry(task_key.to_owned())
+            .or_default()
+            .push(handle);
+    }
+
+    /// Forget task `task_key` of `query_id` (it finished and was cleaned up).
+    fn untrack(query_tasks: &Mutex<QueryTasks>, query_id: QueryId, task_key: &str) {
+        let mut tasks = query_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = tasks.get_mut(&query_id) {
+            entry.remove(task_key);
+            if entry.is_empty() {
+                tasks.remove(&query_id);
+            }
+        }
+    }
+
+    /// Cancel every task of `query_id` on this node: mark its output
+    /// buffers failed (so a consumer sees an error, never a silent EOF),
+    /// abort the task bodies and pumpers (dropping their operators and
+    /// reservations), and drop the buffers, statuses and dynamic-filter
+    /// collectors. Idempotent; returns the number of tasks cancelled.
+    pub fn cancel_query(&self, query_id: QueryId) -> usize {
+        let entry = {
+            let mut tasks = self.query_tasks.lock().unwrap_or_else(|e| e.into_inner());
+            tasks.remove(&query_id)
+        };
+        let Some(entry) = entry else {
+            return 0;
+        };
+        let cancelled = entry.len();
+        for (task_key, handles) in entry {
+            match self.flight_state.get_buffer(&task_key) {
+                Some(arneb_rpc::BufferKind::Partitioned(buf)) => {
+                    if let Ok(buf) = buf.try_lock() {
+                        let failure = buf.failure_handle();
+                        let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.get_or_insert_with(|| "query cancelled".to_owned());
+                    }
+                }
+                Some(arneb_rpc::BufferKind::Broadcast(buf)) => {
+                    let failure = buf.failure_handle();
+                    let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.get_or_insert_with(|| "query cancelled".to_owned());
+                }
+                None => {}
+            }
+            for handle in handles {
+                handle.abort();
+            }
+            self.flight_state.remove_buffer(&task_key);
+            if let Ok(mut statuses) = self.task_statuses.write() {
+                statuses.remove(&task_key);
+            }
+        }
+        if let Ok(mut collectors) = self.df_collectors.write() {
+            collectors.retain(|(q, _), _| *q != query_id);
+        }
+        tracing::info!(
+            target: "arneb::cluster",
+            query_id = %query_id,
+            tasks = cancelled,
+            "query cancelled on worker"
+        );
+        cancelled
     }
 
     /// Limit each query to `limit` bytes of this node's pool (default: no
@@ -326,7 +407,10 @@ impl TaskManager {
             .insert((descriptor.query_id, descriptor.task_id), df_collector);
         let df_collector_key = (descriptor.query_id, descriptor.task_id);
 
-        tokio::spawn(async move {
+        let query_id = descriptor.query_id;
+        let task_key = task_id_str.clone();
+        let tracker = self.clone();
+        let handle = tokio::spawn(async move {
             let task_id_for_cleanup = task_id_str.clone();
             match manager.execute_task(descriptor).await {
                 Ok(()) => {
@@ -348,6 +432,7 @@ impl TaskManager {
             let flight_state = manager.flight_state.clone();
             let task_statuses = Arc::clone(&manager.task_statuses);
             let df_collectors = Arc::clone(&manager.df_collectors);
+            let query_tasks = Arc::clone(&manager.query_tasks);
             tokio::spawn(async move {
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
                 loop {
@@ -373,8 +458,10 @@ impl TaskManager {
                 if let Ok(mut collectors) = df_collectors.write() {
                     collectors.remove(&df_collector_key);
                 }
+                TaskManager::untrack(&query_tasks, df_collector_key.0, &task_id_for_cleanup);
             });
         });
+        tracker.track(query_id, &task_key, handle.abort_handle());
     }
 
     /// Get the status of a task.
@@ -690,6 +777,7 @@ impl TaskManager {
                 Ok::<usize, String>(rows)
             });
 
+            self.track(descriptor.query_id, &task_id_str, pumper.abort_handle());
             let rows_emitted = pumper
                 .await
                 .map_err(|e| format!("broadcast pumper panicked: {e}"))??;
@@ -899,6 +987,9 @@ impl TaskManager {
             }));
         }
 
+        for pumper in &pumpers {
+            self.track(descriptor.query_id, &task_id_str, pumper.abort_handle());
+        }
         let mut rows_emitted: usize = 0;
         for (idx, pumper) in pumpers.into_iter().enumerate() {
             let rows = pumper
@@ -1103,6 +1194,42 @@ mod tests {
         drop(r2);
         assert_eq!(node.reserved(), 0);
         assert_eq!(tm.live_query_pools(), 0);
+    }
+
+    /// admission-control D4: `cancel_query` aborts every tracked task body
+    /// and pumper of the query, marks and removes its buffers, and leaves
+    /// other queries alone. A repeat is a no-op.
+    #[tokio::test]
+    async fn cancel_query_aborts_tasks_and_removes_buffers() {
+        use arneb_execution::memory_pool::UnboundedMemoryPool;
+        let tm = manager_with_limit(Arc::new(UnboundedMemoryPool::new()), None);
+        let (q, other) = (QueryId::new(), QueryId::new());
+        let sleeper = || tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(600)));
+
+        let (body, pumper, survivor) = (sleeper(), sleeper(), sleeper());
+        let key = format!("{q}.1.0");
+        let buf = OutputBuffer::single(4, schema());
+        let failure = buf.failure_handle();
+        tm.flight_state
+            .register_partitioned_buffer(key.clone(), buf);
+        tm.task_statuses
+            .write()
+            .unwrap()
+            .insert(key.clone(), TaskStatus::Running);
+        tm.track(q, &key, body.abort_handle());
+        tm.track(q, &key, pumper.abort_handle());
+        tm.track(other, &format!("{other}.1.0"), survivor.abort_handle());
+
+        assert_eq!(tm.cancel_query(q), 1);
+        assert!(body.await.unwrap_err().is_cancelled());
+        assert!(pumper.await.unwrap_err().is_cancelled());
+        assert!(tm.flight_state.get_buffer(&key).is_none());
+        assert!(tm.task_status(&key).is_none());
+        assert_eq!(failure.lock().unwrap().as_deref(), Some("query cancelled"));
+
+        assert_eq!(tm.cancel_query(q), 0);
+        assert!(!survivor.is_finished());
+        assert_eq!(tm.cancel_query(other), 1);
     }
 
     #[test]

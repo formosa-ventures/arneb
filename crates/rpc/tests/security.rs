@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use arneb_common::{QueryId, StageId, TaskId};
 use arneb_rpc::{
-    send_heartbeat_with, serve_flight, submit_task_with, BufferKind, ClusterSecret,
-    ClusterSecurity, ClusterTls, ExchangeClient, FlightState, HeartbeatError, HeartbeatMessage,
-    OutputBuffer, SourceExchange, TaskDescriptor,
+    cancel_query_with, send_heartbeat_with, serve_flight, submit_task_with, BufferKind,
+    ClusterSecret, ClusterSecurity, ClusterTls, ExchangeClient, FlightState, HeartbeatError,
+    HeartbeatMessage, OutputBuffer, SourceExchange, TaskDescriptor,
 };
 use arrow::array::{Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -109,6 +109,17 @@ async fn recording_state() -> (FlightState, Arc<Mutex<usize>>, Arc<Mutex<usize>>
     (state, beats, tasks)
 }
 
+/// Count `cancel_query` actions that reach the worker.
+fn count_cancels(state: &mut FlightState) -> Arc<Mutex<usize>> {
+    let cancels = Arc::new(Mutex::new(0));
+    let c = cancels.clone();
+    state.set_cancel_query_callback(Arc::new(move |_| {
+        *c.lock().unwrap() += 1;
+        0
+    }));
+    cancels
+}
+
 async fn fetch_rows(addr: &str, security: ClusterSecurity) -> Result<usize, String> {
     let client = ExchangeClient::new(addr).with_security(security);
     let stream = tokio::time::timeout(Duration::from_secs(5), client.fetch_partition("task-1", 0))
@@ -123,13 +134,18 @@ async fn fetch_rows(addr: &str, security: ClusterSecurity) -> Result<usize, Stri
 
 #[tokio::test]
 async fn matching_secret_allows_every_call() {
-    let (state, beats, tasks) = recording_state().await;
+    let (mut state, beats, tasks) = recording_state().await;
+    let cancels = count_cancels(&mut state);
     let addr = start(state, with_secret('a')).await;
     let sec = with_secret('a');
     send_heartbeat_with(&addr, &heartbeat(), &sec)
         .await
         .unwrap();
     submit_task_with(&addr, &descriptor(), &sec).await.unwrap();
+    cancel_query_with(&addr, QueryId::new(), &sec)
+        .await
+        .unwrap();
+    assert_eq!(*cancels.lock().unwrap(), 1);
     assert_eq!(fetch_rows(&addr, sec).await.unwrap(), 3);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(*beats.lock().unwrap(), 1);
@@ -138,7 +154,8 @@ async fn matching_secret_allows_every_call() {
 
 #[tokio::test]
 async fn wrong_or_missing_secret_is_unauthenticated() {
-    let (state, beats, tasks) = recording_state().await;
+    let (mut state, beats, tasks) = recording_state().await;
+    let cancels = count_cancels(&mut state);
     let addr = start(state, with_secret('a')).await;
     for sec in [with_secret('b'), ClusterSecurity::default()] {
         let err = send_heartbeat_with(&addr, &heartbeat(), &sec)
@@ -150,9 +167,14 @@ async fn wrong_or_missing_secret_is_unauthenticated() {
             .await
             .unwrap_err();
         assert!(err.contains("invalid cluster secret"), "{err}");
+        let err = cancel_query_with(&addr, QueryId::new(), &sec)
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid cluster secret"), "{err}");
         let err = fetch_rows(&addr, sec).await.unwrap_err();
         assert!(err.contains("invalid cluster secret"), "{err}");
     }
+    assert_eq!(*cancels.lock().unwrap(), 0);
     tokio::time::sleep(Duration::from_millis(50)).await;
     // The worker was never registered and no task ran.
     assert_eq!(*beats.lock().unwrap(), 0);

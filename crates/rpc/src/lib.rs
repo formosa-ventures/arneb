@@ -46,7 +46,8 @@ pub use task_error::{
     RESOURCE_EXHAUSTED_TAG,
 };
 pub use task_submission::{
-    cancel_query, notify_dynamic_filter, report_dynamic_filters, submit_task, submit_task_with,
+    cancel_query, cancel_query_with, notify_dynamic_filter, report_dynamic_filters, submit_task,
+    submit_task_with,
 };
 
 /// Test helper: create a FlightServiceServer for integration tests.

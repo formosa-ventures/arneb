@@ -328,8 +328,13 @@ impl QueryCoordinator {
                 physical_plan
             };
         let stream = physical_plan.execute(0).await?;
-        let batches = collect_stream(stream).await.map_err(|e| {
-            ExecutionError::InvalidOperation(format!("root stage collection failed: {e}"))
+        let batches = collect_stream(stream).await.map_err(|e| match e {
+            // Keep a worker's memory-limit failure typed (pgwire 53200,
+            // Trino EXCEEDED_LOCAL_MEMORY_LIMIT).
+            arneb_common::error::ArnebError::Execution(
+                e @ ExecutionError::ResourceExhausted(_),
+            ) => e,
+            e => ExecutionError::InvalidOperation(format!("root stage collection failed: {e}")),
         })?;
 
         tracing::info!(

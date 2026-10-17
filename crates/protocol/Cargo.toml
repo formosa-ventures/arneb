@@ -60,7 +60,7 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "http2"] }
 pgwire = { workspace = true }
 tokio-postgres = "0.7"
 postgres-protocol = "0.6"

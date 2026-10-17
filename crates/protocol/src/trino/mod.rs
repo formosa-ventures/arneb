@@ -299,7 +299,22 @@ fn router(state: AppState) -> Router {
             auth,
             auth::require_auth,
         ))
+        .layer(axum::middleware::map_request(host_from_authority))
         .with_state(state)
+}
+
+/// HTTP/2 carries the host in the `:authority` pseudo-header, not `Host`.
+/// Copy it into `Host` so [`base_uri`] builds `nextUri` / `infoUri` from the
+/// address the client actually used (h2 is negotiated on the HTTPS
+/// listener).
+async fn host_from_authority(mut req: axum::extract::Request) -> axum::extract::Request {
+    if !req.headers().contains_key("Host") {
+        let authority = req.uri().authority().map(|a| a.as_str().to_owned());
+        if let Some(v) = authority.and_then(|a| HeaderValue::from_str(&a).ok()) {
+            req.headers_mut().insert("Host", v);
+        }
+    }
+    req
 }
 
 async fn not_found() -> Response {

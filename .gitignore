@@ -31,3 +31,4 @@ Thumbs.db
 
 # Frontend
 web/node_modules/
+/.dev-certs/

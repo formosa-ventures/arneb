@@ -77,6 +77,35 @@ async fn https_select_pages_to_completion() {
     assert_eq!(rows, vec![serde_json::json!([1])]);
 }
 
+/// HTTP/2 has no `Host` header; `nextUri` must still point at the address
+/// the client used (here `127.0.0.1`, not the `localhost` fallback).
+#[tokio::test]
+async fn next_uri_uses_the_h2_authority() {
+    let pki = TestPki::new();
+    let port = start_https(&pki).await;
+    let mut config = pki.client_config();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(config)
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("https://127.0.0.1:{port}/v1/statement"))
+        .header("X-Trino-User", "tester")
+        .body("SELECT 1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    let doc: Value = resp.json().await.unwrap();
+    let next = doc["nextUri"].as_str().unwrap();
+    assert!(
+        next.starts_with(&format!("https://127.0.0.1:{port}/")),
+        "nextUri {next}"
+    );
+}
+
 #[tokio::test]
 async fn plain_http_fails_without_killing_the_listener() {
     let pki = TestPki::new();

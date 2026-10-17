@@ -1,5 +1,5 @@
 use arneb_common::diagnostic::{render_plan_error, SourceFile};
-use arneb_common::error::{ArnebError, ExecutionError};
+use arneb_common::error::ArnebError;
 use pgwire::error::{ErrorInfo, PgWireError};
 
 #[derive(Debug, thiserror::Error)]
@@ -51,9 +51,10 @@ pub fn arneb_error_to_pg_error_with_source(
         }
         // A query over its memory limit is `out_of_memory`, which clients
         // can tell apart from an internal error (admission-control D3).
-        ArnebError::Execution(e @ ExecutionError::ResourceExhausted(_)) => {
-            ("53200".to_string(), e.to_string())
-        }
+        e if arneb_common::error::is_resource_exhausted(e) => (
+            "53200".to_string(),
+            arneb_common::error::resource_exhausted_message(e),
+        ),
         ArnebError::Execution(e) => ("XX000".to_string(), e.to_string()),
         ArnebError::Connector(e) => ("58030".to_string(), e.to_string()),
         ArnebError::Catalog(e) => ("3D000".to_string(), e.to_string()),

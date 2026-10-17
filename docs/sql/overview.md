@@ -45,6 +45,29 @@ RESET search_path;                  -- back to the server default
 
 Trino clients set the catalog and schema with `USE` instead; see [Trino Clients](/guide/trino-clients#session-statements).
 
+### Statement timeout
+
+```sql
+SET statement_timeout = '30s';      -- also 30000 (ms), '2min', '1h'; 0 = off
+SHOW statement_timeout;             -- 30s
+RESET statement_timeout;            -- back to the server default
+```
+
+A statement still running when the timeout expires (counting any time spent
+waiting in the admission queue, as in PostgreSQL) is cancelled on every
+node and fails with `ERROR 57014 canceling statement due to statement
+timeout`; the connection stays usable. An invalid value is `22023`. The
+server default is `[admission] statement_timeout`
+([Admission Control](/guide/configuration#admission-control)).
+
+### Resource errors
+
+| SQLSTATE | Meaning |
+|---|---|
+| `53200` | The query exceeded its per-node memory limit (`query_max_memory_per_node`). |
+| `53000` | The admission queue is full (`max_queued_queries`). |
+| `57014` | The statement timed out (`statement_timeout`). |
+
 ## Further Reading
 
 - [Expressions](/sql/expressions) — operators, CASE, CAST, LIKE, and more

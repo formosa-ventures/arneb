@@ -85,6 +85,16 @@ impl TrinoError {
     /// Classifies an engine error. `source` enables the caret-annotated
     /// planner diagnostics already used by the pgwire path.
     pub(crate) fn from_arneb(err: &ArnebError, source: Option<&SourceFile>) -> Self {
+        // A memory-limit failure, possibly re-wrapped by operators on its
+        // way back from a worker (admission-control D3).
+        if arneb_common::error::is_resource_exhausted(err) {
+            return Self {
+                message: arneb_common::error::resource_exhausted_message(err),
+                code: 131079,
+                name: "EXCEEDED_LOCAL_MEMORY_LIMIT",
+                kind: INSUFFICIENT_RESOURCES,
+            };
+        }
         let message = match (err, source) {
             (ArnebError::Plan(e), Some(src)) => render_plan_error(e, src),
             _ => err.to_string(),

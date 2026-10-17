@@ -29,13 +29,21 @@ async fn start(state: FlightState) -> String {
 }
 
 fn assert_resource_exhausted(err: &ExecutionError) {
-    match err {
-        ExecutionError::ResourceExhausted(msg) => {
-            assert!(msg.contains("query memory limit exceeded"), "{msg}");
-            assert!(!msg.contains(RESOURCE_EXHAUSTED_TAG), "tag leaked: {msg}");
-        }
-        other => panic!("expected ResourceExhausted, got {other:?}"),
-    }
+    assert!(
+        matches!(err, ExecutionError::ResourceExhausted(_)),
+        "expected ResourceExhausted, got {err:?}"
+    );
+    // What a client sees: the cause, without the wire tag.
+    let client =
+        arneb_common::error::resource_exhausted_message(&ArnebError::Execution(match err {
+            ExecutionError::ResourceExhausted(m) => ExecutionError::ResourceExhausted(m.clone()),
+            _ => unreachable!(),
+        }));
+    assert!(client.contains("query memory limit exceeded"), "{client}");
+    assert!(
+        !client.contains(RESOURCE_EXHAUSTED_TAG),
+        "tag leaked: {client}"
+    );
 }
 
 #[tokio::test]

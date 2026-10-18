@@ -517,9 +517,17 @@ impl BroadcastOutputBuffer {
     /// tailing new ones. Multiple consumers can be subscribed
     /// concurrently; they do not interfere.
     pub fn subscribe(&self) -> BroadcastStream {
+        self.subscribe_from_row(0)
+    }
+
+    /// Like [`subscribe`](Self::subscribe), but starting after the first
+    /// `skip_rows` rows: a consumer resuming a broken read (#139) gets only
+    /// the remainder, with the batch it stopped in sliced.
+    pub fn subscribe_from_row(&self, skip_rows: usize) -> BroadcastStream {
         BroadcastStream {
             inner: Arc::clone(&self.inner),
             next_idx: 0,
+            skip_rows,
         }
     }
 
@@ -554,6 +562,8 @@ impl std::fmt::Debug for BroadcastOutputBuffer {
 pub struct BroadcastStream {
     inner: Arc<BroadcastInner>,
     next_idx: usize,
+    /// Rows still to skip before the first batch is returned.
+    skip_rows: usize,
 }
 
 impl BroadcastStream {
@@ -568,10 +578,19 @@ impl BroadcastStream {
             let notified = self.inner.notify.notified();
             {
                 let state = self.inner.state.lock().unwrap();
-                if let Some(batch) = state.batches.get(self.next_idx) {
-                    let batch = batch.clone();
+                while let Some(batch) = state.batches.get(self.next_idx) {
                     self.next_idx += 1;
-                    return Some(batch);
+                    let rows = batch.num_rows();
+                    if self.skip_rows > 0 && self.skip_rows >= rows {
+                        self.skip_rows -= rows;
+                        continue;
+                    }
+                    let skip = std::mem::take(&mut self.skip_rows);
+                    return Some(if skip > 0 {
+                        batch.slice(skip, rows - skip)
+                    } else {
+                        batch.clone()
+                    });
                 }
                 if state.closed {
                     return None;
@@ -839,6 +858,31 @@ mod tests {
         assert_eq!(b.next().await.unwrap().num_rows(), 1);
         assert_eq!(b.next().await.unwrap().num_rows(), 2);
         assert!(b.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn broadcast_subscribe_from_row_skips_and_slices() {
+        let schema = test_schema();
+        let buf = BroadcastOutputBuffer::new(schema.clone());
+        buf.write_batch(test_batch(&schema, vec![0, 1, 2]));
+        buf.write_batch(test_batch(&schema, vec![]));
+        buf.write_batch(test_batch(&schema, vec![3, 4, 5]));
+        buf.write_batch(test_batch(&schema, vec![6]));
+        buf.finish();
+        for (skip, expected) in [
+            (0, vec![0, 1, 2, 3, 4, 5, 6]),
+            (3, vec![3, 4, 5, 6]),
+            (4, vec![4, 5, 6]),
+            (7, vec![]),
+        ] {
+            let mut stream = buf.subscribe_from_row(skip);
+            let mut values = Vec::new();
+            while let Some(b) = stream.next().await {
+                let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                values.extend(col.values().iter().copied());
+            }
+            assert_eq!(values, expected, "skip={skip}");
+        }
     }
 
     #[tokio::test]

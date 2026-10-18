@@ -195,7 +195,8 @@ impl ExchangeClient {
 
     /// Open `ticket` again after its stream broke. `Err(true)`: worth
     /// another attempt (transport trouble); `Err(false)`: the output can't
-    /// be read again (a partitioned buffer is consumed once, or is gone).
+    /// be read again (a partitioned buffer is consumed once and refuses a
+    /// resume, or the output is gone).
     async fn reopen(&self, ticket: &str) -> Result<FlightBatchStream, bool> {
         let mut client = self.connect().await.map_err(|_| true)?;
         match client.do_get(Ticket::new(ticket.to_owned())).await {
@@ -205,32 +206,20 @@ impl ExchangeClient {
     }
 
     /// Wrap a response so a transport break mid-stream (#139) reopens the
-    /// ticket and skips the rows already delivered. Only broadcast output
-    /// can be read again: it replays the same batches in the same order to
-    /// every `do_get`. A partitioned ticket answers the reopen with
-    /// `AlreadyExists`, and the original error is surfaced as before.
+    /// ticket from the first row not yet delivered (`ticket:from_row`), so
+    /// the producer sends only the remainder. Only broadcast output can be
+    /// read again: it keeps every batch, in order, for every `do_get`. A
+    /// partitioned ticket refuses the reopen, and the original error is
+    /// surfaced as before.
     fn resumable(self, ticket: String, first: FlightBatchStream) -> FlightBatchStream {
         Box::pin(async_stream::stream! {
             use futures::StreamExt;
             let mut stream = first;
             let mut delivered = 0usize;
-            let mut to_skip = 0usize;
             let mut attempts = 0usize;
             loop {
                 match stream.next().await {
                     Some(Ok(batch)) => {
-                        let rows = batch.num_rows();
-                        if to_skip > 0 && to_skip >= rows {
-                            to_skip -= rows;
-                            continue;
-                        }
-                        let batch = if to_skip > 0 {
-                            let rest = batch.slice(to_skip, rows - to_skip);
-                            to_skip = 0;
-                            rest
-                        } else {
-                            batch
-                        };
                         delivered += batch.num_rows();
                         yield Ok(batch);
                     }
@@ -247,10 +236,9 @@ impl ExchangeClient {
                                 "exchange stream broke, reopening"
                             );
                             tokio::time::sleep(std::time::Duration::from_millis(50 << attempts)).await;
-                            match self.reopen(&ticket).await {
+                            match self.reopen(&format!("{ticket}:{delivered}")).await {
                                 Ok(reopened) => {
                                     stream = reopened;
-                                    to_skip = delivered;
                                     break;
                                 }
                                 Err(true) if attempts < MAX_RESUME_ATTEMPTS => continue,
@@ -265,14 +253,7 @@ impl ExchangeClient {
                         yield Err(err);
                         return;
                     }
-                    None => {
-                        if to_skip > 0 {
-                            yield Err(FlightError::ProtocolError(format!(
-                                "reopened stream for {ticket} ended {to_skip} rows short"
-                            )));
-                        }
-                        return;
-                    }
+                    None => return,
                 }
             }
         })

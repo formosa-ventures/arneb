@@ -12,6 +12,8 @@
 //! - Trino clients resend credentials on every `nextUri` poll, so successful
 //!   verifications are cached (bounded, TTL) under an HMAC of the password
 //!   with a per-process key; failures are never cached.
+//! - A cache miss runs PBKDF2 on the blocking pool behind a small limiter,
+//!   so unauthenticated requests cannot tie up the async workers.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,12 +27,16 @@ use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde_json::json;
+use tokio::sync::Semaphore;
 
 use super::session::claimed_users;
 use crate::auth::{hmac_sha256, AuthConfigError, UserCredentials};
 
 const CACHE_TTL: Duration = Duration::from_secs(300);
 const CACHE_CAPACITY: usize = 1024;
+/// PBKDF2 verifications (cache misses) allowed to run at once; further
+/// misses wait for a slot. Cache hits never wait.
+const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
 
 /// Paths reachable without credentials (load-balancer health checks).
 const PUBLIC_PATHS: &[&str] = &["/v1/info", "/v1/info/state", "/v1/status"];
@@ -50,6 +56,8 @@ pub(crate) struct Authenticator {
     cache: Arc<Mutex<VerifyCache>>,
     /// Number of full (PBKDF2) verifications; read by tests.
     verifications: Arc<AtomicU64>,
+    /// Slots for concurrent PBKDF2 verifications.
+    limiter: Arc<Semaphore>,
 }
 
 impl Authenticator {
@@ -64,25 +72,51 @@ impl Authenticator {
             cache_key: key,
             cache: Arc::new(Mutex::new(HashMap::new())),
             verifications,
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_VERIFICATIONS)),
         })
     }
 
-    fn verify(&self, user: &str, password: &str) -> bool {
+    fn is_cached(&self, key: &(String, [u8; 32]), now: Instant) -> bool {
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .get(key)
+            .is_some_and(|at| now.duration_since(*at) < CACHE_TTL)
+    }
+
+    /// Check `user:password`. A cache hit answers at once; otherwise the
+    /// PBKDF2 derivation runs on the blocking pool, at most
+    /// [`MAX_CONCURRENT_VERIFICATIONS`] at a time, so a flood of bad
+    /// credentials can neither stall the async workers nor use more than a
+    /// few cores.
+    async fn verify(&self, user: &str, password: &str) -> bool {
         let digest = hmac_sha256(&self.cache_key, password.as_bytes());
         let key = (user.to_owned(), digest);
-        let now = Instant::now();
-        {
-            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(at) = cache.get(&key) {
-                if now.duration_since(*at) < CACHE_TTL {
-                    return true;
-                }
-            }
+        if self.is_cached(&key, Instant::now()) {
+            return true;
+        }
+        let Ok(permit) = Arc::clone(&self.limiter).acquire_owned().await else {
+            return false;
+        };
+        // A concurrent request (e.g. a client's parallel first polls) may
+        // have verified the same credentials while this one waited.
+        if self.is_cached(&key, Instant::now()) {
+            return true;
         }
         self.verifications.fetch_add(1, Ordering::Relaxed);
-        if !self.creds.verify_password(user, password) {
+        let creds = Arc::clone(&self.creds);
+        let (u, p) = (user.to_owned(), password.to_owned());
+        // The permit moves into the blocking task, so a request dropped
+        // mid-verification still holds its slot until PBKDF2 finishes.
+        let ok = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            creds.verify_password(&u, &p)
+        })
+        .await
+        .unwrap_or(false);
+        if !ok {
             return false;
         }
+        let now = Instant::now();
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() >= CACHE_CAPACITY {
             cache.retain(|_, at| now.duration_since(*at) < CACHE_TTL);
@@ -151,7 +185,7 @@ pub(crate) async fn require_auth(
     let Some((user, password)) = basic_credentials(&req) else {
         return unauthorized("Authentication required");
     };
-    if user.is_empty() || !auth.verify(&user, &password) {
+    if user.is_empty() || !auth.verify(&user, &password).await {
         tracing::warn!(user = %user, "Trino password authentication failed");
         return unauthorized("Invalid credentials");
     }
@@ -166,4 +200,59 @@ pub(crate) async fn require_auth(
     }
     req.extensions_mut().insert(AuthUser(user));
     next.run(req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::ScramVerifier;
+
+    fn authenticator() -> (Authenticator, Arc<AtomicU64>) {
+        let creds = UserCredentials::new(vec![(
+            "alice".to_owned(),
+            ScramVerifier::generate("alice-pw").unwrap(),
+        )])
+        .unwrap();
+        let counter = Arc::new(AtomicU64::new(0));
+        let auth = Authenticator::new(Arc::new(creds), Arc::clone(&counter)).unwrap();
+        (auth, counter)
+    }
+
+    #[tokio::test]
+    async fn cache_misses_wait_for_a_verification_slot() {
+        let (auth, counter) = authenticator();
+        let held = Arc::clone(&auth.limiter)
+            .acquire_many_owned(MAX_CONCURRENT_VERIFICATIONS as u32)
+            .await
+            .unwrap();
+        let pending = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.verify("alice", "wrong").await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!pending.is_finished(), "verification must wait for a slot");
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        drop(held);
+        assert!(!pending.await.unwrap());
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            auth.limiter.available_permits(),
+            MAX_CONCURRENT_VERIFICATIONS
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hits_skip_the_limiter() {
+        let (auth, counter) = authenticator();
+        assert!(auth.verify("alice", "alice-pw").await);
+        let _held = Arc::clone(&auth.limiter)
+            .acquire_many_owned(MAX_CONCURRENT_VERIFICATIONS as u32)
+            .await
+            .unwrap();
+        let hit =
+            tokio::time::timeout(Duration::from_secs(1), auth.verify("alice", "alice-pw")).await;
+        assert_eq!(hit.ok(), Some(true));
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
 }

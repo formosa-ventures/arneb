@@ -208,21 +208,17 @@ impl ConnectionHandler {
                 ))))
             }
         };
-        let response = match command {
-            Command::Show => crate::timeout::show_result(self.effective_timeout(client)),
-            Command::Set(value) => {
-                client.session_extensions().insert(SessionTimeout {
-                    explicit: Some(value),
-                });
-                Ok(crate::metadata::MetadataResponse::Command("SET".to_owned()))
-            }
-            Command::Reset => {
+        let response = match command.tag() {
+            None => crate::timeout::show_result(self.effective_timeout(client)),
+            Some(tag) => {
+                let explicit = match command {
+                    Command::Set(value) => Some(value),
+                    _ => None,
+                };
                 client
                     .session_extensions()
-                    .insert(SessionTimeout::default());
-                Ok(crate::metadata::MetadataResponse::Command(
-                    "RESET".to_owned(),
-                ))
+                    .insert(SessionTimeout { explicit });
+                Ok(crate::metadata::MetadataResponse::Command(tag.to_owned()))
             }
         };
         Some(
@@ -320,15 +316,14 @@ impl ConnectionHandler {
         catalog_manager: &CatalogManager,
     ) -> Option<crate::metadata::MetadataResult> {
         match crate::timeout::parse(sql) {
-            Some(Ok(crate::timeout::Command::Show)) => {
-                return Some(crate::timeout::show_result(self.effective_timeout(client)));
+            Some(Ok(command)) => {
+                return Some(match command.tag() {
+                    Some(tag) => Ok(crate::metadata::MetadataResponse::Command(tag.to_owned())),
+                    None => crate::timeout::show_result(self.effective_timeout(client)),
+                });
             }
-            Some(Ok(crate::timeout::Command::Reset)) => {
-                return Some(Ok(crate::metadata::MetadataResponse::Command(
-                    "RESET".to_owned(),
-                )))
-            }
-            Some(_) => {
+            // Execute reports the invalid value; Describe answers `SET`.
+            Some(Err(_)) => {
                 return Some(Ok(crate::metadata::MetadataResponse::Command(
                     "SET".to_owned(),
                 )))

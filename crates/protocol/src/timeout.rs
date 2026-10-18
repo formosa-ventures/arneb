@@ -29,8 +29,24 @@ impl SessionTimeout {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Set(Option<Duration>),
+    /// `SET statement_timeout TO DEFAULT`: a reset answered with the `SET`
+    /// tag, as PostgreSQL does (and as `search_path` does).
+    SetDefault,
+    /// `RESET statement_timeout`.
     Reset,
     Show,
+}
+
+impl Command {
+    /// The command tag of a `SET` / `RESET` (`None` for `SHOW`, which
+    /// returns rows). Execute and Describe both use it, so they agree.
+    pub(crate) fn tag(&self) -> Option<&'static str> {
+        match self {
+            Command::Set(_) | Command::SetDefault => Some("SET"),
+            Command::Reset => Some("RESET"),
+            Command::Show => None,
+        }
+    }
 }
 
 /// Parse a `statement_timeout` command. `None`: not one. `Some(Err)`: an
@@ -57,7 +73,7 @@ pub(crate) fn parse(sql: &str) -> Option<Result<Command, String>> {
         .or_else(|| keyword(rest, "to"))?
         .trim();
     if value.eq_ignore_ascii_case("default") {
-        return Some(Ok(Command::Reset));
+        return Some(Ok(Command::SetDefault));
     }
     Some(
         parse_time_limit(value)
@@ -107,7 +123,7 @@ mod tests {
         );
         assert_eq!(
             parse("SET statement_timeout TO DEFAULT"),
-            Some(Ok(Command::Reset))
+            Some(Ok(Command::SetDefault))
         );
         assert_eq!(parse("RESET statement_timeout"), Some(Ok(Command::Reset)));
         assert_eq!(parse("SHOW statement_timeout"), Some(Ok(Command::Show)));
@@ -119,6 +135,18 @@ mod tests {
         assert_eq!(parse("SHOW statement_timeouts"), None);
         assert!(is_reset_all("RESET ALL;"));
         assert!(!is_reset_all("RESET statement_timeout"));
+    }
+
+    /// #150 review: `SET ... TO DEFAULT` answers `SET`, like PostgreSQL and
+    /// the `search_path` split; only `RESET` answers `RESET`.
+    #[test]
+    fn command_tags_match_postgres() {
+        let tag = |sql: &str| parse(sql).unwrap().unwrap().tag();
+        assert_eq!(tag("SET statement_timeout TO DEFAULT"), Some("SET"));
+        assert_eq!(tag("SET statement_timeout = default"), Some("SET"));
+        assert_eq!(tag("SET statement_timeout = 5"), Some("SET"));
+        assert_eq!(tag("RESET statement_timeout"), Some("RESET"));
+        assert_eq!(tag("SHOW statement_timeout"), None);
     }
 
     #[test]

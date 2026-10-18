@@ -18,6 +18,9 @@ pub struct WebState {
     /// Admission controller shared with pgwire and Trino (coordinator /
     /// standalone); `None` on workers or when admission is off.
     pub admission: Option<arneb_scheduler::AdmissionController>,
+    /// Configured `[admission] max_queued_queries`, reported when there is
+    /// no controller (`max_running_queries = 0`, i.e. unlimited).
+    pub max_queued_queries: usize,
 }
 
 /// Build the axum Router with API and frontend routes.

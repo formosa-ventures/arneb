@@ -106,6 +106,9 @@ pub struct TrinoServer {
     tls: Option<TlsAcceptor>,
     auth: Option<Authenticator>,
     verifications: Arc<AtomicU64>,
+    query_memory_limit: Option<usize>,
+    admission: Option<arneb_scheduler::AdmissionController>,
+    statement_timeout: Option<Duration>,
 }
 
 impl TrinoServer {
@@ -126,6 +129,9 @@ impl TrinoServer {
             tls: None,
             auth: None,
             verifications: Arc::new(AtomicU64::new(0)),
+            query_memory_limit: None,
+            admission: None,
+            statement_timeout: None,
         }
     }
 
@@ -150,6 +156,32 @@ impl TrinoServer {
     /// Serve HTTPS only with this acceptor (default: plain HTTP).
     pub fn with_tls(mut self, tls: Option<TlsAcceptor>) -> Self {
         self.tls = tls;
+        self
+    }
+
+    /// Server default time limit for queries whose session sets neither
+    /// `query_max_run_time` nor `query_max_execution_time`
+    /// (`[admission] statement_timeout`); it counts queue time, like
+    /// `query_max_run_time`. Default: off.
+    pub fn with_statement_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.statement_timeout = timeout;
+        self
+    }
+
+    /// Queue statements through this admission controller (shared with
+    /// pgwire). Default: none, every statement runs at once.
+    pub fn with_admission(
+        mut self,
+        admission: Option<arneb_scheduler::AdmissionController>,
+    ) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// Limit each statement to `limit` bytes of the memory pool on this node
+    /// (`query_max_memory_per_node`; default: no per-query limit).
+    pub fn with_query_memory_limit(mut self, limit: Option<usize>) -> Self {
+        self.query_memory_limit = limit;
         self
     }
 
@@ -178,6 +210,7 @@ impl TrinoServer {
                 connector_registry: Arc::clone(&self.connector_registry),
                 distributed_executor: self.distributed_executor.clone(),
                 memory_pool: Arc::clone(&self.memory_pool),
+                query_memory_limit: self.query_memory_limit,
             }),
             queries: Arc::new(Mutex::new(HashMap::new())),
             config: Arc::new(self.config.clone()),
@@ -186,6 +219,8 @@ impl TrinoServer {
             counter: Arc::new(AtomicU64::new(0)),
             scheme: if self.tls.is_some() { "https" } else { "http" },
             auth: self.auth.clone(),
+            admission: self.admission.clone(),
+            statement_timeout: self.statement_timeout,
         }
     }
 
@@ -275,6 +310,8 @@ struct AppState {
     /// `X-Forwarded-Proto`: `https` when the listener serves TLS.
     scheme: &'static str,
     auth: Option<Authenticator>,
+    admission: Option<arneb_scheduler::AdmissionController>,
+    statement_timeout: Option<Duration>,
 }
 
 fn router(state: AppState) -> Router {
@@ -361,11 +398,14 @@ struct Query {
     done: watch::Sender<bool>,
     abort: Mutex<Option<AbortHandle>>,
     tracker_id: Option<QueryId>,
+    /// Waiting for an admission slot: reported as `QUEUED`.
+    queued: std::sync::atomic::AtomicBool,
 }
 
 impl Query {
     fn state_name(&self, inner: &Inner) -> &'static str {
         match &inner.phase {
+            Phase::Running if self.queued.load(Ordering::Relaxed) => "QUEUED",
             Phase::Running => "RUNNING",
             Phase::Finished(r) if r.batch < r.output.batches.len() => "RUNNING",
             Phase::Finished(_) => "FINISHED",
@@ -435,6 +475,7 @@ async fn submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         done,
         abort: Mutex::new(None),
         tracker_id,
+        queued: std::sync::atomic::AtomicBool::new(false),
     });
     state
         .queries
@@ -446,6 +487,49 @@ async fn submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     let task_state = state.clone();
     let task_query = Arc::clone(&query);
     let handle = tokio::spawn(async move {
+        // admission-control D5: wait for a slot before planning; the permit
+        // is held until the statement task completes (paging out the
+        // materialized results does not hold it).
+        // admission-control D7: `query_max_run_time` (or the server
+        // default) runs from submission and covers the queue wait;
+        // `query_max_execution_time` runs from admission. On expiry the
+        // statement future is dropped, which cancels it on the workers.
+        let limits = match TimeLimits::from_session(&session, task_state.statement_timeout) {
+            Ok(l) => l,
+            Err(err) => {
+                complete(&task_state, &task_query, Err(err));
+                return;
+            }
+        };
+        // A limit past the clock's range (`checked_add` overflow) never fires.
+        let run_deadline = limits
+            .run
+            .and_then(|d| tokio::time::Instant::from_std(task_query.created).checked_add(d));
+        let _admission =
+            match with_deadline(run_deadline, admit(&task_state, &task_query, &session)).await {
+                Some(Ok(permit)) => permit,
+                Some(Err(err)) => {
+                    complete(&task_state, &task_query, Err(err));
+                    return;
+                }
+                None => {
+                    complete(
+                        &task_state,
+                        &task_query,
+                        Err(limits.exceeded("query_max_run_time")),
+                    );
+                    return;
+                }
+            };
+        let exec_deadline = match (
+            run_deadline,
+            limits
+                .execution
+                .and_then(|d| tokio::time::Instant::now().checked_add(d)),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         tracker_transition(
             &task_state,
             task_query.tracker_id,
@@ -455,12 +539,16 @@ async fn submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
                 TrackerState::Running,
             ],
         );
-        let result = std::panic::AssertUnwindSafe(
+        let run = std::panic::AssertUnwindSafe(
             task_state.engine.run_statement(&session, &task_query.sql),
         )
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|_| Err(TrinoError::internal("query execution panicked")));
+        .catch_unwind();
+        let result = match with_deadline(exec_deadline, run).await {
+            Some(outcome) => {
+                outcome.unwrap_or_else(|_| Err(TrinoError::internal("query execution panicked")))
+            }
+            None => Err(limits.exceeded_during_execution(run_deadline, exec_deadline)),
+        };
         complete(&task_state, &task_query, result);
     });
     *query.abort.lock().unwrap() = Some(handle.abort_handle());
@@ -476,6 +564,124 @@ async fn submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
         doc
     };
     json_response(StatusCode::OK, body, &[], query.family)
+}
+
+/// A query's time limits from its session (admission-control D7).
+struct TimeLimits {
+    /// `query_max_execution_time`: from admission.
+    execution: Option<Duration>,
+    /// `query_max_run_time`, else the server default: from submission.
+    run: Option<Duration>,
+}
+
+impl TimeLimits {
+    fn from_session(
+        session: &ClientSession,
+        server_default: Option<Duration>,
+    ) -> Result<Self, TrinoError> {
+        let property = |name: &str| -> Result<Option<Option<Duration>>, TrinoError> {
+            session
+                .properties
+                .iter()
+                .rev()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| {
+                    arneb_common::duration::parse_time_limit(v)
+                        .map_err(|e| TrinoError::invalid_session_property(format!("{name}: {e}")))
+                })
+                .transpose()
+        };
+        let execution = property("query_max_execution_time")?;
+        let run = property("query_max_run_time")?;
+        let run = match (execution, run) {
+            (_, Some(run)) => run,
+            (None, None) => server_default,
+            (Some(_), None) => None,
+        };
+        Ok(Self {
+            execution: execution.flatten(),
+            run,
+        })
+    }
+
+    fn exceeded(&self, property: &str) -> TrinoError {
+        let limit = match property {
+            "query_max_execution_time" => self.execution,
+            _ => self.run,
+        };
+        TrinoError::exceeded_time_limit(format!(
+            "Query exceeded the maximum {} limit of {}",
+            property.trim_start_matches("query_max_").replace('_', " "),
+            arneb_common::duration::format_pg_time_limit(limit)
+        ))
+    }
+
+    /// Which limit fired during execution: the earlier deadline.
+    fn exceeded_during_execution(
+        &self,
+        run_deadline: Option<tokio::time::Instant>,
+        exec_deadline: Option<tokio::time::Instant>,
+    ) -> TrinoError {
+        if run_deadline.is_some() && run_deadline == exec_deadline {
+            self.exceeded("query_max_run_time")
+        } else {
+            self.exceeded("query_max_execution_time")
+        }
+    }
+}
+
+/// Await `fut` until `deadline`; `None` when the deadline passed first.
+async fn with_deadline<F: std::future::Future>(
+    deadline: Option<tokio::time::Instant>,
+    fut: F,
+) -> Option<F::Output> {
+    match deadline {
+        None => Some(fut.await),
+        Some(at) => tokio::time::timeout_at(at, fut).await.ok(),
+    }
+}
+
+/// Take an admission slot for a statement that executes a plan, reporting
+/// the query as `QUEUED` while it waits.
+async fn admit(
+    state: &AppState,
+    query: &Query,
+    session: &ClientSession,
+) -> Result<Option<arneb_scheduler::AdmissionPermit>, TrinoError> {
+    let Some(controller) = &state.admission else {
+        return Ok(None);
+    };
+    if !needs_admission(session, &query.sql) {
+        return Ok(None);
+    }
+    let pending = controller
+        .admit(&crate::handler::admission_label(&query.sql))
+        .map_err(|e| TrinoError::queue_full(e.to_string()))?;
+    if pending.queue_position().is_some() {
+        query.queued.store(true, Ordering::Relaxed);
+    }
+    let permit = pending.wait().await;
+    query.queued.store(false, Ordering::Relaxed);
+    Ok(Some(permit))
+}
+
+/// Whether `sql` takes an admission slot, deciding `EXECUTE` /
+/// `EXECUTE IMMEDIATE` on the statement they run. Other control statements
+/// (`SHOW`, `USE`, `SET SESSION`, `PREPARE`, …) never queue; an `EXECUTE`
+/// that cannot be resolved fails in the engine, so it does not queue either.
+fn needs_admission(session: &ClientSession, sql: &str) -> bool {
+    use statements::{parse_control, ControlStatement};
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let target = match parse_control(sql) {
+        None => return crate::handler::needs_admission(sql),
+        Some(ControlStatement::Execute { name, .. }) => match session.prepared_statement(&name) {
+            Some(prepared) => prepared.to_owned(),
+            None => return false,
+        },
+        Some(ControlStatement::ExecuteImmediate { sql, .. }) => sql,
+        Some(_) => return false,
+    };
+    crate::handler::needs_admission(&target)
 }
 
 fn complete(state: &AppState, query: &Query, result: Result<QueryOutput, TrinoError>) {

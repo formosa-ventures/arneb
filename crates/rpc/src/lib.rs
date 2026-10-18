@@ -13,6 +13,7 @@ mod heartbeat;
 mod output_buffer;
 mod security;
 pub mod task_descriptor;
+mod task_error;
 mod task_submission;
 
 /// Max Arrow Flight gRPC message size (encode + decode) for the
@@ -26,8 +27,9 @@ pub const MAX_FLIGHT_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub use dynamic_filter::{NotifyDynamicFilterRequest, ReportDynamicFilterRequest};
 pub use exchange_client::ExchangeClient;
 pub use flight_service::{
-    serve_flight, start_flight_server, BufferKind, DfNotifyCallback, DfReportCallback, FlightState,
-    HeartbeatCallback, TaskCallback, TaskStatusCallback, TaskStatusResponse,
+    serve_flight, start_flight_server, BufferKind, CancelQueryCallback, DfNotifyCallback,
+    DfReportCallback, FlightState, HeartbeatCallback, TaskCallback, TaskStatusCallback,
+    TaskStatusResponse,
 };
 pub use heartbeat::{send_heartbeat, send_heartbeat_with, HeartbeatError, HeartbeatMessage};
 pub use output_buffer::{
@@ -39,8 +41,13 @@ pub use security::{
     ClusterTls, FlightClient, MIN_CLUSTER_SECRET_LEN,
 };
 pub use task_descriptor::{SourceExchange, TaskDescriptor};
+pub use task_error::{
+    describe_execution_failure, describe_task_failure, tag_resource_exhausted,
+    RESOURCE_EXHAUSTED_TAG,
+};
 pub use task_submission::{
-    notify_dynamic_filter, report_dynamic_filters, submit_task, submit_task_with,
+    cancel_query, cancel_query_with, notify_dynamic_filter, report_dynamic_filters, submit_task,
+    submit_task_with,
 };
 
 /// Test helper: create a FlightServiceServer for integration tests.
@@ -51,4 +58,14 @@ pub fn __flight_service_for_test(
     arrow_flight::flight_service_server::FlightServiceServer::new(
         flight_service::TrinoFlightService::new(state),
     )
+}
+
+/// Test helper: serve a Flight server for `state` on an already-bound
+/// listener until the runtime shuts down.
+#[doc(hidden)]
+pub async fn __serve_flight_for_test(listener: tokio::net::TcpListener, state: FlightState) {
+    let _ = tonic::transport::Server::builder()
+        .add_service(__flight_service_for_test(state))
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+        .await;
 }

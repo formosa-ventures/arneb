@@ -101,7 +101,7 @@ use arneb_connectors::file::{FileCatalog, FileConnectorFactory, FileFormat, File
 use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
 use arneb_connectors::{ConnectorRegistry, StorageRegistry};
 use arneb_execution::memory_pool::{
-    GreedyMemoryPool, MemoryPool, QueryMemoryPool, TrackConsumersPool, UnboundedMemoryPool,
+    GreedyMemoryPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool,
 };
 use arneb_protocol::{
     PgwireTls, ProtocolConfig, ProtocolServer, ServerTls, TrinoConfig, TrinoServer,
@@ -532,30 +532,25 @@ async fn run() -> Result<()> {
         )),
         None => Arc::new(UnboundedMemoryPool::new()),
     };
-    // Phase 4 (2026-05-21): wrap the global pool with a per-task
-    // QueryMemoryPool when `query_max_memory_per_node` is set. This
-    // closes the swiss-cheese gap where untracked operators
-    // (Filter / Project / scan buffers / Repartition queue) accumulate
-    // uncounted allocations and OOM the worker before any single
-    // spillable operator hits its own `spill_budget_bytes`. With this
-    // wrap, the QUERY's cumulative `MemoryReservation` total fails
-    // the query cleanly instead.
+    // admission-control D1: `query_max_memory_per_node` is enforced per
+    // query. The node pool stays shared; each query gets its own
+    // `QueryMemoryPool` over it — per statement on the coordinator /
+    // standalone (`ProtocolServer`, `TrinoServer`) and per query id on a
+    // worker (`TaskManager`). A query over its limit fails with
+    // `ResourceExhausted` without starving the other queries on the node.
     let query_cap_resolved = config.memory.resolve_query_cap();
-    let memory_pool: Arc<dyn MemoryPool> = match query_cap_resolved {
-        Some(query_cap) => Arc::new(QueryMemoryPool::new(global_pool, query_cap as usize)),
-        None => global_pool,
-    };
+    let query_memory_limit = query_cap_resolved.map(|b| b as usize);
     let memory_pool: Arc<dyn MemoryPool> = if memory_profile::mem_profile_enabled() {
-        Arc::new(memory_profile::MemoryProfilePool::new(memory_pool))
+        Arc::new(memory_profile::MemoryProfilePool::new(global_pool))
     } else {
-        memory_pool
+        global_pool
     };
     match (budget, query_cap_resolved) {
         (Some(bytes), Some(qcap)) => tracing::info!(
             spill_budget_bytes = bytes,
             spill_budget_source = budget_source,
             query_max_memory_per_node = qcap,
-            "memory pool installed (per-task query cap on top of global spill budget)"
+            "memory pool installed (per-query limit on top of the node spill budget)"
         ),
         (Some(bytes), None) => tracing::info!(
             spill_budget_bytes = bytes,
@@ -564,7 +559,7 @@ async fn run() -> Result<()> {
         ),
         (None, Some(qcap)) => tracing::info!(
             query_max_memory_per_node = qcap,
-            "memory pool installed (per-task query cap only; no global spill budget)"
+            "memory pool installed (per-query limit only; no node spill budget)"
         ),
         (None, None) => tracing::info!(
             spill_budget_source = budget_source,
@@ -629,13 +624,11 @@ async fn run() -> Result<()> {
         // `FlightDynamicFilterPublisher`. We mirror the heartbeat
         // address normalisation (add `http://` when the config omits
         // it) so the publisher and heartbeats use the same wire form.
-        let coord_address_for_publisher = config.cluster.coordinator_address.as_ref().map(|addr| {
-            if addr.starts_with("http") {
-                addr.clone()
-            } else {
-                format!("http://{addr}")
-            }
-        });
+        let coord_address_for_publisher = config
+            .cluster
+            .coordinator_address
+            .as_ref()
+            .map(|addr| coordinator::flight_address(addr));
         let tm = task_manager::TaskManager::with_admission_gate(
             flight_state.clone(),
             catalog_manager.clone(),
@@ -643,7 +636,8 @@ async fn run() -> Result<()> {
             Arc::clone(&memory_pool),
             memory_probe,
             coord_address_for_publisher,
-        );
+        )
+        .with_query_memory_limit(query_memory_limit);
         let tm_for_task = tm.clone();
         flight_state.set_task_callback(Arc::new(move |descriptor| {
             tm_for_task.handle_task(descriptor);
@@ -651,6 +645,12 @@ async fn run() -> Result<()> {
         let tm_for_status = tm.clone();
         flight_state.set_task_status_callback(Arc::new(move |task_id| {
             tm_for_status.task_status_as_response(task_id)
+        }));
+        // admission-control D4: the coordinator's cancel guard stops a
+        // query's tasks here when the query ends early anywhere.
+        let tm_for_cancel = tm.clone();
+        flight_state.set_cancel_query_callback(Arc::new(move |query_id| {
+            tm_for_cancel.cancel_query(query_id)
         }));
         // A1.3 (2026-05-27): route coord-pushed Domains into the
         // per-task `DynamicFilterCollector` (populated at handle_task
@@ -740,12 +740,49 @@ async fn run() -> Result<()> {
         arneb_protocol::AuthMethod::None => None,
     };
 
+    // admission-control D5/D8: one controller for the process, shared by
+    // pgwire, the Trino listener and the Web UI. Workers have none; their
+    // admission stays the RSS probe, and this cap bounds what reaches them.
+    let serves_sql = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
+    let admission_settings = &config.admission_settings;
+    let admission = serves_sql.then(|| {
+        arneb_scheduler::AdmissionController::new(
+            admission_settings.max_running_queries,
+            admission_settings.max_queued_queries,
+        )
+    });
+    if let Some(controller) = &admission {
+        controller.spawn_snapshot_logger(std::time::Duration::from_secs(10));
+        tracing::info!(
+            target: "arneb::config",
+            max_running_queries = admission_settings.max_running_queries,
+            max_queued_queries = admission_settings.max_queued_queries,
+            statement_timeout = %arneb_common::duration::format_pg_time_limit(
+                admission_settings.statement_timeout
+            ),
+            query_max_memory_per_node = %query_memory_limit
+                .map_or_else(|| "off".to_owned(), |b| b.to_string()),
+            "admission effective settings ([admission] / ARNEB_MAX_RUNNING_QUERIES / \
+             ARNEB_MAX_QUEUED_QUERIES / ARNEB_STATEMENT_TIMEOUT / ARNEB_QUERY_MAX_MEMORY_BYTES)"
+        );
+    } else {
+        tracing::info!(
+            target: "arneb::config",
+            query_max_memory_per_node = %query_memory_limit
+                .map_or_else(|| "off".to_owned(), |b| b.to_string()),
+            "worker per-query memory limit (ARNEB_QUERY_MAX_MEMORY_BYTES)"
+        );
+    }
+
     let mut server = ProtocolServer::new(
         protocol_config,
         catalog_manager.clone(),
         connector_registry.clone(),
     )
     .with_memory_pool(Arc::clone(&memory_pool))
+    .with_query_memory_limit(query_memory_limit)
+    .with_admission(admission.clone())
+    .with_statement_timeout(config.admission_settings.statement_timeout)
     .with_auth(auth_method)
     .with_tls(pgwire_tls);
     if let Some(ref executor) = distributed_executor {
@@ -784,6 +821,9 @@ async fn run() -> Result<()> {
             connector_registry.clone(),
         )
         .with_memory_pool(Arc::clone(&memory_pool))
+        .with_query_memory_limit(query_memory_limit)
+        .with_admission(admission.clone())
+        .with_statement_timeout(config.admission_settings.statement_timeout)
         .with_query_tracker(query_tracker.clone())
         .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
         .with_password_auth(password_users.clone())
@@ -822,6 +862,7 @@ async fn run() -> Result<()> {
         node_registry: node_registry.clone(),
         start_time: std::time::Instant::now(),
         role: config.cluster.role.clone(),
+        admission: admission.clone(),
     };
     let web_router = web::build_router(web_state);
     let web_port = config.server.port + 1000; // default: pgwire port + 1000 (e.g., 5432 → 6432)

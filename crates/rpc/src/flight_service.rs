@@ -58,6 +58,10 @@ pub type DfReportCallback = Arc<dyn Fn(ReportDynamicFilterRequest) + Send + Sync
 /// task's per-task `DynamicFilterCollector`. A1.3 — inert when unset.
 pub type DfNotifyCallback = Arc<dyn Fn(NotifyDynamicFilterRequest) + Send + Sync>;
 
+/// Callback for the `cancel_query` action: cancel every task of a query on
+/// this node and return how many were aborted (admission-control D4).
+pub type CancelQueryCallback = Arc<dyn Fn(arneb_common::QueryId) -> usize + Send + Sync>;
+
 /// Producer-side buffer kind held by the worker's `FlightState`.
 ///
 /// A2.1.2 (2026-05-28): partitioned producers (the W3-Hash auto-wrap
@@ -92,6 +96,7 @@ pub struct FlightState {
     task_status_callback: Option<TaskStatusCallback>,
     df_report_callback: Option<DfReportCallback>,
     df_notify_callback: Option<DfNotifyCallback>,
+    cancel_query_callback: Option<CancelQueryCallback>,
 }
 
 impl Default for FlightState {
@@ -103,6 +108,7 @@ impl Default for FlightState {
             task_status_callback: None,
             df_report_callback: None,
             df_notify_callback: None,
+            cancel_query_callback: None,
         }
     }
 }
@@ -116,12 +122,8 @@ impl FlightState {
     /// Creates a new state with a heartbeat callback (for coordinator mode).
     pub fn with_heartbeat_callback(callback: HeartbeatCallback) -> Self {
         Self {
-            buffers: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_callback: Some(callback),
-            task_callback: None,
-            task_status_callback: None,
-            df_report_callback: None,
-            df_notify_callback: None,
+            ..Self::default()
         }
     }
 
@@ -146,6 +148,11 @@ impl FlightState {
 
     /// Set a callback for coord-pushed resolved Domains (worker-side).
     /// A1.3 — caller is `TaskManager`.
+    /// Install the `cancel_query` handler (workers).
+    pub fn set_cancel_query_callback(&mut self, callback: CancelQueryCallback) {
+        self.cancel_query_callback = Some(callback);
+    }
+
     pub fn set_df_notify_callback(&mut self, callback: DfNotifyCallback) {
         self.df_notify_callback = Some(callback);
     }
@@ -328,7 +335,7 @@ impl FlightService for TrinoFlightService {
                             )));
                         }
                         Some(TaskStatusResponse::Failed(reason)) => {
-                            return Err(Status::internal(format!(
+                            return Err(crate::task_error::failure_status(format!(
                                 "task '{task_id}' failed: {reason}"
                             )));
                         }
@@ -413,6 +420,25 @@ impl FlightService for TrinoFlightService {
 
                 let result = arrow_flight::Result {
                     body: "df_report_accepted".into(),
+                };
+                let stream = futures::stream::once(async { Ok(result) });
+                Ok(Response::new(Box::pin(stream)))
+            }
+            "cancel_query" => {
+                let query_id = std::str::from_utf8(&action.body)
+                    .ok()
+                    .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+                    .map(arneb_common::QueryId)
+                    .ok_or_else(|| Status::invalid_argument("bad cancel_query body"))?;
+                // Idempotent: an unknown query (already finished or never
+                // here) cancels nothing and is still acknowledged.
+                let aborted = self
+                    .state
+                    .cancel_query_callback
+                    .as_ref()
+                    .map_or(0, |cb| cb(query_id));
+                let result = arrow_flight::Result {
+                    body: format!("cancelled {aborted}").into(),
                 };
                 let stream = futures::stream::once(async { Ok(result) });
                 Ok(Response::new(Box::pin(stream)))
@@ -518,7 +544,7 @@ fn async_stream(
     // Convert FlightError to tonic::Status.
     #[allow(clippy::result_large_err)]
     let mapped = futures::StreamExt::map(encoder, |result| {
-        result.map_err(|e| Status::internal(format!("flight encoding error: {e}")))
+        result.map_err(|e| crate::task_error::failure_status(format!("flight encoding error: {e}")))
     });
 
     Box::pin(mapped)
@@ -553,7 +579,7 @@ fn async_stream_broadcast(
 
     #[allow(clippy::result_large_err)]
     let mapped = futures::StreamExt::map(encoder, |result| {
-        result.map_err(|e| Status::internal(format!("flight encoding error: {e}")))
+        result.map_err(|e| crate::task_error::failure_status(format!("flight encoding error: {e}")))
     });
 
     Box::pin(mapped)

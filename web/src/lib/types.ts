@@ -12,6 +12,11 @@ export interface QueriesResponse {
 export interface ClusterResponse {
   worker_count: number
   role: string
+  /** Admission counters; max_running_queries 0 means unlimited. */
+  running_queries: number
+  queued_queries: number
+  max_running_queries: number
+  max_queued_queries: number
 }
 
 export interface WorkerResponse {

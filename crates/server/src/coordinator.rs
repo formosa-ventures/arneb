@@ -137,6 +137,13 @@ impl QueryCoordinator {
                 "no workers available for distributed execution".to_string(),
             ));
         }
+        // admission-control D4: from here on, any exit other than success
+        // (an error, a panic, or this future being dropped by a cancel,
+        // timeout or client disconnect) cancels the query on every worker.
+        let mut cancel_guard = CancelGuard::new(
+            query_id,
+            workers.iter().map(|w| flight_address(&w.address)).collect(),
+        );
 
         let num_fragments = count_fragments(&root_fragment);
         tracing::info!(
@@ -329,7 +336,14 @@ impl QueryCoordinator {
             };
         let stream = physical_plan.execute(0).await?;
         let batches = collect_stream(stream).await.map_err(|e| {
-            ExecutionError::InvalidOperation(format!("root stage collection failed: {e}"))
+            // Keep a worker's memory-limit failure typed (pgwire 53200,
+            // Trino EXCEEDED_LOCAL_MEMORY_LIMIT), even when an operator on
+            // the way re-wrapped it.
+            if arneb_common::error::is_resource_exhausted(&e) {
+                ExecutionError::ResourceExhausted(format!("root stage collection failed: {e}"))
+            } else {
+                ExecutionError::InvalidOperation(format!("root stage collection failed: {e}"))
+            }
         })?;
 
         tracing::info!(
@@ -338,7 +352,76 @@ impl QueryCoordinator {
             "distributed query complete"
         );
 
+        cancel_guard.disarm();
         Ok(batches)
+    }
+}
+
+/// A worker's Flight address with its scheme.
+pub(crate) fn flight_address(address: &str) -> String {
+    if address.starts_with("http") {
+        address.to_owned()
+    } else {
+        format!("http://{address}")
+    }
+}
+
+/// Cancels a distributed query on its workers unless disarmed
+/// (admission-control D4). Armed for the whole of `execute` once tasks may
+/// have been dispatched; `Drop` sends `cancel_query` from a detached task so
+/// it never blocks, and covers error returns, panics and the future being
+/// dropped. Delivery is best-effort: a failure is logged, and the worker's
+/// own buffer cleanup still frees the tasks later.
+pub(crate) struct CancelGuard {
+    query_id: QueryId,
+    workers: Vec<String>,
+    armed: bool,
+}
+
+impl CancelGuard {
+    pub(crate) fn new(query_id: QueryId, workers: Vec<String>) -> Self {
+        Self {
+            query_id,
+            workers,
+            armed: true,
+        }
+    }
+
+    /// The query finished normally; its tasks end on their own.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if !self.armed || self.workers.is_empty() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let query_id = self.query_id;
+        let workers = std::mem::take(&mut self.workers);
+        tracing::info!(
+            target: "arneb::cluster",
+            query_id = %query_id,
+            workers = workers.len(),
+            "cancelling query on workers"
+        );
+        runtime.spawn(async move {
+            for addr in workers {
+                if let Err(e) = arneb_rpc::cancel_query(&addr, query_id).await {
+                    tracing::warn!(
+                        target: "arneb::cluster",
+                        query_id = %query_id,
+                        worker = %addr,
+                        error = %e,
+                        "cancel_query delivery failed"
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -549,11 +632,7 @@ async fn execute_child_on_worker(
             scan_task_count,
         };
 
-        let flight_addr = if worker.address.starts_with("http") {
-            worker.address.clone()
-        } else {
-            format!("http://{}", worker.address)
-        };
+        let flight_addr = flight_address(&worker.address);
         tracing::info!(
             stage_id = %stage_id,
             partition = consumer_k,
@@ -1103,6 +1182,62 @@ impl DistributedExecutor for QueryCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Flight server whose `cancel_query` callback records query ids.
+    async fn recording_worker() -> (String, Arc<std::sync::Mutex<Vec<QueryId>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = arneb_rpc::FlightState::new();
+        let s = seen.clone();
+        state.set_cancel_query_callback(Arc::new(move |q| {
+            s.lock().unwrap().push(q);
+            0
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(arneb_rpc::__serve_flight_for_test(listener, state));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        (addr, seen)
+    }
+
+    /// admission-control D4: an armed guard dropped (error, panic, or the
+    /// query future dropped) cancels the query on every worker; a disarmed
+    /// one (success) sends nothing.
+    #[tokio::test]
+    async fn cancel_guard_cancels_on_drop_unless_disarmed() {
+        let (a, seen_a) = recording_worker().await;
+        let (b, seen_b) = recording_worker().await;
+        let q = QueryId::new();
+        drop(CancelGuard::new(q, vec![a.clone(), b.clone()]));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(*seen_a.lock().unwrap(), vec![q]);
+        assert_eq!(*seen_b.lock().unwrap(), vec![q]);
+
+        let mut ok = CancelGuard::new(QueryId::new(), vec![a, b]);
+        ok.disarm();
+        drop(ok);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(seen_a.lock().unwrap().len(), 1);
+        assert_eq!(seen_b.lock().unwrap().len(), 1);
+    }
+
+    /// Dropping the future of a query whose tasks are dispatched (here: a
+    /// future parked on a guard, like `execute` awaiting the root stage)
+    /// cancels it on the workers.
+    #[tokio::test]
+    async fn dropping_the_query_future_cancels_on_workers() {
+        let (a, seen) = recording_worker().await;
+        let q = QueryId::new();
+        let fut = async move {
+            let _guard = CancelGuard::new(q, vec![a]);
+            futures::future::pending::<()>().await;
+        };
+        let handle = tokio::spawn(fut);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
+        let _ = handle.await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(*seen.lock().unwrap(), vec![q]);
+    }
     use arneb_common::types::{ColumnInfo, DataType, TableReference};
     use arneb_planner::{FragmentType, JoinCondition, PartitioningScheme, PlanExpr, PlanFragment};
 

@@ -15,7 +15,7 @@ use super::metadata::{self, Cell, TableBuilder};
 use super::session::{url_encode, ClientSession};
 use super::statements::{bind_placeholders, like_match, parse_control, ControlStatement};
 use super::types::{trino_type_of, OutputColumn, TrinoType};
-use crate::handler::{execute_query, DistributedExecutor};
+use crate::handler::{execute_query_with_limit, DistributedExecutor};
 
 /// The result of one statement, before paging.
 #[derive(Debug, Default)]
@@ -65,6 +65,8 @@ pub(crate) struct Engine {
     pub(crate) connector_registry: Arc<ConnectorRegistry>,
     pub(crate) distributed_executor: Option<Arc<dyn DistributedExecutor>>,
     pub(crate) memory_pool: Arc<dyn MemoryPool>,
+    /// Per-query memory limit on this node (`query_max_memory_per_node`).
+    pub(crate) query_memory_limit: Option<usize>,
 }
 
 fn filter_like(names: Vec<String>, like: &Option<String>) -> Vec<String> {
@@ -160,12 +162,13 @@ impl Engine {
         registry: &ConnectorRegistry,
         distributed: Option<&dyn DistributedExecutor>,
     ) -> Result<QueryOutput, TrinoError> {
-        let (plan, batches) = execute_query(
+        let (plan, batches) = execute_query_with_limit(
             sql,
             catalog_manager,
             registry,
             distributed,
             &self.memory_pool,
+            self.query_memory_limit,
         )
         .await
         .map_err(|e| TrinoError::from_arneb(&e, Some(&SourceFile::new("<query>", sql))))?;

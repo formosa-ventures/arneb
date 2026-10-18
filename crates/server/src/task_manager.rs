@@ -1,13 +1,13 @@
 //! Worker-side TaskManager: receives, executes, and serves task output.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use arneb_catalog::CatalogManager;
 use arneb_common::inflight_budget::InflightBudget;
 use arneb_common::{Domain, DynamicFilterId, QueryId, TaskId};
 use arneb_connectors::ConnectorRegistry;
-use arneb_execution::memory_pool::MemoryPool;
+use arneb_execution::memory_pool::{MemoryPool, QueryMemoryPool};
 use arneb_execution::DynamicFilterCollector;
 use arneb_planner::LogicalPlan;
 use arneb_rpc::{FlightState, OutputBuffer, TaskDescriptor};
@@ -120,6 +120,10 @@ pub enum TaskStatus {
     Failed(String),
 }
 
+/// Abort handles of running task bodies and pumpers: query → task buffer
+/// key → handles.
+type QueryTasks = HashMap<QueryId, HashMap<String, Vec<tokio::task::AbortHandle>>>;
+
 /// Manages task execution on a worker node.
 #[derive(Clone)]
 pub struct TaskManager {
@@ -159,6 +163,17 @@ pub struct TaskManager {
     /// then proceeds, which is compatible with downstream stream
     /// back-pressure.
     memory_probe: Option<Arc<MemoryProbe>>,
+    /// Per-query memory limit on this node (`query_max_memory_per_node`).
+    /// `None` means a query is limited only by the node pool.
+    query_memory_limit: Option<usize>,
+    /// Live per-query pools, keyed by query. Every task of a query on this
+    /// node reserves from the same `QueryMemoryPool`; the pool goes away
+    /// with the query's last reservation, so entries are `Weak`.
+    query_pools: Arc<Mutex<HashMap<QueryId, Weak<QueryMemoryPool>>>>,
+    /// Abort handles of every running task body and pumper, per query and
+    /// task buffer key, so `cancel_query` can stop a query on this node
+    /// (admission-control D4). Entries are removed by the task's cleanup.
+    query_tasks: Arc<Mutex<QueryTasks>>,
 }
 
 impl TaskManager {
@@ -212,7 +227,112 @@ impl TaskManager {
             df_collectors: Arc::new(RwLock::new(HashMap::new())),
             memory_pool,
             memory_probe,
+            query_memory_limit: None,
+            query_pools: Arc::new(Mutex::new(HashMap::new())),
+            query_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Remember `handle` as part of task `task_key` of `query_id`.
+    fn track(&self, query_id: QueryId, task_key: &str, handle: tokio::task::AbortHandle) {
+        let mut tasks = self.query_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks
+            .entry(query_id)
+            .or_default()
+            .entry(task_key.to_owned())
+            .or_default()
+            .push(handle);
+    }
+
+    /// Forget task `task_key` of `query_id` (it finished and was cleaned up).
+    fn untrack(query_tasks: &Mutex<QueryTasks>, query_id: QueryId, task_key: &str) {
+        let mut tasks = query_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = tasks.get_mut(&query_id) {
+            entry.remove(task_key);
+            if entry.is_empty() {
+                tasks.remove(&query_id);
+            }
+        }
+    }
+
+    /// Cancel every task of `query_id` on this node: mark its output
+    /// buffers failed (so a consumer sees an error, never a silent EOF),
+    /// abort the task bodies and pumpers (dropping their operators and
+    /// reservations), and drop the buffers, statuses and dynamic-filter
+    /// collectors. Idempotent; returns the number of tasks cancelled.
+    pub fn cancel_query(&self, query_id: QueryId) -> usize {
+        let entry = {
+            let mut tasks = self.query_tasks.lock().unwrap_or_else(|e| e.into_inner());
+            tasks.remove(&query_id)
+        };
+        let Some(entry) = entry else {
+            return 0;
+        };
+        let cancelled = entry.len();
+        for (task_key, handles) in entry {
+            match self.flight_state.get_buffer(&task_key) {
+                Some(arneb_rpc::BufferKind::Partitioned(buf)) => {
+                    if let Ok(buf) = buf.try_lock() {
+                        let failure = buf.failure_handle();
+                        let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.get_or_insert_with(|| "query cancelled".to_owned());
+                    }
+                }
+                Some(arneb_rpc::BufferKind::Broadcast(buf)) => {
+                    let failure = buf.failure_handle();
+                    let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.get_or_insert_with(|| "query cancelled".to_owned());
+                }
+                None => {}
+            }
+            for handle in handles {
+                handle.abort();
+            }
+            self.flight_state.remove_buffer(&task_key);
+            if let Ok(mut statuses) = self.task_statuses.write() {
+                statuses.remove(&task_key);
+            }
+        }
+        if let Ok(mut collectors) = self.df_collectors.write() {
+            collectors.retain(|(q, _), _| *q != query_id);
+        }
+        tracing::info!(
+            target: "arneb::cluster",
+            query_id = %query_id,
+            tasks = cancelled,
+            "query cancelled on worker"
+        );
+        cancelled
+    }
+
+    /// Limit each query to `limit` bytes of this node's pool (default: no
+    /// per-query limit).
+    pub fn with_query_memory_limit(mut self, limit: Option<usize>) -> Self {
+        self.query_memory_limit = limit;
+        self
+    }
+
+    /// The pool a task of `query_id` reserves from: the query's
+    /// `QueryMemoryPool` on this node (created on first use), or the node
+    /// pool when there is no per-query limit.
+    pub fn query_pool(&self, query_id: QueryId) -> Arc<dyn MemoryPool> {
+        let Some(limit) = self.query_memory_limit else {
+            return Arc::clone(&self.memory_pool);
+        };
+        let mut pools = self.query_pools.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pool) = pools.get(&query_id).and_then(Weak::upgrade) {
+            return pool;
+        }
+        pools.retain(|_, pool| pool.strong_count() > 0);
+        let pool = Arc::new(QueryMemoryPool::new(Arc::clone(&self.memory_pool), limit));
+        pools.insert(query_id, Arc::downgrade(&pool));
+        pool
+    }
+
+    /// Number of queries that currently hold a per-query pool on this node.
+    pub fn live_query_pools(&self) -> usize {
+        let pools = self.query_pools.lock().unwrap_or_else(|e| e.into_inner());
+        pools.values().filter(|p| p.strong_count() > 0).count()
     }
 
     /// Returns the per-task `DynamicFilterCollector` for the given
@@ -287,7 +407,10 @@ impl TaskManager {
             .insert((descriptor.query_id, descriptor.task_id), df_collector);
         let df_collector_key = (descriptor.query_id, descriptor.task_id);
 
-        tokio::spawn(async move {
+        let query_id = descriptor.query_id;
+        let task_key = task_id_str.clone();
+        let tracker = self.clone();
+        let handle = tokio::spawn(async move {
             let task_id_for_cleanup = task_id_str.clone();
             match manager.execute_task(descriptor).await {
                 Ok(()) => {
@@ -309,6 +432,7 @@ impl TaskManager {
             let flight_state = manager.flight_state.clone();
             let task_statuses = Arc::clone(&manager.task_statuses);
             let df_collectors = Arc::clone(&manager.df_collectors);
+            let query_tasks = Arc::clone(&manager.query_tasks);
             tokio::spawn(async move {
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
                 loop {
@@ -334,8 +458,10 @@ impl TaskManager {
                 if let Ok(mut collectors) = df_collectors.write() {
                     collectors.remove(&df_collector_key);
                 }
+                TaskManager::untrack(&query_tasks, df_collector_key.0, &task_id_for_cleanup);
             });
         });
+        tracker.track(query_id, &task_key, handle.abort_handle());
     }
 
     /// Get the status of a task.
@@ -359,6 +485,9 @@ impl TaskManager {
     async fn execute_task(&self, descriptor: TaskDescriptor) -> Result<(), String> {
         // Same query-scoped key as handle_task — see comment there.
         let task_id_str = format!("{}.{}", descriptor.query_id, descriptor.task_id);
+        // admission-control D1: every reservation this task makes counts
+        // against its query's limit on this node.
+        let query_pool = self.query_pool(descriptor.query_id);
 
         // Phase A (2026-05-23): the count-based admission semaphore was
         // removed. It held a permit across the entire task body, which
@@ -407,7 +536,7 @@ impl TaskManager {
                         probe.threshold_bytes(),
                     );
                     tracing::warn!(target: "arneb::mem", "{msg}");
-                    return Err(msg);
+                    return Err(arneb_rpc::tag_resource_exhausted(msg));
                 }
             }
             if waited_ms > 0 {
@@ -457,7 +586,7 @@ impl TaskManager {
                 ))
             });
         let mut exec_ctx = arneb_execution::ExecutionContext::new()
-            .with_memory_pool(self.memory_pool.clone())
+            .with_memory_pool(query_pool.clone())
             .with_inflight_budget(Arc::clone(&inflight_budget))
             .with_dynamic_filter_collector(df_collector)
             .with_dynamic_filter_publisher(df_publisher)
@@ -574,7 +703,7 @@ impl TaskManager {
                 let partitioning = arneb_execution::Partitioning::Hash(hash_exprs, n_out);
                 Arc::new(
                     arneb_execution::RepartitionExec::new(coalesced, partitioning)
-                        .with_memory_pool(self.memory_pool.clone())
+                        .with_memory_pool(query_pool.clone())
                         .with_inflight_budget(Arc::clone(&inflight_budget)),
                 )
             } else {
@@ -620,7 +749,10 @@ impl TaskManager {
                 let mut stream = match plan_for_pump.execute(0).await {
                     Ok(s) => s,
                     Err(e) => {
-                        let msg = record_failure(format!("execute(0) failed: {e}"));
+                        let msg = record_failure(arneb_rpc::describe_execution_failure(
+                            "execute(0) failed",
+                            &e,
+                        ));
                         bbuf_for_pump.finish();
                         return Err(msg);
                     }
@@ -630,7 +762,10 @@ impl TaskManager {
                     let batch = match batch_result {
                         Ok(b) => b,
                         Err(e) => {
-                            let msg = record_failure(format!("stream error during execution: {e}"));
+                            let msg = record_failure(arneb_rpc::describe_task_failure(
+                                "stream error during execution",
+                                &e,
+                            ));
                             bbuf_for_pump.finish();
                             return Err(msg);
                         }
@@ -642,6 +777,7 @@ impl TaskManager {
                 Ok::<usize, String>(rows)
             });
 
+            self.track(descriptor.query_id, &task_id_str, pumper.abort_handle());
             let rows_emitted = pumper
                 .await
                 .map_err(|e| format!("broadcast pumper panicked: {e}"))??;
@@ -672,7 +808,7 @@ impl TaskManager {
         // buffer to ~1.6 GB worst-case per partition (still generous;
         // typical lineitem-class fragments fit far smaller).
         let mut buffer = OutputBuffer::new(n_out, output_buffer_capacity(), output_schema_arrow)
-            .with_memory_pool(self.memory_pool.clone())
+            .with_memory_pool(query_pool.clone())
             .with_inflight_budget(Arc::clone(&inflight_budget));
         let senders = buffer.take_senders();
         // B-fix-3 (2026-05-22): pumpers share this flag so a stream
@@ -729,8 +865,9 @@ impl TaskManager {
                 let mut stream = match plan_for_pump.execute(partition_idx).await {
                     Ok(s) => s,
                     Err(e) => {
-                        return Err(record_failure(format!(
-                            "execute({partition_idx}) failed: {e}"
+                        return Err(record_failure(arneb_rpc::describe_execution_failure(
+                            &format!("execute({partition_idx}) failed"),
+                            &e,
                         )));
                     }
                 };
@@ -749,8 +886,9 @@ impl TaskManager {
                     let batch = match batch_result {
                         Ok(b) => b,
                         Err(e) => {
-                            return Err(record_failure(format!(
-                                "stream error during execution: {e}"
+                            return Err(record_failure(arneb_rpc::describe_task_failure(
+                                "stream error during execution",
+                                &e,
                             )));
                         }
                     };
@@ -849,6 +987,9 @@ impl TaskManager {
             }));
         }
 
+        for pumper in &pumpers {
+            self.track(descriptor.query_id, &task_id_str, pumper.abort_handle());
+        }
         let mut rows_emitted: usize = 0;
         for (idx, pumper) in pumpers.into_iter().enumerate() {
             let rows = pumper
@@ -1005,6 +1146,99 @@ mod tests {
     }
     fn batch(s: &Arc<Schema>, v: i32) -> RecordBatch {
         RecordBatch::try_new(s.clone(), vec![Arc::new(Int32Array::from(vec![v]))]).unwrap()
+    }
+
+    fn manager_with_limit(node: Arc<dyn MemoryPool>, limit: Option<usize>) -> TaskManager {
+        TaskManager::new(
+            FlightState::new(),
+            Arc::new(CatalogManager::new("memory", "default")),
+            Arc::new(ConnectorRegistry::new()),
+            node,
+        )
+        .with_query_memory_limit(limit)
+    }
+
+    /// admission-control D1: each query gets its own pool on the node; one
+    /// query over its limit fails while another keeps reserving, tasks of
+    /// the same query share a pool, and the node returns to its baseline
+    /// once the query's reservations are gone.
+    #[test]
+    fn query_pools_are_per_query_and_released() {
+        use arneb_execution::memory_pool::{GreedyMemoryPool, MemoryConsumer};
+        let node: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(10_000));
+        let tm = manager_with_limit(Arc::clone(&node), Some(1_000));
+        let (q1, q2) = (QueryId::new(), QueryId::new());
+
+        let pool_q1 = tm.query_pool(q1);
+        let mut r1 = MemoryConsumer::new("q1-op").register(Arc::clone(&pool_q1));
+        r1.try_grow(900).unwrap();
+        let err = r1.try_grow(200).unwrap_err();
+        assert!(matches!(
+            err,
+            arneb_common::error::ExecutionError::ResourceExhausted(_)
+        ));
+
+        // A second task of q1 shares q1's budget.
+        let mut r1b = MemoryConsumer::new("q1-op2").register(tm.query_pool(q1));
+        assert!(r1b.try_grow(200).is_err());
+
+        // q2 is unaffected by q1 being at its limit.
+        let mut r2 = MemoryConsumer::new("q2-op").register(tm.query_pool(q2));
+        r2.try_grow(900).unwrap();
+        assert_eq!(node.reserved(), 1_800);
+        assert_eq!(tm.live_query_pools(), 2);
+
+        drop((r1, r1b, pool_q1));
+        assert_eq!(node.reserved(), 900);
+        assert_eq!(tm.live_query_pools(), 1);
+        drop(r2);
+        assert_eq!(node.reserved(), 0);
+        assert_eq!(tm.live_query_pools(), 0);
+    }
+
+    /// admission-control D4: `cancel_query` aborts every tracked task body
+    /// and pumper of the query, marks and removes its buffers, and leaves
+    /// other queries alone. A repeat is a no-op.
+    #[tokio::test]
+    async fn cancel_query_aborts_tasks_and_removes_buffers() {
+        use arneb_execution::memory_pool::UnboundedMemoryPool;
+        let tm = manager_with_limit(Arc::new(UnboundedMemoryPool::new()), None);
+        let (q, other) = (QueryId::new(), QueryId::new());
+        let sleeper = || tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(600)));
+
+        let (body, pumper, survivor) = (sleeper(), sleeper(), sleeper());
+        let key = format!("{q}.1.0");
+        let buf = OutputBuffer::single(4, schema());
+        let failure = buf.failure_handle();
+        tm.flight_state
+            .register_partitioned_buffer(key.clone(), buf);
+        tm.task_statuses
+            .write()
+            .unwrap()
+            .insert(key.clone(), TaskStatus::Running);
+        tm.track(q, &key, body.abort_handle());
+        tm.track(q, &key, pumper.abort_handle());
+        tm.track(other, &format!("{other}.1.0"), survivor.abort_handle());
+
+        assert_eq!(tm.cancel_query(q), 1);
+        assert!(body.await.unwrap_err().is_cancelled());
+        assert!(pumper.await.unwrap_err().is_cancelled());
+        assert!(tm.flight_state.get_buffer(&key).is_none());
+        assert!(tm.task_status(&key).is_none());
+        assert_eq!(failure.lock().unwrap().as_deref(), Some("query cancelled"));
+
+        assert_eq!(tm.cancel_query(q), 0);
+        assert!(!survivor.is_finished());
+        assert_eq!(tm.cancel_query(other), 1);
+    }
+
+    #[test]
+    fn no_limit_uses_the_node_pool() {
+        use arneb_execution::memory_pool::UnboundedMemoryPool;
+        let node: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::new());
+        let tm = manager_with_limit(Arc::clone(&node), None);
+        assert!(Arc::ptr_eq(&tm.query_pool(QueryId::new()), &node));
+        assert_eq!(tm.live_query_pools(), 0);
     }
 
     /// exec-memory-accounting D2 (3.4a): the spill-overflow drain delivers every

@@ -286,11 +286,17 @@ fn check_transport(
 
 /// How long a client gets to finish the TLS handshake.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// h2 keep-alive: ping an h2 connection this often...
+const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// ...and close it when a ping goes unanswered this long, so a dead or
+/// stalled h2 peer does not hold its connection open indefinitely.
+const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// HTTPS accept loop: TCP accept → rustls handshake → hyper (HTTP/1.1 or h2
 /// by ALPN) serving the axum router. A failed handshake only drops that
 /// connection; an HTTP/1 request whose headers take longer than
-/// `header_timeout` closes it.
+/// `header_timeout` closes it, and an h2 connection whose peer stops
+/// answering keep-alive pings is closed after [`H2_KEEP_ALIVE_TIMEOUT`].
 async fn serve_tls(
     listener: TcpListener,
     acceptor: TlsAcceptor,
@@ -328,11 +334,17 @@ async fn serve_tls(
             };
             let service = TowerToHyperService::new(router);
             let mut builder = auto::Builder::new(TokioExecutor::new());
-            // hyper only enforces `header_read_timeout` with a timer set.
+            // hyper only enforces `header_read_timeout` / keep-alive with a
+            // timer set.
             builder
                 .http1()
                 .timer(TokioTimer::new())
                 .header_read_timeout(header_timeout);
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .keep_alive_interval(Some(H2_KEEP_ALIVE_INTERVAL))
+                .keep_alive_timeout(H2_KEEP_ALIVE_TIMEOUT);
             if let Err(e) = builder
                 .serve_connection_with_upgrades(TokioIo::new(tls), service)
                 .await

@@ -361,30 +361,17 @@ enum ScramState {
     Done,
 }
 
-fn protocol_violation(msg: impl Into<String>) -> PgWireError {
+/// A `FATAL` error with SQLSTATE `code`; it ends the connection.
+fn fatal(code: &str, msg: impl Into<String>) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "FATAL".to_owned(),
-        "08P01".to_owned(),
+        code.to_owned(),
         msg.into(),
     )))
 }
 
-/// `FATAL 28000`, the code PostgreSQL uses when `hostssl` rejects a
-/// plaintext connection.
-fn ssl_required() -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "FATAL".to_owned(),
-        "28000".to_owned(),
-        "SSL connection is required".to_owned(),
-    )))
-}
-
-fn invalid_password(user: &str) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "FATAL".to_owned(),
-        "28P01".to_owned(),
-        format!("password authentication failed for user \"{user}\""),
-    )))
+fn protocol_violation(msg: impl Into<String>) -> PgWireError {
+    fatal("08P01", msg)
 }
 
 /// Force any error raised during authentication to `FATAL`. pgwire moves a
@@ -596,7 +583,13 @@ impl AuthStartupHandler {
                         peer = %client.socket_addr(),
                         "pgwire password authentication failed"
                     );
-                    return Err(invalid_password(&exchange.user));
+                    return Err(fatal(
+                        "28P01",
+                        format!(
+                            "password authentication failed for user \"{}\"",
+                            exchange.user
+                        ),
+                    ));
                 }
                 let signature = exchange.verifier.server_signature(auth_message.as_bytes());
                 let server_final = format!("v={}", STANDARD.encode(signature));
@@ -632,7 +625,11 @@ impl StartupHandler for AuthStartupHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         // Transport check first: `[tls] pgwire = "required"` applies in every
-        // auth mode, before any SASL exchange starts.
+        // auth mode, before any SASL exchange starts. A plaintext
+        // CancelRequest never reaches this handler, and needs no check:
+        // pgwire hands it to the cancel handler, which Arneb leaves as the
+        // no-op default (statement cancel is not implemented over pgwire),
+        // and closes the connection.
         if self.tls_required
             && matches!(message, PgWireFrontendMessage::Startup(_))
             && !client.is_secure()
@@ -641,7 +638,9 @@ impl StartupHandler for AuthStartupHandler {
                 peer = %client.socket_addr(),
                 "pgwire plaintext connection rejected (tls required)"
             );
-            return Err(ssl_required());
+            // `FATAL 28000`, the code PostgreSQL uses when `hostssl`
+            // rejects a plaintext connection.
+            return Err(fatal("28000", "SSL connection is required"));
         }
         match &self.method {
             AuthMethod::None => {
@@ -839,8 +838,8 @@ mod tests {
 
     #[test]
     fn auth_errors_are_fatal() {
-        assert!(ErrorInfo::from(invalid_password("bob")).is_fatal());
-        let info = ErrorInfo::from(invalid_password("bob"));
+        let info = ErrorInfo::from(fatal("28P01", "password authentication failed"));
+        assert!(info.is_fatal());
         assert_eq!(info.code, "28P01");
         // A non-fatal pgwire error must be promoted so the connection closes.
         let promoted = ErrorInfo::from(ensure_fatal(PgWireError::InvalidSASLState));

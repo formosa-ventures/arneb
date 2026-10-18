@@ -80,6 +80,10 @@ pub struct TrinoConfig {
     pub target_page_bytes: usize,
     /// Hard cap on rows per result page.
     pub max_page_rows: usize,
+    /// HTTPS only: an HTTP/1 connection that has not sent a full request
+    /// header block this long after the request starts is closed, so slow
+    /// or stalled clients cannot pin connections open.
+    pub header_read_timeout: Duration,
 }
 
 impl Default for TrinoConfig {
@@ -91,6 +95,7 @@ impl Default for TrinoConfig {
             max_wait: Duration::from_secs(1),
             target_page_bytes: 1024 * 1024,
             max_page_rows: 10_000,
+            header_read_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -237,14 +242,46 @@ impl TrinoServer {
     }
 
     /// Serves on an already-bound listener (used by tests with port 0).
+    ///
+    /// Fails closed with [`std::io::ErrorKind::InvalidInput`] when password
+    /// auth is on without TLS and the listener is not loopback-only: Trino
+    /// clients send Basic credentials only over HTTPS, so such a listener
+    /// would be unusable or would take passwords in cleartext. (The server
+    /// binary rejects password auth without `[tls]` outright, loopback
+    /// included.)
     pub async fn serve(&self, listener: TcpListener) -> std::io::Result<()> {
+        check_transport(
+            self.auth.is_some(),
+            self.tls.is_some(),
+            listener.local_addr()?,
+        )?;
         let state = self.state();
         tokio::spawn(reaper(state.clone()));
         match &self.tls {
             None => axum::serve(listener, router(state)).await,
-            Some(acceptor) => serve_tls(listener, acceptor.clone(), router(state)).await,
+            Some(acceptor) => {
+                let header_timeout = self.config.header_read_timeout;
+                serve_tls(listener, acceptor.clone(), router(state), header_timeout).await
+            }
         }
     }
+}
+
+fn check_transport(
+    password_auth: bool,
+    tls: bool,
+    local: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    if password_auth && !tls && !local.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Trino listener on {local}: password auth requires TLS on a non-loopback \
+                 address"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// How long a client gets to finish the TLS handshake.
@@ -252,13 +289,15 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// HTTPS accept loop: TCP accept → rustls handshake → hyper (HTTP/1.1 or h2
 /// by ALPN) serving the axum router. A failed handshake only drops that
-/// connection.
+/// connection; an HTTP/1 request whose headers take longer than
+/// `header_timeout` closes it.
 async fn serve_tls(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     router: Router,
+    header_timeout: Duration,
 ) -> std::io::Result<()> {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
     use hyper_util::server::conn::auto;
     use hyper_util::service::TowerToHyperService;
 
@@ -288,7 +327,13 @@ async fn serve_tls(
                 }
             };
             let service = TowerToHyperService::new(router);
-            if let Err(e) = auto::Builder::new(TokioExecutor::new())
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            // hyper only enforces `header_read_timeout` with a timer set.
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_timeout);
+            if let Err(e) = builder
                 .serve_connection_with_upgrades(TokioIo::new(tls), service)
                 .await
             {
@@ -446,12 +491,17 @@ fn tracker_transition(state: &AppState, id: Option<QueryId>, to: &[TrackerState]
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn submit(
+    State(state): State<AppState>,
+    user: Option<Extension<AuthUser>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let sql = String::from_utf8_lossy(&body).trim().to_string();
     if sql.is_empty() {
         return (StatusCode::BAD_REQUEST, "SQL statement is empty").into_response();
     }
-    let session = ClientSession::from_headers(&headers);
+    let session = ClientSession::from_headers(&headers, user.as_ref().map(|Extension(u)| u));
     let id = new_query_id(&state.counter);
     let slug = format!("y{}", uuid::Uuid::new_v4().simple());
     let tracker_id = state.tracker.as_ref().map(|t| t.create_query(sql.clone()));

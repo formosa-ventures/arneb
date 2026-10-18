@@ -9,6 +9,8 @@
 use axum::http::HeaderMap;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 
+use super::auth::AuthUser;
+
 /// Characters escaped when writing a header value that Trino clients
 /// URL-decode (session property values, prepared statement text).
 const HEADER_VALUE: &AsciiSet = &CONTROLS
@@ -78,6 +80,21 @@ fn header<'a>(headers: &'a HeaderMap, family: HeaderFamily, suffix: &str) -> Opt
         .filter(|v| !v.is_empty())
 }
 
+fn header_family(headers: &HeaderMap) -> HeaderFamily {
+    if header(headers, HeaderFamily::Trino, "User").is_some() {
+        return HeaderFamily::Trino;
+    }
+    if header(headers, HeaderFamily::Presto, "User").is_some() {
+        return HeaderFamily::Presto;
+    }
+    let has = |prefix: &str| headers.keys().any(|k| k.as_str().starts_with(prefix));
+    if has("x-presto-") && !has("x-trino-") {
+        HeaderFamily::Presto
+    } else {
+        HeaderFamily::Trino
+    }
+}
+
 /// Parses a comma-separated `name=value` list (values URL-encoded). A header
 /// may appear multiple times; all occurrences are merged.
 fn key_values(headers: &HeaderMap, family: HeaderFamily, suffix: &str) -> Vec<(String, String)> {
@@ -97,21 +114,37 @@ fn key_values(headers: &HeaderMap, family: HeaderFamily, suffix: &str) -> Vec<(S
         .collect()
 }
 
+/// Every non-blank `X-Trino-User` / `X-Presto-User` value, trimmed, in
+/// header order (Trino first).
+pub(crate) fn claimed_users(headers: &HeaderMap) -> impl Iterator<Item = &str> {
+    ["X-Trino-User", "X-Presto-User"]
+        .into_iter()
+        .flat_map(|h| headers.get_all(h).iter())
+        .filter_map(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
 impl ClientSession {
     /// Reads the session from request headers. `X-Trino-*` wins when both
-    /// families are present.
-    pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
-        let family =
-            if headers.get("X-Trino-User").is_none() && headers.get("X-Presto-User").is_some() {
-                HeaderFamily::Presto
-            } else {
-                HeaderFamily::Trino
-            };
-        Self {
-            family,
-            user: header(headers, family, "User")
+    /// families are present; the legacy `X-Presto-*` family is used when the
+    /// client sends a non-blank `X-Presto-User` and no non-blank
+    /// `X-Trino-User`, or only `X-Presto-*` headers.
+    ///
+    /// Under password auth `auth_user` is the authenticated user and is the
+    /// session user whatever the headers say (the auth middleware has
+    /// already rejected a header naming anyone else).
+    pub(crate) fn from_headers(headers: &HeaderMap, auth_user: Option<&AuthUser>) -> Self {
+        let family = header_family(headers);
+        let user = match auth_user {
+            Some(AuthUser(user)) => user.clone(),
+            None => header(headers, family, "User")
                 .unwrap_or("anonymous")
                 .to_string(),
+        };
+        Self {
+            family,
+            user,
             source: header(headers, family, "Source").map(str::to_string),
             catalog: header(headers, family, "Catalog").map(str::to_string),
             schema: header(headers, family, "Schema").map(str::to_string),
@@ -148,7 +181,7 @@ mod tests {
             "X-Trino-Prepared-Statement",
             HeaderValue::from_static("q1=SELECT+%3F+%2B+1"),
         );
-        let s = ClientSession::from_headers(&h);
+        let s = ClientSession::from_headers(&h, None);
         assert_eq!(s.family, HeaderFamily::Trino);
         assert_eq!(s.user, "alice");
         assert_eq!(s.catalog.as_deref(), Some("hive"));
@@ -162,11 +195,42 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("X-Presto-User", HeaderValue::from_static("bob"));
         h.insert("X-Presto-Catalog", HeaderValue::from_static("memory"));
-        let s = ClientSession::from_headers(&h);
+        let s = ClientSession::from_headers(&h, None);
         assert_eq!(s.family, HeaderFamily::Presto);
         assert_eq!(s.user, "bob");
         assert_eq!(s.catalog.as_deref(), Some("memory"));
         assert_eq!(s.family.name("Set-Catalog"), "X-Presto-Set-Catalog");
+    }
+
+    #[test]
+    fn blank_user_headers_are_ignored() {
+        let mut h = HeaderMap::new();
+        h.insert("X-Trino-User", HeaderValue::from_static(" "));
+        h.insert("X-Presto-User", HeaderValue::from_static(" carol "));
+        let s = ClientSession::from_headers(&h, None);
+        assert_eq!(s.family, HeaderFamily::Presto);
+        assert_eq!(s.user, "carol");
+        assert_eq!(claimed_users(&h).collect::<Vec<_>>(), ["carol"]);
+
+        // Only Presto-family headers, no user: Presto, anonymous.
+        let mut h = HeaderMap::new();
+        h.insert("X-Presto-Catalog", HeaderValue::from_static("memory"));
+        let s = ClientSession::from_headers(&h, None);
+        assert_eq!(s.family, HeaderFamily::Presto);
+        assert_eq!(s.user, "anonymous");
+    }
+
+    #[test]
+    fn authenticated_user_wins() {
+        let mut h = HeaderMap::new();
+        h.insert("X-Trino-User", HeaderValue::from_static(" "));
+        let auth = AuthUser("alice".to_owned());
+        let s = ClientSession::from_headers(&h, Some(&auth));
+        assert_eq!(s.user, "alice");
+        assert_eq!(
+            ClientSession::from_headers(&HeaderMap::new(), Some(&auth)).user,
+            "alice"
+        );
     }
 
     #[test]

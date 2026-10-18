@@ -16,13 +16,17 @@ use arneb_protocol::{ServerTls, TrinoConfig, TrinoServer};
 use support::TestPki;
 
 async fn start_https(pki: &TestPki) -> u16 {
+    start_https_with(pki, TrinoConfig::default()).await
+}
+
+async fn start_https_with(pki: &TestPki, config: TrinoConfig) -> u16 {
     let tls = ServerTls::load(&pki.cert_path, &pki.key_path).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = TrinoServer::new(
         TrinoConfig {
             bind_address: format!("127.0.0.1:{port}"),
-            ..TrinoConfig::default()
+            ..config
         },
         Arc::new(CatalogManager::new("memory", "default")),
         Arc::new(ConnectorRegistry::new()),
@@ -135,6 +139,38 @@ async fn plain_http_fails_without_killing_the_listener() {
     );
 
     // The listener still serves TLS clients.
+    let rows = select_one(&client(&pki), port).await;
+    assert_eq!(rows.len(), 1);
+}
+
+/// A client that opens a TLS connection and then trickles (or never
+/// finishes) its request headers is disconnected after
+/// `header_read_timeout`.
+#[tokio::test]
+async fn slow_request_headers_time_out() {
+    let pki = TestPki::new();
+    let port = start_https_with(
+        &pki,
+        TrinoConfig {
+            header_read_timeout: Duration::from_millis(300),
+            ..TrinoConfig::default()
+        },
+    )
+    .await;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(pki.client_config()));
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut tls = connector.connect(name, tcp).await.unwrap();
+    tls.write_all(b"GET /v1/info HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut buf = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut buf)).await;
+    assert!(closed.is_ok(), "connection still open after 10s");
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // The listener still serves well-behaved clients.
     let rows = select_one(&client(&pki), port).await;
     assert_eq!(rows.len(), 1);
 }

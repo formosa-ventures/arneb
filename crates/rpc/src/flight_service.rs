@@ -262,18 +262,29 @@ impl FlightService for TrinoFlightService {
         let ticket_str = String::from_utf8(ticket.ticket.to_vec())
             .map_err(|_| Status::invalid_argument("invalid ticket encoding"))?;
 
+        // `task_id:partition_id`, or `task_id:partition_id:from_row` for a
+        // consumer resuming a broken broadcast read (#139).
         let parts: Vec<&str> = ticket_str.split(':').collect();
-        if parts.len() != 2 {
+        if !(2..=3).contains(&parts.len()) {
             return Err(Status::invalid_argument(
-                "ticket format: task_id:partition_id",
+                "ticket format: task_id:partition_id[:from_row]",
             ));
         }
         let task_id = parts[0];
         let partition_id: usize = parts[1]
             .parse()
             .map_err(|_| Status::invalid_argument("invalid partition_id"))?;
+        let from_row: usize = match parts.get(2) {
+            Some(n) => n
+                .parse()
+                .map_err(|_| Status::invalid_argument("invalid from_row"))?,
+            None => 0,
+        };
 
         match self.state.get_buffer(task_id) {
+            Some(BufferKind::Partitioned(_)) if from_row > 0 => Err(Status::failed_precondition(
+                format!("partitioned output of task '{task_id}' can't be resumed"),
+            )),
             Some(BufferKind::Partitioned(buffer)) => {
                 let mut buf = buffer.lock().await;
                 // dist-mxn-nested-joins T2 (2026-06-05): env-gated trace of
@@ -321,7 +332,7 @@ impl FlightService for TrinoFlightService {
                 // ticket format for protocol uniformity).
                 let _ = partition_id;
                 let schema = buffer.schema();
-                let stream = buffer.subscribe();
+                let stream = buffer.subscribe_from_row(from_row);
                 let failure = buffer.failure_handle();
                 let flight_stream = async_stream_broadcast(schema, stream, failure);
                 Ok(Response::new(flight_stream))
@@ -553,7 +564,9 @@ fn async_stream(
 /// a `BroadcastStream` (which yields `Option<RecordBatch>` via async
 /// `.next()`) instead of an mpsc receiver. Same B-fix-3 failure
 /// propagation semantics — after the stream EOFs, the shared `failure`
-/// flag is checked and surfaced as a final `Err` frame if set.
+/// flag is checked and surfaced as a final `Err` frame if set. The flag
+/// is read, not taken: every reader of a broadcast (each consumer task, a
+/// resumed read) must see the failure.
 fn async_stream_broadcast(
     schema: Arc<arrow::datatypes::Schema>,
     mut stream: crate::output_buffer::BroadcastStream,
@@ -565,7 +578,8 @@ fn async_stream_broadcast(
         while let Some(batch) = stream.next().await {
             yield Ok(batch) as Result<arrow::array::RecordBatch, arrow_flight::error::FlightError>;
         }
-        if let Some(failure) = failure.lock().ok().and_then(|mut g| g.take()) {
+        let failure = failure.lock().ok().and_then(|g| g.clone());
+        if let Some(failure) = failure {
             // The status (and so the error class) reaches the consumer as is.
             yield Err(arrow_flight::error::FlightError::Tonic(Box::new(
                 failure.to_status("producer task failed"),
@@ -667,19 +681,8 @@ mod tests {
         FlightState,
         tokio::task::JoinHandle<()>,
     ) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let state_for_server = state.clone();
-        let handle = tokio::spawn(async move {
-            let service = TrinoFlightService::new(state_for_server);
-            tonic::transport::Server::builder()
-                .add_service(FlightServiceServer::new(service))
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .unwrap();
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let client = crate::ExchangeClient::new(format!("http://127.0.0.1:{port}"));
+        let (addr, handle) = start_server_at(state.clone()).await;
+        let client = crate::ExchangeClient::new(format!("http://{addr}"));
         (client, state, handle)
     }
 
@@ -945,16 +948,67 @@ mod tests {
     async fn start_server_at(
         state: FlightState,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        start_secured_server_at(state, crate::ClusterSecurity::default()).await
+    }
+
+    /// The production `serve_flight` on a random port. The listener is
+    /// bound before the spawn, so a client can connect right away.
+    async fn start_secured_server_at(
+        state: FlightState,
+        security: crate::ClusterSecurity,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(FlightServiceServer::new(TrinoFlightService::new(state)))
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .unwrap();
+            serve_flight(listener, state, &security).await.unwrap();
         });
         (addr, handle)
+    }
+
+    /// State with a finished `q.bcast` broadcast buffer holding `batches`
+    /// numbered batches of `rows` rows (values `0..batches * rows`).
+    fn broadcast_state(batches: i32, rows: i32) -> FlightState {
+        let schema = test_schema();
+        let buffer = Arc::new(BroadcastOutputBuffer::new(schema.clone()));
+        for b in 0..batches {
+            buffer.write_batch(numbered_batch(&schema, b, rows));
+        }
+        buffer.finish();
+        let state = FlightState::new();
+        state.register_broadcast_buffer("q.bcast".into(), buffer);
+        state
+    }
+
+    /// Read `ticket` to the end through `client`, failing a hang after 20 s.
+    async fn read_all(
+        client: &crate::ExchangeClient,
+        ticket: &str,
+    ) -> Result<Vec<arrow::array::RecordBatch>, arneb_common::error::ArnebError> {
+        use futures::TryStreamExt;
+        let (task, partition) = ticket.rsplit_once(':').unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            client
+                .fetch_partition(task, partition.parse().unwrap())
+                .await?
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .await
+        .expect("no hang")
+    }
+
+    fn int_values(batches: &[arrow::array::RecordBatch]) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
     }
 
     fn numbered_batch(schema: &Arc<Schema>, batch: i32, rows: i32) -> arrow::array::RecordBatch {
@@ -973,42 +1027,14 @@ mod tests {
     /// once, in order.
     #[tokio::test]
     async fn broadcast_read_resumes_after_connection_cut() {
-        let schema = test_schema();
-        let buffer = Arc::new(BroadcastOutputBuffer::new(schema.clone()));
-        for b in 0..200 {
-            buffer.write_batch(numbered_batch(&schema, b, 1000));
-        }
-        buffer.finish();
-        let state = FlightState::new();
-        state.register_broadcast_buffer("q.bcast".into(), buffer);
-        let (addr, handle) = start_server_at(state).await;
+        let (addr, handle) = start_server_at(broadcast_state(200, 1000)).await;
         // ~800 KB in total; cut at 300 KB (not on a batch boundary).
         let client = crate::ExchangeClient::new(cutting_proxy(addr, 300_007).await);
 
-        use futures::TryStreamExt;
-        let batches: Vec<_> = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            client
-                .fetch_partition("q.bcast", 0)
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-        })
-        .await
-        .expect("no hang")
-        .expect("resumed read succeeds");
-        let values: Vec<i32> = batches
-            .iter()
-            .flat_map(|b| {
-                b.column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int32Array>()
-                    .unwrap()
-                    .values()
-                    .to_vec()
-            })
-            .collect();
-        assert_eq!(values, (0..200_000).collect::<Vec<i32>>());
+        let batches = read_all(&client, "q.bcast:0")
+            .await
+            .expect("resumed read succeeds");
+        assert_eq!(int_values(&batches), (0..200_000).collect::<Vec<i32>>());
         handle.abort();
     }
 
@@ -1035,37 +1061,14 @@ mod tests {
             }),
         };
 
-        let schema = test_schema();
-        let buffer = Arc::new(BroadcastOutputBuffer::new(schema.clone()));
-        for b in 0..200 {
-            buffer.write_batch(numbered_batch(&schema, b, 1000));
-        }
-        buffer.finish();
-        let state = FlightState::new();
-        state.register_broadcast_buffer("q.bcast".into(), buffer);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_security = security.clone();
-        let handle = tokio::spawn(async move {
-            serve_flight(listener, state, &server_security)
-                .await
-                .unwrap();
-        });
+        let (addr, handle) =
+            start_secured_server_at(broadcast_state(200, 1000), security.clone()).await;
         let client =
             crate::ExchangeClient::new(cutting_proxy(addr, 300_007).await).with_security(security);
 
-        use futures::TryStreamExt;
-        let batches: Vec<_> = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            client
-                .fetch_partition("q.bcast", 0)
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-        })
-        .await
-        .expect("no hang")
-        .expect("resumed read succeeds over TLS with the secret");
+        let batches = read_all(&client, "q.bcast:0")
+            .await
+            .expect("resumed read succeeds over TLS with the secret");
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 200_000);
         handle.abort();
@@ -1123,29 +1126,12 @@ mod tests {
     /// read in full.
     #[tokio::test]
     async fn broadcast_do_get_retries_a_break_before_the_response() {
-        let schema = test_schema();
-        let buffer = Arc::new(BroadcastOutputBuffer::new(schema.clone()));
-        for b in 0..10 {
-            buffer.write_batch(numbered_batch(&schema, b, 100));
-        }
-        buffer.finish();
-        let state = FlightState::new();
-        state.register_broadcast_buffer("q.bcast".into(), buffer);
-        let (addr, handle) = start_server_at(state).await;
+        let (addr, handle) = start_server_at(broadcast_state(10, 100)).await;
         let client = crate::ExchangeClient::new(proxy(addr, Cut::BeforeResponseHeaders).await);
 
-        use futures::TryStreamExt;
-        let batches: Vec<_> = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            client
-                .fetch_partition("q.bcast", 0)
-                .await
-                .expect("do_get retried after the break")
-                .try_collect::<Vec<_>>()
-                .await
-        })
-        .await
-        .expect("no hang")
-        .expect("read succeeds");
+        let batches = read_all(&client, "q.bcast:0")
+            .await
+            .expect("do_get retried after the break");
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1000);
         handle.abort();
@@ -1181,5 +1167,97 @@ mod tests {
             "{err}"
         );
         handle.abort();
+    }
+
+    /// A resume ticket (`task:partition:from_row`) makes the broadcast
+    /// producer send only the remainder, with the partial batch sliced.
+    #[tokio::test]
+    async fn broadcast_do_get_from_row_sends_only_the_remainder() {
+        let (addr, handle) = start_server_at(broadcast_state(10, 100)).await;
+        let mut client = crate::security::connect(
+            &format!("http://{addr}"),
+            &crate::ClusterSecurity::default(),
+        )
+        .await
+        .unwrap();
+
+        use futures::TryStreamExt;
+        let response = client
+            .do_get(Ticket::new("q.bcast:0:250"))
+            .await
+            .unwrap()
+            .into_inner();
+        let batches: Vec<_> = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            response.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        assert_eq!(int_values(&batches), (250..1000).collect::<Vec<i32>>());
+
+        let err = client.do_get(Ticket::new("q.bcast:0:x")).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        handle.abort();
+    }
+
+    /// A broadcast buffer has many readers: every consumer task, and a
+    /// resumed read (#139) whose first reader's error frame was lost. A
+    /// producer failure must end every one of them, not only the first to
+    /// reach EOF; otherwise a later reader takes a clean EOF and builds
+    /// from a truncated broadcast.
+    #[tokio::test]
+    async fn every_broadcast_reader_sees_the_producer_failure() {
+        let schema = test_schema();
+        let buffer = Arc::new(BroadcastOutputBuffer::new(schema.clone()));
+        buffer.write_batch(numbered_batch(&schema, 0, 100));
+        *buffer.failure_handle().lock().unwrap() = Some(crate::TaskFailure::new("scan failed"));
+        buffer.finish();
+        let state = FlightState::new();
+        state.register_broadcast_buffer("q.bcast".into(), buffer);
+        let (addr, handle) = start_server_at(state).await;
+        let client = crate::ExchangeClient::new(format!("http://{addr}"));
+
+        for (reader, ticket) in [(1, "q.bcast:0"), (2, "q.bcast:0"), (3, "q.bcast:0:50")] {
+            let err = if ticket.matches(':').count() == 1 {
+                read_all(&client, ticket).await.err().map(|e| e.to_string())
+            } else {
+                let mut raw = crate::security::connect(
+                    &format!("http://{addr}"),
+                    &crate::ClusterSecurity::default(),
+                )
+                .await
+                .unwrap();
+                use futures::TryStreamExt;
+                let response = raw.do_get(Ticket::new(ticket)).await.unwrap().into_inner();
+                arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+                    response.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
+                )
+                .try_collect::<Vec<_>>()
+                .await
+                .err()
+                .map(|e| e.to_string())
+            };
+            let err = err.unwrap_or_else(|| panic!("reader {reader} got a clean EOF"));
+            assert!(err.contains("scan failed"), "reader {reader}: {err}");
+        }
+        handle.abort();
+    }
+
+    /// A partitioned buffer is consumed once, so a resume ticket is refused
+    /// without taking the buffer.
+    #[tokio::test]
+    async fn partitioned_do_get_refuses_a_resume_ticket() {
+        let schema = test_schema();
+        let buf = OutputBuffer::single(4, schema.clone());
+        let state = FlightState::new();
+        state.register_partitioned_buffer("q.part".into(), buf);
+        let service = TrinoFlightService::new(state);
+        let err = do_get_expect_err(&service, "q.part:0:10").await;
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        // The buffer was not taken: a normal read still gets it.
+        assert!(service
+            .do_get(Request::new(Ticket::new("q.part:0")))
+            .await
+            .is_ok());
     }
 }

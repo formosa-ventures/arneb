@@ -15,7 +15,7 @@ use arrow_flight::Ticket;
 use futures::stream::Stream;
 use futures::TryStreamExt;
 
-use crate::security::{cluster_security, ClusterSecurity};
+use crate::security::{cluster_security, ClusterSecurity, FlightPeer};
 
 /// Decoded batches of one `do_get` response.
 type FlightBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, FlightError>> + Send>>;
@@ -66,7 +66,8 @@ impl ExchangeClient {
     ///   immediately with the worker's error message.
     ///
     /// A transport break before the response arrives (`Unknown`, #139)
-    /// reconnects and asks again, up to [`MAX_RESUME_ATTEMPTS`] times. A
+    /// reconnects and asks again, up to [`MAX_RESUME_ATTEMPTS`] times
+    /// ([`classify`] has the whole policy). A
     /// partitioned buffer the lost response already took answers the
     /// retry with `AlreadyExists`; the transport error is reported then.
     pub async fn fetch_partition(
@@ -93,18 +94,22 @@ impl ExchangeClient {
         let safety_deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(safety_secs);
 
-        let mut client = self.connect().await?;
+        let peer = self.peer()?;
+        let mut client = connect(&peer).await?;
         let mut transport_attempts = 0usize;
         let mut transport_error: Option<tonic::Status> = None;
 
         loop {
             let ticket = Ticket::new(ticket_text.clone());
 
-            let response = match client.do_get(ticket).await {
-                Ok(resp) => resp,
-
-                // Task running, buffer not ready — keep waiting.
-                Err(status) if status.code() == tonic::Code::Unavailable => {
+            let status = match client.do_get(ticket).await {
+                Ok(response) => {
+                    return self.collect_response(peer, response, ticket_text).await;
+                }
+                Err(status) => status,
+            };
+            match classify(&status) {
+                StatusClass::Wait => {
                     if tokio::time::Instant::now() >= safety_deadline {
                         return Err(ExecutionError::InvalidOperation(format!(
                             "Flight do_get safety ceiling ({safety_secs}s) exceeded \
@@ -115,11 +120,8 @@ impl ExchangeClient {
                     }
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, backoff_max);
-                    continue;
                 }
-
-                // Task ID unknown — short grace period, then fail.
-                Err(status) if status.code() == tonic::Code::NotFound => {
+                StatusClass::Grace => {
                     if tokio::time::Instant::now() >= not_found_deadline {
                         return Err(ExecutionError::InvalidOperation(format!(
                             "Flight do_get: task {ticket_text} unknown on {} \
@@ -129,28 +131,16 @@ impl ExchangeClient {
                     }
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, backoff_max);
-                    continue;
                 }
-
-                // Task failed — propagate the worker's error immediately,
-                // keeping a memory-limit failure's class.
-                Err(status)
-                    if matches!(
-                        status.code(),
-                        tonic::Code::Internal | tonic::Code::ResourceExhausted
-                    ) =>
-                {
+                // Propagate the worker's error immediately, keeping a
+                // memory-limit failure's class.
+                StatusClass::Failed => {
                     return Err(crate::task_error::remote_error(
                         format!("remote task {ticket_text} on {} failed", self.address),
                         &status,
                     ));
                 }
-
-                // The connection broke before the response: reconnect.
-                Err(status)
-                    if status.code() == tonic::Code::Unknown
-                        && transport_attempts < MAX_RESUME_ATTEMPTS =>
-                {
+                StatusClass::Transport if transport_attempts < MAX_RESUME_ATTEMPTS => {
                     transport_attempts += 1;
                     tracing::warn!(
                         target: "arneb::exchange",
@@ -160,117 +150,114 @@ impl ExchangeClient {
                         error = %status,
                         "exchange do_get broke before the response, reconnecting"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(50 << transport_attempts))
-                        .await;
-                    if let Ok(reconnected) = self.connect().await {
+                    tokio::time::sleep(resume_backoff(transport_attempts)).await;
+                    if let Ok(reconnected) = connect(&peer).await {
                         client = reconnected;
                     }
                     transport_error.get_or_insert(status);
-                    continue;
                 }
-
-                Err(e) => {
-                    let e = transport_error.unwrap_or(e);
+                StatusClass::Transport | StatusClass::Fatal => {
+                    let e = transport_error.unwrap_or(status);
                     return Err(ExecutionError::InvalidOperation(format!(
                         "Flight do_get failed: {e}"
                     )));
                 }
-            };
-
-            return self.clone().collect_response(response, ticket_text).await;
+            }
         }
     }
 
-    /// A Flight connection with this client's cluster security (bearer
-    /// secret, TLS), for the first `do_get` and for every reopen.
-    async fn connect(&self) -> Result<crate::security::FlightClient, ExecutionError> {
+    /// This client's peer with its cluster security (bearer secret, TLS),
+    /// prepared once per `fetch_partition` for the first `do_get` and
+    /// every reconnect.
+    fn peer(&self) -> Result<FlightPeer, ExecutionError> {
         let security = self
             .security
             .as_deref()
             .unwrap_or_else(|| cluster_security());
-        crate::security::connect(&self.address, security)
-            .await
+        FlightPeer::new(&self.address, security)
             .map_err(|e| ExecutionError::InvalidOperation(format!("Flight server: {e}")))
     }
 
-    /// Open `ticket` again after its stream broke. `Err(true)`: worth
-    /// another attempt (transport trouble); `Err(false)`: the output can't
-    /// be read again (a partitioned buffer is consumed once, or is gone).
-    async fn reopen(&self, ticket: &str) -> Result<FlightBatchStream, bool> {
-        let mut client = self.connect().await.map_err(|_| true)?;
-        match client.do_get(Ticket::new(ticket.to_owned())).await {
-            Ok(response) => Ok(decode(response)),
-            Err(status) => Err(is_transport_status(&status)),
+    /// Open `ticket` from row `delivered` after its stream broke with
+    /// `err`, spending `attempts` from the [`MAX_RESUME_ATTEMPTS`] budget.
+    /// `None` once the budget is spent or the output can't be read again
+    /// (a partitioned buffer is consumed once and refuses a resume, or the
+    /// output is gone).
+    async fn reopen(
+        &self,
+        peer: &FlightPeer,
+        ticket: &str,
+        delivered: usize,
+        attempts: &mut usize,
+        err: &FlightError,
+    ) -> Option<FlightBatchStream> {
+        let resume_ticket = format!("{ticket}:{delivered}");
+        while *attempts < MAX_RESUME_ATTEMPTS {
+            *attempts += 1;
+            tracing::warn!(
+                target: "arneb::exchange",
+                ticket = %ticket,
+                address = %self.address,
+                delivered_rows = delivered,
+                attempt = *attempts,
+                error = %err,
+                "exchange stream broke, reopening"
+            );
+            tokio::time::sleep(resume_backoff(*attempts)).await;
+            let Ok(mut client) = connect(peer).await else {
+                continue;
+            };
+            match client.do_get(Ticket::new(resume_ticket.clone())).await {
+                Ok(response) => return Some(decode(response)),
+                Err(status) if classify(&status).resumes() => continue,
+                Err(_) => return None,
+            }
         }
+        None
     }
 
     /// Wrap a response so a transport break mid-stream (#139) reopens the
-    /// ticket and skips the rows already delivered. Only broadcast output
-    /// can be read again: it replays the same batches in the same order to
-    /// every `do_get`. A partitioned ticket answers the reopen with
-    /// `AlreadyExists`, and the original error is surfaced as before.
-    fn resumable(self, ticket: String, first: FlightBatchStream) -> FlightBatchStream {
+    /// ticket from the first row not yet delivered (`ticket:from_row`), so
+    /// the producer sends only the remainder. Only broadcast output can be
+    /// read again, and the resume rests on two producer-side contracts:
+    ///
+    /// - every `subscribe` of a `BroadcastOutputBuffer` replays the buffer
+    ///   from its first row, and `subscribe_from_row` skips exactly the
+    ///   rows already delivered;
+    /// - the task manager keeps a broadcast buffer registered until the
+    ///   query's 600 s ceiling (its early cleanup removes only partitioned
+    ///   buffers), so the reopened ticket still finds it.
+    ///
+    /// A partitioned ticket refuses the reopen, and the original error is
+    /// surfaced as before.
+    fn resumable(
+        self,
+        peer: FlightPeer,
+        ticket: String,
+        first: FlightBatchStream,
+    ) -> FlightBatchStream {
         Box::pin(async_stream::stream! {
             use futures::StreamExt;
             let mut stream = first;
             let mut delivered = 0usize;
-            let mut to_skip = 0usize;
             let mut attempts = 0usize;
-            loop {
-                match stream.next().await {
-                    Some(Ok(batch)) => {
-                        let rows = batch.num_rows();
-                        if to_skip > 0 && to_skip >= rows {
-                            to_skip -= rows;
-                            continue;
-                        }
-                        let batch = if to_skip > 0 {
-                            let rest = batch.slice(to_skip, rows - to_skip);
-                            to_skip = 0;
-                            rest
-                        } else {
-                            batch
-                        };
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(batch) => {
                         delivered += batch.num_rows();
                         yield Ok(batch);
                     }
-                    Some(Err(err)) if is_transport_error(&err) && attempts < MAX_RESUME_ATTEMPTS => {
-                        loop {
-                            attempts += 1;
-                            tracing::warn!(
-                                target: "arneb::exchange",
-                                ticket = %ticket,
-                                address = %self.address,
-                                delivered_rows = delivered,
-                                attempt = attempts,
-                                error = %err,
-                                "exchange stream broke, reopening"
-                            );
-                            tokio::time::sleep(std::time::Duration::from_millis(50 << attempts)).await;
-                            match self.reopen(&ticket).await {
-                                Ok(reopened) => {
-                                    stream = reopened;
-                                    to_skip = delivered;
-                                    break;
-                                }
-                                Err(true) if attempts < MAX_RESUME_ATTEMPTS => continue,
-                                Err(_) => {
-                                    yield Err(err);
-                                    return;
-                                }
+                    Err(err) if is_transport_error(&err) => {
+                        match self.reopen(&peer, &ticket, delivered, &mut attempts, &err).await {
+                            Some(reopened) => stream = reopened,
+                            None => {
+                                yield Err(err);
+                                return;
                             }
                         }
                     }
-                    Some(Err(err)) => {
+                    Err(err) => {
                         yield Err(err);
-                        return;
-                    }
-                    None => {
-                        if to_skip > 0 {
-                            yield Err(FlightError::ProtocolError(format!(
-                                "reopened stream for {ticket} ended {to_skip} rows short"
-                            )));
-                        }
                         return;
                     }
                 }
@@ -279,7 +266,8 @@ impl ExchangeClient {
     }
 
     async fn collect_response(
-        self,
+        &self,
+        peer: FlightPeer,
         response: tonic::Response<tonic::Streaming<arrow_flight::FlightData>>,
         ticket_text: String,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
@@ -290,7 +278,9 @@ impl ExchangeClient {
         let traced = std::env::var("ARNEB_TRACE_FRAGMENTS")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
-        let mut flight_stream = self.resumable(ticket_text.clone(), decode(response));
+        let mut flight_stream = self
+            .clone()
+            .resumable(peer, ticket_text.clone(), decode(response));
 
         // Phase 3b.7a (2026-05-21): true streaming. Peek the first batch
         // only (so we have a schema before returning a typed stream), then
@@ -418,18 +408,64 @@ fn decode(
     ))
 }
 
-/// A status the transport produced (connection closed or reset, h2
-/// error), as opposed to one the producer sent: producer failures arrive
-/// as `Internal` / `ResourceExhausted`.
-fn is_transport_status(status: &tonic::Status) -> bool {
-    matches!(
-        status.code(),
-        tonic::Code::Unknown | tonic::Code::Unavailable
-    )
+async fn connect(peer: &FlightPeer) -> Result<crate::security::FlightClient, ExecutionError> {
+    peer.connect()
+        .await
+        .map_err(|e| ExecutionError::InvalidOperation(format!("Flight server: {e}")))
+}
+
+/// Backoff before resume attempt `attempt` (1-based): 100, 200, 400 ms.
+fn resume_backoff(attempt: usize) -> std::time::Duration {
+    std::time::Duration::from_millis(50 << attempt)
+}
+
+/// How the exchange client treats a status from a `do_get` call or a
+/// stream, in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusClass {
+    /// `Unavailable`: the producer's task is running but its buffer is not
+    /// registered yet. tonic also reports a refused or dropped connection
+    /// with this code, so on a stream (or a reopen, whose buffer was
+    /// registered) it means transport trouble.
+    Wait,
+    /// `NotFound`: the task is unknown on the worker, which covers
+    /// dispatch latency on a first call and a cleaned-up output on a
+    /// reopen.
+    Grace,
+    /// The producer's task failed: `Internal`, or `ResourceExhausted`
+    /// marked as a memory-limit failure.
+    Failed,
+    /// The transport broke: `Unknown` (connection closed or reset, h2
+    /// error), or a `ResourceExhausted` the producer did not send, such as
+    /// an h2 `ENHANCE_YOUR_CALM` GOAWAY.
+    Transport,
+    /// Anything else (`AlreadyExists`: a partitioned buffer already taken;
+    /// `FailedPrecondition`: a resume it refuses; auth failures).
+    Fatal,
+}
+
+impl StatusClass {
+    /// Whether a broken stream or a failed reopen is worth reopening.
+    fn resumes(self) -> bool {
+        matches!(self, Self::Wait | Self::Transport)
+    }
+}
+
+fn classify(status: &tonic::Status) -> StatusClass {
+    match status.code() {
+        tonic::Code::Unavailable => StatusClass::Wait,
+        tonic::Code::NotFound => StatusClass::Grace,
+        tonic::Code::Internal => StatusClass::Failed,
+        tonic::Code::ResourceExhausted if crate::task_error::is_memory_limit(status) => {
+            StatusClass::Failed
+        }
+        tonic::Code::Unknown | tonic::Code::ResourceExhausted => StatusClass::Transport,
+        _ => StatusClass::Fatal,
+    }
 }
 
 fn is_transport_error(err: &FlightError) -> bool {
-    matches!(err, FlightError::Tonic(status) if is_transport_status(status))
+    matches!(err, FlightError::Tonic(status) if classify(status).resumes())
 }
 
 fn exchange_receive_batch_bytes(batch: &RecordBatch) -> u64 {
@@ -457,5 +493,42 @@ impl Drop for FlightPassthroughStream {
                 self.ticket, self.rows, self.batches
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TaskFailure;
+
+    #[test]
+    fn classify_separates_producer_failures_from_transport() {
+        use tonic::Status;
+        assert_eq!(
+            classify(&Status::unavailable("not ready")),
+            StatusClass::Wait
+        );
+        assert_eq!(classify(&Status::not_found("unknown")), StatusClass::Grace);
+        assert_eq!(classify(&Status::internal("boom")), StatusClass::Failed);
+        let memory = TaskFailure::resource_exhausted("query memory limit exceeded")
+            .to_status("producer task failed");
+        assert_eq!(classify(&memory), StatusClass::Failed);
+        // tonic's code for an h2 ENHANCE_YOUR_CALM GOAWAY, no producer marker.
+        let goaway = Status::resource_exhausted("h2 protocol error: ENHANCE_YOUR_CALM");
+        assert_eq!(classify(&goaway), StatusClass::Transport);
+        assert_eq!(
+            classify(&Status::unknown("broken pipe")),
+            StatusClass::Transport
+        );
+        assert_eq!(
+            classify(&Status::already_exists("taken")),
+            StatusClass::Fatal
+        );
+        assert_eq!(
+            classify(&Status::failed_precondition("no resume")),
+            StatusClass::Fatal
+        );
+        assert!(StatusClass::Wait.resumes() && StatusClass::Transport.resumes());
+        assert!(!StatusClass::Grace.resumes() && !StatusClass::Fatal.resumes());
     }
 }

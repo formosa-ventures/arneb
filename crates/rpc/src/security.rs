@@ -21,7 +21,9 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity, ServerTlsConfig};
+use tonic::transport::{
+    Certificate, Channel, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig,
+};
 use tonic::{Request, Status};
 
 /// Minimum accepted length of `[cluster] secret`.
@@ -128,23 +130,52 @@ pub type FlightClient = FlightServiceClient<InterceptedService<Channel, BearerIn
 /// `http://` address is upgraded to `https://` and the peer must present a
 /// certificate signed by the cluster CA.
 pub async fn connect(address: &str, security: &ClusterSecurity) -> Result<FlightClient, String> {
-    let address = match (&security.tls, address.strip_prefix("http://")) {
-        (Some(_), Some(rest)) => format!("https://{rest}"),
-        _ => address.to_owned(),
-    };
-    let mut endpoint = Channel::from_shared(address.clone())
-        .map_err(|e| format!("invalid flight address {address}: {e}"))?;
-    if let Some(tls) = &security.tls {
-        endpoint = endpoint
-            .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(&tls.ca_pem)))
-            .map_err(|e| format!("invalid [cluster.tls] client config: {e}"))?;
+    FlightPeer::new(address, security)?.connect().await
+}
+
+/// A Flight peer prepared once (address resolved for TLS, CA parsed,
+/// bearer built), for a caller that connects to it more than once.
+#[derive(Clone)]
+pub(crate) struct FlightPeer {
+    address: String,
+    endpoint: Endpoint,
+    interceptor: BearerInterceptor,
+}
+
+impl FlightPeer {
+    pub(crate) fn new(address: &str, security: &ClusterSecurity) -> Result<Self, String> {
+        let address = match (&security.tls, address.strip_prefix("http://")) {
+            (Some(_), Some(rest)) => format!("https://{rest}"),
+            _ => address.to_owned(),
+        };
+        let mut endpoint = Channel::from_shared(address.clone())
+            .map_err(|e| format!("invalid flight address {address}: {e}"))?;
+        if let Some(tls) = &security.tls {
+            endpoint = endpoint
+                .tls_config(
+                    ClientTlsConfig::new().ca_certificate(Certificate::from_pem(&tls.ca_pem)),
+                )
+                .map_err(|e| format!("invalid [cluster.tls] client config: {e}"))?;
+        }
+        let interceptor = BearerInterceptor(security.secret.as_ref().map(ClusterSecret::bearer));
+        Ok(Self {
+            address,
+            endpoint,
+            interceptor,
+        })
     }
-    let channel = endpoint
-        .connect()
-        .await
-        .map_err(|e| format!("failed to connect to {address}: {e}"))?;
-    let interceptor = BearerInterceptor(security.secret.as_ref().map(ClusterSecret::bearer));
-    Ok(FlightServiceClient::with_interceptor(channel, interceptor))
+
+    pub(crate) async fn connect(&self) -> Result<FlightClient, String> {
+        let channel = self
+            .endpoint
+            .connect()
+            .await
+            .map_err(|e| format!("failed to connect to {}: {e}", self.address))?;
+        Ok(FlightServiceClient::with_interceptor(
+            channel,
+            self.interceptor.clone(),
+        ))
+    }
 }
 
 /// Constant-time byte comparison (length is not secret).

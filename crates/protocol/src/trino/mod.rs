@@ -237,7 +237,19 @@ impl TrinoServer {
     }
 
     /// Serves on an already-bound listener (used by tests with port 0).
+    ///
+    /// Fails closed with [`std::io::ErrorKind::InvalidInput`] when password
+    /// auth is on without TLS and the listener is not loopback-only: Trino
+    /// clients send Basic credentials only over HTTPS, so such a listener
+    /// would be unusable or would take passwords in cleartext. (The server
+    /// binary rejects password auth without `[tls]` outright, loopback
+    /// included.)
     pub async fn serve(&self, listener: TcpListener) -> std::io::Result<()> {
+        check_transport(
+            self.auth.is_some(),
+            self.tls.is_some(),
+            listener.local_addr()?,
+        )?;
         let state = self.state();
         tokio::spawn(reaper(state.clone()));
         match &self.tls {
@@ -245,6 +257,23 @@ impl TrinoServer {
             Some(acceptor) => serve_tls(listener, acceptor.clone(), router(state)).await,
         }
     }
+}
+
+fn check_transport(
+    password_auth: bool,
+    tls: bool,
+    local: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    if password_auth && !tls && !local.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Trino listener on {local}: password auth requires TLS on a non-loopback \
+                 address"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// How long a client gets to finish the TLS handshake.

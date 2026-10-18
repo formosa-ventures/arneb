@@ -259,6 +259,40 @@ async fn none_mode_is_unchanged() {
     assert_eq!(counter.load(Ordering::Relaxed), 0);
 }
 
+/// Password auth over plain HTTP is refused on any non-loopback listener,
+/// however the server was built (the binary also refuses it in config).
+#[tokio::test]
+async fn password_auth_without_tls_refuses_non_loopback() {
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let server = TrinoServer::new(
+        TrinoConfig::default(),
+        Arc::new(CatalogManager::new("memory", "default")),
+        Arc::new(ConnectorRegistry::new()),
+    )
+    .with_password_auth(Some(creds()))
+    .unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(5), server.serve(listener))
+        .await
+        .expect("serve must refuse, not run")
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("TLS"), "{err}");
+
+    // Without password auth the same listener serves.
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let server = TrinoServer::new(
+        TrinoConfig::default(),
+        Arc::new(CatalogManager::new("memory", "default")),
+        Arc::new(ConnectorRegistry::new()),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), server.serve(listener))
+            .await
+            .is_err(),
+        "an unauthenticated listener keeps serving"
+    );
+}
+
 /// A blank `X-Trino-User` must not hide a matching `X-Presto-User` from the
 /// impersonation check and then leave the session user blank: the
 /// authenticated user owns the query.

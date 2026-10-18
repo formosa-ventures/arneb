@@ -398,7 +398,9 @@ pub fn check_cluster_transport(secret: bool, tls: bool, bind_address: &str) -> R
 
 /// Fail closed: password auth on an enabled Trino listener needs `[tls]`.
 /// Trino clients only send passwords over HTTPS, so a plain-HTTP listener
-/// under password auth would be either unusable or a bypass.
+/// under password auth would be either unusable or a bypass. Stricter than
+/// the `TrinoServer::serve` guard, which still allows a loopback-only
+/// listener (tests, local tunnels).
 pub fn check_trino_transport(trino_enabled: bool, password_auth: bool, tls: bool) -> Result<()> {
     if trino_enabled && password_auth && !tls {
         bail!(

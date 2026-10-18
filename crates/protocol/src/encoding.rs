@@ -103,21 +103,21 @@ fn encode_value(array: &dyn Array, row: usize) -> Option<String> {
                         .as_any()
                         .downcast_ref::<TimestampSecondArray>()
                         .unwrap();
-                    arr.value(row) * 1_000_000_000
+                    arr.value(row).checked_mul(1_000_000_000)?
                 }
                 arrow_types::TimeUnit::Millisecond => {
                     let arr = array
                         .as_any()
                         .downcast_ref::<TimestampMillisecondArray>()
                         .unwrap();
-                    arr.value(row) * 1_000_000
+                    arr.value(row).checked_mul(1_000_000)?
                 }
                 arrow_types::TimeUnit::Microsecond => {
                     let arr = array
                         .as_any()
                         .downcast_ref::<TimestampMicrosecondArray>()
                         .unwrap();
-                    arr.value(row) * 1_000
+                    arr.value(row).checked_mul(1_000)?
                 }
                 arrow_types::TimeUnit::Nanosecond => {
                     let arr = array
@@ -127,12 +127,19 @@ fn encode_value(array: &dyn Array, row: usize) -> Option<String> {
                     arr.value(row)
                 }
             };
-            let secs = value / 1_000_000_000;
-            let nsecs = (value % 1_000_000_000) as u32;
-            let dt = chrono::DateTime::from_timestamp(secs, nsecs)
-                .unwrap_or_default()
-                .naive_utc();
-            Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            // Floor division: a pre-1970 instant has a negative remainder.
+            let secs = value.div_euclid(1_000_000_000);
+            let nsecs = value.rem_euclid(1_000_000_000) as u32;
+            let dt = chrono::DateTime::from_timestamp(secs, nsecs)?.naive_utc();
+            let mut text = dt.format("%Y-%m-%d %H:%M:%S").to_string();
+            // Fractional seconds as PostgreSQL prints them: trailing zeros
+            // trimmed, none for a whole second.
+            if nsecs > 0 {
+                let frac = format!("{nsecs:09}");
+                text.push('.');
+                text.push_str(frac.trim_end_matches('0'));
+            }
+            Some(text)
         }
         arrow_types::DataType::Decimal128(precision, scale) => {
             let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
@@ -330,6 +337,18 @@ mod tests {
         let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![micros]));
         let val = encode_value(arr.as_ref(), 0).unwrap();
         assert_eq!(val, "2024-01-15 10:30:00");
+    }
+
+    #[test]
+    fn test_encode_timestamp_fraction_and_pre_epoch() {
+        let enc = |micros: i64| {
+            let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![micros]));
+            encode_value(arr.as_ref(), 0).unwrap()
+        };
+        assert_eq!(enc(981_173_106_789_012), "2001-02-03 04:05:06.789012");
+        assert_eq!(enc(1_500_000), "1970-01-01 00:00:01.5");
+        assert_eq!(enc(-1), "1969-12-31 23:59:59.999999");
+        assert_eq!(enc(-1_000_000), "1969-12-31 23:59:59");
     }
 
     #[test]

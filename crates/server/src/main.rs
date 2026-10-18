@@ -908,31 +908,40 @@ async fn run() -> Result<()> {
                 bail!("flight server error: {e}");
             }
         }
-        // Web UI HTTP server (coordinator + standalone only)
-        result = async {
-            let listener = tokio::net::TcpListener::bind(&web_addr).await?;
-            tracing::info!(web_address = %web_addr, "web UI listening");
-            axum::serve(listener, web_router).await
-        }, if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "web server error");
-            }
-        }
+        // Web UI HTTP server (coordinator + standalone only). Like the Trino
+        // listener, a bind failure is logged but not fatal.
+        _ = non_fatal_listener(
+            async {
+                let listener = tokio::net::TcpListener::bind(&web_addr).await?;
+                tracing::info!(web_address = %web_addr, "web UI listening");
+                axum::serve(listener, web_router).await
+            },
+            |e| {
+                tracing::error!(
+                    error = %e,
+                    address = %web_addr,
+                    "web UI listener failed; continuing without it"
+                )
+            },
+        ), if serves_clients => {}
         // Trino client protocol. A bind failure (e.g. a local Trino already
         // on 8080) is logged but not fatal: pgwire keeps serving.
-        _ = async {
-            if let Some(trino) = &trino_server {
-                if let Err(e) = trino.start().await {
-                    tracing::error!(
-                        error = %e,
-                        address = %trino_addr,
-                        "Trino client protocol listener failed; continuing without it \
-                         (set [trino] port / ARNEB_TRINO_PORT / --trino-port, or --no-trino)"
-                    );
+        _ = non_fatal_listener(
+            async {
+                match &trino_server {
+                    Some(trino) => trino.start().await,
+                    None => futures::future::pending().await,
                 }
-            }
-            futures::future::pending::<()>().await
-        } => {}
+            },
+            |e| {
+                tracing::error!(
+                    error = %e,
+                    address = %trino_addr,
+                    "Trino client protocol listener failed; continuing without it \
+                     (set [trino] port / ARNEB_TRINO_PORT / --trino-port, or --no-trino)"
+                )
+            },
+        ) => {}
 
         // Worker heartbeat loop
         _ = worker_heartbeat_loop(role, &config, &rpc_addr) => {}
@@ -943,6 +952,19 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Run an auxiliary listener (Web UI, Trino) whose failure must not stop
+/// the server: an error is passed to `on_error` (which logs it) and the
+/// future then never completes, so the `select!` in `main` keeps serving.
+async fn non_fatal_listener<F>(listener: F, on_error: impl FnOnce(std::io::Error))
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    if let Err(e) = listener.await {
+        on_error(e);
+    }
+    futures::future::pending::<()>().await
 }
 
 /// Periodically send heartbeat to coordinator (worker mode only).
@@ -1019,5 +1041,25 @@ async fn worker_heartbeat_loop(role: ServerRole, config: &AppConfig, my_rpc_addr
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_auxiliary_listener_keeps_the_server_up() {
+        let mut logged = None;
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            non_fatal_listener(
+                async { Err(std::io::Error::from(std::io::ErrorKind::AddrInUse)) },
+                |e| logged = Some(e.kind()),
+            ),
+        )
+        .await;
+        assert!(finished.is_err(), "a failed listener must not end select!");
+        assert_eq!(logged, Some(std::io::ErrorKind::AddrInUse));
     }
 }

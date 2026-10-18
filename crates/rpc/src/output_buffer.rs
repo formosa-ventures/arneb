@@ -542,11 +542,6 @@ impl BroadcastOutputBuffer {
     pub fn failure_handle(&self) -> Arc<Mutex<Option<crate::TaskFailure>>> {
         Arc::clone(&self.inner.failure)
     }
-
-    /// The recorded failure, if any. Left in place for the other readers.
-    pub fn failure(&self) -> Option<crate::TaskFailure> {
-        self.inner.failure.lock().ok()?.clone()
-    }
 }
 
 impl std::fmt::Debug for BroadcastOutputBuffer {
@@ -599,6 +594,13 @@ impl BroadcastStream {
             }
             notified.await;
         }
+    }
+
+    /// After `next` returned `None`: how many of the rows a resume asked
+    /// to skip the finished buffer never had. Non-zero means the replay
+    /// is shorter than what the consumer already received.
+    pub fn rows_short(&self) -> usize {
+        self.skip_rows
     }
 }
 
@@ -881,6 +883,7 @@ mod tests {
             (3, vec![3, 4, 5, 6]),
             (4, vec![4, 5, 6]),
             (7, vec![]),
+            (9, vec![]),
         ] {
             let mut stream = buf.subscribe_from_row(skip);
             let mut values = Vec::new();
@@ -889,6 +892,7 @@ mod tests {
                 values.extend(col.values().iter().copied());
             }
             assert_eq!(values, expected, "skip={skip}");
+            assert_eq!(stream.rows_short(), skip.saturating_sub(7), "skip={skip}");
         }
     }
 

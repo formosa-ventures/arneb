@@ -925,6 +925,28 @@ impl ExecutionPlan for ScanExec {
     }
 
     async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream, ExecutionError> {
+        // A scan task past the end of a source with fewer partitions than
+        // scan tasks (e.g. a 1-partition table on 2 workers) owns nothing:
+        // `strided_partition_count` reports 0 partitions, but the task still
+        // drives partition 0. Answer with an empty stream rather than asking
+        // the source for a partition it does not have.
+        if self.scan_task_count > 1
+            && self.scan_task_index + partition * self.scan_task_count
+                >= self.source.partition_count()
+        {
+            let columns = self.source.schema();
+            let out: Vec<ColumnInfo> = match &self.scan_context.projection {
+                Some(proj) => proj
+                    .iter()
+                    .filter_map(|&i| columns.get(i).cloned())
+                    .collect(),
+                None => columns,
+            };
+            return Ok(stream_from_batches(
+                crate::datasource::column_info_to_arrow_schema(&out),
+                vec![],
+            ));
+        }
         // A1.4: gather cross-fragment Domains first (potentially
         // awaiting on `oneshot::Receiver<Domain>`s with timeout).
         // No-op when the feature flag is off or no annotations exist,
@@ -4142,6 +4164,33 @@ mod tests {
         let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn scan_task_owning_no_partition_yields_nothing() {
+        // 1-partition source, 2 scan tasks: task 0 reads it, task 1 owns
+        // nothing but is still executed.
+        let scan = |index| ScanExec {
+            source: make_test_source(),
+            _table_name: "test".to_string(),
+            scan_context: ScanContext::default().with_projection(vec![1]),
+            dynamic_filters: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
+            dynamic_filter_collector: None,
+            dynamic_filtering_enabled: false,
+            dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+            scan_task_index: index,
+            scan_task_count: 2,
+        };
+        let owner = collect_stream(scan(0).execute(0).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(owner.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        let idle = scan(1);
+        assert_eq!(idle.output_partitioning().partition_count(), 0);
+        let stream = idle.execute(0).await.unwrap();
+        assert_eq!(stream.schema().fields().len(), 1);
+        assert!(collect_stream(stream).await.unwrap().is_empty());
     }
 
     #[tokio::test]

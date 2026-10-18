@@ -268,7 +268,7 @@ impl ExecutionPlan for WindowExec {
         let stream = self.child.execute(0).await?;
         let batches = collect_stream(stream)
             .await
-            .map_err(|e| ExecutionError::InvalidOperation(format!("window collect: {e}")))?;
+            .map_err(|e| ExecutionError::upstream("window collect", e))?;
 
         let child_schema = self.child.schema();
         let child_arrow_schema = Arc::new(Schema::new(

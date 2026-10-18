@@ -422,7 +422,7 @@ pub(crate) async fn collect_stream_pool_tracked(
     let mut batches: Vec<RecordBatch> = Vec::new();
     while let Some(batch_res) = stream.next().await {
         let batch = batch_res.map_err(|e| {
-            ExecutionError::InvalidOperation(format!("{consumer_name}: stream error: {e}"))
+            ExecutionError::upstream(format_args!("{consumer_name}: stream error"), e)
         })?;
         let bytes = record_batch_bytes(&batch);
         reservation.try_grow(bytes)?;
@@ -476,7 +476,7 @@ pub(crate) async fn collect_probe_within_budget(
     let mut collected: usize = 0;
     while let Some(batch_res) = stream.next().await {
         let batch = batch_res.map_err(|e| {
-            ExecutionError::InvalidOperation(format!("{consumer_name}: stream error: {e}"))
+            ExecutionError::upstream(format_args!("{consumer_name}: stream error"), e)
         })?;
         let bytes = record_batch_bytes(&batch);
         // Overflow when EITHER the dedicated `max_bytes` cap would be
@@ -517,7 +517,7 @@ pub(crate) fn prepend_batches(
         }
         while let Some(batch_res) = futures::StreamExt::next(&mut rest).await {
             let batch = batch_res.map_err(|e| {
-                ExecutionError::InvalidOperation(format!("prepend_batches rest stream: {e}"))
+                ExecutionError::upstream("prepend_batches rest stream", e)
             })?;
             yield batch;
         }
@@ -1332,9 +1332,9 @@ impl NestedLoopJoinExec {
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<RecordBatch>, ExecutionError> {
         let stream = plan.execute(0).await?;
-        let batches = collect_stream(stream).await.map_err(|e| {
-            ExecutionError::InvalidOperation(format!("failed to collect input: {e}"))
-        })?;
+        let batches = collect_stream(stream)
+            .await
+            .map_err(|e| ExecutionError::upstream("failed to collect input", e))?;
         if batches.is_empty() {
             return Ok(None);
         }
@@ -1796,9 +1796,8 @@ impl HashAggregateExec {
         let mut groups: FastHashMap<GroupKey, GroupState> = FastHashMap::default();
 
         while let Some(batch_res) = stream.next().await {
-            let batch = batch_res.map_err(|e| {
-                ExecutionError::InvalidOperation(format!("aggregate input stream: {e}"))
-            })?;
+            let batch =
+                batch_res.map_err(|e| ExecutionError::upstream("aggregate input stream", e))?;
             let group_cols: Vec<ArrayRef> = self
                 .group_by
                 .iter()
@@ -1864,9 +1863,8 @@ impl HashAggregateExec {
             .collect::<Result<_, _>>()?;
 
         while let Some(batch_res) = stream.next().await {
-            let batch = batch_res.map_err(|e| {
-                ExecutionError::InvalidOperation(format!("aggregate input stream: {e}"))
-            })?;
+            let batch =
+                batch_res.map_err(|e| ExecutionError::upstream("aggregate input stream", e))?;
             for (i, info) in aggr_info.iter().enumerate() {
                 let col = if info.is_count_star {
                     batch.column(0).clone()
@@ -2059,9 +2057,8 @@ impl HashAggregateExec {
 
         let mut rows_seen = 0usize;
         while let Some(batch_res) = stream.next().await {
-            let batch = batch_res.map_err(|e| {
-                ExecutionError::InvalidOperation(format!("aggregate input stream: {e}"))
-            })?;
+            let batch =
+                batch_res.map_err(|e| ExecutionError::upstream("aggregate input stream", e))?;
             let group_cols: Vec<ArrayRef> = self
                 .group_by
                 .iter()
@@ -2110,9 +2107,8 @@ impl HashAggregateExec {
         let mut input_bytes = 0usize;
 
         while let Some(batch_res) = stream.next().await {
-            let batch = batch_res.map_err(|e| {
-                ExecutionError::InvalidOperation(format!("aggregate input stream: {e}"))
-            })?;
+            let batch =
+                batch_res.map_err(|e| ExecutionError::upstream("aggregate input stream", e))?;
             if batch.num_rows() == 0 {
                 continue;
             }
@@ -2237,9 +2233,8 @@ impl HashAggregateExec {
         }
 
         while let Some(batch_res) = stream.next().await {
-            let batch = batch_res.map_err(|e| {
-                ExecutionError::InvalidOperation(format!("aggregate input stream: {e}"))
-            })?;
+            let batch =
+                batch_res.map_err(|e| ExecutionError::upstream("aggregate input stream", e))?;
             let n = batch.num_rows();
             if n == 0 {
                 continue;
@@ -2663,9 +2658,10 @@ async fn build_partial_groups(
         });
         while let Some(batch_res) = stream.next().await {
             let batch = batch_res.map_err(|e| {
-                ExecutionError::InvalidOperation(format!(
-                    "partial aggregate input stream (p={partition}): {e}"
-                ))
+                ExecutionError::upstream(
+                    format_args!("partial aggregate input stream (p={partition})"),
+                    e,
+                )
             })?;
             for (i, info) in aggr_info.iter().enumerate() {
                 let col = if info.is_count_star {
@@ -2681,9 +2677,10 @@ async fn build_partial_groups(
 
     while let Some(batch_res) = stream.next().await {
         let batch = batch_res.map_err(|e| {
-            ExecutionError::InvalidOperation(format!(
-                "partial aggregate input stream (p={partition}): {e}"
-            ))
+            ExecutionError::upstream(
+                format_args!("partial aggregate input stream (p={partition})"),
+                e,
+            )
         })?;
         let group_cols: Vec<ArrayRef> = group_by
             .iter()
@@ -2757,9 +2754,10 @@ async fn build_partial_groups_batch_aware(
         }
         while let Some(batch_res) = stream.next().await {
             let batch = batch_res.map_err(|e| {
-                ExecutionError::InvalidOperation(format!(
-                    "partial aggregate input stream (p={partition}): {e}"
-                ))
+                ExecutionError::upstream(
+                    format_args!("partial aggregate input stream (p={partition})"),
+                    e,
+                )
             })?;
             let n = batch.num_rows();
             if n == 0 {
@@ -2781,9 +2779,10 @@ async fn build_partial_groups_batch_aware(
     let mut rows_seen = 0usize;
     while let Some(batch_res) = stream.next().await {
         let batch = batch_res.map_err(|e| {
-            ExecutionError::InvalidOperation(format!(
-                "partial aggregate input stream (p={partition}): {e}"
-            ))
+            ExecutionError::upstream(
+                format_args!("partial aggregate input stream (p={partition})"),
+                e,
+            )
         })?;
         let group_cols: Vec<ArrayRef> = group_by
             .iter()
@@ -2986,7 +2985,7 @@ impl ExecutionPlan for LimitExec {
             let mut emitted: usize = 0;
             while let Some(batch_res) = futures::StreamExt::next(&mut input).await {
                 let batch = batch_res.map_err(|e| {
-                    ExecutionError::InvalidOperation(format!("limit input stream: {e}"))
+                    ExecutionError::upstream("limit input stream", e)
                 })?;
                 let rows = batch.num_rows();
                 if rows == 0 {
@@ -3253,9 +3252,7 @@ impl ExecutionPlan for ExplainExec {
             let mut batches: u64 = 0;
             while let Some(b) = stream.next().await {
                 let batch = b.map_err(|e| {
-                    ExecutionError::InvalidOperation(format!(
-                        "EXPLAIN ANALYZE: inner stream error: {e}"
-                    ))
+                    ExecutionError::upstream("EXPLAIN ANALYZE: inner stream error", e)
                 })?;
                 rows = rows.saturating_add(batch.num_rows() as u64);
                 batches = batches.saturating_add(1);

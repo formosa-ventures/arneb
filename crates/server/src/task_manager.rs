@@ -117,7 +117,7 @@ fn emit_memory_profile(task_id: &str, memory_pool: &Arc<dyn MemoryPool>) {
 pub enum TaskStatus {
     Running,
     Finished,
-    Failed(String),
+    Failed(arneb_rpc::TaskFailure),
 }
 
 /// How long a cancelled query's tombstone refuses its late tasks: the
@@ -338,13 +338,13 @@ impl TaskManager {
                     if let Ok(buf) = buf.try_lock() {
                         let failure = buf.failure_handle();
                         let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.get_or_insert_with(|| "query cancelled".to_owned());
+                        guard.get_or_insert_with(|| "query cancelled".into());
                     }
                 }
                 Some(arneb_rpc::BufferKind::Broadcast(buf)) => {
                     let failure = buf.failure_handle();
                     let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.get_or_insert_with(|| "query cancelled".to_owned());
+                    guard.get_or_insert_with(|| "query cancelled".into());
                 }
                 None => {}
             }
@@ -573,7 +573,7 @@ impl TaskManager {
     }
 
     /// Execute a task: deserialize plan, run it, write output to buffer.
-    async fn execute_task(&self, descriptor: TaskDescriptor) -> Result<(), String> {
+    async fn execute_task(&self, descriptor: TaskDescriptor) -> Result<(), arneb_rpc::TaskFailure> {
         // Same query-scoped key as handle_task — see comment there.
         let task_id_str = format!("{}.{}", descriptor.query_id, descriptor.task_id);
         // admission-control D1: every reservation this task makes counts
@@ -627,7 +627,7 @@ impl TaskManager {
                         probe.threshold_bytes(),
                     );
                     tracing::warn!(target: "arneb::mem", "{msg}");
-                    return Err(arneb_rpc::tag_resource_exhausted(msg));
+                    return Err(arneb_rpc::TaskFailure::resource_exhausted(msg));
                 }
             }
             if waited_ms > 0 {
@@ -815,9 +815,9 @@ impl TaskManager {
         // to set this flag; until then the early-return branch is dead.
         if descriptor.broadcast {
             if n_out != 1 {
-                return Err(format!(
-                    "broadcast task expected output_partitions=1, got {n_out}"
-                ));
+                return Err(
+                    format!("broadcast task expected output_partitions=1, got {n_out}").into(),
+                );
             }
             let bbuf = Arc::new(arneb_rpc::BroadcastOutputBuffer::new(output_schema_arrow));
             let failure_flag = bbuf.failure_handle();
@@ -828,7 +828,7 @@ impl TaskManager {
             let task_id_for_log = task_id_str.clone();
             let bbuf_for_pump = Arc::clone(&bbuf);
             let pumper = tokio::spawn(async move {
-                let record_failure = |err: String| {
+                let record_failure = |err: arneb_rpc::TaskFailure| {
                     if let Ok(mut guard) = failure_flag.lock() {
                         if guard.is_none() {
                             *guard = Some(err.clone());
@@ -840,7 +840,7 @@ impl TaskManager {
                 let mut stream = match plan_for_pump.execute(0).await {
                     Ok(s) => s,
                     Err(e) => {
-                        let msg = record_failure(arneb_rpc::describe_execution_failure(
+                        let msg = record_failure(arneb_rpc::TaskFailure::from_execution_error(
                             "execute(0) failed",
                             &e,
                         ));
@@ -853,7 +853,7 @@ impl TaskManager {
                     let batch = match batch_result {
                         Ok(b) => b,
                         Err(e) => {
-                            let msg = record_failure(arneb_rpc::describe_task_failure(
+                            let msg = record_failure(arneb_rpc::TaskFailure::from_error(
                                 "stream error during execution",
                                 &e,
                             ));
@@ -865,7 +865,7 @@ impl TaskManager {
                     bbuf_for_pump.write_batch(batch);
                 }
                 bbuf_for_pump.finish();
-                Ok::<usize, String>(rows)
+                Ok::<usize, arneb_rpc::TaskFailure>(rows)
             });
 
             self.track(descriptor.query_id, &task_id_str, pumper.abort_handle());
@@ -944,7 +944,7 @@ impl TaskManager {
             let failure_flag = Arc::clone(&failure_flag);
             let spill_schema = output_schema_for_spill.clone();
             pumpers.push(tokio::spawn(async move {
-                let record_failure = |err: String| {
+                let record_failure = |err: arneb_rpc::TaskFailure| {
                     if let Ok(mut guard) = failure_flag.lock() {
                         if guard.is_none() {
                             *guard = Some(err.clone());
@@ -956,7 +956,7 @@ impl TaskManager {
                 let mut stream = match plan_for_pump.execute(partition_idx).await {
                     Ok(s) => s,
                     Err(e) => {
-                        return Err(record_failure(arneb_rpc::describe_execution_failure(
+                        return Err(record_failure(arneb_rpc::TaskFailure::from_execution_error(
                             &format!("execute({partition_idx}) failed"),
                             &e,
                         )));
@@ -977,7 +977,7 @@ impl TaskManager {
                     let batch = match batch_result {
                         Ok(b) => b,
                         Err(e) => {
-                            return Err(record_failure(arneb_rpc::describe_task_failure(
+                            return Err(record_failure(arneb_rpc::TaskFailure::from_error(
                                 "stream error during execution",
                                 &e,
                             )));
@@ -989,7 +989,7 @@ impl TaskManager {
                         if let Err(e) = sw.write(&batch) {
                             return Err(record_failure(format!(
                                 "exchange spill write failed: {e}"
-                            )));
+                            ).into()));
                         }
                         continue;
                     }
@@ -1021,7 +1021,7 @@ impl TaskManager {
                                     "partition {partition_idx} consumer dropped receiver mid-stream \
                                      on a must-drain exchange — an upstream stall/reset truncated the \
                                      partition (q21 SF30 silent-truncation guard)"
-                                )));
+                                ).into()));
                             }
                             // Legitimate LIMIT early-stop or query teardown:
                             // the consumer can stop before EOF, so stop quietly.
@@ -1043,13 +1043,13 @@ impl TaskManager {
                             Err(e) => {
                                 return Err(record_failure(format!(
                                     "exchange spill create failed: {e}"
-                                )));
+                                ).into()));
                             }
                         };
                         if let Err(e) = sw.write(&returned) {
                             return Err(record_failure(format!(
                                 "exchange spill write failed: {e}"
-                            )));
+                            ).into()));
                         }
                         spill = Some(sw);
                     }
@@ -1069,12 +1069,12 @@ impl TaskManager {
                                     "exchange overflow spilled to disk, drained"
                                 );
                             }
-                            Err(e) => return Err(record_failure(e)),
+                            Err(e) => return Err(record_failure(e.into())),
                         }
                     }
                 }
 
-                Ok::<usize, String>(rows)
+                Ok::<usize, arneb_rpc::TaskFailure>(rows)
             }));
         }
 
@@ -1316,7 +1316,10 @@ mod tests {
         assert!(pumper.await.unwrap_err().is_cancelled());
         assert!(tm.flight_state.get_buffer(&key).is_none());
         assert!(tm.task_status(&key).is_none());
-        assert_eq!(failure.lock().unwrap().as_deref(), Some("query cancelled"));
+        assert_eq!(
+            failure.lock().unwrap().as_ref().map(|f| f.message()),
+            Some("query cancelled")
+        );
 
         assert_eq!(tm.cancel_query(q), 0);
         assert!(!survivor.is_finished());
@@ -1394,6 +1397,86 @@ mod tests {
         assert_eq!(tasks.cancelled.len(), 1, "expired tombstones pruned");
         assert!(tasks.is_cancelled(q, later));
         assert!(!tasks.is_cancelled(q, later + TOMBSTONE_TTL));
+    }
+
+    /// #145 / admission-control D3 through a real worker: a task over its
+    /// per-query limit fails, and a consumer reading its output over Flight
+    /// gets `ResourceExhausted` from the status code (not from the text).
+    #[tokio::test]
+    async fn worker_memory_limit_failure_reaches_the_consumer_typed() {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        use arneb_execution::memory_pool::GreedyMemoryPool;
+
+        let ids = Int32Array::from((0..10_000).collect::<Vec<_>>());
+        let rows = RecordBatch::try_new(schema(), vec![Arc::new(ids)]).unwrap();
+        let table = Arc::new(MemoryTable::new(
+            vec![arneb_common::types::ColumnInfo {
+                name: "id".into(),
+                data_type: arneb_common::types::DataType::Int32,
+                nullable: false,
+            }],
+            vec![rows],
+        ));
+        let mem_schema = Arc::new(MemorySchema::new());
+        mem_schema.register_table("t", table);
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", mem_schema);
+        let cm = Arc::new(CatalogManager::new("memory", "default"));
+        cm.register_catalog("memory", catalog.clone());
+        let mut registry = ConnectorRegistry::new();
+        registry.register(
+            "memory",
+            Arc::new(MemoryConnectorFactory::new(catalog, "default")),
+        );
+
+        let statement = arneb_sql_parser::parse("SELECT id, count(*) FROM t GROUP BY id").unwrap();
+        let plan = arneb_planner::QueryPlanner::new(&cm)
+            .plan_statement(&statement)
+            .await
+            .unwrap();
+
+        let mut state = FlightState::new();
+        let tm = TaskManager::new(
+            state.clone(),
+            cm,
+            Arc::new(registry),
+            Arc::new(GreedyMemoryPool::new(1 << 30)),
+        )
+        .with_query_memory_limit(Some(1024));
+        let for_status = tm.clone();
+        state.set_task_status_callback(Arc::new(move |id| for_status.task_status_as_response(id)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(arneb_rpc::__serve_flight_for_test(listener, state));
+
+        let q = QueryId::new();
+        let mut task = descriptor(q);
+        task.plan_json = serde_json::to_string(&plan).unwrap();
+        tm.handle_task(task);
+
+        let err = match arneb_rpc::ExchangeClient::new(&addr)
+            .fetch_partition(&format!("{q}.1.0"), 0)
+            .await
+        {
+            Err(e) => e,
+            Ok(mut stream) => loop {
+                match stream.next().await {
+                    Some(Ok(_)) => continue,
+                    Some(Err(arneb_common::error::ArnebError::Execution(e))) => break e,
+                    other => panic!("expected an execution error, got {other:?}"),
+                }
+            },
+        };
+        assert!(
+            matches!(
+                err,
+                arneb_common::error::ExecutionError::ResourceExhausted(_)
+            ),
+            "expected ResourceExhausted, got {err:?}"
+        );
+        assert!(err.to_string().contains("memory limit"), "{err}");
     }
 
     #[test]

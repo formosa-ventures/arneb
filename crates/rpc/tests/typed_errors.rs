@@ -1,15 +1,15 @@
 //! admission-control D3: a worker task's memory-limit failure reaches the
 //! consumer as `ExecutionError::ResourceExhausted`, on both failure paths:
 //! the task failed before registering its buffer (task-status callback), and
-//! the producer failed mid-stream (buffer failure flag).
+//! the producer failed mid-stream (buffer failure flag). The class travels
+//! as the gRPC status code, never in the text (#145).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use arneb_common::error::{ArnebError, ExecutionError};
 use arneb_rpc::{
-    tag_resource_exhausted, BufferKind, ExchangeClient, FlightState, OutputBuffer,
-    TaskStatusResponse, RESOURCE_EXHAUSTED_TAG,
+    BufferKind, ExchangeClient, FlightState, OutputBuffer, TaskFailure, TaskStatusResponse,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use futures::StreamExt;
@@ -33,16 +33,11 @@ fn assert_resource_exhausted(err: &ExecutionError) {
         matches!(err, ExecutionError::ResourceExhausted(_)),
         "expected ResourceExhausted, got {err:?}"
     );
-    // What a client sees: the cause, without the wire tag.
-    let client =
-        arneb_common::error::resource_exhausted_message(&ArnebError::Execution(match err {
-            ExecutionError::ResourceExhausted(m) => ExecutionError::ResourceExhausted(m.clone()),
-            _ => unreachable!(),
-        }));
-    assert!(client.contains("query memory limit exceeded"), "{client}");
+    // What a client sees: the worker's message, without wire wrapping.
+    let client = err.to_string();
     assert!(
-        !client.contains(RESOURCE_EXHAUSTED_TAG),
-        "tag leaked: {client}"
+        client.starts_with("resource exhausted: query memory limit exceeded"),
+        "{client}"
     );
 }
 
@@ -50,7 +45,7 @@ fn assert_resource_exhausted(err: &ExecutionError) {
 async fn failed_task_status_keeps_the_class() {
     let mut state = FlightState::new();
     state.set_task_status_callback(Arc::new(|_| {
-        Some(TaskStatusResponse::Failed(tag_resource_exhausted(
+        Some(TaskStatusResponse::Failed(TaskFailure::resource_exhausted(
             "query memory limit exceeded: HashAggregateExec",
         )))
     }));
@@ -69,8 +64,8 @@ async fn mid_stream_failure_keeps_the_class() {
     let buf = OutputBuffer::single(4, schema);
     let failure = buf.failure_handle();
     state.register_partitioned_buffer("q.t".into(), buf);
-    *failure.lock().unwrap() = Some(tag_resource_exhausted(
-        "stream error during execution: query memory limit exceeded",
+    *failure.lock().unwrap() = Some(TaskFailure::resource_exhausted(
+        "query memory limit exceeded: HashAggregateExec",
     ));
     if let Some(BufferKind::Partitioned(buf)) = state.get_buffer("q.t") {
         buf.lock().await.close();
@@ -85,4 +80,25 @@ async fn mid_stream_failure_keeps_the_class() {
         },
     };
     assert_resource_exhausted(&err);
+}
+
+/// #145: a failure whose text spells the old wire tag (a table literally
+/// named `[resource exhausted] x`) is an ordinary failure on the consumer.
+#[tokio::test]
+async fn tag_like_text_does_not_make_a_memory_failure() {
+    let mut state = FlightState::new();
+    state.set_task_status_callback(Arc::new(|_| {
+        Some(TaskStatusResponse::Failed(TaskFailure::new(
+            "table not found: [resource exhausted] x",
+        )))
+    }));
+    let addr = start(state).await;
+    let err = match ExchangeClient::new(&addr).fetch_partition("q.t", 0).await {
+        Ok(_) => panic!("fetch should fail"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, ExecutionError::InvalidOperation(_)),
+        "expected InvalidOperation, got {err:?}"
+    );
 }

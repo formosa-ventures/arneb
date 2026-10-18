@@ -288,61 +288,69 @@ pub enum ConfigError {
 /// Convenience type alias for Results using ArnebError.
 pub type Result<T> = std::result::Result<T, ArnebError>;
 
-/// Marker a worker puts on a memory-limit failure so its class survives
-/// the trip back across exchanges (admission-control D3). Operators wrap
-/// upstream errors in their own message (`aggregate input stream: …`), so
-/// the tag is kept wherever the text goes and classified only at the
-/// client-facing edge.
-pub const RESOURCE_EXHAUSTED_TAG: &str = "[resource exhausted] ";
+impl ExecutionError {
+    /// An upstream failure (an input stream, a child operator, a remote
+    /// task) re-raised by an operator under `context`. A memory-limit
+    /// failure keeps its variant and its message, so it reaches the client
+    /// as one (pgwire `53200`, Trino `EXCEEDED_LOCAL_MEMORY_LIMIT`) however
+    /// many operators re-raise it (admission-control D3). Anything else
+    /// becomes `InvalidOperation("{context}: {err}")`.
+    pub fn upstream(context: impl std::fmt::Display, err: impl Into<ArnebError>) -> Self {
+        match err.into() {
+            ArnebError::Execution(ExecutionError::ResourceExhausted(msg)) => {
+                ExecutionError::ResourceExhausted(msg)
+            }
+            other => ExecutionError::InvalidOperation(format!("{context}: {other}")),
+        }
+    }
+}
 
-/// Whether `err` is, or wraps, a memory-limit failure.
+/// Whether `err` is a memory-limit failure. Decided by the variant alone:
+/// operators keep it when they re-raise one ([`ExecutionError::upstream`]),
+/// and the exchange restores it from the gRPC status code, so no error
+/// text (a table name, a string value) can make an error look like one.
 pub fn is_resource_exhausted(err: &ArnebError) -> bool {
     matches!(
         err,
         ArnebError::Execution(ExecutionError::ResourceExhausted(_))
-    ) || err.to_string().contains(RESOURCE_EXHAUSTED_TAG)
-}
-
-/// The client-facing message for a memory-limit failure: the innermost
-/// tagged cause (without the tag and the escaping that nested gRPC
-/// messages add), or the whole message when it carries no tag.
-pub fn resource_exhausted_message(err: &ArnebError) -> String {
-    let text = err.to_string();
-    match text.rfind(RESOURCE_EXHAUSTED_TAG) {
-        None => text,
-        Some(i) => text[i + RESOURCE_EXHAUSTED_TAG.len()..]
-            .trim_end_matches(['\\', '"', '\'', ' '])
-            .to_owned(),
-    }
+    )
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn resource_exhausted_survives_wrapping() {
-        let inner = format!(
-            "{RESOURCE_EXHAUSTED_TAG}stream error during execution: query memory limit exceeded: \\\"x\\\""
-        );
-        let wrapped = ArnebError::Execution(ExecutionError::InvalidOperation(format!(
-            "aggregate input stream: Flight stream error: message: \"{inner}\\\"\""
-        )));
-        assert!(is_resource_exhausted(&wrapped));
-        let msg = resource_exhausted_message(&wrapped);
-        assert!(
-            msg.starts_with("stream error during execution: query memory limit exceeded"),
-            "{msg}"
-        );
-        assert!(!msg.ends_with('"') && !msg.ends_with('\\'), "{msg}");
-
-        let local = ArnebError::Execution(ExecutionError::ResourceExhausted("limit".into()));
-        assert!(is_resource_exhausted(&local));
+    fn resource_exhausted_survives_upstream_wrapping() {
+        let root = ExecutionError::ResourceExhausted("query memory limit exceeded: x".into());
+        let once = ExecutionError::upstream("aggregate input stream", ArnebError::Execution(root));
+        let twice = ExecutionError::upstream(format_args!("TopKExec.input"), once);
+        let err = ArnebError::Execution(twice);
+        assert!(is_resource_exhausted(&err));
         assert_eq!(
-            resource_exhausted_message(&local),
-            "resource exhausted: limit"
+            err.to_string(),
+            "resource exhausted: query memory limit exceeded: x"
         );
 
-        let other = ArnebError::Execution(ExecutionError::InvalidOperation("boom".into()));
-        assert!(!is_resource_exhausted(&other));
+        let other = ExecutionError::upstream(
+            "aggregate input stream",
+            ExecutionError::InvalidOperation("boom".into()),
+        );
+        assert_eq!(
+            other.to_string(),
+            "invalid operation: aggregate input stream: invalid operation: boom"
+        );
+        assert!(!is_resource_exhausted(&ArnebError::Execution(other)));
+    }
+
+    /// #145: classification never looks at the text. A table literally
+    /// named like the old wire tag is still a missing table.
+    #[test]
+    fn resource_exhausted_is_not_sniffed_from_text() {
+        let err = ArnebError::Plan(PlanError::TableNotFound("[resource exhausted] x".into()));
+        assert!(!is_resource_exhausted(&err));
+        let err = ArnebError::Execution(ExecutionError::InvalidOperation(
+            "resource exhausted: [resource exhausted] x".into(),
+        ));
+        assert!(!is_resource_exhausted(&err));
     }
 
     use super::*;

@@ -89,7 +89,7 @@ impl ExecutionPlan for UnionAllExec {
                 let mut s = child.execute(0).await?;
                 while let Some(batch_res) = futures::StreamExt::next(&mut s).await {
                     let batch = batch_res.map_err(|e| {
-                        ExecutionError::InvalidOperation(format!("union all input: {e}"))
+                        ExecutionError::upstream("union all input", e)
                     })?;
                     yield batch;
                 }
@@ -166,7 +166,7 @@ impl ExecutionPlan for DistinctExec {
         let stream = self.child.execute(0).await?;
         let batches = collect_stream(stream)
             .await
-            .map_err(|e| ExecutionError::InvalidOperation(format!("distinct collect: {e}")))?;
+            .map_err(|e| ExecutionError::upstream("distinct collect", e))?;
 
         let output_schema = build_schema(&self.child.schema());
         let mut seen: FastHashSet<u64> = FastHashSet::default();
@@ -233,7 +233,7 @@ impl ExecutionPlan for IntersectExec {
         let right_stream = self.right.execute(0).await?;
         let right_batches = collect_stream(right_stream)
             .await
-            .map_err(|e| ExecutionError::InvalidOperation(format!("intersect right: {e}")))?;
+            .map_err(|e| ExecutionError::upstream("intersect right", e))?;
 
         let mut right_set: FastHashSet<u64> = FastHashSet::default();
         for batch in &right_batches {
@@ -245,7 +245,7 @@ impl ExecutionPlan for IntersectExec {
         let left_stream = self.left.execute(0).await?;
         let left_batches = collect_stream(left_stream)
             .await
-            .map_err(|e| ExecutionError::InvalidOperation(format!("intersect left: {e}")))?;
+            .map_err(|e| ExecutionError::upstream("intersect left", e))?;
 
         let output_schema = build_schema(&self.left.schema());
         let mut seen: FastHashSet<u64> = FastHashSet::default();
@@ -312,7 +312,7 @@ impl ExecutionPlan for ExceptExec {
         let right_stream = self.right.execute(0).await?;
         let right_batches = collect_stream(right_stream)
             .await
-            .map_err(|e| ExecutionError::InvalidOperation(format!("except right: {e}")))?;
+            .map_err(|e| ExecutionError::upstream("except right", e))?;
 
         let mut right_set: FastHashSet<u64> = FastHashSet::default();
         for batch in &right_batches {
@@ -324,7 +324,7 @@ impl ExecutionPlan for ExceptExec {
         let left_stream = self.left.execute(0).await?;
         let left_batches = collect_stream(left_stream)
             .await
-            .map_err(|e| ExecutionError::InvalidOperation(format!("except left: {e}")))?;
+            .map_err(|e| ExecutionError::upstream("except left", e))?;
 
         let output_schema = build_schema(&self.left.schema());
         let mut seen: FastHashSet<u64> = FastHashSet::default();

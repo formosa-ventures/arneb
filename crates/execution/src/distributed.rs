@@ -71,7 +71,7 @@ impl ExecutionPlan for ShuffleWriteExec {
         let stream = self.input.execute(partition).await?;
         let batches = collect_stream(stream)
             .await
-            .map_err(|e| ExecutionError::InvalidOperation(format!("shuffle collect: {e}")))?;
+            .map_err(|e| ExecutionError::upstream("shuffle collect", e))?;
 
         // For now, return all batches as-is (the partition_batch method is
         // available for the TaskManager to use when writing to OutputBuffer).
@@ -143,7 +143,7 @@ impl ExecutionPlan for MergeExec {
             let stream = input.execute(0).await?;
             let batches = collect_stream(stream)
                 .await
-                .map_err(|e| ExecutionError::InvalidOperation(format!("merge collect: {e}")))?;
+                .map_err(|e| ExecutionError::upstream("merge collect", e))?;
             all_batches.extend(batches);
         }
 

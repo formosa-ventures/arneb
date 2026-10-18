@@ -335,16 +335,12 @@ impl QueryCoordinator {
                 physical_plan
             };
         let stream = physical_plan.execute(0).await?;
-        let batches = collect_stream(stream).await.map_err(|e| {
-            // Keep a worker's memory-limit failure typed (pgwire 53200,
-            // Trino EXCEEDED_LOCAL_MEMORY_LIMIT), even when an operator on
-            // the way re-wrapped it.
-            if arneb_common::error::is_resource_exhausted(&e) {
-                ExecutionError::ResourceExhausted(format!("root stage collection failed: {e}"))
-            } else {
-                ExecutionError::InvalidOperation(format!("root stage collection failed: {e}"))
-            }
-        })?;
+        // A worker's memory-limit failure stays typed (pgwire 53200, Trino
+        // EXCEEDED_LOCAL_MEMORY_LIMIT): the exchange restores it from the
+        // status code and operators keep it when they re-raise it.
+        let batches = collect_stream(stream)
+            .await
+            .map_err(|e| ExecutionError::upstream("root stage collection failed", e))?;
 
         tracing::info!(
             query_id = %query_id,

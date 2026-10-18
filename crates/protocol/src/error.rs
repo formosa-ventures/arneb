@@ -51,10 +51,7 @@ pub fn arneb_error_to_pg_error_with_source(
         }
         // A query over its memory limit is `out_of_memory`, which clients
         // can tell apart from an internal error (admission-control D3).
-        e if arneb_common::error::is_resource_exhausted(e) => (
-            "53200".to_string(),
-            arneb_common::error::resource_exhausted_message(e),
-        ),
+        e if arneb_common::error::is_resource_exhausted(e) => ("53200".to_string(), e.to_string()),
         ArnebError::Execution(e) => ("XX000".to_string(), e.to_string()),
         ArnebError::Connector(e) => ("58030".to_string(), e.to_string()),
         ArnebError::Catalog(e) => ("3D000".to_string(), e.to_string()),
@@ -135,6 +132,16 @@ mod tests {
                 assert_eq!(info.code, "53200");
                 assert!(info.message.contains("memory limit"), "{}", info.message);
             }
+            other => panic!("expected UserError, got {other:?}"),
+        }
+    }
+
+    /// #145: classification is by variant, not by the message text.
+    #[test]
+    fn test_tag_like_table_name_maps_to_42p01() {
+        let err = ArnebError::Plan(PlanError::TableNotFound("[resource exhausted] x".into()));
+        match arneb_error_to_pg_error(&err) {
+            PgWireError::UserError(info) => assert_eq!(info.code, "42P01"),
             other => panic!("expected UserError, got {other:?}"),
         }
     }

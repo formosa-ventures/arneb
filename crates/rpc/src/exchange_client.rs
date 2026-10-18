@@ -128,7 +128,7 @@ impl ExchangeClient {
                 {
                     return Err(crate::task_error::remote_error(
                         format!("remote task {ticket_text} on {} failed", self.address),
-                        status.message(),
+                        &status,
                     ));
                 }
 
@@ -174,7 +174,7 @@ impl ExchangeClient {
             Some(Err(e)) => {
                 return Err(crate::task_error::remote_error(
                     "Flight stream error".to_owned(),
-                    &e.to_string(),
+                    &e,
                 ));
             }
             None => None,
@@ -258,10 +258,7 @@ impl Stream for FlightPassthroughStream {
                     );
                 }
                 Poll::Ready(Some(Err(ArnebError::Execution(
-                    crate::task_error::remote_error(
-                        "Flight stream error".to_owned(),
-                        &e.to_string(),
-                    ),
+                    crate::task_error::remote_error("Flight stream error".to_owned(), &e),
                 ))))
             }
             Poll::Ready(None) => {

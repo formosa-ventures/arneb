@@ -572,9 +572,7 @@ impl ExecutionContext {
                 let stream = exec.execute(0).await?;
                 let batches = arneb_common::stream::collect_stream(stream)
                     .await
-                    .map_err(|e| {
-                        ExecutionError::InvalidOperation(format!("scalar subquery failed: {e}"))
-                    })?;
+                    .map_err(|e| ExecutionError::upstream("scalar subquery failed", e))?;
                 let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 if total_rows > 1 {
                     return Err(ExecutionError::InvalidOperation(

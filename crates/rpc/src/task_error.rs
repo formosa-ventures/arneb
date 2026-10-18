@@ -1,133 +1,234 @@
 //! Keeping a remote task's error class across the Flight wire.
 //!
-//! Worker task failures travel as strings: the output buffer's failure
-//! flag, the task-status callback, and a mid-stream `FlightError`. A
-//! memory-limit failure must still reach the client as one (pgwire `53200`,
-//! Trino `EXCEEDED_LOCAL_MEMORY_LIMIT`), not as a generic internal error.
+//! A memory-limit failure on a worker must reach the client as one (pgwire
+//! `53200`, Trino `EXCEEDED_LOCAL_MEMORY_LIMIT`), not as a generic internal
+//! error. The class travels structurally, never in the error text:
 //!
-//! The worker tags such messages with [`RESOURCE_EXHAUSTED_TAG`]. The tag
-//! stays in the text on every hop: the Flight server answers a tagged
-//! failure with `RESOURCE_EXHAUSTED`, [`crate::ExchangeClient`] turns a
-//! tagged status or stream error into `ExecutionError::ResourceExhausted`,
-//! and when an operator further up re-wraps that error in its own message
-//! the tag is still there for the next hop. The client-facing edge
-//! classifies with `arneb_common::error::is_resource_exhausted` and strips
-//! it with `resource_exhausted_message`.
+//! - the worker records a [`TaskFailure`] (message + class) from the typed
+//!   error, in the output buffer's failure flag or the task status;
+//! - the Flight server answers it with gRPC `RESOURCE_EXHAUSTED` (else
+//!   `INTERNAL`), on `do_get` and as the final frame of a stream;
+//! - the consumer's [`crate::ExchangeClient`] maps that status code back to
+//!   `ExecutionError::ResourceExhausted` ([`remote_error`]);
+//! - operators re-raising it keep the variant
+//!   (`ExecutionError::upstream`), and the next hop starts over.
 
-pub use arneb_common::error::RESOURCE_EXHAUSTED_TAG;
+use std::fmt;
+
 use arneb_common::error::{ArnebError, ExecutionError};
-use tonic::Status;
+use arrow_flight::error::FlightError;
+use tonic::{Code, Status};
 
-/// Describe a task failure for the wire: `context: error`, tagged when the
-/// error is (or wraps) a memory-limit failure.
-pub fn describe_task_failure(context: &str, err: &ArnebError) -> String {
-    match err {
-        ArnebError::Execution(e) => describe_execution_failure(context, e),
-        other => format!("{context}: {other}"),
-    }
+/// Why a task failed, as it travels from the worker to its consumers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskFailure {
+    message: String,
+    resource_exhausted: bool,
 }
 
-/// [`describe_task_failure`] for an `ExecutionError`.
-pub fn describe_execution_failure(context: &str, err: &ExecutionError) -> String {
-    let text = format!("{context}: {err}");
-    match err {
-        ExecutionError::ResourceExhausted(_) if !text.contains(RESOURCE_EXHAUSTED_TAG) => {
-            format!("{RESOURCE_EXHAUSTED_TAG}{text}")
+impl TaskFailure {
+    /// A failure that is not a memory-limit failure.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            resource_exhausted: false,
         }
-        _ => text,
+    }
+
+    /// A memory-limit failure; `message` is what the client will see.
+    pub fn resource_exhausted(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            resource_exhausted: true,
+        }
+    }
+
+    /// Describe `err` for the wire: `context: err`, or the memory-limit
+    /// message itself when `err` is one.
+    pub fn from_error(context: &str, err: &ArnebError) -> Self {
+        match err {
+            ArnebError::Execution(e) => Self::from_execution_error(context, e),
+            other => Self::new(format!("{context}: {other}")),
+        }
+    }
+
+    /// [`Self::from_error`] for an `ExecutionError`.
+    pub fn from_execution_error(context: &str, err: &ExecutionError) -> Self {
+        match err {
+            ExecutionError::ResourceExhausted(msg) => Self::resource_exhausted(msg.clone()),
+            other => Self::new(format!("{context}: {other}")),
+        }
+    }
+
+    /// The failure's message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Whether this is a memory-limit failure.
+    pub fn is_resource_exhausted(&self) -> bool {
+        self.resource_exhausted
+    }
+
+    /// The status a consumer gets for this failure: `RESOURCE_EXHAUSTED`
+    /// with the message unchanged, or `INTERNAL` with `context: message`.
+    pub(crate) fn to_status(&self, context: impl fmt::Display) -> Status {
+        if self.resource_exhausted {
+            Status::resource_exhausted(self.message.clone())
+        } else {
+            Status::internal(format!("{context}: {}", self.message))
+        }
     }
 }
 
-/// Tag a message that describes a memory-limit failure (idempotent).
-pub fn tag_resource_exhausted(msg: impl AsRef<str>) -> String {
-    let msg = msg.as_ref();
-    if msg.contains(RESOURCE_EXHAUSTED_TAG) {
-        msg.to_owned()
-    } else {
-        format!("{RESOURCE_EXHAUSTED_TAG}{msg}")
+impl fmt::Display for TaskFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
     }
 }
 
-/// Status for a failed task: `RESOURCE_EXHAUSTED` when tagged, else
-/// `INTERNAL`.
-pub(crate) fn failure_status(msg: String) -> Status {
-    if msg.contains(RESOURCE_EXHAUSTED_TAG) {
-        Status::resource_exhausted(msg)
-    } else {
-        Status::internal(msg)
+impl From<String> for TaskFailure {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for TaskFailure {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
+
+/// A failure a consumer saw on the other side of an exchange.
+pub(crate) trait RemoteFailure {
+    /// The gRPC status, when there is one.
+    fn status(&self) -> Option<&Status>;
+    /// The text for a non-memory failure's message.
+    fn describe(&self) -> String;
+}
+
+impl RemoteFailure for Status {
+    fn status(&self) -> Option<&Status> {
+        Some(self)
+    }
+
+    fn describe(&self) -> String {
+        self.message().to_owned()
+    }
+}
+
+impl RemoteFailure for FlightError {
+    fn status(&self) -> Option<&Status> {
+        match self {
+            FlightError::Tonic(status) => Some(status),
+            _ => None,
+        }
+    }
+
+    fn describe(&self) -> String {
+        self.to_string()
     }
 }
 
 /// Error for a remote failure seen by the consumer: `ResourceExhausted`
-/// (tag kept for later hops) when the message is tagged, else
-/// `InvalidOperation`.
-pub(crate) fn remote_error(context: String, msg: &str) -> ExecutionError {
-    if msg.contains(RESOURCE_EXHAUSTED_TAG) {
-        ExecutionError::ResourceExhausted(format!("{context}: {msg}"))
-    } else {
-        ExecutionError::InvalidOperation(format!("{context}: {msg}"))
+/// (with the worker's message) when the status code says so, else
+/// `InvalidOperation("{context}: …")`.
+pub(crate) fn remote_error(context: String, failure: &impl RemoteFailure) -> ExecutionError {
+    match failure.status() {
+        Some(status) if status.code() == Code::ResourceExhausted => {
+            ExecutionError::ResourceExhausted(status.message().to_owned())
+        }
+        _ => ExecutionError::InvalidOperation(format!("{context}: {}", failure.describe())),
+    }
+}
+
+/// Status for a server-side stream error: a status already chosen for a
+/// task failure passes through; anything else is `INTERNAL`.
+pub(crate) fn stream_error_status(err: FlightError) -> Status {
+    match err {
+        FlightError::Tonic(status) => *status,
+        other => Status::internal(format!("flight encoding error: {other}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arneb_common::error::{is_resource_exhausted, resource_exhausted_message};
+    use arneb_common::error::{is_resource_exhausted, PlanError};
 
     #[test]
     fn resource_exhausted_round_trips() {
         let err = ArnebError::Execution(ExecutionError::ResourceExhausted(
             "query memory limit exceeded".into(),
         ));
-        let wire = describe_task_failure("stream error", &err);
-        assert!(wire.starts_with(RESOURCE_EXHAUSTED_TAG));
-        let status = failure_status(format!("task 't' failed: {wire}"));
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-        let back = remote_error("remote task t".into(), status.message());
+        let failure = TaskFailure::from_error("stream error", &err);
+        assert!(failure.is_resource_exhausted());
+        let status = failure.to_status("task 't' failed");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        let back = remote_error("remote task t".into(), &status);
         assert!(matches!(back, ExecutionError::ResourceExhausted(_)));
-        let client = resource_exhausted_message(&ArnebError::Execution(back));
-        assert!(client.contains("query memory limit exceeded"), "{client}");
-        assert!(!client.contains(RESOURCE_EXHAUSTED_TAG), "{client}");
+        assert_eq!(
+            back.to_string(),
+            "resource exhausted: query memory limit exceeded"
+        );
+
+        let mid_stream = FlightError::Tonic(Box::new(failure.to_status("producer task failed")));
+        assert!(matches!(
+            remote_error("Flight stream error".into(), &mid_stream),
+            ExecutionError::ResourceExhausted(_)
+        ));
     }
 
-    /// Tier 2 regression: an operator re-wraps the remote ResourceExhausted
-    /// as InvalidOperation; the next hop must still see it as one.
+    /// An operator re-raises the remote ResourceExhausted; the next hop
+    /// must still see it as one.
     #[test]
     fn class_survives_operator_rewrapping_over_two_hops() {
         let first = remote_error(
             "Flight stream error".into(),
-            &tag_resource_exhausted("stream error during execution: query memory limit exceeded"),
+            &Status::resource_exhausted("query memory limit exceeded"),
         );
-        let rewrapped = ArnebError::Execution(ExecutionError::InvalidOperation(format!(
-            "aggregate input stream: {first}"
-        )));
-        let wire = describe_task_failure("execute(0) failed", &rewrapped);
-        assert_eq!(
-            failure_status(wire.clone()).code(),
-            tonic::Code::ResourceExhausted
-        );
-        let top = ArnebError::Execution(ExecutionError::InvalidOperation(format!(
-            "TopKExec.input: {}",
-            remote_error("Flight stream error".into(), &wire)
-        )));
+        let rewrapped =
+            ArnebError::Execution(ExecutionError::upstream("aggregate input stream", first));
+        let failure = TaskFailure::from_error("execute(0) failed", &rewrapped);
+        let status = failure.to_status("producer task failed");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        let top = ArnebError::Execution(ExecutionError::upstream(
+            "TopKExec.input",
+            remote_error("Flight stream error".into(), &status),
+        ));
         assert!(is_resource_exhausted(&top));
-        assert!(resource_exhausted_message(&top).contains("query memory limit exceeded"));
+        assert!(top.to_string().contains("query memory limit exceeded"));
     }
 
     #[test]
     fn other_errors_stay_internal() {
         let err = ArnebError::Execution(ExecutionError::InvalidOperation("boom".into()));
-        let wire = describe_task_failure("stream error", &err);
-        assert_eq!(failure_status(wire.clone()).code(), tonic::Code::Internal);
+        let failure = TaskFailure::from_error("stream error", &err);
+        assert!(!failure.is_resource_exhausted());
+        let status = failure.to_status("task 't' failed");
+        assert_eq!(status.code(), Code::Internal);
         assert!(matches!(
-            remote_error("ctx".into(), &wire),
+            remote_error("ctx".into(), &status),
             ExecutionError::InvalidOperation(_)
         ));
     }
 
+    /// #145: the class comes from the status code alone. A message that
+    /// spells the old wire tag (here a table name) stays an internal
+    /// failure, on every hop.
     #[test]
-    fn tagging_does_not_nest() {
-        let once = tag_resource_exhausted("limit");
-        assert_eq!(tag_resource_exhausted(&once), once);
+    fn text_never_decides_the_class() {
+        let err = ArnebError::Plan(PlanError::TableNotFound("[resource exhausted] x".into()));
+        let failure = TaskFailure::from_error("execute(0) failed", &err);
+        assert!(!failure.is_resource_exhausted());
+        let status = failure.to_status("task 't' failed");
+        assert_eq!(status.code(), Code::Internal);
+        let back = remote_error("remote task t".into(), &status);
+        assert!(matches!(back, ExecutionError::InvalidOperation(_)));
+        let flight = FlightError::ProtocolError("[resource exhausted] x".into());
+        assert!(matches!(
+            remote_error("Flight stream error".into(), &flight),
+            ExecutionError::InvalidOperation(_)
+        ));
     }
 }

@@ -80,6 +80,10 @@ pub struct TrinoConfig {
     pub target_page_bytes: usize,
     /// Hard cap on rows per result page.
     pub max_page_rows: usize,
+    /// HTTPS only: an HTTP/1 connection that has not sent a full request
+    /// header block this long after the request starts is closed, so slow
+    /// or stalled clients cannot pin connections open.
+    pub header_read_timeout: Duration,
 }
 
 impl Default for TrinoConfig {
@@ -91,6 +95,7 @@ impl Default for TrinoConfig {
             max_wait: Duration::from_secs(1),
             target_page_bytes: 1024 * 1024,
             max_page_rows: 10_000,
+            header_read_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -254,7 +259,10 @@ impl TrinoServer {
         tokio::spawn(reaper(state.clone()));
         match &self.tls {
             None => axum::serve(listener, router(state)).await,
-            Some(acceptor) => serve_tls(listener, acceptor.clone(), router(state)).await,
+            Some(acceptor) => {
+                let header_timeout = self.config.header_read_timeout;
+                serve_tls(listener, acceptor.clone(), router(state), header_timeout).await
+            }
         }
     }
 }
@@ -281,13 +289,15 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// HTTPS accept loop: TCP accept → rustls handshake → hyper (HTTP/1.1 or h2
 /// by ALPN) serving the axum router. A failed handshake only drops that
-/// connection.
+/// connection; an HTTP/1 request whose headers take longer than
+/// `header_timeout` closes it.
 async fn serve_tls(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     router: Router,
+    header_timeout: Duration,
 ) -> std::io::Result<()> {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
     use hyper_util::server::conn::auto;
     use hyper_util::service::TowerToHyperService;
 
@@ -317,7 +327,13 @@ async fn serve_tls(
                 }
             };
             let service = TowerToHyperService::new(router);
-            if let Err(e) = auto::Builder::new(TokioExecutor::new())
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            // hyper only enforces `header_read_timeout` with a timer set.
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_timeout);
+            if let Err(e) = builder
                 .serve_connection_with_upgrades(TokioIo::new(tls), service)
                 .await
             {

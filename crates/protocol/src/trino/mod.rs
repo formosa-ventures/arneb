@@ -446,12 +446,17 @@ fn tracker_transition(state: &AppState, id: Option<QueryId>, to: &[TrackerState]
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn submit(
+    State(state): State<AppState>,
+    user: Option<Extension<AuthUser>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let sql = String::from_utf8_lossy(&body).trim().to_string();
     if sql.is_empty() {
         return (StatusCode::BAD_REQUEST, "SQL statement is empty").into_response();
     }
-    let session = ClientSession::from_headers(&headers);
+    let session = ClientSession::from_headers(&headers, user.as_ref().map(|Extension(u)| u));
     let id = new_query_id(&state.counter);
     let slug = format!("y{}", uuid::Uuid::new_v4().simple());
     let tracker_id = state.tracker.as_ref().map(|t| t.create_query(sql.clone()));

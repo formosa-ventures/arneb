@@ -5,9 +5,10 @@
 //! - `/v1/info`, `/v1/info/state` and `/v1/status` stay open for health
 //!   checks; everything else needs `Authorization: Basic`.
 //! - Failure is `401` with `WWW-Authenticate: Basic realm="arneb"`.
-//! - The authenticated user is the query's user: a different
-//!   `X-Trino-User` / `X-Presto-User` is `403`, and a missing one is filled
-//!   in so the session layer sees the authenticated name.
+//! - The authenticated user is the query's user: any non-blank
+//!   `X-Trino-User` / `X-Presto-User` naming someone else is `403`, and the
+//!   session takes its user from the [`AuthUser`] extension, never from the
+//!   headers.
 //! - Trino clients resend credentials on every `nextUri` poll, so successful
 //!   verifications are cached (bounded, TTL) under an HMAC of the password
 //!   with a per-process key; failures are never cached.
@@ -25,6 +26,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde_json::json;
 
+use super::session::claimed_users;
 use crate::auth::{hmac_sha256, AuthConfigError, UserCredentials};
 
 const CACHE_TTL: Duration = Duration::from_secs(300);
@@ -154,33 +156,13 @@ pub(crate) async fn require_auth(
         return unauthorized("Invalid credentials");
     }
 
-    // The authenticated user is the session user: reject impersonation and
-    // fill in a missing user header.
-    let headers = req.headers();
-    let claimed = ["X-Trino-User", "X-Presto-User"]
-        .iter()
-        .filter_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()))
-        .map(str::trim)
-        .find(|v| !v.is_empty());
-    match claimed {
-        Some(claimed) if claimed != user => {
-            return forbidden(&format!(
-                "User '{user}' cannot impersonate user '{claimed}'"
-            ));
-        }
-        Some(_) => {}
-        None => {
-            let header = if headers.contains_key("X-Presto-User")
-                || headers.keys().any(|k| k.as_str().starts_with("x-presto-"))
-            {
-                "X-Presto-User"
-            } else {
-                "X-Trino-User"
-            };
-            if let Ok(v) = HeaderValue::from_str(&user) {
-                req.headers_mut().insert(header, v);
-            }
-        }
+    // The authenticated user is the session user (`ClientSession` reads it
+    // from the extension): any user header naming someone else is
+    // impersonation.
+    if let Some(claimed) = claimed_users(req.headers()).find(|c| *c != user) {
+        return forbidden(&format!(
+            "User '{user}' cannot impersonate user '{claimed}'"
+        ));
     }
     req.extensions_mut().insert(AuthUser(user));
     next.run(req).await

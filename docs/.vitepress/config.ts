@@ -56,7 +56,8 @@ export default defineConfig({
             { text: 'File Connector', link: '/connectors/file' },
             { text: 'Object Store', link: '/connectors/object-store' },
             { text: 'Hive', link: '/connectors/hive' },
-            { text: 'Iceberg', link: '/connectors/iceberg' }
+            { text: 'Iceberg', link: '/connectors/iceberg' },
+            { text: 'PostgreSQL', link: '/connectors/postgresql' }
           ]
         }
       ],

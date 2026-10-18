@@ -270,7 +270,7 @@ async fn run() -> Result<()> {
     let default_schema = config
         .catalogs
         .first()
-        .map(|c| c.default_schema.as_str())
+        .map(|c| c.effective_default_schema())
         .unwrap_or("default");
     let catalog_manager = CatalogManager::new(default_catalog, default_schema);
 
@@ -347,9 +347,16 @@ async fn run() -> Result<()> {
         connector_registry.register("file", file_factory);
     }
 
-    // 6.5. Register Hive catalogs from config (Iceberg tables in the same
-    // metastore are redirected to the Iceberg reader by the Hive catalog).
+    // 6.5. Register external catalogs from config: Hive (Iceberg tables in
+    // the same metastore are redirected to the Iceberg reader by the Hive
+    // catalog) and PostgreSQL. Runs on every role, so workers can create
+    // data sources for the scans they are sent.
     for catalog_cfg in &config.catalogs {
+        if catalog_cfg.catalog_type == "postgresql" {
+            register_postgresql_catalog(catalog_cfg, &catalog_manager, &mut connector_registry)
+                .await;
+            continue;
+        }
         if catalog_cfg.catalog_type != "hive" {
             tracing::warn!(
                 catalog = %catalog_cfg.name,
@@ -1047,6 +1054,48 @@ async fn worker_heartbeat_loop(role: ServerRole, config: &AppConfig, my_rpc_addr
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+}
+
+/// Mount one `type = "postgresql"` catalog. Like an unreachable Hive
+/// Metastore, a bad config or unreachable database is logged and the
+/// catalog skipped; the server keeps serving.
+async fn register_postgresql_catalog(
+    catalog_cfg: &config::CatalogConfig,
+    catalog_manager: &CatalogManager,
+    connector_registry: &mut ConnectorRegistry,
+) {
+    let pg_config = match catalog_cfg.postgres_config() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(catalog = %catalog_cfg.name, error = %e, "invalid postgresql catalog, skipping");
+            return;
+        }
+    };
+    let target = pg_config.display_target();
+    match arneb_postgresql::PostgresCatalog::connect(&catalog_cfg.name, pg_config).await {
+        Ok(catalog) => {
+            let c = catalog.config();
+            tracing::info!(
+                catalog = %catalog_cfg.name,
+                target = %target,
+                max_connections = c.max_connections,
+                split_min_rows = c.split_min_rows,
+                max_splits = c.max_splits,
+                unconstrained_numeric_scale = c.unconstrained_numeric_scale,
+                "registered postgresql catalog"
+            );
+            connector_registry.register(&catalog_cfg.name, Arc::new(catalog.connector_factory()));
+            catalog_manager.register_catalog(&catalog_cfg.name, Arc::new(catalog));
+        }
+        Err(e) => {
+            tracing::warn!(
+                catalog = %catalog_cfg.name,
+                target = %target,
+                error = %e,
+                "failed to connect to postgresql, skipping catalog"
+            );
+        }
     }
 }
 

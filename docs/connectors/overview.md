@@ -25,6 +25,7 @@ Connectors are registered through the `ConnectorFactory` and `ConnectorRegistry`
 - **Object store connector**: Activated for `[[tables]]` entries with `s3://`, `gs://`, or `az://` paths
 - **Hive connector**: Activated for `[[catalogs]]` entries with `type = "hive"`
 - **Iceberg reader**: Used automatically by a `hive` catalog for tables with `table_type=ICEBERG` (read-only)
+- **PostgreSQL connector**: Activated for `[[catalogs]]` entries with `type = "postgresql"` (read-only)
 
 ## Pushdown Optimization
 
@@ -44,3 +45,4 @@ Connectors apply as many pushdown hints as they support. The query engine always
 - [Object Store](/connectors/object-store) — S3, GCS, and Azure Blob Storage
 - [Hive](/connectors/hive) — Hive Metastore catalog with automatic table discovery
 - [Iceberg](/connectors/iceberg) — Apache Iceberg tables tracked by a Hive Metastore (read-only, current snapshot)
+- [PostgreSQL](/connectors/postgresql) — a PostgreSQL database as a read-only catalog, with filter/projection/limit pushdown and parallel key-range reads

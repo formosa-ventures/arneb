@@ -723,6 +723,11 @@ impl TableProvider for HiveTableProvider {
         if self.transactional {
             p.insert(props::TRANSACTIONAL.to_string(), "true".to_string());
         }
+        // Planned here (the coordinator), read on every worker (#157).
+        p.insert(
+            arneb_connectors::parquet_scan::SCAN_PARALLELISM_PROPERTY.to_string(),
+            arneb_connectors::parquet_scan::local_scan_parallelism().to_string(),
+        );
         p
     }
 
@@ -845,6 +850,25 @@ mod tests {
             "parquet".to_string(),
         );
         assert!(provider.statistics().is_none());
+    }
+
+    #[test]
+    fn hive_table_provider_records_the_planning_scan_parallelism() {
+        use arneb_connectors::parquet_scan;
+        let provider = HiveTableProvider::new(
+            vec![ColumnInfo {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+            "/tmp/t".to_string(),
+            "parquet".to_string(),
+        );
+        let props = provider.properties();
+        assert_eq!(
+            props.get(parquet_scan::SCAN_PARALLELISM_PROPERTY),
+            Some(&parquet_scan::local_scan_parallelism().to_string())
+        );
     }
 
     #[test]

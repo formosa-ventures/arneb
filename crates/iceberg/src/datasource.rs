@@ -186,11 +186,11 @@ pub async fn create_data_source(
         Some(id) => plan_files(storage, &metadata, id, &table.to_string()).await?,
         None => Vec::new(),
     };
-    Ok(Arc::new(IcebergDataSource::new(
-        storage.clone(),
-        &metadata,
-        files,
-    )))
+    let mut ds = IcebergDataSource::new(storage.clone(), &metadata, files);
+    // Same partitions on every node (#157).
+    ds.splits_per_file =
+        parquet_scan::splits_per_file(ds.files.len(), parquet_scan::scan_parallelism(properties));
+    Ok(Arc::new(ds))
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +230,10 @@ impl IcebergDataSource {
             columns,
             field_ids,
             name_mapping,
-            splits_per_file: parquet_scan::splits_per_file(files.len()),
+            splits_per_file: parquet_scan::splits_per_file(
+                files.len(),
+                parquet_scan::local_scan_parallelism(),
+            ),
             files,
         }
     }

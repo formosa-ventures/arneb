@@ -182,7 +182,8 @@ impl HiveDataSource {
         format: HiveFileFormat,
         files: Vec<HiveFile>,
     ) -> Self {
-        let splits_per_file = parquet_scan::splits_per_file(files.len());
+        let splits_per_file =
+            parquet_scan::splits_per_file(files.len(), parquet_scan::local_scan_parallelism());
         Self {
             column_schema,
             partition_column_count,
@@ -190,6 +191,14 @@ impl HiveDataSource {
             files,
             splits_per_file,
         }
+    }
+
+    /// Size the splits for the planning node's scan-parallelism `target`
+    /// ([`parquet_scan::scan_parallelism`]) instead of this node's cores, so
+    /// every node exposes the same partitions (#157).
+    pub fn with_scan_parallelism(mut self, target: usize) -> Self {
+        self.splits_per_file = parquet_scan::splits_per_file(self.files.len(), target);
+        self
     }
 
     /// Async constructor that lists the Parquet files under `prefix`
@@ -519,6 +528,9 @@ async fn list_data_files(
             paths.push(meta.location);
         }
     }
+    // Object stores need not list in a stable order. Partition `p` must name
+    // the same file on every node (#157).
+    paths.sort();
     Ok(paths)
 }
 
@@ -780,7 +792,8 @@ impl ConnectorFactory for HiveConnectorFactory {
                     &partitions,
                 )
                 .await
-                .map_err(|e| ConnectorError::ReadError(format!("hive table '{table}': {e}")))?;
+                .map_err(|e| ConnectorError::ReadError(format!("hive table '{table}': {e}")))?
+                .with_scan_parallelism(parquet_scan::scan_parallelism(properties));
                 return Ok(Arc::new(ds));
             }
         }
@@ -795,7 +808,8 @@ impl ConnectorFactory for HiveConnectorFactory {
             partition_column_count,
         )
         .await
-        .map_err(|e| ConnectorError::ReadError(format!("hive table '{table}': {e}")))?;
+        .map_err(|e| ConnectorError::ReadError(format!("hive table '{table}': {e}")))?
+        .with_scan_parallelism(parquet_scan::scan_parallelism(properties));
         Ok(Arc::new(ds))
     }
 }
@@ -1115,6 +1129,88 @@ mod tests {
             total_rows += batches.iter().map(|b| b.num_rows()).sum::<usize>();
         }
         assert_eq!(total_rows, 2);
+    }
+
+    /// Regression for #157: the partition count comes from the plan's
+    /// scan-parallelism property, not from the node's cores, so workers with
+    /// different core counts stride over the same partitions and together
+    /// read every row exactly once.
+    #[tokio::test]
+    async fn factory_partitions_follow_the_planned_scan_parallelism() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for (i, name) in ["part-b.parquet", "part-a.parquet"].iter().enumerate() {
+            let base = (i as i32) * 100;
+            let bytes =
+                write_parquet_bytes((base..base + 50).collect(), (0..50).map(|_| "v").collect());
+            store
+                .put(
+                    &ObjectPath::from(format!("data/table/{name}")),
+                    PutPayload::from_bytes(bytes.into()),
+                )
+                .await
+                .unwrap();
+        }
+        let registry = Arc::new(StorageRegistry::new());
+        registry.register_store("s3://test-bucket", store);
+        let factory = HiveConnectorFactory::new(registry);
+        let mut props = location_props("s3://test-bucket/data/table");
+        props.insert(
+            parquet_scan::SCAN_PARALLELISM_PROPERTY.to_string(),
+            "6".to_string(),
+        );
+        let table_ref = TableReference::table("t");
+
+        // Two "workers" building the source from the same plan properties.
+        let a = factory
+            .create_data_source(&table_ref, &test_column_schema(), &props)
+            .await
+            .unwrap();
+        let b = factory
+            .create_data_source(&table_ref, &test_column_schema(), &props)
+            .await
+            .unwrap();
+        assert_eq!(a.partition_count(), 6, "2 files x ceil(6/2) splits");
+        assert_eq!(a.partition_count(), b.partition_count());
+
+        // Stride the partitions across the two "workers" as ScanExec does.
+        let mut ids = Vec::new();
+        for (worker, ds) in [(0usize, &a), (1, &b)] {
+            for p in (worker..ds.partition_count()).step_by(2) {
+                let stream = ds.scan(&ScanContext::default(), p).await.unwrap();
+                for batch in collect_stream(stream).await.unwrap() {
+                    let col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    ids.extend(col.values().iter().copied());
+                }
+            }
+        }
+        ids.sort();
+        let expected: Vec<i32> = (0..50).chain(100..150).collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[tokio::test]
+    async fn listing_is_sorted() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for name in ["c.parquet", "a.parquet", "b/x.parquet"] {
+            store
+                .put(
+                    &ObjectPath::from(format!("t/{name}")),
+                    PutPayload::from_bytes(vec![1u8].into()),
+                )
+                .await
+                .unwrap();
+        }
+        let paths = list_data_files(&store, &ObjectPath::from("t"))
+            .await
+            .unwrap();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
+        assert_eq!(paths.len(), 3);
     }
 
     /// Regression for #111: same-named tables in different schemas must each

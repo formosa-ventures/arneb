@@ -36,15 +36,41 @@ use arneb_common::stream::RecordBatchStream;
 use arneb_planner::PlanExpr;
 use parquet::file::metadata::ParquetMetaData;
 
-/// Pick a `splits_per_file` so the resulting partition count saturates
-/// available CPU cores. For a 4-file table on a 14-core machine that's
-/// `ceil(14/4) = 4` splits per file → 16 scan partitions. For a 16-file
-/// table we already have enough — keep splits_per_file=1.
-pub fn splits_per_file(n_files: usize) -> usize {
-    let n_files = n_files.max(1);
-    let target = std::thread::available_parallelism()
+/// `TableScan` property carrying the scan-parallelism target the planning
+/// node chose (see [`scan_parallelism`]).
+pub const SCAN_PARALLELISM_PROPERTY: &str = "scan_parallelism";
+
+/// This node's scan-parallelism target: its available CPU cores.
+pub fn local_scan_parallelism() -> usize {
+    std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(8);
+        .unwrap_or(8)
+}
+
+/// The scan-parallelism target for a table scan: the planning node's value
+/// from [`SCAN_PARALLELISM_PROPERTY`], or this node's own when the plan
+/// carries none.
+///
+/// In distributed mode every worker builds its own data source and the scan
+/// tasks stride over its `files × splits_per_file` partitions. Those only
+/// cover every partition exactly once when all nodes compute the same count,
+/// so the count must not depend on each worker's core count (#157). Catalogs
+/// therefore record the planning node's target in the scan's properties.
+pub fn scan_parallelism(properties: &std::collections::HashMap<String, String>) -> usize {
+    properties
+        .get(SCAN_PARALLELISM_PROPERTY)
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(local_scan_parallelism)
+}
+
+/// Pick a `splits_per_file` so the resulting partition count reaches
+/// `target` (normally [`scan_parallelism`]). For a 4-file table and a target
+/// of 14 that's `ceil(14/4) = 4` splits per file → 16 scan partitions. For a
+/// 16-file table we already have enough — keep splits_per_file=1.
+pub fn splits_per_file(n_files: usize, target: usize) -> usize {
+    let n_files = n_files.max(1);
+    let target = target.max(1);
     if n_files >= target {
         1
     } else {
@@ -354,6 +380,23 @@ impl RecordBatchStream for ParquetBatchStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_per_file_depends_only_on_its_inputs() {
+        assert_eq!(splits_per_file(4, 14), 4);
+        assert_eq!(splits_per_file(16, 14), 1);
+        assert_eq!(splits_per_file(0, 0), 1);
+    }
+
+    #[test]
+    fn scan_parallelism_prefers_the_plan_property() {
+        let mut props = std::collections::HashMap::new();
+        assert_eq!(scan_parallelism(&props), local_scan_parallelism());
+        props.insert(SCAN_PARALLELISM_PROPERTY.to_string(), "3".to_string());
+        assert_eq!(scan_parallelism(&props), 3);
+        props.insert(SCAN_PARALLELISM_PROPERTY.to_string(), "0".to_string());
+        assert_eq!(scan_parallelism(&props), local_scan_parallelism());
+    }
     use arneb_common::memory_pool::{GreedyMemoryPool, MemoryPool};
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};

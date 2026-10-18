@@ -99,7 +99,13 @@ impl TableProvider for IcebergTableProvider {
     }
 
     fn properties(&self) -> HashMap<String, String> {
-        self.properties.clone()
+        let mut p = self.properties.clone();
+        // Planned here (the coordinator), read on every worker (#157).
+        p.insert(
+            arneb_connectors::parquet_scan::SCAN_PARALLELISM_PROPERTY.to_string(),
+            arneb_connectors::parquet_scan::local_scan_parallelism().to_string(),
+        );
+        p
     }
 
     fn statistics(&self) -> Option<TableStatistics> {

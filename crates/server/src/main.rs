@@ -433,6 +433,11 @@ async fn run() -> Result<()> {
         cluster_tls = if cluster_security.tls.is_some() { "on" } else { "off" },
         "cluster RPC security effective mode ([cluster] secret / [cluster.tls] / ARNEB_CLUSTER_*)"
     );
+    config::check_cluster_transport(
+        cluster_security.secret.is_some(),
+        cluster_security.tls.is_some(),
+        &config.server.bind_address,
+    )?;
     if cluster_security.secret.is_some()
         && cluster_security.tls.is_none()
         && !config::is_loopback_host(&config.server.bind_address)

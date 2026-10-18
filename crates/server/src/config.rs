@@ -277,6 +277,21 @@ impl AuthConfig {
     }
 }
 
+/// Fail closed: `[cluster.tls]` without a `[cluster]` secret encrypts the
+/// Flight port but authenticates no peer (the server asks for no client
+/// certificate), so on a non-loopback bind any host that reaches it could
+/// submit tasks and read exchange data.
+pub fn check_cluster_transport(secret: bool, tls: bool, bind_address: &str) -> Result<()> {
+    if tls && !secret && !is_loopback_host(bind_address) {
+        bail!(
+            "[cluster.tls] is set without a [cluster] secret on non-loopback bind_address \
+             '{bind_address}': TLS encrypts cluster RPC but does not authenticate peers. Set \
+             [cluster] secret (or ARNEB_CLUSTER_SECRET) on every node"
+        );
+    }
+    Ok(())
+}
+
 /// Fail closed: password auth on an enabled Trino listener needs `[tls]`.
 /// Trino clients only send passwords over HTTPS, so a plain-HTTP listener
 /// under password auth would be either unusable or a bypass.
@@ -1079,6 +1094,21 @@ pgwire = "required"
         check_trino_transport(true, true, true).unwrap();
         check_trino_transport(false, true, false).unwrap();
         check_trino_transport(true, false, false).unwrap();
+    }
+
+    #[test]
+    fn test_cluster_tls_without_secret_fails_closed_off_loopback() {
+        let err = check_cluster_transport(false, true, "0.0.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[cluster] secret") && err.contains("0.0.0.0"),
+            "{err}"
+        );
+        check_cluster_transport(true, true, "0.0.0.0").unwrap();
+        check_cluster_transport(false, true, "127.0.0.1").unwrap();
+        check_cluster_transport(false, true, "localhost").unwrap();
+        check_cluster_transport(false, false, "0.0.0.0").unwrap();
     }
 
     #[test]

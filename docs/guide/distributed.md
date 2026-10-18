@@ -126,6 +126,8 @@ password_hash = "SCRAM-SHA-256$…"   # arneb hash-password
   peers dial (the `advertised_address` host for workers, the
   `coordinator_address` host for the coordinator). Keep `host:port` in those
   settings; nodes switch to `https://` automatically.
+- Cluster TLS does not authenticate peers; the secret does. A node with
+  `[cluster.tls]` but no secret refuses to start on a non-loopback bind.
 - Every node must use the same mode: a plaintext node cannot talk to a TLS
   node, and the failure shows up as heartbeat errors on the worker.
 - With password auth, the coordinator's Web UI binds to `127.0.0.1` unless

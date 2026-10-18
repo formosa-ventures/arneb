@@ -323,6 +323,11 @@ impl ConnectionHandler {
             Some(Ok(crate::timeout::Command::Show)) => {
                 return Some(crate::timeout::show_result(self.effective_timeout(client)));
             }
+            Some(Ok(crate::timeout::Command::Reset)) => {
+                return Some(Ok(crate::metadata::MetadataResponse::Command(
+                    "RESET".to_owned(),
+                )))
+            }
             Some(_) => {
                 return Some(Ok(crate::metadata::MetadataResponse::Command(
                     "SET".to_owned(),

@@ -30,6 +30,9 @@ pub(crate) struct SearchPath {
 
 enum Command {
     Set(Vec<String>),
+    /// `SET search_path TO DEFAULT`: a reset answered with the `SET` tag.
+    SetDefault,
+    /// `RESET search_path` / `RESET ALL`.
     Reset,
     Show,
 }
@@ -49,7 +52,11 @@ pub(crate) async fn handle_search_path(
             let value = current.map_or(root.default_schema(), |p| p.display.as_str());
             Some((show_result("search_path", value), None))
         }
-        Command::Reset => Some((set_ok(), Some(default_path(root)))),
+        Command::SetDefault => Some((set_ok(), Some(default_path(root)))),
+        Command::Reset => Some((
+            Ok(MetadataResponse::Command("RESET".to_string())),
+            Some(default_path(root)),
+        )),
         Command::Set(entries) => {
             let path = resolve(root, entries).await;
             Some((set_ok(), Some(path)))
@@ -146,7 +153,7 @@ fn parse(sql: &str) -> Option<Command> {
         .or_else(|| keyword(rest, "to"))?
         .trim();
     if value.eq_ignore_ascii_case("default") {
-        return Some(Command::Reset);
+        return Some(Command::SetDefault);
     }
     let entries = value
         .split(',')
@@ -182,11 +189,30 @@ mod tests {
         );
         assert!(matches!(
             parse("SET search_path TO DEFAULT"),
-            Some(Command::Reset)
+            Some(Command::SetDefault)
         ));
         assert!(matches!(parse("RESET search_path"), Some(Command::Reset)));
         assert!(matches!(parse("RESET ALL"), Some(Command::Reset)));
         assert!(matches!(parse("show search_path"), Some(Command::Show)));
+    }
+
+    /// `RESET ALL` / `RESET search_path` answer with the `RESET` command
+    /// tag, as PostgreSQL does; `SET ... TO DEFAULT` keeps `SET`.
+    #[tokio::test]
+    async fn reset_answers_with_the_reset_tag() {
+        let root = Arc::new(CatalogManager::new("memory", "default"));
+        for (sql, tag) in [
+            ("RESET ALL", "RESET"),
+            ("reset search_path;", "RESET"),
+            ("SET search_path TO DEFAULT", "SET"),
+            ("SET search_path = a", "SET"),
+        ] {
+            let (result, _) = handle_search_path(sql, &root, None).await.unwrap();
+            match result {
+                Ok(MetadataResponse::Command(t)) => assert_eq!(t, tag, "{sql}"),
+                _ => panic!("expected a command tag for {sql}"),
+            }
+        }
     }
 
     #[test]

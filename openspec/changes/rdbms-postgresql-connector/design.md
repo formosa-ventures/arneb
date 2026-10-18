@@ -130,6 +130,15 @@ not pushed. Text equality and `IN` are pushed, because equality is
 collation-independent for deterministic collations, which is PostgreSQL's
 default.
 
+Implementation added two rules for comparison semantics that
+differ in PostgreSQL. `real`/`double precision` columns are never pushed,
+because PostgreSQL orders `NaN` above every number, so `NOT (x > 1)` would drop
+NaN rows Arneb keeps. `char(n)` columns are refused through
+`Dialect::pushable_column`, because PostgreSQL ignores their trailing spaces,
+so `<>` would drop rows. Lossless widening casts the analyzer puts on columns
+(`CAST(int4_col AS BIGINT) IN (…)`) are looked through. Without that, almost
+no integer predicate would be pushed.
+
 ### D4. Limit
 
 The physical planner does not set `ScanContext.limit` today. This change adds
@@ -180,11 +189,13 @@ to typed Arrow builders, with no `Row`/`FromSql` per value:
 | bytea | bytes | Binary |
 
 PostgreSQL `date`/`timestamp` `±infinity` (i32/i64 MIN/MAX) fail with a
-column-named error. A batch is flushed every `batch_size` rows, and its
-`get_array_memory_size()` is reserved from `ctx.memory_pool` before it is
-emitted. That uses the same `MemoryReservation` pattern as the Parquet scan
-(#137), and keeps the reservation in the stream until the batch is dropped
-downstream, consistent with how the Parquet scan accounts decode buffers.
+column-named error. A batch is flushed every `batch_size` rows. The stream holds a
+`MemoryReservation` sized to the decode buffer, which is the last flushed batch's
+`get_array_memory_size()`, as the estimate for the builders being refilled. It
+is recorded with the infallible `grow`/`shrink` and freed when the stream ends,
+fails or is dropped. That matches the Parquet scan's decode-buffer accounting
+(#137): a scan cannot spill, so it never fails on its reservation, but
+spillable operators see the pressure.
 
 *Alternative*: `query_raw` with text or binary `Row`s. Rejected, because
 per-value `FromSql` plus `Row` allocation is several times slower than COPY,
@@ -218,11 +229,40 @@ becomes the default catalog. That is documented.
 
 ### D9. Read-only
 
-The factory's `ddl_provider()` returns `None`. If the existing DML path's
-error for a connector without a DDL provider does not say "read-only", the
-factory provides a `DDLProvider` whose every method returns
-`ConnectorError::UnsupportedOperation("catalog '<name>' is read-only")`, so
-the message is explicit.
+The factory's `ddl_provider()` returns `None`. No server path routes DML to a
+connector's `DDLProvider` today. `INSERT … SELECT` fails in the protocol layer
+("DDL/DML plans are handled at the protocol level"), and `INSERT … VALUES` fails
+in the planner, before any connector is involved. Nothing reaches PostgreSQL,
+which Tier 2 checked. A read-only `DDLProvider` would be dead code, so none is
+added. The spec requires failure without remote writes, not a specific message.
+
+### D10. Stacked filters (found in Tier 2)
+
+The logical optimizer splits `WHERE a AND b AND c` into stacked `Filter`
+nodes. The column-pruning pre-pass then puts a column-only `Projection`
+between them and the scan. The physical planner only ever passed a `Filter`
+**directly** on a `TableScan` into `ScanContext.filters`, so a remote source saw
+at most one conjunct, and with pruning often none. A new
+`DataSource::pushdown_stacked_filters()` (default `false`) lets a source opt
+in. The planner then collects every stacked predicate, composes the
+projections into the scan's projection, maps predicate indices back to the table
+schema for the source, and keeps the same `FilterExec`s above the scan. The
+default is `false` so file connectors keep their measured behavior. Enabling it
+for Parquet is a separate change that needs SF10/SF30 measurement.
+
+### D11. Engine fixes found in Tier 2
+
+- **Scan task owning no partition.** With M scan tasks and a source with
+  N < M partitions (a 1-partition PostgreSQL table on 2 workers), task
+  `i ≥ N` owns 0 partitions, but it is still executed for partition 0, and
+  `ScanExec` asked the source for global partition `i`. `ScanExec` now returns
+  an empty stream for that case. Hive never hit it, because its seeded tables
+  have 8 files.
+- **pgwire timestamp text.** `encode_value` dropped fractional seconds and
+  mapped every pre-1970 instant to the epoch (`%` remainder sign plus
+  `unwrap_or_default`). It now uses floor division and prints fractions the way
+  PostgreSQL does (trailing zeros trimmed). The Trino protocol encoder was
+  already correct.
 
 ## Risks / Trade-offs
 

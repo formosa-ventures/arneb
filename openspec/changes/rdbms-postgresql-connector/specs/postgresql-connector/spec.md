@@ -22,10 +22,12 @@ unreachable Hive Metastore is handled. The server SHALL keep serving.
 - **THEN** startup logs an error naming the catalog and the missing field, and skips the catalog
 
 ### Requirement: Schema and table discovery
-The catalog SHALL list schemas and tables from the remote `information_schema`,
-excluding `pg_catalog`, `information_schema` and `pg_toast*` schemas. It SHALL
+The catalog SHALL list schemas and tables from the remote system catalogs
+(`pg_namespace`, `pg_class`, `pg_attribute`), excluding `pg_catalog`,
+`information_schema`, `pg_toast*` and `pg_temp_*` schemas. It SHALL
 include ordinary tables, views, materialized views, foreign tables and
-partitioned tables. Column order SHALL follow `ordinal_position`. A table's
+partitioned tables. Column order SHALL follow the column number (`attnum`). A name is resolved by
+exact match first, then by a unique case-insensitive match. A table's
 estimated row count SHALL come from `pg_class.reltuples`, and SHALL be exposed
 as table statistics when it is non-negative.
 
@@ -70,17 +72,19 @@ unconstrained `numeric` with more fractional digits than the scale, `NaN` or
 ### Requirement: Binary COPY reads
 The connector SHALL fetch rows with `COPY (<generated SELECT>) TO STDOUT
 (FORMAT binary)` and decode them directly into Arrow arrays. Batches SHALL hold
-at most the scan's batch size (default 8192 rows). Each batch's memory SHALL be
-reserved from the scan context's memory pool, so a query memory limit covers
-PostgreSQL scans too.
+at most the scan's batch size (default 8192 rows). The scan SHALL account its
+in-flight decode buffer against the scan context's memory pool, the same way
+Parquet scans do (#137): an infallible reservation held from the first poll
+until the stream ends, fails or is dropped. Spillable operators then see the
+pool's true pressure.
 
 #### Scenario: Batches respect the batch size
 - **WHEN** a 20,000-row table is scanned with the default batch size
 - **THEN** the scan emits batches of at most 8192 rows
 
-#### Scenario: Memory limit applies
-- **WHEN** a query with a memory limit smaller than one batch scans a PostgreSQL table
-- **THEN** the query fails with the resource-exhausted error used for other scans
+#### Scenario: Decode buffer is accounted and released
+- **WHEN** a PostgreSQL table is scanned with a tracking memory pool
+- **THEN** the pool shows a non-zero reservation while the scan streams and zero after the stream ends
 
 ### Requirement: Connection pooling
 Each PostgreSQL catalog SHALL keep one connection pool per node, bounded by

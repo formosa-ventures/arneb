@@ -18,15 +18,25 @@ database-specific syntax outside a `Dialect` implementation.
 ### Requirement: Filter pushdown with safe fallback
 The framework SHALL split each pushed-down filter into its top-level `AND`
 conjuncts and translate each one independently. It SHALL translate
-comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`) between a column and a literal,
-`IS NULL` / `IS NOT NULL`, `IN` / `NOT IN` lists of literals, `BETWEEN` with
-literal bounds, `LIKE` / `NOT LIKE` with a literal pattern, and `AND` / `OR` /
-`NOT` over translatable operands. A conjunct that contains anything else
-(function calls, casts, arithmetic, subqueries, parameters, column-to-column
-comparisons of differing types) SHALL be omitted from the remote `WHERE`
-clause and never cause the query to fail. Arneb's own `FilterExec` above the
-scan SHALL keep evaluating the full predicate, so results are identical
-whether or not a conjunct was pushed.
+comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`) between a column and a literal
+(or two columns) of compatible types, `IS NULL` / `IS NOT NULL`, `IN` /
+`NOT IN` lists of literals, `BETWEEN` with literal bounds, `LIKE` / `NOT LIKE`
+with a literal pattern, and `AND` / `OR` / `NOT` over translatable operands. A
+lossless widening cast of a column (integer → wider integer or a decimal that
+holds it, decimal → decimal with no fewer integer or fractional digits) SHALL be
+looked through. It SHALL NOT push range comparisons on text, any condition on a
+floating-point column, any condition on a column the dialect refuses (e.g.
+PostgreSQL `char(n)`), or comparisons with a NULL literal. A conjunct that
+contains anything else (function calls, other casts, arithmetic, subqueries,
+parameters) SHALL be omitted from the remote `WHERE` clause and never cause the
+query to fail. Arneb's own `FilterExec` above the scan SHALL keep evaluating the
+full predicate, so results are identical whether or not a conjunct was pushed.
+
+The physical planner SHALL hand such a source the predicates of every `Filter`
+stacked directly above its scan (the optimizer splits a conjunction into
+stacked filters), including through the column-only projections the
+column-pruning pass inserts, with column indices mapped back to the table
+schema. Sources that do not opt in keep receiving only the innermost filter.
 
 #### Scenario: Supported conjuncts are pushed
 - **WHEN** a query filters `WHERE n_regionkey = 1 AND n_name LIKE 'A%'`
@@ -43,6 +53,18 @@ whether or not a conjunct was pushed.
 #### Scenario: Text range comparison is kept local
 - **WHEN** a query filters `WHERE n_name < 'C'` on a VARCHAR column
 - **THEN** the conjunct is not pushed, because remote collation order can differ from Arneb's byte order
+
+#### Scenario: Float and char(n) conditions are kept local
+- **WHEN** a query filters on a `double precision` column or a `char(n)` column
+- **THEN** the conjunct is not pushed
+
+#### Scenario: Analyzer widening casts are looked through
+- **WHEN** an `integer` column is compared after the analyzer's coercion, as in `CAST(grp AS BIGINT) IN (1, 3)`
+- **THEN** the remote SQL contains `"grp" IN (1, 3)`
+
+#### Scenario: Stacked filters are all pushed
+- **WHEN** a query filters `WHERE grp IN (1, 3) AND id > 1000 AND label LIKE 'label-1%'`, which the optimizer plans as three stacked filters
+- **THEN** each remote query's `WHERE` contains all three conditions
 
 #### Scenario: NULL literal comparison is not pushed
 - **WHEN** a conjunct compares a column to a NULL literal with `=`
@@ -113,9 +135,10 @@ messages.
 
 ### Requirement: Read-only remote catalogs
 RDBMS catalogs SHALL be read-only in this change. A DDL or DML statement
-targeting an RDBMS catalog SHALL fail with an error stating that the catalog is
-read-only. It SHALL NOT send any statement to the remote database.
+targeting an RDBMS catalog SHALL fail, and SHALL NOT send any statement to the
+remote database. Connector-delegated DML is not routed today: the protocol
+layer rejects such plans before any connector is involved.
 
 #### Scenario: INSERT is rejected
 - **WHEN** a client runs `INSERT INTO pg.public.nation VALUES (...)`
-- **THEN** the statement fails with a read-only catalog error and no remote write occurs
+- **THEN** the statement fails and no remote write occurs

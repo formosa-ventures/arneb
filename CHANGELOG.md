@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.3](https://github.com/formosa-ventures/arneb/compare/v0.1.2...v0.1.3) (2026-10-18)
+
+
+### Features
+
+* admission control — per-query memory limit, cluster cancel, query queue, statement timeout ([#138](https://github.com/formosa-ventures/arneb/issues/138)) ([656b747](https://github.com/formosa-ventures/arneb/commit/656b7477f91c382cef62f8e259f234f85c2ed25f))
+* **connectors:** account Parquet scan decode buffers in the memory pool ([#137](https://github.com/formosa-ventures/arneb/issues/137)) ([33d675c](https://github.com/formosa-ventures/arneb/commit/33d675c576c20749cbc7b43cde0969bbe1f3d2e1))
+* TLS, Trino Basic auth, and cluster RPC authentication (Phase 3 P3) ([#136](https://github.com/formosa-ventures/arneb/issues/136)) ([f9d85df](https://github.com/formosa-ventures/arneb/commit/f9d85dff59c627039b5479241c9325538bf0f3ad))
+
+
+### Bug Fixes
+
+* admission review follow-ups ([#145](https://github.com/formosa-ventures/arneb/issues/145)) ([#150](https://github.com/formosa-ventures/arneb/issues/150)) ([2c29cba](https://github.com/formosa-ventures/arneb/commit/2c29cbadc7fb0c6d631292543d729a0f9cf0b252))
+* admission review nits from [#150](https://github.com/formosa-ventures/arneb/issues/150) ([#152](https://github.com/formosa-ventures/arneb/issues/152)) ([166247a](https://github.com/formosa-ventures/arneb/commit/166247a266b6dd98957b70cd847156fd764d7cf5))
+* **connectors:** scan memory accounting follow-ups from [#137](https://github.com/formosa-ventures/arneb/issues/137) ([#148](https://github.com/formosa-ventures/arneb/issues/148)) ([6654007](https://github.com/formosa-ventures/arneb/commit/6654007b90853f9735560f90d9d9ba7c334882a5))
+* **rpc:** refuse a broadcast resume past the end; cover the mid-batch resume ([#153](https://github.com/formosa-ventures/arneb/issues/153)) ([a7a9aeb](https://github.com/formosa-ventures/arneb/commit/a7a9aeb8a8e622aae88bb717d218f023295545eb))
+* **rpc:** resume a broadcast exchange read after a transport break ([#140](https://github.com/formosa-ventures/arneb/issues/140)) ([4681f79](https://github.com/formosa-ventures/arneb/commit/4681f79784a3ee2fee96a16ea0c132fd6b61bbca))
+* **rpc:** resume a broken broadcast read from the first undelivered row ([#147](https://github.com/formosa-ventures/arneb/issues/147)) ([dba1074](https://github.com/formosa-ventures/arneb/commit/dba107499264cad24012b5014232dda7f128281a))
+* security review follow-ups ([#145](https://github.com/formosa-ventures/arneb/issues/145)) ([#149](https://github.com/formosa-ventures/arneb/issues/149)) ([135594b](https://github.com/formosa-ventures/arneb/commit/135594b45cd17c99b1e2b099cc8c838c4f28ec7b))
+* **trino:** bound the auth verification queue and dedupe concurrent misses ([#151](https://github.com/formosa-ventures/arneb/issues/151)) ([13f2aae](https://github.com/formosa-ventures/arneb/commit/13f2aae0d12b29c885ce735613e632c3763d0219))
+
 ## [0.1.2](https://github.com/formosa-ventures/arneb/compare/v0.1.1...v0.1.2) (2026-10-15)
 
 

@@ -14,7 +14,7 @@ export default defineConfig({
       { text: 'Architecture', link: '/architecture/overview' },
       { text: 'Performance', link: '/guide/performance' },
       {
-        text: 'v0.1.2', // x-release-please-version
+        text: 'v0.1.3', // x-release-please-version
         items: [
           { text: 'Release notes', link: 'https://github.com/formosa-ventures/arneb/releases' },
           { text: 'Changelog', link: 'https://github.com/formosa-ventures/arneb/blob/main/CHANGELOG.md' },

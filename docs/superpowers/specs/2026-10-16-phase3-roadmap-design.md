@@ -3,6 +3,13 @@
 **Date:** 2026-10-16
 **Status:** Approved design; each work item becomes its own OpenSpec change.
 
+**Progress (2026-10-18, v0.1.3):** P2 admission control (`admission-control`, #138)
+and P3 security (`security-tls-auth`, #136) are done, with review follow-ups in
+#149–#152. P1's code is done (scan accounting, #137 / #148); its SF30
+validation tasks (tracked-vs-RSS ratio, q21 SF30 distributed, 3-run stability)
+and the SF100 spill smoke remain. #126 traced to the seed's file layout and is
+fixed by #135. M2–M4 not started.
+
 ## Intent
 
 Phase 1–2.5 made Arneb a correct, fast single-node and distributed engine:
@@ -48,7 +55,7 @@ applied and logged by the binary.
 
 ### P1 — Finish memory accounting and spill
 
-Completes the open `exec-memory-accounting` change (14/23 tasks done).
+Completes the open `exec-memory-accounting` change (14/23 tasks done at the time of writing).
 
 - Bring Parquet scan decode buffers under `MemoryReservation`, after first
   verifying the produced `RecordBatch` is not double-counted downstream.

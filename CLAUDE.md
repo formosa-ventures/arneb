@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Arneb** — A Trino alternative built in Rust. Distributed SQL query engine for federated queries across heterogeneous data sources.
 
-**Status**: Phase 1 (single-node) and Phase 2 (distribution) complete. 18 OpenSpec changes implemented. TPC-H 16/22 queries passing.
+**Status**: Phases 1, 2 and 2.5 complete; Phase 3 (production readiness + federation) in progress. TPC-H 22/22 cell-identical to Trino at SF10 and SF30.
 
 ## Build & Development Commands
 
@@ -263,9 +263,9 @@ Adding a function: implement `ScalarFunction` in `crates/execution/src/functions
 ### Phase 2.5 (SQL completeness + client compat) — complete
 8 changes: ansi-expressions, scalar-functions, subquery-support, advanced-dql, ddl-dml-connector-delegated, coordinator-web-ui, extended-query-protocol, pg-catalog-metadata
 
-### Phase 3 (production readiness + federation) — planned
+### Phase 3 (production readiness + federation) — in progress
 4 milestones, each work item its own OpenSpec change — full design in `docs/superpowers/specs/2026-10-16-phase3-roadmap-design.md`:
-- M1 safe to share: memory accounting + spill, admission control, TLS/auth
+- M1 safe to share: memory accounting + spill (validation left), admission control (done, #138), TLS/auth (done, #136)
 - M2 federation MVP: RDBMS connector framework, PostgreSQL connector, cross-source join
 - M3 survives failure: fault tolerance, Prometheus metrics + query history, GHCR images + Helm
 - M4 wider federation: MySQL connector, aggregate/TopN/join pushdown

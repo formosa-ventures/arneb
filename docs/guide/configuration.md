@@ -374,10 +374,12 @@ Behavior:
 `Authorization: Basic`, verified against the same verifiers in constant
 time. A wrong password, an unknown user or a missing header gets `401` with
 `WWW-Authenticate: Basic realm="arneb"`. The authenticated user is the
-query's user: a different `X-Trino-User` gets `403`, and a query's paging,
-cancel and info URIs only work for its owner. Successful checks are cached
-for 5 minutes, so a changed password keeps working until the cache entry
-expires or the server restarts.
+query's user: any non-blank `X-Trino-User` / `X-Presto-User` naming
+someone else gets `403`, and a query's paging, cancel and info URIs only
+work for its owner. Successful checks are cached for 5 minutes, so a
+changed password keeps working until the cache entry expires or the server
+restarts. Uncached checks run off the request threads, at most four at a
+time; further ones wait their turn.
 
 **Fail closed.** Trino clients refuse to send a password over plain HTTP, so
 `type = "password"` with the Trino listener enabled and no [`[tls]`](#tls)

@@ -335,6 +335,7 @@ impl HiveDataSource {
             .cloned()
             .collect();
         let builder = parquet_scan::open_parquet_builder(&file.store, &file.path).await?;
+        let buffer_bytes = parquet_scan::row_group_buffer_bytes(builder.metadata(), Some(&roots));
         let stream = parquet_scan::build_split_stream(
             builder,
             &file.path,
@@ -347,11 +348,10 @@ impl HiveDataSource {
         )?;
         let schema = output_schema.clone();
         let path = file.path.to_string();
-        Ok(Box::pin(
-            ParquetBatchStream::new(output_schema, stream, path.clone()).with_adapter(Box::new(
-                move |batch| adapt_batch(&schema, &sources, &path, batch),
-            )),
-        ))
+        let stream = ParquetBatchStream::new(output_schema, stream, path.clone()).with_adapter(
+            Box::new(move |batch| adapt_batch(&schema, &sources, &path, batch)),
+        );
+        Ok(Box::pin(stream.with_scan_memory(ctx, buffer_bytes)))
     }
 }
 
@@ -439,6 +439,10 @@ impl DataSource for HiveDataSource {
             HiveFileFormat::Parquet => {
                 let file_path = &file.path;
                 let builder = parquet_scan::open_parquet_builder(&file.store, file_path).await?;
+                let buffer_bytes = parquet_scan::row_group_buffer_bytes(
+                    builder.metadata(),
+                    ctx.projection.as_deref(),
+                );
                 let stream = parquet_scan::build_split_stream(
                     builder,
                     file_path,
@@ -458,11 +462,8 @@ impl DataSource for HiveDataSource {
                 // first row — for a 6M-row lineitem scan with 7 projected
                 // columns that's ~336 MB per query, which dominated the
                 // single-table-aggregate work-memory delta vs Trino.
-                Ok(Box::pin(ParquetBatchStream::new(
-                    output_schema,
-                    stream,
-                    file_path.to_string(),
-                )))
+                let stream = ParquetBatchStream::new(output_schema, stream, file_path.to_string());
+                Ok(Box::pin(stream.with_scan_memory(ctx, buffer_bytes)))
             }
         }
     }

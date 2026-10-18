@@ -1,5 +1,8 @@
 //! Scan context for pushdown hints to connectors.
 
+use std::sync::Arc;
+
+use arneb_common::memory_pool::MemoryPool;
 use arneb_common::Domain;
 use arneb_planner::PlanExpr;
 
@@ -39,6 +42,10 @@ pub struct ScanContext {
     /// Batch size hint for record batch readers.
     /// `None` means use the reader's default (typically 8192).
     pub batch_size: Option<usize>,
+
+    /// Pool the scan accounts its read buffers against. `None` leaves
+    /// them untracked.
+    pub memory_pool: Option<Arc<dyn MemoryPool>>,
 }
 
 impl ScanContext {
@@ -74,6 +81,12 @@ impl ScanContext {
     /// Sets the batch size hint.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Sets the memory pool for scan buffer accounting.
+    pub fn with_memory_pool(mut self, pool: Arc<dyn MemoryPool>) -> Self {
+        self.memory_pool = Some(pool);
         self
     }
 }

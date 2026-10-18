@@ -584,6 +584,15 @@ fn async_stream_broadcast(
             yield Err(arrow_flight::error::FlightError::Tonic(Box::new(
                 failure.to_status("producer task failed"),
             ))) as Result<arrow::array::RecordBatch, arrow_flight::error::FlightError>;
+        } else if stream.rows_short() > 0 {
+            // A resume past the end: the consumer already holds rows this
+            // buffer doesn't, so a clean EOF would hide a mismatch.
+            yield Err(arrow_flight::error::FlightError::Tonic(Box::new(Status::out_of_range(
+                format!(
+                    "resume past the end of the broadcast output ({} rows short)",
+                    stream.rows_short()
+                ),
+            )))) as Result<arrow::array::RecordBatch, arrow_flight::error::FlightError>;
         }
     };
 
@@ -1038,6 +1047,25 @@ mod tests {
         handle.abort();
     }
 
+    /// The client counts the rows of decoded batches, but the Flight
+    /// encoder splits a batch above its message size (2 MiB) into several,
+    /// so a resume can start inside a producer batch: the server slices it.
+    /// 3 batches of 1 M rows (4 MB, two 500 k-row messages each); the cut at
+    /// 7 MB lands after the second batch's first message, so the resume
+    /// starts at row 1.5 M, inside that batch.
+    #[tokio::test]
+    async fn broadcast_resume_inside_a_producer_batch() {
+        let (addr, handle) = start_server_at(broadcast_state(3, 1_000_000)).await;
+        let client = crate::ExchangeClient::new(cutting_proxy(addr, 7_000_007).await);
+
+        let batches = read_all(&client, "q.bcast:0")
+            .await
+            .expect("resumed read succeeds");
+        assert!(batches.len() > 3, "the encoder split the batches");
+        assert_eq!(int_values(&batches), (0..3_000_000).collect::<Vec<i32>>());
+        handle.abort();
+    }
+
     /// #139 with cluster security: the reopen goes through the same
     /// bearer secret and TLS as the first `do_get`.
     #[tokio::test]
@@ -1197,6 +1225,21 @@ mod tests {
 
         let err = client.do_get(Ticket::new("q.bcast:0:x")).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // A resume past the end is an error, not a clean EOF.
+        let response = client
+            .do_get(Ticket::new("q.bcast:0:1250"))
+            .await
+            .unwrap()
+            .into_inner();
+        let err = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            response.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("250 rows short"), "{err}");
         handle.abort();
     }
 

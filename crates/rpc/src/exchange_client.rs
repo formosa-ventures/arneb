@@ -437,7 +437,13 @@ enum StatusClass {
     Failed,
     /// The transport broke: `Unknown` (connection closed or reset, h2
     /// error), or a `ResourceExhausted` the producer did not send, such as
-    /// an h2 `ENHANCE_YOUR_CALM` GOAWAY.
+    /// an h2 `ENHANCE_YOUR_CALM` GOAWAY. Two other unmarked
+    /// `ResourceExhausted`s land here too, and cost at most
+    /// [`MAX_RESUME_ATTEMPTS`] reopens before the error surfaces: a
+    /// memory-limit failure from a worker older than the class marker
+    /// (mixed versions; it then surfaces as a generic error, not `53200`),
+    /// and tonic's message-too-large encode error, which the encoder's
+    /// 2 MiB message split keeps far below the 64 MiB limit.
     Transport,
     /// Anything else (`AlreadyExists`: a partitioned buffer already taken;
     /// `FailedPrecondition`: a resume it refuses; auth failures).

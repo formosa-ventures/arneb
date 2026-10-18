@@ -209,8 +209,18 @@ pub struct AdmissionConfig {
     /// Decisions log #2: default 256.
     pub max_queued_queries: usize,
     /// Server default for sessions that set no timeout; `None` = off.
-    #[serde(deserialize_with = "deserialize_time_limit")]
+    /// Resolved by [`AdmissionConfig::apply_env`] from
+    /// `ARNEB_STATEMENT_TIMEOUT` or, failing that, the file value.
+    #[serde(skip)]
     pub statement_timeout: Option<std::time::Duration>,
+    /// The file's `statement_timeout`, unparsed: it is validated only once
+    /// the env override is known, so a valid `ARNEB_STATEMENT_TIMEOUT`
+    /// still wins over a bad file value (env > file).
+    #[serde(
+        rename = "statement_timeout",
+        deserialize_with = "deserialize_time_limit_text"
+    )]
+    statement_timeout_file: Option<String>,
 }
 
 impl Default for AdmissionConfig {
@@ -219,14 +229,16 @@ impl Default for AdmissionConfig {
             max_running_queries: 8,
             max_queued_queries: 256,
             statement_timeout: None,
+            statement_timeout_file: None,
         }
     }
 }
 
-/// A time limit written as milliseconds (`30000`) or a string (`"30s"`).
-fn deserialize_time_limit<'de, D: serde::Deserializer<'de>>(
+/// A time limit written as milliseconds (`30000`) or a string (`"30s"`),
+/// kept as text; [`AdmissionConfig::apply_env`] parses it.
+fn deserialize_time_limit_text<'de, D: serde::Deserializer<'de>>(
     d: D,
-) -> std::result::Result<Option<std::time::Duration>, D::Error> {
+) -> std::result::Result<Option<String>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Value {
@@ -237,13 +249,14 @@ fn deserialize_time_limit<'de, D: serde::Deserializer<'de>>(
         Value::Millis(ms) => ms.to_string(),
         Value::Text(t) => t,
     };
-    arneb_common::duration::parse_time_limit(&text).map_err(serde::de::Error::custom)
+    Ok(Some(text))
 }
 
 impl AdmissionConfig {
     /// Apply `ARNEB_MAX_RUNNING_QUERIES`, `ARNEB_MAX_QUEUED_QUERIES` and
     /// `ARNEB_STATEMENT_TIMEOUT` (looked up through `env`) over the file
-    /// values (env > file > defaults).
+    /// values (env > file > defaults), then validate the effective
+    /// statement timeout, naming its source in the error.
     pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
         for (var, field) in [
             ("ARNEB_MAX_RUNNING_QUERIES", &mut self.max_running_queries),
@@ -255,9 +268,16 @@ impl AdmissionConfig {
                 })?;
             }
         }
-        if let Some(v) = env("ARNEB_STATEMENT_TIMEOUT") {
+        let source = match env("ARNEB_STATEMENT_TIMEOUT") {
+            Some(v) => Some(("ARNEB_STATEMENT_TIMEOUT", v)),
+            None => self
+                .statement_timeout_file
+                .clone()
+                .map(|v| ("[admission] statement_timeout", v)),
+        };
+        if let Some((name, v)) = source {
             self.statement_timeout = arneb_common::duration::parse_time_limit(&v)
-                .map_err(|e| anyhow::anyhow!("invalid ARNEB_STATEMENT_TIMEOUT value: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("invalid {name} value: {e}"))?;
         }
         Ok(())
     }
@@ -1308,11 +1328,37 @@ pgwire = "required"
         assert_eq!(ms.max_running_queries, 8);
     }
 
+    /// #150 review: a bad file `statement_timeout` is not rejected at parse
+    /// time, so a valid `ARNEB_STATEMENT_TIMEOUT` still overrides it.
+    #[test]
+    fn test_admission_env_overrides_bad_file_timeout() {
+        let bad_file = "[admission]\nstatement_timeout = \"soon\"\n";
+        assert!(toml::from_str::<AppConfig>(bad_file).is_ok());
+        let s = admission(bad_file, &[("ARNEB_STATEMENT_TIMEOUT", "45s")]).unwrap();
+        assert_eq!(
+            s.statement_timeout,
+            Some(std::time::Duration::from_secs(45))
+        );
+        let off = admission(bad_file, &[("ARNEB_STATEMENT_TIMEOUT", "0")]).unwrap();
+        assert_eq!(off.statement_timeout, None);
+        assert!(admission(bad_file, &[]).is_err());
+    }
+
     #[test]
     fn test_admission_validation() {
         assert!(admission("port = 5432", &[("ARNEB_MAX_RUNNING_QUERIES", "-1")]).is_err());
         assert!(admission("port = 5432", &[("ARNEB_STATEMENT_TIMEOUT", "soon")]).is_err());
-        assert!(admission("[admission]\nstatement_timeout = \"soon\"\n", &[]).is_err());
+        let err = admission("[admission]\nstatement_timeout = \"soon\"\n", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[admission] statement_timeout"), "{err}");
+        let err = admission(
+            "[admission]\nstatement_timeout = \"30s\"\n",
+            &[("ARNEB_STATEMENT_TIMEOUT", "soon")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ARNEB_STATEMENT_TIMEOUT"), "{err}");
         assert!(toml::from_str::<AppConfig>("[admission]\nmax_running = 1\n").is_err());
     }
 

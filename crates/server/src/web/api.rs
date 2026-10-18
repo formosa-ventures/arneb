@@ -131,15 +131,25 @@ async fn cancel_query(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn cluster_overview(State(state): State<WebState>) -> Json<ClusterResponse> {
-    let admission = state.admission.as_ref().map(|a| a.snapshot()).unwrap_or(
-        arneb_scheduler::AdmissionSnapshot {
+/// Admission counters for the overview: the controller's, or with none
+/// (admission unlimited) zero counters, `max_running` 0 (unlimited) and the
+/// configured `max_queued_queries`.
+fn admission_counters(
+    admission: Option<&arneb_scheduler::AdmissionController>,
+    configured_max_queued: usize,
+) -> arneb_scheduler::AdmissionSnapshot {
+    admission
+        .map(|a| a.snapshot())
+        .unwrap_or(arneb_scheduler::AdmissionSnapshot {
             running: 0,
             queued: 0,
             max_running: 0,
-            max_queued: 0,
-        },
-    );
+            max_queued: configured_max_queued,
+        })
+}
+
+async fn cluster_overview(State(state): State<WebState>) -> Json<ClusterResponse> {
+    let admission = admission_counters(state.admission.as_ref(), state.max_queued_queries);
     Json(ClusterResponse {
         worker_count: state.node_registry.alive_count(),
         role: state.role.clone(),
@@ -172,4 +182,22 @@ async fn server_info(State(state): State<WebState>) -> Json<InfoResponse> {
         uptime_secs: state.start_time.elapsed().as_secs(),
         role: state.role.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #150 review: with no controller the overview reports the configured
+    /// `max_queued_queries`, not 0; with one, the controller's limits.
+    #[test]
+    fn admission_counters_report_the_configured_queue_limit() {
+        let none = admission_counters(None, 256);
+        assert_eq!((none.max_running, none.max_queued), (0, 256));
+        assert_eq!((none.running, none.queued), (0, 0));
+
+        let controller = arneb_scheduler::AdmissionController::new(4, 32);
+        let some = admission_counters(Some(&controller), 256);
+        assert_eq!((some.max_running, some.max_queued), (4, 32));
+    }
 }

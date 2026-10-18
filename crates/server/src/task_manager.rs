@@ -292,6 +292,44 @@ impl TaskManager {
         true
     }
 
+    /// Track the pumpers of task `task_key` once its output buffer is
+    /// registered. If the query was cancelled since the buffer went into
+    /// `flight_state` (so `cancel_query` may have found no buffer to fail),
+    /// the pumpers are aborted, the buffer is marked failed and
+    /// unregistered, and the failure is returned, so a consumer reads an
+    /// error instead of a clean EOF.
+    fn track_pumpers(
+        &self,
+        query_id: QueryId,
+        task_key: &str,
+        pumpers: &[tokio::task::AbortHandle],
+        failure_flag: &Mutex<Option<arneb_rpc::TaskFailure>>,
+    ) -> Result<(), arneb_rpc::TaskFailure> {
+        let mut live = true;
+        for handle in pumpers {
+            live &= self.track(query_id, task_key, handle.clone());
+        }
+        if live {
+            return Ok(());
+        }
+        for handle in pumpers {
+            handle.abort();
+        }
+        let failure = {
+            let mut guard = failure_flag.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .get_or_insert_with(|| "query cancelled".into())
+                .clone()
+        };
+        self.flight_state.remove_buffer(task_key);
+        tracing::info!(
+            target: "arneb::cluster",
+            task_id = %task_key,
+            "task of a cancelled query stopped after its buffer was registered"
+        );
+        Err(failure)
+    }
+
     /// Whether `query_id` was cancelled on this node (within the tombstone
     /// lifetime).
     fn is_cancelled(&self, query_id: QueryId) -> bool {
@@ -342,9 +380,14 @@ impl TaskManager {
                     }
                 }
                 Some(arneb_rpc::BufferKind::Broadcast(buf)) => {
-                    let failure = buf.failure_handle();
-                    let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.get_or_insert_with(|| "query cancelled".into());
+                    {
+                        let failure = buf.failure_handle();
+                        let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.get_or_insert_with(|| "query cancelled".into());
+                    }
+                    // The aborted pumper never finishes the buffer; close it
+                    // so subscribed consumers wake and read the failure.
+                    buf.finish();
                 }
                 None => {}
             }
@@ -868,7 +911,15 @@ impl TaskManager {
                 Ok::<usize, arneb_rpc::TaskFailure>(rows)
             });
 
-            self.track(descriptor.query_id, &task_id_str, pumper.abort_handle());
+            if let Err(failure) = self.track_pumpers(
+                descriptor.query_id,
+                &task_id_str,
+                &[pumper.abort_handle()],
+                &bbuf.failure_handle(),
+            ) {
+                bbuf.finish();
+                return Err(failure);
+            }
             let rows_emitted = pumper
                 .await
                 .map_err(|e| format!("broadcast pumper panicked: {e}"))??;
@@ -1078,9 +1129,13 @@ impl TaskManager {
             }));
         }
 
-        for pumper in &pumpers {
-            self.track(descriptor.query_id, &task_id_str, pumper.abort_handle());
-        }
+        let pumper_handles: Vec<_> = pumpers.iter().map(|p| p.abort_handle()).collect();
+        self.track_pumpers(
+            descriptor.query_id,
+            &task_id_str,
+            &pumper_handles,
+            &failure_flag,
+        )?;
         let mut rows_emitted: usize = 0;
         for (idx, pumper) in pumpers.into_iter().enumerate() {
             let rows = pumper
@@ -1324,6 +1379,64 @@ mod tests {
         assert_eq!(tm.cancel_query(q), 0);
         assert!(!survivor.is_finished());
         assert_eq!(tm.cancel_query(other), 1);
+    }
+
+    /// #150 review: a cancel that lands after a task registered its output
+    /// buffer but before its pumpers are tracked finds nothing to fail (the
+    /// buffer was not there yet). Tracking the pumpers then fails and
+    /// unregisters the buffer, so a consumer that already took a receiver
+    /// reads an error, and a later `do_get` finds no buffer: never a clean
+    /// EOF.
+    #[tokio::test]
+    async fn cancel_between_buffer_registration_and_pumper_tracking_fails_the_buffer() {
+        use arneb_execution::memory_pool::UnboundedMemoryPool;
+        let tm = manager_with_limit(Arc::new(UnboundedMemoryPool::new()), None);
+        let q = QueryId::new();
+        let key = format!("{q}.1.0");
+
+        // Cancel wins the race: it finds no tracked task and no buffer, and
+        // only leaves a tombstone.
+        assert_eq!(tm.cancel_query(q), 0);
+
+        // The task body then registers its buffer and spawns a pumper.
+        let mut buf = OutputBuffer::single(4, schema());
+        let senders = buf.take_senders();
+        let failure = buf.failure_handle();
+        let mut receiver = buf.take_receiver(0).unwrap();
+        tm.flight_state
+            .register_partitioned_buffer(key.clone(), buf);
+        let pumper = tokio::spawn(async move {
+            let _senders = senders;
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        });
+
+        let err = tm
+            .track_pumpers(q, &key, &[pumper.abort_handle()], &failure)
+            .unwrap_err();
+        assert_eq!(err.message(), "query cancelled");
+        assert!(pumper.await.unwrap_err().is_cancelled());
+        assert!(tm.flight_state.get_buffer(&key).is_none());
+        // The consumer sees end of data, then the recorded failure.
+        assert!(receiver.recv().await.is_none());
+        assert_eq!(
+            failure.lock().unwrap().as_ref().map(|f| f.message()),
+            Some("query cancelled")
+        );
+
+        // A query that was not cancelled tracks its pumpers normally.
+        let other = QueryId::new();
+        let live = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(600)));
+        let other_failure = Mutex::new(None);
+        tm.track_pumpers(
+            other,
+            &format!("{other}.1.0"),
+            &[live.abort_handle()],
+            &other_failure,
+        )
+        .unwrap();
+        assert!(other_failure.lock().unwrap().is_none());
+        assert_eq!(tm.cancel_query(other), 1);
+        assert!(live.await.unwrap_err().is_cancelled());
     }
 
     fn descriptor(query_id: QueryId) -> TaskDescriptor {

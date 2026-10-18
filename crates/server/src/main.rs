@@ -868,6 +868,7 @@ async fn run() -> Result<()> {
         start_time: std::time::Instant::now(),
         role: config.cluster.role.clone(),
         admission: admission.clone(),
+        max_queued_queries: config.admission.max_queued_queries,
     };
     let web_router = web::build_router(web_state);
     let web_port = config.server.port + 1000; // default: pgwire port + 1000 (e.g., 5432 → 6432)

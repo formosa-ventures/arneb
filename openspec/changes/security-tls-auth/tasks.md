@@ -99,4 +99,5 @@ Native release build, coordinator + 2 workers on one host, against the docker-co
 - [x] 8.1 `docs/guide/configuration.md`: add a TLS section and a Cluster security section, document the fail-closed rule and the Web UI loopback default with `[web] bind_address`, and list the new `ARNEB_*` variables.
 - [x] 8.2 `docs/guide/trino-clients.md`: https and password examples for the CLI, JDBC and the Python client. Remove the "Trino bypasses auth" limitation.
 - [x] 8.3 `docs/guide/distributed.md`: the cluster secret and TLS setup. Recommend using both.
-- [ ] 8.4 Close #85 when the section 4 PR merges.
+- [x] 8.4 Close #85 when the section 4 PR merges.
+  - #85 closed on 2026-10-18 by the merge of #136 (squash `f9d85df`).

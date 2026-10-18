@@ -743,9 +743,12 @@ async fn run() -> Result<()> {
     // admission-control D5/D8: one controller for the process, shared by
     // pgwire, the Trino listener and the Web UI. Workers have none; their
     // admission stays the RSS probe, and this cap bounds what reaches them.
+    // `max_running_queries = 0` admits every query at once, so no queue can
+    // form whatever `max_queued_queries` says: build no controller, and
+    // statements skip admission (and its lock) entirely.
     let serves_sql = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
     let admission_settings = &config.admission_settings;
-    let admission = serves_sql.then(|| {
+    let admission = (serves_sql && admission_settings.max_running_queries > 0).then(|| {
         arneb_scheduler::AdmissionController::new(
             admission_settings.max_running_queries,
             admission_settings.max_queued_queries,
@@ -753,6 +756,8 @@ async fn run() -> Result<()> {
     });
     if let Some(controller) = &admission {
         controller.spawn_snapshot_logger(std::time::Duration::from_secs(10));
+    }
+    if serves_sql {
         tracing::info!(
             target: "arneb::config",
             max_running_queries = admission_settings.max_running_queries,

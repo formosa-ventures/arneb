@@ -655,7 +655,7 @@ async fn admit(
         return Ok(None);
     }
     let pending = controller
-        .admit(&crate::handler::admission_label(&query.sql))
+        .admit_with(|| crate::handler::admission_label(&query.sql))
         .map_err(|e| TrinoError::queue_full(e.to_string()))?;
     if pending.queue_position().is_some() {
         query.queued.store(true, Ordering::Relaxed);

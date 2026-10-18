@@ -64,6 +64,23 @@ impl MemoryProfilePool {
             Self::update_peak(&self.jemalloc_retained_peak, stats.retained);
         }
     }
+
+    fn record_grow(&self, consumer: &MemoryConsumer, additional: usize) {
+        let additional = additional as u64;
+        let new_total = self
+            .current_reserved
+            .fetch_add(additional, Ordering::Relaxed)
+            .saturating_add(additional);
+        Self::update_peak(&self.peak_reserved, new_total);
+
+        let mut consumers = self.consumers.lock().expect("memory pool mutex poisoned");
+        let profile = consumers.entry(consumer.name().to_string()).or_default();
+        profile.current = profile.current.saturating_add(additional);
+        profile.peak = profile.peak.max(profile.current);
+        drop(consumers);
+
+        self.sample_jemalloc_resident();
+    }
 }
 
 impl MemoryPool for MemoryProfilePool {
@@ -81,22 +98,13 @@ impl MemoryPool for MemoryProfilePool {
         additional: usize,
     ) -> Result<(), arneb_common::error::ExecutionError> {
         self.inner.try_grow(consumer, additional)?;
-
-        let additional = additional as u64;
-        let new_total = self
-            .current_reserved
-            .fetch_add(additional, Ordering::Relaxed)
-            .saturating_add(additional);
-        Self::update_peak(&self.peak_reserved, new_total);
-
-        let mut consumers = self.consumers.lock().expect("memory pool mutex poisoned");
-        let profile = consumers.entry(consumer.name().to_string()).or_default();
-        profile.current = profile.current.saturating_add(additional);
-        profile.peak = profile.peak.max(profile.current);
-        drop(consumers);
-
-        self.sample_jemalloc_resident();
+        self.record_grow(consumer, additional);
         Ok(())
+    }
+
+    fn grow(&self, consumer: &MemoryConsumer, additional: usize) {
+        self.inner.grow(consumer, additional);
+        self.record_grow(consumer, additional);
     }
 
     fn shrink(&self, consumer: &MemoryConsumer, bytes: usize) {

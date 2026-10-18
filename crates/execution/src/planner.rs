@@ -457,6 +457,142 @@ impl ExecutionContext {
     /// the per-scan context, populating the four A1.4 cross-fragment
     /// dynamic-filter fields from `self`. Centralises the boilerplate
     /// shared by the four `ScanExec` construction sites in `convert()`.
+    /// `Filter(p1) → … → Filter(pn) → [Projection(columns)] → TableScan` over
+    /// a source that wants every stacked predicate
+    /// ([`DataSource::pushdown_stacked_filters`]): one scan carrying all
+    /// predicates, under the same FilterExecs (which keep results exact
+    /// whatever the source applies). The optional column-only Projection is
+    /// the one the column-pruning pre-pass inserts; the scan then also takes
+    /// it as its projection, and the predicates are mapped back to
+    /// table-schema indices for the source. `None` when the shape or the
+    /// source does not qualify (the default paths then apply).
+    fn try_stacked_filter_scan(
+        &self,
+        predicate: &PlanExpr,
+        input: &LogicalPlan,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>, ExecutionError> {
+        let mut predicates = vec![predicate];
+        let mut node = input;
+        while let LogicalPlan::Filter { input, predicate } = node {
+            predicates.push(predicate);
+            node = input;
+        }
+        // Column-only projections between the filters and the scan (the
+        // column-pruning pre-pass adds one; a user projection may sit on
+        // it), composed into one table-index list. `exprs`/`schema` are the
+        // topmost projection's.
+        let mut projection: Option<(
+            Vec<usize>,
+            &[PlanExpr],
+            &Vec<arneb_common::types::ColumnInfo>,
+        )> = None;
+        while let LogicalPlan::Projection {
+            input,
+            exprs,
+            schema,
+        } = node
+        {
+            let level: Option<Vec<usize>> = exprs
+                .iter()
+                .map(|e| match e {
+                    PlanExpr::Column { index, .. } => Some(*index),
+                    _ => None,
+                })
+                .collect();
+            let Some(level) = level else {
+                return Ok(None);
+            };
+            projection = Some(match projection {
+                None => (level, exprs.as_slice(), schema),
+                Some((upper, top_exprs, top_schema)) => {
+                    let Some(composed) = upper
+                        .iter()
+                        .map(|&i| level.get(i).copied())
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return Ok(None);
+                    };
+                    (composed, top_exprs, top_schema)
+                }
+            });
+            node = input;
+        }
+        let LogicalPlan::TableScan {
+            table,
+            dynamic_filters_consumed,
+            ..
+        } = node
+        else {
+            return Ok(None);
+        };
+        // A single filter directly on the scan is already pushed by the
+        // default path.
+        if predicates.len() < 2 && projection.is_none() {
+            return Ok(None);
+        }
+        let key = table.to_string();
+        let Some(source) = self
+            .data_sources
+            .get(&key)
+            .or_else(|| self.data_sources.get(&table.table))
+        else {
+            return Ok(None);
+        };
+        if !source.pushdown_stacked_filters() {
+            return Ok(None);
+        }
+        let filters = match &projection {
+            Some((indices, ..)) => {
+                let to_table: HashMap<usize, usize> = indices.iter().copied().enumerate().collect();
+                predicates
+                    .iter()
+                    .map(|p| rewrite_column_indices(p, &to_table))
+                    .collect()
+            }
+            None => predicates.iter().map(|p| (*p).clone()).collect(),
+        };
+        let scan_ctx = ScanContext {
+            filters,
+            projection: projection.as_ref().map(|(indices, ..)| indices.clone()),
+            ..Default::default()
+        };
+        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(self.build_scan_exec(
+            source.clone(),
+            key,
+            scan_ctx,
+            dynamic_filters_consumed.clone(),
+        ));
+        if let Some((_, exprs, schema)) = projection {
+            // As the Projection-over-TableScan pushdown does: the scan emits
+            // the projected columns in order, so each output is column `i`.
+            let identity = exprs
+                .iter()
+                .enumerate()
+                .map(|(i, e)| match e {
+                    PlanExpr::Column { name, span, .. } => PlanExpr::Column {
+                        index: i,
+                        name: name.clone(),
+                        span: *span,
+                    },
+                    other => other.clone(),
+                })
+                .collect();
+            plan = Arc::new(ProjectionExec {
+                input: plan,
+                exprs: identity,
+                output_schema: schema.clone(),
+            });
+        }
+        // Innermost filter first, as the stack would evaluate them.
+        for p in predicates.into_iter().rev() {
+            plan = Arc::new(FilterExec {
+                input: plan,
+                predicate: p.clone(),
+            });
+        }
+        Ok(Some(plan))
+    }
+
     fn build_scan_exec(
         &self,
         source: Arc<dyn DataSource>,
@@ -774,6 +910,9 @@ impl ExecutionContext {
             }
 
             LogicalPlan::Filter { input, predicate } => {
+                if let Some(plan) = self.try_stacked_filter_scan(predicate, input)? {
+                    return Ok(plan);
+                }
                 // When filtering a table scan, pass the filter to ScanContext
                 // for potential pushdown into the connector. The FilterExec is
                 // still kept for correctness — the connector may only partially
@@ -959,6 +1098,42 @@ impl ExecutionContext {
                 limit,
                 offset,
             } => {
+                // `LIMIT n` directly over a scan: pass `n` to the source as a
+                // hint (remote-SQL connectors push it when exact; others
+                // ignore it). LimitExec stays on top. Skipped when the scan
+                // awaits dynamic filters, which apply after the source.
+                if let (Some(n), None | Some(0)) = (*limit, *offset) {
+                    if let LogicalPlan::TableScan {
+                        table,
+                        dynamic_filters_consumed,
+                        ..
+                    } = input.as_ref()
+                    {
+                        if dynamic_filters_consumed.is_empty() {
+                            let key = table.to_string();
+                            let source = self
+                                .data_sources
+                                .get(&key)
+                                .or_else(|| self.data_sources.get(&table.table))
+                                .ok_or_else(|| {
+                                    ExecutionError::InvalidOperation(format!(
+                                        "data source not found for table '{key}'"
+                                    ))
+                                })?;
+                            let scan: Arc<dyn ExecutionPlan> = Arc::new(self.build_scan_exec(
+                                source.clone(),
+                                key,
+                                ScanContext::default().with_limit(n),
+                                Vec::new(),
+                            ));
+                            return Ok(Arc::new(LimitExec {
+                                input: coalesce_if_multi(scan),
+                                limit: *limit,
+                                offset: *offset,
+                            }));
+                        }
+                    }
+                }
                 // Top-K rewrite: `LIMIT k` directly on top of a Sort
                 // (no OFFSET, finite k) collapses into TopKExec to
                 // skip the full O(n log n) sort. Saves big on TPC-H
@@ -2893,6 +3068,262 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap();
         assert_eq!(ratio.value(0), 25.0);
+    }
+
+    /// A source that records the limit hint it was scanned with.
+    #[derive(Debug)]
+    struct LimitRecordingSource {
+        inner: InMemoryDataSource,
+        seen: std::sync::Mutex<Vec<Option<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DataSource for LimitRecordingSource {
+        fn schema(&self) -> Vec<arneb_common::types::ColumnInfo> {
+            self.inner.schema()
+        }
+
+        async fn scan(
+            &self,
+            ctx: &ScanContext,
+            partition: usize,
+        ) -> Result<arneb_common::stream::SendableRecordBatchStream, ExecutionError> {
+            self.seen.lock().unwrap().push(ctx.limit);
+            self.inner.scan(ctx, partition).await
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_over_scan_passes_the_limit_hint() {
+        let (ctx, schema) = test_context();
+        let users = ctx.data_sources.get("users").unwrap().clone();
+        let batches = collect_stream(users.scan(&ScanContext::default(), 0).await.unwrap())
+            .await
+            .unwrap();
+        let recording = Arc::new(LimitRecordingSource {
+            inner: InMemoryDataSource::new(users.schema(), batches),
+            seen: Default::default(),
+        });
+        let mut ctx = ctx;
+        ctx.register_data_source("users", recording.clone());
+        let scan = || {
+            Box::new(LogicalPlan::TableScan {
+                table: TableReference::table("users"),
+                schema: schema.clone(),
+                alias: None,
+                properties: Default::default(),
+                dynamic_filters_consumed: Vec::new(),
+            })
+        };
+        let run = |plan: LogicalPlan| {
+            let exec = ctx.create_physical_plan(&plan).unwrap();
+            async move {
+                collect_stream(exec.execute(0).await.unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let out = run(LogicalPlan::Limit {
+            input: scan(),
+            limit: Some(2),
+            offset: None,
+        })
+        .await;
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        // With an offset the hint would be wrong, so none is passed.
+        let out = run(LogicalPlan::Limit {
+            input: scan(),
+            limit: Some(2),
+            offset: Some(1),
+        })
+        .await;
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        assert_eq!(*recording.seen.lock().unwrap(), vec![Some(2), None]);
+    }
+
+    /// A source that opts into stacked-filter pushdown and records the
+    /// filters it was scanned with.
+    #[derive(Debug)]
+    struct StackedFilterSource {
+        inner: InMemoryDataSource,
+        opt_in: bool,
+        seen: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DataSource for StackedFilterSource {
+        fn schema(&self) -> Vec<arneb_common::types::ColumnInfo> {
+            self.inner.schema()
+        }
+
+        fn pushdown_stacked_filters(&self) -> bool {
+            self.opt_in
+        }
+
+        async fn scan(
+            &self,
+            ctx: &ScanContext,
+            partition: usize,
+        ) -> Result<arneb_common::stream::SendableRecordBatchStream, ExecutionError> {
+            self.seen.lock().unwrap().push(ctx.filters.len());
+            self.inner.scan(ctx, partition).await
+        }
+    }
+
+    #[tokio::test]
+    async fn stacked_filters_reach_sources_that_opt_in() {
+        for opt_in in [true, false] {
+            let (ctx, schema) = test_context();
+            let users = ctx.data_sources.get("users").unwrap().clone();
+            let batches = collect_stream(users.scan(&ScanContext::default(), 0).await.unwrap())
+                .await
+                .unwrap();
+            let source = Arc::new(StackedFilterSource {
+                inner: InMemoryDataSource::new(users.schema(), batches),
+                opt_in,
+                seen: Default::default(),
+            });
+            let mut ctx = ctx;
+            ctx.register_data_source("users", source.clone());
+            let gt = |v| PlanExpr::BinaryOp {
+                left: Box::new(PlanExpr::Column {
+                    index: 0,
+                    name: "id".into(),
+                    span: None,
+                }),
+                op: arneb_sql_parser::ast::BinaryOp::Gt,
+                right: Box::new(PlanExpr::Literal {
+                    value: ScalarValue::Int32(v),
+                    span: None,
+                }),
+                span: None,
+            };
+            let plan = LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::Filter {
+                    input: Box::new(LogicalPlan::TableScan {
+                        table: TableReference::table("users"),
+                        schema: schema.clone(),
+                        alias: None,
+                        properties: Default::default(),
+                        dynamic_filters_consumed: Vec::new(),
+                    }),
+                    predicate: gt(1),
+                }),
+                predicate: gt(2),
+            };
+            let exec = ctx.create_physical_plan(&plan).unwrap();
+            let out = collect_stream(exec.execute(0).await.unwrap())
+                .await
+                .unwrap();
+            let ids: Vec<i32> = out
+                .iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert!(ids.iter().all(|&id| id > 2), "{ids:?}");
+            let expected = if opt_in { 2 } else { 1 };
+            assert_eq!(*source.seen.lock().unwrap(), vec![expected]);
+        }
+    }
+
+    /// A source that records the filters it was scanned with.
+    #[derive(Debug)]
+    struct FilterRecordingSource {
+        inner: InMemoryDataSource,
+        seen: std::sync::Mutex<Vec<Vec<PlanExpr>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DataSource for FilterRecordingSource {
+        fn schema(&self) -> Vec<arneb_common::types::ColumnInfo> {
+            self.inner.schema()
+        }
+
+        fn pushdown_stacked_filters(&self) -> bool {
+            true
+        }
+
+        async fn scan(
+            &self,
+            ctx: &ScanContext,
+            partition: usize,
+        ) -> Result<arneb_common::stream::SendableRecordBatchStream, ExecutionError> {
+            self.seen.lock().unwrap().push(ctx.filters.clone());
+            self.inner.scan(ctx, partition).await
+        }
+    }
+
+    #[tokio::test]
+    async fn filters_over_a_pruning_projection_reach_the_source_in_table_indices() {
+        let (ctx, schema) = test_context();
+        let users = ctx.data_sources.get("users").unwrap().clone();
+        let batches = collect_stream(users.scan(&ScanContext::default(), 0).await.unwrap())
+            .await
+            .unwrap();
+        let source = Arc::new(FilterRecordingSource {
+            inner: InMemoryDataSource::new(users.schema(), batches),
+            seen: Default::default(),
+        });
+        let mut ctx = ctx;
+        ctx.register_data_source("users", source.clone());
+        let column = |index: usize, name: &str| PlanExpr::Column {
+            index,
+            name: name.into(),
+            span: None,
+        };
+        // Filter(value > 250) → Projection[value, id] → TableScan(id, name, value)
+        let predicate = PlanExpr::BinaryOp {
+            left: Box::new(column(0, "value")),
+            op: arneb_sql_parser::ast::BinaryOp::Gt,
+            right: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int64(250),
+                span: None,
+            }),
+            span: None,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Projection {
+                input: Box::new(LogicalPlan::TableScan {
+                    table: TableReference::table("users"),
+                    schema: schema.clone(),
+                    alias: None,
+                    properties: Default::default(),
+                    dynamic_filters_consumed: Vec::new(),
+                }),
+                exprs: vec![column(2, "value"), column(0, "id")],
+                schema: vec![schema[2].clone(), schema[0].clone()],
+            }),
+            predicate,
+        };
+        let exec = ctx.create_physical_plan(&plan).unwrap();
+        let out = collect_stream(exec.execute(0).await.unwrap())
+            .await
+            .unwrap();
+        let ids: Vec<i32> = out
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![3, 4, 5]);
+        let seen = source.seen.lock().unwrap();
+        // The source saw the predicate on table column 2 (`value`).
+        let PlanExpr::BinaryOp { left, .. } = &seen[0][0] else {
+            panic!("{seen:?}");
+        };
+        assert!(matches!(left.as_ref(), PlanExpr::Column { index: 2, .. }));
     }
 
     #[tokio::test]

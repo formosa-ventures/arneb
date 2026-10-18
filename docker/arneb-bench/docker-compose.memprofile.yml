@@ -1,0 +1,25 @@
+# Overlay for the tracked-vs-RSS measurement (exec-memory-accounting 1.1 /
+# 2.4 / 4.3): turns on the read-only memory profile on every arneb node, so
+# each worker task logs an `arneb::memprofile` event with the pool peak next
+# to jemalloc's resident peak.
+#
+# Usage (any scale; the sf10 scenario's data must already be seeded):
+#   EXTRA_COMPOSE=docker/arneb-bench/docker-compose.memprofile.yml \
+#   SKIP_TRINO=1 ./benchmarks/tpch/scripts/run_memory_bench.sh
+#   python3 benchmarks/tpch/scripts/tracked_vs_rss.py \
+#       benchmarks/tpch/results/memory_total_<ts>.csv
+#
+# The profile never changes admission or spill decisions, but it takes a
+# mutex and reads jemalloc stats on every reservation grow, so do not quote
+# latencies from a run with this overlay.
+
+services:
+  arneb:
+    environment:
+      ARNEB_MEM_PROFILE: "1"
+  arneb-worker-1:
+    environment:
+      ARNEB_MEM_PROFILE: "1"
+  arneb-worker-2:
+    environment:
+      ARNEB_MEM_PROFILE: "1"

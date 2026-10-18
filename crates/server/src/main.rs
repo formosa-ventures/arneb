@@ -541,7 +541,9 @@ async fn run() -> Result<()> {
     let query_cap_resolved = config.memory.resolve_query_cap();
     let query_memory_limit = query_cap_resolved.map(|b| b as usize);
     let memory_pool: Arc<dyn MemoryPool> = if memory_profile::mem_profile_enabled() {
-        Arc::new(memory_profile::MemoryProfilePool::new(global_pool))
+        let pool = Arc::new(memory_profile::MemoryProfilePool::new(global_pool));
+        pool.start_resident_sampler(std::time::Duration::from_millis(50));
+        pool
     } else {
         global_pool
     };

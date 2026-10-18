@@ -153,6 +153,14 @@ impl ScramVerifier {
         constant_time::verify_slices_are_equal(&sha256(&client_key), &self.stored_key).is_ok()
     }
 
+    /// Check a plaintext password (e.g. from HTTP Basic auth) against this
+    /// verifier: SASLprep + PBKDF2 with the stored salt and iterations, then
+    /// a constant-time StoredKey compare.
+    pub fn verify_password(&self, password: &str) -> bool {
+        let candidate = Self::from_password(password, &self.salt, self.iterations);
+        constant_time::verify_slices_are_equal(&candidate.stored_key, &self.stored_key).is_ok()
+    }
+
     fn server_signature(&self, auth_message: &[u8]) -> [u8; KEY_LEN] {
         hmac_sha256(&self.server_key, auth_message)
     }
@@ -274,6 +282,15 @@ impl UserCredentials {
         self.users.is_empty()
     }
 
+    /// Check `user` / `password` (HTTP Basic auth). An unknown user runs the
+    /// same PBKDF2 against a decoy verifier, so timing does not reveal which
+    /// users exist.
+    pub fn verify_password(&self, user: &str, password: &str) -> bool {
+        let (verifier, known) = self.lookup(user);
+        let ok = verifier.verify_password(password);
+        ok && known
+    }
+
     /// Verifier for `user`, or a deterministic decoy verifier (and `false`)
     /// when the user does not exist.
     fn lookup(&self, user: &str) -> (ScramVerifier, bool) {
@@ -349,6 +366,16 @@ fn protocol_violation(msg: impl Into<String>) -> PgWireError {
         "FATAL".to_owned(),
         "08P01".to_owned(),
         msg.into(),
+    )))
+}
+
+/// `FATAL 28000`, the code PostgreSQL uses when `hostssl` rejects a
+/// plaintext connection.
+fn ssl_required() -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "FATAL".to_owned(),
+        "28000".to_owned(),
+        "SSL connection is required".to_owned(),
     )))
 }
 
@@ -454,13 +481,15 @@ fn parse_client_final(data: &[u8], exchange: &ScramExchange) -> PgWireResult<(St
 /// [`AuthMethod`]. A fresh instance is created for every connection.
 pub(crate) struct AuthStartupHandler {
     method: AuthMethod,
+    tls_required: bool,
     state: Mutex<ScramState>,
 }
 
 impl AuthStartupHandler {
-    pub(crate) fn new(method: AuthMethod) -> Self {
+    pub(crate) fn new(method: AuthMethod, tls_required: bool) -> Self {
         Self {
             method,
+            tls_required,
             state: Mutex::new(ScramState::Start),
         }
     }
@@ -602,6 +631,18 @@ impl StartupHandler for AuthStartupHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // Transport check first: `[tls] pgwire = "required"` applies in every
+        // auth mode, before any SASL exchange starts.
+        if self.tls_required
+            && matches!(message, PgWireFrontendMessage::Startup(_))
+            && !client.is_secure()
+        {
+            tracing::debug!(
+                peer = %client.socket_addr(),
+                "pgwire plaintext connection rejected (tls required)"
+            );
+            return Err(ssl_required());
+        }
         match &self.method {
             AuthMethod::None => {
                 if let PgWireFrontendMessage::Startup(ref startup) = message {
@@ -626,7 +667,7 @@ fn sha256(data: &[u8]) -> [u8; KEY_LEN] {
     out
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; KEY_LEN] {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; KEY_LEN] {
     let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data);
     let mut out = [0u8; KEY_LEN];
     out.copy_from_slice(tag.as_ref());
@@ -636,6 +677,30 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; KEY_LEN] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_password_checks_the_stored_key() {
+        let alice = ScramVerifier::generate("alice-pw").unwrap();
+        assert!(alice.verify_password("alice-pw"));
+        assert!(!alice.verify_password("alice-PW"));
+        assert!(!alice.verify_password(""));
+
+        // A verifier produced by postgres-protocol (rust-postgres' ALTER ROLE
+        // ... PASSWORD implementation) verifies too.
+        let bob: ScramVerifier = postgres_protocol::password::scram_sha_256(b"bob-pw")
+            .parse()
+            .unwrap();
+        assert!(bob.verify_password("bob-pw"));
+        assert!(!bob.verify_password("alice-pw"));
+
+        let creds =
+            UserCredentials::new(vec![("alice".to_owned(), alice), ("bob".to_owned(), bob)])
+                .unwrap();
+        assert!(creds.verify_password("alice", "alice-pw"));
+        assert!(!creds.verify_password("alice", "bob-pw"));
+        assert!(!creds.verify_password("mallory", "alice-pw"));
+        assert!(!creds.verify_password("mallory", ""));
+    }
 
     /// Client side of SCRAM-SHA-256, used to drive the verifier in tests.
     fn client_proof(password: &str, salt: &[u8], iterations: u32, auth_message: &str) -> Vec<u8> {

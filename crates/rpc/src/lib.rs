@@ -11,6 +11,7 @@ mod exchange_client;
 mod flight_service;
 mod heartbeat;
 mod output_buffer;
+mod security;
 pub mod task_descriptor;
 mod task_submission;
 
@@ -25,16 +26,22 @@ pub const MAX_FLIGHT_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub use dynamic_filter::{NotifyDynamicFilterRequest, ReportDynamicFilterRequest};
 pub use exchange_client::ExchangeClient;
 pub use flight_service::{
-    start_flight_server, BufferKind, DfNotifyCallback, DfReportCallback, FlightState,
+    serve_flight, start_flight_server, BufferKind, DfNotifyCallback, DfReportCallback, FlightState,
     HeartbeatCallback, TaskCallback, TaskStatusCallback, TaskStatusResponse,
 };
-pub use heartbeat::{send_heartbeat, HeartbeatMessage};
+pub use heartbeat::{send_heartbeat, send_heartbeat_with, HeartbeatError, HeartbeatMessage};
 pub use output_buffer::{
     BroadcastOutputBuffer, BroadcastStream, OutputBuffer, TrackedReceiver, TrackedSendOutcome,
     TrackedSender,
 };
+pub use security::{
+    cluster_security, connect, install_cluster_security, ClusterSecret, ClusterSecurity,
+    ClusterTls, FlightClient, MIN_CLUSTER_SECRET_LEN,
+};
 pub use task_descriptor::{SourceExchange, TaskDescriptor};
-pub use task_submission::{notify_dynamic_filter, report_dynamic_filters, submit_task};
+pub use task_submission::{
+    notify_dynamic_filter, report_dynamic_filters, submit_task, submit_task_with,
+};
 
 /// Test helper: create a FlightServiceServer for integration tests.
 #[doc(hidden)]

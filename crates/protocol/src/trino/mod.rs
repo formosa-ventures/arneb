@@ -16,6 +16,7 @@
 //! PostgreSQL wire protocol ([`crate::handler`]). See
 //! `docs/guide/trino-clients.md` for the supported surface.
 
+mod auth;
 mod engine;
 mod error;
 mod metadata;
@@ -33,12 +34,14 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::Extension;
 use axum::{Json, Router};
 use futures::FutureExt;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
+use tokio_rustls::TlsAcceptor;
 
 use arneb_catalog::CatalogManager;
 use arneb_common::identifiers::QueryId;
@@ -46,7 +49,9 @@ use arneb_connectors::ConnectorRegistry;
 use arneb_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
 use arneb_scheduler::{QueryState as TrackerState, QueryTracker};
 
+use crate::auth::{AuthConfigError, UserCredentials};
 use crate::handler::DistributedExecutor;
+use auth::{AuthUser, Authenticator};
 use engine::{Engine, QueryOutput};
 use error::TrinoError;
 use session::{ClientSession, HeaderFamily};
@@ -98,6 +103,9 @@ pub struct TrinoServer {
     distributed_executor: Option<Arc<dyn DistributedExecutor>>,
     memory_pool: Arc<dyn MemoryPool>,
     query_tracker: Option<Arc<QueryTracker>>,
+    tls: Option<TlsAcceptor>,
+    auth: Option<Authenticator>,
+    verifications: Arc<AtomicU64>,
 }
 
 impl TrinoServer {
@@ -115,7 +123,34 @@ impl TrinoServer {
             distributed_executor: None,
             memory_pool: Arc::new(UnboundedMemoryPool::new()),
             query_tracker: None,
+            tls: None,
+            auth: None,
+            verifications: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Require HTTP Basic auth against these users (`[auth] type =
+    /// "password"`); default: none, every `X-Trino-User` is trusted.
+    pub fn with_password_auth(
+        mut self,
+        creds: Option<Arc<UserCredentials>>,
+    ) -> Result<Self, AuthConfigError> {
+        self.auth = creds
+            .map(|c| Authenticator::new(c, Arc::clone(&self.verifications)))
+            .transpose()?;
+        Ok(self)
+    }
+
+    /// Count of full password verifications (cache misses); test hook.
+    #[doc(hidden)]
+    pub fn password_verifications(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.verifications)
+    }
+
+    /// Serve HTTPS only with this acceptor (default: plain HTTP).
+    pub fn with_tls(mut self, tls: Option<TlsAcceptor>) -> Self {
+        self.tls = tls;
+        self
     }
 
     /// Routes queries through the coordinator's distributed executor.
@@ -149,6 +184,8 @@ impl TrinoServer {
             tracker: self.query_tracker.clone(),
             started: Instant::now(),
             counter: Arc::new(AtomicU64::new(0)),
+            scheme: if self.tls.is_some() { "https" } else { "http" },
+            auth: self.auth.clone(),
         }
     }
 
@@ -157,6 +194,8 @@ impl TrinoServer {
         let listener = TcpListener::bind(&self.config.bind_address).await?;
         tracing::info!(
             address = %self.config.bind_address,
+            scheme = if self.tls.is_some() { "https" } else { "http" },
+            auth = if self.auth.is_some() { "password" } else { "none" },
             "Trino client protocol listening"
         );
         self.serve(listener).await
@@ -166,7 +205,61 @@ impl TrinoServer {
     pub async fn serve(&self, listener: TcpListener) -> std::io::Result<()> {
         let state = self.state();
         tokio::spawn(reaper(state.clone()));
-        axum::serve(listener, router(state)).await
+        match &self.tls {
+            None => axum::serve(listener, router(state)).await,
+            Some(acceptor) => serve_tls(listener, acceptor.clone(), router(state)).await,
+        }
+    }
+}
+
+/// How long a client gets to finish the TLS handshake.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// HTTPS accept loop: TCP accept → rustls handshake → hyper (HTTP/1.1 or h2
+/// by ALPN) serving the axum router. A failed handshake only drops that
+/// connection.
+async fn serve_tls(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    router: Router,
+) -> std::io::Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
+    use hyper_util::service::TowerToHyperService;
+
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Same back-off axum::serve uses (e.g. EMFILE).
+                tracing::warn!(error = %e, "Trino listener accept failed");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let router = router.clone();
+        tokio::spawn(async move {
+            let tls = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    tracing::debug!(peer = %peer, error = %e, "Trino TLS handshake failed");
+                    return;
+                }
+                Err(_) => {
+                    tracing::debug!(peer = %peer, "Trino TLS handshake timed out");
+                    return;
+                }
+            };
+            let service = TowerToHyperService::new(router);
+            if let Err(e) = auto::Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(TokioIo::new(tls), service)
+                .await
+            {
+                tracing::debug!(peer = %peer, error = %e, "Trino HTTPS connection closed");
+            }
+        });
     }
 }
 
@@ -178,9 +271,14 @@ struct AppState {
     tracker: Option<Arc<QueryTracker>>,
     started: Instant,
     counter: Arc<AtomicU64>,
+    /// Scheme for `nextUri` / `infoUri` when the client sends no
+    /// `X-Forwarded-Proto`: `https` when the listener serves TLS.
+    scheme: &'static str,
+    auth: Option<Authenticator>,
 }
 
 fn router(state: AppState) -> Router {
+    let auth = state.auth.clone();
     Router::new()
         .route("/v1/statement", post(submit))
         .route(
@@ -197,7 +295,26 @@ fn router(state: AppState) -> Router {
         .route("/v1/info/state", get(info_state))
         .route("/v1/status", get(info))
         .fallback(not_found)
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            auth::require_auth,
+        ))
+        .layer(axum::middleware::map_request(host_from_authority))
         .with_state(state)
+}
+
+/// HTTP/2 carries the host in the `:authority` pseudo-header, not `Host`.
+/// Copy it into `Host` so [`base_uri`] builds `nextUri` / `infoUri` from the
+/// address the client actually used (h2 is negotiated on the HTTPS
+/// listener).
+async fn host_from_authority(mut req: axum::extract::Request) -> axum::extract::Request {
+    if !req.headers().contains_key("Host") {
+        let authority = req.uri().authority().map(|a| a.as_str().to_owned());
+        if let Some(v) = authority.and_then(|a| HeaderValue::from_str(&a).ok()) {
+            req.headers_mut().insert("Host", v);
+        }
+    }
+    req
 }
 
 async fn not_found() -> Response {
@@ -264,7 +381,7 @@ fn new_query_id(counter: &AtomicU64) -> String {
     format!("{now}_{n:05}_{}", &rand[..5])
 }
 
-fn base_uri(headers: &HeaderMap) -> String {
+fn base_uri(headers: &HeaderMap, default_scheme: &str) -> String {
     let host = headers
         .get("X-Forwarded-Host")
         .or_else(|| headers.get("Host"))
@@ -273,7 +390,7 @@ fn base_uri(headers: &HeaderMap) -> String {
     let proto = headers
         .get("X-Forwarded-Proto")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
+        .unwrap_or(default_scheme);
     format!("{proto}://{host}")
 }
 
@@ -348,7 +465,7 @@ async fn submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
     });
     *query.abort.lock().unwrap() = Some(handle.abort_handle());
 
-    let base = base_uri(&headers);
+    let base = base_uri(&headers, state.scheme);
     let body = {
         let inner = query.inner.lock().unwrap();
         let mut doc = results_document(&query, &inner, &base, Some(1), None, None);
@@ -393,6 +510,11 @@ fn complete(state: &AppState, query: &Query, result: Result<QueryOutput, TrinoEr
     let _ = query.done.send(true);
 }
 
+/// Under password auth, a query is only visible to the user who submitted it.
+fn not_owner(user: &Option<Extension<AuthUser>>, query: &Query) -> bool {
+    matches!(user, Some(Extension(AuthUser(u))) if *u != query.user)
+}
+
 fn lookup(state: &AppState, id: &str, slug: &str) -> Option<Arc<Query>> {
     let queries = state.queries.lock().unwrap();
     queries.get(id).filter(|q| q.slug == slug).cloned()
@@ -401,12 +523,16 @@ fn lookup(state: &AppState, id: &str, slug: &str) -> Option<Arc<Query>> {
 async fn fetch(
     State(state): State<AppState>,
     Path((id, slug, token)): Path<(String, String, u64)>,
+    user: Option<Extension<AuthUser>>,
     headers: HeaderMap,
 ) -> Response {
     let Some(query) = lookup(&state, &id, &slug) else {
         return (StatusCode::NOT_FOUND, "Query not found").into_response();
     };
-    let base = base_uri(&headers);
+    if not_owner(&user, &query) {
+        return auth::forbidden("Query belongs to another user");
+    }
+    let base = base_uri(&headers, state.scheme);
 
     // Long-poll while the query is still executing.
     let running = {
@@ -640,18 +766,27 @@ fn cancel_query(state: &AppState, query: &Query, error: TrinoError, reason: &str
 async fn cancel(
     State(state): State<AppState>,
     Path((id, slug, _token)): Path<(String, String, u64)>,
+    user: Option<Extension<AuthUser>>,
 ) -> Response {
     let Some(query) = lookup(&state, &id, &slug) else {
         return StatusCode::NO_CONTENT.into_response();
     };
+    if not_owner(&user, &query) {
+        return auth::forbidden("Query belongs to another user");
+    }
     cancel_query(&state, &query, TrinoError::canceled(), "client DELETE");
     state.queries.lock().unwrap().remove(&id);
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn kill(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn kill(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    user: Option<Extension<AuthUser>>,
+) -> Response {
     let query = state.queries.lock().unwrap().get(&id).cloned();
     match query {
+        Some(q) if not_owner(&user, &q) => auth::forbidden("Query belongs to another user"),
         Some(q) => {
             cancel_query(&state, &q, TrinoError::canceled(), "kill");
             StatusCode::NO_CONTENT.into_response()
@@ -689,18 +824,31 @@ fn query_summary(query: &Query, base: &str) -> Value {
 async fn query_info(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    user: Option<Extension<AuthUser>>,
     headers: HeaderMap,
 ) -> Response {
     let query = state.queries.lock().unwrap().get(&id).cloned();
     match query {
-        Some(q) => Json(query_summary(&q, &base_uri(&headers))).into_response(),
+        Some(q) if not_owner(&user, &q) => auth::forbidden("Query belongs to another user"),
+        Some(q) => Json(query_summary(&q, &base_uri(&headers, state.scheme))).into_response(),
         None => (StatusCode::NOT_FOUND, "Query not found").into_response(),
     }
 }
 
-async fn list_queries(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let base = base_uri(&headers);
-    let queries: Vec<Arc<Query>> = state.queries.lock().unwrap().values().cloned().collect();
+async fn list_queries(
+    State(state): State<AppState>,
+    user: Option<Extension<AuthUser>>,
+    headers: HeaderMap,
+) -> Response {
+    let base = base_uri(&headers, state.scheme);
+    let queries: Vec<Arc<Query>> = state
+        .queries
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|q| !not_owner(&user, q))
+        .cloned()
+        .collect();
     Json(Value::Array(
         queries.iter().map(|q| query_summary(q, &base)).collect(),
     ))

@@ -10,17 +10,20 @@ arneb-common = { path = "../common" }
 arneb-planner = { path = "../planner" }
 arrow = { workspace = true }
 arrow-flight = "60"
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-aws-lc"] }
 prost = "0.14"
 tokio = { workspace = true, features = ["sync"] }
 futures.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-stream = "0.3"
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 tokio-stream = "0.1"
 arneb-common = { path = "../common" }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }

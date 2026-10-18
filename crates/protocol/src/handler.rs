@@ -103,6 +103,9 @@ pub struct HandlerFactory {
     /// both the Simple and Extended Query paths, which share one startup
     /// handler.
     pub auth: AuthMethod,
+    /// Reject StartupMessages on connections that did not negotiate TLS
+    /// (`[tls] pgwire = "required"`).
+    pub tls_required: bool,
 }
 
 impl PgWireServerHandlers for HandlerFactory {
@@ -127,7 +130,10 @@ impl PgWireServerHandlers for HandlerFactory {
     fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
         // pgwire calls this once per connection, so the SCRAM exchange state
         // inside the handler is never shared between clients.
-        Arc::new(AuthStartupHandler::new(self.auth.clone()))
+        Arc::new(AuthStartupHandler::new(
+            self.auth.clone(),
+            self.tls_required,
+        ))
     }
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {

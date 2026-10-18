@@ -1,11 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use arneb_common::types::DataType;
 use arneb_common::ServerConfig;
 use arneb_connectors::{CloudStorageConfig, S3StorageConfig};
-use arneb_protocol::{AuthMethod, ScramVerifier, UserCredentials};
+use arneb_protocol::{AuthMethod, PgwireTlsMode, ScramVerifier, UserCredentials};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -38,13 +38,159 @@ pub struct AppConfig {
     /// Trino client REST protocol listener (coordinator/standalone only).
     #[serde(default)]
     pub trino: TrinoProtocolConfig,
+
+    /// TLS for the client-facing listeners (pgwire, Trino). Raw file values;
+    /// the effective settings (env applied, validated) are in
+    /// [`AppConfig::tls_settings`].
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+
+    /// Effective TLS settings after env overrides and validation; `None`
+    /// means TLS is off.
+    #[serde(skip)]
+    pub tls_settings: Option<TlsSettings>,
+
+    /// Web UI listener (coordinator/standalone only).
+    #[serde(default)]
+    pub web: WebConfig,
+}
+
+/// `[web]` section.
+///
+/// ```toml
+/// [web]
+/// bind_address = "0.0.0.0"   # ARNEB_WEB_BIND_ADDRESS
+/// ```
+///
+/// The Web UI has no login and shows query text, so under
+/// `[auth] type = "password"` it binds to `127.0.0.1` unless this is set.
+/// The port stays at the pgwire port + 1000.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    #[serde(default)]
+    pub bind_address: Option<String>,
+}
+
+impl WebConfig {
+    /// Apply `ARNEB_WEB_BIND_ADDRESS` (env > file).
+    pub fn apply_env_overrides(&mut self, env: impl Fn(&str) -> Option<String>) {
+        if let Some(v) = env("ARNEB_WEB_BIND_ADDRESS") {
+            self.bind_address = Some(v);
+        }
+    }
+}
+
+/// Why the Web UI binds where it does (logged on `arneb::config`).
+pub const WEB_BIND_DEFAULT: &str = "default";
+pub const WEB_BIND_LOOPBACK: &str = "loopback (auth=password)";
+pub const WEB_BIND_EXPLICIT: &str = "explicit";
+
+/// Resolve the Web UI bind host: an explicit `[web] bind_address` wins;
+/// otherwise `127.0.0.1` under password auth and the server's
+/// `bind_address` without it. Returns `(host, reason)`.
+pub fn resolve_web_bind(
+    auth: AuthType,
+    server_bind: &str,
+    web_bind: Option<&str>,
+) -> Result<(String, &'static str)> {
+    let (host, reason) = match (web_bind.map(str::trim), auth) {
+        (Some(explicit), _) => (explicit.to_owned(), WEB_BIND_EXPLICIT),
+        (None, AuthType::Password) => ("127.0.0.1".to_owned(), WEB_BIND_LOOPBACK),
+        (None, AuthType::None) => (server_bind.to_owned(), WEB_BIND_DEFAULT),
+    };
+    if host != "localhost" && host.parse::<std::net::IpAddr>().is_err() {
+        bail!("invalid [web] bind_address '{host}' (expected an IP address)");
+    }
+    Ok((host, reason))
+}
+
+/// Whether a bind host only listens on loopback.
+pub fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// `[tls]` section: one certificate for both client-facing listeners.
+///
+/// ```toml
+/// [tls]
+/// cert_path = "/etc/arneb/server.crt"   # PEM chain, leaf first  (ARNEB_TLS_CERT_PATH)
+/// key_path  = "/etc/arneb/server.key"   # PEM private key        (ARNEB_TLS_KEY_PATH)
+/// pgwire    = "required"                # "required" (default) | "optional" (ARNEB_TLS_PGWIRE)
+/// ```
+///
+/// Setting both `ARNEB_TLS_*_PATH` variables enables TLS without the section.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub pgwire: Option<String>,
+}
+
+/// Validated `[tls]` settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsSettings {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    pub pgwire: PgwireTlsMode,
+}
+
+impl TlsConfig {
+    /// Apply `ARNEB_TLS_*` overrides (looked up through `env`) on top of the
+    /// file section and validate. `Ok(None)` means TLS is off.
+    pub fn resolve(
+        file: Option<&TlsConfig>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<TlsSettings>> {
+        let mut c = file.cloned().unwrap_or_default();
+        let section = file.is_some();
+        if let Some(v) = env("ARNEB_TLS_CERT_PATH") {
+            c.cert_path = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env("ARNEB_TLS_KEY_PATH") {
+            c.key_path = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env("ARNEB_TLS_PGWIRE") {
+            c.pgwire = Some(v);
+        }
+        let pgwire = match c.pgwire.as_deref() {
+            None => PgwireTlsMode::default(),
+            Some(m) => m
+                .parse()
+                .map_err(|e| anyhow::anyhow!("[tls] pgwire: {e}"))?,
+        };
+        match (c.cert_path, c.key_path) {
+            (Some(cert_path), Some(key_path)) => Ok(Some(TlsSettings {
+                cert_path,
+                key_path,
+                pgwire,
+            })),
+            (None, None) if !section && c.pgwire.is_none() => Ok(None),
+            (Some(_), None) => {
+                bail!("[tls] key_path is required when cert_path is set (or ARNEB_TLS_KEY_PATH)")
+            }
+            (None, Some(_)) => {
+                bail!("[tls] cert_path is required when key_path is set (or ARNEB_TLS_CERT_PATH)")
+            }
+            (None, None) => bail!(
+                "[tls] cert_path and key_path are required (or ARNEB_TLS_CERT_PATH / ARNEB_TLS_KEY_PATH)"
+            ),
+        }
+    }
 }
 
 /// `[auth]` section: client authentication for the server.
 ///
-/// One credential store for every client-facing listener. Today it is
-/// enforced on the pgwire port; the Trino listener will verify HTTP Basic
-/// passwords against the same `[[auth.users]]` in a follow-up.
+/// One credential store for every client-facing listener. Password auth is
+/// enforced on pgwire (SCRAM) and on the Trino listener (HTTP Basic against
+/// the same verifiers).
 ///
 /// ```toml
 /// [auth]
@@ -129,6 +275,35 @@ impl AuthConfig {
             }
         }
     }
+}
+
+/// Fail closed: `[cluster.tls]` without a `[cluster]` secret encrypts the
+/// Flight port but authenticates no peer (the server asks for no client
+/// certificate), so on a non-loopback bind any host that reaches it could
+/// submit tasks and read exchange data.
+pub fn check_cluster_transport(secret: bool, tls: bool, bind_address: &str) -> Result<()> {
+    if tls && !secret && !is_loopback_host(bind_address) {
+        bail!(
+            "[cluster.tls] is set without a [cluster] secret on non-loopback bind_address \
+             '{bind_address}': TLS encrypts cluster RPC but does not authenticate peers. Set \
+             [cluster] secret (or ARNEB_CLUSTER_SECRET) on every node"
+        );
+    }
+    Ok(())
+}
+
+/// Fail closed: password auth on an enabled Trino listener needs `[tls]`.
+/// Trino clients only send passwords over HTTPS, so a plain-HTTP listener
+/// under password auth would be either unusable or a bypass.
+pub fn check_trino_transport(trino_enabled: bool, password_auth: bool, tls: bool) -> Result<()> {
+    if trino_enabled && password_auth && !tls {
+        bail!(
+            "[auth] type = \"password\" requires TLS on the Trino listener: configure [tls] \
+             (or ARNEB_TLS_CERT_PATH / ARNEB_TLS_KEY_PATH), or disable the listener with \
+             --no-trino / ARNEB_TRINO_ENABLED=false"
+        );
+    }
+    Ok(())
 }
 
 /// Trino client REST protocol (`POST /v1/statement`) listener.
@@ -502,6 +677,103 @@ pub struct ClusterConfig {
     /// share the same loopback (e.g. all on one host or k8s pod).
     #[serde(default)]
     pub advertised_address: Option<String>,
+
+    /// Shared secret every node sends as `authorization: Bearer` on cluster
+    /// RPC (`ARNEB_CLUSTER_SECRET`, preferred). At least 32 characters.
+    #[serde(default)]
+    pub secret: Option<RedactedString>,
+
+    /// TLS between nodes (`[cluster.tls]`).
+    #[serde(default)]
+    pub tls: Option<ClusterTlsConfig>,
+}
+
+/// A string that never appears in `Debug` output.
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct RedactedString(pub String);
+
+impl std::fmt::Debug for RedactedString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// `[cluster.tls]`: this node's certificate and key, plus the CA that
+/// signed every node's certificate (all PEM).
+///
+/// ```toml
+/// [cluster.tls]
+/// cert_path = "/etc/arneb/node.crt"   # ARNEB_CLUSTER_TLS_CERT_PATH
+/// key_path  = "/etc/arneb/node.key"   # ARNEB_CLUSTER_TLS_KEY_PATH
+/// ca_path   = "/etc/arneb/ca.crt"     # ARNEB_CLUSTER_TLS_CA_PATH
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterTlsConfig {
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub ca_path: Option<PathBuf>,
+}
+
+impl ClusterConfig {
+    /// Build the cluster RPC security from `[cluster] secret` /
+    /// `[cluster.tls]` with `ARNEB_CLUSTER_*` overrides (looked up through
+    /// `env`). Reads the PEM files.
+    pub fn security(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<arneb_rpc::ClusterSecurity> {
+        let secret = env("ARNEB_CLUSTER_SECRET")
+            .or_else(|| self.secret.as_ref().map(|s| s.0.clone()))
+            .map(arneb_rpc::ClusterSecret::new)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let mut tls = self.tls.clone();
+        for (var, field) in [
+            ("ARNEB_CLUSTER_TLS_CERT_PATH", 0),
+            ("ARNEB_CLUSTER_TLS_KEY_PATH", 1),
+            ("ARNEB_CLUSTER_TLS_CA_PATH", 2),
+        ] {
+            if let Some(v) = env(var) {
+                let t = tls.get_or_insert_with(ClusterTlsConfig::default);
+                let slot = match field {
+                    0 => &mut t.cert_path,
+                    1 => &mut t.key_path,
+                    _ => &mut t.ca_path,
+                };
+                *slot = Some(PathBuf::from(v));
+            }
+        }
+        let tls = match tls {
+            None => None,
+            Some(ClusterTlsConfig {
+                cert_path: Some(cert),
+                key_path: Some(key),
+                ca_path: Some(ca),
+            }) => {
+                let read = |name: &str, p: &Path| -> Result<Vec<u8>> {
+                    std::fs::read(p).map_err(|e| {
+                        anyhow::anyhow!("[cluster.tls] cannot read {name} {}: {e}", p.display())
+                    })
+                };
+                Some(arneb_rpc::ClusterTls {
+                    cert_pem: read("cert_path", &cert)?,
+                    key_pem: read("key_path", &key)?,
+                    ca_pem: read("ca_path", &ca)?,
+                })
+            }
+            Some(_) => bail!(
+                "[cluster.tls] needs cert_path, key_path and ca_path (or \
+                 ARNEB_CLUSTER_TLS_CERT_PATH / _KEY_PATH / _CA_PATH)"
+            ),
+        };
+        Ok(arneb_rpc::ClusterSecurity { secret, tls })
+    }
 }
 
 fn default_role() -> String {
@@ -520,6 +792,8 @@ impl Default for ClusterConfig {
             rpc_port: default_rpc_port(),
             worker_id: None,
             advertised_address: None,
+            secret: None,
+            tls: None,
         }
     }
 }
@@ -588,6 +862,9 @@ impl AppConfig {
                         memory: MemoryConfig::default(),
                         auth: AuthConfig::default(),
                         trino: TrinoProtocolConfig::default(),
+                        tls: None,
+                        tls_settings: None,
+                        web: WebConfig::default(),
                     }
                 }
             }
@@ -598,6 +875,9 @@ impl AppConfig {
         server.validate()?;
         let mut trino = config.trino;
         trino.apply_env_overrides()?;
+        let tls_settings = TlsConfig::resolve(config.tls.as_ref(), |k| std::env::var(k).ok())?;
+        let mut web = config.web;
+        web.apply_env_overrides(|k| std::env::var(k).ok());
 
         Ok(AppConfig {
             server,
@@ -608,6 +888,9 @@ impl AppConfig {
             memory: config.memory,
             auth: config.auth,
             trino,
+            tls: config.tls,
+            tls_settings,
+            web,
         })
     }
 }
@@ -711,6 +994,188 @@ port = 18080
         .unwrap();
         assert!(!config.trino.enabled);
         assert_eq!(config.trino.port, 18080);
+    }
+
+    fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    #[test]
+    fn test_tls_section_omitted_is_off() {
+        let config: AppConfig = toml::from_str("port = 5432").unwrap();
+        assert!(config.tls.is_none());
+        assert_eq!(TlsConfig::resolve(None, env_from(&[])).unwrap(), None);
+    }
+
+    #[test]
+    fn test_tls_section_defaults_to_required() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[tls]
+cert_path = "/c.pem"
+key_path = "/k.pem"
+"#,
+        )
+        .unwrap();
+        let tls = TlsConfig::resolve(config.tls.as_ref(), env_from(&[]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(tls.cert_path, PathBuf::from("/c.pem"));
+        assert_eq!(tls.key_path, PathBuf::from("/k.pem"));
+        assert_eq!(tls.pgwire, PgwireTlsMode::Required);
+    }
+
+    #[test]
+    fn test_tls_env_overrides_file() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[tls]
+cert_path = "/c.pem"
+key_path = "/k.pem"
+pgwire = "required"
+"#,
+        )
+        .unwrap();
+        let tls = TlsConfig::resolve(
+            config.tls.as_ref(),
+            env_from(&[
+                ("ARNEB_TLS_CERT_PATH", "/env.pem"),
+                ("ARNEB_TLS_PGWIRE", "optional"),
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tls.cert_path, PathBuf::from("/env.pem"));
+        assert_eq!(tls.key_path, PathBuf::from("/k.pem"));
+        assert_eq!(tls.pgwire, PgwireTlsMode::Optional);
+
+        // Both path variables enable TLS without a [tls] section.
+        let tls = TlsConfig::resolve(
+            None,
+            env_from(&[("ARNEB_TLS_CERT_PATH", "/c"), ("ARNEB_TLS_KEY_PATH", "/k")]),
+        )
+        .unwrap();
+        assert!(tls.is_some());
+    }
+
+    #[test]
+    fn test_tls_validation_errors() {
+        let only_cert: AppConfig = toml::from_str("[tls]\ncert_path = \"/c.pem\"\n").unwrap();
+        let err = TlsConfig::resolve(only_cert.tls.as_ref(), env_from(&[])).unwrap_err();
+        assert!(err.to_string().contains("key_path"), "{err}");
+
+        let bad_mode: AppConfig =
+            toml::from_str("[tls]\ncert_path = \"/c\"\nkey_path = \"/k\"\npgwire = \"prefer\"\n")
+                .unwrap();
+        let err = TlsConfig::resolve(bad_mode.tls.as_ref(), env_from(&[])).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("required") && msg.contains("optional"),
+            "{msg}"
+        );
+
+        assert!(toml::from_str::<AppConfig>("[tls]\ncert = \"/c\"\n").is_err());
+
+        let err =
+            TlsConfig::resolve(None, env_from(&[("ARNEB_TLS_PGWIRE", "optional")])).unwrap_err();
+        assert!(err.to_string().contains("cert_path"), "{err}");
+    }
+
+    #[test]
+    fn test_trino_password_auth_fails_closed_without_tls() {
+        let err = check_trino_transport(true, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[tls]") && err.contains("--no-trino"), "{err}");
+        check_trino_transport(true, true, true).unwrap();
+        check_trino_transport(false, true, false).unwrap();
+        check_trino_transport(true, false, false).unwrap();
+    }
+
+    #[test]
+    fn test_cluster_tls_without_secret_fails_closed_off_loopback() {
+        let err = check_cluster_transport(false, true, "0.0.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[cluster] secret") && err.contains("0.0.0.0"),
+            "{err}"
+        );
+        check_cluster_transport(true, true, "0.0.0.0").unwrap();
+        check_cluster_transport(false, true, "127.0.0.1").unwrap();
+        check_cluster_transport(false, true, "localhost").unwrap();
+        check_cluster_transport(false, false, "0.0.0.0").unwrap();
+    }
+
+    #[test]
+    fn test_resolve_web_bind() {
+        assert_eq!(
+            resolve_web_bind(AuthType::None, "0.0.0.0", None).unwrap(),
+            ("0.0.0.0".to_owned(), WEB_BIND_DEFAULT)
+        );
+        assert_eq!(
+            resolve_web_bind(AuthType::Password, "0.0.0.0", None).unwrap(),
+            ("127.0.0.1".to_owned(), WEB_BIND_LOOPBACK)
+        );
+        for auth in [AuthType::None, AuthType::Password] {
+            assert_eq!(
+                resolve_web_bind(auth, "127.0.0.1", Some("0.0.0.0")).unwrap(),
+                ("0.0.0.0".to_owned(), WEB_BIND_EXPLICIT)
+            );
+        }
+        assert!(resolve_web_bind(AuthType::Password, "0.0.0.0", Some("not an ip")).is_err());
+        assert!(is_loopback_host("127.0.0.1") && is_loopback_host("::1"));
+        assert!(!is_loopback_host("0.0.0.0"));
+    }
+
+    #[test]
+    fn test_web_bind_env_overrides_file() {
+        let config: AppConfig = toml::from_str("[web]\nbind_address = \"10.0.0.5\"\n").unwrap();
+        let mut web = config.web;
+        assert_eq!(web.bind_address.as_deref(), Some("10.0.0.5"));
+        web.apply_env_overrides(env_from(&[("ARNEB_WEB_BIND_ADDRESS", "0.0.0.0")]));
+        assert_eq!(web.bind_address.as_deref(), Some("0.0.0.0"));
+        assert!(toml::from_str::<AppConfig>("[web]\nport = 1\n").is_err());
+    }
+
+    #[test]
+    fn test_cluster_secret_from_env_and_validation() {
+        let config: AppConfig = toml::from_str("[cluster]\nrole = \"worker\"\n").unwrap();
+        let sec = config
+            .cluster
+            .security(env_from(&[("ARNEB_CLUSTER_SECRET", &"k".repeat(40))]))
+            .unwrap();
+        assert!(sec.secret.is_some() && sec.tls.is_none());
+
+        let short: AppConfig = toml::from_str("[cluster]\nsecret = \"tooshort\"\n").unwrap();
+        let err = short
+            .cluster
+            .security(env_from(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("32"), "{err}");
+        assert!(!format!("{:?}", short.cluster).contains("tooshort"));
+
+        let none: AppConfig = toml::from_str("port = 5432").unwrap();
+        let sec = none.cluster.security(env_from(&[])).unwrap();
+        assert!(sec.secret.is_none() && sec.tls.is_none());
+    }
+
+    #[test]
+    fn test_cluster_tls_requires_all_paths() {
+        let config: AppConfig =
+            toml::from_str("[cluster.tls]\ncert_path = \"/nope.crt\"\n").unwrap();
+        let err = config
+            .cluster
+            .security(env_from(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("key_path") && err.contains("ca_path"), "{err}");
+        assert!(toml::from_str::<AppConfig>("[cluster.tls]\ncert = \"/x\"\n").is_err());
     }
 
     #[test]

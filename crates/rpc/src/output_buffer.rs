@@ -513,8 +513,9 @@ impl BroadcastOutputBuffer {
     }
 
     /// Create a new consumer stream. Each call returns an independent
-    /// `BroadcastStream` that replays the historical batches before
-    /// tailing new ones. Multiple consumers can be subscribed
+    /// `BroadcastStream` that replays the historical batches from the
+    /// first row before tailing new ones (a resumed read relies on it,
+    /// see `broadcast_late_subscriber_replays_history`). Multiple consumers can be subscribed
     /// concurrently; they do not interfere.
     pub fn subscribe(&self) -> BroadcastStream {
         self.subscribe_from_row(0)
@@ -533,18 +534,18 @@ impl BroadcastOutputBuffer {
 
     /// Clone the shared failure flag. B-fix-3 parity (A2.1.2, 2026-05-28):
     /// the producer pumper task calls `set` on the returned handle when
-    /// it errors; the Flight `do_get` handler calls `take_failure()`
-    /// after the consumer's `BroadcastStream` returns `None` to detect
-    /// that the stream is truncated because of a producer error rather
-    /// than a normal end of input.
+    /// it errors; the Flight `do_get` handler reads it after the
+    /// consumer's `BroadcastStream` returns `None` to detect that the
+    /// stream is truncated because of a producer error rather than a
+    /// normal end of input. Unlike `OutputBuffer`'s, it is never cleared:
+    /// a broadcast has many readers and each must see the failure.
     pub fn failure_handle(&self) -> Arc<Mutex<Option<crate::TaskFailure>>> {
         Arc::clone(&self.inner.failure)
     }
 
-    /// Returns and clears the recorded failure, if any.
-    /// Mirror of `OutputBuffer::take_failure`.
-    pub fn take_failure(&self) -> Option<crate::TaskFailure> {
-        self.inner.failure.lock().ok()?.take()
+    /// The recorded failure, if any. Left in place for the other readers.
+    pub fn failure(&self) -> Option<crate::TaskFailure> {
+        self.inner.failure.lock().ok()?.clone()
     }
 }
 

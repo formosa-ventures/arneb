@@ -28,8 +28,10 @@ const MAX_RESUME_ATTEMPTS: usize = 3;
 pub struct ExchangeClient {
     /// Address of the remote Flight server (e.g., "http://host:9090").
     address: String,
-    /// Cluster credentials; the process-wide installed ones by default.
-    security: ClusterSecurity,
+    /// Explicit cluster credentials; `None` uses the process-wide
+    /// installed ones. Shared, so cloning the client per stream copies no
+    /// TLS material.
+    security: Option<Arc<ClusterSecurity>>,
 }
 
 impl ExchangeClient {
@@ -37,13 +39,13 @@ impl ExchangeClient {
     pub fn new(address: impl Into<String>) -> Self {
         Self {
             address: address.into(),
-            security: cluster_security().clone(),
+            security: None,
         }
     }
 
     /// Use explicit cluster security instead of the installed one.
     pub fn with_security(mut self, security: ClusterSecurity) -> Self {
-        self.security = security;
+        self.security = Some(Arc::new(security));
         self
     }
 
@@ -62,6 +64,11 @@ impl ExchangeClient {
     ///   to cover dispatch-to-start latency, then fail.
     /// - **Internal** — task failed before producing output. Fail
     ///   immediately with the worker's error message.
+    ///
+    /// A transport break before the response arrives (`Unknown`, #139)
+    /// reconnects and asks again, up to [`MAX_RESUME_ATTEMPTS`] times. A
+    /// partitioned buffer the lost response already took answers the
+    /// retry with `AlreadyExists`; the transport error is reported then.
     pub async fn fetch_partition(
         &self,
         task_id: &str,
@@ -87,6 +94,8 @@ impl ExchangeClient {
             tokio::time::Instant::now() + std::time::Duration::from_secs(safety_secs);
 
         let mut client = self.connect().await?;
+        let mut transport_attempts = 0usize;
+        let mut transport_error: Option<tonic::Status> = None;
 
         loop {
             let ticket = Ticket::new(ticket_text.clone());
@@ -137,7 +146,31 @@ impl ExchangeClient {
                     ));
                 }
 
+                // The connection broke before the response: reconnect.
+                Err(status)
+                    if status.code() == tonic::Code::Unknown
+                        && transport_attempts < MAX_RESUME_ATTEMPTS =>
+                {
+                    transport_attempts += 1;
+                    tracing::warn!(
+                        target: "arneb::exchange",
+                        ticket = %ticket_text,
+                        address = %self.address,
+                        attempt = transport_attempts,
+                        error = %status,
+                        "exchange do_get broke before the response, reconnecting"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50 << transport_attempts))
+                        .await;
+                    if let Ok(reconnected) = self.connect().await {
+                        client = reconnected;
+                    }
+                    transport_error.get_or_insert(status);
+                    continue;
+                }
+
                 Err(e) => {
+                    let e = transport_error.unwrap_or(e);
                     return Err(ExecutionError::InvalidOperation(format!(
                         "Flight do_get failed: {e}"
                     )));
@@ -151,7 +184,11 @@ impl ExchangeClient {
     /// A Flight connection with this client's cluster security (bearer
     /// secret, TLS), for the first `do_get` and for every reopen.
     async fn connect(&self) -> Result<crate::security::FlightClient, ExecutionError> {
-        crate::security::connect(&self.address, &self.security)
+        let security = self
+            .security
+            .as_deref()
+            .unwrap_or_else(|| cluster_security());
+        crate::security::connect(&self.address, security)
             .await
             .map_err(|e| ExecutionError::InvalidOperation(format!("Flight server: {e}")))
     }

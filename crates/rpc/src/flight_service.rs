@@ -856,10 +856,24 @@ mod tests {
         handle.abort();
     }
 
+    /// Where [`proxy`] cuts its first connection.
+    #[derive(Clone, Copy)]
+    enum Cut {
+        /// After forwarding this many bytes from the server.
+        AfterBytes(usize),
+        /// Just before the server's first h2 HEADERS frame: the request
+        /// reached the server but its response never arrives.
+        BeforeResponseHeaders,
+    }
+
     /// #139: a TCP proxy to `target` that cuts its first connection after
     /// forwarding `cut_after` bytes from the server (no GOAWAY, like the
     /// h2 `BrokenPipe` seen under load). Later connections pass through.
     async fn cutting_proxy(target: std::net::SocketAddr, cut_after: usize) -> String {
+        proxy(target, Cut::AfterBytes(cut_after)).await
+    }
+
+    async fn proxy(target: std::net::SocketAddr, cut: Cut) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -867,7 +881,7 @@ mod tests {
             let mut first = true;
             loop {
                 let (inbound, _) = listener.accept().await.unwrap();
-                let cut = std::mem::take(&mut first).then_some(cut_after);
+                let cut = std::mem::take(&mut first).then_some(cut);
                 tokio::spawn(async move {
                     let outbound = tokio::net::TcpStream::connect(target).await.unwrap();
                     let (mut client_read, mut client_write) = inbound.into_split();
@@ -875,13 +889,37 @@ mod tests {
                     let upstream = tokio::io::copy(&mut client_read, &mut server_write);
                     let downstream = async {
                         let mut sent = 0usize;
+                        // Server-to-client bytes seen, for finding h2 frame
+                        // boundaries (the server sends no preface).
+                        let mut seen = Vec::new();
+                        let mut next_frame = 0usize;
                         let mut buf = vec![0u8; 16 * 1024];
                         loop {
                             let n = server_read.read(&mut buf).await.unwrap_or(0);
                             if n == 0 {
                                 return;
                             }
-                            let n = match cut {
+                            let limit = match cut {
+                                Some(Cut::AfterBytes(limit)) => Some(limit),
+                                Some(Cut::BeforeResponseHeaders) => {
+                                    seen.extend_from_slice(&buf[..n]);
+                                    let mut at = None;
+                                    while next_frame + 9 <= seen.len() {
+                                        let h = &seen[next_frame..next_frame + 9];
+                                        if h[3] == 0x1 {
+                                            at = Some(next_frame);
+                                            break;
+                                        }
+                                        let len = (usize::from(h[0]) << 16)
+                                            | (usize::from(h[1]) << 8)
+                                            | usize::from(h[2]);
+                                        next_frame += 9 + len;
+                                    }
+                                    at
+                                }
+                                None => None,
+                            };
+                            let n = match limit {
                                 Some(limit) if sent + n >= limit => {
                                     let _ = client_write.write_all(&buf[..limit - sent]).await;
                                     return;
@@ -1013,7 +1051,6 @@ mod tests {
                 .await
                 .unwrap();
         });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let client =
             crate::ExchangeClient::new(cutting_proxy(addr, 300_007).await).with_security(security);
 
@@ -1078,6 +1115,71 @@ mod tests {
         assert!(err.contains("Flight stream error"), "{err}");
         assert!(rows < 200_000, "rows={rows}");
         producer.abort();
+        handle.abort();
+    }
+
+    /// #140 review: a break before the response headers fails the `do_get`
+    /// call itself (no stream yet). A broadcast ticket is reconnected and
+    /// read in full.
+    #[tokio::test]
+    async fn broadcast_do_get_retries_a_break_before_the_response() {
+        let schema = test_schema();
+        let buffer = Arc::new(BroadcastOutputBuffer::new(schema.clone()));
+        for b in 0..10 {
+            buffer.write_batch(numbered_batch(&schema, b, 100));
+        }
+        buffer.finish();
+        let state = FlightState::new();
+        state.register_broadcast_buffer("q.bcast".into(), buffer);
+        let (addr, handle) = start_server_at(state).await;
+        let client = crate::ExchangeClient::new(proxy(addr, Cut::BeforeResponseHeaders).await);
+
+        use futures::TryStreamExt;
+        let batches: Vec<_> = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            client
+                .fetch_partition("q.bcast", 0)
+                .await
+                .expect("do_get retried after the break")
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .await
+        .expect("no hang")
+        .expect("read succeeds");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1000);
+        handle.abort();
+    }
+
+    /// The same break on a partitioned ticket: the server already handed
+    /// the buffer to the lost response, so the retry is refused and the
+    /// original transport error surfaces instead of `AlreadyExists`.
+    #[tokio::test]
+    async fn partitioned_do_get_break_surfaces_the_transport_error() {
+        let schema = test_schema();
+        let mut buf = OutputBuffer::single(256, schema.clone());
+        let sender = buf.take_senders().into_iter().next().unwrap();
+        let state = FlightState::new();
+        state.register_partitioned_buffer("q.part".into(), buf);
+        sender.send(numbered_batch(&schema, 0, 100)).await.unwrap();
+        drop(sender);
+        let (addr, handle) = start_server_at(state).await;
+        let client = crate::ExchangeClient::new(proxy(addr, Cut::BeforeResponseHeaders).await);
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.fetch_partition("q.part", 0),
+        )
+        .await
+        .expect("no hang")
+        .err()
+        .expect("the break surfaces as an error")
+        .to_string();
+        assert!(err.contains("Flight do_get failed"), "{err}");
+        assert!(
+            !err.contains("AlreadyExists") && !err.contains("already"),
+            "{err}"
+        );
         handle.abort();
     }
 }

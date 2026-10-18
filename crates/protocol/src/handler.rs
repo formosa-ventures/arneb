@@ -1732,7 +1732,10 @@ mod tests {
         assert_eq!(admission_label("  SELECT\n  1\t, 2 "), "SELECT 1 , 2");
         let eighty = "x".repeat(80);
         assert_eq!(admission_label(&eighty), eighty);
-        assert_eq!(admission_label(&format!("{eighty} y")), format!("{eighty}…"));
+        assert_eq!(
+            admission_label(&format!("{eighty} y")),
+            format!("{eighty}…")
+        );
         assert_eq!(
             admission_label(&format!("{} é", "x".repeat(79))),
             format!("{} …", "x".repeat(79))

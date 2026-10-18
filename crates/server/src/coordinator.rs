@@ -409,8 +409,10 @@ impl Drop for CancelGuard {
             workers = workers.len(),
             "cancelling query on workers"
         );
+        // All workers at once: one unreachable worker (waiting out its
+        // connect timeout) must not delay the cancel on the others.
         runtime.spawn(async move {
-            for addr in workers {
+            futures::future::join_all(workers.into_iter().map(|addr| async move {
                 if let Err(e) = arneb_rpc::cancel_query(&addr, query_id).await {
                     tracing::warn!(
                         target: "arneb::cluster",
@@ -420,7 +422,8 @@ impl Drop for CancelGuard {
                         "cancel_query delivery failed"
                     );
                 }
-            }
+            }))
+            .await;
         });
     }
 }
@@ -1218,6 +1221,26 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(seen_a.lock().unwrap().len(), 1);
         assert_eq!(seen_b.lock().unwrap().len(), 1);
+    }
+
+    /// #145: workers are cancelled concurrently, so a worker that never
+    /// answers does not hold up the cancel on the others.
+    #[tokio::test]
+    async fn cancel_guard_does_not_wait_on_a_hung_worker() {
+        // Accepts connections and never speaks: a call to it hangs.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hung = format!("http://127.0.0.1:{}", silent.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = silent.accept().await {
+                held.push(sock);
+            }
+        });
+        let (a, seen) = recording_worker().await;
+        let q = QueryId::new();
+        drop(CancelGuard::new(q, vec![hung, a]));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(*seen.lock().unwrap(), vec![q]);
     }
 
     /// Dropping the future of a query whose tasks are dispatched (here: a

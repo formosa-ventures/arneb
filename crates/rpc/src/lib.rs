@@ -41,10 +41,7 @@ pub use security::{
     ClusterTls, FlightClient, MIN_CLUSTER_SECRET_LEN,
 };
 pub use task_descriptor::{SourceExchange, TaskDescriptor};
-pub use task_error::{
-    describe_execution_failure, describe_task_failure, tag_resource_exhausted,
-    RESOURCE_EXHAUSTED_TAG,
-};
+pub use task_error::TaskFailure;
 pub use task_submission::{
     cancel_query, cancel_query_with, notify_dynamic_filter, report_dynamic_filters, submit_task,
     submit_task_with,

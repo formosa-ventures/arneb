@@ -99,6 +99,13 @@ impl AdmissionController {
     /// rejected because the queue is full. Await [`Pending::wait`] for the
     /// permit.
     pub fn admit(&self, label: &str) -> Result<Pending, AdmissionError> {
+        self.admit_with(|| label.to_owned())
+    }
+
+    /// [`Self::admit`] with the label built only when the query is queued,
+    /// the one case that logs it: a query admitted at once costs no
+    /// allocation for its label.
+    pub fn admit_with(&self, label: impl FnOnce() -> String) -> Result<Pending, AdmissionError> {
         let mut state = self.shared.lock();
         let unlimited = self.shared.max_running == 0;
         if unlimited || (state.running < self.shared.max_running && state.queue.is_empty()) {
@@ -106,7 +113,7 @@ impl AdmissionController {
             return Ok(Pending {
                 shared: Arc::clone(&self.shared),
                 inner: PendingInner::Admitted,
-                label: label.to_owned(),
+                label: String::new(),
                 since: Instant::now(),
             });
         }
@@ -116,6 +123,7 @@ impl AdmissionController {
                 queued: state.queue.len(),
             });
         }
+        let label = label();
         let (tx, rx) = oneshot::channel();
         let id = state.next_id;
         state.next_id += 1;
@@ -123,7 +131,7 @@ impl AdmissionController {
         let position = state.queue.len();
         tracing::info!(
             target: "arneb::admission",
-            query = label,
+            query = %label,
             position,
             running = state.running,
             max_running = self.shared.max_running,
@@ -136,7 +144,7 @@ impl AdmissionController {
                 grant: rx,
                 position,
             },
-            label: label.to_owned(),
+            label,
             since: Instant::now(),
         })
     }
@@ -191,6 +199,7 @@ enum PendingInner {
 pub struct Pending {
     shared: Arc<Shared>,
     inner: PendingInner,
+    /// Empty when the query was admitted at once.
     label: String,
     since: Instant,
 }
@@ -273,6 +282,26 @@ mod tests {
 
     async fn admitted(c: &AdmissionController) -> AdmissionPermit {
         c.admit("q").unwrap().wait().await
+    }
+
+    /// The label is built only for a query that has to queue.
+    #[tokio::test]
+    async fn label_is_built_only_when_queued() {
+        let c = AdmissionController::new(1, 10);
+        let built = std::cell::Cell::new(0);
+        let label = || {
+            built.set(built.get() + 1);
+            "q".to_owned()
+        };
+        let _running = c.admit_with(label).unwrap().wait().await;
+        assert_eq!(built.get(), 0);
+        let queued = c.admit_with(label).unwrap();
+        assert_eq!(queued.queue_position(), Some(1));
+        assert_eq!(built.get(), 1);
+
+        let unlimited = AdmissionController::new(0, 0);
+        let _a = unlimited.admit_with(label).unwrap();
+        assert_eq!(built.get(), 1);
     }
 
     #[tokio::test]

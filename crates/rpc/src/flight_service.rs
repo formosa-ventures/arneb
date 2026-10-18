@@ -32,7 +32,7 @@ pub enum TaskStatusResponse {
     /// Task is executing; buffer will appear eventually.
     Running,
     /// Task failed before registering its output buffer.
-    Failed(String),
+    Failed(crate::TaskFailure),
 }
 
 /// Callback that resolves a task's liveness on this worker. Keyed by the
@@ -334,10 +334,8 @@ impl FlightService for TrinoFlightService {
                                 "task '{task_id}' running, buffer not yet registered"
                             )));
                         }
-                        Some(TaskStatusResponse::Failed(reason)) => {
-                            return Err(crate::task_error::failure_status(format!(
-                                "task '{task_id}' failed: {reason}"
-                            )));
+                        Some(TaskStatusResponse::Failed(failure)) => {
+                            return Err(failure.to_status(format_args!("task '{task_id}' failed")));
                         }
                         None => {}
                     }
@@ -502,7 +500,7 @@ impl FlightService for TrinoFlightService {
 fn async_stream(
     schema: Arc<arrow::datatypes::Schema>,
     mut receiver: crate::output_buffer::TrackedReceiver,
-    failure: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    failure: std::sync::Arc<std::sync::Mutex<Option<crate::TaskFailure>>>,
     ticket: String,
 ) -> BoxedStream<FlightData> {
     use arrow_flight::encode::FlightDataEncoderBuilder;
@@ -529,9 +527,10 @@ fn async_stream(
         if traced {
             eprintln!("[EXCHTRACE] SERVE ticket={ticket} rows={rows} batches={batches}");
         }
-        if let Some(msg) = failure.lock().ok().and_then(|mut g| g.take()) {
-            yield Err(arrow_flight::error::FlightError::ProtocolError(format!(
-                "producer task failed: {msg}"
+        if let Some(failure) = failure.lock().ok().and_then(|mut g| g.take()) {
+            // The status (and so the error class) reaches the consumer as is.
+            yield Err(arrow_flight::error::FlightError::Tonic(Box::new(
+                failure.to_status("producer task failed"),
             ))) as Result<arrow::array::RecordBatch, arrow_flight::error::FlightError>;
         }
     };
@@ -544,7 +543,7 @@ fn async_stream(
     // Convert FlightError to tonic::Status.
     #[allow(clippy::result_large_err)]
     let mapped = futures::StreamExt::map(encoder, |result| {
-        result.map_err(|e| crate::task_error::failure_status(format!("flight encoding error: {e}")))
+        result.map_err(crate::task_error::stream_error_status)
     });
 
     Box::pin(mapped)
@@ -558,7 +557,7 @@ fn async_stream(
 fn async_stream_broadcast(
     schema: Arc<arrow::datatypes::Schema>,
     mut stream: crate::output_buffer::BroadcastStream,
-    failure: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    failure: std::sync::Arc<std::sync::Mutex<Option<crate::TaskFailure>>>,
 ) -> BoxedStream<FlightData> {
     use arrow_flight::encode::FlightDataEncoderBuilder;
 
@@ -566,9 +565,10 @@ fn async_stream_broadcast(
         while let Some(batch) = stream.next().await {
             yield Ok(batch) as Result<arrow::array::RecordBatch, arrow_flight::error::FlightError>;
         }
-        if let Some(msg) = failure.lock().ok().and_then(|mut g| g.take()) {
-            yield Err(arrow_flight::error::FlightError::ProtocolError(format!(
-                "producer task failed: {msg}"
+        if let Some(failure) = failure.lock().ok().and_then(|mut g| g.take()) {
+            // The status (and so the error class) reaches the consumer as is.
+            yield Err(arrow_flight::error::FlightError::Tonic(Box::new(
+                failure.to_status("producer task failed"),
             ))) as Result<arrow::array::RecordBatch, arrow_flight::error::FlightError>;
         }
     };
@@ -579,7 +579,7 @@ fn async_stream_broadcast(
 
     #[allow(clippy::result_large_err)]
     let mapped = futures::StreamExt::map(encoder, |result| {
-        result.map_err(|e| crate::task_error::failure_status(format!("flight encoding error: {e}")))
+        result.map_err(crate::task_error::stream_error_status)
     });
 
     Box::pin(mapped)

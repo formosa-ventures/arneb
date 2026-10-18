@@ -74,8 +74,11 @@ pub(crate) async fn try_handle_metadata(
     }
 
     // SET / SHOW / RESET — silently accept session commands
-    if lower.starts_with("set ") || lower.starts_with("reset ") {
-        return Some(handle_empty_ok());
+    if lower.starts_with("set ") {
+        return Some(command_ok("SET"));
+    }
+    if lower.starts_with("reset ") {
+        return Some(command_ok("RESET"));
     }
     if lower.starts_with("show ") {
         return Some(handle_show(&lower));
@@ -560,8 +563,8 @@ fn handle_current_info(lower: &str, catalog_manager: &CatalogManager) -> MetaRes
 // SET / SHOW / RESET — session commands
 // ---------------------------------------------------------------------------
 
-fn handle_empty_ok() -> MetaResult {
-    Ok(MetadataResponse::Command("SET".to_string()))
+fn command_ok(tag: &str) -> MetaResult {
+    Ok(MetadataResponse::Command(tag.to_string()))
 }
 
 fn handle_show(lower: &str) -> MetaResult {

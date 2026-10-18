@@ -252,7 +252,7 @@ pub struct OutputBuffer {
     senders: Vec<mpsc::Sender<TrackedBatch>>,
     receivers: Vec<Option<mpsc::Receiver<TrackedBatch>>>,
     schema: Arc<arrow::datatypes::Schema>,
-    failure: Arc<Mutex<Option<String>>>,
+    failure: Arc<Mutex<Option<crate::TaskFailure>>>,
     /// Global pool the in-flight buffered batches are accounted against.
     /// Defaults to [`UnboundedMemoryPool`] (tests / single-node); the
     /// distributed worker installs the cgroup-derived pool via
@@ -404,12 +404,12 @@ impl OutputBuffer {
     /// consumers (Flight `do_get`) call `take_failure` after the EOF
     /// to detect that the stream is truncated because of a producer
     /// error rather than a normal end of input. B-fix-3 (2026-05-22).
-    pub fn failure_handle(&self) -> Arc<Mutex<Option<String>>> {
+    pub fn failure_handle(&self) -> Arc<Mutex<Option<crate::TaskFailure>>> {
         Arc::clone(&self.failure)
     }
 
-    /// Returns and clears the recorded failure message, if any.
-    pub fn take_failure(&self) -> Option<String> {
+    /// Returns and clears the recorded failure, if any.
+    pub fn take_failure(&self) -> Option<crate::TaskFailure> {
         self.failure.lock().ok()?.take()
     }
 
@@ -460,7 +460,7 @@ struct BroadcastInner {
     /// error instead of clean EOF. Mirrors the `OutputBuffer::failure`
     /// field so partitioned + broadcast share the same propagation
     /// model.
-    failure: Arc<Mutex<Option<String>>>,
+    failure: Arc<Mutex<Option<crate::TaskFailure>>>,
 }
 
 struct BroadcastState {
@@ -529,13 +529,13 @@ impl BroadcastOutputBuffer {
     /// after the consumer's `BroadcastStream` returns `None` to detect
     /// that the stream is truncated because of a producer error rather
     /// than a normal end of input.
-    pub fn failure_handle(&self) -> Arc<Mutex<Option<String>>> {
+    pub fn failure_handle(&self) -> Arc<Mutex<Option<crate::TaskFailure>>> {
         Arc::clone(&self.inner.failure)
     }
 
-    /// Returns and clears the recorded failure message, if any.
+    /// Returns and clears the recorded failure, if any.
     /// Mirror of `OutputBuffer::take_failure`.
-    pub fn take_failure(&self) -> Option<String> {
+    pub fn take_failure(&self) -> Option<crate::TaskFailure> {
         self.inner.failure.lock().ok()?.take()
     }
 }

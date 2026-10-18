@@ -1385,9 +1385,8 @@ pub(crate) async fn build_with_spill(
     let mut total_build_rows: usize = 0;
 
     while let Some(batch_res) = right_stream.next().await {
-        let batch = batch_res.map_err(|e| {
-            ExecutionError::InvalidOperation(format!("hash join right collect: {e}"))
-        })?;
+        let batch =
+            batch_res.map_err(|e| ExecutionError::upstream("hash join right collect", e))?;
         if right_schema.is_none() {
             right_schema = Some(batch.schema());
         }
@@ -1534,9 +1533,8 @@ pub(crate) async fn build_with_partitioned_spill_collecting_df(
     let mut df_collectors: Option<Vec<DfDistinctCollector>> = None;
 
     while let Some(batch_res) = right_stream.next().await {
-        let batch = batch_res.map_err(|e| {
-            ExecutionError::InvalidOperation(format!("hash join right collect: {e}"))
-        })?;
+        let batch =
+            batch_res.map_err(|e| ExecutionError::upstream("hash join right collect", e))?;
         if right_schema.is_none() {
             right_schema = Some(batch.schema());
         }
@@ -1980,9 +1978,9 @@ impl ExecutionPlan for HashJoinExec {
                     );
                 }
 
-                let left_batches = collect_stream(left_stream).await.map_err(|e| {
-                    ExecutionError::InvalidOperation(format!("hash join left collect: {e}"))
-                })?;
+                let left_batches = collect_stream(left_stream)
+                    .await
+                    .map_err(|e| ExecutionError::upstream("hash join left collect", e))?;
                 let left_combined = if left_batches.is_empty() {
                     None
                 } else if left_batches.len() == 1 {
@@ -2011,9 +2009,9 @@ impl ExecutionPlan for HashJoinExec {
                 chunks,
                 right_schema,
             } => {
-                let left_batches = collect_stream(left_stream).await.map_err(|e| {
-                    ExecutionError::InvalidOperation(format!("hash join left collect: {e}"))
-                })?;
+                let left_batches = collect_stream(left_stream)
+                    .await
+                    .map_err(|e| ExecutionError::upstream("hash join left collect", e))?;
                 self.execute_multipass_inner(Arc::clone(chunks), right_schema.clone(), left_batches)
                     .await
             }
@@ -2069,9 +2067,7 @@ impl HashJoinExec {
         let inner = async_stream::try_stream! {
             while let Some(batch_res) = left_stream.next().await {
                 let left_batch = batch_res.map_err(|e| {
-                    ExecutionError::InvalidOperation(format!(
-                        "hash join streaming probe left stream: {e}"
-                    ))
+                    ExecutionError::upstream("hash join streaming probe left stream", e)
                 })?;
                 if left_batch.num_rows() == 0 {
                     continue;
@@ -2266,7 +2262,7 @@ impl HashJoinExec {
         let t_left = Instant::now();
         let left_stream = self.left.execute(partition).await?;
         let left_batches = collect_stream(left_stream).await.map_err(|e| {
-            ExecutionError::InvalidOperation(format!("hash join left collect (p={partition}): {e}"))
+            ExecutionError::upstream(format_args!("hash join left collect (p={partition})"), e)
         })?;
         let left_collect_ms = t_left.elapsed().as_millis() as u64;
         let left_rows: u64 = left_batches.iter().map(|b| b.num_rows() as u64).sum();
@@ -2385,9 +2381,7 @@ impl HashJoinExec {
         right_stream: SendableRecordBatchStream,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
         let right_batches = collect_stream(right_stream).await.map_err(|e| {
-            ExecutionError::InvalidOperation(format!(
-                "hash join right collect (p={partition}): {e}"
-            ))
+            ExecutionError::upstream(format_args!("hash join right collect (p={partition})"), e)
         })?;
         let right_combined = if right_batches.is_empty() {
             None
@@ -2407,7 +2401,7 @@ impl HashJoinExec {
 
         let left_stream = self.left.execute(partition).await?;
         let left_batches = collect_stream(left_stream).await.map_err(|e| {
-            ExecutionError::InvalidOperation(format!("hash join left collect (p={partition}): {e}"))
+            ExecutionError::upstream(format_args!("hash join left collect (p={partition})"), e)
         })?;
         let left_combined = if left_batches.is_empty() {
             None
@@ -2521,9 +2515,7 @@ impl HashJoinExec {
                 }
 
                 let right_batch = compute::concat_batches(&right_schema, chunk_batches.iter())
-                    .map_err(|e| ExecutionError::InvalidOperation(format!(
-                        "multipass concat (chunk {chunk_idx}): {e}"
-                    )))?;
+                    .map_err(|e| ExecutionError::InvalidOperation(format!("multipass concat (chunk {chunk_idx}): {e}")))?;
                 if right_batch.num_rows() == 0 {
                     load_reservation.shrink(loaded_bytes);
                     continue;
@@ -2638,9 +2630,7 @@ impl HashJoinExec {
             let mut left_stream = left_stream;
             while let Some(batch_res) = left_stream.next().await {
                 let left_batch = batch_res.map_err(|e| {
-                    ExecutionError::InvalidOperation(format!(
-                        "grace shared probe stream: {e}"
-                    ))
+                    ExecutionError::upstream("grace shared probe stream", e)
                 })?;
                 if left_batch.num_rows() == 0 {
                     continue;
@@ -2912,9 +2902,7 @@ impl HashJoinExec {
             let mut left_stream = left_stream;
             while let Some(batch_res) = left_stream.next().await {
                 let left_batch = batch_res.map_err(|e| {
-                    ExecutionError::InvalidOperation(format!(
-                        "grace probe input stream: {e}"
-                    ))
+                    ExecutionError::upstream("grace probe input stream", e)
                 })?;
                 if left_batch.num_rows() == 0 {
                     continue;
@@ -3250,9 +3238,7 @@ impl HashJoinExec {
                 // in container memory but exceed the pool budget.
                 if !self.multipass_supported() {
                     let right_batches = collect_stream(right_stream).await.map_err(|e| {
-                        ExecutionError::InvalidOperation(format!(
-                            "hash join right collect: {e}"
-                        ))
+                        ExecutionError::upstream("hash join right collect", e)
                     })?;
                     return self.build_state_from_collected(right_batches);
                 }
@@ -3650,9 +3636,9 @@ impl HashJoinExec {
             return Ok(stream_from_batches(schema, vec![]));
         }
         let left_stream = self.left.execute(partition).await?;
-        let left_batches = collect_stream(left_stream).await.map_err(|e| {
-            ExecutionError::InvalidOperation(format!("hash join left collect: {e}"))
-        })?;
+        let left_batches = collect_stream(left_stream)
+            .await
+            .map_err(|e| ExecutionError::upstream("hash join left collect", e))?;
         if left_batches.is_empty() {
             return Ok(stream_from_batches(schema, vec![]));
         }
@@ -4311,9 +4297,10 @@ impl HashJoinExec {
                             let mut rest = rest;
                             while let Some(b) = rest.next().await {
                                 b.map_err(|e| {
-                                    ExecutionError::InvalidOperation(format!(
-                                        "grace_single empty-build probe drain: {e}"
-                                    ))
+                                    ExecutionError::upstream(
+                                        "grace_single empty-build probe drain",
+                                        e,
+                                    )
                                 })?;
                             }
                             drop(prefix);
@@ -4362,12 +4349,12 @@ impl HashJoinExec {
         left_stream: SendableRecordBatchStream,
         right_stream: SendableRecordBatchStream,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
-        let left_batches = collect_stream(left_stream).await.map_err(|e| {
-            ExecutionError::InvalidOperation(format!("hash join left collect: {e}"))
-        })?;
-        let right_batches = collect_stream(right_stream).await.map_err(|e| {
-            ExecutionError::InvalidOperation(format!("hash join right collect: {e}"))
-        })?;
+        let left_batches = collect_stream(left_stream)
+            .await
+            .map_err(|e| ExecutionError::upstream("hash join left collect", e))?;
+        let right_batches = collect_stream(right_stream)
+            .await
+            .map_err(|e| ExecutionError::upstream("hash join right collect", e))?;
 
         let right_combined = if right_batches.is_empty() {
             None
@@ -4479,9 +4466,7 @@ impl HashJoinExec {
             let mut output_batches: u64 = 0;
             while let Some(res) = tasks.next().await {
                 let part = res.map_err(|e| {
-                    ExecutionError::InvalidOperation(format!(
-                        "single parallel probe task join: {e}"
-                    ))
+                    ExecutionError::InvalidOperation(format!("single parallel probe task join: {e}"))
                 })??;
                 for b in part {
                     output_rows += b.num_rows() as u64;
@@ -4754,9 +4739,7 @@ impl HashJoinExec {
 
             while let Some(batch_res) = left_stream.next().await {
                 let left_batch = batch_res.map_err(|e| {
-                    ExecutionError::InvalidOperation(format!(
-                        "grace single streaming probe: left stream error: {e}"
-                    ))
+                    ExecutionError::upstream("grace single streaming probe: left stream error", e)
                 })?;
                 if left_batch.num_rows() == 0 {
                     continue;
@@ -4856,9 +4839,7 @@ impl HashJoinExec {
             let inner = async_stream::try_stream! {
                 while let Some(batch_res) = left_stream.next().await {
                     batch_res.map_err(|e| {
-                        ExecutionError::InvalidOperation(format!(
-                            "grace single multi-batch empty-build probe drain: {e}"
-                        ))
+                        ExecutionError::upstream("grace single multi-batch empty-build probe drain", e)
                     })?;
                 }
                 // Empty INNER build → no output rows. This never-taken yield
@@ -4900,9 +4881,7 @@ impl HashJoinExec {
             let mut output_batches: u64 = 0;
             while let Some(batch_res) = left_stream.next().await {
                 let left_batch = batch_res.map_err(|e| {
-                    ExecutionError::InvalidOperation(format!(
-                        "grace single multi-batch streaming probe: left stream error: {e}"
-                    ))
+                    ExecutionError::upstream("grace single multi-batch streaming probe: left stream error", e)
                 })?;
                 if left_batch.num_rows() == 0 {
                     continue;

@@ -117,12 +117,52 @@ fn emit_memory_profile(task_id: &str, memory_pool: &Arc<dyn MemoryPool>) {
 pub enum TaskStatus {
     Running,
     Finished,
-    Failed(String),
+    Failed(arneb_rpc::TaskFailure),
 }
 
-/// Abort handles of running task bodies and pumpers: query → task buffer
-/// key → handles.
-type QueryTasks = HashMap<QueryId, HashMap<String, Vec<tokio::task::AbortHandle>>>;
+/// How long a cancelled query's tombstone refuses its late tasks: the
+/// cleanup ceiling, by which an orphaned task would have been freed anyway.
+const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Most tombstones kept at once; past it the oldest is dropped.
+const MAX_TOMBSTONES: usize = 4096;
+
+/// The queries of this node: abort handles of running task bodies and
+/// pumpers, and tombstones of cancelled queries. One lock covers both, so
+/// a task is either tracked before its query's cancel (and aborted by it)
+/// or refused after it.
+#[derive(Default)]
+struct QueryTasks {
+    /// query → task buffer key → handles.
+    running: HashMap<QueryId, HashMap<String, Vec<tokio::task::AbortHandle>>>,
+    /// Cancelled queries and when. A cancel can reach the worker before
+    /// `submit_task` for the same query does (#145); the tombstone makes
+    /// `handle_task` refuse that late task instead of running it orphaned.
+    cancelled: HashMap<QueryId, std::time::Instant>,
+}
+
+impl QueryTasks {
+    fn tombstone(&mut self, query_id: QueryId, now: std::time::Instant) {
+        self.cancelled
+            .retain(|_, at| now.saturating_duration_since(*at) < TOMBSTONE_TTL);
+        if self.cancelled.len() >= MAX_TOMBSTONES && !self.cancelled.contains_key(&query_id) {
+            let oldest = self
+                .cancelled
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(q, _)| *q);
+            if let Some(oldest) = oldest {
+                self.cancelled.remove(&oldest);
+            }
+        }
+        self.cancelled.insert(query_id, now);
+    }
+
+    fn is_cancelled(&self, query_id: QueryId, now: std::time::Instant) -> bool {
+        self.cancelled
+            .get(&query_id)
+            .is_some_and(|at| now.saturating_duration_since(*at) < TOMBSTONE_TTL)
+    }
+}
 
 /// Manages task execution on a worker node.
 #[derive(Clone)]
@@ -229,28 +269,43 @@ impl TaskManager {
             memory_probe,
             query_memory_limit: None,
             query_pools: Arc::new(Mutex::new(HashMap::new())),
-            query_tasks: Arc::new(Mutex::new(HashMap::new())),
+            query_tasks: Arc::new(Mutex::new(QueryTasks::default())),
         }
     }
 
-    /// Remember `handle` as part of task `task_key` of `query_id`.
-    fn track(&self, query_id: QueryId, task_key: &str, handle: tokio::task::AbortHandle) {
+    /// Remember `handle` as part of task `task_key` of `query_id`, so
+    /// `cancel_query` can abort it. When the query was already cancelled
+    /// the handle is aborted instead, and `false` returned.
+    fn track(&self, query_id: QueryId, task_key: &str, handle: tokio::task::AbortHandle) -> bool {
         let mut tasks = self.query_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if tasks.is_cancelled(query_id, std::time::Instant::now()) {
+            handle.abort();
+            return false;
+        }
         tasks
+            .running
             .entry(query_id)
             .or_default()
             .entry(task_key.to_owned())
             .or_default()
             .push(handle);
+        true
+    }
+
+    /// Whether `query_id` was cancelled on this node (within the tombstone
+    /// lifetime).
+    fn is_cancelled(&self, query_id: QueryId) -> bool {
+        let tasks = self.query_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.is_cancelled(query_id, std::time::Instant::now())
     }
 
     /// Forget task `task_key` of `query_id` (it finished and was cleaned up).
     fn untrack(query_tasks: &Mutex<QueryTasks>, query_id: QueryId, task_key: &str) {
         let mut tasks = query_tasks.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = tasks.get_mut(&query_id) {
+        if let Some(entry) = tasks.running.get_mut(&query_id) {
             entry.remove(task_key);
             if entry.is_empty() {
-                tasks.remove(&query_id);
+                tasks.running.remove(&query_id);
             }
         }
     }
@@ -259,13 +314,21 @@ impl TaskManager {
     /// buffers failed (so a consumer sees an error, never a silent EOF),
     /// abort the task bodies and pumpers (dropping their operators and
     /// reservations), and drop the buffers, statuses and dynamic-filter
-    /// collectors. Idempotent; returns the number of tasks cancelled.
+    /// collectors. A task of the query submitted later is refused (see
+    /// [`QueryTasks::cancelled`]). Idempotent; returns the number of tasks
+    /// cancelled.
     pub fn cancel_query(&self, query_id: QueryId) -> usize {
         let entry = {
             let mut tasks = self.query_tasks.lock().unwrap_or_else(|e| e.into_inner());
-            tasks.remove(&query_id)
+            tasks.tombstone(query_id, std::time::Instant::now());
+            tasks.running.remove(&query_id)
         };
         let Some(entry) = entry else {
+            tracing::debug!(
+                target: "arneb::cluster",
+                query_id = %query_id,
+                "query cancelled on worker before any of its tasks arrived"
+            );
             return 0;
         };
         let cancelled = entry.len();
@@ -275,13 +338,13 @@ impl TaskManager {
                     if let Ok(buf) = buf.try_lock() {
                         let failure = buf.failure_handle();
                         let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.get_or_insert_with(|| "query cancelled".to_owned());
+                        guard.get_or_insert_with(|| "query cancelled".into());
                     }
                 }
                 Some(arneb_rpc::BufferKind::Broadcast(buf)) => {
                     let failure = buf.failure_handle();
                     let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.get_or_insert_with(|| "query cancelled".to_owned());
+                    guard.get_or_insert_with(|| "query cancelled".into());
                 }
                 None => {}
             }
@@ -386,6 +449,14 @@ impl TaskManager {
         // consumed" errors when coord's do_get hit the *previous* query's
         // drained buffer instead of the new one.
         let task_id_str = format!("{}.{}", descriptor.query_id, descriptor.task_id);
+        if self.is_cancelled(descriptor.query_id) {
+            tracing::info!(
+                target: "arneb::cluster",
+                task_id = %task_id_str,
+                "task of a cancelled query refused"
+            );
+            return;
+        }
         let manager = self.clone();
 
         // Mark as running
@@ -410,7 +481,13 @@ impl TaskManager {
         let query_id = descriptor.query_id;
         let task_key = task_id_str.clone();
         let tracker = self.clone();
+        // The body starts only once it is tracked, so a cancel racing this
+        // submission either aborts it or makes `track` refuse it.
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
             let task_id_for_cleanup = task_id_str.clone();
             match manager.execute_task(descriptor).await {
                 Ok(()) => {
@@ -461,7 +538,21 @@ impl TaskManager {
                 TaskManager::untrack(&query_tasks, df_collector_key.0, &task_id_for_cleanup);
             });
         });
-        tracker.track(query_id, &task_key, handle.abort_handle());
+        if tracker.track(query_id, &task_key, handle.abort_handle()) {
+            let _ = start_tx.send(());
+        } else {
+            tracing::info!(
+                target: "arneb::cluster",
+                task_id = %task_key,
+                "task of a cancelled query refused"
+            );
+            if let Ok(mut statuses) = tracker.task_statuses.write() {
+                statuses.remove(&task_key);
+            }
+            if let Ok(mut collectors) = tracker.df_collectors.write() {
+                collectors.remove(&df_collector_key);
+            }
+        }
     }
 
     /// Get the status of a task.
@@ -482,7 +573,7 @@ impl TaskManager {
     }
 
     /// Execute a task: deserialize plan, run it, write output to buffer.
-    async fn execute_task(&self, descriptor: TaskDescriptor) -> Result<(), String> {
+    async fn execute_task(&self, descriptor: TaskDescriptor) -> Result<(), arneb_rpc::TaskFailure> {
         // Same query-scoped key as handle_task — see comment there.
         let task_id_str = format!("{}.{}", descriptor.query_id, descriptor.task_id);
         // admission-control D1: every reservation this task makes counts
@@ -536,7 +627,7 @@ impl TaskManager {
                         probe.threshold_bytes(),
                     );
                     tracing::warn!(target: "arneb::mem", "{msg}");
-                    return Err(arneb_rpc::tag_resource_exhausted(msg));
+                    return Err(arneb_rpc::TaskFailure::resource_exhausted(msg));
                 }
             }
             if waited_ms > 0 {
@@ -724,9 +815,9 @@ impl TaskManager {
         // to set this flag; until then the early-return branch is dead.
         if descriptor.broadcast {
             if n_out != 1 {
-                return Err(format!(
-                    "broadcast task expected output_partitions=1, got {n_out}"
-                ));
+                return Err(
+                    format!("broadcast task expected output_partitions=1, got {n_out}").into(),
+                );
             }
             let bbuf = Arc::new(arneb_rpc::BroadcastOutputBuffer::new(output_schema_arrow));
             let failure_flag = bbuf.failure_handle();
@@ -737,7 +828,7 @@ impl TaskManager {
             let task_id_for_log = task_id_str.clone();
             let bbuf_for_pump = Arc::clone(&bbuf);
             let pumper = tokio::spawn(async move {
-                let record_failure = |err: String| {
+                let record_failure = |err: arneb_rpc::TaskFailure| {
                     if let Ok(mut guard) = failure_flag.lock() {
                         if guard.is_none() {
                             *guard = Some(err.clone());
@@ -749,7 +840,7 @@ impl TaskManager {
                 let mut stream = match plan_for_pump.execute(0).await {
                     Ok(s) => s,
                     Err(e) => {
-                        let msg = record_failure(arneb_rpc::describe_execution_failure(
+                        let msg = record_failure(arneb_rpc::TaskFailure::from_execution_error(
                             "execute(0) failed",
                             &e,
                         ));
@@ -762,7 +853,7 @@ impl TaskManager {
                     let batch = match batch_result {
                         Ok(b) => b,
                         Err(e) => {
-                            let msg = record_failure(arneb_rpc::describe_task_failure(
+                            let msg = record_failure(arneb_rpc::TaskFailure::from_error(
                                 "stream error during execution",
                                 &e,
                             ));
@@ -774,7 +865,7 @@ impl TaskManager {
                     bbuf_for_pump.write_batch(batch);
                 }
                 bbuf_for_pump.finish();
-                Ok::<usize, String>(rows)
+                Ok::<usize, arneb_rpc::TaskFailure>(rows)
             });
 
             self.track(descriptor.query_id, &task_id_str, pumper.abort_handle());
@@ -853,7 +944,7 @@ impl TaskManager {
             let failure_flag = Arc::clone(&failure_flag);
             let spill_schema = output_schema_for_spill.clone();
             pumpers.push(tokio::spawn(async move {
-                let record_failure = |err: String| {
+                let record_failure = |err: arneb_rpc::TaskFailure| {
                     if let Ok(mut guard) = failure_flag.lock() {
                         if guard.is_none() {
                             *guard = Some(err.clone());
@@ -865,7 +956,7 @@ impl TaskManager {
                 let mut stream = match plan_for_pump.execute(partition_idx).await {
                     Ok(s) => s,
                     Err(e) => {
-                        return Err(record_failure(arneb_rpc::describe_execution_failure(
+                        return Err(record_failure(arneb_rpc::TaskFailure::from_execution_error(
                             &format!("execute({partition_idx}) failed"),
                             &e,
                         )));
@@ -886,7 +977,7 @@ impl TaskManager {
                     let batch = match batch_result {
                         Ok(b) => b,
                         Err(e) => {
-                            return Err(record_failure(arneb_rpc::describe_task_failure(
+                            return Err(record_failure(arneb_rpc::TaskFailure::from_error(
                                 "stream error during execution",
                                 &e,
                             )));
@@ -898,7 +989,7 @@ impl TaskManager {
                         if let Err(e) = sw.write(&batch) {
                             return Err(record_failure(format!(
                                 "exchange spill write failed: {e}"
-                            )));
+                            ).into()));
                         }
                         continue;
                     }
@@ -930,7 +1021,7 @@ impl TaskManager {
                                     "partition {partition_idx} consumer dropped receiver mid-stream \
                                      on a must-drain exchange — an upstream stall/reset truncated the \
                                      partition (q21 SF30 silent-truncation guard)"
-                                )));
+                                ).into()));
                             }
                             // Legitimate LIMIT early-stop or query teardown:
                             // the consumer can stop before EOF, so stop quietly.
@@ -952,13 +1043,13 @@ impl TaskManager {
                             Err(e) => {
                                 return Err(record_failure(format!(
                                     "exchange spill create failed: {e}"
-                                )));
+                                ).into()));
                             }
                         };
                         if let Err(e) = sw.write(&returned) {
                             return Err(record_failure(format!(
                                 "exchange spill write failed: {e}"
-                            )));
+                            ).into()));
                         }
                         spill = Some(sw);
                     }
@@ -978,12 +1069,12 @@ impl TaskManager {
                                     "exchange overflow spilled to disk, drained"
                                 );
                             }
-                            Err(e) => return Err(record_failure(e)),
+                            Err(e) => return Err(record_failure(e.into())),
                         }
                     }
                 }
 
-                Ok::<usize, String>(rows)
+                Ok::<usize, arneb_rpc::TaskFailure>(rows)
             }));
         }
 
@@ -1225,11 +1316,167 @@ mod tests {
         assert!(pumper.await.unwrap_err().is_cancelled());
         assert!(tm.flight_state.get_buffer(&key).is_none());
         assert!(tm.task_status(&key).is_none());
-        assert_eq!(failure.lock().unwrap().as_deref(), Some("query cancelled"));
+        assert_eq!(
+            failure.lock().unwrap().as_ref().map(|f| f.message()),
+            Some("query cancelled")
+        );
 
         assert_eq!(tm.cancel_query(q), 0);
         assert!(!survivor.is_finished());
         assert_eq!(tm.cancel_query(other), 1);
+    }
+
+    fn descriptor(query_id: QueryId) -> TaskDescriptor {
+        TaskDescriptor {
+            task_id: TaskId {
+                stage_id: arneb_common::StageId(1),
+                partition_id: 0,
+            },
+            stage_id: arneb_common::StageId(1),
+            query_id,
+            // Never deserialized when the task is refused; a task that does
+            // run fails on it and leaves a `Failed` status behind.
+            plan_json: "not a plan".into(),
+            output_partitions: 1,
+            pending_dynamic_filters: Vec::new(),
+            output_hash_columns: Vec::new(),
+            broadcast: false,
+            source_exchanges: Vec::new(),
+            scan_task_count: 1,
+            must_drain: false,
+        }
+    }
+
+    /// #145: a cancel that reaches the worker before the query's task is
+    /// submitted leaves a tombstone, so the late `submit_task` does not run
+    /// the task (which would otherwise hold its pool until the 600 s
+    /// cleanup ceiling).
+    #[tokio::test]
+    async fn cancel_before_submit_refuses_the_late_task() {
+        use arneb_execution::memory_pool::UnboundedMemoryPool;
+        let tm = manager_with_limit(Arc::new(UnboundedMemoryPool::new()), None);
+        let (q, other) = (QueryId::new(), QueryId::new());
+
+        assert_eq!(tm.cancel_query(q), 0);
+        tm.handle_task(descriptor(q));
+        tm.handle_task(descriptor(other));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let key = format!("{q}.1.0");
+        assert!(tm.task_status(&key).is_none(), "cancelled task ran");
+        assert!(tm.flight_state.get_buffer(&key).is_none());
+        assert!(tm.df_collector(q, descriptor(q).task_id).is_none());
+        assert!(!tm.query_tasks.lock().unwrap().running.contains_key(&q));
+        // Another query is unaffected: it ran (and failed on its plan).
+        assert!(matches!(
+            tm.task_status(&format!("{other}.1.0")),
+            Some(TaskStatus::Failed(_))
+        ));
+    }
+
+    /// Tombstones expire, and their number is bounded.
+    #[test]
+    fn tombstones_are_bounded() {
+        let mut tasks = QueryTasks::default();
+        let t0 = std::time::Instant::now();
+        let at = |i: usize| t0 + std::time::Duration::from_micros(i as u64);
+        let first = QueryId::new();
+        tasks.tombstone(first, at(0));
+        for i in 1..MAX_TOMBSTONES {
+            tasks.tombstone(QueryId::new(), at(i));
+        }
+        let now = at(MAX_TOMBSTONES);
+        assert!(tasks.is_cancelled(first, now));
+        tasks.tombstone(QueryId::new(), now);
+        assert_eq!(tasks.cancelled.len(), MAX_TOMBSTONES);
+        assert!(!tasks.is_cancelled(first, now), "oldest tombstone evicted");
+
+        let later = now + TOMBSTONE_TTL + std::time::Duration::from_secs(1);
+        let q = QueryId::new();
+        tasks.tombstone(q, later);
+        assert_eq!(tasks.cancelled.len(), 1, "expired tombstones pruned");
+        assert!(tasks.is_cancelled(q, later));
+        assert!(!tasks.is_cancelled(q, later + TOMBSTONE_TTL));
+    }
+
+    /// #145 / admission-control D3 through a real worker: a task over its
+    /// per-query limit fails, and a consumer reading its output over Flight
+    /// gets `ResourceExhausted` from the status code (not from the text).
+    #[tokio::test]
+    async fn worker_memory_limit_failure_reaches_the_consumer_typed() {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        use arneb_execution::memory_pool::GreedyMemoryPool;
+
+        let ids = Int32Array::from((0..10_000).collect::<Vec<_>>());
+        let rows = RecordBatch::try_new(schema(), vec![Arc::new(ids)]).unwrap();
+        let table = Arc::new(MemoryTable::new(
+            vec![arneb_common::types::ColumnInfo {
+                name: "id".into(),
+                data_type: arneb_common::types::DataType::Int32,
+                nullable: false,
+            }],
+            vec![rows],
+        ));
+        let mem_schema = Arc::new(MemorySchema::new());
+        mem_schema.register_table("t", table);
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", mem_schema);
+        let cm = Arc::new(CatalogManager::new("memory", "default"));
+        cm.register_catalog("memory", catalog.clone());
+        let mut registry = ConnectorRegistry::new();
+        registry.register(
+            "memory",
+            Arc::new(MemoryConnectorFactory::new(catalog, "default")),
+        );
+
+        let statement = arneb_sql_parser::parse("SELECT id, count(*) FROM t GROUP BY id").unwrap();
+        let plan = arneb_planner::QueryPlanner::new(&cm)
+            .plan_statement(&statement)
+            .await
+            .unwrap();
+
+        let mut state = FlightState::new();
+        let tm = TaskManager::new(
+            state.clone(),
+            cm,
+            Arc::new(registry),
+            Arc::new(GreedyMemoryPool::new(1 << 30)),
+        )
+        .with_query_memory_limit(Some(1024));
+        let for_status = tm.clone();
+        state.set_task_status_callback(Arc::new(move |id| for_status.task_status_as_response(id)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(arneb_rpc::__serve_flight_for_test(listener, state));
+
+        let q = QueryId::new();
+        let mut task = descriptor(q);
+        task.plan_json = serde_json::to_string(&plan).unwrap();
+        tm.handle_task(task);
+
+        let err = match arneb_rpc::ExchangeClient::new(&addr)
+            .fetch_partition(&format!("{q}.1.0"), 0)
+            .await
+        {
+            Err(e) => e,
+            Ok(mut stream) => loop {
+                match stream.next().await {
+                    Some(Ok(_)) => continue,
+                    Some(Err(arneb_common::error::ArnebError::Execution(e))) => break e,
+                    other => panic!("expected an execution error, got {other:?}"),
+                }
+            },
+        };
+        assert!(
+            matches!(
+                err,
+                arneb_common::error::ExecutionError::ResourceExhausted(_)
+            ),
+            "expected ResourceExhausted, got {err:?}"
+        );
+        assert!(err.to_string().contains("memory limit"), "{err}");
     }
 
     #[test]

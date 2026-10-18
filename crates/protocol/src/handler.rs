@@ -270,7 +270,7 @@ impl ConnectionHandler {
         if !needs_admission(sql) {
             return Ok(None);
         }
-        match controller.admit(&admission_label(sql)) {
+        match controller.admit_with(|| admission_label(sql)) {
             Ok(pending) => Ok(Some(pending.wait().await)),
             Err(e) => Err(PgWireError::UserError(Box::new(
                 pgwire::error::ErrorInfo::new(
@@ -322,6 +322,11 @@ impl ConnectionHandler {
         match crate::timeout::parse(sql) {
             Some(Ok(crate::timeout::Command::Show)) => {
                 return Some(crate::timeout::show_result(self.effective_timeout(client)));
+            }
+            Some(Ok(crate::timeout::Command::Reset)) => {
+                return Some(Ok(crate::metadata::MetadataResponse::Command(
+                    "RESET".to_owned(),
+                )))
             }
             Some(_) => {
                 return Some(Ok(crate::metadata::MetadataResponse::Command(
@@ -765,13 +770,22 @@ pub fn needs_admission(sql: &str) -> bool {
 }
 
 /// A short, single-line form of `sql` for admission logs.
+/// Built in one allocation, and only for a query that has to queue.
 pub(crate) fn admission_label(sql: &str) -> String {
-    let flat: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() > 80 {
-        format!("{}…", flat.chars().take(80).collect::<String>())
-    } else {
-        flat
+    const MAX_CHARS: usize = 80;
+    let mut label = String::with_capacity(sql.len().min(MAX_CHARS * 4) + 3);
+    let flat = sql
+        .split_whitespace()
+        .enumerate()
+        .flat_map(|(i, word)| (i > 0).then_some(' ').into_iter().chain(word.chars()));
+    for (i, c) in flat.enumerate() {
+        if i == MAX_CHARS {
+            label.push('…');
+            break;
+        }
+        label.push(c);
     }
+    label
 }
 
 /// Execute the full query pipeline asynchronously, with no per-query memory
@@ -1712,6 +1726,21 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{Field, Schema};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn admission_label_flattens_and_truncates() {
+        assert_eq!(admission_label("  SELECT\n  1\t, 2 "), "SELECT 1 , 2");
+        let eighty = "x".repeat(80);
+        assert_eq!(admission_label(&eighty), eighty);
+        assert_eq!(
+            admission_label(&format!("{eighty} y")),
+            format!("{eighty}…")
+        );
+        assert_eq!(
+            admission_label(&format!("{} é", "x".repeat(79))),
+            format!("{} …", "x".repeat(79))
+        );
+    }
 
     struct MockDistributedExecutor {
         batches: Vec<arrow::record_batch::RecordBatch>,

@@ -139,3 +139,66 @@ async fn trino_over_limit_is_exceeded_local_memory_limit() {
         "{doc}"
     );
 }
+
+/// #145: a table literally named like the old wire tag is a missing table
+/// (pgwire `42P01`, Trino `TABLE_NOT_FOUND`), not a memory-limit failure.
+#[tokio::test]
+async fn tag_like_table_name_is_table_not_found() {
+    const SQL: &str = "SELECT * FROM \"[resource exhausted] x\"";
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (cm, cr) = state();
+    let server = ProtocolServer::new(
+        ProtocolConfig {
+            bind_address: format!("127.0.0.1:{port}"),
+        },
+        cm,
+        cr,
+    );
+    tokio::spawn(async move {
+        let _ = server.serve(listener).await;
+    });
+    let (client, conn) =
+        tokio_postgres::connect(&format!("host=127.0.0.1 port={port} user=tester"), NoTls)
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let err = client.simple_query(SQL).await.unwrap_err();
+    let db = err.as_db_error().expect("server error");
+    assert_eq!(db.code(), &SqlState::UNDEFINED_TABLE, "{}", db.message());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (cm, cr) = state();
+    let server = TrinoServer::new(
+        TrinoConfig {
+            bind_address: format!("127.0.0.1:{port}"),
+            ..TrinoConfig::default()
+        },
+        cm,
+        cr,
+    );
+    tokio::spawn(async move {
+        let _ = server.serve(listener).await;
+    });
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut doc: Value = http
+        .post(format!("http://127.0.0.1:{port}/v1/statement"))
+        .header("X-Trino-User", "tester")
+        .body(SQL)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    while let Some(next) = doc.get("nextUri").and_then(Value::as_str) {
+        doc = http.get(next).send().await.unwrap().json().await.unwrap();
+    }
+    assert_eq!(doc["stats"]["state"], "FAILED", "{doc}");
+    assert_eq!(doc["error"]["errorName"], "TABLE_NOT_FOUND", "{doc}");
+}

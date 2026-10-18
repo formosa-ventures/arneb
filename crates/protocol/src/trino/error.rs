@@ -86,15 +86,12 @@ impl TrinoError {
     /// planner diagnostics already used by the pgwire path.
     pub(crate) fn from_arneb(err: &ArnebError, source: Option<&SourceFile>) -> Self {
         let message = match (err, source) {
-            _ if arneb_common::error::is_resource_exhausted(err) => {
-                arneb_common::error::resource_exhausted_message(err)
-            }
             (ArnebError::Plan(e), Some(src)) => render_plan_error(e, src),
             _ => err.to_string(),
         };
         let (code, name, kind) = match err {
-            // A memory-limit failure, possibly re-wrapped by operators on its
-            // way back from a worker (admission-control D3).
+            // A memory-limit failure, kept typed by operators re-raising it
+            // and across exchanges (admission-control D3).
             _ if arneb_common::error::is_resource_exhausted(err) => (
                 131079,
                 "EXCEEDED_LOCAL_MEMORY_LIMIT",
@@ -172,5 +169,24 @@ mod tests {
         let json = e.to_json();
         assert_eq!(json["errorCode"], 46);
         assert_eq!(json["failureInfo"]["type"], "io.trino.spi.TrinoException");
+    }
+
+    /// #145: a table named like the old wire tag is still a missing table,
+    /// and a memory-limit failure is recognized by its variant.
+    #[test]
+    fn memory_limit_is_classified_by_variant_not_text() {
+        let e = TrinoError::from_arneb(
+            &ArnebError::Plan(PlanError::TableNotFound("[resource exhausted] x".into())),
+            None,
+        );
+        assert_eq!(e.name, "TABLE_NOT_FOUND");
+        let e = TrinoError::from_arneb(
+            &ArnebError::Execution(arneb_common::error::ExecutionError::ResourceExhausted(
+                "query memory limit exceeded".into(),
+            )),
+            None,
+        );
+        assert_eq!(e.name, "EXCEEDED_LOCAL_MEMORY_LIMIT");
+        assert_eq!(e.message, "resource exhausted: query memory limit exceeded");
     }
 }

@@ -936,9 +936,8 @@ impl ExecutionPlan for SemiJoinExec {
             .unwrap_or_else(resolve_spill_chunk_cap_bytes);
 
         while let Some(batch_res) = right_stream.next().await {
-            let batch = batch_res.map_err(|e| {
-                ExecutionError::InvalidOperation(format!("failed to collect right input: {e}"))
-            })?;
+            let batch = batch_res
+                .map_err(|e| ExecutionError::upstream("failed to collect right input", e))?;
             if right_schema.is_none() {
                 right_schema = Some(batch.schema());
             }
@@ -1499,9 +1498,7 @@ impl SemiJoinExec {
         let mut right_rows = 0usize;
         while let Some(batch) = right_stream.next().await {
             let batch = batch.map_err(|e| {
-                ExecutionError::InvalidOperation(format!(
-                    "failed to collect compact right input: {e}"
-                ))
+                ExecutionError::upstream("failed to collect compact right input", e)
             })?;
             let keys = expression::evaluate(&self.right_key, &batch, None)?;
             let typed_keys = TypedKey::from_array(&keys)?;
@@ -1571,9 +1568,7 @@ impl SemiJoinExec {
                         let item = input.next().await?;
                         let result = (|| -> Result<Option<RecordBatch>, ExecutionError> {
                             let batch = item.map_err(|e| {
-                                ExecutionError::InvalidOperation(format!(
-                                    "failed to read compact left input: {e}"
-                                ))
+                                ExecutionError::upstream("failed to read compact left input", e)
                             })?;
                             if batch.num_rows() == 0 {
                                 return Ok(None);
@@ -1660,9 +1655,7 @@ impl SemiJoinExec {
         let mut right_stream = self.right.execute(0).await?;
         while let Some(batch_res) = right_stream.next().await {
             let right_batch = batch_res.map_err(|e| {
-                ExecutionError::InvalidOperation(format!(
-                    "failed to read right input (mark semi join): {e}"
-                ))
+                ExecutionError::upstream("failed to read right input (mark semi join)", e)
             })?;
             if right_batch.num_rows() == 0 {
                 continue;
@@ -1757,9 +1750,7 @@ impl SemiJoinExec {
                     let output_schema_clone = output_schema_clone.clone();
                     async move {
                         let left_batch = batch_res.map_err(|e| {
-                            ExecutionError::InvalidOperation(format!(
-                                "failed to read left input (streaming semi probe): {e}"
-                            ))
+                            ExecutionError::upstream("failed to read left input (streaming semi probe)", e)
                         })?;
                         tokio::task::spawn_blocking(move || {
                             probe_one_left_batch(
@@ -1854,16 +1845,18 @@ impl SemiJoinExec {
         // Both sides use the equi-join key so equal keys map to the same bucket.
         let right_partitioner = Arc::new(
             HashPartitioner::new(vec![self.right_key.clone()], n_partitions).map_err(|e| {
-                ExecutionError::InvalidOperation(format!(
-                    "{op_name}: failed to build right partitioner: {e}"
-                ))
+                ExecutionError::upstream(
+                    format_args!("{op_name}: failed to build right partitioner"),
+                    e,
+                )
             })?,
         );
         let left_partitioner = Arc::new(
             HashPartitioner::new(vec![self.left_key.clone()], n_partitions).map_err(|e| {
-                ExecutionError::InvalidOperation(format!(
-                    "{op_name}: failed to build left partitioner: {e}"
-                ))
+                ExecutionError::upstream(
+                    format_args!("{op_name}: failed to build left partitioner"),
+                    e,
+                )
             })?,
         );
 
@@ -1878,9 +1871,10 @@ impl SemiJoinExec {
                 match rd.next() {
                     Some(Ok(b)) => b.schema(),
                     Some(Err(e)) => {
-                        return Err(ExecutionError::InvalidOperation(format!(
-                            "{op_name}: failed reading first build batch for schema: {e}"
-                        )))
+                        return Err(ExecutionError::upstream(
+                            format_args!("{op_name}: failed reading first build batch for schema"),
+                            e,
+                        ))
                     }
                     None => return Ok(stream_from_batches(output_schema, vec![])),
                 }
@@ -1893,9 +1887,10 @@ impl SemiJoinExec {
                     let mut v = Vec::new();
                     while let Some(r) = s.next().await {
                         v.push(r.map_err(|e| {
-                            ExecutionError::InvalidOperation(format!(
-                                "{op_name}: left collect (empty build): {e}"
-                            ))
+                            ExecutionError::upstream(
+                                format_args!("{op_name}: left collect (empty build)"),
+                                e,
+                            )
                         })?);
                     }
                     v
@@ -1973,9 +1968,10 @@ impl SemiJoinExec {
         let mut left_stream = self.left.execute(0).await?;
         while let Some(batch_res) = left_stream.next().await {
             let batch = batch_res.map_err(|e| {
-                ExecutionError::InvalidOperation(format!(
-                    "{op_name}: left input error (partitioned spill): {e}"
-                ))
+                ExecutionError::upstream(
+                    format_args!("{op_name}: left input error (partitioned spill)"),
+                    e,
+                )
             })?;
             if batch.num_rows() == 0 {
                 continue;
@@ -2322,9 +2318,7 @@ impl SemiJoinExec {
         let mut left_row_counts: Vec<usize> = Vec::new();
         while let Some(batch_res) = left_stream.next().await {
             let batch = batch_res.map_err(|e| {
-                ExecutionError::InvalidOperation(format!(
-                    "failed to read left input (multipass): {e}"
-                ))
+                ExecutionError::upstream("failed to read left input (multipass)", e)
             })?;
             if left_writer.is_none() {
                 left_writer = Some(crate::spill::SpillWriter::new(

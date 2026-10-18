@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arneb_common::memory_pool::MemoryPool;
+use arneb_common::memory_pool::{MemoryPool, UnboundedMemoryPool};
 use arneb_common::Domain;
 use arneb_planner::PlanExpr;
 
@@ -19,9 +19,9 @@ pub struct DynamicFilterDomain {
 
 /// Pushdown hints passed to [`DataSource::scan()`](crate::DataSource::scan).
 ///
-/// All fields are optional. A connector that doesn't support a particular
-/// pushdown simply ignores that field and performs a full scan.
-#[derive(Debug, Clone, Default)]
+/// All pushdown fields are optional. A connector that doesn't support a
+/// particular pushdown simply ignores that field and performs a full scan.
+#[derive(Debug, Clone)]
 pub struct ScanContext {
     /// Filter predicates to push down into the scan.
     /// The connector should apply as many as it can; any remaining filters
@@ -43,9 +43,22 @@ pub struct ScanContext {
     /// `None` means use the reader's default (typically 8192).
     pub batch_size: Option<usize>,
 
-    /// Pool the scan accounts its read buffers against. `None` leaves
-    /// them untracked.
-    pub memory_pool: Option<Arc<dyn MemoryPool>>,
+    /// Pool the scan accounts its read buffers against. Defaults to an
+    /// [`UnboundedMemoryPool`]; the physical planner sets the query's pool.
+    pub memory_pool: Arc<dyn MemoryPool>,
+}
+
+impl Default for ScanContext {
+    fn default() -> Self {
+        Self {
+            filters: Vec::new(),
+            dynamic_filter_domains: Vec::new(),
+            projection: None,
+            limit: None,
+            batch_size: None,
+            memory_pool: Arc::new(UnboundedMemoryPool::new()),
+        }
+    }
 }
 
 impl ScanContext {
@@ -86,7 +99,7 @@ impl ScanContext {
 
     /// Sets the memory pool for scan buffer accounting.
     pub fn with_memory_pool(mut self, pool: Arc<dyn MemoryPool>) -> Self {
-        self.memory_pool = Some(pool);
+        self.memory_pool = pool;
         self
     }
 }

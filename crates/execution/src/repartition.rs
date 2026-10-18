@@ -743,6 +743,9 @@ mod tests {
             *p = (*p).max(*u);
             Ok(())
         }
+        fn grow(&self, c: &crate::memory_pool::MemoryConsumer, additional: usize) {
+            self.try_grow(c, additional).unwrap();
+        }
         fn shrink(&self, _c: &crate::memory_pool::MemoryConsumer, bytes: usize) {
             let mut u = self.used.lock().unwrap();
             *u = u.saturating_sub(bytes);

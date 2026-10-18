@@ -63,6 +63,13 @@ pub trait MemoryPool: fmt::Debug + Send + Sync + 'static {
     /// would be exceeded; the pool's state is unchanged in that case.
     fn try_grow(&self, consumer: &MemoryConsumer, additional: usize) -> Result<(), ExecutionError>;
 
+    /// Grow the pool's reserved count by `additional` bytes without
+    /// checking the limit, so [`reserved`](Self::reserved) may exceed it.
+    /// For consumers that cannot spill or fail (scan decode buffers): the
+    /// bytes are live either way, and recording them keeps the pool honest
+    /// for the spillable operators that read its `try_grow` errors.
+    fn grow(&self, consumer: &MemoryConsumer, additional: usize);
+
     /// Release `bytes` from the pool's reserved count. The caller is
     /// responsible for ensuring it has actually freed that much.
     fn shrink(&self, consumer: &MemoryConsumer, bytes: usize);
@@ -166,6 +173,13 @@ impl MemoryReservation {
         Ok(())
     }
 
+    /// Grow by `additional` bytes even past the pool's limit; see
+    /// [`MemoryPool::grow`].
+    pub fn grow(&mut self, additional: usize) {
+        self.pool.grow(&self.consumer, additional);
+        self.size += additional;
+    }
+
     /// Try to reach exactly `target` bytes. If `target` is larger,
     /// grows; if smaller, shrinks (cannot fail in the shrink case).
     pub fn try_resize(&mut self, target: usize) -> Result<(), ExecutionError> {
@@ -259,6 +273,13 @@ impl MemoryPool for GreedyMemoryPool {
         Ok(())
     }
 
+    fn grow(&self, _consumer: &MemoryConsumer, additional: usize) {
+        let mut used = self.used.lock().expect("memory pool mutex poisoned");
+        *used = used.saturating_add(additional);
+        let mut peak = self.peak.lock().expect("memory pool mutex poisoned");
+        *peak = (*peak).max(*used);
+    }
+
     fn shrink(&self, _consumer: &MemoryConsumer, bytes: usize) {
         let mut used = self.used.lock().expect("memory pool mutex poisoned");
         *used = used.saturating_sub(bytes);
@@ -319,6 +340,13 @@ impl MemoryPool for UnboundedMemoryPool {
         let mut peak = self.peak.lock().expect("memory pool mutex poisoned");
         *peak = (*peak).max(*used);
         Ok(())
+    }
+
+    fn grow(&self, _consumer: &MemoryConsumer, additional: usize) {
+        let mut used = self.used.lock().expect("memory pool mutex poisoned");
+        *used = used.saturating_add(additional);
+        let mut peak = self.peak.lock().expect("memory pool mutex poisoned");
+        *peak = (*peak).max(*used);
     }
 
     fn shrink(&self, _consumer: &MemoryConsumer, bytes: usize) {
@@ -412,6 +440,12 @@ impl MemoryPool for QueryMemoryPool {
         self.global.try_grow(consumer, additional)?;
         *used = new_total;
         Ok(())
+    }
+
+    fn grow(&self, consumer: &MemoryConsumer, additional: usize) {
+        let mut used = self.used.lock().expect("memory pool mutex poisoned");
+        *used = used.saturating_add(additional);
+        self.global.grow(consumer, additional);
     }
 
     fn shrink(&self, consumer: &MemoryConsumer, bytes: usize) {
@@ -509,6 +543,12 @@ impl MemoryPool for TrackConsumersPool {
                 self.top_consumers_report()
             ))),
         }
+    }
+
+    fn grow(&self, consumer: &MemoryConsumer, additional: usize) {
+        self.inner.grow(consumer, additional);
+        let mut map = self.consumers.lock().expect("memory pool mutex poisoned");
+        *map.entry(consumer.name().to_string()).or_insert(0) += additional;
     }
 
     fn shrink(&self, consumer: &MemoryConsumer, bytes: usize) {
@@ -710,6 +750,24 @@ mod tests {
         assert_eq!(res.size(), 0);
     }
 
+    #[test]
+    fn grow_records_past_the_limit() {
+        let pool = pool(1_000);
+        let mut full = MemoryConsumer::new("Full").register(pool.clone());
+        full.try_grow(1_000).unwrap();
+        let mut scan = MemoryConsumer::new("Scan").register(pool.clone());
+        scan.grow(400);
+        assert_eq!(scan.size(), 400);
+        assert_eq!(pool.reserved(), 1_400);
+        assert_eq!(pool.reserved_peak(), 1_400);
+        assert!(
+            full.try_grow(1).is_err(),
+            "over the limit: try_grow still fails"
+        );
+        scan.free();
+        assert_eq!(pool.reserved(), 1_000);
+    }
+
     // ---- QueryMemoryPool (Phase 4) ----
 
     fn query_pool(global_limit: usize, query_limit: usize) -> Arc<dyn MemoryPool> {
@@ -748,6 +806,19 @@ mod tests {
             0,
             "atomic: no bytes reserved on cascade failure"
         );
+    }
+
+    #[test]
+    fn query_pool_grow_records_past_both_caps() {
+        let global: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(500));
+        let pool: Arc<dyn MemoryPool> = Arc::new(QueryMemoryPool::new(global.clone(), 300));
+        let mut res = MemoryConsumer::new("Scan").register(pool.clone());
+        res.grow(800);
+        assert_eq!(pool.reserved(), 800);
+        assert_eq!(global.reserved(), 800);
+        drop(res);
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(global.reserved(), 0);
     }
 
     #[test]

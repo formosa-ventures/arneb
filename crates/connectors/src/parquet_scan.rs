@@ -288,8 +288,10 @@ impl ParquetBatchStream {
     /// [`row_group_buffer_bytes`]) against `pool` from the first poll until
     /// the stream ends, fails, or is dropped.
     ///
-    /// Best-effort: a scan cannot spill, so when the pool declines the
-    /// reservation the scan proceeds untracked rather than failing.
+    /// A scan cannot spill or shrink its buffer, so the bytes are recorded
+    /// with the infallible [`MemoryReservation::grow`] even when that takes
+    /// the pool past its limit: the scan never fails on the reservation, and
+    /// spillable operators see the pool as full rather than an untracked gap.
     pub fn with_memory_pool(mut self, pool: &Arc<dyn MemoryPool>, bytes: usize) -> Self {
         if bytes > 0 {
             self.memory = Some(ScanMemory {
@@ -300,13 +302,10 @@ impl ParquetBatchStream {
         self
     }
 
-    /// Account the decode buffer against the scan context's memory pool, if
-    /// any; see [`Self::with_memory_pool`].
+    /// Account the decode buffer against the scan context's memory pool; see
+    /// [`Self::with_memory_pool`].
     pub fn with_scan_memory(self, ctx: &arneb_execution::ScanContext, bytes: usize) -> Self {
-        match &ctx.memory_pool {
-            Some(pool) => self.with_memory_pool(pool, bytes),
-            None => self,
-        }
+        self.with_memory_pool(&ctx.memory_pool, bytes)
     }
 
     /// Transform every batch with `adapter` before yielding it.
@@ -322,7 +321,7 @@ impl Stream for ParquetBatchStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some(mem) = self.memory.as_mut() {
             if let Some(bytes) = mem.pending.take() {
-                let _ = mem.reservation.try_grow(bytes);
+                mem.reservation.grow(bytes);
             }
         }
         let polled = self.inner.as_mut().poll_next(cx);
@@ -458,19 +457,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_stream_is_best_effort_when_pool_is_full() {
+    async fn scan_stream_records_bytes_when_pool_is_full() {
         let (store, path) = store_with_parquet(10_000, 2_500).await;
         let builder = open_parquet_builder(&store, &path).await.unwrap();
         let bytes = row_group_buffer_bytes(builder.metadata(), None);
         let schema = builder.schema().clone();
         let inner = build_split_stream(builder, &path, &[], &[], None, None, 0, 1).unwrap();
-        // A pool too small for the row group: the scan must still succeed.
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes / 2));
-        let stream =
+        // Fill the pool to its limit with another consumer: the scan must
+        // still succeed, and its buffer must be recorded past the limit.
+        let limit = bytes / 2;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let mut other = MemoryConsumer::new("Other").register(pool.clone());
+        other.try_grow(limit).unwrap();
+        let mut stream =
             ParquetBatchStream::new(schema, inner, path.to_string()).with_memory_pool(&pool, bytes);
-        let batches: Vec<_> = stream.collect().await;
-        let rows: usize = batches.into_iter().map(|b| b.unwrap().num_rows()).sum();
+
+        let mut rows = stream.next().await.unwrap().unwrap().num_rows();
+        assert_eq!(pool.reserved(), limit + bytes, "recorded over the limit");
+        assert!(pool.try_grow(&MemoryConsumer::new("Join"), 1).is_err());
+        while let Some(b) = stream.next().await {
+            rows += b.unwrap().num_rows();
+        }
         assert_eq!(rows, 10_000);
+        assert_eq!(pool.reserved(), limit, "scan bytes released at end");
+        drop(other);
         assert_eq!(pool.reserved(), 0);
     }
 }

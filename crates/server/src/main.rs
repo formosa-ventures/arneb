@@ -747,11 +747,11 @@ async fn run() -> Result<()> {
     // form whatever `max_queued_queries` says: build no controller, and
     // statements skip admission (and its lock) entirely.
     let serves_sql = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
-    let admission_settings = &config.admission_settings;
-    let admission = (serves_sql && admission_settings.max_running_queries > 0).then(|| {
+    let admission_config = &config.admission;
+    let admission = (serves_sql && admission_config.max_running_queries > 0).then(|| {
         arneb_scheduler::AdmissionController::new(
-            admission_settings.max_running_queries,
-            admission_settings.max_queued_queries,
+            admission_config.max_running_queries,
+            admission_config.max_queued_queries,
         )
     });
     if let Some(controller) = &admission {
@@ -760,10 +760,10 @@ async fn run() -> Result<()> {
     if serves_sql {
         tracing::info!(
             target: "arneb::config",
-            max_running_queries = admission_settings.max_running_queries,
-            max_queued_queries = admission_settings.max_queued_queries,
+            max_running_queries = admission_config.max_running_queries,
+            max_queued_queries = admission_config.max_queued_queries,
             statement_timeout = %arneb_common::duration::format_pg_time_limit(
-                admission_settings.statement_timeout
+                admission_config.statement_timeout
             ),
             query_max_memory_per_node = %query_memory_limit
                 .map_or_else(|| "off".to_owned(), |b| b.to_string()),
@@ -787,7 +787,7 @@ async fn run() -> Result<()> {
     .with_memory_pool(Arc::clone(&memory_pool))
     .with_query_memory_limit(query_memory_limit)
     .with_admission(admission.clone())
-    .with_statement_timeout(config.admission_settings.statement_timeout)
+    .with_statement_timeout(config.admission.statement_timeout)
     .with_auth(auth_method)
     .with_tls(pgwire_tls);
     if let Some(ref executor) = distributed_executor {
@@ -828,7 +828,7 @@ async fn run() -> Result<()> {
         .with_memory_pool(Arc::clone(&memory_pool))
         .with_query_memory_limit(query_memory_limit)
         .with_admission(admission.clone())
-        .with_statement_timeout(config.admission_settings.statement_timeout)
+        .with_statement_timeout(config.admission.statement_timeout)
         .with_query_tracker(query_tracker.clone())
         .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
         .with_password_auth(password_users.clone())

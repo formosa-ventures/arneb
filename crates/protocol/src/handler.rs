@@ -746,9 +746,10 @@ fn metadata_to_response(resp: crate::metadata::MetadataResponse) -> PgWireResult
 
 /// Whether `sql` executes a plan and so takes an admission slot
 /// (admission-control D5): queries, `INSERT`, `DELETE`, CTAS and
-/// `EXPLAIN ANALYZE`. Catalog-only DDL and plain `EXPLAIN` never queue, and
-/// neither does SQL that fails to parse (it fails right away instead).
-/// Session and metadata statements are intercepted before this point.
+/// `EXPLAIN ANALYZE`. Catalog-only DDL and plain `EXPLAIN` never queue.
+/// SQL the arneb parser rejects is admitted (fail closed): the caller must
+/// resolve statements it handles itself (session, metadata, Trino
+/// `EXECUTE`) before asking.
 pub fn needs_admission(sql: &str) -> bool {
     use arneb_sql_parser::ast::Statement;
     match arneb_sql_parser::parse(sql) {
@@ -759,8 +760,7 @@ pub fn needs_admission(sql: &str) -> bool {
             | Statement::CreateView { .. }
             | Statement::DropView { .. },
         ) => false,
-        Ok(_) => true,
-        Err(_) => false,
+        Ok(_) | Err(_) => true,
     }
 }
 

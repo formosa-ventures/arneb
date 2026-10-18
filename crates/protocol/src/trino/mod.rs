@@ -501,27 +501,31 @@ async fn submit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) 
                 return;
             }
         };
+        // A limit past the clock's range (`checked_add` overflow) never fires.
         let run_deadline = limits
             .run
-            .map(|d| tokio::time::Instant::from_std(task_query.created) + d);
-        let _admission = match with_deadline(run_deadline, admit(&task_state, &task_query)).await {
-            Some(Ok(permit)) => permit,
-            Some(Err(err)) => {
-                complete(&task_state, &task_query, Err(err));
-                return;
-            }
-            None => {
-                complete(
-                    &task_state,
-                    &task_query,
-                    Err(limits.exceeded("query_max_run_time")),
-                );
-                return;
-            }
-        };
+            .and_then(|d| tokio::time::Instant::from_std(task_query.created).checked_add(d));
+        let _admission =
+            match with_deadline(run_deadline, admit(&task_state, &task_query, &session)).await {
+                Some(Ok(permit)) => permit,
+                Some(Err(err)) => {
+                    complete(&task_state, &task_query, Err(err));
+                    return;
+                }
+                None => {
+                    complete(
+                        &task_state,
+                        &task_query,
+                        Err(limits.exceeded("query_max_run_time")),
+                    );
+                    return;
+                }
+            };
         let exec_deadline = match (
             run_deadline,
-            limits.execution.map(|d| tokio::time::Instant::now() + d),
+            limits
+                .execution
+                .and_then(|d| tokio::time::Instant::now().checked_add(d)),
         ) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -642,11 +646,12 @@ async fn with_deadline<F: std::future::Future>(
 async fn admit(
     state: &AppState,
     query: &Query,
+    session: &ClientSession,
 ) -> Result<Option<arneb_scheduler::AdmissionPermit>, TrinoError> {
     let Some(controller) = &state.admission else {
         return Ok(None);
     };
-    if !crate::handler::needs_admission(&query.sql) {
+    if !needs_admission(session, &query.sql) {
         return Ok(None);
     }
     let pending = controller
@@ -658,6 +663,25 @@ async fn admit(
     let permit = pending.wait().await;
     query.queued.store(false, Ordering::Relaxed);
     Ok(Some(permit))
+}
+
+/// Whether `sql` takes an admission slot, deciding `EXECUTE` /
+/// `EXECUTE IMMEDIATE` on the statement they run. Other control statements
+/// (`SHOW`, `USE`, `SET SESSION`, `PREPARE`, …) never queue; an `EXECUTE`
+/// that cannot be resolved fails in the engine, so it does not queue either.
+fn needs_admission(session: &ClientSession, sql: &str) -> bool {
+    use statements::{parse_control, ControlStatement};
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let target = match parse_control(sql) {
+        None => return crate::handler::needs_admission(sql),
+        Some(ControlStatement::Execute { name, .. }) => match session.prepared_statement(&name) {
+            Some(prepared) => prepared.to_owned(),
+            None => return false,
+        },
+        Some(ControlStatement::ExecuteImmediate { sql, .. }) => sql,
+        Some(_) => return false,
+    };
+    crate::handler::needs_admission(&target)
 }
 
 fn complete(state: &AppState, query: &Query, result: Result<QueryOutput, TrinoError>) {

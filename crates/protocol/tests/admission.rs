@@ -168,3 +168,60 @@ async fn unlimited_admission_never_queues() {
     }
     assert_eq!(admission.snapshot().queued, 0);
 }
+
+async fn finish(http: &reqwest::Client, mut doc: Value) -> Value {
+    while doc.get("nextUri").is_some() {
+        doc = next(http, &doc).await;
+    }
+    doc
+}
+
+#[tokio::test]
+async fn trino_execute_is_admitted_like_the_statement_it_runs() {
+    let admission = AdmissionController::new(1, 2);
+    let base = trino_server(&admission).await;
+    let http = reqwest::Client::new();
+    let held = admission.admit("test").unwrap().wait().await;
+
+    // `EXECUTE IMMEDIATE` and `EXECUTE` of a prepared SELECT both queue.
+    let immediate = submit(&http, &base, "EXECUTE IMMEDIATE 'SELECT 1'").await;
+    wait_for(|| admission.snapshot().queued == 1).await;
+    let prepared: Value = http
+        .post(format!("{base}/v1/statement"))
+        .header("X-Trino-User", "t")
+        .header("X-Trino-Prepared-Statement", "q1=SELECT%20%3F%20%2B%201")
+        .body("EXECUTE q1 USING 41")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    wait_for(|| admission.snapshot().queued == 2).await;
+
+    // Control statements, including an unknown prepared name, never queue.
+    for sql in [
+        "SHOW CATALOGS",
+        "PREPARE q2 FROM SELECT 1",
+        "EXECUTE missing",
+    ] {
+        let doc = finish(&http, submit(&http, &base, sql).await).await;
+        assert!(
+            doc["stats"]["state"] == "FINISHED" || doc["stats"]["state"] == "FAILED",
+            "{sql}: {doc}"
+        );
+        assert_ne!(
+            doc["error"]["errorName"], "QUERY_QUEUE_FULL",
+            "{sql}: {doc}"
+        );
+    }
+    assert_eq!(admission.snapshot().queued, 2);
+
+    drop(held);
+    let immediate = finish(&http, immediate).await;
+    assert_eq!(immediate["stats"]["state"], "FINISHED", "{immediate}");
+    let prepared = finish(&http, prepared).await;
+    assert_eq!(prepared["stats"]["state"], "FINISHED", "{prepared}");
+    assert_eq!(prepared["data"][0][0], 42, "{prepared}");
+    wait_for(|| admission.snapshot().running == 0).await;
+}

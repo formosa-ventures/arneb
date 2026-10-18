@@ -45,7 +45,9 @@ pub fn parse_time_limit(input: &str) -> Result<Option<Duration>, String> {
     if millis == 0.0 {
         return Ok(None);
     }
-    Ok(Some(Duration::from_secs_f64(millis / 1_000.0)))
+    Duration::try_from_secs_f64(millis / 1_000.0)
+        .map(Some)
+        .map_err(|_| format!("invalid duration '{input}' (out of range)"))
 }
 
 /// PostgreSQL's display form for `SHOW statement_timeout`: `0`, or the
@@ -97,7 +99,15 @@ mod tests {
 
     #[test]
     fn invalid_values() {
-        for bad in ["", "abc", "-5s", "5 weeks", "1.2.3s"] {
+        for bad in [
+            "",
+            "abc",
+            "-5s",
+            "5 weeks",
+            "1.2.3s",
+            "99999999999999999999999d",
+            "'99999999999999999999999d'",
+        ] {
             assert!(parse_time_limit(bad).is_err(), "{bad}");
         }
     }

@@ -262,6 +262,12 @@ docker exec arneb-trino-1 trino --catalog hive --schema tpch \
 python3 benchmarks/tpch/scripts/bench_report.py \
   "$(ls -t benchmarks/tpch/results/memory_total_*.csv | head -1)"
 
+# (optional) the same CSV as a chart: latency and peak memory per query, one
+# bar per engine (SVG, standard library only). --mode picks cold or warm rows.
+python3 benchmarks/tpch/scripts/plot_comparison.py \
+  "$(ls -t benchmarks/tpch/results/memory_total_*.csv | head -1)" \
+  --mode cold -o chart.svg --title "Arneb vs Trino — TPC-H SF30, cold"
+
 # (optional) correctness gate — every query is deterministic AND cell-identical
 # to Trino. Run with the cluster up.
 python3 benchmarks/tpch/scripts/blast_radius_oracle.py --runs 2

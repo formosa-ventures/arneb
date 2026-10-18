@@ -7,11 +7,13 @@ through the same Hive Metastore. Correctness is a separate gate: every query is
 compared cell by cell against Trino, and all 22 match at both scale factors
 below.
 
-| Scale | Protocol | Latency (Trino ÷ Arneb, geomean) | Peak memory (Arneb ÷ Trino, mean) | Faster on |
-|---|---|--:|--:|--:|
-| SF10 | warm | **2.3×** | **0.14×** | 22 / 22 |
-| SF10 | cold | **4.6×** | **0.14×** | 22 / 22 |
-| SF30 | cold | **3.7×** | **0.21×** | 22 / 22 |
+| Scale | Protocol | Release | Latency (Trino ÷ Arneb, geomean) | Peak memory (Arneb ÷ Trino, mean) | Faster on |
+|---|---|---|--:|--:|--:|
+| SF10 | warm | v0.1.2 | **2.3×** | **0.14×** | 22 / 22 |
+| SF10 | cold | v0.1.2 | **4.6×** | **0.14×** | 22 / 22 |
+| SF30 | cold | v0.1.3 | **3.5×** | **0.22×** | 22 / 22 |
+
+![Arneb vs Trino, TPC-H SF30 cold: latency and peak memory per query](/perf/tpch-sf30-cold-2026-10-18.svg)
 
 Quote the warm SF10 column. A cold run recreates the cluster, so Trino's figure
 includes the JVM re-JITting its code, a start-up cost Arneb does not have:
@@ -70,38 +72,77 @@ committed heap (1.84–2.15 GB across 44 restarts); Arneb's holds 0.07 GB.
 
 ## SF30, cold
 
-Measured 2026-10-15 on a separate benchmark host, cold protocol only, one run
-per query, from the same code. Arneb's latency is in seconds; ratios are as
-above. The second half of the run was slowed for both engines by the host
-(Trino's own `q21` took 207 s against 151–199 s in earlier runs), so the later
-queries understate Arneb a little. Numbers from this host are not comparable
-with the SF10 table.
+Measured 2026-10-18 on a separate benchmark host, cold protocol only, one run
+per query, from the code released as v0.1.3. Latency is in seconds; memory is
+the simultaneous cluster peak in GB (KiB ÷ 10⁶), with Trino's derived from the
+recorded ratio, so it is good to about 2%. The oracle was 22/22 clean,
+deterministic over two runs. Numbers from this host are not comparable with the
+SF10 table.
 
-| Query | | Arneb (s) | Latency | Memory |
-|---|---|--:|--:|--:|
-| `q01` | Pricing Summary | 19.1 | 2.5× | 0.07× |
-| `q02` | Minimum Cost Supplier | 5.9 | 7.9× | 0.13× |
-| `q03` | Shipping Priority | 24.6 | 2.8× | 0.27× |
-| `q04` | Order Priority Checking | 12.7 | 4.2× | 0.08× |
-| `q05` | Local Supplier Volume | 24.4 | 3.7× | 0.32× |
-| `q06` | Forecasting Revenue | 7.2 | 6.1× | 0.06× |
-| `q07` | Volume Shipping | 38.4 | 2.0× | 0.20× |
-| `q08` | National Market Share | 30.7 | 3.5× | 0.23× |
-| `q09` | Product Type Profit | 71.7 | 2.0× | 0.16× |
-| `q10` | Returned Item Reporting | 30.0 | 4.0× | 0.31× |
-| `q11` | Important Stock ID | 8.3 | 5.5× | 0.26× |
-| `q12` | Shipping Modes | 13.4 | 3.5× | 0.20× |
-| `q13` | Customer Distribution | 17.4 | 3.5× | 0.11× |
-| `q14` | Promotion Effect | 12.1 | 5.6× | 0.19× |
-| `q15` | Top Supplier | 18.1 | 4.9× | 0.07× |
-| `q16` | Parts/Supplier Relationship | 12.0 | 5.7× | 0.23× |
-| `q17` | Small-Quantity-Order Revenue | 39.9 | 2.8× | 0.56× |
-| `q18` | Large Volume Customer | 54.9 | 2.1× | 0.38× |
-| `q19` | Discounted Revenue | 12.7 | 4.7× | 0.10× |
-| `q20` | Potential Part Promotion | 21.0 | 3.4× | 0.17× |
-| `q21` | Suppliers Who Kept Orders Waiting | 108.6 | 1.9× | 0.52× |
-| `q22` | Global Sales Opportunity | 7.8 | 4.5× | 0.10× |
-| | **aggregate** | | **3.7×** | **0.21×** |
+| Query | | Arneb (s) | Trino (s) | Latency | Arneb (GB) | Memory |
+|---|---|--:|--:|--:|--:|--:|
+| `q01` | Pricing Summary | 19.5 | 46.5 | 2.4× | 0.35 | 0.06× |
+| `q02` | Minimum Cost Supplier | 6.1 | 45.0 | 7.4× | 0.66 | 0.16× |
+| `q03` | Shipping Priority | 29.5 | 65.3 | 2.2× | 1.65 | 0.23× |
+| `q04` | Order Priority Checking | 14.1 | 55.3 | 3.9× | 0.61 | 0.07× |
+| `q05` | Local Supplier Volume | 24.5 | 75.9 | 3.1× | 2.19 | 0.35× |
+| `q06` | Forecasting Revenue | 7.0 | 31.6 | 4.5× | 0.34 | 0.06× |
+| `q07` | Volume Shipping | 28.7 | 69.4 | 2.4× | 1.36 | 0.26× |
+| `q08` | National Market Share | 21.8 | 77.3 | 3.5× | 1.14 | 0.17× |
+| `q09` | Product Type Profit | 49.1 | 130.9 | 2.7× | 1.94 | 0.17× |
+| `q10` | Returned Item Reporting | 20.3 | 94.2 | 4.6× | 2.08 | 0.39× |
+| `q11` | Important Stock ID | 8.4 | 37.5 | 4.5× | 1.09 | 0.26× |
+| `q12` | Shipping Modes | 13.5 | 45.2 | 3.3× | 0.86 | 0.17× |
+| `q13` | Customer Distribution | 16.5 | 70.2 | 4.3× | 0.99 | 0.14× |
+| `q14` | Promotion Effect | 12.1 | 43.9 | 3.6× | 1.48 | 0.25× |
+| `q15` | Top Supplier | 13.2 | 65.3 | 4.9× | 0.50 | 0.07× |
+| `q16` | Parts/Supplier Relationship | 10.7 | 53.4 | 5.0× | 1.06 | 0.19× |
+| `q17` | Small-Quantity-Order Revenue | 31.2 | 83.2 | 2.7× | 4.29 | 0.52× |
+| `q18` | Large Volume Customer | 49.1 | 86.0 | 1.8× | 5.33 | 0.48× |
+| `q19` | Discounted Revenue | 12.9 | 49.3 | 3.8× | 0.75 | 0.12× |
+| `q20` | Potential Part Promotion | 15.8 | 63.5 | 4.0× | 1.07 | 0.15× |
+| `q21` | Suppliers Who Kept Orders Waiting | 65.4 | 169.7 | 2.6× | 4.34 | 0.48× |
+| `q22` | Global Sales Opportunity | 7.8 | 37.4 | 4.8× | 0.50 | 0.09× |
+| | **aggregate** | | | **3.5×** | | **0.22×** |
+
+The v0.1.2 run on 2026-10-15 got 3.7× and 0.21×. This release adds no
+performance work, and the difference is inside run-to-run noise. The second
+half of that earlier run was also slowed for both engines by the host: Trino's
+own `q21` took 207 s, against 170 s here.
+
+The chart is drawn from
+[the run's data](/perf/tpch-sf30-cold-2026-10-18.csv) by
+[`benchmarks/tpch/scripts/plot_comparison.py`](https://github.com/formosa-ventures/arneb/blob/main/benchmarks/tpch/scripts/plot_comparison.py),
+which reads any `run_memory_bench` CSV:
+
+```bash
+python3 benchmarks/tpch/scripts/plot_comparison.py \
+    benchmarks/tpch/results/memory_total_<stamp>.csv --mode cold \
+    -o chart.svg --title "Arneb vs Trino — TPC-H SF30, cold"
+```
+
+## What changed in v0.1.3
+
+v0.1.3 is about running Arneb safely next to other workloads, not about speed:
+
+- **Security**: TLS on pgwire and on the Trino listener (HTTPS), password
+  authentication on both against the same users, and a shared secret plus TLS
+  on the coordinator–worker Flight RPC. See
+  [Authentication](/guide/configuration#authentication),
+  [TLS](/guide/configuration#tls) and
+  [Securing the Cluster](/guide/distributed#securing-the-cluster).
+- **Admission control**: a cap on running queries with a queue behind it, a
+  per-query memory limit on every node, `statement_timeout`, and cancellation
+  that reaches the workers. See
+  [Admission Control](/guide/configuration#admission-control).
+- **Memory accounting**: Parquet scans now count their decode buffers in the
+  memory pool, so the per-query limit and a join's spill decision see the real
+  usage. In the run above, no join spilled earlier because of it; arneb's
+  median peak was 0.97× that of the run before the change.
+- **Exchange resilience**: a worker-to-worker broadcast read that breaks on the
+  transport (for example an h2 `BrokenPipe` under many concurrent queries) is
+  reopened and resumed from the first row not yet delivered, instead of failing
+  the query.
 
 ## What changed in v0.1.2
 

@@ -18,7 +18,7 @@ hero:
 
 features:
   - title: Faster and Leaner than Trino
-    details: On all 22 TPC-H queries at SF10, cell-identical results, 2.3× faster warm and about a seventh of Trino's peak memory; faster on all 22 at SF30 too.
+    details: On all 22 TPC-H queries, cell-identical results. SF10 2.3× faster warm at about a seventh of Trino's peak memory; SF30 3.5× faster cold at 0.22× the memory.
     link: /guide/performance
     linkText: See the numbers
   - title: Arrow-Native
@@ -31,4 +31,8 @@ features:
     details: Query CSV and Parquet files, S3/GCS/Azure object stores, and Hive Metastore catalogs (Parquet, ORC, partitioned and Iceberg tables) from a single SQL interface.
   - title: Distributed Execution
     details: Coordinator-worker architecture with Apache Arrow Flight RPC for high-throughput data exchange.
+  - title: Secure and Governed
+    details: TLS and password authentication on both client protocols, a secret plus TLS between nodes, a query queue, per-query memory limits and statement timeouts.
+    link: /guide/configuration#admission-control
+    linkText: Configure it
 ---

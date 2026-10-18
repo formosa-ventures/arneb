@@ -29,6 +29,11 @@ Snappy Parquet from RustFS through the same Hive Metastore. `lineitem` is
 | **Correctness** | **Cell-identical to Trino on all 22**, deterministic run-to-run |
 | **Footprint** | One self-contained binary (~60 MB). No JVM, no heap tuning, no GC pauses |
 
+At SF30 the gap holds: **3.5× faster** (cold, geomean) at **0.22×** the memory,
+faster on all 22 ([details](#sf30-cold-on-a-separate-host)).
+
+![Arneb vs Trino, TPC-H SF30 cold: latency and peak memory per query](docs/public/perf/tpch-sf30-cold-2026-10-18.svg)
+
 ### Every query, both protocols
 
 Latency in milliseconds, peak memory in MB. Latency ratios are Trino ÷ arneb
@@ -144,9 +149,11 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 - **90 Trino-compatible Scalar Functions**: conditional (IF, TRY, GREATEST, LEAST), string (SPLIT_PART, STRPOS, LPAD/RPAD, CONCAT_WS, `||`, ...), regex (REGEXP_LIKE/EXTRACT/REPLACE/COUNT), math (SQRT, LN, LOG, TRUNCATE, RANDOM, trig, ...), date/time (DATE_ADD, DATE_DIFF, DATE_TRUNC, DATE_FORMAT, DATE_PARSE, FORMAT_DATETIME, YEAR/MONTH/DAY_OF_WEEK/..., FROM_UNIXTIME, NOW) — see [docs/sql/functions.md](docs/sql/functions.md)
 - **Arrow-native Execution**: Vectorized columnar processing using Apache Arrow
 - **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API) with Parquet and ORC tables and partitioned tables (partitions read from HMS, as in Trino), Apache Iceberg tables in the same HMS via table redirection (read-only; field-ID schema evolution) — see [Hive](docs/connectors/hive.md)
-- **PostgreSQL Wire Protocol**: Compatible with psql, DBeaver, JDBC, psycopg2, node-postgres, and all standard PostgreSQL clients; per-connection `SET search_path`; SCRAM-SHA-256 password authentication
+- **PostgreSQL Wire Protocol**: Compatible with psql, DBeaver, JDBC, psycopg2, node-postgres, and all standard PostgreSQL clients; per-connection `SET search_path`; SCRAM-SHA-256 password authentication; TLS (`sslmode=require` / `verify-full`)
 - **Extended Query Protocol**: Full prepared statement support (Parse/Bind/Describe/Execute/Sync)
-- **Trino Client Protocol**: Trino's REST protocol on port 8080, so the `trino` CLI, Trino JDBC, `trino-python-client` (Superset), Metabase's Trino driver and dbt-trino can connect unchanged — see [Trino client compatibility](docs/guide/trino-clients.md)
+- **Trino Client Protocol**: Trino's REST protocol on port 8080, so the `trino` CLI, Trino JDBC, `trino-python-client` (Superset), Metabase's Trino driver and dbt-trino can connect unchanged; HTTPS with Basic authentication against the same users as pgwire — see [Trino client compatibility](docs/guide/trino-clients.md)
+- **Security**: TLS on both client protocols, password authentication on both, and a shared secret plus TLS on the coordinator–worker Flight RPC — see [Securing the Cluster](docs/guide/distributed.md#securing-the-cluster)
+- **Admission Control**: a cap on running queries with a FIFO queue behind it, a per-query memory limit on every node (SQLSTATE `53200` / `EXCEEDED_LOCAL_MEMORY_LIMIT`), `statement_timeout`, and cancellation that reaches the workers — see [Admission Control](docs/guide/configuration.md#admission-control)
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
 - **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC; data-parallel scans, hash-partitioned joins, semi/anti joins and final aggregates, and key-set filters published from the small side of a large semi/anti join to the scans on the big side
 - **Web UI**: Dashboard with query monitoring, cluster overview, and worker status
@@ -207,23 +214,38 @@ schema = [
     { name = "total", type = "float64" },
 ]
 
-# Trino client protocol listener (default: enabled on port 8080). It does not
-# check [auth] yet — set enabled = false (or --no-trino) if you need passwords.
+# Trino client protocol listener (default: enabled on port 8080).
 [trino]
 enabled = true
 port = 8080
 
-# Optional: require SCRAM-SHA-256 passwords (default: type = "none").
-# Enforced on the pgwire port; the Trino listener follows in a later release.
+# Optional: require passwords (default: type = "none"). pgwire runs
+# SCRAM-SHA-256; the Trino listener checks HTTP Basic against the same users
+# and needs [tls] when passwords are on.
 [auth]
 type = "password"
 
 [[auth.users]]
 name = "alice"
 password_hash = "SCRAM-SHA-256$4096:..."   # generate with: arneb hash-password
+
+# Optional: TLS for pgwire and the Trino listener (HTTPS), one certificate.
+[tls]
+cert_path = "/etc/arneb/server.crt"
+key_path  = "/etc/arneb/server.key"
+
+# Optional: admission control (defaults shown, except the timeout).
+[admission]
+max_running_queries = 8       # 0 = unlimited
+max_queued_queries  = 256
+statement_timeout   = "5min"  # default "0" = off
 ```
 
-See [docs/guide/configuration.md](docs/guide/configuration.md#authentication) for authentication details.
+See [Authentication](docs/guide/configuration.md#authentication),
+[TLS](docs/guide/configuration.md#tls) and
+[Admission Control](docs/guide/configuration.md#admission-control) for details,
+and [Securing the Cluster](docs/guide/distributed.md#securing-the-cluster) for
+the coordinator–worker secret and TLS.
 
 ### Distributed Mode
 
@@ -364,16 +386,20 @@ hardware-independent.
 
 ### SF30, cold, on a separate host
 
-The reviewer of #129 reran all 22 at SF30 cold on a separate benchmark host
-(2026-10-15, the `main` that became v0.1.2), same harness, one run per query.
-Arneb was faster on **all 22**: **3.7×** on the geomean, slowest `q21` at 1.9×,
-fastest `q02` at 7.9×. Peak memory averaged **0.21×** of Trino's (best 0.06×
-`q06`, worst 0.56× `q17`), and the oracle was 22/22 clean. The second half of
-that run was slowed for both engines by the host (Trino's own `q21` took 207 s
-against 151–199 s in earlier runs), so the later queries understate arneb a
-little. These are cold numbers only; SF30 has not been measured warm, and a
-different host means they are not comparable with the SF10 table above. Per
-query figures are on the [Performance](https://arneb.io/guide/performance) page.
+All 22 at SF30 cold on a separate benchmark host (2026-10-18, the code released
+as v0.1.3), same harness, one run per query. Arneb was faster on **all 22**:
+**3.5×** on the geomean, slowest `q18` at 1.8×, fastest `q02` at 7.4×. Peak
+memory averaged **0.22×** of Trino's (best 0.06× `q01` and `q06`, worst 0.52×
+`q17`), and the oracle was 22/22 clean, deterministic over two runs; the chart
+at the top of this README plots it. The v0.1.2 run got 3.7× / 0.21×; v0.1.3
+adds no performance work, and the difference is inside run-to-run noise.
+v0.1.3 does account Parquet scan buffers in the memory pool, and this run
+confirmed that it moved no join into an earlier spill. These
+are cold numbers only; SF30 has not been measured warm, and a different host
+means they are not comparable with the SF10 table above. Per-query figures are
+on the [Performance](https://arneb.io/guide/performance) page, and the chart is
+drawn from [its data](docs/public/perf/tpch-sf30-cold-2026-10-18.csv) by
+[`plot_comparison.py`](benchmarks/tpch/scripts/plot_comparison.py).
 
 `q11` numbers measured at SF10 before 2026-10-13 timed an empty result: the
 query hard-coded the SF1 threshold fraction, so above SF1 both engines filtered

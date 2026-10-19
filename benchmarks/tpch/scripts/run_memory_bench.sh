@@ -390,11 +390,9 @@ measure() {
     # recreated for this query, so the logs hold this query's tasks only.
     # tracked_vs_rss.py pairs them with the cgroup peaks above.
     if [[ "$engine" == "arneb" ]]; then
-        local mem_log="$LOG_DIR/arneb_${q}_${mode}.mem"
-        : >"$mem_log"
         for c in "${cluster[@]}"; do
-            docker logs "$c" 2>&1 | grep -E 'arneb::mem(profile)?' | sed "s/^/$c /" >>"$mem_log"
-        done
+            docker logs "$c" 2>&1 | sed -n "/arneb::mem/s/^/$c /p"
+        done >"$LOG_DIR/arneb_${q}_${mode}.mem"
     fi
     status=${res%%:*}
     rest=${res#*:}

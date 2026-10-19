@@ -10,7 +10,7 @@ Per worker and query:
               (the pool's high-water; the process was fresh for this query)
   jemalloc    max `jemalloc_resident_peak_bytes` of the `arneb::memprofile`
               events (only with the memprofile overlay; sampled on each
-              reservation grow, so it can miss a peak no grow coincided with)
+              reservation grow and release and every 50 ms in between)
   cgroup      the node's cgroup memory.peak from the CSV
   trk/cg      tracked / cgroup, the headline ratio
   trk/je      tracked / jemalloc, the ratio without page cache or allocator
@@ -46,16 +46,12 @@ def parse_mem_log(path):
     return peaks
 
 
-def gib(n):
-    return f"{n / 2**30:.2f}" if n else "-"
+def fmt(x):
+    return f"{x:.2f}" if x else "-"
 
 
 def ratio(num, den):
     return num / den if num and den else None
-
-
-def fmt_ratio(r):
-    return f"{r:.2f}" if r is not None else "-"
 
 
 def main():
@@ -87,13 +83,11 @@ def main():
                 missing += 1
             rc, rj = ratio(tracked, cgroup), ratio(tracked, jemalloc)
             if r["status"] == "OK":
-                if rc is not None:
-                    trk_cg.append(rc)
-                if rj is not None:
-                    trk_je.append(rj)
+                trk_cg += [rc] if rc else []
+                trk_je += [rj] if rj else []
             print(
-                f"| {r['query']} | {r['mode']} | {r['status']} | {container} | {gib(tracked)} "
-                f"| {gib(jemalloc)} | {gib(cgroup)} | {fmt_ratio(rc)} | {fmt_ratio(rj)} |"
+                f"| {r['query']} | {r['mode']} | {r['status']} | {container} | {fmt(tracked / 2**30)} "
+                f"| {fmt(jemalloc / 2**30)} | {fmt(cgroup / 2**30)} | {fmt(rc)} | {fmt(rj)} |"
             )
 
     print()

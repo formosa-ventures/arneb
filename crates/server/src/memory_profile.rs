@@ -56,6 +56,27 @@ impl MemoryProfilePool {
         }
     }
 
+    /// Sample jemalloc every `interval` on a background thread for as long as
+    /// the pool is alive. Reservation events alone sample too sparsely: a scan
+    /// reserves once and then decodes for seconds without another event, so
+    /// the resident peak would otherwise be read from whichever event came
+    /// nearest to it.
+    pub fn start_resident_sampler(self: &Arc<Self>, interval: std::time::Duration) {
+        let pool = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("arneb-memprofile".into())
+            .spawn(move || {
+                while let Some(pool) = pool.upgrade() {
+                    pool.sample_jemalloc_resident();
+                    drop(pool);
+                    std::thread::sleep(interval);
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "memory profile sampler not started");
+        }
+    }
+
     fn sample_jemalloc_resident(&self) {
         if let Some(stats) = jemalloc_memory_stats() {
             Self::update_peak(&self.jemalloc_resident_peak, stats.resident);
@@ -108,6 +129,12 @@ impl MemoryPool for MemoryProfilePool {
     }
 
     fn shrink(&self, consumer: &MemoryConsumer, bytes: usize) {
+        // Sample before the release as well as on grow. A reservation is
+        // usually made before its buffers are allocated (a scan reserves its
+        // row-group buffer on the first poll), so grow-time samples alone
+        // read the heap before the bytes they account for exist; a release
+        // happens while they are still resident.
+        self.sample_jemalloc_resident();
         self.inner.shrink(consumer, bytes);
 
         let bytes = bytes as u64;
@@ -220,4 +247,59 @@ fn jemalloc_memory_stats() -> Option<JemallocMemoryStats> {
 #[cfg(target_env = "msvc")]
 fn jemalloc_memory_stats() -> Option<JemallocMemoryStats> {
     None
+}
+
+#[cfg(all(test, not(target_env = "msvc")))]
+mod tests {
+    use super::*;
+    use arneb_execution::memory_pool::UnboundedMemoryPool;
+
+    #[test]
+    fn resident_peak_counts_buffers_allocated_after_the_reservation() {
+        const BYTES: usize = 256 << 20;
+        let pool = MemoryProfilePool::new(Arc::new(UnboundedMemoryPool::new()));
+        let consumer = MemoryConsumer::new("buffer");
+        pool.register(&consumer);
+
+        // Reserve first, allocate afterwards: the order a scan uses.
+        pool.grow(&consumer, BYTES);
+        let buffer = vec![1u8; BYTES];
+        pool.shrink(&consumer, BYTES);
+        drop(buffer);
+        pool.unregister(&consumer);
+
+        let snapshot = pool.memory_profile_snapshot().unwrap();
+        assert_eq!(snapshot.pool_peak_bytes, BYTES as u64);
+        assert!(
+            snapshot.jemalloc_resident_peak_bytes >= BYTES as u64,
+            "resident peak {} missed the {BYTES}-byte buffer",
+            snapshot.jemalloc_resident_peak_bytes
+        );
+    }
+
+    #[test]
+    fn sampler_sees_memory_no_reservation_accounts_for() {
+        const BYTES: usize = 256 << 20;
+        let pool = Arc::new(MemoryProfilePool::new(Arc::new(UnboundedMemoryPool::new())));
+        pool.start_resident_sampler(std::time::Duration::from_millis(5));
+
+        let buffer = vec![1u8; BYTES];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let peak = loop {
+            let peak = pool
+                .memory_profile_snapshot()
+                .unwrap()
+                .jemalloc_resident_peak_bytes;
+            if peak >= BYTES as u64 || std::time::Instant::now() > deadline {
+                break peak;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        drop(buffer);
+
+        assert!(
+            peak >= BYTES as u64,
+            "sampler peak {peak} missed the {BYTES}-byte buffer"
+        );
+    }
 }

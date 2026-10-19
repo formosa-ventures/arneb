@@ -385,6 +385,17 @@ measure() {
     for c in "${cluster[@]}"; do
         node_peaks+=("$(( $(read_cgroup_field "$c" peak) / 1024 ))")
     done
+    # Keep each arneb node's memory events (`arneb::mem` always;
+    # `arneb::memprofile` under the memprofile overlay). The cluster was
+    # recreated for this query, so the logs hold this query's tasks only.
+    # tracked_vs_rss.py pairs them with the cgroup peaks above.
+    if [[ "$engine" == "arneb" ]]; then
+        local mem_log="$LOG_DIR/arneb_${q}_${mode}.mem"
+        : >"$mem_log"
+        for c in "${cluster[@]}"; do
+            docker logs "$c" 2>&1 | grep -E 'arneb::mem(profile)?' | sed "s/^/$c /" >>"$mem_log"
+        done
+    fi
     status=${res%%:*}
     rest=${res#*:}
     latency=${rest%%:*}

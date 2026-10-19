@@ -95,7 +95,7 @@ services:
           cpus: "${BENCH_NODE_CPUS:-2}"
     # Pinned (here and below): the seed services write the bench data with
     # this image, so a floating tag can change file layout between seeds.
-    image: trinodb/trino:483
+    image: trinodb/trino:484
     ports:
       # Host side overridable for hosts where 8080 is already taken; the bench
       # scripts reach Trino from inside its container, so they never use it.
@@ -123,7 +123,7 @@ services:
       resources:
         limits:
           cpus: "${BENCH_NODE_CPUS:-2}"
-    image: trinodb/trino:483
+    image: trinodb/trino:484
     volumes:
       - ./docker/trino/catalog:/etc/trino/catalog
       - ./docker/trino/etc/worker.properties:/etc/trino/config.properties
@@ -143,7 +143,7 @@ services:
       resources:
         limits:
           cpus: "${BENCH_NODE_CPUS:-2}"
-    image: trinodb/trino:483
+    image: trinodb/trino:484
     volumes:
       - ./docker/trino/catalog:/etc/trino/catalog
       - ./docker/trino/etc/worker.properties:/etc/trino/config.properties
@@ -159,7 +159,7 @@ services:
         condition: service_healthy
 
   tpch-seed:
-    image: trinodb/trino:483
+    image: trinodb/trino:484
     volumes:
       - ./docker/tpch-seed:/seed
     entrypoint: ["/bin/bash", "/seed/seed.sh"]
@@ -177,7 +177,7 @@ services:
   # exercising Arneb's Iceberg reader through a `hive` catalog. See
   # docker/iceberg-seed/seed.sh.
   iceberg-seed:
-    image: trinodb/trino:483
+    image: trinodb/trino:484
     volumes:
       - ./docker/iceberg-seed:/seed
     entrypoint: ["/bin/bash", "/seed/seed.sh"]
@@ -191,7 +191,7 @@ services:
       - iceberg-seed
 
   tpcds-seed:
-    image: trinodb/trino:483
+    image: trinodb/trino:484
     volumes:
       - ./docker/tpcds-seed:/seed
     entrypoint: ["/bin/bash", "/seed/seed.sh"]

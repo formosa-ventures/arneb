@@ -37,6 +37,16 @@ pub trait DataSource: Send + Sync + Debug {
         1
     }
 
+    /// Whether the planner should pass the predicates of *every* `Filter`
+    /// stacked directly above this scan in [`ScanContext::filters`], not
+    /// only the innermost one. The optimizer splits a conjunction into
+    /// stacked filters, so a remote-SQL source needs all of them to push
+    /// the whole `WHERE`. Default `false` keeps the long-standing behavior
+    /// (and the measured performance) of the file connectors.
+    fn pushdown_stacked_filters(&self) -> bool {
+        false
+    }
+
     /// Scans rows from one partition as an async stream.
     ///
     /// The `ctx` parameter carries optional pushdown hints. Implementations

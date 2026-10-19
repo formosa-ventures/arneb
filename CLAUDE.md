@@ -40,6 +40,7 @@ cd benchmarks/tpch && cargo run --release -- --engine arneb --port 5432
 docker compose up -d                                        # start HMS + RustFS + Trino
 docker compose run --rm tpch-seed                           # seed TPC-H SF1 data
 docker compose run --rm iceberg-seed                        # seed Iceberg tables (<hive catalog>.ice.*)
+docker compose up -d postgres                               # PostgreSQL on :5433 for the postgresql connector
 cargo run --bin arneb -- --config benchmarks/tpch/tpch-hive.toml  # start Arneb with hive catalog
 psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.nation;"
 docker compose down                                         # tear down
@@ -176,6 +177,14 @@ crates/
 │                  # manifest list/manifests (Avro via apache-avro), field-ID
 │                  # column resolution over the shared connectors::parquet_scan.
 │                  # Delete files → clear unsupported error. See docs/connectors/iceberg.md.
+├── rdbms/         # Remote-SQL connector framework: Dialect trait, conservative
+│                  # PlanExpr→SQL filter translation (unsafe conjuncts stay
+│                  # local), SELECT building, PK-range SplitPlan carried in
+│                  # TableScan properties so every node agrees on partitions.
+├── postgresql/    # Read-only PostgreSQL catalog (`type = "postgresql"`) on
+│                  # arneb-rdbms: pg_catalog discovery, type mapping, binary
+│                  # COPY → Arrow decoder, deadpool pool. Live tests need
+│                  # ARNEB_TEST_POSTGRES_URL (docker compose up -d postgres).
 ├── hive-metastore/# Auto-generated Thrift bindings from Hive 4.2.0 IDL via volo-build.
 │                  # Rebuild with `cargo run -p hive-metastore-thrift-build` after
 │                  # editing `thrift_idl/hive_metastore.thrift`.

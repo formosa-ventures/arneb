@@ -223,7 +223,7 @@ service_account_path = "/path/to/service-account.json"
 
 ## Catalog Configuration
 
-Register external catalogs (e.g., Hive Metastore; its Iceberg tables are read through the same catalog):
+Register external catalogs: a Hive Metastore (its Iceberg tables are read through the same catalog) or a PostgreSQL database:
 
 ```toml
 [[catalogs]]
@@ -242,9 +242,24 @@ allow_http = true
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | yes | Catalog name (used as first part of `catalog.schema.table`) |
-| `type` | string | yes | Catalog type (currently `"hive"`; Iceberg tables in the metastore are included, see [Iceberg](/connectors/iceberg)) |
-| `metastore_uri` | string | yes | `host:port` of the Hive Metastore (no scheme prefix) |
-| `default_schema` | string | no | Default schema within the catalog |
+| `type` | string | yes | `"hive"` (Iceberg tables in the metastore are included, see [Iceberg](/connectors/iceberg)) or `"postgresql"` |
+| `metastore_uri` | string | hive | `host:port` of the Hive Metastore (no scheme prefix) |
+| `default_schema` | string | no | Default schema within the catalog (`default`; `public` for PostgreSQL) |
+
+A PostgreSQL catalog takes `connection_url`, `user`, `password` and the pool/split
+knobs `max_connections`, `split_min_rows`, `max_splits`,
+`unconstrained_numeric_scale`, `connect_timeout_secs` and
+`pool_wait_timeout_secs`. `ARNEB_CATALOG_<NAME>_PASSWORD` overrides the
+password. See [PostgreSQL](/connectors/postgresql):
+
+```toml
+[[catalogs]]
+name = "pg"
+type = "postgresql"
+connection_url = "postgresql://127.0.0.1:5433/arneb"
+user = "arneb"
+password = "arneb"
+```
 
 ## Cluster Configuration
 

@@ -11,6 +11,7 @@
 #   docker compose run tpch-seed            # seed TPC-H data (SF1)
 #   docker compose run tpcds-seed           # seed TPC-DS data (SF1)
 #   docker compose run iceberg-seed         # seed Iceberg tables (iceberg.ice.*)
+#   docker compose up -d postgres           # PostgreSQL for the postgresql connector
 #   docker compose down                     # tear down (keeps seeded data)
 #   docker compose down -v                  # tear down AND delete seeded data
 #
@@ -204,6 +205,27 @@ services:
     profiles:
       - tpcds-seed
 
+  # PostgreSQL for Arneb's `postgresql` catalog (crates/postgresql) and the
+  # bundled Trino's `postgresql` catalog over the same database. The fixture
+  # in docker/postgres/init loads once, on an empty `pg-data` volume.
+  postgres:
+    image: postgres:17.6
+    environment:
+      POSTGRES_USER: arneb
+      POSTGRES_PASSWORD: arneb
+      POSTGRES_DB: arneb
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "arneb", "-d", "arneb"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
 volumes:
   s3-data:
   hms-db:
+  pg-data:

@@ -639,21 +639,145 @@ impl MemoryConfig {
 pub struct CatalogConfig {
     /// Catalog name (used in SQL: `SELECT * FROM <name>.schema.table`).
     pub name: String,
-    /// Catalog type (currently only "hive" is supported; Iceberg tables in
-    /// the metastore are read through it).
+    /// Catalog type: `"hive"` (Iceberg tables in the metastore are read
+    /// through it) or `"postgresql"`.
     #[serde(rename = "type")]
     pub catalog_type: String,
     /// Hive Metastore URI (e.g., "thrift://hms.internal:9083").
     pub metastore_uri: Option<String>,
-    /// Default schema name within this catalog.
-    #[serde(default = "default_catalog_schema")]
-    pub default_schema: String,
+    /// Default schema name within this catalog (used when it is the
+    /// default catalog). Unset: `default`, or `public` for `postgresql`;
+    /// see [`effective_default_schema`](Self::effective_default_schema).
+    #[serde(default)]
+    pub default_schema: Option<String>,
     /// Per-catalog storage configuration (overrides global [storage]).
     pub storage: Option<StorageConfig>,
+
+    // ---- postgresql only ----
+    /// `postgresql://host:port/database`. Redacted in `Debug`: it may carry
+    /// a password.
+    pub connection_url: Option<RedactedString>,
+    /// Remote user; overrides one in `connection_url`.
+    pub user: Option<String>,
+    /// Remote password; `ARNEB_CATALOG_<NAME>_PASSWORD` overrides it.
+    pub password: Option<RedactedString>,
+    /// Connection pool size per node (default 8).
+    pub max_connections: Option<usize>,
+    /// Minimum estimated rows per primary-key range split (default 500000).
+    pub split_min_rows: Option<u64>,
+    /// Maximum splits per table (default 16).
+    pub max_splits: Option<usize>,
+    /// Scale for unconstrained `numeric` columns (default 10).
+    pub unconstrained_numeric_scale: Option<i8>,
+    /// Seconds allowed to open one connection (default 10).
+    pub connect_timeout_secs: Option<u64>,
+    /// Seconds to wait for a free pooled connection (default 60).
+    pub pool_wait_timeout_secs: Option<u64>,
 }
 
-fn default_catalog_schema() -> String {
-    "default".to_string()
+impl CatalogConfig {
+    /// The configured default schema, or the type's conventional one.
+    pub fn effective_default_schema(&self) -> &str {
+        match (&self.default_schema, self.catalog_type.as_str()) {
+            (Some(s), _) => s,
+            (None, "postgresql") => "public",
+            (None, _) => "default",
+        }
+    }
+
+    /// The environment variable that overrides this catalog's password:
+    /// `ARNEB_CATALOG_<NAME>_PASSWORD`, with the name upper-cased and every
+    /// non-alphanumeric character replaced by `_`.
+    pub fn password_env_var(&self) -> String {
+        let name: String = self
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("ARNEB_CATALOG_{name}_PASSWORD")
+    }
+
+    /// Apply `ARNEB_*` overrides (currently the password).
+    pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) {
+        if let Some(password) = env(&self.password_env_var()) {
+            self.password = Some(RedactedString(password));
+        }
+    }
+
+    /// The PostgreSQL connector settings, or an error naming the missing
+    /// field.
+    pub fn postgres_config(&self) -> Result<arneb_postgresql::PostgresConfig> {
+        let url = self.connection_url.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("postgresql catalog '{}' requires connection_url", self.name)
+        })?;
+        let mut c = arneb_postgresql::PostgresConfig::new(url.0.clone());
+        c.user = self.user.clone();
+        c.password = self.password.as_ref().map(|p| p.0.clone());
+        if let Some(v) = self.max_connections {
+            anyhow::ensure!(
+                v > 0,
+                "catalog '{}': max_connections must be > 0",
+                self.name
+            );
+            c.max_connections = v;
+        }
+        if let Some(v) = self.split_min_rows {
+            anyhow::ensure!(v > 0, "catalog '{}': split_min_rows must be > 0", self.name);
+            c.split_min_rows = v;
+        }
+        if let Some(v) = self.max_splits {
+            anyhow::ensure!(v > 0, "catalog '{}': max_splits must be > 0", self.name);
+            c.max_splits = v;
+        }
+        if let Some(v) = self.unconstrained_numeric_scale {
+            anyhow::ensure!(
+                (0..=38).contains(&v),
+                "catalog '{}': unconstrained_numeric_scale must be within 0..=38",
+                self.name
+            );
+            c.unconstrained_numeric_scale = v;
+        }
+        if let Some(v) = self.connect_timeout_secs {
+            anyhow::ensure!(
+                v > 0,
+                "catalog '{}': connect_timeout_secs must be > 0",
+                self.name
+            );
+            c.connect_timeout_secs = v;
+        }
+        if let Some(v) = self.pool_wait_timeout_secs {
+            anyhow::ensure!(
+                v > 0,
+                "catalog '{}': pool_wait_timeout_secs must be > 0",
+                self.name
+            );
+            c.pool_wait_timeout_secs = v;
+        }
+        Ok(c)
+    }
+}
+
+/// Refuse two PostgreSQL catalogs whose names normalise to the same
+/// `ARNEB_CATALOG_<NAME>_PASSWORD` (`pg-prod` and `pg_prod`): one variable
+/// would silently set both passwords.
+fn check_password_env_vars(catalogs: &[CatalogConfig]) -> Result<()> {
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for c in catalogs.iter().filter(|c| c.catalog_type == "postgresql") {
+        if let Some(other) = seen.insert(c.password_env_var(), &c.name) {
+            anyhow::bail!(
+                "catalogs '{other}' and '{}' would share {}; rename one",
+                c.name,
+                c.password_env_var()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Global storage backend configuration.
@@ -977,13 +1101,18 @@ impl AppConfig {
         web.apply_env_overrides(|k| std::env::var(k).ok());
         let mut admission = config.admission;
         admission.apply_env(|k| std::env::var(k).ok())?;
+        let mut catalogs = config.catalogs;
+        check_password_env_vars(&catalogs)?;
+        for catalog in &mut catalogs {
+            catalog.apply_env(|k| std::env::var(k).ok());
+        }
 
         Ok(AppConfig {
             server,
             tables: config.tables,
             cluster: config.cluster,
             storage: config.storage,
-            catalogs: config.catalogs,
+            catalogs,
             memory: config.memory,
             auth: config.auth,
             trino,
@@ -1434,9 +1563,99 @@ region = "us-west-2"
             cat.metastore_uri.as_deref(),
             Some("thrift://hms.internal:9083")
         );
-        assert_eq!(cat.default_schema, "analytics");
+        assert_eq!(cat.effective_default_schema(), "analytics");
         let s3 = cat.storage.as_ref().unwrap().s3.as_ref().unwrap();
         assert_eq!(s3.region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn test_app_config_with_postgresql_catalog() {
+        let toml_str = r#"
+[[catalogs]]
+name = "pg-prod"
+type = "postgresql"
+connection_url = "postgresql://db.internal:5432/sales"
+user = "arneb"
+password = "file-secret"
+max_splits = 4
+
+[[catalogs]]
+name = "lake"
+type = "hive"
+metastore_uri = "127.0.0.1:9083"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let mut pg = config.catalogs[0].clone();
+        assert_eq!(pg.catalog_type, "postgresql");
+        assert_eq!(pg.password_env_var(), "ARNEB_CATALOG_PG_PROD_PASSWORD");
+        assert!(!format!("{pg:?}").contains("file-secret"));
+
+        let c = pg.postgres_config().unwrap();
+        assert_eq!(c.password.as_deref(), Some("file-secret"));
+        assert_eq!(c.max_splits, 4);
+        assert_eq!(c.max_connections, arneb_postgresql::DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(c.split_min_rows, arneb_postgresql::DEFAULT_SPLIT_MIN_ROWS);
+        assert_eq!(pg.effective_default_schema(), "public");
+        assert_eq!(config.catalogs[1].effective_default_schema(), "default");
+
+        pg.apply_env(env_from(&[(
+            "ARNEB_CATALOG_PG_PROD_PASSWORD",
+            "env-secret",
+        )]));
+        assert_eq!(
+            pg.postgres_config().unwrap().password.as_deref(),
+            Some("env-secret")
+        );
+        // Hive entries ignore the postgresql fields.
+        assert!(config.catalogs[1].connection_url.is_none());
+    }
+
+    #[test]
+    fn test_postgresql_catalog_validation() {
+        let toml_str = r#"
+[[catalogs]]
+name = "pg"
+type = "postgresql"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let err = config.catalogs[0]
+            .postgres_config()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("connection_url"), "{err}");
+
+        let toml_str = r#"
+[[catalogs]]
+name = "pg"
+type = "postgresql"
+connection_url = "postgresql://h/d"
+max_splits = 0
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.catalogs[0].postgres_config().is_err());
+    }
+
+    #[test]
+    fn test_postgresql_password_env_var_collision_is_refused() {
+        let toml_str = r#"
+[[catalogs]]
+name = "pg-prod"
+type = "postgresql"
+connection_url = "postgresql://h/a"
+
+[[catalogs]]
+name = "pg_prod"
+type = "postgresql"
+connection_url = "postgresql://h/b"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let err = check_password_env_vars(&config.catalogs)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ARNEB_CATALOG_PG_PROD_PASSWORD"), "{err}");
+
+        let config: AppConfig = toml::from_str(&toml_str.replace("pg_prod", "pg_dev")).unwrap();
+        assert!(check_password_env_vars(&config.catalogs).is_ok());
     }
 
     #[test]

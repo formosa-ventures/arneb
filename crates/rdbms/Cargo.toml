@@ -1,0 +1,12 @@
+[package]
+name = "arneb-rdbms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arneb-common = { path = "../common" }
+arneb-planner = { path = "../planner" }
+arneb-sql-parser = { path = "../sql-parser" }
+serde.workspace = true
+serde_json.workspace = true

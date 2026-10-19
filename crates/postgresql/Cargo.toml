@@ -1,0 +1,25 @@
+[package]
+name = "arneb-postgresql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arneb-common = { path = "../common" }
+arneb-catalog = { path = "../catalog" }
+arneb-connectors = { path = "../connectors" }
+arneb-execution = { path = "../execution" }
+arneb-planner = { path = "../planner" }
+arneb-rdbms = { path = "../rdbms" }
+arrow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+deadpool-postgres.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+arneb-sql-parser = { path = "../sql-parser" }

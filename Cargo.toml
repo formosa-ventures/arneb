@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution", "crates/connectors", "crates/protocol", "crates/server", "crates/scheduler", "crates/rpc", "crates/hive", "crates/iceberg", "crates/hive-metastore", "crates/hive-metastore/thrift_build"]
+members = ["crates/common", "crates/sql-parser", "crates/catalog", "crates/planner", "crates/execution", "crates/connectors", "crates/protocol", "crates/server", "crates/scheduler", "crates/rpc", "crates/hive", "crates/iceberg", "crates/rdbms", "crates/postgresql", "crates/hive-metastore", "crates/hive-metastore/thrift_build"]
 exclude = ["benchmarks/tpch"]
 resolver = "2"
 
@@ -63,6 +63,10 @@ async-recursion = "1"
 futures = "0.3"
 bytes = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# PostgreSQL client + pool for the postgresql connector (crates/postgresql)
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+deadpool-postgres = { version = "0.14", default-features = false, features = ["rt_tokio_1"] }
 
 # HTTP framework
 axum = "0.8"

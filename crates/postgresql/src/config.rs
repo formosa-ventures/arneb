@@ -9,6 +9,10 @@ pub const DEFAULT_SPLIT_MIN_ROWS: u64 = 500_000;
 pub const DEFAULT_MAX_SPLITS: usize = 16;
 /// Default scale for unconstrained `numeric` columns.
 pub const DEFAULT_UNCONSTRAINED_NUMERIC_SCALE: i8 = 10;
+/// Default limit, in seconds, on opening one connection (TCP + startup).
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Default limit, in seconds, on waiting for a free pooled connection.
+pub const DEFAULT_POOL_WAIT_TIMEOUT_SECS: u64 = 60;
 
 /// Connection and scan settings for one PostgreSQL catalog.
 #[derive(Clone)]
@@ -27,6 +31,12 @@ pub struct PostgresConfig {
     pub max_splits: usize,
     /// Scale used for unconstrained `numeric` columns.
     pub unconstrained_numeric_scale: i8,
+    /// Seconds allowed to open one connection; a `connect_timeout` in the
+    /// URL takes precedence for the TCP connect.
+    pub connect_timeout_secs: u64,
+    /// Seconds a scan or metadata lookup waits for a free pooled connection
+    /// before it fails.
+    pub pool_wait_timeout_secs: u64,
 }
 
 impl PostgresConfig {
@@ -40,6 +50,8 @@ impl PostgresConfig {
             split_min_rows: DEFAULT_SPLIT_MIN_ROWS,
             max_splits: DEFAULT_MAX_SPLITS,
             unconstrained_numeric_scale: DEFAULT_UNCONSTRAINED_NUMERIC_SCALE,
+            connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            pool_wait_timeout_secs: DEFAULT_POOL_WAIT_TIMEOUT_SECS,
         }
     }
 
@@ -57,6 +69,9 @@ impl PostgresConfig {
         }
         if let Some(password) = &self.password {
             config.password(password);
+        }
+        if config.get_connect_timeout().is_none() {
+            config.connect_timeout(std::time::Duration::from_secs(self.connect_timeout_secs));
         }
         config.application_name("arneb");
         Ok(config)
@@ -96,6 +111,8 @@ impl fmt::Debug for PostgresConfig {
                 "unconstrained_numeric_scale",
                 &self.unconstrained_numeric_scale,
             )
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("pool_wait_timeout_secs", &self.pool_wait_timeout_secs)
             .finish()
     }
 }
@@ -122,6 +139,22 @@ mod tests {
         let d = c.driver_config().unwrap();
         assert_eq!(d.get_user(), Some("alice"));
         assert_eq!(d.get_password(), Some(&b"pw"[..]));
+    }
+
+    #[test]
+    fn connect_timeout_defaults_unless_the_url_sets_one() {
+        let c = PostgresConfig::new("postgresql://h:5433/db");
+        assert_eq!(
+            c.driver_config().unwrap().get_connect_timeout(),
+            Some(&std::time::Duration::from_secs(
+                DEFAULT_CONNECT_TIMEOUT_SECS
+            ))
+        );
+        let c = PostgresConfig::new("postgresql://h:5433/db?connect_timeout=3");
+        assert_eq!(
+            c.driver_config().unwrap().get_connect_timeout(),
+            Some(&std::time::Duration::from_secs(3))
+        );
     }
 
     #[test]

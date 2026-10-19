@@ -1083,6 +1083,8 @@ async fn register_postgresql_catalog(
                 split_min_rows = c.split_min_rows,
                 max_splits = c.max_splits,
                 unconstrained_numeric_scale = c.unconstrained_numeric_scale,
+                connect_timeout_secs = c.connect_timeout_secs,
+                pool_wait_timeout_secs = c.pool_wait_timeout_secs,
                 "registered postgresql catalog"
             );
             connector_registry.register(&catalog_cfg.name, Arc::new(catalog.connector_factory()));

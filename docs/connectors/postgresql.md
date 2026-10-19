@@ -28,6 +28,8 @@ password = "..."            # or ARNEB_CATALOG_PG_PASSWORD
 # split_min_rows = 500000
 # max_splits = 16
 # unconstrained_numeric_scale = 10
+# connect_timeout_secs = 10
+# pool_wait_timeout_secs = 60
 ```
 
 | Field | Default | Description |
@@ -39,6 +41,8 @@ password = "..."            # or ARNEB_CATALOG_PG_PASSWORD
 | `split_min_rows` | `500000` | A table is split once its estimated row count reaches this value. |
 | `max_splits` | `16` | The maximum number of key-range splits per table. |
 | `unconstrained_numeric_scale` | `10` | The scale used for `numeric` columns that have no declared precision. |
+| `connect_timeout_secs` | `10` | How long opening one connection may take before it fails. A `connect_timeout` in `connection_url` takes precedence for the TCP connect. |
+| `pool_wait_timeout_secs` | `60` | How long a scan or a metadata lookup waits for a free connection when all `max_connections` are busy, before the query fails. |
 
 `ARNEB_CATALOG_<NAME>_PASSWORD` overrides `password`. `<NAME>` is the catalog
 name in upper case, with every non-alphanumeric character replaced by `_`. For
@@ -97,8 +101,9 @@ the result is decoded straight into Arrow.
 - **Kept in Arneb**: function calls and arithmetic, comparisons with a NULL
   literal, range comparisons on text (PostgreSQL collation order can differ
   from Arneb's), anything on `real` / `double precision` columns (PostgreSQL
-  sorts `NaN` above every number), and anything on `char(n)` columns
-  (PostgreSQL ignores their trailing spaces). Such a conjunct is evaluated by
+  sorts `NaN` above every number), anything on `char(n)` columns
+  (PostgreSQL ignores their trailing spaces), and anything on `uuid` columns
+  (PostgreSQL compares them as uuids, not as the text Arneb sees). Such a conjunct is evaluated by
   Arneb after the scan. It costs transfer, never correctness.
 - **Limit**: `SELECT … FROM pg.t LIMIT n` sends `LIMIT n`, but only when
   every filter was pushed.

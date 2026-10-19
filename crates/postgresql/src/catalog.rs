@@ -2,13 +2,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arneb_catalog::{CatalogProvider, SchemaProvider, TableProvider, TableStatistics};
 use arneb_common::error::ConnectorError;
 use arneb_common::types::ColumnInfo;
 use arneb_rdbms::{plan_splits, RemoteColumn, RemoteTable, SplitPlan};
 use async_trait::async_trait;
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
 
 use crate::config::PostgresConfig;
@@ -51,8 +52,13 @@ impl PostgresCatalog {
                 recycling_method: RecyclingMethod::Fast,
             },
         );
+        // Without these a full pool or an unresponsive host makes a query
+        // (or planning, which needs a connection for metadata) wait forever.
         let pool = Pool::builder(manager)
             .max_size(config.max_connections.max(1))
+            .runtime(Runtime::Tokio1)
+            .wait_timeout(Some(Duration::from_secs(config.pool_wait_timeout_secs)))
+            .create_timeout(Some(Duration::from_secs(config.connect_timeout_secs)))
             .build()
             .map_err(|e| {
                 ConnectorError::ConnectionFailed(format!("postgresql catalog '{name}': {e}"))
@@ -89,9 +95,22 @@ impl PostgresCatalog {
     }
 }
 
+/// SQL for a column's type name as `map_type` reads it: the bare `typname`
+/// for built-in types, schema-qualified otherwise, so a user type that
+/// shares a built-in's name (`public.date`) is unsupported, not misread.
+const TYPE_NAME: &str = "CASE WHEN t.typnamespace = 'pg_catalog'::regnamespace \
+     THEN t.typname::text ELSE t.typnamespace::regnamespace::text || '.' || t.typname END";
+
 pub(crate) fn pool_error(e: &deadpool_postgres::PoolError) -> String {
     match e {
         deadpool_postgres::PoolError::Backend(e) => pg_error(e),
+        deadpool_postgres::PoolError::Timeout(deadpool_postgres::TimeoutType::Wait) => {
+            "no free connection within pool_wait_timeout_secs (all max_connections busy)"
+                .to_string()
+        }
+        deadpool_postgres::PoolError::Timeout(deadpool_postgres::TimeoutType::Create) => {
+            "connecting took longer than connect_timeout_secs".to_string()
+        }
         other => other.to_string(),
     }
 }
@@ -239,9 +258,11 @@ async fn load_table(
 
     let cols = client
         .query(
-            "SELECT a.attname, t.typname, a.atttypmod, a.attnotnull FROM pg_attribute a \
+            &format!(
+                "SELECT a.attname, {TYPE_NAME}, a.atttypmod, a.attnotnull FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
-             WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+             WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
+            ),
             &[&oid],
         )
         .await
@@ -273,7 +294,23 @@ async fn load_table(
 
     // reltuples is -1 for a never-analyzed table (PostgreSQL 14+).
     let row_count = (reltuples >= 0.0).then_some(reltuples as u64);
-    let split = plan_table_splits(state, &client, oid, &remote, row_count.unwrap_or(0)).await?;
+    // Splitting is an optimisation: if its key or min/max lookup fails (a
+    // permission on the key, a transient error), read the table as one split
+    // rather than report it missing.
+    let split = match plan_table_splits(state, &client, oid, &remote, row_count.unwrap_or(0)).await
+    {
+        Ok(split) => split,
+        Err(e) => {
+            tracing::warn!(
+                catalog = %state.name,
+                schema = %schema,
+                table = %name,
+                error = %e,
+                "split planning failed; reading the table as one split"
+            );
+            SplitPlan::single()
+        }
+    };
     tracing::debug!(
         target: "arneb::rdbms",
         catalog = %state.name,
@@ -304,10 +341,12 @@ async fn plan_table_splits(
     }
     let keys = client
         .query(
-            "SELECT a.attname, t.typname FROM pg_index i \
+            &format!(
+                "SELECT a.attname, {TYPE_NAME} FROM pg_index i \
              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
              JOIN pg_type t ON t.oid = a.atttypid \
-             WHERE i.indrelid = $1 AND i.indisprimary",
+             WHERE i.indrelid = $1 AND i.indisprimary"
+            ),
             &[&oid],
         )
         .await

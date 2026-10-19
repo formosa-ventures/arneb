@@ -50,7 +50,11 @@ impl Dialect for PostgresDialect {
     fn pushable_column(&self, column: &RemoteColumn) -> bool {
         // `char(n)` compares ignoring trailing spaces in PostgreSQL but not
         // in Arneb (which sees the padded value), so `<>` would drop rows.
-        !matches!(column.remote_type.as_str(), "bpchar") && !column.remote_type.starts_with('!')
+        // `uuid` reaches Arneb as text, but PostgreSQL casts the literal to
+        // uuid: it compares case-insensitively, and a literal that is not a
+        // uuid (or a LIKE) is an error where Arneb's filter returns no rows.
+        !matches!(column.remote_type.as_str(), "bpchar" | "uuid")
+            && !column.remote_type.starts_with('!')
     }
 
     fn empty_select_list(&self) -> &'static str {
@@ -171,13 +175,14 @@ mod tests {
     }
 
     #[test]
-    fn bpchar_and_unsupported_columns_are_not_pushable() {
+    fn bpchar_uuid_and_unsupported_columns_are_not_pushable() {
         let c = |t: &str| RemoteColumn {
             name: "c".into(),
             remote_type: t.into(),
         };
         assert!(PostgresDialect.pushable_column(&c("varchar")));
         assert!(!PostgresDialect.pushable_column(&c("bpchar")));
+        assert!(!PostgresDialect.pushable_column(&c("uuid")));
         assert!(!PostgresDialect.pushable_column(&c("!jsonb")));
     }
 }

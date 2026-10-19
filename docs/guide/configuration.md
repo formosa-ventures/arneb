@@ -247,8 +247,9 @@ allow_http = true
 | `default_schema` | string | no | Default schema within the catalog (`default`; `public` for PostgreSQL) |
 
 A PostgreSQL catalog takes `connection_url`, `user`, `password` and the pool/split
-knobs `max_connections`, `split_min_rows`, `max_splits` and
-`unconstrained_numeric_scale`. `ARNEB_CATALOG_<NAME>_PASSWORD` overrides the
+knobs `max_connections`, `split_min_rows`, `max_splits`,
+`unconstrained_numeric_scale`, `connect_timeout_secs` and
+`pool_wait_timeout_secs`. `ARNEB_CATALOG_<NAME>_PASSWORD` overrides the
 password. See [PostgreSQL](/connectors/postgresql):
 
 ```toml

@@ -108,17 +108,17 @@ remote `WHERE`. The supported grammar:
 ```
 conj   := cmp | IS [NOT] NULL col | col [NOT] IN (lit, …) | col BETWEEN lit AND lit
         | col [NOT] LIKE 'pattern' | conj AND conj | conj OR conj | NOT conj
-cmp    := col op lit | lit op col | col op col (same mapped type)
+cmp    := col op lit | lit op col | col op col (comparable type families)
 op     := = <> < <= > >=
 ```
 
 Literals go through `Dialect::render_literal`, which returns `None` for any
 value it cannot render exactly. That covers NULL (never pushed for
 comparisons; `IS NULL` is separate), NaN/∞ floats, and types the dialect does
-not know. A literal whose `ScalarValue` type differs from the column's mapped
-type is rendered only when the dialect knows a safe widening (integer literal
-against a decimal column, date literal against a date column). Otherwise the
-conjunct stays local. This avoids PostgreSQL's implicit casts producing
+not know. Both sides of a comparison, column or literal, must fall in the same
+type family: exact numbers (any integer or decimal against any other, which
+PostgreSQL compares exactly), text (equality only), boolean (equality only),
+date, or timestamp with the same time zone. Any other pairing stays local. This avoids PostgreSQL's implicit casts producing
 different comparison semantics than Arneb's. `complete = true` only if every
 conjunct translated, which gates `LIMIT` (D4).
 
@@ -135,7 +135,9 @@ differ in PostgreSQL. `real`/`double precision` columns are never pushed,
 because PostgreSQL orders `NaN` above every number, so `NOT (x > 1)` would drop
 NaN rows Arneb keeps. `char(n)` columns are refused through
 `Dialect::pushable_column`, because PostgreSQL ignores their trailing spaces,
-so `<>` would drop rows. Lossless widening casts the analyzer puts on columns
+so `<>` would drop rows. `uuid` columns are refused the same way: Arneb reads
+them as text, but PostgreSQL casts the literal to `uuid`, so it compares
+case-insensitively and turns a non-uuid literal or a `LIKE` into an error. Lossless widening casts the analyzer puts on columns
 (`CAST(int4_col AS BIGINT) IN (…)`) are looked through. Without that, almost
 no integer predicate would be pushed.
 
@@ -195,7 +197,10 @@ column-named error. A batch is flushed every `batch_size` rows. The stream holds
 is recorded with the infallible `grow`/`shrink` and freed when the stream ends,
 fails or is dropped. That matches the Parquet scan's decode-buffer accounting
 (#137): a scan cannot spill, so it never fails on its reservation, but
-spillable operators see the pressure.
+spillable operators see the pressure. The estimate lags: it is taken after the
+first full batch and released before the last one, and the decoder's own
+`BytesMut` read buffer is not counted. At the default batch size that is small,
+but wide rows (large `bytea` or text) can decode well past the reservation.
 
 *Alternative*: `query_raw` with text or binary `Row`s. Rejected, because
 per-value `FromSql` plus `Row` allocation is several times slower than COPY,
@@ -210,6 +215,12 @@ upstream), the in-flight COPY's connection is **not** returned to the pool. It
 is detached (`Object::take`) and dropped, which closes the socket and
 makes PostgreSQL abort the COPY. Returning a connection mid-COPY would
 poison the pool.
+
+Opening a connection is bounded by `connect_timeout_secs` (default 10, both
+the TCP connect and the pool's create step) and waiting for a free one by
+`pool_wait_timeout_secs` (default 60). Without them a full pool, including
+the planning-time metadata lookups, or a host that drops packets would make a
+query wait with no error. (Found in review.)
 
 ### D8. Configuration
 
@@ -283,6 +294,27 @@ for Parquet is a separate change that needs SF10/SF30 measurement.
   conservative grammar (no text ranges, no implicit casts, no NULL literals),
   by the always-present `FilterExec`, and by Tier 1 tests that compare pushed
   and unpushed results on the same data.
+- **Split snapshots**: each split is its own COPY with its own snapshot, so a
+  concurrent `UPDATE` that moves a row's key from one range to another can
+  show it twice or not at all. D2's every-row-once holds for a table that is
+  not written during the query, and for inserts.
+- **Collations**: D3 pushes text `=` / `<>` / `IN` assuming a deterministic
+  collation. A column with a nondeterministic (for example ICU
+  case-insensitive) collation makes a pushed `<>` or `NOT IN` drop rows Arneb
+  would keep. `pg_collation.collisdeterministic` is not checked yet.
+- **Pushdown can turn an error into rows**: a pushed filter that excludes
+  values Arneb cannot read (`numeric` NaN or ±Infinity, `±infinity`
+  timestamps, an unconstrained `numeric` with more fractional digits than
+  `unconstrained_numeric_scale`) lets the query succeed where the unpushed
+  read fails. The rows returned are still correct.
+- **Load errors look like a missing table**: `SchemaProvider::table` returns
+  an `Option`, so a failed column lookup (permission, connection) is logged
+  and reported as "table not found". A failed split lookup no longer does: the
+  table is read as one split.
+- **Workers that start before PostgreSQL**: each node connects at startup and
+  skips the catalog if it cannot. A worker that started while PostgreSQL was
+  unreachable has no factory for it, so the coordinator plans scans whose
+  tasks fail on that worker until it restarts. A lazy connect is a follow-up.
 - **New dependencies**: `tokio-postgres` and `deadpool-postgres`
   (MIT/Apache-2.0). `cargo deny` must pass.
 

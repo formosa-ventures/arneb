@@ -26,7 +26,7 @@ lossless widening cast of a column (integer → wider integer or a decimal that
 holds it, decimal → decimal with no fewer integer or fractional digits) SHALL be
 looked through. It SHALL NOT push range comparisons on text, any condition on a
 floating-point column, any condition on a column the dialect refuses (e.g.
-PostgreSQL `char(n)`), or comparisons with a NULL literal. A conjunct that
+PostgreSQL `char(n)` and `uuid`), or comparisons with a NULL literal. A conjunct that
 contains anything else (function calls, other casts, arithmetic, subqueries,
 parameters) SHALL be omitted from the remote `WHERE` clause and never cause the
 query to fail. Arneb's own `FilterExec` above the scan SHALL keep evaluating the

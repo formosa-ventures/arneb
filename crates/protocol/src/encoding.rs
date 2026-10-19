@@ -92,54 +92,50 @@ fn encode_value(array: &dyn Array, row: usize) -> Option<String> {
         arrow_types::DataType::Date32 => {
             let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
             let days = arr.value(row);
-            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163)
-                .unwrap_or(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
-            Some(date.format("%Y-%m-%d").to_string())
+            Some(
+                days.checked_add(719_163)
+                    .and_then(chrono::NaiveDate::from_num_days_from_ce_opt)
+                    .map(|date| with_era(date, date.format("%m-%d").to_string()))
+                    // Past chrono's ±262 143 years: no calendar form, but never
+                    // a made-up date.
+                    .unwrap_or_else(|| days.to_string()),
+            )
         }
         arrow_types::DataType::Timestamp(unit, _) => {
-            let value = match unit {
+            // `(value, units per second)`. Split into whole seconds and a
+            // remainder in the array's own unit; scaling to nanoseconds
+            // first would overflow i64 outside 1677..2262.
+            let (value, per_sec) = match unit {
                 arrow_types::TimeUnit::Second => {
                     let arr = array
                         .as_any()
                         .downcast_ref::<TimestampSecondArray>()
                         .unwrap();
-                    arr.value(row).checked_mul(1_000_000_000)?
+                    (arr.value(row), 1)
                 }
                 arrow_types::TimeUnit::Millisecond => {
                     let arr = array
                         .as_any()
                         .downcast_ref::<TimestampMillisecondArray>()
                         .unwrap();
-                    arr.value(row).checked_mul(1_000_000)?
+                    (arr.value(row), 1_000)
                 }
                 arrow_types::TimeUnit::Microsecond => {
                     let arr = array
                         .as_any()
                         .downcast_ref::<TimestampMicrosecondArray>()
                         .unwrap();
-                    arr.value(row).checked_mul(1_000)?
+                    (arr.value(row), 1_000_000)
                 }
                 arrow_types::TimeUnit::Nanosecond => {
                     let arr = array
                         .as_any()
                         .downcast_ref::<TimestampNanosecondArray>()
                         .unwrap();
-                    arr.value(row)
+                    (arr.value(row), 1_000_000_000)
                 }
             };
-            // Floor division: a pre-1970 instant has a negative remainder.
-            let secs = value.div_euclid(1_000_000_000);
-            let nsecs = value.rem_euclid(1_000_000_000) as u32;
-            let dt = chrono::DateTime::from_timestamp(secs, nsecs)?.naive_utc();
-            let mut text = dt.format("%Y-%m-%d %H:%M:%S").to_string();
-            // Fractional seconds as PostgreSQL prints them: trailing zeros
-            // trimmed, none for a whole second.
-            if nsecs > 0 {
-                let frac = format!("{nsecs:09}");
-                text.push('.');
-                text.push_str(frac.trim_end_matches('0'));
-            }
-            Some(text)
+            Some(format_timestamp(value, per_sec))
         }
         arrow_types::DataType::Decimal128(precision, scale) => {
             let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
@@ -151,6 +147,39 @@ fn encode_value(array: &dyn Array, row: usize) -> Option<String> {
             encode_value(materialized.as_ref(), row)
         }
         _ => arrow::util::display::array_value_to_string(array, row).ok(),
+    }
+}
+
+/// PostgreSQL text form of a timestamp `value` counted in `1 / per_sec`
+/// seconds from the epoch: fractional seconds with trailing zeros trimmed,
+/// and `BC` for years before 1 AD.
+fn format_timestamp(value: i64, per_sec: i64) -> String {
+    // Floor division: a pre-1970 instant has a negative remainder.
+    let secs = value.div_euclid(per_sec);
+    let nsecs = (value.rem_euclid(per_sec) * (1_000_000_000 / per_sec)) as u32;
+    let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs).map(|d| d.naive_utc()) else {
+        // Past chrono's ±262 143 years: no calendar form, but never a NULL.
+        return value.to_string();
+    };
+    let mut rest = dt.format("%m-%d %H:%M:%S").to_string();
+    if nsecs > 0 {
+        let frac = format!("{nsecs:09}");
+        rest.push('.');
+        rest.push_str(frac.trim_end_matches('0'));
+    }
+    with_era(dt.date(), rest)
+}
+
+/// `YYYY-<rest>` the way PostgreSQL prints a year: 1 BC is year 0 in chrono,
+/// so years ≤ 0 print as `1 - year` with a trailing ` BC`.
+fn with_era(date: chrono::NaiveDate, rest: String) -> String {
+    use chrono::Datelike;
+
+    let year = date.year();
+    if year <= 0 {
+        format!("{:04}-{rest} BC", 1 - year)
+    } else {
+        format!("{year:04}-{rest}")
     }
 }
 
@@ -328,6 +357,15 @@ mod tests {
         let arr: ArrayRef = Arc::new(Date32Array::from(vec![19737]));
         let val = encode_value(arr.as_ref(), 0).unwrap();
         assert_eq!(val, "2024-01-15");
+
+        let enc = |days: i32| {
+            let arr: ArrayRef = Arc::new(Date32Array::from(vec![days]));
+            encode_value(arr.as_ref(), 0).unwrap()
+        };
+        assert_eq!(enc(2_932_896), "9999-12-31");
+        assert_eq!(enc(-719_162), "0001-01-01");
+        assert_eq!(enc(-719_163), "0001-12-31 BC");
+        assert_eq!(enc(-735_160), "0044-03-15 BC");
     }
 
     #[test]
@@ -349,6 +387,34 @@ mod tests {
         assert_eq!(enc(1_500_000), "1970-01-01 00:00:01.5");
         assert_eq!(enc(-1), "1969-12-31 23:59:59.999999");
         assert_eq!(enc(-1_000_000), "1969-12-31 23:59:59");
+    }
+
+    #[test]
+    fn test_encode_timestamp_outside_the_nanosecond_range() {
+        use arrow::array::TimestampMillisecondArray;
+        // Microseconds from the epoch, as PostgreSQL's COPY delivers them.
+        let enc = |micros: i64| {
+            let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![micros]));
+            encode_value(arr.as_ref(), 0).unwrap()
+        };
+        assert_eq!(enc(253_402_300_799_000_000), "9999-12-31 23:59:59");
+        assert_eq!(enc(-62_135_596_800_000_000), "0001-01-01 00:00:00");
+        assert_eq!(enc(-14_817_470_400_000_000), "1500-06-15 12:00:00");
+        assert_eq!(
+            enc(-62_135_596_800_000_001),
+            "0001-12-31 23:59:59.999999 BC"
+        );
+
+        let secs: ArrayRef = Arc::new(TimestampSecondArray::from(vec![253_402_300_799]));
+        assert_eq!(
+            encode_value(secs.as_ref(), 0).unwrap(),
+            "9999-12-31 23:59:59"
+        );
+        let millis: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![-62_135_596_799_500]));
+        assert_eq!(
+            encode_value(millis.as_ref(), 0).unwrap(),
+            "0001-01-01 00:00:00.5"
+        );
     }
 
     #[test]

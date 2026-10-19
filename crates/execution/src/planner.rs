@@ -453,10 +453,6 @@ impl ExecutionContext {
         self.dynamic_filter_publisher.as_ref()
     }
 
-    /// Internal helper: build a `ScanExec` from a `DataSource` and
-    /// the per-scan context, populating the four A1.4 cross-fragment
-    /// dynamic-filter fields from `self`. Centralises the boilerplate
-    /// shared by the four `ScanExec` construction sites in `convert()`.
     /// `Filter(p1) → … → Filter(pn) → [Projection(columns)] → TableScan` over
     /// a source that wants every stacked predicate
     /// ([`DataSource::pushdown_stacked_filters`]): one scan carrying all
@@ -593,6 +589,10 @@ impl ExecutionContext {
         Ok(Some(plan))
     }
 
+    /// Internal helper: build a `ScanExec` from a `DataSource` and
+    /// the per-scan context, populating the four A1.4 cross-fragment
+    /// dynamic-filter fields from `self`. Centralises the boilerplate
+    /// shared by the four `ScanExec` construction sites in `convert()`.
     fn build_scan_exec(
         &self,
         source: Arc<dyn DataSource>,

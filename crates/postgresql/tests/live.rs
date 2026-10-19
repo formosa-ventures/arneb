@@ -245,6 +245,36 @@ async fn unsupported_type_fails_only_when_read() {
 }
 
 #[tokio::test]
+async fn user_type_named_like_a_builtin_is_unsupported() {
+    let url = require_postgres!();
+    let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    client
+        .batch_execute(
+            "DROP SCHEMA IF EXISTS arneb_shadow CASCADE; \
+             CREATE SCHEMA arneb_shadow; \
+             CREATE TYPE arneb_shadow.date AS ENUM ('x'); \
+             CREATE TABLE arneb_shadow.t (id int, d arneb_shadow.date); \
+             INSERT INTO arneb_shadow.t VALUES (1, 'x');",
+        )
+        .await
+        .unwrap();
+    let cat = catalog(&url, |_| {}).await;
+    let ds = source(&cat, "arneb_shadow", "t").await;
+    let err = match ds.scan(&ScanContext::default(), 0).await {
+        Ok(_) => panic!("an enum named date must not be read as a date"),
+        Err(e) => e.to_string(),
+    };
+    client
+        .batch_execute("DROP SCHEMA arneb_shadow CASCADE")
+        .await
+        .unwrap();
+    assert!(err.contains("arneb_shadow.date"), "{err}");
+}
+
+#[tokio::test]
 async fn inexact_numeric_fails() {
     let url = require_postgres!();
     // At scale 0 the unconstrained numeric 3.1415926535 cannot be read exactly.
@@ -295,6 +325,33 @@ async fn pushed_filters_match_remote_results() {
     .await;
     assert_eq!(got as i64, expected);
     assert!(got > 0);
+}
+
+#[tokio::test]
+async fn uuid_conditions_stay_local() {
+    let url = require_postgres!();
+    let cat = catalog(&url, |_| {}).await;
+    let ds = source(&cat, "arneb_test", "all_types").await;
+    // Pushed, PostgreSQL would compare as uuid: `<>` against the upper-case
+    // spelling drops row 1, and `= 'xyz'` / LIKE would be errors. Kept local,
+    // the source returns every row and FilterExec decides.
+    let upper = lit(ScalarValue::Utf8(
+        "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11".into(),
+    ));
+    for filter in [
+        bin(col(15), BinaryOp::NotEq, upper),
+        bin(col(15), BinaryOp::Eq, lit(ScalarValue::Utf8("xyz".into()))),
+        bin(
+            col(15),
+            BinaryOp::Like,
+            lit(ScalarValue::Utf8("a0%".into())),
+        ),
+    ] {
+        let ctx = ScanContext::default()
+            .with_projection(vec![0, 15])
+            .with_filters(vec![filter]);
+        assert_eq!(rows(&scan_all(ds.as_ref(), &ctx).await), 3);
+    }
 }
 
 #[tokio::test]
@@ -395,6 +452,33 @@ async fn small_pool_serves_many_partitions_and_survives_cancellation() {
     let results = futures::future::join_all(streams).await;
     let total: usize = results.into_iter().map(|r| rows(&r.unwrap())).sum();
     assert_eq!(total, 200_000);
+}
+
+#[tokio::test]
+async fn a_full_pool_fails_after_the_wait_timeout() {
+    let url = require_postgres!();
+    let cat = catalog(&url, |c| {
+        c.max_connections = 1;
+        c.pool_wait_timeout_secs = 1;
+        c.split_min_rows = 20_000;
+        c.max_splits = 2;
+    })
+    .await;
+    let ds = source(&cat, "arneb_test", "keyed").await;
+    let ctx = ScanContext::default().with_projection(vec![0]);
+
+    // Partition 0 holds the only connection mid-COPY.
+    let mut first = ds.scan(&ctx, 0).await.unwrap();
+    assert!(first.next().await.unwrap().is_ok());
+
+    let started = std::time::Instant::now();
+    let err = match collect_stream(ds.scan(&ctx, 1).await.unwrap()).await {
+        Ok(_) => panic!("a scan with no free connection should fail"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("pool_wait_timeout_secs"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    drop(first);
 }
 
 #[tokio::test]

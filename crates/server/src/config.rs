@@ -654,8 +654,9 @@ pub struct CatalogConfig {
     pub storage: Option<StorageConfig>,
 
     // ---- postgresql only ----
-    /// `postgresql://host:port/database`.
-    pub connection_url: Option<String>,
+    /// `postgresql://host:port/database`. Redacted in `Debug`: it may carry
+    /// a password.
+    pub connection_url: Option<RedactedString>,
     /// Remote user; overrides one in `connection_url`.
     pub user: Option<String>,
     /// Remote password; `ARNEB_CATALOG_<NAME>_PASSWORD` overrides it.
@@ -668,6 +669,10 @@ pub struct CatalogConfig {
     pub max_splits: Option<usize>,
     /// Scale for unconstrained `numeric` columns (default 10).
     pub unconstrained_numeric_scale: Option<i8>,
+    /// Seconds allowed to open one connection (default 10).
+    pub connect_timeout_secs: Option<u64>,
+    /// Seconds to wait for a free pooled connection (default 60).
+    pub pool_wait_timeout_secs: Option<u64>,
 }
 
 impl CatalogConfig {
@@ -711,7 +716,7 @@ impl CatalogConfig {
         let url = self.connection_url.as_ref().ok_or_else(|| {
             anyhow::anyhow!("postgresql catalog '{}' requires connection_url", self.name)
         })?;
-        let mut c = arneb_postgresql::PostgresConfig::new(url.clone());
+        let mut c = arneb_postgresql::PostgresConfig::new(url.0.clone());
         c.user = self.user.clone();
         c.password = self.password.as_ref().map(|p| p.0.clone());
         if let Some(v) = self.max_connections {
@@ -738,8 +743,41 @@ impl CatalogConfig {
             );
             c.unconstrained_numeric_scale = v;
         }
+        if let Some(v) = self.connect_timeout_secs {
+            anyhow::ensure!(
+                v > 0,
+                "catalog '{}': connect_timeout_secs must be > 0",
+                self.name
+            );
+            c.connect_timeout_secs = v;
+        }
+        if let Some(v) = self.pool_wait_timeout_secs {
+            anyhow::ensure!(
+                v > 0,
+                "catalog '{}': pool_wait_timeout_secs must be > 0",
+                self.name
+            );
+            c.pool_wait_timeout_secs = v;
+        }
         Ok(c)
     }
+}
+
+/// Refuse two PostgreSQL catalogs whose names normalise to the same
+/// `ARNEB_CATALOG_<NAME>_PASSWORD` (`pg-prod` and `pg_prod`): one variable
+/// would silently set both passwords.
+fn check_password_env_vars(catalogs: &[CatalogConfig]) -> Result<()> {
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for c in catalogs.iter().filter(|c| c.catalog_type == "postgresql") {
+        if let Some(other) = seen.insert(c.password_env_var(), &c.name) {
+            anyhow::bail!(
+                "catalogs '{other}' and '{}' would share {}; rename one",
+                c.name,
+                c.password_env_var()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Global storage backend configuration.
@@ -1064,6 +1102,7 @@ impl AppConfig {
         let mut admission = config.admission;
         admission.apply_env(|k| std::env::var(k).ok())?;
         let mut catalogs = config.catalogs;
+        check_password_env_vars(&catalogs)?;
         for catalog in &mut catalogs {
             catalog.apply_env(|k| std::env::var(k).ok());
         }
@@ -1594,6 +1633,29 @@ max_splits = 0
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(config.catalogs[0].postgres_config().is_err());
+    }
+
+    #[test]
+    fn test_postgresql_password_env_var_collision_is_refused() {
+        let toml_str = r#"
+[[catalogs]]
+name = "pg-prod"
+type = "postgresql"
+connection_url = "postgresql://h/a"
+
+[[catalogs]]
+name = "pg_prod"
+type = "postgresql"
+connection_url = "postgresql://h/b"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let err = check_password_env_vars(&config.catalogs)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ARNEB_CATALOG_PG_PROD_PASSWORD"), "{err}");
+
+        let config: AppConfig = toml::from_str(&toml_str.replace("pg_prod", "pg_dev")).unwrap();
+        assert!(check_password_env_vars(&config.catalogs).is_ok());
     }
 
     #[test]

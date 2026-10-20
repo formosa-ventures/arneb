@@ -12,7 +12,7 @@ pub use admission::{
 };
 pub use dynamic_filter::DynamicFilterService;
 pub use dynamic_filter_registry::DynamicFilterServiceRegistry;
-pub use node_registry::{NodeRegistry, WorkerInfo};
+pub use node_registry::{LostWorker, NodeRegistry, WorkerInfo};
 pub use state::{
     QueryState, QueryStateMachine, StageState, StageStateMachine, TaskState, TaskStateMachine,
 };

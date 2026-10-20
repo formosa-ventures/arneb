@@ -295,7 +295,7 @@ impl ExchangeClient {
             Some(Ok(batch)) => Some(batch),
             Some(Err(e)) => {
                 return Err(crate::task_error::remote_error(
-                    "Flight stream error".to_owned(),
+                    format!("Flight stream error from {}", self.address),
                     &e,
                 ));
             }
@@ -321,6 +321,7 @@ impl ExchangeClient {
             first: Some(first_batch),
             first_live,
             inner: flight_stream,
+            address: self.address.clone(),
             ticket: ticket_text,
             traced,
             rows: 0,
@@ -339,6 +340,8 @@ struct FlightPassthroughStream {
     first: Option<RecordBatch>,
     first_live: Option<LiveBytesGuard>,
     inner: FlightBatchStream,
+    /// The remote Flight address, named in errors.
+    address: String,
     // [EXCHTRACE] per-ticket consumer-side row tally (gated by ARNEB_TRACE_FRAGMENTS).
     ticket: String,
     traced: bool,
@@ -380,7 +383,10 @@ impl Stream for FlightPassthroughStream {
                     );
                 }
                 Poll::Ready(Some(Err(ArnebError::Execution(
-                    crate::task_error::remote_error("Flight stream error".to_owned(), &e),
+                    crate::task_error::remote_error(
+                        format!("Flight stream error from {}", self.address),
+                        &e,
+                    ),
                 ))))
             }
             Poll::Ready(None) => {

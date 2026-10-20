@@ -20,6 +20,17 @@ pub struct WorkerInfo {
 }
 
 /// Thread-safe registry of worker nodes.
+/// A worker [`NodeRegistry::lost_worker`] found lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LostWorker {
+    /// The worker's id.
+    pub worker_id: String,
+    /// Its last advertised Flight address (empty when unknown).
+    pub address: String,
+    /// Why it counts as lost.
+    pub reason: String,
+}
+
 #[derive(Clone)]
 pub struct NodeRegistry {
     workers: Arc<RwLock<HashMap<String, WorkerInfo>>>,
@@ -50,10 +61,79 @@ impl NodeRegistry {
                 alive: true,
             }
         });
+        if !entry.alive {
+            tracing::info!(
+                target: "arneb::cluster",
+                worker_id = %worker_id,
+                address = %address,
+                "worker re-registered"
+            );
+        }
         entry.last_heartbeat = Instant::now();
         entry.address = address;
         entry.max_splits = max_splits;
         entry.alive = true;
+    }
+
+    /// The heartbeat timeout this registry applies.
+    pub fn heartbeat_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.heartbeat_timeout_secs)
+    }
+
+    /// The first of `worker_ids` that is lost: marked dead, past its
+    /// heartbeat deadline, or no longer registered. A worker past its
+    /// deadline is marked dead as a side effect.
+    pub fn lost_worker(&self, worker_ids: &[String]) -> Option<LostWorker> {
+        let timeout = self.heartbeat_timeout();
+        let now = Instant::now();
+        let mut workers = self.workers.write().unwrap();
+        for id in worker_ids {
+            let Some(worker) = workers.get_mut(id) else {
+                return Some(LostWorker {
+                    worker_id: id.clone(),
+                    address: String::new(),
+                    reason: "no longer registered".to_string(),
+                });
+            };
+            let silent = now.duration_since(worker.last_heartbeat);
+            if worker.alive && silent > timeout {
+                tracing::warn!(
+                    target: "arneb::cluster",
+                    worker_id = %worker.worker_id,
+                    silent_secs = silent.as_secs(),
+                    "worker heartbeat timeout, marking as dead"
+                );
+                worker.alive = false;
+            }
+            if !worker.alive {
+                return Some(LostWorker {
+                    worker_id: worker.worker_id.clone(),
+                    address: worker.address.clone(),
+                    reason: format!("no heartbeat for {} s", silent.as_secs()),
+                });
+            }
+        }
+        None
+    }
+
+    /// Mark a worker dead after a transport failure, until its next
+    /// heartbeat. Returns whether it was alive.
+    pub fn mark_dead(&self, worker_id: &str, reason: &str) -> bool {
+        let mut workers = self.workers.write().unwrap();
+        let Some(worker) = workers.get_mut(worker_id) else {
+            return false;
+        };
+        let was_alive = worker.alive;
+        if was_alive {
+            tracing::warn!(
+                target: "arneb::cluster",
+                worker_id = %worker_id,
+                reason,
+                "worker marked dead"
+            );
+        }
+        worker.alive = false;
+        was_alive
     }
 
     /// Returns all alive workers.
@@ -132,5 +212,58 @@ mod tests {
 
         registry.remove_worker("w1");
         assert_eq!(registry.total_count(), 0);
+    }
+
+    #[test]
+    fn a_silent_worker_is_lost_and_its_heartbeat_brings_it_back() {
+        let registry = NodeRegistry::new(0);
+        registry.heartbeat("w1".into(), "host1:9090".into(), 256);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let lost = registry.lost_worker(&["w1".into()]).unwrap();
+        assert_eq!(lost.worker_id, "w1");
+        assert_eq!(lost.address, "host1:9090");
+        assert!(
+            lost.reason.starts_with("no heartbeat for"),
+            "{}",
+            lost.reason
+        );
+        assert_eq!(registry.alive_count(), 0);
+
+        let fresh = NodeRegistry::new(30);
+        fresh.heartbeat("w1".into(), "host1:9090".into(), 256);
+        assert!(fresh.lost_worker(&["w1".into()]).is_none());
+    }
+
+    #[test]
+    fn mark_dead_excludes_a_worker_until_its_next_heartbeat() {
+        let registry = NodeRegistry::new(30);
+        registry.heartbeat("w1".into(), "host1:9090".into(), 256);
+        registry.heartbeat("w2".into(), "host2:9090".into(), 256);
+        assert!(registry.mark_dead("w2", "connect refused"));
+        assert!(!registry.mark_dead("w2", "again"));
+        assert_eq!(
+            registry
+                .lost_worker(&["w1".into(), "w2".into()])
+                .unwrap()
+                .worker_id,
+            "w2"
+        );
+        let alive: Vec<_> = registry
+            .alive_workers()
+            .into_iter()
+            .map(|w| w.worker_id)
+            .collect();
+        assert_eq!(alive, vec!["w1".to_string()]);
+
+        registry.heartbeat("w2".into(), "host2:9090".into(), 256);
+        assert_eq!(registry.alive_count(), 2);
+        assert!(registry.lost_worker(&["w2".into()]).is_none());
+    }
+
+    #[test]
+    fn an_unregistered_worker_is_lost() {
+        let registry = NodeRegistry::new(30);
+        let lost = registry.lost_worker(&["gone".into()]).unwrap();
+        assert_eq!(lost.reason, "no longer registered");
     }
 }

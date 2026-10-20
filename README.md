@@ -148,7 +148,7 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 - **SQL Support**: SELECT, JOIN (INNER/LEFT/RIGHT/FULL/CROSS), GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, CASE/COALESCE/NULLIF, CTEs, UNION/INTERSECT/EXCEPT, window functions, subqueries (IN/EXISTS/scalar), DDL/DML (CREATE/DROP TABLE, INSERT, DELETE, views)
 - **90 Trino-compatible Scalar Functions**: conditional (IF, TRY, GREATEST, LEAST), string (SPLIT_PART, STRPOS, LPAD/RPAD, CONCAT_WS, `||`, ...), regex (REGEXP_LIKE/EXTRACT/REPLACE/COUNT), math (SQRT, LN, LOG, TRUNCATE, RANDOM, trig, ...), date/time (DATE_ADD, DATE_DIFF, DATE_TRUNC, DATE_FORMAT, DATE_PARSE, FORMAT_DATETIME, YEAR/MONTH/DAY_OF_WEEK/..., FROM_UNIXTIME, NOW) — see [docs/sql/functions.md](docs/sql/functions.md)
 - **Arrow-native Execution**: Vectorized columnar processing using Apache Arrow
-- **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API) with Parquet and ORC tables and partitioned tables (partitions read from HMS, as in Trino), Apache Iceberg tables in the same HMS via table redirection (read-only; field-ID schema evolution) — see [Hive](docs/connectors/hive.md)
+- **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API) with Parquet and ORC tables and partitioned tables (partitions read from HMS, as in Trino), Apache Iceberg tables in the same HMS via table redirection (read-only; field-ID schema evolution), PostgreSQL databases as read-only catalogs with filter/projection/limit pushdown and parallel key-range reads — see [Hive](docs/connectors/hive.md), [PostgreSQL](docs/connectors/postgresql.md)
 - **PostgreSQL Wire Protocol**: Compatible with psql, DBeaver, JDBC, psycopg2, node-postgres, and all standard PostgreSQL clients; per-connection `SET search_path`; SCRAM-SHA-256 password authentication; TLS (`sslmode=require` / `verify-full`)
 - **Extended Query Protocol**: Full prepared statement support (Parse/Bind/Describe/Execute/Sync)
 - **Trino Client Protocol**: Trino's REST protocol on port 8080, so the `trino` CLI, Trino JDBC, `trino-python-client` (Superset), Metabase's Trino driver and dbt-trino can connect unchanged; HTTPS with Basic authentication against the same users as pgwire — see [Trino client compatibility](docs/guide/trino-clients.md)
@@ -304,6 +304,8 @@ crates/
 ├── connectors/    # Memory + File connectors, object store abstraction (S3/GCS/Azure)
 ├── hive/          # Hive Metastore catalog provider + HiveDataSource
 ├── iceberg/       # Iceberg reader (hive catalogs redirect Iceberg tables here)
+├── rdbms/         # Remote-SQL connector framework (dialects, pushdown, pooling, splits)
+├── postgresql/    # Read-only PostgreSQL catalog on the rdbms framework
 ├── hive-metastore/# Auto-generated Thrift bindings from Hive 4.2.0 IDL
 ├── protocol/      # PostgreSQL wire protocol (Simple + Extended Query), Trino client REST protocol
 ├── scheduler/     # QueryTracker, NodeRegistry, resource groups

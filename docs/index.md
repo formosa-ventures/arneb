@@ -28,7 +28,7 @@ features:
   - title: Trino Client Compatible
     details: Trino's REST protocol, so the trino CLI, Trino JDBC, Superset, Metabase and dbt-trino connect unchanged.
   - title: Federated Queries
-    details: Query CSV and Parquet files, S3/GCS/Azure object stores, and Hive Metastore catalogs (Parquet, ORC, partitioned and Iceberg tables) from a single SQL interface.
+    details: Query CSV and Parquet files, S3/GCS/Azure object stores, Hive Metastore catalogs (Parquet, ORC, partitioned and Iceberg tables) and PostgreSQL databases from a single SQL interface.
   - title: Distributed Execution
     details: Coordinator-worker architecture with Apache Arrow Flight RPC for high-throughput data exchange.
   - title: Secure and Governed

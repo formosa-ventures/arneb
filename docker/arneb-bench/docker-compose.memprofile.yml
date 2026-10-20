@@ -10,8 +10,9 @@
 #       benchmarks/tpch/results/memory_total_<ts>.csv
 #
 # The profile never changes admission or spill decisions, but it takes a
-# mutex and reads jemalloc stats on every reservation grow, so do not quote
-# latencies from a run with this overlay.
+# mutex and reads jemalloc stats on every reservation grow and release, plus
+# every 50 ms on a sampler thread, so do not quote latencies from a run with
+# this overlay.
 
 services:
   arneb:

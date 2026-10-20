@@ -455,7 +455,9 @@ trino --server https://localhost:8080 --truststore-path .dev-certs/ca.crt --user
 ## Web UI
 
 The Web UI (pgwire port + 1000) has no login and shows query text and
-cluster state, so where it listens depends on `[auth]`:
+cluster state. It also serves Prometheus metrics at `/metrics` (see
+[Observability](/guide/observability)). Because of this, where it listens
+depends on `[auth]`:
 
 ```toml
 [web]

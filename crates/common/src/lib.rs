@@ -14,6 +14,7 @@ pub mod identifiers;
 pub mod inflight_budget;
 pub mod memory_pool;
 pub mod memory_profile;
+pub mod metrics;
 pub mod stream;
 pub mod types;
 

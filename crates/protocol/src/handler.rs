@@ -827,6 +827,49 @@ pub async fn execute_query_with_limit(
     ),
     ArnebError,
 > {
+    // Every pgwire and Trino statement that reaches the engine passes here,
+    // so this is where `/metrics` and the slow-query log observe queries. A
+    // statement dropped mid-way (cancel, timeout, client gone) records as
+    // cancelled when `observation` drops.
+    let observation = arneb_common::metrics::QueryObservation::start(sql);
+    let result = run_query_with_limit(
+        sql,
+        catalog_manager,
+        connector_registry,
+        distributed_executor,
+        memory_pool,
+        query_memory_limit,
+    )
+    .await;
+    match &result {
+        Ok((_, batches)) => observation.finish(
+            arneb_common::metrics::QueryOutcome::Finished,
+            Some(batches.iter().map(|b| b.num_rows()).sum()),
+            None,
+        ),
+        Err(e) => observation.finish(
+            arneb_common::metrics::QueryOutcome::Failed,
+            None,
+            Some(&e.to_string()),
+        ),
+    }
+    result
+}
+
+async fn run_query_with_limit(
+    sql: &str,
+    catalog_manager: &CatalogManager,
+    connector_registry: &ConnectorRegistry,
+    distributed_executor: Option<&dyn DistributedExecutor>,
+    memory_pool: &Arc<dyn arneb_execution::memory_pool::MemoryPool>,
+    query_memory_limit: Option<usize>,
+) -> Result<
+    (
+        Arc<dyn ExecutionPlan>,
+        Vec<arrow::record_batch::RecordBatch>,
+    ),
+    ArnebError,
+> {
     let memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> = match query_memory_limit {
         Some(limit) => Arc::new(arneb_execution::memory_pool::QueryMemoryPool::new(
             Arc::clone(memory_pool),
@@ -2418,6 +2461,30 @@ mod tests {
 
     /// TPC-H Q22 shape: a DECIMAL scalar subquery used to come back as a
     /// Utf8 literal ("compare_op received mismatched types Decimal128 vs Utf8").
+    /// Statements through `execute_query_with_limit` feed `/metrics`. The
+    /// registry is process-wide and tests run in parallel, so this checks
+    /// lower bounds.
+    #[tokio::test]
+    async fn executed_statements_are_counted_by_outcome() {
+        fn total(outcome: &str) -> f64 {
+            let series = format!("arneb_queries_total{{outcome=\"{outcome}\"}} ");
+            arneb_common::metrics::render(&[])
+                .lines()
+                .find_map(|l| l.strip_prefix(series.as_str()).map(|v| v.parse().unwrap()))
+                .unwrap()
+        }
+        let (cm, reg) = decimal_arith_env();
+        let (finished, failed) = (total("finished"), total("failed"));
+        run_sql("SELECT count(*) FROM t", &cm, &reg).await;
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        assert!(execute_query("SELECT nope FROM t", &cm, &reg, None, &pool)
+            .await
+            .is_err());
+        assert!(total("finished") >= finished + 1.0);
+        assert!(total("failed") >= failed + 1.0);
+    }
+
     #[tokio::test]
     async fn decimal_scalar_subquery_stays_decimal() {
         let (cm, reg) = decimal_arith_env();

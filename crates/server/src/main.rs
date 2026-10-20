@@ -878,6 +878,8 @@ async fn run() -> Result<()> {
         role: config.cluster.role.clone(),
         admission: admission.clone(),
         max_queued_queries: config.admission.max_queued_queries,
+        memory_pool: memory_pool.clone(),
+        memory_limit_bytes: budget.map(|b| b as u64),
     };
     let web_router = web::build_router(web_state);
     let web_port = config.server.port + 1000; // default: pgwire port + 1000 (e.g., 5432 → 6432)

@@ -76,6 +76,15 @@ impl NodeRegistry {
     }
 
     /// Returns the total number of registered workers (alive or dead).
+    /// Every registered worker, alive or not, with liveness re-evaluated
+    /// against the heartbeat deadline; sorted by worker id.
+    pub fn all_workers(&self) -> Vec<WorkerInfo> {
+        self.alive_workers();
+        let mut all: Vec<WorkerInfo> = self.workers.read().unwrap().values().cloned().collect();
+        all.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+        all
+    }
+
     pub fn total_count(&self) -> usize {
         self.workers.read().unwrap().len()
     }

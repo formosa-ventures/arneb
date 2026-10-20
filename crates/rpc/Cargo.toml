@@ -21,9 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 async-stream = "0.3"
-tokio-stream = { version = "0.1", features = ["net"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time", "io-util"] }
 arneb-common = { path = "../common" }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
+tokio-stream = { version = "0.1", features = ["net"] }

@@ -645,14 +645,38 @@ pub async fn serve_flight(
         .add_service(tonic::service::interceptor::InterceptedService::new(
             service, check,
         ))
-        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+        .serve_with_incoming(flight_incoming(listener))
         .await?;
     Ok(())
+}
+
+/// Accepted connections for a Flight server on an already-bound listener,
+/// with `TCP_NODELAY` set. `serve_with_incoming` ignores the builder's
+/// `tcp_nodelay` (on by default for `serve(addr)`), and Flight's small
+/// request/response frames otherwise stall on Nagle + delayed ACK.
+pub(crate) fn flight_incoming(
+    listener: tokio::net::TcpListener,
+) -> tonic::transport::server::TcpIncoming {
+    tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #136 moved the server to `serve_with_incoming`, which ignores tonic's
+    /// default `tcp_nodelay`: small Flight frames then waited on Nagle +
+    /// delayed ACK (~40 ms per round trip), +0.35 s on SF10 q11.
+    #[tokio::test]
+    async fn accepted_flight_connections_disable_nagle() {
+        use futures::StreamExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut incoming = flight_incoming(listener);
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let accepted = incoming.next().await.unwrap().unwrap();
+        assert!(accepted.nodelay().unwrap());
+    }
     use arrow::datatypes::{DataType, Field, Schema};
 
     fn test_schema() -> Arc<Schema> {

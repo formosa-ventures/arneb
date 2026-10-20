@@ -390,11 +390,7 @@ impl Drop for SpillReader {
 /// column's buffer bytes (plus null buffer if present). Used to
 /// account for spill bytes written and to drive the budget threshold.
 fn batch_in_memory_bytes(batch: &RecordBatch) -> usize {
-    batch
-        .columns()
-        .iter()
-        .map(|col| col.get_array_memory_size())
-        .sum()
+    arneb_common::memory_pool::batch_memory_size(batch)
 }
 
 // ===========================================================================

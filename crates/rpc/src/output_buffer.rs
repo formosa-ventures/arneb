@@ -14,14 +14,12 @@ use std::time::Instant;
 use arneb_common::error::ExecutionError;
 use arneb_common::inflight_budget::InflightBudget;
 use arneb_common::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool};
-use arrow::array::{Array, RecordBatch};
+use arrow::array::RecordBatch;
 use tokio::sync::{mpsc, Notify};
 
-/// Bytes a batch holds, for memory accounting (Arrow array memory size).
+/// Bytes a batch holds, for memory accounting.
 fn batch_bytes(batch: &RecordBatch) -> usize {
-    (0..batch.num_columns())
-        .map(|i| batch.column(i).get_array_memory_size())
-        .sum()
+    arneb_common::memory_pool::batch_memory_size(batch)
 }
 
 /// Releases an OutputBuffer reservation when the batch it accompanies

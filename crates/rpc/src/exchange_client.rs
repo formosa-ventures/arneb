@@ -314,7 +314,7 @@ impl ExchangeClient {
         let schema = first_batch.schema();
         let first_live = Some(LiveBytesGuard::new(
             "ExchangeReceive.live",
-            first_batch.get_array_memory_size() as u64,
+            exchange_receive_batch_bytes(&first_batch),
         ));
         Ok(Box::pin(FlightPassthroughStream {
             schema,
@@ -474,8 +474,10 @@ fn is_transport_error(err: &FlightError) -> bool {
     matches!(err, FlightError::Tonic(status) if classify(status).resumes())
 }
 
+/// Decoded Flight batches are zero-copy slices of one message body, so the
+/// body is counted once, not once per column.
 fn exchange_receive_batch_bytes(batch: &RecordBatch) -> u64 {
-    batch.get_array_memory_size() as u64
+    arneb_common::memory_pool::batch_memory_size(batch) as u64
 }
 
 impl RecordBatchStream for FlightPassthroughStream {

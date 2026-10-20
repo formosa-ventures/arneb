@@ -749,6 +749,26 @@ impl ExecutionContext {
                     span: *span,
                 })
             }
+            // The analyzer's coercions wrap a subquery operand in a cast
+            // (TPC-H Q11: `SUM(..) / CAST((SELECT COUNT(*) ..) AS ..)`).
+            PlanExpr::Cast {
+                expr: inner,
+                data_type,
+                span,
+            } => Ok(PlanExpr::Cast {
+                expr: Box::new(Box::pin(self.resolve_scalar_subqueries(inner)).await?),
+                data_type: data_type.clone(),
+                span: *span,
+            }),
+            PlanExpr::UnaryOp {
+                op,
+                expr: inner,
+                span,
+            } => Ok(PlanExpr::UnaryOp {
+                op: *op,
+                expr: Box::new(Box::pin(self.resolve_scalar_subqueries(inner)).await?),
+                span: *span,
+            }),
             _ => Ok(expr.clone()),
         }
     }

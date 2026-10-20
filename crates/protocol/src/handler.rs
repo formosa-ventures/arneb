@@ -1093,23 +1093,68 @@ async fn resolve_expr_subqueries_distributed(
     distributed_executor: Option<&dyn DistributedExecutor>,
     expr: PlanExpr,
 ) -> Result<PlanExpr, ArnebError> {
-    let Some(executor) = distributed_executor else {
-        return ctx
-            .resolve_scalar_subqueries(&expr)
-            .await
-            .map_err(ArnebError::Execution);
+    let executor = match distributed_executor {
+        Some(executor) if distribute_scalar_subquery_enabled() && executor.has_workers() => {
+            executor
+        }
+        _ => {
+            let expr = resolve_nested_subqueries_locally(ctx, expr).await?;
+            return ctx
+                .resolve_scalar_subqueries(&expr)
+                .await
+                .map_err(ArnebError::Execution);
+        }
     };
-    if !distribute_scalar_subquery_enabled() || !executor.has_workers() {
-        return ctx
-            .resolve_scalar_subqueries(&expr)
-            .await
-            .map_err(ArnebError::Execution);
-    }
 
     let resolved = resolve_expr_subqueries_distributed_inner(ctx, executor, expr).await?;
     ctx.resolve_scalar_subqueries(&resolved)
         .await
         .map_err(ArnebError::Execution)
+}
+
+/// Resolve the scalar subqueries *inside* each scalar subquery's plan (TPC-H
+/// Q11's `SUM(..) / (SELECT COUNT(*) ..)`), so the outer one can then be
+/// evaluated locally. Covers the same expression shapes as
+/// `ExecutionContext::resolve_scalar_subqueries` (binary/unary ops, casts).
+async fn resolve_nested_subqueries_locally(
+    ctx: &ExecutionContext,
+    expr: PlanExpr,
+) -> Result<PlanExpr, ArnebError> {
+    match expr {
+        PlanExpr::ScalarSubquery { subplan, span } => {
+            let subplan = Box::pin(resolve_plan_subqueries(ctx, None, *subplan)).await?;
+            Ok(PlanExpr::ScalarSubquery {
+                subplan: Box::new(subplan),
+                span,
+            })
+        }
+        PlanExpr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => Ok(PlanExpr::BinaryOp {
+            left: Box::new(Box::pin(resolve_nested_subqueries_locally(ctx, *left)).await?),
+            op,
+            right: Box::new(Box::pin(resolve_nested_subqueries_locally(ctx, *right)).await?),
+            span,
+        }),
+        PlanExpr::UnaryOp { op, expr, span } => Ok(PlanExpr::UnaryOp {
+            op,
+            expr: Box::new(Box::pin(resolve_nested_subqueries_locally(ctx, *expr)).await?),
+            span,
+        }),
+        PlanExpr::Cast {
+            expr,
+            data_type,
+            span,
+        } => Ok(PlanExpr::Cast {
+            expr: Box::new(Box::pin(resolve_nested_subqueries_locally(ctx, *expr)).await?),
+            data_type,
+            span,
+        }),
+        other => Ok(other),
+    }
 }
 
 async fn resolve_expr_subqueries_distributed_inner(
@@ -1625,6 +1670,59 @@ fn arrow_to_scalar_value(array: &arrow::array::ArrayRef, row: usize) -> ScalarVa
     }
 }
 
+/// The subplans of the scalar subqueries in `expr`, outermost first.
+fn expr_subplans(expr: &PlanExpr) -> Vec<&LogicalPlan> {
+    fn walk<'a>(expr: &'a PlanExpr, out: &mut Vec<&'a LogicalPlan>) {
+        match expr {
+            PlanExpr::ScalarSubquery { subplan, .. } => out.push(subplan),
+            PlanExpr::Column { .. }
+            | PlanExpr::Literal { .. }
+            | PlanExpr::Wildcard
+            | PlanExpr::Parameter { .. } => {}
+            PlanExpr::BinaryOp { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            PlanExpr::UnaryOp { expr, .. }
+            | PlanExpr::IsNull { expr, .. }
+            | PlanExpr::IsNotNull { expr, .. }
+            | PlanExpr::Cast { expr, .. } => walk(expr, out),
+            PlanExpr::Function { args, .. } => args.iter().for_each(|a| walk(a, out)),
+            PlanExpr::Between {
+                expr, low, high, ..
+            } => {
+                walk(expr, out);
+                walk(low, out);
+                walk(high, out);
+            }
+            PlanExpr::InList { expr, list, .. } => {
+                walk(expr, out);
+                list.iter().for_each(|item| walk(item, out));
+            }
+            PlanExpr::CaseExpr {
+                operand,
+                when_clauses,
+                else_result,
+                ..
+            } => {
+                if let Some(operand) = operand {
+                    walk(operand, out);
+                }
+                for (condition, result) in when_clauses {
+                    walk(condition, out);
+                    walk(result, out);
+                }
+                if let Some(else_result) = else_result {
+                    walk(else_result, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(expr, &mut out);
+    out
+}
+
 /// Walk the logical plan to find all TableScan nodes and register data sources.
 #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
 #[async_recursion]
@@ -1657,9 +1755,22 @@ async fn register_data_sources(
                 ctx.register_data_source(key, ds);
             }
         }
-        LogicalPlan::Projection { input, .. }
-        | LogicalPlan::Filter { input, .. }
-        | LogicalPlan::Sort { input, .. }
+        // A scalar subquery inside an expression may read a table nothing
+        // else in the plan scans; without workers it runs locally and needs
+        // that table's data source too.
+        LogicalPlan::Filter { input, predicate } => {
+            for subplan in expr_subplans(predicate) {
+                register_data_sources(subplan, catalog_manager, registry, ctx).await?;
+            }
+            register_data_sources(input, catalog_manager, registry, ctx).await?;
+        }
+        LogicalPlan::Projection { input, exprs, .. } => {
+            for subplan in exprs.iter().flat_map(expr_subplans) {
+                register_data_sources(subplan, catalog_manager, registry, ctx).await?;
+            }
+            register_data_sources(input, catalog_manager, registry, ctx).await?;
+        }
+        LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Explain { input, .. } => {
             register_data_sources(input, catalog_manager, registry, ctx).await?;
@@ -2360,6 +2471,14 @@ mod tests {
         .unwrap();
         let schema = Arc::new(MemorySchema::new());
         schema.register_table("t", Arc::new(MemoryTable::new(cols, vec![batch])));
+        // `u` is read only from subqueries in the scalar-subquery tests.
+        let u_cols = vec![col("k", DataType::Int64)];
+        let u_batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::from(u_cols[0].clone())])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4]))],
+        )
+        .unwrap();
+        schema.register_table("u", Arc::new(MemoryTable::new(u_cols, vec![u_batch])));
         let catalog = Arc::new(MemoryCatalog::new());
         catalog.register_schema("default", schema);
         let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
@@ -2429,6 +2548,54 @@ mod tests {
         .await;
         let n = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(n.value(0), 1);
+    }
+
+    /// Standalone (no workers): a scalar subquery over a table the outer
+    /// query does not scan still gets that table's data source.
+    #[tokio::test]
+    async fn scalar_subquery_over_a_table_only_it_reads() {
+        let (cm, reg) = decimal_arith_env();
+        let b = run_sql(
+            "SELECT count(*) FROM t WHERE i < (SELECT count(*) FROM u) - 2",
+            &cm,
+            &reg,
+        )
+        .await;
+        let n = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(n.value(0), 1);
+    }
+
+    /// TPC-H Q11 shape: a scalar subquery nested inside another one's
+    /// expression, resolved without workers.
+    #[tokio::test]
+    async fn nested_scalar_subquery_is_resolved_locally() {
+        let (cm, reg) = decimal_arith_env();
+        let b = run_sql(
+            "SELECT count(*) FROM t \
+             WHERE i >= (SELECT max(k) / (SELECT count(*) FROM u) FROM u) + 1",
+            &cm,
+            &reg,
+        )
+        .await;
+        let n = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(n.value(0), 1);
+    }
+
+    /// The full TPC-H Q11 shape: the nested subquery sits under a HAVING
+    /// threshold built from an aggregate.
+    #[tokio::test]
+    async fn q11_shaped_having_with_nested_scalar_subquery() {
+        let (cm, reg) = decimal_arith_env();
+        let b = run_sql(
+            "SELECT i, sum(p * qty) AS v FROM t GROUP BY i \
+             HAVING sum(p * qty) > (SELECT sum(p * qty) / (SELECT count(*) FROM u) FROM t) \
+             ORDER BY v DESC",
+            &cm,
+            &reg,
+        )
+        .await;
+        let i = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(i.values(), &[2]);
     }
 
     /// TPC-H Q15 shape: the CTE self-MAX is rewritten to a window MAX, which

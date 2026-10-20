@@ -41,7 +41,9 @@ docker compose up -d                                        # start HMS + RustFS
 docker compose run --rm tpch-seed                           # seed TPC-H SF1 data
 docker compose run --rm iceberg-seed                        # seed Iceberg tables (<hive catalog>.ice.*)
 docker compose up -d postgres                               # PostgreSQL on :5433 for the postgresql connector
+docker compose run --rm pg-tpch-seed                        # TPC-H dims into postgresql.tpch_mixed (mixed layout; same TPCH_SF as tpch-seed)
 cargo run --bin arneb -- --config benchmarks/tpch/tpch-hive.toml  # start Arneb with hive catalog
+cargo run --release --bin arneb -- --config benchmarks/tpch/tpch-mixed.toml  # hive facts + postgresql dims (queries-mixed/)
 psql -h 127.0.0.1 -p 5432 -c "SELECT COUNT(*) FROM datalake.tpch.nation;"
 docker compose down                                         # tear down
 ```

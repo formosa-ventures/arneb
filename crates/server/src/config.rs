@@ -673,6 +673,9 @@ pub struct CatalogConfig {
     pub connect_timeout_secs: Option<u64>,
     /// Seconds to wait for a free pooled connection (default 60).
     pub pool_wait_timeout_secs: Option<u64>,
+    /// A dynamic-filter `IN` list longer than this is pushed as a range
+    /// (default 1000).
+    pub domain_compaction_threshold: Option<usize>,
 }
 
 impl CatalogConfig {
@@ -758,6 +761,14 @@ impl CatalogConfig {
                 self.name
             );
             c.pool_wait_timeout_secs = v;
+        }
+        if let Some(v) = self.domain_compaction_threshold {
+            anyhow::ensure!(
+                v > 0,
+                "catalog '{}': domain_compaction_threshold must be > 0",
+                self.name
+            );
+            c.domain_compaction_threshold = v;
         }
         Ok(c)
     }
@@ -1578,6 +1589,7 @@ connection_url = "postgresql://db.internal:5432/sales"
 user = "arneb"
 password = "file-secret"
 max_splits = 4
+domain_compaction_threshold = 250
 
 [[catalogs]]
 name = "lake"
@@ -1593,6 +1605,7 @@ metastore_uri = "127.0.0.1:9083"
         let c = pg.postgres_config().unwrap();
         assert_eq!(c.password.as_deref(), Some("file-secret"));
         assert_eq!(c.max_splits, 4);
+        assert_eq!(c.domain_compaction_threshold, 250);
         assert_eq!(c.max_connections, arneb_postgresql::DEFAULT_MAX_CONNECTIONS);
         assert_eq!(c.split_min_rows, arneb_postgresql::DEFAULT_SPLIT_MIN_ROWS);
         assert_eq!(pg.effective_default_schema(), "public");
@@ -1633,6 +1646,23 @@ max_splits = 0
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(config.catalogs[0].postgres_config().is_err());
+
+        let toml_str = r#"
+[[catalogs]]
+name = "pg"
+type = "postgresql"
+connection_url = "postgresql://h/d"
+domain_compaction_threshold = 0
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let err = config.catalogs[0]
+            .postgres_config()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'pg'") && err.contains("domain_compaction_threshold"),
+            "{err}"
+        );
     }
 
     #[test]

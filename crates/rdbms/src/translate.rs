@@ -27,13 +27,44 @@ use crate::{Dialect, RemoteTable};
 pub struct Translation {
     /// Translated conjuncts, to be `AND`ed into the remote `WHERE`.
     pub conjuncts: Vec<String>,
-    /// `true` when every conjunct was translated — the remote query then
-    /// returns exactly the rows Arneb's filter would keep, so a `LIMIT`
+    /// `true` when every conjunct was translated exactly — the remote query
+    /// then returns exactly the rows Arneb's filter would keep, so a `LIMIT`
     /// may be pushed.
     pub complete: bool,
+    /// Dynamic-filter conjuncts pushed as they are.
+    pub dynamic_pushed: usize,
+    /// Dynamic `IN` lists over the compaction threshold, pushed as a
+    /// `BETWEEN min AND max` range.
+    pub dynamic_compacted: usize,
+    /// Dynamic-filter conjuncts not pushed at all.
+    pub dynamic_skipped: usize,
 }
 
-/// Translate the scan's pushed-down filters.
+/// Default for [`TranslateOptions::compaction_threshold`].
+pub const DEFAULT_DOMAIN_COMPACTION_THRESHOLD: usize = 1000;
+
+/// How [`translate_filters_with`] treats runtime dynamic filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranslateOptions {
+    /// Index of the first dynamic-filter entry in `filters`
+    /// (`ScanContext::dynamic_filters_start`); `None` = all static.
+    pub dynamic_from: Option<usize>,
+    /// A dynamic `IN` list with more literals than this is compacted to a
+    /// range. Static lists are never compacted.
+    pub compaction_threshold: usize,
+}
+
+impl Default for TranslateOptions {
+    fn default() -> Self {
+        Self {
+            dynamic_from: None,
+            compaction_threshold: DEFAULT_DOMAIN_COMPACTION_THRESHOLD,
+        }
+    }
+}
+
+/// Translate the scan's pushed-down filters, treating every filter as
+/// static.
 ///
 /// `schema` is the Arneb table schema the filters' column indices refer to;
 /// `table` gives each column's remote name (same order).
@@ -43,26 +74,155 @@ pub fn translate_filters(
     table: &RemoteTable,
     dialect: &dyn Dialect,
 ) -> Translation {
+    translate_filters_with(filters, schema, table, dialect, TranslateOptions::default())
+}
+
+/// Translate the scan's pushed-down filters; entries from
+/// `options.dynamic_from` on are runtime dynamic filters.
+///
+/// A dynamic filter only prunes the probe side of the join that produced it
+/// — the join still checks every key — so pushing a weaker range in place
+/// of a long `IN` list, or nothing at all, never changes a result.
+pub fn translate_filters_with(
+    filters: &[PlanExpr],
+    schema: &[ColumnInfo],
+    table: &RemoteTable,
+    dialect: &dyn Dialect,
+    options: TranslateOptions,
+) -> Translation {
     let ctx = Ctx {
         schema,
         table,
         dialect,
     };
-    let mut conjuncts = Vec::new();
-    let mut complete = true;
-    for filter in filters {
+    let mut t = Translation {
+        complete: true,
+        ..Default::default()
+    };
+    for (i, filter) in filters.iter().enumerate() {
+        let dynamic = options.dynamic_from.is_some_and(|from| i >= from);
         let mut parts = Vec::new();
         flatten_and(filter, &mut parts);
         for part in parts {
-            match ctx.predicate(part) {
-                Some(sql) => conjuncts.push(sql),
-                None => complete = false,
+            if !dynamic {
+                match ctx.predicate(part) {
+                    Some(sql) => t.conjuncts.push(sql),
+                    None => t.complete = false,
+                }
+                continue;
+            }
+            match compact(part, options.compaction_threshold) {
+                Compaction::Unchanged => match ctx.predicate(part) {
+                    Some(sql) => {
+                        t.conjuncts.push(sql);
+                        t.dynamic_pushed += 1;
+                    }
+                    None => {
+                        t.complete = false;
+                        t.dynamic_skipped += 1;
+                    }
+                },
+                Compaction::Range(range) => {
+                    // Weaker than the list: Arneb must still filter.
+                    t.complete = false;
+                    match ctx.predicate(&range) {
+                        Some(sql) => {
+                            t.conjuncts.push(sql);
+                            t.dynamic_compacted += 1;
+                        }
+                        None => t.dynamic_skipped += 1,
+                    }
+                }
+                Compaction::Drop => {
+                    t.complete = false;
+                    t.dynamic_skipped += 1;
+                }
             }
         }
     }
-    Translation {
-        conjuncts,
-        complete,
+    t
+}
+
+enum Compaction {
+    Unchanged,
+    Range(PlanExpr),
+    Drop,
+}
+
+/// An `IN` list over `threshold` literals becomes `BETWEEN min AND max` when
+/// all literals share one orderable type, else it is dropped.
+fn compact(expr: &PlanExpr, threshold: usize) -> Compaction {
+    let PlanExpr::InList {
+        expr,
+        list,
+        negated: false,
+        span,
+    } = expr
+    else {
+        return Compaction::Unchanged;
+    };
+    if list.len() <= threshold {
+        return Compaction::Unchanged;
+    }
+    let mut bounds: Option<(&ScalarValue, &ScalarValue)> = None;
+    for item in list {
+        let PlanExpr::Literal { value, .. } = item else {
+            return Compaction::Drop;
+        };
+        bounds = match bounds {
+            None if orderable(value) => Some((value, value)),
+            None => return Compaction::Drop,
+            Some((lo, hi)) => match (order(value, lo), order(value, hi)) {
+                (Some(l), Some(h)) => Some((
+                    if l.is_lt() { value } else { lo },
+                    if h.is_gt() { value } else { hi },
+                )),
+                _ => return Compaction::Drop,
+            },
+        };
+    }
+    let Some((lo, hi)) = bounds else {
+        return Compaction::Drop;
+    };
+    let bound = |value: &ScalarValue| {
+        Box::new(PlanExpr::Literal {
+            value: value.clone(),
+            span: None,
+        })
+    };
+    Compaction::Range(PlanExpr::Between {
+        expr: expr.clone(),
+        negated: false,
+        low: bound(lo),
+        high: bound(hi),
+        span: *span,
+    })
+}
+
+fn orderable(v: &ScalarValue) -> bool {
+    order(v, v).is_some()
+}
+
+/// Order two literals of the same orderable type; `None` across types.
+fn order(a: &ScalarValue, b: &ScalarValue) -> Option<std::cmp::Ordering> {
+    use ScalarValue as S;
+    match (a, b) {
+        (S::Int32(x), S::Int32(y)) => Some(x.cmp(y)),
+        (S::Int64(x), S::Int64(y)) => Some(x.cmp(y)),
+        (S::Date32(x), S::Date32(y)) => Some(x.cmp(y)),
+        (
+            S::Decimal128 {
+                value: x,
+                scale: sx,
+                ..
+            },
+            S::Decimal128 {
+                value: y,
+                scale: sy,
+                ..
+            },
+        ) if sx == sy => Some(x.cmp(y)),
+        _ => None,
     }
 }
 
@@ -637,5 +797,133 @@ mod tests {
         let t = translate(&[]);
         assert!(t.complete);
         assert!(t.conjuncts.is_empty());
+    }
+
+    fn in_list(index: usize, values: Vec<ScalarValue>) -> PlanExpr {
+        PlanExpr::InList {
+            expr: Box::new(col(index)),
+            list: values.into_iter().map(lit).collect(),
+            negated: false,
+            span: None,
+        }
+    }
+
+    fn translate_dynamic(
+        filters: &[PlanExpr],
+        dynamic_from: usize,
+        threshold: usize,
+    ) -> Translation {
+        let (schema, table) = nation();
+        translate_filters_with(
+            filters,
+            &schema,
+            &table,
+            &TestDialect,
+            TranslateOptions {
+                dynamic_from: Some(dynamic_from),
+                compaction_threshold: threshold,
+            },
+        )
+    }
+
+    fn ints(values: impl IntoIterator<Item = i32>) -> Vec<ScalarValue> {
+        values.into_iter().map(ScalarValue::Int32).collect()
+    }
+
+    #[test]
+    fn small_dynamic_in_list_is_pushed_exactly() {
+        let t = translate_dynamic(&[in_list(0, ints([3, 1, 2]))], 0, 3);
+        assert_eq!(
+            t.conjuncts,
+            vec!["(\"n_nationkey\" IN (3, 1, 2))".to_string()]
+        );
+        assert!(t.complete);
+        assert_eq!(
+            (t.dynamic_pushed, t.dynamic_compacted, t.dynamic_skipped),
+            (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn large_dynamic_in_list_is_compacted_to_a_range() {
+        let t = translate_dynamic(&[in_list(0, ints([40, 7, 9000, 12]))], 0, 3);
+        assert_eq!(
+            t.conjuncts,
+            vec!["(\"n_nationkey\" BETWEEN 7 AND 9000)".to_string()]
+        );
+        assert!(!t.complete, "a range returns a superset: no LIMIT");
+        assert_eq!(
+            (t.dynamic_pushed, t.dynamic_compacted, t.dynamic_skipped),
+            (0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn decimal_list_compacts_within_one_scale() {
+        let d = |value| ScalarValue::Decimal128 {
+            value,
+            precision: 15,
+            scale: 2,
+        };
+        let t = translate_dynamic(&[in_list(4, vec![d(500), d(-125), d(99)])], 0, 2);
+        assert_eq!(
+            t.conjuncts,
+            vec!["(\"n_balance\" BETWEEN -1.25 AND 5.00)".to_string()]
+        );
+    }
+
+    #[test]
+    fn large_list_without_one_orderable_type_is_skipped() {
+        let mixed = vec![
+            ScalarValue::Int32(1),
+            ScalarValue::Int64(2),
+            ScalarValue::Int32(3),
+        ];
+        let text = ["a", "b", "c"]
+            .map(|v| ScalarValue::Utf8(v.into()))
+            .to_vec();
+        let t = translate_dynamic(&[in_list(0, mixed), in_list(1, text)], 0, 2);
+        assert!(t.conjuncts.is_empty());
+        assert!(!t.complete);
+        assert_eq!(t.dynamic_skipped, 2);
+    }
+
+    #[test]
+    fn static_in_list_is_never_compacted() {
+        let static_list = in_list(0, ints(0..20));
+        let dynamic = in_list(2, ints(0..20));
+        let t = translate_dynamic(&[static_list, dynamic], 1, 5);
+        assert_eq!(t.conjuncts.len(), 2);
+        assert!(t.conjuncts[0].contains("IN (0, 1, 2"), "{}", t.conjuncts[0]);
+        assert_eq!(t.conjuncts[1], "(\"n_regionkey\" BETWEEN 0 AND 19)");
+        assert_eq!(
+            (t.dynamic_pushed, t.dynamic_compacted, t.dynamic_skipped),
+            (0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn untranslatable_dynamic_filter_is_counted_as_skipped() {
+        // A float column is never pushed, compacted or not.
+        let floats = vec![ScalarValue::Float64(1.0)];
+        let t = translate_dynamic(&[in_list(6, floats)], 0, 10);
+        assert!(t.conjuncts.is_empty());
+        assert_eq!(t.dynamic_skipped, 1);
+    }
+
+    #[test]
+    fn static_only_options_match_translate_filters() {
+        let f = [in_list(0, ints(0..5000))];
+        let (schema, table) = nation();
+        assert_eq!(
+            translate_filters_with(
+                &f,
+                &schema,
+                &table,
+                &TestDialect,
+                TranslateOptions::default()
+            ),
+            translate(&f)
+        );
     }
 }

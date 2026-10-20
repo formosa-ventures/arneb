@@ -13,6 +13,9 @@ pub const DEFAULT_UNCONSTRAINED_NUMERIC_SCALE: i8 = 10;
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Default limit, in seconds, on waiting for a free pooled connection.
 pub const DEFAULT_POOL_WAIT_TIMEOUT_SECS: u64 = 60;
+/// Default size above which a dynamic-filter `IN` list is sent as a range.
+pub const DEFAULT_DOMAIN_COMPACTION_THRESHOLD: usize =
+    arneb_rdbms::DEFAULT_DOMAIN_COMPACTION_THRESHOLD;
 
 /// Connection and scan settings for one PostgreSQL catalog.
 #[derive(Clone)]
@@ -37,6 +40,9 @@ pub struct PostgresConfig {
     /// Seconds a scan or metadata lookup waits for a free pooled connection
     /// before it fails.
     pub pool_wait_timeout_secs: u64,
+    /// A dynamic-filter `IN` list with more values than this is pushed as a
+    /// `BETWEEN min AND max` range instead.
+    pub domain_compaction_threshold: usize,
 }
 
 impl PostgresConfig {
@@ -52,6 +58,7 @@ impl PostgresConfig {
             unconstrained_numeric_scale: DEFAULT_UNCONSTRAINED_NUMERIC_SCALE,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             pool_wait_timeout_secs: DEFAULT_POOL_WAIT_TIMEOUT_SECS,
+            domain_compaction_threshold: DEFAULT_DOMAIN_COMPACTION_THRESHOLD,
         }
     }
 
@@ -113,6 +120,10 @@ impl fmt::Debug for PostgresConfig {
             )
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("pool_wait_timeout_secs", &self.pool_wait_timeout_secs)
+            .field(
+                "domain_compaction_threshold",
+                &self.domain_compaction_threshold,
+            )
             .finish()
     }
 }

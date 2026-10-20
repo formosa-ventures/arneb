@@ -962,6 +962,7 @@ impl ExecutionPlan for ScanExec {
                 self.scan_context.clone()
             } else {
                 let mut merged = self.scan_context.clone();
+                merged.dynamic_filters_start = Some(merged.filters.len());
                 merged.filters.extend(dynamic.iter().cloned());
                 for df in cross_fragment {
                     if let Some(expr) =
@@ -4164,6 +4165,89 @@ mod tests {
         let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
+    }
+
+    /// Records the `ScanContext` each `scan` call receives.
+    #[derive(Debug)]
+    struct ContextRecordingSource {
+        inner: Arc<dyn DataSource>,
+        seen: std::sync::Mutex<Vec<ScanContext>>,
+    }
+
+    #[async_trait]
+    impl DataSource for ContextRecordingSource {
+        fn schema(&self) -> Vec<ColumnInfo> {
+            self.inner.schema()
+        }
+
+        async fn scan(
+            &self,
+            ctx: &ScanContext,
+            partition: usize,
+        ) -> Result<SendableRecordBatchStream, ExecutionError> {
+            self.seen.lock().unwrap().push(ctx.clone());
+            self.inner.scan(ctx, partition).await
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_marks_where_dynamic_filters_start() {
+        let source = Arc::new(ContextRecordingSource {
+            inner: make_test_source(),
+            seen: Default::default(),
+        });
+        let static_filter = PlanExpr::IsNotNull {
+            expr: Box::new(PlanExpr::Column {
+                index: 0,
+                name: "id".to_string(),
+                span: None,
+            }),
+            span: None,
+        };
+        let scan = ScanExec {
+            source: source.clone(),
+            _table_name: "test".to_string(),
+            scan_context: ScanContext::default().with_filters(vec![static_filter]),
+            dynamic_filters: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
+            dynamic_filter_collector: None,
+            dynamic_filtering_enabled: false,
+            dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+            scan_task_index: 0,
+            scan_task_count: 1,
+        };
+        collect_stream(scan.execute(0).await.unwrap())
+            .await
+            .unwrap();
+        scan.inject_dynamic_filter(
+            PlanExpr::InList {
+                expr: Box::new(PlanExpr::Column {
+                    index: 0,
+                    name: "id".to_string(),
+                    span: None,
+                }),
+                list: vec![PlanExpr::Literal {
+                    value: ScalarValue::Int32(2),
+                    span: None,
+                }],
+                negated: false,
+                span: None,
+            },
+            0,
+        );
+        collect_stream(scan.execute(0).await.unwrap())
+            .await
+            .unwrap();
+
+        let seen = source.seen.lock().unwrap();
+        assert_eq!(seen[0].filters.len(), 1);
+        assert_eq!(seen[0].dynamic_filters_start, None, "no dynamic filter yet");
+        assert_eq!(seen[1].filters.len(), 2);
+        assert_eq!(
+            seen[1].dynamic_filters_start,
+            Some(1),
+            "boundary points at the first dynamic conjunct"
+        );
     }
 
     #[tokio::test]

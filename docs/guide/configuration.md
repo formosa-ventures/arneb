@@ -248,9 +248,10 @@ allow_http = true
 
 A PostgreSQL catalog takes `connection_url`, `user`, `password` and the pool/split
 knobs `max_connections`, `split_min_rows`, `max_splits`,
-`unconstrained_numeric_scale`, `connect_timeout_secs` and
-`pool_wait_timeout_secs`. `ARNEB_CATALOG_<NAME>_PASSWORD` overrides the
-password. See [PostgreSQL](/connectors/postgresql):
+`unconstrained_numeric_scale`, `connect_timeout_secs`,
+`pool_wait_timeout_secs` and `domain_compaction_threshold` (dynamic filters
+longer than this are sent as a range). `ARNEB_CATALOG_<NAME>_PASSWORD`
+overrides the password. See [PostgreSQL](/connectors/postgresql):
 
 ```toml
 [[catalogs]]

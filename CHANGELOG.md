@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.4](https://github.com/formosa-ventures/arneb/compare/v0.1.3...v0.1.4) (2026-10-20)
+
+
+### Features
+
+* PostgreSQL connector on a shared RDBMS framework (Phase 3 M2, F1+F2) ([#158](https://github.com/formosa-ventures/arneb/issues/158)) ([5c5ada9](https://github.com/formosa-ventures/arneb/commit/5c5ada9c6da7e76a89e0bdd15079e54589ab77f7))
+
+
+### Bug Fixes
+
+* **hive,iceberg:** every node computes the same scan partitions ([#160](https://github.com/formosa-ventures/arneb/issues/160)) ([cebfe9e](https://github.com/formosa-ventures/arneb/commit/cebfe9ef5028f1b8d41310517781e851c3684596)), closes [#157](https://github.com/formosa-ventures/arneb/issues/157)
+
 ## [0.1.3](https://github.com/formosa-ventures/arneb/compare/v0.1.2...v0.1.3) (2026-10-18)
 
 

@@ -16,4 +16,4 @@ pub use node_registry::{LostWorker, NodeRegistry, WorkerInfo};
 pub use state::{
     QueryState, QueryStateMachine, StageState, StageStateMachine, TaskState, TaskStateMachine,
 };
-pub use tracker::QueryTracker;
+pub use tracker::{query_history_size, QueryInfo, QueryTracker};

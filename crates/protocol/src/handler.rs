@@ -116,6 +116,8 @@ pub struct HandlerFactory {
     /// Reject StartupMessages on connections that did not negotiate TLS
     /// (`[tls] pgwire = "required"`).
     pub tls_required: bool,
+    /// Records each statement (Web UI, `system.runtime.queries`).
+    pub query_tracker: Option<Arc<arneb_scheduler::QueryTracker>>,
 }
 
 impl PgWireServerHandlers for HandlerFactory {
@@ -128,6 +130,7 @@ impl PgWireServerHandlers for HandlerFactory {
             query_memory_limit: self.query_memory_limit,
             admission: self.admission.clone(),
             statement_timeout: self.statement_timeout,
+            query_tracker: self.query_tracker.clone(),
         })
     }
 
@@ -140,6 +143,7 @@ impl PgWireServerHandlers for HandlerFactory {
             query_memory_limit: self.query_memory_limit,
             admission: self.admission.clone(),
             statement_timeout: self.statement_timeout,
+            query_tracker: self.query_tracker.clone(),
         })
     }
 
@@ -154,6 +158,69 @@ impl PgWireServerHandlers for HandlerFactory {
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {
         Arc::new(NoopHandler)
+    }
+}
+
+/// One pgwire statement's entry in the query tracker: `Queued` at receipt,
+/// `Running` once admitted, then finished or failed. Dropped before either
+/// (the client went away mid-statement) it is recorded as cancelled.
+struct TrackedStatement {
+    entry: Option<(
+        Arc<arneb_scheduler::QueryTracker>,
+        arneb_common::identifiers::QueryId,
+    )>,
+    done: std::sync::atomic::AtomicBool,
+}
+
+impl TrackedStatement {
+    fn start(
+        tracker: Option<&Arc<arneb_scheduler::QueryTracker>>,
+        sql: &str,
+        user: Option<String>,
+    ) -> Self {
+        Self {
+            entry: tracker.map(|t| {
+                let id = t.create_query_from(sql.to_string(), "pgwire", user);
+                (Arc::clone(t), id)
+            }),
+            done: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn running(&self) {
+        if let Some((t, id)) = &self.entry {
+            let _ = t.advance_to(id, arneb_scheduler::QueryState::Running);
+        }
+    }
+
+    fn finish(&self, rows: u64) {
+        if let Some((t, id)) = self.claim() {
+            let _ = t.finish_query(id, rows);
+        }
+    }
+
+    fn fail(&self, error: String) {
+        if let Some((t, id)) = self.claim() {
+            let _ = t.fail_query(id, error);
+        }
+    }
+
+    fn claim(
+        &self,
+    ) -> Option<&(
+        Arc<arneb_scheduler::QueryTracker>,
+        arneb_common::identifiers::QueryId,
+    )> {
+        let first = !self.done.swap(true, std::sync::atomic::Ordering::Relaxed);
+        self.entry.as_ref().filter(|_| first)
+    }
+}
+
+impl Drop for TrackedStatement {
+    fn drop(&mut self) {
+        if let Some((t, id)) = self.claim() {
+            let _ = t.cancel_query(id);
+        }
     }
 }
 
@@ -173,6 +240,8 @@ pub struct ConnectionHandler {
     pub admission: Option<arneb_scheduler::AdmissionController>,
     /// Server default timeout; see [`HandlerFactory::statement_timeout`].
     pub statement_timeout: Option<std::time::Duration>,
+    /// See [`HandlerFactory::query_tracker`].
+    pub query_tracker: Option<Arc<arneb_scheduler::QueryTracker>>,
 }
 
 impl ConnectionHandler {
@@ -281,6 +350,73 @@ impl ConnectionHandler {
 
     /// The catalog manager resolving unqualified names for this connection:
     /// a session view when `SET search_path` chose a non-default schema.
+    /// Admit and execute one statement under the session's timeout,
+    /// recording it in the query tracker. `system.runtime.queries` reads
+    /// run over a snapshot of the tracker instead of the real catalogs.
+    async fn run_statement<C: ClientInfo>(
+        &self,
+        client: &C,
+        sql: &str,
+        catalog_manager: &Arc<CatalogManager>,
+    ) -> PgWireResult<
+        Result<
+            (
+                Arc<dyn ExecutionPlan>,
+                Vec<arrow::record_batch::RecordBatch>,
+            ),
+            ArnebError,
+        >,
+    > {
+        let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
+        let tracked = TrackedStatement::start(self.query_tracker.as_ref(), sql, user);
+        let result = self
+            .with_timeout(client, async {
+                let _admission = self.admit(sql).await?;
+                tracked.running();
+                // Snapshot after admission, so the reading statement shows
+                // itself as RUNNING.
+                let runtime = self
+                    .query_tracker
+                    .as_deref()
+                    .filter(|_| crate::runtime_queries::references_runtime_queries(sql))
+                    .map(crate::runtime_queries::runtime_catalog);
+                Ok(match &runtime {
+                    Some((cm, registry)) => {
+                        execute_query_with_limit(
+                            sql,
+                            cm,
+                            registry,
+                            None,
+                            &self.memory_pool,
+                            self.query_memory_limit,
+                        )
+                        .await
+                    }
+                    None => {
+                        execute_query_with_limit(
+                            sql,
+                            catalog_manager,
+                            &self.connector_registry,
+                            self.distributed_executor.as_deref(),
+                            &self.memory_pool,
+                            self.query_memory_limit,
+                        )
+                        .await
+                    }
+                })
+            })
+            .await;
+        match &result {
+            Ok(Ok((_, batches))) => {
+                tracked.finish(batches.iter().map(|b| b.num_rows() as u64).sum())
+            }
+            Ok(Err(e)) => tracked.fail(e.to_string()),
+            // Admission refusal or statement timeout.
+            Err(e) => tracked.fail(e.to_string()),
+        }
+        result
+    }
+
     fn session_catalog<C: ClientInfo>(&self, client: &C) -> Arc<CatalogManager> {
         client.session_extensions().get::<SearchPath>().map_or_else(
             || Arc::clone(&self.catalog_manager),
@@ -378,18 +514,7 @@ impl SimpleQueryHandler for ConnectionHandler {
         let source = SourceFile::new("<query>", trimmed);
 
         let result = self
-            .with_timeout(client, async {
-                let _admission = self.admit(trimmed).await?;
-                Ok(execute_query_with_limit(
-                    trimmed,
-                    &catalog_manager,
-                    &self.connector_registry,
-                    self.distributed_executor.as_deref(),
-                    &self.memory_pool,
-                    self.query_memory_limit,
-                )
-                .await)
-            })
+            .run_statement(client, trimmed, &catalog_manager)
             .await?;
 
         match result {
@@ -557,18 +682,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
 
         let source = SourceFile::new("<query>", trimmed);
         let result = self
-            .with_timeout(client, async {
-                let _admission = self.admit(trimmed).await?;
-                Ok(execute_query_with_limit(
-                    trimmed,
-                    &catalog_manager,
-                    &self.connector_registry,
-                    self.distributed_executor.as_deref(),
-                    &self.memory_pool,
-                    self.query_memory_limit,
-                )
-                .await)
-            })
+            .run_statement(client, trimmed, &catalog_manager)
             .await?;
 
         match result {

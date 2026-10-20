@@ -177,6 +177,37 @@ The effective values are logged at startup on `arneb::config`. Set
 `max_running_queries = 0` and leave the other two unset to turn admission
 off.
 
+## Query History
+
+The coordinator, or a standalone server, keeps every running query and the
+most recent finished ones. That covers every statement from pgwire or the
+Trino protocol that reaches the engine. Session commands and metadata queries
+are not kept. `ARNEB_QUERY_HISTORY_SIZE` sets how many finished queries are
+kept (default `100`).
+
+Query them as a table, over either protocol:
+
+```sql
+SELECT query_id, state, "user", source, elapsed_time_ms, rows, error_message
+FROM system.runtime.queries
+WHERE state <> 'FINISHED'
+ORDER BY created DESC;
+```
+
+| Column | Meaning |
+|---|---|
+| `query_id`, `query` | Id and SQL text |
+| `state` | `QUEUED`, `RUNNING`, `FINISHED`, `FAILED` or `CANCELLED` (the client went away) |
+| `user`, `source` | Who submitted it, and over `pgwire` or `trino` |
+| `queued_time_ms`, `elapsed_time_ms` | Time waiting for admission, and total time (so far, if still running) |
+| `rows` | Rows returned, once finished |
+| `created`, `started`, `end` | Timestamps (UTC) |
+| `error_message` | Why it failed, including statement timeouts and admission refusals |
+
+The Web UI's query list (`/api/v1/queries`) shows the same history.
+`system.runtime.queries` is a snapshot taken when the statement starts, and
+it cannot be joined with other catalogs' tables.
+
 ## Table Registration
 
 Register tables directly in the config file:

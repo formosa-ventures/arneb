@@ -598,11 +598,8 @@ async fn run() -> Result<()> {
     // Worker: create TaskManager and register task callback
     let distributed_executor: Option<Arc<dyn arneb_protocol::DistributedExecutor>> = match role {
         ServerRole::Coordinator => {
-            let coord = coordinator::QueryCoordinator::new(
-                node_registry.clone(),
-                query_tracker.clone(),
-                df_registry.clone(),
-            );
+            let coord =
+                coordinator::QueryCoordinator::new(node_registry.clone(), df_registry.clone());
             Some(Arc::new(coord))
         }
         _ => None,
@@ -824,7 +821,8 @@ async fn run() -> Result<()> {
     .with_admission(admission.clone())
     .with_statement_timeout(config.admission.statement_timeout)
     .with_auth(auth_method)
-    .with_tls(pgwire_tls);
+    .with_tls(pgwire_tls)
+    .with_query_tracker(query_tracker.clone());
     if let Some(ref executor) = distributed_executor {
         server = server.with_distributed_executor(Arc::clone(executor));
     }

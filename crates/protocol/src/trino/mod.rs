@@ -216,6 +216,7 @@ impl TrinoServer {
                 distributed_executor: self.distributed_executor.clone(),
                 memory_pool: Arc::clone(&self.memory_pool),
                 query_memory_limit: self.query_memory_limit,
+                query_tracker: self.query_tracker.clone(),
             }),
             queries: Arc::new(Mutex::new(HashMap::new())),
             config: Arc::new(self.config.clone()),
@@ -516,7 +517,10 @@ async fn submit(
     let session = ClientSession::from_headers(&headers, user.as_ref().map(|Extension(u)| u));
     let id = new_query_id(&state.counter);
     let slug = format!("y{}", uuid::Uuid::new_v4().simple());
-    let tracker_id = state.tracker.as_ref().map(|t| t.create_query(sql.clone()));
+    let tracker_id = state
+        .tracker
+        .as_ref()
+        .map(|t| t.create_query_from(sql.clone(), "trino", Some(session.user.clone())));
     let (done, _) = watch::channel(false);
     let query = Arc::new(Query {
         id: id.clone(),
@@ -755,11 +759,10 @@ fn complete(state: &AppState, query: &Query, result: Result<QueryOutput, TrinoEr
         inner.ended = Some(Instant::now());
         inner.phase = match result {
             Ok(output) => {
-                tracker_transition(
-                    state,
-                    query.tracker_id,
-                    &[TrackerState::Finishing, TrackerState::Finished],
-                );
+                if let (Some(t), Some(id)) = (&state.tracker, query.tracker_id) {
+                    let rows = output.batches.iter().map(|b| b.num_rows() as u64).sum();
+                    let _ = t.finish_query(&id, rows);
+                }
                 Phase::Finished(Results {
                     output,
                     batch: 0,

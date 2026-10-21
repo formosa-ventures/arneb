@@ -248,3 +248,14 @@ config migration is involved.
 - Should the default threshold move after the SF10 measurement? D2's
   default of 1000 is a starting point, and the SF10 report either confirms
   it or proposes a new value.
+- Should IN→range compaction move into the engine? The oversized dynamic
+  filter is built in `ScanExec`, but this change compacts it in the RDBMS
+  translator under a per-catalog threshold. Compacting once at the merge
+  site, under one engine-level threshold, would give the MySQL connector (M4)
+  and the Hive reader the same bound and keep `translate.rs` a pure
+  `PlanExpr`→SQL mapping. Decide before M4, so the next connector does not
+  copy the per-catalog knob.
+- Should `ScanContext` carry `dynamic_filters: Vec<PlanExpr>` instead of
+  `dynamic_filters_start`? The index silently breaks if anything reorders or
+  extends `filters`. The merge site already holds the two lists apart, so a
+  separate field would carry the same information without that invariant.

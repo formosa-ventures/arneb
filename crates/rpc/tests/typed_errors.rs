@@ -17,13 +17,7 @@ use futures::StreamExt;
 async fn start(state: FlightState) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(arneb_rpc::__flight_service_for_test(state))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .unwrap();
-    });
+    tokio::spawn(arneb_rpc::__serve_flight_for_test(listener, state));
     tokio::time::sleep(Duration::from_millis(200)).await;
     addr
 }

@@ -275,11 +275,7 @@ fn coalesce_build_batches(
         if b.num_rows() == 0 {
             continue;
         }
-        group_bytes += b
-            .columns()
-            .iter()
-            .map(|c| c.get_array_memory_size())
-            .sum::<usize>();
+        group_bytes += crate::operator::record_batch_bytes(&b);
         group.push(b);
         if group_bytes >= target_bytes {
             out.push(if group.len() == 1 {

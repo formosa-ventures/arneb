@@ -313,7 +313,7 @@ impl ScanState {
     /// builders refill to about that size). Infallible, like the Parquet
     /// scan: a scan cannot spill.
     fn account(&mut self, batch: &RecordBatch) {
-        let bytes = batch.get_array_memory_size();
+        let bytes = arneb_common::memory_pool::batch_memory_size(batch);
         let held = self.reservation.size();
         if bytes > held {
             self.reservation.grow(bytes - held);

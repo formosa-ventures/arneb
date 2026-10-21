@@ -191,7 +191,7 @@ impl SpillWriter {
         })?;
         // Approximate on-wire bytes via in-memory batch size. Arrow IPC
         // streams without compression are within ~5% of in-memory.
-        let size = batch_in_memory_bytes(batch);
+        let size = crate::operator::record_batch_bytes(batch);
         self.bytes_written += size;
         self.num_batches += 1;
         Ok(size)
@@ -384,17 +384,6 @@ impl Drop for SpillReader {
     fn drop(&mut self) {
         self.drop_page_cache_once();
     }
-}
-
-/// In-memory byte size estimate for a [`RecordBatch`]. Sums each
-/// column's buffer bytes (plus null buffer if present). Used to
-/// account for spill bytes written and to drive the budget threshold.
-fn batch_in_memory_bytes(batch: &RecordBatch) -> usize {
-    batch
-        .columns()
-        .iter()
-        .map(|col| col.get_array_memory_size())
-        .sum()
 }
 
 // ===========================================================================

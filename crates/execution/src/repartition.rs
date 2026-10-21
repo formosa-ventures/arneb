@@ -393,7 +393,7 @@ async fn make_channel_item(
 ) -> ChannelItem {
     let bytes = crate::operator::record_batch_bytes(&batch);
     inflight_budget.acquire(bytes as u64).await;
-    let live_bytes = batch.get_array_memory_size() as u64;
+    let live_bytes = bytes as u64;
     record_live_alloc("RepartitionExec.live", live_bytes);
     let granted = if memory_pool.try_grow(channel_consumer, bytes).is_ok() {
         bytes

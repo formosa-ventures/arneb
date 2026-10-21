@@ -59,9 +59,14 @@ impl NodeRegistry {
     /// Returns all alive workers.
     pub fn alive_workers(&self) -> Vec<WorkerInfo> {
         let mut workers = self.workers.write().unwrap();
+        self.expire_silent(&mut workers);
+        workers.values().filter(|w| w.alive).cloned().collect()
+    }
+
+    /// Mark every worker silent past the heartbeat timeout as dead.
+    fn expire_silent(&self, workers: &mut HashMap<String, WorkerInfo>) {
         let timeout = std::time::Duration::from_secs(self.heartbeat_timeout_secs);
         let now = Instant::now();
-
         for worker in workers.values_mut() {
             if now.duration_since(worker.last_heartbeat) > timeout && worker.alive {
                 tracing::warn!(
@@ -71,20 +76,19 @@ impl NodeRegistry {
                 worker.alive = false;
             }
         }
-
-        workers.values().filter(|w| w.alive).cloned().collect()
     }
 
-    /// Returns the total number of registered workers (alive or dead).
     /// Every registered worker, alive or not, with liveness re-evaluated
     /// against the heartbeat deadline; sorted by worker id.
     pub fn all_workers(&self) -> Vec<WorkerInfo> {
-        self.alive_workers();
-        let mut all: Vec<WorkerInfo> = self.workers.read().unwrap().values().cloned().collect();
+        let mut workers = self.workers.write().unwrap();
+        self.expire_silent(&mut workers);
+        let mut all: Vec<WorkerInfo> = workers.values().cloned().collect();
         all.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
         all
     }
 
+    /// Returns the total number of registered workers (alive or dead).
     pub fn total_count(&self) -> usize {
         self.workers.read().unwrap().len()
     }

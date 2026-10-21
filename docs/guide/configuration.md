@@ -476,6 +476,17 @@ when an explicit non-loopback address is used under password auth. In
 docker or Kubernetes, set `[web] bind_address` (or reach the Web UI through
 a port-forward) if you need it from outside the container.
 
+## Observability
+
+```toml
+[observability]
+slow_query_threshold_ms = 10000   # ARNEB_SLOW_QUERY_THRESHOLD_MS; 0 = slow-query log off
+```
+
+Statements running at least this long are logged on `arneb::slow_query` (see
+[Observability](/guide/observability)). An invalid value fails startup, and
+the effective value is logged on `arneb::config`.
+
 ## CLI Arguments
 
 ```

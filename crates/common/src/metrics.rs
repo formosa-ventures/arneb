@@ -8,7 +8,6 @@
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// How a query ended.
@@ -81,33 +80,24 @@ static QUERY_METRICS: QueryMetrics = QueryMetrics {
     durations: [const { Histogram::new() }; 3],
 };
 
-/// Default for `ARNEB_SLOW_QUERY_THRESHOLD_MS`.
+/// Default slow-query threshold, in milliseconds.
 pub const DEFAULT_SLOW_QUERY_THRESHOLD_MS: u64 = 10_000;
 
-/// The slow-query threshold: `ARNEB_SLOW_QUERY_THRESHOLD_MS` (milliseconds;
-/// `0` disables the log), read and logged once.
+/// The slow-query threshold in milliseconds; `0` = log off.
+static SLOW_QUERY_THRESHOLD_MS: AtomicU64 = AtomicU64::new(DEFAULT_SLOW_QUERY_THRESHOLD_MS);
+
+/// Set the slow-query threshold; `None` turns the slow-query log off. The
+/// server sets it once at startup from `[observability]
+/// slow_query_threshold_ms`.
+pub fn set_slow_query_threshold(threshold: Option<Duration>) {
+    let ms = threshold.map_or(0, |d| d.as_millis().max(1) as u64);
+    SLOW_QUERY_THRESHOLD_MS.store(ms, Ordering::Relaxed);
+}
+
+/// The slow-query threshold; `None` when the log is off.
 pub fn slow_query_threshold() -> Option<Duration> {
-    static THRESHOLD: OnceLock<Option<Duration>> = OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        let raw = std::env::var("ARNEB_SLOW_QUERY_THRESHOLD_MS").ok();
-        let ms = match raw.as_deref().map(str::trim) {
-            None => DEFAULT_SLOW_QUERY_THRESHOLD_MS,
-            Some(v) => v.parse::<u64>().unwrap_or_else(|_| {
-                tracing::warn!(
-                    target: "arneb::config",
-                    value = v,
-                    "invalid ARNEB_SLOW_QUERY_THRESHOLD_MS, using the default"
-                );
-                DEFAULT_SLOW_QUERY_THRESHOLD_MS
-            }),
-        };
-        tracing::info!(
-            target: "arneb::config",
-            slow_query_threshold_ms = ms,
-            "ARNEB_SLOW_QUERY_THRESHOLD_MS effective value (0 = slow-query log off)"
-        );
-        (ms > 0).then(|| Duration::from_millis(ms))
-    })
+    let ms = SLOW_QUERY_THRESHOLD_MS.load(Ordering::Relaxed);
+    (ms > 0).then(|| Duration::from_millis(ms))
 }
 
 /// Longest SQL text the slow-query log records.
@@ -209,23 +199,36 @@ fn label_set(labels: &[(&str, String)]) -> String {
     format!("{{{}}}", inner.join(","))
 }
 
+fn header(out: &mut String, name: &str, help: &str, kind: &str) {
+    let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}");
+}
+
 /// The query metrics plus `gauges`, in the Prometheus text format (0.0.4).
 pub fn render(gauges: &[Gauge]) -> String {
     let m = &QUERY_METRICS;
     let mut out = String::new();
+    header(&mut out, "arneb_build_info", "Arneb build.", "gauge");
     let _ = writeln!(
         out,
-        "# HELP arneb_build_info Arneb build.\n# TYPE arneb_build_info gauge\narneb_build_info{{version=\"{}\"}} 1",
+        "arneb_build_info{{version=\"{}\"}} 1",
         env!("CARGO_PKG_VERSION")
     );
-    let _ = writeln!(
-        out,
-        "# HELP arneb_queries_running Queries executing now.\n# TYPE arneb_queries_running gauge\narneb_queries_running {}",
-        m.running.load(Ordering::Relaxed).max(0)
+    header(
+        &mut out,
+        "arneb_queries_running",
+        "Queries executing now.",
+        "gauge",
     );
     let _ = writeln!(
         out,
-        "# HELP arneb_queries_total Queries that ended, by outcome.\n# TYPE arneb_queries_total counter"
+        "arneb_queries_running {}",
+        m.running.load(Ordering::Relaxed).max(0)
+    );
+    header(
+        &mut out,
+        "arneb_queries_total",
+        "Queries that ended, by outcome.",
+        "counter",
     );
     for o in QueryOutcome::ALL {
         let _ = writeln!(
@@ -235,41 +238,34 @@ pub fn render(gauges: &[Gauge]) -> String {
             m.outcomes[o.index()].load(Ordering::Relaxed)
         );
     }
-    let _ = writeln!(
-        out,
-        "# HELP arneb_query_duration_seconds Query wall time, by outcome.\n# TYPE arneb_query_duration_seconds histogram"
+    header(
+        &mut out,
+        "arneb_query_duration_seconds",
+        "Query wall time, by outcome.",
+        "histogram",
     );
     for o in QueryOutcome::ALL {
+        let outcome = o.label();
         let h = &m.durations[o.index()];
         let mut cumulative = 0;
-        for (i, bound) in DURATION_BUCKETS_SECS.iter().enumerate() {
-            cumulative += h.buckets[i].load(Ordering::Relaxed);
+        for (bound, bucket) in DURATION_BUCKETS_SECS.iter().zip(&h.buckets) {
+            cumulative += bucket.load(Ordering::Relaxed);
             let _ = writeln!(
                 out,
-                "arneb_query_duration_seconds_bucket{{outcome=\"{}\",le=\"{bound}\"}} {cumulative}",
-                o.label()
+                "arneb_query_duration_seconds_bucket{{outcome=\"{outcome}\",le=\"{bound}\"}} {cumulative}"
             );
         }
         let count = h.count.load(Ordering::Relaxed);
+        let sum = h.sum_micros.load(Ordering::Relaxed) as f64 / 1e6;
         let _ = writeln!(
             out,
-            "arneb_query_duration_seconds_bucket{{outcome=\"{}\",le=\"+Inf\"}} {count}",
-            o.label()
-        );
-        let _ = writeln!(
-            out,
-            "arneb_query_duration_seconds_sum{{outcome=\"{}\"}} {}",
-            o.label(),
-            h.sum_micros.load(Ordering::Relaxed) as f64 / 1e6
-        );
-        let _ = writeln!(
-            out,
-            "arneb_query_duration_seconds_count{{outcome=\"{}\"}} {count}",
-            o.label()
+            "arneb_query_duration_seconds_bucket{{outcome=\"{outcome}\",le=\"+Inf\"}} {count}\n\
+             arneb_query_duration_seconds_sum{{outcome=\"{outcome}\"}} {sum}\n\
+             arneb_query_duration_seconds_count{{outcome=\"{outcome}\"}} {count}"
         );
     }
     for g in gauges {
-        let _ = writeln!(out, "# HELP {} {}\n# TYPE {} gauge", g.name, g.help, g.name);
+        header(&mut out, g.name, g.help, "gauge");
         for (labels, value) in &g.samples {
             let _ = writeln!(out, "{}{} {value}", g.name, label_set(labels));
         }

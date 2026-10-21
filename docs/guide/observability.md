@@ -12,8 +12,8 @@ curl -s http://127.0.0.1:6432/metrics
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `arneb_queries_total` | counter | `outcome` | Statements that ended: `finished`, `failed`, or `cancelled` (cancel, `statement_timeout`, or the client left) |
-| `arneb_query_duration_seconds` | histogram | `outcome` | Statement wall time, from parse to the last batch |
-| `arneb_queries_running` | gauge | | Statements executing now |
+| `arneb_query_duration_seconds` | histogram | `outcome` | Statement wall time, from parse to the last batch; time spent waiting in the admission queue is not included |
+| `arneb_queries_running` | gauge | | Statements executing now, whether or not admission control is on |
 | `arneb_admission_running` / `arneb_admission_queued` | gauge | | Admission slots in use and the queue length, when admission control is on |
 | `arneb_memory_pool_reserved_bytes` / `_peak_bytes` / `_limit_bytes` | gauge | | This node's memory pool (the limit only appears when the pool is bounded) |
 | `arneb_workers` | gauge | `state` | Registered workers, `alive` or `dead` |
@@ -26,12 +26,21 @@ counts once. Metadata queries answered by the protocol layer (`pg_catalog`,
 `SET`, `SHOW`) do not count. Workers have no HTTP listener, so their memory
 pools are not exported. The coordinator reports their liveness.
 
+`arneb_queries_running` and `arneb_admission_running` measure different
+things. The first counts every statement the engine is executing and exists
+even with `max_running_queries = 0`. The second counts admission slots in use
+and is absent when admission control is off. For "how busy is the
+coordinator", use `arneb_queries_running`; for "how close are we to the
+admission cap", use the admission pair.
+
 ## Slow-query log
 
-Statements that take at least `ARNEB_SLOW_QUERY_THRESHOLD_MS` milliseconds
-(default `10000`; `0` turns the log off) are logged at `warn` on the
+Statements that take at least `[observability] slow_query_threshold_ms`
+milliseconds (`ARNEB_SLOW_QUERY_THRESHOLD_MS`; default `10000`; `0` turns the
+log off) are logged at `warn` on the
 `arneb::slow_query` target. Each entry has the duration, outcome, row count or
-error, and the SQL (up to 2000 characters):
+error, and the SQL (up to 2000 characters). As with the histogram, the
+duration starts once the statement is admitted:
 
 ```text
 WARN arneb::slow_query: slow query duration_ms=12731 outcome="finished" rows=175 sql=SELECT ...

@@ -779,6 +779,15 @@ async fn run() -> Result<()> {
             "admission effective settings ([admission] / ARNEB_MAX_RUNNING_QUERIES / \
              ARNEB_MAX_QUEUED_QUERIES / ARNEB_STATEMENT_TIMEOUT / ARNEB_QUERY_MAX_MEMORY_BYTES)"
         );
+        arneb_common::metrics::set_slow_query_threshold(
+            config.observability.slow_query_threshold(),
+        );
+        tracing::info!(
+            target: "arneb::config",
+            slow_query_threshold_ms = config.observability.slow_query_threshold_ms,
+            "observability effective settings ([observability] / \
+             ARNEB_SLOW_QUERY_THRESHOLD_MS; 0 = slow-query log off)"
+        );
     } else {
         tracing::info!(
             target: "arneb::config",

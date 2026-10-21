@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use arneb_catalog::CatalogManager;
 use arneb_common::error::{ArnebError, ExecutionError};
+use arneb_common::metrics::{QueryObservation, QueryOutcome};
 use arneb_common::stream::collect_stream;
 use arneb_common::types::ScalarValue;
 use arneb_connectors::ConnectorRegistry;
@@ -831,7 +832,7 @@ pub async fn execute_query_with_limit(
     // so this is where `/metrics` and the slow-query log observe queries. A
     // statement dropped mid-way (cancel, timeout, client gone) records as
     // cancelled when `observation` drops.
-    let observation = arneb_common::metrics::QueryObservation::start(sql);
+    let observation = QueryObservation::start(sql);
     let result = run_query_with_limit(
         sql,
         catalog_manager,
@@ -841,18 +842,15 @@ pub async fn execute_query_with_limit(
         query_memory_limit,
     )
     .await;
-    match &result {
-        Ok((_, batches)) => observation.finish(
-            arneb_common::metrics::QueryOutcome::Finished,
+    let (outcome, rows, error) = match &result {
+        Ok((_, batches)) => (
+            QueryOutcome::Finished,
             Some(batches.iter().map(|b| b.num_rows()).sum()),
             None,
         ),
-        Err(e) => observation.finish(
-            arneb_common::metrics::QueryOutcome::Failed,
-            None,
-            Some(&e.to_string()),
-        ),
-    }
+        Err(e) => (QueryOutcome::Failed, None, Some(e.to_string())),
+    };
+    observation.finish(outcome, rows, error.as_deref());
     result
 }
 
@@ -2459,8 +2457,6 @@ mod tests {
         assert_eq!(decimal_cell(&b, 5), (600, 12, 2)); // 1000.00 % 7
     }
 
-    /// TPC-H Q22 shape: a DECIMAL scalar subquery used to come back as a
-    /// Utf8 literal ("compare_op received mismatched types Decimal128 vs Utf8").
     /// Statements through `execute_query_with_limit` feed `/metrics`. The
     /// registry is process-wide and tests run in parallel, so this checks
     /// lower bounds.
@@ -2485,6 +2481,8 @@ mod tests {
         assert!(total("failed") >= failed + 1.0);
     }
 
+    /// TPC-H Q22 shape: a DECIMAL scalar subquery used to come back as a
+    /// Utf8 literal ("compare_op received mismatched types Decimal128 vs Utf8").
     #[tokio::test]
     async fn decimal_scalar_subquery_stays_decimal() {
         let (cm, reg) = decimal_arith_env();

@@ -664,9 +664,13 @@ pub(crate) fn flight_incoming(
 mod tests {
     use super::*;
 
-    /// #136 moved the server to `serve_with_incoming`, which ignores tonic's
-    /// default `tcp_nodelay`: small Flight frames then waited on Nagle +
-    /// delayed ACK (~40 ms per round trip), +0.35 s on SF10 q11.
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn test_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+    }
+
+    /// `flight_incoming` sets `TCP_NODELAY` on every accepted socket.
     #[tokio::test]
     async fn accepted_flight_connections_disable_nagle() {
         use futures::StreamExt;
@@ -676,11 +680,6 @@ mod tests {
         let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let accepted = incoming.next().await.unwrap().unwrap();
         assert!(accepted.nodelay().unwrap());
-    }
-    use arrow::datatypes::{DataType, Field, Schema};
-
-    fn test_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
     }
 
     #[test]

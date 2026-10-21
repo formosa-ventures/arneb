@@ -20,15 +20,7 @@ async fn start_test_flight_server(state: FlightState) -> String {
     let addr = listener.local_addr().unwrap();
     let addr_str = format!("http://127.0.0.1:{}", addr.port());
 
-    tokio::spawn(async move {
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-        let service = arneb_rpc::__flight_service_for_test(state);
-        tonic::transport::Server::builder()
-            .add_service(service)
-            .serve_with_incoming(incoming)
-            .await
-            .unwrap();
-    });
+    tokio::spawn(arneb_rpc::__serve_flight_for_test(listener, state));
 
     // Give server time to start.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

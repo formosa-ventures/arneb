@@ -36,10 +36,11 @@ dropped before it ends (cancel, `statement_timeout`, client disconnect) as
 
 ### Requirement: Slow-query log
 The server SHALL log a statement whose duration is at least
-`ARNEB_SLOW_QUERY_THRESHOLD_MS` milliseconds (default 10000; `0` disables the
-log) at `warn` on the `arneb::slow_query` tracing target, with its
-duration, outcome, row count or error, and SQL text truncated to 2000 characters. The effective
-threshold SHALL be logged once.
+`[observability] slow_query_threshold_ms` milliseconds
+(`ARNEB_SLOW_QUERY_THRESHOLD_MS`; default 10000; `0` disables the log) at
+`warn` on the `arneb::slow_query` tracing target, with its
+duration, outcome, row count or error, and SQL text truncated to 2000 characters. The server SHALL reject an
+invalid threshold at startup and SHALL log the effective one.
 
 #### Scenario: Threshold override
 - **WHEN** the coordinator runs with `ARNEB_SLOW_QUERY_THRESHOLD_MS=3000` and executes queries slower than 3 s

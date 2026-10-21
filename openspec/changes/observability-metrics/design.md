@@ -33,8 +33,10 @@ into atomics that could drift.
 
 ### D4 — Slow-query threshold is a runtime knob
 
-`ARNEB_SLOW_QUERY_THRESHOLD_MS` is read once and logged on `arneb::config`,
-following `docs/guide/configuration.md`. The default is 10 s, which is above
+`[observability] slow_query_threshold_ms`, overridable by
+`ARNEB_SLOW_QUERY_THRESHOLD_MS`, is resolved and validated in `config.rs` and
+logged on `arneb::config` at startup, like the other sections and following
+`docs/guide/configuration.md`. An invalid value fails startup. The default is 10 s, which is above
 every SF10 TPC-H query on the bench cluster, so the log stays quiet unless
 something is wrong.
 

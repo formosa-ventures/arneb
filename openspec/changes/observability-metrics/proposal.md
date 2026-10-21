@@ -27,7 +27,8 @@ it does today for neither.
   pgwire and Trino statement goes through. A statement dropped mid-way
   (cancel, `statement_timeout`, client gone) counts as cancelled.
 - **Slow-query log:** queries that take at least
-  `ARNEB_SLOW_QUERY_THRESHOLD_MS` (default 10000; `0` turns it off) are
+  `[observability] slow_query_threshold_ms` (`ARNEB_SLOW_QUERY_THRESHOLD_MS`;
+  default 10000; `0` turns it off) are
   logged on the `arneb::slow_query` target with their duration, outcome,
   rows, error and SQL (truncated to 2000 chars).
 - **Grafana:** `docker/observability/` holds a Prometheus scrape config, a

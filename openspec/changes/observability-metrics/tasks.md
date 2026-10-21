@@ -6,7 +6,7 @@
 
 ## 2. Slow-query log
 
-- [x] 2.1 `ARNEB_SLOW_QUERY_THRESHOLD_MS` (default 10000, 0 = off), logged once; `arneb::slow_query` event with duration, outcome, rows / error, SQL
+- [x] 2.1 `[observability] slow_query_threshold_ms` / `ARNEB_SLOW_QUERY_THRESHOLD_MS` (default 10000, 0 = off), validated and logged at startup; `arneb::slow_query` event with duration, outcome, rows / error, SQL
 
 ## 3. Dashboard
 

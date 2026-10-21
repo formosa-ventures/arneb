@@ -349,11 +349,14 @@ impl QueryCoordinator {
                 .map_err(|e| ExecutionError::upstream("root stage collection failed", e))?;
             Ok::<_, ExecutionError>(batches)
         };
+        // `biased`: when the stream breaks because its worker died, both
+        // branches can be ready in the same poll; report the lost worker.
         let batches = tokio::select! {
-            result = run => result.map_err(|e| attribute_worker_failure(e, &workers, &self.node_registry))?,
+            biased;
             lost = watch_workers(&self.node_registry, &worker_ids, WORKER_WATCH_INTERVAL) => {
                 return Err(lost_worker_error(&lost));
             }
+            result = run => result.map_err(|e| attribute_worker_failure(e, &workers, &self.node_registry))?,
         };
 
         tracing::info!(
@@ -426,32 +429,28 @@ fn attribute_worker_failure(
     registry: &arneb_scheduler::NodeRegistry,
 ) -> ExecutionError {
     let message = err.to_string();
-    if !is_transport_failure(&message) {
+    if !is_transport_failure(&message) || message.contains("worker '") {
         return err;
     }
     // Errors nest outermost first ("stream from worker-1 failed: … stream
     // from worker-2: broken pipe"), so the worker named last is the one
     // whose connection broke.
-    let Some(worker) = workers
+    let Some((worker, address, _)) = workers
         .iter()
-        .filter_map(|w| {
-            message
-                .rfind(&flight_address(&w.address))
-                .map(|position| (position, w))
+        .map(|w| {
+            let address = flight_address(&w.address);
+            let position = message.rfind(&address);
+            (w, address, position)
         })
-        .max_by_key(|(position, _)| *position)
-        .map(|(_, w)| w)
+        .filter(|(_, _, position)| position.is_some())
+        .max_by_key(|(_, _, position)| *position)
     else {
         return err;
     };
-    if message.contains(&format!("worker '{}'", worker.worker_id)) {
-        return err;
-    }
     registry.mark_dead(&worker.worker_id, "transport failure during query");
     ExecutionError::InvalidOperation(format!(
-        "worker '{}' ({}) failed: {message}",
-        worker.worker_id,
-        flight_address(&worker.address)
+        "worker '{}' ({address}) failed: {message}",
+        worker.worker_id
     ))
 }
 
@@ -1304,9 +1303,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_resolves_when_a_query_worker_goes_silent() {
-        let registry = arneb_scheduler::NodeRegistry::new(0);
+    async fn watch_resolves_when_a_query_worker_is_lost() {
+        let registry = arneb_scheduler::NodeRegistry::new(30);
         registry.heartbeat("w1".into(), "http://w1:9090".into(), 256);
+        registry.mark_dead("w1", "test");
         let lost = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             watch_workers(
@@ -1316,7 +1316,7 @@ mod tests {
             ),
         )
         .await
-        .expect("a silent worker is detected");
+        .expect("a lost worker is detected");
         assert_eq!(lost.worker_id, "w1");
         let message = lost_worker_error(&lost).to_string();
         assert!(

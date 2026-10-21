@@ -44,6 +44,8 @@ pub fn batch_memory_size(batch: &arrow::record_batch::RecordBatch) -> usize {
 
     fn visit(data: &ArrayData, seen: &mut Vec<usize>, total: &mut usize) {
         let mut add = |buffer: &arrow::buffer::Buffer| {
+            // `data_ptr` is the start of the allocation, not of this slice, and
+            // `capacity` is the whole allocation, so slices share one key.
             let key = buffer.data_ptr().as_ptr() as usize;
             if !seen.contains(&key) {
                 seen.push(key);
@@ -611,6 +613,7 @@ impl MemoryPool for TrackConsumersPool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     fn int64_batch(columns: Vec<arrow::array::Int64Array>) -> arrow::record_batch::RecordBatch {
         use arrow::datatypes::{DataType as ArrowType, Field, Schema};
@@ -655,8 +658,6 @@ mod tests {
             + arrow::array::Array::nulls(&b).unwrap().buffer().capacity();
         assert_eq!(batch_memory_size(&int64_batch(vec![a, b])), expected);
     }
-
-    use super::*;
 
     fn pool(limit: usize) -> Arc<dyn MemoryPool> {
         Arc::new(GreedyMemoryPool::new(limit))

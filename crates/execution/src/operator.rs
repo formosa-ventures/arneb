@@ -138,10 +138,10 @@ impl dyn ExecutionPlan {
     }
 }
 
-/// Sum the in-memory size of every column of a [`RecordBatch`] —
-/// Trino-equivalent to `Page.getRetainedSizeInBytes()`. Includes
-/// shared buffer overhead, so the value is "retained bytes",
-/// stable across batch slicing.
+/// Retained bytes of a [`RecordBatch`] — Trino-equivalent to
+/// `Page.getRetainedSizeInBytes()`: every allocation the batch keeps alive,
+/// counted once even when columns share it (see
+/// [`arneb_common::memory_pool::batch_memory_size`]).
 pub(crate) fn record_batch_bytes(batch: &RecordBatch) -> usize {
     arneb_common::memory_pool::batch_memory_size(batch)
 }
@@ -4143,8 +4143,9 @@ mod tests {
         assert_eq!(date_arr.value(2), 19500);
     }
 
+    /// exec-memory-accounting 4.5: a batch decoded from one IPC message body
+    /// is sized at the body, not at the body once per column.
     #[test]
-    /// exec-memory-accounting 4.5.
     fn record_batch_bytes_counts_an_ipc_body_once() {
         use arrow::ipc::reader::StreamReader;
         use arrow::ipc::writer::StreamWriter;

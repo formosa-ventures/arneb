@@ -1,41 +1,48 @@
 //! Query tracker: active queries plus a bounded history of finished ones.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, OnceLock, RwLock};
-use std::time::SystemTime;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
 
 use arneb_common::error::ExecutionError;
 use arneb_common::identifiers::QueryId;
+use arneb_common::metrics::{self, QueryEnd, QueryOutcome};
 
 use crate::state::{QueryState, QueryStateMachine};
 
-/// Default for `ARNEB_QUERY_HISTORY_SIZE`.
+/// Default number of finished queries a tracker keeps
+/// (`[observability] query_history_size`).
 pub const DEFAULT_QUERY_HISTORY_SIZE: usize = 100;
 
-/// How many finished (terminal) queries a tracker keeps:
-/// `ARNEB_QUERY_HISTORY_SIZE`, read and logged once.
-pub fn query_history_size() -> usize {
-    static SIZE: OnceLock<usize> = OnceLock::new();
-    *SIZE.get_or_init(|| {
-        let raw = std::env::var("ARNEB_QUERY_HISTORY_SIZE").ok();
-        let size = match raw.as_deref().map(str::trim) {
-            None => DEFAULT_QUERY_HISTORY_SIZE,
-            Some(v) => v.parse::<usize>().unwrap_or_else(|_| {
-                tracing::warn!(
-                    target: "arneb::config",
-                    value = v,
-                    "invalid ARNEB_QUERY_HISTORY_SIZE, using the default"
-                );
-                DEFAULT_QUERY_HISTORY_SIZE
-            }),
-        };
-        tracing::info!(
-            target: "arneb::config",
-            query_history_size = size,
-            "ARNEB_QUERY_HISTORY_SIZE effective value (finished queries kept)"
-        );
-        size
-    })
+/// The non-terminal lifecycle, in order, ending in `Finished`.
+const CHAIN: [QueryState; 6] = [
+    QueryState::Queued,
+    QueryState::Planning,
+    QueryState::Starting,
+    QueryState::Running,
+    QueryState::Finishing,
+    QueryState::Finished,
+];
+
+/// Step `m` through [`CHAIN`] until `target`; a no-op when it is already
+/// there or past it. A query that already failed or was cancelled cannot
+/// advance.
+fn advance_machine(m: &mut QueryStateMachine, target: QueryState) -> Result<(), ExecutionError> {
+    let Some(goal) = CHAIN.iter().position(|s| *s == target) else {
+        return m.transition(target);
+    };
+    let Some(mut at) = CHAIN.iter().position(|s| *s == m.state) else {
+        return Err(ExecutionError::InvalidOperation(format!(
+            "query {} is already {}",
+            m.query_id, m.state
+        )));
+    };
+    while at < goal {
+        at += 1;
+        m.transition(CHAIN[at])?;
+    }
+    Ok(())
 }
 
 struct Entry {
@@ -53,6 +60,10 @@ struct Inner {
 
 /// Tracks running queries and keeps the most recent `history_limit`
 /// finished ones. A query is never evicted while it is still active.
+///
+/// The tracker owns each statement's lifecycle, so it also feeds the
+/// process-wide query metrics: a query counts as running once it reaches
+/// `Running`, and by outcome and duration when it turns terminal.
 #[derive(Clone)]
 pub struct QueryTracker {
     inner: Arc<RwLock<Inner>>,
@@ -60,9 +71,9 @@ pub struct QueryTracker {
 }
 
 impl QueryTracker {
-    /// A tracker keeping [`query_history_size`] finished queries.
+    /// A tracker keeping [`DEFAULT_QUERY_HISTORY_SIZE`] finished queries.
     pub fn new() -> Self {
-        Self::with_history_limit(query_history_size())
+        Self::with_history_limit(DEFAULT_QUERY_HISTORY_SIZE)
     }
 
     /// A tracker keeping at most `limit` finished queries.
@@ -106,7 +117,7 @@ impl QueryTracker {
             .filter(|e| state_filter.is_none_or(|s| e.machine.state == s))
             .map(QueryInfo::from)
             .collect();
-        out.sort_by(|a, b| b.created.cmp(&a.created));
+        out.sort_by_key(|q| Reverse(q.created));
         out
     }
 
@@ -120,50 +131,31 @@ impl QueryTracker {
     }
 
     pub fn transition_query(&self, id: &QueryId, state: QueryState) -> Result<(), ExecutionError> {
-        self.update(id, |m| m.transition(state))
+        self.update(id, |e| e.machine.transition(state))
     }
 
     /// Step through the lifecycle (`Queued → Planning → Starting → Running
     /// → Finishing → Finished`) until `target`; a no-op when the query is
     /// already there or past it.
     pub fn advance_to(&self, id: &QueryId, target: QueryState) -> Result<(), ExecutionError> {
-        const CHAIN: [QueryState; 6] = [
-            QueryState::Queued,
-            QueryState::Planning,
-            QueryState::Starting,
-            QueryState::Running,
-            QueryState::Finishing,
-            QueryState::Finished,
-        ];
-        let Some(goal) = CHAIN.iter().position(|s| *s == target) else {
-            return self.transition_query(id, target);
-        };
-        self.update(id, |m| {
-            let Some(mut at) = CHAIN.iter().position(|s| *s == m.state) else {
-                return Ok(());
-            };
-            while at < goal {
-                at += 1;
-                m.transition(CHAIN[at])?;
-            }
-            Ok(())
-        })
+        self.update(id, |e| advance_machine(&mut e.machine, target))
     }
 
     /// The query returned `rows` rows: record them and mark it `Finished`.
     pub fn finish_query(&self, id: &QueryId, rows: u64) -> Result<(), ExecutionError> {
-        if let Some(entry) = self.inner.write().unwrap().queries.get_mut(id) {
-            entry.rows = Some(rows);
-        }
-        self.advance_to(id, QueryState::Finished)
+        self.update(id, |e| {
+            advance_machine(&mut e.machine, QueryState::Finished)?;
+            e.rows = Some(rows);
+            Ok(())
+        })
     }
 
     pub fn cancel_query(&self, id: &QueryId) -> Result<(), ExecutionError> {
-        self.update(id, |m| m.cancel())
+        self.update(id, |e| e.machine.cancel())
     }
 
     pub fn fail_query(&self, id: &QueryId, error: String) -> Result<(), ExecutionError> {
-        self.update(id, |m| m.fail(error))
+        self.update(id, |e| e.machine.fail(error))
     }
 
     pub fn active_count(&self) -> usize {
@@ -175,13 +167,13 @@ impl QueryTracker {
             .count()
     }
 
-    /// Apply `f` to a query's state machine; when that makes it terminal,
-    /// add it to the history and evict the oldest finished queries over the
-    /// limit.
+    /// Apply `f` to a query's entry and report what changed to the
+    /// metrics. When that makes it terminal, add it to the history and
+    /// evict the oldest finished queries over the limit.
     fn update(
         &self,
         id: &QueryId,
-        f: impl FnOnce(&mut QueryStateMachine) -> Result<(), ExecutionError>,
+        f: impl FnOnce(&mut Entry) -> Result<(), ExecutionError>,
     ) -> Result<(), ExecutionError> {
         let mut inner = self.inner.write().unwrap();
         let entry = inner
@@ -189,8 +181,19 @@ impl QueryTracker {
             .get_mut(id)
             .ok_or_else(|| ExecutionError::InvalidOperation(format!("query {id} not found")))?;
         let was_terminal = entry.machine.state.is_terminal();
-        f(&mut entry.machine)?;
-        if !was_terminal && entry.machine.state.is_terminal() {
+        let was_started = entry.machine.started.is_some();
+        // A failed step may still have moved the machine; report either way.
+        let result = f(entry);
+        let m = &entry.machine;
+        if !was_started && m.started.is_some() {
+            metrics::query_started();
+        }
+        let ended = !was_terminal && m.state.is_terminal();
+        if ended {
+            report_end(entry);
+        }
+        result?;
+        if ended {
             inner.finished.push_back(*id);
             while inner.finished.len() > self.history_limit {
                 if let Some(old) = inner.finished.pop_front() {
@@ -200,6 +203,28 @@ impl QueryTracker {
         }
         Ok(())
     }
+}
+
+fn report_end(entry: &Entry) {
+    let m = &entry.machine;
+    let outcome = match m.state {
+        QueryState::Finished => QueryOutcome::Finished,
+        QueryState::Failed => QueryOutcome::Failed,
+        _ => QueryOutcome::Cancelled,
+    };
+    let from = m.started.unwrap_or(m.created);
+    let elapsed = m
+        .ended
+        .and_then(|end| end.duration_since(from).ok())
+        .unwrap_or(Duration::ZERO);
+    metrics::query_ended(QueryEnd {
+        outcome,
+        elapsed,
+        was_running: m.started.is_some(),
+        rows: entry.rows,
+        error: m.error.as_deref(),
+        sql: &m.sql,
+    });
 }
 
 impl Default for QueryTracker {
@@ -337,6 +362,36 @@ mod tests {
         assert_eq!(done.state, QueryState::Finished);
         assert!(done.ended.unwrap() >= done.started.unwrap());
         assert!(done.started.unwrap() >= done.created);
+    }
+
+    /// The tracker feeds `/metrics`. The registry is process-wide and tests
+    /// run in parallel, so this checks lower bounds.
+    #[test]
+    fn terminal_transitions_are_counted_by_outcome() {
+        fn total(outcome: &str) -> f64 {
+            let series = format!("arneb_queries_total{{outcome=\"{outcome}\"}} ");
+            arneb_common::metrics::render(&[])
+                .lines()
+                .find_map(|l| l.strip_prefix(series.as_str()).map(|v| v.parse().unwrap()))
+                .unwrap()
+        }
+        let before = ["finished", "failed", "cancelled"].map(total);
+        let tracker = QueryTracker::with_history_limit(10);
+        let done = tracker.create_query("SELECT 1".into());
+        tracker.advance_to(&done, QueryState::Running).unwrap();
+        tracker.finish_query(&done, 1).unwrap();
+        // Refused before admission: counted, never running.
+        let refused = tracker.create_query("SELECT 2".into());
+        tracker.fail_query(&refused, "queue full".into()).unwrap();
+        let cancelled = tracker.create_query("SELECT 3".into());
+        tracker.advance_to(&cancelled, QueryState::Running).unwrap();
+        tracker.cancel_query(&cancelled).unwrap();
+        // A second terminal transition is rejected and not counted again.
+        assert!(tracker.finish_query(&cancelled, 5).is_err());
+        let after = ["finished", "failed", "cancelled"].map(total);
+        for i in 0..3 {
+            assert!(after[i] >= before[i] + 1.0, "{i}: {before:?} -> {after:?}");
+        }
     }
 
     #[test]

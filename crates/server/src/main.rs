@@ -474,7 +474,9 @@ async fn run() -> Result<()> {
         );
     }
     arneb_rpc::install_cluster_security(cluster_security);
-    let query_tracker = Arc::new(arneb_scheduler::QueryTracker::new());
+    let query_tracker = Arc::new(arneb_scheduler::QueryTracker::with_history_limit(
+        config.observability.query_history_size,
+    ));
     // A1.3 (2026-05-27): per-query dynamic-filter service registry,
     // shared between QueryCoordinator (registers on execute) and the
     // FlightState `df_report_callback` (routes worker reports in).
@@ -799,8 +801,9 @@ async fn run() -> Result<()> {
         tracing::info!(
             target: "arneb::config",
             slow_query_threshold_ms = config.observability.slow_query_threshold_ms,
+            query_history_size = config.observability.query_history_size,
             "observability effective settings ([observability] / \
-             ARNEB_SLOW_QUERY_THRESHOLD_MS; 0 = slow-query log off)"
+             ARNEB_SLOW_QUERY_THRESHOLD_MS (0 = slow-query log off) / ARNEB_QUERY_HISTORY_SIZE)"
         );
     } else {
         tracing::info!(

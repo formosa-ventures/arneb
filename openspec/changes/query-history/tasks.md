@@ -1,7 +1,8 @@
 ## 1. Tracker
 
 - [x] 1.1 Source, user, wall-clock times and rows per query; `create_query_from`, `advance_to`, `finish_query`
-- [x] 1.2 Bounded history (`ARNEB_QUERY_HISTORY_SIZE`, default 100, logged); newest-first listing; tests
+- [x] 1.2 Bounded history (`[observability] query_history_size` / `ARNEB_QUERY_HISTORY_SIZE`, default 100, positive, logged); newest-first listing; tests
+- [x] 1.3 Tracker feeds `/metrics` on Running and terminal transitions, replacing `QueryObservation` (review)
 
 ## 2. Protocols
 

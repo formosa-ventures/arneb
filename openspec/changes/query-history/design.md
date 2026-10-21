@@ -25,8 +25,19 @@ message the client sees, as Trino reports time limits.
 
 A `VecDeque` of terminal ids gives O(1) eviction. Active queries are never
 evicted, so a long-running query is always visible. The count is a runtime
-knob (`ARNEB_QUERY_HISTORY_SIZE`). Trino's equivalent `query.max-history`
-defaults to 100 too.
+knob (`[observability] query_history_size`, `ARNEB_QUERY_HISTORY_SIZE`),
+resolved and validated in `config.rs` like the other sections. Trino's
+equivalent `query.max-history` defaults to 100 too.
+
+### D5 — The tracker feeds the query metrics
+
+The tracker already owns each statement's lifecycle, so it reports to
+`arneb_common::metrics` on the transitions: `query_started` when a query
+reaches `Running`, `query_ended` (outcome, duration, slow-query log) when it
+turns terminal. This replaces the separate `QueryObservation` guard from the
+metrics change, which tracked the same lifecycle at nearly the same call
+site. The tracker is therefore required in both protocol servers; a server
+built without one gets a private tracker.
 
 ### D4 — A per-statement snapshot table
 

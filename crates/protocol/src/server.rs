@@ -39,7 +39,7 @@ pub struct ProtocolServer {
     query_memory_limit: Option<usize>,
     admission: Option<arneb_scheduler::AdmissionController>,
     statement_timeout: Option<std::time::Duration>,
-    query_tracker: Option<Arc<arneb_scheduler::QueryTracker>>,
+    query_tracker: Arc<arneb_scheduler::QueryTracker>,
 }
 
 impl ProtocolServer {
@@ -59,13 +59,14 @@ impl ProtocolServer {
             query_memory_limit: None,
             admission: None,
             statement_timeout: None,
-            query_tracker: None,
+            query_tracker: Arc::new(arneb_scheduler::QueryTracker::new()),
         }
     }
 
-    /// Record statements in `tracker` (Web UI, `system.runtime.queries`).
+    /// Record statements in `tracker` (Web UI, `system.runtime.queries`,
+    /// `/metrics`) instead of a private one.
     pub fn with_query_tracker(mut self, tracker: Arc<arneb_scheduler::QueryTracker>) -> Self {
-        self.query_tracker = Some(tracker);
+        self.query_tracker = tracker;
         self
     }
 

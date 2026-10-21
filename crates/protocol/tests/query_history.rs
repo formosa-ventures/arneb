@@ -102,15 +102,27 @@ fn pg_rows(messages: &[SimpleQueryMessage]) -> Vec<Vec<Option<String>>> {
         .collect()
 }
 
+fn queries_total(outcome: &str) -> f64 {
+    let series = format!("arneb_queries_total{{outcome=\"{outcome}\"}} ");
+    arneb_common::metrics::render(&[])
+        .lines()
+        .find_map(|l| l.strip_prefix(series.as_str()).map(|v| v.parse().unwrap()))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn statements_from_both_protocols_appear_in_system_runtime_queries() {
     let tracker = Arc::new(QueryTracker::with_history_limit(50));
     let client = pg(Arc::clone(&tracker), "ann").await;
     let base = trino(Arc::clone(&tracker)).await;
 
+    let (finished, failed) = (queries_total("finished"), queries_total("failed"));
     client.simple_query("SELECT 42 AS answer").await.unwrap();
     assert!(client.simple_query("SELECT nope").await.is_err());
     trino_rows(&base, "bob", "SELECT 7").await;
+    // The tracker feeds `/metrics`: two finished, one failed.
+    assert!(queries_total("finished") >= finished + 2.0);
+    assert!(queries_total("failed") >= failed + 1.0);
 
     // Read through pgwire, with a filter and an ordering the engine applies.
     let rows = pg_rows(

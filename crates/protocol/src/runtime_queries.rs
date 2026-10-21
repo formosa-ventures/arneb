@@ -13,7 +13,7 @@ use arneb_catalog::CatalogManager;
 use arneb_common::types::{ColumnInfo, DataType, TimeUnit};
 use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable};
 use arneb_connectors::ConnectorRegistry;
-use arneb_scheduler::{QueryInfo, QueryTracker};
+use arneb_scheduler::{QueryInfo, QueryState, QueryTracker};
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray};
 
 const CATALOG: &str = "system";
@@ -22,12 +22,29 @@ const TABLE: &str = "queries";
 
 /// Does `sql` read `system.runtime.queries`?
 pub fn references_runtime_queries(sql: &str) -> bool {
-    let lower: String = sql
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| *c != '"')
-        .collect();
+    let mut lower = sql.to_ascii_lowercase();
+    if lower.contains('"') {
+        lower.retain(|c| c != '"');
+    }
     lower.contains("system.runtime.queries")
+}
+
+/// The `state` column: Trino has no `CANCELLED` state (a cancelled query is
+/// `FAILED` with `USER_CANCELED`), so cancelled queries read as `FAILED`.
+fn state_name(state: QueryState) -> String {
+    match state {
+        QueryState::Cancelled => QueryState::Failed.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The `error_message` column; a cancelled query without one says so.
+fn error_message(q: &QueryInfo) -> Option<String> {
+    match (&q.error, q.state) {
+        (Some(e), _) => Some(e.clone()),
+        (None, QueryState::Cancelled) => Some("Query was canceled".to_string()),
+        (None, _) => None,
+    }
 }
 
 fn millis(t: SystemTime) -> i64 {
@@ -96,7 +113,7 @@ fn batch(queries: &[QueryInfo], now: SystemTime) -> RecordBatch {
         schema,
         vec![
             text(&|q| Some(q.query_id.to_string())),
-            text(&|q| Some(q.state.to_string())),
+            text(&|q| Some(state_name(q.state))),
             text(&|q| q.user.clone()),
             text(&|q| Some(q.source.clone())),
             text(&|q| Some(q.sql.clone())),
@@ -106,7 +123,7 @@ fn batch(queries: &[QueryInfo], now: SystemTime) -> RecordBatch {
             time(&|q| Some(q.created)),
             time(&|q| q.started),
             time(&|q| q.ended),
-            text(&|q| q.error.clone()),
+            text(&|q| error_message(q)),
         ],
     )
     .expect("runtime.queries columns match their schema")
@@ -139,7 +156,6 @@ pub fn runtime_catalog(tracker: &QueryTracker) -> (CatalogManager, ConnectorRegi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arneb_scheduler::QueryState;
 
     #[test]
     fn detects_qualified_and_quoted_references() {
@@ -165,13 +181,15 @@ mod tests {
             .unwrap();
         let running = tracker.create_query_from("SELECT 3".into(), "pgwire", None);
         tracker.advance_to(&running, QueryState::Running).unwrap();
+        let cancelled = tracker.create_query_from("SELECT 4".into(), "trino", None);
+        tracker.cancel_query(&cancelled).unwrap();
 
         let (cm, registry) = runtime_catalog(&tracker);
         let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
             Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
         let (_, batches) = crate::handler::execute_query(
             "SELECT state, source, rows, error_message FROM system.runtime.queries \
-             WHERE state <> 'RUNNING' ORDER BY state",
+             WHERE state <> 'RUNNING' ORDER BY state, rows NULLS FIRST, error_message",
             &cm,
             &registry,
             None,
@@ -189,17 +207,15 @@ mod tests {
                 .map(|v| v.map(str::to_string))
                 .collect::<Vec<_>>()
         };
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(col(0), vec![s("FAILED"), s("FAILED"), s("FINISHED")]);
+        assert_eq!(col(1), vec![s("trino"), s("trino"), s("pgwire")]);
         assert_eq!(
-            col(0),
-            vec![Some("FAILED".to_string()), Some("FINISHED".to_string())]
+            col(3)[..2],
+            [s("Query was canceled"), s("column nope not found")]
         );
-        assert_eq!(
-            col(1),
-            vec![Some("trino".to_string()), Some("pgwire".to_string())]
-        );
-        assert_eq!(col(3)[0].as_deref(), Some("column nope not found"));
         let rows = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         assert!(arrow::array::Array::is_null(rows, 0));
-        assert_eq!(rows.value(1), 1);
+        assert_eq!(rows.value(2), 1);
     }
 }

@@ -1,7 +1,7 @@
 //! State machines for query, stage, and task lifecycle.
 
 use std::fmt;
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
 
 use arneb_common::error::ExecutionError;
 use arneb_common::identifiers::QueryId;
@@ -76,7 +76,6 @@ pub struct QueryStateMachine {
     pub query_id: QueryId,
     pub state: QueryState,
     pub sql: String,
-    pub created_at: Instant,
     pub error: Option<String>,
     /// Wall-clock time the query was created.
     pub created: SystemTime,
@@ -93,7 +92,6 @@ impl QueryStateMachine {
             query_id,
             state: QueryState::Queued,
             sql,
-            created_at: Instant::now(),
             error: None,
             created: SystemTime::now(),
             started: None,

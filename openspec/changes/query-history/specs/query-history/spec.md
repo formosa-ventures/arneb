@@ -6,7 +6,8 @@ through pgwire or the Trino protocol, with its source protocol, user, SQL
 text, and created, started and ended times. Its state SHALL be `QUEUED` until
 admitted and `RUNNING` while executing. It SHALL end `FINISHED` with the
 returned row count, `FAILED` with the error message, or `CANCELLED` when the
-statement was dropped before it ended. Metadata queries and session commands
+statement was dropped before it ended. A query that already ended SHALL NOT
+change state again. Metadata queries and session commands
 answered by the protocol layer SHALL NOT be recorded. A distributed query
 SHALL appear once.
 
@@ -15,10 +16,11 @@ SHALL appear once.
 - **THEN** the tracker holds them as `pgwire`/`ann` `FINISHED` with its row count, `pgwire`/`ann` `FAILED` with the error, and `trino`/`bob` `FINISHED`
 
 ### Requirement: Bounded history
-The tracker SHALL keep every active query and at most `ARNEB_QUERY_HISTORY_SIZE`
-finished queries (default 100). When a query finishes beyond the limit, the
-tracker SHALL evict the oldest finished query. The effective size SHALL be
-logged once.
+The tracker SHALL keep every active query and at most `[observability]
+query_history_size` (`ARNEB_QUERY_HISTORY_SIZE`) finished queries (default
+100). When a query finishes beyond the limit, the tracker SHALL evict the
+oldest finished query. The server SHALL reject a size of `0` at startup and
+SHALL log the effective size.
 
 #### Scenario: Eviction
 - **WHEN** `ARNEB_QUERY_HISTORY_SIZE=5` and nine statements finish
@@ -28,7 +30,8 @@ logged once.
 Over both pgwire and the Trino protocol, `system.runtime.queries` SHALL return
 one row per tracked query, with the columns `query_id`, `state`, `user`,
 `source`, `query`, `queued_time_ms`, `elapsed_time_ms`, `rows`, `created`,
-`started`, `end` and `error_message`. The server SHALL evaluate filters,
+`started`, `end` and `error_message`. As in Trino, a cancelled query SHALL
+read as `FAILED`. The server SHALL evaluate filters,
 ordering and limits on it like on any table. The statement reading it SHALL
 see itself as `RUNNING`.
 

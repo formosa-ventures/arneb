@@ -13,9 +13,6 @@ pub const DEFAULT_UNCONSTRAINED_NUMERIC_SCALE: i8 = 10;
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Default limit, in seconds, on waiting for a free pooled connection.
 pub const DEFAULT_POOL_WAIT_TIMEOUT_SECS: u64 = 60;
-/// Default size above which a dynamic-filter `IN` list is sent as a range.
-pub const DEFAULT_DOMAIN_COMPACTION_THRESHOLD: usize =
-    arneb_rdbms::DEFAULT_DOMAIN_COMPACTION_THRESHOLD;
 
 /// Connection and scan settings for one PostgreSQL catalog.
 #[derive(Clone)]
@@ -58,7 +55,7 @@ impl PostgresConfig {
             unconstrained_numeric_scale: DEFAULT_UNCONSTRAINED_NUMERIC_SCALE,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
             pool_wait_timeout_secs: DEFAULT_POOL_WAIT_TIMEOUT_SECS,
-            domain_compaction_threshold: DEFAULT_DOMAIN_COMPACTION_THRESHOLD,
+            domain_compaction_threshold: arneb_rdbms::DEFAULT_DOMAIN_COMPACTION_THRESHOLD,
         }
     }
 

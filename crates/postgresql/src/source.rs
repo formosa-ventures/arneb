@@ -12,7 +12,7 @@ use arneb_common::types::{ColumnInfo, TableReference};
 use arneb_connectors::ConnectorFactory;
 use arneb_execution::{column_info_to_arrow_schema, DataSource, ScanContext};
 use arneb_rdbms::{
-    build_select, translate_filters_with, RemoteTable, SplitPlan, TranslateOptions, Translation,
+    build_select, translate_filters, RemoteTable, SplitPlan, TranslateOptions, Translation,
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -109,7 +109,7 @@ impl PostgresDataSource {
             ));
             out_schema.push(info.clone());
         }
-        let translation = translate_filters_with(
+        let translation = translate_filters(
             &ctx.filters,
             &self.schema,
             &self.remote,

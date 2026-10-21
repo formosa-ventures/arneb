@@ -16,6 +16,8 @@
 //! - `IS [NOT] NULL`, `[NOT] IN`, `[NOT] BETWEEN`, `[NOT] LIKE`, `AND`, `OR`,
 //!   `NOT` over translatable operands.
 
+use std::borrow::Cow;
+
 use arneb_common::types::{ColumnInfo, DataType, ScalarValue};
 use arneb_planner::PlanExpr;
 use arneb_sql_parser::ast::{BinaryOp, UnaryOp};
@@ -43,7 +45,7 @@ pub struct Translation {
 /// Default for [`TranslateOptions::compaction_threshold`].
 pub const DEFAULT_DOMAIN_COMPACTION_THRESHOLD: usize = 1000;
 
-/// How [`translate_filters_with`] treats runtime dynamic filters.
+/// How [`translate_filters`] treats runtime dynamic filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TranslateOptions {
     /// Index of the first dynamic-filter entry in `filters`
@@ -63,27 +65,16 @@ impl Default for TranslateOptions {
     }
 }
 
-/// Translate the scan's pushed-down filters, treating every filter as
-/// static.
+/// Translate the scan's pushed-down filters; entries from
+/// `options.dynamic_from` on are runtime dynamic filters.
 ///
 /// `schema` is the Arneb table schema the filters' column indices refer to;
 /// `table` gives each column's remote name (same order).
-pub fn translate_filters(
-    filters: &[PlanExpr],
-    schema: &[ColumnInfo],
-    table: &RemoteTable,
-    dialect: &dyn Dialect,
-) -> Translation {
-    translate_filters_with(filters, schema, table, dialect, TranslateOptions::default())
-}
-
-/// Translate the scan's pushed-down filters; entries from
-/// `options.dynamic_from` on are runtime dynamic filters.
 ///
 /// A dynamic filter only prunes the probe side of the join that produced it
 /// — the join still checks every key — so pushing a weaker range in place
 /// of a long `IN` list, or nothing at all, never changes a result.
-pub fn translate_filters_with(
+pub fn translate_filters(
     filters: &[PlanExpr],
     schema: &[ColumnInfo],
     table: &RemoteTable,
@@ -104,39 +95,33 @@ pub fn translate_filters_with(
         let mut parts = Vec::new();
         flatten_and(filter, &mut parts);
         for part in parts {
-            if !dynamic {
-                match ctx.predicate(part) {
-                    Some(sql) => t.conjuncts.push(sql),
-                    None => t.complete = false,
-                }
-                continue;
-            }
-            match compact(part, options.compaction_threshold) {
-                Compaction::Unchanged => match ctx.predicate(part) {
-                    Some(sql) => {
-                        t.conjuncts.push(sql);
-                        t.dynamic_pushed += 1;
-                    }
-                    None => {
+            // Only dynamic filters are compacted; a range is weaker than the
+            // list it replaces, so Arneb must still filter.
+            let (part, compacted) = match dynamic {
+                false => (Cow::Borrowed(part), false),
+                true => match compact(part, options.compaction_threshold) {
+                    Compaction::Unchanged => (Cow::Borrowed(part), false),
+                    Compaction::Range(range) => (Cow::Owned(range), true),
+                    Compaction::Drop => {
                         t.complete = false;
                         t.dynamic_skipped += 1;
+                        continue;
                     }
                 },
-                Compaction::Range(range) => {
-                    // Weaker than the list: Arneb must still filter.
-                    t.complete = false;
-                    match ctx.predicate(&range) {
-                        Some(sql) => {
-                            t.conjuncts.push(sql);
-                            t.dynamic_compacted += 1;
-                        }
-                        None => t.dynamic_skipped += 1,
-                    }
-                }
-                Compaction::Drop => {
-                    t.complete = false;
+            };
+            let Some(sql) = ctx.predicate(&part) else {
+                t.complete = false;
+                if dynamic {
                     t.dynamic_skipped += 1;
                 }
+                continue;
+            };
+            t.conjuncts.push(sql);
+            if compacted {
+                t.complete = false;
+                t.dynamic_compacted += 1;
+            } else if dynamic {
+                t.dynamic_pushed += 1;
             }
         }
     }
@@ -204,6 +189,10 @@ fn orderable(v: &ScalarValue) -> bool {
 }
 
 /// Order two literals of the same orderable type; `None` across types.
+///
+/// Deliberately narrower than `arneb_common::domain`'s ordering: text is not
+/// orderable here, because a `BETWEEN` computed in Arneb's byte order is not
+/// guaranteed to cover the list under the remote collation.
 fn order(a: &ScalarValue, b: &ScalarValue) -> Option<std::cmp::Ordering> {
     use ScalarValue as S;
     match (a, b) {
@@ -507,7 +496,13 @@ mod tests {
 
     fn translate(filters: &[PlanExpr]) -> Translation {
         let (schema, table) = nation();
-        translate_filters(filters, &schema, &table, &TestDialect)
+        translate_filters(
+            filters,
+            &schema,
+            &table,
+            &TestDialect,
+            TranslateOptions::default(),
+        )
     }
 
     fn func(name: &str, args: Vec<PlanExpr>) -> PlanExpr {
@@ -814,7 +809,7 @@ mod tests {
         threshold: usize,
     ) -> Translation {
         let (schema, table) = nation();
-        translate_filters_with(
+        translate_filters(
             filters,
             &schema,
             &table,
@@ -909,21 +904,5 @@ mod tests {
         let t = translate_dynamic(&[in_list(6, floats)], 0, 10);
         assert!(t.conjuncts.is_empty());
         assert_eq!(t.dynamic_skipped, 1);
-    }
-
-    #[test]
-    fn static_only_options_match_translate_filters() {
-        let f = [in_list(0, ints(0..5000))];
-        let (schema, table) = nation();
-        assert_eq!(
-            translate_filters_with(
-                &f,
-                &schema,
-                &table,
-                &TestDialect,
-                TranslateOptions::default()
-            ),
-            translate(&f)
-        );
     }
 }

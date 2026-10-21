@@ -1093,84 +1093,33 @@ async fn resolve_expr_subqueries_distributed(
     distributed_executor: Option<&dyn DistributedExecutor>,
     expr: PlanExpr,
 ) -> Result<PlanExpr, ArnebError> {
-    let executor = match distributed_executor {
-        Some(executor) if distribute_scalar_subquery_enabled() && executor.has_workers() => {
-            executor
-        }
-        _ => {
-            let expr = resolve_nested_subqueries_locally(ctx, expr).await?;
-            return ctx
-                .resolve_scalar_subqueries(&expr)
-                .await
-                .map_err(ArnebError::Execution);
-        }
-    };
-
+    let executor = distributed_executor
+        .filter(|executor| distribute_scalar_subquery_enabled() && executor.has_workers());
     let resolved = resolve_expr_subqueries_distributed_inner(ctx, executor, expr).await?;
     ctx.resolve_scalar_subqueries(&resolved)
         .await
         .map_err(ArnebError::Execution)
 }
 
-/// Resolve the scalar subqueries *inside* each scalar subquery's plan (TPC-H
-/// Q11's `SUM(..) / (SELECT COUNT(*) ..)`), so the outer one can then be
-/// evaluated locally. Covers the same expression shapes as
-/// `ExecutionContext::resolve_scalar_subqueries` (binary/unary ops, casts).
-async fn resolve_nested_subqueries_locally(
-    ctx: &ExecutionContext,
-    expr: PlanExpr,
-) -> Result<PlanExpr, ArnebError> {
-    match expr {
-        PlanExpr::ScalarSubquery { subplan, span } => {
-            let subplan = Box::pin(resolve_plan_subqueries(ctx, None, *subplan)).await?;
-            Ok(PlanExpr::ScalarSubquery {
-                subplan: Box::new(subplan),
-                span,
-            })
-        }
-        PlanExpr::BinaryOp {
-            left,
-            op,
-            right,
-            span,
-        } => Ok(PlanExpr::BinaryOp {
-            left: Box::new(Box::pin(resolve_nested_subqueries_locally(ctx, *left)).await?),
-            op,
-            right: Box::new(Box::pin(resolve_nested_subqueries_locally(ctx, *right)).await?),
-            span,
-        }),
-        PlanExpr::UnaryOp { op, expr, span } => Ok(PlanExpr::UnaryOp {
-            op,
-            expr: Box::new(Box::pin(resolve_nested_subqueries_locally(ctx, *expr)).await?),
-            span,
-        }),
-        PlanExpr::Cast {
-            expr,
-            data_type,
-            span,
-        } => Ok(PlanExpr::Cast {
-            expr: Box::new(Box::pin(resolve_nested_subqueries_locally(ctx, *expr)).await?),
-            data_type,
-            span,
-        }),
-        other => Ok(other),
-    }
-}
-
+/// Resolve the scalar subqueries in `expr`. With an `executor`, uncorrelated
+/// ones run on the workers and become literals. Without one, only the
+/// subqueries nested *inside* each subquery's plan are resolved (TPC-H Q11's
+/// `SUM(..) / (SELECT COUNT(*) ..)`), leaving the outer one for
+/// `ExecutionContext::resolve_scalar_subqueries`.
 async fn resolve_expr_subqueries_distributed_inner(
     ctx: &ExecutionContext,
-    executor: &dyn DistributedExecutor,
+    executor: Option<&dyn DistributedExecutor>,
     expr: PlanExpr,
 ) -> Result<PlanExpr, ArnebError> {
     match expr {
         PlanExpr::ScalarSubquery { subplan, span } => {
-            let subplan = Box::pin(resolve_plan_subqueries(ctx, Some(executor), *subplan)).await?;
-            if !is_uncorrelated(&subplan) {
+            let subplan = Box::pin(resolve_plan_subqueries(ctx, executor, *subplan)).await?;
+            let Some(executor) = executor.filter(|_| is_uncorrelated(&subplan)) else {
                 return Ok(PlanExpr::ScalarSubquery {
                     subplan: Box::new(subplan),
                     span,
                 });
-            }
+            };
             let batches = executor.execute(subplan.clone(), ctx).await?;
             let value = scalar_value_from_batches(&batches)?;
             Ok(PlanExpr::Literal { value, span })
@@ -1988,7 +1937,7 @@ mod tests {
 
         let resolved = resolve_expr_subqueries_distributed_inner(
             &ExecutionContext::new(),
-            &executor,
+            Some(&executor),
             scalar_subquery(correlated_subplan),
         )
         .await

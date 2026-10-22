@@ -1,0 +1,7 @@
+# Scrapes the bench cluster's coordinator (Web UI port = pgwire + 1000).
+global:
+  scrape_interval: 5s
+scrape_configs:
+  - job_name: arneb
+    static_configs:
+      - targets: ["arneb-coord:6432"]

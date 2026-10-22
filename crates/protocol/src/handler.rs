@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use arneb_catalog::CatalogManager;
 use arneb_common::error::{ArnebError, ExecutionError};
+use arneb_common::metrics::{QueryObservation, QueryOutcome};
 use arneb_common::stream::collect_stream;
 use arneb_common::types::ScalarValue;
 use arneb_connectors::ConnectorRegistry;
@@ -814,6 +815,46 @@ pub async fn execute_query(
 /// from a `QueryMemoryPool` of `query_memory_limit` bytes over
 /// `memory_pool`, dropped when the statement ends.
 pub async fn execute_query_with_limit(
+    sql: &str,
+    catalog_manager: &CatalogManager,
+    connector_registry: &ConnectorRegistry,
+    distributed_executor: Option<&dyn DistributedExecutor>,
+    memory_pool: &Arc<dyn arneb_execution::memory_pool::MemoryPool>,
+    query_memory_limit: Option<usize>,
+) -> Result<
+    (
+        Arc<dyn ExecutionPlan>,
+        Vec<arrow::record_batch::RecordBatch>,
+    ),
+    ArnebError,
+> {
+    // Every pgwire and Trino statement that reaches the engine passes here,
+    // so this is where `/metrics` and the slow-query log observe queries. A
+    // statement dropped mid-way (cancel, timeout, client gone) records as
+    // cancelled when `observation` drops.
+    let observation = QueryObservation::start(sql);
+    let result = run_query_with_limit(
+        sql,
+        catalog_manager,
+        connector_registry,
+        distributed_executor,
+        memory_pool,
+        query_memory_limit,
+    )
+    .await;
+    let (outcome, rows, error) = match &result {
+        Ok((_, batches)) => (
+            QueryOutcome::Finished,
+            Some(batches.iter().map(|b| b.num_rows()).sum()),
+            None,
+        ),
+        Err(e) => (QueryOutcome::Failed, None, Some(e.to_string())),
+    };
+    observation.finish(outcome, rows, error.as_deref());
+    result
+}
+
+async fn run_query_with_limit(
     sql: &str,
     catalog_manager: &CatalogManager,
     connector_registry: &ConnectorRegistry,
@@ -2482,6 +2523,30 @@ mod tests {
         // 0.0166666666666|66 rounds half up (Trino: DECIMAL(26,13))
         assert_eq!(decimal_cell(&b, 4), (166_666_666_667, 26, 13));
         assert_eq!(decimal_cell(&b, 5), (600, 12, 2)); // 1000.00 % 7
+    }
+
+    /// Statements through `execute_query_with_limit` feed `/metrics`. The
+    /// registry is process-wide and tests run in parallel, so this checks
+    /// lower bounds.
+    #[tokio::test]
+    async fn executed_statements_are_counted_by_outcome() {
+        fn total(outcome: &str) -> f64 {
+            let series = format!("arneb_queries_total{{outcome=\"{outcome}\"}} ");
+            arneb_common::metrics::render(&[])
+                .lines()
+                .find_map(|l| l.strip_prefix(series.as_str()).map(|v| v.parse().unwrap()))
+                .unwrap()
+        }
+        let (cm, reg) = decimal_arith_env();
+        let (finished, failed) = (total("finished"), total("failed"));
+        run_sql("SELECT count(*) FROM t", &cm, &reg).await;
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        assert!(execute_query("SELECT nope FROM t", &cm, &reg, None, &pool)
+            .await
+            .is_err());
+        assert!(total("finished") >= finished + 1.0);
+        assert!(total("failed") >= failed + 1.0);
     }
 
     /// TPC-H Q22 shape: a DECIMAL scalar subquery used to come back as a

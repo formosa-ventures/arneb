@@ -796,6 +796,15 @@ async fn run() -> Result<()> {
             "admission effective settings ([admission] / ARNEB_MAX_RUNNING_QUERIES / \
              ARNEB_MAX_QUEUED_QUERIES / ARNEB_STATEMENT_TIMEOUT / ARNEB_QUERY_MAX_MEMORY_BYTES)"
         );
+        arneb_common::metrics::set_slow_query_threshold(
+            config.observability.slow_query_threshold(),
+        );
+        tracing::info!(
+            target: "arneb::config",
+            slow_query_threshold_ms = config.observability.slow_query_threshold_ms,
+            "observability effective settings ([observability] / \
+             ARNEB_SLOW_QUERY_THRESHOLD_MS; 0 = slow-query log off)"
+        );
     } else {
         tracing::info!(
             target: "arneb::config",
@@ -895,6 +904,8 @@ async fn run() -> Result<()> {
         role: config.cluster.role.clone(),
         admission: admission.clone(),
         max_queued_queries: config.admission.max_queued_queries,
+        memory_pool: memory_pool.clone(),
+        memory_limit_bytes: budget.map(|b| b as u64),
     };
     let web_router = web::build_router(web_state);
     let web_port = config.server.port + 1000; // default: pgwire port + 1000 (e.g., 5432 → 6432)

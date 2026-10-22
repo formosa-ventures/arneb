@@ -58,6 +58,11 @@ pub struct AppConfig {
     /// after [`AppConfig::load`].
     #[serde(default)]
     pub admission: AdmissionConfig,
+
+    /// Query metrics and the slow-query log (coordinator/standalone only);
+    /// effective values after [`AppConfig::load`].
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 /// `[web]` section.
@@ -280,6 +285,49 @@ impl AdmissionConfig {
                 .map_err(|e| anyhow::anyhow!("invalid {name} value: {e}"))?;
         }
         Ok(())
+    }
+}
+
+/// `[observability]` section.
+///
+/// ```toml
+/// [observability]
+/// slow_query_threshold_ms = 10000   # ARNEB_SLOW_QUERY_THRESHOLD_MS; 0 = slow-query log off
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    /// Statements running at least this long are logged on the
+    /// `arneb::slow_query` target; `0` turns the log off.
+    pub slow_query_threshold_ms: u64,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            slow_query_threshold_ms: arneb_common::metrics::DEFAULT_SLOW_QUERY_THRESHOLD_MS,
+        }
+    }
+}
+
+impl ObservabilityConfig {
+    /// Apply `ARNEB_SLOW_QUERY_THRESHOLD_MS` (looked up through `env`) over
+    /// the file value.
+    pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+        if let Some(v) = env("ARNEB_SLOW_QUERY_THRESHOLD_MS") {
+            self.slow_query_threshold_ms = v.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid ARNEB_SLOW_QUERY_THRESHOLD_MS value '{v}' (expected milliseconds, 0 = off)"
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The slow-query threshold; `None` when the log is off.
+    pub fn slow_query_threshold(&self) -> Option<std::time::Duration> {
+        (self.slow_query_threshold_ms > 0)
+            .then(|| std::time::Duration::from_millis(self.slow_query_threshold_ms))
     }
 }
 
@@ -1160,6 +1208,7 @@ impl AppConfig {
                         tls_settings: None,
                         web: WebConfig::default(),
                         admission: AdmissionConfig::default(),
+                        observability: ObservabilityConfig::default(),
                     }
                 }
             }
@@ -1175,6 +1224,8 @@ impl AppConfig {
         web.apply_env_overrides(|k| std::env::var(k).ok());
         let mut admission = config.admission;
         admission.apply_env(|k| std::env::var(k).ok())?;
+        let mut observability = config.observability;
+        observability.apply_env(|k| std::env::var(k).ok())?;
         let mut catalogs = config.catalogs;
         check_password_env_vars(&catalogs)?;
         for catalog in &mut catalogs {
@@ -1194,6 +1245,7 @@ impl AppConfig {
             tls_settings,
             web,
             admission,
+            observability,
         })
     }
 }
@@ -1529,6 +1581,35 @@ pgwire = "required"
         );
         // Only the named knob moves; the others keep their defaults.
         assert_eq!(ms.max_running_queries, 8);
+    }
+
+    #[test]
+    fn test_observability_defaults_file_and_env() {
+        let load = |toml_text: &str, env: &[(&str, &str)]| {
+            let mut c = toml::from_str::<AppConfig>(toml_text)
+                .unwrap()
+                .observability;
+            let env: Vec<(String, String)> = env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            c.apply_env(|k| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()))
+                .map(|()| c)
+        };
+        let none = load("port = 5432", &[]).unwrap();
+        assert_eq!(
+            none.slow_query_threshold(),
+            Some(std::time::Duration::from_secs(10))
+        );
+        let file = "[observability]\nslow_query_threshold_ms = 2500\n";
+        assert_eq!(load(file, &[]).unwrap().slow_query_threshold_ms, 2500);
+        let off = load(file, &[("ARNEB_SLOW_QUERY_THRESHOLD_MS", "0")]).unwrap();
+        assert_eq!(off.slow_query_threshold(), None);
+        let err = load(file, &[("ARNEB_SLOW_QUERY_THRESHOLD_MS", "soon")]).unwrap_err();
+        assert!(
+            err.to_string().contains("ARNEB_SLOW_QUERY_THRESHOLD_MS"),
+            "{err}"
+        );
     }
 
     /// #150 review: a bad file `statement_timeout` is not rejected at parse

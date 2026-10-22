@@ -138,6 +138,27 @@ certificate that every node on one host can share. See
 [Cluster security](/guide/configuration#cluster-security) and
 [TLS](/guide/configuration#tls) for every setting.
 
+## When a Worker Fails
+
+The coordinator does not retry queries yet. When a worker is lost, the
+queries running on it fail cleanly and the cluster keeps serving:
+
+- **The worker crashes or its connection breaks.** Its queries fail at once
+  with `worker '<id>' (<address>) failed: …`. The coordinator marks the
+  worker dead, so the next query runs on the remaining workers.
+- **The worker hangs** (stuck process, network partition). It stops sending
+  heartbeats. Once `heartbeat_timeout_secs` passes (default 10 s, with a
+  heartbeat every `heartbeat_interval_secs`, default 2 s), its queries fail
+  with `worker '<id>' (<address>) lost: no heartbeat for <n> s`.
+- In both cases the coordinator cancels the query's tasks on every other
+  worker, so they release their memory right away.
+- **A worker that comes back** (restarted or unfrozen) rejoins with its next
+  heartbeat. The coordinator logs `worker re-registered`, and new queries use
+  it again.
+
+`benchmarks/tpch/scripts/fault_injection.sh` checks all of this on the local
+bench cluster by killing and pausing a worker during SF10 q09.
+
 ## How It Works
 
 1. A SQL query arrives at the coordinator via pgwire

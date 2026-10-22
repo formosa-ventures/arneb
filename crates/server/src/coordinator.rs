@@ -203,144 +203,161 @@ impl QueryCoordinator {
         let mut stage_results: std::collections::HashMap<u32, Vec<(String, String, u32)>> =
             std::collections::HashMap::new();
 
-        // q21 SF30 fix: the root fragment is consumed by the coordinator's own
-        // root plan. Its producers must_drain unless that root can early-stop
-        // (a top-level LIMIT short-circuit); otherwise a mid-stream consumer
-        // drop is a silent truncation and must fail loud.
-        let root_must_drain = !root_fragment.root.may_stop_input_early();
-        for child in &root_fragment.source_fragments {
-            execute_child_on_worker(
-                child,
-                &workers,
-                &mut stage_results,
-                &query_id,
-                root_must_drain,
-            )
-            .await?;
-        }
-
-        // A1.5 (2026-05-27): for each consumer DF, spawn an async
-        // pusher that waits on the pre-subscribed receiver and pushes
-        // the resolved Domain to every worker task of the consumer
-        // stage via the `notify_dynamic_filter` Flight action. The
-        // pushers detach so coord's root-plan execution proceeds in
-        // parallel; soundness fallback at the scan side (timeout →
-        // no filter) preserves correctness if a pusher fails.
-        for (df_id, rx) in pre_receivers {
-            // Resolve every consumer stage's tasks to (worker_addr, task_id).
-            // A DF can have several consumer stages (a probe-side filter
-            // shared by a semi join's and an anti join's build scans). The
-            // dispatch loop pushed one entry per `consumer_k` in ascending
-            // order, so `index == partition_id`. A producer-only DF (no
-            // scan annotation reachable from this fragment tree) gets no
-            // targets: the service still merges reports, nobody waits.
-            let consumer_stages: std::collections::BTreeSet<u32> = consumers
-                .iter()
-                .filter(|c| c.df_id == df_id)
-                .map(|c| c.stage_id.0)
-                .collect();
-            let targets: Vec<(String, TaskId)> = consumer_stages
-                .into_iter()
-                .filter_map(|stage| {
-                    let consumer_stage_id = StageId(stage);
-                    let entries = stage_results.get(&stage)?;
-                    Some(entries.iter().enumerate().map(move |(k, (addr, _, _))| {
-                        (
-                            addr.clone(),
-                            TaskId {
-                                stage_id: consumer_stage_id,
-                                partition_id: k as u32,
-                            },
-                        )
-                    }))
-                })
-                .flatten()
-                .collect();
-            if targets.is_empty() {
-                continue;
+        // P4 stage 1: race the query against its workers' liveness, so a
+        // hung or dead worker fails the query (and the CancelGuard cancels
+        // its tasks everywhere) instead of leaving it waiting forever.
+        let worker_ids: Vec<String> = workers.iter().map(|w| w.worker_id.clone()).collect();
+        let run = async {
+            // q21 SF30 fix: the root fragment is consumed by the coordinator's own
+            // root plan. Its producers must_drain unless that root can early-stop
+            // (a top-level LIMIT short-circuit); otherwise a mid-stream consumer
+            // drop is a silent truncation and must fail loud.
+            let root_must_drain = !root_fragment.root.may_stop_input_early();
+            for child in &root_fragment.source_fragments {
+                execute_child_on_worker(
+                    child,
+                    &workers,
+                    &self.node_registry,
+                    &mut stage_results,
+                    &query_id,
+                    root_must_drain,
+                )
+                .await?;
             }
-            let query_id_for_push = query_id;
-            tokio::spawn(async move {
-                let domain = match rx.await {
-                    Ok(d) => d,
-                    Err(_) => {
-                        // Service dropped before resolution (query ended
-                        // early). Consumer-side timeouts handle this.
-                        eprintln!(
-                            "[DFRPC] coord pusher receiver_closed query_id={} df_id={}",
-                            query_id_for_push, df_id
-                        );
-                        return;
-                    }
-                };
-                eprintln!(
-                    "[DFRPC] coord pusher resolved query_id={} df_id={} domain={} targets={}",
-                    query_id_for_push,
-                    df_id,
-                    dfrpc_domain_variant(&domain),
-                    targets.len()
-                );
-                for (addr, task_id) in targets {
-                    let req = arneb_rpc::NotifyDynamicFilterRequest {
-                        query_id: query_id_for_push,
-                        task_id,
-                        df_id,
-                        domain: domain.clone(),
+
+            // A1.5 (2026-05-27): for each consumer DF, spawn an async
+            // pusher that waits on the pre-subscribed receiver and pushes
+            // the resolved Domain to every worker task of the consumer
+            // stage via the `notify_dynamic_filter` Flight action. The
+            // pushers detach so coord's root-plan execution proceeds in
+            // parallel; soundness fallback at the scan side (timeout →
+            // no filter) preserves correctness if a pusher fails.
+            for (df_id, rx) in pre_receivers {
+                // Resolve every consumer stage's tasks to (worker_addr, task_id).
+                // A DF can have several consumer stages (a probe-side filter
+                // shared by a semi join's and an anti join's build scans). The
+                // dispatch loop pushed one entry per `consumer_k` in ascending
+                // order, so `index == partition_id`. A producer-only DF (no
+                // scan annotation reachable from this fragment tree) gets no
+                // targets: the service still merges reports, nobody waits.
+                let consumer_stages: std::collections::BTreeSet<u32> = consumers
+                    .iter()
+                    .filter(|c| c.df_id == df_id)
+                    .map(|c| c.stage_id.0)
+                    .collect();
+                let targets: Vec<(String, TaskId)> = consumer_stages
+                    .into_iter()
+                    .filter_map(|stage| {
+                        let consumer_stage_id = StageId(stage);
+                        let entries = stage_results.get(&stage)?;
+                        Some(entries.iter().enumerate().map(move |(k, (addr, _, _))| {
+                            (
+                                addr.clone(),
+                                TaskId {
+                                    stage_id: consumer_stage_id,
+                                    partition_id: k as u32,
+                                },
+                            )
+                        }))
+                    })
+                    .flatten()
+                    .collect();
+                if targets.is_empty() {
+                    continue;
+                }
+                let query_id_for_push = query_id;
+                tokio::spawn(async move {
+                    let domain = match rx.await {
+                        Ok(d) => d,
+                        Err(_) => {
+                            // Service dropped before resolution (query ended
+                            // early). Consumer-side timeouts handle this.
+                            eprintln!(
+                                "[DFRPC] coord pusher receiver_closed query_id={} df_id={}",
+                                query_id_for_push, df_id
+                            );
+                            return;
+                        }
                     };
                     eprintln!(
-                        "[DFRPC] coord notify_send query_id={} task_id={} df_id={} addr={} domain={}",
+                        "[DFRPC] coord pusher resolved query_id={} df_id={} domain={} targets={}",
                         query_id_for_push,
-                        task_id,
                         df_id,
-                        addr,
-                        dfrpc_domain_variant(&domain)
+                        dfrpc_domain_variant(&domain),
+                        targets.len()
                     );
-                    if let Err(e) = arneb_rpc::notify_dynamic_filter(&addr, &req).await {
-                        tracing::warn!(
-                            query_id = %query_id_for_push,
-                            task_id = %task_id,
-                            df_id = %df_id,
-                            error = %e,
-                            "dynamic filter notify push failed"
-                        );
-                    } else {
+                    for (addr, task_id) in targets {
+                        let req = arneb_rpc::NotifyDynamicFilterRequest {
+                            query_id: query_id_for_push,
+                            task_id,
+                            df_id,
+                            domain: domain.clone(),
+                        };
                         eprintln!(
-                            "[DFRPC] coord notify_ok query_id={} task_id={} df_id={}",
-                            query_id_for_push, task_id, df_id
+                            "[DFRPC] coord notify_send query_id={} task_id={} df_id={} addr={} domain={}",
+                            query_id_for_push,
+                            task_id,
+                            df_id,
+                            addr,
+                            dfrpc_domain_variant(&domain)
                         );
+                        if let Err(e) = arneb_rpc::notify_dynamic_filter(&addr, &req).await {
+                            tracing::warn!(
+                                query_id = %query_id_for_push,
+                                task_id = %task_id,
+                                df_id = %df_id,
+                                error = %e,
+                                "dynamic filter notify push failed"
+                            );
+                        } else {
+                            eprintln!(
+                                "[DFRPC] coord notify_ok query_id={} task_id={} df_id={}",
+                                query_id_for_push, task_id, df_id
+                            );
+                        }
                     }
-                }
-            });
-        }
+                });
+            }
 
-        // Build the root fragment's physical plan. `ExchangeNode` placeholders
-        // resolve through `stage_results` to `ExchangeExec` operators that
-        // pull from the worker `OutputBuffer`s registered above. The coord no
-        // longer re-executes the entire original plan locally — that was the
-        // 2026-05-20 placeholder we just removed.
-        let coord_stage_results = expand_stage_results_for_single_consumer(
-            &root_fragment.source_fragments,
-            &stage_results,
-        );
-        let coord_ctx = exec_ctx.with_stage_results(coord_stage_results);
-        let physical_plan = coord_ctx.create_physical_plan(&root_fragment.root)?;
-        // Same coalesce wrap the pgwire handler applies in single-node mode:
-        // `ExchangeExec` + `CoalescePartitionsExec` siblings produce N
-        // output partitions; pgwire only drains partition 0. Without this
-        // we'd silently lose N-1 partitions of the final result.
-        let physical_plan: Arc<dyn arneb_execution::ExecutionPlan> =
-            if physical_plan.output_partitioning().partition_count() > 1 {
-                Arc::new(arneb_execution::CoalescePartitionsExec::new(physical_plan))
-            } else {
-                physical_plan
-            };
-        let stream = physical_plan.execute(0).await?;
-        // A worker's memory-limit failure stays typed (pgwire 53200, Trino
-        // EXCEEDED_LOCAL_MEMORY_LIMIT): the exchange restores it from the
-        // status code and operators keep it when they re-raise it.
-        let batches = collect_stream(stream)
-            .await
-            .map_err(|e| ExecutionError::upstream("root stage collection failed", e))?;
+            // Build the root fragment's physical plan. `ExchangeNode` placeholders
+            // resolve through `stage_results` to `ExchangeExec` operators that
+            // pull from the worker `OutputBuffer`s registered above. The coord no
+            // longer re-executes the entire original plan locally — that was the
+            // 2026-05-20 placeholder we just removed.
+            let coord_stage_results = expand_stage_results_for_single_consumer(
+                &root_fragment.source_fragments,
+                &stage_results,
+            );
+            let coord_ctx = exec_ctx.with_stage_results(coord_stage_results);
+            let physical_plan = coord_ctx.create_physical_plan(&root_fragment.root)?;
+            // Same coalesce wrap the pgwire handler applies in single-node mode:
+            // `ExchangeExec` + `CoalescePartitionsExec` siblings produce N
+            // output partitions; pgwire only drains partition 0. Without this
+            // we'd silently lose N-1 partitions of the final result.
+            let physical_plan: Arc<dyn arneb_execution::ExecutionPlan> =
+                if physical_plan.output_partitioning().partition_count() > 1 {
+                    Arc::new(arneb_execution::CoalescePartitionsExec::new(physical_plan))
+                } else {
+                    physical_plan
+                };
+            let stream = physical_plan.execute(0).await?;
+            // A worker's memory-limit failure stays typed (pgwire 53200, Trino
+            // EXCEEDED_LOCAL_MEMORY_LIMIT): the exchange restores it from the
+            // status code and operators keep it when they re-raise it.
+            let batches = collect_stream(stream)
+                .await
+                .map_err(|e| ExecutionError::upstream("root stage collection failed", e))?;
+            Ok::<_, ExecutionError>(batches)
+        };
+        // `biased`: when the stream breaks because its worker died, both
+        // branches can be ready in the same poll; report the lost worker.
+        let batches = tokio::select! {
+            biased;
+            lost = watch_workers(&self.node_registry, &worker_ids, WORKER_WATCH_INTERVAL) => {
+                return Err(lost_worker_error(&lost));
+            }
+            result = run => result.map_err(|e| attribute_worker_failure(e, &workers, &self.node_registry))?,
+        };
 
         tracing::info!(
             query_id = %query_id,
@@ -351,6 +368,90 @@ impl QueryCoordinator {
         cancel_guard.disarm();
         Ok(batches)
     }
+}
+
+/// How often a running distributed query checks its workers' liveness.
+const WORKER_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Resolves once one of `worker_ids` is lost (marked dead or past its
+/// heartbeat deadline); pending forever otherwise.
+async fn watch_workers(
+    registry: &arneb_scheduler::NodeRegistry,
+    worker_ids: &[String],
+    interval: std::time::Duration,
+) -> arneb_scheduler::LostWorker {
+    loop {
+        if let Some(lost) = registry.lost_worker(worker_ids) {
+            return lost;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+fn lost_worker_error(lost: &arneb_scheduler::LostWorker) -> ExecutionError {
+    tracing::warn!(
+        target: "arneb::cluster",
+        worker_id = %lost.worker_id,
+        reason = %lost.reason,
+        "failing query: worker lost"
+    );
+    ExecutionError::InvalidOperation(format!(
+        "worker '{}' ({}) lost: {}",
+        lost.worker_id, lost.address, lost.reason
+    ))
+}
+
+/// Whether an RPC error means the peer could not be reached or the
+/// connection broke, as opposed to the peer answering with an error.
+fn is_transport_failure(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    [
+        "failed to connect",
+        "transport error",
+        "connection refused",
+        "connection reset",
+        "broken pipe",
+        "brokenpipe",
+        "h2 protocol error",
+        "error trying to connect",
+        "dns error",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
+}
+
+/// A transport failure from one of the query's workers marks that worker
+/// dead (until its next heartbeat) and names it in the error. Any other
+/// error, including typed ones such as a memory limit, is returned as is.
+fn attribute_worker_failure(
+    err: ExecutionError,
+    workers: &[arneb_scheduler::WorkerInfo],
+    registry: &arneb_scheduler::NodeRegistry,
+) -> ExecutionError {
+    let message = err.to_string();
+    if !is_transport_failure(&message) || message.contains("worker '") {
+        return err;
+    }
+    // Errors nest outermost first ("stream from worker-1 failed: … stream
+    // from worker-2: broken pipe"), so the worker named last is the one
+    // whose connection broke.
+    let Some((worker, address, _)) = workers
+        .iter()
+        .map(|w| {
+            let address = flight_address(&w.address);
+            let position = message.rfind(&address);
+            (w, address, position)
+        })
+        .filter(|(_, _, position)| position.is_some())
+        .max_by_key(|(_, _, position)| *position)
+    else {
+        return err;
+    };
+    registry.mark_dead(&worker.worker_id, "transport failure during query");
+    ExecutionError::InvalidOperation(format!(
+        "worker '{}' ({address}) failed: {message}",
+        worker.worker_id
+    ))
 }
 
 /// A worker's Flight address with its scheme.
@@ -428,6 +529,7 @@ impl Drop for CancelGuard {
 async fn execute_child_on_worker(
     fragment: &arneb_planner::PlanFragment,
     workers: &[arneb_scheduler::WorkerInfo],
+    registry: &arneb_scheduler::NodeRegistry,
     stage_results: &mut std::collections::HashMap<u32, Vec<(String, String, u32)>>,
     query_id: &QueryId,
     // q21 SF30 fix: true when THIS fragment's own consumer must drain it fully
@@ -444,6 +546,7 @@ async fn execute_child_on_worker(
         Box::pin(execute_child_on_worker(
             child,
             workers,
+            registry,
             stage_results,
             query_id,
             child_must_drain,
@@ -639,11 +742,18 @@ async fn execute_child_on_worker(
             "submitting task"
         );
 
-        arneb_rpc::submit_task(&flight_addr, &descriptor)
-            .await
-            .map_err(|e| {
-                ExecutionError::InvalidOperation(format!("task submission failed: {e}"))
-            })?;
+        if let Err(e) = arneb_rpc::submit_task(&flight_addr, &descriptor).await {
+            if is_transport_failure(&e) {
+                registry.mark_dead(&worker.worker_id, &e);
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "worker '{}' ({}) unreachable: task submission failed: {e}",
+                    worker.worker_id, flight_addr
+                )));
+            }
+            return Err(ExecutionError::InvalidOperation(format!(
+                "task submission failed: {e}"
+            )));
+        }
 
         let buffer_key = format!("{query_id}.{task_id}");
         // Keep this directory as one entry per scheduled task. The third tuple
@@ -1181,6 +1291,108 @@ impl DistributedExecutor for QueryCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker(id: &str, address: &str) -> arneb_scheduler::WorkerInfo {
+        arneb_scheduler::WorkerInfo {
+            worker_id: id.to_string(),
+            address: address.to_string(),
+            last_heartbeat: std::time::Instant::now(),
+            max_splits: 256,
+            alive: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_resolves_when_a_query_worker_is_lost() {
+        let registry = arneb_scheduler::NodeRegistry::new(30);
+        registry.heartbeat("w1".into(), "http://w1:9090".into(), 256);
+        registry.mark_dead("w1", "test");
+        let lost = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            watch_workers(
+                &registry,
+                &["w1".to_string()],
+                std::time::Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("a lost worker is detected");
+        assert_eq!(lost.worker_id, "w1");
+        let message = lost_worker_error(&lost).to_string();
+        assert!(
+            message.contains("worker 'w1' (http://w1:9090) lost"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_stays_pending_while_workers_heartbeat() {
+        let registry = arneb_scheduler::NodeRegistry::new(30);
+        registry.heartbeat("w1".into(), "http://w1:9090".into(), 256);
+        let watched = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            watch_workers(
+                &registry,
+                &["w1".to_string()],
+                std::time::Duration::from_millis(20),
+            ),
+        )
+        .await;
+        assert!(watched.is_err(), "no worker is lost");
+    }
+
+    #[test]
+    fn transport_failures_are_told_apart_from_remote_errors() {
+        assert!(is_transport_failure(
+            "failed to connect to http://w2:9090: transport error"
+        ));
+        assert!(is_transport_failure(
+            "h2 protocol error: error reading a body from connection: BrokenPipe"
+        ));
+        assert!(!is_transport_failure(
+            "remote task q.1.0 on http://w2:9090 failed: query exceeded memory limit"
+        ));
+    }
+
+    #[test]
+    fn a_broken_stream_is_blamed_on_the_innermost_worker_and_marks_it_dead() {
+        let registry = arneb_scheduler::NodeRegistry::new(30);
+        registry.heartbeat("worker-1".into(), "http://w1:9090".into(), 256);
+        registry.heartbeat("worker-2".into(), "http://w2:9090".into(), 256);
+        let workers = [
+            worker("worker-1", "http://w1:9090"),
+            worker("worker-2", "http://w2:9090"),
+        ];
+        let err = ExecutionError::InvalidOperation(
+            "Flight stream error from http://w1:9090: remote task failed: \
+             Flight stream error from http://w2:9090: h2 protocol error: broken pipe"
+                .to_string(),
+        );
+        let message = attribute_worker_failure(err, &workers, &registry).to_string();
+        assert!(
+            message.starts_with("invalid operation: worker 'worker-2' (http://w2:9090) failed"),
+            "{message}"
+        );
+        let alive: Vec<_> = registry
+            .alive_workers()
+            .into_iter()
+            .map(|w| w.worker_id)
+            .collect();
+        assert_eq!(alive, vec!["worker-1".to_string()]);
+    }
+
+    #[test]
+    fn a_remote_error_is_not_blamed_on_a_worker() {
+        let registry = arneb_scheduler::NodeRegistry::new(30);
+        registry.heartbeat("worker-1".into(), "http://w1:9090".into(), 256);
+        let workers = [worker("worker-1", "http://w1:9090")];
+        let err = ExecutionError::InvalidOperation(
+            "remote task q.1.0 on http://w1:9090 failed: division by zero".to_string(),
+        );
+        let message = attribute_worker_failure(err, &workers, &registry).to_string();
+        assert!(!message.contains("worker 'worker-1'"), "{message}");
+        assert_eq!(registry.alive_count(), 1);
+    }
 
     /// A Flight server whose `cancel_query` callback records query ids.
     async fn recording_worker() -> (String, Arc<std::sync::Mutex<Vec<QueryId>>>) {

@@ -7,8 +7,6 @@
 use std::any::Any;
 use std::fmt::Debug;
 use std::pin::Pin;
-#[cfg(test)]
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 #[cfg(not(test))]
 use std::sync::OnceLock;
@@ -1718,10 +1716,8 @@ fn agg_spill_enabled() -> bool {
 fn dict_probe_build_enabled() -> bool {
     #[cfg(test)]
     {
-        match DICT_PROBE_BUILD_TEST_OVERRIDE.load(Ordering::SeqCst) {
-            1 => return false,
-            2 => return true,
-            _ => {}
+        if let Some(forced) = DICT_PROBE_BUILD_TEST_OVERRIDE.with(|c| c.get()) {
+            return forced;
         }
         std::env::var("ARNEB_DICT_PROBE_BUILD")
             .ok()
@@ -1747,16 +1743,14 @@ fn dict_probe_build_enabled() -> bool {
 }
 
 #[cfg(test)]
-static DICT_PROBE_BUILD_TEST_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+thread_local! {
+    static DICT_PROBE_BUILD_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
 
 #[cfg(test)]
 fn set_dict_probe_build_for_test(enabled: Option<bool>) {
-    let value = match enabled {
-        None => 0,
-        Some(false) => 1,
-        Some(true) => 2,
-    };
-    DICT_PROBE_BUILD_TEST_OVERRIDE.store(value, Ordering::SeqCst);
+    DICT_PROBE_BUILD_TEST_OVERRIDE.with(|c| c.set(enabled));
 }
 
 // The group's accumulator vector. The group's `Vec<ScalarValue>` lives

@@ -32,6 +32,13 @@ pub struct ScanContext {
     /// represented compactly as `PlanExpr` filters.
     pub dynamic_filter_domains: Vec<DynamicFilterDomain>,
 
+    /// Index in [`filters`](Self::filters) at which runtime dynamic-filter
+    /// conjuncts begin (`None` = every filter is static). Lets a connector
+    /// treat runtime filters differently, e.g. bound how much remote SQL a
+    /// large build-side key set may produce. Connectors that only read
+    /// `filters` can ignore it.
+    pub dynamic_filters_start: Option<usize>,
+
     /// Column indices to project — only these columns need to be returned.
     /// `None` means all columns.
     pub projection: Option<Vec<usize>>,
@@ -53,6 +60,7 @@ impl Default for ScanContext {
         Self {
             filters: Vec::new(),
             dynamic_filter_domains: Vec::new(),
+            dynamic_filters_start: None,
             projection: None,
             limit: None,
             batch_size: None,

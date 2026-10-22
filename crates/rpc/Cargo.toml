@@ -21,7 +21,6 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 async-stream = "0.3"
-tokio-stream = { version = "0.1", features = ["net"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time", "io-util"] }

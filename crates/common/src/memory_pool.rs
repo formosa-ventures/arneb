@@ -30,6 +30,45 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::ExecutionError;
 
+/// Bytes of memory a [`RecordBatch`](arrow::record_batch::RecordBatch) keeps
+/// alive, counting each underlying allocation once.
+///
+/// `Array::get_array_memory_size` reports the full capacity of every buffer
+/// an array references. Arrays that share one allocation (every column of a
+/// batch decoded from Arrow IPC / Flight is a zero-copy slice of the same
+/// message body) would each report that whole body, so summing them counts
+/// it once per column. Here every buffer, null buffer and child buffer is
+/// keyed by the start of its allocation and counted once.
+pub fn batch_memory_size(batch: &arrow::record_batch::RecordBatch) -> usize {
+    use arrow::array::{Array, ArrayData};
+
+    fn visit(data: &ArrayData, seen: &mut Vec<usize>, total: &mut usize) {
+        let mut add = |buffer: &arrow::buffer::Buffer| {
+            // `data_ptr` is the start of the allocation, not of this slice, and
+            // `capacity` is the whole allocation, so slices share one key.
+            let key = buffer.data_ptr().as_ptr() as usize;
+            if !seen.contains(&key) {
+                seen.push(key);
+                *total += buffer.capacity();
+            }
+        };
+        data.buffers().iter().for_each(&mut add);
+        if let Some(nulls) = data.nulls() {
+            add(nulls.buffer());
+        }
+        for child in data.child_data() {
+            visit(child, seen, total);
+        }
+    }
+
+    let mut seen = Vec::new();
+    let mut total = 0;
+    for column in batch.columns() {
+        visit(&column.to_data(), &mut seen, &mut total);
+    }
+    total
+}
+
 /// Read-only memory profile snapshot emitted by an optional diagnostic
 /// pool wrapper.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -575,6 +614,50 @@ impl MemoryPool for TrackConsumersPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn int64_batch(columns: Vec<arrow::array::Int64Array>) -> arrow::record_batch::RecordBatch {
+        use arrow::datatypes::{DataType as ArrowType, Field, Schema};
+        let fields: Vec<Field> = (0..columns.len())
+            .map(|i| Field::new(format!("c{i}"), ArrowType::Int64, true))
+            .collect();
+        let columns = columns
+            .into_iter()
+            .map(|c| Arc::new(c) as arrow::array::ArrayRef)
+            .collect();
+        arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    #[test]
+    fn batch_memory_size_counts_a_shared_allocation_once() {
+        use arrow::buffer::{Buffer, ScalarBuffer};
+        // Four columns that are slices of one 4 × 1000 value allocation, the
+        // layout an Arrow IPC / Flight decoder produces.
+        let n = 1000;
+        let shared = Buffer::from_vec((0..4 * n as i64).collect::<Vec<i64>>());
+        let columns = (0..4)
+            .map(|i| {
+                arrow::array::Int64Array::new(ScalarBuffer::new(shared.clone(), i * n, n), None)
+            })
+            .collect();
+        let batch = int64_batch(columns);
+        assert_eq!(batch_memory_size(&batch), shared.capacity());
+        let per_column: usize = batch
+            .columns()
+            .iter()
+            .map(|c| arrow::array::Array::get_array_memory_size(c.as_ref()))
+            .sum();
+        assert!(per_column >= 4 * shared.capacity(), "{per_column}");
+    }
+
+    #[test]
+    fn batch_memory_size_sums_independent_columns_and_null_buffers() {
+        let a = arrow::array::Int64Array::from_iter_values(0..1000);
+        let b = arrow::array::Int64Array::from_iter((0..1000).map(|v| (v % 2 == 0).then_some(v)));
+        let expected = a.values().inner().capacity()
+            + b.values().inner().capacity()
+            + arrow::array::Array::nulls(&b).unwrap().buffer().capacity();
+        assert_eq!(batch_memory_size(&int64_batch(vec![a, b])), expected);
+    }
 
     fn pool(limit: usize) -> Arc<dyn MemoryPool> {
         Arc::new(GreedyMemoryPool::new(limit))

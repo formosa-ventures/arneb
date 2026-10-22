@@ -878,7 +878,8 @@ fn next_page(results: &mut Results, config: &TrinoConfig) -> Option<Vec<Value>> 
             results.row = 0;
             continue;
         }
-        let per_row = (batch.get_array_memory_size() / num_rows.max(1)).max(8);
+        let per_row =
+            (arneb_common::memory_pool::batch_memory_size(batch) / num_rows.max(1)).max(8);
         let columns: Vec<_> = batch.columns().iter().map(materialize).collect();
         while results.row < num_rows
             && rows.len() < config.max_page_rows

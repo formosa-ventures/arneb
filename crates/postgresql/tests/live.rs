@@ -514,3 +514,39 @@ async fn unreachable_database_is_a_connection_error() {
     assert!(err.contains("connection failed"), "{err}");
     assert!(!err.contains("do-not-log-me"), "{err}");
 }
+
+fn ids(batches: &[RecordBatch]) -> BTreeSet<i64> {
+    batches
+        .iter()
+        .flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec())
+        .collect()
+}
+
+#[tokio::test]
+async fn dynamic_in_list_is_exact_under_the_threshold_and_a_range_over_it() {
+    let url = require_postgres!();
+    let keys = [5_i64, 17, 4_000, 4_001, 90_000];
+    let dynamic = PlanExpr::InList {
+        expr: Box::new(col(0)),
+        list: keys.iter().map(|&k| lit(ScalarValue::Int64(k))).collect(),
+        negated: false,
+        span: None,
+    };
+    let ctx = ScanContext {
+        filters: vec![dynamic],
+        dynamic_filters_start: Some(0),
+        ..Default::default()
+    }
+    .with_projection(vec![0]);
+
+    let exact_cat = catalog(&url, |c| c.domain_compaction_threshold = 10).await;
+    let exact = ids(&scan_all(&*source(&exact_cat, "arneb_test", "keyed").await, &ctx).await);
+    assert_eq!(exact, keys.into_iter().collect());
+
+    // Over the threshold the scan returns the whole min..max range: a
+    // superset the join above it narrows back down.
+    let compact_cat = catalog(&url, |c| c.domain_compaction_threshold = 2).await;
+    let ranged = ids(&scan_all(&*source(&compact_cat, "arneb_test", "keyed").await, &ctx).await);
+    assert_eq!(ranged, (5..=90_000).collect());
+    assert!(exact.is_subset(&ranged));
+}

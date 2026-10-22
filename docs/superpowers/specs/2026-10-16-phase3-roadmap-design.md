@@ -10,6 +10,11 @@ validation tasks (tracked-vs-RSS ratio, q21 SF30 distributed, 3-run stability)
 and the SF100 spill smoke remain. #126 traced to the seed's file layout and is
 fixed by #135. M2–M4 not started.
 
+**Progress (2026-10-20, v0.1.4):** M2 F1 + F2 landed in #158
+(`rdbms-postgresql-connector`, archived). F4 is `cross-source-join`: a mixed
+TPC-H layout (dimensions in PostgreSQL, facts in Hive), dynamic-filter pushdown
+into PostgreSQL with `IN`-list compaction, and the mixed-layout correctness gate.
+
 ## Intent
 
 Phase 1–2.5 made Arneb a correct, fast single-node and distributed engine:

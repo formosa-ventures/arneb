@@ -82,6 +82,7 @@ mod tests {
         Translation {
             conjuncts: vec![],
             complete: true,
+            ..Default::default()
         }
     }
 
@@ -121,6 +122,7 @@ mod tests {
         let t = Translation {
             conjuncts: vec!["(\"n_regionkey\" = 1)".into()],
             complete: true,
+            ..Default::default()
         };
         let plan = SplitPlan::new("n_nationkey", vec![10, 20]);
         assert_eq!(
@@ -139,6 +141,7 @@ mod tests {
         let t = Translation {
             conjuncts: vec![],
             complete: false,
+            ..Default::default()
         };
         assert_eq!(
             sql(None, &t, None, Some(5)),

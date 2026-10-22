@@ -138,14 +138,12 @@ impl dyn ExecutionPlan {
     }
 }
 
-/// Sum the in-memory size of every column of a [`RecordBatch`] —
-/// Trino-equivalent to `Page.getRetainedSizeInBytes()`. Includes
-/// shared buffer overhead, so the value is "retained bytes",
-/// stable across batch slicing.
+/// Retained bytes of a [`RecordBatch`] — Trino-equivalent to
+/// `Page.getRetainedSizeInBytes()`: every allocation the batch keeps alive,
+/// counted once even when columns share it (see
+/// [`arneb_common::memory_pool::batch_memory_size`]).
 pub(crate) fn record_batch_bytes(batch: &RecordBatch) -> usize {
-    (0..batch.num_columns())
-        .map(|i| batch.column(i).get_array_memory_size())
-        .sum()
+    arneb_common::memory_pool::batch_memory_size(batch)
 }
 
 /// Pass-through stream that times the entire produce-to-drain lifetime
@@ -269,7 +267,7 @@ impl Stream for LiveBatchStream {
         self.current.take();
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                let bytes = batch.get_array_memory_size() as u64;
+                let bytes = record_batch_bytes(&batch) as u64;
                 self.current = Some(LiveBytesGuard::new(self.label, bytes));
                 Poll::Ready(Some(Ok(batch)))
             }
@@ -962,6 +960,7 @@ impl ExecutionPlan for ScanExec {
                 self.scan_context.clone()
             } else {
                 let mut merged = self.scan_context.clone();
+                merged.dynamic_filters_start = Some(merged.filters.len());
                 merged.filters.extend(dynamic.iter().cloned());
                 for df in cross_fragment {
                     if let Some(expr) =
@@ -4145,6 +4144,43 @@ mod tests {
         assert_eq!(date_arr.value(2), 19500);
     }
 
+    /// exec-memory-accounting 4.5: a batch decoded from one IPC message body
+    /// is sized at the body, not at the body once per column.
+    #[test]
+    fn record_batch_bytes_counts_an_ipc_body_once() {
+        use arrow::ipc::reader::StreamReader;
+        use arrow::ipc::writer::StreamWriter;
+        let n = 100_000;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", ArrowDataType::Int64, false),
+            Field::new("b", ArrowDataType::Int64, false),
+            Field::new("c", ArrowDataType::Int64, false),
+            Field::new("d", ArrowDataType::Int64, false),
+        ]));
+        let col = || Arc::new(Int64Array::from_iter_values(0..n)) as arrow::array::ArrayRef;
+        let batch = RecordBatch::try_new(schema.clone(), vec![col(), col(), col(), col()]).unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut buf, &schema).unwrap();
+            w.write(&batch).unwrap();
+            w.finish().unwrap();
+        }
+        let decoded = StreamReader::try_new(std::io::Cursor::new(buf), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        // Every decoded column is a slice of one message body: counting
+        // capacity per column used to report ~4x the body here (13.0 MB for
+        // 3.2 MB of data), the SemiJoinExec.probe_left over-count on q20.
+        let original = record_batch_bytes(&batch);
+        let decoded = record_batch_bytes(&decoded);
+        assert!(
+            decoded <= original + original / 10,
+            "decoded {decoded} B vs original {original} B"
+        );
+    }
+
     #[tokio::test]
     async fn scan_exec() {
         let source = make_test_source();
@@ -4164,6 +4200,89 @@ mod tests {
         let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
+    }
+
+    /// Records the `ScanContext` each `scan` call receives.
+    #[derive(Debug)]
+    struct ContextRecordingSource {
+        inner: Arc<dyn DataSource>,
+        seen: std::sync::Mutex<Vec<ScanContext>>,
+    }
+
+    #[async_trait]
+    impl DataSource for ContextRecordingSource {
+        fn schema(&self) -> Vec<ColumnInfo> {
+            self.inner.schema()
+        }
+
+        async fn scan(
+            &self,
+            ctx: &ScanContext,
+            partition: usize,
+        ) -> Result<SendableRecordBatchStream, ExecutionError> {
+            self.seen.lock().unwrap().push(ctx.clone());
+            self.inner.scan(ctx, partition).await
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_marks_where_dynamic_filters_start() {
+        let source = Arc::new(ContextRecordingSource {
+            inner: make_test_source(),
+            seen: Default::default(),
+        });
+        let static_filter = PlanExpr::IsNotNull {
+            expr: Box::new(PlanExpr::Column {
+                index: 0,
+                name: "id".to_string(),
+                span: None,
+            }),
+            span: None,
+        };
+        let scan = ScanExec {
+            source: source.clone(),
+            _table_name: "test".to_string(),
+            scan_context: ScanContext::default().with_filters(vec![static_filter]),
+            dynamic_filters: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
+            dynamic_filter_collector: None,
+            dynamic_filtering_enabled: false,
+            dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+            scan_task_index: 0,
+            scan_task_count: 1,
+        };
+        collect_stream(scan.execute(0).await.unwrap())
+            .await
+            .unwrap();
+        scan.inject_dynamic_filter(
+            PlanExpr::InList {
+                expr: Box::new(PlanExpr::Column {
+                    index: 0,
+                    name: "id".to_string(),
+                    span: None,
+                }),
+                list: vec![PlanExpr::Literal {
+                    value: ScalarValue::Int32(2),
+                    span: None,
+                }],
+                negated: false,
+                span: None,
+            },
+            0,
+        );
+        collect_stream(scan.execute(0).await.unwrap())
+            .await
+            .unwrap();
+
+        let seen = source.seen.lock().unwrap();
+        assert_eq!(seen[0].filters.len(), 1);
+        assert_eq!(seen[0].dynamic_filters_start, None, "no dynamic filter yet");
+        assert_eq!(seen[1].filters.len(), 2);
+        assert_eq!(
+            seen[1].dynamic_filters_start,
+            Some(1),
+            "boundary points at the first dynamic conjunct"
+        );
     }
 
     #[tokio::test]

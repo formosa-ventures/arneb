@@ -1,0 +1,37 @@
+# TPC-H mixed (federated) layout: dimensions in PostgreSQL, facts in Hive.
+#
+# Prerequisites (same TPCH_SF / TPCH_DECIMAL for both seeds):
+#   docker compose up -d                         # RustFS + HMS + Trino
+#   docker compose up -d postgres
+#   docker compose run --rm tpch-seed            # facts (and dims) into hive.tpch
+#   docker compose run --rm pg-tpch-seed         # dims into postgresql.tpch_mixed
+#
+# Usage (standalone; for distributed see docker/arneb-bench/docker-compose.mixed.yml):
+#   cargo run --release --bin arneb -- --config benchmarks/tpch/tpch-mixed.toml
+#
+# The catalogs are named like the bundled Trino's (`hive`, `postgresql`), so
+# benchmarks/tpch/queries-mixed runs unchanged on both engines.
+
+bind_address = "127.0.0.1"
+port = 5432
+
+[storage.s3]
+region = "us-east-1"
+endpoint = "http://localhost:9000"
+allow_http = true
+access_key_id = "s3admin"
+secret_access_key = "s3adminsecret"
+
+[[catalogs]]
+name = "hive"
+type = "hive"
+metastore_uri = "127.0.0.1:9083"
+default_schema = "tpch"
+
+[[catalogs]]
+name = "postgresql"
+type = "postgresql"
+connection_url = "postgresql://127.0.0.1:5433/arneb"
+user = "arneb"
+password = "arneb"
+default_schema = "tpch_mixed"

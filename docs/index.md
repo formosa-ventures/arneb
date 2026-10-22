@@ -28,11 +28,17 @@ features:
   - title: Trino Client Compatible
     details: Trino's REST protocol, so the trino CLI, Trino JDBC, Superset, Metabase and dbt-trino connect unchanged.
   - title: Federated Queries
-    details: Query CSV and Parquet files, S3/GCS/Azure object stores, Hive Metastore catalogs (Parquet, ORC, partitioned and Iceberg tables) and PostgreSQL databases from a single SQL interface.
+    details: Query CSV and Parquet files, S3/GCS/Azure object stores, Hive Metastore catalogs (Parquet, ORC, partitioned and Iceberg tables) and PostgreSQL databases from a single SQL interface, and join across them in one statement.
+    link: /connectors/postgresql#cross-source-joins
+    linkText: Cross-source joins
   - title: Distributed Execution
     details: Coordinator-worker architecture with Apache Arrow Flight RPC for high-throughput data exchange.
   - title: Secure and Governed
     details: TLS and password authentication on both client protocols, a secret plus TLS between nodes, a query queue, per-query memory limits and statement timeouts.
     link: /guide/configuration#admission-control
     linkText: Configure it
+  - title: Observable and Fail-Safe
+    details: Prometheus metrics, a slow-query log, a Grafana dashboard and system.runtime.queries; a lost worker fails its queries with a clear error instead of hanging them.
+    link: /guide/observability
+    linkText: Monitor it
 ---

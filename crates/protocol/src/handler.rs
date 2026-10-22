@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use arneb_catalog::CatalogManager;
 use arneb_common::error::{ArnebError, ExecutionError};
-use arneb_common::metrics::{QueryObservation, QueryOutcome};
 use arneb_common::stream::collect_stream;
 use arneb_common::types::ScalarValue;
 use arneb_connectors::ConnectorRegistry;
@@ -116,6 +115,8 @@ pub struct HandlerFactory {
     /// Reject StartupMessages on connections that did not negotiate TLS
     /// (`[tls] pgwire = "required"`).
     pub tls_required: bool,
+    /// Records each statement (Web UI, `system.runtime.queries`, `/metrics`).
+    pub query_tracker: Arc<arneb_scheduler::QueryTracker>,
 }
 
 impl PgWireServerHandlers for HandlerFactory {
@@ -128,6 +129,7 @@ impl PgWireServerHandlers for HandlerFactory {
             query_memory_limit: self.query_memory_limit,
             admission: self.admission.clone(),
             statement_timeout: self.statement_timeout,
+            query_tracker: self.query_tracker.clone(),
         })
     }
 
@@ -140,6 +142,7 @@ impl PgWireServerHandlers for HandlerFactory {
             query_memory_limit: self.query_memory_limit,
             admission: self.admission.clone(),
             statement_timeout: self.statement_timeout,
+            query_tracker: self.query_tracker.clone(),
         })
     }
 
@@ -154,6 +157,53 @@ impl PgWireServerHandlers for HandlerFactory {
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {
         Arc::new(NoopHandler)
+    }
+}
+
+/// One pgwire statement's entry in the query tracker: `Queued` at receipt,
+/// `Running` once admitted, then finished or failed. Dropped before either
+/// (the client went away mid-statement) it is recorded as cancelled.
+struct TrackedStatement(Option<Tracked>);
+
+type Tracked = (
+    Arc<arneb_scheduler::QueryTracker>,
+    arneb_common::identifiers::QueryId,
+);
+
+impl TrackedStatement {
+    fn start(
+        tracker: &Arc<arneb_scheduler::QueryTracker>,
+        sql: &str,
+        user: Option<String>,
+    ) -> Self {
+        let id = tracker.create_query_from(sql.to_string(), "pgwire", user);
+        Self(Some((Arc::clone(tracker), id)))
+    }
+
+    fn running(&self) {
+        if let Some((t, id)) = &self.0 {
+            let _ = t.advance_to(id, arneb_scheduler::QueryState::Running);
+        }
+    }
+
+    fn finish(&mut self, rows: u64) {
+        if let Some((t, id)) = self.0.take() {
+            let _ = t.finish_query(&id, rows);
+        }
+    }
+
+    fn fail(&mut self, error: String) {
+        if let Some((t, id)) = self.0.take() {
+            let _ = t.fail_query(&id, error);
+        }
+    }
+}
+
+impl Drop for TrackedStatement {
+    fn drop(&mut self) {
+        if let Some((t, id)) = self.0.take() {
+            let _ = t.cancel_query(&id);
+        }
     }
 }
 
@@ -173,6 +223,8 @@ pub struct ConnectionHandler {
     pub admission: Option<arneb_scheduler::AdmissionController>,
     /// Server default timeout; see [`HandlerFactory::statement_timeout`].
     pub statement_timeout: Option<std::time::Duration>,
+    /// See [`HandlerFactory::query_tracker`].
+    pub query_tracker: Arc<arneb_scheduler::QueryTracker>,
 }
 
 impl ConnectionHandler {
@@ -279,6 +331,63 @@ impl ConnectionHandler {
         }
     }
 
+    /// Admit and execute one statement under the session's timeout,
+    /// recording it in the query tracker. `system.runtime.queries` reads
+    /// run over a snapshot of the tracker instead of the real catalogs.
+    async fn run_statement<C: ClientInfo>(
+        &self,
+        client: &C,
+        sql: &str,
+        catalog_manager: &Arc<CatalogManager>,
+    ) -> PgWireResult<
+        Result<
+            (
+                Arc<dyn ExecutionPlan>,
+                Vec<arrow::record_batch::RecordBatch>,
+            ),
+            ArnebError,
+        >,
+    > {
+        let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
+        let mut tracked = TrackedStatement::start(&self.query_tracker, sql, user);
+        let result = self
+            .with_timeout(client, async {
+                let _admission = self.admit(sql).await?;
+                tracked.running();
+                // Snapshot after admission, so the reading statement shows
+                // itself as RUNNING.
+                let runtime = crate::runtime_queries::references_runtime_queries(sql)
+                    .then(|| crate::runtime_queries::runtime_catalog(&self.query_tracker));
+                let (cm, registry, executor) = match &runtime {
+                    Some((cm, registry)) => (cm, registry, None),
+                    None => (
+                        catalog_manager.as_ref(),
+                        self.connector_registry.as_ref(),
+                        self.distributed_executor.as_deref(),
+                    ),
+                };
+                Ok(execute_query_with_limit(
+                    sql,
+                    cm,
+                    registry,
+                    executor,
+                    &self.memory_pool,
+                    self.query_memory_limit,
+                )
+                .await)
+            })
+            .await;
+        match &result {
+            Ok(Ok((_, batches))) => {
+                tracked.finish(batches.iter().map(|b| b.num_rows() as u64).sum())
+            }
+            Ok(Err(e)) => tracked.fail(e.to_string()),
+            // Admission refusal or statement timeout.
+            Err(e) => tracked.fail(e.to_string()),
+        }
+        result
+    }
+
     /// The catalog manager resolving unqualified names for this connection:
     /// a session view when `SET search_path` chose a non-default schema.
     fn session_catalog<C: ClientInfo>(&self, client: &C) -> Arc<CatalogManager> {
@@ -378,18 +487,7 @@ impl SimpleQueryHandler for ConnectionHandler {
         let source = SourceFile::new("<query>", trimmed);
 
         let result = self
-            .with_timeout(client, async {
-                let _admission = self.admit(trimmed).await?;
-                Ok(execute_query_with_limit(
-                    trimmed,
-                    &catalog_manager,
-                    &self.connector_registry,
-                    self.distributed_executor.as_deref(),
-                    &self.memory_pool,
-                    self.query_memory_limit,
-                )
-                .await)
-            })
+            .run_statement(client, trimmed, &catalog_manager)
             .await?;
 
         match result {
@@ -557,18 +655,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
 
         let source = SourceFile::new("<query>", trimmed);
         let result = self
-            .with_timeout(client, async {
-                let _admission = self.admit(trimmed).await?;
-                Ok(execute_query_with_limit(
-                    trimmed,
-                    &catalog_manager,
-                    &self.connector_registry,
-                    self.distributed_executor.as_deref(),
-                    &self.memory_pool,
-                    self.query_memory_limit,
-                )
-                .await)
-            })
+            .run_statement(client, trimmed, &catalog_manager)
             .await?;
 
         match result {
@@ -815,46 +902,6 @@ pub async fn execute_query(
 /// from a `QueryMemoryPool` of `query_memory_limit` bytes over
 /// `memory_pool`, dropped when the statement ends.
 pub async fn execute_query_with_limit(
-    sql: &str,
-    catalog_manager: &CatalogManager,
-    connector_registry: &ConnectorRegistry,
-    distributed_executor: Option<&dyn DistributedExecutor>,
-    memory_pool: &Arc<dyn arneb_execution::memory_pool::MemoryPool>,
-    query_memory_limit: Option<usize>,
-) -> Result<
-    (
-        Arc<dyn ExecutionPlan>,
-        Vec<arrow::record_batch::RecordBatch>,
-    ),
-    ArnebError,
-> {
-    // Every pgwire and Trino statement that reaches the engine passes here,
-    // so this is where `/metrics` and the slow-query log observe queries. A
-    // statement dropped mid-way (cancel, timeout, client gone) records as
-    // cancelled when `observation` drops.
-    let observation = QueryObservation::start(sql);
-    let result = run_query_with_limit(
-        sql,
-        catalog_manager,
-        connector_registry,
-        distributed_executor,
-        memory_pool,
-        query_memory_limit,
-    )
-    .await;
-    let (outcome, rows, error) = match &result {
-        Ok((_, batches)) => (
-            QueryOutcome::Finished,
-            Some(batches.iter().map(|b| b.num_rows()).sum()),
-            None,
-        ),
-        Err(e) => (QueryOutcome::Failed, None, Some(e.to_string())),
-    };
-    observation.finish(outcome, rows, error.as_deref());
-    result
-}
-
-async fn run_query_with_limit(
     sql: &str,
     catalog_manager: &CatalogManager,
     connector_registry: &ConnectorRegistry,
@@ -2523,30 +2570,6 @@ mod tests {
         // 0.0166666666666|66 rounds half up (Trino: DECIMAL(26,13))
         assert_eq!(decimal_cell(&b, 4), (166_666_666_667, 26, 13));
         assert_eq!(decimal_cell(&b, 5), (600, 12, 2)); // 1000.00 % 7
-    }
-
-    /// Statements through `execute_query_with_limit` feed `/metrics`. The
-    /// registry is process-wide and tests run in parallel, so this checks
-    /// lower bounds.
-    #[tokio::test]
-    async fn executed_statements_are_counted_by_outcome() {
-        fn total(outcome: &str) -> f64 {
-            let series = format!("arneb_queries_total{{outcome=\"{outcome}\"}} ");
-            arneb_common::metrics::render(&[])
-                .lines()
-                .find_map(|l| l.strip_prefix(series.as_str()).map(|v| v.parse().unwrap()))
-                .unwrap()
-        }
-        let (cm, reg) = decimal_arith_env();
-        let (finished, failed) = (total("finished"), total("failed"));
-        run_sql("SELECT count(*) FROM t", &cm, &reg).await;
-        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
-            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
-        assert!(execute_query("SELECT nope FROM t", &cm, &reg, None, &pool)
-            .await
-            .is_err());
-        assert!(total("finished") >= finished + 1.0);
-        assert!(total("failed") >= failed + 1.0);
     }
 
     /// TPC-H Q22 shape: a DECIMAL scalar subquery used to come back as a

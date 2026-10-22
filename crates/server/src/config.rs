@@ -293,6 +293,7 @@ impl AdmissionConfig {
 /// ```toml
 /// [observability]
 /// slow_query_threshold_ms = 10000   # ARNEB_SLOW_QUERY_THRESHOLD_MS; 0 = slow-query log off
+/// query_history_size      = 100     # ARNEB_QUERY_HISTORY_SIZE; finished queries kept, > 0
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -300,19 +301,23 @@ pub struct ObservabilityConfig {
     /// Statements running at least this long are logged on the
     /// `arneb::slow_query` target; `0` turns the log off.
     pub slow_query_threshold_ms: u64,
+    /// Finished queries the query tracker keeps for the Web UI and
+    /// `system.runtime.queries`; must be positive.
+    pub query_history_size: usize,
 }
 
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
             slow_query_threshold_ms: arneb_common::metrics::DEFAULT_SLOW_QUERY_THRESHOLD_MS,
+            query_history_size: arneb_scheduler::DEFAULT_QUERY_HISTORY_SIZE,
         }
     }
 }
 
 impl ObservabilityConfig {
-    /// Apply `ARNEB_SLOW_QUERY_THRESHOLD_MS` (looked up through `env`) over
-    /// the file value.
+    /// Apply `ARNEB_SLOW_QUERY_THRESHOLD_MS` and `ARNEB_QUERY_HISTORY_SIZE`
+    /// (looked up through `env`) over the file values, then validate.
     pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
         if let Some(v) = env("ARNEB_SLOW_QUERY_THRESHOLD_MS") {
             self.slow_query_threshold_ms = v.trim().parse().map_err(|_| {
@@ -321,6 +326,18 @@ impl ObservabilityConfig {
                 )
             })?;
         }
+        if let Some(v) = env("ARNEB_QUERY_HISTORY_SIZE") {
+            self.query_history_size = v.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid ARNEB_QUERY_HISTORY_SIZE value '{v}' (expected a positive integer)"
+                )
+            })?;
+        }
+        // 0 would evict every statement the moment it finished.
+        anyhow::ensure!(
+            self.query_history_size > 0,
+            "[observability] query_history_size / ARNEB_QUERY_HISTORY_SIZE must be positive"
+        );
         Ok(())
     }
 
@@ -1610,6 +1627,18 @@ pgwire = "required"
             err.to_string().contains("ARNEB_SLOW_QUERY_THRESHOLD_MS"),
             "{err}"
         );
+
+        assert_eq!(none.query_history_size, 100);
+        let history = "[observability]\nquery_history_size = 500\n";
+        assert_eq!(load(history, &[]).unwrap().query_history_size, 500);
+        let env = load(history, &[("ARNEB_QUERY_HISTORY_SIZE", "7")]).unwrap();
+        assert_eq!(env.query_history_size, 7);
+        for zero in [
+            load("[observability]\nquery_history_size = 0\n", &[]),
+            load(history, &[("ARNEB_QUERY_HISTORY_SIZE", "0")]),
+        ] {
+            assert!(zero.unwrap_err().to_string().contains("must be positive"));
+        }
     }
 
     /// #150 review: a bad file `statement_timeout` is not rejected at parse

@@ -67,6 +67,8 @@ pub(crate) struct Engine {
     pub(crate) memory_pool: Arc<dyn MemoryPool>,
     /// Per-query memory limit on this node (`query_max_memory_per_node`).
     pub(crate) query_memory_limit: Option<usize>,
+    /// Backs `system.runtime.queries`.
+    pub(crate) query_tracker: Arc<arneb_scheduler::QueryTracker>,
 }
 
 fn filter_like(names: Vec<String>, like: &Option<String>) -> Vec<String> {
@@ -131,6 +133,10 @@ impl Engine {
 
         let (catalog, schema) = self.session_defaults(session);
         let root = &self.catalog_manager;
+        if crate::runtime_queries::references_runtime_queries(sql) {
+            let (cm, registry) = crate::runtime_queries::runtime_catalog(&self.query_tracker);
+            return self.run_sql(sql, &cm, &registry, None).await;
+        }
         if metadata::references_virtual_metadata(sql) {
             let (cm, registry) = metadata::build_virtual_catalogs(root, &catalog, sql).await;
             return self.run_sql(sql, &cm, &registry, None).await;

@@ -107,7 +107,7 @@ pub struct TrinoServer {
     connector_registry: Arc<ConnectorRegistry>,
     distributed_executor: Option<Arc<dyn DistributedExecutor>>,
     memory_pool: Arc<dyn MemoryPool>,
-    query_tracker: Option<Arc<QueryTracker>>,
+    query_tracker: Arc<QueryTracker>,
     tls: Option<TlsAcceptor>,
     auth: Option<Authenticator>,
     verifications: Arc<AtomicU64>,
@@ -130,7 +130,7 @@ impl TrinoServer {
             connector_registry,
             distributed_executor: None,
             memory_pool: Arc::new(UnboundedMemoryPool::new()),
-            query_tracker: None,
+            query_tracker: Arc::new(QueryTracker::new()),
             tls: None,
             auth: None,
             verifications: Arc::new(AtomicU64::new(0)),
@@ -202,9 +202,10 @@ impl TrinoServer {
         self
     }
 
-    /// Registers each query with the tracker so it shows in the Web UI.
+    /// Record queries in `tracker` (Web UI, `system.runtime.queries`,
+    /// `/metrics`) instead of a private one.
     pub fn with_query_tracker(mut self, tracker: Arc<QueryTracker>) -> Self {
-        self.query_tracker = Some(tracker);
+        self.query_tracker = tracker;
         self
     }
 
@@ -216,10 +217,11 @@ impl TrinoServer {
                 distributed_executor: self.distributed_executor.clone(),
                 memory_pool: Arc::clone(&self.memory_pool),
                 query_memory_limit: self.query_memory_limit,
+                query_tracker: Arc::clone(&self.query_tracker),
             }),
             queries: Arc::new(Mutex::new(HashMap::new())),
             config: Arc::new(self.config.clone()),
-            tracker: self.query_tracker.clone(),
+            tracker: Arc::clone(&self.query_tracker),
             started: Instant::now(),
             counter: Arc::new(AtomicU64::new(0)),
             scheme: if self.tls.is_some() { "https" } else { "http" },
@@ -360,7 +362,7 @@ struct AppState {
     engine: Arc<Engine>,
     queries: Arc<Mutex<HashMap<String, Arc<Query>>>>,
     config: Arc<TrinoConfig>,
-    tracker: Option<Arc<QueryTracker>>,
+    tracker: Arc<QueryTracker>,
     started: Instant,
     counter: Arc<AtomicU64>,
     /// Scheme for `nextUri` / `infoUri` when the client sends no
@@ -454,7 +456,7 @@ struct Query {
     inner: Mutex<Inner>,
     done: watch::Sender<bool>,
     abort: Mutex<Option<AbortHandle>>,
-    tracker_id: Option<QueryId>,
+    tracker_id: QueryId,
     /// Waiting for an admission slot: reported as `QUEUED`.
     queued: std::sync::atomic::AtomicBool,
 }
@@ -491,14 +493,6 @@ fn base_uri(headers: &HeaderMap, default_scheme: &str) -> String {
     format!("{proto}://{host}")
 }
 
-fn tracker_transition(state: &AppState, id: Option<QueryId>, to: &[TrackerState]) {
-    if let (Some(tracker), Some(id)) = (&state.tracker, id) {
-        for s in to {
-            let _ = tracker.transition_query(&id, *s);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -516,7 +510,10 @@ async fn submit(
     let session = ClientSession::from_headers(&headers, user.as_ref().map(|Extension(u)| u));
     let id = new_query_id(&state.counter);
     let slug = format!("y{}", uuid::Uuid::new_v4().simple());
-    let tracker_id = state.tracker.as_ref().map(|t| t.create_query(sql.clone()));
+    let tracker_id =
+        state
+            .tracker
+            .create_query_from(sql.clone(), "trino", Some(session.user.clone()));
     let (done, _) = watch::channel(false);
     let query = Arc::new(Query {
         id: id.clone(),
@@ -592,15 +589,9 @@ async fn submit(
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        tracker_transition(
-            &task_state,
-            task_query.tracker_id,
-            &[
-                TrackerState::Planning,
-                TrackerState::Starting,
-                TrackerState::Running,
-            ],
-        );
+        let _ = task_state
+            .tracker
+            .advance_to(&task_query.tracker_id, TrackerState::Running);
         let run = std::panic::AssertUnwindSafe(
             task_state.engine.run_statement(&session, &task_query.sql),
         )
@@ -755,11 +746,8 @@ fn complete(state: &AppState, query: &Query, result: Result<QueryOutput, TrinoEr
         inner.ended = Some(Instant::now());
         inner.phase = match result {
             Ok(output) => {
-                tracker_transition(
-                    state,
-                    query.tracker_id,
-                    &[TrackerState::Finishing, TrackerState::Finished],
-                );
+                let rows = output.batches.iter().map(|b| b.num_rows() as u64).sum();
+                let _ = state.tracker.finish_query(&query.tracker_id, rows);
                 Phase::Finished(Results {
                     output,
                     batch: 0,
@@ -768,9 +756,9 @@ fn complete(state: &AppState, query: &Query, result: Result<QueryOutput, TrinoEr
                 })
             }
             Err(err) => {
-                if let (Some(t), Some(id)) = (&state.tracker, query.tracker_id) {
-                    let _ = t.fail_query(&id, err.message.clone());
-                }
+                let _ = state
+                    .tracker
+                    .fail_query(&query.tracker_id, err.message.clone());
                 Phase::Failed(err)
             }
         };
@@ -1023,9 +1011,7 @@ fn cancel_query(state: &AppState, query: &Query, error: TrinoError, reason: &str
             inner.phase = Phase::Failed(error);
             inner.ended = Some(Instant::now());
             inner.last = None;
-            if let (Some(t), Some(id)) = (&state.tracker, query.tracker_id) {
-                let _ = t.cancel_query(&id);
-            }
+            let _ = state.tracker.cancel_query(&query.tracker_id);
         }
     }
     let _ = query.done.send(true);
@@ -1080,7 +1066,7 @@ fn query_summary(query: &Query, base: &str) -> Value {
             "source": query.source,
             "clientInfo": query.client_info,
         },
-        "arnebQueryId": query.tracker_id.map(|id| id.to_string()),
+        "arnebQueryId": query.tracker_id.to_string(),
         "elapsedTimeMillis": inner
             .ended
             .unwrap_or_else(Instant::now)

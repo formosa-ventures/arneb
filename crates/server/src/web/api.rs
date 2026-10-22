@@ -17,6 +17,39 @@ struct QueryResponse {
     state: String,
     sql: String,
     error: Option<String>,
+    /// Protocol that submitted it (`pgwire`, `trino`).
+    source: String,
+    user: Option<String>,
+    /// Milliseconds since the Unix epoch.
+    created_ms: u64,
+    /// Milliseconds since creation, until now or the end.
+    elapsed_ms: u64,
+    rows: Option<u64>,
+}
+
+impl From<arneb_scheduler::QueryInfo> for QueryResponse {
+    fn from(q: arneb_scheduler::QueryInfo) -> Self {
+        let epoch_ms = |t: std::time::SystemTime| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        };
+        let end = q.ended.unwrap_or_else(std::time::SystemTime::now);
+        Self {
+            query_id: q.query_id.to_string(),
+            state: format!("{:?}", q.state),
+            sql: q.sql,
+            error: q.error,
+            source: q.source,
+            user: q.user,
+            created_ms: epoch_ms(q.created),
+            elapsed_ms: end
+                .duration_since(q.created)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            rows: q.rows,
+        }
+    }
 }
 
 /// JSON response for the query list.
@@ -88,12 +121,7 @@ async fn list_queries(
         .query_tracker
         .list_queries(state_filter)
         .into_iter()
-        .map(|q| QueryResponse {
-            query_id: q.query_id.to_string(),
-            state: format!("{:?}", q.state),
-            sql: q.sql,
-            error: q.error,
-        })
+        .map(QueryResponse::from)
         .collect();
 
     Json(QueriesResponse { queries })
@@ -110,12 +138,7 @@ async fn get_query(
         .get_query(&query_id)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(Json(QueryResponse {
-        query_id: info.query_id.to_string(),
-        state: format!("{:?}", info.state),
-        sql: info.sql,
-        error: info.error,
-    }))
+    Ok(Json(QueryResponse::from(info)))
 }
 
 async fn cancel_query(

@@ -11,9 +11,7 @@ use arneb_common::stream::collect_stream;
 use arneb_common::DynamicFilterId;
 use arneb_planner::LogicalPlan;
 use arneb_protocol::DistributedExecutor;
-use arneb_scheduler::{
-    DynamicFilterService, DynamicFilterServiceRegistry, NodeRegistry, QueryTracker,
-};
+use arneb_scheduler::{DynamicFilterService, DynamicFilterServiceRegistry, NodeRegistry};
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 
@@ -35,7 +33,6 @@ fn dfrpc_domain_variant(domain: &arneb_common::Domain) -> String {
 /// Orchestrates distributed query execution across multiple workers.
 pub struct QueryCoordinator {
     node_registry: NodeRegistry,
-    query_tracker: Arc<QueryTracker>,
     /// A1.3 (2026-05-27): per-query dynamic-filter merge services live
     /// here. `execute()` registers an empty service at query start and
     /// drops it at end; A1.5 will start populating it from the plan's
@@ -46,14 +43,9 @@ pub struct QueryCoordinator {
 }
 
 impl QueryCoordinator {
-    pub fn new(
-        node_registry: NodeRegistry,
-        query_tracker: Arc<QueryTracker>,
-        df_registry: DynamicFilterServiceRegistry,
-    ) -> Self {
+    pub fn new(node_registry: NodeRegistry, df_registry: DynamicFilterServiceRegistry) -> Self {
         Self {
             node_registry,
-            query_tracker,
             df_registry,
         }
     }
@@ -76,8 +68,9 @@ impl QueryCoordinator {
         plan: LogicalPlan,
         exec_ctx: &ExecutionContext,
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
+        // The protocol layer records the statement in the query tracker;
+        // this id only keys the distributed tasks.
         let query_id = QueryId::new();
-        let _query = self.query_tracker.create_query(format!("{plan:?}"));
 
         // The DF service is built shortly after fragmentation, once we
         // know which DF ids exist + how many partitions each producer

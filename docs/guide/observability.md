@@ -21,9 +21,11 @@ curl -s http://127.0.0.1:6432/metrics
 | `arneb_worker_heartbeat_age_seconds` | gauge | `worker_id` | Seconds since the worker's last heartbeat |
 | `arneb_uptime_seconds`, `arneb_build_info` | gauge | `version` | Process uptime and version |
 
-Every statement that reaches the engine through pgwire or the Trino protocol
-counts once. Metadata queries answered by the protocol layer (`pg_catalog`,
-`SET`, `SHOW`) do not count. Workers have no HTTP listener, so their memory
+The query metrics count what the [query history](/guide/configuration#query-history)
+records: every pgwire statement that reaches the engine and every statement
+submitted over the Trino protocol, each once. pgwire metadata queries answered
+by the protocol layer (`pg_catalog`, `SET`, `SHOW`) do not count. A statement
+refused by admission or timed out in the queue counts as `failed`. Workers have no HTTP listener, so their memory
 pools are not exported. The coordinator reports their liveness.
 
 `arneb_queries_running` and `arneb_admission_running` measure different

@@ -474,7 +474,9 @@ async fn run() -> Result<()> {
         );
     }
     arneb_rpc::install_cluster_security(cluster_security);
-    let query_tracker = Arc::new(arneb_scheduler::QueryTracker::new());
+    let query_tracker = Arc::new(arneb_scheduler::QueryTracker::with_history_limit(
+        config.observability.query_history_size,
+    ));
     // A1.3 (2026-05-27): per-query dynamic-filter service registry,
     // shared between QueryCoordinator (registers on execute) and the
     // FlightState `df_report_callback` (routes worker reports in).
@@ -598,11 +600,8 @@ async fn run() -> Result<()> {
     // Worker: create TaskManager and register task callback
     let distributed_executor: Option<Arc<dyn arneb_protocol::DistributedExecutor>> = match role {
         ServerRole::Coordinator => {
-            let coord = coordinator::QueryCoordinator::new(
-                node_registry.clone(),
-                query_tracker.clone(),
-                df_registry.clone(),
-            );
+            let coord =
+                coordinator::QueryCoordinator::new(node_registry.clone(), df_registry.clone());
             Some(Arc::new(coord))
         }
         _ => None,
@@ -802,8 +801,9 @@ async fn run() -> Result<()> {
         tracing::info!(
             target: "arneb::config",
             slow_query_threshold_ms = config.observability.slow_query_threshold_ms,
+            query_history_size = config.observability.query_history_size,
             "observability effective settings ([observability] / \
-             ARNEB_SLOW_QUERY_THRESHOLD_MS; 0 = slow-query log off)"
+             ARNEB_SLOW_QUERY_THRESHOLD_MS (0 = slow-query log off) / ARNEB_QUERY_HISTORY_SIZE)"
         );
     } else {
         tracing::info!(
@@ -824,7 +824,8 @@ async fn run() -> Result<()> {
     .with_admission(admission.clone())
     .with_statement_timeout(config.admission.statement_timeout)
     .with_auth(auth_method)
-    .with_tls(pgwire_tls);
+    .with_tls(pgwire_tls)
+    .with_query_tracker(query_tracker.clone());
     if let Some(ref executor) = distributed_executor {
         server = server.with_distributed_executor(Arc::clone(executor));
     }

@@ -39,6 +39,7 @@ pub struct ProtocolServer {
     query_memory_limit: Option<usize>,
     admission: Option<arneb_scheduler::AdmissionController>,
     statement_timeout: Option<std::time::Duration>,
+    query_tracker: Arc<arneb_scheduler::QueryTracker>,
 }
 
 impl ProtocolServer {
@@ -58,7 +59,15 @@ impl ProtocolServer {
             query_memory_limit: None,
             admission: None,
             statement_timeout: None,
+            query_tracker: Arc::new(arneb_scheduler::QueryTracker::new()),
         }
+    }
+
+    /// Record statements in `tracker` (Web UI, `system.runtime.queries`,
+    /// `/metrics`) instead of a private one.
+    pub fn with_query_tracker(mut self, tracker: Arc<arneb_scheduler::QueryTracker>) -> Self {
+        self.query_tracker = tracker;
+        self
     }
 
     /// Set the client authentication mode (default: [`AuthMethod::None`]).
@@ -152,6 +161,7 @@ impl ProtocolServer {
             query_memory_limit: self.query_memory_limit,
             admission: self.admission.clone(),
             statement_timeout: self.statement_timeout,
+            query_tracker: self.query_tracker.clone(),
         });
         let acceptor = self.tls.as_ref().map(|t| t.acceptor.clone());
 

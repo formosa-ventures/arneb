@@ -3,6 +3,7 @@ mod encoding;
 mod error;
 mod handler;
 mod metadata;
+mod runtime_queries;
 mod server;
 mod session;
 mod timeout;

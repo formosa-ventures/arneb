@@ -1,14 +1,15 @@
 //! Process-wide query metrics in the Prometheus text exposition format.
 //!
-//! Query lifecycle counters live here as atomics so that every protocol
-//! (pgwire, Trino) records through one [`QueryObservation`] without passing a
-//! registry around. Values that are cheap to read at scrape time (admission
+//! Query lifecycle counters live here as atomics. The query tracker, which
+//! owns every pgwire and Trino statement's lifecycle, reports into them
+//! through [`query_started`] and [`query_ended`], so no registry is passed
+//! around. Values that are cheap to read at scrape time (admission
 //! queue, memory pool, workers) are not stored: the `/metrics` handler reads
 //! them and hands them to [`render`] as [`Gauge`]s.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How a query ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,7 +18,8 @@ pub enum QueryOutcome {
     Finished,
     /// Returned an error.
     Failed,
-    /// Dropped before it ended: cancelled, timed out, or the client left.
+    /// Cancelled before it ended: by the client, the Web UI, or the client
+    /// going away.
     Cancelled,
 }
 
@@ -103,60 +105,48 @@ pub fn slow_query_threshold() -> Option<Duration> {
 /// Longest SQL text the slow-query log records.
 const SLOW_QUERY_SQL_CHARS: usize = 2000;
 
-/// One query's lifetime: counted as running from [`start`](Self::start),
-/// recorded with its outcome and duration when it [`finish`](Self::finish)es,
-/// or as cancelled when dropped first.
-pub struct QueryObservation {
-    started: Instant,
-    sql: Option<String>,
-    done: bool,
+/// A query started executing (it was admitted).
+pub fn query_started() {
+    QUERY_METRICS.running.fetch_add(1, Ordering::Relaxed);
 }
 
-impl QueryObservation {
-    /// A query begins. `sql` is kept only if the slow-query log is on.
-    pub fn start(sql: &str) -> Self {
-        QUERY_METRICS.running.fetch_add(1, Ordering::Relaxed);
-        Self {
-            started: Instant::now(),
-            sql: slow_query_threshold().map(|_| sql.chars().take(SLOW_QUERY_SQL_CHARS).collect()),
-            done: false,
-        }
-    }
-
-    /// The query ended with `outcome`; `rows` and `error` are logged when it
-    /// was slow.
-    pub fn finish(mut self, outcome: QueryOutcome, rows: Option<usize>, error: Option<&str>) {
-        self.record(outcome, rows, error);
-    }
-
-    fn record(&mut self, outcome: QueryOutcome, rows: Option<usize>, error: Option<&str>) {
-        if self.done {
-            return;
-        }
-        self.done = true;
-        let elapsed = self.started.elapsed();
-        QUERY_METRICS.running.fetch_sub(1, Ordering::Relaxed);
-        QUERY_METRICS.outcomes[outcome.index()].fetch_add(1, Ordering::Relaxed);
-        QUERY_METRICS.durations[outcome.index()].observe(elapsed);
-        if let Some(threshold) = slow_query_threshold() {
-            if elapsed >= threshold {
-                tracing::warn!(
-                    target: "arneb::slow_query",
-                    duration_ms = elapsed.as_millis() as u64,
-                    outcome = outcome.label(),
-                    rows,
-                    error,
-                    sql = self.sql.as_deref().unwrap_or(""),
-                    "slow query"
-                );
-            }
-        }
-    }
+/// How one query ended, for [`query_ended`].
+#[derive(Debug, Clone, Copy)]
+pub struct QueryEnd<'a> {
+    /// Its outcome.
+    pub outcome: QueryOutcome,
+    /// Wall time from admission (or submission, when never admitted).
+    pub elapsed: Duration,
+    /// Whether [`query_started`] was reported for it.
+    pub was_running: bool,
+    /// Rows returned, when finished.
+    pub rows: Option<u64>,
+    /// The error, when failed.
+    pub error: Option<&'a str>,
+    /// Its SQL, for the slow-query log.
+    pub sql: &'a str,
 }
 
-impl Drop for QueryObservation {
-    fn drop(&mut self) {
-        self.record(QueryOutcome::Cancelled, None, None);
+/// A query ended: count it by outcome and duration, and log it on
+/// `arneb::slow_query` when it ran at least the slow-query threshold.
+pub fn query_ended(end: QueryEnd<'_>) {
+    let m = &QUERY_METRICS;
+    if end.was_running {
+        m.running.fetch_sub(1, Ordering::Relaxed);
+    }
+    m.outcomes[end.outcome.index()].fetch_add(1, Ordering::Relaxed);
+    m.durations[end.outcome.index()].observe(end.elapsed);
+    if slow_query_threshold().is_some_and(|t| end.elapsed >= t) {
+        let sql: String = end.sql.chars().take(SLOW_QUERY_SQL_CHARS).collect();
+        tracing::warn!(
+            target: "arneb::slow_query",
+            duration_ms = end.elapsed.as_millis() as u64,
+            outcome = end.outcome.label(),
+            rows = end.rows,
+            error = end.error,
+            sql,
+            "slow query"
+        );
     }
 }
 
@@ -296,12 +286,21 @@ mod tests {
         let fin_count = r#"arneb_query_duration_seconds_count{outcome="finished"}"#;
         let fin_inf = r#"arneb_query_duration_seconds_bucket{outcome="finished",le="+Inf"}"#;
 
-        let running = QueryObservation::start("SELECT 1");
+        let end = |outcome, was_running| QueryEnd {
+            outcome,
+            elapsed: Duration::from_millis(3),
+            was_running,
+            rows: None,
+            error: None,
+            sql: "SELECT 1",
+        };
+        query_started();
         let mid = render(&[]);
         assert!(sample(&mid, "arneb_queries_running") >= 1.0);
-        running.finish(QueryOutcome::Finished, Some(1), None);
-        QueryObservation::start("SELECT x").finish(QueryOutcome::Failed, None, Some("no x"));
-        drop(QueryObservation::start("SELECT slow")); // dropped = cancelled
+        query_ended(end(QueryOutcome::Finished, true));
+        query_ended(end(QueryOutcome::Failed, false)); // refused before admission
+        query_started();
+        query_ended(end(QueryOutcome::Cancelled, true));
 
         let after = render(&[Gauge {
             name: "arneb_workers",

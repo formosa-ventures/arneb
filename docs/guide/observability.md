@@ -61,8 +61,8 @@ docker compose -f docker-compose.yml -f docker/arneb-bench/docker-compose.bench.
   -f docker/observability/docker-compose.observability.yml up -d prometheus grafana
 ```
 
-- Prometheus: <http://localhost:9091>
-- Grafana: <http://localhost:3000>, dashboard **Arneb**. It shows running and
+- Prometheus: `http://localhost:9091`
+- Grafana: `http://localhost:3000`, dashboard **Arneb**. It shows running and
   queued queries, queries per second by outcome, p50/p95/p99 latency, the
   memory pool, and worker liveness.
 

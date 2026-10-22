@@ -120,12 +120,13 @@ The system SHALL accept a `--target-partitions=N` CLI flag on the `arneb` binary
 `[[catalogs]]` entries SHALL accept `type = "postgresql"` alongside `"hive"`.
 A `postgresql` entry SHALL accept `connection_url`, `user`, `password`,
 `max_connections`, `split_min_rows`, `max_splits`,
-`unconstrained_numeric_scale` and `default_schema`. Hive-only fields
-(`metastore_uri`, `storage`) SHALL be ignored on a `postgresql` entry, and
-PostgreSQL-only fields SHALL be ignored on a `hive` entry. The effective
-non-secret settings of each mounted PostgreSQL catalog SHALL be logged at
-startup. An unknown catalog `type` SHALL keep today's behavior: logged and
-skipped.
+`unconstrained_numeric_scale`, `domain_compaction_threshold` and
+`default_schema`. `domain_compaction_threshold` SHALL default to 1000 and SHALL
+be at least 1. Hive-only fields (`metastore_uri`, `storage`) SHALL be ignored on
+a `postgresql` entry, and PostgreSQL-only fields SHALL be ignored on a `hive`
+entry. The effective non-secret settings of each mounted PostgreSQL catalog
+SHALL be logged at startup. An unknown catalog `type` SHALL keep today's
+behavior: logged and skipped.
 
 #### Scenario: Mixed catalogs
 - **WHEN** the config has one `hive` catalog and one `postgresql` catalog
@@ -133,5 +134,25 @@ skipped.
 
 #### Scenario: Effective settings logged
 - **WHEN** a `postgresql` catalog is mounted
-- **THEN** a startup log line shows its name, host, database, `max_connections`, `split_min_rows` and `max_splits`, without the password
+- **THEN** a startup log line shows its name, host, database, `max_connections`, `split_min_rows`, `max_splits` and `domain_compaction_threshold`, without the password
+
+#### Scenario: Invalid compaction threshold
+- **WHEN** a `postgresql` entry sets `domain_compaction_threshold = 0`
+- **THEN** startup fails with an error naming the catalog and the field
+
+### Requirement: Heartbeat settings
+`[cluster]` SHALL accept `heartbeat_interval_secs` (how often a worker sends
+its heartbeat; default 2) and `heartbeat_timeout_secs` (how long the
+coordinator waits before treating a silent worker as lost; default 10).
+`ARNEB_HEARTBEAT_INTERVAL_SECS` and `ARNEB_HEARTBEAT_TIMEOUT_SECS` SHALL
+override them. Both SHALL be at least 1, the timeout SHALL be greater than
+the interval, and the effective values SHALL be logged at startup.
+
+#### Scenario: Defaults
+- **WHEN** neither setting nor variable is given
+- **THEN** workers heartbeat every 2 s and the coordinator's timeout is 10 s
+
+#### Scenario: Invalid combination
+- **WHEN** `heartbeat_timeout_secs = 2` and `heartbeat_interval_secs = 2`
+- **THEN** startup fails with an error naming both settings
 

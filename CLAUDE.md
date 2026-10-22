@@ -119,7 +119,7 @@ allow_http = true
 See `benchmarks/tpch/tpch-hive.toml` for a Hive-backed benchmark config.
 
 **Ports**:
-- Coordinator/Standalone: pgwire (configured port), Trino client REST protocol (`[trino] port`, default 8080; `ARNEB_TRINO_PORT` / `--trino-port`, disable with `--no-trino`), Web UI (port + 1000), Flight RPC (9090)
+- Coordinator/Standalone: pgwire (configured port), Trino client REST protocol (`[trino] port`, default 8080; `ARNEB_TRINO_PORT` / `--trino-port`, disable with `--no-trino`), Web UI + Prometheus `/metrics` (port + 1000), Flight RPC (9090)
 - Worker: Flight RPC only (no pgwire, no Trino HTTP, no Web UI)
 - The Trino listener's bind failure is non-fatal (logged; pgwire keeps serving) — `docker compose up` publishes the bundled Trino on 8080, so use `--trino-port` when both run locally. See `docs/guide/trino-clients.md`.
 
@@ -277,8 +277,8 @@ Adding a function: implement `ScalarFunction` in `crates/execution/src/functions
 ### Phase 3 (production readiness + federation) — in progress
 4 milestones, each work item its own OpenSpec change — full design in `docs/superpowers/specs/2026-10-16-phase3-roadmap-design.md`:
 - M1 safe to share: memory accounting + spill (validation left), admission control (done, #138), TLS/auth (done, #136)
-- M2 federation MVP: RDBMS connector framework, PostgreSQL connector, cross-source join
-- M3 survives failure: fault tolerance, Prometheus metrics + query history, GHCR images + Helm
+- M2 federation MVP: RDBMS connector framework + PostgreSQL connector (done, #158), cross-source join (done, #167)
+- M3 survives failure: fault tolerance stage 1 fail-clean (done, #171; stage 2 query retry left), Prometheus metrics + slow-query log (done, #172), query history + `system.runtime.queries` (done, #173), GHCR images + Helm
 - M4 wider federation: MySQL connector, aggregate/TopN/join pushdown
 
 ### OpenSpec Structure

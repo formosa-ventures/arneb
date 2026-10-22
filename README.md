@@ -149,11 +149,14 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 - **90 Trino-compatible Scalar Functions**: conditional (IF, TRY, GREATEST, LEAST), string (SPLIT_PART, STRPOS, LPAD/RPAD, CONCAT_WS, `||`, ...), regex (REGEXP_LIKE/EXTRACT/REPLACE/COUNT), math (SQRT, LN, LOG, TRUNCATE, RANDOM, trig, ...), date/time (DATE_ADD, DATE_DIFF, DATE_TRUNC, DATE_FORMAT, DATE_PARSE, FORMAT_DATETIME, YEAR/MONTH/DAY_OF_WEEK/..., FROM_UNIXTIME, NOW) — see [docs/sql/functions.md](docs/sql/functions.md)
 - **Arrow-native Execution**: Vectorized columnar processing using Apache Arrow
 - **Connectors**: In-memory tables, CSV/Parquet files, S3/GCS/Azure object stores, Hive Metastore catalog (HMS 4.x via `_req` API) with Parquet and ORC tables and partitioned tables (partitions read from HMS, as in Trino), Apache Iceberg tables in the same HMS via table redirection (read-only; field-ID schema evolution), PostgreSQL databases as read-only catalogs with filter/projection/limit pushdown and parallel key-range reads — see [Hive](docs/connectors/hive.md), [PostgreSQL](docs/connectors/postgresql.md)
+- **Cross-source Joins**: one statement joins PostgreSQL tables with Hive, Iceberg or file tables; join keys known only at runtime reach PostgreSQL's `WHERE` as an `IN` list, or a range when the list is large. TPC-H 22/22 cell-identical to Trino on a mixed layout (dimensions in PostgreSQL, facts in Hive) — see [Cross-source joins](docs/connectors/postgresql.md#cross-source-joins)
 - **PostgreSQL Wire Protocol**: Compatible with psql, DBeaver, JDBC, psycopg2, node-postgres, and all standard PostgreSQL clients; per-connection `SET search_path`; SCRAM-SHA-256 password authentication; TLS (`sslmode=require` / `verify-full`)
 - **Extended Query Protocol**: Full prepared statement support (Parse/Bind/Describe/Execute/Sync)
 - **Trino Client Protocol**: Trino's REST protocol on port 8080, so the `trino` CLI, Trino JDBC, `trino-python-client` (Superset), Metabase's Trino driver and dbt-trino can connect unchanged; HTTPS with Basic authentication against the same users as pgwire — see [Trino client compatibility](docs/guide/trino-clients.md)
 - **Security**: TLS on both client protocols, password authentication on both, and a shared secret plus TLS on the coordinator–worker Flight RPC — see [Securing the Cluster](docs/guide/distributed.md#securing-the-cluster)
 - **Admission Control**: a cap on running queries with a FIFO queue behind it, a per-query memory limit on every node (SQLSTATE `53200` / `EXCEEDED_LOCAL_MEMORY_LIMIT`), `statement_timeout`, and cancellation that reaches the workers — see [Admission Control](docs/guide/configuration.md#admission-control)
+- **Worker Failure Handling**: a worker that crashes fails its queries at once, and one that hangs fails them after the heartbeat timeout (default 10 s), each with an error naming the worker; the query's tasks on the other workers are cancelled, and the next queries run on the remaining workers (no retry yet) — see [When a Worker Fails](docs/guide/distributed.md#when-a-worker-fails)
+- **Observability**: Prometheus `/metrics` on the Web UI port (queries by outcome, latency histogram, memory pool, admission queue, worker liveness), a slow-query log, an example Grafana dashboard, and a bounded query history queryable as `system.runtime.queries` over both protocols — see [Observability](docs/guide/observability.md)
 - **pg_catalog / information_schema**: System catalog tables for client schema browser compatibility
 - **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC; data-parallel scans, hash-partitioned joins, semi/anti joins and final aggregates, and key-set filters published from the small side of a large semi/anti join to the scans on the big side
 - **Web UI**: Dashboard with query monitoring, cluster overview, and worker status
@@ -239,11 +242,17 @@ key_path  = "/etc/arneb/server.key"
 max_running_queries = 8       # 0 = unlimited
 max_queued_queries  = 256
 statement_timeout   = "5min"  # default "0" = off
+
+# Optional: slow-query log and query history (defaults shown).
+[observability]
+slow_query_threshold_ms = 10000  # 0 = off
+query_history_size      = 100
 ```
 
 See [Authentication](docs/guide/configuration.md#authentication),
 [TLS](docs/guide/configuration.md#tls) and
-[Admission Control](docs/guide/configuration.md#admission-control) for details,
+[Admission Control](docs/guide/configuration.md#admission-control) and
+[Observability](docs/guide/configuration.md#observability) for details,
 and [Securing the Cluster](docs/guide/distributed.md#securing-the-cluster) for
 the coordinator–worker secret and TLS.
 

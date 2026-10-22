@@ -1,0 +1,227 @@
+blast_radius_oracle: ARNEB_MAX_HASH_PARTITIONS=(unset → default 2)  runs=2  sigfig=6  rel_tol=1e-06
+==============================================================================
+
+### q01
+  arneb run1: 4 rows
+  arneb run2: 4 rows
+  trino:     4 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q02
+  arneb run1: 100 rows
+  arneb run2: 100 rows
+  trino:     100 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q03
+  arneb run1: 10 rows
+  arneb run2: 10 rows
+  trino:     10 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q04
+  arneb run1: 5 rows
+  arneb run2: 5 rows
+  trino:     5 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q05
+  arneb run1: 5 rows
+  arneb run2: 5 rows
+  trino:     5 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q06
+  arneb run1: 1 rows
+  arneb run2: 1 rows
+  trino:     1 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q07
+  arneb run1: 4 rows
+  arneb run2: 4 rows
+  trino:     4 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q08
+  arneb run1: 2 rows
+  arneb run2: 2 rows
+  trino:     2 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q09
+  arneb run1: 25 rows
+  arneb run2: 25 rows
+  trino:     25 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q10
+  arneb run1: 20 rows
+  arneb run2: 20 rows
+  trino:     20 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q11
+  arneb run1: 8685 rows
+  arneb run2: 8685 rows
+  trino:     8685 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q12
+  arneb run1: 2 rows
+  arneb run2: 2 rows
+  trino:     2 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q13
+  arneb run1: 46 rows
+  arneb run2: 46 rows
+  trino:     46 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q14
+  arneb run1: 1 rows
+  arneb run2: 1 rows
+  trino:     1 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q15
+  arneb run1: 1 rows
+  arneb run2: 1 rows
+  trino:     1 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q16
+  arneb run1: 27840 rows
+  arneb run2: 27840 rows
+  trino:     27840 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q17
+  arneb run1: 1 rows
+  arneb run2: 1 rows
+  trino:     1 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q18
+  arneb run1: 100 rows
+  arneb run2: 100 rows
+  trino:     100 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q19
+  arneb run1: 1 rows
+  arneb run2: 1 rows
+  trino:     1 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q20
+  arneb run1: 1804 rows
+  arneb run2: 1804 rows
+  trino:     1804 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q21
+  arneb run1: 100 rows
+  arneb run2: 100 rows
+  trino:     100 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+### q22
+  arneb run1: 7 rows
+  arneb run2: 7 rows
+  trino:     7 rows
+  determinism run1 vs run2: 0 only-in-run1 / 0 only-in-run2  ✅ identical
+  vs-Trino run1: 0 arneb-only / 0 trino-only  ✅ match
+  vs-Trino run2: 0 arneb-only / 0 trino-only  ✅ match
+  → 🟢 PASS (deterministic + cell-identical to Trino)
+
+==============================================================================
+BLAST-RADIUS SUMMARY
+  q01: 🟢 PASS (deterministic + cell-identical to Trino)
+  q02: 🟢 PASS (deterministic + cell-identical to Trino)
+  q03: 🟢 PASS (deterministic + cell-identical to Trino)
+  q04: 🟢 PASS (deterministic + cell-identical to Trino)
+  q05: 🟢 PASS (deterministic + cell-identical to Trino)
+  q06: 🟢 PASS (deterministic + cell-identical to Trino)
+  q07: 🟢 PASS (deterministic + cell-identical to Trino)
+  q08: 🟢 PASS (deterministic + cell-identical to Trino)
+  q09: 🟢 PASS (deterministic + cell-identical to Trino)
+  q10: 🟢 PASS (deterministic + cell-identical to Trino)
+  q11: 🟢 PASS (deterministic + cell-identical to Trino)
+  q12: 🟢 PASS (deterministic + cell-identical to Trino)
+  q13: 🟢 PASS (deterministic + cell-identical to Trino)
+  q14: 🟢 PASS (deterministic + cell-identical to Trino)
+  q15: 🟢 PASS (deterministic + cell-identical to Trino)
+  q16: 🟢 PASS (deterministic + cell-identical to Trino)
+  q17: 🟢 PASS (deterministic + cell-identical to Trino)
+  q18: 🟢 PASS (deterministic + cell-identical to Trino)
+  q19: 🟢 PASS (deterministic + cell-identical to Trino)
+  q20: 🟢 PASS (deterministic + cell-identical to Trino)
+  q21: 🟢 PASS (deterministic + cell-identical to Trino)
+  q22: 🟢 PASS (deterministic + cell-identical to Trino)
+
+22/22 clean (🟢);  0 not clean

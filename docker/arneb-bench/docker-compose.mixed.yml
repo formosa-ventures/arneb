@@ -1,0 +1,27 @@
+# Mixed (federated) TPC-H layout for the bench cluster: dimensions in the
+# `postgres` service (seeded by `pg-tpch-seed`), facts in Hive.
+#
+#   docker compose -f docker-compose.yml -f docker/arneb-bench/docker-compose.bench.yml \
+#     -f docker/arneb-bench/docker-compose.mixed.yml up -d --build arneb arneb-worker-1 arneb-worker-2
+#   python3 benchmarks/tpch/scripts/blast_radius_oracle.py --layout mixed
+#   EXTRA_COMPOSE=docker/arneb-bench/docker-compose.mixed.yml \
+#     QDIR=benchmarks/tpch/queries-mixed ./benchmarks/tpch/scripts/run_memory_bench.sh
+services:
+  arneb:
+    volumes:
+      - ./docker/arneb-bench/coord-mixed.toml:/etc/arneb/coord.toml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+  arneb-worker-1:
+    volumes:
+      - ./docker/arneb-bench/worker-1-mixed.toml:/etc/arneb/worker-1.toml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+  arneb-worker-2:
+    volumes:
+      - ./docker/arneb-bench/worker-2-mixed.toml:/etc/arneb/worker-2.toml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy

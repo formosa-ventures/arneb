@@ -23,7 +23,9 @@ mod translate;
 pub use select::build_select;
 pub use split::{plan_splits, SplitPlan, SplitRange};
 pub use table::{RemoteColumn, RemoteTable, TABLE_META_PROPERTY};
-pub use translate::{translate_filters, Translation};
+pub use translate::{
+    translate_filters, TranslateOptions, Translation, DEFAULT_DOMAIN_COMPACTION_THRESHOLD,
+};
 
 use std::fmt::Debug;
 

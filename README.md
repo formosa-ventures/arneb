@@ -164,10 +164,10 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 
 ## Releases
 
-The latest release is **v0.1.4** <!-- x-release-please-version --> — see the [release notes](https://github.com/formosa-ventures/arneb/releases/latest) and [`CHANGELOG.md`](CHANGELOG.md). Releases are source releases (no prebuilt binaries yet); build one from its tag:
+The latest release is **v0.1.5** <!-- x-release-please-version --> — see the [release notes](https://github.com/formosa-ventures/arneb/releases/latest) and [`CHANGELOG.md`](CHANGELOG.md). Releases are source releases (no prebuilt binaries yet); build one from its tag:
 
 ```bash
-git clone --branch v0.1.4 https://github.com/formosa-ventures/arneb.git  # x-release-please-version
+git clone --branch v0.1.5 https://github.com/formosa-ventures/arneb.git  # x-release-please-version
 cd arneb && cargo build --release
 ```
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.5](https://github.com/formosa-ventures/arneb/compare/v0.1.4...v0.1.5) (2026-10-22)
+
+
+### Features
+
+* bounded query history and system.runtime.queries (Phase 3 M3, P5) ([#173](https://github.com/formosa-ventures/arneb/issues/173)) ([1ac1e1b](https://github.com/formosa-ventures/arneb/commit/1ac1e1b2e5dd1e8819ea309d037a015ed7b73738))
+* cross-source joins — PostgreSQL dimensions × Hive facts (Phase 3 M2, F4) ([#167](https://github.com/formosa-ventures/arneb/issues/167)) ([db6b2b6](https://github.com/formosa-ventures/arneb/commit/db6b2b6ee3fea0c22d72c33dd67fa21ec66f0274))
+* fail queries cleanly when a worker is lost (Phase 3 M3, P4 stage 1) ([#171](https://github.com/formosa-ventures/arneb/issues/171)) ([79fe426](https://github.com/formosa-ventures/arneb/commit/79fe4263529dcf1864f7b097212003e808e72494))
+* Prometheus /metrics, slow-query log and a Grafana dashboard (Phase 3 M3, P5) ([#172](https://github.com/formosa-ventures/arneb/issues/172)) ([29ac414](https://github.com/formosa-ventures/arneb/commit/29ac4141cd7ccb2a84d7f17679a17939128e3168))
+
+
+### Bug Fixes
+
+* **memory:** count a batch's shared allocations once (exec-memory-accounting 4.5) ([#169](https://github.com/formosa-ventures/arneb/issues/169)) ([00ce541](https://github.com/formosa-ventures/arneb/commit/00ce541c36589344db4f4b1132fec070920e452d))
+* **rpc:** set TCP_NODELAY on accepted Flight connections (SF10 regression from [#136](https://github.com/formosa-ventures/arneb/issues/136)) ([#170](https://github.com/formosa-ventures/arneb/issues/170)) ([5d49c9f](https://github.com/formosa-ventures/arneb/commit/5d49c9fdc902653703f743167c5e9e8871f92680))
+
 ## [0.1.4](https://github.com/formosa-ventures/arneb/compare/v0.1.3...v0.1.4) (2026-10-20)
 
 

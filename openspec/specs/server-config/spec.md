@@ -1,5 +1,8 @@
-## ADDED Requirements
+# server-config Specification
 
+## Purpose
+Server configuration: TOML file, `ARNEB_*` environment overrides, CLI flags, and their validation.
+## Requirements
 ### Requirement: TOML configuration file loading
 The system SHALL load server configuration from a TOML file. The default path SHALL be `./arneb.toml`. If the file does not exist, the system SHALL use default values for all settings.
 
@@ -112,3 +115,23 @@ The system SHALL accept a `--target-partitions=N` CLI flag on the `arneb` binary
 - **GIVEN** `arneb.toml` has `target_partitions = 4` and CLI flag `--target-partitions=8`
 - **WHEN** the server starts
 - **THEN** `target_partitions` resolves to `8`
+
+### Requirement: PostgreSQL catalog entries
+`[[catalogs]]` entries SHALL accept `type = "postgresql"` alongside `"hive"`.
+A `postgresql` entry SHALL accept `connection_url`, `user`, `password`,
+`max_connections`, `split_min_rows`, `max_splits`,
+`unconstrained_numeric_scale` and `default_schema`. Hive-only fields
+(`metastore_uri`, `storage`) SHALL be ignored on a `postgresql` entry, and
+PostgreSQL-only fields SHALL be ignored on a `hive` entry. The effective
+non-secret settings of each mounted PostgreSQL catalog SHALL be logged at
+startup. An unknown catalog `type` SHALL keep today's behavior: logged and
+skipped.
+
+#### Scenario: Mixed catalogs
+- **WHEN** the config has one `hive` catalog and one `postgresql` catalog
+- **THEN** both are mounted and both can be referenced in the same query
+
+#### Scenario: Effective settings logged
+- **WHEN** a `postgresql` catalog is mounted
+- **THEN** a startup log line shows its name, host, database, `max_connections`, `split_min_rows` and `max_splits`, without the password
+

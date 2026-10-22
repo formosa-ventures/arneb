@@ -61,7 +61,13 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BENCH_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_DIR="$(cd "$BENCH_DIR/../.." && pwd)"
-QDIR="$BENCH_DIR/queries"
+# QDIR overrides the query directory (absolute, or relative to the repo root),
+# e.g. QDIR=benchmarks/tpch/queries-mixed with
+# EXTRA_COMPOSE=docker/arneb-bench/docker-compose.mixed.yml for the federated
+# layout. Mixed queries are catalog-qualified, so the search_path / --catalog
+# defaults below do not affect them.
+QDIR="${QDIR:-$BENCH_DIR/queries}"
+[[ "$QDIR" = /* ]] || QDIR="$PROJECT_DIR/$QDIR"
 RESULTS_DIR="$BENCH_DIR/results"
 mkdir -p "$RESULTS_DIR"
 

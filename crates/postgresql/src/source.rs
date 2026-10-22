@@ -11,7 +11,9 @@ use arneb_common::stream::{RecordBatchStream, SendableRecordBatchStream};
 use arneb_common::types::{ColumnInfo, TableReference};
 use arneb_connectors::ConnectorFactory;
 use arneb_execution::{column_info_to_arrow_schema, DataSource, ScanContext};
-use arneb_rdbms::{build_select, translate_filters, RemoteTable, SplitPlan};
+use arneb_rdbms::{
+    build_select, translate_filters, RemoteTable, SplitPlan, TranslateOptions, Translation,
+};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -68,9 +70,9 @@ impl ConnectorFactory for PostgresConnectorFactory {
     }
 }
 
-/// One partition's `COPY` statement, output columns, and per-column
-/// (name, decoder).
-type PartitionPlan = (String, Vec<ColumnInfo>, Vec<(String, Kind)>);
+/// One partition's `COPY` statement, output columns, per-column
+/// (name, decoder), and the filter translation it was built from.
+type PartitionPlan = (String, Vec<ColumnInfo>, Vec<(String, Kind)>, Translation);
 
 /// A PostgreSQL table (or view) as a partitioned data source.
 #[derive(Debug)]
@@ -107,8 +109,16 @@ impl PostgresDataSource {
             ));
             out_schema.push(info.clone());
         }
-        let translation =
-            translate_filters(&ctx.filters, &self.schema, &self.remote, &PostgresDialect);
+        let translation = translate_filters(
+            &ctx.filters,
+            &self.schema,
+            &self.remote,
+            &PostgresDialect,
+            TranslateOptions {
+                dynamic_from: ctx.dynamic_filters_start,
+                compaction_threshold: self.state.config.domain_compaction_threshold,
+            },
+        );
         let select = build_select(
             &self.remote,
             Some(indices),
@@ -121,6 +131,7 @@ impl PostgresDataSource {
             format!("COPY ({select}) TO STDOUT (FORMAT binary)"),
             out_schema,
             kinds,
+            translation,
         ))
     }
 }
@@ -157,12 +168,16 @@ impl DataSource for PostgresDataSource {
                 self.partition_count()
             )));
         }
-        let (copy_sql, out_schema, kinds) = self.plan_partition(ctx, partition).map_err(fail)?;
+        let (copy_sql, out_schema, kinds, translation) =
+            self.plan_partition(ctx, partition).map_err(fail)?;
         tracing::debug!(
             target: "arneb::rdbms",
             catalog = %self.state.name,
             table = %table,
             partition,
+            dynamic_pushed = translation.dynamic_pushed,
+            dynamic_compacted = translation.dynamic_compacted,
+            dynamic_skipped = translation.dynamic_skipped,
             sql = %copy_sql,
             "remote query"
         );
@@ -298,7 +313,7 @@ impl ScanState {
     /// builders refill to about that size). Infallible, like the Parquet
     /// scan: a scan cannot spill.
     fn account(&mut self, batch: &RecordBatch) {
-        let bytes = batch.get_array_memory_size();
+        let bytes = arneb_common::memory_pool::batch_memory_size(batch);
         let held = self.reservation.size();
         if bytes > held {
             self.reservation.grow(bytes - held);

@@ -1,7 +1,5 @@
 //! Hash join operator and supporting hash table.
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -209,15 +207,6 @@ fn build_coalesce_bytes() -> usize {
 }
 
 fn dict_probe_build_enabled() -> bool {
-    #[cfg(test)]
-    {
-        match DICT_PROBE_BUILD_TEST_OVERRIDE.load(Ordering::SeqCst) {
-            1 => return false,
-            2 => return true,
-            _ => {}
-        }
-    }
-
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_DICT_PROBE_BUILD")
@@ -231,19 +220,6 @@ fn dict_probe_build_enabled() -> bool {
         );
         enabled
     })
-}
-
-#[cfg(test)]
-static DICT_PROBE_BUILD_TEST_OVERRIDE: AtomicU8 = AtomicU8::new(0);
-
-#[cfg(test)]
-fn set_dict_probe_build_for_test(enabled: Option<bool>) {
-    let value = match enabled {
-        None => 0,
-        Some(false) => 1,
-        Some(true) => 2,
-    };
-    DICT_PROBE_BUILD_TEST_OVERRIDE.store(value, Ordering::SeqCst);
 }
 
 /// Concatenate adjacent build batches into chunks of at least `target_bytes`
@@ -275,11 +251,7 @@ fn coalesce_build_batches(
         if b.num_rows() == 0 {
             continue;
         }
-        group_bytes += b
-            .columns()
-            .iter()
-            .map(|c| c.get_array_memory_size())
-            .sum::<usize>();
+        group_bytes += crate::operator::record_batch_bytes(&b);
         group.push(b);
         if group_bytes >= target_bytes {
             out.push(if group.len() == 1 {
@@ -4923,6 +4895,21 @@ impl HashJoinExec {
         right_batch: &RecordBatch,
         hash_map: &JoinHashMap,
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
+        self.probe_with_dict_build(
+            left_batch,
+            right_batch,
+            hash_map,
+            dict_probe_build_enabled(),
+        )
+    }
+
+    fn probe_with_dict_build(
+        &self,
+        left_batch: &RecordBatch,
+        right_batch: &RecordBatch,
+        hash_map: &JoinHashMap,
+        dict_probe_build: bool,
+    ) -> Result<Vec<RecordBatch>, ExecutionError> {
         let left_rows = left_batch.num_rows();
         let right_rows = right_batch.num_rows();
 
@@ -4991,7 +4978,7 @@ impl HashJoinExec {
         // Matched rows.
         if !left_indices.is_empty() {
             let use_dict_probe_build =
-                dict_probe_build_enabled() && matches!(self.join_type, ast::JoinType::Inner);
+                dict_probe_build && matches!(self.join_type, ast::JoinType::Inner);
             let left_idx = UInt32Array::from(left_indices);
             let right_idx = UInt32Array::from(right_indices);
 
@@ -6430,12 +6417,12 @@ mod tests {
         };
         let hash_map = JoinHashMap::build_single(&right_batch, &[0]).unwrap();
 
-        set_dict_probe_build_for_test(Some(false));
-        let take_batches = join.probe(&left_batch, &right_batch, &hash_map).unwrap();
-
-        set_dict_probe_build_for_test(Some(true));
-        let dict_batches = join.probe(&left_batch, &right_batch, &hash_map).unwrap();
-        set_dict_probe_build_for_test(None);
+        let take_batches = join
+            .probe_with_dict_build(&left_batch, &right_batch, &hash_map, false)
+            .unwrap();
+        let dict_batches = join
+            .probe_with_dict_build(&left_batch, &right_batch, &hash_map, true)
+            .unwrap();
 
         assert_eq!(take_batches.len(), 1);
         assert_eq!(dict_batches.len(), 1);

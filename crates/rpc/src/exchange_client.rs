@@ -295,7 +295,7 @@ impl ExchangeClient {
             Some(Ok(batch)) => Some(batch),
             Some(Err(e)) => {
                 return Err(crate::task_error::remote_error(
-                    "Flight stream error".to_owned(),
+                    format!("Flight stream error from {}", self.address),
                     &e,
                 ));
             }
@@ -314,13 +314,14 @@ impl ExchangeClient {
         let schema = first_batch.schema();
         let first_live = Some(LiveBytesGuard::new(
             "ExchangeReceive.live",
-            first_batch.get_array_memory_size() as u64,
+            arneb_common::memory_pool::batch_memory_size(&first_batch) as u64,
         ));
         Ok(Box::pin(FlightPassthroughStream {
             schema,
             first: Some(first_batch),
             first_live,
             inner: flight_stream,
+            address: self.address.clone(),
             ticket: ticket_text,
             traced,
             rows: 0,
@@ -339,6 +340,8 @@ struct FlightPassthroughStream {
     first: Option<RecordBatch>,
     first_live: Option<LiveBytesGuard>,
     inner: FlightBatchStream,
+    /// The remote Flight address, named in errors.
+    address: String,
     // [EXCHTRACE] per-ticket consumer-side row tally (gated by ARNEB_TRACE_FRAGMENTS).
     ticket: String,
     traced: bool,
@@ -360,7 +363,7 @@ impl Stream for FlightPassthroughStream {
         }
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(b))) => {
-                let bytes = exchange_receive_batch_bytes(&b);
+                let bytes = arneb_common::memory_pool::batch_memory_size(&b) as u64;
                 record_live_alloc("ExchangeReceive.live", bytes);
                 self.rows += b.num_rows();
                 self.batches += 1;
@@ -380,7 +383,10 @@ impl Stream for FlightPassthroughStream {
                     );
                 }
                 Poll::Ready(Some(Err(ArnebError::Execution(
-                    crate::task_error::remote_error("Flight stream error".to_owned(), &e),
+                    crate::task_error::remote_error(
+                        format!("Flight stream error from {}", self.address),
+                        &e,
+                    ),
                 ))))
             }
             Poll::Ready(None) => {
@@ -472,10 +478,6 @@ fn classify(status: &tonic::Status) -> StatusClass {
 
 fn is_transport_error(err: &FlightError) -> bool {
     matches!(err, FlightError::Tonic(status) if classify(status).resumes())
-}
-
-fn exchange_receive_batch_bytes(batch: &RecordBatch) -> u64 {
-    batch.get_array_memory_size() as u64
 }
 
 impl RecordBatchStream for FlightPassthroughStream {

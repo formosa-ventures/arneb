@@ -13,16 +13,11 @@ use std::time::Instant;
 
 use arneb_common::error::ExecutionError;
 use arneb_common::inflight_budget::InflightBudget;
-use arneb_common::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool};
-use arrow::array::{Array, RecordBatch};
+use arneb_common::memory_pool::{
+    batch_memory_size, MemoryConsumer, MemoryPool, UnboundedMemoryPool,
+};
+use arrow::array::RecordBatch;
 use tokio::sync::{mpsc, Notify};
-
-/// Bytes a batch holds, for memory accounting (Arrow array memory size).
-fn batch_bytes(batch: &RecordBatch) -> usize {
-    (0..batch.num_columns())
-        .map(|i| batch.column(i).get_array_memory_size())
-        .sum()
-}
 
 /// Releases an OutputBuffer reservation when the batch it accompanies
 /// leaves the bounded channel — whether the consumer pulls it
@@ -89,7 +84,7 @@ impl TrackedSender {
     /// Reserve the batch's bytes (best-effort) and wrap it with a release
     /// guard. D1: `try_grow` failure → granted 0, no gating.
     fn make_item(&self, batch: RecordBatch) -> TrackedBatch {
-        let bytes = batch_bytes(&batch);
+        let bytes = batch_memory_size(&batch);
         let granted = if self.pool.try_grow(&self.consumer, bytes).is_ok() {
             bytes
         } else {
@@ -110,7 +105,7 @@ impl TrackedSender {
     /// Wait for the shared byte budget, then reserve the batch's bytes
     /// (best-effort) and wrap it with a release guard.
     async fn make_item_budgeted(&self, batch: RecordBatch) -> TrackedBatch {
-        let bytes = batch_bytes(&batch);
+        let bytes = batch_memory_size(&batch);
         self.inflight_budget.acquire(bytes as u64).await;
         let granted = if self.pool.try_grow(&self.consumer, bytes).is_ok() {
             bytes
@@ -168,7 +163,7 @@ impl TrackedSender {
     /// (single-node / tests) `try_grow` never fails, so `PoolFull` never fires
     /// and the fast path is unchanged.
     pub fn try_send_pooled(&self, batch: RecordBatch) -> TrackedSendOutcome {
-        let bytes = batch_bytes(&batch);
+        let bytes = batch_memory_size(&batch);
         if self.pool.try_grow(&self.consumer, bytes).is_err() {
             // No reservation made — hand the batch back to be spilled.
             return TrackedSendOutcome::PoolFull(batch);
@@ -196,7 +191,7 @@ impl TrackedSender {
     /// to enqueue. The existing count cap and memory-pool spill outcomes are
     /// preserved.
     pub async fn send_pooled(&self, batch: RecordBatch) -> TrackedSendOutcome {
-        let bytes = batch_bytes(&batch);
+        let bytes = batch_memory_size(&batch);
         self.inflight_budget.acquire(bytes as u64).await;
         if self.pool.try_grow(&self.consumer, bytes).is_err() {
             self.inflight_budget.release(bytes as u64);
@@ -333,7 +328,7 @@ impl OutputBuffer {
             ))
         })?;
         let num_rows = batch.num_rows();
-        let num_bytes = batch_bytes(&batch);
+        let num_bytes = batch_memory_size(&batch);
         // Reserve + send via a TrackedSender so the in-flight batch is
         // accounted against the pool (released when the consumer pulls it).
         let tracked = TrackedSender {
@@ -691,7 +686,7 @@ mod tests {
         // not the fixed channel cap. The channel here is large (1000) so a
         // `ChannelFull` cannot fire first and confound the test.
         let schema = test_schema();
-        let one = batch_bytes(&test_batch(&schema, vec![1, 2, 3]));
+        let one = batch_memory_size(&test_batch(&schema, vec![1, 2, 3]));
         // Limit fits exactly one batch.
         let pool: Arc<dyn MemoryPool> = Arc::new(LimitPool::new(one));
         let mut buf = OutputBuffer::new(1, 1000, schema.clone()).with_memory_pool(pool.clone());

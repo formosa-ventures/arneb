@@ -12,6 +12,7 @@
 #   docker compose run tpcds-seed           # seed TPC-DS data (SF1)
 #   docker compose run iceberg-seed         # seed Iceberg tables (iceberg.ice.*)
 #   docker compose up -d postgres           # PostgreSQL for the postgresql connector
+#   docker compose run --rm pg-tpch-seed    # TPC-H dimensions into postgresql.tpch_mixed
 #   docker compose down                     # tear down (keeps seeded data)
 #   docker compose down -v                  # tear down AND delete seeded data
 #
@@ -205,11 +206,36 @@ services:
     profiles:
       - tpcds-seed
 
+  # TPC-H dimension tables in PostgreSQL (postgresql.tpch_mixed) for the
+  # mixed layout: dimensions remote, facts in Hive. Run the Hive seed at the
+  # same TPCH_SF / TPCH_DECIMAL. See docker/postgres-tpch-seed/seed.sh.
+  pg-tpch-seed:
+    image: trinodb/trino:484
+    volumes:
+      - ./docker/postgres-tpch-seed:/seed
+      - ./docker/tpch-seed:/tables:ro
+    entrypoint: ["/bin/bash", "/seed/seed.sh"]
+    environment:
+      TPCH_SF: ${TPCH_SF:-sf1}
+      TPCH_DECIMAL: ${TPCH_DECIMAL:-0}
+      TRINO_SERVER: trino:8080
+    depends_on:
+      trino:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    profiles:
+      - pg-tpch-seed
+
   # PostgreSQL for Arneb's `postgresql` catalog (crates/postgresql) and the
   # bundled Trino's `postgresql` catalog over the same database. The fixture
   # in docker/postgres/init loads once, on an empty `pg-data` volume.
   postgres:
     image: postgres:17.6
+    # Every statement is logged with its client's application_name (Arneb
+    # connects as `arneb`), so pushdown is visible from the remote side:
+    # benchmarks/tpch/scripts/pg_pushdown_evidence.py.
+    command: ["postgres", "-c", "log_statement=all", "-c", "log_line_prefix=%m [%a] "]
     environment:
       POSTGRES_USER: arneb
       POSTGRES_PASSWORD: arneb

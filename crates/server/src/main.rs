@@ -424,7 +424,24 @@ async fn run() -> Result<()> {
     let connector_registry = Arc::new(connector_registry);
 
     // 8. Set up Flight RPC server + heartbeat handling
-    let node_registry = arneb_scheduler::NodeRegistry::default();
+    let heartbeat = config
+        .cluster
+        .heartbeat(|k| std::env::var(k).ok())
+        .context("invalid [cluster] heartbeat configuration")?;
+    match role {
+        ServerRole::Coordinator => tracing::info!(
+            target: "arneb::config",
+            heartbeat_timeout_secs = heartbeat.timeout_secs,
+            "worker heartbeat timeout effective value ([cluster] heartbeat_timeout_secs / ARNEB_HEARTBEAT_TIMEOUT_SECS)"
+        ),
+        ServerRole::Worker => tracing::info!(
+            target: "arneb::config",
+            heartbeat_interval_secs = heartbeat.interval_secs,
+            "heartbeat interval effective value ([cluster] heartbeat_interval_secs / ARNEB_HEARTBEAT_INTERVAL_SECS)"
+        ),
+        ServerRole::Standalone => {}
+    }
+    let node_registry = arneb_scheduler::NodeRegistry::new(heartbeat.timeout_secs);
     let rpc_addr = format!("{}:{}", config.server.bind_address, config.cluster.rpc_port);
 
     // Cluster RPC security ([cluster] secret / [cluster.tls] / ARNEB_CLUSTER_*):
@@ -970,7 +987,7 @@ async fn run() -> Result<()> {
         ) => {}
 
         // Worker heartbeat loop
-        _ = worker_heartbeat_loop(role, &config, &rpc_addr) => {}
+        _ = worker_heartbeat_loop(role, &config, &rpc_addr, heartbeat.interval_secs) => {}
         // Graceful shutdown
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");
@@ -994,7 +1011,12 @@ where
 }
 
 /// Periodically send heartbeat to coordinator (worker mode only).
-async fn worker_heartbeat_loop(role: ServerRole, config: &AppConfig, my_rpc_addr: &str) {
+async fn worker_heartbeat_loop(
+    role: ServerRole,
+    config: &AppConfig,
+    my_rpc_addr: &str,
+    interval_secs: u64,
+) {
     if !matches!(role, ServerRole::Worker) {
         // Non-workers just wait forever (this future is never selected).
         futures::future::pending::<()>().await;
@@ -1066,7 +1088,7 @@ async fn worker_heartbeat_loop(role: ServerRole, config: &AppConfig, my_rpc_addr
                 );
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
     }
 }
 
@@ -1098,6 +1120,7 @@ async fn register_postgresql_catalog(
                 unconstrained_numeric_scale = c.unconstrained_numeric_scale,
                 connect_timeout_secs = c.connect_timeout_secs,
                 pool_wait_timeout_secs = c.pool_wait_timeout_secs,
+                domain_compaction_threshold = c.domain_compaction_threshold,
                 "registered postgresql catalog"
             );
             connector_registry.register(&catalog_cfg.name, Arc::new(catalog.connector_factory()));

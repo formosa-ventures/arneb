@@ -721,6 +721,9 @@ pub struct CatalogConfig {
     pub connect_timeout_secs: Option<u64>,
     /// Seconds to wait for a free pooled connection (default 60).
     pub pool_wait_timeout_secs: Option<u64>,
+    /// A dynamic-filter `IN` list longer than this is pushed as a range
+    /// (default 1000).
+    pub domain_compaction_threshold: Option<usize>,
 }
 
 impl CatalogConfig {
@@ -806,6 +809,14 @@ impl CatalogConfig {
                 self.name
             );
             c.pool_wait_timeout_secs = v;
+        }
+        if let Some(v) = self.domain_compaction_threshold {
+            anyhow::ensure!(
+                v > 0,
+                "catalog '{}': domain_compaction_threshold must be > 0",
+                self.name
+            );
+            c.domain_compaction_threshold = v;
         }
         Ok(c)
     }
@@ -954,6 +965,29 @@ pub struct ClusterConfig {
     /// TLS between nodes (`[cluster.tls]`).
     #[serde(default)]
     pub tls: Option<ClusterTlsConfig>,
+
+    /// Seconds between a worker's heartbeats (`ARNEB_HEARTBEAT_INTERVAL_SECS`).
+    #[serde(default)]
+    pub heartbeat_interval_secs: Option<u64>,
+
+    /// Seconds without a heartbeat after which the coordinator treats a
+    /// worker as lost and fails its queries (`ARNEB_HEARTBEAT_TIMEOUT_SECS`).
+    #[serde(default)]
+    pub heartbeat_timeout_secs: Option<u64>,
+}
+
+/// Default `[cluster] heartbeat_interval_secs`.
+pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 2;
+/// Default `[cluster] heartbeat_timeout_secs`.
+pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 10;
+
+/// Effective heartbeat settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatSettings {
+    /// Seconds between a worker's heartbeats.
+    pub interval_secs: u64,
+    /// Seconds of silence after which a worker is lost.
+    pub timeout_secs: u64,
 }
 
 /// A string that never appears in `Debug` output.
@@ -988,6 +1022,44 @@ pub struct ClusterTlsConfig {
 }
 
 impl ClusterConfig {
+    /// `[cluster] heartbeat_*_secs` with `ARNEB_HEARTBEAT_*_SECS` overrides
+    /// (env > file > defaults), validated: both at least 1, timeout greater
+    /// than interval.
+    pub fn heartbeat(&self, env: impl Fn(&str) -> Option<String>) -> Result<HeartbeatSettings> {
+        let read = |var: &str, file: Option<u64>, default: u64| -> Result<u64> {
+            let value = match env(var) {
+                Some(v) => v.trim().parse::<u64>().map_err(|_| {
+                    anyhow::anyhow!("invalid {var} value '{v}' (expected whole seconds)")
+                })?,
+                None => file.unwrap_or(default),
+            };
+            anyhow::ensure!(
+                value >= 1,
+                "{var} / [cluster] heartbeat setting must be at least 1 s"
+            );
+            Ok(value)
+        };
+        let interval_secs = read(
+            "ARNEB_HEARTBEAT_INTERVAL_SECS",
+            self.heartbeat_interval_secs,
+            DEFAULT_HEARTBEAT_INTERVAL_SECS,
+        )?;
+        let timeout_secs = read(
+            "ARNEB_HEARTBEAT_TIMEOUT_SECS",
+            self.heartbeat_timeout_secs,
+            DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+        )?;
+        anyhow::ensure!(
+            timeout_secs > interval_secs,
+            "heartbeat_timeout_secs ({timeout_secs}) must be greater than \
+             heartbeat_interval_secs ({interval_secs})"
+        );
+        Ok(HeartbeatSettings {
+            interval_secs,
+            timeout_secs,
+        })
+    }
+
     /// Build the cluster RPC security from `[cluster] secret` /
     /// `[cluster.tls]` with `ARNEB_CLUSTER_*` overrides (looked up through
     /// `env`). Reads the PEM files.
@@ -1062,6 +1134,8 @@ impl Default for ClusterConfig {
             advertised_address: None,
             secret: None,
             tls: None,
+            heartbeat_interval_secs: None,
+            heartbeat_timeout_secs: None,
         }
     }
 }
@@ -1659,6 +1733,7 @@ connection_url = "postgresql://db.internal:5432/sales"
 user = "arneb"
 password = "file-secret"
 max_splits = 4
+domain_compaction_threshold = 250
 
 [[catalogs]]
 name = "lake"
@@ -1674,6 +1749,7 @@ metastore_uri = "127.0.0.1:9083"
         let c = pg.postgres_config().unwrap();
         assert_eq!(c.password.as_deref(), Some("file-secret"));
         assert_eq!(c.max_splits, 4);
+        assert_eq!(c.domain_compaction_threshold, 250);
         assert_eq!(c.max_connections, arneb_postgresql::DEFAULT_MAX_CONNECTIONS);
         assert_eq!(c.split_min_rows, arneb_postgresql::DEFAULT_SPLIT_MIN_ROWS);
         assert_eq!(pg.effective_default_schema(), "public");
@@ -1714,6 +1790,23 @@ max_splits = 0
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(config.catalogs[0].postgres_config().is_err());
+
+        let toml_str = r#"
+[[catalogs]]
+name = "pg"
+type = "postgresql"
+connection_url = "postgresql://h/d"
+domain_compaction_threshold = 0
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let err = config.catalogs[0]
+            .postgres_config()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'pg'") && err.contains("domain_compaction_threshold"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1902,5 +1995,35 @@ password = "hunter2"
 
         let res: std::result::Result<AppConfig, _> = toml::from_str("[auth]\ntype = \"md5\"\n");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn heartbeat_settings_defaults_overrides_and_validation() {
+        let cluster = ClusterConfig::default();
+        let h = cluster.heartbeat(env_from(&[])).unwrap();
+        assert_eq!((h.interval_secs, h.timeout_secs), (2, 10));
+
+        let cluster: ClusterConfig =
+            toml::from_str("heartbeat_interval_secs = 3\nheartbeat_timeout_secs = 15").unwrap();
+        let h = cluster.heartbeat(env_from(&[])).unwrap();
+        assert_eq!((h.interval_secs, h.timeout_secs), (3, 15));
+        let h = cluster
+            .heartbeat(env_from(&[("ARNEB_HEARTBEAT_TIMEOUT_SECS", "20")]))
+            .unwrap();
+        assert_eq!((h.interval_secs, h.timeout_secs), (3, 20));
+
+        let cluster: ClusterConfig =
+            toml::from_str("heartbeat_interval_secs = 2\nheartbeat_timeout_secs = 2").unwrap();
+        let err = cluster.heartbeat(env_from(&[])).unwrap_err().to_string();
+        assert!(
+            err.contains("heartbeat_timeout_secs") && err.contains("heartbeat_interval_secs"),
+            "{err}"
+        );
+        assert!(ClusterConfig::default()
+            .heartbeat(env_from(&[("ARNEB_HEARTBEAT_INTERVAL_SECS", "0")]))
+            .is_err());
+        assert!(ClusterConfig::default()
+            .heartbeat(env_from(&[("ARNEB_HEARTBEAT_INTERVAL_SECS", "x")]))
+            .is_err());
     }
 }

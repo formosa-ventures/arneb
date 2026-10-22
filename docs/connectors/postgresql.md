@@ -30,6 +30,7 @@ password = "..."            # or ARNEB_CATALOG_PG_PASSWORD
 # unconstrained_numeric_scale = 10
 # connect_timeout_secs = 10
 # pool_wait_timeout_secs = 60
+# domain_compaction_threshold = 1000
 ```
 
 | Field | Default | Description |
@@ -43,6 +44,7 @@ password = "..."            # or ARNEB_CATALOG_PG_PASSWORD
 | `unconstrained_numeric_scale` | `10` | The scale used for `numeric` columns that have no declared precision. |
 | `connect_timeout_secs` | `10` | How long opening one connection may take before it fails. A `connect_timeout` in `connection_url` takes precedence for the TCP connect. |
 | `pool_wait_timeout_secs` | `60` | How long a scan or a metadata lookup waits for a free connection when all `max_connections` are busy, before the query fails. |
+| `domain_compaction_threshold` | `1000` | A dynamic filter with more values than this is sent as a `BETWEEN min AND max` range instead of an `IN` list. See [Cross-source joins](#cross-source-joins). |
 
 `ARNEB_CATALOG_<NAME>_PASSWORD` overrides `password`. `<NAME>` is the catalog
 name in upper case, with every non-alphanumeric character replaced by `_`. For
@@ -110,6 +112,41 @@ the result is decoded straight into Arrow.
 
 To see the SQL each partition sends, set `RUST_LOG=arneb::rdbms=debug`.
 
+## Cross-source joins
+
+A PostgreSQL table joins with Hive, Iceberg or file tables like any other
+table. Arneb reads each side through its own connector and runs the join
+itself:
+
+```sql
+SELECT n_name, SUM(l_extendedprice)
+FROM hive.tpch.lineitem
+JOIN postgresql.tpch_mixed.supplier ON l_suppkey = s_suppkey
+JOIN postgresql.tpch_mixed.nation ON s_nationkey = n_nationkey
+GROUP BY n_name;
+```
+
+**Dynamic filters.** When a PostgreSQL scan is the probe side of a hash join,
+the join first builds its hash table from the other side. It then hands the
+build keys to the scan, and they become part of the remote `WHERE`:
+
+- up to `domain_compaction_threshold` values (default 1000) are sent as
+  `"col" IN (…)`;
+- more values are compacted to `"col" BETWEEN min AND max`, which keeps the
+  SQL small (it is repeated once per split) at the cost of returning extra
+  rows;
+- a filter that cannot be translated, or one that arrives too late, is not
+  sent.
+
+A dynamic filter only prunes rows; the join still compares every key, so none
+of these choices changes a result. User-written `IN` lists are always sent in
+full. The `remote query` log event (`RUST_LOG=arneb::rdbms=debug`) counts each
+scan's `dynamic_pushed`, `dynamic_compacted` and `dynamic_skipped` filters.
+
+Dynamic filters reach a scan in the same plan fragment as its join: always in
+standalone mode, and for broadcast joins in distributed mode. Filters across
+fragments, for partitioned joins, are off by default for every connector.
+
 ## Parallel reads
 
 On the coordinator, while planning, Arneb reads the row estimate
@@ -151,6 +188,26 @@ connection_url = "postgresql://127.0.0.1:5433/arneb"
 user = "arneb"
 password = "arneb"
 ```
+
+### Mixed TPC-H layout
+
+The six TPC-H dimension tables can be loaded into PostgreSQL (schema
+`tpch_mixed`) next to the Hive facts. The seed uses the same scale factor and
+the same column definitions as the Hive seed:
+
+```bash
+docker compose run --rm tpch-seed                       # hive.tpch
+docker compose run --rm pg-tpch-seed                    # postgresql.tpch_mixed
+cargo run --release --bin arneb -- --config benchmarks/tpch/tpch-mixed.toml
+python3 benchmarks/tpch/scripts/blast_radius_oracle.py --layout mixed --arneb-host-run
+python3 benchmarks/tpch/scripts/pg_pushdown_evidence.py --queries q05,q11
+```
+
+`benchmarks/tpch/queries-mixed/` holds the 22 queries with catalog-qualified
+names (`qualify_queries.py` regenerates them). The same SQL runs on the bundled
+Trino. The `postgres` service logs every statement with its client's
+`application_name`, and `pg_pushdown_evidence.py` uses that log to show what
+PostgreSQL received for each query.
 
 The connector's integration tests run against this database:
 

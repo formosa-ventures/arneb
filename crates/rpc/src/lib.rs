@@ -63,6 +63,6 @@ pub fn __flight_service_for_test(
 pub async fn __serve_flight_for_test(listener: tokio::net::TcpListener, state: FlightState) {
     let _ = tonic::transport::Server::builder()
         .add_service(__flight_service_for_test(state))
-        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+        .serve_with_incoming(flight_service::flight_incoming(listener))
         .await;
 }

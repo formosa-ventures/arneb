@@ -371,25 +371,14 @@ impl TaskManager {
         };
         let cancelled = entry.len();
         for (task_key, handles) in entry {
-            match self.flight_state.get_buffer(&task_key) {
-                Some(arneb_rpc::BufferKind::Partitioned(buf)) => {
-                    if let Ok(buf) = buf.try_lock() {
-                        let failure = buf.failure_handle();
-                        let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.get_or_insert_with(|| "query cancelled".into());
-                    }
-                }
-                Some(arneb_rpc::BufferKind::Broadcast(buf)) => {
-                    {
-                        let failure = buf.failure_handle();
-                        let mut guard = failure.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.get_or_insert_with(|| "query cancelled".into());
-                    }
-                    // The aborted pumper never finishes the buffer; close it
-                    // so subscribed consumers wake and read the failure.
-                    buf.finish();
-                }
-                None => {}
+            self.flight_state
+                .fail_output(&task_key, || "query cancelled".into());
+            if let Some(arneb_rpc::BufferKind::Broadcast(buf)) =
+                self.flight_state.get_buffer(&task_key)
+            {
+                // The aborted pumper never finishes the buffer; close it so
+                // subscribed consumers wake and read the failure.
+                buf.finish();
             }
             for handle in handles {
                 handle.abort();

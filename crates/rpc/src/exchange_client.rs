@@ -248,7 +248,9 @@ impl ExchangeClient {
                         yield Ok(batch);
                     }
                     Err(err) if is_transport_error(&err) => {
-                        match self.reopen(&peer, &ticket, delivered, &mut attempts, &err).await {
+                        let reopened = self.reopen(&peer, &ticket, delivered, &mut attempts, &err).await;
+                        arneb_common::metrics::exchange_stream_broke(reopened.is_some());
+                        match reopened {
                             Some(reopened) => stream = reopened,
                             None => {
                                 yield Err(err);

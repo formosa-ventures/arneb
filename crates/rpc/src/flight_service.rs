@@ -91,6 +91,9 @@ pub enum BufferKind {
 #[derive(Clone)]
 pub struct FlightState {
     buffers: Arc<RwLock<HashMap<String, BufferKind>>>,
+    /// Each registered buffer's failure flag, held outside the buffer so
+    /// [`FlightState::fail_output`] needs no lock a `do_get` may hold.
+    failures: Arc<RwLock<HashMap<String, FailureHandle>>>,
     heartbeat_callback: Option<HeartbeatCallback>,
     task_callback: Option<TaskCallback>,
     task_status_callback: Option<TaskStatusCallback>,
@@ -103,6 +106,7 @@ impl Default for FlightState {
     fn default() -> Self {
         Self {
             buffers: Arc::new(RwLock::new(HashMap::new())),
+            failures: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_callback: None,
             task_callback: None,
             task_status_callback: None,
@@ -161,6 +165,10 @@ impl FlightState {
     /// from `register_buffer`; the broadcast equivalent is
     /// `register_broadcast_buffer`.
     pub fn register_partitioned_buffer(&self, task_id: String, buffer: OutputBuffer) {
+        self.failures
+            .write()
+            .unwrap()
+            .insert(task_id.clone(), buffer.failure_handle());
         self.buffers.write().unwrap().insert(
             task_id,
             BufferKind::Partitioned(Arc::new(tokio::sync::Mutex::new(buffer))),
@@ -172,6 +180,10 @@ impl FlightState {
     /// pumper (which calls `write_batch` + `finish`) and the Flight
     /// `do_get` handler (which calls `subscribe` per consumer).
     pub fn register_broadcast_buffer(&self, task_id: String, buffer: Arc<BroadcastOutputBuffer>) {
+        self.failures
+            .write()
+            .unwrap()
+            .insert(task_id.clone(), buffer.failure_handle());
         self.buffers
             .write()
             .unwrap()
@@ -189,6 +201,22 @@ impl FlightState {
     /// Remove a buffer when task is complete.
     pub fn remove_buffer(&self, task_id: &str) {
         self.buffers.write().unwrap().remove(task_id);
+        self.failures.write().unwrap().remove(task_id);
+    }
+
+    /// Mark task `task_id`'s output failed unless it already is, so its
+    /// consumers end on an error frame instead of a clean EOF. Takes no
+    /// buffer lock, so a cancel can't miss a partitioned buffer a `do_get`
+    /// holds (#156). `false` when no buffer is registered.
+    pub fn fail_output(&self, task_id: &str, failure: impl FnOnce() -> crate::TaskFailure) -> bool {
+        let Some(handle) = self.failures.read().unwrap().get(task_id).cloned() else {
+            return false;
+        };
+        handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(failure);
+        true
     }
 }
 
@@ -204,6 +232,8 @@ impl TrinoFlightService {
         Self { state }
     }
 }
+
+type FailureHandle = Arc<std::sync::Mutex<Option<crate::TaskFailure>>>;
 
 type BoxedStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
@@ -258,6 +288,7 @@ impl FlightService for TrinoFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        let peer = request.remote_addr();
         let ticket = request.into_inner();
         let ticket_str = String::from_utf8(ticket.ticket.to_vec())
             .map_err(|_| Status::invalid_argument("invalid ticket encoding"))?;
@@ -322,7 +353,12 @@ impl FlightService for TrinoFlightService {
                     failure,
                     format!("{task_id}:{partition_id}"),
                 );
-                Ok(Response::new(stream))
+                Ok(Response::new(ServedStream::wrap(
+                    stream,
+                    ticket_str.clone(),
+                    "partitioned",
+                    peer,
+                )))
             }
             Some(BufferKind::Broadcast(buffer)) => {
                 // A2.1.2: each `do_get` subscribes a fresh independent
@@ -335,7 +371,12 @@ impl FlightService for TrinoFlightService {
                 let stream = buffer.subscribe_from_row(from_row);
                 let failure = buffer.failure_handle();
                 let flight_stream = async_stream_broadcast(schema, stream, failure);
-                Ok(Response::new(flight_stream))
+                Ok(Response::new(ServedStream::wrap(
+                    flight_stream,
+                    ticket_str.clone(),
+                    "broadcast",
+                    peer,
+                )))
             }
             None => {
                 if let Some(ref cb) = self.state.task_status_callback {
@@ -498,6 +539,82 @@ impl FlightService for TrinoFlightService {
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<arrow_flight::PollInfo>, Status> {
         Err(Status::unimplemented("poll_flight_info"))
+    }
+}
+
+/// A `do_get` response stream that records how far it got. Dropped before
+/// its end — the connection went away, or the consumer stopped reading —
+/// it counts on `arneb_exchange_streams_dropped_total` and logs one line on
+/// `arneb::exchange`. Read with the consumer's "exchange stream broke"
+/// warning, it tells which side ended a broken stream (#139).
+struct ServedStream {
+    inner: BoxedStream<FlightData>,
+    ticket: String,
+    kind: &'static str,
+    peer: Option<std::net::SocketAddr>,
+    opened: std::time::Instant,
+    messages: u64,
+    bytes: u64,
+    ended: bool,
+}
+
+impl ServedStream {
+    fn wrap(
+        inner: BoxedStream<FlightData>,
+        ticket: String,
+        kind: &'static str,
+        peer: Option<std::net::SocketAddr>,
+    ) -> BoxedStream<FlightData> {
+        Box::pin(Self {
+            inner,
+            ticket,
+            kind,
+            peer,
+            opened: std::time::Instant::now(),
+            messages: 0,
+            bytes: 0,
+            ended: false,
+        })
+    }
+}
+
+impl Stream for ServedStream {
+    type Item = Result<FlightData, Status>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let polled = self.inner.as_mut().poll_next(cx);
+        match &polled {
+            std::task::Poll::Ready(Some(Ok(data))) => {
+                self.messages += 1;
+                self.bytes += (data.data_header.len() + data.data_body.len()) as u64;
+            }
+            // An error frame is the producer's own end of the stream.
+            std::task::Poll::Ready(Some(Err(_)) | None) => self.ended = true,
+            std::task::Poll::Pending => {}
+        }
+        polled
+    }
+}
+
+impl Drop for ServedStream {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        arneb_common::metrics::exchange_stream_dropped_early();
+        tracing::info!(
+            target: "arneb::exchange",
+            ticket = %self.ticket,
+            kind = self.kind,
+            peer = ?self.peer,
+            messages = self.messages,
+            bytes = self.bytes,
+            age_ms = self.opened.elapsed().as_millis() as u64,
+            "exchange response dropped before its end"
+        );
     }
 }
 
@@ -682,6 +799,50 @@ mod tests {
         assert!(accepted.nodelay().unwrap());
     }
 
+    fn served(frames: usize, error_last: bool) -> ServedStream {
+        let mut items: Vec<Result<FlightData, Status>> = (0..frames)
+            .map(|_| {
+                Ok(FlightData {
+                    data_body: vec![0u8; 8].into(),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        if error_last {
+            items.push(Err(Status::internal("producer task failed")));
+        }
+        ServedStream {
+            inner: Box::pin(futures::stream::iter(items)),
+            ticket: "q.t:0".into(),
+            kind: "partitioned",
+            peer: None,
+            opened: std::time::Instant::now(),
+            messages: 0,
+            bytes: 0,
+            ended: false,
+        }
+    }
+
+    /// A response read to its end, or to the producer's error frame, is not
+    /// an early drop; one dropped part-way is, with what it had sent.
+    #[tokio::test]
+    async fn served_stream_tracks_whether_it_reached_its_end() {
+        use futures::StreamExt;
+        let mut full = served(3, false);
+        while full.next().await.is_some() {}
+        assert!(full.ended);
+        assert_eq!((full.messages, full.bytes), (3, 24));
+
+        let mut failed = served(1, true);
+        while failed.next().await.is_some() {}
+        assert!(failed.ended);
+
+        let mut partial = served(3, false);
+        partial.next().await.unwrap().unwrap();
+        assert!(!partial.ended);
+        assert_eq!(partial.messages, 1);
+    }
+
     #[test]
     fn flight_state_register_and_get() {
         let state = FlightState::new();
@@ -690,6 +851,26 @@ mod tests {
         state.register_partitioned_buffer("task-1".into(), buf);
         assert!(state.get_buffer("task-1").is_some());
         assert!(state.get_buffer("task-2").is_none());
+    }
+
+    /// #156: a cancel flags a partitioned buffer even while a `do_get`
+    /// holds its lock, and the first failure recorded wins.
+    #[tokio::test]
+    async fn fail_output_flags_a_locked_partitioned_buffer() {
+        let state = FlightState::new();
+        state.register_partitioned_buffer("q.t".into(), OutputBuffer::single(4, test_schema()));
+        let Some(BufferKind::Partitioned(buf)) = state.get_buffer("q.t") else {
+            panic!("partitioned buffer missing");
+        };
+        let held = buf.lock().await;
+        assert!(state.fail_output("q.t", || "query cancelled".into()));
+        assert!(state.fail_output("q.t", || "later".into()));
+        let failure = held.failure_handle().lock().unwrap().clone().unwrap();
+        assert!(failure.to_status("x").message().contains("query cancelled"));
+        drop(held);
+
+        state.remove_buffer("q.t");
+        assert!(!state.fail_output("q.t", || "gone".into()));
     }
 
     #[test]

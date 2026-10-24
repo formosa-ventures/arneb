@@ -176,6 +176,35 @@ queries running on it fail cleanly and the cluster keeps serving:
 `benchmarks/tpch/scripts/fault_injection.sh` checks all of this on the local
 bench cluster by killing and pausing a worker during SF10 q09.
 
+## Stopping a Worker
+
+Send a worker SIGTERM (or press Ctrl-C) to take it out of the cluster
+without failing queries, as Kubernetes does on a rolling upgrade:
+
+1. The worker logs `worker draining` and tells the coordinator at once. The
+   coordinator schedules no new query on it; the Cluster page shows it as
+   *Draining*, and `GET /api/v1/cluster/workers` reports
+   `state: "draining"`. Queries already running on it keep running.
+2. The worker exits once the coordinator has finished every query it holds,
+   logging `worker drained`, and deregisters (`worker deregistered` on the
+   coordinator). It waits at least one heartbeat interval first, so a query
+   that was being planned when the drain began is covered too.
+3. If queries are still running after `drain_timeout_secs` (default 120 s),
+   it logs `drain timed out` with the number left and exits; those queries
+   fail as for a lost worker. A second SIGTERM or Ctrl-C exits at once.
+
+Give the process manager more time than `drain_timeout_secs` before it
+force-kills the worker. On Kubernetes, set `terminationGracePeriodSeconds`
+above it; the default 30 s is shorter than the default drain timeout.
+
+When a query finishes, the coordinator sends each of its workers
+`release_query`, and they drop the query's tasks and exchange buffers right
+away. That is how a draining worker knows it is idle, and it also frees
+broadcast buffers that used to stay in memory for up to 600 s.
+
+The coordinator and standalone server stop on SIGTERM or Ctrl-C at once;
+they do not drain.
+
 ## How It Works
 
 1. A SQL query arrives at the coordinator via pgwire

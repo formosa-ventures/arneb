@@ -26,6 +26,7 @@ export interface WorkerResponse {
   max_splits: number
   last_heartbeat_secs_ago: number
   version: string
+  state: 'active' | 'draining'
 }
 
 export interface InfoResponse {

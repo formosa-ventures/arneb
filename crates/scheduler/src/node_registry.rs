@@ -20,6 +20,8 @@ pub struct WorkerInfo {
     /// The worker's release version (always the coordinator's own, since
     /// [`NodeRegistry::admit`] refuses any other).
     pub version: String,
+    /// Shutting down: alive for the queries it runs, but not scheduled.
+    pub draining: bool,
 }
 
 /// A worker [`NodeRegistry::lost_worker`] found lost.
@@ -44,6 +46,9 @@ pub struct NodeRegistry {
     version: &'static str,
     /// Last refused version per worker id, so each refusal is logged once.
     rejected: Arc<Mutex<HashMap<String, String>>>,
+    /// Address of each worker that deregistered after a drain, so a query
+    /// it still ran reports why it is gone. Cleared when the id rejoins.
+    departed: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl NodeRegistry {
@@ -54,23 +59,26 @@ impl NodeRegistry {
             heartbeat_timeout_secs,
             version: env!("CARGO_PKG_VERSION"),
             rejected: Arc::new(Mutex::new(HashMap::new())),
+            departed: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Register or update a worker that reported `version`, if it is this
-    /// coordinator's release. Otherwise the worker is removed if registered,
-    /// the refusal is logged once per worker and version, and the returned
-    /// error explains it.
+    /// coordinator's release, recording whether it is `draining`. Otherwise
+    /// the worker is removed if registered, the refusal is logged once per
+    /// worker and version, and the returned error explains it.
     pub fn admit(
         &self,
         worker_id: String,
         address: String,
         max_splits: usize,
         version: &str,
+        draining: bool,
     ) -> Result<(), String> {
         if version == self.version {
             self.rejected.lock().unwrap().remove(&worker_id);
-            self.heartbeat(worker_id, address, max_splits);
+            self.heartbeat(worker_id.clone(), address, max_splits);
+            self.set_draining(&worker_id, draining);
             return Ok(());
         }
         let message = format!(
@@ -93,6 +101,35 @@ impl NodeRegistry {
         Err(message)
     }
 
+    /// Mark a registered worker draining (or active again), logging the change.
+    fn set_draining(&self, worker_id: &str, draining: bool) {
+        let mut workers = self.workers.write().unwrap();
+        let Some(worker) = workers.get_mut(worker_id) else {
+            return;
+        };
+        if worker.draining != draining {
+            tracing::info!(
+                target: "arneb::cluster",
+                worker_id = %worker_id,
+                draining,
+                "{}",
+                if draining { "worker draining" } else { "worker active again" }
+            );
+        }
+        worker.draining = draining;
+    }
+
+    /// A drained worker said it is exiting: forget it.
+    pub fn deregister(&self, worker_id: &str) {
+        if let Some(worker) = self.workers.write().unwrap().remove(worker_id) {
+            tracing::info!(target: "arneb::cluster", worker_id = %worker_id, "worker deregistered");
+            self.departed
+                .lock()
+                .unwrap()
+                .insert(worker.worker_id, worker.address);
+        }
+    }
+
     /// Record that `worker_id` was refused on `version`; true unless it was
     /// already refused on that same version.
     fn first_rejection(&self, worker_id: &str, version: &str) -> bool {
@@ -107,6 +144,7 @@ impl NodeRegistry {
     /// Register or update a worker's heartbeat, taking it to run this
     /// coordinator's release (see [`NodeRegistry::admit`]).
     pub fn heartbeat(&self, worker_id: String, address: String, max_splits: usize) {
+        self.departed.lock().unwrap().remove(&worker_id);
         let mut workers = self.workers.write().unwrap();
         let entry = workers.entry(worker_id.clone()).or_insert_with(|| {
             tracing::info!(worker_id = %worker_id, address = %address, "new worker registered");
@@ -117,6 +155,7 @@ impl NodeRegistry {
                 max_splits,
                 alive: true,
                 version: self.version.to_string(),
+                draining: false,
             }
         });
         if !entry.alive {
@@ -147,10 +186,15 @@ impl NodeRegistry {
         let mut workers = self.workers.write().unwrap();
         for id in worker_ids {
             let Some(worker) = workers.get_mut(id) else {
+                let departed = self.departed.lock().unwrap().get(id).cloned();
+                let (address, reason) = match departed {
+                    Some(address) => (address, "left the cluster when its drain ended"),
+                    None => (String::new(), "no longer registered"),
+                };
                 return Some(LostWorker {
                     worker_id: id.clone(),
-                    address: String::new(),
-                    reason: "no longer registered".to_string(),
+                    address,
+                    reason: reason.to_string(),
                 });
             };
             expire(worker, now, timeout);
@@ -191,11 +235,22 @@ impl NodeRegistry {
         was_alive
     }
 
-    /// Returns all alive workers.
+    /// Returns all alive workers, draining ones included.
     pub fn alive_workers(&self) -> Vec<WorkerInfo> {
         let mut workers = self.workers.write().unwrap();
         self.expire_silent(&mut workers);
         workers.values().filter(|w| w.alive).cloned().collect()
+    }
+
+    /// Alive workers that take new queries (not draining).
+    pub fn active_workers(&self) -> Vec<WorkerInfo> {
+        let mut workers = self.workers.write().unwrap();
+        self.expire_silent(&mut workers);
+        workers
+            .values()
+            .filter(|w| w.alive && !w.draining)
+            .cloned()
+            .collect()
     }
 
     /// Mark every worker silent past the heartbeat timeout as dead.
@@ -285,7 +340,7 @@ mod tests {
         let registry = NodeRegistry::new(30);
         let own = env!("CARGO_PKG_VERSION");
         registry
-            .admit("w1".into(), "host1:9090".into(), 256, own)
+            .admit("w1".into(), "host1:9090".into(), 256, own, false)
             .unwrap();
         let alive = registry.alive_workers();
         assert_eq!(alive.len(), 1);
@@ -297,7 +352,7 @@ mod tests {
         let registry = NodeRegistry::new(30);
         registry.heartbeat("w1".into(), "host1:9090".into(), 256);
         let err = registry
-            .admit("w1".into(), "host1:9090".into(), 256, "9.9.9")
+            .admit("w1".into(), "host1:9090".into(), 256, "9.9.9", false)
             .unwrap_err();
         assert!(err.contains("9.9.9"), "{err}");
         assert!(err.contains(env!("CARGO_PKG_VERSION")), "{err}");
@@ -315,9 +370,50 @@ mod tests {
         // Admitting the worker clears its record, so a later refusal logs again.
         let own = env!("CARGO_PKG_VERSION");
         registry
-            .admit("w1".into(), "host1:9090".into(), 256, own)
+            .admit("w1".into(), "host1:9090".into(), 256, own, false)
             .unwrap();
         assert!(registry.first_rejection("w1", "9.9.9"));
+    }
+
+    #[test]
+    fn a_draining_worker_is_alive_but_not_active_until_it_says_otherwise() {
+        let registry = NodeRegistry::new(30);
+        let own = env!("CARGO_PKG_VERSION");
+        registry.heartbeat("w1".into(), "host1:9090".into(), 256);
+        registry
+            .admit("w2".into(), "host2:9090".into(), 256, own, true)
+            .unwrap();
+        let mut active: Vec<_> = registry
+            .active_workers()
+            .into_iter()
+            .map(|w| w.worker_id)
+            .collect();
+        active.sort();
+        assert_eq!(active, vec!["w1"]);
+        assert_eq!(registry.alive_count(), 2);
+        assert_eq!(registry.lost_worker(&["w2".into()]), None);
+
+        registry
+            .admit("w2".into(), "host2:9090".into(), 256, own, false)
+            .unwrap();
+        assert_eq!(registry.active_workers().len(), 2);
+    }
+
+    #[test]
+    fn deregister_forgets_the_worker() {
+        let registry = NodeRegistry::new(30);
+        registry.heartbeat("w1".into(), "host1:9090".into(), 256);
+        registry.deregister("w1");
+        registry.deregister("w1");
+        assert_eq!(registry.total_count(), 0);
+        let lost = registry.lost_worker(&["w1".into()]).unwrap();
+        assert_eq!(lost.address, "host1:9090");
+        assert_eq!(lost.reason, "left the cluster when its drain ended");
+
+        registry.heartbeat("w1".into(), "host1:9090".into(), 256);
+        registry.remove_worker("w1");
+        let lost = registry.lost_worker(&["w1".into()]).unwrap();
+        assert_eq!(lost.reason, "no longer registered");
     }
 
     #[test]

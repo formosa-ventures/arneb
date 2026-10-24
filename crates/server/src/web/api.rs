@@ -86,6 +86,8 @@ struct WorkerResponse {
     max_splits: usize,
     last_heartbeat_secs_ago: u64,
     version: String,
+    /// `active` or `draining`.
+    state: &'static str,
 }
 
 /// JSON response for server info.
@@ -196,6 +198,7 @@ async fn list_workers(State(state): State<WebState>) -> Json<Vec<WorkerResponse>
             max_splits: w.max_splits,
             last_heartbeat_secs_ago: w.last_heartbeat.elapsed().as_secs(),
             version: w.version,
+            state: if w.draining { "draining" } else { "active" },
         })
         .collect();
     Json(workers)

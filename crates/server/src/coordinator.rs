@@ -1292,6 +1292,7 @@ mod tests {
             last_heartbeat: std::time::Instant::now(),
             max_splits: 256,
             alive: true,
+            version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 

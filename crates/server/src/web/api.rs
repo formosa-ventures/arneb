@@ -85,6 +85,7 @@ struct WorkerResponse {
     alive: bool,
     max_splits: usize,
     last_heartbeat_secs_ago: u64,
+    version: String,
 }
 
 /// JSON response for server info.
@@ -194,6 +195,7 @@ async fn list_workers(State(state): State<WebState>) -> Json<Vec<WorkerResponse>
             alive: w.alive,
             max_splits: w.max_splits,
             last_heartbeat_secs_ago: w.last_heartbeat.elapsed().as_secs(),
+            version: w.version,
         })
         .collect();
     Json(workers)

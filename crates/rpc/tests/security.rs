@@ -55,11 +55,7 @@ async fn start(state: FlightState, security: ClusterSecurity) -> String {
 }
 
 fn heartbeat() -> HeartbeatMessage {
-    HeartbeatMessage {
-        worker_id: "w1".into(),
-        flight_address: "http://localhost:1".into(),
-        max_splits: 8,
-    }
+    HeartbeatMessage::new("w1".into(), "http://localhost:1".into(), 8)
 }
 
 fn descriptor() -> TaskDescriptor {
@@ -89,6 +85,7 @@ async fn recording_state() -> (FlightState, Arc<Mutex<usize>>, Arc<Mutex<usize>>
     let b = beats.clone();
     let mut state = FlightState::with_heartbeat_callback(Arc::new(move |_| {
         *b.lock().unwrap() += 1;
+        Ok(())
     }));
     let t = tasks.clone();
     state.set_task_callback(Arc::new(move |_| {

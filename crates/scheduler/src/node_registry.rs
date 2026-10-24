@@ -1,7 +1,7 @@
 //! Node registry: tracks known workers in the cluster.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 /// Information about a registered worker node.
@@ -17,6 +17,9 @@ pub struct WorkerInfo {
     pub max_splits: usize,
     /// Whether the worker is considered alive.
     pub alive: bool,
+    /// The worker's release version (always the coordinator's own, since
+    /// [`NodeRegistry::admit`] refuses any other).
+    pub version: String,
 }
 
 /// A worker [`NodeRegistry::lost_worker`] found lost.
@@ -37,6 +40,10 @@ pub struct NodeRegistry {
     /// Heartbeat timeout in seconds. Workers not heard from within this
     /// duration are considered dead.
     heartbeat_timeout_secs: u64,
+    /// The release this coordinator runs; only workers on it are admitted.
+    version: &'static str,
+    /// Last refused version per worker id, so each refusal is logged once.
+    rejected: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl NodeRegistry {
@@ -45,10 +52,60 @@ impl NodeRegistry {
         Self {
             workers: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_timeout_secs,
+            version: env!("CARGO_PKG_VERSION"),
+            rejected: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Register or update a worker's heartbeat.
+    /// Register or update a worker that reported `version`, if it is this
+    /// coordinator's release. Otherwise the worker is removed if registered,
+    /// the refusal is logged once per worker and version, and the returned
+    /// error explains it.
+    pub fn admit(
+        &self,
+        worker_id: String,
+        address: String,
+        max_splits: usize,
+        version: &str,
+    ) -> Result<(), String> {
+        if version == self.version {
+            self.rejected.lock().unwrap().remove(&worker_id);
+            self.heartbeat(worker_id, address, max_splits);
+            return Ok(());
+        }
+        let message = format!(
+            "worker '{worker_id}' runs arneb {version} but the coordinator runs {}; \
+             every node must run the same release",
+            self.version
+        );
+        let removed = self.workers.write().unwrap().remove(&worker_id).is_some();
+        if self.first_rejection(&worker_id, version) {
+            tracing::warn!(
+                target: "arneb::cluster",
+                worker_id = %worker_id,
+                address = %address,
+                version,
+                coordinator_version = self.version,
+                removed,
+                "worker rejected: version mismatch"
+            );
+        }
+        Err(message)
+    }
+
+    /// Record that `worker_id` was refused on `version`; true unless it was
+    /// already refused on that same version.
+    fn first_rejection(&self, worker_id: &str, version: &str) -> bool {
+        let previous = self
+            .rejected
+            .lock()
+            .unwrap()
+            .insert(worker_id.to_owned(), version.to_owned());
+        previous.as_deref() != Some(version)
+    }
+
+    /// Register or update a worker's heartbeat, taking it to run this
+    /// coordinator's release (see [`NodeRegistry::admit`]).
     pub fn heartbeat(&self, worker_id: String, address: String, max_splits: usize) {
         let mut workers = self.workers.write().unwrap();
         let entry = workers.entry(worker_id.clone()).or_insert_with(|| {
@@ -59,6 +116,7 @@ impl NodeRegistry {
                 last_heartbeat: Instant::now(),
                 max_splits,
                 alive: true,
+                version: self.version.to_string(),
             }
         });
         if !entry.alive {
@@ -220,6 +278,46 @@ mod tests {
         assert_eq!(alive.len(), 1);
         assert_eq!(alive[0].address, "host1:9091");
         assert_eq!(alive[0].max_splits, 512);
+    }
+
+    #[test]
+    fn admit_registers_a_worker_of_this_release() {
+        let registry = NodeRegistry::new(30);
+        let own = env!("CARGO_PKG_VERSION");
+        registry
+            .admit("w1".into(), "host1:9090".into(), 256, own)
+            .unwrap();
+        let alive = registry.alive_workers();
+        assert_eq!(alive.len(), 1);
+        assert_eq!(alive[0].version, own);
+    }
+
+    #[test]
+    fn admit_refuses_another_release_and_drops_a_registered_worker() {
+        let registry = NodeRegistry::new(30);
+        registry.heartbeat("w1".into(), "host1:9090".into(), 256);
+        let err = registry
+            .admit("w1".into(), "host1:9090".into(), 256, "9.9.9")
+            .unwrap_err();
+        assert!(err.contains("9.9.9"), "{err}");
+        assert!(err.contains(env!("CARGO_PKG_VERSION")), "{err}");
+        assert_eq!(registry.total_count(), 0);
+        assert!(registry.alive_workers().is_empty());
+    }
+
+    #[test]
+    fn a_rejection_is_new_only_when_the_version_changes() {
+        let registry = NodeRegistry::new(30);
+        assert!(registry.first_rejection("w1", "9.9.8"));
+        assert!(!registry.first_rejection("w1", "9.9.8"));
+        assert!(registry.first_rejection("w1", "9.9.9"));
+        assert!(registry.first_rejection("w2", "9.9.9"));
+        // Admitting the worker clears its record, so a later refusal logs again.
+        let own = env!("CARGO_PKG_VERSION");
+        registry
+            .admit("w1".into(), "host1:9090".into(), 256, own)
+            .unwrap();
+        assert!(registry.first_rejection("w1", "9.9.9"));
     }
 
     #[test]

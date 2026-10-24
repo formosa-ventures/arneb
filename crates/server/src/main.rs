@@ -488,7 +488,12 @@ async fn run() -> Result<()> {
             let registry = node_registry.clone();
             let mut state = arneb_rpc::FlightState::with_heartbeat_callback(std::sync::Arc::new(
                 move |msg: arneb_rpc::HeartbeatMessage| {
-                    registry.heartbeat(msg.worker_id, msg.flight_address, msg.max_splits);
+                    registry.admit(
+                        msg.worker_id,
+                        msg.flight_address,
+                        msg.max_splits,
+                        &msg.version,
+                    )
                 },
             ));
             // A1.3: route worker DF reports into the per-query
@@ -1048,11 +1053,8 @@ async fn worker_heartbeat_loop(
         .advertised_address
         .clone()
         .unwrap_or_else(|| my_rpc_addr.to_string());
-    let message = arneb_rpc::HeartbeatMessage {
-        worker_id: worker_id.clone(),
-        flight_address: format!("http://{advertised}"),
-        max_splits: 256,
-    };
+    let message =
+        arneb_rpc::HeartbeatMessage::new(worker_id.clone(), format!("http://{advertised}"), 256);
 
     tracing::info!(
         worker_id = %worker_id,
@@ -1071,9 +1073,13 @@ async fn worker_heartbeat_loop(
             Ok(()) => {
                 tracing::debug!(worker_id = %worker_id, "heartbeat sent");
             }
-            Err(e @ arneb_rpc::HeartbeatError::Unauthenticated(_)) => {
-                // Keep retrying: fixing the secret and restarting the
-                // coordinator recovers without restarting workers.
+            Err(
+                e @ (arneb_rpc::HeartbeatError::Unauthenticated(_)
+                | arneb_rpc::HeartbeatError::Incompatible(..)),
+            ) => {
+                // Keep retrying: fixing the secret, or replacing the
+                // coordinator with this worker's release, recovers without
+                // restarting workers.
                 tracing::error!(
                     target: "arneb::cluster",
                     worker_id = %worker_id,

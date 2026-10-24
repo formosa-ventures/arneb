@@ -86,6 +86,23 @@ worker_id = "worker-2"
 
 Workers register with the coordinator automatically via a heartbeat protocol on startup.
 
+### Versions
+
+Every node in a cluster must run the same Arneb release. Each heartbeat
+carries the worker's version, and the coordinator refuses a worker on any
+other release, so no query is ever scheduled on it. The coordinator logs
+`worker rejected: version mismatch` once per worker and version, and the
+worker logs `heartbeat rejected` with both versions at error level on every
+attempt. A refused worker keeps retrying, so replacing the coordinator with
+the worker's release lets it join without a restart. The Cluster page and
+`GET /api/v1/cluster/workers` show each worker's version.
+
+During an upgrade, workers still on the old release drop out of the cluster
+as soon as the new coordinator starts, and rejoin as they are replaced.
+Releases before 0.1.6 have no version in their heartbeat and cannot talk to
+0.1.6 or later in either direction, so upgrade the coordinator and every
+worker together when moving from 0.1.5.
+
 ## Securing the Cluster
 
 Out of the box, the Flight RPC port trusts every peer, and the client-facing

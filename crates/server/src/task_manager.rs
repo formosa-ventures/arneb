@@ -356,17 +356,38 @@ impl TaskManager {
     /// [`QueryTasks::cancelled`]). Idempotent; returns the number of tasks
     /// cancelled.
     pub fn cancel_query(&self, query_id: QueryId) -> usize {
+        self.end_query(query_id, false)
+    }
+
+    /// The coordinator collected `query_id`'s result: tear its tasks down
+    /// as [`TaskManager::cancel_query`] does, without logging a cancel.
+    /// Nothing reads them any more (a producer under a satisfied `LIMIT`
+    /// may still be running). Idempotent; returns the number of tasks.
+    pub fn release_query(&self, query_id: QueryId) -> usize {
+        self.end_query(query_id, true)
+    }
+
+    /// Queries with a task on this node that the coordinator has not
+    /// released or cancelled yet (or whose cleanup poll has not run).
+    pub fn active_queries(&self) -> usize {
+        let tasks = self.query_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.running.len()
+    }
+
+    fn end_query(&self, query_id: QueryId, released: bool) -> usize {
         let entry = {
             let mut tasks = self.query_tasks.lock().unwrap_or_else(|e| e.into_inner());
             tasks.tombstone(query_id, std::time::Instant::now());
             tasks.running.remove(&query_id)
         };
         let Some(entry) = entry else {
-            tracing::debug!(
-                target: "arneb::cluster",
-                query_id = %query_id,
-                "query cancelled on worker before any of its tasks arrived"
-            );
+            if !released {
+                tracing::debug!(
+                    target: "arneb::cluster",
+                    query_id = %query_id,
+                    "query cancelled on worker before any of its tasks arrived"
+                );
+            }
             return 0;
         };
         let cancelled = entry.len();
@@ -384,12 +405,21 @@ impl TaskManager {
         if let Ok(mut collectors) = self.df_collectors.write() {
             collectors.retain(|(q, _), _| *q != query_id);
         }
-        tracing::info!(
-            target: "arneb::cluster",
-            query_id = %query_id,
-            tasks = cancelled,
-            "query cancelled on worker"
-        );
+        if released {
+            tracing::debug!(
+                target: "arneb::cluster",
+                query_id = %query_id,
+                tasks = cancelled,
+                "query released on worker"
+            );
+        } else {
+            tracing::info!(
+                target: "arneb::cluster",
+                query_id = %query_id,
+                tasks = cancelled,
+                "query cancelled on worker"
+            );
+        }
         cancelled
     }
 
@@ -1322,6 +1352,33 @@ mod tests {
         drop(r2);
         assert_eq!(node.reserved(), 0);
         assert_eq!(tm.live_query_pools(), 0);
+    }
+
+    /// worker-graceful-drain: `release_query` tears a finished query down
+    /// like a cancel, and `active_queries` counts what is left.
+    #[tokio::test]
+    async fn release_query_drops_the_query_and_active_queries_counts_the_rest() {
+        use arneb_execution::memory_pool::UnboundedMemoryPool;
+        let tm = manager_with_limit(Arc::new(UnboundedMemoryPool::new()), None);
+        let (q, other) = (QueryId::new(), QueryId::new());
+        let sleeper = || tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(600)));
+        let (body, survivor) = (sleeper(), sleeper());
+        let key = format!("{q}.1.0");
+        tm.flight_state.register_broadcast_buffer(
+            key.clone(),
+            Arc::new(arneb_rpc::BroadcastOutputBuffer::new(schema())),
+        );
+        tm.track(q, &key, body.abort_handle());
+        tm.track(other, &format!("{other}.1.0"), survivor.abort_handle());
+        assert_eq!(tm.active_queries(), 2);
+
+        assert_eq!(tm.release_query(q), 1);
+        assert!(body.await.unwrap_err().is_cancelled());
+        assert!(tm.flight_state.get_buffer(&key).is_none());
+        assert_eq!(tm.active_queries(), 1);
+        assert_eq!(tm.release_query(q), 0);
+        assert_eq!(tm.release_query(other), 1);
+        assert_eq!(tm.active_queries(), 0);
     }
 
     /// admission-control D4: `cancel_query` aborts every tracked task body

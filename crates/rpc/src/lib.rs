@@ -28,11 +28,12 @@ pub use dynamic_filter::{NotifyDynamicFilterRequest, ReportDynamicFilterRequest}
 pub use exchange_client::ExchangeClient;
 pub use flight_service::{
     serve_flight, start_flight_server, BufferKind, CancelQueryCallback, DfNotifyCallback,
-    DfReportCallback, FlightState, HeartbeatCallback, TaskCallback, TaskStatusCallback,
-    TaskStatusResponse,
+    DfReportCallback, FlightState, HeartbeatCallback, ReleaseQueryCallback, TaskCallback,
+    TaskStatusCallback, TaskStatusResponse,
 };
 pub use heartbeat::{
-    send_heartbeat, send_heartbeat_with, HeartbeatError, HeartbeatMessage, LEGACY_VERSION, VERSION,
+    send_heartbeat, send_heartbeat_with, HeartbeatError, HeartbeatMessage, WorkerState,
+    LEGACY_VERSION, VERSION,
 };
 pub use output_buffer::{
     BroadcastOutputBuffer, BroadcastStream, OutputBuffer, TrackedReceiver, TrackedSendOutcome,
@@ -45,8 +46,8 @@ pub use security::{
 pub use task_descriptor::{SourceExchange, TaskDescriptor};
 pub use task_error::TaskFailure;
 pub use task_submission::{
-    cancel_query, cancel_query_with, notify_dynamic_filter, report_dynamic_filters, submit_task,
-    submit_task_with,
+    cancel_query, cancel_query_with, notify_dynamic_filter, release_query, report_dynamic_filters,
+    submit_task, submit_task_with,
 };
 
 /// Test helper: create a FlightServiceServer for integration tests.

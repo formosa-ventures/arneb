@@ -117,6 +117,11 @@ export function Cluster() {
                       )}
                     />
                     <CardTitle className="text-sm font-medium">{w.worker_id}</CardTitle>
+                    {w.state === 'draining' && (
+                      <Badge variant="outline" className="ml-auto">
+                        Draining
+                      </Badge>
+                    )}
                   </CardHeader>
                   <CardContent className="space-y-1 text-sm">
                     <div className="flex items-center gap-2 text-muted-foreground">

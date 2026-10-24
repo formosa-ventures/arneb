@@ -41,3 +41,40 @@ async fn cancel_query_without_a_callback_is_acked() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     cancel_query(&addr, QueryId::new()).await.unwrap();
 }
+
+/// worker-graceful-drain: `release_query` reaches its own callback, not
+/// the cancel one, and an unset callback is still acknowledged.
+#[tokio::test]
+async fn release_query_reaches_the_release_callback_only() {
+    let released = Arc::new(Mutex::new(Vec::new()));
+    let cancelled = Arc::new(Mutex::new(Vec::new()));
+    let mut state = FlightState::new();
+    let r = released.clone();
+    state.set_release_query_callback(Arc::new(move |q| {
+        r.lock().unwrap().push(q);
+        1
+    }));
+    let c = cancelled.clone();
+    state.set_cancel_query_callback(Arc::new(move |q| {
+        c.lock().unwrap().push(q);
+        1
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(arneb_rpc::__serve_flight_for_test(listener, state));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let q = QueryId::new();
+    arneb_rpc::release_query(&addr, q).await.unwrap();
+    assert_eq!(*released.lock().unwrap(), vec![q]);
+    assert!(cancelled.lock().unwrap().is_empty());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bare = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(arneb_rpc::__serve_flight_for_test(
+        listener,
+        FlightState::new(),
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    arneb_rpc::release_query(&bare, q).await.unwrap();
+}

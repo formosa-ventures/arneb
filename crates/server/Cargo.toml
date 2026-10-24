@@ -35,7 +35,7 @@ async-trait.workspace = true
 async-recursion = { workspace = true }
 
 # Async runtime
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "signal", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "signal", "sync", "time"] }
 futures.workspace = true
 uuid.workspace = true
 
@@ -81,7 +81,7 @@ parquet = { workspace = true, features = ["arrow"] }
 object_store.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time", "signal", "test-util"] }
 pgwire = { workspace = true }
 arrow = { workspace = true }
 tempfile = "3"

@@ -27,6 +27,22 @@ pub struct HeartbeatMessage {
     pub max_splits: usize,
     /// The worker's release version; the coordinator admits only its own.
     pub version: String,
+    /// Whether the worker takes new queries.
+    #[serde(default)]
+    pub state: WorkerState,
+}
+
+/// A worker's lifecycle state, as its heartbeat reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerState {
+    /// Takes new queries.
+    #[default]
+    Active,
+    /// Shutting down: finishes its queries but takes no new ones.
+    Draining,
+    /// Drained and exiting; the coordinator forgets it.
+    Stopped,
 }
 
 /// The version a legacy (pre-handshake) heartbeat decodes to. It matches no
@@ -41,6 +57,7 @@ impl HeartbeatMessage {
             flight_address,
             max_splits,
             version: VERSION.to_string(),
+            state: WorkerState::Active,
         }
     }
 
@@ -65,6 +82,7 @@ impl HeartbeatMessage {
                 flight_address: flight_address.to_string(),
                 max_splits: max_splits.parse().map_err(|_| invalid())?,
                 version: LEGACY_VERSION.to_string(),
+                state: WorkerState::Active,
             }),
             _ => Err(invalid()),
         }
@@ -146,6 +164,19 @@ mod tests {
         assert_eq!(msg.version, VERSION);
         let decoded = HeartbeatMessage::decode(&msg.encode()).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn state_round_trips_and_defaults_to_active() {
+        let mut msg = HeartbeatMessage::new("w1".into(), "http://localhost:9090".into(), 8);
+        msg.state = WorkerState::Draining;
+        let json = String::from_utf8(msg.encode()).unwrap();
+        assert!(json.contains("\"state\":\"draining\""), "{json}");
+        assert_eq!(HeartbeatMessage::decode(json.as_bytes()).unwrap(), msg);
+
+        let without = r#"{"worker_id":"w1","flight_address":"a","max_splits":8,"version":"x"}"#;
+        let decoded = HeartbeatMessage::decode(without.as_bytes()).unwrap();
+        assert_eq!(decoded.state, WorkerState::Active);
     }
 
     #[test]

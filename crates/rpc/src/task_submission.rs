@@ -115,15 +115,39 @@ pub async fn cancel_query_with(
     query_id: arneb_common::QueryId,
     security: &ClusterSecurity,
 ) -> Result<(), String> {
+    query_action(worker_address, "cancel_query", query_id, security).await
+}
+
+/// Coord → worker: `query_id` finished, so drop its tasks and buffers on
+/// that worker. Idempotent; an unknown query is a no-op ack.
+pub async fn release_query(
+    worker_address: &str,
+    query_id: arneb_common::QueryId,
+) -> Result<(), String> {
+    query_action(
+        worker_address,
+        "release_query",
+        query_id,
+        cluster_security(),
+    )
+    .await
+}
+
+async fn query_action(
+    worker_address: &str,
+    kind: &str,
+    query_id: arneb_common::QueryId,
+    security: &ClusterSecurity,
+) -> Result<(), String> {
     let mut client = connect(worker_address, security).await?;
     let action = Action {
-        r#type: "cancel_query".to_string(),
+        r#type: kind.to_string(),
         body: query_id.0.to_string().into_bytes().into(),
     };
     let stream = client
         .do_action(action)
         .await
-        .map_err(|e| format!("cancel_query RPC failed: {e}"))?
+        .map_err(|e| format!("{kind} RPC failed: {e}"))?
         .into_inner();
-    drain_ack(stream, "cancel_query").await
+    drain_ack(stream, kind).await
 }

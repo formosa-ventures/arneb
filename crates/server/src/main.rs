@@ -86,6 +86,7 @@ fn configure_jemalloc_decay() {}
 
 mod config;
 pub mod coordinator;
+mod drain;
 pub mod dynamic_filter;
 mod fragment_pruning;
 pub mod memory_probe;
@@ -428,17 +429,28 @@ async fn run() -> Result<()> {
         .cluster
         .heartbeat(|k| std::env::var(k).ok())
         .context("invalid [cluster] heartbeat configuration")?;
+    let drain_timeout_secs = config
+        .cluster
+        .drain_timeout_secs(|k| std::env::var(k).ok())
+        .context("invalid [cluster] drain_timeout_secs")?;
     match role {
         ServerRole::Coordinator => tracing::info!(
             target: "arneb::config",
             heartbeat_timeout_secs = heartbeat.timeout_secs,
             "worker heartbeat timeout effective value ([cluster] heartbeat_timeout_secs / ARNEB_HEARTBEAT_TIMEOUT_SECS)"
         ),
-        ServerRole::Worker => tracing::info!(
-            target: "arneb::config",
-            heartbeat_interval_secs = heartbeat.interval_secs,
-            "heartbeat interval effective value ([cluster] heartbeat_interval_secs / ARNEB_HEARTBEAT_INTERVAL_SECS)"
-        ),
+        ServerRole::Worker => {
+            tracing::info!(
+                target: "arneb::config",
+                heartbeat_interval_secs = heartbeat.interval_secs,
+                "heartbeat interval effective value ([cluster] heartbeat_interval_secs / ARNEB_HEARTBEAT_INTERVAL_SECS)"
+            );
+            tracing::info!(
+                target: "arneb::config",
+                drain_timeout_secs,
+                "drain timeout effective value ([cluster] drain_timeout_secs / ARNEB_DRAIN_TIMEOUT_SECS)"
+            );
+        }
         ServerRole::Standalone => {}
     }
     let node_registry = arneb_scheduler::NodeRegistry::new(heartbeat.timeout_secs);
@@ -488,11 +500,16 @@ async fn run() -> Result<()> {
             let registry = node_registry.clone();
             let mut state = arneb_rpc::FlightState::with_heartbeat_callback(std::sync::Arc::new(
                 move |msg: arneb_rpc::HeartbeatMessage| {
+                    if msg.state == arneb_rpc::WorkerState::Stopped {
+                        registry.deregister(&msg.worker_id);
+                        return Ok(());
+                    }
                     registry.admit(
                         msg.worker_id,
                         msg.flight_address,
                         msg.max_splits,
                         &msg.version,
+                        msg.state == arneb_rpc::WorkerState::Draining,
                     )
                 },
             ));
@@ -612,6 +629,7 @@ async fn run() -> Result<()> {
         _ => None,
     };
 
+    let mut worker_tasks: Option<task_manager::TaskManager> = None;
     if matches!(role, ServerRole::Worker) {
         // Phase A (2026-05-23): the count-based `[memory]
         // task_concurrency` field is deprecated. The semaphore it
@@ -682,6 +700,13 @@ async fn run() -> Result<()> {
         flight_state.set_cancel_query_callback(Arc::new(move |query_id| {
             tm_for_cancel.cancel_query(query_id)
         }));
+        // worker-graceful-drain: a finished query is released at once
+        // instead of waiting for the per-task cleanup polls.
+        let tm_for_release = tm.clone();
+        flight_state.set_release_query_callback(Arc::new(move |query_id| {
+            tm_for_release.release_query(query_id)
+        }));
+        worker_tasks = Some(tm.clone());
         // A1.3 (2026-05-27): route coord-pushed Domains into the
         // per-task `DynamicFilterCollector` (populated at handle_task
         // time). Sync callback wraps an async spawn — the notify
@@ -939,6 +964,13 @@ async fn run() -> Result<()> {
     }
 
     // 11. Run services based on role
+    let heartbeat_target = match role {
+        ServerRole::Worker => HeartbeatTarget::from_config(&config, &rpc_addr),
+        _ => None,
+    };
+    let (worker_state, worker_state_rx) =
+        tokio::sync::watch::channel(arneb_rpc::WorkerState::Active);
+    let stopped_sent = tokio::sync::Notify::new();
     let flight_state_clone = flight_state.clone();
     let rpc_addr_clone = rpc_addr.clone();
 
@@ -993,11 +1025,21 @@ async fn run() -> Result<()> {
         ) => {}
 
         // Worker heartbeat loop
-        _ = worker_heartbeat_loop(role, &config, &rpc_addr, heartbeat.interval_secs) => {}
-        // Graceful shutdown
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutting down");
-        }
+        _ = worker_heartbeat_loop(
+            heartbeat_target.as_ref(),
+            role,
+            worker_state_rx,
+            &stopped_sent,
+            heartbeat.interval_secs,
+        ) => {}
+        // SIGTERM / Ctrl-C; a worker drains first (worker-graceful-drain).
+        _ = run_until_shutdown(
+            heartbeat_target.as_ref().zip(worker_tasks.as_ref()),
+            &worker_state,
+            &stopped_sent,
+            heartbeat.interval_secs,
+            drain_timeout_secs,
+        ) => {}
     }
 
     Ok(())
@@ -1016,62 +1058,59 @@ where
     futures::future::pending::<()>().await
 }
 
-/// Periodically send heartbeat to coordinator (worker mode only).
-async fn worker_heartbeat_loop(
-    role: ServerRole,
-    config: &AppConfig,
-    my_rpc_addr: &str,
-    interval_secs: u64,
-) {
-    if !matches!(role, ServerRole::Worker) {
-        // Non-workers just wait forever (this future is never selected).
-        futures::future::pending::<()>().await;
-        return;
+/// Where and as whom a worker heartbeats.
+struct HeartbeatTarget {
+    coordinator_address: String,
+    message: arneb_rpc::HeartbeatMessage,
+}
+
+impl HeartbeatTarget {
+    /// The worker's heartbeat target, or `None` (logged) without
+    /// `[cluster] coordinator_address`.
+    fn from_config(config: &AppConfig, my_rpc_addr: &str) -> Option<Self> {
+        let Some(addr) = &config.cluster.coordinator_address else {
+            tracing::error!("worker mode requires --coordinator-address");
+            return None;
+        };
+        let worker_id = config
+            .cluster
+            .worker_id
+            .clone()
+            .unwrap_or_else(|| format!("worker-{}", uuid::Uuid::new_v4()));
+        // Workers advertise a routable hostname:port to the coordinator
+        // for inbound task RPCs. `bind_address` of "0.0.0.0" means listen
+        // on all interfaces — useless to send back as a destination. Use
+        // `advertised_address` if set (docker compose / k8s case), else
+        // fall back to `bind_address:rpc_port` for same-host setups.
+        let advertised = config
+            .cluster
+            .advertised_address
+            .clone()
+            .unwrap_or_else(|| my_rpc_addr.to_string());
+        Some(Self {
+            coordinator_address: format!("http://{addr}"),
+            message: arneb_rpc::HeartbeatMessage::new(
+                worker_id,
+                format!("http://{advertised}"),
+                256,
+            ),
+        })
     }
 
-    let coordinator_address = match &config.cluster.coordinator_address {
-        Some(addr) => format!("http://{addr}"),
-        None => {
-            tracing::error!("worker mode requires --coordinator-address");
-            return;
-        }
-    };
-
-    let worker_id = config
-        .cluster
-        .worker_id
-        .clone()
-        .unwrap_or_else(|| format!("worker-{}", uuid::Uuid::new_v4()));
-
-    // Workers advertise a routable hostname:port to the coordinator
-    // for inbound task RPCs. `bind_address` of "0.0.0.0" means listen
-    // on all interfaces — useless to send back as a destination. Use
-    // `advertised_address` if set (docker compose / k8s case), else
-    // fall back to `bind_address:rpc_port` for same-host setups.
-    let advertised = config
-        .cluster
-        .advertised_address
-        .clone()
-        .unwrap_or_else(|| my_rpc_addr.to_string());
-    let message =
-        arneb_rpc::HeartbeatMessage::new(worker_id.clone(), format!("http://{advertised}"), 256);
-
-    tracing::info!(
-        worker_id = %worker_id,
-        coordinator = %coordinator_address,
-        "starting heartbeat loop"
-    );
-
-    loop {
+    /// Send one heartbeat reporting `state`, logging a failure.
+    async fn send(&self, state: arneb_rpc::WorkerState) {
+        let mut message = self.message.clone();
+        message.state = state;
+        let worker_id = &message.worker_id;
         match arneb_rpc::send_heartbeat_with(
-            &coordinator_address,
+            &self.coordinator_address,
             &message,
             arneb_rpc::cluster_security(),
         )
         .await
         {
             Ok(()) => {
-                tracing::debug!(worker_id = %worker_id, "heartbeat sent");
+                tracing::debug!(worker_id = %worker_id, ?state, "heartbeat sent");
             }
             Err(
                 e @ (arneb_rpc::HeartbeatError::Unauthenticated(_)
@@ -1095,7 +1134,115 @@ async fn worker_heartbeat_loop(
                 );
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+    }
+}
+
+/// Send a heartbeat every `interval_secs`, and at once whenever `state`
+/// changes (a drain starting or ending). After sending `stopped` it signals
+/// `stopped_sent` and sends nothing more, so no later `draining` heartbeat
+/// can re-register the worker. Pending forever off workers; returns at once
+/// on a worker with no heartbeat target, which stops the server.
+async fn worker_heartbeat_loop(
+    target: Option<&HeartbeatTarget>,
+    role: ServerRole,
+    mut state: tokio::sync::watch::Receiver<arneb_rpc::WorkerState>,
+    stopped_sent: &tokio::sync::Notify,
+    interval_secs: u64,
+) {
+    if !matches!(role, ServerRole::Worker) {
+        futures::future::pending::<()>().await;
+    }
+    let Some(target) = target else {
+        return;
+    };
+    tracing::info!(
+        worker_id = %target.message.worker_id,
+        coordinator = %target.coordinator_address,
+        "starting heartbeat loop"
+    );
+    loop {
+        let current = *state.borrow_and_update();
+        target.send(current).await;
+        if current == arneb_rpc::WorkerState::Stopped {
+            stopped_sent.notify_one();
+            futures::future::pending::<()>().await;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
+            changed = state.changed() => {
+                if changed.is_err() {
+                    futures::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+}
+
+/// Wait for SIGTERM or Ctrl-C. On a worker, then drain: report `draining`,
+/// wait until the coordinator has released every query here (or the drain
+/// timeout passes), and report `stopped`. A second signal ends the drain.
+async fn run_until_shutdown(
+    worker: Option<(&HeartbeatTarget, &task_manager::TaskManager)>,
+    state: &tokio::sync::watch::Sender<arneb_rpc::WorkerState>,
+    stopped_sent: &tokio::sync::Notify,
+    interval_secs: u64,
+    drain_timeout_secs: u64,
+) {
+    drain::shutdown_signal().await;
+    let Some((target, tasks)) = worker else {
+        tracing::info!("shutting down");
+        return;
+    };
+    let worker_id = &target.message.worker_id;
+    tracing::info!(
+        target: "arneb::cluster",
+        worker_id = %worker_id,
+        active_queries = tasks.active_queries(),
+        drain_timeout_secs,
+        "worker draining"
+    );
+    state.send_replace(arneb_rpc::WorkerState::Draining);
+    let started = std::time::Instant::now();
+    let wait = drain::wait_until_idle(
+        || tasks.active_queries(),
+        std::time::Duration::from_secs(interval_secs),
+        std::time::Duration::from_secs(drain_timeout_secs),
+        std::time::Duration::from_millis(500),
+    );
+    tokio::select! {
+        outcome = wait => match outcome {
+            drain::DrainOutcome::Idle => tracing::info!(
+                target: "arneb::cluster",
+                worker_id = %worker_id,
+                drained_secs = started.elapsed().as_secs(),
+                "worker drained"
+            ),
+            drain::DrainOutcome::TimedOut(left) => tracing::warn!(
+                target: "arneb::cluster",
+                worker_id = %worker_id,
+                active_queries = left,
+                drain_timeout_secs,
+                "drain timed out"
+            ),
+        },
+        _ = drain::shutdown_signal() => {
+            tracing::warn!(
+                target: "arneb::cluster",
+                worker_id = %worker_id,
+                active_queries = tasks.active_queries(),
+                "second shutdown signal, exiting without finishing the drain"
+            );
+        }
+    }
+    // The heartbeat loop sends it, after any heartbeat already in flight.
+    // Bounded: an unreachable coordinator must not hold up the exit; it then
+    // drops this worker at its heartbeat timeout.
+    state.send_replace(arneb_rpc::WorkerState::Stopped);
+    if tokio::time::timeout(std::time::Duration::from_secs(5), stopped_sent.notified())
+        .await
+        .is_err()
+    {
+        tracing::warn!(worker_id = %worker_id, "stopped heartbeat timed out");
     }
 }
 

@@ -991,7 +991,15 @@ pub struct ClusterConfig {
     /// worker as lost and fails its queries (`ARNEB_HEARTBEAT_TIMEOUT_SECS`).
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
+
+    /// Longest a worker waits on SIGTERM for its queries to finish before
+    /// exiting (`ARNEB_DRAIN_TIMEOUT_SECS`).
+    #[serde(default)]
+    pub drain_timeout_secs: Option<u64>,
 }
+
+/// Default `[cluster] drain_timeout_secs`.
+pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 120;
 
 /// Default `[cluster] heartbeat_interval_secs`.
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 2;
@@ -1038,23 +1046,33 @@ pub struct ClusterTlsConfig {
     pub ca_path: Option<PathBuf>,
 }
 
+/// A whole-seconds setting of at least 1: `var` from `env`, else `file`,
+/// else `default`.
+fn positive_secs(
+    env: &impl Fn(&str) -> Option<String>,
+    var: &str,
+    file: Option<u64>,
+    default: u64,
+    what: &str,
+) -> Result<u64> {
+    let value = match env(var) {
+        Some(v) => v
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("invalid {var} value '{v}' (expected whole seconds)"))?,
+        None => file.unwrap_or(default),
+    };
+    anyhow::ensure!(value >= 1, "{var} / {what} must be at least 1 s");
+    Ok(value)
+}
+
 impl ClusterConfig {
     /// `[cluster] heartbeat_*_secs` with `ARNEB_HEARTBEAT_*_SECS` overrides
     /// (env > file > defaults), validated: both at least 1, timeout greater
     /// than interval.
     pub fn heartbeat(&self, env: impl Fn(&str) -> Option<String>) -> Result<HeartbeatSettings> {
-        let read = |var: &str, file: Option<u64>, default: u64| -> Result<u64> {
-            let value = match env(var) {
-                Some(v) => v.trim().parse::<u64>().map_err(|_| {
-                    anyhow::anyhow!("invalid {var} value '{v}' (expected whole seconds)")
-                })?,
-                None => file.unwrap_or(default),
-            };
-            anyhow::ensure!(
-                value >= 1,
-                "{var} / [cluster] heartbeat setting must be at least 1 s"
-            );
-            Ok(value)
+        let read = |var, file, default| {
+            positive_secs(&env, var, file, default, "[cluster] heartbeat setting")
         };
         let interval_secs = read(
             "ARNEB_HEARTBEAT_INTERVAL_SECS",
@@ -1075,6 +1093,18 @@ impl ClusterConfig {
             interval_secs,
             timeout_secs,
         })
+    }
+
+    /// `[cluster] drain_timeout_secs` with the `ARNEB_DRAIN_TIMEOUT_SECS`
+    /// override (env > file > default), at least 1.
+    pub fn drain_timeout_secs(&self, env: impl Fn(&str) -> Option<String>) -> Result<u64> {
+        positive_secs(
+            &env,
+            "ARNEB_DRAIN_TIMEOUT_SECS",
+            self.drain_timeout_secs,
+            DEFAULT_DRAIN_TIMEOUT_SECS,
+            "[cluster] drain_timeout_secs",
+        )
     }
 
     /// Build the cluster RPC security from `[cluster] secret` /
@@ -1153,6 +1183,7 @@ impl Default for ClusterConfig {
             tls: None,
             heartbeat_interval_secs: None,
             heartbeat_timeout_secs: None,
+            drain_timeout_secs: None,
         }
     }
 }
@@ -2054,5 +2085,26 @@ password = "hunter2"
         assert!(ClusterConfig::default()
             .heartbeat(env_from(&[("ARNEB_HEARTBEAT_INTERVAL_SECS", "x")]))
             .is_err());
+    }
+
+    #[test]
+    fn drain_timeout_defaults_overrides_and_validation() {
+        let read = |toml_src: &str, env: &[(&str, &str)]| {
+            let cluster: ClusterConfig = toml::from_str(toml_src).unwrap();
+            cluster.drain_timeout_secs(env_from(env))
+        };
+        assert_eq!(read("", &[]).unwrap(), 120);
+        assert_eq!(read("drain_timeout_secs = 30", &[]).unwrap(), 30);
+        assert_eq!(
+            read(
+                "drain_timeout_secs = 30",
+                &[("ARNEB_DRAIN_TIMEOUT_SECS", "45")]
+            )
+            .unwrap(),
+            45
+        );
+        let err = read("drain_timeout_secs = 0", &[]).unwrap_err().to_string();
+        assert!(err.contains("drain_timeout_secs"), "{err}");
+        assert!(read("", &[("ARNEB_DRAIN_TIMEOUT_SECS", "soon")]).is_err());
     }
 }

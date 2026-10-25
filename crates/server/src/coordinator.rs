@@ -40,6 +40,8 @@ pub struct QueryCoordinator {
     /// report Domains and consumers can subscribe. Shared with the
     /// FlightState `df_report_callback` registered in `main.rs`.
     df_registry: DynamicFilterServiceRegistry,
+    /// P4 stage 2: re-run settings, `None` when retry is off.
+    retry: Option<QueryRetry>,
 }
 
 impl QueryCoordinator {
@@ -47,7 +49,15 @@ impl QueryCoordinator {
         Self {
             node_registry,
             df_registry,
+            retry: None,
         }
+    }
+
+    /// Re-run read-only queries that fail because a worker was lost
+    /// (`[cluster] retry_policy = "query"`); `None` keeps retry off.
+    pub fn with_retry(mut self, retry: Option<QueryRetry>) -> Self {
+        self.retry = retry;
+        self
     }
 
     /// Returns the per-query dynamic-filter service registry shared
@@ -63,11 +73,29 @@ impl QueryCoordinator {
     }
 
     /// Execute a query distributedly: fragment → schedule → dispatch → collect.
+    /// With retry on, a read-only query that fails because one of its
+    /// workers was lost re-runs on the remaining workers. Results are
+    /// collected in full before they are returned, so a re-run never sends
+    /// a client the same rows twice.
     pub async fn execute(
         &self,
         plan: LogicalPlan,
         exec_ctx: &ExecutionContext,
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
+        let retry = self.retry.filter(|_| !writes_data(&plan));
+        with_query_retry(retry, &self.node_registry, || {
+            self.execute_once(&plan, exec_ctx)
+        })
+        .await
+    }
+
+    /// One run of [`Self::execute`]. A failure carries the workers the run
+    /// used, so the caller can tell whether one of them was lost.
+    async fn execute_once(
+        &self,
+        plan: &LogicalPlan,
+        exec_ctx: &ExecutionContext,
+    ) -> Result<Vec<RecordBatch>, AttemptError> {
         // The protocol layer records the statement in the query tracker;
         // this id only keys the distributed tasks.
         let query_id = QueryId::new();
@@ -127,9 +155,12 @@ impl QueryCoordinator {
         // Draining workers finish what they run but get no new query.
         let workers = self.node_registry.active_workers();
         if workers.is_empty() {
-            return Err(ExecutionError::InvalidOperation(
-                "no workers available for distributed execution".to_string(),
-            ));
+            return Err(AttemptError {
+                error: ExecutionError::InvalidOperation(
+                    "no workers available for distributed execution".to_string(),
+                ),
+                worker_ids: Vec::new(),
+            });
         }
         // admission-control D4: from here on, any exit other than success
         // (an error, a panic, or this future being dropped by a cancel,
@@ -348,9 +379,15 @@ impl QueryCoordinator {
         let batches = tokio::select! {
             biased;
             lost = watch_workers(&self.node_registry, &worker_ids, WORKER_WATCH_INTERVAL) => {
-                return Err(lost_worker_error(&lost));
+                return Err(AttemptError {
+                    error: lost_worker_error(&lost),
+                    worker_ids: worker_ids.clone(),
+                });
             }
-            result = run => result.map_err(|e| attribute_worker_failure(e, &workers, &self.node_registry))?,
+            result = run => result.map_err(|e| AttemptError {
+                error: attribute_worker_failure(e, &workers, &self.node_registry),
+                worker_ids: worker_ids.clone(),
+            })?,
         };
 
         tracing::info!(
@@ -366,6 +403,111 @@ impl QueryCoordinator {
                 .map(|(addr, _, _)| addr),
         );
         Ok(batches)
+    }
+}
+
+/// P4 stage 2 (`retry_policy = "query"`, Trino's `retry_policy=QUERY`):
+/// how a read-only query that failed because one of its workers was lost
+/// is re-run on the remaining workers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryRetry {
+    /// Most re-runs of one query.
+    pub max_retries: u32,
+    /// Wait before the first re-run. It doubles for each later one, up to
+    /// [`MAX_RETRY_DELAY`].
+    pub initial_delay: std::time::Duration,
+}
+
+/// Default [`QueryRetry::initial_delay`].
+pub const DEFAULT_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+/// Longest wait between two runs of a query.
+pub const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl QueryRetry {
+    /// Up to `max_retries` re-runs with the default delays.
+    pub fn new(max_retries: u32) -> Self {
+        Self {
+            max_retries,
+            initial_delay: DEFAULT_RETRY_INITIAL_DELAY,
+        }
+    }
+
+    /// The wait before re-run number `done + 1`.
+    fn delay(&self, done: u32) -> std::time::Duration {
+        self.initial_delay
+            .saturating_mul(1 << done.min(16))
+            .min(MAX_RETRY_DELAY)
+    }
+}
+
+/// A failed run of a distributed query and the workers it used.
+struct AttemptError {
+    error: ExecutionError,
+    worker_ids: Vec<String>,
+}
+
+/// Whether a plan writes data, so re-running it is not safe.
+fn writes_data(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::CreateTableAsSelect { .. }
+        | LogicalPlan::InsertInto { .. }
+        | LogicalPlan::DeleteFrom { .. }
+        | LogicalPlan::CreateView { .. }
+        | LogicalPlan::DropView { .. } => true,
+        LogicalPlan::Explain { input, .. } => writes_data(input),
+        _ => false,
+    }
+}
+
+/// Run `attempt` until it succeeds, or fails for a reason other than a
+/// lost worker, or `retry` allows no further re-run, or no worker is left.
+/// The error returned is the last run's.
+async fn with_query_retry<T, F, Fut>(
+    retry: Option<QueryRetry>,
+    registry: &NodeRegistry,
+    mut attempt: F,
+) -> Result<T, ExecutionError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, AttemptError>>,
+{
+    let mut done = 0;
+    loop {
+        let failed = match attempt().await {
+            Ok(value) => {
+                if done > 0 {
+                    tracing::info!(target: "arneb::cluster", retries = done, "query succeeded after retry");
+                }
+                return Ok(value);
+            }
+            Err(failed) => failed,
+        };
+        let Some(retry) = retry.filter(|r| done < r.max_retries) else {
+            return Err(failed.error);
+        };
+        // Retry only a run that one of its own workers failed; the lost
+        // worker is out of `active_workers` until it heartbeats again.
+        let Some(lost) = registry.lost_worker(&failed.worker_ids) else {
+            return Err(failed.error);
+        };
+        if registry.active_workers().is_empty() {
+            return Err(failed.error);
+        }
+        let delay = retry.delay(done);
+        done += 1;
+        arneb_common::metrics::query_retried();
+        tracing::warn!(
+            target: "arneb::cluster",
+            retry = done,
+            max_retries = retry.max_retries,
+            worker_id = %lost.worker_id,
+            delay_ms = delay.as_millis() as u64,
+            error = %failed.error,
+            "retrying query after worker loss"
+        );
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -1417,6 +1559,138 @@ mod tests {
         let message = attribute_worker_failure(err, &workers, &registry).to_string();
         assert!(!message.contains("worker 'worker-1'"), "{message}");
         assert_eq!(registry.alive_count(), 1);
+    }
+
+    fn quick_retry(max_retries: u32) -> Option<QueryRetry> {
+        Some(QueryRetry {
+            max_retries,
+            initial_delay: std::time::Duration::from_millis(1),
+        })
+    }
+
+    fn two_worker_registry() -> arneb_scheduler::NodeRegistry {
+        let registry = arneb_scheduler::NodeRegistry::new(30);
+        registry.heartbeat("worker-1".into(), "http://w1:9090".into(), 256);
+        registry.heartbeat("worker-2".into(), "http://w2:9090".into(), 256);
+        registry
+    }
+
+    fn failure(message: &str) -> AttemptError {
+        AttemptError {
+            error: ExecutionError::InvalidOperation(message.to_string()),
+            worker_ids: vec!["worker-1".to_string(), "worker-2".to_string()],
+        }
+    }
+
+    /// Runs `with_query_retry` over scripted attempts: each one either
+    /// loses `worker-2` and fails, or fails without losing a worker, or
+    /// succeeds. Returns the result and the number of runs.
+    async fn run_script(
+        retry: Option<QueryRetry>,
+        registry: &arneb_scheduler::NodeRegistry,
+        script: &[&str],
+    ) -> (Result<u32, String>, usize) {
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let result = with_query_retry(retry, registry, || {
+            let n = runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let step = script[n.min(script.len() - 1)];
+            async move {
+                match step {
+                    "lose" => {
+                        registry.mark_dead("worker-2", "transport failure during query");
+                        Err(failure(
+                            "worker 'worker-2' (http://w2:9090) failed: broken pipe",
+                        ))
+                    }
+                    "error" => Err(failure("division by zero")),
+                    _ => Ok(n as u32),
+                }
+            }
+        })
+        .await
+        .map_err(|e| e.to_string());
+        (result, runs.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn retry_off_returns_the_first_failure() {
+        let registry = two_worker_registry();
+        let (result, runs) = run_script(None, &registry, &["lose", "ok"]).await;
+        assert!(result.unwrap_err().contains("worker 'worker-2'"));
+        assert_eq!(runs, 1);
+    }
+
+    #[tokio::test]
+    async fn a_lost_worker_reruns_the_query_on_the_rest() {
+        let registry = two_worker_registry();
+        let (result, runs) = run_script(quick_retry(4), &registry, &["lose", "ok"]).await;
+        assert_eq!(result, Ok(1));
+        assert_eq!(runs, 2);
+        let active: Vec<_> = registry
+            .active_workers()
+            .into_iter()
+            .map(|w| w.worker_id)
+            .collect();
+        assert_eq!(active, vec!["worker-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_failure_without_a_lost_worker_is_not_retried() {
+        let registry = two_worker_registry();
+        let (result, runs) = run_script(quick_retry(4), &registry, &["error", "ok"]).await;
+        assert_eq!(result.unwrap_err(), "invalid operation: division by zero");
+        assert_eq!(runs, 1);
+    }
+
+    #[tokio::test]
+    async fn retries_stop_at_the_limit_with_the_last_error() {
+        let registry = two_worker_registry();
+        // Each run loses worker-2 again (it heartbeats back in between).
+        let registry_ref = &registry;
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let result: Result<(), _> = with_query_retry(quick_retry(2), registry_ref, || {
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            registry_ref.heartbeat("worker-2".into(), "http://w2:9090".into(), 256);
+            async move {
+                registry_ref.mark_dead("worker-2", "transport failure during query");
+                Err(failure(
+                    "worker 'worker-2' (http://w2:9090) failed: broken pipe",
+                ))
+            }
+        })
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("worker 'worker-2'"));
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn no_retry_when_no_worker_is_left() {
+        let registry = arneb_scheduler::NodeRegistry::new(30);
+        registry.heartbeat("worker-2".into(), "http://w2:9090".into(), 256);
+        let (result, runs) = run_script(quick_retry(4), &registry, &["lose", "ok"]).await;
+        assert!(result.is_err());
+        assert_eq!(runs, 1);
+    }
+
+    #[test]
+    fn writes_are_never_retried_and_delays_double_up_to_the_cap() {
+        let insert = LogicalPlan::InsertInto {
+            table: TableReference::table("t"),
+            source: Box::new(scan()),
+        };
+        assert!(writes_data(&insert));
+        assert!(writes_data(&LogicalPlan::Explain {
+            input: Box::new(insert),
+            analyze: true,
+        }));
+        assert!(!writes_data(&partial_aggregate()));
+
+        let retry = QueryRetry::new(10);
+        let secs: Vec<u64> = (0..6).map(|n| retry.delay(n).as_secs()).collect();
+        assert_eq!(secs, vec![1, 2, 4, 8, 10, 10]);
     }
 
     /// A Flight server whose `cancel_query` callback records query ids,

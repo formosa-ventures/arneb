@@ -157,8 +157,8 @@ certificate that every node on one host can share. See
 
 ## When a Worker Fails
 
-The coordinator does not retry queries yet. When a worker is lost, the
-queries running on it fail cleanly and the cluster keeps serving:
+When a worker is lost, the queries running on it fail cleanly and the
+cluster keeps serving (unless [query retry](#query-retry) is on):
 
 - **The worker crashes or its connection breaks.** Its queries fail at once
   with `worker '<id>' (<address>) failed: …`. The coordinator marks the
@@ -173,8 +173,38 @@ queries running on it fail cleanly and the cluster keeps serving:
   heartbeat. The coordinator logs `worker re-registered`, and new queries use
   it again.
 
+### Query retry
+
+With `retry_policy = "query"` in `[cluster]` (or `ARNEB_RETRY_POLICY=query`)
+on the coordinator, a query that fails because one of its workers was lost
+runs again from the start on the remaining workers, like Trino's
+`retry_policy=QUERY`. It is off by default.
+
+- Only read-only queries are re-run. `INSERT`, `CREATE TABLE AS` and other
+  writes fail as before.
+- Only a loss of one of the query's workers triggers a re-run: a crash, a
+  broken connection, a missed heartbeat deadline, or a worker that left the
+  cluster. A query that fails for any other reason (a SQL error, the memory
+  limit, a timeout, a cancel) is not re-run.
+- A query is re-run at most `query_retry_attempts` times (default 4). The
+  first re-run waits 1 s, and each later one waits twice as long, up to
+  10 s. With no worker left, the query fails with the last error.
+- The client sees nothing of the failed runs: results are collected in full
+  on the coordinator before any row is sent, so no row arrives twice. The
+  [`statement_timeout`](/guide/configuration#admission-control) covers
+  all of a query's runs.
+- Each re-run logs `retrying query after worker loss` on `arneb::cluster`,
+  with the lost worker and the error, and counts in
+  `arneb_query_retries_total` on `/metrics`. Startup logs the effective
+  policy on `arneb::config`.
+
+A hung worker is detected only after `heartbeat_timeout_secs`, so a re-run
+after one starts about 10 s after the hang, plus the delay.
+
 `benchmarks/tpch/scripts/fault_injection.sh` checks all of this on the local
-bench cluster by killing and pausing a worker during SF10 q09.
+bench cluster by killing and pausing a worker during SF10 q09. With
+`RETRY=1` it runs the coordinator with `retry_policy = "query"` and checks
+that q09 completes instead, with the same rows as a run without a fault.
 
 `benchmarks/tpch/scripts/concurrency_soak.sh [rounds]` runs rounds of 20
 concurrent TPC-H queries against a running cluster and exits non-zero if any

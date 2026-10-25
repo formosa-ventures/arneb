@@ -484,6 +484,19 @@ CURRENT_DATE → DATE
 NOW() → TIMESTAMP
 ```
 
+### CURRENT_CATALOG / CURRENT_SCHEMA
+
+The session's default catalog and schema (Trino's `X-Trino-Catalog` /
+`X-Trino-Schema`, or the server defaults). Written without parentheses, as in
+Trino; the planner replaces them with the value. A column of the same name
+takes precedence. Over pgwire, `current_schema()` and `current_user` are
+answered by the metadata layer.
+
+```sql
+current_catalog → VARCHAR
+current_schema → VARCHAR
+```
+
 ### EXTRACT
 
 Extracts a field from a date or timestamp.

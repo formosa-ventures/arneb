@@ -29,8 +29,7 @@ use base64::Engine;
 use bytes::Bytes;
 use futures::{Sink, SinkExt};
 use pgwire::api::auth::{
-    finish_authentication, save_startup_parameters_to_metadata, DefaultServerParameterProvider,
-    StartupHandler,
+    finish_authentication, save_startup_parameters_to_metadata, StartupHandler,
 };
 use pgwire::api::{ClientInfo, PgWireConnectionState, METADATA_USER};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
@@ -603,7 +602,7 @@ impl AuthStartupHandler {
                     peer = %client.socket_addr(),
                     "pgwire client authenticated"
                 );
-                finish_authentication(client, &DefaultServerParameterProvider::default()).await
+                finish_authentication(client, &crate::metadata::server_parameters()).await
             }
             (_, _) => Err(protocol_violation(
                 "unexpected message during authentication",
@@ -646,8 +645,7 @@ impl StartupHandler for AuthStartupHandler {
             AuthMethod::None => {
                 if let PgWireFrontendMessage::Startup(ref startup) = message {
                     save_startup_parameters_to_metadata(client, startup);
-                    finish_authentication(client, &DefaultServerParameterProvider::default())
-                        .await?;
+                    finish_authentication(client, &crate::metadata::server_parameters()).await?;
                 }
                 Ok(())
             }

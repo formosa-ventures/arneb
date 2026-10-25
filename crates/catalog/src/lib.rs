@@ -445,6 +445,51 @@ impl CatalogManager {
         names
     }
 
+    /// `reference` with each part that names nothing as written, but names
+    /// something in lowercase, replaced by the lowercase form. PostgreSQL
+    /// and Trino fold unquoted identifiers to lowercase, and the parser
+    /// keeps no quoting, so `FROM NATION` and `INFORMATION_SCHEMA.TABLES`
+    /// find `nation` and `information_schema.tables`. A part that names
+    /// something as written is kept, so mixed-case names still resolve.
+    pub async fn fold_reference_case(&self, reference: &TableReference) -> TableReference {
+        let mut folded = reference.clone();
+        let catalog_name = match &reference.catalog {
+            Some(name) => {
+                let catalogs = self.catalogs.read().unwrap();
+                if !catalogs.contains_key(name) && catalogs.contains_key(&name.to_lowercase()) {
+                    folded.catalog = Some(name.to_lowercase());
+                }
+                folded.catalog.clone().unwrap_or_default()
+            }
+            None => self.default_catalog.clone(),
+        };
+        let Some(catalog) = self.catalog(&catalog_name) else {
+            return folded;
+        };
+        let schema_name = match &reference.schema {
+            Some(name) => {
+                if catalog.schema(name).await.is_none()
+                    && catalog.schema(&name.to_lowercase()).await.is_some()
+                {
+                    folded.schema = Some(name.to_lowercase());
+                }
+                folded.schema.clone().unwrap_or_default()
+            }
+            None => self.default_schema.clone(),
+        };
+        let Some(schema) = catalog.schema(&schema_name).await else {
+            return folded;
+        };
+        let lower = reference.table.to_lowercase();
+        if lower != reference.table
+            && schema.table(&reference.table).await.is_none()
+            && schema.table(&lower).await.is_some()
+        {
+            folded.table = lower;
+        }
+        folded
+    }
+
     /// Resolves a [`TableReference`] to a [`TableProvider`].
     ///
     /// Resolution logic:
@@ -657,6 +702,36 @@ mod tests {
     }
 
     // -- MemorySchema tests --
+
+    #[tokio::test]
+    async fn unmatched_names_fold_to_lowercase() {
+        let cm = CatalogManager::new("lake", "sales");
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("nation", Arc::new(MemoryTable::new(test_columns())));
+        schema.register_table("MixedT", Arc::new(MemoryTable::new(test_columns())));
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("sales", schema);
+        cm.register_catalog("lake", catalog);
+        let fold = |catalog: Option<&str>, schema: Option<&str>, table: &str| {
+            let reference = TableReference {
+                catalog: catalog.map(str::to_string),
+                schema: schema.map(str::to_string),
+                table: table.to_string(),
+            };
+            let cm = &cm;
+            async move { cm.fold_reference_case(&reference).await.to_string() }
+        };
+        assert_eq!(fold(None, None, "NATION").await, "nation");
+        assert_eq!(
+            fold(Some("LAKE"), Some("Sales"), "Nation").await,
+            "lake.sales.nation"
+        );
+        // A name that matches as written is kept; one that matches nothing
+        // either way is left for resolve_table to report.
+        assert_eq!(fold(None, None, "MixedT").await, "MixedT");
+        assert_eq!(fold(None, None, "MIXEDT").await, "MIXEDT");
+        assert_eq!(fold(Some("NOPE"), None, "T").await, "NOPE.T");
+    }
 
     #[tokio::test]
     async fn memory_schema_empty() {

@@ -219,6 +219,7 @@ pub(crate) fn references_virtual_metadata(sql: &str) -> bool {
         || lower.contains("system.jdbc")
         || lower.contains("system.metadata")
         || lower.contains("\"system\".\"jdbc\"")
+        || lower.contains("\"system\".\"metadata\"")
 }
 
 async fn collect_tables(

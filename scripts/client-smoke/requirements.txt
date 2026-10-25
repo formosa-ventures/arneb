@@ -1,0 +1,9 @@
+# Python clients for scripts/client-smoke (pinned so CI results are comparable).
+duckdb==2.0.0
+psycopg[binary]==3.3.6
+psycopg2-binary==2.9.13
+SQLAlchemy==2.1.6
+trino[sqlalchemy]==0.340.0
+dbt-core==1.12.6
+dbt-trino==1.10.6
+dbt-postgres==1.11.0

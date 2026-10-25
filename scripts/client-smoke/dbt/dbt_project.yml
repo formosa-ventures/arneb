@@ -1,0 +1,9 @@
+# Read-only dbt project for scripts/client-smoke: source tests, an
+# ephemeral model, `dbt show` and `dbt docs generate` (Arneb does not
+# materialize models yet).
+name: arneb_smoke
+version: "1.0"
+profile: arneb_smoke
+model-paths: ["models"]
+flags:
+  send_anonymous_usage_stats: false

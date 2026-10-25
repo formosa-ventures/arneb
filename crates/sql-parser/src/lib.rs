@@ -1251,6 +1251,25 @@ mod tests {
     }
 
     #[test]
+    fn schema_and_catalog_qualified_columns_keep_the_table_qualifier() {
+        for sql in [
+            "SELECT \"default\".nation.n_name FROM \"default\".nation",
+            "SELECT file.\"default\".nation.n_name FROM file.\"default\".nation",
+        ] {
+            let Statement::Query { query, .. } = parse(sql).unwrap() else {
+                panic!("expected Query");
+            };
+            let body = select_body(&query);
+            let SelectItem::UnnamedExpr(Expr::Column { col_ref, .. }) = &body.projection[0] else {
+                panic!("expected column projection");
+            };
+            assert_eq!(col_ref.table.as_deref(), Some("nation"), "{sql}");
+            assert_eq!(col_ref.name, "n_name", "{sql}");
+        }
+        assert!(parse("SELECT a.b.c.d.e FROM t").is_err());
+    }
+
+    #[test]
     fn parse_binary_op_span_covers_whole_expr() {
         let stmt = parse("SELECT a <= b FROM t").unwrap();
         let Statement::Query { query, .. } = stmt else {

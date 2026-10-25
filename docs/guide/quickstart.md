@@ -27,7 +27,7 @@ cargo build --release
 `main` moves faster than releases. To build the latest release instead, check out its tag ([all releases](https://github.com/formosa-ventures/arneb/releases)):
 
 ```bash
-git clone --branch v0.1.5 https://github.com/formosa-ventures/arneb.git  # x-release-please-version
+git clone --branch v0.1.6 https://github.com/formosa-ventures/arneb.git  # x-release-please-version
 cd arneb
 cargo build --release
 ```

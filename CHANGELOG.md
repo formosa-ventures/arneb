@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.6](https://github.com/formosa-ventures/arneb/compare/v0.1.5...v0.1.6) (2026-10-25)
+
+
+### Features
+
+* cluster version handshake (G5) ([#178](https://github.com/formosa-ventures/arneb/issues/178)) ([a2534d1](https://github.com/formosa-ventures/arneb/commit/a2534d153ea89c7401887c69e28df6a1663fa83c))
+* exchange observability, cancel race fix and concurrency soak test (Phase 3, G1/G2) ([#177](https://github.com/formosa-ventures/arneb/issues/177)) ([c001243](https://github.com/formosa-ventures/arneb/commit/c0012438cfd6a818ed6ee7c11866c81ff8d23763))
+* worker graceful drain and release of finished queries (G4) ([#179](https://github.com/formosa-ventures/arneb/issues/179)) ([b3735e7](https://github.com/formosa-ventures/arneb/commit/b3735e748adcd9b05b2b4cb61bcbaee0d196eab6))
+
 ## [0.1.5](https://github.com/formosa-ventures/arneb/compare/v0.1.4...v0.1.5) (2026-10-22)
 
 

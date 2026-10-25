@@ -64,6 +64,10 @@ pub type DfNotifyCallback = Arc<dyn Fn(NotifyDynamicFilterRequest) + Send + Sync
 /// this node and return how many were aborted (admission-control D4).
 pub type CancelQueryCallback = Arc<dyn Fn(arneb_common::QueryId) -> usize + Send + Sync>;
 
+/// Callback for the `release_query` action: the query finished on the
+/// coordinator, so drop its tasks on this node; returns how many.
+pub type ReleaseQueryCallback = Arc<dyn Fn(arneb_common::QueryId) -> usize + Send + Sync>;
+
 /// Producer-side buffer kind held by the worker's `FlightState`.
 ///
 /// A2.1.2 (2026-05-28): partitioned producers (the W3-Hash auto-wrap
@@ -99,6 +103,7 @@ pub struct FlightState {
     df_report_callback: Option<DfReportCallback>,
     df_notify_callback: Option<DfNotifyCallback>,
     cancel_query_callback: Option<CancelQueryCallback>,
+    release_query_callback: Option<ReleaseQueryCallback>,
 }
 
 impl Default for FlightState {
@@ -111,6 +116,7 @@ impl Default for FlightState {
             df_report_callback: None,
             df_notify_callback: None,
             cancel_query_callback: None,
+            release_query_callback: None,
         }
     }
 }
@@ -153,6 +159,11 @@ impl FlightState {
     /// Install the `cancel_query` handler (workers).
     pub fn set_cancel_query_callback(&mut self, callback: CancelQueryCallback) {
         self.cancel_query_callback = Some(callback);
+    }
+
+    /// Set the callback for `release_query` actions.
+    pub fn set_release_query_callback(&mut self, callback: ReleaseQueryCallback) {
+        self.release_query_callback = Some(callback);
     }
 
     pub fn set_df_notify_callback(&mut self, callback: DfNotifyCallback) {
@@ -489,21 +500,22 @@ impl FlightService for TrinoFlightService {
                 let stream = futures::stream::once(async { Ok(result) });
                 Ok(Response::new(Box::pin(stream)))
             }
-            "cancel_query" => {
+            kind @ ("cancel_query" | "release_query") => {
                 let query_id = std::str::from_utf8(&action.body)
                     .ok()
                     .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
                     .map(arneb_common::QueryId)
-                    .ok_or_else(|| Status::invalid_argument("bad cancel_query body"))?;
+                    .ok_or_else(|| Status::invalid_argument(format!("bad {kind} body")))?;
                 // Idempotent: an unknown query (already finished or never
-                // here) cancels nothing and is still acknowledged.
-                let aborted = self
-                    .state
-                    .cancel_query_callback
-                    .as_ref()
-                    .map_or(0, |cb| cb(query_id));
+                // here) ends nothing and is still acknowledged.
+                let (callback, verb) = if kind == "cancel_query" {
+                    (&self.state.cancel_query_callback, "cancelled")
+                } else {
+                    (&self.state.release_query_callback, "released")
+                };
+                let ended = callback.as_ref().map_or(0, |cb| cb(query_id));
                 let result = arrow_flight::Result {
-                    body: format!("cancelled {aborted}").into(),
+                    body: format!("{verb} {ended}").into(),
                 };
                 let stream = futures::stream::once(async { Ok(result) });
                 Ok(Response::new(Box::pin(stream)))

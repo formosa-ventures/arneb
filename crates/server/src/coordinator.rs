@@ -124,7 +124,8 @@ impl QueryCoordinator {
             eprintln!("[FRAGTRACE] === end fragment tree ===");
         }
 
-        let workers = self.node_registry.alive_workers();
+        // Draining workers finish what they run but get no new query.
+        let workers = self.node_registry.active_workers();
         if workers.is_empty() {
             return Err(ExecutionError::InvalidOperation(
                 "no workers available for distributed execution".to_string(),
@@ -358,7 +359,12 @@ impl QueryCoordinator {
             "distributed query complete"
         );
 
-        cancel_guard.disarm();
+        cancel_guard.finish(
+            stage_results
+                .into_values()
+                .flatten()
+                .map(|(addr, _, _)| addr),
+        );
         Ok(batches)
     }
 }
@@ -456,16 +462,24 @@ pub(crate) fn flight_address(address: &str) -> String {
     }
 }
 
-/// Cancels a distributed query on its workers unless disarmed
-/// (admission-control D4). Armed for the whole of `execute` once tasks may
-/// have been dispatched; `Drop` sends `cancel_query` from a detached task so
-/// it never blocks, and covers error returns, panics and the future being
-/// dropped. Delivery is best-effort: a failure is logged, and the worker's
-/// own buffer cleanup still frees the tasks later.
+/// Ends a distributed query on its workers (admission-control D4). From
+/// the moment tasks may be dispatched, `Drop` sends `cancel_query` to every
+/// worker, covering error returns, panics and the future being dropped.
+/// Once [`CancelGuard::finish`] records the result, it sends `release_query`
+/// to the workers that ran a task instead, so they drop the query's tasks
+/// at once (worker-graceful-drain). Both go from a detached task so `Drop`
+/// never blocks. Delivery is best-effort: a failure is logged, and the
+/// worker's own buffer cleanup still frees the tasks later.
 pub(crate) struct CancelGuard {
     query_id: QueryId,
     workers: Vec<String>,
-    armed: bool,
+    action: EndAction,
+}
+
+#[derive(Clone, Copy)]
+enum EndAction {
+    Cancel,
+    Release,
 }
 
 impl CancelGuard {
@@ -473,19 +487,22 @@ impl CancelGuard {
         Self {
             query_id,
             workers,
-            armed: true,
+            action: EndAction::Cancel,
         }
     }
 
-    /// The query finished normally; its tasks end on their own.
-    pub(crate) fn disarm(&mut self) {
-        self.armed = false;
+    /// The query finished normally: release it on the workers at
+    /// `dispatched` (deduplicated) instead of cancelling it everywhere.
+    pub(crate) fn finish(&mut self, dispatched: impl IntoIterator<Item = String>) {
+        let dispatched: std::collections::BTreeSet<String> = dispatched.into_iter().collect();
+        self.workers = dispatched.into_iter().collect();
+        self.action = EndAction::Release;
     }
 }
 
 impl Drop for CancelGuard {
     fn drop(&mut self) {
-        if !self.armed || self.workers.is_empty() {
+        if self.workers.is_empty() {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -493,23 +510,36 @@ impl Drop for CancelGuard {
         };
         let query_id = self.query_id;
         let workers = std::mem::take(&mut self.workers);
-        tracing::info!(
-            target: "arneb::cluster",
-            query_id = %query_id,
-            workers = workers.len(),
-            "cancelling query on workers"
-        );
+        let action = self.action;
+        if let EndAction::Cancel = action {
+            tracing::info!(
+                target: "arneb::cluster",
+                query_id = %query_id,
+                workers = workers.len(),
+                "cancelling query on workers"
+            );
+        }
         // All workers at once: one unreachable worker (waiting out its
-        // connect timeout) must not delay the cancel on the others.
+        // connect timeout) must not delay the others.
         runtime.spawn(async move {
             futures::future::join_all(workers.into_iter().map(|addr| async move {
-                if let Err(e) = arneb_rpc::cancel_query(&addr, query_id).await {
+                let (result, kind) = match action {
+                    EndAction::Cancel => (
+                        arneb_rpc::cancel_query(&addr, query_id).await,
+                        "cancel_query",
+                    ),
+                    EndAction::Release => (
+                        arneb_rpc::release_query(&addr, query_id).await,
+                        "release_query",
+                    ),
+                };
+                if let Err(e) = result {
                     tracing::warn!(
                         target: "arneb::cluster",
                         query_id = %query_id,
                         worker = %addr,
                         error = %e,
-                        "cancel_query delivery failed"
+                        "{kind} delivery failed"
                     );
                 }
             }))
@@ -1293,6 +1323,7 @@ mod tests {
             max_splits: 256,
             alive: true,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            draining: false,
         }
     }
 
@@ -1388,41 +1419,62 @@ mod tests {
         assert_eq!(registry.alive_count(), 1);
     }
 
-    /// A Flight server whose `cancel_query` callback records query ids.
+    /// A Flight server whose `cancel_query` callback records query ids,
+    /// and whose `release_query` callback records them as `released`.
     async fn recording_worker() -> (String, Arc<std::sync::Mutex<Vec<QueryId>>>) {
+        let (addr, seen, _) = recording_worker_with_releases().await;
+        (addr, seen)
+    }
+
+    async fn recording_worker_with_releases() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<QueryId>>>,
+        Arc<std::sync::Mutex<Vec<QueryId>>>,
+    ) {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let released = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut state = arneb_rpc::FlightState::new();
         let s = seen.clone();
         state.set_cancel_query_callback(Arc::new(move |q| {
             s.lock().unwrap().push(q);
             0
         }));
+        let r = released.clone();
+        state.set_release_query_callback(Arc::new(move |q| {
+            r.lock().unwrap().push(q);
+            0
+        }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         tokio::spawn(arneb_rpc::__serve_flight_for_test(listener, state));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        (addr, seen)
+        (addr, seen, released)
     }
 
-    /// admission-control D4: an armed guard dropped (error, panic, or the
-    /// query future dropped) cancels the query on every worker; a disarmed
-    /// one (success) sends nothing.
+    /// admission-control D4: a guard dropped before `finish` (error, panic,
+    /// or the query future dropped) cancels the query on every worker; a
+    /// finished one (success) releases it on the workers that ran a task,
+    /// once each (worker-graceful-drain).
     #[tokio::test]
-    async fn cancel_guard_cancels_on_drop_unless_disarmed() {
-        let (a, seen_a) = recording_worker().await;
-        let (b, seen_b) = recording_worker().await;
+    async fn cancel_guard_cancels_on_drop_and_releases_once_finished() {
+        let (a, seen_a, released_a) = recording_worker_with_releases().await;
+        let (b, seen_b, released_b) = recording_worker_with_releases().await;
         let q = QueryId::new();
         drop(CancelGuard::new(q, vec![a.clone(), b.clone()]));
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(*seen_a.lock().unwrap(), vec![q]);
         assert_eq!(*seen_b.lock().unwrap(), vec![q]);
+        assert!(released_a.lock().unwrap().is_empty());
 
-        let mut ok = CancelGuard::new(QueryId::new(), vec![a, b]);
-        ok.disarm();
+        let done = QueryId::new();
+        let mut ok = CancelGuard::new(done, vec![a.clone(), b]);
+        ok.finish([a.clone(), a]);
         drop(ok);
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(seen_a.lock().unwrap().len(), 1);
         assert_eq!(seen_b.lock().unwrap().len(), 1);
+        assert_eq!(*released_a.lock().unwrap(), vec![done]);
+        assert!(released_b.lock().unwrap().is_empty(), "b ran no task");
     }
 
     /// #145: workers are cancelled concurrently, so a worker that never

@@ -312,6 +312,7 @@ worker_id = "worker-1"
 | `secret` | string | no | Shared cluster secret, see [Cluster security](#cluster-security) |
 | `heartbeat_interval_secs` | integer | no | Seconds between a worker's heartbeats (default `2`, `ARNEB_HEARTBEAT_INTERVAL_SECS`). Read on workers. |
 | `heartbeat_timeout_secs` | integer | no | Seconds without a heartbeat before the coordinator treats a worker as lost and fails its running queries (default `10`, `ARNEB_HEARTBEAT_TIMEOUT_SECS`). Read on the coordinator; must be greater than the interval. |
+| `drain_timeout_secs` | integer | no | Longest a worker waits on SIGTERM for its running queries to finish before it exits (default `120`, `ARNEB_DRAIN_TIMEOUT_SECS`). Read on workers; set the orchestrator's grace period (Kubernetes `terminationGracePeriodSeconds`) above it. See [Stopping a worker](/guide/distributed#stopping-a-worker). |
 
 See [Distributed Mode](/guide/distributed) for full setup instructions.
 

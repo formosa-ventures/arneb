@@ -40,8 +40,10 @@ pub enum TaskStatusResponse {
 /// the task ID is unknown (never submitted or already cleaned up).
 pub type TaskStatusCallback = Arc<dyn Fn(&str) -> Option<TaskStatusResponse> + Send + Sync>;
 
-/// Callback invoked when a heartbeat is received.
-pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatMessage) + Send + Sync>;
+/// Callback invoked when a heartbeat is received. An `Err` refuses the
+/// worker (e.g. a version mismatch) and is returned to it as
+/// `FailedPrecondition` with that message.
+pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatMessage) -> Result<(), String> + Send + Sync>;
 
 /// Callback invoked when a task submission is received.
 pub type TaskCallback = Arc<dyn Fn(TaskDescriptor) + Send + Sync>;
@@ -429,11 +431,12 @@ impl FlightService for TrinoFlightService {
                 tracing::debug!(
                     worker_id = %msg.worker_id,
                     address = %msg.flight_address,
+                    version = %msg.version,
                     "received heartbeat"
                 );
 
                 if let Some(ref callback) = self.state.heartbeat_callback {
-                    callback(msg);
+                    callback(msg).map_err(Status::failed_precondition)?;
                 }
 
                 let result = arrow_flight::Result { body: "ok".into() };

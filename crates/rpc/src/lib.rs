@@ -31,7 +31,9 @@ pub use flight_service::{
     DfReportCallback, FlightState, HeartbeatCallback, TaskCallback, TaskStatusCallback,
     TaskStatusResponse,
 };
-pub use heartbeat::{send_heartbeat, send_heartbeat_with, HeartbeatError, HeartbeatMessage};
+pub use heartbeat::{
+    send_heartbeat, send_heartbeat_with, HeartbeatError, HeartbeatMessage, LEGACY_VERSION, VERSION,
+};
 pub use output_buffer::{
     BroadcastOutputBuffer, BroadcastStream, OutputBuffer, TrackedReceiver, TrackedSendOutcome,
     TrackedSender,

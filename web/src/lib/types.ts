@@ -25,6 +25,7 @@ export interface WorkerResponse {
   alive: boolean
   max_splits: number
   last_heartbeat_secs_ago: number
+  version: string
 }
 
 export interface InfoResponse {

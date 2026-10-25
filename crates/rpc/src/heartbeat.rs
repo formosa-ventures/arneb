@@ -5,11 +5,19 @@
 
 use arneb_common::error::ExecutionError;
 use arrow_flight::Action;
+use serde::{Deserialize, Serialize};
 
 use crate::security::{cluster_security, ClusterSecurity};
 
-/// Heartbeat message sent from worker to coordinator.
-#[derive(Debug, Clone)]
+/// The release this binary was built from. Every crate shares the workspace
+/// version, so this is the server's version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Heartbeat message sent from worker to coordinator, encoded as JSON.
+///
+/// Fields added after `version` must be `#[serde(default)]` so a heartbeat
+/// stays readable within a release line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeartbeatMessage {
     /// Unique worker identifier.
     pub worker_id: String,
@@ -17,35 +25,52 @@ pub struct HeartbeatMessage {
     pub flight_address: String,
     /// Maximum concurrent splits this worker can handle.
     pub max_splits: usize,
+    /// The worker's release version; the coordinator admits only its own.
+    pub version: String,
 }
 
+/// The version a legacy (pre-handshake) heartbeat decodes to. It matches no
+/// release, so the coordinator refuses such a worker like any other mismatch.
+pub const LEGACY_VERSION: &str = "<0.1.6";
+
 impl HeartbeatMessage {
-    /// Serialize to a simple string format: "worker_id|flight_address|max_splits"
-    pub fn encode(&self) -> Vec<u8> {
-        format!(
-            "{}|{}|{}",
-            self.worker_id, self.flight_address, self.max_splits
-        )
-        .into_bytes()
+    /// A heartbeat from this binary, carrying [`VERSION`].
+    pub fn new(worker_id: String, flight_address: String, max_splits: usize) -> Self {
+        Self {
+            worker_id,
+            flight_address,
+            max_splits,
+            version: VERSION.to_string(),
+        }
     }
 
-    /// Deserialize from the string format.
+    /// Serialize to JSON.
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("HeartbeatMessage serialization should not fail")
+    }
+
+    /// Deserialize from JSON. The pipe-separated
+    /// `worker_id|flight_address|max_splits` body of releases before 0.1.6
+    /// decodes with [`LEGACY_VERSION`].
     pub fn decode(data: &[u8]) -> Result<Self, ExecutionError> {
-        let s = String::from_utf8(data.to_vec()).map_err(|e| {
-            ExecutionError::InvalidOperation(format!("invalid heartbeat encoding: {e}"))
-        })?;
-        let parts: Vec<&str> = s.split('|').collect();
-        if parts.len() != 3 {
-            return Err(ExecutionError::InvalidOperation(
-                "heartbeat format: worker_id|flight_address|max_splits".into(),
-            ));
-        }
-        Ok(Self {
-            worker_id: parts[0].to_string(),
-            flight_address: parts[1].to_string(),
-            max_splits: parts[2].parse().map_err(|e| {
-                ExecutionError::InvalidOperation(format!("invalid max_splits: {e}"))
-            })?,
+        serde_json::from_slice(data).or_else(|json_err| {
+            Self::decode_legacy(data).ok_or_else(|| {
+                ExecutionError::InvalidOperation(format!("invalid heartbeat: {json_err}"))
+            })
+        })
+    }
+
+    fn decode_legacy(data: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(data).ok()?;
+        let [worker_id, flight_address, max_splits] = text.split('|').collect::<Vec<_>>()[..]
+        else {
+            return None;
+        };
+        Some(Self {
+            worker_id: worker_id.to_string(),
+            flight_address: flight_address.to_string(),
+            max_splits: max_splits.parse().ok()?,
+            version: LEGACY_VERSION.to_string(),
         })
     }
 }
@@ -69,6 +94,9 @@ pub enum HeartbeatError {
          ARNEB_CLUSTER_SECRET on this worker and the coordinator"
     )]
     Unauthenticated(String),
+    /// The coordinator runs another release and refused this worker.
+    #[error("coordinator {0} refused this worker: {1}")]
+    Incompatible(String, String),
     /// Any other failure (connect, transport, server error).
     #[error("{0}")]
     Other(String),
@@ -99,6 +127,11 @@ pub async fn send_heartbeat_with(
     let _response = client.do_action(action).await.map_err(|status| {
         if status.code() == tonic::Code::Unauthenticated {
             HeartbeatError::Unauthenticated(coordinator_address.to_owned())
+        } else if status.code() == tonic::Code::FailedPrecondition {
+            HeartbeatError::Incompatible(
+                coordinator_address.to_owned(),
+                status.message().to_owned(),
+            )
         } else {
             HeartbeatError::Other(format!("heartbeat failed: {status}"))
         }
@@ -113,20 +146,25 @@ mod tests {
 
     #[test]
     fn heartbeat_encode_decode() {
-        let msg = HeartbeatMessage {
-            worker_id: "w1".into(),
-            flight_address: "http://localhost:9090".into(),
-            max_splits: 256,
-        };
-        let encoded = msg.encode();
-        let decoded = HeartbeatMessage::decode(&encoded).unwrap();
-        assert_eq!(decoded.worker_id, "w1");
-        assert_eq!(decoded.flight_address, "http://localhost:9090");
-        assert_eq!(decoded.max_splits, 256);
+        let msg = HeartbeatMessage::new("w1".into(), "http://localhost:9090".into(), 256);
+        assert_eq!(msg.version, VERSION);
+        let decoded = HeartbeatMessage::decode(&msg.encode()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn a_legacy_heartbeat_decodes_with_the_legacy_version() {
+        let msg = HeartbeatMessage::decode(b"w1|http://localhost:9090|256").unwrap();
+        assert_eq!(msg.worker_id, "w1");
+        assert_eq!(msg.flight_address, "http://localhost:9090");
+        assert_eq!(msg.max_splits, 256);
+        assert_eq!(msg.version, LEGACY_VERSION);
     }
 
     #[test]
     fn heartbeat_decode_invalid() {
-        assert!(HeartbeatMessage::decode(b"bad").is_err());
+        for body in [&b"bad"[..], b"{\"worker_id\":\"w1\"}", b"a|b", b"a|b|many"] {
+            assert!(HeartbeatMessage::decode(body).is_err());
+        }
     }
 }

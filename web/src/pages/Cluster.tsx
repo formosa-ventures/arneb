@@ -128,7 +128,7 @@ export function Cluster() {
                       <span className="font-mono text-xs">{w.address}</span>
                     </div>
                     <p className="text-muted-foreground">
-                      {w.max_splits} splits
+                      {w.max_splits} splits · v{w.version}
                     </p>
                     <p className="text-xs text-muted-foreground">
                       {w.alive

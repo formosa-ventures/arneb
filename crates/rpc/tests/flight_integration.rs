@@ -74,16 +74,14 @@ async fn flight_server_heartbeat_roundtrip() {
 
     let state = FlightState::with_heartbeat_callback(Arc::new(move |msg| {
         received_clone.lock().unwrap().push(msg);
+        Ok(())
     }));
 
     let addr = start_test_flight_server(state).await;
 
     // Send a heartbeat.
-    let msg = arneb_rpc::HeartbeatMessage {
-        worker_id: "test-worker".into(),
-        flight_address: "http://localhost:9091".into(),
-        max_splits: 128,
-    };
+    let msg =
+        arneb_rpc::HeartbeatMessage::new("test-worker".into(), "http://localhost:9091".into(), 128);
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -99,6 +97,52 @@ async fn flight_server_heartbeat_roundtrip() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].worker_id, "test-worker");
     assert_eq!(messages[0].max_splits, 128);
+}
+
+#[tokio::test]
+async fn a_refused_heartbeat_is_incompatible_on_the_worker() {
+    let state = FlightState::with_heartbeat_callback(Arc::new(|msg| {
+        Err(format!("worker '{}' runs another release", msg.worker_id))
+    }));
+    let addr = start_test_flight_server(state).await;
+
+    let msg = arneb_rpc::HeartbeatMessage::new("w1".into(), "http://localhost:1".into(), 8);
+    let err = arneb_rpc::send_heartbeat_with(&addr, &msg, &Default::default())
+        .await
+        .unwrap_err();
+    match err {
+        arneb_rpc::HeartbeatError::Incompatible(_, message) => {
+            assert_eq!(message, "worker 'w1' runs another release")
+        }
+        other => panic!("expected Incompatible, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_legacy_heartbeat_reaches_the_callback_with_the_legacy_version() {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let s = seen.clone();
+    let state = FlightState::with_heartbeat_callback(Arc::new(move |msg| {
+        *s.lock().unwrap() = Some(msg.version);
+        Err("refused".to_string())
+    }));
+    let addr = start_test_flight_server(state).await;
+
+    let mut client = arneb_rpc::connect(&addr, &Default::default())
+        .await
+        .unwrap();
+    let status = client
+        .do_action(arrow_flight::Action {
+            r#type: "heartbeat".into(),
+            body: "w1|http://localhost:1|8".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        seen.lock().unwrap().as_deref(),
+        Some(arneb_rpc::LEGACY_VERSION)
+    );
 }
 
 // A2.1.4 (2026-05-28): forced-broadcast end-to-end tests. The fragmenter

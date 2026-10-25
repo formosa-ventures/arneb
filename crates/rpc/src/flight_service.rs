@@ -90,10 +90,7 @@ pub enum BufferKind {
 /// broadcast path is ever disabled.
 #[derive(Clone)]
 pub struct FlightState {
-    buffers: Arc<RwLock<HashMap<String, BufferKind>>>,
-    /// Each registered buffer's failure flag, held outside the buffer so
-    /// [`FlightState::fail_output`] needs no lock a `do_get` may hold.
-    failures: Arc<RwLock<HashMap<String, FailureHandle>>>,
+    buffers: Arc<RwLock<HashMap<String, BufferEntry>>>,
     heartbeat_callback: Option<HeartbeatCallback>,
     task_callback: Option<TaskCallback>,
     task_status_callback: Option<TaskStatusCallback>,
@@ -106,7 +103,6 @@ impl Default for FlightState {
     fn default() -> Self {
         Self {
             buffers: Arc::new(RwLock::new(HashMap::new())),
-            failures: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_callback: None,
             task_callback: None,
             task_status_callback: None,
@@ -165,13 +161,11 @@ impl FlightState {
     /// from `register_buffer`; the broadcast equivalent is
     /// `register_broadcast_buffer`.
     pub fn register_partitioned_buffer(&self, task_id: String, buffer: OutputBuffer) {
-        self.failures
-            .write()
-            .unwrap()
-            .insert(task_id.clone(), buffer.failure_handle());
-        self.buffers.write().unwrap().insert(
+        let failure = buffer.failure_handle();
+        self.insert(
             task_id,
             BufferKind::Partitioned(Arc::new(tokio::sync::Mutex::new(buffer))),
+            failure,
         );
     }
 
@@ -180,14 +174,15 @@ impl FlightState {
     /// pumper (which calls `write_batch` + `finish`) and the Flight
     /// `do_get` handler (which calls `subscribe` per consumer).
     pub fn register_broadcast_buffer(&self, task_id: String, buffer: Arc<BroadcastOutputBuffer>) {
-        self.failures
-            .write()
-            .unwrap()
-            .insert(task_id.clone(), buffer.failure_handle());
+        let failure = buffer.failure_handle();
+        self.insert(task_id, BufferKind::Broadcast(buffer), failure);
+    }
+
+    fn insert(&self, task_id: String, kind: BufferKind, failure: FailureHandle) {
         self.buffers
             .write()
             .unwrap()
-            .insert(task_id, BufferKind::Broadcast(buffer));
+            .insert(task_id, BufferEntry { kind, failure });
     }
 
     /// Look up the buffer for a task by key. A2.1.2 returns `BufferKind`
@@ -195,27 +190,36 @@ impl FlightState {
     /// handler — matches on the kind to pick partitioned vs broadcast
     /// consume.
     pub fn get_buffer(&self, task_id: &str) -> Option<BufferKind> {
-        self.buffers.read().unwrap().get(task_id).cloned()
+        let buffers = self.buffers.read().unwrap();
+        buffers.get(task_id).map(|entry| entry.kind.clone())
     }
 
     /// Remove a buffer when task is complete.
     pub fn remove_buffer(&self, task_id: &str) {
         self.buffers.write().unwrap().remove(task_id);
-        self.failures.write().unwrap().remove(task_id);
     }
 
     /// Mark task `task_id`'s output failed unless it already is, so its
-    /// consumers end on an error frame instead of a clean EOF. Takes no
-    /// buffer lock, so a cancel can't miss a partitioned buffer a `do_get`
-    /// holds (#156). `false` when no buffer is registered.
+    /// consumers end on an error frame instead of a clean EOF, and close a
+    /// broadcast buffer (its producer is gone and would never finish it)
+    /// so subscribed consumers wake and read the failure. Takes no buffer
+    /// lock, so a cancel can't miss a partitioned buffer a `do_get` holds
+    /// (#156). `false` when no buffer is registered.
     pub fn fail_output(&self, task_id: &str, failure: impl FnOnce() -> crate::TaskFailure) -> bool {
-        let Some(handle) = self.failures.read().unwrap().get(task_id).cloned() else {
+        let Some(BufferEntry {
+            kind,
+            failure: handle,
+        }) = self.buffers.read().unwrap().get(task_id).cloned()
+        else {
             return false;
         };
         handle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_or_insert_with(failure);
+        if let BufferKind::Broadcast(buffer) = kind {
+            buffer.finish();
+        }
         true
     }
 }
@@ -234,6 +238,14 @@ impl TrinoFlightService {
 }
 
 type FailureHandle = Arc<std::sync::Mutex<Option<crate::TaskFailure>>>;
+
+/// A registered buffer and its failure flag. The flag is held outside the
+/// buffer so [`FlightState::fail_output`] needs no lock a `do_get` may hold.
+#[derive(Clone)]
+struct BufferEntry {
+    kind: BufferKind,
+    failure: FailureHandle,
+}
 
 type BoxedStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
@@ -355,7 +367,7 @@ impl FlightService for TrinoFlightService {
                 );
                 Ok(Response::new(ServedStream::wrap(
                     stream,
-                    ticket_str.clone(),
+                    ticket_str,
                     "partitioned",
                     peer,
                 )))
@@ -373,7 +385,7 @@ impl FlightService for TrinoFlightService {
                 let flight_stream = async_stream_broadcast(schema, stream, failure);
                 Ok(Response::new(ServedStream::wrap(
                     flight_stream,
-                    ticket_str.clone(),
+                    ticket_str,
                     "broadcast",
                     peer,
                 )))
@@ -565,7 +577,16 @@ impl ServedStream {
         kind: &'static str,
         peer: Option<std::net::SocketAddr>,
     ) -> BoxedStream<FlightData> {
-        Box::pin(Self {
+        Box::pin(Self::new(inner, ticket, kind, peer))
+    }
+
+    fn new(
+        inner: BoxedStream<FlightData>,
+        ticket: String,
+        kind: &'static str,
+        peer: Option<std::net::SocketAddr>,
+    ) -> Self {
+        Self {
             inner,
             ticket,
             kind,
@@ -574,7 +595,7 @@ impl ServedStream {
             messages: 0,
             bytes: 0,
             ended: false,
-        })
+        }
     }
 }
 
@@ -811,16 +832,12 @@ mod tests {
         if error_last {
             items.push(Err(Status::internal("producer task failed")));
         }
-        ServedStream {
-            inner: Box::pin(futures::stream::iter(items)),
-            ticket: "q.t:0".into(),
-            kind: "partitioned",
-            peer: None,
-            opened: std::time::Instant::now(),
-            messages: 0,
-            bytes: 0,
-            ended: false,
-        }
+        ServedStream::new(
+            Box::pin(futures::stream::iter(items)),
+            "q.t:0".into(),
+            "partitioned",
+            None,
+        )
     }
 
     /// A response read to its end, or to the producer's error frame, is not
@@ -871,6 +888,25 @@ mod tests {
 
         state.remove_buffer("q.t");
         assert!(!state.fail_output("q.t", || "gone".into()));
+    }
+
+    /// A cancelled broadcast producer never finishes its buffer, so
+    /// `fail_output` closes it: a subscriber blocked on `next()` wakes
+    /// instead of waiting forever, and the failure is recorded.
+    #[tokio::test]
+    async fn fail_output_wakes_broadcast_subscribers() {
+        let buffer = Arc::new(BroadcastOutputBuffer::new(test_schema()));
+        let state = FlightState::new();
+        state.register_broadcast_buffer("q.b".into(), buffer.clone());
+        let mut sub = buffer.subscribe();
+        let read = tokio::spawn(async move { sub.next().await });
+        assert!(state.fail_output("q.b", || "query cancelled".into()));
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .expect("subscriber still blocked after fail_output")
+            .unwrap();
+        assert!(next.is_none());
+        assert!(buffer.failure_handle().lock().unwrap().is_some());
     }
 
     #[test]

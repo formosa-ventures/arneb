@@ -373,13 +373,6 @@ impl TaskManager {
         for (task_key, handles) in entry {
             self.flight_state
                 .fail_output(&task_key, || "query cancelled".into());
-            if let Some(arneb_rpc::BufferKind::Broadcast(buf)) =
-                self.flight_state.get_buffer(&task_key)
-            {
-                // The aborted pumper never finishes the buffer; close it so
-                // subscribed consumers wake and read the failure.
-                buf.finish();
-            }
             for handle in handles {
                 handle.abort();
             }

@@ -53,21 +53,25 @@ impl HeartbeatMessage {
     /// `worker_id|flight_address|max_splits` body of releases before 0.1.6
     /// decodes with [`LEGACY_VERSION`].
     pub fn decode(data: &[u8]) -> Result<Self, ExecutionError> {
-        let json_err = match serde_json::from_slice(data) {
-            Ok(msg) => return Ok(msg),
-            Err(e) => e,
+        serde_json::from_slice(data).or_else(|json_err| {
+            Self::decode_legacy(data).ok_or_else(|| {
+                ExecutionError::InvalidOperation(format!("invalid heartbeat: {json_err}"))
+            })
+        })
+    }
+
+    fn decode_legacy(data: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(data).ok()?;
+        let [worker_id, flight_address, max_splits] = text.split('|').collect::<Vec<_>>()[..]
+        else {
+            return None;
         };
-        let invalid = || ExecutionError::InvalidOperation(format!("invalid heartbeat: {json_err}"));
-        let text = std::str::from_utf8(data).map_err(|_| invalid())?;
-        match text.split('|').collect::<Vec<_>>()[..] {
-            [worker_id, flight_address, max_splits] => Ok(Self {
-                worker_id: worker_id.to_string(),
-                flight_address: flight_address.to_string(),
-                max_splits: max_splits.parse().map_err(|_| invalid())?,
-                version: LEGACY_VERSION.to_string(),
-            }),
-            _ => Err(invalid()),
-        }
+        Some(Self {
+            worker_id: worker_id.to_string(),
+            flight_address: flight_address.to_string(),
+            max_splits: max_splits.parse().ok()?,
+            version: LEGACY_VERSION.to_string(),
+        })
     }
 }
 

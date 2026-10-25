@@ -78,7 +78,7 @@ impl NodeRegistry {
              every node must run the same release",
             self.version
         );
-        let removed = self.workers.write().unwrap().remove(&worker_id).is_some();
+        let removed = self.remove_worker(&worker_id);
         if self.first_rejection(&worker_id, version) {
             tracing::warn!(
                 target: "arneb::cluster",
@@ -227,9 +227,9 @@ impl NodeRegistry {
         self.alive_workers().len()
     }
 
-    /// Remove a worker from the registry.
-    pub fn remove_worker(&self, worker_id: &str) {
-        self.workers.write().unwrap().remove(worker_id);
+    /// Remove a worker from the registry; `true` if it was registered.
+    pub fn remove_worker(&self, worker_id: &str) -> bool {
+        self.workers.write().unwrap().remove(worker_id).is_some()
     }
 }
 

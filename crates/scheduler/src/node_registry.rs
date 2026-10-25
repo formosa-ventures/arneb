@@ -64,7 +64,9 @@ impl NodeRegistry {
     }
 
     /// Register or update a worker that reported `version`, if it is this
-    /// coordinator's release, recording whether it is `draining`. Otherwise
+    /// coordinator's release, recording whether it is `draining`. A draining
+    /// heartbeat from a worker that already deregistered is a late one and
+    /// is ignored; an active one is a restart and rejoins. Otherwise
     /// the worker is removed if registered, the refusal is logged once per
     /// worker and version, and the returned error explains it.
     pub fn admit(
@@ -77,8 +79,7 @@ impl NodeRegistry {
     ) -> Result<(), String> {
         if version == self.version {
             self.rejected.lock().unwrap().remove(&worker_id);
-            self.heartbeat(worker_id.clone(), address, max_splits);
-            self.set_draining(&worker_id, draining);
+            self.record(worker_id, address, max_splits, draining);
             return Ok(());
         }
         let message = format!(
@@ -99,24 +100,6 @@ impl NodeRegistry {
             );
         }
         Err(message)
-    }
-
-    /// Mark a registered worker draining (or active again), logging the change.
-    fn set_draining(&self, worker_id: &str, draining: bool) {
-        let mut workers = self.workers.write().unwrap();
-        let Some(worker) = workers.get_mut(worker_id) else {
-            return;
-        };
-        if worker.draining != draining {
-            tracing::info!(
-                target: "arneb::cluster",
-                worker_id = %worker_id,
-                draining,
-                "{}",
-                if draining { "worker draining" } else { "worker active again" }
-            );
-        }
-        worker.draining = draining;
     }
 
     /// A drained worker said it is exiting: forget it.
@@ -141,11 +124,29 @@ impl NodeRegistry {
         previous.as_deref() != Some(version)
     }
 
-    /// Register or update a worker's heartbeat, taking it to run this
-    /// coordinator's release (see [`NodeRegistry::admit`]).
+    /// Register or update an active worker's heartbeat, taking it to run
+    /// this coordinator's release (see [`NodeRegistry::admit`]).
     pub fn heartbeat(&self, worker_id: String, address: String, max_splits: usize) {
-        self.departed.lock().unwrap().remove(&worker_id);
+        self.record(worker_id, address, max_splits, false);
+    }
+
+    fn record(&self, worker_id: String, address: String, max_splits: usize, draining: bool) {
+        // One write lock for liveness and drain state, so no reader sees a
+        // draining worker as active in between. Lock order: workers, then
+        // departed (as in `deregister` and `lost_worker`).
         let mut workers = self.workers.write().unwrap();
+        {
+            let mut departed = self.departed.lock().unwrap();
+            if draining && departed.contains_key(&worker_id) {
+                tracing::debug!(
+                    target: "arneb::cluster",
+                    worker_id = %worker_id,
+                    "ignoring a late heartbeat from a deregistered worker"
+                );
+                return;
+            }
+            departed.remove(&worker_id);
+        }
         let entry = workers.entry(worker_id.clone()).or_insert_with(|| {
             tracing::info!(worker_id = %worker_id, address = %address, "new worker registered");
             WorkerInfo {
@@ -155,7 +156,7 @@ impl NodeRegistry {
                 max_splits,
                 alive: true,
                 version: self.version.to_string(),
-                draining: false,
+                draining,
             }
         });
         if !entry.alive {
@@ -166,10 +167,20 @@ impl NodeRegistry {
                 "worker re-registered"
             );
         }
+        if entry.draining != draining {
+            tracing::info!(
+                target: "arneb::cluster",
+                worker_id = %worker_id,
+                draining,
+                "{}",
+                if draining { "worker draining" } else { "worker active again" }
+            );
+        }
         entry.last_heartbeat = Instant::now();
         entry.address = address;
         entry.max_splits = max_splits;
         entry.alive = true;
+        entry.draining = draining;
     }
 
     /// The heartbeat timeout this registry applies.
@@ -414,6 +425,26 @@ mod tests {
         registry.remove_worker("w1");
         let lost = registry.lost_worker(&["w1".into()]).unwrap();
         assert_eq!(lost.reason, "no longer registered");
+    }
+
+    #[test]
+    fn a_late_draining_heartbeat_does_not_bring_a_deregistered_worker_back() {
+        let registry = NodeRegistry::new(30);
+        let own = env!("CARGO_PKG_VERSION");
+        registry
+            .admit("w1".into(), "host1:9090".into(), 256, own, true)
+            .unwrap();
+        registry.deregister("w1");
+        registry
+            .admit("w1".into(), "host1:9090".into(), 256, own, true)
+            .unwrap();
+        assert_eq!(registry.total_count(), 0);
+
+        // A restart under the same id comes back active and rejoins.
+        registry
+            .admit("w1".into(), "host1:9090".into(), 256, own, false)
+            .unwrap();
+        assert_eq!(registry.active_workers().len(), 1);
     }
 
     #[test]

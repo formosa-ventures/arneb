@@ -207,7 +207,7 @@ Give the process manager more time than `drain_timeout_secs` before it
 force-kills the worker. On Kubernetes, set `terminationGracePeriodSeconds`
 above it; the default 30 s is shorter than the default drain timeout.
 
-When a query finishes, the coordinator sends each of its workers
+When a query finishes, the coordinator sends each worker that ran part of it
 `release_query`, and they drop the query's tasks and exchange buffers right
 away. That is how a draining worker knows it is idle, and it also frees
 broadcast buffers that used to stay in memory for up to 600 s.

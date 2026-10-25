@@ -66,8 +66,12 @@ Either too short for long queries or slower than needed for short ones.
   registry remembers its address, so a query it still ran (drain timed out)
   fails with `left the cluster when its drain ended` rather than
   `no longer registered`.
-- A worker whose heartbeat says `active` again (a restart under the same id)
-  becomes schedulable again.
+- A `draining` heartbeat from an id that already deregistered is a late one
+  (sent before `stopped`, delivered after) and is ignored, so the registry
+  itself keeps a drained worker out. A worker whose heartbeat says `active`
+  (a restart under the same id) rejoins and becomes schedulable again.
+- Liveness and drain state are updated under one write lock, so no reader
+  sees a draining worker as active in between.
 
 ### Drain sequence on the worker
 
@@ -80,10 +84,9 @@ Either too short for long queries or slower than needed for short ones.
 3. Poll every 500 ms until `QueryTasks.running` is empty or
    `drain_timeout_secs` passes. Tasks are still accepted while draining.
 4. Log `worker drained` (or `drain timed out` with the number of queries
-   left), hand `stopped` to the heartbeat loop, and exit once it is sent
-   (at most 5 s). The loop sends nothing after it, so a `draining`
-   heartbeat already in flight cannot re-register the worker after its
-   deregistration.
+   left), send `stopped`, and exit once it is sent (at most 5 s). A
+   `draining` heartbeat still in flight may land after it; the coordinator
+   ignores it (see above).
 
 A second SIGTERM or Ctrl-C during the drain exits at once.
 
@@ -99,9 +102,11 @@ elsewhere). Coordinator and standalone stop on it as they do on Ctrl-C now.
 
 ## Risks / Trade-offs
 
-- [One extra RPC per worker per successful query] → It is one small action
-  sent in parallel after the result is collected, off the query's latency
-  path (spawned from `Drop`).
+- [One extra RPC per worker per successful query] → It goes only to the
+  workers that ran a task of the query, once each, in parallel after the
+  result is collected, off the query's latency path (spawned from `Drop`).
+  A release adds no cancel tombstone on the worker, since every task of a
+  successful query was already submitted.
 - [A release that fails to arrive keeps the query on the worker until the
   cleanup polls drop it] → Same as today; it only lengthens a drain.
 - [Release aborts a task still running after the result is complete, such as

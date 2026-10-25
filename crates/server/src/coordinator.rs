@@ -359,7 +359,12 @@ impl QueryCoordinator {
             "distributed query complete"
         );
 
-        cancel_guard.disarm();
+        cancel_guard.finish(
+            stage_results
+                .into_values()
+                .flatten()
+                .map(|(addr, _, _)| addr),
+        );
         Ok(batches)
     }
 }
@@ -457,18 +462,24 @@ pub(crate) fn flight_address(address: &str) -> String {
     }
 }
 
-/// Ends a distributed query on its workers (admission-control D4). Armed
-/// for the whole of `execute` once tasks may have been dispatched: `Drop`
-/// sends `cancel_query`, covering error returns, panics and the future
-/// being dropped. Once disarmed (the result is collected) it sends
-/// `release_query` instead, so workers drop the query's tasks at once
-/// (worker-graceful-drain). Both go from a detached task so `Drop` never
-/// blocks. Delivery is best-effort: a failure is logged, and the worker's
-/// own buffer cleanup still frees the tasks later.
+/// Ends a distributed query on its workers (admission-control D4). From
+/// the moment tasks may be dispatched, `Drop` sends `cancel_query` to every
+/// worker, covering error returns, panics and the future being dropped.
+/// Once [`CancelGuard::finish`] records the result, it sends `release_query`
+/// to the workers that ran a task instead, so they drop the query's tasks
+/// at once (worker-graceful-drain). Both go from a detached task so `Drop`
+/// never blocks. Delivery is best-effort: a failure is logged, and the
+/// worker's own buffer cleanup still frees the tasks later.
 pub(crate) struct CancelGuard {
     query_id: QueryId,
     workers: Vec<String>,
-    armed: bool,
+    action: EndAction,
+}
+
+#[derive(Clone, Copy)]
+enum EndAction {
+    Cancel,
+    Release,
 }
 
 impl CancelGuard {
@@ -476,13 +487,16 @@ impl CancelGuard {
         Self {
             query_id,
             workers,
-            armed: true,
+            action: EndAction::Cancel,
         }
     }
 
-    /// The query finished normally: release it instead of cancelling it.
-    pub(crate) fn disarm(&mut self) {
-        self.armed = false;
+    /// The query finished normally: release it on the workers at
+    /// `dispatched` (deduplicated) instead of cancelling it everywhere.
+    pub(crate) fn finish(&mut self, dispatched: impl IntoIterator<Item = String>) {
+        let dispatched: std::collections::BTreeSet<String> = dispatched.into_iter().collect();
+        self.workers = dispatched.into_iter().collect();
+        self.action = EndAction::Release;
     }
 }
 
@@ -496,8 +510,8 @@ impl Drop for CancelGuard {
         };
         let query_id = self.query_id;
         let workers = std::mem::take(&mut self.workers);
-        let cancel = self.armed;
-        if cancel {
+        let action = self.action;
+        if let EndAction::Cancel = action {
             tracing::info!(
                 target: "arneb::cluster",
                 query_id = %query_id,
@@ -509,16 +523,15 @@ impl Drop for CancelGuard {
         // connect timeout) must not delay the others.
         runtime.spawn(async move {
             futures::future::join_all(workers.into_iter().map(|addr| async move {
-                let (result, kind) = if cancel {
-                    (
+                let (result, kind) = match action {
+                    EndAction::Cancel => (
                         arneb_rpc::cancel_query(&addr, query_id).await,
                         "cancel_query",
-                    )
-                } else {
-                    (
+                    ),
+                    EndAction::Release => (
                         arneb_rpc::release_query(&addr, query_id).await,
                         "release_query",
-                    )
+                    ),
                 };
                 if let Err(e) = result {
                     tracing::warn!(
@@ -1438,11 +1451,12 @@ mod tests {
         (addr, seen, released)
     }
 
-    /// admission-control D4: an armed guard dropped (error, panic, or the
-    /// query future dropped) cancels the query on every worker; a disarmed
-    /// one (success) releases it instead (worker-graceful-drain).
+    /// admission-control D4: a guard dropped before `finish` (error, panic,
+    /// or the query future dropped) cancels the query on every worker; a
+    /// finished one (success) releases it on the workers that ran a task,
+    /// once each (worker-graceful-drain).
     #[tokio::test]
-    async fn cancel_guard_cancels_on_drop_and_releases_once_disarmed() {
+    async fn cancel_guard_cancels_on_drop_and_releases_once_finished() {
         let (a, seen_a, released_a) = recording_worker_with_releases().await;
         let (b, seen_b, released_b) = recording_worker_with_releases().await;
         let q = QueryId::new();
@@ -1453,14 +1467,14 @@ mod tests {
         assert!(released_a.lock().unwrap().is_empty());
 
         let done = QueryId::new();
-        let mut ok = CancelGuard::new(done, vec![a, b]);
-        ok.disarm();
+        let mut ok = CancelGuard::new(done, vec![a.clone(), b]);
+        ok.finish([a.clone(), a]);
         drop(ok);
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(seen_a.lock().unwrap().len(), 1);
         assert_eq!(seen_b.lock().unwrap().len(), 1);
         assert_eq!(*released_a.lock().unwrap(), vec![done]);
-        assert_eq!(*released_b.lock().unwrap(), vec![done]);
+        assert!(released_b.lock().unwrap().is_empty(), "b ran no task");
     }
 
     /// #145: workers are cancelled concurrently, so a worker that never

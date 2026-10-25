@@ -27,12 +27,17 @@ The coordinator SHALL schedule new queries only on workers that are alive
 and active. A draining worker SHALL still count as alive for the queries it
 already runs, and the workers API SHALL list it with `state: "draining"`.
 A `stopped` heartbeat SHALL remove the worker from the registry and log
-`worker deregistered`. An `active` heartbeat from the same id SHALL make it
-schedulable again.
+`worker deregistered`. A later `draining` heartbeat from that id SHALL be
+ignored; an `active` heartbeat from the same id SHALL make it schedulable
+again.
 
 #### Scenario: Query started during a drain
 - **WHEN** worker-2 is draining and a new query starts
 - **THEN** the query's tasks are dispatched to worker-1 only and it succeeds
+
+#### Scenario: A late draining heartbeat
+- **WHEN** worker-2 has deregistered and a `draining` heartbeat it sent earlier arrives
+- **THEN** worker-2 stays out of the registry
 
 #### Scenario: Running query is not failed
 - **WHEN** a worker that runs a query's tasks starts draining
@@ -40,7 +45,7 @@ schedulable again.
 
 ### Requirement: The coordinator releases finished queries
 After a distributed query has collected its result, the coordinator SHALL
-send `release_query` to each of its workers. A worker SHALL then drop that
+send `release_query` to each worker that ran one of its tasks, once. A worker SHALL then drop that
 query's tasks, buffers and dynamic-filter state, as for a cancel, without
 logging it as a cancellation. A release of an unknown query SHALL be
 acknowledged and do nothing.

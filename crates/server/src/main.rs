@@ -970,7 +970,6 @@ async fn run() -> Result<()> {
     };
     let (worker_state, worker_state_rx) =
         tokio::sync::watch::channel(arneb_rpc::WorkerState::Active);
-    let stopped_sent = tokio::sync::Notify::new();
     let flight_state_clone = flight_state.clone();
     let rpc_addr_clone = rpc_addr.clone();
 
@@ -1029,14 +1028,12 @@ async fn run() -> Result<()> {
             heartbeat_target.as_ref(),
             role,
             worker_state_rx,
-            &stopped_sent,
             heartbeat.interval_secs,
         ) => {}
         // SIGTERM / Ctrl-C; a worker drains first (worker-graceful-drain).
         _ = run_until_shutdown(
             heartbeat_target.as_ref().zip(worker_tasks.as_ref()),
             &worker_state,
-            &stopped_sent,
             heartbeat.interval_secs,
             drain_timeout_secs,
         ) => {}
@@ -1138,15 +1135,12 @@ impl HeartbeatTarget {
 }
 
 /// Send a heartbeat every `interval_secs`, and at once whenever `state`
-/// changes (a drain starting or ending). After sending `stopped` it signals
-/// `stopped_sent` and sends nothing more, so no later `draining` heartbeat
-/// can re-register the worker. Pending forever off workers; returns at once
+/// changes (a drain starting). Pending forever off workers; returns at once
 /// on a worker with no heartbeat target, which stops the server.
 async fn worker_heartbeat_loop(
     target: Option<&HeartbeatTarget>,
     role: ServerRole,
     mut state: tokio::sync::watch::Receiver<arneb_rpc::WorkerState>,
-    stopped_sent: &tokio::sync::Notify,
     interval_secs: u64,
 ) {
     if !matches!(role, ServerRole::Worker) {
@@ -1163,10 +1157,6 @@ async fn worker_heartbeat_loop(
     loop {
         let current = *state.borrow_and_update();
         target.send(current).await;
-        if current == arneb_rpc::WorkerState::Stopped {
-            stopped_sent.notify_one();
-            futures::future::pending::<()>().await;
-        }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
             changed = state.changed() => {
@@ -1184,7 +1174,6 @@ async fn worker_heartbeat_loop(
 async fn run_until_shutdown(
     worker: Option<(&HeartbeatTarget, &task_manager::TaskManager)>,
     state: &tokio::sync::watch::Sender<arneb_rpc::WorkerState>,
-    stopped_sent: &tokio::sync::Notify,
     interval_secs: u64,
     drain_timeout_secs: u64,
 ) {
@@ -1234,13 +1223,16 @@ async fn run_until_shutdown(
             );
         }
     }
-    // The heartbeat loop sends it, after any heartbeat already in flight.
-    // Bounded: an unreachable coordinator must not hold up the exit; it then
-    // drops this worker at its heartbeat timeout.
-    state.send_replace(arneb_rpc::WorkerState::Stopped);
-    if tokio::time::timeout(std::time::Duration::from_secs(5), stopped_sent.notified())
-        .await
-        .is_err()
+    // A `draining` heartbeat still in flight may land after this; the
+    // coordinator ignores those once the worker has deregistered. Bounded:
+    // an unreachable coordinator must not hold up the exit; it then drops
+    // this worker at its heartbeat timeout.
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        target.send(arneb_rpc::WorkerState::Stopped),
+    )
+    .await
+    .is_err()
     {
         tracing::warn!(worker_id = %worker_id, "stopped heartbeat timed out");
     }

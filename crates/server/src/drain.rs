@@ -48,17 +48,16 @@ pub async fn wait_until_idle(
     timeout: Duration,
     poll: Duration,
 ) -> DrainOutcome {
-    let deadline = tokio::time::Instant::now() + timeout;
-    tokio::time::sleep(settle.min(timeout)).await;
-    loop {
-        let left = active_queries();
-        if left == 0 {
-            return DrainOutcome::Idle;
+    let drained = tokio::time::timeout(timeout, async {
+        tokio::time::sleep(settle).await;
+        while active_queries() > 0 {
+            tokio::time::sleep(poll).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return DrainOutcome::TimedOut(left);
-        }
-        tokio::time::sleep(poll.min(deadline - tokio::time::Instant::now())).await;
+    })
+    .await;
+    match (drained, active_queries()) {
+        (Ok(()), _) | (Err(_), 0) => DrainOutcome::Idle,
+        (Err(_), left) => DrainOutcome::TimedOut(left),
     }
 }
 

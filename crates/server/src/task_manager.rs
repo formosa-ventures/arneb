@@ -377,7 +377,11 @@ impl TaskManager {
     fn end_query(&self, query_id: QueryId, released: bool) -> usize {
         let entry = {
             let mut tasks = self.query_tasks.lock().unwrap_or_else(|e| e.into_inner());
-            tasks.tombstone(query_id, std::time::Instant::now());
+            // A release follows a successful query, whose every task was
+            // already submitted, so no late task needs turning away.
+            if !released {
+                tasks.tombstone(query_id, std::time::Instant::now());
+            }
             tasks.running.remove(&query_id)
         };
         let Some(entry) = entry else {

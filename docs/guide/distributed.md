@@ -149,6 +149,8 @@ password_hash = "SCRAM-SHA-256$…"   # arneb hash-password
   node, and the failure shows up as heartbeat errors on the worker.
 - With password auth, the coordinator's Web UI binds to `127.0.0.1` unless
   `[web] bind_address` is set.
+- Per-user read permissions on catalogs, schemas and tables come from an
+  [access rules file](/guide/access-control) on the coordinator.
 
 `./scripts/dev-certs.sh` creates a throwaway CA and a `localhost`
 certificate that every node on one host can share. See

@@ -128,9 +128,10 @@ struct TableMeta {
     columns: Vec<ColumnInfo>,
 }
 
-/// Lists the catalogs visible to Trino clients (registered + `system`).
+/// Lists the catalogs visible to Trino clients (registered ones the
+/// session user may see, plus `system`).
 pub(crate) fn catalog_names(cm: &CatalogManager) -> Vec<String> {
-    let mut names = cm.catalog_names();
+    let mut names = cm.visible_catalog_names();
     if !names.iter().any(|n| n == SYSTEM_CATALOG) {
         names.push(SYSTEM_CATALOG.to_string());
     }
@@ -143,7 +144,11 @@ pub(crate) async fn schema_names(cm: &CatalogManager, catalog: &str) -> Option<V
     let mut names = if catalog == SYSTEM_CATALOG && cm.catalog(catalog).is_none() {
         vec!["jdbc".to_string(), "metadata".to_string()]
     } else {
-        cm.catalog(catalog)?.schema_names().await
+        cm.catalog(catalog)?;
+        if !cm.catalog_visible(catalog) {
+            return None;
+        }
+        cm.visible_schema_names(catalog).await
     };
     if !names.iter().any(|n| n == INFORMATION_SCHEMA) {
         names.push(INFORMATION_SCHEMA.to_string());
@@ -180,12 +185,11 @@ pub(crate) async fn table_names(
             _ => None,
         };
     }
-    let mut names = cm
-        .catalog(catalog)?
-        .schema(schema)
-        .await?
-        .table_names()
-        .await;
+    cm.catalog(catalog)?.schema(schema).await?;
+    if !cm.catalog_visible(catalog) {
+        return None;
+    }
+    let mut names = cm.visible_table_names(catalog, schema).await;
     names.sort();
     Some(names)
 }
@@ -230,13 +234,16 @@ async fn collect_tables(
         let Some(provider) = cm.catalog(catalog) else {
             continue;
         };
-        let mut schemas = provider.schema_names().await;
+        if !cm.catalog_visible(catalog) {
+            continue;
+        }
+        let mut schemas = cm.visible_schema_names(catalog).await;
         schemas.sort();
         for schema in schemas {
             let Some(schema_provider) = provider.schema(&schema).await else {
                 continue;
             };
-            let mut tables = schema_provider.table_names().await;
+            let mut tables = cm.visible_table_names(catalog, &schema).await;
             tables.sort();
             for table in tables {
                 let columns = if with_columns {
@@ -297,7 +304,7 @@ pub(crate) async fn build_virtual_catalogs(
     let lower = sql.to_ascii_lowercase();
     let with_columns = lower.contains("columns");
     let wants_system = lower.contains("system.") || lower.contains("\"system\"");
-    let real_catalogs = root.catalog_names();
+    let real_catalogs = root.visible_catalog_names();
 
     // Which catalogs' information_schema does the query read? The session
     // catalog (unqualified form) plus any `<catalog>.information_schema`.

@@ -117,6 +117,9 @@ pub struct HandlerFactory {
     pub tls_required: bool,
     /// Records each statement (Web UI, `system.runtime.queries`, `/metrics`).
     pub query_tracker: Arc<arneb_scheduler::QueryTracker>,
+    /// Access rules checked for the connection's user; `None` allows all
+    /// (file-based-access-control).
+    pub access_rules: Option<Arc<arneb_catalog::AccessRules>>,
 }
 
 impl PgWireServerHandlers for HandlerFactory {
@@ -130,6 +133,7 @@ impl PgWireServerHandlers for HandlerFactory {
             admission: self.admission.clone(),
             statement_timeout: self.statement_timeout,
             query_tracker: self.query_tracker.clone(),
+            access_rules: self.access_rules.clone(),
         })
     }
 
@@ -143,6 +147,7 @@ impl PgWireServerHandlers for HandlerFactory {
             admission: self.admission.clone(),
             statement_timeout: self.statement_timeout,
             query_tracker: self.query_tracker.clone(),
+            access_rules: self.access_rules.clone(),
         })
     }
 
@@ -225,6 +230,8 @@ pub struct ConnectionHandler {
     pub statement_timeout: Option<std::time::Duration>,
     /// See [`HandlerFactory::query_tracker`].
     pub query_tracker: Arc<arneb_scheduler::QueryTracker>,
+    /// See [`HandlerFactory::access_rules`].
+    pub access_rules: Option<Arc<arneb_catalog::AccessRules>>,
 }
 
 impl ConnectionHandler {
@@ -356,8 +363,9 @@ impl ConnectionHandler {
                 tracked.running();
                 // Snapshot after admission, so the reading statement shows
                 // itself as RUNNING.
-                let runtime = crate::runtime_queries::references_runtime_queries(sql)
-                    .then(|| crate::runtime_queries::runtime_catalog(&self.query_tracker));
+                let runtime = crate::runtime_queries::references_runtime_queries(sql).then(|| {
+                    crate::runtime_queries::runtime_catalog(&self.query_tracker, catalog_manager)
+                });
                 let (cm, registry, executor) = match &runtime {
                     Some((cm, registry)) => (cm, registry, None),
                     None => (
@@ -389,12 +397,29 @@ impl ConnectionHandler {
     }
 
     /// The catalog manager resolving unqualified names for this connection:
-    /// a session view when `SET search_path` chose a non-default schema.
-    fn session_catalog<C: ClientInfo>(&self, client: &C) -> Arc<CatalogManager> {
-        client.session_extensions().get::<SearchPath>().map_or_else(
+    /// a session view when `SET search_path` chose a non-default schema,
+    /// checked against the access rules for the connection's user. Fails
+    /// when the rules do not let the user run statements.
+    fn session_catalog<C: ClientInfo>(&self, client: &C) -> PgWireResult<Arc<CatalogManager>> {
+        let base = client.session_extensions().get::<SearchPath>().map_or_else(
             || Arc::clone(&self.catalog_manager),
             |p| Arc::clone(&p.catalog_manager),
-        )
+        );
+        let Some(rules) = &self.access_rules else {
+            return Ok(base);
+        };
+        let user = client
+            .metadata()
+            .get(pgwire::api::METADATA_USER)
+            .cloned()
+            .unwrap_or_default();
+        let view = base.with_access(user, Arc::clone(rules));
+        if !view.can_execute() {
+            return Err(arneb_error_to_pg_error(&ArnebError::Plan(
+                arneb_common::error::PlanError::AccessDenied("Cannot execute query".into()),
+            )));
+        }
+        Ok(Arc::new(view))
     }
 
     /// Handle `SET`/`SHOW`/`RESET search_path` (updating the connection's
@@ -470,7 +495,7 @@ impl SimpleQueryHandler for ConnectionHandler {
 
         // Intercept session commands and metadata queries (pg_catalog,
         // information_schema, version()).
-        let catalog_manager = self.session_catalog(client);
+        let catalog_manager = self.session_catalog(client)?;
         if let Some(meta_result) = self.intercept(client, trimmed, &catalog_manager).await {
             return match meta_result {
                 Ok(resp) => metadata_to_response(resp).map(|r| vec![r]),
@@ -643,7 +668,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
         }
 
         // Intercept session commands and metadata queries
-        let catalog_manager = self.session_catalog(client);
+        let catalog_manager = self.session_catalog(client)?;
         if let Some(meta_result) = self.intercept(client, trimmed, &catalog_manager).await {
             return match meta_result {
                 Ok(resp) => metadata_to_response(resp),
@@ -686,7 +711,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
         if sql.trim().is_empty() {
             return Ok(DescribeStatementResponse::no_data());
         }
-        let catalog_manager = self.session_catalog(client);
+        let catalog_manager = self.session_catalog(client)?;
 
         // Intercept metadata queries for Describe too
         if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) = self
@@ -750,7 +775,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
         if trimmed.is_empty() {
             return Ok(DescribePortalResponse::no_data());
         }
-        let catalog_manager = self.session_catalog(client);
+        let catalog_manager = self.session_catalog(client)?;
 
         // Intercept metadata queries
         if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) = self

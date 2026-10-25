@@ -40,6 +40,7 @@ pub struct ProtocolServer {
     admission: Option<arneb_scheduler::AdmissionController>,
     statement_timeout: Option<std::time::Duration>,
     query_tracker: Arc<arneb_scheduler::QueryTracker>,
+    access_rules: Option<Arc<arneb_catalog::AccessRules>>,
 }
 
 impl ProtocolServer {
@@ -60,6 +61,7 @@ impl ProtocolServer {
             admission: None,
             statement_timeout: None,
             query_tracker: Arc::new(arneb_scheduler::QueryTracker::new()),
+            access_rules: None,
         }
     }
 
@@ -123,6 +125,13 @@ impl ProtocolServer {
         self
     }
 
+    /// Check every statement against `rules` for the connection's user
+    /// (file-based-access-control). Default: none, every user reads all.
+    pub fn with_access_rules(mut self, rules: Option<Arc<arneb_catalog::AccessRules>>) -> Self {
+        self.access_rules = rules;
+        self
+    }
+
     /// Start the server and begin accepting connections.
     /// This method runs until the process is terminated.
     pub async fn start(&self) -> Result<(), std::io::Error> {
@@ -162,6 +171,7 @@ impl ProtocolServer {
             admission: self.admission.clone(),
             statement_timeout: self.statement_timeout,
             query_tracker: self.query_tracker.clone(),
+            access_rules: self.access_rules.clone(),
         });
         let acceptor = self.tls.as_ref().map(|t| t.acceptor.clone());
 

@@ -114,6 +114,7 @@ pub struct TrinoServer {
     query_memory_limit: Option<usize>,
     admission: Option<arneb_scheduler::AdmissionController>,
     statement_timeout: Option<Duration>,
+    access_rules: Option<Arc<arneb_catalog::AccessRules>>,
 }
 
 impl TrinoServer {
@@ -137,6 +138,7 @@ impl TrinoServer {
             query_memory_limit: None,
             admission: None,
             statement_timeout: None,
+            access_rules: None,
         }
     }
 
@@ -202,6 +204,13 @@ impl TrinoServer {
         self
     }
 
+    /// Check every statement against `rules` for the session user
+    /// (file-based-access-control). Default: none, every user reads all.
+    pub fn with_access_rules(mut self, rules: Option<Arc<arneb_catalog::AccessRules>>) -> Self {
+        self.access_rules = rules;
+        self
+    }
+
     /// Record queries in `tracker` (Web UI, `system.runtime.queries`,
     /// `/metrics`) instead of a private one.
     pub fn with_query_tracker(mut self, tracker: Arc<QueryTracker>) -> Self {
@@ -218,6 +227,7 @@ impl TrinoServer {
                 memory_pool: Arc::clone(&self.memory_pool),
                 query_memory_limit: self.query_memory_limit,
                 query_tracker: Arc::clone(&self.query_tracker),
+                access_rules: self.access_rules.clone(),
             }),
             queries: Arc::new(Mutex::new(HashMap::new())),
             config: Arc::new(self.config.clone()),

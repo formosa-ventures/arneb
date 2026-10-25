@@ -22,7 +22,9 @@ stage 2, query-level retry, remains). P5 landed in #172
 (`observability-metrics`: `/metrics`, slow-query log, Grafana dashboard) and
 #173 (`query-history`: bounded history, `system.runtime.queries`, and the
 Web UI's query list reads the same history). P6 is
-`kubernetes-deployment` (GHCR images, `charts/arneb`, kind acceptance).
+`kubernetes-deployment` (GHCR images, `charts/arneb`, kind acceptance). G3
+is `file-based-access-control` (Trino-format rules file, read checks,
+filtered listings).
 
 **Plan after v0.1.5 (2026-10-23):** see "Path to production" at the end of
 this document. It adds gaps the original milestones did not cover (G1–G6)

@@ -197,6 +197,10 @@ version = "0.1.6"
 dependencies = [
  "arneb-common",
  "async-trait",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
  "tokio",
 ]
 

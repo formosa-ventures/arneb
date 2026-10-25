@@ -35,6 +35,7 @@ pub fn arneb_error_to_pg_error_with_source(
             let code = match e {
                 PlanError::ColumnNotFound { .. } | PlanError::AmbiguousReference { .. } => "42703",
                 PlanError::TableNotFound(_) => "42P01",
+                PlanError::AccessDenied(_) => "42501",
                 PlanError::FunctionNotFound { .. } => "42883",
                 PlanError::TypeMismatch { .. } => "42804",
                 PlanError::UnsupportedExpression { .. } | PlanError::InvalidExpression { .. } => {
@@ -54,6 +55,9 @@ pub fn arneb_error_to_pg_error_with_source(
         e if arneb_common::error::is_resource_exhausted(e) => ("53200".to_string(), e.to_string()),
         ArnebError::Execution(e) => ("XX000".to_string(), e.to_string()),
         ArnebError::Connector(e) => ("58030".to_string(), e.to_string()),
+        ArnebError::Catalog(e @ arneb_common::error::CatalogError::AccessDenied(_)) => {
+            ("42501".to_string(), e.to_string())
+        }
         ArnebError::Catalog(e) => ("3D000".to_string(), e.to_string()),
         ArnebError::Config(e) => ("F0000".to_string(), e.to_string()),
         _ => ("XX000".to_string(), err.to_string()),

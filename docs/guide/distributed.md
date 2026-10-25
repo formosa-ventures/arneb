@@ -159,6 +159,16 @@ queries running on it fail cleanly and the cluster keeps serving:
 `benchmarks/tpch/scripts/fault_injection.sh` checks all of this on the local
 bench cluster by killing and pausing a worker during SF10 q09.
 
+`benchmarks/tpch/scripts/concurrency_soak.sh [rounds]` runs rounds of 20
+concurrent TPC-H queries against a running cluster and exits non-zero if any
+fails. With `LOG_DIR` pointing at the nodes' log files, it also counts the
+[exchange events](/guide/observability#exchange-events) each node logged.
+With the default admission cap of 8, the rest of each round waits in the
+queue. Lifting it (`ARNEB_MAX_RUNNING_QUERIES=0`) runs all 20 at once, but
+with an unbounded memory pool that needs the memory for 20 concurrent SF10
+queries: on a 16 GB Docker Desktop VM it gets a worker or RustFS OOM-killed
+within a few rounds.
+
 ## How It Works
 
 1. A SQL query arrives at the coordinator via pgwire

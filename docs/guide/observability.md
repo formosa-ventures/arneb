@@ -20,6 +20,8 @@ curl -s http://127.0.0.1:6432/metrics
 | `arneb_worker_up` | gauge | `worker_id` | `1` while the worker heartbeats within the timeout |
 | `arneb_worker_heartbeat_age_seconds` | gauge | `worker_id` | Seconds since the worker's last heartbeat |
 | `arneb_uptime_seconds`, `arneb_build_info` | gauge | `version` | Process uptime and version |
+| `arneb_exchange_stream_breaks_total` | counter | `outcome` | Exchange streams this node read that broke mid-stream on a transport error: `resumed` (broadcast output, read again from the first missing row) or `failed` |
+| `arneb_exchange_streams_dropped_total` | counter | | Exchange streams this node served that were dropped before their end |
 
 The query metrics count what the [query history](/guide/configuration#query-history)
 records: every pgwire statement that reaches the engine and every statement
@@ -34,6 +36,25 @@ even with `max_running_queries = 0`. The second counts admission slots in use
 and is absent when admission control is off. For "how busy is the
 coordinator", use `arneb_queries_running`; for "how close are we to the
 admission cap", use the admission pair.
+
+### Exchange events
+
+Workers exchange data over Arrow Flight. Both ends of an exchange stream log
+on the `arneb::exchange` target, so worker-to-worker exchanges, which no
+`/metrics` endpoint covers, still show up in the logs:
+
+- `exchange stream broke, reopening` (warn, reading side): the stream broke
+  on a transport error. Broadcast output is reopened; partitioned output
+  can't be, and the query fails.
+- `exchange response dropped before its end` (info, sending side): with the
+  ticket, buffer kind, peer address, messages and bytes sent, and the
+  stream's age. A consumer that stops reading on purpose (a cancelled query)
+  also causes it.
+
+To see why a connection failed, add
+`tonic::transport::server=debug,tonic::transport::channel::service::connection=debug`
+to `RUST_LOG`. Each logs one line per failed connection, so they are cheap
+to leave on, unlike `h2=debug`.
 
 ## Slow-query log
 

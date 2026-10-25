@@ -1,6 +1,7 @@
-//! Process-wide query metrics in the Prometheus text exposition format.
+//! Process-wide query and exchange metrics in the Prometheus text
+//! exposition format.
 //!
-//! Query lifecycle counters live here as atomics. The query tracker, which
+//! Query lifecycle and exchange counters live here as atomics. The query tracker, which
 //! owns every pgwire and Trino statement's lifecycle, reports into them
 //! through [`query_started`] and [`query_ended`], so no registry is passed
 //! around. Values that are cheap to read at scrape time (admission
@@ -150,6 +151,37 @@ pub fn query_ended(end: QueryEnd<'_>) {
     }
 }
 
+struct ExchangeMetrics {
+    breaks_resumed: AtomicU64,
+    breaks_failed: AtomicU64,
+    dropped_early: AtomicU64,
+}
+
+static EXCHANGE_METRICS: ExchangeMetrics = ExchangeMetrics {
+    breaks_resumed: AtomicU64::new(0),
+    breaks_failed: AtomicU64::new(0),
+    dropped_early: AtomicU64::new(0),
+};
+
+/// A consumer's exchange stream broke mid-stream on a transport error;
+/// `resumed` when it was reopened and read on (#139).
+pub fn exchange_stream_broke(resumed: bool) {
+    let m = &EXCHANGE_METRICS;
+    let counter = if resumed {
+        &m.breaks_resumed
+    } else {
+        &m.breaks_failed
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A producer's exchange response stream was dropped before its end.
+pub fn exchange_stream_dropped_early() {
+    EXCHANGE_METRICS
+        .dropped_early
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 /// A value read at scrape time, rendered as a Prometheus gauge.
 #[derive(Debug, Clone)]
 pub struct Gauge {
@@ -254,6 +286,31 @@ pub fn render(gauges: &[Gauge]) -> String {
              arneb_query_duration_seconds_count{{outcome=\"{outcome}\"}} {count}"
         );
     }
+    let x = &EXCHANGE_METRICS;
+    header(
+        &mut out,
+        "arneb_exchange_stream_breaks_total",
+        "Exchange streams this node read that broke on a transport error, by outcome.",
+        "counter",
+    );
+    for (outcome, counter) in [("resumed", &x.breaks_resumed), ("failed", &x.breaks_failed)] {
+        let _ = writeln!(
+            out,
+            "arneb_exchange_stream_breaks_total{{outcome=\"{outcome}\"}} {}",
+            counter.load(Ordering::Relaxed)
+        );
+    }
+    header(
+        &mut out,
+        "arneb_exchange_streams_dropped_total",
+        "Exchange streams this node served that were dropped before their end.",
+        "counter",
+    );
+    let _ = writeln!(
+        out,
+        "arneb_exchange_streams_dropped_total {}",
+        x.dropped_early.load(Ordering::Relaxed)
+    );
     for g in gauges {
         header(&mut out, g.name, g.help, "gauge");
         for (labels, value) in &g.samples {
@@ -301,6 +358,9 @@ mod tests {
         query_ended(end(QueryOutcome::Failed, false)); // refused before admission
         query_started();
         query_ended(end(QueryOutcome::Cancelled, true));
+        exchange_stream_broke(true);
+        exchange_stream_broke(false);
+        exchange_stream_dropped_early();
 
         let after = render(&[Gauge {
             name: "arneb_workers",
@@ -316,6 +376,15 @@ mod tests {
             (cancelled, 1.0),
             (fin_count, 1.0),
             (fin_inf, 1.0),
+            (
+                r#"arneb_exchange_stream_breaks_total{outcome="resumed"}"#,
+                1.0,
+            ),
+            (
+                r#"arneb_exchange_stream_breaks_total{outcome="failed"}"#,
+                1.0,
+            ),
+            ("arneb_exchange_streams_dropped_total", 1.0),
         ] {
             assert_eq!(
                 sample(&after, series) - sample(&before, series),

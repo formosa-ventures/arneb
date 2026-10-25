@@ -23,6 +23,10 @@ stage 2, query-level retry, remains). P5 landed in #172
 #173 (`query-history`: bounded history, `system.runtime.queries`, and the
 Web UI's query list reads the same history). P6 not started.
 
+**Plan after v0.1.5 (2026-10-23):** see "Path to production" at the end of
+this document. It adds gaps the original milestones did not cover (G1–G6)
+and sequences the remaining work into releases ending at v0.2.0.
+
 ## Intent
 
 Phase 1–2.5 made Arneb a correct, fast single-node and distributed engine:
@@ -256,3 +260,53 @@ or parked on its own merit:
 - `dist-adaptive-partition` (11/19 tasks)
 - `selective-dim-first-gating` (proposal only, uncommitted)
 - Issue #116 — return `orc-rust` to crates.io once it supports arrow 60
+
+---
+
+## Path to production (added 2026-10-23, after v0.1.5)
+
+Remaining Phase 3 items at v0.1.5: P1's SF30 validation, P4 stage 2, P6, and
+M4. Checking scenario 1 ("replace an internal Trino cluster") against the
+current code turned up gaps that none of the milestones cover. Each becomes
+its own OpenSpec change.
+
+### Gaps
+
+- **G1 — Concurrent exchange failures (#139).** Under ~20 concurrent SF10
+  queries on a local cluster, about one query per run fails with an h2
+  `BrokenPipe` / `ConnectionReset` on a worker-to-worker Flight stream.
+  Scenario 1 is exactly this workload. It is fixed before P4 stage 2, so
+  retry does not hide it.
+- **G2 — `cancel_query` vs a held partitioned-buffer lock (#156, item 3).**
+  A cancel that loses the `try_lock` race leaves the buffer unflagged, which
+  weakens P2's "a timed-out query releases its memory and tasks". Lands with
+  G1.
+- **G3 — Authorization.** Arneb authenticates users but does not authorize
+  them: any authenticated user can read every catalog, including federated
+  PostgreSQL. Minimum: file-based rules on catalog and schema read access,
+  modeled on Trino's file-based access control.
+- **G4 — Worker graceful drain.** On SIGTERM, a worker stops accepting
+  tasks, finishes the running ones (bounded by a timeout), and deregisters.
+  Without it, every Helm rolling upgrade fails in-flight queries.
+- **G5 — Version handshake.** Workers report their version at registration
+  and the coordinator rejects an incompatible one. This is also the
+  compatibility plan #156 item 1 (scheme-less peer addresses) waits on.
+- **G6 — Scenario 1 acceptance with real clients.** A Tier 2 concurrency
+  soak (20 concurrent queries × N rounds, zero failures) in CI, plus smoke
+  tests from Superset, Metabase and dbt.
+
+### Releases
+
+| Release | Theme | Items | Validation |
+|---|---|---|---|
+| v0.1.6 | Concurrency reliability | G1, G2, G6 soak test | Tier 1 + 2 |
+| v0.1.7 | Deployable | P6, G4, G5 | Tier 1 + 2 + kind |
+| v0.1.8 | Safe to share | G3, P4 stage 2 (off by default) | Tier 1 + 2 |
+| in parallel | Large-scale memory | P1 SF30 validation, `dist-adaptive-partition` SF30 sweep (q18 SF30 still OOMs) | Tier 3 |
+| v0.2.0 | Production-ready | Scenario 1 checklist green, BI client smoke (G6), `docs/guide/production-checklist.md` | — |
+
+M4 follows v0.2.0.
+
+**Order:** G1 first, because it makes the soak test and retry results
+unreliable. G4 and G5 before P6 ships, so the chart's rolling upgrade does
+not fail queries. G3 before v0.2.0 is announced.

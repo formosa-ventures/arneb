@@ -1,0 +1,11 @@
+# kind cluster for the chart smoke test: one node, with the TPC-H Parquet
+# directory from gen_tpch.py mounted at /data (the chart mounts it into
+# every pod as a hostPath). Set the host path with KIND_DATA_DIR via envsubst.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: ${KIND_DATA_DIR}
+        containerPath: /data
+        readOnly: true

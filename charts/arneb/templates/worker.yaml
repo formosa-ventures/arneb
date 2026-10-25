@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "arneb.fullname" . }}-worker
+  labels:
+    {{- include "arneb.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "arneb.selectorLabels" (dict "ctx" . "component" "worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "arneb.labels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+      annotations:
+        checksum/config: {{ include "arneb.configChecksum" . }}
+        {{- with .Values.worker.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      # Service links would inject ARNEB_PORT=tcp://... for a Service named
+      # "arneb", which arneb reads as its pgwire port.
+      enableServiceLinks: false
+      # SIGTERM starts a drain of up to drainTimeoutSecs; Kubernetes must
+      # not SIGKILL before it ends.
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds | default (add .Values.worker.drainTimeoutSecs 30) }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: worker
+          image: {{ include "arneb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - --config=/etc/arneb/config.toml
+            - --role=worker
+            - --bind=0.0.0.0
+            {{- with .Values.worker.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: ARNEB_CLUSTER_WORKER_ID
+              value: $(POD_NAME)
+            - name: ARNEB_CLUSTER_ADVERTISED_ADDRESS
+              value: $(POD_IP):9090
+            - name: ARNEB_CLUSTER_COORDINATOR_ADDRESS
+              value: {{ include "arneb.fullname" . }}:{{ .Values.coordinator.service.ports.rpc }}
+            - name: ARNEB_DRAIN_TIMEOUT_SECS
+              value: {{ .Values.worker.drainTimeoutSecs | quote }}
+            {{- include "arneb.commonEnv" . | nindent 12 }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: rpc
+              containerPort: 9090
+          readinessProbe:
+            tcpSocket:
+              port: rpc
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            {{- include "arneb.volumeMounts" . | nindent 12 }}
+          {{- with .Values.worker.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "arneb.volumes" . | nindent 8 }}
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

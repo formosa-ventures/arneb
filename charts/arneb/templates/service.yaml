@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "arneb.fullname" . }}
+  labels:
+    {{- include "arneb.labels" . | nindent 4 }}
+  {{- with .Values.coordinator.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.coordinator.service.type }}
+  selector:
+    {{- include "arneb.selectorLabels" (dict "ctx" . "component" "coordinator") | nindent 4 }}
+  ports:
+    - name: pgwire
+      port: {{ .Values.coordinator.service.ports.pgwire }}
+      targetPort: pgwire
+    {{- if .Values.coordinator.trino.enabled }}
+    - name: trino
+      port: {{ .Values.coordinator.service.ports.trino }}
+      targetPort: trino
+    {{- end }}
+    - name: web
+      port: {{ .Values.coordinator.service.ports.web }}
+      targetPort: web
+    - name: rpc
+      port: {{ .Values.coordinator.service.ports.rpc }}
+      targetPort: rpc

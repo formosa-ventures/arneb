@@ -21,7 +21,8 @@ distributed). M3: P4 stage 1 landed in #171 (`fault-tolerance-fail-clean`;
 stage 2, query-level retry, remains). P5 landed in #172
 (`observability-metrics`: `/metrics`, slow-query log, Grafana dashboard) and
 #173 (`query-history`: bounded history, `system.runtime.queries`, and the
-Web UI's query list reads the same history). P6 not started.
+Web UI's query list reads the same history). P6 is
+`kubernetes-deployment` (GHCR images, `charts/arneb`, kind acceptance).
 
 **Plan after v0.1.5 (2026-10-23):** see "Path to production" at the end of
 this document. It adds gaps the original milestones did not cover (G1–G6)
@@ -299,8 +300,8 @@ its own OpenSpec change.
 
 | Release | Theme | Items | Validation |
 |---|---|---|---|
-| v0.1.6 | Concurrency reliability | G1, G2, G6 soak test | Tier 1 + 2 |
-| v0.1.7 | Deployable | P6, G4, G5 | Tier 1 + 2 + kind |
+| v0.1.6 | Concurrency reliability | G1, G2, G6 soak test; G4 and G5 landed early (#178, #179) | Tier 1 + 2 |
+| v0.1.7 | Deployable | P6 | Tier 1 + 2 + kind |
 | v0.1.8 | Safe to share | G3, P4 stage 2 (off by default) | Tier 1 + 2 |
 | in parallel | Large-scale memory | P1 SF30 validation, `dist-adaptive-partition` SF30 sweep (q18 SF30 still OOMs) | Tier 3 |
 | v0.2.0 | Production-ready | Scenario 1 checklist green, BI client smoke (G6), `docs/guide/production-checklist.md` | — |

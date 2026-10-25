@@ -1067,6 +1067,30 @@ fn positive_secs(
 }
 
 impl ClusterConfig {
+    /// Apply `ARNEB_CLUSTER_COORDINATOR_ADDRESS`, `ARNEB_CLUSTER_WORKER_ID`
+    /// and `ARNEB_CLUSTER_ADVERTISED_ADDRESS` (env > file), so one config
+    /// file can serve every worker. An empty value is an error.
+    pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+        for (var, field) in [
+            (
+                "ARNEB_CLUSTER_COORDINATOR_ADDRESS",
+                &mut self.coordinator_address,
+            ),
+            ("ARNEB_CLUSTER_WORKER_ID", &mut self.worker_id),
+            (
+                "ARNEB_CLUSTER_ADVERTISED_ADDRESS",
+                &mut self.advertised_address,
+            ),
+        ] {
+            if let Some(v) = env(var) {
+                let v = v.trim();
+                anyhow::ensure!(!v.is_empty(), "{var} is set but empty");
+                *field = Some(v.to_owned());
+            }
+        }
+        Ok(())
+    }
+
     /// `[cluster] heartbeat_*_secs` with `ARNEB_HEARTBEAT_*_SECS` overrides
     /// (env > file > defaults), validated: both at least 1, timeout greater
     /// than interval.
@@ -1274,6 +1298,8 @@ impl AppConfig {
         admission.apply_env(|k| std::env::var(k).ok())?;
         let mut observability = config.observability;
         observability.apply_env(|k| std::env::var(k).ok())?;
+        let mut cluster = config.cluster;
+        cluster.apply_env(|k| std::env::var(k).ok())?;
         let mut catalogs = config.catalogs;
         check_password_env_vars(&catalogs)?;
         for catalog in &mut catalogs {
@@ -1283,7 +1309,7 @@ impl AppConfig {
         Ok(AppConfig {
             server,
             tables: config.tables,
-            cluster: config.cluster,
+            cluster,
             storage: config.storage,
             catalogs,
             memory: config.memory,
@@ -2106,5 +2132,34 @@ password = "hunter2"
         let err = read("drain_timeout_secs = 0", &[]).unwrap_err().to_string();
         assert!(err.contains("drain_timeout_secs"), "{err}");
         assert!(read("", &[("ARNEB_DRAIN_TIMEOUT_SECS", "soon")]).is_err());
+    }
+
+    #[test]
+    fn cluster_addresses_and_worker_id_from_env() {
+        let file = r#"
+            coordinator_address = "coord:9090"
+            worker_id = "a"
+        "#;
+        let mut cluster: ClusterConfig = toml::from_str(file).unwrap();
+        cluster.apply_env(env_from(&[])).unwrap();
+        assert_eq!(cluster.worker_id.as_deref(), Some("a"));
+        assert_eq!(cluster.advertised_address, None);
+
+        cluster
+            .apply_env(env_from(&[
+                ("ARNEB_CLUSTER_WORKER_ID", "b"),
+                ("ARNEB_CLUSTER_ADVERTISED_ADDRESS", " 10.0.0.7:9090 "),
+                ("ARNEB_CLUSTER_COORDINATOR_ADDRESS", "arneb:9090"),
+            ]))
+            .unwrap();
+        assert_eq!(cluster.worker_id.as_deref(), Some("b"));
+        assert_eq!(cluster.advertised_address.as_deref(), Some("10.0.0.7:9090"));
+        assert_eq!(cluster.coordinator_address.as_deref(), Some("arneb:9090"));
+
+        let err = cluster
+            .apply_env(env_from(&[("ARNEB_CLUSTER_WORKER_ID", "")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ARNEB_CLUSTER_WORKER_ID"), "{err}");
     }
 }

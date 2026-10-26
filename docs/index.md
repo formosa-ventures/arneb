@@ -24,21 +24,25 @@ features:
   - title: Arrow-Native
     details: All intermediate data in Apache Arrow columnar format. No row-by-row processing.
   - title: PostgreSQL Compatible
-    details: Full Simple and Extended Query protocol. Works with psql, DBeaver, JDBC, and psycopg2 out of the box.
+    details: Full Simple and Extended Query protocol and a queryable pg_catalog. psql, psycopg2, psycopg 3, SQLAlchemy and dbt-postgres are checked in CI.
   - title: Trino Client Compatible
-    details: Trino's REST protocol, so the trino CLI, Trino JDBC, Superset, Metabase and dbt-trino connect unchanged.
+    details: Trino's REST protocol for the trino CLI, Trino JDBC and trino-python-client. Superset's SQLAlchemy dialect and dbt-trino are checked in CI.
+    link: /guide/clients
+    linkText: Client compatibility
   - title: Federated Queries
     details: Query CSV and Parquet files, S3/GCS/Azure object stores, Hive Metastore catalogs (Parquet, ORC, partitioned and Iceberg tables) and PostgreSQL databases from a single SQL interface, and join across them in one statement.
     link: /connectors/postgresql#cross-source-joins
     linkText: Cross-source joins
   - title: Distributed Execution
-    details: Coordinator-worker architecture with Apache Arrow Flight RPC for high-throughput data exchange.
+    details: Coordinator-worker architecture with Apache Arrow Flight RPC. Release images and a Helm chart; workers drain on SIGTERM for rolling upgrades.
+    link: /guide/kubernetes
+    linkText: Deploy on Kubernetes
   - title: Secure and Governed
-    details: TLS and password authentication on both client protocols, a secret plus TLS between nodes, a query queue, per-query memory limits and statement timeouts.
+    details: TLS and password authentication on both client protocols, file-based access control per user, a secret plus TLS between nodes, a query queue, per-query memory limits and statement timeouts.
     link: /guide/configuration#admission-control
     linkText: Configure it
   - title: Observable and Fail-Safe
-    details: Prometheus metrics, a slow-query log, a Grafana dashboard and system.runtime.queries; a lost worker fails its queries with a clear error instead of hanging them.
+    details: Prometheus metrics, a slow-query log, a Grafana dashboard and system.runtime.queries; a lost worker fails its queries with a clear error, or re-runs them with query retry on.
     link: /guide/observability
     linkText: Monitor it
 ---

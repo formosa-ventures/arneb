@@ -280,7 +280,7 @@ Adding a function: implement `ScalarFunction` in `crates/execution/src/functions
 - M2 federation MVP: RDBMS connector framework + PostgreSQL connector (done, #158), cross-source join (done, #167)
 - M3 survives failure: fault tolerance stage 1 fail-clean (done, #171) + stage 2 query retry (done, #184; off by default), Prometheus metrics + slow-query log (done, #172), query history + `system.runtime.queries` (done, #173), worker drain + version handshake (done, #178/#179), GHCR images + Helm (done, #182)
 - M4 wider federation: MySQL connector, aggregate/TopN/join pushdown
-- Path to production (v0.1.6 → v0.2.0): concurrency fix #139 + soak test, worker drain + version handshake + Helm, authorization, query retry — see "Path to production" in the roadmap doc
+- Path to production (v0.1.6 → v0.2.0): concurrency fix + soak test, worker drain + version handshake, Helm, authorization, query retry, client smoke + queryable pg_catalog (all done by v0.1.7); left: G6 stage 2b (arrays, SQLAlchemy reflection, Metabase), P1 SF30 validation, production checklist — see "Path to production" in the roadmap doc
 
 ### OpenSpec Structure
 

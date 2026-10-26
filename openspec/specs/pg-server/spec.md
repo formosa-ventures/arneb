@@ -1,5 +1,8 @@
-## ADDED Requirements
+# pg-server Specification
 
+## Purpose
+The PostgreSQL wire protocol server: listening, connection handling, query flow and per-connection session state.
+## Requirements
 ### Requirement: ProtocolServer struct
 The system SHALL provide a `ProtocolServer` struct that holds shared server state: an `Arc<CatalogManager>`, an `Arc<ConnectorRegistry>`, and a `ProtocolConfig`. It SHALL provide a `new()` constructor accepting these dependencies.
 
@@ -8,7 +11,7 @@ The system SHALL provide a `ProtocolServer` struct that holds shared server stat
 - **THEN** it returns a ProtocolServer ready to accept connections
 
 ### Requirement: TCP listener and connection spawning
-The system SHALL bind a TCP listener to the address specified in `ProtocolConfig` and accept incoming connections. Each accepted connection SHALL be processed in a separate tokio task using `pgwire`'s `process_socket` function with the server's handler implementation.
+The system SHALL bind a TCP listener to the address specified in `ProtocolConfig` and accept incoming connections. Each accepted connection SHALL be processed in a separate tokio task using `pgwire`'s `process_socket` function with the server's handler implementation and the server's TLS acceptor. The acceptor SHALL be `None` when no `[tls]` section is configured, and a rustls acceptor built from the configured certificate otherwise. A failed TLS handshake SHALL close only that connection.
 
 #### Scenario: Server starts listening
 - **WHEN** `server.start()` is called with config binding to `127.0.0.1:5433`
@@ -23,6 +26,10 @@ The system SHALL bind a TCP listener to the address specified in `ProtocolConfig
 #### Scenario: Multiple simultaneous connections
 - **WHEN** three clients connect to the server simultaneously
 - **THEN** each connection is handled in its own tokio task, running concurrently
+
+#### Scenario: Failed TLS handshake
+- **WHEN** `[tls]` is configured and a client aborts or fails the TLS handshake
+- **THEN** that connection is closed and the server keeps accepting other connections
 
 ### Requirement: ProtocolConfig
 The system SHALL provide a `ProtocolConfig` struct with at minimum a `bind_address` field (String, e.g., "127.0.0.1:5433"). Default bind address SHALL be `127.0.0.1:5433` (port 5433 to avoid conflict with a real PostgreSQL on 5432).
@@ -49,3 +56,4 @@ Each spawned connection handler SHALL receive clones of `Arc<CatalogManager>` an
 - **WHEN** a new connection is accepted
 - **THEN** the connection handler has access to the server's CatalogManager and ConnectorRegistry
 - **AND** can use them to resolve tables and create data sources for query execution
+

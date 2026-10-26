@@ -5,7 +5,7 @@ in addition to the PostgreSQL wire protocol. Tools that already talk to Trino
 can point at an Arneb coordinator (or standalone node) without code changes:
 
 - the `trino` CLI
-- the Trino JDBC driver (DBeaver, DataGrip, Metabase's Trino driver, …)
+- the Trino JDBC driver (DBeaver, DataGrip, …; Metabase's Trino driver is built on it but has not been run against Arneb yet)
 - [`trino-python-client`](https://github.com/trinodb/trino-python-client), including its SQLAlchemy dialect (Superset)
 - dbt-trino
 

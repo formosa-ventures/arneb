@@ -30,4 +30,4 @@ default_schema = "tpcds"
 # into a join condition) must fail with a resource error, not take the
 # process down with it.
 [memory]
-query_max_memory_per_node = 2147483648
+query_max_memory_per_node = 4294967296

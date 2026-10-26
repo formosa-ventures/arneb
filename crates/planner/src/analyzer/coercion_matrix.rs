@@ -26,7 +26,7 @@
 //! - [`Safety::PrecisionLoss`]: allowed column-to-column but may lose
 //!   precision (e.g., `Int64 → Float64`). Trino allows these; we match.
 
-use arneb_common::types::DataType;
+use arneb_common::types::{DataType, CHAR_MAX_LENGTH};
 
 /// How dangerous an implicit coercion is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +278,28 @@ pub fn common_supertype(a: &DataType, b: &DataType, site: CoercionSite) -> Optio
     }
     if *b == DataType::Null {
         return Some(a.clone());
+    }
+
+    // CHAR(n): varchar coerces to char (Trino). A varchar literal takes
+    // the char side's length; at a comparison any other varchar may be
+    // longer, so it widens to the maximum. A varchar column in a CASE arm
+    // or set-operation branch keeps the result varchar instead of padding
+    // every value to the maximum length.
+    match (a, b) {
+        (DataType::Char(x), DataType::Char(y)) => return Some(DataType::Char(*x.max(y))),
+        (DataType::Char(n), DataType::Utf8) | (DataType::Utf8, DataType::Char(n)) => {
+            let utf8_is_literal = if matches!(a, DataType::Utf8) {
+                site.left_is_literal()
+            } else {
+                site.right_is_literal()
+            };
+            return Some(match site {
+                _ if utf8_is_literal => DataType::Char(*n),
+                CoercionSite::Binary { .. } => DataType::Char(CHAR_MAX_LENGTH),
+                CoercionSite::CaseBranch { .. } | CoercionSite::UnionColumn => DataType::Utf8,
+            });
+        }
+        _ => {}
     }
 
     // Decimal ↔ Decimal has its own precision/scale reconciliation.

@@ -373,9 +373,16 @@ pub(crate) fn function_return_type(
 
         // String — Utf8 in, Utf8 out (except length/position which
         // return integer counts).
-        "UPPER" | "LOWER" | "SUBSTRING" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "CONCAT"
-        | "REPLACE" | "SPLIT_PART" | "REVERSE" | "LPAD" | "RPAD" | "CHR" | "CONCAT_WS"
-        | "TRANSLATE" | "REGEXP_EXTRACT" | "REGEXP_REPLACE" | "LIKE_ESCAPE" => Some(DataType::Utf8),
+        // Case mapping and trimming keep a CHAR(n) argument's type (Trino).
+        "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM" => {
+            match args.first().and_then(|a| plan_expr_type(a, schema)) {
+                Some(DataType::Char(length)) => Some(DataType::Char(length)),
+                _ => Some(DataType::Utf8),
+            }
+        }
+        "SUBSTRING" | "SUBSTR" | "CONCAT" | "REPLACE" | "SPLIT_PART" | "REVERSE" | "LPAD"
+        | "RPAD" | "CHR" | "CONCAT_WS" | "TRANSLATE" | "REGEXP_EXTRACT" | "REGEXP_REPLACE"
+        | "LIKE_ESCAPE" => Some(DataType::Utf8),
         "LENGTH"
         | "POSITION"
         | "STRPOS"

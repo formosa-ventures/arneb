@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use arneb_catalog::CatalogManager;
 use arneb_common::diagnostic::SourceFile;
+use arneb_common::types::DataType;
 use arneb_connectors::ConnectorRegistry;
 use arneb_execution::memory_pool::MemoryPool;
 use arrow::array::RecordBatch;
@@ -200,6 +201,7 @@ impl Engine {
         let infos = plan.schema();
         // Prefer the physical Arrow type of the produced data (it is what
         // gets encoded); fall back to the planned type for empty results.
+        // CHAR(n) is Utf8 in Arrow, so only the planned type names it.
         let physical = batches
             .first()
             .filter(|b| b.num_columns() == infos.len())
@@ -209,10 +211,10 @@ impl Engine {
             .enumerate()
             .map(|(i, info)| OutputColumn {
                 name: info.name.clone(),
-                ty: physical
-                    .as_ref()
-                    .map(|s| TrinoType::from_arrow(s.field(i).data_type()))
-                    .unwrap_or_else(|| trino_type_of(&info.data_type)),
+                ty: match (&info.data_type, physical.as_ref()) {
+                    (DataType::Char(_), _) | (_, None) => trino_type_of(&info.data_type),
+                    (_, Some(s)) => TrinoType::from_arrow(s.field(i).data_type()),
+                },
             })
             .collect();
         Ok(QueryOutput {

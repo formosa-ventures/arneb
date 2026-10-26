@@ -827,6 +827,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_cast_char_types() {
+        for (sql_type, expected) in [
+            ("CHAR(5)", DataType::Char(5)),
+            ("CHARACTER(16)", DataType::Char(16)),
+            ("CHAR", DataType::Char(1)),
+            ("CHARACTER VARYING(10)", DataType::Utf8),
+        ] {
+            let stmt = parse(&format!("SELECT CAST(x AS {sql_type}) FROM t")).unwrap();
+            let Statement::Query { query, .. } = stmt else {
+                panic!("expected Query for {sql_type}");
+            };
+            match &select_body(&query).projection[0] {
+                SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => {
+                    assert_eq!(*data_type, expected, "failed for {sql_type}");
+                }
+                other => panic!("expected cast for {sql_type}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn parse_cast_decimal() {
         let stmt = parse("SELECT CAST(x AS DECIMAL(10, 2)) FROM t").unwrap();
         let Statement::Query { query, .. } = stmt else {

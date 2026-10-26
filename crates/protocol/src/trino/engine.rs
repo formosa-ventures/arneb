@@ -100,12 +100,8 @@ impl Engine {
         let view = self
             .catalog_manager
             .with_access(session.user.clone(), Arc::clone(rules));
-        if !view.can_execute() {
-            return Err(TrinoError::from_arneb(
-                &arneb_common::error::PlanError::AccessDenied("Cannot execute query".into()).into(),
-                None,
-            ));
-        }
+        view.check_execute()
+            .map_err(|e| TrinoError::from_arneb(&e.into(), None))?;
         Ok(Arc::new(view))
     }
 

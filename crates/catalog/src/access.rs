@@ -103,25 +103,23 @@ impl AccessRules {
         if !self.catalog_visible(user, catalog) {
             return false;
         }
-        let owner = match &self.schemas {
-            None => true,
-            Some(rules) => rules
+        let owner = self.schemas.as_ref().is_none_or(|rules| {
+            rules
                 .iter()
                 .find(|r| {
                     r.user.matches(user) && r.catalog.matches(catalog) && r.schema.matches(schema)
                 })
-                .is_some_and(|r| r.owner),
-        };
+                .is_some_and(|r| r.owner)
+        });
         owner
-            || match &self.tables {
-                None => true,
-                Some(rules) => rules.iter().any(|r| {
+            || self.tables.as_ref().is_none_or(|rules| {
+                rules.iter().any(|r| {
                     r.user.matches(user)
                         && r.catalog.matches(catalog)
                         && r.schema.matches(schema)
                         && !r.privileges.is_empty()
-                }),
-            }
+                })
+            })
     }
 
     /// Whether `catalog.schema.table` is listed for `user`.

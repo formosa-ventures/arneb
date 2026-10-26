@@ -217,6 +217,22 @@ async fn pgwire_checks_reads_listings_and_execute() {
     let names: Vec<&[String]> = tables.iter().map(|r| &r[..3]).collect();
     assert_eq!(names, vec![["memory", "default", "open_t"]]);
 
+    // A hidden schema in search_path is skipped as if it did not exist, so
+    // whether the path takes effect does not reveal it.
+    for path in ["lake.sales", "lake.nope"] {
+        alice
+            .simple_query(&format!("SET search_path TO {path}"))
+            .await
+            .unwrap();
+        let (code, message) = pg_error(&alice, "SELECT * FROM orders").await;
+        assert_eq!(code, "42501");
+        assert!(
+            message.contains("memory.default.orders"),
+            "{path}: {message}"
+        );
+    }
+    alice.simple_query("RESET search_path").await.unwrap();
+
     let admin = pg(port, "admin").await;
     let tables = pg_rows(
         &admin

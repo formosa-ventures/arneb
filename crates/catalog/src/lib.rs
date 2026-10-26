@@ -304,12 +304,18 @@ impl CatalogManager {
         }
     }
 
-    /// Whether the session user may run queries (`queries` rules); always
-    /// true without access rules.
-    pub fn can_execute(&self) -> bool {
-        self.access
+    /// Fails with [`CatalogError::AccessDenied`] when the session user may
+    /// not run queries (`queries` rules); always passes without access rules.
+    pub fn check_execute(&self) -> Result<(), CatalogError> {
+        if self
+            .access
             .as_ref()
             .is_none_or(|a| a.rules.can_execute(&a.user))
+        {
+            Ok(())
+        } else {
+            Err(CatalogError::AccessDenied("Cannot execute query".into()))
+        }
     }
 
     /// Whether the session user may see a query run by `owner`; always true
@@ -326,6 +332,14 @@ impl CatalogManager {
         self.access
             .as_ref()
             .is_none_or(|a| a.rules.catalog_visible(&a.user, catalog))
+    }
+
+    /// Whether the session user may see `catalog.schema` (true without
+    /// rules, whether or not it exists).
+    pub fn schema_visible(&self, catalog: &str, schema: &str) -> bool {
+        self.access
+            .as_ref()
+            .is_none_or(|a| a.rules.schema_visible(&a.user, catalog, schema))
     }
 
     /// Catalog names the session user may see (all of them without rules).

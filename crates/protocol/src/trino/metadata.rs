@@ -234,9 +234,6 @@ async fn collect_tables(
         let Some(provider) = cm.catalog(catalog) else {
             continue;
         };
-        if !cm.catalog_visible(catalog) {
-            continue;
-        }
         let mut schemas = cm.visible_schema_names(catalog).await;
         schemas.sort();
         for schema in schemas {

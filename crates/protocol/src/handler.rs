@@ -414,11 +414,8 @@ impl ConnectionHandler {
             .cloned()
             .unwrap_or_default();
         let view = base.with_access(user, Arc::clone(rules));
-        if !view.can_execute() {
-            return Err(arneb_error_to_pg_error(&ArnebError::Plan(
-                arneb_common::error::PlanError::AccessDenied("Cannot execute query".into()),
-            )));
-        }
+        view.check_execute()
+            .map_err(|e| arneb_error_to_pg_error(&e.into()))?;
         Ok(Arc::new(view))
     }
 
@@ -431,8 +428,13 @@ impl ConnectionHandler {
         catalog_manager: &CatalogManager,
     ) -> Option<crate::metadata::MetadataResult> {
         let current = client.session_extensions().get::<SearchPath>();
-        if let Some((result, new_path)) =
-            handle_search_path(sql, &self.catalog_manager, current.as_deref()).await
+        if let Some((result, new_path)) = handle_search_path(
+            sql,
+            &self.catalog_manager,
+            catalog_manager,
+            current.as_deref(),
+        )
+        .await
         {
             if let Some(path) = new_path {
                 client.session_extensions().insert(path);
@@ -466,8 +468,13 @@ impl ConnectionHandler {
             None => {}
         }
         let current = client.session_extensions().get::<SearchPath>();
-        if let Some((result, _)) =
-            handle_search_path(sql, &self.catalog_manager, current.as_deref()).await
+        if let Some((result, _)) = handle_search_path(
+            sql,
+            &self.catalog_manager,
+            catalog_manager,
+            current.as_deref(),
+        )
+        .await
         {
             return Some(result);
         }

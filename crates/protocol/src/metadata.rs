@@ -28,6 +28,7 @@ pub(crate) type MetadataResult = Result<MetadataResponse, String>;
 pub(crate) async fn try_handle_metadata(
     sql: &str,
     catalog_manager: &CatalogManager,
+    user: Option<&str>,
 ) -> Option<MetadataResult> {
     let lower = sql.trim().to_lowercase();
 
@@ -70,7 +71,14 @@ pub(crate) async fn try_handle_metadata(
         || lower.contains("current_schema()")
         || lower.contains("current_user")
     {
-        return Some(handle_current_info(&lower, catalog_manager));
+        return Some(handle_current_info(&lower, catalog_manager, user));
+    }
+
+    // Transactions: every statement is read-only and autocommitted, so
+    // drivers that wrap statements in a transaction (psycopg2, SQLAlchemy,
+    // dbt) get the tag they expect and nothing else happens.
+    if let Some(tag) = transaction_tag(&lower) {
+        return Some(command_ok(tag));
     }
 
     // SET / SHOW / RESET — silently accept session commands
@@ -132,6 +140,31 @@ fn make_result(schema: Arc<Schema>, batch: RecordBatch) -> MetaResult {
 // version()
 // ---------------------------------------------------------------------------
 
+/// The PostgreSQL version Arneb reports (`server_version`).
+const PG_SERVER_VERSION: &str = "14.0";
+
+/// The parameters sent at startup. They agree with [`show_value`]:
+/// drivers read `server_version` from here (psycopg2, JDBC) and others
+/// with `SHOW`.
+pub(crate) fn server_parameters() -> pgwire::api::auth::DefaultServerParameterProvider {
+    let mut params = pgwire::api::auth::DefaultServerParameterProvider::default();
+    params.server_version = PG_SERVER_VERSION.to_string();
+    params.is_superuser = false;
+    params
+}
+
+/// `version()`: starts with `PostgreSQL <version>` because drivers parse it
+/// (SQLAlchemy's psycopg2 dialect fails to connect otherwise), then names
+/// Arneb.
+fn version_string() -> String {
+    format!(
+        "PostgreSQL {PG_SERVER_VERSION} on {}-{} (Arneb {})",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 fn handle_version() -> MetaResult {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "version",
@@ -140,10 +173,7 @@ fn handle_version() -> MetaResult {
     )]));
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(StringArray::from(vec![format!(
-            "Arneb {}",
-            env!("CARGO_PKG_VERSION")
-        )]))],
+        vec![Arc::new(StringArray::from(vec![version_string()]))],
     )
     .map_err(|e| e.to_string())?;
     make_result(schema, batch)
@@ -550,13 +580,19 @@ async fn handle_info_schemata(catalog_manager: &CatalogManager) -> MetaResult {
 // current_database() / current_schema() / current_user
 // ---------------------------------------------------------------------------
 
-fn handle_current_info(lower: &str, catalog_manager: &CatalogManager) -> MetaResult {
-    // current_schema() reflects the connection's search_path; everything
-    // else reports the default catalog as before.
+fn handle_current_info(
+    lower: &str,
+    catalog_manager: &CatalogManager,
+    user: Option<&str>,
+) -> MetaResult {
+    // current_schema() reflects the connection's search_path; current_user
+    // is the connection's user; current_database() is the default catalog.
     let (name, value) = if lower.contains("current_schema()") {
         ("current_schema", catalog_manager.default_schema())
-    } else {
+    } else if lower.contains("current_database()") {
         ("current_database", catalog_manager.default_catalog())
+    } else {
+        ("current_user", user.unwrap_or(""))
     };
     let schema = Arc::new(Schema::new(vec![Field::new(
         name,
@@ -579,6 +615,36 @@ fn command_ok(tag: &str) -> MetaResult {
     Ok(MetadataResponse::Command(tag.to_string()))
 }
 
+/// The command tag for a transaction-control statement, or `None`.
+fn transaction_tag(lower: &str) -> Option<&'static str> {
+    let mut words = lower.trim_end_matches(';').split_whitespace();
+    match (words.next()?, words.next()) {
+        ("begin", _) => Some("BEGIN"),
+        ("start", Some("transaction")) => Some("START TRANSACTION"),
+        ("commit" | "end", _) => Some("COMMIT"),
+        ("rollback" | "abort", _) => Some("ROLLBACK"),
+        _ => None,
+    }
+}
+
+/// PostgreSQL's value for a setting clients commonly read with `SHOW`.
+fn show_value(name: &str) -> &'static str {
+    match name {
+        "server_version" => PG_SERVER_VERSION,
+        "server_version_num" => "140000",
+        "standard_conforming_strings" | "integer_datetimes" => "on",
+        "transaction isolation level" | "default_transaction_isolation" => "read committed",
+        "transaction_read_only" | "default_transaction_read_only" | "is_superuser" => "off",
+        "client_encoding" | "server_encoding" => "UTF8",
+        "datestyle" => "ISO, YMD",
+        "intervalstyle" => "postgres",
+        "timezone" => "Etc/UTC",
+        "max_identifier_length" => "63",
+        "lc_collate" | "lc_ctype" => "C",
+        _ => "",
+    }
+}
+
 fn handle_show(lower: &str) -> MetaResult {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "setting",
@@ -586,11 +652,12 @@ fn handle_show(lower: &str) -> MetaResult {
         false,
     )]));
     // `SHOW search_path` is answered per connection in `crate::session`.
-    let value = if lower.contains("server_version") {
-        "14.0"
-    } else {
-        ""
-    };
+    let name = lower
+        .trim_start_matches("show")
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let value = show_value(name);
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(StringArray::from(vec![value]))],

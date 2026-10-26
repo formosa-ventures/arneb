@@ -1,0 +1,31 @@
+version: 2
+
+sources:
+  - name: tpch
+    schema: default
+    tables:
+      - name: nation
+        columns:
+          - name: n_nationkey
+            data_tests: [not_null, unique]
+          - name: n_regionkey
+            data_tests:
+              - relationships:
+                  arguments:
+                    to: source('tpch', 'region')
+                    field: r_regionkey
+      - name: region
+        columns:
+          - name: r_regionkey
+            data_tests: [not_null, unique]
+          - name: r_name
+            data_tests:
+              - accepted_values:
+                  arguments:
+                    values: ["AFRICA", "AMERICA", "ASIA", "EUROPE", "MIDDLE EAST"]
+
+models:
+  - name: nations_per_region
+    columns:
+      - name: r_name
+        data_tests: [not_null, unique]

@@ -19,7 +19,11 @@ def main() -> None:
     out = sys.argv[1]
     sf = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
     os.makedirs(out, exist_ok=True)
-    con = duckdb.connect(os.path.join(out, "tpch.duckdb"))
+    db = os.path.join(out, "tpch.duckdb")
+    # dbgen appends to existing tables, so a rerun would double every row.
+    if os.path.exists(db):
+        os.remove(db)
+    con = duckdb.connect(db)
     con.execute("INSTALL tpch; LOAD tpch;")
     con.execute(f"CALL dbgen(sf = {sf})")
     for table in TABLES:

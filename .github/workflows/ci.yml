@@ -93,3 +93,34 @@ jobs:
           path: crates/server/frontend/
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arneb-release
+          path: target/release/arneb
+          retention-days: 1
+
+  cluster-smoke:
+    # Scenario 1 acceptance (G6): a local coordinator + 2 workers on TPC-H
+    # SF1; 22 queries vs DuckDB, a 20-concurrent soak, and the Python and
+    # dbt clients. See scripts/client-smoke/run.sh.
+    name: Cluster smoke (TPC-H SF1, clients)
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: arneb-release
+          path: target/release
+      - run: chmod +x target/release/arneb
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: scripts/client-smoke/requirements.txt
+      - run: pip install -r scripts/client-smoke/requirements.txt
+      - name: Generate TPC-H SF1
+        run: python scripts/k8s-smoke/gen_tpch.py "$RUNNER_TEMP/tpch" 1
+      - name: Smoke test
+        run: ROUNDS=5 scripts/client-smoke/run.sh "$RUNNER_TEMP/tpch"

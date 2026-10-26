@@ -342,6 +342,14 @@ impl CatalogManager {
             .is_none_or(|a| a.rules.schema_visible(&a.user, catalog, schema))
     }
 
+    /// Whether the session user may see `catalog.schema.table` (true
+    /// without rules, whether or not it exists).
+    pub fn table_visible(&self, catalog: &str, schema: &str, table: &str) -> bool {
+        self.access
+            .as_ref()
+            .is_none_or(|a| a.rules.table_visible(&a.user, catalog, schema, table))
+    }
+
     /// Catalog names the session user may see (all of them without rules).
     pub fn visible_catalog_names(&self) -> Vec<String> {
         let mut names = self.catalog_names();
@@ -443,6 +451,68 @@ impl CatalogManager {
         let mut names: Vec<String> = catalogs.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// `reference` with each part that names nothing as written, but names
+    /// something in lowercase, replaced by the lowercase form. PostgreSQL
+    /// and Trino fold unquoted identifiers to lowercase, and the parser
+    /// keeps no quoting, so `FROM NATION` and `INFORMATION_SCHEMA.TABLES`
+    /// find `nation` and `information_schema.tables`. A part that names
+    /// something as written is kept, so mixed-case names still resolve.
+    /// A lowercase form the session user may not see is never probed, so
+    /// the folded name does not reveal whether a hidden object exists.
+    pub async fn fold_reference_case(&self, reference: &TableReference) -> TableReference {
+        // All-lowercase references (the common case) need no lookups.
+        let folds = |name: &str| name.to_lowercase() != name;
+        if !reference.catalog.as_deref().is_some_and(folds)
+            && !reference.schema.as_deref().is_some_and(folds)
+            && !folds(&reference.table)
+        {
+            return reference.clone();
+        }
+        let mut folded = reference.clone();
+        let catalog_name = match &reference.catalog {
+            Some(name) => {
+                let catalogs = self.catalogs.read().unwrap();
+                let lower = name.to_lowercase();
+                if !catalogs.contains_key(name)
+                    && self.catalog_visible(&lower)
+                    && catalogs.contains_key(&lower)
+                {
+                    folded.catalog = Some(lower);
+                }
+                folded.catalog.clone().unwrap_or_default()
+            }
+            None => self.default_catalog.clone(),
+        };
+        let Some(catalog) = self.catalog(&catalog_name) else {
+            return folded;
+        };
+        let schema_name = match &reference.schema {
+            Some(name) => {
+                let lower = name.to_lowercase();
+                if self.schema_visible(&catalog_name, &lower)
+                    && catalog.schema(name).await.is_none()
+                    && catalog.schema(&lower).await.is_some()
+                {
+                    folded.schema = Some(lower);
+                }
+                folded.schema.clone().unwrap_or_default()
+            }
+            None => self.default_schema.clone(),
+        };
+        let Some(schema) = catalog.schema(&schema_name).await else {
+            return folded;
+        };
+        let lower = reference.table.to_lowercase();
+        if lower != reference.table
+            && self.table_visible(&catalog_name, &schema_name, &lower)
+            && schema.table(&reference.table).await.is_none()
+            && schema.table(&lower).await.is_some()
+        {
+            folded.table = lower;
+        }
+        folded
     }
 
     /// Resolves a [`TableReference`] to a [`TableProvider`].
@@ -657,6 +727,36 @@ mod tests {
     }
 
     // -- MemorySchema tests --
+
+    #[tokio::test]
+    async fn unmatched_names_fold_to_lowercase() {
+        let cm = CatalogManager::new("lake", "sales");
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("nation", Arc::new(MemoryTable::new(test_columns())));
+        schema.register_table("MixedT", Arc::new(MemoryTable::new(test_columns())));
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("sales", schema);
+        cm.register_catalog("lake", catalog);
+        let fold = |catalog: Option<&str>, schema: Option<&str>, table: &str| {
+            let reference = TableReference {
+                catalog: catalog.map(str::to_string),
+                schema: schema.map(str::to_string),
+                table: table.to_string(),
+            };
+            let cm = &cm;
+            async move { cm.fold_reference_case(&reference).await.to_string() }
+        };
+        assert_eq!(fold(None, None, "NATION").await, "nation");
+        assert_eq!(
+            fold(Some("LAKE"), Some("Sales"), "Nation").await,
+            "lake.sales.nation"
+        );
+        // A name that matches as written is kept; one that matches nothing
+        // either way is left for resolve_table to report.
+        assert_eq!(fold(None, None, "MixedT").await, "MixedT");
+        assert_eq!(fold(None, None, "MIXEDT").await, "MIXEDT");
+        assert_eq!(fold(Some("NOPE"), None, "T").await, "NOPE.T");
+    }
 
     #[tokio::test]
     async fn memory_schema_empty() {

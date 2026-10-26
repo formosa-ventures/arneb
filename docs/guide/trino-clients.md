@@ -9,9 +9,10 @@ can point at an Arneb coordinator (or standalone node) without code changes:
 - [`trino-python-client`](https://github.com/trinodb/trino-python-client), including its SQLAlchemy dialect (Superset)
 - dbt-trino
 
-Verified end to end with `trino-python-client` 0.340.0 (DB-API and the
-SQLAlchemy dialect); the protocol test suite drives the same HTTP exchange a
-client performs.
+`trino-python-client` (DB-API and the SQLAlchemy dialect) and dbt-trino run
+against a local cluster on every pull request; see
+[Client Compatibility](/guide/clients). The protocol test suite drives the
+same HTTP exchange a client performs.
 
 Both protocols share one engine: a statement sent over HTTP is parsed, planned,
 optimized and executed by the same pipeline as one sent over pgwire, including

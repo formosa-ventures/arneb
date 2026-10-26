@@ -54,12 +54,17 @@ struct PlanningContext {
     /// All columns available in the current scope.
     /// (qualifier, column_info)
     columns: Vec<(Option<String>, ColumnInfo)>,
+    /// Right-hand copies of `JOIN ... USING` columns: reachable only with
+    /// their table qualifier, and left out of `*`, so the joined column
+    /// appears once (the left copy), as in PostgreSQL and Trino.
+    merged: std::collections::HashSet<usize>,
 }
 
 impl PlanningContext {
     fn new() -> Self {
         Self {
             columns: Vec::new(),
+            merged: std::collections::HashSet::new(),
         }
     }
 
@@ -86,6 +91,9 @@ impl PlanningContext {
     ) -> Result<(usize, ColumnInfo), PlanError> {
         let mut found = None;
         for (i, (qualifier, col)) in self.columns.iter().enumerate() {
+            if table.is_none() && self.merged.contains(&i) {
+                continue;
+            }
             let name_matches = col.name.eq_ignore_ascii_case(name);
             let qualifier_matches = match (table, qualifier) {
                 (Some(t), Some(q)) => t.eq_ignore_ascii_case(q),
@@ -1428,6 +1436,15 @@ impl<'a> QueryPlanner<'a> {
 
         for join in &twj.joins {
             let (right_plan, right_ctx) = self.plan_table_factor(&join.relation).await?;
+            let left_len = ctx.columns.len();
+            let using = match &join.condition {
+                ast::JoinCondition::Using(columns) => {
+                    using_pairs(&ctx, &right_ctx, columns, join.join_type)?
+                }
+                _ => Vec::new(),
+            };
+            ctx.merged
+                .extend(right_ctx.merged.iter().map(|i| i + left_len));
             ctx.columns.extend(right_ctx.columns);
 
             let condition = match &join.condition {
@@ -1436,9 +1453,36 @@ impl<'a> QueryPlanner<'a> {
                     JoinCondition::On(plan_expr)
                 }
                 ast::JoinCondition::Using(_) => {
-                    return Err(PlanError::invalid_expression(
-                        "USING join condition not yet supported".to_string(),
-                    ));
+                    // `USING (a, b)` = `ON l.a = r.a AND l.b = r.b`.
+                    ctx.merged
+                        .extend(using.iter().map(|&(_, right)| right + left_len));
+                    let column = |index: usize| {
+                        Box::new(PlanExpr::Column {
+                            index,
+                            name: ctx.columns[index].1.name.clone(),
+                            span: None,
+                        })
+                    };
+                    let on = using
+                        .iter()
+                        .map(|&(left, right)| PlanExpr::BinaryOp {
+                            left: column(left),
+                            op: ast::BinaryOp::Eq,
+                            right: column(right + left_len),
+                            span: None,
+                        })
+                        .reduce(|acc, eq| PlanExpr::BinaryOp {
+                            left: Box::new(acc),
+                            op: ast::BinaryOp::And,
+                            right: Box::new(eq),
+                            span: None,
+                        })
+                        .ok_or_else(|| {
+                            PlanError::invalid_expression(
+                                "USING needs at least one column".to_string(),
+                            )
+                        })?;
+                    JoinCondition::On(on)
                 }
                 ast::JoinCondition::None => JoinCondition::None,
             };
@@ -1478,6 +1522,7 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
 
+                let name = &self.catalog.fold_reference_case(name).await;
                 let table_provider =
                     self.catalog
                         .resolve_table(name)
@@ -1529,11 +1574,19 @@ impl<'a> QueryPlanner<'a> {
         let node_span = Some(expr.span());
         match expr {
             ast::Expr::Column { col_ref, .. } => {
-                let (index, col_info) = ctx.resolve_column(
+                let resolved = ctx.resolve_column(
                     &col_ref.name,
                     col_ref.table.as_deref(),
                     Some(col_ref.span.start),
-                )?;
+                );
+                // The parser reads a bare `current_schema` as a column.
+                if resolved.is_err() && col_ref.table.is_none() {
+                    if let Some(literal) = session_literal(self.catalog, &col_ref.name, node_span)
+                    {
+                        return Ok(literal);
+                    }
+                }
+                let (index, col_info) = resolved?;
                 Ok(PlanExpr::Column {
                     index,
                     name: col_info.name,
@@ -1563,6 +1616,11 @@ impl<'a> QueryPlanner<'a> {
                 distinct,
                 ..
             } => {
+                if args.is_empty() {
+                    if let Some(literal) = session_literal(self.catalog, name, node_span) {
+                        return Ok(literal);
+                    }
+                }
                 let mut plan_args = Vec::with_capacity(args.len());
                 for a in args {
                     let plan_arg = match a {
@@ -1717,7 +1775,7 @@ impl<'a> QueryPlanner<'a> {
                 ast::SelectItem::Wildcard => {
                     // Expand * to all columns (not the window results)
                     for (i, (q, col)) in ctx.columns.iter().enumerate() {
-                        if q.as_deref() == Some(WINDOW_QUALIFIER) {
+                        if q.as_deref() == Some(WINDOW_QUALIFIER) || ctx.merged.contains(&i) {
                             continue;
                         }
                         exprs.push(PlanExpr::Column {
@@ -1880,7 +1938,7 @@ impl<'a> QueryPlanner<'a> {
                 }
                 ast::SelectItem::Wildcard => {
                     for (i, (q, col)) in ctx.columns.iter().enumerate() {
-                        if q.as_deref() == Some(WINDOW_QUALIFIER) {
+                        if q.as_deref() == Some(WINDOW_QUALIFIER) || ctx.merged.contains(&i) {
                             continue;
                         }
                         exprs.push(PlanExpr::Column {
@@ -3380,6 +3438,51 @@ fn write_ast_unqualified(out: &mut String, expr: &ast::Expr) {
             let _ = write!(out, "{other}");
         }
     }
+}
+
+/// The (left index, right index) of each `JOIN ... USING` column, each
+/// resolved without a qualifier on its own side. The merged column takes
+/// the left value, which is only right for inner and left joins.
+fn using_pairs(
+    left: &PlanningContext,
+    right: &PlanningContext,
+    columns: &[String],
+    join_type: ast::JoinType,
+) -> Result<Vec<(usize, usize)>, PlanError> {
+    if !matches!(join_type, ast::JoinType::Inner | ast::JoinType::Left) {
+        return Err(PlanError::invalid_expression(format!(
+            "USING is only supported with INNER and LEFT joins, not {join_type:?}"
+        )));
+    }
+    columns
+        .iter()
+        .map(|c| {
+            let (l, _) = left.resolve_column(c, None, None)?;
+            let (r, _) = right.resolve_column(c, None, None)?;
+            Ok((l, r))
+        })
+        .collect()
+}
+
+/// A session function the planner folds to a literal: `current_catalog` and
+/// `current_schema` (Trino's niladic forms), from the session's defaults.
+/// `None` for any other name.
+fn session_literal(
+    catalog: &CatalogManager,
+    name: &str,
+    span: Option<arneb_sql_parser::Span>,
+) -> Option<PlanExpr> {
+    let value = if name.eq_ignore_ascii_case("current_catalog") {
+        catalog.default_catalog()
+    } else if name.eq_ignore_ascii_case("current_schema") {
+        catalog.default_schema()
+    } else {
+        return None;
+    };
+    Some(PlanExpr::Literal {
+        value: ScalarValue::Utf8(value.to_string()),
+        span,
+    })
 }
 
 #[cfg(test)]

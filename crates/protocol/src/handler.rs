@@ -441,7 +441,8 @@ impl ConnectionHandler {
             }
             return Some(result);
         }
-        crate::metadata::try_handle_metadata(sql, catalog_manager).await
+        let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
+        crate::metadata::try_handle_metadata(sql, catalog_manager, user.as_deref()).await
     }
 
     /// Like [`Self::intercept`] but without updating the connection's state,
@@ -478,7 +479,8 @@ impl ConnectionHandler {
         {
             return Some(result);
         }
-        crate::metadata::try_handle_metadata(sql, catalog_manager).await
+        let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
+        crate::metadata::try_handle_metadata(sql, catalog_manager, user.as_deref()).await
     }
 }
 
@@ -544,34 +546,101 @@ impl SimpleQueryHandler for ConnectionHandler {
 // Extended Query protocol (Parse → Bind → Describe → Execute → Sync)
 // ---------------------------------------------------------------------------
 
-/// Substitute `$1`, `$2`, ... placeholders with parameter values.
-fn bind_parameters(sql: &str, params: &[Option<String>]) -> String {
+/// Substitute `$1`, `$2`, ... placeholders with parameter values, each
+/// already a SQL literal (see [`extract_params`]).
+fn bind_parameters(sql: &str, params: &[String]) -> String {
     let mut result = sql.to_string();
     // Replace in reverse order ($10 before $1) to avoid partial matches
-    for (i, param) in params.iter().enumerate().rev() {
-        let placeholder = format!("${}", i + 1);
-        let replacement = match param {
-            Some(val) => {
-                // Check if it looks like a number
-                if val.parse::<f64>().is_ok() {
-                    val.clone()
-                } else {
-                    format!("'{}'", val.replace('\'', "''"))
-                }
-            }
-            None => "NULL".to_string(),
-        };
-        result = result.replace(&placeholder, &replacement);
+    for (i, literal) in params.iter().enumerate().rev() {
+        result = result.replace(&format!("${}", i + 1), literal);
     }
     result
 }
 
-/// Extract parameter values from a portal as `Vec<Option<String>>`.
-fn extract_params(portal: &Portal<String>) -> Vec<Option<String>> {
-    let len = portal.parameter_len();
-    (0..len)
-        .map(|i| portal.parameter::<String>(i, &Type::TEXT).ok().flatten())
+/// A portal's parameters as SQL literals. A parameter is decoded by the type
+/// the client declared and the format it chose: psycopg 3 sends integers,
+/// floats and booleans in binary, JDBC and tokio-postgres mostly in text.
+fn extract_params(portal: &Portal<String>) -> PgWireResult<Vec<String>> {
+    (0..portal.parameter_len())
+        .map(|i| {
+            let declared = portal
+                .statement
+                .parameter_types
+                .get(i)
+                .cloned()
+                .flatten()
+                .unwrap_or(Type::UNKNOWN);
+            Ok(param_literal(portal, i, &declared)?.unwrap_or_else(|| "NULL".to_string()))
+        })
         .collect()
+}
+
+/// One parameter as a SQL literal, `None` for NULL. A binary value of a type
+/// Arneb does not decode is an error, never a silent NULL.
+fn param_literal(
+    portal: &Portal<String>,
+    i: usize,
+    declared: &Type,
+) -> PgWireResult<Option<String>> {
+    macro_rules! get {
+        ($t:ty, $ty:expr) => {
+            portal.parameter::<$t>(i, $ty)?
+        };
+    }
+    let quoted = |v: String| format!("'{}'", v.replace('\'', "''"));
+    if portal.parameter_format.is_binary(i) {
+        return Ok(match *declared {
+            Type::INT2 => get!(i16, declared).map(|v| v.to_string()),
+            Type::INT4 => get!(i32, declared).map(|v| v.to_string()),
+            Type::INT8 => get!(i64, declared).map(|v| v.to_string()),
+            Type::FLOAT4 => get!(f32, declared).map(|v| v.to_string()),
+            Type::FLOAT8 => get!(f64, declared).map(|v| v.to_string()),
+            Type::BOOL => get!(bool, declared).map(bool_literal),
+            Type::DATE => get!(chrono::NaiveDate, declared).map(|d| format!("DATE '{d}'")),
+            Type::TIMESTAMP => get!(chrono::NaiveDateTime, declared).map(timestamp_literal),
+            Type::TIMESTAMPTZ => get!(chrono::DateTime<chrono::FixedOffset>, declared)
+                .map(|t| timestamp_literal(t.naive_utc())),
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
+                get!(String, &Type::TEXT).map(quoted)
+            }
+            ref other => {
+                return Err(PgWireError::UserError(Box::new(
+                    pgwire::error::ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "0A000".to_owned(),
+                        format!(
+                            "parameter ${} has binary type {}, which is not supported; \
+                             send it in text format",
+                            i + 1,
+                            other.name()
+                        ),
+                    ),
+                )))
+            }
+        });
+    }
+    let Some(value) = get!(String, &Type::TEXT) else {
+        return Ok(None);
+    };
+    Ok(Some(match *declared {
+        Type::BOOL => match value.to_ascii_lowercase().as_str() {
+            "t" | "true" | "y" | "yes" | "on" | "1" => bool_literal(true),
+            "f" | "false" | "n" | "no" | "off" | "0" => bool_literal(false),
+            _ => quoted(value),
+        },
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => quoted(value),
+        // Declared numeric, or untyped: a number stays a number.
+        _ if value.parse::<f64>().is_ok() => value,
+        _ => quoted(value),
+    }))
+}
+
+fn bool_literal(value: bool) -> String {
+    if value { "TRUE" } else { "FALSE" }.to_string()
+}
+
+fn timestamp_literal(value: chrono::NaiveDateTime) -> String {
+    format!("TIMESTAMP '{}'", value.format("%Y-%m-%d %H:%M:%S%.f"))
 }
 
 /// Plan a SQL string (without executing) to obtain output column schema.
@@ -661,7 +730,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = &&portal.statement.statement;
-        let params = extract_params(portal);
+        let params = extract_params(portal)?;
         let bound_sql = bind_parameters(sql, &params);
         let trimmed = bound_sql.trim();
 
@@ -775,7 +844,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = &target.statement.statement;
-        let params = extract_params(target);
+        let params = extract_params(target)?;
         let bound_sql = bind_parameters(sql, &params);
         let trimmed = bound_sql.trim();
 

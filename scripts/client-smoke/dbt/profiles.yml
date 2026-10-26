@@ -1,0 +1,22 @@
+arneb_smoke:
+  target: trino
+  outputs:
+    trino:
+      type: trino
+      method: none
+      host: "{{ env_var('TRINO_HOST', '127.0.0.1') }}"
+      port: "{{ env_var('TRINO_PORT', '18080') | as_number }}"
+      user: smoke
+      database: "{{ env_var('ARNEB_CATALOG', 'file') }}"
+      schema: default
+      http_scheme: http
+      threads: 4
+    postgres:
+      type: postgres
+      host: "{{ env_var('PGHOST', '127.0.0.1') }}"
+      port: "{{ env_var('PGPORT', '15432') | as_number }}"
+      user: smoke
+      password: ""
+      dbname: "{{ env_var('ARNEB_CATALOG', 'file') }}"
+      schema: default
+      threads: 4

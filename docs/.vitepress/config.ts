@@ -38,7 +38,8 @@ export default defineConfig({
             { text: 'Access Control', link: '/guide/access-control' },
             { text: 'Observability', link: '/guide/observability' },
             { text: 'Performance', link: '/guide/performance' },
-            { text: 'Trino Clients', link: '/guide/trino-clients' }
+            { text: 'Trino Clients', link: '/guide/trino-clients' },
+            { text: 'Client Compatibility', link: '/guide/clients' }
           ]
         }
       ],

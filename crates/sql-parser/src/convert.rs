@@ -421,12 +421,18 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             })
         }
         sp::Expr::CompoundIdentifier(idents) => match idents.len() {
-            2 => {
-                let col_span = idents[0].span.union(&idents[1].span);
+            // `[catalog.][schema.]table.column`: qualifiers match a table by
+            // its name or alias, so the schema and catalog parts (which
+            // SQLAlchemy's Trino dialect writes) are dropped. Two tables
+            // with the same name from different schemas therefore make
+            // `a.t.col` and `b.t.col` ambiguous; alias them to tell them apart.
+            n @ 2..=4 => {
+                let (table, column) = (&idents[n - 2], &idents[n - 1]);
+                let col_span = table.span.union(&column.span);
                 Ok(ast::Expr::Column {
                     col_ref: ast::ColumnRef {
-                        table: Some(idents[0].value.clone()),
-                        name: idents[1].value.clone(),
+                        table: Some(table.value.clone()),
+                        name: column.value.clone(),
                         span: col_span,
                     },
                     span,
@@ -1341,7 +1347,14 @@ fn convert_join_constraint(
             Ok(ast::JoinCondition::On(e))
         }
         sp::JoinConstraint::Using(idents) => {
-            let cols = idents.into_iter().map(|id| id.to_string()).collect();
+            // Quotes are stripped like everywhere else (`USING ("a")` = `USING (a)`).
+            let cols = idents
+                .into_iter()
+                .map(|name| match name.0.last().and_then(|p| p.as_ident()) {
+                    Some(ident) => ident.value.clone(),
+                    None => name.to_string(),
+                })
+                .collect();
             Ok(ast::JoinCondition::Using(cols))
         }
         sp::JoinConstraint::Natural => {

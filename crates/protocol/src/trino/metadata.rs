@@ -214,11 +214,11 @@ pub(crate) async fn table_columns(
 
 /// Does `sql` reference one of the virtual metadata schemas?
 pub(crate) fn references_virtual_metadata(sql: &str) -> bool {
-    let lower = sql.to_ascii_lowercase();
+    // Quotes dropped, so `"system"."metadata"` and `system."jdbc"` match too.
+    let lower = sql.to_ascii_lowercase().replace('"', "");
     lower.contains(INFORMATION_SCHEMA)
         || lower.contains("system.jdbc")
         || lower.contains("system.metadata")
-        || lower.contains("\"system\".\"jdbc\"")
 }
 
 async fn collect_tables(
@@ -661,6 +661,21 @@ mod tests {
         catalog.register_schema("sales", schema);
         cm.register_catalog("lake", catalog);
         cm
+    }
+
+    #[test]
+    fn virtual_metadata_matches_any_quoting() {
+        for sql in [
+            "SELECT * FROM system.metadata.catalogs",
+            "SELECT * FROM \"system\".\"metadata\".catalogs",
+            "SELECT * FROM system.\"jdbc\".tables",
+            "SELECT * FROM \"INFORMATION_SCHEMA\".tables",
+        ] {
+            assert!(references_virtual_metadata(sql), "{sql}");
+        }
+        assert!(!references_virtual_metadata(
+            "SELECT * FROM lake.sales.orders"
+        ));
     }
 
     #[tokio::test]

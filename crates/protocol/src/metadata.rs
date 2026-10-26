@@ -617,18 +617,12 @@ fn command_ok(tag: &str) -> MetaResult {
 
 /// The command tag for a transaction-control statement, or `None`.
 fn transaction_tag(lower: &str) -> Option<&'static str> {
-    let first = lower
-        .trim_end_matches(';')
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
-    match first {
-        "begin" => Some("BEGIN"),
-        "start" if lower.split_whitespace().nth(1) == Some("transaction") => {
-            Some("START TRANSACTION")
-        }
-        "commit" | "end" => Some("COMMIT"),
-        "rollback" | "abort" => Some("ROLLBACK"),
+    let mut words = lower.trim_end_matches(';').split_whitespace();
+    match (words.next()?, words.next()) {
+        ("begin", _) => Some("BEGIN"),
+        ("start", Some("transaction")) => Some("START TRANSACTION"),
+        ("commit" | "end", _) => Some("COMMIT"),
+        ("rollback" | "abort", _) => Some("ROLLBACK"),
         _ => None,
     }
 }

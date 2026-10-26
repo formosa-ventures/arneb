@@ -597,14 +597,9 @@ fn param_literal(
             Type::FLOAT8 => get!(f64, declared).map(|v| v.to_string()),
             Type::BOOL => get!(bool, declared).map(bool_literal),
             Type::DATE => get!(chrono::NaiveDate, declared).map(|d| format!("DATE '{d}'")),
-            Type::TIMESTAMP => get!(chrono::NaiveDateTime, declared)
-                .map(|t| format!("TIMESTAMP '{}'", t.format("%Y-%m-%d %H:%M:%S%.f"))),
-            Type::TIMESTAMPTZ => get!(chrono::DateTime<chrono::FixedOffset>, declared).map(|t| {
-                format!(
-                    "TIMESTAMP '{}'",
-                    t.naive_utc().format("%Y-%m-%d %H:%M:%S%.f")
-                )
-            }),
+            Type::TIMESTAMP => get!(chrono::NaiveDateTime, declared).map(timestamp_literal),
+            Type::TIMESTAMPTZ => get!(chrono::DateTime<chrono::FixedOffset>, declared)
+                .map(|t| timestamp_literal(t.naive_utc())),
             Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
                 get!(String, &Type::TEXT).map(quoted)
             }
@@ -642,6 +637,10 @@ fn param_literal(
 
 fn bool_literal(value: bool) -> String {
     if value { "TRUE" } else { "FALSE" }.to_string()
+}
+
+fn timestamp_literal(value: chrono::NaiveDateTime) -> String {
+    format!("TIMESTAMP '{}'", value.format("%Y-%m-%d %H:%M:%S%.f"))
 }
 
 /// Plan a SQL string (without executing) to obtain output column schema.

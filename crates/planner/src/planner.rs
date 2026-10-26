@@ -1454,34 +1454,35 @@ impl<'a> QueryPlanner<'a> {
                 }
                 ast::JoinCondition::Using(_) => {
                     // `USING (a, b)` = `ON l.a = r.a AND l.b = r.b`.
-                    let mut on: Option<PlanExpr> = None;
-                    for (left, right) in using {
-                        let right = right + left_len;
-                        ctx.merged.insert(right);
-                        let column = |index: usize| PlanExpr::Column {
+                    ctx.merged
+                        .extend(using.iter().map(|&(_, right)| right + left_len));
+                    let column = |index: usize| {
+                        Box::new(PlanExpr::Column {
                             index,
                             name: ctx.columns[index].1.name.clone(),
                             span: None,
-                        };
-                        let eq = PlanExpr::BinaryOp {
-                            left: Box::new(column(left)),
+                        })
+                    };
+                    let on = using
+                        .iter()
+                        .map(|&(left, right)| PlanExpr::BinaryOp {
+                            left: column(left),
                             op: ast::BinaryOp::Eq,
-                            right: Box::new(column(right)),
+                            right: column(right + left_len),
                             span: None,
-                        };
-                        on = Some(match on {
-                            None => eq,
-                            Some(prev) => PlanExpr::BinaryOp {
-                                left: Box::new(prev),
-                                op: ast::BinaryOp::And,
-                                right: Box::new(eq),
-                                span: None,
-                            },
-                        });
-                    }
-                    JoinCondition::On(on.ok_or_else(|| {
-                        PlanError::invalid_expression("USING needs at least one column".to_string())
-                    })?)
+                        })
+                        .reduce(|acc, eq| PlanExpr::BinaryOp {
+                            left: Box::new(acc),
+                            op: ast::BinaryOp::And,
+                            right: Box::new(eq),
+                            span: None,
+                        })
+                        .ok_or_else(|| {
+                            PlanError::invalid_expression(
+                                "USING needs at least one column".to_string(),
+                            )
+                        })?;
+                    JoinCondition::On(on)
                 }
                 ast::JoinCondition::None => JoinCondition::None,
             };
@@ -1579,20 +1580,13 @@ impl<'a> QueryPlanner<'a> {
                     Some(col_ref.span.start),
                 );
                 // The parser reads a bare `current_schema` as a column.
-                let (index, col_info) = match resolved {
-                    Err(_) if col_ref.table.is_none() => {
-                        match session_value(self.catalog, &col_ref.name) {
-                            Some(value) => {
-                                return Ok(PlanExpr::Literal {
-                                    value: ScalarValue::Utf8(value),
-                                    span: node_span,
-                                })
-                            }
-                            None => resolved?,
-                        }
+                if resolved.is_err() && col_ref.table.is_none() {
+                    if let Some(literal) = session_literal(self.catalog, &col_ref.name, node_span)
+                    {
+                        return Ok(literal);
                     }
-                    other => other?,
-                };
+                }
+                let (index, col_info) = resolved?;
                 Ok(PlanExpr::Column {
                     index,
                     name: col_info.name,
@@ -1616,20 +1610,17 @@ impl<'a> QueryPlanner<'a> {
                 expr: Box::new(self.plan_expr(expr, ctx).await?),
                 span: node_span,
             }),
-            ast::Expr::Function { name, args, .. }
-                if args.is_empty() && session_value(self.catalog, name).is_some() =>
-            {
-                Ok(PlanExpr::Literal {
-                    value: ScalarValue::Utf8(session_value(self.catalog, name).unwrap_or_default()),
-                    span: node_span,
-                })
-            }
             ast::Expr::Function {
                 name,
                 args,
                 distinct,
                 ..
             } => {
+                if args.is_empty() {
+                    if let Some(literal) = session_literal(self.catalog, name, node_span) {
+                        return Ok(literal);
+                    }
+                }
                 let mut plan_args = Vec::with_capacity(args.len());
                 for a in args {
                     let plan_arg = match a {
@@ -3473,17 +3464,25 @@ fn using_pairs(
         .collect()
 }
 
-/// The value of a session function the planner folds to a literal:
-/// `current_catalog` and `current_schema` (Trino's niladic forms), from the
-/// session's defaults.
-fn session_value(catalog: &CatalogManager, name: &str) -> Option<String> {
-    if name.eq_ignore_ascii_case("current_catalog") {
-        Some(catalog.default_catalog().to_string())
+/// A session function the planner folds to a literal: `current_catalog` and
+/// `current_schema` (Trino's niladic forms), from the session's defaults.
+/// `None` for any other name.
+fn session_literal(
+    catalog: &CatalogManager,
+    name: &str,
+    span: Option<arneb_sql_parser::Span>,
+) -> Option<PlanExpr> {
+    let value = if name.eq_ignore_ascii_case("current_catalog") {
+        catalog.default_catalog()
     } else if name.eq_ignore_ascii_case("current_schema") {
-        Some(catalog.default_schema().to_string())
+        catalog.default_schema()
     } else {
-        None
-    }
+        return None;
+    };
+    Some(PlanExpr::Literal {
+        value: ScalarValue::Utf8(value.to_string()),
+        span,
+    })
 }
 
 #[cfg(test)]

@@ -423,7 +423,9 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
         sp::Expr::CompoundIdentifier(idents) => match idents.len() {
             // `[catalog.][schema.]table.column`: qualifiers match a table by
             // its name or alias, so the schema and catalog parts (which
-            // SQLAlchemy's Trino dialect writes) are dropped.
+            // SQLAlchemy's Trino dialect writes) are dropped. Two tables
+            // with the same name from different schemas therefore make
+            // `a.t.col` and `b.t.col` ambiguous; alias them to tell them apart.
             n @ 2..=4 => {
                 let (table, column) = (&idents[n - 2], &idents[n - 1]);
                 let col_span = table.span.union(&column.span);

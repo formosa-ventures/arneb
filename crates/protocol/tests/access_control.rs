@@ -217,6 +217,19 @@ async fn pgwire_checks_reads_listings_and_execute() {
     let names: Vec<&[String]> = tables.iter().map(|r| &r[..3]).collect();
     assert_eq!(names, vec![["memory", "default", "open_t"]]);
 
+    // Uppercase names fold to a visible table only, so the denial for a
+    // hidden one names it as written, exactly as for a missing table.
+    let rows = pg_rows(&alice.simple_query("SELECT n FROM OPEN_T").await.unwrap());
+    assert_eq!(rows.len(), 3);
+    for table in ["SECRET", "NOPE"] {
+        let (code, message) = pg_error(&alice, &format!("SELECT n FROM {table}")).await;
+        assert_eq!(code, "42501");
+        assert!(
+            message.contains(&format!("memory.default.{table}")),
+            "{table}: {message}"
+        );
+    }
+
     // A hidden schema in search_path is skipped as if it did not exist, so
     // whether the path takes effect does not reveal it.
     for path in ["lake.sales", "lake.nope"] {

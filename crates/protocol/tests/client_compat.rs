@@ -94,6 +94,7 @@ async fn pgwire_answers_driver_session_queries() {
     for (sql, tag) in [
         ("BEGIN", "BEGIN"),
         ("START TRANSACTION READ ONLY", "START TRANSACTION"),
+        ("START TRANSACTION;", "START TRANSACTION"),
         ("COMMIT", "COMMIT"),
         ("ROLLBACK;", "ROLLBACK"),
         ("END", "COMMIT"),

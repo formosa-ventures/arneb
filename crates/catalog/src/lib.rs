@@ -342,6 +342,14 @@ impl CatalogManager {
             .is_none_or(|a| a.rules.schema_visible(&a.user, catalog, schema))
     }
 
+    /// Whether the session user may see `catalog.schema.table` (true
+    /// without rules, whether or not it exists).
+    pub fn table_visible(&self, catalog: &str, schema: &str, table: &str) -> bool {
+        self.access
+            .as_ref()
+            .is_none_or(|a| a.rules.table_visible(&a.user, catalog, schema, table))
+    }
+
     /// Catalog names the session user may see (all of them without rules).
     pub fn visible_catalog_names(&self) -> Vec<String> {
         let mut names = self.catalog_names();
@@ -451,13 +459,27 @@ impl CatalogManager {
     /// keeps no quoting, so `FROM NATION` and `INFORMATION_SCHEMA.TABLES`
     /// find `nation` and `information_schema.tables`. A part that names
     /// something as written is kept, so mixed-case names still resolve.
+    /// A lowercase form the session user may not see is never probed, so
+    /// the folded name does not reveal whether a hidden object exists.
     pub async fn fold_reference_case(&self, reference: &TableReference) -> TableReference {
+        // All-lowercase references (the common case) need no lookups.
+        let folds = |name: &str| name.to_lowercase() != name;
+        if !reference.catalog.as_deref().is_some_and(folds)
+            && !reference.schema.as_deref().is_some_and(folds)
+            && !folds(&reference.table)
+        {
+            return reference.clone();
+        }
         let mut folded = reference.clone();
         let catalog_name = match &reference.catalog {
             Some(name) => {
                 let catalogs = self.catalogs.read().unwrap();
-                if !catalogs.contains_key(name) && catalogs.contains_key(&name.to_lowercase()) {
-                    folded.catalog = Some(name.to_lowercase());
+                let lower = name.to_lowercase();
+                if !catalogs.contains_key(name)
+                    && self.catalog_visible(&lower)
+                    && catalogs.contains_key(&lower)
+                {
+                    folded.catalog = Some(lower);
                 }
                 folded.catalog.clone().unwrap_or_default()
             }
@@ -468,10 +490,12 @@ impl CatalogManager {
         };
         let schema_name = match &reference.schema {
             Some(name) => {
-                if catalog.schema(name).await.is_none()
-                    && catalog.schema(&name.to_lowercase()).await.is_some()
+                let lower = name.to_lowercase();
+                if self.schema_visible(&catalog_name, &lower)
+                    && catalog.schema(name).await.is_none()
+                    && catalog.schema(&lower).await.is_some()
                 {
-                    folded.schema = Some(name.to_lowercase());
+                    folded.schema = Some(lower);
                 }
                 folded.schema.clone().unwrap_or_default()
             }
@@ -482,6 +506,7 @@ impl CatalogManager {
         };
         let lower = reference.table.to_lowercase();
         if lower != reference.table
+            && self.table_visible(&catalog_name, &schema_name, &lower)
             && schema.table(&reference.table).await.is_none()
             && schema.table(&lower).await.is_some()
         {

@@ -746,6 +746,36 @@ async fn run() -> Result<()> {
         .auth
         .to_auth_method()
         .context("invalid [auth] configuration")?;
+    let access_rules = if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
+        config
+            .access_control
+            .load_rules()
+            .context("invalid [access_control] configuration")?
+            .map(Arc::new)
+    } else {
+        None
+    };
+    if let (Some(rules), Some(path)) = (&access_rules, &config.access_control.rules_file) {
+        let [catalogs, schemas, tables, queries] = rules
+            .section_sizes()
+            .map(|n| n.map_or_else(|| "absent (allow all)".to_owned(), |n| n.to_string()));
+        tracing::info!(
+            target: "arneb::config",
+            rules_file = %path.display(),
+            catalogs = %catalogs,
+            schemas = %schemas,
+            tables = %tables,
+            queries = %queries,
+            "access control rules loaded"
+        );
+        if matches!(auth_method, arneb_protocol::AuthMethod::None) {
+            tracing::warn!(
+                target: "arneb::config",
+                "access control rules are set but [auth] type = \"none\": user names are \
+                 not verified, so any client can claim any user"
+            );
+        }
+    }
     if !matches!(role, ServerRole::Worker) {
         let users = match &auth_method {
             arneb_protocol::AuthMethod::ScramSha256(creds) => creds.len(),
@@ -855,7 +885,8 @@ async fn run() -> Result<()> {
     .with_statement_timeout(config.admission.statement_timeout)
     .with_auth(auth_method)
     .with_tls(pgwire_tls)
-    .with_query_tracker(query_tracker.clone());
+    .with_query_tracker(query_tracker.clone())
+    .with_access_rules(access_rules.clone());
     if let Some(ref executor) = distributed_executor {
         server = server.with_distributed_executor(Arc::clone(executor));
     }
@@ -896,6 +927,7 @@ async fn run() -> Result<()> {
         .with_admission(admission.clone())
         .with_statement_timeout(config.admission.statement_timeout)
         .with_query_tracker(query_tracker.clone())
+        .with_access_rules(access_rules.clone())
         .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
         .with_password_auth(password_users.clone())
         .context("Trino listener authentication")?;

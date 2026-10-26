@@ -35,6 +35,7 @@ export default defineConfig({
             { text: 'Configuration', link: '/guide/configuration' },
             { text: 'Distributed Mode', link: '/guide/distributed' },
             { text: 'Kubernetes', link: '/guide/kubernetes' },
+            { text: 'Access Control', link: '/guide/access-control' },
             { text: 'Observability', link: '/guide/observability' },
             { text: 'Performance', link: '/guide/performance' },
             { text: 'Trino Clients', link: '/guide/trino-clients' }

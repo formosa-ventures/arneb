@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 arneb-common = { path = "../common" }
 async-trait.workspace = true
+regex = "1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

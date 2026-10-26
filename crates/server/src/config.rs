@@ -63,6 +63,54 @@ pub struct AppConfig {
     /// effective values after [`AppConfig::load`].
     #[serde(default)]
     pub observability: ObservabilityConfig,
+
+    /// Access rules (coordinator/standalone only); effective values after
+    /// [`AppConfig::load`].
+    #[serde(default)]
+    pub access_control: AccessControlConfig,
+}
+
+/// `[access_control]` section (file-based-access-control).
+///
+/// ```toml
+/// [access_control]
+/// rules_file = "/etc/arneb/rules.json"   # ARNEB_ACCESS_CONTROL_RULES_FILE
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccessControlConfig {
+    /// A rules file in Trino's file-based access control format. Unset:
+    /// every user may read every table.
+    pub rules_file: Option<std::path::PathBuf>,
+}
+
+impl AccessControlConfig {
+    /// Apply `ARNEB_ACCESS_CONTROL_RULES_FILE` (env > file); an empty value
+    /// is an error.
+    pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+        if let Some(v) = env("ARNEB_ACCESS_CONTROL_RULES_FILE") {
+            let v = v.trim();
+            anyhow::ensure!(
+                !v.is_empty(),
+                "ARNEB_ACCESS_CONTROL_RULES_FILE is set but empty"
+            );
+            self.rules_file = Some(v.into());
+        }
+        Ok(())
+    }
+
+    /// Read and parse the rules file, if one is set.
+    pub fn load_rules(&self) -> Result<Option<arneb_catalog::AccessRules>> {
+        let Some(path) = &self.rules_file else {
+            return Ok(None);
+        };
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!("cannot read access rules file {}: {e}", path.display())
+        })?;
+        arneb_catalog::AccessRules::from_json(&text)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("access rules file {}: {e}", path.display()))
+    }
 }
 
 /// `[web]` section.
@@ -1293,6 +1341,7 @@ impl AppConfig {
                         web: WebConfig::default(),
                         admission: AdmissionConfig::default(),
                         observability: ObservabilityConfig::default(),
+                        access_control: AccessControlConfig::default(),
                     }
                 }
             }
@@ -1312,6 +1361,8 @@ impl AppConfig {
         observability.apply_env(|k| std::env::var(k).ok())?;
         let mut cluster = config.cluster;
         cluster.apply_env(|k| std::env::var(k).ok())?;
+        let mut access_control = config.access_control;
+        access_control.apply_env(|k| std::env::var(k).ok())?;
         let mut catalogs = config.catalogs;
         check_password_env_vars(&catalogs)?;
         for catalog in &mut catalogs {
@@ -1332,6 +1383,7 @@ impl AppConfig {
             web,
             admission,
             observability,
+            access_control,
         })
     }
 }
@@ -2173,5 +2225,46 @@ password = "hunter2"
             .unwrap_err()
             .to_string();
         assert!(err.contains("ARNEB_CLUSTER_WORKER_ID"), "{err}");
+    }
+
+    #[test]
+    fn access_control_rules_file_from_file_or_env() {
+        let dir = std::env::temp_dir().join(format!("arneb-rules-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.json");
+        std::fs::write(
+            &good,
+            r#"{"tables": [{"user": "a", "privileges": ["SELECT"]}]}"#,
+        )
+        .unwrap();
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, r#"{"tables": [{"filter": "x", "privileges": []}]}"#).unwrap();
+
+        let mut cfg: AccessControlConfig = toml::from_str("").unwrap();
+        cfg.apply_env(env_from(&[])).unwrap();
+        assert!(cfg.load_rules().unwrap().is_none());
+
+        let mut cfg: AccessControlConfig =
+            toml::from_str(&format!("rules_file = {:?}", bad.display().to_string())).unwrap();
+        let err = cfg.load_rules().unwrap_err().to_string();
+        assert!(err.contains("bad.json") && err.contains("filter"), "{err}");
+        cfg.apply_env(env_from(&[(
+            "ARNEB_ACCESS_CONTROL_RULES_FILE",
+            good.to_str().unwrap(),
+        )]))
+        .unwrap();
+        let rules = cfg.load_rules().unwrap().unwrap();
+        assert_eq!(rules.section_sizes(), [None, None, Some(1), None]);
+
+        cfg.rules_file = Some(dir.join("missing.json"));
+        assert!(cfg
+            .load_rules()
+            .unwrap_err()
+            .to_string()
+            .contains("missing.json"));
+        assert!(cfg
+            .apply_env(env_from(&[("ARNEB_ACCESS_CONTROL_RULES_FILE", "")]))
+            .is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

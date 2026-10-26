@@ -8,9 +8,13 @@
 #![warn(unreachable_pub)]
 #![deny(unsafe_code)]
 
+pub mod access;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
+
+pub use access::{AccessRules, CatalogAccess, RulesError};
 
 use arneb_common::error::CatalogError;
 use arneb_common::types::{ColumnInfo, ScalarValue, TableReference};
@@ -236,6 +240,16 @@ pub struct CatalogManager {
     /// reference planned against a view must carry its resolved catalog and
     /// schema explicitly.
     qualify_references: bool,
+    /// The session user and the rules they are checked against, on a view
+    /// made by [`CatalogManager::with_access`]. `None` checks nothing.
+    access: Option<Arc<SessionAccess>>,
+}
+
+/// A session user and the access rules that apply to them.
+#[derive(Debug)]
+struct SessionAccess {
+    user: String,
+    rules: Arc<AccessRules>,
 }
 
 impl CatalogManager {
@@ -246,6 +260,7 @@ impl CatalogManager {
             default_catalog: default_catalog.into(),
             default_schema: default_schema.into(),
             qualify_references: false,
+            access: None,
         }
     }
 
@@ -269,7 +284,105 @@ impl CatalogManager {
             default_catalog: default_catalog.into(),
             default_schema: default_schema.into(),
             qualify_references: true,
+            access: self.access.clone(),
         }
+    }
+
+    /// Returns a view of this manager, keeping its defaults, that checks
+    /// every table read and filters every listing against `rules` for
+    /// `user` (file-based-access-control).
+    pub fn with_access(&self, user: impl Into<String>, rules: Arc<AccessRules>) -> Self {
+        Self {
+            catalogs: Arc::clone(&self.catalogs),
+            default_catalog: self.default_catalog.clone(),
+            default_schema: self.default_schema.clone(),
+            qualify_references: self.qualify_references,
+            access: Some(Arc::new(SessionAccess {
+                user: user.into(),
+                rules,
+            })),
+        }
+    }
+
+    /// Fails with [`CatalogError::AccessDenied`] when the session user may
+    /// not run queries (`queries` rules); always passes without access rules.
+    pub fn check_execute(&self) -> Result<(), CatalogError> {
+        if self
+            .access
+            .as_ref()
+            .is_none_or(|a| a.rules.can_execute(&a.user))
+        {
+            Ok(())
+        } else {
+            Err(CatalogError::AccessDenied("Cannot execute query".into()))
+        }
+    }
+
+    /// Whether the session user may see a query run by `owner`; always true
+    /// without access rules.
+    pub fn can_view_query(&self, owner: &str) -> bool {
+        self.access
+            .as_ref()
+            .is_none_or(|a| a.rules.can_view_query(&a.user, owner))
+    }
+
+    /// Whether the session user may see `catalog` (true without rules,
+    /// whether or not it is registered).
+    pub fn catalog_visible(&self, catalog: &str) -> bool {
+        self.access
+            .as_ref()
+            .is_none_or(|a| a.rules.catalog_visible(&a.user, catalog))
+    }
+
+    /// Whether the session user may see `catalog.schema` (true without
+    /// rules, whether or not it exists).
+    pub fn schema_visible(&self, catalog: &str, schema: &str) -> bool {
+        self.access
+            .as_ref()
+            .is_none_or(|a| a.rules.schema_visible(&a.user, catalog, schema))
+    }
+
+    /// Catalog names the session user may see (all of them without rules).
+    pub fn visible_catalog_names(&self) -> Vec<String> {
+        let mut names = self.catalog_names();
+        if let Some(a) = &self.access {
+            names.retain(|c| a.rules.catalog_visible(&a.user, c));
+        }
+        names
+    }
+
+    /// Schema names of `catalog` the session user may see; empty for an
+    /// unknown or hidden catalog.
+    pub async fn visible_schema_names(&self, catalog: &str) -> Vec<String> {
+        let Some(provider) = self.catalog(catalog) else {
+            return Vec::new();
+        };
+        let mut names = provider.schema_names().await;
+        if let Some(a) = &self.access {
+            names.retain(|s| a.rules.schema_visible(&a.user, catalog, s));
+        }
+        names
+    }
+
+    /// Table names of `catalog.schema` the session user may see; empty for
+    /// an unknown or hidden schema.
+    pub async fn visible_table_names(&self, catalog: &str, schema: &str) -> Vec<String> {
+        if let Some(a) = &self.access {
+            if !a.rules.schema_visible(&a.user, catalog, schema) {
+                return Vec::new();
+            }
+        }
+        let Some(provider) = self.catalog(catalog) else {
+            return Vec::new();
+        };
+        let Some(schema_provider) = provider.schema(schema).await else {
+            return Vec::new();
+        };
+        let mut names = schema_provider.table_names().await;
+        if let Some(a) = &self.access {
+            names.retain(|t| a.rules.table_visible(&a.user, catalog, schema, t));
+        }
+        names
     }
 
     /// Returns the reference the planner should record for a scanned table.
@@ -348,6 +461,18 @@ impl CatalogManager {
             .unwrap_or(&self.default_catalog);
         let schema_name = reference.schema.as_deref().unwrap_or(&self.default_schema);
         let table_name = &reference.table;
+        // Checked before the lookup, so a denied name reads the same
+        // whether or not the table exists.
+        if let Some(a) = &self.access {
+            if !a
+                .rules
+                .can_select(&a.user, catalog_name, schema_name, table_name)
+            {
+                return Err(CatalogError::AccessDenied(format!(
+                    "Cannot select from table {catalog_name}.{schema_name}.{table_name}"
+                )));
+            }
+        }
 
         let catalog = {
             let catalogs = self.catalogs.read().unwrap();
@@ -419,6 +544,89 @@ mod tests {
         // Catalogs registered on the root after the view exists are shared.
         root.register_catalog("late", Arc::new(MemoryCatalog::new()));
         assert!(view.catalog("late").is_some());
+    }
+
+    /// file-based-access-control: a view checks reads before the lookup,
+    /// keeps the session defaults it wraps, and filters every listing.
+    #[tokio::test]
+    async fn access_view_checks_reads_and_filters_listings() {
+        let root = CatalogManager::new("lake", "sales");
+        for (catalog_name, schemas) in [("lake", ["sales", "hr"]), ("pg", ["public", "ops"])] {
+            let catalog = Arc::new(MemoryCatalog::new());
+            for schema_name in schemas {
+                let schema = Arc::new(MemorySchema::new());
+                for table in ["orders", "salaries"] {
+                    schema.register_table(table, Arc::new(MemoryTable::new(test_columns())));
+                }
+                catalog.register_schema(schema_name, schema);
+            }
+            root.register_catalog(catalog_name, catalog);
+        }
+        let rules = Arc::new(
+            AccessRules::from_json(
+                r#"{
+                    "catalogs": [{"catalog": "pg", "allow": "none"}, {"allow": "read-only"}],
+                    "schemas": [{"owner": false}],
+                    "tables": [{"user": "alice", "schema": "sales", "table": "orders",
+                                "privileges": ["SELECT"]}]
+                }"#,
+            )
+            .unwrap(),
+        );
+        let alice = root.with_access("alice", Arc::clone(&rules));
+        assert!(
+            read(&alice, "orders").await.is_ok(),
+            "unqualified names use the defaults"
+        );
+        let err = read(&alice, "salaries").await.unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "Access Denied: Cannot select from table lake.sales.salaries"
+        );
+        let missing = read(&alice, "lake.sales.nope")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            missing,
+            "Access Denied: Cannot select from table lake.sales.nope"
+        );
+        assert!(read(&alice, "pg.public.orders").await.is_err());
+        assert!(
+            read(&root, "pg.public.salaries").await.is_ok(),
+            "the root checks nothing"
+        );
+
+        assert_eq!(alice.visible_catalog_names(), vec!["lake"]);
+        assert_eq!(alice.visible_schema_names("lake").await, vec!["sales"]);
+        assert!(alice.visible_schema_names("pg").await.is_empty());
+        assert_eq!(
+            alice.visible_table_names("lake", "sales").await,
+            vec!["orders"]
+        );
+        assert!(alice.visible_table_names("lake", "hr").await.is_empty());
+
+        // A session-defaults view of an access view keeps the user.
+        let session = alice.with_session_defaults("lake", "hr");
+        assert!(read(&session, "orders").await.is_err());
+        assert!(read(&session, "sales.orders").await.is_ok());
+    }
+
+    async fn read(
+        manager: &CatalogManager,
+        name: &str,
+    ) -> Result<Arc<dyn TableProvider>, CatalogError> {
+        let mut parts: Vec<String> = name.split('.').map(String::from).collect();
+        let table = parts.pop().unwrap();
+        let schema = parts.pop();
+        let catalog = parts.pop();
+        manager
+            .resolve_table(&TableReference {
+                catalog,
+                schema,
+                table,
+            })
+            .await
     }
 
     // -- MemoryTable tests --

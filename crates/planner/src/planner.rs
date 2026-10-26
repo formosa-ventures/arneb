@@ -4,7 +4,7 @@ use async_recursion::async_recursion;
 use std::sync::OnceLock;
 
 use arneb_catalog::CatalogManager;
-use arneb_common::error::PlanError;
+use arneb_common::error::{CatalogError, PlanError};
 use arneb_common::types::{ColumnInfo, DataType, ScalarValue};
 use arneb_sql_parser::ast;
 
@@ -1478,11 +1478,14 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
 
-                let table_provider = self
-                    .catalog
-                    .resolve_table(name)
-                    .await
-                    .map_err(|_| PlanError::TableNotFound(name.to_string()))?;
+                let table_provider =
+                    self.catalog
+                        .resolve_table(name)
+                        .await
+                        .map_err(|e| match e {
+                            CatalogError::AccessDenied(denial) => PlanError::AccessDenied(denial),
+                            _ => PlanError::TableNotFound(name.to_string()),
+                        })?;
                 let schema = table_provider.schema();
                 let qualifier = alias.as_deref().unwrap_or(&name.table);
 

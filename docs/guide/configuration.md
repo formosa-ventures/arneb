@@ -448,8 +448,22 @@ Limitations:
   by default; see [Web UI](#web-ui).
 - The **Flight RPC** port is protected by [Cluster security](#cluster-security),
   not by `[auth]`.
-- Channel binding (`SCRAM-SHA-256-PLUS`), client-certificate authentication
-  and per-user permissions are not supported.
+- Channel binding (`SCRAM-SHA-256-PLUS`) and client-certificate
+  authentication are not supported. Per-user permissions are set with
+  [access control](#access-control).
+
+## Access Control
+
+```toml
+[access_control]
+rules_file = "/etc/arneb/rules.json"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `rules_file` | path | unset | Rules in Trino's file-based access control format (`ARNEB_ACCESS_CONTROL_RULES_FILE`). Read at startup on the coordinator and standalone server; an unreadable or unsupported file stops startup. Unset: every user reads every table. |
+
+See [Access Control](/guide/access-control) for the rule format.
 
 ## TLS
 

@@ -80,6 +80,11 @@ pub enum PlanError {
     #[error("table not found: {0}")]
     TableNotFound(String),
 
+    /// The session user may not read a referenced table (access control).
+    /// The message is the denial, e.g. `Cannot select from table c.s.t`.
+    #[error("Access Denied: {0}")]
+    AccessDenied(String),
+
     /// The referenced column does not exist in the table schema.
     #[error("column not found: {name}")]
     ColumnNotFound {
@@ -183,7 +188,9 @@ impl PlanError {
             | PlanError::AmbiguousReference { location, .. }
             | PlanError::InvalidLiteral { location, .. }
             | PlanError::ParameterTypeConflict { location, .. } => *location,
-            PlanError::TableNotFound(_) | PlanError::InternalError(_) => None,
+            PlanError::TableNotFound(_)
+            | PlanError::AccessDenied(_)
+            | PlanError::InternalError(_) => None,
         }
     }
 
@@ -259,6 +266,11 @@ pub enum CatalogError {
     /// A table with this name already exists in the schema.
     #[error("table already exists: {0}")]
     TableAlreadyExists(String),
+
+    /// The session user is not allowed this access (access control). The
+    /// message is the denial, e.g. `Cannot select from table c.s.t`.
+    #[error("Access Denied: {0}")]
+    AccessDenied(String),
 }
 
 /// Errors from configuration loading.

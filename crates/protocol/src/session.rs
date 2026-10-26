@@ -39,11 +39,13 @@ enum Command {
 
 /// Handle `SET` / `SHOW` / `RESET search_path`. Returns `None` for any other
 /// statement. `current` is the connection's path, `None` meaning the server
-/// default. On `Some((result, Some(path)))` the caller stores `path` as the
-/// connection's new search path.
+/// default. `session` is the connection's access view: a schema it hides is
+/// skipped as if it did not exist. On `Some((result, Some(path)))` the
+/// caller stores `path` as the connection's new search path.
 pub(crate) async fn handle_search_path(
     sql: &str,
     root: &Arc<CatalogManager>,
+    session: &CatalogManager,
     current: Option<&SearchPath>,
 ) -> Option<(MetadataResult, Option<SearchPath>)> {
     let set_ok = || Ok(MetadataResponse::Command("SET".to_string()));
@@ -58,7 +60,7 @@ pub(crate) async fn handle_search_path(
             Some(default_path(root)),
         )),
         Command::Set(entries) => {
-            let path = resolve(root, entries).await;
+            let path = resolve(root, session, entries).await;
             Some((set_ok(), Some(path)))
         }
     }
@@ -71,7 +73,11 @@ fn default_path(root: &Arc<CatalogManager>) -> SearchPath {
     }
 }
 
-async fn resolve(root: &Arc<CatalogManager>, entries: Vec<String>) -> SearchPath {
+async fn resolve(
+    root: &Arc<CatalogManager>,
+    session: &CatalogManager,
+    entries: Vec<String>,
+) -> SearchPath {
     let candidates: Vec<(String, String)> = entries
         .iter()
         .filter(|e| *e != "$user")
@@ -85,6 +91,9 @@ async fn resolve(root: &Arc<CatalogManager>, entries: Vec<String>) -> SearchPath
     // pointing unqualified names at a schema that doesn't exist.
     let mut chosen = None;
     for (catalog, schema) in &candidates {
+        if !session.schema_visible(catalog, schema) {
+            continue;
+        }
         if let Some(provider) = root.catalog(catalog) {
             if provider.schema(schema).await.is_some() {
                 chosen = Some((catalog.clone(), schema.clone()));
@@ -207,7 +216,7 @@ mod tests {
             ("SET search_path TO DEFAULT", "SET"),
             ("SET search_path = a", "SET"),
         ] {
-            let (result, _) = handle_search_path(sql, &root, None).await.unwrap();
+            let (result, _) = handle_search_path(sql, &root, &root, None).await.unwrap();
             match result {
                 Ok(MetadataResponse::Command(t)) => assert_eq!(t, tag, "{sql}"),
                 _ => panic!("expected a command tag for {sql}"),

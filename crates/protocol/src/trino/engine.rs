@@ -69,6 +69,9 @@ pub(crate) struct Engine {
     pub(crate) query_memory_limit: Option<usize>,
     /// Backs `system.runtime.queries`.
     pub(crate) query_tracker: Arc<arneb_scheduler::QueryTracker>,
+    /// Access rules checked for the session user; `None` allows all
+    /// (file-based-access-control).
+    pub(crate) access_rules: Option<Arc<arneb_catalog::AccessRules>>,
 }
 
 fn filter_like(names: Vec<String>, like: &Option<String>) -> Vec<String> {
@@ -87,6 +90,21 @@ fn single_column(name: &'static str, values: Vec<String>) -> QueryOutput {
 }
 
 impl Engine {
+    /// The catalog manager this session plans against: the root, checked
+    /// against the access rules for the session user. Fails when the rules
+    /// do not let the user run statements.
+    fn session_root(&self, session: &ClientSession) -> Result<Arc<CatalogManager>, TrinoError> {
+        let Some(rules) = &self.access_rules else {
+            return Ok(Arc::clone(&self.catalog_manager));
+        };
+        let view = self
+            .catalog_manager
+            .with_access(session.user.clone(), Arc::clone(rules));
+        view.check_execute()
+            .map_err(|e| TrinoError::from_arneb(&e.into(), None))?;
+        Ok(Arc::new(view))
+    }
+
     /// Session catalog/schema, falling back to the server defaults.
     fn session_defaults(&self, session: &ClientSession) -> (String, String) {
         let root = &self.catalog_manager;
@@ -132,9 +150,10 @@ impl Engine {
         }
 
         let (catalog, schema) = self.session_defaults(session);
-        let root = &self.catalog_manager;
+        let root = self.session_root(session)?;
+        let root = root.as_ref();
         if crate::runtime_queries::references_runtime_queries(sql) {
-            let (cm, registry) = crate::runtime_queries::runtime_catalog(&self.query_tracker);
+            let (cm, registry) = crate::runtime_queries::runtime_catalog(&self.query_tracker, root);
             return self.run_sql(sql, &cm, &registry, None).await;
         }
         if metadata::references_virtual_metadata(sql) {
@@ -209,7 +228,8 @@ impl Engine {
         session: &ClientSession,
         depth: u8,
     ) -> Result<QueryOutput, TrinoError> {
-        let root = &self.catalog_manager;
+        let root = self.session_root(session)?;
+        let root = root.as_ref();
         let (session_catalog, session_schema) = self.session_defaults(session);
         match stmt {
             ControlStatement::ShowCatalogs { like } => Ok(single_column(

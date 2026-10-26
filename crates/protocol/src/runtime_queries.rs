@@ -130,9 +130,15 @@ fn batch(queries: &[QueryInfo], now: SystemTime) -> RecordBatch {
 }
 
 /// A catalog manager and connector registry holding only
-/// `system.runtime.queries`, snapshotted from `tracker` now.
-pub fn runtime_catalog(tracker: &QueryTracker) -> (CatalogManager, ConnectorRegistry) {
-    let queries = tracker.list_queries(None);
+/// `system.runtime.queries`, snapshotted from `tracker` now. `session` is the
+/// reader's catalog view: only queries its user may see are listed
+/// (file-based-access-control).
+pub fn runtime_catalog(
+    tracker: &QueryTracker,
+    session: &CatalogManager,
+) -> (CatalogManager, ConnectorRegistry) {
+    let mut queries = tracker.list_queries(None);
+    queries.retain(|q| session.can_view_query(q.user.as_deref().unwrap_or_default()));
     let schema = Arc::new(MemorySchema::new());
     schema.register_table(
         TABLE,
@@ -184,7 +190,7 @@ mod tests {
         let cancelled = tracker.create_query_from("SELECT 4".into(), "trino", None);
         tracker.cancel_query(&cancelled).unwrap();
 
-        let (cm, registry) = runtime_catalog(&tracker);
+        let (cm, registry) = runtime_catalog(&tracker, &CatalogManager::new("memory", "default"));
         let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
             Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
         let (_, batches) = crate::handler::execute_query(

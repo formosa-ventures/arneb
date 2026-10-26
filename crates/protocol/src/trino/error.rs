@@ -100,6 +100,7 @@ impl TrinoError {
             ArnebError::Parse(_) => (1, "SYNTAX_ERROR", USER_ERROR),
             ArnebError::Plan(e) => match e {
                 PlanError::TableNotFound(_) => (46, "TABLE_NOT_FOUND", USER_ERROR),
+                PlanError::AccessDenied(_) => (4, "PERMISSION_DENIED", USER_ERROR),
                 PlanError::ColumnNotFound { .. } => (47, "COLUMN_NOT_FOUND", USER_ERROR),
                 PlanError::FunctionNotFound { .. } => (6, "FUNCTION_NOT_FOUND", USER_ERROR),
                 PlanError::TypeMismatch { .. } => (58, "TYPE_MISMATCH", USER_ERROR),
@@ -111,6 +112,7 @@ impl TrinoError {
                 CatalogError::CatalogNotFound(_) => (44, "CATALOG_NOT_FOUND", USER_ERROR),
                 CatalogError::SchemaNotFound(_) => (45, "SCHEMA_NOT_FOUND", USER_ERROR),
                 CatalogError::TableAlreadyExists(_) => (50, "TABLE_ALREADY_EXISTS", USER_ERROR),
+                CatalogError::AccessDenied(_) => (4, "PERMISSION_DENIED", USER_ERROR),
                 #[allow(unreachable_patterns)]
                 _ => (0, "GENERIC_USER_ERROR", USER_ERROR),
             },

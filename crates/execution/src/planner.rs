@@ -1040,6 +1040,7 @@ impl ExecutionContext {
                     right: coalesce_if_multi(right_plan),
                     join_type: *join_type,
                     condition: condition.clone(),
+                    memory_pool: self.memory_pool.clone(),
                 }))
             }
 

@@ -156,3 +156,116 @@ the interval, and the effective values SHALL be logged at startup.
 - **WHEN** `heartbeat_timeout_secs = 2` and `heartbeat_interval_secs = 2`
 - **THEN** startup fails with an error naming both settings
 
+### Requirement: [admission] config section
+The system SHALL accept an optional `[admission]` TOML section with `max_running_queries` (integer, default `8`, `0` = unlimited), `max_queued_queries` (integer, default `256`) and `statement_timeout` (milliseconds or a duration string, default `0` = off). Unknown keys SHALL be rejected. `ARNEB_MAX_RUNNING_QUERIES`, `ARNEB_MAX_QUEUED_QUERIES` and `ARNEB_STATEMENT_TIMEOUT` SHALL override the file values. An unparseable value SHALL be a startup error. Coordinator and standalone nodes SHALL log the effective values on the `arneb::config` target at startup.
+
+#### Scenario: Defaults
+- **WHEN** the config has no `[admission]` section and no `ARNEB_*` admission variables are set
+- **THEN** the coordinator logs `max_running_queries=8 max_queued_queries=256 statement_timeout="0"` on `arneb::config`
+
+#### Scenario: Env override
+- **WHEN** the file sets `max_running_queries = 4` and `ARNEB_MAX_RUNNING_QUERIES=16`
+- **THEN** the effective cap is 16
+
+#### Scenario: Invalid timeout
+- **WHEN** `[admission] statement_timeout = "fast"`
+- **THEN** startup fails with a configuration error naming `statement_timeout`
+
+### Requirement: Per-query memory limit setting
+`[memory] query_max_memory_per_node` (bytes, overridable by `ARNEB_QUERY_MAX_MEMORY_BYTES`) SHALL limit each query's memory on each node, as specified by `query-memory-limit`. It SHALL NOT be applied as a single limit shared by all queries on a node. Every node SHALL log the effective value, or `off`, on the `arneb::config` target at startup.
+
+#### Scenario: Logged per node
+- **WHEN** a worker starts with `ARNEB_QUERY_MAX_MEMORY_BYTES=2147483648`
+- **THEN** it logs `query_max_memory_per_node=2147483648` on `arneb::config`, described as a per-query limit
+
+### Requirement: Per-node cluster settings from the environment
+The server SHALL read `ARNEB_CLUSTER_COORDINATOR_ADDRESS`,
+`ARNEB_CLUSTER_WORKER_ID` and `ARNEB_CLUSTER_ADVERTISED_ADDRESS` and, when
+set, use them in place of `[cluster]` `coordinator_address`, `worker_id` and
+`advertised_address` (env > file). An empty value SHALL be rejected with an
+error naming the variable.
+
+#### Scenario: One config file for every worker
+- **WHEN** two workers load the same config file, with different `ARNEB_CLUSTER_WORKER_ID` and `ARNEB_CLUSTER_ADVERTISED_ADDRESS` values
+- **THEN** each registers with the coordinator under its own id and address
+
+#### Scenario: Env wins over the file
+- **WHEN** the file sets `worker_id = "a"` and `ARNEB_CLUSTER_WORKER_ID=b`
+- **THEN** the worker registers as `b`
+
+#### Scenario: Empty value
+- **WHEN** `ARNEB_CLUSTER_WORKER_ID` is set to an empty string
+- **THEN** startup fails with an error naming `ARNEB_CLUSTER_WORKER_ID`
+
+### Requirement: Access control settings
+The `[access_control]` section SHALL accept `rules_file`, the path of the
+access rules file, overridden by `ARNEB_ACCESS_CONTROL_RULES_FILE`
+(env > file). A file that cannot be read or parsed SHALL stop startup with
+an error naming the path.
+
+#### Scenario: Env override
+- **WHEN** the config sets `rules_file = "/a.json"` and `ARNEB_ACCESS_CONTROL_RULES_FILE=/b.json`
+- **THEN** the server loads `/b.json`
+
+### Requirement: Query retry settings
+`[cluster] retry_policy` SHALL accept `none` (default) or `query`, case
+insensitive, overridden by `ARNEB_RETRY_POLICY`. `[cluster]
+query_retry_attempts` SHALL default to 4 and SHALL be at least 1, overridden
+by `ARNEB_QUERY_RETRY_ATTEMPTS`. Any other policy, including `task`, or an
+invalid count SHALL stop startup with an error naming the setting. The
+coordinator SHALL log the effective policy and attempt count on
+`arneb::config`.
+
+#### Scenario: Task policy
+- **WHEN** `retry_policy = "task"`
+- **THEN** the coordinator refuses to start, saying `task` is not supported
+
+#### Scenario: Env override
+- **WHEN** the file sets `retry_policy = "query"` and `ARNEB_RETRY_POLICY=none` is set
+- **THEN** retry is off
+
+### Requirement: [tls] config section
+The system SHALL accept an optional `[tls]` TOML section with `cert_path` and `key_path` (both required when the section is present), plus `pgwire` (`"required"` by default, or `"optional"`). Unknown keys SHALL be rejected. `ARNEB_TLS_CERT_PATH`, `ARNEB_TLS_KEY_PATH` and `ARNEB_TLS_PGWIRE` SHALL override the file values, and setting both path variables SHALL enable TLS without a `[tls]` section. The effective TLS mode SHALL be logged at startup on the `arneb::config` target, for example `tls_pgwire="required" tls_trino="https"`, or `tls="off"`.
+
+#### Scenario: Section omitted
+- **WHEN** the config has no `[tls]` section and no `ARNEB_TLS_*` variables are set
+- **THEN** both listeners run without TLS and the server logs `tls="off"`
+
+#### Scenario: Only one path configured
+- **WHEN** `[tls]` sets `cert_path` but not `key_path`
+- **THEN** startup fails with a configuration error naming `key_path`
+
+#### Scenario: Unknown pgwire mode
+- **WHEN** `[tls] pgwire = "prefer"`
+- **THEN** startup fails with a configuration error listing `required` and `optional`
+
+### Requirement: Web UI bind address
+The system SHALL accept an optional `[web] bind_address`, overridable by `ARNEB_WEB_BIND_ADDRESS`, for the Web UI listener; the Web UI port stays at the pgwire port + 1000. When `[web] bind_address` is unset, the Web UI SHALL bind to `127.0.0.1` if `[auth] type = "password"`, and to the server's `bind_address` otherwise. An explicitly configured value SHALL always be used. The effective Web UI bind address and the reason for it (`default`, `loopback (auth=password)` or `explicit`) SHALL be logged on the `arneb::config` target. A WARN SHALL be logged when password auth is on and the Web UI is explicitly bound to a non-loopback address. An unparseable address SHALL be a startup error.
+
+#### Scenario: No auth, no web setting
+- **WHEN** `[auth]` is absent, `bind_address = "0.0.0.0"`, and `[web]` is not configured
+- **THEN** the Web UI binds to `0.0.0.0:<port+1000>` exactly as before, with reason `default`
+
+#### Scenario: Password auth defaults to loopback
+- **WHEN** `[auth] type = "password"`, `bind_address = "0.0.0.0"`, and `[web] bind_address` is unset
+- **THEN** the Web UI binds to `127.0.0.1:<port+1000>` and logs reason `loopback (auth=password)`
+
+#### Scenario: Explicit bind under password auth
+- **WHEN** `[auth] type = "password"` and `ARNEB_WEB_BIND_ADDRESS=0.0.0.0`
+- **THEN** the Web UI binds to `0.0.0.0:<port+1000>`, logs reason `explicit`, and logs a WARN that the Web UI is unauthenticated
+
+### Requirement: Cluster security settings
+The `[cluster]` section SHALL accept an optional `secret` (overridable by `ARNEB_CLUSTER_SECRET`) and an optional `[cluster.tls]` subsection with `cert_path`, `key_path` and `ca_path`, all required when the subsection is present (overridable by `ARNEB_CLUSTER_TLS_CERT_PATH`, `ARNEB_CLUSTER_TLS_KEY_PATH` and `ARNEB_CLUSTER_TLS_CA_PATH`). A secret shorter than 32 characters SHALL be a startup error. The secret SHALL be redacted from `Debug` and `Display` output and from logs. Startup SHALL log whether cluster auth and cluster TLS are on, without the secret value, and SHALL log a WARN when a secret is set without `[cluster.tls]` on a non-loopback bind address.
+
+#### Scenario: Secret from the environment
+- **WHEN** `ARNEB_CLUSTER_SECRET` holds a 40-character value and the file has no `secret`
+- **THEN** the node starts with cluster auth on and logs `cluster.auth="secret"` without printing the value
+
+#### Scenario: Short secret
+- **WHEN** `[cluster] secret` is 10 characters long
+- **THEN** startup fails with a configuration error stating the 32-character minimum
+
+#### Scenario: Secret without cluster TLS on a public interface
+- **WHEN** a secret is set, `[cluster.tls]` is absent, and the bind address is `0.0.0.0`
+- **THEN** the node starts and logs a WARN that the secret crosses the network unencrypted
+

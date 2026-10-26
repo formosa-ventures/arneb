@@ -1,5 +1,8 @@
-## Requirements
+# web-ui-cluster Specification
 
+## Purpose
+The Web UI Cluster page: server information and the list of workers with their health.
+## Requirements
 ### Requirement: Server information display
 The system SHALL display server information at the top of the Cluster page including: server version (from `GET /api/v1/info`), uptime formatted as a human-readable duration (e.g., "2h 15m 30s"), and the server role as a badge (Standalone, Coordinator, or Worker).
 
@@ -14,7 +17,7 @@ The system SHALL display server information at the top of the Cluster page inclu
 - **THEN** the display shows "1d 0h 0m"
 
 ### Requirement: Worker list with health indicators
-The system SHALL display a list of workers as cards on the Cluster page, fetched from `GET /api/v1/cluster/workers`. Each worker card SHALL show: worker ID, RPC address, alive/dead status indicator (green dot for alive, red dot for dead), max splits capacity, and time since last heartbeat. Workers SHALL be sorted with alive workers first, then by worker ID.
+The system SHALL display a list of workers as cards on the Cluster page, fetched from `GET /api/v1/cluster/workers`. Each worker card SHALL show: worker ID, RPC address, release version, state (`active` or `draining`, with a "Draining" badge when draining), alive/dead status indicator (green dot for alive, red dot for dead), max splits capacity, and time since last heartbeat. Each entry returned by the API SHALL include the worker's `version` and `state`. Workers SHALL be sorted with alive workers first, then by worker ID.
 
 #### Scenario: Display healthy workers
 - **WHEN** the API returns 3 workers all with `alive: true`
@@ -25,8 +28,12 @@ The system SHALL display a list of workers as cards on the Cluster page, fetched
 - **THEN** the worker card shows a red status indicator and "Last seen: 2m ago"
 
 #### Scenario: Worker card details
-- **WHEN** a worker has `worker_id: "worker-1"`, `address: "10.0.0.2:9091"`, `max_splits: 8`
-- **THEN** the card displays "worker-1", address "10.0.0.2:9091", and "8 splits" capacity
+- **WHEN** a worker has `worker_id: "worker-1"`, `address: "10.0.0.2:9091"`, `max_splits: 8`, `version: "0.1.6"`
+- **THEN** the card displays "worker-1", address "10.0.0.2:9091", "8 splits" capacity and version "0.1.6"
+
+#### Scenario: Draining worker
+- **WHEN** a worker has `alive: true` and `state: "draining"`
+- **THEN** its card shows a green status indicator and a "Draining" badge
 
 ### Requirement: Standalone mode handling
 The system SHALL handle standalone mode gracefully on the Cluster page. When the server role is "standalone", the worker list section SHALL display an informational message instead of an empty worker list, indicating that the server is running in single-node mode.
@@ -45,3 +52,4 @@ The system SHALL display a summary bar above the worker list showing: total work
 #### Scenario: All workers healthy
 - **WHEN** all 3 workers are alive
 - **THEN** the summary bar shows "3 total, 3 healthy, 0 unhealthy"
+

@@ -242,8 +242,52 @@ fn push_down(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(push_down(*input)),
             id_column,
         },
-        // Leaves and non-recursive variants pass through unchanged.
-        other => other,
+        // The operators below only get their children rewritten: no
+        // predicate is pushed through them, but a Filter beneath one
+        // (e.g. a comma join under a Window or a UNION ALL branch) must
+        // still be pushed down within its own subtree.
+        L::Window { input, functions } => L::Window {
+            input: Box::new(push_down(*input)),
+            functions,
+        },
+        L::Distinct { input } => L::Distinct {
+            input: Box::new(push_down(*input)),
+        },
+        L::ScalarSubquery { subplan } => L::ScalarSubquery {
+            subplan: Box::new(push_down(*subplan)),
+        },
+        L::UnionAll { inputs } => L::UnionAll {
+            inputs: inputs.into_iter().map(push_down).collect(),
+        },
+        L::Intersect { left, right } => L::Intersect {
+            left: Box::new(push_down(*left)),
+            right: Box::new(push_down(*right)),
+        },
+        L::Except { left, right } => L::Except {
+            left: Box::new(push_down(*left)),
+            right: Box::new(push_down(*right)),
+        },
+        L::CreateTableAsSelect { name, source } => L::CreateTableAsSelect {
+            name,
+            source: Box::new(push_down(*source)),
+        },
+        L::InsertInto { table, source } => L::InsertInto {
+            table,
+            source: Box::new(push_down(*source)),
+        },
+        L::CreateView { name, sql, plan } => L::CreateView {
+            name,
+            sql,
+            plan: Box::new(push_down(*plan)),
+        },
+        // Leaves pass through unchanged.
+        leaf @ (L::TableScan { .. }
+        | L::ExchangeNode { .. }
+        | L::CreateTable { .. }
+        | L::DropTable { .. }
+        | L::DeleteFrom { .. }
+        | L::DropView { .. }
+        | L::OneRow) => leaf,
     }
 }
 

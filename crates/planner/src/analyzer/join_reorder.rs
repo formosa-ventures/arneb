@@ -1148,9 +1148,12 @@ fn connected_to_prefix(edge_refs: &[Vec<usize>], prefix: &[usize], candidate: us
 
 /// Flattens a contiguous inner-join chain rooted at `plan` into `leaves`
 /// (one per non-Join leaf) and `edges` (one per AND-atom in each Join's
-/// `On(expr)` condition). Returns `false` if a non-inner Join or a
-/// non-equi join condition (`JoinCondition::None`) is encountered,
-/// signalling to caller that no rewrite should be attempted.
+/// `On(expr)` condition). A CROSS join (a comma join whose first tables
+/// share no predicate) is an inner join with no edge, so it is flattened
+/// too: the chain's other edges may connect its leaves, and
+/// `emit_left_deep` refuses any order that would leave a step without
+/// one. Returns `false` if an Inner join without a condition is
+/// encountered, signalling to caller that no rewrite should be attempted.
 fn flatten_inner_chain(
     plan: &LogicalPlan,
     leaves: &mut Vec<LogicalPlan>,
@@ -1176,6 +1179,13 @@ fn flatten_inner_chain(
             }
             true
         }
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type: JoinType::Cross,
+            condition: JoinCondition::None,
+            ..
+        } => flatten_inner_chain(left, leaves, edges) && flatten_inner_chain(right, leaves, edges),
         _ => {
             leaves.push(plan.clone());
             true

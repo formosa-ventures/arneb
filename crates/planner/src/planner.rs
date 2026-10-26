@@ -4654,6 +4654,74 @@ mod tests {
         }
     }
 
+    // -- comma joins inside other operators and in an order with no
+    // predicate between the first two tables (TPC-DS shapes) --
+
+    fn cross_joins(plan: &LogicalPlan) -> usize {
+        plan.to_string().matches("Join: Cross").count()
+    }
+
+    #[tokio::test]
+    async fn comma_join_under_a_window_becomes_inner() {
+        let plan = plan_sql(
+            "SELECT u.name, sum(o.amount) OVER (PARTITION BY u.name) \
+             FROM users u, orders o WHERE u.id = o.user_id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cross_joins(&plan), 0, "{plan}");
+    }
+
+    #[tokio::test]
+    async fn comma_joins_in_both_union_all_branches_become_inner() {
+        let plan = plan_sql(
+            "SELECT u.name FROM users u, orders o WHERE u.id = o.user_id \
+             UNION ALL \
+             SELECT u.name FROM users u, orders o WHERE o.user_id = u.id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cross_joins(&plan), 0, "{plan}");
+    }
+
+    #[tokio::test]
+    async fn comma_join_whose_first_two_tables_share_no_predicate_is_reordered() {
+        // o1 and u are only connected through o2: FROM order alone would
+        // cross o1 with u first.
+        let plan = plan_sql(
+            "SELECT u.name FROM orders o1, users u, orders o2 \
+             WHERE o1.user_id = o2.order_id AND u.id = o2.user_id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cross_joins(&plan), 0, "{plan}");
+        assert_eq!(plan.to_string().matches("Join: Inner").count(), 2, "{plan}");
+    }
+
+    #[tokio::test]
+    async fn comma_join_reorder_ignores_predicate_order() {
+        let plan = plan_sql(
+            "SELECT u.name FROM orders o1, users u, orders o2 \
+             WHERE u.id = o2.user_id AND o1.user_id = o2.order_id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cross_joins(&plan), 0, "{plan}");
+    }
+
+    #[tokio::test]
+    async fn comma_join_without_a_join_predicate_stays_cross() {
+        // Only one-sided predicates: this really is a cross product, and
+        // no condition may be invented.
+        for sql in [
+            "SELECT u.name FROM users u, orders o",
+            "SELECT u.name FROM users u, orders o WHERE u.age > 30 AND o.amount > 1",
+        ] {
+            let plan = plan_sql(sql).await.unwrap();
+            assert_eq!(cross_joins(&plan), 1, "{sql}\n{plan}");
+        }
+    }
+
     #[tokio::test]
     async fn test_qualified_wildcard() {
         let plan = plan_sql("SELECT users.* FROM users JOIN orders ON users.id = orders.user_id")

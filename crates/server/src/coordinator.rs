@@ -82,7 +82,7 @@ impl QueryCoordinator {
         plan: LogicalPlan,
         exec_ctx: &ExecutionContext,
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
-        let retry = self.retry.filter(|_| !writes_data(&plan));
+        let retry = self.retry.filter(|_| !plan.writes_data());
         with_query_retry(retry, &self.node_registry, || {
             self.execute_once(&plan, exec_ctx)
         })
@@ -379,16 +379,11 @@ impl QueryCoordinator {
         let batches = tokio::select! {
             biased;
             lost = watch_workers(&self.node_registry, &worker_ids, WORKER_WATCH_INTERVAL) => {
-                return Err(AttemptError {
-                    error: lost_worker_error(&lost),
-                    worker_ids: worker_ids.clone(),
-                });
+                Err(lost_worker_error(&lost))
             }
-            result = run => result.map_err(|e| AttemptError {
-                error: attribute_worker_failure(e, &workers, &self.node_registry),
-                worker_ids: worker_ids.clone(),
-            })?,
-        };
+            result = run => result.map_err(|e| attribute_worker_failure(e, &workers, &self.node_registry)),
+        }
+        .map_err(|error| AttemptError { error, worker_ids })?;
 
         tracing::info!(
             query_id = %query_id,
@@ -444,21 +439,6 @@ impl QueryRetry {
 struct AttemptError {
     error: ExecutionError,
     worker_ids: Vec<String>,
-}
-
-/// Whether a plan writes data, so re-running it is not safe.
-fn writes_data(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::CreateTable { .. }
-        | LogicalPlan::DropTable { .. }
-        | LogicalPlan::CreateTableAsSelect { .. }
-        | LogicalPlan::InsertInto { .. }
-        | LogicalPlan::DeleteFrom { .. }
-        | LogicalPlan::CreateView { .. }
-        | LogicalPlan::DropView { .. } => true,
-        LogicalPlan::Explain { input, .. } => writes_data(input),
-        _ => false,
-    }
 }
 
 /// Run `attempt` until it succeeds, or fails for a reason other than a
@@ -1681,12 +1661,13 @@ mod tests {
             table: TableReference::table("t"),
             source: Box::new(scan()),
         };
-        assert!(writes_data(&insert));
-        assert!(writes_data(&LogicalPlan::Explain {
+        assert!(insert.writes_data());
+        assert!(LogicalPlan::Explain {
             input: Box::new(insert),
             analyze: true,
-        }));
-        assert!(!writes_data(&partial_aggregate()));
+        }
+        .writes_data());
+        assert!(!partial_aggregate().writes_data());
 
         let retry = QueryRetry::new(10);
         let secs: Vec<u64> = (0..6).map(|n| retry.delay(n).as_secs()).collect();

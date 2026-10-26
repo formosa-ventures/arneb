@@ -25,11 +25,11 @@ use arneb_catalog::{
     CatalogProvider, ColumnStatistics, SchemaProvider, TableGate, TableLookup, TableProvider,
 };
 use arneb_common::error::{CatalogError, ConnectorError};
-use arneb_common::types::{ColumnInfo, DataType};
+use arneb_common::types::ColumnInfo;
 use arneb_connectors::storage::StorageRegistry;
 
 use crate::datasource::HivePartition;
-use crate::hive_type_to_arrow;
+use crate::hive_type_to_data_type;
 
 // ---------------------------------------------------------------------------
 // HiveTableMeta
@@ -529,11 +529,8 @@ fn convert_field_schemas(
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        match hive_type_to_arrow(&hive_type) {
-            Ok(arrow_dt) => {
-                let data_type = DataType::try_from(arrow_dt).map_err(|e| {
-                    ConnectorError::UnsupportedOperation(format!("column {db}.{table}.{name}: {e}"))
-                })?;
+        match hive_type_to_data_type(&hive_type) {
+            Ok(data_type) => {
                 columns.push(ColumnInfo {
                     name,
                     data_type,

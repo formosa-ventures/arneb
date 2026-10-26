@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use arneb_common::error::ExecutionError;
-use arneb_common::types::ScalarValue;
+use arneb_common::types::{char_storage_value, DataType, ScalarValue};
 use arneb_planner::analyzer::coercion_matrix::decimal_arithmetic_type;
 use arneb_planner::PlanExpr;
 use arneb_sql_parser::ast;
@@ -19,6 +19,25 @@ use arrow::datatypes::DataType as ArrowDataType;
 use arrow::record_batch::RecordBatch;
 
 use crate::functions::{default_registry, FunctionRegistry};
+
+/// The stored form of a CHAR(`length`) column: each value of the Utf8
+/// array `array` truncated to `length` characters, without trailing blanks.
+fn char_storage_array(array: &ArrayRef, length: u32) -> Result<ArrayRef, ExecutionError> {
+    let strings = array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            ExecutionError::InvalidOperation(format!(
+                "CHAR({length}) cast expects a Utf8 array, got {}",
+                array.data_type()
+            ))
+        })?;
+    let stored: StringArray = strings
+        .iter()
+        .map(|v| v.map(|s| char_storage_value(s, length)))
+        .collect();
+    Ok(Arc::new(stored))
+}
 
 /// Process-wide default registry, lazily initialised on first use.
 /// Acts as a fallback when `evaluate` is called with `registry: None`
@@ -85,7 +104,10 @@ pub(crate) fn evaluate(
             let arr = evaluate(expr, batch, registry)?;
             let arrow_type: ArrowDataType = data_type.clone().into();
             let result = arrow::compute::cast(&arr, &arrow_type)?;
-            Ok(result)
+            match data_type {
+                DataType::Char(length) => char_storage_array(&result, *length),
+                _ => Ok(result),
+            }
         }
 
         PlanExpr::Between {

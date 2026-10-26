@@ -10,7 +10,7 @@
 //! degrades error quality, even if the compiler does not catch it.
 
 use arneb_common::error::ParseError;
-use arneb_common::types::{DataType, ScalarValue, TableReference, TimeUnit};
+use arneb_common::types::{DataType, ScalarValue, TableReference, TimeUnit, CHAR_MAX_LENGTH};
 use sqlparser::ast as sp;
 use sqlparser::ast::Spanned;
 use sqlparser::tokenizer::Span;
@@ -44,7 +44,12 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
                 .columns
                 .into_iter()
                 .map(|col| {
-                    let dt = convert_data_type(col.data_type)?;
+                    // CHAR semantics apply to catalog-provided columns
+                    // only; a CHAR column in DDL is stored as varchar.
+                    let dt = match convert_data_type(col.data_type)? {
+                        DataType::Char(_) => DataType::Utf8,
+                        dt => dt,
+                    };
                     Ok(ast::ColumnDef {
                         name: col.name.value,
                         data_type: dt,
@@ -1629,7 +1634,18 @@ pub(crate) fn convert_data_type(dt: sp::DataType) -> Result<DataType, ParseError
         sp::DataType::Varchar(_) | sp::DataType::Text | sp::DataType::String(_) => {
             Ok(DataType::Utf8)
         }
-        sp::DataType::Char(_) | sp::DataType::CharacterVarying(_) => Ok(DataType::Utf8),
+        sp::DataType::CharacterVarying(_) => Ok(DataType::Utf8),
+        sp::DataType::Char(length) | sp::DataType::Character(length) => match length {
+            None => Ok(DataType::Char(1)),
+            Some(sp::CharacterLength::IntegerLength { length, .. })
+                if (1..=u64::from(CHAR_MAX_LENGTH)).contains(&length) =>
+            {
+                Ok(DataType::Char(length as u32))
+            }
+            Some(other) => Err(ParseError::UnsupportedFeature(format!(
+                "CHAR length: {other}"
+            ))),
+        },
         sp::DataType::Decimal(info) | sp::DataType::Dec(info) | sp::DataType::Numeric(info) => {
             match info {
                 sp::ExactNumberInfo::PrecisionAndScale(p, s) => Ok(DataType::Decimal128 {

@@ -233,7 +233,7 @@ pub fn estimate_row_width_bytes(schema: &[arneb_common::types::ColumnInfo]) -> u
             DataType::Int64 | DataType::Float64 | DataType::Timestamp { .. } => 8,
             DataType::Decimal64 { .. } => 8,
             DataType::Decimal128 { .. } => 16,
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary => 16,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Char(_) | DataType::Binary => 16,
             DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_) => 32,
             // `DataType` is `#[non_exhaustive]`; conservative default for
             // future variants. The fragmenter falls back to "not broadcastable"

@@ -4,16 +4,18 @@ use std::sync::Arc;
 use arneb_catalog::{CatalogManager, TablePrivilege};
 use arneb_common::error::{ArnebError, ExecutionError};
 use arneb_common::stream::collect_stream;
-use arneb_common::types::ScalarValue;
+use arneb_common::types::{char_padded_value, ColumnInfo, DataType, ScalarValue};
 use arneb_connectors::ConnectorRegistry;
 use arneb_execution::{ExecutionContext, ExecutionPlan};
 use arneb_planner::{JoinCondition, LogicalOptimizer, LogicalPlan, PlanExpr, QueryPlanner};
+use arrow::array::AsArray;
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow::datatypes::DataType as ArrowDataType;
+use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::stream;
@@ -1343,6 +1345,7 @@ pub(crate) async fn execute_query_capped(
             let local_plan = exec_ctx.create_physical_plan(
                 &optimizer.optimize(planner.plan_statement(&statement).await?)?,
             )?;
+            let batches = pad_char_columns(&local_plan.schema(), batches)?;
             return Ok((local_plan, batches));
         }
     }
@@ -1376,8 +1379,61 @@ pub(crate) async fn execute_query_capped(
         }
         None => collect_stream(stream).await?,
     };
+    let batches = pad_char_columns(&physical_plan.schema(), batches)?;
 
     Ok((physical_plan, batches))
+}
+
+/// Blank-pad every CHAR(n) column of `batches` (per `schema`) to its
+/// length. CHAR values travel through execution without trailing blanks;
+/// clients see them padded, as in Trino.
+fn pad_char_columns(
+    schema: &[ColumnInfo],
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>, ArnebError> {
+    let char_columns: Vec<(usize, u32)> = schema
+        .iter()
+        .enumerate()
+        .filter_map(|(i, col)| match col.data_type {
+            DataType::Char(length) => Some((i, length)),
+            _ => None,
+        })
+        .collect();
+    if char_columns.is_empty() {
+        return Ok(batches);
+    }
+    let arrow_error = |e| ArnebError::Execution(ExecutionError::ArrowError(e));
+    batches
+        .into_iter()
+        .map(|batch| {
+            let mut fields: Vec<Field> = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect();
+            let mut columns = batch.columns().to_vec();
+            for &(i, length) in &char_columns {
+                if i >= columns.len() {
+                    continue;
+                }
+                let strings =
+                    arrow::compute::cast(&columns[i], &ArrowDataType::Utf8).map_err(arrow_error)?;
+                let padded: StringArray = strings
+                    .as_string::<i32>()
+                    .iter()
+                    .map(|v| v.map(|s| char_padded_value(s, length)))
+                    .collect();
+                columns[i] = Arc::new(padded);
+                fields[i] = fields[i].clone().with_data_type(ArrowDataType::Utf8);
+            }
+            let schema = Arc::new(Schema::new_with_metadata(
+                fields,
+                batch.schema().metadata().clone(),
+            ));
+            RecordBatch::try_new(schema, columns).map_err(arrow_error)
+        })
+        .collect()
 }
 
 /// Walk a logical plan and resolve any scalar subqueries in expressions.

@@ -15,7 +15,8 @@ SF1 Parquet, with the client versions pinned in
 | `trino-python-client` 0.340 (DB-API) | Trino | `SHOW CATALOGS`, `current_catalog` / `current_schema`, an upper-case table name |
 | SQLAlchemy 2.1 Trino dialect (Superset's path) | Trino | Inspector: schemas, tables, columns, keys, indexes, table comment; a reflected table queried with `GROUP BY` / `ORDER BY` / `LIMIT` |
 | dbt-trino 1.10 | Trino | `dbt debug`, `dbt test` (not-null, unique, relationships, accepted-values tests on sources and an ephemeral model), `dbt show`, `dbt docs generate` |
-| dbt-postgres 1.11 | pgwire | `dbt debug` only (see below) |
+| SQLAlchemy 2.1 postgresql dialect (psycopg2 and psycopg 3) | pgwire | Inspector: schemas, tables, `has_table`, views; a query (reflecting a table's columns is not supported yet, see below) |
+| dbt-postgres 1.11 | pgwire | `dbt debug`, `dbt test`, `dbt show`, `dbt docs generate` (the same project as dbt-trino) |
 
 The same job checks the 22 TPC-H queries against DuckDB and runs 5 rounds of
 20 concurrent queries with the admission cap lifted, failing on any error.
@@ -31,13 +32,25 @@ against Arneb yet.
 - **Read-only.** dbt models can be `ephemeral` only: `table`, `view` and
   `incremental` need `CREATE TABLE AS` / `CREATE VIEW` on a writable
   connector. `dbt seed` and snapshots need writes too.
-- **PostgreSQL catalog introspection.** Over pgwire, `pg_catalog` is
-  answered by matching the statement text, not by queryable tables, so
-  catalog queries that join `pg_catalog` tables, reference them without the
-  `pg_catalog.` prefix, or cast to `regclass` / `oid` fail. That blocks
-  SQLAlchemy's `postgresql` dialect (it probes `pg_type` on connect),
-  dbt-postgres beyond `dbt debug`, and Metabase's and Superset's PostgreSQL
-  drivers. Use the Trino protocol for these tools for now.
+- **PostgreSQL catalog introspection** is partial.
+  - Over pgwire, `pg_catalog` reads run in the engine over tables that
+    describe the session's catalog: `pg_namespace`, `pg_class`,
+    `pg_attribute`, `pg_type`, `pg_database`, `pg_roles`, `pg_am` and
+    `pg_tablespace`. `pg_depend`, `pg_description`, `pg_attrdef` and
+    `pg_constraint` are there too, always empty.
+  - These work: joins, filters, unqualified names, `'name'::regclass`,
+    `= ANY (ARRAY[...])`, and the
+    [catalog functions](/sql/functions#postgresql-catalog-functions).
+  - Arneb has no array type, so a query that needs arrays (`unnest`,
+    `array_agg`, `indkey`) gets the old fixed answer: the whole first
+    `pg_catalog` table it names, whatever it asks for. So does a query that
+    needs `json_build_object` or a correlated subquery in `CASE`.
+  - That is how SQLAlchemy's postgresql dialect reflects columns, keys and
+    indexes, so `Table(..., autoload_with=engine)` and `get_columns` do not
+    work over pgwire yet. Metabase's PostgreSQL driver has not been tried.
+  - Use the Trino protocol for these for now.
+  - A query that mixes `pg_catalog` tables with your own tables cannot see
+    your tables.
 - **Several statements in one simple-query message** (`BEGIN; SELECT 1;
   COMMIT`) are refused; drivers send them one at a time.
 - **`JOIN … USING`** works with `INNER` and `LEFT` joins. `RIGHT` / `FULL`

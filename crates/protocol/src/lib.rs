@@ -3,6 +3,7 @@ mod encoding;
 mod error;
 mod handler;
 mod metadata;
+mod pg_catalog;
 mod runtime_queries;
 mod server;
 mod session;

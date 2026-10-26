@@ -647,6 +647,35 @@ SELECT FORMAT_DATETIME(TIMESTAMP '2024-03-01 15:04:05', 'yyyy-MM-dd''T''HH:mm:ss
 SELECT FORMAT_DATETIME(TIMESTAMP '2024-03-01 15:04:05', 'EEE, d MMM yyyy');          -- 'Fri, 1 Mar 2024'
 ```
 
+## PostgreSQL Catalog Functions
+
+PostgreSQL clients call these while reading `pg_catalog` over pgwire (see
+[Client Compatibility](/guide/clients)). A `pg_catalog.` qualifier is
+accepted on any function name.
+
+| Function | Result |
+|---|---|
+| `FORMAT_TYPE(type_oid, typmod)` | The SQL name of a type, such as `integer`, `numeric(12,2)` or `character varying`. `???` for an unknown oid. |
+| `PG_GET_USERBYID(role_oid)` | `arneb`, the role that owns every object. `unknown (OID=n)` for any other oid. |
+| `PG_TABLE_IS_VISIBLE(oid)` | `true` |
+| `PG_IS_OTHER_TEMP_SCHEMA(oid)` | `false` |
+| `OBJ_DESCRIPTION(oid[, catalog])`, `COL_DESCRIPTION(oid, column)` | `NULL`, because Arneb stores no comments. |
+| `TO_REGTYPE(name)` | The oid of a built-in type, by `typname` (`int4`) or SQL name (`integer`). `NULL` when there is none. |
+
+`'name'::regclass` (or `CAST('name' AS REGCLASS)`) is the oid that
+`pg_class` reports for that relation:
+- An unqualified name is looked up first among PostgreSQL's system
+  relations, then in the session's schema.
+- The argument must be a string literal.
+- Unlike PostgreSQL, the relation does not have to exist.
+
+`'int4'::regtype` is the type's oid. A `regtype` cast of an oid column,
+such as `atttypid::regtype`, gives the type's name, as `FORMAT_TYPE` does.
+`CAST(x AS oid)` is a `BIGINT` cast.
+
+`x LIKE pattern ESCAPE 'c'` treats `c` as the escape character. Without
+`ESCAPE`, `\` escapes `%`, `_` and itself, as in PostgreSQL.
+
 ## Differences from Trino
 
 - **Time zones**: there is no session time zone. `NOW()`/`CURRENT_TIMESTAMP` and `FROM_UNIXTIME` return a zone-less `TIMESTAMP` holding UTC time, where Trino returns `TIMESTAMP WITH TIME ZONE` in the session zone. `NOW()` is read once per batch rather than once per query.

@@ -531,10 +531,32 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             negated,
             expr,
             pattern,
+            escape_char,
             ..
         } => {
             let l = convert_expr(*expr)?;
-            let r = convert_expr(*pattern)?;
+            let mut r = convert_expr(*pattern)?;
+            // The LIKE kernel escapes with `\`; any other ESCAPE character
+            // is rewritten into that form by `like_escape`.
+            if let Some(escape) = escape_char {
+                let escape = convert_expr(*escape)?;
+                let backslash = matches!(
+                    &escape,
+                    ast::Expr::Literal { value: ScalarValue::Utf8(c), .. } if c == "\\"
+                );
+                if !backslash {
+                    let pattern_span = r.span();
+                    r = ast::Expr::Function {
+                        name: "like_escape".to_string(),
+                        args: vec![
+                            ast::FunctionArg::Unnamed(r),
+                            ast::FunctionArg::Unnamed(escape),
+                        ],
+                        distinct: false,
+                        span: pattern_span,
+                    };
+                }
+            }
             let op = if negated {
                 ast::BinaryOp::NotLike
             } else {
@@ -595,10 +617,36 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 span,
             })
         }
+        // `x = ANY (ARRAY[...])` / `x <> ALL (ARRAY[...])` over literal
+        // arrays are IN lists; Arneb has no array type (pg-catalog-tables).
+        sp::Expr::AnyOp {
+            left,
+            compare_op: sp::BinaryOperator::Eq,
+            right,
+            ..
+        } => array_in_list(*left, *right, false, span),
+        sp::Expr::AllOp {
+            left,
+            compare_op: sp::BinaryOperator::NotEq,
+            right,
+        } => array_in_list(*left, *right, true, span),
         sp::Expr::Cast {
             expr, data_type, ..
         } => {
             let e = convert_expr(*expr)?;
+            // `'name'::regclass` / `::regtype` are resolved by the planner
+            // (pg-catalog-tables).
+            if let Some(reg) = ["regclass", "regtype"]
+                .into_iter()
+                .find(|reg| is_custom_type(&data_type, reg))
+            {
+                return Ok(ast::Expr::Function {
+                    name: reg.to_string(),
+                    args: vec![ast::FunctionArg::Unnamed(e)],
+                    distinct: false,
+                    span,
+                });
+            }
             let dt = convert_data_type(data_type)?;
             Ok(ast::Expr::Cast {
                 expr: Box::new(e),
@@ -1006,6 +1054,12 @@ fn try_fold_date_interval(
 /// Convert a `sqlparser` [`sp::Function`] into a arneb [`ast::Expr::Function`].
 fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseError> {
     let name = func.name.to_string();
+    // PostgreSQL's search path always holds pg_catalog, so clients qualify
+    // its functions (`pg_catalog.format_type(...)`) freely.
+    let name = match name.split_once('.') {
+        Some((schema, rest)) if schema.eq_ignore_ascii_case("pg_catalog") => rest.to_string(),
+        _ => name,
+    };
     let name_upper = name.to_uppercase();
 
     // Desugar COALESCE(a, b, ...) → CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ... ELSE last END
@@ -1459,7 +1513,60 @@ fn decimal_literal(s: &str, int_part: &str, frac_part: &str) -> Result<ScalarVal
 }
 
 /// Convert a `sqlparser` [`sp::DataType`] into a arneb [`DataType`].
+/// Whether `dt` is PostgreSQL type `name` (`REGCLASS`, `OID`, ...), which
+/// sqlparser reports either as its own variant or as a custom type.
+fn is_custom_type(dt: &sp::DataType, name: &str) -> bool {
+    match dt {
+        sp::DataType::Regclass => name == "regclass",
+        sp::DataType::Custom(object, modifiers) => {
+            modifiers.is_empty()
+                && object.0.len() <= 2
+                && object
+                    .0
+                    .last()
+                    .and_then(|p| p.as_ident())
+                    .is_some_and(|i| i.value.eq_ignore_ascii_case(name))
+                && object
+                    .0
+                    .first()
+                    .and_then(|p| p.as_ident())
+                    .is_some_and(|i| {
+                        object.0.len() == 1 || i.value.eq_ignore_ascii_case("pg_catalog")
+                    })
+        }
+        _ => false,
+    }
+}
+
+/// `left IN (elements)` (or `NOT IN`) for `left = ANY (ARRAY[elements])`.
+fn array_in_list(
+    left: sp::Expr,
+    right: sp::Expr,
+    negated: bool,
+    span: Span,
+) -> Result<ast::Expr, ParseError> {
+    let sp::Expr::Array(array) = right else {
+        return Err(ParseError::UnsupportedFeature(format!(
+            "ANY / ALL over {right}; only an ARRAY[...] literal is supported"
+        )));
+    };
+    let list = array
+        .elem
+        .into_iter()
+        .map(convert_expr)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ast::Expr::InList {
+        expr: Box::new(convert_expr(left)?),
+        list,
+        negated,
+        span,
+    })
+}
+
 pub(crate) fn convert_data_type(dt: sp::DataType) -> Result<DataType, ParseError> {
+    if is_custom_type(&dt, "oid") {
+        return Ok(DataType::Int64);
+    }
     match dt {
         sp::DataType::Boolean => Ok(DataType::Boolean),
         sp::DataType::TinyInt(_) => Ok(DataType::Int8),

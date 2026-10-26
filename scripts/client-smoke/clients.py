@@ -5,6 +5,8 @@ Usage: python clients.py
 Connects the way BI and ELT tools do and checks what they need:
   - psycopg2 in its default mode (statements inside BEGIN ... COMMIT) and
     psycopg 3, over pgwire
+  - SQLAlchemy's postgresql dialect (psycopg2 and psycopg 3) listing
+    schemas and tables from pg_catalog (pg-catalog-tables)
   - the Trino DB-API client, and SQLAlchemy's Trino dialect reflecting a
     table and running a query built from it (what Superset does when a
     Trino database is added and a table is browsed)
@@ -72,6 +74,24 @@ def _():
             "SELECT n_name FROM nation WHERE n_nationkey < %s ORDER BY n_nationkey", (3,)
         ).fetchall()
         assert [r[0] for r in rows] == ["ALGERIA", "ARGENTINA", "BRAZIL"], rows
+
+
+@check("SQLAlchemy postgresql dialect: list schemas and tables")
+def _():
+    from sqlalchemy import create_engine, inspect, text
+
+    url = f"{PG['user']}@{PG['host']}:{PG['port']}/{PG['dbname']}"
+    for driver in ["psycopg2", "psycopg"]:
+        engine = create_engine(f"postgresql+{driver}://{url}")
+        with engine.connect() as conn:
+            insp = inspect(conn)
+            assert SCHEMA in insp.get_schema_names(), driver
+            assert sorted(insp.get_table_names(schema=SCHEMA)) == TABLES, driver
+            assert insp.has_table("nation", schema=SCHEMA), driver
+            assert not insp.has_table("no_such_table", schema=SCHEMA), driver
+            assert insp.get_view_names(schema=SCHEMA) == [], driver
+            count = conn.execute(text('SELECT count(*) FROM "default".nation')).scalar()
+            assert count == 25, (driver, count)
 
 
 @check("trino DB-API: catalogs, schemas, current session")

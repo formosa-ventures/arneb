@@ -5,9 +5,9 @@
 #   2. ROUNDS rounds of 20 concurrent queries with the admission cap lifted,
 #      zero failures (benchmarks/tpch/scripts/concurrency_soak.sh)
 #   3. client checks: psycopg2, psycopg 3, the Trino client, SQLAlchemy's
-#      Trino dialect (clients.py)
-#   4. the dbt project in dbt/: dbt-trino debug, test, show and
-#      docs generate; dbt-postgres debug
+#      Trino and postgresql dialects (clients.py)
+#   4. the dbt project in dbt/: debug, test, show and docs generate, with
+#      dbt-trino and dbt-postgres
 #
 # Usage: scripts/client-smoke/run.sh DATA_DIR
 #   DATA_DIR  output of scripts/k8s-smoke/gen_tpch.py
@@ -63,10 +63,10 @@ dbt_run() { # $1 = target, rest = dbt arguments
     (cd "$HERE/dbt" && DBT_TARGET_PATH="$RUN_DIR/dbt-target" DBT_LOG_PATH="$RUN_DIR/dbt-logs" \
         "$DBT" "$@" --profiles-dir . --target "$target")
 }
-# `docs generate`, then check the catalog it wrote has no errors and holds
-# the sources' columns.
+# `docs generate` for target $1, then check the catalog it wrote has no
+# errors and holds the sources' columns.
 dbt_docs() {
-    dbt_run trino docs generate &&
+    dbt_run "$1" docs generate &&
         "$PYTHON" - "$RUN_DIR/dbt-target/catalog.json" <<'PY'
 import json, sys
 catalog = json.load(open(sys.argv[1]))
@@ -79,8 +79,11 @@ PY
 step "dbt-trino debug" dbt_run trino debug
 step "dbt-trino test" dbt_run trino test
 step "dbt-trino show" dbt_run trino show --select nations_per_region --limit 10
-step "dbt-trino docs generate" dbt_docs
+step "dbt-trino docs generate" dbt_docs trino
 step "dbt-postgres debug" dbt_run postgres debug
+step "dbt-postgres test" dbt_run postgres test
+step "dbt-postgres show" dbt_run postgres show --select nations_per_region --limit 10
+step "dbt-postgres docs generate" dbt_docs postgres
 
 if [[ ${#FAILED[@]} -gt 0 ]]; then
     echo "FAILED: ${FAILED[*]}"

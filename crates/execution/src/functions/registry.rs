@@ -107,6 +107,11 @@ pub fn default_registry() -> FunctionRegistry {
         reg.register(f);
     }
 
+    // PostgreSQL catalog functions pgwire clients call.
+    for f in super::pg_catalog::all_pg_catalog_functions() {
+        reg.register(f);
+    }
+
     // Trino-compatible alternate spellings.
     for (alias, target) in [
         ("CEILING", "CEIL"),
@@ -345,6 +350,14 @@ mod tests {
             ("format_datetime", vec![ts.clone(), s.clone()]),
             ("extract", vec![s.clone(), ts.clone()]),
             ("current_date", vec![]),
+            ("like_escape", vec![s.clone(), s.clone()]),
+            ("format_type", vec![i.clone(), i32t.clone()]),
+            ("pg_get_userbyid", vec![i.clone()]),
+            ("to_regtype", vec![s.clone()]),
+            ("pg_table_is_visible", vec![i.clone()]),
+            ("pg_is_other_temp_schema", vec![i.clone()]),
+            ("obj_description", vec![i.clone(), s.clone()]),
+            ("col_description", vec![i.clone(), i32t.clone()]),
         ];
         let reg = default_registry();
         for (name, arg_types) in cases {

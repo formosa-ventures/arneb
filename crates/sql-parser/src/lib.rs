@@ -1270,6 +1270,54 @@ mod tests {
     }
 
     #[test]
+    fn postgres_catalog_syntax() {
+        let projection = |sql: &str| {
+            let Statement::Query { query, .. } = parse(sql).unwrap() else {
+                panic!("expected Query");
+            };
+            match &select_body(&query).projection[0] {
+                SelectItem::UnnamedExpr(e) => e.clone(),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        for sql in [
+            "SELECT 'pg_rewrite'::regclass",
+            "SELECT CAST('pg_catalog.pg_constraint' AS REGCLASS)",
+        ] {
+            let Expr::Function { name, args, .. } = projection(sql) else {
+                panic!("{sql}: expected a regclass call");
+            };
+            assert_eq!(name, "regclass", "{sql}");
+            assert_eq!(args.len(), 1, "{sql}");
+        }
+        let Expr::Cast { data_type, .. } = projection("SELECT CAST(x AS oid) FROM t") else {
+            panic!("expected cast");
+        };
+        assert_eq!(data_type, DataType::Int64);
+        let Expr::Function { name, .. } = projection("SELECT pg_catalog.format_type(1, 2)") else {
+            panic!("expected function");
+        };
+        assert_eq!(name, "format_type");
+
+        for (sql, negated) in [
+            ("SELECT x = ANY (ARRAY['r', 'p']) FROM t", false),
+            ("SELECT x = SOME (ARRAY['r']) FROM t", false),
+            ("SELECT x <> ALL (ARRAY['r', 'p']) FROM t", true),
+        ] {
+            let Expr::InList {
+                list, negated: n, ..
+            } = projection(sql)
+            else {
+                panic!("{sql}: expected IN list");
+            };
+            assert_eq!(n, negated, "{sql}");
+            assert!(!list.is_empty(), "{sql}");
+        }
+        assert!(parse("SELECT x = ANY (y) FROM t").is_err());
+        assert!(parse("SELECT x > ANY (ARRAY[1]) FROM t").is_err());
+    }
+
+    #[test]
     fn parse_binary_op_span_covers_whole_expr() {
         let stmt = parse("SELECT a <= b FROM t").unwrap();
         let Statement::Query { query, .. } = stmt else {

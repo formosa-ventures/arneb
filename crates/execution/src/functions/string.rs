@@ -37,6 +37,7 @@ pub(crate) fn all_string_functions() -> Vec<Arc<dyn ScalarFunction>> {
         Arc::new(LevenshteinFunction),
         Arc::new(HammingFunction),
         Arc::new(TranslateFunction),
+        Arc::new(LikeEscapeFunction),
     ]
 }
 
@@ -877,6 +878,69 @@ impl ScalarFunction for TranslateFunction {
     }
 }
 
+// -- LIKE_ESCAPE --
+
+/// `like_escape(pattern, escape)`: `pattern` written with `escape` as its
+/// escape character, rewritten for the LIKE kernel, whose escape is `\`.
+/// The parser wraps the pattern of `x LIKE pattern ESCAPE 'c'` in it. An
+/// empty `escape` means no escape character, as in PostgreSQL.
+#[derive(Debug)]
+struct LikeEscapeFunction;
+
+/// `pattern` with escape character `escape` (or none) in the kernel's
+/// backslash-escaped form.
+fn backslash_escaped(pattern: &str, escape: Option<char>) -> Result<String, ExecutionError> {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            let next = chars
+                .next()
+                .ok_or_else(|| invalid("LIKE pattern must not end with escape character"))?;
+            if matches!(next, '%' | '_' | '\\') {
+                out.push('\\');
+            }
+            out.push(next);
+        } else if c == '\\' {
+            out.push_str("\\\\");
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+impl ScalarFunction for LikeEscapeFunction {
+    fn name(&self) -> &str {
+        "LIKE_ESCAPE"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Utf8)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        check_arity("LIKE_ESCAPE", args, 2, 2)?;
+        let patterns = utf8(&args[0], "LIKE_ESCAPE")?;
+        let escapes = utf8(&args[1], "LIKE_ESCAPE")?;
+        let result = patterns
+            .iter()
+            .zip(escapes.iter())
+            .map(|(pattern, escape)| match (pattern, escape) {
+                (Some(pattern), Some(escape)) => {
+                    let mut it = escape.chars();
+                    let escape = match (it.next(), it.next()) {
+                        (None, _) => None,
+                        (Some(c), None) => Some(c),
+                        _ => return Err(invalid("invalid escape string: must be one character")),
+                    };
+                    backslash_escaped(pattern, escape).map(Some)
+                }
+                _ => Ok(None),
+            })
+            .collect::<Result<StringArray, _>>()?;
+        Ok(Arc::new(result))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1242,5 +1306,37 @@ mod tests {
             vec![s("zbcd"), s("xd"), s("heLLo"), None],
             "extra 'from' chars are deleted; first mapping of a duplicate wins"
         );
+    }
+
+    #[test]
+    fn like_escape_rewrites_for_the_kernel() {
+        use arrow::compute::kernels::comparison::like;
+        let f = LikeEscapeFunction;
+        let pattern = |p: &str, e: &str| -> StringArray {
+            let out = f
+                .evaluate(&[
+                    Arc::new(StringArray::from(vec![p])),
+                    Arc::new(StringArray::from(vec![e])),
+                ])
+                .unwrap();
+            out.as_any().downcast_ref::<StringArray>().unwrap().clone()
+        };
+        let matches = |value: &str, p: &str, e: &str| {
+            like(&StringArray::from(vec![value]), &pattern(p, e))
+                .unwrap()
+                .value(0)
+        };
+        assert!(matches("pg_catalog", "pg/_%", "/"));
+        assert!(!matches("pgxcatalog", "pg/_%", "/"));
+        assert!(matches("50%", "50!%", "!"));
+        assert!(!matches("500", "50!%", "!"));
+        assert!(matches("a\\b", "a\\b", "/"));
+        assert!(matches("a\\b", "a\\_", ""));
+        assert!(f
+            .evaluate(&[
+                Arc::new(StringArray::from(vec!["ab/"])),
+                Arc::new(StringArray::from(vec!["/"])),
+            ])
+            .is_err());
     }
 }

@@ -419,6 +419,38 @@ impl ConnectionHandler {
         Ok(Arc::new(view))
     }
 
+    /// Answer a metadata statement: a `pg_catalog` read runs in the engine
+    /// over the session's catalog tables (pg-catalog-tables), falling back
+    /// to the fixed result when the engine cannot run it; everything else
+    /// goes to the fixed handlers.
+    async fn metadata<C: ClientInfo>(
+        &self,
+        client: &C,
+        sql: &str,
+        catalog_manager: &CatalogManager,
+    ) -> Option<crate::metadata::MetadataResult> {
+        if crate::pg_catalog::references_pg_catalog(sql) {
+            match crate::pg_catalog::run(sql, catalog_manager, &self.memory_pool).await {
+                Ok(response) => return Some(Ok(response)),
+                Err(error) => {
+                    if let Some(fixed) =
+                        crate::metadata::fixed_pg_catalog(sql, catalog_manager).await
+                    {
+                        tracing::debug!(
+                            target: "arneb::protocol",
+                            %error,
+                            "pg_catalog statement answered with the fixed result"
+                        );
+                        return Some(fixed);
+                    }
+                    return Some(Err(error.to_string()));
+                }
+            }
+        }
+        let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
+        crate::metadata::try_handle_metadata(sql, catalog_manager, user.as_deref()).await
+    }
+
     /// Handle `SET`/`SHOW`/`RESET search_path` (updating the connection's
     /// state), then fall back to metadata interception.
     async fn intercept<C: ClientInfo + Sync>(
@@ -441,8 +473,7 @@ impl ConnectionHandler {
             }
             return Some(result);
         }
-        let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
-        crate::metadata::try_handle_metadata(sql, catalog_manager, user.as_deref()).await
+        self.metadata(client, sql, catalog_manager).await
     }
 
     /// Like [`Self::intercept`] but without updating the connection's state,
@@ -479,8 +510,7 @@ impl ConnectionHandler {
         {
             return Some(result);
         }
-        let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
-        crate::metadata::try_handle_metadata(sql, catalog_manager, user.as_deref()).await
+        self.metadata(client, sql, catalog_manager).await
     }
 }
 
@@ -788,6 +818,27 @@ impl ExtendedQueryHandler for ConnectionHandler {
             return Ok(DescribeStatementResponse::no_data());
         }
         let catalog_manager = self.session_catalog(client)?;
+        let param_count = count_placeholders(sql);
+        let describe = |fields, param_type_map: std::collections::HashMap<_, _>| {
+            let param_types: Vec<Type> = (1..=param_count)
+                .map(|i| {
+                    param_type_map
+                        .get(&i)
+                        .map(arneb_type_to_pg_param_type)
+                        .unwrap_or(Type::TEXT)
+                })
+                .collect();
+            DescribeStatementResponse::new(param_types, fields)
+        };
+
+        // A pg_catalog statement is planned over its catalog tables, so its
+        // parameters get types (pg-catalog-tables).
+        if crate::pg_catalog::references_pg_catalog(sql) {
+            let (pg_catalog, _) = crate::pg_catalog::catalog_for(sql, &catalog_manager).await;
+            if let Ok((fields, param_type_map)) = plan_for_describe(sql, &pg_catalog).await {
+                return Ok(describe(fields, param_type_map));
+            }
+        }
 
         // Intercept metadata queries for Describe too
         if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) = self
@@ -816,20 +867,10 @@ impl ExtendedQueryHandler for ConnectionHandler {
         // analyzer didn't see (e.g., because planning failed)
         // fall back to `Type::TEXT` to preserve the legacy behavior
         // for clients that don't care about precise types.
-        let param_count = count_placeholders(sql);
         let (fields, param_type_map) = plan_for_describe(sql, &catalog_manager)
             .await
             .unwrap_or_else(|_| (Vec::new(), std::collections::HashMap::new()));
-        let param_types: Vec<Type> = (1..=param_count)
-            .map(|i| {
-                param_type_map
-                    .get(&i)
-                    .map(arneb_type_to_pg_param_type)
-                    .unwrap_or(Type::TEXT)
-            })
-            .collect();
-
-        Ok(DescribeStatementResponse::new(param_types, fields))
+        Ok(describe(fields, param_type_map))
     }
 
     async fn do_describe_portal<C>(

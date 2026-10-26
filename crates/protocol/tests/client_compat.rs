@@ -98,6 +98,8 @@ async fn pgwire_answers_driver_session_queries() {
         ("COMMIT", "COMMIT"),
         ("ROLLBACK;", "ROLLBACK"),
         ("END", "COMMIT"),
+        ("SAVEPOINT \"_pg3_1\"", "SAVEPOINT"),
+        ("RELEASE \"_pg3_1\"", "RELEASE"),
     ] {
         let messages = client.simple_query(sql).await.unwrap();
         assert!(

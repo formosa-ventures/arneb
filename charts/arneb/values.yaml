@@ -1,0 +1,85 @@
+# Default values for the arneb chart. See docs/guide/kubernetes.md.
+
+image:
+  repository: ghcr.io/formosa-ventures/arneb
+  # Defaults to the chart's appVersion. Every node must run the same release.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# TOML shared by every pod: [[tables]], [[catalogs]], [storage], [memory],
+# [auth], ... Leave [cluster] coordinator_address / worker_id /
+# advertised_address unset: the chart sets them per pod. The chart also sets
+# the role, bind address and pgwire port, and assumes the default
+# rpc_port (9090).
+config: ""
+
+# Use the key `config.toml` of this Secret instead of `config`, for a
+# config that holds [auth] users or credentials.
+existingConfigSecret: ""
+
+# Shared secret every node presents on cluster RPC (ARNEB_CLUSTER_SECRET).
+# Without existingSecret, the chart generates a random one on install and
+# keeps it on upgrade.
+clusterSecret:
+  existingSecret: ""
+  key: secret
+
+# RUST_LOG for every pod. Per-operator profile events (arneb::profile) are
+# off by default here; add `arneb::profile=info` to turn them on.
+logLevel: "info,arneb::profile=warn"
+
+# Extra environment for every pod, e.g. catalog passwords from a Secret.
+extraEnv: []
+envFrom: []
+# Extra volumes for every pod (TLS certificates, data directories).
+extraVolumes: []
+extraVolumeMounts: []
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+coordinator:
+  service:
+    type: ClusterIP
+    annotations: {}
+    ports:
+      pgwire: 5432
+      trino: 8080
+      web: 6432
+      rpc: 9090
+  # Trino client REST protocol listener.
+  trino:
+    enabled: true
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraArgs: []
+
+worker:
+  replicas: 2
+  # A worker gets SIGTERM, stops taking queries, and exits once its running
+  # queries end or this many seconds pass (ARNEB_DRAIN_TIMEOUT_SECS).
+  drainTimeoutSecs: 120
+  # Defaults to drainTimeoutSecs + 30, so Kubernetes lets the drain finish.
+  terminationGracePeriodSeconds: null
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraArgs: []

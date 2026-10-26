@@ -278,7 +278,7 @@ Adding a function: implement `ScalarFunction` in `crates/execution/src/functions
 4 milestones, each work item its own OpenSpec change — full design in `docs/superpowers/specs/2026-10-16-phase3-roadmap-design.md`:
 - M1 safe to share: memory accounting + spill (validation left), admission control (done, #138), TLS/auth (done, #136)
 - M2 federation MVP: RDBMS connector framework + PostgreSQL connector (done, #158), cross-source join (done, #167)
-- M3 survives failure: fault tolerance stage 1 fail-clean (done, #171; stage 2 query retry left), Prometheus metrics + slow-query log (done, #172), query history + `system.runtime.queries` (done, #173), GHCR images + Helm
+- M3 survives failure: fault tolerance stage 1 fail-clean (done, #171; stage 2 query retry left), Prometheus metrics + slow-query log (done, #172), query history + `system.runtime.queries` (done, #173), worker drain + version handshake (done, #178/#179), GHCR images + Helm (`kubernetes-deployment`)
 - M4 wider federation: MySQL connector, aggregate/TopN/join pushdown
 - Path to production (v0.1.6 → v0.2.0): concurrency fix #139 + soak test, worker drain + version handshake + Helm, authorization, query retry — see "Path to production" in the roadmap doc
 

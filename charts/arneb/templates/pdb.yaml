@@ -1,0 +1,13 @@
+{{- if .Values.worker.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "arneb.fullname" . }}-worker
+  labels:
+    {{- include "arneb.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.worker.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "arneb.selectorLabels" (dict "ctx" . "component" "worker") | nindent 6 }}
+{{- end }}

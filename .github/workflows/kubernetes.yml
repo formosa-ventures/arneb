@@ -1,0 +1,65 @@
+name: Kubernetes
+
+# Helm chart acceptance test (charts/arneb): build the image, install the
+# chart on kind (1 coordinator + 2 workers), check the 22 TPC-H queries at
+# SF1 against DuckDB, replace a worker pod while queries run, and upgrade.
+# See scripts/k8s-smoke/run.sh.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**/*.md"]
+  pull_request:
+    branches: [main]
+    paths-ignore: ["docs/**", "**/*.md"]
+  workflow_dispatch:
+
+concurrency:
+  group: kubernetes-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Chart lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+      - run: helm lint charts/arneb -f charts/arneb/ci/kind-values.yaml
+      - name: Grace period follows the drain timeout
+        run: |
+          grace=$(helm template t charts/arneb --set worker.drainTimeoutSecs=300 \
+            | awk '/terminationGracePeriodSeconds/ {print $2}')
+          test "$grace" = 330 || { echo "terminationGracePeriodSeconds=$grace, expected 330"; exit 1; }
+
+  kind:
+    name: kind (TPC-H SF1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/arneb/Dockerfile
+          load: true
+          tags: arneb:ci
+          cache-from: type=gha,scope=kind
+          cache-to: type=gha,scope=kind,mode=max
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install duckdb 'psycopg[binary]'
+      - name: Generate TPC-H SF1
+        run: python scripts/k8s-smoke/gen_tpch.py "$RUNNER_TEMP/tpch" 1
+      - uses: azure/setup-helm@v5
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - name: Smoke test
+        run: scripts/k8s-smoke/run.sh "$RUNNER_TEMP/tpch"

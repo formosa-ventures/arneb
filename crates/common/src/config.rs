@@ -63,6 +63,17 @@ fn parse_env_var<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, Conf
     })
 }
 
+/// Whether `value` is a Kubernetes service-link variable (`tcp://host:port`)
+/// rather than a setting. A Service named `arneb` injects
+/// `ARNEB_PORT=tcp://…` into every pod in its namespace that has service
+/// links on, and `arneb-trino` injects `ARNEB_TRINO_PORT`.
+pub fn is_service_link(value: &str) -> bool {
+    let v = value.trim();
+    ["tcp://", "udp://", "sctp://"]
+        .iter()
+        .any(|scheme| v.starts_with(scheme))
+}
+
 impl ServerConfig {
     /// Load config from a TOML file.
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
@@ -76,15 +87,24 @@ impl ServerConfig {
         toml::from_str(&content).map_err(|e| ConfigError::ParseError(e.to_string()))
     }
 
-    /// Apply environment variable overrides with `TRINO_` prefix.
-    /// Env vars take precedence over file/default values.
+    /// Apply environment variable overrides with `ARNEB_` prefix.
+    /// Env vars take precedence over file/default values. An `ARNEB_PORT`
+    /// that is a Kubernetes service link is ignored with a warning.
     pub fn apply_env_overrides(&mut self) -> Result<(), ConfigError> {
         if let Ok(val) = std::env::var("ARNEB_BIND_ADDRESS") {
             self.bind_address = val;
         }
 
         if let Ok(val) = std::env::var("ARNEB_PORT") {
-            self.port = parse_env_var("port", &val)?;
+            if is_service_link(&val) {
+                tracing::warn!(
+                    value = %val,
+                    "ignoring ARNEB_PORT: it is a Kubernetes service link for a Service \
+                     named \"arneb\", not a port; set enableServiceLinks: false on the pod"
+                );
+            } else {
+                self.port = parse_env_var("port", &val)?;
+            }
         }
 
         if let Ok(val) = std::env::var("ARNEB_MAX_WORKER_THREADS") {
@@ -238,6 +258,31 @@ mod tests {
         assert_eq!(config.bind_address, "10.0.0.1");
 
         clear_arneb_env_vars();
+    }
+
+    #[test]
+    fn service_link_port_is_ignored() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        clear_arneb_env_vars();
+
+        std::env::set_var("ARNEB_PORT", "tcp://10.96.0.12:5432");
+        let mut config = ServerConfig::default();
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.port, 5432);
+
+        std::env::set_var("ARNEB_PORT", "6543");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.port, 6543);
+
+        clear_arneb_env_vars();
+    }
+
+    #[test]
+    fn service_link_detection() {
+        assert!(is_service_link("tcp://10.96.0.12:5432"));
+        assert!(is_service_link(" udp://h:1"));
+        assert!(!is_service_link("5432"));
+        assert!(!is_service_link("http://h:1"));
     }
 
     #[test]

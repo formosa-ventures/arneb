@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "arneb.fullname" . }}-coordinator
+  labels:
+    {{- include "arneb.componentLabels" (dict "ctx" . "component" "coordinator") | nindent 4 }}
+spec:
+  # One coordinator, replaced rather than rolled: two behind the Service
+  # would split worker heartbeats between them.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "arneb.selectorLabels" (dict "ctx" . "component" "coordinator") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "arneb.componentLabels" (dict "ctx" . "component" "coordinator") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "arneb.configChecksum" . }}
+        {{- with .Values.coordinator.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "arneb.podCommon" . | nindent 6 }}
+      containers:
+        - name: coordinator
+          image: {{ include "arneb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - --config=/etc/arneb/config.toml
+            - --role=coordinator
+            - --bind=0.0.0.0
+            - --port=5432
+            {{- if .Values.coordinator.trino.enabled }}
+            - --trino-port=8080
+            {{- else }}
+            - --no-trino
+            {{- end }}
+            {{- with .Values.coordinator.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            {{- include "arneb.commonEnv" . | nindent 12 }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: pgwire
+              containerPort: 5432
+            {{- if .Values.coordinator.trino.enabled }}
+            - name: trino
+              containerPort: 8080
+            {{- end }}
+            - name: web
+              containerPort: 6432
+            - name: rpc
+              containerPort: 9090
+          readinessProbe:
+            tcpSocket:
+              port: pgwire
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            {{- include "arneb.volumeMounts" . | nindent 12 }}
+          {{- with .Values.coordinator.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- include "arneb.volumes" . | nindent 8 }}
+      {{- with include "arneb.scheduling" .Values.coordinator }}
+      {{- . | trim | nindent 6 }}
+      {{- end }}

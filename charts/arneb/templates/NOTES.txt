@@ -1,0 +1,9 @@
+Arneb {{ .Chart.AppVersion }}: 1 coordinator, {{ .Values.worker.replicas }} workers.
+
+Connect with psql:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "arneb.fullname" . }} 5432:{{ .Values.coordinator.service.ports.pgwire }}
+  psql -h 127.0.0.1 -p 5432
+
+Registered workers (Web UI API, port {{ .Values.coordinator.service.ports.web }}):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "arneb.fullname" . }} 6432:{{ .Values.coordinator.service.ports.web }}
+  curl -s localhost:6432/api/v1/cluster/workers

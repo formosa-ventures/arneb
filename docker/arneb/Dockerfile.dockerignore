@@ -1,0 +1,15 @@
+# Keep the build context to what cargo needs; target/ alone can be 100 GB+.
+target/
+**/target/
+.git/
+node_modules/
+**/node_modules/
+benchmarks/*/results/
+docs/
+web/
+# Not read by the build; excluded so editing them keeps the build cache.
+openspec/
+charts/
+.github/
+*.log
+.DS_Store

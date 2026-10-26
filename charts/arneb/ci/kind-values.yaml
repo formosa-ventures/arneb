@@ -1,0 +1,61 @@
+# Values for the kind smoke test (.github/workflows/kubernetes.yml):
+# the image built in CI, and TPC-H SF1 Parquet from a hostPath.
+image:
+  repository: arneb
+  tag: ci
+  pullPolicy: Never
+
+worker:
+  replicas: 2
+  drainTimeoutSecs: 30
+
+extraVolumes:
+  - name: tpch
+    hostPath:
+      path: /data
+      type: Directory
+extraVolumeMounts:
+  - name: tpch
+    mountPath: /data
+    readOnly: true
+
+config: |
+  [[tables]]
+  name = "lineitem"
+  path = "/data/lineitem.parquet"
+  format = "parquet"
+
+  [[tables]]
+  name = "orders"
+  path = "/data/orders.parquet"
+  format = "parquet"
+
+  [[tables]]
+  name = "customer"
+  path = "/data/customer.parquet"
+  format = "parquet"
+
+  [[tables]]
+  name = "part"
+  path = "/data/part.parquet"
+  format = "parquet"
+
+  [[tables]]
+  name = "partsupp"
+  path = "/data/partsupp.parquet"
+  format = "parquet"
+
+  [[tables]]
+  name = "supplier"
+  path = "/data/supplier.parquet"
+  format = "parquet"
+
+  [[tables]]
+  name = "nation"
+  path = "/data/nation.parquet"
+  format = "parquet"
+
+  [[tables]]
+  name = "region"
+  path = "/data/region.parquet"
+  format = "parquet"

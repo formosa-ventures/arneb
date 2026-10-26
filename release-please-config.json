@@ -28,7 +28,8 @@
         { "type": "generic", "path": "README.md" },
         { "type": "generic", "path": "docs/.vitepress/config.ts" },
         { "type": "generic", "path": "docs/guide/introduction.md" },
-        { "type": "generic", "path": "docs/guide/quickstart.md" }
+        { "type": "generic", "path": "docs/guide/quickstart.md" },
+        { "type": "generic", "path": "charts/arneb/Chart.yaml" }
       ],
       "include-component-in-tag": false
     }

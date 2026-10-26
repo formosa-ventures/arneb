@@ -52,3 +52,7 @@ When the engine cannot run a pg_catalog statement, the fixed result the server r
 #### Scenario: Array-based reflection
 - **WHEN** a client sends a pg_catalog query that uses `unnest`
 - **THEN** the server answers it as before this change
+
+#### Scenario: Fallback is visible
+- **WHEN** a pg_catalog statement is answered with the fixed result
+- **THEN** the server logs a warning with the statement on `arneb::protocol` and increments `arneb_pg_catalog_fallbacks_total`

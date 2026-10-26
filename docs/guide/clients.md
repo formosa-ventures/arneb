@@ -45,6 +45,8 @@ against Arneb yet.
     `array_agg`, `indkey`) gets the old fixed answer: the whole first
     `pg_catalog` table it names, whatever it asks for. So does a query that
     needs `json_build_object` or a correlated subquery in `CASE`.
+    Each such answer is logged at `warn` on `arneb::protocol` with its SQL
+    and counted in `arneb_pg_catalog_fallbacks_total`.
   - That is how SQLAlchemy's postgresql dialect reflects columns, keys and
     indexes, so `Table(..., autoload_with=engine)` and `get_columns` do not
     work over pgwire yet. Metabase's PostgreSQL driver has not been tried.

@@ -9,11 +9,11 @@
 use std::sync::Arc;
 
 use arneb_catalog::CatalogManager;
-use arneb_common::types::{ColumnInfo, DataType, TableReference};
-use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable};
+use arneb_common::types::{ColumnInfo, TableReference};
+use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
 use arneb_connectors::ConnectorRegistry;
-use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType as ArrowType, Field, Schema};
+
+pub(crate) use crate::memory_table::{s, Cell, TableBuilder};
 
 use super::types::{trino_type_of, TrinoType};
 
@@ -22,102 +22,8 @@ pub(crate) const SYSTEM_CATALOG: &str = "system";
 const INFORMATION_SCHEMA: &str = "information_schema";
 const INFO_SCHEMA_TABLES: [&str; 4] = ["columns", "schemata", "tables", "views"];
 
-/// A cell of a metadata row.
-#[derive(Debug, Clone)]
-pub(crate) enum Cell {
-    Str(Option<String>),
-    Int(Option<i64>),
-}
-
-fn s(v: impl Into<String>) -> Cell {
-    Cell::Str(Some(v.into()))
-}
-
 const NULL_STR: Cell = Cell::Str(None);
 const NULL_INT: Cell = Cell::Int(None);
-
-/// Column-typed row buffer that turns into an Arrow batch / memory table.
-pub(crate) struct TableBuilder {
-    columns: Vec<(&'static str, bool)>, // (name, is_int)
-    rows: Vec<Vec<Cell>>,
-}
-
-impl TableBuilder {
-    /// `columns`: names; a trailing `#` marks a bigint column.
-    pub(crate) fn new(columns: &[&'static str]) -> Self {
-        Self {
-            columns: columns
-                .iter()
-                .map(|c| match c.strip_suffix('#') {
-                    Some(name) => (name, true),
-                    None => (*c, false),
-                })
-                .collect(),
-            rows: Vec::new(),
-        }
-    }
-
-    pub(crate) fn push(&mut self, row: Vec<Cell>) {
-        debug_assert_eq!(row.len(), self.columns.len());
-        self.rows.push(row);
-    }
-
-    pub(crate) fn column_infos(&self) -> Vec<ColumnInfo> {
-        self.columns
-            .iter()
-            .map(|(name, is_int)| ColumnInfo {
-                name: name.to_string(),
-                data_type: if *is_int {
-                    DataType::Int64
-                } else {
-                    DataType::Utf8
-                },
-                nullable: true,
-            })
-            .collect()
-    }
-
-    pub(crate) fn batch(&self) -> RecordBatch {
-        let fields: Vec<Field> = self
-            .columns
-            .iter()
-            .map(|(name, is_int)| {
-                let ty = if *is_int {
-                    ArrowType::Int64
-                } else {
-                    ArrowType::Utf8
-                };
-                Field::new(*name, ty, true)
-            })
-            .collect();
-        let arrays: Vec<ArrayRef> = (0..self.columns.len())
-            .map(|i| -> ArrayRef {
-                if self.columns[i].1 {
-                    Arc::new(Int64Array::from_iter(self.rows.iter().map(|r| {
-                        match &r[i] {
-                            Cell::Int(v) => *v,
-                            Cell::Str(_) => None,
-                        }
-                    })))
-                } else {
-                    Arc::new(StringArray::from_iter(self.rows.iter().map(|r| {
-                        match &r[i] {
-                            Cell::Str(v) => v.clone(),
-                            Cell::Int(v) => v.map(|n| n.to_string()),
-                        }
-                    })))
-                }
-            })
-            .collect();
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-            .expect("metadata batch columns match schema")
-    }
-
-    fn into_memory_table(self) -> Arc<MemoryTable> {
-        let batch = self.batch();
-        Arc::new(MemoryTable::new(self.column_infos(), vec![batch]))
-    }
-}
 
 /// One table's metadata, as the virtual tables need it.
 struct TableMeta {
@@ -645,6 +551,7 @@ fn metadata_schema(tables: &[TableMeta]) -> MemorySchema {
 mod tests {
     use super::*;
     use arneb_catalog::{MemoryCatalog as CatMemoryCatalog, MemorySchema as CatMemorySchema};
+    use arneb_common::types::DataType;
 
     fn root() -> CatalogManager {
         let cm = CatalogManager::new("lake", "sales");

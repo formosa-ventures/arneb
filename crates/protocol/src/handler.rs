@@ -430,22 +430,22 @@ impl ConnectionHandler {
         catalog_manager: &CatalogManager,
     ) -> Option<crate::metadata::MetadataResult> {
         if crate::pg_catalog::references_pg_catalog(sql) {
-            match crate::pg_catalog::run(sql, catalog_manager, &self.memory_pool).await {
+            let error = match crate::pg_catalog::run(sql, catalog_manager, &self.memory_pool).await
+            {
                 Ok(response) => return Some(Ok(response)),
-                Err(error) => {
-                    if let Some(fixed) =
-                        crate::metadata::fixed_pg_catalog(sql, catalog_manager).await
-                    {
-                        tracing::debug!(
-                            target: "arneb::protocol",
-                            %error,
-                            "pg_catalog statement answered with the fixed result"
-                        );
-                        return Some(fixed);
-                    }
-                    return Some(Err(error.to_string()));
-                }
-            }
+                Err(error) => error,
+            };
+            let Some(fixed) = crate::metadata::fixed_pg_catalog(sql, catalog_manager).await else {
+                return Some(Err(error.to_string()));
+            };
+            arneb_common::metrics::pg_catalog_fallback();
+            tracing::warn!(
+                target: "arneb::protocol",
+                %error,
+                sql,
+                "pg_catalog statement answered with the fixed result"
+            );
+            return Some(fixed);
         }
         let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
         crate::metadata::try_handle_metadata(sql, catalog_manager, user.as_deref()).await

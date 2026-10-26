@@ -359,6 +359,15 @@ async fn hidden_objects_are_absent() {
 
 #[tokio::test]
 async fn statements_the_engine_cannot_run_keep_the_fixed_result() {
+    let fallbacks = || {
+        let text = arneb_common::metrics::render(&[]);
+        text.lines()
+            .find_map(|l| l.strip_prefix("arneb_pg_catalog_fallbacks_total "))
+            .expect("fallback counter rendered")
+            .parse::<u64>()
+            .unwrap()
+    };
+    let before = fallbacks();
     let client = connect(pg_server(None).await).await;
     // SQLAlchemy's primary-key reflection reads arrays (stage 2b).
     let fixed = rows(
@@ -367,4 +376,6 @@ async fn statements_the_engine_cannot_run_keep_the_fixed_result() {
     )
     .await;
     assert!(!fixed.is_empty());
+    // Tests in this binary run in parallel, so other fallbacks may land too.
+    assert!(fallbacks() > before, "the fallback is counted");
 }

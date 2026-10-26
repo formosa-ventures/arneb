@@ -2,6 +2,7 @@ pub mod auth;
 mod encoding;
 mod error;
 mod handler;
+mod memory_table;
 mod metadata;
 mod pg_catalog;
 mod runtime_queries;

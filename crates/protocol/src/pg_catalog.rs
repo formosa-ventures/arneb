@@ -15,13 +15,13 @@ use arneb_catalog::CatalogManager;
 use arneb_common::error::ArnebError;
 use arneb_common::pg_oid::{self, PG_CATALOG, PG_TYPES};
 use arneb_common::types::{ColumnInfo, DataType};
-use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable};
+use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
 use arneb_connectors::ConnectorRegistry;
 use arneb_execution::memory_pool::MemoryPool;
-use arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::Field;
 
 use crate::encoding::datatype_to_pg_type;
+use crate::memory_table::{s, Cell, TableBuilder};
 use crate::metadata::MetadataResponse;
 
 /// The `pg_catalog` tables provided, with their columns. A trailing `#`
@@ -157,6 +157,15 @@ const TABLES: &[(&str, &[&str])] = &[
 
 /// Whether `sql` reads one of the provided `pg_catalog` tables.
 pub(crate) fn references_pg_catalog(sql: &str) -> bool {
+    // Every table name starts with `pg_`; most statements have none, so they
+    // skip the lowercase copy and the word split.
+    if !sql
+        .as_bytes()
+        .windows(3)
+        .any(|w| w.eq_ignore_ascii_case(b"pg_"))
+    {
+        return false;
+    }
     let lower = sql.to_ascii_lowercase();
     lower
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -196,17 +205,6 @@ pub(crate) async fn run(
     Ok(MetadataResponse::Query(fields, batches))
 }
 
-/// A cell of a catalog row.
-enum Cell {
-    Str(Option<String>),
-    Int(Option<i64>),
-    Bool(Option<bool>),
-}
-
-fn s(v: impl Into<String>) -> Cell {
-    Cell::Str(Some(v.into()))
-}
-
 fn i(v: i64) -> Cell {
     Cell::Int(Some(v))
 }
@@ -217,90 +215,14 @@ fn b(v: bool) -> Cell {
 
 const NULL: Cell = Cell::Str(None);
 
-#[derive(Clone, Copy)]
-enum Kind {
-    Str,
-    Int,
-    Bool,
-}
-
-/// Rows of one catalog table, typed by its column spec in [`TABLES`].
-struct Table {
-    columns: Vec<(&'static str, Kind)>,
-    rows: Vec<Vec<Cell>>,
-}
-
-impl Table {
-    fn new(name: &str) -> Self {
-        let spec = TABLES
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, c)| *c)
-            .expect("known pg_catalog table");
-        let columns = spec
-            .iter()
-            .map(|c| {
-                if let Some(n) = c.strip_suffix('#') {
-                    (n, Kind::Int)
-                } else if let Some(n) = c.strip_suffix('?') {
-                    (n, Kind::Bool)
-                } else {
-                    (*c, Kind::Str)
-                }
-            })
-            .collect();
-        Self {
-            columns,
-            rows: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, row: Vec<Cell>) {
-        debug_assert_eq!(row.len(), self.columns.len());
-        self.rows.push(row);
-    }
-
-    fn into_memory_table(self) -> Arc<MemoryTable> {
-        let infos: Vec<ColumnInfo> = self
-            .columns
-            .iter()
-            .map(|(name, kind)| ColumnInfo {
-                name: name.to_string(),
-                data_type: match kind {
-                    Kind::Str => DataType::Utf8,
-                    Kind::Int => DataType::Int64,
-                    Kind::Bool => DataType::Boolean,
-                },
-                nullable: true,
-            })
-            .collect();
-        let fields: Vec<Field> = infos
-            .iter()
-            .map(|c| Field::new(&c.name, c.data_type.clone().into(), true))
-            .collect();
-        let arrays: Vec<ArrayRef> = (0..self.columns.len())
-            .map(|col| -> ArrayRef {
-                let cells = self.rows.iter().map(move |r| &r[col]);
-                match self.columns[col].1 {
-                    Kind::Str => Arc::new(StringArray::from_iter(cells.map(|c| match c {
-                        Cell::Str(v) => v.clone(),
-                        _ => None,
-                    }))),
-                    Kind::Int => Arc::new(Int64Array::from_iter(cells.map(|c| match c {
-                        Cell::Int(v) => *v,
-                        _ => None,
-                    }))),
-                    Kind::Bool => Arc::new(BooleanArray::from_iter(cells.map(|c| match c {
-                        Cell::Bool(v) => *v,
-                        _ => None,
-                    }))),
-                }
-            })
-            .collect();
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-            .expect("pg_catalog batch columns match schema");
-        Arc::new(MemoryTable::new(infos, vec![batch]))
-    }
+/// An empty table of `name`, typed by its column spec in [`TABLES`].
+fn table(name: &str) -> TableBuilder {
+    let spec = TABLES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, c)| *c)
+        .expect("known pg_catalog table");
+    TableBuilder::new(spec)
 }
 
 /// A relation listed in `pg_class` / `pg_attribute`.
@@ -361,31 +283,17 @@ async fn build(
     }
     // The catalog's own tables, so clients can list and describe them.
     for (name, spec) in TABLES {
-        let columns = Table::new(name)
-            .columns
-            .iter()
-            .map(|(col, kind)| ColumnInfo {
-                name: col.to_string(),
-                data_type: match kind {
-                    Kind::Str => DataType::Utf8,
-                    Kind::Int => DataType::Int64,
-                    Kind::Bool => DataType::Boolean,
-                },
-                nullable: true,
-            })
-            .collect();
-        debug_assert!(!spec.is_empty());
         relations.push(Relation {
             schema: PG_CATALOG.to_string(),
             name: name.to_string(),
-            columns,
+            columns: TableBuilder::new(spec).column_infos(),
         });
     }
 
     let pg_schema = Arc::new(MemorySchema::new());
     let owner = pg_oid::OWNER_ROLE_OID;
 
-    let mut namespace = Table::new("pg_namespace");
+    let mut namespace = table("pg_namespace");
     for name in [PG_CATALOG, "information_schema"].into_iter().chain(
         schemas
             .iter()
@@ -400,8 +308,8 @@ async fn build(
         ]);
     }
 
-    let mut class = Table::new("pg_class");
-    let mut attribute = Table::new("pg_attribute");
+    let mut class = table("pg_class");
+    let mut attribute = table("pg_attribute");
     for rel in &relations {
         let oid = pg_oid::relation_oid(&database, &rel.schema, &rel.name);
         class.push(vec![
@@ -446,7 +354,7 @@ async fn build(
         }
     }
 
-    let mut types = Table::new("pg_type");
+    let mut types = table("pg_type");
     for ty in PG_TYPES {
         types.push(vec![
             i(ty.oid),
@@ -469,7 +377,7 @@ async fn build(
         ]);
     }
 
-    let mut database_table = Table::new("pg_database");
+    let mut database_table = table("pg_database");
     for name in session.visible_catalog_names() {
         database_table.push(vec![
             i(pg_oid::database_oid(&name)),
@@ -485,7 +393,7 @@ async fn build(
         ]);
     }
 
-    let mut roles = Table::new("pg_roles");
+    let mut roles = table("pg_roles");
     roles.push(vec![
         i(owner),
         s(pg_oid::OWNER_ROLE_NAME),
@@ -496,11 +404,11 @@ async fn build(
         b(true),
     ]);
 
-    let mut am = Table::new("pg_am");
+    let mut am = table("pg_am");
     am.push(vec![i(2), s("heap"), s("t")]);
     am.push(vec![i(403), s("btree"), s("i")]);
 
-    let mut tablespace = Table::new("pg_tablespace");
+    let mut tablespace = table("pg_tablespace");
     tablespace.push(vec![i(1663), s("pg_default"), i(owner)]);
     tablespace.push(vec![i(1664), s("pg_global"), i(owner)]);
 
@@ -513,10 +421,10 @@ async fn build(
         ("pg_roles", roles),
         ("pg_am", am),
         ("pg_tablespace", tablespace),
-        ("pg_depend", Table::new("pg_depend")),
-        ("pg_description", Table::new("pg_description")),
-        ("pg_attrdef", Table::new("pg_attrdef")),
-        ("pg_constraint", Table::new("pg_constraint")),
+        ("pg_depend", table("pg_depend")),
+        ("pg_description", table("pg_description")),
+        ("pg_attrdef", table("pg_attrdef")),
+        ("pg_constraint", table("pg_constraint")),
     ] {
         pg_schema.register_table(name, table.into_memory_table());
     }
@@ -535,4 +443,19 @@ async fn build(
         Arc::new(MemoryConnectorFactory::new(catalog, &default_schema)),
     );
     (catalog_manager, registry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn references_pg_catalog_matches_table_names_only() {
+        // The `pg_` pre-check in `references_pg_catalog` relies on this.
+        assert!(TABLES.iter().all(|(name, _)| name.starts_with("pg_")));
+        assert!(references_pg_catalog("SELECT relname FROM PG_CLASS"));
+        assert!(references_pg_catalog("select * from pg_catalog.pg_type t"));
+        assert!(!references_pg_catalog("SELECT * FROM lineitem"));
+        assert!(!references_pg_catalog("SELECT pg_typeof(x) FROM t"));
+    }
 }

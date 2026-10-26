@@ -1053,12 +1053,16 @@ fn try_fold_date_interval(
 
 /// Convert a `sqlparser` [`sp::Function`] into a arneb [`ast::Expr::Function`].
 fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseError> {
-    let name = func.name.to_string();
-    // PostgreSQL's search path always holds pg_catalog, so clients qualify
-    // its functions (`pg_catalog.format_type(...)`) freely.
-    let name = match name.split_once('.') {
-        Some((schema, rest)) if schema.eq_ignore_ascii_case("pg_catalog") => rest.to_string(),
-        _ => name,
+    // Identifier quotes are dropped (`"sum"(x)` is `sum(x)`), and so is a
+    // `pg_catalog.` qualifier: PostgreSQL's search path always holds
+    // pg_catalog, so clients qualify its functions freely.
+    let parts: Vec<_> = func.name.0.iter().map(|p| p.as_ident()).collect();
+    let name = match parts.as_slice() {
+        [Some(f)] => f.value.clone(),
+        [Some(schema), Some(f)] if schema.value.eq_ignore_ascii_case("pg_catalog") => {
+            f.value.clone()
+        }
+        _ => func.name.to_string(),
     };
     let name_upper = name.to_uppercase();
 
@@ -1512,7 +1516,6 @@ fn decimal_literal(s: &str, int_part: &str, frac_part: &str) -> Result<ScalarVal
     })
 }
 
-/// Convert a `sqlparser` [`sp::DataType`] into a arneb [`DataType`].
 /// Whether `dt` is PostgreSQL type `name` (`REGCLASS`, `OID`, ...), which
 /// sqlparser reports either as its own variant or as a custom type.
 fn is_custom_type(dt: &sp::DataType, name: &str) -> bool {
@@ -1563,6 +1566,7 @@ fn array_in_list(
     })
 }
 
+/// Convert a `sqlparser` [`sp::DataType`] into a arneb [`DataType`].
 pub(crate) fn convert_data_type(dt: sp::DataType) -> Result<DataType, ParseError> {
     if is_custom_type(&dt, "oid") {
         return Ok(DataType::Int64);

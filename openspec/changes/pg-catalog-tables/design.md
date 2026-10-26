@@ -107,8 +107,10 @@ as PostgreSQL does.
 
 When the engine fails on a pg_catalog statement, the old fixed result is
 returned if one matches. Engine failures here are mostly unsupported SQL,
-such as the stage 2b array queries. The fallback is logged at debug level
-on `arneb::protocol`.
+such as the stage 2b array queries. Because the fixed result may not match
+the query, each fallback is logged at warn level on `arneb::protocol` with
+its SQL and counted in `arneb_pg_catalog_fallbacks_total`, so the gaps can
+be seen and the fallback retired.
 
 The fallback keeps today's behavior for clients this change does not
 target, such as DBeaver's and JDBC's catalog queries. Removing it is part

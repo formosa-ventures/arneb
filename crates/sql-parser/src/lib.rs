@@ -1294,10 +1294,16 @@ mod tests {
             panic!("expected cast");
         };
         assert_eq!(data_type, DataType::Int64);
-        let Expr::Function { name, .. } = projection("SELECT pg_catalog.format_type(1, 2)") else {
-            panic!("expected function");
-        };
-        assert_eq!(name, "format_type");
+        for sql in [
+            "SELECT pg_catalog.format_type(1, 2)",
+            r#"SELECT "pg_catalog"."format_type"(1, 2)"#,
+            r#"SELECT "format_type"(1, 2)"#,
+        ] {
+            let Expr::Function { name, .. } = projection(sql) else {
+                panic!("{sql}: expected function");
+            };
+            assert_eq!(name, "format_type", "{sql}");
+        }
 
         for (sql, negated) in [
             ("SELECT x = ANY (ARRAY['r', 'p']) FROM t", false),

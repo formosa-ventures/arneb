@@ -160,6 +160,16 @@ pub fn query_retried() {
     QUERY_RETRIES.fetch_add(1, Ordering::Relaxed);
 }
 
+/// pgwire `pg_catalog` statements the engine could not run, answered
+/// with the fixed result instead (pg-catalog-tables).
+static PG_CATALOG_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// A pgwire `pg_catalog` statement failed in the engine and was answered
+/// with the fixed result.
+pub fn pg_catalog_fallback() {
+    PG_CATALOG_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
 struct ExchangeMetrics {
     breaks_resumed: AtomicU64,
     breaks_failed: AtomicU64,
@@ -306,6 +316,17 @@ pub fn render(gauges: &[Gauge]) -> String {
         "arneb_query_retries_total {}",
         QUERY_RETRIES.load(Ordering::Relaxed)
     );
+    header(
+        &mut out,
+        "arneb_pg_catalog_fallbacks_total",
+        "pgwire pg_catalog statements the engine could not run, answered with the fixed result.",
+        "counter",
+    );
+    let _ = writeln!(
+        out,
+        "arneb_pg_catalog_fallbacks_total {}",
+        PG_CATALOG_FALLBACKS.load(Ordering::Relaxed)
+    );
     let x = &EXCHANGE_METRICS;
     header(
         &mut out,
@@ -382,6 +403,7 @@ mod tests {
         exchange_stream_broke(false);
         exchange_stream_dropped_early();
         query_retried();
+        pg_catalog_fallback();
 
         let after = render(&[Gauge {
             name: "arneb_workers",
@@ -407,6 +429,7 @@ mod tests {
             ),
             ("arneb_exchange_streams_dropped_total", 1.0),
             ("arneb_query_retries_total", 1.0),
+            ("arneb_pg_catalog_fallbacks_total", 1.0),
         ] {
             assert_eq!(
                 sample(&after, series) - sample(&before, series),

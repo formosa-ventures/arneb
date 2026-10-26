@@ -692,6 +692,42 @@ impl LogicalPlan {
         }
     }
 
+    /// Whether running this plan writes data or changes the catalog, so
+    /// re-running it after a failure is not safe. The match lists every
+    /// variant, so a new one must be classified here.
+    pub fn writes_data(&self) -> bool {
+        match self {
+            LogicalPlan::CreateTable { .. }
+            | LogicalPlan::DropTable { .. }
+            | LogicalPlan::CreateTableAsSelect { .. }
+            | LogicalPlan::InsertInto { .. }
+            | LogicalPlan::DeleteFrom { .. }
+            | LogicalPlan::CreateView { .. }
+            | LogicalPlan::DropView { .. } => true,
+            LogicalPlan::Explain { input, .. } => input.writes_data(),
+            LogicalPlan::TableScan { .. }
+            | LogicalPlan::Projection { .. }
+            | LogicalPlan::Filter { .. }
+            | LogicalPlan::Join { .. }
+            | LogicalPlan::Aggregate { .. }
+            | LogicalPlan::Sort { .. }
+            | LogicalPlan::Limit { .. }
+            | LogicalPlan::ExchangeNode { .. }
+            | LogicalPlan::PartialAggregate { .. }
+            | LogicalPlan::FinalAggregate { .. }
+            | LogicalPlan::SemiJoin { .. }
+            | LogicalPlan::AntiJoin { .. }
+            | LogicalPlan::ScalarSubquery { .. }
+            | LogicalPlan::UnionAll { .. }
+            | LogicalPlan::Distinct { .. }
+            | LogicalPlan::Intersect { .. }
+            | LogicalPlan::Except { .. }
+            | LogicalPlan::Window { .. }
+            | LogicalPlan::AssignUniqueId { .. }
+            | LogicalPlan::OneRow => false,
+        }
+    }
+
     /// Returns the output schema of this plan node.
     pub fn schema(&self) -> Vec<ColumnInfo> {
         match self {

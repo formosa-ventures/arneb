@@ -1,0 +1,23 @@
+== recreate the bench cluster (retry_policy=query)
+     baseline q09: 25 rows
+== kill arneb-worker-2 during q09
+     query rc=0 after 8.2s: 
+  PASS  kill: q09 completes with retry
+  PASS  kill: same rows as without a fault
+  PASS  kill: coordinator logs the retry after losing 'worker-2'
+  PASS  kill: arneb-worker-1 cancels the query's tasks
+     next query rc=0 after 0.2s: 1199942
+  PASS  kill: next query succeeds on the remaining worker
+  PASS  kill: arneb-worker-2 re-registers
+  PASS  kill: arneb-worker-2 runs tasks again
+== pause arneb-worker-2 during q09
+     query rc=0 after 16.0s: 
+  PASS  pause: q09 completes with retry
+  PASS  pause: same rows as without a fault
+  PASS  pause: coordinator logs the retry after losing 'worker-2'
+     next query rc=0 after 0.2s: 1199942
+  PASS  pause: next query succeeds on the remaining worker
+  PASS  pause: arneb-worker-2 re-registers
+  PASS  pause: arneb-worker-2 runs tasks again
+ALL CHECKS PASSED
+retry exit 0

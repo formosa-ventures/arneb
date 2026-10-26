@@ -1056,10 +1056,23 @@ pub struct ClusterConfig {
     /// exiting (`ARNEB_DRAIN_TIMEOUT_SECS`).
     #[serde(default)]
     pub drain_timeout_secs: Option<u64>,
+
+    /// `none` (default) or `query`: re-run a read-only query that failed
+    /// because one of its workers was lost (`ARNEB_RETRY_POLICY`).
+    #[serde(default)]
+    pub retry_policy: Option<String>,
+
+    /// Most re-runs of one query under `retry_policy = "query"`
+    /// (`ARNEB_QUERY_RETRY_ATTEMPTS`).
+    #[serde(default)]
+    pub query_retry_attempts: Option<u32>,
 }
 
 /// Default `[cluster] drain_timeout_secs`.
 pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 120;
+
+/// Default `[cluster] query_retry_attempts`.
+pub const DEFAULT_QUERY_RETRY_ATTEMPTS: u32 = 4;
 
 /// Default `[cluster] heartbeat_interval_secs`.
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 2;
@@ -1191,6 +1204,43 @@ impl ClusterConfig {
         )
     }
 
+    /// `[cluster] retry_policy` / `query_retry_attempts` with the
+    /// `ARNEB_RETRY_POLICY` / `ARNEB_QUERY_RETRY_ATTEMPTS` overrides (env >
+    /// file > defaults). `None` when retry is off.
+    pub fn query_retry(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<crate::coordinator::QueryRetry>> {
+        let policy = env("ARNEB_RETRY_POLICY")
+            .or_else(|| self.retry_policy.clone())
+            .unwrap_or_else(|| "none".to_string());
+        match policy.trim().to_ascii_lowercase().as_str() {
+            "none" => return Ok(None),
+            "query" => {}
+            "task" => bail!(
+                "retry_policy 'task' is not supported (it needs exchange spooling); \
+                 use 'query' or 'none'"
+            ),
+            other => bail!(
+                "invalid ARNEB_RETRY_POLICY / [cluster] retry_policy '{other}' \
+                 (expected 'none' or 'query')"
+            ),
+        }
+        let attempts = match env("ARNEB_QUERY_RETRY_ATTEMPTS") {
+            Some(v) => v.trim().parse::<u32>().map_err(|_| {
+                anyhow::anyhow!("invalid ARNEB_QUERY_RETRY_ATTEMPTS value '{v}' (expected a count)")
+            })?,
+            None => self
+                .query_retry_attempts
+                .unwrap_or(DEFAULT_QUERY_RETRY_ATTEMPTS),
+        };
+        anyhow::ensure!(
+            attempts >= 1,
+            "ARNEB_QUERY_RETRY_ATTEMPTS / [cluster] query_retry_attempts must be at least 1"
+        );
+        Ok(Some(crate::coordinator::QueryRetry::new(attempts)))
+    }
+
     /// Build the cluster RPC security from `[cluster] secret` /
     /// `[cluster.tls]` with `ARNEB_CLUSTER_*` overrides (looked up through
     /// `env`). Reads the PEM files.
@@ -1268,6 +1318,8 @@ impl Default for ClusterConfig {
             heartbeat_interval_secs: None,
             heartbeat_timeout_secs: None,
             drain_timeout_secs: None,
+            retry_policy: None,
+            query_retry_attempts: None,
         }
     }
 }
@@ -2175,6 +2227,56 @@ password = "hunter2"
         assert!(ClusterConfig::default()
             .heartbeat(env_from(&[("ARNEB_HEARTBEAT_INTERVAL_SECS", "x")]))
             .is_err());
+    }
+
+    #[test]
+    fn query_retry_defaults_overrides_and_validation() {
+        let read = |toml_src: &str, env: &[(&str, &str)]| {
+            let cluster: ClusterConfig = toml::from_str(toml_src).unwrap();
+            cluster
+                .query_retry(env_from(env))
+                .map(|r| r.map(|r| r.max_retries))
+        };
+        assert_eq!(read("", &[]).unwrap(), None);
+        assert_eq!(read("retry_policy = \"none\"", &[]).unwrap(), None);
+        assert_eq!(read("retry_policy = \"QUERY\"", &[]).unwrap(), Some(4));
+        assert_eq!(
+            read("retry_policy = \"query\"\nquery_retry_attempts = 2", &[]).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            read(
+                "query_retry_attempts = 2",
+                &[
+                    ("ARNEB_RETRY_POLICY", "query"),
+                    ("ARNEB_QUERY_RETRY_ATTEMPTS", "1")
+                ]
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            read(
+                "retry_policy = \"query\"",
+                &[("ARNEB_RETRY_POLICY", "none")]
+            )
+            .unwrap(),
+            None
+        );
+        let err = read("retry_policy = \"task\"", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not supported"), "{err}");
+        assert!(read("retry_policy = \"always\"", &[]).is_err());
+        assert!(read("retry_policy = \"query\"\nquery_retry_attempts = 0", &[]).is_err());
+        assert!(read(
+            "",
+            &[
+                ("ARNEB_RETRY_POLICY", "query"),
+                ("ARNEB_QUERY_RETRY_ATTEMPTS", "x")
+            ]
+        )
+        .is_err());
     }
 
     #[test]

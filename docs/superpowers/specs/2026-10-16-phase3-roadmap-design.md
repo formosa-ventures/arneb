@@ -18,7 +18,7 @@ into PostgreSQL with `IN`-list compaction, and the mixed-layout correctness gate
 **Progress (2026-10-22, v0.1.5):** M2 is done: F4 landed in #167
 (`cross-source-join`; mixed-layout gate 22/22 at SF10, standalone and
 distributed). M3: P4 stage 1 landed in #171 (`fault-tolerance-fail-clean`;
-stage 2, query-level retry, remains). P5 landed in #172
+stage 2, query-level retry, is `query-retry`). P5 landed in #172
 (`observability-metrics`: `/metrics`, slow-query log, Grafana dashboard) and
 #173 (`query-history`: bounded history, `system.runtime.queries`, and the
 Web UI's query list reads the same history). P6 is

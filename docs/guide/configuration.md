@@ -314,6 +314,8 @@ worker_id = "worker-1"
 | `heartbeat_interval_secs` | integer | no | Seconds between a worker's heartbeats (default `2`, `ARNEB_HEARTBEAT_INTERVAL_SECS`). Read on workers. |
 | `heartbeat_timeout_secs` | integer | no | Seconds without a heartbeat before the coordinator treats a worker as lost and fails its running queries (default `10`, `ARNEB_HEARTBEAT_TIMEOUT_SECS`). Read on the coordinator; must be greater than the interval. |
 | `drain_timeout_secs` | integer | no | Longest a worker waits on SIGTERM for its running queries to finish before it exits (default `120`, `ARNEB_DRAIN_TIMEOUT_SECS`). Read on workers; set the orchestrator's grace period (Kubernetes `terminationGracePeriodSeconds`) above it. See [Stopping a worker](/guide/distributed#stopping-a-worker). |
+| `retry_policy` | string | no | `none` (default) or `query`: re-run a read-only query that failed because one of its workers was lost, on the remaining workers (`ARNEB_RETRY_POLICY`). Read on the coordinator. `task` is refused. See [When a worker fails](/guide/distributed#when-a-worker-fails). |
+| `query_retry_attempts` | integer | no | Most re-runs of one query under `retry_policy = "query"` (default `4`, at least `1`, `ARNEB_QUERY_RETRY_ATTEMPTS`). Read on the coordinator. |
 
 The three `ARNEB_CLUSTER_*` variables above override the file (env > file),
 so one config file can serve every worker; the Helm chart sets them per

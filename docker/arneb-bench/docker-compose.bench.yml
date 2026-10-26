@@ -44,6 +44,9 @@ services:
     # network alias `arneb-coord` so worker configs don't need to
     # know the compose-generated container name.
     command: ["--config", "/etc/arneb/coord.toml", "--role", "coordinator"]
+    # Not a tuning lever: fault_injection.sh sets it to check query retry.
+    environment:
+      ARNEB_RETRY_POLICY: "${ARNEB_RETRY_POLICY:-none}"
     networks:
       default:
         aliases:

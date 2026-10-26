@@ -151,6 +151,15 @@ pub fn query_ended(end: QueryEnd<'_>) {
     }
 }
 
+/// Distributed queries re-run after a worker was lost (P4 stage 2).
+static QUERY_RETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// A distributed query is about to re-run after one of its workers was
+/// lost (`retry_policy = "query"`).
+pub fn query_retried() {
+    QUERY_RETRIES.fetch_add(1, Ordering::Relaxed);
+}
+
 struct ExchangeMetrics {
     breaks_resumed: AtomicU64,
     breaks_failed: AtomicU64,
@@ -286,6 +295,17 @@ pub fn render(gauges: &[Gauge]) -> String {
              arneb_query_duration_seconds_count{{outcome=\"{outcome}\"}} {count}"
         );
     }
+    header(
+        &mut out,
+        "arneb_query_retries_total",
+        "Distributed queries re-run after one of their workers was lost.",
+        "counter",
+    );
+    let _ = writeln!(
+        out,
+        "arneb_query_retries_total {}",
+        QUERY_RETRIES.load(Ordering::Relaxed)
+    );
     let x = &EXCHANGE_METRICS;
     header(
         &mut out,
@@ -361,6 +381,7 @@ mod tests {
         exchange_stream_broke(true);
         exchange_stream_broke(false);
         exchange_stream_dropped_early();
+        query_retried();
 
         let after = render(&[Gauge {
             name: "arneb_workers",
@@ -385,6 +406,7 @@ mod tests {
                 1.0,
             ),
             ("arneb_exchange_streams_dropped_total", 1.0),
+            ("arneb_query_retries_total", 1.0),
         ] {
             assert_eq!(
                 sample(&after, series) - sample(&before, series),

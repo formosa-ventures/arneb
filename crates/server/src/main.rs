@@ -622,8 +622,19 @@ async fn run() -> Result<()> {
     // Worker: create TaskManager and register task callback
     let distributed_executor: Option<Arc<dyn arneb_protocol::DistributedExecutor>> = match role {
         ServerRole::Coordinator => {
+            let retry = config
+                .cluster
+                .query_retry(|k| std::env::var(k).ok())
+                .context("invalid [cluster] retry_policy")?;
+            tracing::info!(
+                target: "arneb::config",
+                retry_policy = if retry.is_some() { "query" } else { "none" },
+                query_retry_attempts = retry.map(|r| r.max_retries),
+                "query retry effective value ([cluster] retry_policy / ARNEB_RETRY_POLICY, query_retry_attempts / ARNEB_QUERY_RETRY_ATTEMPTS)"
+            );
             let coord =
-                coordinator::QueryCoordinator::new(node_registry.clone(), df_registry.clone());
+                coordinator::QueryCoordinator::new(node_registry.clone(), df_registry.clone())
+                    .with_retry(retry);
             Some(Arc::new(coord))
         }
         _ => None,

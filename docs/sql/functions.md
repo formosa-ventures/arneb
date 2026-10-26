@@ -1,6 +1,6 @@
 # Functions
 
-Arneb provides 90 built-in scalar functions (plus 10 alternate spellings), organized by category. Names, argument order, NULL handling and return types follow [Trino](https://trino.io/docs/current/functions.html) unless a difference is called out under [Differences from Trino](#differences-from-trino).
+Arneb provides 90 built-in scalar functions (plus 11 alternate spellings), organized by category. Names, argument order, NULL handling and return types follow [Trino](https://trino.io/docs/current/functions.html) unless a difference is called out under [Differences from Trino](#differences-from-trino).
 
 Unless stated otherwise, a function returns `NULL` when any argument is `NULL`. Function names are case-insensitive.
 

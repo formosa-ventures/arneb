@@ -660,30 +660,51 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             })
         }
         // Typed string literals (`DATE '...'`, `TIMESTAMP '...'`, `TIME '...'`)
-        // parse as Expr::TypedString in sqlparser-rs. Lower them to
-        // `CAST('...' AS <type>)` so the rest of the pipeline treats them
-        // identically to the explicit CAST form. This matches Trino/Postgres
-        // semantics for ANSI typed-string literals.
+        // parse as Expr::TypedString in sqlparser-rs. Lower them to casts,
+        // except bare DECIMAL literals, whose precision and scale come from
+        // their text rather than the default DECIMAL(38,0) cast type.
         sp::Expr::TypedString(ts) => {
             if ts.uses_odbc_syntax {
                 return Err(ParseError::UnsupportedFeature(
                     "ODBC-style typed-string literal ({d '...'})".to_string(),
                 ));
             }
-            let literal = match sp::Value::from(ts.value) {
-                sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => {
-                    ScalarValue::Utf8(s)
-                }
+            let text = match sp::Value::from(ts.value) {
+                sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => s,
                 other => {
                     return Err(ParseError::InvalidSyntax(format!(
                         "typed-string literal expects a string value, got: {other}"
                     )))
                 }
             };
+            if matches!(
+                ts.data_type,
+                sp::DataType::Decimal(sp::ExactNumberInfo::None)
+            ) {
+                let (negative, unsigned) = match text.strip_prefix('-') {
+                    Some(unsigned) => (true, unsigned),
+                    None => (false, text.as_str()),
+                };
+                let (int_part, frac_part) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+                if !unsigned.bytes().any(|b| b.is_ascii_digit()) {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "invalid decimal literal: {text}"
+                    )));
+                }
+                let mut value = decimal_literal(unsigned, int_part, frac_part)?;
+                if negative {
+                    match &mut value {
+                        ScalarValue::Decimal128 { value, .. } => *value = -*value,
+                        ScalarValue::Float64(value) => *value = -*value,
+                        _ => unreachable!(),
+                    }
+                }
+                return Ok(ast::Expr::Literal { value, span });
+            }
             let dt = convert_data_type(ts.data_type)?;
             Ok(ast::Expr::Cast {
                 expr: Box::new(ast::Expr::Literal {
-                    value: literal,
+                    value: ScalarValue::Utf8(text),
                     span,
                 }),
                 data_type: dt,

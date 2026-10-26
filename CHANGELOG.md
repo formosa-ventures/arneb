@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.7](https://github.com/formosa-ventures/arneb/compare/v0.1.6...v0.1.7) (2026-10-26)
+
+
+### Features
+
+* client smoke test in CI and the client fixes it found (G6) ([#185](https://github.com/formosa-ventures/arneb/issues/185)) ([75be7e9](https://github.com/formosa-ventures/arneb/commit/75be7e9dceb353b939fe2c046dfb281f26370f46))
+* file-based access control (G3) ([#183](https://github.com/formosa-ventures/arneb/issues/183)) ([d861726](https://github.com/formosa-ventures/arneb/commit/d861726985e74726b9aed70a28048548224bc8bd))
+* GHCR images, Helm chart and kind acceptance test (P6) ([#182](https://github.com/formosa-ventures/arneb/issues/182)) ([5fc283a](https://github.com/formosa-ventures/arneb/commit/5fc283a763a9654d3f8f1ffe9c5eaf6072aed6e3))
+* query retry after a worker loss (P4 stage 2) ([#184](https://github.com/formosa-ventures/arneb/issues/184)) ([c1a99b1](https://github.com/formosa-ventures/arneb/commit/c1a99b1a573e05daf095c5ac42e3e683082c68d8))
+* queryable pg_catalog over pgwire (G6 stage 2a) ([#188](https://github.com/formosa-ventures/arneb/issues/188)) ([303c604](https://github.com/formosa-ventures/arneb/commit/303c604bf0337dd82150a764349c2a640f000755))
+
 ## [0.1.6](https://github.com/formosa-ventures/arneb/compare/v0.1.5...v0.1.6) (2026-10-25)
 
 

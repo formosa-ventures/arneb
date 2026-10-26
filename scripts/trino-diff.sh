@@ -19,7 +19,7 @@
 #   trino-err Trino failed (the query is not a fair comparison)
 #   err:crash Arneb exited while running the query (it is restarted, the
 #             panic is in arneb.log, and the run continues)
-#   A query whose Arneb RSS passes --max-rss-mb (default 4096) or whose time
+#   A query whose Arneb RSS passes --max-rss-mb (default 8192; TPC-H SF1 peaks near 3.7 GB) or whose time
 #   passes --timeout is killed together with Arneb and counted as err:memory
 #   or err:timeout; Arneb is restarted and the run continues.
 #
@@ -31,7 +31,7 @@ SUITE=tpch
 TOL=1e-9
 PORT=15432
 TIMEOUT=600
-MAX_RSS_MB=4096
+MAX_RSS_MB=8192
 OUT=""
 QDIR=""
 QUERIES=()

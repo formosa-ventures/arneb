@@ -2220,9 +2220,11 @@ impl HashJoinExec {
         // Grace HJ when `ARNEB_GRACE_HJ=1`. Avoids the `collect_stream(left)`
         // below which materialises the per-partition left input (~150 MB
         // per partition for Q09 SF1 lineitem) into a `Vec<RecordBatch>`
-        // before probing. `execute_grace_single` streams the left side
-        // batch-by-batch and routes rows to matching partition hash
-        // tables / spill files, keeping per-partition peak bounded.
+        // before probing. `execute_grace(.., ProbeDfInjection::Skip)` streams
+        // the left side batch-by-batch and routes rows to matching partition
+        // hash tables / spill files, keeping per-partition peak bounded.
+        // This build holds only this partition's keys, while the probe
+        // subtree is shared, so it must not inject a partial key list.
         if self.grace_enabled() {
             let left_stream = self.left.execute(partition).await?;
             return self
@@ -4065,6 +4067,13 @@ impl HashJoinExec {
         right_stream: SendableRecordBatchStream,
         probe_df: ProbeDfInjection,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let (path, single_path) = match probe_df {
+            ProbeDfInjection::Inject => ("execute_grace_single", "execute_grace_single.single"),
+            ProbeDfInjection::Skip => (
+                "execute_grace.per_partition",
+                "execute_grace.per_partition.single",
+            ),
+        };
         let n_partitions = grace_partition_count();
         let build_partitioner =
             Arc::new(HashPartitioner::new(self.right_key_exprs(), n_partitions)?);
@@ -4119,7 +4128,7 @@ impl HashJoinExec {
                 tracing::info!(
                     target: "arneb::mem",
                     operator = "HashJoinExec",
-                    path = "execute_grace_single",
+                    path,
                     build_bytes = total_bytes,
                     spilled_partitions,
                     n_partitions,
@@ -4209,7 +4218,7 @@ impl HashJoinExec {
                             tracing::info!(
                                 target: "arneb::mem",
                                 operator = "HashJoinExec",
-                                path = "execute_grace_single",
+                                path,
                                 "probe exceeded pool budget; streaming probe (bounded)",
                             );
                             let left_schema = column_info_to_arrow_schema(&self.left.schema());
@@ -4348,7 +4357,7 @@ impl HashJoinExec {
                             tracing::info!(
                                 target: "arneb::mem",
                                 operator = "HashJoinExec",
-                                path = "execute_grace_single.single",
+                                path = single_path,
                                 "probe exceeded budget; direct streaming probe against single build",
                             );
                             // Direct streaming probe against the single
@@ -7604,6 +7613,40 @@ mod tests {
         assert_eq!(count(&scan_a), 1, "scan_a unchanged by the B.k filter");
     }
 
+    /// An unbounded pool that records the name of every consumer that
+    /// registers, so a test can tell which hash-join path ran.
+    #[derive(Debug, Default)]
+    struct ConsumerRecordingPool {
+        inner: crate::memory_pool::UnboundedMemoryPool,
+        names: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::memory_pool::MemoryPool for ConsumerRecordingPool {
+        fn register(&self, consumer: &crate::memory_pool::MemoryConsumer) {
+            self.names.lock().unwrap().push(consumer.name().to_string());
+            self.inner.register(consumer);
+        }
+        fn unregister(&self, consumer: &crate::memory_pool::MemoryConsumer) {
+            self.inner.unregister(consumer);
+        }
+        fn try_grow(
+            &self,
+            consumer: &crate::memory_pool::MemoryConsumer,
+            additional: usize,
+        ) -> Result<(), ExecutionError> {
+            self.inner.try_grow(consumer, additional)
+        }
+        fn grow(&self, consumer: &crate::memory_pool::MemoryConsumer, additional: usize) {
+            self.inner.grow(consumer, additional);
+        }
+        fn shrink(&self, consumer: &crate::memory_pool::MemoryConsumer, bytes: usize) {
+            self.inner.shrink(consumer, bytes);
+        }
+        fn reserved(&self) -> usize {
+            self.inner.reserved()
+        }
+    }
+
     #[tokio::test]
     async fn copartitioned_grace_join_injects_no_partial_dynamic_filter() {
         // Both sides are hash-partitioned on the key into 2 partitions, so
@@ -7611,6 +7654,15 @@ mod tests {
         // list built from one slice must never reach the probe scan, which
         // every partition shares: a scan partition that starts after it would
         // drop the rows whose keys belong to the other slice.
+        //
+        // Pin the grace path (it is read from the environment on every call)
+        // and make sure the injection switch is not set, so the test cannot
+        // pass by skipping the path it guards.
+        let _env = env_test_guard().await;
+        std::env::set_var("ARNEB_GRACE_HJ", "1");
+        std::env::remove_var("ARNEB_DISABLE_DF");
+        let pool = Arc::new(ConsumerRecordingPool::default());
+
         let probe_scan = two_col_scan("l_id", (1..=8).collect(), (1..=8).collect());
         let build_scan = two_col_scan("r_id", (1..=8).collect(), (1..=8).collect());
         let hash_on = |name: &str| {
@@ -7638,7 +7690,7 @@ mod tests {
             residual: None,
             build_state: Default::default(),
             peak_build_bytes: Default::default(),
-            memory_pool: Arc::new(crate::memory_pool::UnboundedMemoryPool::new()),
+            memory_pool: pool.clone(),
             dynamic_filter_producers: Vec::new(),
             dynamic_filter_publisher: None,
             dynamic_filtering_enabled: false,
@@ -7667,6 +7719,20 @@ mod tests {
                 );
             }
         }
+
+        // The grace path built, not the non-grace per-partition one.
+        let names = pool.names.lock().unwrap().clone();
+        std::env::remove_var("ARNEB_GRACE_HJ");
+        assert!(
+            names.iter().any(|n| n == "HashJoinExec.grace_build"),
+            "grace build never ran: {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == "HashJoinExec.per_partition_build"),
+            "the non-grace per-partition build ran: {names:?}"
+        );
     }
 
     #[tokio::test]

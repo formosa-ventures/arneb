@@ -315,6 +315,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_quoted_function_name_drops_the_quotes() {
+        // Trino writes "sum"("x"); the quotes are identifier quoting, not
+        // part of the name, so the planner must see the same name as sum(x).
+        let stmt = parse(r#"SELECT "sum"("x"), "substr"("y", 1, 5), "Count"(*) FROM t"#).unwrap();
+        let Statement::Query { query, .. } = stmt else {
+            panic!("expected Query");
+        };
+        let names: Vec<&str> = select_body(&query)
+            .projection
+            .iter()
+            .map(|item| match item {
+                SelectItem::UnnamedExpr(Expr::Function { name, .. }) => name.as_str(),
+                other => panic!("expected function, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["sum", "substr", "Count"]);
+    }
+
+    #[test]
+    fn parse_quoted_window_function_name_drops_the_quotes() {
+        let stmt = parse(r#"SELECT "rank"() OVER (ORDER BY x) FROM t"#).unwrap();
+        let Statement::Query { query, .. } = stmt else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(Expr::WindowFunction { name, .. }) => assert_eq!(name, "rank"),
+            other => panic!("expected window function, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_function_distinct() {
         let stmt = parse("SELECT COUNT(DISTINCT x) FROM t").unwrap();
         let Statement::Query { query, .. } = stmt else {

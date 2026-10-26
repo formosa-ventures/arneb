@@ -30,6 +30,12 @@ app.kubernetes.io/instance: {{ .ctx.Release.Name }}
 app.kubernetes.io/component: {{ .component }}
 {{- end }}
 
+{{/* Labels plus the component; pass (dict "ctx" $ "component" "worker"). */}}
+{{- define "arneb.componentLabels" -}}
+{{ include "arneb.labels" .ctx }}
+app.kubernetes.io/component: {{ .component }}
+{{- end }}
+
 {{- define "arneb.image" -}}
 {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
 {{- end }}
@@ -81,4 +87,29 @@ app.kubernetes.io/component: {{ .component }}
 
 {{- define "arneb.configChecksum" -}}
 {{- if .Values.existingConfigSecret }}{{ .Values.existingConfigSecret | sha256sum }}{{ else }}{{ .Values.config | sha256sum }}{{ end }}
+{{- end }}
+
+{{/* Pod-level fields every pod shares. */}}
+{{- define "arneb.podCommon" -}}
+automountServiceAccountToken: false
+# Service links would inject ARNEB_PORT=tcp://... for a Service named
+# "arneb", which arneb reads as its pgwire port.
+enableServiceLinks: false
+{{- with .Values.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+securityContext:
+  {{- toYaml .Values.podSecurityContext | nindent 2 }}
+{{- end }}
+
+{{/* nodeSelector, tolerations and affinity; pass .Values.coordinator or .Values.worker. */}}
+{{- define "arneb.scheduling" -}}
+{{- $v := . }}
+{{- range $k := list "nodeSelector" "tolerations" "affinity" }}
+{{- with index $v $k }}
+{{ $k }}:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
 {{- end }}

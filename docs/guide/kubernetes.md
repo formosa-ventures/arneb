@@ -69,8 +69,10 @@ these per pod, so `config` should leave them out of `[cluster]`:
 The chart assumes the default `rpc_port` of 9090. It also turns off
 Kubernetes service links (`enableServiceLinks: false`): a Service named
 `arneb` would otherwise inject `ARNEB_PORT=tcp://…` into every pod in the
-namespace, and Arneb reads `ARNEB_PORT` as its pgwire port. Set the same
-on any other pod in the namespace that runs Arneb.
+namespace, and Arneb reads `ARNEB_PORT` as its pgwire port. Arneb ignores
+an `ARNEB_PORT` or `ARNEB_TRINO_PORT` of that form and logs a warning, but
+other service-link variables can still collide, so set the same on any
+other pod in the namespace that runs Arneb.
 
 ## Values
 

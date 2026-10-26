@@ -519,11 +519,23 @@ impl TrinoProtocolConfig {
             };
         }
         if let Ok(val) = std::env::var("ARNEB_TRINO_PORT") {
+            if arneb_common::config::is_service_link(&val) {
+                tracing::warn!(
+                    value = %val,
+                    "ignoring ARNEB_TRINO_PORT: it is a Kubernetes service link for a \
+                     Service named \"arneb-trino\", not a port"
+                );
+                return self.check_port();
+            }
             self.port = val
                 .trim()
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid ARNEB_TRINO_PORT value '{val}'"))?;
         }
+        self.check_port()
+    }
+
+    fn check_port(&self) -> Result<()> {
         if self.enabled && self.port == 0 {
             bail!("trino.port must be > 0");
         }

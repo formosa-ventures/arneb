@@ -3,8 +3,7 @@ kind: Deployment
 metadata:
   name: {{ include "arneb.fullname" . }}-worker
   labels:
-    {{- include "arneb.labels" . | nindent 4 }}
-    app.kubernetes.io/component: worker
+    {{- include "arneb.componentLabels" (dict "ctx" . "component" "worker") | nindent 4 }}
 spec:
   replicas: {{ .Values.worker.replicas }}
   strategy:
@@ -18,27 +17,17 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "arneb.labels" . | nindent 8 }}
-        app.kubernetes.io/component: worker
+        {{- include "arneb.componentLabels" (dict "ctx" . "component" "worker") | nindent 8 }}
       annotations:
         checksum/config: {{ include "arneb.configChecksum" . }}
         {{- with .Values.worker.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
-      automountServiceAccountToken: false
-      # Service links would inject ARNEB_PORT=tcp://... for a Service named
-      # "arneb", which arneb reads as its pgwire port.
-      enableServiceLinks: false
+      {{- include "arneb.podCommon" . | nindent 6 }}
       # SIGTERM starts a drain of up to drainTimeoutSecs; Kubernetes must
       # not SIGKILL before it ends.
       terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds | default (add .Values.worker.drainTimeoutSecs 30) }}
-      {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: worker
           image: {{ include "arneb.image" . }}
@@ -94,15 +83,6 @@ spec:
           {{- end }}
       volumes:
         {{- include "arneb.volumes" . | nindent 8 }}
-      {{- with .Values.worker.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.worker.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.worker.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
+      {{- with include "arneb.scheduling" .Values.worker }}
+      {{- . | trim | nindent 6 }}
       {{- end }}

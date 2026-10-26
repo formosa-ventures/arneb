@@ -3,8 +3,7 @@ kind: Deployment
 metadata:
   name: {{ include "arneb.fullname" . }}-coordinator
   labels:
-    {{- include "arneb.labels" . | nindent 4 }}
-    app.kubernetes.io/component: coordinator
+    {{- include "arneb.componentLabels" (dict "ctx" . "component" "coordinator") | nindent 4 }}
 spec:
   # One coordinator, replaced rather than rolled: two behind the Service
   # would split worker heartbeats between them.
@@ -17,24 +16,14 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "arneb.labels" . | nindent 8 }}
-        app.kubernetes.io/component: coordinator
+        {{- include "arneb.componentLabels" (dict "ctx" . "component" "coordinator") | nindent 8 }}
       annotations:
         checksum/config: {{ include "arneb.configChecksum" . }}
         {{- with .Values.coordinator.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
-      automountServiceAccountToken: false
-      # Service links would inject ARNEB_PORT=tcp://... for a Service named
-      # "arneb", which arneb reads as its pgwire port.
-      enableServiceLinks: false
-      {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- include "arneb.podCommon" . | nindent 6 }}
       containers:
         - name: coordinator
           image: {{ include "arneb.image" . }}
@@ -88,15 +77,6 @@ spec:
           {{- end }}
       volumes:
         {{- include "arneb.volumes" . | nindent 8 }}
-      {{- with .Values.coordinator.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.coordinator.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.coordinator.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
+      {{- with include "arneb.scheduling" .Values.coordinator }}
+      {{- . | trim | nindent 6 }}
       {{- end }}

@@ -4,6 +4,7 @@ mod args;
 mod conditional;
 mod date;
 mod math;
+mod pg_catalog;
 mod regexp;
 mod registry;
 mod string;

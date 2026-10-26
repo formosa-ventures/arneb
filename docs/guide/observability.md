@@ -23,6 +23,7 @@ curl -s http://127.0.0.1:6432/metrics
 | `arneb_exchange_stream_breaks_total` | counter | `outcome` | Exchange streams this node read that broke mid-stream on a transport error: `resumed` (broadcast output, read again from the first missing row) or `failed` |
 | `arneb_exchange_streams_dropped_total` | counter | | Exchange streams this node served that were dropped before their end |
 | `arneb_query_retries_total` | counter | | Distributed queries re-run after one of their workers was lost ([query retry](/guide/distributed#query-retry)) |
+| `arneb_pg_catalog_fallbacks_total` | counter | | pgwire `pg_catalog` statements the engine could not run, answered with a fixed result that may not match the query; each one is also logged at `warn` on `arneb::protocol` with its SQL ([catalog introspection](/guide/clients#not-supported-yet)) |
 
 The query metrics count what the [query history](/guide/configuration#query-history)
 records: every pgwire statement that reaches the engine and every statement

@@ -1621,6 +1621,43 @@ impl<'a> QueryPlanner<'a> {
                         return Ok(literal);
                     }
                 }
+                if name.eq_ignore_ascii_case("regclass") {
+                    return regclass_literal(self.catalog, args, node_span);
+                }
+                if name.eq_ignore_ascii_case("regtype") {
+                    return match args.as_slice() {
+                        // `'int4'::regtype`: the type's oid.
+                        [ast::FunctionArg::Unnamed(ast::Expr::Literal {
+                            value: ScalarValue::Utf8(type_name),
+                            ..
+                        })] => arneb_common::pg_oid::type_oid(type_name)
+                            .map(|oid| PlanExpr::Literal {
+                                value: ScalarValue::Int64(oid),
+                                span: node_span,
+                            })
+                            .ok_or_else(|| PlanError::InvalidLiteral {
+                                message: format!("type \"{type_name}\" does not exist"),
+                                location: node_span.map(|s| s.start),
+                            }),
+                        // `typoid::regtype`: shown as the type's name.
+                        [ast::FunctionArg::Unnamed(e)] => Ok(PlanExpr::Function {
+                            name: "format_type".to_string(),
+                            args: vec![
+                                self.plan_expr(e, ctx).await?,
+                                PlanExpr::Literal {
+                                    value: ScalarValue::Null,
+                                    span: node_span,
+                                },
+                            ],
+                            distinct: false,
+                            span: node_span,
+                        }),
+                        _ => Err(PlanError::UnsupportedExpression {
+                            message: "regtype takes one argument".to_string(),
+                            location: node_span.map(|s| s.start),
+                        }),
+                    };
+                }
                 let mut plan_args = Vec::with_capacity(args.len());
                 for a in args {
                     let plan_arg = match a {
@@ -3481,6 +3518,40 @@ fn session_literal(
     };
     Some(PlanExpr::Literal {
         value: ScalarValue::Utf8(value.to_string()),
+        span,
+    })
+}
+
+/// `'<name>'::regclass` as the relation's oid (pg-catalog-tables), resolved
+/// against the session's catalog and default schema. Only a string literal
+/// can be resolved at plan time.
+fn regclass_literal(
+    catalog: &CatalogManager,
+    args: &[ast::FunctionArg],
+    span: Option<arneb_sql_parser::Span>,
+) -> Result<PlanExpr, PlanError> {
+    let oid = match args {
+        [ast::FunctionArg::Unnamed(ast::Expr::Literal {
+            value: ScalarValue::Utf8(name),
+            ..
+        })] => arneb_common::pg_oid::regclass_oid(
+            name,
+            catalog.default_catalog(),
+            catalog.default_schema(),
+        )
+        .ok_or_else(|| PlanError::InvalidLiteral {
+            message: format!("invalid relation name for regclass: '{name}'"),
+            location: span.map(|s| s.start),
+        })?,
+        _ => {
+            return Err(PlanError::UnsupportedExpression {
+                message: "regclass of anything but a string literal".to_string(),
+                location: span.map(|s| s.start),
+            })
+        }
+    };
+    Ok(PlanExpr::Literal {
+        value: ScalarValue::Int64(oid),
         span,
     })
 }

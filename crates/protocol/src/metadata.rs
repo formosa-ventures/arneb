@@ -3,11 +3,10 @@
 //! Intercepts queries to pg_catalog.*, information_schema.*, and version()
 //! before they reach the SQL parser, returning synthetic results from CatalogManager.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arneb_catalog::CatalogManager;
+use arneb_common::pg_oid;
 use arneb_common::types::DataType;
 use arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
@@ -35,24 +34,6 @@ pub(crate) async fn try_handle_metadata(
     // version()
     if lower.contains("version()") && lower.starts_with("select") {
         return Some(handle_version());
-    }
-
-    // pg_catalog tables — match the primary FROM table, not JOINed tables
-    // Use "from pg_catalog.X" pattern to find the main table
-    if has_from_table(&lower, "pg_type") || lower.contains("pg_catalog.pg_type") {
-        return Some(handle_pg_type());
-    }
-    if has_from_table(&lower, "pg_class") || lower.contains("pg_catalog.pg_class") {
-        return Some(handle_pg_class(catalog_manager).await);
-    }
-    if has_from_table(&lower, "pg_attribute") || lower.contains("pg_catalog.pg_attribute") {
-        return Some(handle_pg_attribute(catalog_manager).await);
-    }
-    if has_from_table(&lower, "pg_namespace") || lower.contains("pg_catalog.pg_namespace") {
-        return Some(handle_pg_namespace(catalog_manager).await);
-    }
-    if has_from_table(&lower, "pg_database") || lower.contains("pg_catalog.pg_database") {
-        return Some(handle_pg_database(catalog_manager));
     }
 
     // information_schema
@@ -95,16 +76,38 @@ pub(crate) async fn try_handle_metadata(
     None
 }
 
+/// The fixed result for a `pg_catalog` statement the engine could not run
+/// (pg-catalog-tables D7): the whole of the first table it names, whatever
+/// the query asks. Kept for clients whose catalog queries need more SQL
+/// than the engine has, until they are covered.
+pub(crate) async fn fixed_pg_catalog(
+    sql: &str,
+    catalog_manager: &CatalogManager,
+) -> Option<MetadataResult> {
+    let lower = sql.trim().to_lowercase();
+    // Match the primary FROM table, not JOINed tables.
+    if has_from_table(&lower, "pg_type") || lower.contains("pg_catalog.pg_type") {
+        return Some(handle_pg_type());
+    }
+    if has_from_table(&lower, "pg_class") || lower.contains("pg_catalog.pg_class") {
+        return Some(handle_pg_class(catalog_manager).await);
+    }
+    if has_from_table(&lower, "pg_attribute") || lower.contains("pg_catalog.pg_attribute") {
+        return Some(handle_pg_attribute(catalog_manager).await);
+    }
+    if has_from_table(&lower, "pg_namespace") || lower.contains("pg_catalog.pg_namespace") {
+        return Some(handle_pg_namespace(catalog_manager).await);
+    }
+    if has_from_table(&lower, "pg_database") || lower.contains("pg_catalog.pg_database") {
+        return Some(handle_pg_database(catalog_manager));
+    }
+    None
+}
+
 /// Check if the SQL has a FROM clause targeting a specific pg_catalog table.
 fn has_from_table(lower: &str, table_name: &str) -> bool {
     lower.contains(&format!("from pg_catalog.{table_name}"))
         || lower.contains(&format!("from pg_catalog.{table_name} "))
-}
-
-fn stable_hash(s: &str) -> i64 {
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    (hasher.finish() & 0x7FFF_FFFF) as i64 // positive i32 range
 }
 
 fn pg_type_name(dt: &DataType) -> &'static str {
@@ -212,7 +215,7 @@ fn handle_pg_type() -> MetaResult {
         Field::new("typnotnull", ArrowDataType::Boolean, false),
     ]));
 
-    let pg_catalog_oid = stable_hash("pg_catalog");
+    let pg_catalog_oid = pg_oid::PG_CATALOG_NAMESPACE_OID;
     let n = types.len();
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -248,9 +251,12 @@ async fn handle_pg_namespace(catalog_manager: &CatalogManager) -> MetaResult {
 
     // Built-in namespaces
     names.push("pg_catalog".to_string());
-    oids.push(stable_hash("pg_catalog"));
+    oids.push(pg_oid::PG_CATALOG_NAMESPACE_OID);
     names.push("information_schema".to_string());
-    oids.push(stable_hash("information_schema"));
+    oids.push(pg_oid::namespace_oid(
+        catalog_manager.default_catalog(),
+        "information_schema",
+    ));
 
     // User schemas from catalogs (only include schemas that contain tables)
     for cat_name in catalog_manager.visible_catalog_names() {
@@ -263,7 +269,7 @@ async fn handle_pg_namespace(catalog_manager: &CatalogManager) -> MetaResult {
                 .await
                 .is_empty()
             {
-                oids.push(stable_hash(&schema_name));
+                oids.push(pg_oid::namespace_oid(&cat_name, &schema_name));
                 names.push(schema_name);
             }
         }
@@ -298,14 +304,13 @@ async fn handle_pg_class(catalog_manager: &CatalogManager) -> MetaResult {
     for cat_name in catalog_manager.visible_catalog_names() {
         if let Some(catalog) = catalog_manager.catalog(&cat_name) {
             for schema_name in catalog_manager.visible_schema_names(&cat_name).await {
-                let ns_oid = stable_hash(&schema_name);
+                let ns_oid = pg_oid::namespace_oid(&cat_name, &schema_name);
                 if let Some(schema) = catalog.schema(&schema_name).await {
                     for table_name in catalog_manager
                         .visible_table_names(&cat_name, &schema_name)
                         .await
                     {
-                        let table_key = format!("{cat_name}.{schema_name}.{table_name}");
-                        oids.push(stable_hash(&table_key));
+                        oids.push(pg_oid::relation_oid(&cat_name, &schema_name, &table_name));
                         relnames.push(table_name.clone());
                         relnamespaces.push(ns_oid);
                         relkinds.push("r".to_string());
@@ -364,8 +369,7 @@ async fn handle_pg_attribute(catalog_manager: &CatalogManager) -> MetaResult {
                         .visible_table_names(&cat_name, &schema_name)
                         .await
                     {
-                        let table_key = format!("{cat_name}.{schema_name}.{table_name}");
-                        let rel_oid = stable_hash(&table_key);
+                        let rel_oid = pg_oid::relation_oid(&cat_name, &schema_name, &table_name);
                         if let Some(table) = schema.table(&table_name).await {
                             for (i, col) in table.schema().iter().enumerate() {
                                 attrelids.push(rel_oid);
@@ -413,7 +417,7 @@ async fn handle_pg_attribute(catalog_manager: &CatalogManager) -> MetaResult {
 
 fn handle_pg_database(catalog_manager: &CatalogManager) -> MetaResult {
     let names = catalog_manager.visible_catalog_names();
-    let oids: Vec<i64> = names.iter().map(|n| stable_hash(n)).collect();
+    let oids: Vec<i64> = names.iter().map(|n| pg_oid::database_oid(n)).collect();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("oid", ArrowDataType::Int64, false),
@@ -623,6 +627,8 @@ fn transaction_tag(lower: &str) -> Option<&'static str> {
         ("start", Some("transaction")) => Some("START TRANSACTION"),
         ("commit" | "end", _) => Some("COMMIT"),
         ("rollback" | "abort", _) => Some("ROLLBACK"),
+        ("savepoint", Some(_)) => Some("SAVEPOINT"),
+        ("release", Some(_)) => Some("RELEASE"),
         _ => None,
     }
 }

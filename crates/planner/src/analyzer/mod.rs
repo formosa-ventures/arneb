@@ -375,7 +375,7 @@ pub(crate) fn function_return_type(
         // return integer counts).
         "UPPER" | "LOWER" | "SUBSTRING" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "CONCAT"
         | "REPLACE" | "SPLIT_PART" | "REVERSE" | "LPAD" | "RPAD" | "CHR" | "CONCAT_WS"
-        | "TRANSLATE" | "REGEXP_EXTRACT" | "REGEXP_REPLACE" => Some(DataType::Utf8),
+        | "TRANSLATE" | "REGEXP_EXTRACT" | "REGEXP_REPLACE" | "LIKE_ESCAPE" => Some(DataType::Utf8),
         "LENGTH"
         | "POSITION"
         | "STRPOS"
@@ -384,6 +384,12 @@ pub(crate) fn function_return_type(
         | "HAMMING_DISTANCE" => Some(DataType::Int64),
         "CODEPOINT" => Some(DataType::Int32),
         "STARTS_WITH" | "REGEXP_LIKE" => Some(DataType::Boolean),
+        // PostgreSQL catalog functions (pg-catalog-tables).
+        "FORMAT_TYPE" | "PG_GET_USERBYID" | "OBJ_DESCRIPTION" | "COL_DESCRIPTION" => {
+            Some(DataType::Utf8)
+        }
+        "PG_TABLE_IS_VISIBLE" | "PG_IS_OTHER_TEMP_SCHEMA" => Some(DataType::Boolean),
+        "TO_REGTYPE" => Some(DataType::Int64),
 
         // Math — preserve integer-ness when the input is integral.
         "ROUND" | "CEIL" | "CEILING" | "FLOOR" | "ABS" => args

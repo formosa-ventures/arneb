@@ -1457,6 +1457,54 @@ mod tests {
     }
 
     #[test]
+    fn decimal_typed_literal_takes_its_type_from_the_text() {
+        // Trino: DECIMAL '1.3' is decimal(2,1); the digits decide p and s.
+        for (sql, value, precision, scale) in [
+            ("SELECT DECIMAL '1.3'", 13, 2, 1),
+            ("SELECT DECIMAL '-0.05'", -5, 2, 2),
+            ("SELECT DECIMAL '12'", 12, 2, 0),
+            ("SELECT DECIMAL '0012.50'", 1250, 4, 2),
+            ("SELECT DECIMAL '.5'", 5, 1, 1),
+        ] {
+            let Statement::Query { query, .. } = parse(sql).unwrap() else {
+                panic!("expected Query for {sql}");
+            };
+            match &select_body(&query).projection[0] {
+                SelectItem::UnnamedExpr(Expr::Literal {
+                    value:
+                        ScalarValue::Decimal128 {
+                            value: v,
+                            precision: p,
+                            scale: s,
+                        },
+                    ..
+                }) => assert_eq!((*v, *p, *s), (value, precision, scale), "{sql}"),
+                other => panic!("{sql}: expected a decimal literal, got {other:?}"),
+            }
+        }
+        assert!(parse("SELECT DECIMAL 'abc'").is_err());
+    }
+
+    #[test]
+    fn cast_to_bare_decimal_keeps_scale_zero() {
+        // Unlike the typed literal, CAST('1.3' AS DECIMAL) is decimal(38,0)
+        // in Trino (it yields 1).
+        let Statement::Query { query, .. } = parse("SELECT CAST('1.3' AS DECIMAL)").unwrap() else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => assert_eq!(
+                *data_type,
+                DataType::Decimal128 {
+                    precision: 38,
+                    scale: 0
+                }
+            ),
+            other => panic!("expected cast, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_typed_string_date_span() {
         let stmt = parse("SELECT DATE '1998-12-01'").unwrap();
         let Statement::Query { query, .. } = stmt else {

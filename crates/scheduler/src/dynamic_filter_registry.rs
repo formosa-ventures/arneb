@@ -68,22 +68,25 @@ impl DynamicFilterServiceRegistry {
                 Ok(guard) => {
                     let waiting = guard.dfrpc_waiting_summary();
                     if waiting.is_empty() {
-                        eprintln!(
-                            "[DFRPC] coord registry unregister query_id={} waiting=none",
+                        tracing::debug!(
+                            target: "arneb::dynamic_filter",
+                            "coord registry unregister query_id={} waiting=none",
                             query_id
                         );
                     } else {
                         for entry in waiting {
-                            eprintln!(
-                                "[DFRPC] coord registry unregister query_id={} still_waiting {}",
+                            tracing::debug!(
+                                target: "arneb::dynamic_filter",
+                                "coord registry unregister query_id={} still_waiting {}",
                                 query_id, entry
                             );
                         }
                     }
                 }
                 Err(_) => {
-                    eprintln!(
-                        "[DFRPC] coord registry unregister query_id={} waiting=unknown service_locked",
+                    tracing::debug!(
+                        target: "arneb::dynamic_filter",
+                        "coord registry unregister query_id={} waiting=unknown service_locked",
                         query_id
                     );
                 }
@@ -110,8 +113,9 @@ impl DynamicFilterServiceRegistry {
                 "no dynamic filter service registered for query {query_id}"
             ))
         })?;
-        eprintln!(
-            "[DFRPC] coord registry route_report query_id={} df_id={} partition_idx={} domain={}",
+        tracing::debug!(
+            target: "arneb::dynamic_filter",
+            "coord registry route_report query_id={} df_id={} partition_idx={} domain={}",
             query_id,
             df_id,
             partition_idx,

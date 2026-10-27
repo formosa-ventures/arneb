@@ -1559,6 +1559,9 @@ impl<'a> QueryPlanner<'a> {
                 ctx.add_table_columns(Some(alias.as_str()), &schema);
                 Ok((plan, ctx))
             }
+            ast::TableFactor::NestedJoin(inner) => {
+                Box::pin(self.plan_table_with_joins(inner)).await
+            }
         }
     }
 

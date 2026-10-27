@@ -14,6 +14,16 @@ ignore = [
     # through serde_yaml <- pilota-build/volo-build <- hive-metastore-thrift-build,
     # the offline Thrift codegen tool, so it is never linked into arneb.
     "RUSTSEC-2024-0449",
+    # zstd 0.13.3 / zstd-safe 7.3.0 stay in the tree through apache-avro 0.22
+    # (iceberg) and the orc-rust git pin; neither has a zstd 0.14 release yet.
+    # Remove these once both move (#199).
+    # with_context constructors only; avro and orc use Decoder::new / bulk.
+    "RUSTSEC-2026-0391",
+    # seekable feature only, which is not enabled.
+    "RUSTSEC-2026-0398",
+    # Reachable via the streaming Decoder on a corrupt legacy frame, which
+    # needs write access to the data lake. Accepted until #199.
+    "RUSTSEC-2026-0403",
 ]
 
 [licenses]

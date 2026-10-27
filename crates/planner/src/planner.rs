@@ -2573,7 +2573,18 @@ impl<'a> QueryPlanner<'a> {
 fn is_aggregate_function(name: &str) -> bool {
     matches!(
         name.to_uppercase().as_str(),
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BOOL_OR"
+        "COUNT"
+            | "SUM"
+            | "AVG"
+            | "MIN"
+            | "MAX"
+            | "BOOL_OR"
+            | "STDDEV_SAMP"
+            | "STDDEV"
+            | "STDDEV_POP"
+            | "VAR_SAMP"
+            | "VARIANCE"
+            | "VAR_POP"
     )
 }
 

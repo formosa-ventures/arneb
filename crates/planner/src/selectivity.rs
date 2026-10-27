@@ -367,7 +367,18 @@ fn is_aggregate_function_call(expr: &PlanExpr) -> bool {
     match expr {
         PlanExpr::Function { name, .. } => matches!(
             name.to_uppercase().as_str(),
-            "SUM" | "COUNT" | "AVG" | "MIN" | "MAX" | "BOOL_OR"
+            "SUM"
+                | "COUNT"
+                | "AVG"
+                | "MIN"
+                | "MAX"
+                | "BOOL_OR"
+                | "STDDEV_SAMP"
+                | "STDDEV"
+                | "STDDEV_POP"
+                | "VAR_SAMP"
+                | "VARIANCE"
+                | "VAR_POP"
         ),
         PlanExpr::Cast { expr, .. } => is_aggregate_function_call(expr),
         PlanExpr::BinaryOp { left, right, .. } => {

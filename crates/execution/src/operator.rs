@@ -679,8 +679,9 @@ impl LateDomain {
             Err(TryRecvError::Empty) => return None,
         };
         *guard = None;
-        eprintln!(
-            "[DFRPC] scan late_resolved subscribed_df_id={} applied={}",
+        tracing::debug!(
+            target: "arneb::dynamic_filter",
+            "scan late_resolved subscribed_df_id={} applied={}",
             self.df_id,
             outcome.is_some()
         );
@@ -821,8 +822,9 @@ impl ScanExec {
         };
         let timeout = self.dynamic_filtering_wait_timeout;
         for consumer in awaited {
-            eprintln!(
-                "[DFRPC] scan subscribe df_id={} column_index={} column_name={}",
+            tracing::debug!(
+                target: "arneb::dynamic_filter",
+                "scan subscribe df_id={} column_index={} column_name={}",
                 consumer.id, consumer.column_index, consumer.column_name
             );
             let Some(column_name) = self.consumer_source_column(consumer) else {
@@ -839,8 +841,9 @@ impl ScanExec {
                         arneb_common::Domain::Bloom(_) => "Bloom".to_string(),
                         arneb_common::Domain::All => "All".to_string(),
                     };
-                    eprintln!(
-                        "[DFRPC] scan resolved subscribed_df_id={} domain={}",
+                    tracing::debug!(
+                        target: "arneb::dynamic_filter",
+                        "scan resolved subscribed_df_id={} domain={}",
                         consumer.id, domain_variant
                     );
                     out.resolved.push(DynamicFilterDomain {
@@ -850,7 +853,7 @@ impl ScanExec {
                     });
                 }
                 Ok(Err(_)) => {
-                    eprintln!("[DFRPC] scan recv_closed subscribed_df_id={}", consumer.id);
+                    tracing::debug!(target: "arneb::dynamic_filter","scan recv_closed subscribed_df_id={}", consumer.id);
                     // Sender dropped before resolution because the
                     // query/worker-side collector went away. Fall
                     // through to static-filter-only behaviour.
@@ -860,8 +863,9 @@ impl ScanExec {
                     );
                 }
                 Err(_) => {
-                    eprintln!(
-                        "[DFRPC] scan timeout subscribed_df_id={} timeout_ms={} deferred={}",
+                    tracing::debug!(
+                        target: "arneb::dynamic_filter",
+                        "scan timeout subscribed_df_id={} timeout_ms={} deferred={}",
                         consumer.id,
                         timeout.as_millis(),
                         consumer.probe_side

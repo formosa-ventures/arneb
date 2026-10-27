@@ -178,8 +178,9 @@ impl DynamicFilterCollector {
             Some(Slot::Resolved(_)) => "resolved",
             None => "none",
         };
-        eprintln!(
-            "[DFRPC] worker collector insert df_id={} domain={} prior_slot={}",
+        tracing::debug!(
+            target: "arneb::dynamic_filter",
+            "worker collector insert df_id={} domain={} prior_slot={}",
             df_id,
             dfrpc_domain_variant(&domain),
             prior_slot
@@ -187,8 +188,9 @@ impl DynamicFilterCollector {
         match inner.remove(&df_id) {
             Some(Slot::Pending(txs)) => {
                 for tx in txs {
-                    eprintln!(
-                        "[DFRPC] worker collector fire_receiver df_id={} domain={}",
+                    tracing::debug!(
+                        target: "arneb::dynamic_filter",
+                        "worker collector fire_receiver df_id={} domain={}",
                         df_id,
                         dfrpc_domain_variant(&domain)
                     );
@@ -220,8 +222,9 @@ impl DynamicFilterCollector {
             Some(Slot::Resolved(_)) => "resolved",
             None => "none",
         };
-        eprintln!(
-            "[DFRPC] worker collector take_receiver subscribed_df_id={} prior_slot={}",
+        tracing::debug!(
+            target: "arneb::dynamic_filter",
+            "worker collector take_receiver subscribed_df_id={} prior_slot={}",
             df_id, prior_slot
         );
         match inner.get_mut(&df_id) {

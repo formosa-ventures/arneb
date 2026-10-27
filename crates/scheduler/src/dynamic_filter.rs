@@ -96,8 +96,9 @@ impl DynamicFilterService {
     /// side); only intentional in test scenarios.
     pub fn register_query(&mut self, filter_ids: &[(DynamicFilterId, StageId, u32)]) {
         for (df_id, stage_id, expected) in filter_ids {
-            eprintln!(
-                "[DFRPC] coord service register df_id={} stage_id={} expected_task_count={}",
+            tracing::debug!(
+                target: "arneb::dynamic_filter",
+                "coord service register df_id={} stage_id={} expected_task_count={}",
                 df_id, stage_id, expected
             );
             self.states.insert(
@@ -132,8 +133,9 @@ impl DynamicFilterService {
             ExecutionError::InvalidOperation(format!("dynamic filter {df_id} not registered"))
         })?;
 
-        eprintln!(
-            "[DFRPC] coord service report df_id={} partition_idx={} domain={} reported_before={} expected_task_count={}",
+        tracing::debug!(
+            target: "arneb::dynamic_filter",
+            "coord service report df_id={} partition_idx={} domain={} reported_before={} expected_task_count={}",
             df_id,
             partition_idx,
             dfrpc_domain_variant(&partial),
@@ -161,8 +163,9 @@ impl DynamicFilterService {
             .or_insert(partial);
 
         if (state.partitions.len() as u32) == state.expected_partitions {
-            eprintln!(
-                "[DFRPC] coord service merge_start df_id={} reports={} expected_task_count={}",
+            tracing::debug!(
+                target: "arneb::dynamic_filter",
+                "coord service merge_start df_id={} reports={} expected_task_count={}",
                 df_id,
                 state.partitions.len(),
                 state.expected_partitions
@@ -174,8 +177,9 @@ impl DynamicFilterService {
                 .cloned()
                 .reduce(|acc, next| acc.union(next, max))
                 .unwrap_or_else(Domain::all);
-            eprintln!(
-                "[DFRPC] coord service resolved df_id={} domain={} subscribers={}",
+            tracing::debug!(
+                target: "arneb::dynamic_filter",
+                "coord service resolved df_id={} domain={} subscribers={}",
                 df_id,
                 dfrpc_domain_variant(&merged),
                 state.notify.len()
@@ -185,8 +189,9 @@ impl DynamicFilterService {
                 let _ = tx.send(merged.clone());
             }
         } else {
-            eprintln!(
-                "[DFRPC] coord service waiting df_id={} reports={} expected_task_count={}",
+            tracing::debug!(
+                target: "arneb::dynamic_filter",
+                "coord service waiting df_id={} reports={} expected_task_count={}",
                 df_id,
                 state.partitions.len(),
                 state.expected_partitions

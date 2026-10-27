@@ -521,8 +521,9 @@ async fn run() -> Result<()> {
             let df_registry_for_cb = df_registry.clone();
             state.set_df_report_callback(std::sync::Arc::new(
                 move |req: arneb_rpc::ReportDynamicFilterRequest| {
-                    eprintln!(
-                        "[DFRPC] coord flight received_report query_id={} task_id={} partition_idx={} df_id={} domain={}",
+                    tracing::debug!(
+                        target: "arneb::dynamic_filter",
+                        "coord flight received_report query_id={} task_id={} partition_idx={} df_id={} domain={}",
                         req.query_id,
                         req.task_id,
                         req.partition_idx,
@@ -728,8 +729,9 @@ async fn run() -> Result<()> {
         let tm_for_notify = tm.clone();
         flight_state.set_df_notify_callback(Arc::new(
             move |req: arneb_rpc::NotifyDynamicFilterRequest| {
-                eprintln!(
-                    "[DFRPC] worker flight received_notify query_id={} task_id={} df_id={} domain={}",
+                tracing::debug!(
+                    target: "arneb::dynamic_filter",
+                    "worker flight received_notify query_id={} task_id={} df_id={} domain={}",
                     req.query_id,
                     req.task_id,
                     req.df_id,

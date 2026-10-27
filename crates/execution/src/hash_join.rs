@@ -2201,6 +2201,13 @@ impl HashJoinExec {
         partition: usize,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
         let t_pp = Instant::now();
+        // Each join partition builds from one slice of the keys, so none of
+        // them has the whole domain to publish cross-fragment (#192). Every
+        // partition of the task reports under the same index and only the
+        // first report counts, so partition 0 publishes for all of them.
+        if partition == 0 {
+            self.publish_all_cross_fragment_dfs();
+        }
         let right_stream = self.right.execute(partition).await?;
 
         if !self.multipass_supported() {
@@ -3363,6 +3370,7 @@ impl HashJoinExec {
         let left_filterable = matches!(self.join_type, ast::JoinType::Inner | ast::JoinType::Right);
         let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
         if !self.dynamic_filtering_enabled
+            || self.is_hash_copartitioned()
             || !left_filterable
             || df_disabled
             || self.dynamic_filter_producers.is_empty()
@@ -3838,6 +3846,7 @@ impl HashJoinExec {
     fn publish_grace_cross_fragment_dfs(&self, domains_per_slot: &[arneb_common::Domain]) {
         let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
         if !self.dynamic_filtering_enabled
+            || self.is_hash_copartitioned()
             || df_disabled
             || self.dynamic_filter_producers.is_empty()
         {
@@ -3885,6 +3894,35 @@ impl HashJoinExec {
                 }
             });
         }
+    }
+
+    /// Publish `Domain::All` for every declared producer: the sound no-op
+    /// that still completes the coordinator's per-task rendezvous.
+    ///
+    /// A hash-copartitioned join builds each partition from one slice of the
+    /// keys, and every partition of a task reports under the same task
+    /// partition index. The coordinator resolves a filter once each task has
+    /// reported, so a partial slice would become the whole filter and the
+    /// probe-side scans would drop rows. The per-partition path publishes
+    /// this instead, and the slice-publishing paths skip copartitioned joins.
+    fn publish_all_cross_fragment_dfs(&self) {
+        let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
+        if !self.dynamic_filtering_enabled
+            || df_disabled
+            || self.dynamic_filter_producers.is_empty()
+        {
+            return;
+        }
+        let Some(publisher) = &self.dynamic_filter_publisher else {
+            return;
+        };
+        let publisher = publisher.clone();
+        let ids: Vec<_> = self.dynamic_filter_producers.iter().map(|p| p.id).collect();
+        tokio::spawn(async move {
+            for id in ids {
+                publisher.publish(id, arneb_common::Domain::All).await;
+            }
+        });
     }
 
     async fn publish_broadcast_cross_fragment_dfs(
@@ -7042,6 +7080,98 @@ mod tests {
                 );
             }
             other => panic!("expected DistinctValues, got {other:?}"),
+        }
+
+        std::env::remove_var("ARNEB_BROADCAST_DF");
+        std::env::remove_var("ARNEB_GRACE_HJ");
+    }
+
+    #[tokio::test]
+    async fn copartitioned_join_publishes_no_partial_cross_fragment_domain() {
+        // #192: every join partition of a task reports under the task's
+        // partition index, and the coordinator resolves on the first report
+        // per task, so a partition's key slice must never be published.
+        let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        let _grace = env_test_guard().await;
+        std::env::set_var("ARNEB_BROADCAST_DF", "true");
+        std::env::remove_var("ARNEB_DISABLE_DF");
+
+        let key = |name: &str| {
+            vec![PlanExpr::Column {
+                index: 0,
+                name: name.into(),
+                span: None,
+            }]
+        };
+        for grace in ["1", "0"] {
+            std::env::set_var("ARNEB_GRACE_HJ", grace);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let publisher = Arc::new(CapturingPartitionDynamicFilterPublisher {
+                task_idx: 0,
+                calls: Arc::clone(&calls),
+            });
+            let join = HashJoinExec {
+                left: Arc::new(crate::RepartitionExec::new(
+                    left_source(),
+                    Partitioning::Hash(key("id"), 2),
+                )),
+                right: Arc::new(crate::RepartitionExec::new(
+                    right_source(),
+                    Partitioning::Hash(key("id"), 2),
+                )),
+                join_type: ast::JoinType::Inner,
+                left_keys: vec![0],
+                right_keys: vec![0],
+                residual: None,
+                build_state: Default::default(),
+                peak_build_bytes: Default::default(),
+                memory_pool: Arc::new(crate::memory_pool::UnboundedMemoryPool::new()),
+                dynamic_filter_producers: vec![arneb_planner::DynamicFilterProducer {
+                    id: DynamicFilterId(21),
+                    build_index: 0,
+                    probe_index: 0,
+                    column_name: "id".into(),
+                }],
+                dynamic_filter_publisher: Some(publisher),
+                dynamic_filtering_enabled: true,
+                df_targets: Vec::new(),
+            };
+            assert!(join.is_hash_copartitioned());
+
+            let mut rows = 0;
+            for partition in 0..2 {
+                let stream = join.execute(partition).await.unwrap();
+                rows += collect_stream(stream)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum::<usize>();
+            }
+            assert_eq!(rows, 2, "ARNEB_GRACE_HJ={grace}: ids 2 and 3 match");
+
+            for _ in 0..50 {
+                if !calls.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // Let any late slice publish land before checking.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let calls = calls.lock().unwrap();
+            assert_eq!(
+                calls.len(),
+                1,
+                "ARNEB_GRACE_HJ={grace}: only partition 0 publishes, once per producer"
+            );
+            for (id, partition_idx, domain) in calls.iter() {
+                assert_eq!((*id, *partition_idx), (DynamicFilterId(21), 0));
+                assert_eq!(
+                    *domain,
+                    Domain::All,
+                    "ARNEB_GRACE_HJ={grace}: a partial domain was published"
+                );
+            }
         }
 
         std::env::remove_var("ARNEB_BROADCAST_DF");

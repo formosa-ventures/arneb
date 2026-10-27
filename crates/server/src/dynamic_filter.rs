@@ -55,8 +55,9 @@ impl FlightDynamicFilterPublisher {
         partition_idx: u32,
         domain: Domain,
     ) {
-        eprintln!(
-            "[DFRPC] worker publish query_id={} task_id={} partition_idx={} df_id={} domain={}",
+        tracing::debug!(
+            target: "arneb::dynamic_filter",
+            "worker publish query_id={} task_id={} partition_idx={} df_id={} domain={}",
             self.query_id,
             self.task_id,
             partition_idx,

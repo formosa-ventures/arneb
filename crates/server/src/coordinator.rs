@@ -192,8 +192,9 @@ impl QueryCoordinator {
             .map(|p| (p.df_id, p.stage_id, p.task_count))
             .collect();
         for (df_id, stage_id, task_count) in &register_entries {
-            eprintln!(
-                "[DFRPC] coord register_entry query_id={} df_id={} producer_stage_id={} expected_task_count={}",
+            tracing::debug!(
+                target: "arneb::dynamic_filter",
+                "coord register_entry query_id={} df_id={} producer_stage_id={} expected_task_count={}",
                 query_id, df_id, stage_id, task_count
             );
         }
@@ -297,15 +298,17 @@ impl QueryCoordinator {
                         Err(_) => {
                             // Service dropped before resolution (query ended
                             // early). Consumer-side timeouts handle this.
-                            eprintln!(
-                                "[DFRPC] coord pusher receiver_closed query_id={} df_id={}",
+                            tracing::debug!(
+                                target: "arneb::dynamic_filter",
+                                "coord pusher receiver_closed query_id={} df_id={}",
                                 query_id_for_push, df_id
                             );
                             return;
                         }
                     };
-                    eprintln!(
-                        "[DFRPC] coord pusher resolved query_id={} df_id={} domain={} targets={}",
+                    tracing::debug!(
+                        target: "arneb::dynamic_filter",
+                        "coord pusher resolved query_id={} df_id={} domain={} targets={}",
                         query_id_for_push,
                         df_id,
                         dfrpc_domain_variant(&domain),
@@ -318,8 +321,9 @@ impl QueryCoordinator {
                             df_id,
                             domain: domain.clone(),
                         };
-                        eprintln!(
-                            "[DFRPC] coord notify_send query_id={} task_id={} df_id={} addr={} domain={}",
+                        tracing::debug!(
+                            target: "arneb::dynamic_filter",
+                            "coord notify_send query_id={} task_id={} df_id={} addr={} domain={}",
                             query_id_for_push,
                             task_id,
                             df_id,
@@ -335,8 +339,9 @@ impl QueryCoordinator {
                                 "dynamic filter notify push failed"
                             );
                         } else {
-                            eprintln!(
-                                "[DFRPC] coord notify_ok query_id={} task_id={} df_id={}",
+                            tracing::debug!(
+                                target: "arneb::dynamic_filter",
+                                "coord notify_ok query_id={} task_id={} df_id={}",
                                 query_id_for_push, task_id, df_id
                             );
                         }

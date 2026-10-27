@@ -734,9 +734,25 @@ impl LogicalPlan {
             LogicalPlan::TableScan { schema, .. } => schema.clone(),
             LogicalPlan::Projection { schema, .. } => schema.clone(),
             LogicalPlan::Filter { input, .. } => input.schema(),
-            LogicalPlan::Join { left, right, .. } => {
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                ..
+            } => {
                 let mut schema = left.schema();
-                schema.extend(right.schema());
+                if matches!(join_type, ast::JoinType::Right | ast::JoinType::Full) {
+                    for col in &mut schema {
+                        col.nullable = true;
+                    }
+                }
+                let mut right_schema = right.schema();
+                if matches!(join_type, ast::JoinType::Left | ast::JoinType::Full) {
+                    for col in &mut right_schema {
+                        col.nullable = true;
+                    }
+                }
+                schema.extend(right_schema);
                 schema
             }
             LogicalPlan::Aggregate { schema, .. } => schema.clone(),

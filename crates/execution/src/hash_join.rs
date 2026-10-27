@@ -1759,7 +1759,18 @@ pub(crate) const DEFAULT_DYNAMIC_FILTER_CAP_PRIMITIVE: usize = 50_000;
 impl ExecutionPlan for HashJoinExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         let mut schema = self.left.schema();
-        schema.extend(self.right.schema());
+        if matches!(self.join_type, ast::JoinType::Right | ast::JoinType::Full) {
+            for col in &mut schema {
+                col.nullable = true;
+            }
+        }
+        let mut right_schema = self.right.schema();
+        if matches!(self.join_type, ast::JoinType::Left | ast::JoinType::Full) {
+            for col in &mut right_schema {
+                col.nullable = true;
+            }
+        }
+        schema.extend(right_schema);
         schema
     }
 

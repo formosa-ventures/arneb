@@ -2202,8 +2202,12 @@ impl HashJoinExec {
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
         let t_pp = Instant::now();
         // Each join partition builds from one slice of the keys, so none of
-        // them has the whole domain to publish cross-fragment (#192).
-        self.publish_all_cross_fragment_dfs();
+        // them has the whole domain to publish cross-fragment (#192). Every
+        // partition of the task reports under the same index and only the
+        // first report counts, so partition 0 publishes for all of them.
+        if partition == 0 {
+            self.publish_all_cross_fragment_dfs();
+        }
         let right_stream = self.right.execute(partition).await?;
 
         if !self.multipass_supported() {
@@ -3365,8 +3369,8 @@ impl HashJoinExec {
     fn emit_cross_fragment_dfs(&self, right_combined: Option<&RecordBatch>) {
         let left_filterable = matches!(self.join_type, ast::JoinType::Inner | ast::JoinType::Right);
         let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
-        if self.is_hash_copartitioned()
-            || !self.dynamic_filtering_enabled
+        if !self.dynamic_filtering_enabled
+            || self.is_hash_copartitioned()
             || !left_filterable
             || df_disabled
             || self.dynamic_filter_producers.is_empty()
@@ -3841,8 +3845,8 @@ impl HashJoinExec {
     /// looked up in `right_keys` to find the matching collector slot.
     fn publish_grace_cross_fragment_dfs(&self, domains_per_slot: &[arneb_common::Domain]) {
         let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
-        if self.is_hash_copartitioned()
-            || !self.dynamic_filtering_enabled
+        if !self.dynamic_filtering_enabled
+            || self.is_hash_copartitioned()
             || df_disabled
             || self.dynamic_filter_producers.is_empty()
         {
@@ -7147,7 +7151,7 @@ mod tests {
             assert_eq!(rows, 2, "ARNEB_GRACE_HJ={grace}: ids 2 and 3 match");
 
             for _ in 0..50 {
-                if calls.lock().unwrap().len() >= 2 {
+                if !calls.lock().unwrap().is_empty() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -7155,9 +7159,10 @@ mod tests {
             // Let any late slice publish land before checking.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let calls = calls.lock().unwrap();
-            assert!(
-                !calls.is_empty(),
-                "ARNEB_GRACE_HJ={grace}: nothing published"
+            assert_eq!(
+                calls.len(),
+                1,
+                "ARNEB_GRACE_HJ={grace}: only partition 0 publishes, once per producer"
             );
             for (id, partition_idx, domain) in calls.iter() {
                 assert_eq!((*id, *partition_idx), (DynamicFilterId(21), 0));

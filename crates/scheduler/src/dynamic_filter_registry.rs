@@ -63,6 +63,10 @@ impl DynamicFilterServiceRegistry {
     /// dropped (`oneshot::Receiver` returns `RecvError`).
     pub fn unregister(&self, query_id: &QueryId) {
         let removed = self.inner.write().unwrap().remove(query_id);
+        // The rest only logs; skip the lock and the summary when nobody reads it.
+        if !tracing::enabled!(target: "arneb::dynamic_filter", tracing::Level::DEBUG) {
+            return;
+        }
         if let Some(svc) = removed {
             match svc.try_lock() {
                 Ok(guard) => {

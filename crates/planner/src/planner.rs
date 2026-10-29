@@ -471,7 +471,17 @@ impl<'a> QueryPlanner<'a> {
         exprs: &[PlanExpr],
     ) -> Result<Vec<SortExpr>, PlanError> {
         let mut input_ctx = self.context_from_plan(input);
-        if let Some(items) = select_items {
+        // Restore the qualifiers of selected columns. A wildcard expands to
+        // several expressions, so items and exprs only line up without one.
+        if let Some(items) = select_items.filter(|items| {
+            items.len() == exprs.len()
+                && !items.iter().any(|item| {
+                    matches!(
+                        item,
+                        ast::SelectItem::Wildcard | ast::SelectItem::QualifiedWildcard(_)
+                    )
+                })
+        }) {
             for (item, expr) in items.iter().zip(exprs) {
                 if let (
                     ast::SelectItem::UnnamedExpr(ast::Expr::Column { col_ref, .. }),

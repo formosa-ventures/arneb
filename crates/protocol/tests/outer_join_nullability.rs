@@ -161,3 +161,28 @@ async fn inner_join_over_not_null_columns_still_works() {
         table(&[&["1", "10"]])
     );
 }
+
+#[tokio::test]
+async fn order_by_after_a_wildcard_does_not_take_another_tables_qualifier() {
+    // `t.*` expands to two expressions, so `b.x` is the third expression but
+    // the second select item. Pairing items with expressions by position
+    // would label `t.x` as `b.x` and sort by the wrong column.
+    let sql = "WITH t AS (SELECT v AS w, x FROM a) \
+               SELECT t.*, b.x FROM t, b ORDER BY b.x + 0, 1";
+    let (cm, cr) = setup();
+    let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::new());
+    if let Ok((_plan, batches)) =
+        arneb_protocol::__private::execute_query(sql, &cm, &cr, None, &pool).await
+    {
+        let b_x: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).map(move |r| (batch, r)))
+            .map(|(batch, r)| array_value_to_string(batch.column(2), r).unwrap())
+            .collect();
+        assert_eq!(
+            b_x,
+            ["1", "1", "1", "4", "4", "4"],
+            "sorted by the wrong column"
+        );
+    }
+}

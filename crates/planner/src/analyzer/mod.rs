@@ -402,7 +402,23 @@ pub(crate) fn function_return_type(
         "TO_REGTYPE" => Some(DataType::Int64),
 
         // Math — preserve integer-ness when the input is integral.
-        "ROUND" | "CEIL" | "CEILING" | "FLOOR" | "ABS" => args
+        "ROUND" => args
+            .first()
+            .and_then(|a| plan_expr_type(a, schema))
+            .map(|t| match t {
+                DataType::Decimal128 { precision, scale } => DataType::Decimal128 {
+                    precision: if args.len() > 1 {
+                        precision.saturating_add(1).min(38)
+                    } else {
+                        (precision as i16 - scale as i16 + 1).min(38) as u8
+                    },
+                    scale: if args.len() > 1 { scale } else { 0 },
+                },
+                DataType::Int32 | DataType::Int64 => DataType::Int64,
+                _ => DataType::Float64,
+            })
+            .or(Some(DataType::Float64)),
+        "CEIL" | "CEILING" | "FLOOR" | "ABS" => args
             .first()
             .and_then(|a| plan_expr_type(a, schema))
             .map(|t| match t {

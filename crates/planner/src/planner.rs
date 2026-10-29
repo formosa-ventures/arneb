@@ -1122,10 +1122,10 @@ impl<'a> QueryPlanner<'a> {
                     negated,
                     ..
                 } => {
-                    let spec = self
+                    let in_specs = self
                         .decorrelate_in_subquery(*expr, *subquery, outer_ctx, negated)
                         .await?;
-                    specs.push(spec);
+                    specs.extend(in_specs);
                 }
                 other => residual.push(other),
             }
@@ -1138,23 +1138,18 @@ impl<'a> QueryPlanner<'a> {
     /// subquery may reference its own FROM tables but not the outer
     /// scope. The subquery must produce exactly one column.
     ///
-    /// Maps to `SemiJoin` (IN) / `AntiJoin` (NOT IN) with
-    /// `left_key = plan_expr(outer_expr, outer_ctx)` and
-    /// `right_key = Column(0)` of the subquery output.
+    /// Maps to `SemiJoin` (IN) / `AntiJoin` (NOT IN). Ordinary joins use
+    /// the outer expression and subquery output as their keys.
     ///
-    /// NOT IN NULL semantics: SQL defines `x NOT IN (S)` as NULL when
-    /// `x` is NULL or any element of `S` is NULL. AntiJoin treats both
-    /// as false (no-match → keep). For TPC-H Q18-style use against
-    /// non-nullable key columns the two coincide; nullable inputs
-    /// would silently disagree with strict SQL, so we accept the
-    /// approximation rather than synthesize the extra NULL-guard.
+    /// Nullable NOT IN also rejects rows when the subquery contains NULL,
+    /// and rejects a NULL outer key when the subquery is nonempty.
     async fn decorrelate_in_subquery(
         &self,
         outer_expr: ast::Expr,
         subquery: ast::Query,
         outer_ctx: &PlanningContext,
         negated: bool,
-    ) -> Result<SemiJoinSpec, PlanError> {
+    ) -> Result<Vec<SemiJoinSpec>, PlanError> {
         let subplan = self.plan_query(&subquery).await?;
         let sub_schema = subplan.schema();
         if sub_schema.len() != 1 {
@@ -1171,17 +1166,102 @@ impl<'a> QueryPlanner<'a> {
             span: None,
         };
 
-        Ok(SemiJoinSpec {
+        let outer_nullable = match &left_key {
+            PlanExpr::Column { index, .. } => outer_ctx.columns[*index].1.nullable,
+            PlanExpr::Literal { value, .. } => matches!(value, ScalarValue::Null),
+            _ => true,
+        };
+        let mut specs = Vec::new();
+        let null_check_plan = if negated && sub_schema[0].nullable {
+            Some(subplan.clone())
+        } else {
+            None
+        };
+        let nonempty_check_plan = if negated && outer_nullable {
+            Some(subplan.clone())
+        } else {
+            None
+        };
+        specs.push(SemiJoinSpec {
             kind: if negated {
                 SemiJoinKind::Anti
             } else {
                 SemiJoinKind::Semi
             },
             right_plan: subplan,
-            left_key,
+            left_key: left_key.clone(),
             right_key,
             residual: None,
-        })
+        });
+
+        let constant_key = PlanExpr::Literal {
+            value: ScalarValue::Int32(1),
+            span: None,
+        };
+        if let Some(plan) = null_check_plan {
+            specs.push(SemiJoinSpec {
+                kind: SemiJoinKind::Anti,
+                right_plan: LogicalPlan::Limit {
+                    input: Box::new(LogicalPlan::Filter {
+                        input: Box::new(plan),
+                        predicate: PlanExpr::IsNull {
+                            expr: Box::new(PlanExpr::Column {
+                                index: 0,
+                                name: sub_schema[0].name.clone(),
+                                span: None,
+                            }),
+                            span: None,
+                        },
+                    }),
+                    limit: Some(1),
+                    offset: None,
+                },
+                left_key: constant_key.clone(),
+                right_key: constant_key.clone(),
+                residual: None,
+            });
+        }
+        if let Some(plan) = nonempty_check_plan {
+            specs.push(SemiJoinSpec {
+                kind: SemiJoinKind::Anti,
+                right_plan: LogicalPlan::Limit {
+                    input: Box::new(plan),
+                    limit: Some(1),
+                    offset: None,
+                },
+                left_key: constant_key.clone(),
+                right_key: constant_key,
+                residual: Some(PlanExpr::BinaryOp {
+                    left: Box::new(PlanExpr::IsNull {
+                        expr: Box::new(left_key),
+                        span: None,
+                    }),
+                    op: ast::BinaryOp::And,
+                    right: Box::new(PlanExpr::BinaryOp {
+                        left: Box::new(PlanExpr::IsNull {
+                            expr: Box::new(PlanExpr::Column {
+                                index: outer_ctx.columns.len(),
+                                name: sub_schema[0].name.clone(),
+                                span: None,
+                            }),
+                            span: None,
+                        }),
+                        op: ast::BinaryOp::Or,
+                        right: Box::new(PlanExpr::IsNotNull {
+                            expr: Box::new(PlanExpr::Column {
+                                index: outer_ctx.columns.len(),
+                                name: sub_schema[0].name.clone(),
+                                span: None,
+                            }),
+                            span: None,
+                        }),
+                        span: None,
+                    }),
+                    span: None,
+                }),
+            });
+        }
+        Ok(specs)
     }
 
     /// Walk the WHERE AND-tree, replacing correlated scalar subqueries

@@ -499,6 +499,12 @@ fn coerce_expr(
                 let arg = args.pop().expect("one argument");
                 args.push(pad_char_operand(arg, schema));
             }
+            if (name.eq_ignore_ascii_case("substr") || name.eq_ignore_ascii_case("substring"))
+                && (args.len() == 2 || args.len() == 3)
+            {
+                let arg = args.remove(0);
+                args.insert(0, pad_char_operand(arg, schema));
+            }
             Ok(PlanExpr::Function {
                 name,
                 args,

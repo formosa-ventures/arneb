@@ -12,11 +12,11 @@ use arneb_planner::PlanExpr;
 use arneb_sql_parser::ast;
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    NullArray, StringArray,
+    NullArray, StringArray, UInt32Array,
 };
 use arrow::compute::kernels;
 use arrow::datatypes::DataType as ArrowDataType;
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::functions::{default_registry, FunctionRegistry};
 
@@ -886,19 +886,21 @@ fn evaluate_case(
         None => None,
     };
 
-    // Track which rows have already been assigned a result
-    let mut assigned = vec![false; num_rows];
+    let mut remaining: Vec<u32> = (0..num_rows as u32).collect();
     // Collect (condition_mask, result_array) for each WHEN clause
     let mut branches: Vec<(BooleanArray, ArrayRef)> = Vec::new();
 
     for (cond, result) in when_clauses {
-        let cond_bool = if let Some(ref op_arr) = operand_arr {
+        let cond_bool = if remaining.is_empty() {
+            BooleanArray::from(Vec::<bool>::new())
+        } else if let Some(ref op_arr) = operand_arr {
             // Simple CASE: compare operand to condition value
-            let cond_arr = evaluate(cond, batch, registry)?;
-            compare_op(op_arr, &cond_arr, CompareOp::Eq)?
+            let cond_arr = evaluate_case_rows(cond, batch, &remaining, registry)?;
+            let op_arr = arrow::compute::take(op_arr, &UInt32Array::from(remaining.clone()), None)?;
+            compare_op(&op_arr, &cond_arr, CompareOp::Eq)?
         } else {
             // Searched CASE: condition should evaluate to boolean
-            let cond_arr = evaluate(cond, batch, registry)?;
+            let cond_arr = evaluate_case_rows(cond, batch, &remaining, registry)?;
             cond_arr
                 .as_any()
                 .downcast_ref::<BooleanArray>()
@@ -910,32 +912,32 @@ fn evaluate_case(
                 .clone()
         };
 
-        // Mask: only consider rows not yet assigned
-        // A NULL condition is treated as not-matched
-        let effective_mask: BooleanArray = (0..num_rows)
-            .map(|i| {
-                if assigned[i] || cond_bool.is_null(i) {
-                    Some(false)
-                } else {
-                    Some(cond_bool.value(i))
-                }
-            })
-            .collect();
-
-        // Mark newly assigned rows
-        for (i, flag) in assigned.iter_mut().enumerate().take(num_rows) {
-            if !effective_mask.is_null(i) && effective_mask.value(i) {
-                *flag = true;
+        let mut matched = Vec::new();
+        let mut next_remaining = Vec::new();
+        for (i, row) in remaining.into_iter().enumerate() {
+            if !cond_bool.is_null(i) && cond_bool.value(i) {
+                matched.push(row);
+            } else {
+                next_remaining.push(row);
             }
         }
-
-        let result_arr = evaluate(result, batch, registry)?;
+        remaining = next_remaining;
+        let mut mask = vec![false; num_rows];
+        for &row in &matched {
+            mask[row as usize] = true;
+        }
+        let effective_mask = BooleanArray::from(mask);
+        let result_arr = evaluate_case_rows(result, batch, &matched, registry)?;
+        let result_arr = expand_case_rows(&result_arr, &matched, num_rows)?;
         branches.push((effective_mask, result_arr));
     }
 
     // Evaluate ELSE if provided
     let else_arr = match else_result {
-        Some(el) => Some(evaluate(el, batch, registry)?),
+        Some(el) => {
+            let arr = evaluate_case_rows(el, batch, &remaining, registry)?;
+            Some(expand_case_rows(&arr, &remaining, num_rows)?)
+        }
         None => None,
     };
 
@@ -1012,6 +1014,39 @@ fn evaluate_case(
     let result = arrow::compute::interleave(&source_refs, &indices)?;
 
     Ok(result)
+}
+
+fn evaluate_case_rows(
+    expr: &PlanExpr,
+    batch: &RecordBatch,
+    rows: &[u32],
+    registry: Option<&FunctionRegistry>,
+) -> Result<ArrayRef, ExecutionError> {
+    let indices = UInt32Array::from(rows.to_vec());
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| arrow::compute::take(column, &indices, None))
+        .collect::<Result<Vec<_>, _>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+    let selected = RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
+    evaluate(expr, &selected, registry)
+}
+
+fn expand_case_rows(
+    arr: &ArrayRef,
+    rows: &[u32],
+    num_rows: usize,
+) -> Result<ArrayRef, ExecutionError> {
+    let mut indices = vec![None; num_rows];
+    for (index, &row) in rows.iter().enumerate() {
+        indices[row as usize] = Some(index as u32);
+    }
+    Ok(arrow::compute::take(
+        arr,
+        &UInt32Array::from(indices),
+        None,
+    )?)
 }
 
 /// Create a null array of the given type and length.

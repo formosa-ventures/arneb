@@ -746,7 +746,31 @@ impl<'a> QueryPlanner<'a> {
 
         // 3. GROUP BY / HAVING → Aggregate
         // Also handle implicit aggregate: SELECT SUM(x) FROM t (no GROUP BY but has aggregates)
-        let group_by_ast = resolve_group_by_ordinals(body)?;
+        let mut group_by_ast = resolve_group_by_ordinals(body)?;
+        let rollup = if group_by_ast.len() == 1 {
+            match &group_by_ast[0] {
+                ast::Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("ROLLUP") => {
+                    let mut keys = Vec::with_capacity(args.len());
+                    for arg in args {
+                        match arg {
+                            ast::FunctionArg::Unnamed(expr) => keys.push(expr.clone()),
+                            _ => {
+                                return Err(PlanError::invalid_expression(
+                                    "ROLLUP requires expressions",
+                                ))
+                            }
+                        }
+                    }
+                    Some(keys)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(keys) = &rollup {
+            group_by_ast = keys.clone();
+        }
         let has_group_by = !group_by_ast.is_empty();
         let mut aggr_exprs = self.collect_aggregates(&body.projection, &ctx).await?;
         // Aggregates can appear in HAVING without being in SELECT (e.g.
@@ -778,11 +802,76 @@ impl<'a> QueryPlanner<'a> {
                 schema.push(self.expr_to_column_info(agg, &ctx));
             }
 
-            plan = LogicalPlan::Aggregate {
-                input: Box::new(plan),
-                group_by: group_by.clone(),
-                aggr_exprs: aggr_exprs.clone(),
-                schema: schema.clone(),
+            plan = if rollup.is_some() {
+                let key_count = group_by.len();
+                let mut output_schema = schema.clone();
+                for col in output_schema.iter_mut().take(key_count) {
+                    col.nullable = true;
+                }
+                for key in &group_by_ast {
+                    output_schema.push(ColumnInfo {
+                        name: format!("GROUPING({})", format_ast_unqualified(key)),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    });
+                }
+                let mut levels = Vec::with_capacity(key_count + 1);
+                for keep in (0..=key_count).rev() {
+                    let mut level_schema = schema[..keep].to_vec();
+                    level_schema.extend_from_slice(&schema[key_count..]);
+                    let aggregate = LogicalPlan::Aggregate {
+                        input: Box::new(plan.clone()),
+                        group_by: group_by[..keep].to_vec(),
+                        aggr_exprs: aggr_exprs.clone(),
+                        schema: level_schema.clone(),
+                    };
+                    let mut exprs = Vec::with_capacity(output_schema.len());
+                    for (index, col) in schema.iter().take(key_count).enumerate() {
+                        exprs.push(if index < keep {
+                            PlanExpr::Column {
+                                index,
+                                name: col.name.clone(),
+                                span: None,
+                            }
+                        } else {
+                            PlanExpr::Cast {
+                                expr: Box::new(PlanExpr::Literal {
+                                    value: ScalarValue::Null,
+                                    span: None,
+                                }),
+                                data_type: col.data_type.clone(),
+                                span: None,
+                            }
+                        });
+                    }
+                    for (index, col) in level_schema.iter().enumerate().skip(keep) {
+                        exprs.push(PlanExpr::Column {
+                            index,
+                            name: col.name.clone(),
+                            span: None,
+                        });
+                    }
+                    for index in 0..key_count {
+                        exprs.push(PlanExpr::Literal {
+                            value: ScalarValue::Int64(i64::from(index >= keep)),
+                            span: None,
+                        });
+                    }
+                    levels.push(LogicalPlan::Projection {
+                        input: Box::new(aggregate),
+                        exprs,
+                        schema: output_schema.clone(),
+                    });
+                }
+                schema = output_schema;
+                LogicalPlan::UnionAll { inputs: levels }
+            } else {
+                LogicalPlan::Aggregate {
+                    input: Box::new(plan),
+                    group_by: group_by.clone(),
+                    aggr_exprs: aggr_exprs.clone(),
+                    schema: schema.clone(),
+                }
             };
 
             // Update context to reflect aggregate output.
@@ -827,7 +916,7 @@ impl<'a> QueryPlanner<'a> {
             }
         }
         if !window_calls.is_empty() {
-            let num_group_by = has_aggregates.then_some(body.group_by.len());
+            let num_group_by = has_aggregates.then_some(group_by_ast.len());
             plan = self
                 .plan_windows(plan, &mut ctx, &window_calls, num_group_by)
                 .await?;
@@ -1851,6 +1940,26 @@ impl<'a> QueryPlanner<'a> {
                 distinct,
                 ..
             } => {
+                if name.eq_ignore_ascii_case("GROUPING") {
+                    if let [ast::FunctionArg::Unnamed(key)] = args.as_slice() {
+                        let marker = format!("GROUPING({})", format_ast_unqualified(key));
+                        if let Some((index, (_, col))) = ctx
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .find(|(_, (_, col))| col.name.eq_ignore_ascii_case(&marker))
+                        {
+                            return Ok(PlanExpr::Column {
+                                index,
+                                name: col.name.clone(),
+                                span: node_span,
+                            });
+                        }
+                    }
+                    return Err(PlanError::invalid_expression(
+                        "GROUPING requires one ROLLUP grouping expression",
+                    ));
+                }
                 if args.is_empty() {
                     if let Some(literal) = session_literal(self.catalog, name, node_span) {
                         return Ok(literal);

@@ -726,6 +726,25 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             })
         }
         sp::Expr::Function(func) => convert_function(func, span),
+        sp::Expr::Rollup(sets) => {
+            let mut args = Vec::with_capacity(sets.len());
+            for set in sets {
+                if set.len() != 1 {
+                    return Err(ParseError::UnsupportedFeature(
+                        "ROLLUP with composite grouping elements".to_string(),
+                    ));
+                }
+                args.push(ast::FunctionArg::Unnamed(convert_expr(
+                    set.into_iter().next().unwrap(),
+                )?));
+            }
+            Ok(ast::Expr::Function {
+                name: "ROLLUP".to_string(),
+                args,
+                distinct: false,
+                span,
+            })
+        }
         sp::Expr::InSubquery {
             expr,
             subquery,

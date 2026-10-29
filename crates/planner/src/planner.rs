@@ -634,7 +634,7 @@ impl<'a> QueryPlanner<'a> {
             // Pre-pass: extract `EXISTS (...)` / `NOT EXISTS (...)`
             // sub-predicates from the WHERE AND-tree and rewrite each
             // one as a SemiJoin / AntiJoin against the outer plan.
-            // What remains becomes a plain FilterExec predicate.
+            // Nested subqueries in the remainder are planned separately.
             //
             // Correlation handling: each EXISTS subquery's inner
             // WHERE is split into AND parts; the one shape we
@@ -731,11 +731,44 @@ impl<'a> QueryPlanner<'a> {
             };
 
             if let Some(remaining) = residual {
-                let predicate = self.plan_expr(&remaining, &ctx).await?;
-                plan = LogicalPlan::Filter {
-                    input: Box::new(plan),
-                    predicate,
-                };
+                if contains_nested_subquery(&remaining) {
+                    let parts = split_and(&remaining);
+                    if parts.iter().any(|part| {
+                        matches!(
+                            part,
+                            ast::Expr::BinaryOp {
+                                op: ast::BinaryOp::Or,
+                                ..
+                            }
+                        ) && contains_nested_subquery(part)
+                    }) {
+                        let (ordinary, nested): (Vec<_>, Vec<_>) = parts
+                            .into_iter()
+                            .partition(|part| !contains_nested_subquery(part));
+                        if let Some(ordinary) = combine_and(ordinary) {
+                            let predicate = self.plan_expr(&ordinary, &ctx).await?;
+                            plan = LogicalPlan::Filter {
+                                input: Box::new(plan),
+                                predicate,
+                            };
+                        }
+                        if let Some(nested) = combine_and(nested) {
+                            plan = self
+                                .filter_nested_subqueries(plan, &nested, &ctx, PredicateTruth::True)
+                                .await?;
+                        }
+                    } else {
+                        plan = self
+                            .filter_nested_subqueries(plan, &remaining, &ctx, PredicateTruth::True)
+                            .await?;
+                    }
+                } else {
+                    let predicate = self.plan_expr(&remaining, &ctx).await?;
+                    plan = LogicalPlan::Filter {
+                        input: Box::new(plan),
+                        predicate,
+                    };
+                }
             }
         }
 
@@ -1131,6 +1164,208 @@ impl<'a> QueryPlanner<'a> {
             }
         }
         Ok((combine_and(residual), specs))
+    }
+
+    #[async_recursion]
+    async fn filter_nested_subqueries(
+        &self,
+        input: LogicalPlan,
+        expr: &ast::Expr,
+        ctx: &PlanningContext,
+        truth: PredicateTruth,
+    ) -> Result<LogicalPlan, PlanError> {
+        match expr {
+            ast::Expr::Nested { expr, .. } => {
+                self.filter_nested_subqueries(input, expr, ctx, truth).await
+            }
+            ast::Expr::UnaryOp {
+                op: ast::UnaryOp::Not,
+                expr,
+                ..
+            } => {
+                let inner_truth = match truth {
+                    PredicateTruth::True => PredicateTruth::False,
+                    PredicateTruth::False => PredicateTruth::True,
+                    PredicateTruth::NotTrue => PredicateTruth::NotFalse,
+                    PredicateTruth::NotFalse => PredicateTruth::NotTrue,
+                };
+                self.filter_nested_subqueries(input, expr, ctx, inner_truth)
+                    .await
+            }
+            ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOp::And,
+                right,
+                ..
+            } => match truth {
+                PredicateTruth::True | PredicateTruth::NotTrue => {
+                    if truth == PredicateTruth::True {
+                        let input = self
+                            .filter_nested_subqueries(input, left, ctx, truth)
+                            .await?;
+                        self.filter_nested_subqueries(input, right, ctx, truth)
+                            .await
+                    } else {
+                        let first = self
+                            .filter_nested_subqueries(input.clone(), left, ctx, truth)
+                            .await?;
+                        let rest = self
+                            .filter_nested_subqueries(input, left, ctx, PredicateTruth::True)
+                            .await?;
+                        let second = self
+                            .filter_nested_subqueries(rest, right, ctx, truth)
+                            .await?;
+                        Ok(LogicalPlan::UnionAll {
+                            inputs: vec![first, second],
+                        })
+                    }
+                }
+                PredicateTruth::False => {
+                    let first = self
+                        .filter_nested_subqueries(input.clone(), left, ctx, truth)
+                        .await?;
+                    let rest = self
+                        .filter_nested_subqueries(input, left, ctx, PredicateTruth::NotFalse)
+                        .await?;
+                    let second = self
+                        .filter_nested_subqueries(rest, right, ctx, truth)
+                        .await?;
+                    Ok(LogicalPlan::UnionAll {
+                        inputs: vec![first, second],
+                    })
+                }
+                PredicateTruth::NotFalse => {
+                    let input = self
+                        .filter_nested_subqueries(input, left, ctx, truth)
+                        .await?;
+                    self.filter_nested_subqueries(input, right, ctx, truth)
+                        .await
+                }
+            },
+            ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOp::Or,
+                right,
+                ..
+            } => match truth {
+                PredicateTruth::True | PredicateTruth::NotFalse => {
+                    let first = self
+                        .filter_nested_subqueries(input.clone(), left, ctx, truth)
+                        .await?;
+                    let rest = self
+                        .filter_nested_subqueries(
+                            input,
+                            left,
+                            ctx,
+                            if truth == PredicateTruth::True {
+                                PredicateTruth::NotTrue
+                            } else {
+                                PredicateTruth::False
+                            },
+                        )
+                        .await?;
+                    let second = self
+                        .filter_nested_subqueries(rest, right, ctx, truth)
+                        .await?;
+                    Ok(LogicalPlan::UnionAll {
+                        inputs: vec![first, second],
+                    })
+                }
+                PredicateTruth::False | PredicateTruth::NotTrue => {
+                    let input = self
+                        .filter_nested_subqueries(input, left, ctx, truth)
+                        .await?;
+                    self.filter_nested_subqueries(input, right, ctx, truth)
+                        .await
+                }
+            },
+            ast::Expr::Exists {
+                subquery, negated, ..
+            } => {
+                let anti = matches!(truth, PredicateTruth::False | PredicateTruth::NotTrue);
+                let spec = self
+                    .decorrelate_exists(*subquery.clone(), ctx, *negated ^ anti)
+                    .await?;
+                Ok(apply_semi_join(input, spec))
+            }
+            ast::Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+                ..
+            } => {
+                let requested = if *negated {
+                    match truth {
+                        PredicateTruth::True => PredicateTruth::False,
+                        PredicateTruth::False => PredicateTruth::True,
+                        PredicateTruth::NotTrue => PredicateTruth::NotFalse,
+                        PredicateTruth::NotFalse => PredicateTruth::NotTrue,
+                    }
+                } else {
+                    truth
+                };
+                let specs = match requested {
+                    PredicateTruth::True | PredicateTruth::False => {
+                        self.decorrelate_in_subquery(
+                            *expr.clone(),
+                            *subquery.clone(),
+                            ctx,
+                            requested == PredicateTruth::False,
+                        )
+                        .await?
+                    }
+                    PredicateTruth::NotTrue => {
+                        let mut specs = self
+                            .decorrelate_in_subquery(*expr.clone(), *subquery.clone(), ctx, false)
+                            .await?;
+                        specs[0].kind = SemiJoinKind::Anti;
+                        specs
+                    }
+                    PredicateTruth::NotFalse => {
+                        return Err(PlanError::invalid_expression(
+                            "IN subquery in this boolean context is not supported".to_string(),
+                        ));
+                    }
+                };
+                Ok(specs.into_iter().fold(input, apply_semi_join))
+            }
+            _ => {
+                let predicate = self.plan_expr(expr, ctx).await?;
+                let predicate = match truth {
+                    PredicateTruth::True => predicate,
+                    PredicateTruth::False => PlanExpr::UnaryOp {
+                        op: ast::UnaryOp::Not,
+                        expr: Box::new(predicate),
+                        span: None,
+                    },
+                    PredicateTruth::NotTrue | PredicateTruth::NotFalse => {
+                        let null = PlanExpr::IsNull {
+                            expr: Box::new(predicate.clone()),
+                            span: None,
+                        };
+                        let known = if truth == PredicateTruth::NotTrue {
+                            PlanExpr::UnaryOp {
+                                op: ast::UnaryOp::Not,
+                                expr: Box::new(predicate),
+                                span: None,
+                            }
+                        } else {
+                            predicate
+                        };
+                        PlanExpr::BinaryOp {
+                            left: Box::new(known),
+                            op: ast::BinaryOp::Or,
+                            right: Box::new(null),
+                            span: None,
+                        }
+                    }
+                };
+                Ok(LogicalPlan::Filter {
+                    input: Box::new(input),
+                    predicate,
+                })
+            }
+        }
     }
 
     /// Decorrelate `<expr> IN (subquery)` / `<expr> NOT IN (subquery)`.
@@ -3013,6 +3248,49 @@ fn is_aggregate_function(name: &str) -> bool {
 enum SemiJoinKind {
     Semi,
     Anti,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PredicateTruth {
+    True,
+    False,
+    NotTrue,
+    NotFalse,
+}
+
+fn apply_semi_join(input: LogicalPlan, spec: SemiJoinSpec) -> LogicalPlan {
+    match spec.kind {
+        SemiJoinKind::Semi => LogicalPlan::SemiJoin {
+            left: Box::new(input),
+            right: Box::new(spec.right_plan),
+            left_key: spec.left_key,
+            right_key: spec.right_key,
+            residual: spec.residual,
+            dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
+        },
+        SemiJoinKind::Anti => LogicalPlan::AntiJoin {
+            left: Box::new(input),
+            right: Box::new(spec.right_plan),
+            left_key: spec.left_key,
+            right_key: spec.right_key,
+            residual: spec.residual,
+            probe_side_filter_ids: Vec::new(),
+        },
+    }
+}
+
+fn contains_nested_subquery(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Exists { .. } | ast::Expr::InSubquery { .. } => true,
+        ast::Expr::BinaryOp { left, right, .. } => {
+            contains_nested_subquery(left) || contains_nested_subquery(right)
+        }
+        ast::Expr::UnaryOp { expr, .. } | ast::Expr::Nested { expr, .. } => {
+            contains_nested_subquery(expr)
+        }
+        _ => false,
+    }
 }
 
 /// A pending LEFT JOIN extracted from a correlated scalar subquery in

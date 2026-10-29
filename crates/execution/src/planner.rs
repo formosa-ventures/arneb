@@ -704,7 +704,7 @@ impl ExecutionContext {
     ) -> Result<PlanExpr, ExecutionError> {
         match expr {
             PlanExpr::ScalarSubquery { subplan, span } => {
-                let exec = self.create_physical_plan(subplan)?;
+                let exec = coalesce_if_multi(self.create_physical_plan(subplan)?);
                 let stream = exec.execute(0).await?;
                 let batches = arneb_common::stream::collect_stream(stream)
                     .await

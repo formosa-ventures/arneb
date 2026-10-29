@@ -1207,6 +1207,23 @@ impl<'a> QueryPlanner<'a> {
             },
             span,
         };
+        let placeholder = if spec.count_on_empty {
+            ast::Expr::Case {
+                operand: None,
+                conditions: vec![ast::Expr::IsNotNull {
+                    expr: Box::new(placeholder.clone()),
+                    span,
+                }],
+                results: vec![placeholder],
+                else_result: Some(Box::new(ast::Expr::Literal {
+                    value: ScalarValue::Int64(0),
+                    span,
+                })),
+                span,
+            }
+        } else {
+            placeholder
+        };
         specs.push(spec);
 
         let (new_left, new_right) = if sub_on_right {
@@ -1251,6 +1268,10 @@ impl<'a> QueryPlanner<'a> {
             ast::SelectItem::ExprWithAlias { expr, .. } => expr.clone(),
             _ => return Ok(None),
         };
+        let count_on_empty = matches!(
+            &proj_expr,
+            ast::Expr::Function { name, .. } if name.eq_ignore_ascii_case("count")
+        );
         let inner_where = match body.selection.clone() {
             Some(w) => w,
             None => return Ok(None),
@@ -1377,6 +1398,7 @@ impl<'a> QueryPlanner<'a> {
         Ok(Some(LeftJoinSpec {
             plan: proj_node,
             correlations: spec_correlations,
+            count_on_empty,
         }))
     }
 
@@ -2797,8 +2819,8 @@ enum SemiJoinKind {
 /// WHERE l_partkey = p_partkey)`). The inner is decorrelated by
 /// adding the correlation column(s) to GROUP BY, so the join attaches
 /// a per-correlation-key scalar value to each outer row. Outer rows
-/// without a matching key get NULL — matching the SQL semantics of an
-/// uncorrelated empty scalar subquery.
+/// without a matching key get NULL from the join; COUNT projections
+/// recover the empty-set value of zero in the residual predicate.
 ///
 /// Supports multi-column correlations (TPC-H Q20: scalar subquery
 /// correlated on both `ps_partkey` AND `ps_suppkey`).
@@ -2810,6 +2832,8 @@ struct LeftJoinSpec {
     /// One entry per correlation, paired with its index in
     /// `plan.schema()`.
     correlations: Vec<(ast::Expr, usize)>,
+    /// Whether the scalar projection is COUNT, which yields zero on an empty set.
+    count_on_empty: bool,
 }
 
 struct CteSelfAggWindowSpec {

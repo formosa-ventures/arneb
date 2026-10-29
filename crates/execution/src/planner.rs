@@ -769,6 +769,93 @@ impl ExecutionContext {
                 expr: Box::new(Box::pin(self.resolve_scalar_subqueries(inner)).await?),
                 span: *span,
             }),
+            PlanExpr::Function {
+                name,
+                args,
+                distinct,
+                span,
+            } => {
+                let mut resolved = Vec::with_capacity(args.len());
+                for arg in args {
+                    resolved.push(Box::pin(self.resolve_scalar_subqueries(arg)).await?);
+                }
+                Ok(PlanExpr::Function {
+                    name: name.clone(),
+                    args: resolved,
+                    distinct: *distinct,
+                    span: *span,
+                })
+            }
+            PlanExpr::IsNull { expr, span } => Ok(PlanExpr::IsNull {
+                expr: Box::new(Box::pin(self.resolve_scalar_subqueries(expr)).await?),
+                span: *span,
+            }),
+            PlanExpr::IsNotNull { expr, span } => Ok(PlanExpr::IsNotNull {
+                expr: Box::new(Box::pin(self.resolve_scalar_subqueries(expr)).await?),
+                span: *span,
+            }),
+            PlanExpr::Between {
+                expr,
+                negated,
+                low,
+                high,
+                span,
+            } => Ok(PlanExpr::Between {
+                expr: Box::new(Box::pin(self.resolve_scalar_subqueries(expr)).await?),
+                negated: *negated,
+                low: Box::new(Box::pin(self.resolve_scalar_subqueries(low)).await?),
+                high: Box::new(Box::pin(self.resolve_scalar_subqueries(high)).await?),
+                span: *span,
+            }),
+            PlanExpr::InList {
+                expr,
+                list,
+                negated,
+                span,
+            } => {
+                let mut resolved = Vec::with_capacity(list.len());
+                for item in list {
+                    resolved.push(Box::pin(self.resolve_scalar_subqueries(item)).await?);
+                }
+                Ok(PlanExpr::InList {
+                    expr: Box::new(Box::pin(self.resolve_scalar_subqueries(expr)).await?),
+                    list: resolved,
+                    negated: *negated,
+                    span: *span,
+                })
+            }
+            PlanExpr::CaseExpr {
+                operand,
+                when_clauses,
+                else_result,
+                span,
+            } => {
+                let operand = match operand {
+                    Some(expr) => Some(Box::new(
+                        Box::pin(self.resolve_scalar_subqueries(expr)).await?,
+                    )),
+                    None => None,
+                };
+                let mut resolved = Vec::with_capacity(when_clauses.len());
+                for (condition, result) in when_clauses {
+                    resolved.push((
+                        Box::pin(self.resolve_scalar_subqueries(condition)).await?,
+                        Box::pin(self.resolve_scalar_subqueries(result)).await?,
+                    ));
+                }
+                let else_result = match else_result {
+                    Some(expr) => Some(Box::new(
+                        Box::pin(self.resolve_scalar_subqueries(expr)).await?,
+                    )),
+                    None => None,
+                };
+                Ok(PlanExpr::CaseExpr {
+                    operand,
+                    when_clauses: resolved,
+                    else_result,
+                    span: *span,
+                })
+            }
             _ => Ok(expr.clone()),
         }
     }

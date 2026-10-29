@@ -1508,6 +1508,30 @@ async fn resolve_plan_subqueries(
                 offset,
             })
         }
+        LogicalPlan::Window { input, functions } => {
+            let input =
+                Box::pin(resolve_plan_subqueries(ctx, distributed_executor, *input)).await?;
+            Ok(LogicalPlan::Window {
+                input: Box::new(input),
+                functions,
+            })
+        }
+        LogicalPlan::UnionAll { inputs } => {
+            let mut resolved = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                resolved.push(
+                    Box::pin(resolve_plan_subqueries(ctx, distributed_executor, input)).await?,
+                );
+            }
+            Ok(LogicalPlan::UnionAll { inputs: resolved })
+        }
+        LogicalPlan::Distinct { input } => {
+            let input =
+                Box::pin(resolve_plan_subqueries(ctx, distributed_executor, *input)).await?;
+            Ok(LogicalPlan::Distinct {
+                input: Box::new(input),
+            })
+        }
         LogicalPlan::Join {
             left,
             right,

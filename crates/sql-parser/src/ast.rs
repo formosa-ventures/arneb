@@ -173,11 +173,13 @@ pub struct Query {
     pub offset: Option<Box<Expr>>,
 }
 
-/// The body of a query — either a single SELECT or a set operation.
+/// The body of a query — a SELECT, a parenthesized query, or a set operation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryBody {
     /// A simple SELECT statement.
     Select(SelectBody),
+    /// A parenthesized query used as a set-operation operand.
+    Query(Box<Query>),
     /// A set operation (UNION ALL, UNION, INTERSECT, EXCEPT).
     SetOperation {
         /// The set operator.

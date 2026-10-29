@@ -412,7 +412,7 @@ impl<'a> QueryPlanner<'a> {
                 .insert(cte.name.clone(), cte_plan);
         }
 
-        let mut plan = self.plan_query_body(&query.body).await?;
+        let mut plan = self.plan_query_body(&query.body, &query.order_by).await?;
 
         // ORDER BY
         if !query.order_by.is_empty() {
@@ -569,7 +569,17 @@ impl<'a> QueryPlanner<'a> {
             };
             let expr = match resolved {
                 Some(index) => exprs[index].clone(),
-                None => self.plan_expr(&ob.expr, &input_ctx).await?,
+                None => {
+                    let rewritten = match &query.body {
+                        ast::QueryBody::Select(body) => self.rewrite_aggregates_as_columns(
+                            &ob.expr,
+                            &input_ctx,
+                            resolve_group_by_ordinals(body)?.len(),
+                        ),
+                        _ => ob.expr.clone(),
+                    };
+                    self.plan_expr(&rewritten, &input_ctx).await?
+                }
             };
             order_by.push(SortExpr {
                 expr,
@@ -583,12 +593,16 @@ impl<'a> QueryPlanner<'a> {
     /// Plan a QueryBody (SELECT or set operation).
     #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
-    async fn plan_query_body(&self, body: &ast::QueryBody) -> Result<LogicalPlan, PlanError> {
+    async fn plan_query_body(
+        &self,
+        body: &ast::QueryBody,
+        order_by: &[ast::OrderByExpr],
+    ) -> Result<LogicalPlan, PlanError> {
         match body {
-            ast::QueryBody::Select(select) => self.plan_select(select).await,
+            ast::QueryBody::Select(select) => self.plan_select(select, order_by).await,
             ast::QueryBody::SetOperation { op, left, right } => {
-                let left_plan = self.plan_query_body(left).await?;
-                let right_plan = self.plan_query_body(right).await?;
+                let left_plan = self.plan_query_body(left, &[]).await?;
+                let right_plan = self.plan_query_body(right, &[]).await?;
                 match op {
                     ast::SetOperator::UnionAll => Ok(LogicalPlan::UnionAll {
                         inputs: vec![left_plan, right_plan],
@@ -612,7 +626,11 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Plan a SelectBody: FROM → WHERE → GROUP BY/HAVING → SELECT projection.
-    async fn plan_select(&self, body: &ast::SelectBody) -> Result<LogicalPlan, PlanError> {
+    async fn plan_select(
+        &self,
+        body: &ast::SelectBody,
+        order_by: &[ast::OrderByExpr],
+    ) -> Result<LogicalPlan, PlanError> {
         // 1. FROM clause → base plan + context
         let (mut plan, mut ctx) = self.plan_from(&body.from).await?;
 
@@ -737,6 +755,10 @@ impl<'a> QueryPlanner<'a> {
         // the HAVING rewrite can replace the call with a column ref.
         if let Some(having) = &body.having {
             self.extract_aggregates(having, &ctx, &mut aggr_exprs)
+                .await?;
+        }
+        for item in order_by {
+            self.extract_aggregates(&item.expr, &ctx, &mut aggr_exprs)
                 .await?;
         }
         let has_aggregates = has_group_by || !aggr_exprs.is_empty();
@@ -2239,12 +2261,44 @@ impl<'a> QueryPlanner<'a> {
     /// Check if an expression contains any aggregate function.
     fn contains_aggregate(&self, expr: &ast::Expr) -> bool {
         match expr {
-            ast::Expr::Function { name, .. } => is_aggregate_function(name),
+            ast::Expr::Function { name, args, .. } => {
+                is_aggregate_function(name)
+                    || args.iter().any(|arg| match arg {
+                        ast::FunctionArg::Unnamed(expr) => self.contains_aggregate(expr),
+                        ast::FunctionArg::Wildcard => false,
+                    })
+            }
             ast::Expr::BinaryOp { left, right, .. } => {
                 self.contains_aggregate(left) || self.contains_aggregate(right)
             }
-            ast::Expr::UnaryOp { expr, .. } => self.contains_aggregate(expr),
-            ast::Expr::Nested { expr: inner, .. } => self.contains_aggregate(inner),
+            ast::Expr::UnaryOp { expr, .. }
+            | ast::Expr::IsNull { expr, .. }
+            | ast::Expr::IsNotNull { expr, .. }
+            | ast::Expr::Cast { expr, .. }
+            | ast::Expr::Nested { expr, .. } => self.contains_aggregate(expr),
+            ast::Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.contains_aggregate(expr)
+                    || self.contains_aggregate(low)
+                    || self.contains_aggregate(high)
+            }
+            ast::Expr::InList { expr, list, .. } => {
+                self.contains_aggregate(expr) || list.iter().any(|e| self.contains_aggregate(e))
+            }
+            ast::Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => operand
+                .iter()
+                .chain(else_result.iter())
+                .map(|e| &**e)
+                .chain(conditions)
+                .chain(results)
+                .any(|e| self.contains_aggregate(e)),
             _ => false,
         }
     }
@@ -2398,6 +2452,92 @@ impl<'a> QueryPlanner<'a> {
                 expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
                 span: *span,
             },
+            ast::Expr::Cast {
+                expr: inner,
+                data_type,
+                span,
+            } => ast::Expr::Cast {
+                expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
+                data_type: data_type.clone(),
+                span: *span,
+            },
+            ast::Expr::IsNull { expr: inner, span } => ast::Expr::IsNull {
+                expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
+                span: *span,
+            },
+            ast::Expr::IsNotNull { expr: inner, span } => ast::Expr::IsNotNull {
+                expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
+                span: *span,
+            },
+            ast::Expr::Between {
+                expr: inner,
+                negated,
+                low,
+                high,
+                span,
+            } => ast::Expr::Between {
+                expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
+                negated: *negated,
+                low: Box::new(self.rewrite_aggregates_as_columns(low, ctx, num_group_by)),
+                high: Box::new(self.rewrite_aggregates_as_columns(high, ctx, num_group_by)),
+                span: *span,
+            },
+            ast::Expr::InList {
+                expr: inner,
+                list,
+                negated,
+                span,
+            } => ast::Expr::InList {
+                expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
+                list: list
+                    .iter()
+                    .map(|e| self.rewrite_aggregates_as_columns(e, ctx, num_group_by))
+                    .collect(),
+                negated: *negated,
+                span: *span,
+            },
+            ast::Expr::Function {
+                name,
+                args,
+                distinct,
+                span,
+            } => ast::Expr::Function {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| match arg {
+                        ast::FunctionArg::Unnamed(e) => ast::FunctionArg::Unnamed(
+                            self.rewrite_aggregates_as_columns(e, ctx, num_group_by),
+                        ),
+                        ast::FunctionArg::Wildcard => ast::FunctionArg::Wildcard,
+                    })
+                    .collect(),
+                distinct: *distinct,
+                span: *span,
+            },
+            ast::Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                span,
+            } => ast::Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(self.rewrite_aggregates_as_columns(e, ctx, num_group_by))),
+                conditions: conditions
+                    .iter()
+                    .map(|e| self.rewrite_aggregates_as_columns(e, ctx, num_group_by))
+                    .collect(),
+                results: results
+                    .iter()
+                    .map(|e| self.rewrite_aggregates_as_columns(e, ctx, num_group_by))
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(self.rewrite_aggregates_as_columns(e, ctx, num_group_by))),
+                span: *span,
+            },
             _ => expr.clone(),
         }
     }
@@ -2447,6 +2587,48 @@ impl<'a> QueryPlanner<'a> {
             }
             ast::Expr::Nested { expr: inner, .. } => {
                 self.extract_aggregates(inner, ctx, out).await?;
+            }
+            ast::Expr::Cast { expr, .. }
+            | ast::Expr::IsNull { expr, .. }
+            | ast::Expr::IsNotNull { expr, .. } => {
+                self.extract_aggregates(expr, ctx, out).await?;
+            }
+            ast::Expr::Function { args, .. } => {
+                for arg in args {
+                    if let ast::FunctionArg::Unnamed(e) = arg {
+                        self.extract_aggregates(e, ctx, out).await?;
+                    }
+                }
+            }
+            ast::Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => {
+                for e in operand
+                    .iter()
+                    .chain(else_result.iter())
+                    .map(|e| &**e)
+                    .chain(conditions)
+                    .chain(results)
+                {
+                    self.extract_aggregates(e, ctx, out).await?;
+                }
+            }
+            ast::Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.extract_aggregates(expr, ctx, out).await?;
+                self.extract_aggregates(low, ctx, out).await?;
+                self.extract_aggregates(high, ctx, out).await?;
+            }
+            ast::Expr::InList { expr, list, .. } => {
+                self.extract_aggregates(expr, ctx, out).await?;
+                for e in list {
+                    self.extract_aggregates(e, ctx, out).await?;
+                }
             }
             // `rank() OVER (ORDER BY sum(x))`: the inner aggregate is
             // computed by the Aggregate node below the Window.

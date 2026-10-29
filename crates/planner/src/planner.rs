@@ -595,6 +595,7 @@ impl<'a> QueryPlanner<'a> {
     ) -> Result<LogicalPlan, PlanError> {
         match body {
             ast::QueryBody::Select(select) => self.plan_select(select, order_by).await,
+            ast::QueryBody::Query(query) => self.plan_query(query).await,
             ast::QueryBody::SetOperation { op, left, right } => {
                 let left_plan = self.plan_query_body(left, &[]).await?;
                 let right_plan = self.plan_query_body(right, &[]).await?;

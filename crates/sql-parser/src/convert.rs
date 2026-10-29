@@ -274,6 +274,7 @@ fn convert_set_expr(expr: sp::SetExpr) -> Result<ast::QueryBody, ParseError> {
             let body = convert_select(*select)?;
             Ok(ast::QueryBody::Select(body))
         }
+        sp::SetExpr::Query(query) => Ok(ast::QueryBody::Query(Box::new(convert_query(*query)?))),
         sp::SetExpr::SetOperation {
             op,
             set_quantifier,

@@ -4101,13 +4101,8 @@ impl HashJoinExec {
                 ProbeDfInjection::Inject => {
                     self.inject_grace_dynamic_filters(df_collectors, publish_cross_fragment);
                 }
-                ProbeDfInjection::Skip if publish_cross_fragment => {
-                    let domains: Vec<arneb_common::Domain> = df_collectors
-                        .into_iter()
-                        .map(|c| c.finish_domain())
-                        .collect();
-                    self.publish_grace_cross_fragment_dfs(&domains);
-                }
+                // A copartitioned build publishes nothing cross-fragment:
+                // `publish_grace_cross_fragment_dfs` returns early for it.
                 ProbeDfInjection::Skip => {}
             }
         }

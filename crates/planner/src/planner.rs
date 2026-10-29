@@ -517,6 +517,21 @@ impl<'a> QueryPlanner<'a> {
         exprs: &[PlanExpr],
     ) -> Result<Vec<SortExpr>, PlanError> {
         let mut input_ctx = self.context_from_plan(input);
+        if let ast::QueryBody::Select(body) = &query.body {
+            let group_by = resolve_group_by_ordinals(body)?;
+            if !group_by.is_empty() {
+                for (col, key) in input_ctx.columns.iter_mut().zip(&group_by) {
+                    col.0 = group_by_qualifier(key);
+                }
+            } else if !matches!(input, LogicalPlan::Aggregate { .. }) {
+                let (_, from_ctx) = self.plan_from(&body.from).await?;
+                if input_ctx.columns.len() == from_ctx.columns.len() {
+                    for (col, source) in input_ctx.columns.iter_mut().zip(from_ctx.columns) {
+                        col.0 = source.0;
+                    }
+                }
+            }
+        }
         // Restore the qualifiers of selected columns. A wildcard expands to
         // several expressions, so items and exprs only line up without one.
         if let Some(items) = select_items.filter(|items| {

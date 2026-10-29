@@ -1035,7 +1035,10 @@ fn fallback_default_param(expr: PlanExpr, ctx: &mut AnalyzerContext) -> PlanExpr
 /// Apply `f` to every `PlanExpr` in `plan` (including in nested
 /// sub-plans). Recursively visits children so the transform reaches
 /// deeply-nested parameter nodes.
-fn walk_plan_exprs(plan: LogicalPlan, f: &mut dyn FnMut(PlanExpr) -> PlanExpr) -> LogicalPlan {
+pub(super) fn walk_plan_exprs(
+    plan: LogicalPlan,
+    f: &mut dyn FnMut(PlanExpr) -> PlanExpr,
+) -> LogicalPlan {
     match plan {
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(walk_plan_exprs(*input, f)),

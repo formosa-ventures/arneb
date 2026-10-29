@@ -57,8 +57,18 @@ impl AnalysisPass for PredicatePushdown {
         plan: LogicalPlan,
         _ctx: &mut AnalyzerContext,
     ) -> Result<LogicalPlan, PlanError> {
-        Ok(push_down(plan))
+        Ok(push_down_expr_subqueries(push_down(plan)))
     }
+}
+
+fn push_down_expr_subqueries(plan: LogicalPlan) -> LogicalPlan {
+    super::type_coercion::walk_plan_exprs(plan, &mut |expr| match expr {
+        PlanExpr::ScalarSubquery { subplan, span } => PlanExpr::ScalarSubquery {
+            subplan: Box::new(push_down_expr_subqueries(push_down(*subplan))),
+            span,
+        },
+        other => other,
+    })
 }
 
 // ---------------------------------------------------------------------------

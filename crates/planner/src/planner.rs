@@ -1017,6 +1017,7 @@ impl<'a> QueryPlanner<'a> {
                 args,
                 partition_by,
                 order_by,
+                rows_frame,
                 ..
             } = call
             else {
@@ -1077,6 +1078,7 @@ impl<'a> QueryPlanner<'a> {
                 args: fn_args,
                 partition_by: fn_partition,
                 order_by: fn_order,
+                rows_frame: *rows_frame,
                 output_name: call.to_string(),
             };
             match specs.iter_mut().find(|(k, _)| *k == key) {
@@ -3521,6 +3523,7 @@ fn wrap_matching_cte_with_window(
                     }],
                     partition_by: Vec::new(),
                     order_by: Vec::new(),
+                    rows_frame: false,
                     output_name: "__cte_max".to_string(),
                 }],
             },

@@ -4065,6 +4065,7 @@ mod tests {
                 args: vec![column(1, "total_revenue")],
                 partition_by: Vec::new(),
                 order_by: Vec::new(),
+                rows_frame: false,
                 output_name: "__cte_max".into(),
             }],
         };
@@ -4133,6 +4134,7 @@ mod tests {
                     asc: true,
                     nulls_first: false,
                 }],
+                rows_frame: false,
                 output_name: "r".into(),
             }],
         };

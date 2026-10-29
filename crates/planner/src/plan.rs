@@ -589,6 +589,8 @@ pub struct WindowFunctionDef {
     pub partition_by: Vec<PlanExpr>,
     /// ORDER BY expressions with direction.
     pub order_by: Vec<SortExpr>,
+    /// Whether the frame ends at the current physical row.
+    pub rows_frame: bool,
     /// Output column name.
     pub output_name: String,
 }

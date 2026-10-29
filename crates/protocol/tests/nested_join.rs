@@ -164,3 +164,17 @@ async fn nested_inner_join_on_right_side_of_left_join_is_not_flattened() {
         table(&[&["1", "10"], &["2", "NULL"], &["3", "NULL"]])
     );
 }
+
+#[tokio::test]
+async fn nested_left_join_on_right_side_of_inner_join() {
+    // a JOIN (b LEFT JOIN c): b's row 2 has no match in c, so it keeps a NULL
+    // c.y and still joins a's row 2.
+    assert_eq!(
+        rows(
+            "SELECT a.x, b.y, c.y FROM a JOIN (b LEFT JOIN c ON b.y = c.y) ON a.x = b.x \
+             ORDER BY a.x"
+        )
+        .await,
+        table(&[&["1", "10", "10"], &["2", "20", "NULL"]])
+    );
+}

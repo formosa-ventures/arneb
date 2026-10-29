@@ -808,12 +808,14 @@ fn unify_case(
         }
         (_, er, _) => er,
     };
-    // The operand of a simple CASE is compared against each WHEN
-    // condition. For MVP we do not rewrite the simple-CASE operand
-    // pair — conditions already flow through `coerce_expr`'s BinaryOp
-    // path when the simple CASE is desugared elsewhere. We pass it
-    // through unchanged.
-    Ok((operand, when_clauses, else_result))
+    if let Some(operand) = operand {
+        let (conditions, results): (Vec<_>, Vec<_>) = when_clauses.into_iter().unzip();
+        let (operand, conditions) = unify_in_list(*operand, conditions, schema, location)?;
+        let when_clauses = conditions.into_iter().zip(results).collect();
+        Ok((Some(Box::new(operand)), when_clauses, else_result))
+    } else {
+        Ok((None, when_clauses, else_result))
+    }
 }
 
 /// Align the output column types of every branch of a set operation

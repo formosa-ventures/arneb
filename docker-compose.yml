@@ -31,7 +31,7 @@ services:
   # S3-compatible object storage: RustFS (Apache-2.0). MinIO's community images
   # are no longer publicly pullable (Docker Hub removed, quay.io requires auth).
   s3:
-    image: rustfs/rustfs:1.0.2
+    image: rustfs/rustfs:1.0.4
     ports:
       - "9000:9000"
       - "9001:9001"

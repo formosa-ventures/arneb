@@ -1100,10 +1100,8 @@ impl<'a> QueryPlanner<'a> {
         })
     }
 
-    /// Walk the WHERE AND-tree pulling out top-level conjuncts of the
-    /// shape `<expr> <cmp> (correlated_scalar_subquery)` (and its
-    /// mirror). Each match is decorrelated into a [`LeftJoinSpec`] and
-    /// the AST node is rewritten to reference a synthesized column.
+    /// Walk the WHERE AND-tree, replacing correlated scalar subqueries
+    /// within comparison operands with values from [`LeftJoinSpec`]s.
     ///
     /// Conjuncts that don't match the shape are passed through
     /// unchanged. Returns `(residual_where, specs)`.
@@ -1124,11 +1122,7 @@ impl<'a> QueryPlanner<'a> {
         Ok((combine_and(residual), specs))
     }
 
-    /// If `part` is a comparison whose RHS (or LHS) is a correlated
-    /// scalar subquery we can decorrelate, return the predicate with
-    /// the subquery substituted for a placeholder column reference and
-    /// push a `LeftJoinSpec` onto `specs`. Otherwise return `part`
-    /// unchanged.
+    /// Rewrite scalar subqueries within the arithmetic operands of a comparison.
     async fn try_rewrite_scalar_subquery_predicate(
         &self,
         part: ast::Expr,
@@ -1162,34 +1156,70 @@ impl<'a> QueryPlanner<'a> {
             });
         }
 
-        let lhs_expr = *left;
-        let rhs_expr = *right;
-        let (sub_on_right, other, subquery) = if let ast::Expr::Subquery { query, .. } = &rhs_expr {
-            (true, lhs_expr.clone(), (**query).clone())
-        } else if let ast::Expr::Subquery { query, .. } = &lhs_expr {
-            (false, rhs_expr.clone(), (**query).clone())
-        } else {
-            return Ok(ast::Expr::BinaryOp {
-                left: Box::new(lhs_expr),
-                op,
-                right: Box::new(rhs_expr),
-                span,
-            });
-        };
+        let left = self.rewrite_scalar_operand(*left, outer_ctx, specs).await?;
+        let right = self
+            .rewrite_scalar_operand(*right, outer_ctx, specs)
+            .await?;
+        Ok(ast::Expr::BinaryOp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+            span,
+        })
+    }
 
-        let spec = match self
-            .try_make_leftjoin_spec(subquery, outer_ctx, specs.len())
-            .await?
-        {
-            Some(s) => s,
-            None => {
+    #[async_recursion]
+    async fn rewrite_scalar_operand(
+        &self,
+        expr: ast::Expr,
+        outer_ctx: &PlanningContext,
+        specs: &mut Vec<LeftJoinSpec>,
+    ) -> Result<ast::Expr, PlanError> {
+        let (subquery, span) = match expr {
+            ast::Expr::Subquery { query, span } => (*query, span),
+            ast::Expr::BinaryOp {
+                left,
+                op,
+                right,
+                span,
+            } if matches!(
+                op,
+                ast::BinaryOp::Plus
+                    | ast::BinaryOp::Minus
+                    | ast::BinaryOp::Multiply
+                    | ast::BinaryOp::Divide
+                    | ast::BinaryOp::Modulo
+            ) =>
+            {
+                let left = self.rewrite_scalar_operand(*left, outer_ctx, specs).await?;
+                let right = self
+                    .rewrite_scalar_operand(*right, outer_ctx, specs)
+                    .await?;
                 return Ok(ast::Expr::BinaryOp {
-                    left: Box::new(lhs_expr),
+                    left: Box::new(left),
                     op,
-                    right: Box::new(rhs_expr),
+                    right: Box::new(right),
                     span,
                 });
             }
+            ast::Expr::Nested { expr, span } => {
+                let expr = self.rewrite_scalar_operand(*expr, outer_ctx, specs).await?;
+                return Ok(ast::Expr::Nested {
+                    expr: Box::new(expr),
+                    span,
+                });
+            }
+            other => return Ok(other),
+        };
+
+        let Some(spec) = self
+            .try_make_leftjoin_spec(subquery.clone(), outer_ctx, specs.len())
+            .await?
+        else {
+            return Ok(ast::Expr::Subquery {
+                query: Box::new(subquery),
+                span,
+            });
         };
 
         let value_col_name = spec
@@ -1225,18 +1255,7 @@ impl<'a> QueryPlanner<'a> {
             placeholder
         };
         specs.push(spec);
-
-        let (new_left, new_right) = if sub_on_right {
-            (Box::new(other), Box::new(placeholder))
-        } else {
-            (Box::new(placeholder), Box::new(other))
-        };
-        Ok(ast::Expr::BinaryOp {
-            left: new_left,
-            op,
-            right: new_right,
-            span,
-        })
+        Ok(placeholder)
     }
 
     /// Try to decorrelate one scalar subquery body into a `[corr_key,
@@ -1290,6 +1309,13 @@ impl<'a> QueryPlanner<'a> {
         for part in parts {
             if let Some(pair) = try_match_correlation(&part, outer_ctx, &inner_ctx) {
                 correlations.push(pair);
+            } else if let Some((common, remainder)) =
+                factor_or_correlations(&part, outer_ctx, &inner_ctx)
+            {
+                correlations.extend(common);
+                if let Some(remainder) = remainder {
+                    inner_only_parts.push(remainder);
+                }
             } else if references_outer(&part, &inner_ctx) {
                 return Ok(None);
             } else {
@@ -3376,6 +3402,107 @@ fn combine_and(parts: Vec<ast::Expr>) -> Option<ast::Expr> {
         right: Box::new(e),
         span: arneb_sql_parser::Span::empty(),
     })
+}
+
+fn split_or(expr: &ast::Expr) -> Vec<ast::Expr> {
+    let mut out = Vec::new();
+    fn go(expr: &ast::Expr, out: &mut Vec<ast::Expr>) {
+        match expr {
+            ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOp::Or,
+                right,
+                ..
+            } => {
+                go(left, out);
+                go(right, out);
+            }
+            ast::Expr::Nested { expr, .. } => go(expr, out),
+            other => out.push(other.clone()),
+        }
+    }
+    go(expr, &mut out);
+    out
+}
+
+fn combine_or(parts: Vec<ast::Expr>) -> Option<ast::Expr> {
+    parts.into_iter().reduce(|acc, expr| ast::Expr::BinaryOp {
+        left: Box::new(acc),
+        op: ast::BinaryOp::Or,
+        right: Box::new(expr),
+        span: arneb_sql_parser::Span::empty(),
+    })
+}
+
+type CorrelationPair = (ast::Expr, ast::Expr);
+
+fn same_correlation(
+    left: &CorrelationPair,
+    right: &CorrelationPair,
+    outer_ctx: &PlanningContext,
+    inner_ctx: &PlanningContext,
+) -> bool {
+    fn column_index(expr: &ast::Expr, ctx: &PlanningContext) -> Option<usize> {
+        let ast::Expr::Column { col_ref, .. } = expr else {
+            return None;
+        };
+        ctx.resolve_column(&col_ref.name, col_ref.table.as_deref(), None)
+            .ok()
+            .map(|(index, _)| index)
+    }
+    column_index(&left.0, outer_ctx) == column_index(&right.0, outer_ctx)
+        && column_index(&left.1, inner_ctx) == column_index(&right.1, inner_ctx)
+}
+
+/// Pull equi-correlations shared by every OR branch above the disjunction.
+fn factor_or_correlations(
+    expr: &ast::Expr,
+    outer_ctx: &PlanningContext,
+    inner_ctx: &PlanningContext,
+) -> Option<(Vec<CorrelationPair>, Option<ast::Expr>)> {
+    let branches = split_or(expr);
+    if branches.len() < 2 {
+        return None;
+    }
+    let branch_parts: Vec<Vec<ast::Expr>> = branches.iter().map(split_and).collect();
+    let mut common: Vec<CorrelationPair> = branch_parts[0]
+        .iter()
+        .filter_map(|part| try_match_correlation(part, outer_ctx, inner_ctx))
+        .collect();
+    common.retain(|candidate| {
+        branch_parts.iter().skip(1).all(|parts| {
+            parts.iter().any(|part| {
+                try_match_correlation(part, outer_ctx, inner_ctx)
+                    .is_some_and(|pair| same_correlation(candidate, &pair, outer_ctx, inner_ctx))
+            })
+        })
+    });
+    if common.is_empty() {
+        return None;
+    }
+    let mut remainders = Vec::new();
+    for mut parts in branch_parts {
+        for pair in &common {
+            let index = parts.iter().position(|part| {
+                try_match_correlation(part, outer_ctx, inner_ctx).is_some_and(|candidate| {
+                    same_correlation(pair, &candidate, outer_ctx, inner_ctx)
+                })
+            })?;
+            parts.remove(index);
+        }
+        match combine_and(parts) {
+            Some(remainder) => remainders.push(remainder),
+            None => return Some((common, None)),
+        }
+    }
+    let remainder = combine_or(remainders);
+    if remainder
+        .as_ref()
+        .is_some_and(|expr| references_outer(expr, inner_ctx))
+    {
+        return None;
+    }
+    Some((common, remainder))
 }
 
 /// Return `Some((outer_key, inner_key))` when `expr` is an equi

@@ -27,8 +27,8 @@ pub use fragment::{
 };
 pub use optimizer::{LogicalOptimizer, LogicalRule};
 pub use plan::{
-    DynamicFilterConsumer, DynamicFilterProducer, JoinCondition, LogicalPlan, PlanExpr, SortExpr,
-    WindowFunctionDef,
+    null_extend, DynamicFilterConsumer, DynamicFilterProducer, JoinCondition, LogicalPlan,
+    PlanExpr, SortExpr, WindowFunctionDef,
 };
 pub use planner::QueryPlanner;
 pub use properties::ActualProperties;

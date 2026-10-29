@@ -620,6 +620,25 @@ pub enum JoinCondition {
     None,
 }
 
+/// Mark the columns an outer join can fill with NULL as nullable: the left
+/// side's for RIGHT and FULL joins, the right side's for LEFT and FULL joins.
+pub fn null_extend<'a>(
+    join_type: ast::JoinType,
+    left: impl IntoIterator<Item = &'a mut ColumnInfo>,
+    right: impl IntoIterator<Item = &'a mut ColumnInfo>,
+) {
+    if matches!(join_type, ast::JoinType::Right | ast::JoinType::Full) {
+        for col in left {
+            col.nullable = true;
+        }
+    }
+    if matches!(join_type, ast::JoinType::Left | ast::JoinType::Full) {
+        for col in right {
+            col.nullable = true;
+        }
+    }
+}
+
 impl LogicalPlan {
     /// q21/q02 SF30 silent-truncation fix (2026-06-12): true if this operator
     /// may legitimately stop reading its input *before* EOF, so a mid-stream
@@ -741,17 +760,8 @@ impl LogicalPlan {
                 ..
             } => {
                 let mut schema = left.schema();
-                if matches!(join_type, ast::JoinType::Right | ast::JoinType::Full) {
-                    for col in &mut schema {
-                        col.nullable = true;
-                    }
-                }
                 let mut right_schema = right.schema();
-                if matches!(join_type, ast::JoinType::Left | ast::JoinType::Full) {
-                    for col in &mut right_schema {
-                        col.nullable = true;
-                    }
-                }
+                null_extend(*join_type, &mut schema, &mut right_schema);
                 schema.extend(right_schema);
                 schema
             }

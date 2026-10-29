@@ -78,8 +78,7 @@ fn push_down(plan: LogicalPlan) -> LogicalPlan {
             let mut remaining: Vec<PlanExpr> = Vec::new();
             // Set once a spanning conjunct turned a CROSS join into an
             // INNER one in this loop; later spanning conjuncts then AND
-            // into that ON (an Inner join that arrived with its own ON
-            // keeps today's behavior).
+            // into that ON.
             let mut converted = false;
             for c in conjuncts {
                 let was_cross = matches!(
@@ -385,31 +384,33 @@ fn try_push_into(
 
             match (join_type, in_left, in_right, ambiguous) {
                 (JoinType::Inner | JoinType::Cross, true, _, false)
-                | (JoinType::Left, true, _, false) => match rewrite_against(&conjunct, &l_schema) {
-                    Some(resolved) => {
-                        let new_left = push_or_wrap(*left, resolved);
-                        Ok(L::Join {
-                            left: Box::new(new_left),
-                            right,
-                            join_type,
-                            condition,
-                            dynamic_filter_ids: Vec::new(),
-                        })
+                | (JoinType::Left, true, _, false) => {
+                    match rewrite_join_child(&conjunct, &l_schema, 0) {
+                        Some(resolved) => {
+                            let new_left = push_or_wrap(*left, resolved);
+                            Ok(L::Join {
+                                left: Box::new(new_left),
+                                right,
+                                join_type,
+                                condition,
+                                dynamic_filter_ids: Vec::new(),
+                            })
+                        }
+                        None => Err((
+                            L::Join {
+                                left,
+                                right,
+                                join_type,
+                                condition,
+                                dynamic_filter_ids: Vec::new(),
+                            },
+                            conjunct,
+                        )),
                     }
-                    None => Err((
-                        L::Join {
-                            left,
-                            right,
-                            join_type,
-                            condition,
-                            dynamic_filter_ids: Vec::new(),
-                        },
-                        conjunct,
-                    )),
-                },
+                }
                 (JoinType::Inner | JoinType::Cross, false, true, false)
                 | (JoinType::Right, _, true, false) => {
-                    match rewrite_against(&conjunct, &r_schema) {
+                    match rewrite_join_child(&conjunct, &r_schema, l_len) {
                         Some(resolved) => {
                             let new_right = push_or_wrap(*right, resolved);
                             Ok(L::Join {
@@ -441,6 +442,29 @@ fn try_push_into(
                     condition: JoinCondition::On(conjunct),
                     dynamic_filter_ids: Vec::new(),
                 }),
+                (JoinType::Inner, false, false, false)
+                    if is_spanning_equality(&conjunct, l_len) =>
+                {
+                    match condition {
+                        JoinCondition::On(existing) => Ok(L::Join {
+                            left,
+                            right,
+                            join_type: JoinType::Inner,
+                            condition: JoinCondition::On(combine_and(vec![existing, conjunct])),
+                            dynamic_filter_ids: Vec::new(),
+                        }),
+                        condition => Err((
+                            L::Join {
+                                left,
+                                right,
+                                join_type: JoinType::Inner,
+                                condition,
+                                dynamic_filter_ids: Vec::new(),
+                            },
+                            conjunct,
+                        )),
+                    }
+                }
                 _ => Err((
                     L::Join {
                         left,
@@ -1063,6 +1087,25 @@ fn collect_column_indices(expr: &PlanExpr) -> Vec<usize> {
     out
 }
 
+fn is_spanning_equality(expr: &PlanExpr, left_len: usize) -> bool {
+    let PlanExpr::BinaryOp {
+        left,
+        op: BinaryOp::Eq,
+        right,
+        ..
+    } = expr
+    else {
+        return false;
+    };
+    let left_cols = collect_column_indices(left);
+    let right_cols = collect_column_indices(right);
+    !left_cols.is_empty()
+        && !right_cols.is_empty()
+        && ((left_cols.iter().all(|&i| i < left_len) && right_cols.iter().all(|&i| i >= left_len))
+            || (left_cols.iter().all(|&i| i >= left_len)
+                && right_cols.iter().all(|&i| i < left_len)))
+}
+
 fn visit_column_names<F: FnMut(&str)>(expr: &PlanExpr, callback: &mut F) {
     use PlanExpr as E;
     match expr {
@@ -1125,6 +1168,16 @@ fn rewrite_against(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<PlanExpr> {
         }
     }
     rewrite_expr(expr, schema)
+}
+
+fn rewrite_join_child(expr: &PlanExpr, schema: &[ColumnInfo], offset: usize) -> Option<PlanExpr> {
+    crate::analyzer::join_reorder::rewrite_expr(expr, &mut |name, index| {
+        let child_index = index.checked_sub(offset)?;
+        if schema.get(child_index)?.name != name {
+            return None;
+        }
+        Some(child_index)
+    })
 }
 
 fn rewrite_expr(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<PlanExpr> {

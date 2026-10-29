@@ -556,6 +556,8 @@ pub enum TableFactor {
         /// Required alias for a derived table.
         alias: String,
     },
+    /// A parenthesized table with its joins.
+    NestedJoin(Box<TableWithJoins>),
 }
 
 /// A JOIN clause.

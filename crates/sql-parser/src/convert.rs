@@ -1348,7 +1348,7 @@ fn convert_table_factor(factor: sp::TableFactor) -> Result<ast::TableFactor, Par
                     "aliased nested join".to_string(),
                 ));
             }
-            Ok(inner.relation)
+            Ok(ast::TableFactor::NestedJoin(Box::new(inner)))
         }
         _ => Err(ParseError::UnsupportedFeature(
             "unsupported table factor".to_string(),

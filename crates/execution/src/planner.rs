@@ -2664,6 +2664,7 @@ mod tests {
             }],
             partition_by: Vec::new(),
             order_by: Vec::new(),
+            rows_frame: false,
             output_name: name.to_lowercase(),
         };
         let plan = LogicalPlan::Window {
@@ -2907,6 +2908,7 @@ mod tests {
                 }],
                 partition_by: Vec::new(),
                 order_by: Vec::new(),
+                rows_frame: false,
                 output_name: "__cte_max".into(),
             }],
         };

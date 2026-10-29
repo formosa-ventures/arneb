@@ -1269,14 +1269,31 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
     if let Some(over) = func.over {
         match over {
             sp::WindowType::WindowSpec(spec) => {
-                // The window operator only implements the SQL default frame
-                // (whole partition, or RANGE UNBOUNDED PRECEDING .. CURRENT
-                // ROW with ORDER BY); reject what it would silently ignore.
-                if spec.window_frame.is_some() {
-                    return Err(ParseError::UnsupportedFeature(
-                        "window frame clause (ROWS/RANGE/GROUPS ...)".to_string(),
-                    ));
-                }
+                let rows_frame = match spec.window_frame {
+                    None => false,
+                    Some(frame)
+                        if matches!(frame.start_bound, sp::WindowFrameBound::Preceding(None))
+                            && matches!(
+                                frame.end_bound,
+                                None | Some(sp::WindowFrameBound::CurrentRow)
+                            ) =>
+                    {
+                        match frame.units {
+                            sp::WindowFrameUnits::Rows => true,
+                            sp::WindowFrameUnits::Range => false,
+                            sp::WindowFrameUnits::Groups => {
+                                return Err(ParseError::UnsupportedFeature(
+                                    "window frame clause (ROWS/RANGE/GROUPS ...)".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        return Err(ParseError::UnsupportedFeature(
+                            "window frame clause (ROWS/RANGE/GROUPS ...)".to_string(),
+                        ));
+                    }
+                };
                 if spec.window_name.is_some() {
                     return Err(ParseError::UnsupportedFeature(
                         "named window references".to_string(),
@@ -1309,6 +1326,7 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
                     args: plain_args,
                     partition_by,
                     order_by,
+                    rows_frame,
                     span,
                 });
             }

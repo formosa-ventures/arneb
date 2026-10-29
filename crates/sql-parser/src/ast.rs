@@ -382,6 +382,8 @@ pub enum Expr {
         partition_by: Vec<Expr>,
         /// ORDER BY expressions.
         order_by: Vec<OrderByExpr>,
+        /// Whether the frame ends at the current physical row.
+        rows_frame: bool,
         /// Source span.
         span: Span,
     },
@@ -796,6 +798,7 @@ impl fmt::Display for Expr {
                 args,
                 partition_by,
                 order_by,
+                rows_frame,
                 ..
             } => {
                 write!(f, "{name}(")?;
@@ -836,6 +839,9 @@ impl fmt::Display for Expr {
                             None => {}
                         }
                     }
+                }
+                if *rows_frame {
+                    write!(f, " ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW")?;
                 }
                 write!(f, ")")
             }

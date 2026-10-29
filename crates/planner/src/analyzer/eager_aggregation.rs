@@ -689,13 +689,15 @@ fn build_rewrite(
             (preserved_input, preaggregated, cond, left_width)
         }
         Side::Left => {
+            let preserved_key =
+                remap_expr_from_join_to_side(preserved_key, Side::Right, left_width)?;
             let cond = eq_expr(
                 PlanExpr::Column {
                     index: 0,
                     name: preagg_schema[preagg_key_index].name.clone(),
                     span: None,
                 },
-                remap_expr_from_join_to_side(preserved_key, Side::Right, left_width)?,
+                shift_column_indices(preserved_key, 1 + aggr_exprs.len()),
             );
             (preaggregated, preserved_input, cond, 1 + aggr_exprs.len())
         }
@@ -1827,6 +1829,40 @@ mod tests {
         assert_eq!(aggr_exprs.len(), 1);
         assert_eq!(schema[0].name, "o_custkey");
         assert_eq!(schema[1].name, "COUNT(o_orderkey)");
+    }
+
+    #[test]
+    fn eager_aggregation_offsets_right_preserved_join_key() {
+        let _override = set_eager_aggregation_for_test(true);
+        let mut ctx = AnalyzerContext::new();
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Join {
+                left: Box::new(scan("f", &["fk", "amt"])),
+                right: Box::new(scan("d", &["dk"])),
+                join_type: ast::JoinType::Inner,
+                condition: JoinCondition::On(eq_expr(col(0, "fk"), col(2, "dk"))),
+                dynamic_filter_ids: Vec::new(),
+            }),
+            group_by: vec![col(2, "dk")],
+            aggr_exprs: vec![sum_expr(col(1, "amt"))],
+            schema: vec![ci("dk"), ci("SUM(amt)")],
+        };
+
+        let after = EagerAggregation::new().analyze(plan, &mut ctx).unwrap();
+        let LogicalPlan::Aggregate { input, .. } = after else {
+            panic!("expected top aggregate");
+        };
+        let LogicalPlan::Projection { input, .. } = *input else {
+            panic!("expected projection below top aggregate");
+        };
+        let LogicalPlan::Join { condition, .. } = *input else {
+            panic!("expected join below projection");
+        };
+        let JoinCondition::On(PlanExpr::BinaryOp { left, right, .. }) = condition else {
+            panic!("expected equality join condition");
+        };
+        assert!(matches!(*left, PlanExpr::Column { index: 0, .. }));
+        assert!(matches!(*right, PlanExpr::Column { index: 2, .. }));
     }
 
     #[test]

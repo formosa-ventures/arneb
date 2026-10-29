@@ -470,7 +470,30 @@ impl<'a> QueryPlanner<'a> {
         input: &LogicalPlan,
         exprs: &[PlanExpr],
     ) -> Result<Vec<SortExpr>, PlanError> {
-        let input_ctx = self.context_from_plan(input);
+        let mut input_ctx = self.context_from_plan(input);
+        // Restore the qualifiers of selected columns. A wildcard expands to
+        // several expressions, so items and exprs only line up without one.
+        if let Some(items) = select_items.filter(|items| {
+            items.len() == exprs.len()
+                && !items.iter().any(|item| {
+                    matches!(
+                        item,
+                        ast::SelectItem::Wildcard | ast::SelectItem::QualifiedWildcard(_)
+                    )
+                })
+        }) {
+            for (item, expr) in items.iter().zip(exprs) {
+                if let (
+                    ast::SelectItem::UnnamedExpr(ast::Expr::Column { col_ref, .. }),
+                    PlanExpr::Column { index, .. },
+                ) = (item, expr)
+                {
+                    if let Some(col) = input_ctx.columns.get_mut(*index) {
+                        col.0 = col_ref.table.clone();
+                    }
+                }
+            }
+        }
         let mut order_by = Vec::with_capacity(query.order_by.len());
         for ob in &query.order_by {
             let resolved = match select_ordinal(&ob.expr, exprs.len(), "ORDER BY")? {
@@ -1486,6 +1509,17 @@ impl<'a> QueryPlanner<'a> {
                 }
                 ast::JoinCondition::None => JoinCondition::None,
             };
+
+            if matches!(join.join_type, ast::JoinType::Right | ast::JoinType::Full) {
+                for (_, col) in &mut ctx.columns[..left_len] {
+                    col.nullable = true;
+                }
+            }
+            if matches!(join.join_type, ast::JoinType::Left | ast::JoinType::Full) {
+                for (_, col) in &mut ctx.columns[left_len..] {
+                    col.nullable = true;
+                }
+            }
 
             plan = LogicalPlan::Join {
                 left: Box::new(plan),

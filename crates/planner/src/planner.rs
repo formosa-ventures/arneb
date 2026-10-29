@@ -111,7 +111,7 @@ impl PlanningContext {
             }
         }
         found.ok_or_else(|| PlanError::ColumnNotFound {
-            name: name.to_string(),
+            name: table.map_or_else(|| name.to_string(), |table| format!("{table}.{name}")),
             location,
         })
     }
@@ -1593,8 +1593,53 @@ impl<'a> QueryPlanner<'a> {
                 ctx.add_table_columns(Some(alias.as_str()), &schema);
                 Ok((plan, ctx))
             }
-            ast::TableFactor::NestedJoin(inner) => {
-                Box::pin(self.plan_table_with_joins(inner)).await
+            ast::TableFactor::NestedJoin {
+                relation,
+                alias,
+                column_aliases,
+            } => {
+                let (mut plan, mut ctx) = Box::pin(self.plan_table_with_joins(relation)).await?;
+                if let Some(alias) = alias {
+                    for (qualifier, _) in &mut ctx.columns {
+                        *qualifier = Some(alias.clone());
+                    }
+                }
+                if !column_aliases.is_empty() {
+                    let schema = plan.schema();
+                    if column_aliases.len() != schema.len() {
+                        return Err(PlanError::invalid_expression(format!(
+                            "nested join alias declares {} columns but produces {} columns",
+                            column_aliases.len(),
+                            schema.len()
+                        )));
+                    }
+                    let exprs = schema
+                        .iter()
+                        .enumerate()
+                        .map(|(index, column)| PlanExpr::Column {
+                            index,
+                            name: column.name.clone(),
+                            span: None,
+                        })
+                        .collect();
+                    let renamed_schema: Vec<ColumnInfo> = schema
+                        .into_iter()
+                        .zip(column_aliases)
+                        .map(|(mut column, alias)| {
+                            column.name = alias.clone();
+                            column
+                        })
+                        .collect();
+                    for ((_, column), renamed) in ctx.columns.iter_mut().zip(&renamed_schema) {
+                        *column = renamed.clone();
+                    }
+                    plan = LogicalPlan::Projection {
+                        input: Box::new(plan),
+                        exprs,
+                        schema: renamed_schema,
+                    };
+                }
+                Ok((plan, ctx))
             }
         }
     }

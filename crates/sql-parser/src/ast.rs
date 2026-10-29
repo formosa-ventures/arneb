@@ -557,7 +557,14 @@ pub enum TableFactor {
         alias: String,
     },
     /// A parenthesized table with its joins.
-    NestedJoin(Box<TableWithJoins>),
+    NestedJoin {
+        /// The joined relation inside the parentheses.
+        relation: Box<TableWithJoins>,
+        /// Optional name for the joined relation.
+        alias: Option<String>,
+        /// Optional replacement names for its columns.
+        column_aliases: Vec<String>,
+    },
 }
 
 /// A JOIN clause.

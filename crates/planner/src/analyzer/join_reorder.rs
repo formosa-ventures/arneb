@@ -815,14 +815,27 @@ fn try_reorder_chain(
     // the permutation is threaded to the consuming operator via the returned
     // `RemapTable` (see `transform_remap`).
 
-    // Reorder each leaf in case it contains its own nested inner-join
-    // chain that survived the boundary detection (e.g., inner inside
-    // outer-join's right side). This is conservative — calling
-    // `transform` again on each leaf is a no-op when there's no chain.
-    let leaves: Vec<LogicalPlan> = leaves
+    // A leaf can contain a join chain beneath a Filter. Preserve its
+    // column permutation when remapping the outer chain's edges and output.
+    let (leaves, leaf_remaps): (Vec<LogicalPlan>, Vec<Option<RemapTable>>) = leaves
         .into_iter()
-        .map(|leaf| transform(leaf, stats, config))
-        .collect();
+        .map(|leaf| transform_remap(leaf, stats, config))
+        .unzip();
+    let widths = leaf_widths(&leaves);
+    let orig_off = cumulative_offsets(&widths);
+    let edges: Vec<PlanExpr> = edges
+        .into_iter()
+        .map(|edge| {
+            rewrite_expr(&edge, &mut |_name, idx| {
+                let (leaf, pos) = leaf_of_orig_index(idx, &orig_off, &widths)?;
+                let mapped = leaf_remaps[leaf]
+                    .as_ref()
+                    .map(|table| table[pos])
+                    .unwrap_or(pos);
+                Some(orig_off[leaf] + mapped)
+            })
+        })
+        .collect::<Option<_>>()?;
 
     let original_cost = estimated_cardinality(plan, stats);
 
@@ -905,15 +918,17 @@ fn try_reorder_chain(
     // combined index `oi` → `new_offsets[leaf] + pos`. The consuming operator
     // remaps its refs through this (`transform_remap`). Identity when the
     // chosen order equals the original.
-    let widths = leaf_widths(&leaves);
-    let orig_off = cumulative_offsets(&widths);
     let new_off = new_offsets(&order, &widths);
     let total: usize = widths.iter().sum();
     let table: RemapTable = (0..total)
         .map(|oi| {
             let (leaf, pos) =
                 leaf_of_orig_index(oi, &orig_off, &widths).expect("orig index within chain width");
-            new_off[leaf] + pos
+            new_off[leaf]
+                + leaf_remaps[leaf]
+                    .as_ref()
+                    .map(|remap| remap[pos])
+                    .unwrap_or(pos)
         })
         .collect();
 
@@ -1654,7 +1669,7 @@ fn rebuild_column_indices(
 /// cloned/recursed unchanged. `remap` returning `None` aborts the rewrite.
 /// Both the name-based and the leaf-origin (index-based) resolvers share
 /// this walk — only the `remap` closure differs.
-fn rewrite_expr<F>(expr: &PlanExpr, remap: &mut F) -> Option<PlanExpr>
+pub(super) fn rewrite_expr<F>(expr: &PlanExpr, remap: &mut F) -> Option<PlanExpr>
 where
     F: FnMut(&str, usize) -> Option<usize>,
 {

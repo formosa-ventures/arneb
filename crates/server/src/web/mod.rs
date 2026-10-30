@@ -1,5 +1,6 @@
 //! Web UI module: REST API + embedded frontend.
 
+mod agent;
 mod api;
 pub mod auth;
 pub mod error;
@@ -46,6 +47,9 @@ pub struct WebState {
     pub basic: Option<arneb_protocol::BasicAuthenticator>,
     /// Web sessions (bearer `arneb_s_…`), in memory.
     pub sessions: SessionStore,
+    /// The agent query API service (`/api/v2` statements, discovery and
+    /// explain); `None` on workers, where those routes answer `not_found`.
+    pub agent: Option<arneb_protocol::agent::AgentQueryService>,
 }
 
 /// Build the axum Router with API and frontend routes.

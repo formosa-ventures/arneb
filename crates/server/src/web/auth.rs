@@ -222,6 +222,7 @@ mod tests {
                 .map(|r| Arc::new(arneb_catalog::AccessRules::from_json(r).unwrap())),
             metrics_auth,
             sessions: SessionStore::new(),
+            agent: None,
         }
     }
 

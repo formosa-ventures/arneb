@@ -139,6 +139,9 @@ password auth without `[tls]` is a startup error; disable the listener with
 | `overloaded` | 503 | Too many pending password checks or sessions; retry (`Retry-After: 1`). |
 | `internal` | 500 | An unexpected failure; the server log has the detail. |
 
+The [querying](#querying) routes add the codes in
+[Querying errors](#querying-errors).
+
 `/api/v1` keeps its historical `400` and `404` bodies; its new `401` and
 `403` responses use the envelope.
 
@@ -162,6 +165,9 @@ All `/api/v2` routes need credentials, except `health` and `POST /sessions`.
 | `GET /api/v2/cluster/workers` | Workers and their state. |
 | `GET /api/v2/info` | Server version and role. |
 
+The [querying](#querying) routes (`catalogs`, `explain`, `statements`) are
+listed in their own section.
+
 The `queries`, `cluster` and `info` bodies are the `/api/v1` JSON; only the
 errors differ. The `/api/v1` routes are `/api/v1/queries`,
 `/api/v1/queries/{id}` (GET, DELETE), `/api/v1/cluster`,
@@ -170,6 +176,162 @@ errors differ. The `/api/v1` routes are `/api/v1/queries`,
 Both versions apply the [`queries` access rules](/guide/access-control):
 a query the caller may not `view` is hidden (`404`), one they may view but
 not `kill` answers `403`, and a user may always kill their own.
+
+## Querying
+
+An agent or script can run SQL and explore the catalog over HTTP, with no
+driver. The routes live on the coordinator's Web port (standalone or
+coordinator; a worker answers `404`). They run as the authenticated user, with
+exactly the visibility and privileges that user has over Trino or pgwire:
+an object the user may not see answers like one that does not exist.
+
+Statements are asynchronous. Submit one, optionally wait a moment for it,
+then poll, fetch result pages, or cancel. The statement id is the query id,
+so `GET /api/v2/queries/{id}` shows the same query with `source: "api"`.
+Only the submitting user can poll, fetch or cancel a statement.
+
+| Method and path | Description |
+|---|---|
+| `GET /api/v2/catalogs` | List catalogs. |
+| `GET /api/v2/catalogs/{c}/schemas` | List schemas. |
+| `GET /api/v2/catalogs/{c}/schemas/{s}/tables` | List tables. |
+| `GET /api/v2/catalogs/{c}/schemas/{s}/tables/{t}` | Columns (with Trino types) and statistics. |
+| `GET /api/v2/catalogs/{c}/schemas/{s}/tables/{t}/sample?rows=` | Sample rows, as a statement status (default 10, at most 100). |
+| `POST /api/v2/explain` | Plan a query without running it. |
+| `POST /api/v2/statements` | Submit a statement. `201` with a `Location` header. |
+| `GET /api/v2/statements/{id}?wait_ms=` | Poll a statement. |
+| `GET /api/v2/statements/{id}/results?cursor=&max_bytes=` | Fetch a page of rows. |
+| `DELETE /api/v2/statements/{id}` | Cancel a statement. Idempotent. |
+
+The three listings take `?prefix=` (case-insensitive) and `?limit=`, and
+return `{"items":[{"name"}],"total","truncated"}`. Path segments are used
+literally (percent-decoded), with no case folding.
+
+### Submit and poll
+
+```json
+POST /api/v2/statements?wait_ms=2000
+{"sql":"SELECT l_orderkey, l_quantity FROM lineitem","catalog":"datalake","schema":"tpch","max_rows":100}
+```
+
+`catalog`, `schema` and `max_rows` are optional. The API is stateless per
+statement, so session statements (`USE`, `SET SESSION`, `PREPARE`, ...) are
+refused with `invalid_argument`; pass `catalog` and `schema` in the body
+instead. `SHOW` works.
+
+The reply is a status:
+
+```json
+{"id":"…","state":"finished","queue_position":null,"elapsed_ms":41,
+ "update_type":null,
+ "columns":[{"name":"l_orderkey","type":"bigint"},{"name":"l_quantity","type":"bigint"}],
+ "total_rows":2,"truncated":false,"max_rows":100,
+ "first_page":{"rows":[[1,17],[2,36]],"…":"…"},"error":null}
+```
+
+`state` is `queued`, `running`, `finished`, `failed` or `cancelled`. A
+statement that finishes inside `wait_ms` carries its first page inline;
+otherwise poll with `GET /statements/{id}?wait_ms=` (long-poll) until it is
+terminal, then fetch pages with `GET /statements/{id}/results?cursor=N`,
+where `cursor` is the row offset (default 0).
+
+A statement that fails after submission is still `200`/`201`: the status has
+`state: "failed"` and an `error` object. HTTP error statuses are for the
+request itself.
+
+DDL and DML (`CREATE`, `INSERT`, `DELETE`, ...) are not supported over this
+API in this release: they fail with an error, as on the Trino path. Writes
+will come with write-privilege enforcement in a later release.
+
+### Explain
+
+```bash
+curl -s -X POST http://127.0.0.1:6432/api/v2/explain \
+  -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT count(*) FROM lineitem","catalog":"datalake","schema":"tpch"}'
+# {"plan":"…","scans":[{"table":"datalake.tpch.lineitem","row_count":6001215,"size_bytes":…}],
+#  "estimated_scan_bytes":…}
+```
+
+Explain plans only: it is not admitted or tracked, and does not run
+`ANALYZE`. Submit `EXPLAIN ANALYZE ...` as a statement for that. A size is
+`null` when the connector does not know it.
+
+### Limits and truncation
+
+Every response that returns data is bounded by rows and by bytes. When
+something is cut, the response says so (`truncated`) and gives the full
+count when it is known. A statement keeps at most `max_rows` rows after it
+finishes, plus its total row count. Cells longer than `max_cell_bytes` are
+truncated.
+
+A request value above its ceiling is refused with `invalid_argument` and a
+hint naming the ceiling; it is never silently clamped. That includes
+`wait_ms`, `max_rows`, `max_bytes` and `rows`. A malformed JSON body or
+query parameter is also `invalid_argument`.
+
+| `[agent_api]` field | Env var | Default |
+|---|---|---|
+| `default_max_rows` | `ARNEB_AGENT_DEFAULT_MAX_ROWS` | 1000 |
+| `max_rows` | `ARNEB_AGENT_MAX_ROWS` | 10000 |
+| `default_page_bytes` | `ARNEB_AGENT_DEFAULT_PAGE_BYTES` | 262144 |
+| `max_page_bytes` | `ARNEB_AGENT_MAX_PAGE_BYTES` | 4194304 |
+| `max_cell_bytes` | `ARNEB_AGENT_MAX_CELL_BYTES` | 8192 |
+| `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 |
+| `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 |
+
+A user may hold 32 live statements and the server 1024 (`overloaded`
+beyond that). After `idle_timeout_secs` with no request for a statement, a
+finished one is dropped and a running one is cancelled as abandoned.
+
+### Querying errors
+
+Same envelope as above, with two optional fields: `location` (`{"line","column"}`
+in the SQL) and `candidates` (the nearest existing names).
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `syntax_error` | 400 | The SQL does not parse. |
+| `catalog_not_found` | 404 | No such catalog, or one you may not see. |
+| `schema_not_found` | 404 | No such schema, or one you may not see. |
+| `table_not_found` | 404 | No such table, or one you may not see. |
+| `column_not_found` | 400 | No such column; `candidates` suggests names. |
+| `function_not_found` | 400 | No such function. |
+| `type_mismatch` | 400 | Operand types do not fit. |
+| `not_supported` | 400 | The engine does not support the statement. |
+| `query_failed` | 400 | Any other error while running the statement. |
+| `exceeded_memory` | 400 | The statement exceeded its memory limit. |
+| `exceeded_time` | 400 | The statement exceeded its time limit. |
+| `cancelled` | 409 | The statement was cancelled. |
+
+`forbidden`, `overloaded`, `invalid_argument`, `not_found` and `internal`
+are reused. For a statement, these codes appear in the status `error`
+object (HTTP 200/201); for explain, discovery and a bad request, they are the
+HTTP error.
+
+### Worked session
+
+```bash
+H='Authorization: Bearer arneb_…'
+B=http://127.0.0.1:6432/api/v2
+
+curl -s -H "$H" "$B/catalogs/datalake/schemas/tpch/tables?prefix=line"
+curl -s -H "$H" "$B/catalogs/datalake/schemas/tpch/tables/lineitem"
+
+# Submit, waiting up to 2 s for the first page
+curl -si -H "$H" -H 'Content-Type: application/json' -X POST "$B/statements?wait_ms=2000" \
+  -d '{"sql":"SELECT l_returnflag, count(*) FROM datalake.tpch.lineitem GROUP BY 1"}'
+# HTTP/1.1 201 Created
+# Location: /api/v2/statements/0b9f…
+# {"id":"0b9f…","state":"running",…}
+
+# Still running: long-poll, then fetch pages
+curl -s -H "$H" "$B/statements/0b9f…?wait_ms=10000"
+curl -s -H "$H" "$B/statements/0b9f…/results?cursor=0&max_bytes=65536"
+
+# Changed your mind
+curl -s -H "$H" -X DELETE "$B/statements/0b9f…"
+```
 
 ## Security notes
 

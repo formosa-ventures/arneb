@@ -73,6 +73,11 @@ impl AgentQueryService {
         }
     }
 
+    /// The limits every request is validated against.
+    pub fn limits(&self) -> &AgentLimits {
+        &self.limits
+    }
+
     /// The access-scoped catalog root `user` sees (same visibility as
     /// `SHOW`), or the error that user is refused with.
     pub(super) fn scoped_root(&self, user: &str) -> Result<Arc<CatalogManager>, AgentError> {

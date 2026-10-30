@@ -3,6 +3,7 @@
 //! Every [`ErrorCode`] maps to exactly one HTTP status. `/api/v1` keeps its
 //! historical 400/404 bodies; only its new 401/403 responses use this.
 
+use arneb_protocol::agent::{AgentError, AgentErrorCode, SqlLocation};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -26,6 +27,30 @@ pub enum ErrorCode {
     Overloaded,
     /// An unexpected server-side failure (500).
     Internal,
+    /// The SQL does not parse (400).
+    SyntaxError,
+    /// No such catalog, or one the caller may not see (404).
+    CatalogNotFound,
+    /// No such schema, or one the caller may not see (404).
+    SchemaNotFound,
+    /// No such table, or one the caller may not see (404).
+    TableNotFound,
+    /// No such column (400).
+    ColumnNotFound,
+    /// No such function (400).
+    FunctionNotFound,
+    /// Operand types do not fit (400).
+    TypeMismatch,
+    /// The engine does not support the statement (400).
+    NotSupported,
+    /// Any other user error while running a statement (400).
+    QueryFailed,
+    /// The statement exceeded its memory limit (400).
+    ExceededMemory,
+    /// The statement exceeded its time limit (400).
+    ExceededTime,
+    /// The statement was cancelled (409).
+    Cancelled,
 }
 
 impl ErrorCode {
@@ -35,7 +60,19 @@ impl ErrorCode {
             Self::Unauthenticated => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::InvalidArgument => StatusCode::BAD_REQUEST,
+            Self::InvalidArgument
+            | Self::SyntaxError
+            | Self::ColumnNotFound
+            | Self::FunctionNotFound
+            | Self::TypeMismatch
+            | Self::NotSupported
+            | Self::QueryFailed
+            | Self::ExceededMemory
+            | Self::ExceededTime => StatusCode::BAD_REQUEST,
+            Self::CatalogNotFound | Self::SchemaNotFound | Self::TableNotFound => {
+                StatusCode::NOT_FOUND
+            }
+            Self::Cancelled => StatusCode::CONFLICT,
             Self::AuthDisabled => StatusCode::CONFLICT,
             Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -49,6 +86,12 @@ pub struct ApiError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: Option<String>,
+    /// Where in the SQL the error is, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<SqlLocation>,
+    /// Nearest existing names (column typos).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
 }
 
 impl ApiError {
@@ -58,6 +101,8 @@ impl ApiError {
             code,
             message: message.into(),
             hint: None,
+            location: None,
+            candidates: Vec::new(),
         }
     }
 
@@ -65,6 +110,38 @@ impl ApiError {
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self
+    }
+}
+
+impl From<AgentError> for ApiError {
+    fn from(e: AgentError) -> Self {
+        use AgentErrorCode as A;
+        let code = match e.code {
+            A::SyntaxError => ErrorCode::SyntaxError,
+            A::CatalogNotFound => ErrorCode::CatalogNotFound,
+            A::SchemaNotFound => ErrorCode::SchemaNotFound,
+            A::TableNotFound => ErrorCode::TableNotFound,
+            A::ColumnNotFound => ErrorCode::ColumnNotFound,
+            A::FunctionNotFound => ErrorCode::FunctionNotFound,
+            A::TypeMismatch => ErrorCode::TypeMismatch,
+            A::NotSupported => ErrorCode::NotSupported,
+            A::QueryFailed => ErrorCode::QueryFailed,
+            A::ExceededMemory => ErrorCode::ExceededMemory,
+            A::ExceededTime => ErrorCode::ExceededTime,
+            A::Cancelled => ErrorCode::Cancelled,
+            A::Forbidden => ErrorCode::Forbidden,
+            A::Overloaded => ErrorCode::Overloaded,
+            A::InvalidArgument => ErrorCode::InvalidArgument,
+            A::NotFound => ErrorCode::NotFound,
+            A::Internal => ErrorCode::Internal,
+        };
+        Self {
+            code,
+            message: e.message,
+            hint: e.hint,
+            location: e.location,
+            candidates: e.candidates,
+        }
     }
 }
 
@@ -107,6 +184,18 @@ mod tests {
             (ErrorCode::AuthDisabled, 409, "auth_disabled"),
             (ErrorCode::Overloaded, 503, "overloaded"),
             (ErrorCode::Internal, 500, "internal"),
+            (ErrorCode::SyntaxError, 400, "syntax_error"),
+            (ErrorCode::CatalogNotFound, 404, "catalog_not_found"),
+            (ErrorCode::SchemaNotFound, 404, "schema_not_found"),
+            (ErrorCode::TableNotFound, 404, "table_not_found"),
+            (ErrorCode::ColumnNotFound, 400, "column_not_found"),
+            (ErrorCode::FunctionNotFound, 400, "function_not_found"),
+            (ErrorCode::TypeMismatch, 400, "type_mismatch"),
+            (ErrorCode::NotSupported, 400, "not_supported"),
+            (ErrorCode::QueryFailed, 400, "query_failed"),
+            (ErrorCode::ExceededMemory, 400, "exceeded_memory"),
+            (ErrorCode::ExceededTime, 400, "exceeded_time"),
+            (ErrorCode::Cancelled, 409, "cancelled"),
         ] {
             let resp = ApiError::new(code, "m").with_hint("h").into_response();
             assert_eq!(resp.status().as_u16(), status);
@@ -126,5 +215,21 @@ mod tests {
         );
         let resp = ApiError::new(ErrorCode::Overloaded, "m").into_response();
         assert_eq!(resp.headers()[header::RETRY_AFTER], "1");
+    }
+
+    #[test]
+    fn agent_errors_keep_location_and_candidates() {
+        let mut e = AgentError::new(AgentErrorCode::ColumnNotFound, "no column");
+        e.location = Some(SqlLocation { line: 1, column: 8 });
+        e.candidates = vec!["l_quantity".into()];
+        let api = ApiError::from(e);
+        assert_eq!(api.code, ErrorCode::ColumnNotFound);
+        assert_eq!(
+            serde_json::to_value(&api).unwrap(),
+            serde_json::json!({
+                "code": "column_not_found", "message": "no column", "hint": null,
+                "location": {"line": 1, "column": 8}, "candidates": ["l_quantity"],
+            })
+        );
     }
 }

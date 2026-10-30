@@ -1024,6 +1024,31 @@ async fn run() -> Result<()> {
         None
     };
 
+    // Agent query API (`/api/v2` statements): whenever SQL is served,
+    // independent of the Trino listener. Same engine state as the other
+    // protocols; statements show in the tracker with source "api".
+    let agent_service = if serves_clients {
+        let limits = config.agent_api.limits();
+        let mut service = arneb_protocol::agent::AgentQueryService::new(
+            catalog_manager.clone(),
+            connector_registry.clone(),
+            query_tracker.clone(),
+            limits,
+        )
+        .with_memory_pool(Arc::clone(&memory_pool))
+        .with_query_memory_limit(query_memory_limit)
+        .with_admission(admission.clone())
+        .with_statement_timeout(config.admission.statement_timeout)
+        .with_access_rules(access_rules.clone());
+        if let Some(ref executor) = distributed_executor {
+            service = service.with_distributed_executor(Arc::clone(executor));
+        }
+        service.spawn_reaper();
+        Some(service)
+    } else {
+        None
+    };
+
     // 9. Startup banner
     match role {
         ServerRole::Worker => {
@@ -1064,6 +1089,7 @@ async fn run() -> Result<()> {
         access_rules: access_rules.clone(),
         metrics_auth: config.web.metrics_auth,
         sessions: web::SessionStore::new(),
+        agent: agent_service,
     };
     let web_router = web::build_router(web_state);
     let web_port = config.server.port + 1000; // default: pgwire port + 1000 (e.g., 5432 → 6432)

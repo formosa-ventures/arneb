@@ -169,6 +169,17 @@ fn push_down(plan: LogicalPlan) -> LogicalPlan {
             aggr_exprs,
             schema,
         },
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => L::RollupAggregate {
+            input: Box::new(push_down(*input)),
+            group_by,
+            aggr_exprs,
+            schema,
+        },
         L::Sort { input, order_by } => L::Sort {
             input: Box::new(push_down(*input)),
             order_by,

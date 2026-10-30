@@ -250,6 +250,7 @@ fn find_supplier_lookup(plan: &LogicalPlan) -> Option<(LogicalPlan, usize, usize
         | LogicalPlan::AssignUniqueId { input, .. }
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::RollupAggregate { input, .. }
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. } => find_supplier_lookup(input),
         LogicalPlan::Join { left, right, .. }
@@ -396,6 +397,12 @@ fn prune_for_columns(
             aggr_exprs,
             schema,
         }
+        | L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        }
         | L::PartialAggregate {
             input,
             group_by,
@@ -422,6 +429,12 @@ fn prune_for_columns(
                 .map(|e| rewrite_expr(e, &child_map))
                 .collect();
             let rebuilt = match plan {
+                L::RollupAggregate { .. } => L::RollupAggregate {
+                    input: Box::new(new_input),
+                    group_by,
+                    aggr_exprs,
+                    schema: schema.clone(),
+                },
                 L::PartialAggregate { .. } => L::PartialAggregate {
                     input: Box::new(new_input),
                     group_by,
@@ -738,6 +751,17 @@ where
             aggr_exprs,
             schema,
         } => L::Aggregate {
+            input: Box::new(f(*input)),
+            group_by,
+            aggr_exprs,
+            schema,
+        },
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => L::RollupAggregate {
             input: Box::new(f(*input)),
             group_by,
             aggr_exprs,

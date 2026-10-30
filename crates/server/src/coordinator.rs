@@ -1377,6 +1377,7 @@ fn plan_node_children(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
         | L::Limit { input, .. }
         | L::Distinct { input }
         | L::Aggregate { input, .. }
+        | L::RollupAggregate { input, .. }
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Window { input, .. }

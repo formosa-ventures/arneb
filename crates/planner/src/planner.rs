@@ -844,56 +844,13 @@ impl<'a> QueryPlanner<'a> {
                         nullable: false,
                     });
                 }
-                let mut levels = Vec::with_capacity(key_count + 1);
-                for keep in (0..=key_count).rev() {
-                    let mut level_schema = schema[..keep].to_vec();
-                    level_schema.extend_from_slice(&schema[key_count..]);
-                    let aggregate = LogicalPlan::Aggregate {
-                        input: Box::new(plan.clone()),
-                        group_by: group_by[..keep].to_vec(),
-                        aggr_exprs: aggr_exprs.clone(),
-                        schema: level_schema.clone(),
-                    };
-                    let mut exprs = Vec::with_capacity(output_schema.len());
-                    for (index, col) in schema.iter().take(key_count).enumerate() {
-                        exprs.push(if index < keep {
-                            PlanExpr::Column {
-                                index,
-                                name: col.name.clone(),
-                                span: None,
-                            }
-                        } else {
-                            PlanExpr::Cast {
-                                expr: Box::new(PlanExpr::Literal {
-                                    value: ScalarValue::Null,
-                                    span: None,
-                                }),
-                                data_type: col.data_type.clone(),
-                                span: None,
-                            }
-                        });
-                    }
-                    for (index, col) in level_schema.iter().enumerate().skip(keep) {
-                        exprs.push(PlanExpr::Column {
-                            index,
-                            name: col.name.clone(),
-                            span: None,
-                        });
-                    }
-                    for index in 0..key_count {
-                        exprs.push(PlanExpr::Literal {
-                            value: ScalarValue::Int64(i64::from(index >= keep)),
-                            span: None,
-                        });
-                    }
-                    levels.push(LogicalPlan::Projection {
-                        input: Box::new(aggregate),
-                        exprs,
-                        schema: output_schema.clone(),
-                    });
-                }
                 schema = output_schema;
-                LogicalPlan::UnionAll { inputs: levels }
+                LogicalPlan::RollupAggregate {
+                    input: Box::new(plan),
+                    group_by,
+                    aggr_exprs: aggr_exprs.clone(),
+                    schema: schema.clone(),
+                }
             } else {
                 LogicalPlan::Aggregate {
                     input: Box::new(plan),
@@ -4196,6 +4153,7 @@ fn collect_table_scan_refs(
         | L::Limit { input, .. }
         | L::Explain { input, .. }
         | L::Aggregate { input, .. }
+        | L::RollupAggregate { input, .. }
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Distinct { input }
@@ -4819,6 +4777,7 @@ mod tests {
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Explain { input, .. }
             | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::RollupAggregate { input, .. }
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Distinct { input }

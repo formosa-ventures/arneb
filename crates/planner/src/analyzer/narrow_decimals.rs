@@ -158,6 +158,12 @@ fn collect_decimal_carry_and_blocks(
             aggr_exprs,
             ..
         }
+        | LogicalPlan::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            ..
+        }
         | LogicalPlan::FinalAggregate {
             input,
             group_by,
@@ -301,6 +307,21 @@ fn rewrite_plan(plan: LogicalPlan, candidates: &HashSet<ColumnSource>) -> Logica
             let input = rewrite_plan(*input, candidates);
             let input = castback_input_if_needed(input, group_by.iter().chain(aggr_exprs.iter()));
             LogicalPlan::Aggregate {
+                input: Box::new(input),
+                group_by,
+                aggr_exprs,
+                schema,
+            }
+        }
+        LogicalPlan::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => {
+            let input = rewrite_plan(*input, candidates);
+            let input = castback_input_if_needed(input, group_by.iter().chain(aggr_exprs.iter()));
+            LogicalPlan::RollupAggregate {
                 input: Box::new(input),
                 group_by,
                 aggr_exprs,

@@ -134,6 +134,12 @@ pub fn estimated_cardinality(plan: &LogicalPlan, stats: &CatalogStats) -> Cost {
             schema,
             ..
         }
+        | LogicalPlan::RollupAggregate {
+            input,
+            group_by,
+            schema,
+            ..
+        }
         | LogicalPlan::PartialAggregate {
             input,
             group_by,
@@ -410,6 +416,7 @@ fn min_filtered_leaf_cardinality(plan: &LogicalPlan, stats: &CatalogStats) -> Co
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::RollupAggregate { input, .. }
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. }
         | LogicalPlan::Window { input, .. }
@@ -560,6 +567,7 @@ fn key_owner_unfiltered_card(
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::RollupAggregate { input, .. }
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. }
         | LogicalPlan::Window { input, .. }
@@ -599,6 +607,7 @@ fn unfiltered_scan_card(plan: &LogicalPlan, stats: &CatalogStats) -> f64 {
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::RollupAggregate { input, .. }
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. }
         | LogicalPlan::Window { input, .. }
@@ -630,6 +639,7 @@ pub fn total_scanned_rows(plan: &LogicalPlan, stats: &CatalogStats) -> f64 {
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::RollupAggregate { input, .. }
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. }
         | LogicalPlan::Window { input, .. }
@@ -671,6 +681,7 @@ where
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::RollupAggregate { input, .. }
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. }
         | LogicalPlan::Window { input, .. } => walk_scans(input, callback),

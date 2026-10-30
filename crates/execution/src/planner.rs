@@ -17,7 +17,7 @@ use crate::hash_join::{extract_equi_join_keys, HashJoinExec};
 use crate::memory_pool::{MemoryPool, UnboundedMemoryPool};
 use crate::operator::{
     AggregateOutputColumn, ExecutionPlan, ExplainExec, FilterExec, HashAggregateExec, LimitExec,
-    NestedLoopJoinExec, ProjectionExec, ScanExec, SortExec, TopKExec,
+    NestedLoopJoinExec, ProjectionExec, RollupAggregateExec, ScanExec, SortExec, TopKExec,
 };
 use crate::scan_context::ScanContext;
 
@@ -646,6 +646,7 @@ impl ExecutionContext {
             | LogicalPlan::Explain { input, .. }
             | LogicalPlan::Distinct { input }
             | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::RollupAggregate { input, .. }
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Window { input, .. }
@@ -1191,6 +1192,19 @@ impl ExecutionContext {
                     memory_pool: self.memory_pool.clone(),
                 }))
             }
+
+            LogicalPlan::RollupAggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                schema,
+            } => Ok(Arc::new(RollupAggregateExec {
+                input: coalesce_if_multi(self.convert(input)?),
+                group_by: group_by.clone(),
+                aggr_exprs: aggr_exprs.clone(),
+                output_schema: schema.clone(),
+                memory_pool: self.memory_pool.clone(),
+            })),
 
             LogicalPlan::Sort { input, order_by } => {
                 let input_plan = coalesce_if_multi(self.convert(input)?);
@@ -1989,6 +2003,12 @@ pub fn prune_for_columns(
             aggr_exprs,
             schema,
         }
+        | L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        }
         | L::PartialAggregate {
             input,
             group_by,
@@ -2015,6 +2035,12 @@ pub fn prune_for_columns(
                 .map(|e| rewrite_column_indices(e, &child_mapping))
                 .collect();
             let rebuilt = match plan {
+                L::RollupAggregate { .. } => L::RollupAggregate {
+                    input: Box::new(new_input),
+                    group_by: new_group_by,
+                    aggr_exprs: new_aggr_exprs,
+                    schema: schema.clone(),
+                },
                 L::PartialAggregate { .. } => L::PartialAggregate {
                     input: Box::new(new_input),
                     group_by: new_group_by,

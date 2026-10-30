@@ -1276,6 +1276,21 @@ async fn resolve_plan_subqueries(
                 schema,
             })
         }
+        LogicalPlan::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => {
+            let input =
+                Box::pin(resolve_plan_subqueries(ctx, distributed_executor, *input)).await?;
+            Ok(LogicalPlan::RollupAggregate {
+                input: Box::new(input),
+                group_by,
+                aggr_exprs,
+                schema,
+            })
+        }
         LogicalPlan::Sort { input, order_by } => {
             let input =
                 Box::pin(resolve_plan_subqueries(ctx, distributed_executor, *input)).await?;
@@ -1645,6 +1660,12 @@ fn plan_columns_in_range(plan: &LogicalPlan) -> bool {
             plan_columns_in_range(input) && expr_columns_in_range(predicate, width)
         }
         LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            ..
+        }
+        | LogicalPlan::RollupAggregate {
             input,
             group_by,
             aggr_exprs,
@@ -2035,6 +2056,7 @@ async fn register_data_sources(
             register_data_sources(input, catalog_manager, registry, ctx).await?;
         }
         LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::RollupAggregate { input, .. }
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. } => {
             register_data_sources(input, catalog_manager, registry, ctx).await?;

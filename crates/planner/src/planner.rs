@@ -111,7 +111,7 @@ impl PlanningContext {
             }
         }
         found.ok_or_else(|| PlanError::ColumnNotFound {
-            name: name.to_string(),
+            name: table.map_or_else(|| name.to_string(), |table| format!("{table}.{name}")),
             location,
         })
     }
@@ -1589,8 +1589,55 @@ impl<'a> QueryPlanner<'a> {
                 ctx.add_table_columns(Some(alias.as_str()), &schema);
                 Ok((plan, ctx))
             }
-            ast::TableFactor::NestedJoin(inner) => {
-                Box::pin(self.plan_table_with_joins(inner)).await
+            ast::TableFactor::NestedJoin {
+                relation,
+                alias,
+                column_aliases,
+            } => {
+                let (mut plan, mut ctx) = Box::pin(self.plan_table_with_joins(relation)).await?;
+                if let Some(alias) = alias {
+                    for (index, (qualifier, _)) in ctx.columns.iter_mut().enumerate() {
+                        *qualifier = (!ctx.merged.contains(&index)).then(|| alias.clone());
+                    }
+                }
+                if !column_aliases.is_empty() {
+                    let schema = plan.schema();
+                    let visible: Vec<usize> = (0..schema.len())
+                        .filter(|index| !ctx.merged.contains(index))
+                        .collect();
+                    if column_aliases.len() != visible.len() {
+                        return Err(PlanError::invalid_expression(format!(
+                            "nested join alias declares {} columns but produces {} columns",
+                            column_aliases.len(),
+                            visible.len()
+                        )));
+                    }
+                    let exprs = visible
+                        .iter()
+                        .map(|&index| PlanExpr::Column {
+                            index,
+                            name: schema[index].name.clone(),
+                            span: None,
+                        })
+                        .collect();
+                    let renamed_schema: Vec<ColumnInfo> = visible
+                        .iter()
+                        .zip(column_aliases)
+                        .map(|(&index, alias)| {
+                            let mut column = schema[index].clone();
+                            column.name = alias.clone();
+                            column
+                        })
+                        .collect();
+                    ctx = PlanningContext::new();
+                    ctx.add_table_columns(alias.as_deref(), &renamed_schema);
+                    plan = LogicalPlan::Projection {
+                        input: Box::new(plan),
+                        exprs,
+                        schema: renamed_schema,
+                    };
+                }
+                Ok((plan, ctx))
             }
         }
     }

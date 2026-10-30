@@ -94,6 +94,16 @@ fn table(rows: &[&[&str]]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Plan and run `sql`, expecting an error; return its message.
+async fn error(sql: &str) -> String {
+    let (cm, cr) = setup();
+    let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::new());
+    match arneb_protocol::__private::execute_query(sql, &cm, &cr, None, &pool).await {
+        Ok(_) => panic!("query should fail: {sql}"),
+        Err(e) => e.to_string(),
+    }
+}
+
 #[tokio::test]
 async fn leading_nested_join_keeps_its_join() {
     assert_eq!(
@@ -177,4 +187,112 @@ async fn nested_left_join_on_right_side_of_inner_join() {
         .await,
         table(&[&["1", "10", "10"], &["2", "20", "NULL"]])
     );
+}
+
+// A parenthesized join with an alias, `FROM (a JOIN b ON ...) t`, as Trino
+// accepts it: its columns are reached through `t`, the inner table names are
+// out of scope, and a name both sides share is ambiguous through `t`.
+
+#[tokio::test]
+async fn aliased_join_keeps_its_join() {
+    assert_eq!(
+        rows("SELECT count(*) FROM (a JOIN b ON a.x = b.x) t").await,
+        table(&[&["2"]])
+    );
+}
+
+#[tokio::test]
+async fn aliased_join_columns_are_reached_through_the_alias() {
+    assert_eq!(
+        rows("SELECT t.y FROM (a JOIN b ON a.x = b.x) t ORDER BY t.y").await,
+        table(&[&["10"], &["20"]])
+    );
+}
+
+#[tokio::test]
+async fn aliased_join_wildcard_returns_both_sides() {
+    assert_eq!(
+        rows("SELECT * FROM (a JOIN b ON a.x = b.x) t ORDER BY 1").await,
+        table(&[&["1", "1", "10"], &["2", "2", "20"]])
+    );
+}
+
+#[tokio::test]
+async fn aliased_left_join_keeps_unmatched_rows() {
+    assert_eq!(
+        rows("SELECT y FROM (a LEFT JOIN b ON a.x = b.x) t ORDER BY 1 NULLS LAST").await,
+        table(&[&["10"], &["20"], &["NULL"]])
+    );
+}
+
+#[tokio::test]
+async fn aliased_join_joined_to_another_table() {
+    assert_eq!(
+        rows(
+            "SELECT t.y, c.y FROM (a JOIN b ON a.x = b.x) t \
+             LEFT JOIN c ON t.y = c.y ORDER BY 1"
+        )
+        .await,
+        table(&[&["10", "10"], &["20", "NULL"]])
+    );
+}
+
+#[tokio::test]
+async fn aliased_join_with_column_aliases() {
+    assert_eq!(
+        rows("SELECT u, v FROM (b JOIN c ON b.y = c.y) t(u, v, w)").await,
+        table(&[&["1", "10"]])
+    );
+}
+
+#[tokio::test]
+async fn inner_table_names_are_out_of_scope_after_the_alias() {
+    let message = error("SELECT b.y FROM (a JOIN b ON a.x = b.x) t").await;
+    assert!(message.contains("b.y"), "{message}");
+}
+
+#[tokio::test]
+async fn a_name_both_sides_share_is_ambiguous_through_the_alias() {
+    let message = error("SELECT t.x FROM (a JOIN b ON a.x = b.x) t").await;
+    assert!(message.contains("ambiguous"), "{message}");
+}
+
+// With USING, the right-hand key is a hidden copy; through the alias only the
+// visible columns count, as in Trino 484.
+
+#[tokio::test]
+async fn aliased_using_join_wildcard_returns_the_visible_columns() {
+    assert_eq!(
+        rows("SELECT * FROM (a JOIN b USING (x)) t ORDER BY 1").await,
+        table(&[&["1", "10"], &["2", "20"]])
+    );
+    assert_eq!(
+        rows("SELECT t.* FROM (a JOIN b USING (x)) t ORDER BY 1").await,
+        table(&[&["1", "10"], &["2", "20"]])
+    );
+}
+
+#[tokio::test]
+async fn aliased_using_key_is_not_ambiguous_through_the_alias() {
+    assert_eq!(
+        rows("SELECT t.x FROM (a JOIN b USING (x)) t ORDER BY 1").await,
+        table(&[&["1"], &["2"]])
+    );
+}
+
+#[tokio::test]
+async fn aliased_using_join_column_aliases_name_the_visible_columns() {
+    assert_eq!(
+        rows("SELECT k, v FROM (a JOIN b USING (x)) t(k, v) ORDER BY 1").await,
+        table(&[&["1", "10"], &["2", "20"]])
+    );
+    let message = error("SELECT * FROM (a JOIN b USING (x)) t(k, v, w)").await;
+    assert!(message.to_lowercase().contains("alias"), "{message}");
+}
+
+#[tokio::test]
+async fn typed_column_alias_on_a_nested_join_is_rejected() {
+    // Trino rejects a type in a FROM alias list as a syntax error.
+    let message = error("SELECT u FROM (b JOIN c ON b.y = c.y) t(u INT, v INT, w INT)").await;
+    assert!(message.to_lowercase().contains("alias"), "{message}");
 }

@@ -1343,12 +1343,32 @@ fn convert_table_factor(factor: sp::TableFactor) -> Result<ast::TableFactor, Par
             alias,
         } => {
             let inner = convert_table_with_joins(*table_with_joins)?;
-            if alias.is_some() {
-                return Err(ParseError::UnsupportedFeature(
-                    "aliased nested join".to_string(),
+            if alias.as_ref().is_some_and(|alias| {
+                alias
+                    .columns
+                    .iter()
+                    .any(|column| column.data_type.is_some())
+            }) {
+                return Err(ParseError::InvalidSyntax(
+                    "nested join column alias cannot include a type".to_string(),
                 ));
             }
-            Ok(ast::TableFactor::NestedJoin(Box::new(inner)))
+            let (alias, column_aliases) = match alias {
+                Some(alias) => (
+                    Some(alias.name.value),
+                    alias
+                        .columns
+                        .into_iter()
+                        .map(|column| column.name.value)
+                        .collect(),
+                ),
+                None => (None, Vec::new()),
+            };
+            Ok(ast::TableFactor::NestedJoin {
+                relation: Box::new(inner),
+                alias,
+                column_aliases,
+            })
         }
         _ => Err(ParseError::UnsupportedFeature(
             "unsupported table factor".to_string(),

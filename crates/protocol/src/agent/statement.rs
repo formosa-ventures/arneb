@@ -10,8 +10,9 @@ use tokio::time::Instant;
 
 use arneb_common::identifiers::QueryId;
 
-use super::error::AgentError;
-use crate::trino::QueryOutput;
+use super::error::{AgentError, AgentErrorCode};
+use super::limits::AgentLimits;
+use super::results::{page, ResultPage, Retained};
 
 /// Body of a statement submission.
 #[derive(Debug, Clone, Deserialize)]
@@ -81,15 +82,26 @@ pub struct StatementStatus {
     pub total_rows: Option<u64>,
     /// Whether rows beyond the retained ones were dropped.
     pub truncated: bool,
+    /// Rows kept for the client at most (the request's `max_rows`).
+    pub max_rows: usize,
+    /// The first page of rows, once finished.
+    pub first_page: Option<ResultPage>,
     /// Why the statement failed or was cancelled.
     pub error: Option<AgentError>,
+}
+
+/// What a finished statement keeps: its shape and the retained rows.
+pub(crate) struct FinishedOutput {
+    pub(crate) columns: Option<Vec<Column>>,
+    pub(crate) update_type: Option<String>,
+    pub(crate) retained: Retained,
 }
 
 pub(crate) enum Phase {
     /// Waiting for admission; the position once it has been queued.
     Queued(Option<usize>),
     Running,
-    Finished(QueryOutput),
+    Finished(FinishedOutput),
     Failed(AgentError),
     Cancelled(AgentError),
 }
@@ -118,9 +130,8 @@ pub(crate) struct Statement {
     pub(crate) tracker_id: QueryId,
     pub(crate) user: String,
     pub(crate) sql: String,
-    /// Accepted and stored; retention applies it (H2 task 4).
-    #[allow(dead_code)]
-    pub(crate) max_rows: Option<usize>,
+    /// Rows kept after completion (validated against the ceiling).
+    pub(crate) max_rows: usize,
     pub(crate) created: Instant,
     pub(crate) inner: Mutex<Inner>,
     /// Flipped to `true` once the statement is terminal.
@@ -129,12 +140,7 @@ pub(crate) struct Statement {
 }
 
 impl Statement {
-    pub(crate) fn new(
-        tracker_id: QueryId,
-        user: &str,
-        sql: String,
-        max_rows: Option<usize>,
-    ) -> Self {
+    pub(crate) fn new(tracker_id: QueryId, user: &str, sql: String, max_rows: usize) -> Self {
         let now = Instant::now();
         Self {
             id: tracker_id.to_string(),
@@ -187,7 +193,7 @@ impl Statement {
     }
 
     /// The status document.
-    pub(crate) fn status(&self) -> StatementStatus {
+    pub(crate) fn status(&self, limits: &AgentLimits) -> StatementStatus {
         let inner = self.lock();
         let elapsed = inner
             .ended
@@ -202,6 +208,8 @@ impl Statement {
             columns: None,
             total_rows: None,
             truncated: false,
+            max_rows: self.max_rows,
+            first_page: None,
             error: None,
         };
         match &inner.phase {
@@ -209,18 +217,46 @@ impl Statement {
             Phase::Running => {}
             Phase::Finished(output) => {
                 status.update_type = output.update_type.clone();
-                status.columns = output.columns.as_ref().map(|cols| {
-                    cols.iter()
-                        .map(|c| Column {
-                            name: c.name.clone(),
-                            type_name: c.ty.display(),
-                        })
-                        .collect()
-                });
-                status.total_rows = Some(output.batches.iter().map(|b| b.num_rows() as u64).sum());
+                status.columns = output.columns.clone();
+                status.total_rows = Some(output.retained.total_rows);
+                status.truncated = output.retained.truncated;
+                status.first_page = Some(page(
+                    &output.retained,
+                    0,
+                    limits.default_page_bytes,
+                    limits.max_cell_bytes,
+                ));
             }
             Phase::Failed(err) | Phase::Cancelled(err) => status.error = Some(err.clone()),
         }
         status
+    }
+}
+
+impl Statement {
+    /// The page of retained rows starting at row `cursor`.
+    pub(crate) fn page(
+        &self,
+        cursor: u64,
+        max_bytes: usize,
+        max_cell_bytes: usize,
+    ) -> Result<ResultPage, AgentError> {
+        let inner = self.lock();
+        let Phase::Finished(output) = &inner.phase else {
+            return Err(AgentError::new(
+                AgentErrorCode::InvalidArgument,
+                format!("statement is {:?}, not finished", inner.phase.state()),
+            )
+            .with_hint("poll the statement until its state is finished"));
+        };
+        let kept = output.retained.kept_rows();
+        if cursor > kept {
+            return Err(AgentError::new(
+                AgentErrorCode::InvalidArgument,
+                format!("cursor {cursor} is past the end of the {kept} retained rows"),
+            )
+            .with_hint(format!("cursor must be in 0..={kept}")));
+        }
+        Ok(page(&output.retained, cursor, max_bytes, max_cell_bytes))
     }
 }

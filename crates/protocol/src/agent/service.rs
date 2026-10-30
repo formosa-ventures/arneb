@@ -14,7 +14,8 @@ use arneb_scheduler::{AdmissionController, AdmissionPermit, QueryState, QueryTra
 
 use super::error::{AgentError, AgentErrorCode};
 use super::limits::AgentLimits;
-use super::statement::{Phase, Statement, StatementStatus, SubmitRequest};
+use super::results::{retain, ResultPage};
+use super::statement::{Column, FinishedOutput, Phase, Statement, StatementStatus, SubmitRequest};
 use crate::handler::DistributedExecutor;
 use crate::trino::{
     needs_admission, parse_control, with_deadline, ClientSession, ControlStatement, Engine,
@@ -160,7 +161,18 @@ impl AgentQueryService {
             ));
         }
         refuse_session_statement(sql)?;
-        let statement = self.register(user, sql.to_string(), req.max_rows)?;
+        let max_rows = match req.max_rows {
+            None => self.limits.default_max_rows,
+            Some(n) if (1..=self.limits.max_rows).contains(&n) => n,
+            Some(n) => {
+                return Err(AgentError::new(
+                    AgentErrorCode::InvalidArgument,
+                    format!("max_rows {n} is out of range"),
+                )
+                .with_hint(format!("max_rows must be in 1..={}", self.limits.max_rows)))
+            }
+        };
+        let statement = self.register(user, sql.to_string(), max_rows)?;
         let session = ClientSession::for_agent(user, req.catalog, req.schema);
         tracing::debug!(statement_id = %statement.id, user, "agent statement submitted");
         let handle = tokio::spawn(self.clone().run(Arc::clone(&statement), session));
@@ -172,7 +184,7 @@ impl AgentQueryService {
             }
         }
         self.wait_for_end(&statement, wait).await;
-        Ok(statement.status())
+        Ok(statement.status(&self.limits))
     }
 
     /// The status of `user`'s statement `id`, waiting up to `wait` (capped
@@ -185,7 +197,34 @@ impl AgentQueryService {
     ) -> Result<StatementStatus, AgentError> {
         let statement = self.lookup(user, id)?;
         self.wait_for_end(&statement, wait).await;
-        Ok(statement.status())
+        Ok(statement.status(&self.limits))
+    }
+
+    /// A page of `user`'s finished statement `id`, starting at row `cursor`,
+    /// at most `max_bytes` (default `default_page_bytes`) of serialized rows.
+    pub fn results(
+        &self,
+        user: &str,
+        id: &str,
+        cursor: u64,
+        max_bytes: Option<usize>,
+    ) -> Result<ResultPage, AgentError> {
+        let statement = self.lookup(user, id)?;
+        let max_bytes = match max_bytes {
+            None => self.limits.default_page_bytes,
+            Some(n) if (1..=self.limits.max_page_bytes).contains(&n) => n,
+            Some(n) => {
+                return Err(AgentError::new(
+                    AgentErrorCode::InvalidArgument,
+                    format!("max_bytes {n} is out of range"),
+                )
+                .with_hint(format!(
+                    "max_bytes must be in 1..={}",
+                    self.limits.max_page_bytes
+                )))
+            }
+        };
+        statement.page(cursor, max_bytes, self.limits.max_cell_bytes)
     }
 
     /// Cancel `user`'s statement `id`. Idempotent: a terminal statement
@@ -197,7 +236,7 @@ impl AgentQueryService {
             AgentError::new(AgentErrorCode::Cancelled, "Statement was cancelled"),
             "client",
         );
-        Ok(statement.status())
+        Ok(statement.status(&self.limits))
     }
 
     /// Checks the caps and registers a new statement with the tracker and
@@ -206,7 +245,7 @@ impl AgentQueryService {
         &self,
         user: &str,
         sql: String,
-        max_rows: Option<usize>,
+        max_rows: usize,
     ) -> Result<Arc<Statement>, AgentError> {
         let mut statements = lock(&self.statements);
         let mine = statements.values().filter(|s| s.user == user).count();
@@ -341,8 +380,21 @@ impl AgentQueryService {
     fn complete(&self, statement: &Statement, result: Result<QueryOutput, TrinoError>) {
         match result {
             Ok(output) => {
-                let rows = output.batches.iter().map(|b| b.num_rows() as u64).sum();
-                if statement.end(Phase::Finished(output)) {
+                let retained = retain(output.batches, statement.max_rows);
+                let rows = retained.total_rows;
+                let finished = FinishedOutput {
+                    columns: output.columns.map(|cols| {
+                        cols.iter()
+                            .map(|c| Column {
+                                name: c.name.clone(),
+                                type_name: c.ty.display(),
+                            })
+                            .collect()
+                    }),
+                    update_type: output.update_type,
+                    retained,
+                };
+                if statement.end(Phase::Finished(finished)) {
                     let _ = self.tracker.finish_query(&statement.tracker_id, rows);
                 }
             }
@@ -461,6 +513,13 @@ mod tests {
 
     /// `memory.default.lineitem(l_orderkey, l_quantity)`, two rows.
     fn engine_state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
+        engine_state_with(Vec::new())
+    }
+
+    /// `engine_state` plus extra `memory.default` tables.
+    fn engine_state_with(
+        extra: Vec<(&str, RecordBatch)>,
+    ) -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("l_orderkey", ArrowDataType::Int64, false),
             Field::new("l_quantity", ArrowDataType::Int64, false),
@@ -481,6 +540,19 @@ mod tests {
         let batch = RecordBatch::try_new(schema, columns).unwrap();
         let default_schema = Arc::new(MemorySchema::new());
         default_schema.register_table("lineitem", Arc::new(MemoryTable::new(infos, vec![batch])));
+        for (name, batch) in extra {
+            let infos = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| ColumnInfo {
+                    name: f.name().clone(),
+                    data_type: DataType::try_from(f.data_type().clone()).unwrap(),
+                    nullable: f.is_nullable(),
+                })
+                .collect();
+            default_schema.register_table(name, Arc::new(MemoryTable::new(infos, vec![batch])));
+        }
         let memory = Arc::new(MemoryCatalog::new());
         memory.register_schema("default", default_schema);
         let cm = CatalogManager::new("memory", "default");
@@ -498,6 +570,165 @@ mod tests {
         let tracker = Arc::new(QueryTracker::new());
         let svc = AgentQueryService::new(cm, registry, Arc::clone(&tracker), limits);
         (svc, tracker)
+    }
+
+    fn service_over(extra: Vec<(&str, RecordBatch)>, limits: AgentLimits) -> AgentQueryService {
+        let (cm, registry) = engine_state_with(extra);
+        AgentQueryService::new(cm, registry, Arc::new(QueryTracker::new()), limits)
+    }
+
+    /// `big(n)`: `n` rows 0..50_000.
+    fn big_table() -> (&'static str, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "n",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let col: ArrayRef = Arc::new(Int64Array::from_iter_values(0..50_000));
+        ("big", RecordBatch::try_new(schema, vec![col]).unwrap())
+    }
+
+    async fn run_to_end(
+        svc: &AgentQueryService,
+        sql: &str,
+        max_rows: Option<usize>,
+    ) -> StatementStatus {
+        let mut r = req(sql);
+        r.max_rows = max_rows;
+        svc.submit("alice", r, Duration::from_secs(30))
+            .await
+            .unwrap()
+    }
+
+    fn assert_invalid(err: AgentError, hint: &str) {
+        assert_eq!(err.code, AgentErrorCode::InvalidArgument);
+        assert!(err.hint.as_deref().unwrap_or("").contains(hint), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn large_result_is_truncated_with_total() {
+        let svc = service_over(vec![big_table()], AgentLimits::default());
+        let s = run_to_end(&svc, "SELECT n FROM big", Some(1000)).await;
+        assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
+        assert_eq!(s.total_rows, Some(50_000));
+        assert!(s.truncated);
+        assert_eq!(s.max_rows, 1000);
+        let mut rows = s.first_page.as_ref().unwrap().rows.len();
+        let mut cursor = s.first_page.unwrap().next_cursor;
+        while let Some(c) = cursor {
+            let p = svc.results("alice", &s.id, c, None).unwrap();
+            rows += p.rows.len();
+            cursor = p.next_cursor;
+        }
+        assert_eq!(rows, 1000);
+    }
+
+    #[tokio::test]
+    async fn pages_respect_max_bytes_and_cursor_walks_all_rows() {
+        let svc = service_over(vec![big_table()], AgentLimits::default());
+        let s = run_to_end(&svc, "SELECT n FROM big", Some(2000)).await;
+        let mut seen = Vec::new();
+        let mut cursor = Some(0);
+        while let Some(c) = cursor {
+            let p = svc.results("alice", &s.id, c, Some(1024)).unwrap();
+            let bytes: usize = p
+                .rows
+                .iter()
+                .map(|r| serde_json::to_string(r).unwrap().len() + 1)
+                .sum();
+            assert!(bytes <= 1024 + 16, "{bytes}");
+            seen.extend(p.rows.iter().map(|r| r[0].as_i64().unwrap()));
+            cursor = p.next_cursor;
+        }
+        assert_eq!(seen, (0..2000).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn oversized_cell_is_cut_and_counted() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        let col: ArrayRef = Arc::new(arrow::array::StringArray::from(vec!["x".repeat(100_000)]));
+        let wide = ("wide", RecordBatch::try_new(schema, vec![col]).unwrap());
+        let svc = service_over(vec![wide], AgentLimits::default());
+        let s = run_to_end(&svc, "SELECT s FROM wide", None).await;
+        let page = s.first_page.unwrap();
+        let cell = page.rows[0][0].as_str().unwrap();
+        assert_eq!(cell.len(), 8192 + "…".len());
+        assert!(cell.ends_with('…'));
+        assert_eq!(page.truncated_cells, 1);
+    }
+
+    #[tokio::test]
+    async fn results_before_finish_is_invalid_argument() {
+        let (svc, _) = service();
+        let (svc, _dropped) = hanging(svc);
+        let s = svc
+            .submit("alice", req(HANGING_SQL), Duration::ZERO)
+            .await
+            .unwrap();
+        let err = svc.results("alice", &s.id, 0, None).unwrap_err();
+        assert_invalid(err, "finished");
+    }
+
+    #[tokio::test]
+    async fn cursor_past_end_is_invalid_argument() {
+        let (svc, _) = service();
+        let s = run_to_end(&svc, "SELECT l_quantity FROM lineitem", None).await;
+        assert!(svc
+            .results("alice", &s.id, 2, None)
+            .unwrap()
+            .rows
+            .is_empty());
+        let err = svc.results("alice", &s.id, 3, None).unwrap_err();
+        assert_invalid(err, "0..=2");
+    }
+
+    #[tokio::test]
+    async fn max_rows_above_ceiling_is_refused() {
+        let (svc, _) = service();
+        for n in [0, 10_001] {
+            let mut r = req("SELECT 1");
+            r.max_rows = Some(n);
+            let err = svc.submit("alice", r, Duration::ZERO).await.unwrap_err();
+            assert_invalid(err, "1..=10000");
+        }
+        let (svc, _) = service();
+        let s = run_to_end(&svc, "SELECT 1", None).await;
+        for n in [0, 4_194_305] {
+            let err = svc.results("alice", &s.id, 0, Some(n)).unwrap_err();
+            assert_invalid(err, "1..=4194304");
+        }
+    }
+
+    /// The Trino engine is read-only: DDL such as CTAS fails as a statement
+    /// error, it does not finish with an `update_type`.
+    #[tokio::test]
+    async fn ddl_statement_fails_with_error_body() {
+        let (svc, _) = service();
+        let s = run_to_end(&svc, "CREATE TABLE memory.default.t AS SELECT 1 AS x", None).await;
+        assert_eq!(s.state, StatementState::Failed);
+        assert!(s.error.is_some() && s.first_page.is_none());
+    }
+
+    /// A finished statement without a result set reports its update type and
+    /// an empty first page.
+    #[test]
+    fn update_statement_reports_update_type_without_rows() {
+        let statement = Statement::new(QueryId::new(), "alice", "USE x".into(), 10);
+        statement.end(Phase::Finished(FinishedOutput {
+            columns: None,
+            update_type: Some("USE".into()),
+            retained: retain(Vec::new(), 10),
+        }));
+        let s = statement.status(&AgentLimits::default());
+        assert_eq!(s.state, StatementState::Finished);
+        assert_eq!(s.update_type.as_deref(), Some("USE"));
+        assert_eq!(s.total_rows, Some(0));
+        let page = s.first_page.unwrap();
+        assert!(page.rows.is_empty() && page.next_cursor.is_none());
     }
 
     fn service() -> (AgentQueryService, Arc<QueryTracker>) {

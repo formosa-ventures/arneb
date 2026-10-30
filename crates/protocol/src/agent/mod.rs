@@ -5,10 +5,12 @@
 
 pub mod error;
 pub mod limits;
+pub mod results;
 pub mod service;
 pub mod statement;
 
 pub use error::{AgentError, AgentErrorCode, SqlLocation};
 pub use limits::AgentLimits;
+pub use results::ResultPage;
 pub use service::AgentQueryService;
 pub use statement::{Column, StatementState, StatementStatus, SubmitRequest};

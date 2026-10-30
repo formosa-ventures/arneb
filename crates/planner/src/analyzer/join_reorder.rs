@@ -351,6 +351,26 @@ fn recurse_remap(
             )
         }
 
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => {
+            let (input, t) = tr(*input);
+            let group_by = remap_exprs(group_by, &t);
+            let aggr_exprs = remap_exprs(aggr_exprs, &t);
+            (
+                L::RollupAggregate {
+                    input: Box::new(input),
+                    group_by,
+                    aggr_exprs,
+                    schema,
+                },
+                None,
+            )
+        }
+
         L::PartialAggregate {
             input,
             group_by,
@@ -654,6 +674,17 @@ where
             aggr_exprs,
             schema,
         },
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => L::RollupAggregate {
+            input: Box::new(f(*input)),
+            group_by,
+            aggr_exprs,
+            schema,
+        },
         L::PartialAggregate {
             input,
             group_by,
@@ -946,6 +977,7 @@ fn leaf_table_label(plan: &LogicalPlan) -> String {
         | L::Sort { input, .. }
         | L::Limit { input, .. }
         | L::Aggregate { input, .. }
+        | L::RollupAggregate { input, .. }
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Distinct { input }
@@ -1857,6 +1889,12 @@ fn indices_consistent(plan: &LogicalPlan) -> bool {
         | L::AssignUniqueId { input, .. } => indices_consistent(input),
 
         L::Aggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            ..
+        }
+        | L::RollupAggregate {
             input,
             group_by,
             aggr_exprs,

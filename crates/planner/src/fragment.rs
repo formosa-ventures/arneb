@@ -274,6 +274,7 @@ fn all_scans_have_row_count(plan: &LogicalPlan, stats: &crate::cost::CatalogStat
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::RollupAggregate { input, .. }
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. }
         | LogicalPlan::Window { input, .. }
@@ -941,6 +942,17 @@ fn remove_dynamic_filter_consumers_for_join(
             aggr_exprs,
             schema,
         } => L::Aggregate {
+            input: Box::new(remove_dynamic_filter_consumers_for_join(*input, producers)),
+            group_by,
+            aggr_exprs,
+            schema,
+        },
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => L::RollupAggregate {
             input: Box::new(remove_dynamic_filter_consumers_for_join(*input, producers)),
             group_by,
             aggr_exprs,
@@ -2902,6 +2914,33 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                 finish_aggregate_split(self, partial_exchange, vec![partial_fragment])
             }
 
+            LogicalPlan::RollupAggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                schema,
+            } => {
+                let (input_plan, input_frags) = self.split(*input);
+                let rollup = LogicalPlan::RollupAggregate {
+                    input: Box::new(input_plan),
+                    group_by,
+                    aggr_exprs,
+                    schema: schema.clone(),
+                };
+                let fragment = PlanFragment {
+                    id: self.next_id(),
+                    fragment_type: FragmentType::Fixed,
+                    root: rollup,
+                    output_partitioning: PartitioningScheme::Single,
+                    source_fragments: input_frags,
+                };
+                let exchange = LogicalPlan::ExchangeNode {
+                    stage_id: fragment.id,
+                    schema,
+                };
+                (exchange, vec![fragment])
+            }
+
             LogicalPlan::Window { input, functions } => {
                 let (input_plan, input_frags) = self.split(*input);
                 let window_plan = LogicalPlan::Window {
@@ -3155,6 +3194,17 @@ fn recurse_avg_children(plan: LogicalPlan) -> LogicalPlan {
             aggr_exprs,
             schema,
         } => L::Aggregate {
+            input: Box::new(rewrite_avg_for_split(*input)),
+            group_by,
+            aggr_exprs,
+            schema,
+        },
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => L::RollupAggregate {
             input: Box::new(rewrite_avg_for_split(*input)),
             group_by,
             aggr_exprs,
@@ -3815,6 +3865,7 @@ mod tests {
             | LogicalPlan::Explain { input, .. }
             | LogicalPlan::Distinct { input }
             | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::RollupAggregate { input, .. }
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Window { input, .. }
@@ -3887,6 +3938,7 @@ mod tests {
             | LogicalPlan::Explain { input, .. }
             | LogicalPlan::Distinct { input }
             | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::RollupAggregate { input, .. }
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Window { input, .. }

@@ -122,6 +122,17 @@ impl SimplifyFilters {
                 aggr_exprs,
                 schema,
             }),
+            LogicalPlan::RollupAggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                schema,
+            } => Ok(LogicalPlan::RollupAggregate {
+                input: Box::new(self.rewrite(*input)?),
+                group_by,
+                aggr_exprs,
+                schema,
+            }),
             LogicalPlan::Join {
                 left,
                 right,
@@ -218,6 +229,17 @@ impl ConstantFolding {
                 aggr_exprs,
                 schema,
             } => Ok(LogicalPlan::Aggregate {
+                input: Box::new(self.rewrite(*input)?),
+                group_by,
+                aggr_exprs,
+                schema,
+            }),
+            LogicalPlan::RollupAggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                schema,
+            } => Ok(LogicalPlan::RollupAggregate {
                 input: Box::new(self.rewrite(*input)?),
                 group_by,
                 aggr_exprs,

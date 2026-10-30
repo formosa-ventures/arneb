@@ -129,6 +129,29 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
                 schema,
             })
         }
+        LogicalPlan::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => {
+            let input = analyze_plan(*input, ctx)?;
+            let input_schema = input.schema();
+            let group_by = group_by
+                .into_iter()
+                .map(|e| coerce_expr(e, &input_schema, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            let aggr_exprs = aggr_exprs
+                .into_iter()
+                .map(|e| coerce_expr(e, &input_schema, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(LogicalPlan::RollupAggregate {
+                input: Box::new(input),
+                group_by,
+                aggr_exprs,
+                schema,
+            })
+        }
         LogicalPlan::PartialAggregate {
             input,
             group_by,
@@ -1065,6 +1088,17 @@ pub(super) fn walk_plan_exprs(
             aggr_exprs,
             schema,
         } => LogicalPlan::Aggregate {
+            input: Box::new(walk_plan_exprs(*input, f)),
+            group_by: group_by.into_iter().map(|e| walk_expr(e, f)).collect(),
+            aggr_exprs: aggr_exprs.into_iter().map(|e| walk_expr(e, f)).collect(),
+            schema,
+        },
+        LogicalPlan::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => LogicalPlan::RollupAggregate {
             input: Box::new(walk_plan_exprs(*input, f)),
             group_by: group_by.into_iter().map(|e| walk_expr(e, f)).collect(),
             aggr_exprs: aggr_exprs.into_iter().map(|e| walk_expr(e, f)).collect(),

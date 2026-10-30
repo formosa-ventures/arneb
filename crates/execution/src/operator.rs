@@ -1735,6 +1735,132 @@ pub(crate) struct HashAggregateExec {
     pub(crate) memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
 }
 
+/// Runs every ROLLUP level over the same input stream. The channels hold at
+/// most one batch per level, so only aggregate group state grows with input.
+#[derive(Debug)]
+pub(crate) struct RollupAggregateExec {
+    pub(crate) input: Arc<dyn ExecutionPlan>,
+    pub(crate) group_by: Vec<PlanExpr>,
+    pub(crate) aggr_exprs: Vec<PlanExpr>,
+    pub(crate) output_schema: Vec<ColumnInfo>,
+    pub(crate) memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
+}
+
+#[async_trait]
+impl ExecutionPlan for RollupAggregateExec {
+    fn schema(&self) -> Vec<ColumnInfo> {
+        self.output_schema.clone()
+    }
+
+    async fn execute(
+        &self,
+        _partition: usize,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let key_count = self.group_by.len();
+        let input_schema = self.input.schema();
+        let mut senders = Vec::with_capacity(key_count + 1);
+        let mut levels = Vec::with_capacity(key_count + 1);
+        for keep in (0..=key_count).rev() {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            senders.push(sender);
+            let mut level_schema = self.output_schema[..keep].to_vec();
+            level_schema.extend_from_slice(
+                &self.output_schema[key_count..key_count + self.aggr_exprs.len()],
+            );
+            let aggregate = HashAggregateExec {
+                input: self.input.clone(),
+                group_by: self.group_by[..keep].to_vec(),
+                aggr_exprs: self.aggr_exprs.clone(),
+                output_schema: level_schema,
+                output_order: None,
+                estimated_groups: None,
+                memory_pool: self.memory_pool.clone(),
+            };
+            let stream: SendableRecordBatchStream = Box::pin(RollupInputStream {
+                schema: crate::datasource::column_info_to_arrow_schema(&input_schema),
+                receiver,
+            });
+            levels.push(async move {
+                let batches = if aggregate.has_distinct() {
+                    aggregate.execute_streaming(stream).await
+                } else {
+                    aggregate.execute_streaming_batch_aware(stream).await
+                }?;
+                Ok::<_, ExecutionError>((keep, batches))
+            });
+        }
+
+        let mut input = self.input.execute(0).await?;
+        let producer = async move {
+            while let Some(batch) = input.next().await {
+                let batch = batch.map_err(|e| ExecutionError::upstream("rollup input", e))?;
+                for sender in &senders {
+                    sender.send(batch.clone()).await.map_err(|_| {
+                        ExecutionError::InvalidOperation("rollup level stopped early".to_string())
+                    })?;
+                }
+            }
+            Ok::<_, ExecutionError>(())
+        };
+        let (produced, results) =
+            futures::future::join(producer, futures::future::join_all(levels)).await;
+        produced?;
+        let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
+        let mut output = Vec::new();
+        for result in results {
+            let (keep, batches) = result?;
+            for batch in batches {
+                let row_count = batch.num_rows();
+                let mut cols = Vec::with_capacity(self.output_schema.len());
+                for index in 0..key_count {
+                    if index < keep {
+                        cols.push(batch.column(index).clone());
+                    } else {
+                        cols.push(arrow::array::new_null_array(
+                            arrow_schema.field(index).data_type(),
+                            row_count,
+                        ));
+                    }
+                }
+                for index in keep..batch.num_columns() {
+                    cols.push(batch.column(index).clone());
+                }
+                for index in 0..key_count {
+                    cols.push(
+                        Arc::new(Int64Array::from_value(i64::from(index >= keep), row_count))
+                            as ArrayRef,
+                    );
+                }
+                output.push(RecordBatch::try_new(arrow_schema.clone(), cols)?);
+            }
+        }
+        Ok(stream_from_batches(arrow_schema, output))
+    }
+
+    fn display_name(&self) -> &str {
+        "RollupAggregateExec"
+    }
+}
+
+struct RollupInputStream {
+    schema: arrow::datatypes::SchemaRef,
+    receiver: tokio::sync::mpsc::Receiver<RecordBatch>,
+}
+
+impl Stream for RollupInputStream {
+    type Item = Result<RecordBatch, arneb_common::error::ArnebError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx).map(|item| item.map(Ok))
+    }
+}
+
+impl RecordBatchStream for RollupInputStream {
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.schema.clone()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AggregateOutputColumn {
     Group(usize),

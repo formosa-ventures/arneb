@@ -379,6 +379,13 @@ pub enum LogicalPlan {
         /// Output schema.
         schema: Vec<ColumnInfo>,
     },
+    /// Aggregates all ROLLUP grouping levels from one input stream.
+    RollupAggregate {
+        input: Box<LogicalPlan>,
+        group_by: Vec<PlanExpr>,
+        aggr_exprs: Vec<PlanExpr>,
+        schema: Vec<ColumnInfo>,
+    },
     /// Orders rows.
     Sort {
         /// Input plan.
@@ -688,6 +695,7 @@ impl LogicalPlan {
             // becomes a TopKExec that likewise collects its whole input.)
             LogicalPlan::Sort { .. }
             | LogicalPlan::Aggregate { .. }
+            | LogicalPlan::RollupAggregate { .. }
             | LogicalPlan::PartialAggregate { .. }
             | LogicalPlan::FinalAggregate { .. }
             | LogicalPlan::Join { .. }
@@ -731,6 +739,7 @@ impl LogicalPlan {
             | LogicalPlan::Filter { .. }
             | LogicalPlan::Join { .. }
             | LogicalPlan::Aggregate { .. }
+            | LogicalPlan::RollupAggregate { .. }
             | LogicalPlan::Sort { .. }
             | LogicalPlan::Limit { .. }
             | LogicalPlan::ExchangeNode { .. }
@@ -768,6 +777,7 @@ impl LogicalPlan {
                 schema
             }
             LogicalPlan::Aggregate { schema, .. } => schema.clone(),
+            LogicalPlan::RollupAggregate { schema, .. } => schema.clone(),
             LogicalPlan::Sort { input, .. } => input.schema(),
             LogicalPlan::Limit { input, .. } => input.schema(),
             LogicalPlan::Explain { input, .. } => input.schema(),
@@ -1009,6 +1019,12 @@ fn fmt_plan(plan: &LogicalPlan, f: &mut fmt::Formatter<'_>, indent: usize) -> fm
                 write!(f, ", aggr=[{}]", agg.join(", "))?;
             }
             writeln!(f)?;
+            fmt_plan(input, f, indent + 1)
+        }
+        LogicalPlan::RollupAggregate {
+            input, group_by, ..
+        } => {
+            writeln!(f, "{pad}RollupAggregate: {} keys", group_by.len())?;
             fmt_plan(input, f, indent + 1)
         }
         LogicalPlan::Sort { input, order_by } => {

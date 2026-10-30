@@ -571,7 +571,7 @@ created with mode `0600`. The path's directory must be writable.
 - The effective path (and `--reseed-state`) is logged on `arneb::config`.
 - The state store is only used under `[auth] type = "password"`. Under
   `none`, `[state]` and `--reseed-state` have no effect (`--reseed-state`
-  logs a WARN).
+  logs an INFO line).
 - On Kubernetes the chart mounts a volume for it; see
   [Kubernetes](/guide/kubernetes#coordinator-state).
 

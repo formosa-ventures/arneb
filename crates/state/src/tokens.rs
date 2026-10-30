@@ -26,6 +26,18 @@ pub struct TokenInfo {
 /// [`StateError::TooManyTokens`].
 pub const MAX_TOKENS_PER_USER: usize = 100;
 
+/// How long an expired token record is kept (so `GET /tokens` still shows
+/// recently expired ones) before a write prunes it.
+const EXPIRED_TOKEN_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Drops token records that expired more than the grace period before `now`.
+fn prune_expired(data: &mut crate::file::StateData, now: u64) {
+    data.tokens.retain(|t| {
+        t.expires_ms
+            .is_none_or(|e| now < e.saturating_add(EXPIRED_TOKEN_GRACE_MS))
+    });
+}
+
 /// A freshly issued token. `token` is shown once and never stored.
 #[derive(Clone)]
 pub struct IssuedToken {
@@ -53,7 +65,7 @@ impl StateStore {
         name: Option<String>,
         expires_at_ms: Option<u64>,
     ) -> Result<IssuedToken, StateError> {
-        self.issue_token_capped(user, name, expires_at_ms, MAX_TOKENS_PER_USER)
+        self.issue_token_capped(user, name, expires_at_ms, MAX_TOKENS_PER_USER, now_ms())
     }
 
     fn issue_token_capped(
@@ -62,6 +74,7 @@ impl StateStore {
         name: Option<String>,
         expires_at_ms: Option<u64>,
         max_tokens: usize,
+        now: u64,
     ) -> Result<IssuedToken, StateError> {
         let mut id_bytes = [0u8; 8];
         let mut secret_bytes = [0u8; 32];
@@ -75,7 +88,7 @@ impl StateStore {
             id,
             user: user.to_string(),
             name,
-            created_ms: now_ms(),
+            created_ms: now,
             expires_ms: expires_at_ms,
         };
         let path = self.path().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -103,7 +116,7 @@ impl StateStore {
                     Some(u) if u.scram != user_scram => return Ok(false),
                     Some(_) => {}
                 }
-                let now = now_ms();
+                prune_expired(data, now);
                 if data
                     .tokens
                     .iter()
@@ -153,6 +166,10 @@ impl StateStore {
     /// Revokes `token_id` if it belongs to `user`; otherwise (unknown id, or
     /// another user's token) fails with [`StateError::TokenNotFound`].
     pub fn revoke_token(&self, user: &str, token_id: &str) -> Result<(), StateError> {
+        self.revoke_token_at(user, token_id, now_ms())
+    }
+
+    fn revoke_token_at(&self, user: &str, token_id: &str, now: u64) -> Result<(), StateError> {
         self.mutate(|data| {
             let before = data.tokens.len();
             data.tokens
@@ -160,6 +177,7 @@ impl StateStore {
             if data.tokens.len() == before {
                 return Err(StateError::TokenNotFound(token_id.to_string()));
             }
+            prune_expired(data, now);
             Ok(())
         })
     }
@@ -241,14 +259,59 @@ mod tests {
     #[test]
     fn issuing_past_the_cap_is_refused_and_revoking_frees_a_slot() {
         let store = store_with_alice();
-        let first = store.issue_token_capped("alice", None, None, 2).unwrap();
-        store.issue_token_capped("alice", None, None, 2).unwrap();
+        let first = store
+            .issue_token_capped("alice", None, None, 2, now_ms())
+            .unwrap();
+        store
+            .issue_token_capped("alice", None, None, 2, now_ms())
+            .unwrap();
         assert!(matches!(
-            store.issue_token_capped("alice", None, None, 2),
+            store.issue_token_capped("alice", None, None, 2, now_ms()),
             Err(StateError::TooManyTokens { limit: 2, .. })
         ));
         store.revoke_token("alice", &first.info.id).unwrap();
-        store.issue_token_capped("alice", None, None, 2).unwrap();
+        store
+            .issue_token_capped("alice", None, None, 2, now_ms())
+            .unwrap();
+    }
+
+    #[test]
+    fn expired_tokens_are_pruned_after_the_grace_period() {
+        let store = store_with_alice();
+        let day = EXPIRED_TOKEN_GRACE_MS;
+        let mut now = 1_000_000_000_000u64;
+        // Mint-and-expire loop: each token lives one minute; a day passes
+        // between iterations. The stored record count must stay bounded.
+        for _ in 0..50 {
+            store
+                .issue_token_capped("alice", None, Some(now + 60_000), 100, now)
+                .unwrap();
+            now += day + 120_000;
+            assert!(
+                store.snapshot().tokens.len() <= 2,
+                "{}",
+                store.snapshot().tokens.len()
+            );
+        }
+        // Recently expired (within grace) is kept; a revoke prunes the old.
+        let keep = store
+            .issue_token_capped("alice", None, Some(now + 1_000), 100, now)
+            .unwrap();
+        let now2 = now + 2_000;
+        let other = store
+            .issue_token_capped("alice", None, None, 100, now2)
+            .unwrap();
+        assert!(store
+            .list_tokens("alice")
+            .iter()
+            .any(|t| t.id == keep.info.id));
+        store
+            .revoke_token_at("alice", &other.info.id, now2 + day + 1_000_000)
+            .unwrap();
+        assert!(!store
+            .list_tokens("alice")
+            .iter()
+            .any(|t| t.id == keep.info.id));
     }
 
     #[test]

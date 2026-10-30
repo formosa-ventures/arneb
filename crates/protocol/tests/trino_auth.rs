@@ -388,3 +388,20 @@ async fn revoked_token_is_refused_on_trino_basic_without_waiting_for_the_cache()
     );
     assert_eq!(counter.load(Ordering::Relaxed), 0);
 }
+
+#[tokio::test]
+async fn trino_basic_refuses_a_web_session_token_as_the_password() {
+    let source = Arc::new(TokenSource::new(&[("alice", "alice-pw")]));
+    let (base, _counter) = start(Some(source)).await;
+    // Session tokens (`arneb_s_<43 base64url>`) are for the Web UI only.
+    let session = format!("arneb_s_{}", "A".repeat(43));
+    assert!(!arneb_protocol::is_token_shaped(&session));
+    assert_eq!(
+        list_queries(&base, "alice", &session).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        list_queries(&base, "alice", "alice-pw").await,
+        StatusCode::OK
+    );
+}

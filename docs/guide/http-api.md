@@ -95,7 +95,9 @@ curl -s -X POST http://127.0.0.1:6432/api/v2/tokens \
   `DELETE /api/v2/tokens/{id}` revokes one of yours. Another user's id is
   `404`.
 - Revocation is immediate on every protocol: pgwire, Trino and the Web API
-  all refuse the token on the next request or connection.
+  all refuse the token on the next request or connection. An already
+  established pgwire connection is not closed: new connections and new
+  requests are refused.
 - Tokens are stored in the [state file](/guide/configuration#state). With no
   `[state] path` they live in memory, the response carries
   `"persistent": false` and a hint, and they are lost when the coordinator
@@ -112,7 +114,8 @@ curl -u "alice:$TOKEN" https://coordinator:8080/v1/info
 ```
 
 On pgwire the token goes through the normal SCRAM exchange, so it never
-crosses the network. The Trino listener needs TLS under password auth (see
+crosses the network. The Trino listener needs TLS under password auth on any non-loopback
+address (see
 [Trino clients](/guide/trino-clients)).
 
 ## Errors

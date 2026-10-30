@@ -110,6 +110,12 @@ impl std::fmt::Debug for StateStore {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: make the directory fsync after the rename fail.
+    static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl StateStore {
     /// Opens the store. `None` keeps state in memory only. A missing file
     /// starts empty and is created on the first write; a leftover
@@ -195,6 +201,14 @@ impl StateStore {
         Ok(out)
     }
 
+    fn sync_dir(dir: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        if FAIL_DIR_SYNC.with(|f| f.get()) {
+            return Err(std::io::Error::other("injected directory fsync failure"));
+        }
+        std::fs::File::open(dir).and_then(|d| d.sync_all())
+    }
+
     /// Writes `<path>.tmp` (mode 0600), fsyncs it, renames it over `path`,
     /// then fsyncs the parent directory.
     fn persist(path: &Path, data: &StateData) -> Result<(), StateError> {
@@ -234,9 +248,17 @@ impl StateStore {
             Some(d) if !d.as_os_str().is_empty() => d,
             _ => Path::new("."),
         };
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(io)?;
+        // The rename is the commit point: the new file is already in place,
+        // so a failed directory fsync only weakens crash durability and must
+        // not make the caller think the write failed.
+        if let Err(e) = Self::sync_dir(dir) {
+            tracing::warn!(
+                target: "arneb::config",
+                path = %path.display(),
+                error = %e,
+                "state file was written but syncing its directory failed"
+            );
+        }
         Ok(())
     }
 }
@@ -267,6 +289,23 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn failed_directory_fsync_after_rename_still_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("state.json");
+        let store = StateStore::open(Some(&p)).unwrap();
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        let r = store.mutate(|d| {
+            d.users.push(alice());
+            Ok(())
+        });
+        FAIL_DIR_SYNC.with(|f| f.set(false));
+        r.unwrap();
+        assert_eq!(names(&store), vec!["alice"]);
+        let reopened = StateStore::open(Some(&p)).unwrap();
+        assert_eq!(names(&reopened), vec!["alice"]);
     }
 
     #[test]

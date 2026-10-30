@@ -330,7 +330,7 @@ async fn issue_token(
     // A token cannot mint a child that outlives it.
     let mut hints = Vec::new();
     let mut expires_at_ms = expires_at_ms;
-    if let Some(parent_expiry) = authenticating_token_expiry(&store, &who, &headers) {
+    if let Some(parent_expiry) = authenticating_token_expiry(&store, &who, &headers)? {
         if expires_at_ms.is_none_or(|e| e > parent_expiry) {
             expires_at_ms = Some(parent_expiry);
             hints.push("expires_ms was clamped to the expiry of the token that made this request");
@@ -363,31 +363,47 @@ async fn issue_token(
     ))
 }
 
-/// The expiry of the API token that authenticated this request, when it
-/// was one and it expires. The middleware already verified the credential,
-/// so only its id is read, and the expiry is looked up in the caller's own
-/// tokens.
+/// The expiry of the API token that authenticated this request. `Ok(None)`
+/// means the request was not made with an API token, or the token never
+/// expires. The middleware already verified the credential, so only its id
+/// is read; if that token is gone or expired by now (revoked between the
+/// middleware and this handler), the request fails as unauthenticated
+/// rather than minting an unclamped child.
 fn authenticating_token_expiry(
     store: &StateStore,
     who: &Identity,
     headers: &HeaderMap,
-) -> Option<u64> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let (_, credential) = value.split_once(' ')?;
+) -> Result<Option<u64>, ApiError> {
+    let gone = || ApiError::new(ErrorCode::Unauthenticated, "authentication required");
+    let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    let Some((_, credential)) = value.split_once(' ') else {
+        return Ok(None);
+    };
     let token = match who.via {
         AuthVia::Token => credential.trim().to_owned(),
-        AuthVia::Basic => decode_basic(credential.trim())?.1,
-        _ => return None,
+        AuthVia::Basic => match decode_basic(credential.trim()) {
+            Some((_, password)) => password,
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
     };
     if !arneb_protocol::is_token_shaped(&token) {
-        return None;
+        return Ok(None);
     }
     let id = &token["arneb_".len()..][..16];
-    store
+    let now = now_ms();
+    let record = store
         .list_tokens(&who.user)
         .into_iter()
-        .find(|t| t.id == id)?
-        .expires_ms
+        .find(|t| t.id == id)
+        .filter(|t| t.expires_ms.is_none_or(|e| now < e))
+        .ok_or_else(gone)?;
+    Ok(record.expires_ms)
 }
 
 #[derive(Serialize)]
@@ -594,6 +610,44 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert!(body["expires_ms"].is_u64());
         format!("Bearer {}", body["token"].as_str().unwrap())
+    }
+
+    #[test]
+    fn parent_token_lookup_fails_closed_when_the_token_is_gone() {
+        let state = web_state(true, None);
+        let store = state.state.clone().unwrap();
+        let issued = store.issue_token("alice", None, None).unwrap();
+        let who = super::Identity {
+            user: "alice".into(),
+            via: super::AuthVia::Token,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", issued.token).parse().unwrap(),
+        );
+        assert_eq!(
+            super::authenticating_token_expiry(&store, &who, &headers).unwrap(),
+            None
+        );
+        store.revoke_token("alice", &issued.info.id).unwrap();
+        let err = super::authenticating_token_expiry(&store, &who, &headers).unwrap_err();
+        assert!(
+            format!("{err:?}")
+                .to_lowercase()
+                .contains("unauthenticated"),
+            "{err:?}"
+        );
+        // Same through Basic with the token as the password.
+        let who = super::Identity {
+            user: "alice".into(),
+            via: super::AuthVia::Basic,
+        };
+        headers.insert(
+            header::AUTHORIZATION,
+            basic("alice", &issued.token).parse().unwrap(),
+        );
+        assert!(super::authenticating_token_expiry(&store, &who, &headers).is_err());
     }
 
     #[tokio::test]

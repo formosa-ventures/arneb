@@ -1,6 +1,6 @@
 ## Why
 
-The v0.2.0 headless agent interface (`docs/superpowers/specs/2026-10-30-headless-agent-interface-design.md`) needs a remote agent to authenticate with a revocable credential and call a stable HTTP API. Today none of that exists: the Web port has no login and shows every query, the only credential is a password in the config file, and nothing is durable except that file. Stage H1 builds the foundation the MCP server and the operation APIs sit on.
+The v0.2.0 headless agent interface (`docs/superpowers/specs/2026-10-30-headless-agent-interface-design.md`) needs a remote agent to authenticate with a revocable credential and call a stable HTTP API. Before this change none of that existed: the Web port had no login and showed every query, the only credential was a password in the config file, and nothing was durable except that file. Stage H1 builds the foundation the MCP server and the operation APIs sit on.
 
 ## What Changes
 

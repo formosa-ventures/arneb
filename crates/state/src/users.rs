@@ -13,6 +13,8 @@ pub struct SeedReport {
     pub seeded: Vec<String>,
     /// Users whose state differs from the config and was left alone.
     pub diverged: Vec<String>,
+    /// The subset of `diverged` that vanished from the config file.
+    pub removed: Vec<String>,
 }
 
 impl StateStore {
@@ -29,6 +31,15 @@ impl StateStore {
     ) -> Result<SeedReport, StateError> {
         let report = self.mutate(|data| Ok(apply_seed(data, users, reseed)))?;
         for user in &report.diverged {
+            if report.removed.contains(user) {
+                tracing::warn!(
+                    target: "arneb::config",
+                    user = %user,
+                    "user {user:?} is in the state but no longer in the config file; \
+                     restart with --reseed-state to delete the user and their tokens"
+                );
+                continue;
+            }
             tracing::warn!(
                 target: "arneb::config",
                 user = %user,
@@ -81,6 +92,7 @@ fn apply_seed(data: &mut StateData, users: &[(String, ScramVerifier)], reseed: b
         for u in &data.users {
             if u.from_config && !in_config(&u.name) {
                 report.diverged.push(u.name.clone());
+                report.removed.push(u.name.clone());
             }
         }
     }
@@ -222,5 +234,9 @@ mod tests {
             log.contains("bob") && log.contains("--reseed-state"),
             "{log}"
         );
+        assert!(r.removed == vec!["bob"], "{r:?}");
+        assert!(log.contains("no longer in the config file"), "{log}");
+        assert!(log.contains("delete the user and their tokens"), "{log}");
+        assert!(!log.contains("differs from the config"), "{log}");
     }
 }

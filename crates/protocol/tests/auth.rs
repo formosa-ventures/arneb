@@ -294,3 +294,13 @@ async fn pgwire_refuses_a_revoked_token() {
     assert_invalid_password(connect(port, "alice", Some(&token)).await);
     assert_can_query(port, "alice", "alice-pw").await;
 }
+
+#[tokio::test]
+async fn pgwire_refuses_a_web_session_token_as_the_password() {
+    let (port, _source) = start_token_server().await;
+    // Session tokens (`arneb_s_<43 base64url>`) are for the Web UI only.
+    let session = format!("arneb_s_{}", "A".repeat(43));
+    assert!(!arneb_protocol::is_token_shaped(&session));
+    assert_invalid_password(connect(port, "alice", Some(&session)).await);
+    assert_can_query(port, "alice", "alice-pw").await;
+}

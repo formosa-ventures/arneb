@@ -1343,6 +1343,16 @@ fn convert_table_factor(factor: sp::TableFactor) -> Result<ast::TableFactor, Par
             alias,
         } => {
             let inner = convert_table_with_joins(*table_with_joins)?;
+            if alias.as_ref().is_some_and(|alias| {
+                alias
+                    .columns
+                    .iter()
+                    .any(|column| column.data_type.is_some())
+            }) {
+                return Err(ParseError::InvalidSyntax(
+                    "nested join column alias cannot include a type".to_string(),
+                ));
+            }
             let (alias, column_aliases) = match alias {
                 Some(alias) => (
                     Some(alias.name.value),

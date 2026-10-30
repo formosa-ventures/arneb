@@ -1600,39 +1600,41 @@ impl<'a> QueryPlanner<'a> {
             } => {
                 let (mut plan, mut ctx) = Box::pin(self.plan_table_with_joins(relation)).await?;
                 if let Some(alias) = alias {
-                    for (qualifier, _) in &mut ctx.columns {
-                        *qualifier = Some(alias.clone());
+                    for (index, (qualifier, _)) in ctx.columns.iter_mut().enumerate() {
+                        *qualifier = (!ctx.merged.contains(&index)).then(|| alias.clone());
                     }
                 }
                 if !column_aliases.is_empty() {
                     let schema = plan.schema();
-                    if column_aliases.len() != schema.len() {
+                    let visible: Vec<usize> = (0..schema.len())
+                        .filter(|index| !ctx.merged.contains(index))
+                        .collect();
+                    if column_aliases.len() != visible.len() {
                         return Err(PlanError::invalid_expression(format!(
                             "nested join alias declares {} columns but produces {} columns",
                             column_aliases.len(),
-                            schema.len()
+                            visible.len()
                         )));
                     }
-                    let exprs = schema
+                    let exprs = visible
                         .iter()
-                        .enumerate()
-                        .map(|(index, column)| PlanExpr::Column {
+                        .map(|&index| PlanExpr::Column {
                             index,
-                            name: column.name.clone(),
+                            name: schema[index].name.clone(),
                             span: None,
                         })
                         .collect();
-                    let renamed_schema: Vec<ColumnInfo> = schema
-                        .into_iter()
+                    let renamed_schema: Vec<ColumnInfo> = visible
+                        .iter()
                         .zip(column_aliases)
-                        .map(|(mut column, alias)| {
+                        .map(|(&index, alias)| {
+                            let mut column = schema[index].clone();
                             column.name = alias.clone();
                             column
                         })
                         .collect();
-                    for ((_, column), renamed) in ctx.columns.iter_mut().zip(&renamed_schema) {
-                        *column = renamed.clone();
-                    }
+                    ctx = PlanningContext::new();
+                    ctx.add_table_columns(alias.as_deref(), &renamed_schema);
                     plan = LogicalPlan::Projection {
                         input: Box::new(plan),
                         exprs,

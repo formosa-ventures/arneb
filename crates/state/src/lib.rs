@@ -2,5 +2,7 @@
 //! versioned JSON file. Only the coordinator / standalone server opens it.
 
 mod file;
+mod users;
 
 pub use file::{StateError, StateStore};
+pub use users::SeedReport;

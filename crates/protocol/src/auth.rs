@@ -139,6 +139,11 @@ impl ScramVerifier {
         self.iterations
     }
 
+    /// Salt of this verifier.
+    pub fn salt(&self) -> &[u8] {
+        &self.salt
+    }
+
     /// Check a client proof against this verifier (constant time).
     fn verify_client_proof(&self, auth_message: &[u8], client_proof: &[u8]) -> bool {
         if client_proof.len() != KEY_LEN {
@@ -295,20 +300,23 @@ impl UserCredentials {
     fn lookup(&self, user: &str) -> (ScramVerifier, bool) {
         match self.users.get(user) {
             Some(v) => (v.clone(), true),
-            None => {
-                let salt = hmac_sha256(&self.mock_secret, user.as_bytes());
-                let keys = hmac_sha256(&self.mock_secret, &salt);
-                (
-                    ScramVerifier {
-                        iterations: DEFAULT_SCRAM_ITERATIONS,
-                        salt: salt[..SALT_LEN].to_vec(),
-                        stored_key: keys,
-                        server_key: keys,
-                    },
-                    false,
-                )
-            }
+            None => (decoy_verifier(&self.mock_secret, user), false),
         }
+    }
+}
+
+/// Deterministic fake verifier for a user that does not exist, derived from a
+/// per-process `secret`. Verifying against it costs the same PBKDF2 as a real
+/// user and never succeeds, so timing and salts do not reveal which users
+/// exist.
+pub fn decoy_verifier(secret: &[u8; 32], user: &str) -> ScramVerifier {
+    let salt = hmac_sha256(secret, user.as_bytes());
+    let keys = hmac_sha256(secret, &salt);
+    ScramVerifier {
+        iterations: DEFAULT_SCRAM_ITERATIONS,
+        salt: salt[..SALT_LEN].to_vec(),
+        stored_key: keys,
+        server_key: keys,
     }
 }
 

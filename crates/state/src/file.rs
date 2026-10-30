@@ -63,7 +63,7 @@ impl Default for StateData {
 
 /// Durable coordinator state. Persistent when opened with a path, in-memory
 /// otherwise. Share as `Arc<StateStore>`.
-// Tasks 2-4 add the readers of `data`; drop this allow when they land.
+// Tasks 3-4 add the readers of `data`; drop this allow when they land.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct StateStore {
@@ -130,7 +130,6 @@ impl StateStore {
 
     /// Applies `f` to a clone of the state, persists the clone, and only then
     /// swaps it in, so a failed write never changes the in-memory state.
-    #[allow(dead_code)]
     pub(crate) fn mutate<R>(
         &self,
         f: impl FnOnce(&mut StateData) -> Result<R, StateError>,
@@ -168,6 +167,14 @@ impl StateStore {
             opts.mode(0o600);
         }
         let mut file = opts.open(&tmp).map_err(io)?;
+        // `mode` only applies to a newly created file; tighten a reused
+        // leftover temp file too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(io)?;
+        }
         file.write_all(&json).map_err(io)?;
         file.sync_all().map_err(io)?;
         drop(file);
@@ -271,6 +278,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_persist_leaves_memory_unchanged() {
         use std::os::unix::fs::PermissionsExt;
@@ -287,6 +295,21 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(r, Err(StateError::Io { .. })));
         assert!(names(&store).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leftover_loose_temp_file_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("state.json");
+        let t = tmp.path().join("state.json.tmp");
+        std::fs::write(&t, "x").unwrap();
+        std::fs::set_permissions(&t, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let store = StateStore::open(Some(&p)).unwrap();
+        add_alice(&store);
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[cfg(unix)]

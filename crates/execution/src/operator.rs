@@ -1295,17 +1295,8 @@ pub(crate) struct NestedLoopJoinExec {
 impl ExecutionPlan for NestedLoopJoinExec {
     fn schema(&self) -> Vec<ColumnInfo> {
         let mut schema = self.left.schema();
-        if matches!(self.join_type, ast::JoinType::Right | ast::JoinType::Full) {
-            for col in &mut schema {
-                col.nullable = true;
-            }
-        }
         let mut right_schema = self.right.schema();
-        if matches!(self.join_type, ast::JoinType::Left | ast::JoinType::Full) {
-            for col in &mut right_schema {
-                col.nullable = true;
-            }
-        }
+        arneb_planner::null_extend(self.join_type, &mut schema, &mut right_schema);
         schema.extend(right_schema);
         schema
     }
@@ -1493,7 +1484,7 @@ impl NestedLoopJoinExec {
             .fields()
             .iter()
             .map(|f| {
-                if matches!(self.join_type, ast::JoinType::Right | ast::JoinType::Full) {
+                if self.join_type.null_extends_left() {
                     Field::new(f.name(), f.data_type().clone(), true)
                 } else {
                     f.as_ref().clone()
@@ -1501,7 +1492,7 @@ impl NestedLoopJoinExec {
             })
             .collect();
         fields.extend(right.schema().fields().iter().map(|f| {
-            if matches!(self.join_type, ast::JoinType::Left | ast::JoinType::Full) {
+            if self.join_type.null_extends_right() {
                 Field::new(f.name(), f.data_type().clone(), true)
             } else {
                 f.as_ref().clone()

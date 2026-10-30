@@ -620,6 +620,25 @@ pub enum JoinCondition {
     None,
 }
 
+/// Mark the columns an outer join can fill with NULL as nullable: the left
+/// side's for RIGHT and FULL joins, the right side's for LEFT and FULL joins.
+pub fn null_extend<'a>(
+    join_type: ast::JoinType,
+    left: impl IntoIterator<Item = &'a mut ColumnInfo>,
+    right: impl IntoIterator<Item = &'a mut ColumnInfo>,
+) {
+    if join_type.null_extends_left() {
+        for col in left {
+            col.nullable = true;
+        }
+    }
+    if join_type.null_extends_right() {
+        for col in right {
+            col.nullable = true;
+        }
+    }
+}
+
 impl LogicalPlan {
     /// q21/q02 SF30 silent-truncation fix (2026-06-12): true if this operator
     /// may legitimately stop reading its input *before* EOF, so a mid-stream
@@ -741,17 +760,8 @@ impl LogicalPlan {
                 ..
             } => {
                 let mut schema = left.schema();
-                if matches!(join_type, ast::JoinType::Right | ast::JoinType::Full) {
-                    for col in &mut schema {
-                        col.nullable = true;
-                    }
-                }
                 let mut right_schema = right.schema();
-                if matches!(join_type, ast::JoinType::Left | ast::JoinType::Full) {
-                    for col in &mut right_schema {
-                        col.nullable = true;
-                    }
-                }
+                null_extend(*join_type, &mut schema, &mut right_schema);
                 schema.extend(right_schema);
                 schema
             }
@@ -1168,6 +1178,28 @@ fn fmt_plan(plan: &LogicalPlan, f: &mut fmt::Formatter<'_>, indent: usize) -> fm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_extend_marks_the_null_extended_side() {
+        let column = |name: &str| ColumnInfo {
+            name: name.to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+        };
+        for (join_type, left_nullable, right_nullable) in [
+            (ast::JoinType::Inner, false, false),
+            (ast::JoinType::Cross, false, false),
+            (ast::JoinType::Left, false, true),
+            (ast::JoinType::Right, true, false),
+            (ast::JoinType::Full, true, true),
+        ] {
+            let mut left = vec![column("l")];
+            let mut right = vec![column("r")];
+            null_extend(join_type, &mut left, &mut right);
+            assert_eq!(left[0].nullable, left_nullable, "{join_type:?} left");
+            assert_eq!(right[0].nullable, right_nullable, "{join_type:?} right");
+        }
+    }
 
     #[test]
     fn only_limit_may_stop_input_early() {

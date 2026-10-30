@@ -9,7 +9,7 @@ use arneb_common::types::{ColumnInfo, DataType, ScalarValue};
 use arneb_sql_parser::ast;
 
 use crate::analyzer::{plan_expr_type, Analyzer, AnalyzerContext};
-use crate::plan::{JoinCondition, LogicalPlan, PlanExpr, SortExpr, WindowFunctionDef};
+use crate::plan::{null_extend, JoinCondition, LogicalPlan, PlanExpr, SortExpr, WindowFunctionDef};
 
 static CTE_SELF_AGG_WINDOW_TEST_OVERRIDE: OnceLock<std::sync::Mutex<Option<bool>>> =
     OnceLock::new();
@@ -1510,16 +1510,12 @@ impl<'a> QueryPlanner<'a> {
                 ast::JoinCondition::None => JoinCondition::None,
             };
 
-            if matches!(join.join_type, ast::JoinType::Right | ast::JoinType::Full) {
-                for (_, col) in &mut ctx.columns[..left_len] {
-                    col.nullable = true;
-                }
-            }
-            if matches!(join.join_type, ast::JoinType::Left | ast::JoinType::Full) {
-                for (_, col) in &mut ctx.columns[left_len..] {
-                    col.nullable = true;
-                }
-            }
+            let (left_cols, right_cols) = ctx.columns.split_at_mut(left_len);
+            null_extend(
+                join.join_type,
+                left_cols.iter_mut().map(|(_, col)| col),
+                right_cols.iter_mut().map(|(_, col)| col),
+            );
 
             plan = LogicalPlan::Join {
                 left: Box::new(plan),

@@ -38,7 +38,7 @@ const SESSION_STATEMENT_HINT: &str = "pass \"catalog\" and \"schema\" in the req
 /// submitted them; any other user is told they do not exist.
 #[derive(Clone)]
 pub struct AgentQueryService {
-    engine: Arc<Engine>,
+    pub(super) engine: Arc<Engine>,
     tracker: Arc<QueryTracker>,
     pub(super) limits: Arc<AgentLimits>,
     admission: Option<AdmissionController>,

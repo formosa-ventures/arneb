@@ -5,6 +5,7 @@
 
 pub mod discovery;
 pub mod error;
+pub mod explain;
 pub mod limits;
 pub mod results;
 pub mod service;
@@ -12,6 +13,7 @@ pub mod statement;
 
 pub use discovery::{ColumnDescription, ListRequest, Listing, Named, TableDescription, TableStats};
 pub use error::{AgentError, AgentErrorCode, SqlLocation};
+pub use explain::{ExplainRequest, Explanation, ScanEstimate};
 pub use limits::AgentLimits;
 pub use results::ResultPage;
 pub use service::AgentQueryService;

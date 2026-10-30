@@ -15,6 +15,7 @@ use super::metadata::{self, Cell, TableBuilder};
 use super::session::{url_encode, ClientSession};
 use super::statements::{bind_placeholders, like_match, parse_control, ControlStatement};
 use super::types::{trino_type_of, OutputColumn, TrinoType};
+use crate::agent::explain::ScanEstimate;
 use crate::handler::{execute_query_with_limit, DistributedExecutor};
 
 /// The result of one statement, before paging.
@@ -180,6 +181,35 @@ impl Engine {
                 self.distributed_executor.as_deref(),
             )
             .await
+        }
+    }
+
+    /// Plans `sql` as `EXPLAIN` would, without executing it: the optimized
+    /// logical plan's text (what `EXPLAIN <sql>` prints) and one estimate per
+    /// table scan, from the table provider's statistics. Plans against the
+    /// same scoped catalogs [`run`](Self::run) uses.
+    pub(crate) async fn plan_for_explain(
+        &self,
+        session: &ClientSession,
+        sql: &str,
+    ) -> Result<(String, Vec<ScanEstimate>), TrinoError> {
+        let sql = sql.trim().trim_end_matches(';').trim();
+        let (catalog, schema) = self.session_defaults(session);
+        let root = self.session_root(session)?;
+        let root = root.as_ref();
+        if crate::runtime_queries::references_runtime_queries(sql) {
+            let (cm, _) = crate::runtime_queries::runtime_catalog(&self.query_tracker, root);
+            return plan_text_and_scans(sql, &cm).await;
+        }
+        if metadata::references_virtual_metadata(sql) {
+            let (cm, _) = metadata::build_virtual_catalogs(root, &catalog, sql).await;
+            return plan_text_and_scans(sql, &cm).await;
+        }
+        if catalog == root.default_catalog() && schema == root.default_schema() {
+            plan_text_and_scans(sql, root).await
+        } else {
+            let view = root.with_session_defaults(catalog, schema);
+            plan_text_and_scans(sql, &view).await
         }
     }
 
@@ -393,4 +423,55 @@ fn schema_not_found(catalog: &str, schema: &str) -> TrinoError {
         "SCHEMA_NOT_FOUND",
         format!("Schema '{catalog}.{schema}' does not exist"),
     )
+}
+
+/// Parses, plans and optimizes `sql` over `cm`; returns the plan text and
+/// the scan estimates.
+async fn plan_text_and_scans(
+    sql: &str,
+    cm: &CatalogManager,
+) -> Result<(String, Vec<ScanEstimate>), TrinoError> {
+    let source = SourceFile::new("<query>", sql);
+    let fail = |e: arneb_common::error::ArnebError| TrinoError::from_arneb(&e, Some(&source));
+    let statement = arneb_sql_parser::parse(sql).map_err(|e| fail(e.into()))?;
+    let (plan, _) = arneb_planner::QueryPlanner::new(cm)
+        .plan_statement_with_context(&statement)
+        .await
+        .map_err(|e| fail(e.into()))?;
+    let plan = arneb_planner::LogicalOptimizer::default_rules()
+        .optimize(plan)
+        .map_err(|e| fail(e.into()))?;
+    let mut scans = Vec::new();
+    collect_scans(&plan, cm, &mut scans).await;
+    Ok((plan.to_string(), scans))
+}
+
+/// One estimate per `TableScan` under `plan` (no de-duplication).
+fn collect_scans<'a>(
+    plan: &'a arneb_planner::LogicalPlan,
+    cm: &'a CatalogManager,
+    out: &'a mut Vec<ScanEstimate>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        if let arneb_planner::LogicalPlan::TableScan { table, .. } = plan {
+            let stats = match cm.resolve_table(table).await {
+                Ok(provider) => provider.statistics(),
+                Err(_) => None,
+            };
+            let name = format!(
+                "{}.{}.{}",
+                table.catalog.as_deref().unwrap_or(cm.default_catalog()),
+                table.schema.as_deref().unwrap_or(cm.default_schema()),
+                table.table
+            );
+            out.push(ScanEstimate {
+                table: name,
+                row_count: stats.as_ref().and_then(|s| s.row_count),
+                size_bytes: stats.as_ref().and_then(|s| s.size_bytes),
+            });
+        }
+        for child in arneb_planner::plan_children(plan) {
+            collect_scans(child, cm, out).await;
+        }
+    })
 }

@@ -1042,10 +1042,16 @@ async fn run() -> Result<()> {
         max_queued_queries: config.admission.max_queued_queries,
         memory_pool: memory_pool.clone(),
         memory_limit_bytes: budget.map(|b| b as u64),
+        basic: credentials_for_web
+            .clone()
+            .map(arneb_protocol::BasicAuthenticator::new)
+            .transpose()
+            .context("Web API Basic authentication")?,
         credentials: credentials_for_web,
         state: state_for_web,
         access_rules: access_rules.clone(),
         metrics_auth: config.web.metrics_auth,
+        sessions: web::SessionStore::new(),
     };
     let web_router = web::build_router(web_state);
     let web_port = config.server.port + 1000; // default: pgwire port + 1000 (e.g., 5432 → 6432)
@@ -1060,7 +1066,11 @@ async fn run() -> Result<()> {
             target: "arneb::config",
             web_bind_address = %web_addr,
             reason = web_reason,
-            "Web UI effective bind ([web] bind_address / ARNEB_WEB_BIND_ADDRESS)"
+            // Credentials exist only under password auth, so only then can
+            // `/metrics` require them.
+            metrics_auth = config.web.metrics_auth && password_users.is_some(),
+            "Web UI effective bind ([web] bind_address / ARNEB_WEB_BIND_ADDRESS) and \
+             /metrics auth ([web] metrics_auth / ARNEB_WEB_METRICS_AUTH)"
         );
         if password_users.is_some() && !config::is_loopback_host(&web_host) {
             tracing::warn!(

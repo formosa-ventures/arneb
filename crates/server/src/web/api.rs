@@ -3,11 +3,13 @@
 use arneb_scheduler::QueryState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::Json;
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Extension, Router};
 use serde::Serialize;
 
+use super::auth::{AuthVia, Identity};
+use super::error::{ApiError, ErrorCode};
 use super::WebState;
 
 /// JSON response for a query.
@@ -107,8 +109,28 @@ pub fn api_routes() -> Router<WebState> {
         .route("/info", get(server_info))
 }
 
+/// The query rules apply to authenticated callers only: under `[auth] type
+/// = "none"` the API stays as open as the Web UI always was. With no rules
+/// file (or no `queries` section) everything is allowed.
+fn may_view(state: &WebState, who: &Identity, owner: Option<&str>) -> bool {
+    who.via == AuthVia::Unauthenticated
+        || state
+            .access_rules
+            .as_ref()
+            .is_none_or(|r| r.can_view_query(&who.user, owner.unwrap_or_default()))
+}
+
+fn may_kill(state: &WebState, who: &Identity, owner: Option<&str>) -> bool {
+    who.via == AuthVia::Unauthenticated
+        || state
+            .access_rules
+            .as_ref()
+            .is_none_or(|r| r.can_kill_query(&who.user, owner.unwrap_or_default()))
+}
+
 async fn list_queries(
     State(state): State<WebState>,
+    Extension(who): Extension<Identity>,
     Query(params): Query<ListQueryParams>,
 ) -> Json<QueriesResponse> {
     let state_filter = params.state.and_then(|s| match s.to_uppercase().as_str() {
@@ -124,36 +146,55 @@ async fn list_queries(
         .query_tracker
         .list_queries(state_filter)
         .into_iter()
+        .filter(|q| may_view(&state, &who, q.user.as_deref()))
         .map(QueryResponse::from)
         .collect();
 
     Json(QueriesResponse { queries })
 }
 
-async fn get_query(
-    State(state): State<WebState>,
-    Path(id): Path<String>,
-) -> Result<Json<QueryResponse>, StatusCode> {
+/// The query `id` if `who` may see it. A hidden query is `404` exactly
+/// like a missing one (the v1 empty body), never `403`.
+fn visible_query(
+    state: &WebState,
+    who: &Identity,
+    id: &str,
+) -> Result<arneb_scheduler::QueryInfo, StatusCode> {
     let uuid: uuid::Uuid = id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
     let query_id = arneb_common::identifiers::QueryId(uuid);
-    let info = state
+    state
         .query_tracker
         .get_query(&query_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .filter(|q| may_view(state, who, q.user.as_deref()))
+        .ok_or(StatusCode::NOT_FOUND)
+}
 
+async fn get_query(
+    State(state): State<WebState>,
+    Extension(who): Extension<Identity>,
+    Path(id): Path<String>,
+) -> Result<Json<QueryResponse>, StatusCode> {
+    let info = visible_query(&state, &who, &id)?;
     Ok(Json(QueryResponse::from(info)))
 }
 
 async fn cancel_query(
     State(state): State<WebState>,
+    Extension(who): Extension<Identity>,
     Path(id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    let uuid: uuid::Uuid = id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let query_id = arneb_common::identifiers::QueryId(uuid);
+) -> Result<StatusCode, Response> {
+    let info = visible_query(&state, &who, &id).map_err(IntoResponse::into_response)?;
+    if !may_kill(&state, &who, info.user.as_deref()) {
+        return Err(ApiError::new(
+            ErrorCode::Forbidden,
+            "the access rules do not allow you to kill this query",
+        )
+        .into_response());
+    }
     state
         .query_tracker
-        .cancel_query(&query_id)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .cancel_query(&info.query_id)
+        .map_err(|_| StatusCode::NOT_FOUND.into_response())?;
     Ok(StatusCode::NO_CONTENT)
 }
 

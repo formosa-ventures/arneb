@@ -1,8 +1,13 @@
 //! Web UI module: REST API + embedded frontend.
 
 mod api;
+pub mod auth;
+pub mod error;
 mod frontend;
 mod metrics;
+pub mod session;
+
+pub use session::SessionStore;
 
 use std::sync::Arc;
 
@@ -10,9 +15,6 @@ use arneb_scheduler::{NodeRegistry, QueryTracker};
 use axum::Router;
 
 /// Shared state for web API handlers.
-// The auth fields are wired at startup but read by the auth middleware
-// that follows; drop the allow then.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct WebState {
     pub query_tracker: Arc<QueryTracker>,
@@ -33,18 +35,33 @@ pub struct WebState {
     /// `[auth] type = "password"` (the state store).
     pub credentials: Option<Arc<dyn arneb_protocol::CredentialSource>>,
     /// The coordinator state store; `Some` only under password auth.
+    // Read by the `/api/v2` token and user routes, mounted next.
+    #[allow(dead_code)]
     pub state: Option<Arc<arneb_state::StateStore>>,
     /// Access rules shared with pgwire and Trino.
     pub access_rules: Option<Arc<arneb_catalog::AccessRules>>,
     /// `[web] metrics_auth`: require credentials for `/metrics`.
     pub metrics_auth: bool,
+    /// HTTP Basic checker over `credentials` (cache + PBKDF2 limiter); `Some`
+    /// exactly when `credentials` is.
+    pub basic: Option<arneb_protocol::BasicAuthenticator>,
+    /// Web sessions (bearer `arneb_s_…`), in memory.
+    pub sessions: SessionStore,
 }
 
 /// Build the axum Router with API and frontend routes.
+///
+/// [`auth::authenticate`] wraps the whole router, so every route added
+/// here (including future `/api/*` nests) is covered; which paths are
+/// public is decided in one place, [`auth::requires_auth`].
 pub fn build_router(state: WebState) -> Router {
     Router::new()
         .nest("/api/v1", api::api_routes())
         .route("/metrics", axum::routing::get(metrics::metrics))
         .fallback(frontend::static_handler)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::authenticate,
+        ))
         .with_state(state)
 }

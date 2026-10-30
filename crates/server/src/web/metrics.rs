@@ -124,6 +124,8 @@ mod tests {
             state: None,
             access_rules: None,
             metrics_auth: false,
+            basic: None,
+            sessions: crate::web::SessionStore::new(),
         };
         let text = render(&gauges(&state));
         for line in [

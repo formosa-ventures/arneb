@@ -627,12 +627,12 @@ pub fn null_extend<'a>(
     left: impl IntoIterator<Item = &'a mut ColumnInfo>,
     right: impl IntoIterator<Item = &'a mut ColumnInfo>,
 ) {
-    if matches!(join_type, ast::JoinType::Right | ast::JoinType::Full) {
+    if join_type.null_extends_left() {
         for col in left {
             col.nullable = true;
         }
     }
-    if matches!(join_type, ast::JoinType::Left | ast::JoinType::Full) {
+    if join_type.null_extends_right() {
         for col in right {
             col.nullable = true;
         }
@@ -1178,6 +1178,28 @@ fn fmt_plan(plan: &LogicalPlan, f: &mut fmt::Formatter<'_>, indent: usize) -> fm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_extend_marks_the_null_extended_side() {
+        let column = |name: &str| ColumnInfo {
+            name: name.to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+        };
+        for (join_type, left_nullable, right_nullable) in [
+            (ast::JoinType::Inner, false, false),
+            (ast::JoinType::Cross, false, false),
+            (ast::JoinType::Left, false, true),
+            (ast::JoinType::Right, true, false),
+            (ast::JoinType::Full, true, true),
+        ] {
+            let mut left = vec![column("l")];
+            let mut right = vec![column("r")];
+            null_extend(join_type, &mut left, &mut right);
+            assert_eq!(left[0].nullable, left_nullable, "{join_type:?} left");
+            assert_eq!(right[0].nullable, right_nullable, "{join_type:?} right");
+        }
+    }
 
     #[test]
     fn only_limit_may_stop_input_early() {

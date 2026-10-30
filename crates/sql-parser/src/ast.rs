@@ -586,6 +586,39 @@ pub enum JoinType {
     Cross,
 }
 
+impl JoinType {
+    /// Whether the join fills the left side with NULL for unmatched right
+    /// rows (RIGHT and FULL joins), so left columns become nullable.
+    pub fn null_extends_left(self) -> bool {
+        matches!(self, JoinType::Right | JoinType::Full)
+    }
+
+    /// Whether the join fills the right side with NULL for unmatched left
+    /// rows (LEFT and FULL joins), so right columns become nullable.
+    pub fn null_extends_right(self) -> bool {
+        matches!(self, JoinType::Left | JoinType::Full)
+    }
+}
+
+#[cfg(test)]
+mod join_type_tests {
+    use super::JoinType;
+
+    #[test]
+    fn null_extension_per_join_type() {
+        for (join_type, left, right) in [
+            (JoinType::Inner, false, false),
+            (JoinType::Cross, false, false),
+            (JoinType::Left, false, true),
+            (JoinType::Right, true, false),
+            (JoinType::Full, true, true),
+        ] {
+            assert_eq!(join_type.null_extends_left(), left, "{join_type:?}");
+            assert_eq!(join_type.null_extends_right(), right, "{join_type:?}");
+        }
+    }
+}
+
 /// A JOIN condition.
 #[derive(Debug, Clone, PartialEq)]
 pub enum JoinCondition {

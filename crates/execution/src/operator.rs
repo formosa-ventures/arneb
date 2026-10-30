@@ -1484,7 +1484,7 @@ impl NestedLoopJoinExec {
             .fields()
             .iter()
             .map(|f| {
-                if matches!(self.join_type, ast::JoinType::Right | ast::JoinType::Full) {
+                if self.join_type.null_extends_left() {
                     Field::new(f.name(), f.data_type().clone(), true)
                 } else {
                     f.as_ref().clone()
@@ -1492,7 +1492,7 @@ impl NestedLoopJoinExec {
             })
             .collect();
         fields.extend(right.schema().fields().iter().map(|f| {
-            if matches!(self.join_type, ast::JoinType::Left | ast::JoinType::Full) {
+            if self.join_type.null_extends_right() {
                 Field::new(f.name(), f.data_type().clone(), true)
             } else {
                 f.as_ref().clone()

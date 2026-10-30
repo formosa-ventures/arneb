@@ -9,9 +9,6 @@ use axum::Json;
 use serde::Serialize;
 
 /// A machine-readable error code, serialized in snake_case.
-// `/api/v1` sends only `unauthenticated`, `forbidden` and `overloaded`; the
-// rest are for the `/api/v2` routes, mounted next.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {

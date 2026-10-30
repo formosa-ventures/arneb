@@ -14,7 +14,7 @@ use super::WebState;
 
 /// JSON response for a query.
 #[derive(Serialize)]
-struct QueryResponse {
+pub(super) struct QueryResponse {
     query_id: String,
     state: String,
     sql: String,
@@ -56,19 +56,19 @@ impl From<arneb_scheduler::QueryInfo> for QueryResponse {
 
 /// JSON response for the query list.
 #[derive(Serialize)]
-struct QueriesResponse {
+pub(super) struct QueriesResponse {
     queries: Vec<QueryResponse>,
 }
 
 /// Query parameters for listing queries.
 #[derive(serde::Deserialize, Default)]
 pub struct ListQueryParams {
-    state: Option<String>,
+    pub(super) state: Option<String>,
 }
 
 /// JSON response for cluster overview.
 #[derive(Serialize)]
-struct ClusterResponse {
+pub(super) struct ClusterResponse {
     worker_count: usize,
     role: String,
     /// Admission counters (admission-control D5); `max_running_queries`
@@ -81,7 +81,7 @@ struct ClusterResponse {
 
 /// JSON response for a worker.
 #[derive(Serialize)]
-struct WorkerResponse {
+pub(super) struct WorkerResponse {
     worker_id: String,
     address: String,
     alive: bool,
@@ -94,7 +94,7 @@ struct WorkerResponse {
 
 /// JSON response for server info.
 #[derive(Serialize)]
-struct InfoResponse {
+pub(super) struct InfoResponse {
     version: String,
     uptime_secs: u64,
     role: String,
@@ -120,7 +120,7 @@ fn may_view(state: &WebState, who: &Identity, owner: Option<&str>) -> bool {
             .is_none_or(|r| r.can_view_query(&who.user, owner.unwrap_or_default()))
 }
 
-fn may_kill(state: &WebState, who: &Identity, owner: Option<&str>) -> bool {
+pub(super) fn may_kill(state: &WebState, who: &Identity, owner: Option<&str>) -> bool {
     who.via == AuthVia::Unauthenticated
         || state
             .access_rules
@@ -133,6 +133,16 @@ async fn list_queries(
     Extension(who): Extension<Identity>,
     Query(params): Query<ListQueryParams>,
 ) -> Json<QueriesResponse> {
+    Json(queries_response(&state, &who, params))
+}
+
+/// The queries `who` may see, filtered by `?state=` (an unknown state
+/// filters nothing). Shared with `/api/v2`.
+pub(super) fn queries_response(
+    state: &WebState,
+    who: &Identity,
+    params: ListQueryParams,
+) -> QueriesResponse {
     let state_filter = params.state.and_then(|s| match s.to_uppercase().as_str() {
         "QUEUED" => Some(QueryState::Queued),
         "RUNNING" => Some(QueryState::Running),
@@ -146,16 +156,16 @@ async fn list_queries(
         .query_tracker
         .list_queries(state_filter)
         .into_iter()
-        .filter(|q| may_view(&state, &who, q.user.as_deref()))
+        .filter(|q| may_view(state, who, q.user.as_deref()))
         .map(QueryResponse::from)
         .collect();
 
-    Json(QueriesResponse { queries })
+    QueriesResponse { queries }
 }
 
 /// The query `id` if `who` may see it. A hidden query is `404` exactly
 /// like a missing one (the v1 empty body), never `403`.
-fn visible_query(
+pub(super) fn visible_query(
     state: &WebState,
     who: &Identity,
     id: &str,
@@ -216,19 +226,29 @@ fn admission_counters(
 }
 
 async fn cluster_overview(State(state): State<WebState>) -> Json<ClusterResponse> {
+    Json(cluster_response(&state))
+}
+
+/// The cluster overview. Shared with `/api/v2`.
+pub(super) fn cluster_response(state: &WebState) -> ClusterResponse {
     let admission = admission_counters(state.admission.as_ref(), state.max_queued_queries);
-    Json(ClusterResponse {
+    ClusterResponse {
         worker_count: state.node_registry.alive_count(),
         role: state.role.clone(),
         running_queries: admission.running,
         queued_queries: admission.queued,
         max_running_queries: admission.max_running,
         max_queued_queries: admission.max_queued,
-    })
+    }
 }
 
 async fn list_workers(State(state): State<WebState>) -> Json<Vec<WorkerResponse>> {
-    let workers = state
+    Json(workers_response(&state))
+}
+
+/// The alive workers. Shared with `/api/v2`.
+pub(super) fn workers_response(state: &WebState) -> Vec<WorkerResponse> {
+    state
         .node_registry
         .alive_workers()
         .into_iter()
@@ -241,16 +261,20 @@ async fn list_workers(State(state): State<WebState>) -> Json<Vec<WorkerResponse>
             version: w.version,
             state: if w.draining { "draining" } else { "active" },
         })
-        .collect();
-    Json(workers)
+        .collect()
 }
 
 async fn server_info(State(state): State<WebState>) -> Json<InfoResponse> {
-    Json(InfoResponse {
+    Json(info_response(&state))
+}
+
+/// Server version, uptime and role. Shared with `/api/v2`.
+pub(super) fn info_response(state: &WebState) -> InfoResponse {
+    InfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_secs: state.start_time.elapsed().as_secs(),
         role: state.role.clone(),
-    })
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ pub mod error;
 mod frontend;
 mod metrics;
 pub mod session;
+mod v2;
 
 pub use session::SessionStore;
 
@@ -35,8 +36,6 @@ pub struct WebState {
     /// `[auth] type = "password"` (the state store).
     pub credentials: Option<Arc<dyn arneb_protocol::CredentialSource>>,
     /// The coordinator state store; `Some` only under password auth.
-    // Read by the `/api/v2` token and user routes, mounted next.
-    #[allow(dead_code)]
     pub state: Option<Arc<arneb_state::StateStore>>,
     /// Access rules shared with pgwire and Trino.
     pub access_rules: Option<Arc<arneb_catalog::AccessRules>>,
@@ -57,6 +56,7 @@ pub struct WebState {
 pub fn build_router(state: WebState) -> Router {
     Router::new()
         .nest("/api/v1", api::api_routes())
+        .nest("/api/v2", v2::routes())
         .route("/metrics", axum::routing::get(metrics::metrics))
         .fallback(frontend::static_handler)
         .layer(axum::middleware::from_fn_with_state(

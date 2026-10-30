@@ -82,13 +82,20 @@ fn unauthenticated() -> Response {
 
 /// Middleware: authenticate the request (see the module docs).
 pub async fn authenticate(State(state): State<WebState>, mut req: Request, next: Next) -> Response {
-    let (Some(creds), Some(basic)) = (&state.credentials, &state.basic) else {
+    let Some(creds) = &state.credentials else {
         let user = claimed_user(req.headers()).unwrap_or_else(|| "anonymous".to_owned());
         req.extensions_mut().insert(Identity {
             user,
             via: AuthVia::Unauthenticated,
         });
         return next.run(req).await;
+    };
+    // Password auth is on, so a missing checker is a wiring bug: refuse,
+    // never fall back to `none`.
+    let Some(basic) = &state.basic else {
+        tracing::error!("password auth is configured without a Basic authenticator");
+        return ApiError::new(ErrorCode::Internal, "authentication is misconfigured")
+            .into_response();
     };
     if !requires_auth(req.method(), req.uri().path(), state.metrics_auth) {
         return next.run(req).await;
@@ -293,8 +300,7 @@ mod tests {
             );
         }
 
-        // `/api/v2` is mounted by the next change; its public routes are
-        // decided here.
+        // `/api/v2`'s public routes are decided here.
         assert!(!requires_auth(&Method::GET, "/api/v2/health", false));
         assert!(!requires_auth(&Method::POST, "/api/v2/sessions", false));
         assert!(requires_auth(&Method::GET, "/api/v2/sessions", false));
@@ -310,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn bearer_token_and_basic_both_authenticate() {
         let state = web_state(true, None, false);
-        let session = state.sessions.create("bob");
+        let session = state.sessions.create("bob").unwrap();
         for auth in [
             format!("Bearer {ALICE_TOKEN}"),
             format!("bearer {ALICE_TOKEN}"),
@@ -369,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_token_id_and_wrong_secret_are_indistinguishable() {
         let state = web_state(true, None, false);
-        let revoked = state.sessions.create("alice");
+        let revoked = state.sessions.create("alice").unwrap();
         state.sessions.revoke(&revoked);
         let attempts = [
             format!("Bearer {UNKNOWN_ID}"),
@@ -391,6 +397,17 @@ mod tests {
             assert_eq!(reply.status, baseline.status, "{auth}");
             assert_eq!(reply.www_authenticate, baseline.www_authenticate, "{auth}");
             assert_eq!(reply.body, baseline.body, "{auth}");
+        }
+    }
+
+    #[tokio::test]
+    async fn credentials_without_a_basic_checker_fail_closed() {
+        let mut state = web_state(true, None, false);
+        state.basic = None;
+        for path in ["/api/v1/queries", "/api/v1/info", "/api/v2/health"] {
+            let reply = get(&state, path, None).await;
+            assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+            assert_eq!(reply.json()["error"]["code"], "internal", "{path}");
         }
     }
 

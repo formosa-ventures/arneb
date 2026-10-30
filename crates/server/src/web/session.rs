@@ -19,16 +19,19 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
 /// How long a session stays valid after it is created.
-// Sessions are created and revoked by `/api/v2/sessions`, mounted next; until
-// then only the middleware's `resolve` is called outside tests.
-#[allow(dead_code)]
 pub const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
 /// Prefix of every session token.
 pub const SESSION_PREFIX: &str = "arneb_s_";
 
+/// Live sessions one user may hold; creating one more ends their oldest.
+pub const MAX_SESSIONS_PER_USER: usize = 16;
+
+/// Live sessions the whole process may hold; past it, creating one fails
+/// with [`SessionLimit`].
+pub const MAX_SESSIONS: usize = 10_000;
+
 /// Random bytes in a session secret (43 base64url characters).
-#[allow(dead_code)]
 const SECRET_LEN: usize = 32;
 
 type TokenDigest = [u8; 32];
@@ -40,10 +43,21 @@ struct Session {
     expires: Instant,
 }
 
+/// The process-wide session cap ([`MAX_SESSIONS`]) is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionLimit;
+
 /// The live Web sessions. Cheap to clone; clones share the sessions.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SessionStore {
     sessions: Arc<Mutex<HashMap<TokenDigest, Session>>>,
+    max_sessions: usize,
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::with_max_sessions(MAX_SESSIONS)
+    }
 }
 
 impl fmt::Debug for SessionStore {
@@ -61,11 +75,18 @@ fn token_digest(token: &str) -> TokenDigest {
     out
 }
 
-#[allow(dead_code)] // `create` / `revoke`: see `SESSION_TTL`.
 impl SessionStore {
     /// An empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty store with its own process-wide cap (tests use a small one).
+    pub(crate) fn with_max_sessions(max_sessions: usize) -> Self {
+        Self {
+            sessions: Arc::default(),
+            max_sessions,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<TokenDigest, Session>> {
@@ -73,12 +94,13 @@ impl SessionStore {
     }
 
     /// Start a session for `user` and return its token, valid for
-    /// [`SESSION_TTL`].
-    pub fn create(&self, user: &str) -> String {
+    /// [`SESSION_TTL`]. A user's [`MAX_SESSIONS_PER_USER`]-th session ends
+    /// their oldest; with [`MAX_SESSIONS`] live in the process it fails.
+    pub fn create(&self, user: &str) -> Result<String, SessionLimit> {
         self.create_at(user, Instant::now())
     }
 
-    fn create_at(&self, user: &str, now: Instant) -> String {
+    fn create_at(&self, user: &str, now: Instant) -> Result<String, SessionLimit> {
         let mut secret = [0u8; SECRET_LEN];
         // The system RNG failing is not recoverable for an auth service.
         aws_lc_rs::rand::fill(&mut secret).expect("system random number generator failed");
@@ -86,6 +108,22 @@ impl SessionStore {
         let digest = token_digest(&token);
         let mut sessions = self.lock();
         sessions.retain(|_, s| s.expires > now);
+        let mut mine: Vec<(Instant, TokenDigest)> = sessions
+            .iter()
+            .filter(|(_, s)| s.user == user)
+            .map(|(d, s)| (s.expires, *d))
+            .collect();
+        if mine.len() >= MAX_SESSIONS_PER_USER {
+            // Every session lives the same TTL, so the earliest expiry is
+            // the oldest session.
+            mine.sort();
+            for (_, d) in &mine[..mine.len() + 1 - MAX_SESSIONS_PER_USER] {
+                sessions.remove(d);
+            }
+        }
+        if sessions.len() >= self.max_sessions {
+            return Err(SessionLimit);
+        }
         sessions.insert(
             digest,
             Session {
@@ -94,7 +132,7 @@ impl SessionStore {
                 expires: now + SESSION_TTL,
             },
         );
-        token
+        Ok(token)
     }
 
     /// The user of the live session `token`, or `None`.
@@ -135,7 +173,7 @@ mod tests {
     #[test]
     fn sessions_resolve_until_revoked_or_expired() {
         let store = SessionStore::new();
-        let token = store.create("alice");
+        let token = store.create("alice").unwrap();
         let secret = token.strip_prefix(SESSION_PREFIX).unwrap();
         assert_eq!(secret.len(), 43);
         assert!(secret
@@ -143,7 +181,7 @@ mod tests {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
         assert!(!arneb_protocol::is_token_shaped(&token));
         assert_eq!(store.resolve(&token).as_deref(), Some("alice"));
-        assert_ne!(store.create("alice"), token, "tokens are random");
+        assert_ne!(store.create("alice").unwrap(), token, "tokens are random");
 
         let mut wrong = token.clone();
         wrong.pop();
@@ -154,7 +192,7 @@ mod tests {
         assert_eq!(store.resolve(&token), None);
 
         let now = Instant::now();
-        let token = store.create_at("bob", now);
+        let token = store.create_at("bob", now).unwrap();
         assert_eq!(
             store.resolve_at(&token, now + SESSION_TTL / 2).as_deref(),
             Some("bob")
@@ -166,11 +204,44 @@ mod tests {
     #[test]
     fn debug_does_not_show_tokens_or_users() {
         let store = SessionStore::new();
-        let token = store.create("alice");
+        let token = store.create("alice").unwrap();
         let shown = format!("{store:?}");
         assert!(
             !shown.contains(&token) && !shown.contains("alice"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn a_user_keeps_at_most_sixteen_sessions_and_loses_the_oldest() {
+        let store = SessionStore::new();
+        let start = Instant::now();
+        let tokens: Vec<String> = (0..MAX_SESSIONS_PER_USER)
+            .map(|i| {
+                store
+                    .create_at("alice", start + Duration::from_secs(i as u64))
+                    .unwrap()
+            })
+            .collect();
+        let bob = store.create_at("bob", start).unwrap();
+        let newest = store
+            .create_at("alice", start + Duration::from_secs(100))
+            .unwrap();
+        let now = start + Duration::from_secs(101);
+        assert_eq!(store.resolve_at(&tokens[0], now), None, "oldest evicted");
+        assert_eq!(store.resolve_at(&tokens[1], now).as_deref(), Some("alice"));
+        assert_eq!(store.resolve_at(&newest, now).as_deref(), Some("alice"));
+        assert_eq!(store.resolve_at(&bob, now).as_deref(), Some("bob"));
+        assert_eq!(store.lock().len(), MAX_SESSIONS_PER_USER + 1);
+    }
+
+    #[test]
+    fn the_global_cap_refuses_new_sessions_until_one_ends() {
+        let store = SessionStore::with_max_sessions(2);
+        let a = store.create("alice").unwrap();
+        store.create("bob").unwrap();
+        assert_eq!(store.create("carol"), Err(SessionLimit));
+        store.revoke(&a);
+        assert!(store.create("carol").is_ok());
     }
 }

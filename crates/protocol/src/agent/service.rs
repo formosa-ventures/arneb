@@ -40,7 +40,7 @@ const SESSION_STATEMENT_HINT: &str = "pass \"catalog\" and \"schema\" in the req
 pub struct AgentQueryService {
     engine: Arc<Engine>,
     tracker: Arc<QueryTracker>,
-    limits: Arc<AgentLimits>,
+    pub(super) limits: Arc<AgentLimits>,
     admission: Option<AdmissionController>,
     statement_timeout: Option<Duration>,
     statements: Arc<Mutex<HashMap<String, Arc<Statement>>>>,
@@ -71,6 +71,14 @@ impl AgentQueryService {
             statement_timeout: None,
             statements: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The access-scoped catalog root `user` sees (same visibility as
+    /// `SHOW`), or the error that user is refused with.
+    pub(super) fn scoped_root(&self, user: &str) -> Result<Arc<CatalogManager>, AgentError> {
+        self.engine
+            .session_root(&ClientSession::for_agent(user, None, None))
+            .map_err(|e| AgentError::from_trino(&e))
     }
 
     /// Replace the engine with a copy changed by `change`.

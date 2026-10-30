@@ -3,12 +3,14 @@
 //! through [`AgentQueryService`], which runs them on the Trino-protocol
 //! engine; the configurable [`AgentLimits`] bound every request.
 
+pub mod discovery;
 pub mod error;
 pub mod limits;
 pub mod results;
 pub mod service;
 pub mod statement;
 
+pub use discovery::{ColumnDescription, ListRequest, Listing, Named, TableDescription, TableStats};
 pub use error::{AgentError, AgentErrorCode, SqlLocation};
 pub use limits::AgentLimits;
 pub use results::ResultPage;

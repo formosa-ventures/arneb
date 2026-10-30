@@ -55,11 +55,12 @@ use auth::AuthUser;
 pub use auth::{BasicAuthenticator, BasicVerdict};
 pub(crate) use engine::{Engine, QueryOutput};
 pub(crate) use error::TrinoError;
+pub(crate) use metadata::{catalog_names, schema_names, table_columns, table_names};
 pub(crate) use session::ClientSession;
 use session::HeaderFamily;
 pub(crate) use statements::{parse_control, ControlStatement};
 use types::column_json;
-pub(crate) use types::{encode_cell, materialize};
+pub(crate) use types::{encode_cell, materialize, trino_type_of};
 
 /// Trino release whose client protocol this server mirrors. Reported in
 /// `/v1/info` as `<compat>-arneb-<version>` so clients that parse the leading

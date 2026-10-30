@@ -93,7 +93,10 @@ impl Engine {
     /// The catalog manager this session plans against: the root, checked
     /// against the access rules for the session user. Fails when the rules
     /// do not let the user run statements.
-    fn session_root(&self, session: &ClientSession) -> Result<Arc<CatalogManager>, TrinoError> {
+    pub(crate) fn session_root(
+        &self,
+        session: &ClientSession,
+    ) -> Result<Arc<CatalogManager>, TrinoError> {
         let Some(rules) = &self.access_rules else {
             return Ok(Arc::clone(&self.catalog_manager));
         };

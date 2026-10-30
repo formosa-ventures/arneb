@@ -1,0 +1,662 @@
+//! Cheap discovery for agents: bounded listings of catalogs, schemas and
+//! tables, a table description with statistics, and a bounded sample. Names
+//! come from the same access-scoped view `SHOW` uses, so an object the user
+//! may not see answers exactly like one that does not exist.
+
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use arneb_catalog::CatalogManager;
+use arneb_common::suggest::nearest;
+use arneb_common::TableReference;
+
+use super::error::{AgentError, AgentErrorCode};
+use super::service::AgentQueryService;
+use super::statement::{StatementStatus, SubmitRequest};
+use crate::trino::{catalog_names, schema_names, table_columns, table_names, trino_type_of};
+
+/// Rows a sample returns when `rows` is not given.
+const DEFAULT_SAMPLE_ROWS: usize = 10;
+/// Most rows a sample may ask for.
+const MAX_SAMPLE_ROWS: usize = 100;
+/// Nearest names offered in a not-found error.
+const MAX_CANDIDATES: usize = 3;
+
+/// Query parameters of a listing.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ListRequest {
+    /// Keep only names starting with this (case-insensitive).
+    pub prefix: Option<String>,
+    /// Most names to return (default `default_max_rows`).
+    pub limit: Option<usize>,
+}
+
+/// One named object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Named {
+    /// The object's name.
+    pub name: String,
+}
+
+/// A bounded, name-sorted listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Listing {
+    /// Up to `limit` matching names, sorted.
+    pub items: Vec<Named>,
+    /// Matches before the limit was applied.
+    pub total: usize,
+    /// Whether `total` exceeds the items returned.
+    pub truncated: bool,
+}
+
+/// One column of a described table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ColumnDescription {
+    /// Column name.
+    pub name: String,
+    /// Trino type, e.g. `bigint` or `decimal(12,2)`.
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// Whether the column may be NULL.
+    pub nullable: bool,
+}
+
+/// Table statistics; null where the connector does not know.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TableStats {
+    /// Approximate row count.
+    pub row_count: Option<u64>,
+    /// Size in bytes (on disk where applicable).
+    pub size_bytes: Option<u64>,
+}
+
+/// A table's columns and statistics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TableDescription {
+    /// Catalog name.
+    pub catalog: String,
+    /// Schema name.
+    pub schema: String,
+    /// Table name.
+    pub table: String,
+    /// Columns in table order.
+    pub columns: Vec<ColumnDescription>,
+    /// Row count and size, when known.
+    pub statistics: TableStats,
+}
+
+fn not_found(
+    code: AgentErrorCode,
+    what: &str,
+    path: &str,
+    target: &str,
+    visible: &[String],
+    list_path: &str,
+) -> AgentError {
+    let mut err = AgentError::new(code, format!("{what} '{path}' does not exist"))
+        .with_hint(format!("list {} with GET /api/v2{list_path}", plural(what)));
+    err.candidates = nearest(target, visible, MAX_CANDIDATES);
+    err
+}
+
+fn plural(what: &str) -> &'static str {
+    match what {
+        "Catalog" => "catalogs",
+        "Schema" => "schemas",
+        _ => "tables",
+    }
+}
+
+fn catalog_missing(catalog: &str, visible: &[String]) -> AgentError {
+    not_found(
+        AgentErrorCode::CatalogNotFound,
+        "Catalog",
+        catalog,
+        catalog,
+        visible,
+        "/catalogs",
+    )
+}
+
+fn schema_missing(catalog: &str, schema: &str, visible: &[String]) -> AgentError {
+    not_found(
+        AgentErrorCode::SchemaNotFound,
+        "Schema",
+        &format!("{catalog}.{schema}"),
+        schema,
+        visible,
+        &format!("/catalogs/{catalog}/schemas"),
+    )
+}
+
+fn table_missing(catalog: &str, schema: &str, table: &str, visible: &[String]) -> AgentError {
+    not_found(
+        AgentErrorCode::TableNotFound,
+        "Table",
+        &format!("{catalog}.{schema}.{table}"),
+        table,
+        visible,
+        &format!("/catalogs/{catalog}/schemas/{schema}/tables"),
+    )
+}
+
+/// Double-quotes an identifier, doubling embedded quotes.
+fn quote(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+impl AgentQueryService {
+    /// Applies `req` to `names`: prefix filter, sort, limit.
+    fn bound(&self, mut names: Vec<String>, req: &ListRequest) -> Result<Listing, AgentError> {
+        let limit = match req.limit {
+            None => self.limits.default_max_rows,
+            Some(n) if (1..=self.limits.max_rows).contains(&n) => n,
+            Some(n) => {
+                return Err(AgentError::new(
+                    AgentErrorCode::InvalidArgument,
+                    format!("limit {n} is out of range"),
+                )
+                .with_hint(format!("limit must be in 1..={}", self.limits.max_rows)))
+            }
+        };
+        if let Some(prefix) = &req.prefix {
+            let prefix = prefix.to_lowercase();
+            names.retain(|n| n.to_lowercase().starts_with(&prefix));
+        }
+        names.sort();
+        let total = names.len();
+        names.truncate(limit);
+        Ok(Listing {
+            items: names.into_iter().map(|name| Named { name }).collect(),
+            total,
+            truncated: total > limit,
+        })
+    }
+
+    /// The catalogs `user` can see, as `SHOW CATALOGS` lists them.
+    pub async fn list_catalogs(
+        &self,
+        user: &str,
+        req: &ListRequest,
+    ) -> Result<Listing, AgentError> {
+        let root = self.scoped_root(user)?;
+        self.bound(catalog_names(&root), req)
+    }
+
+    /// The schemas of `catalog` that `user` can see.
+    pub async fn list_schemas(
+        &self,
+        user: &str,
+        catalog: &str,
+        req: &ListRequest,
+    ) -> Result<Listing, AgentError> {
+        let root = self.scoped_root(user)?;
+        let names = schemas_of(&root, catalog).await?;
+        self.bound(names, req)
+    }
+
+    /// The tables of `catalog.schema` that `user` can see.
+    pub async fn list_tables(
+        &self,
+        user: &str,
+        catalog: &str,
+        schema: &str,
+        req: &ListRequest,
+    ) -> Result<Listing, AgentError> {
+        let root = self.scoped_root(user)?;
+        let names = tables_of(&root, catalog, schema).await?;
+        self.bound(names, req)
+    }
+
+    /// The columns (in order, with Trino types) and statistics of a table.
+    pub async fn describe_table(
+        &self,
+        user: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<TableDescription, AgentError> {
+        let root = self.scoped_root(user)?;
+        let visible = tables_of(&root, catalog, schema).await?;
+        let missing = || table_missing(catalog, schema, table, &visible);
+        if !visible.iter().any(|t| t == table) {
+            return Err(missing());
+        }
+        let columns = table_columns(&root, catalog, schema, table)
+            .await
+            .ok_or_else(missing)?;
+        let reference = TableReference {
+            catalog: Some(catalog.to_string()),
+            schema: Some(schema.to_string()),
+            table: table.to_string(),
+        };
+        let statistics = match root.resolve_table(&reference).await {
+            Ok(provider) => provider.statistics(),
+            Err(_) => None,
+        };
+        Ok(TableDescription {
+            catalog: catalog.to_string(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+            columns: columns
+                .into_iter()
+                .map(|c| ColumnDescription {
+                    type_name: trino_type_of(&c.data_type).display(),
+                    name: c.name,
+                    nullable: c.nullable,
+                })
+                .collect(),
+            statistics: TableStats {
+                row_count: statistics.as_ref().and_then(|s| s.row_count),
+                size_bytes: statistics.as_ref().and_then(|s| s.size_bytes),
+            },
+        })
+    }
+
+    /// Up to `rows` (default 10, at most 100) rows of a table, run as a
+    /// tracked statement and waited for up to `max_wait`.
+    pub async fn sample(
+        &self,
+        user: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        rows: Option<usize>,
+    ) -> Result<StatementStatus, AgentError> {
+        let rows = match rows {
+            None => DEFAULT_SAMPLE_ROWS,
+            Some(n) if (1..=MAX_SAMPLE_ROWS).contains(&n) => n,
+            Some(n) => {
+                return Err(AgentError::new(
+                    AgentErrorCode::InvalidArgument,
+                    format!("rows {n} is out of range"),
+                )
+                .with_hint(format!("rows must be in 1..={MAX_SAMPLE_ROWS}")))
+            }
+        };
+        let root = self.scoped_root(user)?;
+        let visible = tables_of(&root, catalog, schema).await?;
+        if !visible.iter().any(|t| t == table) {
+            return Err(table_missing(catalog, schema, table, &visible));
+        }
+        let sql = format!(
+            "SELECT * FROM {}.{}.{} LIMIT {rows}",
+            quote(catalog),
+            quote(schema),
+            quote(table)
+        );
+        let wait: Duration = self.limits.max_wait;
+        self.submit(
+            user,
+            SubmitRequest {
+                sql,
+                catalog: None,
+                schema: None,
+                max_rows: Some(rows),
+            },
+            wait,
+        )
+        .await
+    }
+}
+
+/// Visible schemas of `catalog`, or catalog_not_found.
+async fn schemas_of(root: &CatalogManager, catalog: &str) -> Result<Vec<String>, AgentError> {
+    match schema_names(root, catalog).await {
+        Some(names) => Ok(names),
+        None => Err(catalog_missing(catalog, &catalog_names(root))),
+    }
+}
+
+/// Visible tables of `catalog.schema`, or the not-found error one level up.
+async fn tables_of(
+    root: &CatalogManager,
+    catalog: &str,
+    schema: &str,
+) -> Result<Vec<String>, AgentError> {
+    let schemas = schemas_of(root, catalog).await?;
+    match table_names(root, catalog, schema).await {
+        Some(names) if schemas.iter().any(|s| s == schema) => Ok(names),
+        _ => Err(schema_missing(catalog, schema, &schemas)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use async_trait::async_trait;
+
+    use arneb_catalog::{
+        AccessRules, CatalogManager, CatalogProvider, SchemaProvider, TableProvider,
+        TableStatistics,
+    };
+    use arneb_common::types::{ColumnInfo, DataType};
+    use arneb_connectors::memory::{
+        MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+    };
+    use arneb_connectors::ConnectorRegistry;
+    use arneb_scheduler::QueryTracker;
+
+    use super::*;
+    use crate::agent::statement::StatementState;
+    use crate::agent::{AgentErrorCode, AgentLimits, AgentQueryService};
+
+    fn int_table(rows: i64) -> Arc<MemoryTable> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l_orderkey", ArrowDataType::Int64, false),
+            Field::new("l_comment", ArrowDataType::Int64, true),
+        ]));
+        let infos = schema
+            .fields()
+            .iter()
+            .map(|f| ColumnInfo {
+                name: f.name().clone(),
+                data_type: DataType::try_from(f.data_type().clone()).unwrap(),
+                nullable: f.is_nullable(),
+            })
+            .collect();
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from_iter_values(0..rows)),
+            Arc::new(Int64Array::from_iter_values(0..rows)),
+        ];
+        let batch = RecordBatch::try_new(schema, cols).unwrap();
+        Arc::new(MemoryTable::new(infos, vec![batch]))
+    }
+
+    /// A table that reports statistics.
+    #[derive(Debug)]
+    struct StatsTable;
+
+    impl TableProvider for StatsTable {
+        fn schema(&self) -> Vec<ColumnInfo> {
+            vec![ColumnInfo {
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+            }]
+        }
+        fn statistics(&self) -> Option<TableStatistics> {
+            Some(TableStatistics {
+                row_count: Some(42),
+                size_bytes: Some(1024),
+                columns: Default::default(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct StatsSchema;
+
+    #[async_trait]
+    impl SchemaProvider for StatsSchema {
+        async fn table_names(&self) -> Vec<String> {
+            vec!["stat".into()]
+        }
+        async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+            (name == "stat").then(|| Arc::new(StatsTable) as Arc<dyn TableProvider>)
+        }
+    }
+
+    #[derive(Debug)]
+    struct StatsCatalog;
+
+    #[async_trait]
+    impl CatalogProvider for StatsCatalog {
+        async fn schema_names(&self) -> Vec<String> {
+            vec!["s".into()]
+        }
+        async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+            (name == "s").then(|| Arc::new(StatsSchema) as Arc<dyn SchemaProvider>)
+        }
+    }
+
+    /// `memory.default`: lineitem (10 rows), orders, `we"ird`, t01..t25.
+    fn service(rules: Option<&str>) -> AgentQueryService {
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("lineitem", int_table(10));
+        schema.register_table("orders", int_table(3));
+        schema.register_table("we\"ird", int_table(3));
+        for i in 1..=25 {
+            schema.register_table(format!("t{i:02}"), int_table(1));
+        }
+        let memory = Arc::new(MemoryCatalog::new());
+        memory.register_schema("default", schema);
+        let cm = CatalogManager::new("memory", "default");
+        cm.register_catalog("memory", memory.clone());
+        cm.register_catalog("stats", Arc::new(StatsCatalog));
+        let mut registry = ConnectorRegistry::new();
+        registry.register(
+            "memory",
+            Arc::new(MemoryConnectorFactory::new(memory, "default")),
+        );
+        let svc = AgentQueryService::new(
+            Arc::new(cm),
+            Arc::new(registry),
+            Arc::new(QueryTracker::new()),
+            AgentLimits::default(),
+        );
+        match rules {
+            Some(r) => svc.with_access_rules(Some(Arc::new(AccessRules::from_json(r).unwrap()))),
+            None => svc,
+        }
+    }
+
+    fn all() -> ListRequest {
+        ListRequest {
+            prefix: None,
+            limit: None,
+        }
+    }
+
+    fn names(l: &Listing) -> Vec<&str> {
+        l.items.iter().map(|n| n.name.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn list_catalogs_matches_show_catalogs() {
+        let svc = service(None);
+        let l = svc.list_catalogs("alice", &all()).await.unwrap();
+        assert_eq!(names(&l), ["memory", "stats", "system"]);
+        assert_eq!(l.total, 3);
+        assert!(!l.truncated);
+        let show = svc
+            .submit(
+                "alice",
+                crate::agent::SubmitRequest {
+                    sql: "SHOW CATALOGS".into(),
+                    catalog: None,
+                    schema: None,
+                    max_rows: None,
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        assert_eq!(show.total_rows, Some(3));
+    }
+
+    #[tokio::test]
+    async fn listing_honors_prefix_limit_and_reports_total() {
+        let svc = service(None);
+        let req = ListRequest {
+            prefix: Some("T".into()),
+            limit: Some(10),
+        };
+        let l = svc
+            .list_tables("alice", "memory", "default", &req)
+            .await
+            .unwrap();
+        assert_eq!(l.items.len(), 10);
+        assert_eq!(l.total, 25);
+        assert!(l.truncated);
+        assert_eq!(l.items[0].name, "t01");
+
+        for bad in [0, AgentLimits::default().max_rows + 1] {
+            let req = ListRequest {
+                prefix: None,
+                limit: Some(bad),
+            };
+            let err = svc.list_catalogs("alice", &req).await.unwrap_err();
+            assert_eq!(err.code, AgentErrorCode::InvalidArgument);
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_missing_levels_is_not_found_with_candidates() {
+        let svc = service(None);
+        let err = svc
+            .list_schemas("alice", "memry", &all())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::CatalogNotFound);
+        assert_eq!(err.candidates, ["memory"]);
+        let err = svc
+            .list_tables("alice", "memory", "defalt", &all())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::SchemaNotFound);
+        assert_eq!(err.candidates, ["default"]);
+        assert!(err
+            .hint
+            .unwrap()
+            .contains("/api/v2/catalogs/memory/schemas"));
+    }
+
+    const HIDE_ORDERS: &str = r#"{"tables": [
+        {"user": "bob", "table": "orders", "privileges": []},
+        {"privileges": ["SELECT"]}
+    ]}"#;
+
+    #[tokio::test]
+    async fn hidden_table_is_indistinguishable_from_missing() {
+        let svc = service(Some(HIDE_ORDERS));
+        let hidden = svc
+            .describe_table("bob", "memory", "default", "orders")
+            .await
+            .unwrap_err();
+        let missing = svc
+            .describe_table("bob", "memory", "default", "nosuch")
+            .await
+            .unwrap_err();
+        assert_eq!(hidden.code, AgentErrorCode::TableNotFound);
+        assert_eq!(hidden.code, missing.code);
+        assert_eq!(
+            hidden.message.replace("orders", "X"),
+            missing.message.replace("nosuch", "X")
+        );
+        assert!(!hidden.candidates.contains(&"orders".to_string()));
+        assert!(!missing.candidates.contains(&"orders".to_string()));
+        let l = svc
+            .list_tables("bob", "memory", "default", &all())
+            .await
+            .unwrap();
+        assert!(!names(&l).contains(&"orders"));
+        // alice is not restricted and still sees it
+        assert!(svc
+            .describe_table("alice", "memory", "default", "orders")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn describe_returns_columns_types_and_stats() {
+        let svc = service(None);
+        let d = svc
+            .describe_table("alice", "memory", "default", "lineitem")
+            .await
+            .unwrap();
+        let cols: Vec<_> = d
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.type_name.as_str(), c.nullable))
+            .collect();
+        assert_eq!(
+            cols,
+            [
+                ("l_orderkey", "bigint", false),
+                ("l_comment", "bigint", true)
+            ]
+        );
+        assert_eq!(d.statistics.row_count, None);
+        assert_eq!(d.statistics.size_bytes, None);
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(json["columns"][0]["type"], "bigint");
+
+        let d = svc
+            .describe_table("alice", "stats", "s", "stat")
+            .await
+            .unwrap();
+        assert_eq!(d.statistics.row_count, Some(42));
+        assert_eq!(d.statistics.size_bytes, Some(1024));
+    }
+
+    #[tokio::test]
+    async fn table_not_found_suggests_visible_neighbours() {
+        let svc = service(None);
+        let err = svc
+            .describe_table("alice", "memory", "default", "lineitm")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound);
+        assert_eq!(err.candidates[0], "lineitem");
+        assert!(err
+            .hint
+            .unwrap()
+            .contains("/api/v2/catalogs/memory/schemas/default/tables"));
+        let err = svc
+            .describe_table("alice", "memry", "default", "lineitem")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::CatalogNotFound);
+        let err = svc
+            .describe_table("alice", "memory", "defalt", "lineitem")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::SchemaNotFound);
+    }
+
+    #[tokio::test]
+    async fn sample_returns_bounded_rows_inline() {
+        let svc = service(None);
+        let s = svc
+            .sample("alice", "memory", "default", "lineitem", Some(5))
+            .await
+            .unwrap();
+        assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
+        assert_eq!(s.first_page.unwrap().rows.len(), 5);
+        let s = svc
+            .sample("alice", "memory", "default", "lineitem", None)
+            .await
+            .unwrap();
+        assert_eq!(s.first_page.unwrap().rows.len(), 10);
+        for bad in [0, 101] {
+            let err = svc
+                .sample("alice", "memory", "default", "lineitem", Some(bad))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, AgentErrorCode::InvalidArgument);
+        }
+        let err = svc
+            .sample("alice", "memory", "default", "nosuch", Some(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound);
+    }
+
+    #[tokio::test]
+    async fn sample_quotes_identifiers() {
+        let svc = service(None);
+        let s = svc
+            .sample("alice", "memory", "default", "we\"ird", Some(2))
+            .await
+            .unwrap();
+        assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
+        assert_eq!(s.first_page.unwrap().rows.len(), 2);
+    }
+}

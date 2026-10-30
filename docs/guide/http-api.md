@@ -114,8 +114,9 @@ curl -u "alice:$TOKEN" https://coordinator:8080/v1/info
 ```
 
 On pgwire the token goes through the normal SCRAM exchange, so it never
-crosses the network. The Trino listener needs TLS under password auth on any non-loopback
-address (see
+crosses the network. On Trino the token is sent as a Basic password, so
+password auth without `[tls]` is a startup error; disable the listener with
+`--no-trino` if you only need pgwire (see
 [Trino clients](/guide/trino-clients)).
 
 ## Errors

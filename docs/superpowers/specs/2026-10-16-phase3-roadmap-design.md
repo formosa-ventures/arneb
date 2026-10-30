@@ -305,9 +305,10 @@ its own OpenSpec change.
 | v0.1.6 (shipped 2026-10-25) | Concurrency reliability | G1, G2, G6 soak test (#177); G4 and G5 landed early (#178, #179) | Tier 1 + 2 |
 | v0.1.7 (shipped 2026-10-26) | Deployable, safe to share | P6 (#182); G3 (#183) and P4 stage 2 (#184, off by default) landed early; G6 client smoke in CI (#185) and queryable `pg_catalog`, stage 2a (#188) | Tier 1 + 2 + kind |
 | v0.1.8 | Correctness fixes (unplanned) | Wrong results from per-partition grace builds (#191) and right-preserved eager aggregation (#206); null-extended outer-join columns now nullable (#203); joins inside a parenthesized `FROM` (#202); no partial cross-fragment domain from copartitioned joins (#198); RustSec dependency bumps (#200, #210) | Tier 1 + CI cluster smoke + kind |
-| v0.1.9 | Client gaps | G6 stage 2b: arrays, `json_build_object`, SQLAlchemy column reflection over pgwire, a Metabase run; `pg_catalog` follow-ups (#189) | Tier 1 + 2 |
+| v0.1.9 onward (first) | Headless agent interface | H1–H6: state store, API tokens and authentication on every route; agent query API; remote MCP; manage API, write privileges and audit log; runtime config; MCP OAuth. See `2026-10-30-headless-agent-interface-design.md` | Tier 1 + 2 + kind |
+| after headless | Client gaps | G6 stage 2b: arrays, `json_build_object`, SQLAlchemy column reflection over pgwire, a Metabase run; `pg_catalog` follow-ups (#189) | Tier 1 + 2 |
 | in parallel | Large-scale memory | P1 SF30 validation, `dist-adaptive-partition` SF30 sweep (q18 SF30 still OOMs) | Tier 3 |
-| v0.2.0 | Production-ready | Scenario 1 checklist green, BI client smoke (G6), `docs/guide/production-checklist.md` | — |
+| v0.2.0 | Production-ready, headless | Headless acceptance scenario green, scenario 1 checklist green, BI client smoke (G6), `docs/guide/production-checklist.md` | — |
 
 M4 follows v0.2.0.
 
@@ -316,7 +317,9 @@ root cause is still open in #139: no break has reproduced since the
 instrumentation landed. G6 is partly done: the soak test, the client smoke
 suite and the pg_catalog stage 2a are in, and stage 2b and Metabase remain.
 v0.1.8 shipped only the correctness fixes above, so G6 stage 2b moves to
-v0.1.9. Left before v0.2.0: G6 stage 2b, the P1 SF30 validation (Tier 3),
+a later release. **Added 2026-10-30:** v0.2.0 also makes Arneb headless, so a
+remote agent can do every operation (H1–H6), and that work goes first. Left
+before v0.2.0: the headless interface, G6 stage 2b, the P1 SF30 validation (Tier 3),
 the production checklist, and the follow-ups in #156, #181, #187, #189,
 #199, #201 and #205.
 

@@ -55,7 +55,9 @@ use auth::AuthUser;
 pub use auth::{BasicAuthenticator, BasicVerdict};
 pub(crate) use engine::{Engine, QueryOutput};
 pub(crate) use error::TrinoError;
-pub(crate) use metadata::{catalog_names, schema_names, table_columns, table_names};
+pub(crate) use metadata::{
+    build_virtual_catalogs, catalog_names, schema_names, table_columns, table_names, SYSTEM_CATALOG,
+};
 pub(crate) use session::ClientSession;
 use session::HeaderFamily;
 pub(crate) use statements::{parse_control, ControlStatement};

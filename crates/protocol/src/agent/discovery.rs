@@ -14,7 +14,10 @@ use arneb_common::TableReference;
 use super::error::{AgentError, AgentErrorCode};
 use super::service::AgentQueryService;
 use super::statement::{StatementStatus, SubmitRequest};
-use crate::trino::{catalog_names, schema_names, table_columns, table_names, trino_type_of};
+use crate::trino::{
+    build_virtual_catalogs, catalog_names, schema_names, table_columns, table_names, trino_type_of,
+    SYSTEM_CATALOG,
+};
 
 /// Rows a sample returns when `rows` is not given.
 const DEFAULT_SAMPLE_ROWS: usize = 10;
@@ -223,17 +226,29 @@ impl AgentQueryService {
         if !visible.iter().any(|t| t == table) {
             return Err(missing());
         }
-        let columns = table_columns(&root, catalog, schema, table)
-            .await
-            .ok_or_else(missing)?;
+        // Virtual tables resolve against per-query metadata catalogs, as
+        // SHOW COLUMNS does; they have no statistics.
+        let is_virtual = schema == "information_schema" || catalog == SYSTEM_CATALOG;
+        let columns = if is_virtual {
+            let probe = format!("{catalog}.information_schema.columns system.jdbc");
+            let (cm, _) = build_virtual_catalogs(&root, catalog, &probe).await;
+            table_columns(&cm, catalog, schema, table).await
+        } else {
+            table_columns(&root, catalog, schema, table).await
+        }
+        .ok_or_else(missing)?;
         let reference = TableReference {
             catalog: Some(catalog.to_string()),
             schema: Some(schema.to_string()),
             table: table.to_string(),
         };
-        let statistics = match root.resolve_table(&reference).await {
-            Ok(provider) => provider.statistics(),
-            Err(_) => None,
+        let statistics = if is_virtual {
+            None
+        } else {
+            match root.resolve_table(&reference).await {
+                Ok(provider) => provider.statistics(),
+                Err(_) => None,
+            }
         };
         Ok(TableDescription {
             catalog: catalog.to_string(),
@@ -427,6 +442,9 @@ mod tests {
         }
         let memory = Arc::new(MemoryCatalog::new());
         memory.register_schema("default", schema);
+        let secret = Arc::new(MemorySchema::new());
+        secret.register_table("vault", int_table(1));
+        memory.register_schema("secret", secret);
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", memory.clone());
         cm.register_catalog("stats", Arc::new(StatsCatalog));
@@ -647,6 +665,100 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
+    }
+
+    #[tokio::test]
+    async fn describe_information_schema_table() {
+        let svc = service(None);
+        let d = svc
+            .describe_table("alice", "memory", "information_schema", "tables")
+            .await
+            .unwrap();
+        let names: Vec<_> = d.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"table_name"), "{names:?}");
+        assert_eq!(d.statistics.row_count, None);
+        let d = svc
+            .describe_table("alice", "system", "jdbc", "tables")
+            .await
+            .unwrap();
+        assert!(!d.columns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sample_information_schema_table() {
+        let svc = service(None);
+        let s = svc
+            .sample("alice", "memory", "information_schema", "tables", Some(5))
+            .await
+            .unwrap();
+        assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
+        assert_eq!(s.first_page.unwrap().rows.len(), 5);
+    }
+
+    const HIDE_SCHEMA_AND_CATALOG: &str = r#"{
+        "catalogs": [
+            {"user": "bob", "catalog": "stats", "allow": "none"},
+            {"allow": "all"}
+        ],
+        "schemas": [
+            {"user": "bob", "catalog": "memory", "schema": "secret", "owner": false},
+            {"owner": true}
+        ],
+        "tables": [
+            {"user": "bob", "schema": "default", "privileges": ["SELECT"]},
+            {"user": "alice", "privileges": ["SELECT"]}
+        ]
+    }"#;
+
+    #[tokio::test]
+    async fn hidden_schema_and_catalog_are_indistinguishable_from_missing() {
+        let svc = service(Some(HIDE_SCHEMA_AND_CATALOG));
+        // catalog "stats" hidden from bob vs "nocat" missing
+        let hidden = svc.list_schemas("bob", "stats", &all()).await.unwrap_err();
+        let missing = svc.list_schemas("bob", "nocat", &all()).await.unwrap_err();
+        assert_eq!(hidden.code, AgentErrorCode::CatalogNotFound);
+        assert_eq!(hidden.code, missing.code);
+        assert_eq!(
+            hidden.message.replace("stats", "X"),
+            missing.message.replace("nocat", "X")
+        );
+        assert!(!hidden.candidates.contains(&"stats".to_string()));
+        assert!(!missing.candidates.contains(&"stats".to_string()));
+        let d = svc
+            .describe_table("bob", "stats", "s", "stat")
+            .await
+            .unwrap_err();
+        assert_eq!(d.code, AgentErrorCode::CatalogNotFound);
+        assert!(!d.candidates.contains(&"stats".to_string()));
+        // alice still sees it
+        assert!(svc.list_schemas("alice", "stats", &all()).await.is_ok());
+
+        // schema "secret" hidden from bob vs "nosuch" missing
+        let hidden = svc
+            .list_tables("bob", "memory", "secret", &all())
+            .await
+            .unwrap_err();
+        let missing = svc
+            .list_tables("bob", "memory", "nosuch", &all())
+            .await
+            .unwrap_err();
+        assert_eq!(hidden.code, AgentErrorCode::SchemaNotFound);
+        assert_eq!(hidden.code, missing.code);
+        assert_eq!(
+            hidden.message.replace("secret", "X"),
+            missing.message.replace("nosuch", "X")
+        );
+        assert!(!hidden.candidates.contains(&"secret".to_string()));
+        let d = svc
+            .describe_table("bob", "memory", "secret", "vault")
+            .await
+            .unwrap_err();
+        assert_eq!(d.code, AgentErrorCode::SchemaNotFound);
+        assert!(!d.candidates.contains(&"secret".to_string()));
+        assert!(svc
+            .list_tables("alice", "memory", "secret", &all())
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

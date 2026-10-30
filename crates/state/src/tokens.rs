@@ -65,42 +65,57 @@ impl StateStore {
             expires_ms: expires_at_ms,
         };
         let path = self.path().map(|p| p.to_path_buf()).unwrap_or_default();
-        self.mutate(|data| {
-            let record = data
+        // PBKDF2 runs outside the writer lock, against the user's verifier
+        // from a snapshot. If that verifier changed before the write (e.g. a
+        // reseed), derive again once from the new one.
+        for attempt in 0..2 {
+            let user_scram = self
+                .snapshot()
                 .users
                 .iter()
                 .find(|u| u.name == user)
+                .map(|u| u.scram.clone())
                 .ok_or_else(|| StateError::UnknownUser(user.to_string()))?;
-            let verifier: ScramVerifier =
-                record.scram.parse().map_err(|e| StateError::Corrupt {
-                    path: path.clone(),
-                    message: format!("user {user:?} has an invalid verifier: {e}"),
-                })?;
-            // 64 random bits: a collision is practically impossible, but
-            // never let one shadow an existing token.
-            if data.tokens.iter().any(|t| t.id == info.id) {
-                return Err(StateError::Random);
-            }
+            let verifier: ScramVerifier = user_scram.parse().map_err(|e| StateError::Corrupt {
+                path: path.clone(),
+                message: format!("user {user:?} has an invalid verifier: {e}"),
+            })?;
             let scram =
-                ScramVerifier::from_password(&token, verifier.salt(), verifier.iterations());
-            data.tokens.push(TokenRecord {
-                id: info.id.clone(),
-                user: info.user.clone(),
-                name: info.name.clone(),
-                created_ms: info.created_ms,
-                expires_ms: info.expires_ms,
-                secret_sha256,
-                scram: scram.to_string(),
-            });
-            Ok(())
-        })?;
-        Ok(IssuedToken { info, token })
+                ScramVerifier::from_password(&token, verifier.salt(), verifier.iterations())
+                    .to_string();
+            let written = self.mutate(|data| {
+                match data.users.iter().find(|u| u.name == user) {
+                    None => return Err(StateError::UnknownUser(user.to_string())),
+                    Some(u) if u.scram != user_scram => return Ok(false),
+                    Some(_) => {}
+                }
+                // 64 random bits: a collision is practically impossible, but
+                // never let one shadow an existing token.
+                if data.tokens.iter().any(|t| t.id == info.id) {
+                    return Err(StateError::Random);
+                }
+                data.tokens.push(TokenRecord {
+                    id: info.id.clone(),
+                    user: info.user.clone(),
+                    name: info.name.clone(),
+                    created_ms: info.created_ms,
+                    expires_ms: info.expires_ms,
+                    secret_sha256,
+                    scram: scram.clone(),
+                });
+                Ok(true)
+            })?;
+            if written {
+                return Ok(IssuedToken { info, token });
+            }
+            tracing::debug!(user = %user, attempt, "user verifier changed while issuing a token; retrying");
+        }
+        Err(StateError::UnknownUser(user.to_string()))
     }
 
     /// The tokens owned by `user`, oldest first. Never includes secrets.
     pub fn list_tokens(&self, user: &str) -> Vec<TokenInfo> {
-        let guard = self.data.lock().unwrap_or_else(|p| p.into_inner());
-        guard
+        self.snapshot()
             .tokens
             .iter()
             .filter(|t| t.user == user)
@@ -132,7 +147,7 @@ impl StateStore {
         }
         let (id, secret) = token["arneb_".len()..].split_once('_')?;
         let presented = sha256(secret.as_bytes());
-        let guard = self.data.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = self.snapshot();
         let record = guard.tokens.iter().find(|t| t.id == id);
         let expected = record.map_or(&DUMMY_SECRET_SHA256, |r| &r.secret_sha256);
         let matches =

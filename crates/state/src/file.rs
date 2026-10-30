@@ -2,7 +2,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -84,7 +84,12 @@ impl Default for StateData {
 /// otherwise. Share as `Arc<StateStore>`.
 pub struct StateStore {
     path: Option<PathBuf>,
-    pub(crate) data: Mutex<StateData>,
+    /// The current state as an immutable snapshot. The lock is held only to
+    /// clone or swap the `Arc`, so readers (the auth hot paths) never wait
+    /// for a write's PBKDF2 or fsync.
+    data: RwLock<Arc<StateData>>,
+    /// Serializes writers; held across apply + persist + swap.
+    writer: Mutex<()>,
     /// Per-process secret for decoy verifiers of unknown users.
     pub(crate) decoy_secret: [u8; 32],
 }
@@ -93,15 +98,12 @@ pub struct StateStore {
 /// not end up in logs.
 impl std::fmt::Debug for StateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut s = f.debug_struct("StateStore");
-        s.field("path", &self.path);
-        // `try_lock`: formatting must never block on (or deadlock against)
-        // a holder of the state lock.
-        if let Ok(guard) = self.data.try_lock() {
-            s.field("users", &guard.users.len())
-                .field("tokens", &guard.tokens.len());
-        }
-        s.finish_non_exhaustive()
+        let data = self.snapshot();
+        f.debug_struct("StateStore")
+            .field("path", &self.path)
+            .field("users", &data.users.len())
+            .field("tokens", &data.tokens.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -118,7 +120,8 @@ impl StateStore {
         aws_lc_rs::rand::fill(&mut decoy_secret).map_err(|_| StateError::Random)?;
         Ok(StateStore {
             path: path.map(Path::to_path_buf),
-            data: Mutex::new(data),
+            data: RwLock::new(Arc::new(data)),
+            writer: Mutex::new(()),
             decoy_secret,
         })
     }
@@ -165,19 +168,27 @@ impl StateStore {
         serde_json::from_value(value).map_err(|e| corrupt(e.to_string()))
     }
 
+    /// The current state. Never waits for a write in progress: the read
+    /// lock is held only to clone the `Arc`.
+    pub(crate) fn snapshot(&self) -> Arc<StateData> {
+        Arc::clone(&self.data.read().unwrap_or_else(|p| p.into_inner()))
+    }
+
     /// Applies `f` to a clone of the state, persists the clone, and only then
     /// swaps it in, so a failed write never changes the in-memory state.
+    /// Writers are serialized; readers keep seeing the previous snapshot
+    /// until the swap.
     pub(crate) fn mutate<R>(
         &self,
         f: impl FnOnce(&mut StateData) -> Result<R, StateError>,
     ) -> Result<R, StateError> {
-        let mut guard = self.data.lock().unwrap_or_else(|p| p.into_inner());
-        let mut next = guard.clone();
+        let _writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let mut next = StateData::clone(&self.snapshot());
         let out = f(&mut next)?;
         if let Some(path) = &self.path {
             Self::persist(path, &next)?;
         }
-        *guard = next;
+        *self.data.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(next);
         Ok(out)
     }
 
@@ -331,6 +342,46 @@ mod tests {
         });
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(r, Err(StateError::Io { .. })));
+        assert!(names(&store).is_empty());
+    }
+
+    #[test]
+    fn readers_do_not_wait_for_a_write_in_progress() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let store = Arc::new(StateStore::open(None).unwrap());
+        add_alice(&store);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let writer = std::thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                store
+                    .mutate(|d| {
+                        entered_tx.send(()).unwrap();
+                        // Stand-in for a slow PBKDF2 / fsync under the writer lock.
+                        release_rx.recv().unwrap();
+                        d.users.clear();
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        });
+        entered_rx.recv().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                let snap = store.snapshot();
+                done_tx.send(snap.users.len()).unwrap();
+            }
+        });
+        let seen = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a reader must not block on a write in progress");
+        assert_eq!(seen, 1, "readers see the previous snapshot until the swap");
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
         assert!(names(&store).is_empty());
     }
 

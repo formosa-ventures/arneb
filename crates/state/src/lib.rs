@@ -16,7 +16,7 @@ use arneb_protocol::{decoy_verifier, is_token_shaped, CredentialSource, ScramVer
 impl CredentialSource for StateStore {
     fn scram_verifiers(&self, user: &str) -> Vec<ScramVerifier> {
         let now = tokens::now_ms();
-        let guard = self.data.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = self.snapshot();
         let Some(record) = guard.users.iter().find(|u| u.name == user) else {
             return Vec::new();
         };
@@ -40,15 +40,12 @@ impl CredentialSource for StateStore {
         if is_token_shaped(password) {
             return self.verify_token(password).as_deref() == Some(user);
         }
-        // Clone the verifier and drop the lock before running PBKDF2.
-        let stored = {
-            let guard = self.data.lock().unwrap_or_else(|p| p.into_inner());
-            guard
-                .users
-                .iter()
-                .find(|u| u.name == user)
-                .and_then(|u| u.scram.parse::<ScramVerifier>().ok())
-        };
+        let stored = self
+            .snapshot()
+            .users
+            .iter()
+            .find(|u| u.name == user)
+            .and_then(|u| u.scram.parse::<ScramVerifier>().ok());
         let known = stored.is_some();
         let verifier = stored.unwrap_or_else(|| decoy_verifier(&self.decoy_secret, user));
         let ok = verifier.verify_password(password);
@@ -60,8 +57,7 @@ impl CredentialSource for StateStore {
     }
 
     fn user_count(&self) -> usize {
-        let guard = self.data.lock().unwrap_or_else(|p| p.into_inner());
-        guard.users.len()
+        self.snapshot().users.len()
     }
 }
 
@@ -93,5 +89,53 @@ mod tests {
         assert_eq!(verifiers.len(), 2);
         assert!(verifiers[0].verify_password("pw"));
         assert!(verifiers[1].verify_password(&live.token));
+    }
+
+    #[test]
+    fn auth_reads_do_not_wait_for_a_write_in_progress() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let store = Arc::new(store_with_alice());
+        let token = store.issue_token("alice", None, None).unwrap().token;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let writer = std::thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                store
+                    .mutate(|d| {
+                        entered_tx.send(()).unwrap();
+                        // Stand-in for a slow PBKDF2 / fsync under the writer lock.
+                        release_rx.recv().unwrap();
+                        d.tokens.clear();
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        });
+        entered_rx.recv().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn({
+            let store = Arc::clone(&store);
+            let token = token.clone();
+            move || {
+                done_tx
+                    .send((
+                        store.verify_token(&token),
+                        store.scram_verifiers("alice").len(),
+                        store.list_tokens("alice").len(),
+                        store.user_count(),
+                    ))
+                    .unwrap();
+            }
+        });
+        let seen = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("auth reads must not block on a write in progress");
+        assert_eq!(seen, (Some("alice".to_string()), 2, 1, 1));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        // The write is visible once it lands.
+        assert_eq!(store.verify_token(&token), None);
     }
 }

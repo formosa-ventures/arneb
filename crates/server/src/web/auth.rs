@@ -153,7 +153,7 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
 }
 
 /// `user:password` from a Basic credential.
-fn decode_basic(value: &str) -> Option<(String, String)> {
+pub(super) fn decode_basic(value: &str) -> Option<(String, String)> {
     let decoded = String::from_utf8(STANDARD.decode(value).ok()?).ok()?;
     let (user, password) = decoded.split_once(':')?;
     Some((user.to_owned(), password.to_owned()))

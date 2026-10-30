@@ -12,9 +12,10 @@ use std::sync::Arc;
 
 use arneb_state::{StateError, StateStore};
 use axum::body::Bytes;
+use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::Json;
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,7 @@ use super::api::{
     self, ClusterResponse, InfoResponse, ListQueryParams, QueriesResponse, QueryResponse,
     WorkerResponse,
 };
-use super::auth::{AuthVia, Identity};
+use super::auth::{decode_basic, AuthVia, Identity};
 use super::error::{ApiError, ErrorCode};
 use super::session::{SESSION_PREFIX, SESSION_TTL};
 use super::WebState;
@@ -33,6 +34,12 @@ const MAX_TOKEN_NAME_CHARS: usize = 128;
 /// The accepted `expires_in_days` range.
 const EXPIRES_IN_DAYS: std::ops::RangeInclusive<i64> = 1..=3650;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Token issuances running PBKDF2 at once; the rest wait, so a burst cannot
+/// saturate the blocking pool.
+const MAX_CONCURRENT_ISSUES: usize = 4;
+static ISSUE_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_ISSUES);
 
 /// The `/api/v2` routes, nested at `/api/v2` by [`super::build_router`].
 pub fn routes() -> Router<WebState> {
@@ -48,6 +55,29 @@ pub fn routes() -> Router<WebState> {
         .route("/cluster", get(cluster))
         .route("/cluster/workers", get(workers))
         .route("/info", get(info))
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+}
+
+async fn not_found() -> ApiError {
+    ApiError::new(ErrorCode::NotFound, "no such endpoint")
+}
+
+async fn method_not_allowed() -> Response {
+    let mut resp = ApiError::new(ErrorCode::InvalidArgument, "method not allowed")
+        .with_hint("check the API reference for the methods this path accepts")
+        .into_response();
+    *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+    resp
+}
+
+fn bad_body(e: BytesRejection) -> ApiError {
+    ApiError::new(ErrorCode::InvalidArgument, e.body_text())
+}
+
+fn bad_query(e: QueryRejection) -> ApiError {
+    ApiError::new(ErrorCode::InvalidArgument, e.body_text())
+        .with_hint("check the query-string parameters")
 }
 
 #[derive(Serialize)]
@@ -118,20 +148,20 @@ fn now_ms() -> u64 {
 
 async fn create_session(
     State(state): State<WebState>,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<SessionResponse>), ApiError> {
     let Some(basic) = &state.basic else {
         return Err(auth_disabled());
     };
-    let login: LoginRequest = parse_body(&body, false)?;
+    let login: LoginRequest = parse_body(&body.map_err(bad_body)?, false)?;
+    // Sessions are for password logins: an API token as the password is
+    // refused exactly like a wrong password.
+    if arneb_protocol::is_token_shaped(&login.password) {
+        return Err(invalid_login());
+    }
     match basic.check(&login.user, &login.password).await {
         arneb_protocol::BasicVerdict::Valid => {}
-        arneb_protocol::BasicVerdict::Invalid => {
-            return Err(ApiError::new(
-                ErrorCode::Unauthenticated,
-                "invalid user or password",
-            ));
-        }
+        arneb_protocol::BasicVerdict::Invalid => return Err(invalid_login()),
         arneb_protocol::BasicVerdict::Overloaded => return Err(overloaded()),
     }
     let token = state.sessions.create(&login.user).map_err(|_| {
@@ -145,6 +175,10 @@ async fn create_session(
             expires_ms: now_ms() + SESSION_TTL.as_millis() as u64,
         }),
     ))
+}
+
+fn invalid_login() -> ApiError {
+    ApiError::new(ErrorCode::Unauthenticated, "invalid user or password")
 }
 
 fn overloaded() -> ApiError {
@@ -216,6 +250,11 @@ fn state_error(e: StateError) -> ApiError {
         StateError::UnknownUser(_) => {
             ApiError::new(ErrorCode::Unauthenticated, "the user no longer exists")
         }
+        StateError::TooManyTokens { limit, .. } => ApiError::new(
+            ErrorCode::InvalidArgument,
+            format!("you already have {limit} live tokens"),
+        )
+        .with_hint("revoke unused tokens with DELETE /api/v2/tokens/{id}"),
         other => {
             tracing::error!(error = %other, "state store operation failed");
             ApiError::new(ErrorCode::Internal, "the state store operation failed")
@@ -247,16 +286,17 @@ struct IssuedTokenResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     persistent: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    hint: Option<&'static str>,
+    hint: Option<String>,
 }
 
 async fn issue_token(
     State(state): State<WebState>,
     Extension(who): Extension<Identity>,
-    body: Bytes,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<IssuedTokenResponse>), ApiError> {
     let store = token_store(&state)?;
-    let req: IssueTokenRequest = parse_body(&body, true)?;
+    let req: IssueTokenRequest = parse_body(&body.map_err(bad_body)?, true)?;
     let name = req
         .name
         .map(|n| n.trim().to_owned())
@@ -287,7 +327,23 @@ async fn issue_token(
             }
         },
     };
+    // A token cannot mint a child that outlives it.
+    let mut hints = Vec::new();
+    let mut expires_at_ms = expires_at_ms;
+    if let Some(parent_expiry) = authenticating_token_expiry(&store, &who, &headers) {
+        if expires_at_ms.is_none_or(|e| e > parent_expiry) {
+            expires_at_ms = Some(parent_expiry);
+            hints.push("expires_ms was clamped to the expiry of the token that made this request");
+        }
+    }
     let persistent = store.is_persistent();
+    if !persistent {
+        hints.push("the server keeps state in memory only: this token is lost when it restarts");
+    }
+    let _permit = ISSUE_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::Internal, "token issuance is unavailable"))?;
     let issued =
         tokio::task::spawn_blocking(move || store.issue_token(&who.user, name, expires_at_ms))
             .await
@@ -302,11 +358,36 @@ async fn issue_token(
             created_ms: issued.info.created_ms,
             expires_ms: issued.info.expires_ms,
             persistent: (!persistent).then_some(false),
-            hint: (!persistent).then_some(
-                "the server keeps state in memory only: this token is lost when it restarts",
-            ),
+            hint: (!hints.is_empty()).then(|| hints.join("; ")),
         }),
     ))
+}
+
+/// The expiry of the API token that authenticated this request, when it
+/// was one and it expires. The middleware already verified the credential,
+/// so only its id is read, and the expiry is looked up in the caller's own
+/// tokens.
+fn authenticating_token_expiry(
+    store: &StateStore,
+    who: &Identity,
+    headers: &HeaderMap,
+) -> Option<u64> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (_, credential) = value.split_once(' ')?;
+    let token = match who.via {
+        AuthVia::Token => credential.trim().to_owned(),
+        AuthVia::Basic => decode_basic(credential.trim())?.1,
+        _ => return None,
+    };
+    if !arneb_protocol::is_token_shaped(&token) {
+        return None;
+    }
+    let id = &token["arneb_".len()..][..16];
+    store
+        .list_tokens(&who.user)
+        .into_iter()
+        .find(|t| t.id == id)?
+        .expires_ms
 }
 
 #[derive(Serialize)]
@@ -356,9 +437,10 @@ async fn revoke_token(
 async fn list_queries(
     State(state): State<WebState>,
     Extension(who): Extension<Identity>,
-    Query(params): Query<ListQueryParams>,
-) -> Json<QueriesResponse> {
-    Json(api::queries_response(&state, &who, params))
+    params: Result<Query<ListQueryParams>, QueryRejection>,
+) -> Result<Json<QueriesResponse>, ApiError> {
+    let Query(params) = params.map_err(bad_query)?;
+    Ok(Json(api::queries_response(&state, &who, params)))
 }
 
 /// The v1 lookup's status as an envelope: a malformed id is
@@ -807,5 +889,119 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT, "no rules: allowed");
+    }
+
+    async fn issue(state: &WebState, auth: &str, body: Value) -> (StatusCode, Value) {
+        call(
+            state,
+            Method::POST,
+            "/api/v2/tokens",
+            Some(auth),
+            Some(body),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn child_of_an_expiring_token_is_clamped() {
+        let state = web_state(true, None);
+        let (_, parent) = issue(
+            &state,
+            &basic("alice", "secret"),
+            json!({"expires_in_days": 1}),
+        )
+        .await;
+        let parent_expiry = parent["expires_ms"].as_u64().unwrap();
+        let ptoken = parent["token"].as_str().unwrap();
+        for auth in [format!("Bearer {ptoken}"), basic("alice", ptoken)] {
+            for body in [json!({"expires_in_days": 30}), json!({})] {
+                let (status, child) = issue(&state, &auth, body).await;
+                assert_eq!(status, StatusCode::CREATED);
+                assert_eq!(child["expires_ms"].as_u64(), Some(parent_expiry));
+                assert!(child["hint"].as_str().unwrap().contains("clamped"));
+            }
+            // A shorter request is kept.
+            let (_, child) = issue(&state, &auth, json!({"expires_in_days": 1})).await;
+            assert!(child["expires_ms"].as_u64().unwrap() <= parent_expiry);
+        }
+    }
+
+    #[tokio::test]
+    async fn child_of_a_non_expiring_token_is_unrestricted() {
+        let state = web_state(true, None);
+        let (_, parent) = issue(&state, &basic("alice", "secret"), json!({})).await;
+        let bearer = format!("Bearer {}", parent["token"].as_str().unwrap());
+        let (_, child) = issue(&state, &bearer, json!({"expires_in_days": 30})).await;
+        let ttl = child["expires_ms"].as_u64().unwrap() - child["created_ms"].as_u64().unwrap();
+        assert!(ttl >= 29 * 24 * 3600 * 1000);
+        assert!(!child["hint"].as_str().unwrap().contains("clamped"));
+        let (_, child) = issue(&state, &bearer, json!({})).await;
+        assert!(child["expires_ms"].is_null());
+    }
+
+    #[tokio::test]
+    async fn login_with_a_token_as_password_looks_like_a_wrong_password() {
+        let state = web_state(true, None);
+        let (_, parent) = issue(&state, &basic("alice", "secret"), json!({})).await;
+        let attempt = |password: String| {
+            let state = state.clone();
+            async move {
+                call(
+                    &state,
+                    Method::POST,
+                    "/api/v2/sessions",
+                    None,
+                    Some(json!({"user": "alice", "password": password})),
+                )
+                .await
+            }
+        };
+        let wrong = attempt("wrong".into()).await;
+        let with_token = attempt(parent["token"].as_str().unwrap().to_owned()).await;
+        assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(wrong, with_token);
+    }
+
+    #[tokio::test]
+    async fn v2_errors_are_always_the_envelope() {
+        let state = web_state(true, None);
+        let auth = basic("alice", "secret");
+        let (status, body) = call(&state, Method::GET, "/api/v2/nope", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "auth comes first");
+        assert_eq!(body["error"]["code"], "unauthenticated");
+        let (status, body) = call(&state, Method::GET, "/api/v2/nope", Some(&auth), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "not_found");
+        let (status, body) = call(&state, Method::PUT, "/api/v2/tokens", Some(&auth), None).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(body["error"]["code"], "invalid_argument");
+        let (status, body) = call(&state, Method::PUT, "/api/v2/tokens", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let (status, body) = call(
+            &state,
+            Method::GET,
+            "/api/v2/queries?state=a&state=b",
+            Some(&auth),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_argument");
+    }
+
+    #[tokio::test]
+    async fn the_hundred_and_first_token_is_refused() {
+        let state = web_state(true, None);
+        let auth = basic("alice", "secret");
+        for _ in 0..arneb_state::MAX_TOKENS_PER_USER {
+            assert_eq!(issue(&state, &auth, json!({})).await.0, StatusCode::CREATED);
+        }
+        let (status, body) = issue(&state, &auth, json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_argument");
+        assert!(body["error"]["hint"].as_str().unwrap().contains("revoke"));
+        // Another user is unaffected.
+        let bob = basic("bob", "hunter2");
+        assert_eq!(issue(&state, &bob, json!({})).await.0, StatusCode::CREATED);
     }
 }

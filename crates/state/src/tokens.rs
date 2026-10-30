@@ -22,6 +22,10 @@ pub struct TokenInfo {
     pub expires_ms: Option<u64>,
 }
 
+/// Live tokens one user may hold; issuing more fails with
+/// [`StateError::TooManyTokens`].
+pub const MAX_TOKENS_PER_USER: usize = 100;
+
 /// A freshly issued token. `token` is shown once and never stored.
 #[derive(Clone)]
 pub struct IssuedToken {
@@ -48,6 +52,16 @@ impl StateStore {
         user: &str,
         name: Option<String>,
         expires_at_ms: Option<u64>,
+    ) -> Result<IssuedToken, StateError> {
+        self.issue_token_capped(user, name, expires_at_ms, MAX_TOKENS_PER_USER)
+    }
+
+    fn issue_token_capped(
+        &self,
+        user: &str,
+        name: Option<String>,
+        expires_at_ms: Option<u64>,
+        max_tokens: usize,
     ) -> Result<IssuedToken, StateError> {
         let mut id_bytes = [0u8; 8];
         let mut secret_bytes = [0u8; 32];
@@ -88,6 +102,19 @@ impl StateStore {
                     None => return Err(StateError::UnknownUser(user.to_string())),
                     Some(u) if u.scram != user_scram => return Ok(false),
                     Some(_) => {}
+                }
+                let now = now_ms();
+                if data
+                    .tokens
+                    .iter()
+                    .filter(|t| t.user == user && is_live(t, now))
+                    .count()
+                    >= max_tokens
+                {
+                    return Err(StateError::TooManyTokens {
+                        user: user.to_string(),
+                        limit: max_tokens,
+                    });
                 }
                 // 64 random bits: a collision is practically impossible, but
                 // never let one shadow an existing token.
@@ -209,6 +236,19 @@ mod tests {
         let v = ScramVerifier::from_password("pw", b"0123456789abcdef", 4096);
         store.seed_users(&[("alice".into(), v)], false).unwrap();
         store
+    }
+
+    #[test]
+    fn issuing_past_the_cap_is_refused_and_revoking_frees_a_slot() {
+        let store = store_with_alice();
+        let first = store.issue_token_capped("alice", None, None, 2).unwrap();
+        store.issue_token_capped("alice", None, None, 2).unwrap();
+        assert!(matches!(
+            store.issue_token_capped("alice", None, None, 2),
+            Err(StateError::TooManyTokens { limit: 2, .. })
+        ));
+        store.revoke_token("alice", &first.info.id).unwrap();
+        store.issue_token_capped("alice", None, None, 2).unwrap();
     }
 
     #[test]

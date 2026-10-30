@@ -30,6 +30,9 @@ pub enum StateError {
     /// No token with this id exists.
     #[error("token {0:?} not found")]
     TokenNotFound(String),
+    /// The user already holds the maximum number of live tokens.
+    #[error("user {user:?} already has {limit} live tokens")]
+    TooManyTokens { user: String, limit: usize },
     /// The system random number generator failed.
     #[error("random number generator failure")]
     Random,

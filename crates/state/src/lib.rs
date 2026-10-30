@@ -6,7 +6,7 @@ mod tokens;
 mod users;
 
 pub use file::{StateError, StateStore};
-pub use tokens::{IssuedToken, TokenInfo};
+pub use tokens::{IssuedToken, TokenInfo, MAX_TOKENS_PER_USER};
 pub use users::SeedReport;
 
 use arneb_protocol::{decoy_verifier, is_token_shaped, CredentialSource, ScramVerifier};

@@ -16,7 +16,6 @@ pub(crate) struct TrinoError {
     /// SQL position of the offending construct, when known.
     pub(crate) location: Option<Location>,
     /// Nearest-name suggestions (column typos only).
-    #[allow(dead_code)] // read by the agent query API (H2 task 3)
     pub(crate) candidates: Vec<String>,
 }
 

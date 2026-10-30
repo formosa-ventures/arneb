@@ -7,3 +7,5 @@ Connect with psql:
 Registered workers (Web UI API, port {{ .Values.coordinator.service.ports.web }}):
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "arneb.fullname" . }} 6432:{{ .Values.coordinator.service.ports.web }}
   curl -s localhost:6432/api/v1/cluster/workers
+
+Coordinator state (users, API tokens): {{ if .Values.coordinator.state.persistence.enabled }}persisted on a volume mounted at /var/lib/arneb{{ else }}NOT persisted (emptyDir); it is lost when the pod restarts{{ end }}.

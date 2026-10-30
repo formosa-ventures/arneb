@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.8](https://github.com/formosa-ventures/arneb/compare/v0.1.7...v0.1.8) (2026-10-30)
+
+
+### Bug Fixes
+
+* **execution:** copartitioned joins publish no partial cross-fragment domain ([#192](https://github.com/formosa-ventures/arneb/issues/192)) ([#198](https://github.com/formosa-ventures/arneb/issues/198)) ([32317b8](https://github.com/formosa-ventures/arneb/commit/32317b81eed9bdc1e180df7ba49ae41df0001da5))
+* **execution:** stop per-partition grace builds dropping probe rows ([#191](https://github.com/formosa-ventures/arneb/issues/191)) ([2f9d3b1](https://github.com/formosa-ventures/arneb/commit/2f9d3b14be126aa4c5bcba17dee0591328f726eb))
+* make null-extended outer join columns nullable ([#203](https://github.com/formosa-ventures/arneb/issues/203)) ([760a40f](https://github.com/formosa-ventures/arneb/commit/760a40fc99a327ceb4ae159e5b6d3c1f14ad5cfd))
+* **planner:** offset the join key in right-preserved eager aggregation ([#206](https://github.com/formosa-ventures/arneb/issues/206)) ([6fa6e5a](https://github.com/formosa-ventures/arneb/commit/6fa6e5a4a99f2a10b0cdee914a6969536500c715))
+* **sql-parser:** keep the joins inside parenthesized FROM ([#202](https://github.com/formosa-ventures/arneb/issues/202)) ([e84c66f](https://github.com/formosa-ventures/arneb/commit/e84c66f9cf86006f1912337381ade9ba5b9e21fb))
+
 ## [0.1.7](https://github.com/formosa-ventures/arneb/compare/v0.1.6...v0.1.7) (2026-10-26)
 
 

@@ -61,6 +61,13 @@ impl AgentLimits {
                 self.default_page_bytes, self.max_page_bytes
             ));
         }
+        if self.idle_timeout < self.max_wait {
+            return Err(format!(
+                "idle_timeout_secs ({}s) must not be shorter than max_wait_ms ({}ms)",
+                self.idle_timeout.as_secs(),
+                self.max_wait.as_millis()
+            ));
+        }
         Ok(())
     }
 }
@@ -87,5 +94,25 @@ mod tests {
             ..Default::default()
         };
         assert!(l.validate().unwrap_err().contains("default_page_bytes"));
+    }
+
+    #[test]
+    fn idle_timeout_shorter_than_max_wait_is_rejected() {
+        let l = AgentLimits {
+            idle_timeout: Duration::from_secs(5),
+            max_wait: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let err = l.validate().unwrap_err();
+        assert!(
+            err.contains("idle_timeout_secs") && err.contains("max_wait_ms"),
+            "{err}"
+        );
+        let l = AgentLimits {
+            idle_timeout: Duration::from_secs(10),
+            max_wait: Duration::from_secs(10),
+            ..Default::default()
+        };
+        l.validate().unwrap();
     }
 }

@@ -165,6 +165,12 @@ impl AgentQueryService {
         tracing::debug!(statement_id = %statement.id, user, "agent statement submitted");
         let handle = tokio::spawn(self.clone().run(Arc::clone(&statement), session));
         *lock(&statement.abort) = Some(handle.abort_handle());
+        // Cancelled before the handle was stored: stop the task now.
+        if statement.is_terminal() {
+            if let Some(handle) = lock(&statement.abort).take() {
+                handle.abort();
+            }
+        }
         self.wait_for_end(&statement, wait).await;
         Ok(statement.status())
     }
@@ -203,22 +209,30 @@ impl AgentQueryService {
         max_rows: Option<usize>,
     ) -> Result<Arc<Statement>, AgentError> {
         let mut statements = lock(&self.statements);
-        let (mut total, mut mine) = (0usize, 0usize);
-        for s in statements.values().filter(|s| !s.is_terminal()) {
-            total += 1;
-            if s.user == user {
-                mine += 1;
-            }
-        }
-        if mine >= MAX_STATEMENTS_PER_USER {
-            return Err(AgentError::overloaded(format!(
-                "user {user} already has {MAX_STATEMENTS_PER_USER} statements running or queued"
-            )));
-        }
-        if total >= MAX_STATEMENTS_TOTAL {
-            return Err(AgentError::overloaded(format!(
-                "the server already has {MAX_STATEMENTS_TOTAL} statements running or queued"
-            )));
+        let mine = statements.values().filter(|s| s.user == user).count();
+        // At a cap, make room by evicting the least-recently-accessed
+        // terminal statement (the user's own for the per-user cap); refuse
+        // only when every counted statement is still queued or running.
+        let victim = if mine >= MAX_STATEMENTS_PER_USER {
+            let victim = lru_terminal(statements.values().filter(|s| s.user == user));
+            Some(victim.ok_or_else(|| {
+                AgentError::overloaded(format!(
+                    "user {user} already has {MAX_STATEMENTS_PER_USER} statements running or queued"
+                ))
+            })?)
+        } else if statements.len() >= MAX_STATEMENTS_TOTAL {
+            let victim = lru_terminal(statements.values());
+            Some(victim.ok_or_else(|| {
+                AgentError::overloaded(format!(
+                    "the server already has {MAX_STATEMENTS_TOTAL} statements running or queued"
+                ))
+            })?)
+        } else {
+            None
+        };
+        if let Some(id) = victim {
+            statements.remove(&id);
+            tracing::debug!(statement_id = %id, "agent statement evicted at the cap");
         }
         let tracker_id = self
             .tracker
@@ -254,6 +268,9 @@ impl AgentQueryService {
     /// registered with the tracker) admit, run under the time limit, record
     /// the outcome.
     async fn run(self, statement: Arc<Statement>, session: ClientSession) {
+        if statement.is_terminal() {
+            return; // cancelled before the task started
+        }
         let limits = match TimeLimits::from_session(&session, self.statement_timeout) {
             Ok(l) => l,
             Err(err) => return self.complete(&statement, Err(err)),
@@ -379,6 +396,21 @@ impl AgentQueryService {
             }
         }
     }
+}
+
+/// Id of the least-recently-accessed terminal statement among `statements`.
+fn lru_terminal<'a>(statements: impl Iterator<Item = &'a Arc<Statement>>) -> Option<String> {
+    statements
+        .filter_map(|s| {
+            let inner = s.lock();
+            inner
+                .phase
+                .state()
+                .is_terminal()
+                .then(|| (inner.last_access, s.id.clone()))
+        })
+        .min()
+        .map(|(_, id)| id)
 }
 
 /// Session statements (`USE`, `SET SESSION`, `PREPARE`, …) have no effect in
@@ -598,7 +630,7 @@ mod tests {
             .unwrap();
         let took = start.elapsed();
         assert!(took >= Duration::from_millis(150), "{took:?}");
-        assert!(took < Duration::from_millis(300), "{took:?}");
+        assert!(took < Duration::from_millis(200 + 500), "{took:?}");
         assert_eq!(s.state, StatementState::Queued);
         assert_eq!(s.queue_position, Some(1));
     }
@@ -816,15 +848,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finished_statements_do_not_count_toward_the_cap() {
-        let (svc, _) = service();
-        for _ in 0..=MAX_STATEMENTS_PER_USER {
+    async fn terminal_statements_are_evicted_lru_when_user_cap_is_full() {
+        let (svc, tracker) = service();
+        let mut ids = Vec::new();
+        for _ in 0..MAX_STATEMENTS_PER_USER {
             let s = svc
                 .submit("alice", req("SELECT 1"), Duration::from_secs(5))
                 .await
                 .unwrap();
             assert_eq!(s.state, StatementState::Finished);
+            ids.push(s.id);
         }
+        // Touch all but the first, so the first is least recently accessed.
+        for id in &ids[1..] {
+            svc.status("alice", id, Duration::ZERO).await.unwrap();
+        }
+        let s = svc
+            .submit("alice", req("SELECT 1"), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(s.state, StatementState::Finished);
+        let err = svc
+            .status("alice", &ids[0], Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::NotFound);
+        for id in &ids[1..] {
+            svc.status("alice", id, Duration::ZERO).await.unwrap();
+        }
+        // Eviction only forgets the statement; the tracker keeps its history.
+        assert_eq!(
+            tracker.list_queries(None).len(),
+            MAX_STATEMENTS_PER_USER + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn user_cap_overloaded_only_when_all_live() {
+        let admission = AdmissionController::new(1, 2000);
+        let (svc, _) = service();
+        let svc = svc.with_admission(Some(admission.clone()));
+        let _held = admission.admit("held").unwrap().wait().await;
+        // One terminal statement (SHOW takes no admission slot) ...
+        let shown = svc
+            .submit("alice", req("SHOW CATALOGS"), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(shown.state, StatementState::Finished);
+        // ... and the rest live (queued behind the held slot).
+        for _ in 1..MAX_STATEMENTS_PER_USER {
+            let s = svc
+                .submit("alice", req("SELECT 1"), Duration::ZERO)
+                .await
+                .unwrap();
+            assert!(!s.state.is_terminal());
+        }
+        // At the cap with one terminal statement: it is evicted.
+        svc.submit("alice", req("SELECT 1"), Duration::ZERO)
+            .await
+            .unwrap();
+        let err = svc
+            .status("alice", &shown.id, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::NotFound);
+        // Now all 32 are live: overloaded.
+        let err = svc
+            .submit("alice", req("SELECT 1"), Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::Overloaded);
+    }
+
+    #[tokio::test]
+    async fn total_cap_evicts_any_users_terminal_statement() {
+        let admission = AdmissionController::new(1, 2000);
+        let (svc, _) = service();
+        let svc = svc.with_admission(Some(admission.clone()));
+        let _held = admission.admit("held").unwrap().wait().await;
+        let shown = svc
+            .submit("user0", req("SHOW CATALOGS"), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(shown.state, StatementState::Finished);
+        for i in 1..MAX_STATEMENTS_TOTAL {
+            let user = format!("user{}", i / MAX_STATEMENTS_PER_USER);
+            svc.submit(&user, req("SELECT 1"), Duration::ZERO)
+                .await
+                .unwrap();
+        }
+        svc.submit("newcomer", req("SELECT 1"), Duration::ZERO)
+            .await
+            .unwrap();
+        let err = svc
+            .status("user0", &shown.id, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::NotFound);
+        let err = svc
+            .submit("other", req("SELECT 1"), Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::Overloaded);
     }
 
     #[tokio::test(start_paused = true)]

@@ -59,6 +59,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub admission: AdmissionConfig,
 
+    /// Agent query API limits (coordinator/standalone only); effective
+    /// values after [`AppConfig::load`].
+    #[serde(default)]
+    pub agent_api: AgentApiConfig,
+
     /// Query metrics and the slow-query log (coordinator/standalone only);
     /// effective values after [`AppConfig::load`].
     #[serde(default)]
@@ -383,6 +388,101 @@ impl AdmissionConfig {
                 .map_err(|e| anyhow::anyhow!("invalid {name} value: {e}"))?;
         }
         Ok(())
+    }
+}
+
+/// `[agent_api]` section: limits of the agent query API. After
+/// [`AppConfig::load`] the fields hold the effective values (env applied,
+/// validated).
+///
+/// ```toml
+/// [agent_api]
+/// default_max_rows   = 1000      # ARNEB_AGENT_DEFAULT_MAX_ROWS
+/// max_rows           = 10000     # ARNEB_AGENT_MAX_ROWS
+/// default_page_bytes = 262144    # ARNEB_AGENT_DEFAULT_PAGE_BYTES
+/// max_page_bytes     = 4194304   # ARNEB_AGENT_MAX_PAGE_BYTES
+/// max_cell_bytes     = 8192      # ARNEB_AGENT_MAX_CELL_BYTES
+/// max_wait_ms        = 10000     # ARNEB_AGENT_MAX_WAIT_MS
+/// idle_timeout_secs  = 600       # ARNEB_AGENT_IDLE_TIMEOUT_SECS
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentApiConfig {
+    pub default_max_rows: usize,
+    pub max_rows: usize,
+    pub default_page_bytes: usize,
+    pub max_page_bytes: usize,
+    pub max_cell_bytes: usize,
+    pub max_wait_ms: u64,
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for AgentApiConfig {
+    fn default() -> Self {
+        let d = arneb_protocol::agent::AgentLimits::default();
+        Self {
+            default_max_rows: d.default_max_rows,
+            max_rows: d.max_rows,
+            default_page_bytes: d.default_page_bytes,
+            max_page_bytes: d.max_page_bytes,
+            max_cell_bytes: d.max_cell_bytes,
+            max_wait_ms: d.max_wait.as_millis() as u64,
+            idle_timeout_secs: d.idle_timeout.as_secs(),
+        }
+    }
+}
+
+impl AgentApiConfig {
+    /// The limits as the agent service consumes them.
+    pub fn limits(&self) -> arneb_protocol::agent::AgentLimits {
+        arneb_protocol::agent::AgentLimits {
+            default_max_rows: self.default_max_rows,
+            max_rows: self.max_rows,
+            default_page_bytes: self.default_page_bytes,
+            max_page_bytes: self.max_page_bytes,
+            max_cell_bytes: self.max_cell_bytes,
+            max_wait: std::time::Duration::from_millis(self.max_wait_ms),
+            idle_timeout: std::time::Duration::from_secs(self.idle_timeout_secs),
+        }
+    }
+
+    /// Apply the `ARNEB_AGENT_*` variables (looked up through `env`) over
+    /// the file values (env > file > defaults), then validate the result.
+    pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+        fn set<T: std::str::FromStr>(
+            env: &impl Fn(&str) -> Option<String>,
+            var: &str,
+            field: &mut T,
+        ) -> Result<()> {
+            if let Some(v) = env(var) {
+                *field = v.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("invalid {var} value '{v}' (expected a non-negative integer)")
+                })?;
+            }
+            Ok(())
+        }
+        set(
+            &env,
+            "ARNEB_AGENT_DEFAULT_MAX_ROWS",
+            &mut self.default_max_rows,
+        )?;
+        set(&env, "ARNEB_AGENT_MAX_ROWS", &mut self.max_rows)?;
+        set(
+            &env,
+            "ARNEB_AGENT_DEFAULT_PAGE_BYTES",
+            &mut self.default_page_bytes,
+        )?;
+        set(&env, "ARNEB_AGENT_MAX_PAGE_BYTES", &mut self.max_page_bytes)?;
+        set(&env, "ARNEB_AGENT_MAX_CELL_BYTES", &mut self.max_cell_bytes)?;
+        set(&env, "ARNEB_AGENT_MAX_WAIT_MS", &mut self.max_wait_ms)?;
+        set(
+            &env,
+            "ARNEB_AGENT_IDLE_TIMEOUT_SECS",
+            &mut self.idle_timeout_secs,
+        )?;
+        self.limits()
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid [agent_api] settings: {e}"))
     }
 }
 
@@ -1466,6 +1566,7 @@ impl AppConfig {
                         tls_settings: None,
                         web: WebConfig::default(),
                         admission: AdmissionConfig::default(),
+                        agent_api: AgentApiConfig::default(),
                         observability: ObservabilityConfig::default(),
                         access_control: AccessControlConfig::default(),
                         state: StateConfig::default(),
@@ -1484,6 +1585,8 @@ impl AppConfig {
         web.apply_env_overrides(|k| std::env::var(k).ok())?;
         let mut admission = config.admission;
         admission.apply_env(|k| std::env::var(k).ok())?;
+        let mut agent_api = config.agent_api;
+        agent_api.apply_env(|k| std::env::var(k).ok())?;
         let mut observability = config.observability;
         observability.apply_env(|k| std::env::var(k).ok())?;
         let mut cluster = config.cluster;
@@ -1511,6 +1614,7 @@ impl AppConfig {
             tls_settings,
             web,
             admission,
+            agent_api,
             observability,
             access_control,
             state,
@@ -1807,6 +1911,54 @@ pgwire = "required"
         let mut c = toml::from_str::<AppConfig>(toml_text)?.admission;
         c.apply_env(env_from(env))?;
         Ok(c)
+    }
+
+    /// `[agent_api]` with env overrides applied the way `load` does.
+    fn agent_api(toml_text: &str, env: &[(&str, &str)]) -> Result<AgentApiConfig> {
+        let mut c = toml::from_str::<AppConfig>(toml_text)?.agent_api;
+        c.apply_env(env_from(env))?;
+        Ok(c)
+    }
+
+    #[test]
+    fn agent_api_defaults_match_documented_values() {
+        let c = agent_api("port = 5432", &[]).unwrap();
+        assert_eq!(
+            toml::from_str::<AppConfig>("port = 5432")
+                .unwrap()
+                .agent_api
+                .limits(),
+            arneb_protocol::agent::AgentLimits::default()
+        );
+        assert_eq!(c.limits().max_rows, 10_000);
+        assert_eq!(c.limits().max_wait, std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn agent_api_env_overrides_file() {
+        let file = "[agent_api]\nmax_rows = 500\ndefault_max_rows = 100\n";
+        assert_eq!(agent_api(file, &[]).unwrap().max_rows, 500);
+        let c = agent_api(file, &[("ARNEB_AGENT_MAX_ROWS", "700")]).unwrap();
+        assert_eq!(c.max_rows, 700);
+    }
+
+    #[test]
+    fn agent_api_rejects_default_above_max() {
+        let err = agent_api(
+            "[agent_api]\ndefault_max_rows = 2000\nmax_rows = 1000\n",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("default_max_rows"), "{err}");
+    }
+
+    #[test]
+    fn agent_api_rejects_unparsable_env() {
+        let err = agent_api("port = 5432", &[("ARNEB_AGENT_MAX_WAIT_MS", "abc")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ARNEB_AGENT_MAX_WAIT_MS"), "{err}");
     }
 
     #[test]

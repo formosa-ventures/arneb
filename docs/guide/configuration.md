@@ -119,6 +119,31 @@ runs the in-binary defaults.
 `ARNEB_NARROW_KEYS` is deliberately **not** a default: its column allowlist is a
 TPC-H-specific stopgap for the Hive connector's missing plan-time min/max stats.
 
+## Agent Query API
+
+The coordinator (or standalone node) bounds every agent query API response and
+wait with these limits. A request value above its ceiling is refused, not
+clamped. The effective values are logged once on `arneb::config` at startup.
+
+```toml
+[agent_api]
+default_max_rows   = 1000
+max_rows           = 10000
+```
+
+| `[agent_api]` field | Env var | Default | Meaning |
+|---|---|---|---|
+| `default_max_rows` | `ARNEB_AGENT_DEFAULT_MAX_ROWS` | 1000 | Rows per response when the request names no limit |
+| `max_rows` | `ARNEB_AGENT_MAX_ROWS` | 10000 | Ceiling for a requested row limit |
+| `default_page_bytes` | `ARNEB_AGENT_DEFAULT_PAGE_BYTES` | 262144 | Bytes per page when the request names no limit |
+| `max_page_bytes` | `ARNEB_AGENT_MAX_PAGE_BYTES` | 4194304 | Ceiling for a requested page size |
+| `max_cell_bytes` | `ARNEB_AGENT_MAX_CELL_BYTES` | 8192 | Longest rendered cell; longer values are truncated |
+| `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 | Longest any request waits before answering "still running" |
+| `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 | Idle time before a statement is reaped |
+
+All values must be greater than 0, `default_max_rows <= max_rows`, and
+`default_page_bytes <= max_page_bytes`; a bad combination stops startup.
+
 ## Admission Control
 
 The coordinator (or standalone node) caps how many queries run at once,

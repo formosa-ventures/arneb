@@ -928,6 +928,18 @@ async fn run() -> Result<()> {
             "admission effective settings ([admission] / ARNEB_MAX_RUNNING_QUERIES / \
              ARNEB_MAX_QUEUED_QUERIES / ARNEB_STATEMENT_TIMEOUT / ARNEB_QUERY_MAX_MEMORY_BYTES)"
         );
+        let agent_limits = config.agent_api.limits();
+        tracing::info!(
+            target: "arneb::config",
+            default_max_rows = agent_limits.default_max_rows,
+            max_rows = agent_limits.max_rows,
+            default_page_bytes = agent_limits.default_page_bytes,
+            max_page_bytes = agent_limits.max_page_bytes,
+            max_cell_bytes = agent_limits.max_cell_bytes,
+            max_wait_ms = config.agent_api.max_wait_ms,
+            idle_timeout_secs = config.agent_api.idle_timeout_secs,
+            "agent_api effective settings ([agent_api] / ARNEB_AGENT_*)"
+        );
         arneb_common::metrics::set_slow_query_threshold(
             config.observability.slow_query_threshold(),
         );

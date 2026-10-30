@@ -23,11 +23,21 @@ pub struct TokenInfo {
 }
 
 /// A freshly issued token. `token` is shown once and never stored.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IssuedToken {
+    /// Public facts about the token.
     pub info: TokenInfo,
     /// The full `arneb_<id>_<secret>` string.
     pub token: String,
+}
+
+impl std::fmt::Debug for IssuedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedToken")
+            .field("info", &self.info)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl StateStore {
@@ -185,6 +195,16 @@ mod tests {
         let u = store.issue_token("alice", None, Some(5)).unwrap();
         assert_ne!(u.token, t.token);
         assert_eq!(u.info.expires_ms, Some(5));
+    }
+
+    #[test]
+    fn debug_output_redacts_the_token() {
+        let store = store_with_alice();
+        let t = store.issue_token("alice", None, None).unwrap();
+        let secret = t.token.rsplit_once('_').unwrap().1;
+        let dbg = format!("{t:?}");
+        assert!(!dbg.contains(&t.token) && !dbg.contains(secret), "{dbg}");
+        assert!(dbg.contains(&t.info.id));
     }
 
     #[test]

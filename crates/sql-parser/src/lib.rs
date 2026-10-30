@@ -100,7 +100,7 @@ mod tests {
         assert_eq!(select_body(&query).projection.len(), 2);
         assert_eq!(select_body(&query).from.len(), 1);
         match &select_body(&query).from[0].relation {
-            TableFactor::Table { name, alias } => {
+            TableFactor::Table { name, alias, .. } => {
                 assert_eq!(name.table, "t");
                 assert!(alias.is_none());
             }

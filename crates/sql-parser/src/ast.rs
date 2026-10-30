@@ -548,6 +548,8 @@ pub enum TableFactor {
         name: TableReference,
         /// Optional alias for the table.
         alias: Option<String>,
+        /// Column names supplied with the table alias.
+        column_aliases: Vec<String>,
     },
     /// A subquery in parentheses.
     Subquery {
@@ -555,6 +557,8 @@ pub enum TableFactor {
         query: Box<Query>,
         /// Required alias for a derived table.
         alias: String,
+        /// Column names supplied with the derived table alias.
+        column_aliases: Vec<String>,
     },
     /// A parenthesized table with its joins.
     NestedJoin(Box<TableWithJoins>),

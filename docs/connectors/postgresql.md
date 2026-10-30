@@ -174,11 +174,26 @@ but the partitions are uneven.
 
 ## Local environment
 
-`docker compose up -d postgres` starts PostgreSQL 17 on `127.0.0.1:5433`,
+`docker compose up -d postgres` starts PostgreSQL 18 on `127.0.0.1:5433`,
 seeded from `docker/postgres/init` with TPC-H `nation`/`region` in schema `tpch`
 and type-coverage and split fixtures in schema `arneb_test`. The bundled
 Trino has a `postgresql` catalog over the same database for comparisons.
 After adding the catalog file, restart Trino once so it picks it up.
+
+PostgreSQL 18 cannot open a data directory written by 17. If `pg-data` came
+from the earlier 17 image, the container exits at start with an error that
+begins:
+
+```text
+Error: in 18+, these Docker images are configured to store database data in a
+       format which is compatible with "pg_ctlcluster" ...
+```
+
+Drop the volume and let the fixture load again:
+`docker compose rm -sf postgres && docker volume rm arneb_pg-data`, then
+`docker compose up -d postgres`. Dropping it also removes the
+`postgresql.tpch_mixed` tables, so if you use the mixed TPC-H layout below,
+run `docker compose run --rm pg-tpch-seed` again with the same `TPCH_SF`.
 
 ```toml
 [[catalogs]]

@@ -25,6 +25,7 @@ arneb-connectors = { path = "../connectors" }
 arneb-execution = { path = "../execution" }
 arneb-planner = { path = "../planner" }
 arneb-protocol = { path = "../protocol" }
+arneb-state = { path = "../state" }
 arneb-scheduler = { path = "../scheduler" }
 arneb-rpc = { path = "../rpc" }
 arneb-sql-parser = { path = "../sql-parser" }

@@ -160,6 +160,12 @@ struct CliArgs {
     #[arg(long)]
     profile: bool,
 
+    /// Overwrite state users that differ from the `[[auth.users]]` in the
+    /// config file (the file only seeds users on first start). Only
+    /// meaningful with `[auth] type = "password"`.
+    #[arg(long)]
+    reseed_state: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -221,6 +227,7 @@ async fn run() -> Result<()> {
     // 2. Load config (file + env overrides)
     let mut config =
         AppConfig::load(args.config.as_deref()).context("failed to load configuration")?;
+    let reseed_state = args.reseed_state;
 
     // 3. Apply CLI overrides
     if let Some(bind) = args.bind {
@@ -755,10 +762,60 @@ async fn run() -> Result<()> {
         ));
     }
 
-    let auth_method = config
+    // Validate [auth] on every role (workers never open the state store).
+    let config_auth = config
         .auth
         .to_auth_method()
         .context("invalid [auth] configuration")?;
+    // Password auth on a coordinator/standalone: users live in the state
+    // store, seeded from the config file; the same store serves pgwire,
+    // Trino and the Web API.
+    let state_store = if matches!(role, ServerRole::Coordinator | ServerRole::Standalone)
+        && matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_))
+    {
+        let verifiers = config
+            .auth
+            .user_verifiers()
+            .context("invalid [auth] configuration")?;
+        let store = arneb_state::StateStore::open(config.state.path.as_deref())
+            .context("cannot open the state store ([state] path / ARNEB_STATE_PATH)")?;
+        let report = store
+            .seed_users(&verifiers, reseed_state)
+            .context("cannot seed the state store from [auth] users")?;
+        tracing::info!(
+            target: "arneb::config",
+            state_path = %store
+                .path()
+                .map_or_else(|| "in-memory".to_owned(), |p| p.display().to_string()),
+            persistent = store.is_persistent(),
+            users = arneb_protocol::CredentialSource::user_count(&store),
+            first_start = report.first_start,
+            seeded = ?report.seeded,
+            diverged = ?report.diverged,
+            reseed = reseed_state,
+            "state store effective settings ([state] path / ARNEB_STATE_PATH / --reseed-state)"
+        );
+        if !store.is_persistent() {
+            tracing::warn!(
+                target: "arneb::config",
+                "no [state] path: API tokens are lost on restart"
+            );
+        }
+        Some(Arc::new(store))
+    } else {
+        if reseed_state {
+            tracing::info!(
+                target: "arneb::config",
+                "--reseed-state ignored: it only applies with [auth] type = \"password\" \
+                 on a coordinator or standalone server"
+            );
+        }
+        None
+    };
+    let auth_method = match &state_store {
+        Some(store) => arneb_protocol::AuthMethod::ScramSha256(store.clone()),
+        None => config_auth,
+    };
     let access_rules = if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
         config
             .access_control
@@ -837,6 +894,9 @@ async fn run() -> Result<()> {
         arneb_protocol::AuthMethod::ScramSha256(creds) => Some(Arc::clone(creds)),
         arneb_protocol::AuthMethod::None => None,
     };
+    let state_for_web = state_store.clone();
+    let credentials_for_web: Option<Arc<dyn arneb_protocol::CredentialSource>> =
+        state_store.clone().map(|s| s as _);
 
     // admission-control D5/D8: one controller for the process, shared by
     // pgwire, the Trino listener and the Web UI. Workers have none; their
@@ -982,6 +1042,10 @@ async fn run() -> Result<()> {
         max_queued_queries: config.admission.max_queued_queries,
         memory_pool: memory_pool.clone(),
         memory_limit_bytes: budget.map(|b| b as u64),
+        credentials: credentials_for_web,
+        state: state_for_web,
+        access_rules: access_rules.clone(),
+        metrics_auth: config.web.metrics_auth,
     };
     let web_router = web::build_router(web_state);
     let web_port = config.server.port + 1000; // default: pgwire port + 1000 (e.g., 5432 → 6432)

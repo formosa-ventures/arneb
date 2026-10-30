@@ -458,6 +458,7 @@ dependencies = [
  "arneb-rpc",
  "arneb-scheduler",
  "arneb-sql-parser",
+ "arneb-state",
  "arrow",
  "async-recursion",
  "async-trait",

@@ -68,6 +68,40 @@ pub struct AppConfig {
     /// [`AppConfig::load`].
     #[serde(default)]
     pub access_control: AccessControlConfig,
+
+    /// Coordinator state store (users, API tokens); effective values after
+    /// [`AppConfig::load`].
+    #[serde(default)]
+    pub state: StateConfig,
+}
+
+/// `[state]` section: where the coordinator keeps its mutable state (users,
+/// API tokens).
+///
+/// ```toml
+/// [state]
+/// path = "/var/lib/arneb/state.json"   # ARNEB_STATE_PATH
+/// ```
+///
+/// Unset: the state lives in memory only and API tokens are lost on restart.
+/// The config file seeds users on first start; afterwards the state wins.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StateConfig {
+    /// Where the state file lives; `None` keeps the state in memory.
+    pub path: Option<PathBuf>,
+}
+
+impl StateConfig {
+    /// Apply `ARNEB_STATE_PATH` (env > file); an empty value is an error.
+    pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+        if let Some(v) = env("ARNEB_STATE_PATH") {
+            let v = v.trim();
+            anyhow::ensure!(!v.is_empty(), "ARNEB_STATE_PATH is set but empty");
+            self.path = Some(v.into());
+        }
+        Ok(())
+    }
 }
 
 /// `[access_control]` section (file-based-access-control).
@@ -118,6 +152,7 @@ impl AccessControlConfig {
 /// ```toml
 /// [web]
 /// bind_address = "0.0.0.0"   # ARNEB_WEB_BIND_ADDRESS
+/// metrics_auth = false       # ARNEB_WEB_METRICS_AUTH
 /// ```
 ///
 /// The Web UI has no login and shows query text, so under
@@ -128,14 +163,28 @@ impl AccessControlConfig {
 pub struct WebConfig {
     #[serde(default)]
     pub bind_address: Option<String>,
+    /// Require credentials for `/metrics` under password auth. Default:
+    /// `false` (unauthenticated, so scrapers work unchanged).
+    #[serde(default)]
+    pub metrics_auth: bool,
 }
 
 impl WebConfig {
-    /// Apply `ARNEB_WEB_BIND_ADDRESS` (env > file).
-    pub fn apply_env_overrides(&mut self, env: impl Fn(&str) -> Option<String>) {
+    /// Apply `ARNEB_WEB_BIND_ADDRESS` and `ARNEB_WEB_METRICS_AUTH` (env > file).
+    pub fn apply_env_overrides(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
         if let Some(v) = env("ARNEB_WEB_BIND_ADDRESS") {
             self.bind_address = Some(v);
         }
+        if let Some(v) = env("ARNEB_WEB_METRICS_AUTH") {
+            self.metrics_auth = match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => true,
+                "0" | "false" | "off" | "no" => false,
+                other => {
+                    bail!("invalid ARNEB_WEB_METRICS_AUTH value '{other}' (expected true/false)")
+                }
+            };
+        }
+        Ok(())
     }
 }
 
@@ -455,6 +504,30 @@ impl std::fmt::Debug for AuthUserConfig {
 }
 
 impl AuthConfig {
+    /// Parse the configured `password_hash` strings, in file order. These
+    /// seed the state store, so they are parsed, never regenerated: the seed
+    /// comparison must be deterministic. An empty or duplicate name is an
+    /// error.
+    pub fn user_verifiers(&self) -> Result<Vec<(String, ScramVerifier)>> {
+        let mut seen = std::collections::HashSet::new();
+        self.users
+            .iter()
+            .map(|u| {
+                anyhow::ensure!(!u.name.is_empty(), "[auth] user name must not be empty");
+                anyhow::ensure!(
+                    seen.insert(u.name.as_str()),
+                    "[auth] duplicate user '{}'",
+                    u.name
+                );
+                let verifier: ScramVerifier = u
+                    .password_hash
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("[auth] user '{}': {e}", u.name))?;
+                Ok((u.name.clone(), verifier))
+            })
+            .collect()
+    }
+
     /// Validate the section and build the protocol-layer [`AuthMethod`].
     pub fn to_auth_method(&self) -> Result<AuthMethod> {
         match self.auth_type {
@@ -1394,6 +1467,7 @@ impl AppConfig {
                         admission: AdmissionConfig::default(),
                         observability: ObservabilityConfig::default(),
                         access_control: AccessControlConfig::default(),
+                        state: StateConfig::default(),
                     }
                 }
             }
@@ -1406,7 +1480,7 @@ impl AppConfig {
         trino.apply_env_overrides()?;
         let tls_settings = TlsConfig::resolve(config.tls.as_ref(), |k| std::env::var(k).ok())?;
         let mut web = config.web;
-        web.apply_env_overrides(|k| std::env::var(k).ok());
+        web.apply_env_overrides(|k| std::env::var(k).ok())?;
         let mut admission = config.admission;
         admission.apply_env(|k| std::env::var(k).ok())?;
         let mut observability = config.observability;
@@ -1415,6 +1489,8 @@ impl AppConfig {
         cluster.apply_env(|k| std::env::var(k).ok())?;
         let mut access_control = config.access_control;
         access_control.apply_env(|k| std::env::var(k).ok())?;
+        let mut state = config.state;
+        state.apply_env(|k| std::env::var(k).ok())?;
         let mut catalogs = config.catalogs;
         check_password_env_vars(&catalogs)?;
         for catalog in &mut catalogs {
@@ -1436,6 +1512,7 @@ impl AppConfig {
             admission,
             observability,
             access_control,
+            state,
         })
     }
 }
@@ -1682,7 +1759,8 @@ pgwire = "required"
         let config: AppConfig = toml::from_str("[web]\nbind_address = \"10.0.0.5\"\n").unwrap();
         let mut web = config.web;
         assert_eq!(web.bind_address.as_deref(), Some("10.0.0.5"));
-        web.apply_env_overrides(env_from(&[("ARNEB_WEB_BIND_ADDRESS", "0.0.0.0")]));
+        web.apply_env_overrides(env_from(&[("ARNEB_WEB_BIND_ADDRESS", "0.0.0.0")]))
+            .unwrap();
         assert_eq!(web.bind_address.as_deref(), Some("0.0.0.0"));
         assert!(toml::from_str::<AppConfig>("[web]\nport = 1\n").is_err());
     }
@@ -2119,6 +2197,92 @@ format = "parquet"
         assert_eq!(config.server.max_worker_threads, 4);
         assert_eq!(config.server.max_memory_mb, 2048);
         assert_eq!(config.tables.len(), 1);
+    }
+
+    #[test]
+    fn state_path_from_file_env_and_default() {
+        let config: AppConfig = toml::from_str("port = 5432\n").unwrap();
+        assert_eq!(config.state.path, None);
+
+        let mut state = toml::from_str::<AppConfig>("[state]\npath = \"/var/arneb/state.json\"\n")
+            .unwrap()
+            .state;
+        assert_eq!(state.path, Some(PathBuf::from("/var/arneb/state.json")));
+        state.apply_env(env_from(&[])).unwrap();
+        assert_eq!(state.path, Some(PathBuf::from("/var/arneb/state.json")));
+        state
+            .apply_env(env_from(&[("ARNEB_STATE_PATH", "/data/s.json")]))
+            .unwrap();
+        assert_eq!(state.path, Some(PathBuf::from("/data/s.json")));
+        assert!(state
+            .apply_env(env_from(&[("ARNEB_STATE_PATH", " ")]))
+            .is_err());
+    }
+
+    #[test]
+    fn metrics_auth_defaults_off_and_env_overrides() {
+        let mut web = toml::from_str::<AppConfig>("port = 5432\n").unwrap().web;
+        assert!(!web.metrics_auth);
+        web.apply_env_overrides(env_from(&[("ARNEB_WEB_METRICS_AUTH", "true")]))
+            .unwrap();
+        assert!(web.metrics_auth);
+        web.apply_env_overrides(env_from(&[("ARNEB_WEB_METRICS_AUTH", "off")]))
+            .unwrap();
+        assert!(!web.metrics_auth);
+        assert!(web
+            .apply_env_overrides(env_from(&[("ARNEB_WEB_METRICS_AUTH", "maybe")]))
+            .is_err());
+        let from_file = toml::from_str::<AppConfig>("[web]\nmetrics_auth = true\n").unwrap();
+        assert!(from_file.web.metrics_auth);
+    }
+
+    #[test]
+    fn user_verifiers_parse_the_configured_hashes() {
+        let a = ScramVerifier::generate("a").unwrap().to_string();
+        let b = ScramVerifier::generate("b").unwrap().to_string();
+        let config: AppConfig = toml::from_str(&format!(
+            "[auth]\ntype = \"password\"\n\
+             [[auth.users]]\nname = \"alice\"\npassword_hash = \"{a}\"\n\
+             [[auth.users]]\nname = \"bob\"\npassword_hash = \"{b}\"\n"
+        ))
+        .unwrap();
+        let v = config.auth.user_verifiers().unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].0, "alice");
+        // The parsed verifier round-trips to the configured text.
+        assert_eq!(v[0].1.to_string(), a);
+        assert_eq!(v[1].1.to_string(), b);
+
+        let dup = AuthConfig {
+            users: vec![
+                AuthUserConfig {
+                    name: "x".into(),
+                    password_hash: a.clone(),
+                },
+                AuthUserConfig {
+                    name: "x".into(),
+                    password_hash: b.clone(),
+                },
+            ],
+            ..AuthConfig::default()
+        };
+        assert!(dup.user_verifiers().unwrap_err().to_string().contains("x"));
+        let empty = AuthConfig {
+            users: vec![AuthUserConfig {
+                name: String::new(),
+                password_hash: a,
+            }],
+            ..AuthConfig::default()
+        };
+        assert!(empty.user_verifiers().is_err());
+        let bad = AuthConfig {
+            users: vec![AuthUserConfig {
+                name: "z".into(),
+                password_hash: "md5x".into(),
+            }],
+            ..AuthConfig::default()
+        };
+        assert!(bad.user_verifiers().unwrap_err().to_string().contains("z"));
     }
 
     #[test]

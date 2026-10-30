@@ -120,6 +120,10 @@ mod tests {
             max_queued_queries: 8,
             memory_pool: pool,
             memory_limit_bytes: Some(1 << 20),
+            credentials: None,
+            state: None,
+            access_rules: None,
+            metrics_auth: false,
         };
         let text = render(&gauges(&state));
         for line in [

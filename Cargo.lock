@@ -497,6 +497,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "arneb-state"
+version = "0.1.8"
+dependencies = [
+ "arneb-protocol",
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "array-init"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

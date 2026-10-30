@@ -133,16 +133,26 @@ max_rows           = 10000
 
 | `[agent_api]` field | Env var | Default | Meaning |
 |---|---|---|---|
-| `default_max_rows` | `ARNEB_AGENT_DEFAULT_MAX_ROWS` | 1000 | Rows per response when the request names no limit |
-| `max_rows` | `ARNEB_AGENT_MAX_ROWS` | 10000 | Ceiling for a requested row limit |
+| `default_max_rows` | `ARNEB_AGENT_DEFAULT_MAX_ROWS` | 1000 | Rows a statement retains when the request names no `max_rows`, and the default listing `limit` |
+| `max_rows` | `ARNEB_AGENT_MAX_ROWS` | 10000 | Ceiling for a statement's `max_rows` and a listing's `limit` |
 | `default_page_bytes` | `ARNEB_AGENT_DEFAULT_PAGE_BYTES` | 262144 | Bytes per page when the request names no limit |
 | `max_page_bytes` | `ARNEB_AGENT_MAX_PAGE_BYTES` | 4194304 | Ceiling for a requested page size |
 | `max_cell_bytes` | `ARNEB_AGENT_MAX_CELL_BYTES` | 8192 | Longest rendered cell; longer values are truncated |
 | `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 | Longest any request waits before answering "still running" |
 | `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 | Idle time before a statement is reaped |
 
-All values must be greater than 0, `default_max_rows <= max_rows`, and
-`default_page_bytes <= max_page_bytes`; a bad combination stops startup.
+All values must be greater than 0, `default_max_rows <= max_rows`,
+`default_page_bytes <= max_page_bytes`, and `idle_timeout_secs` must not be
+shorter than `max_wait_ms` (so a statement is not reaped while a request
+waits on it); a bad combination stops startup.
+
+A catalog, schema or table listing returns `default_max_rows` names unless
+the request passes `limit`, which must be in `1..=max_rows`.
+
+`max_rows` bounds the rows a statement retains, not what its query reads:
+the full result is still collected on the coordinator before the extra rows
+are dropped. A page always holds at least one row, so a single wide row can
+exceed the page byte limit; each cell is still capped at `max_cell_bytes`.
 
 ## Admission Control
 

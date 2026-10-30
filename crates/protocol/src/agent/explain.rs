@@ -320,6 +320,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explain_plans_virtual_catalogs_like_run() {
+        let (svc, _) = service();
+        for sql in [
+            "SELECT table_name FROM information_schema.tables",
+            "SELECT query_id FROM system.runtime.queries",
+        ] {
+            let e = svc.explain("alice", &req(sql)).await.unwrap();
+            assert_eq!(e.scans.len(), 1, "{sql}: {e:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_resolves_unqualified_tables_with_session_defaults() {
+        let (svc, _) = service();
+        let e = svc
+            .explain(
+                "alice",
+                &ExplainRequest {
+                    sql: "SELECT id FROM a".into(),
+                    catalog: Some("sized".into()),
+                    schema: Some("s".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(e.scans.len(), 1);
+        assert_eq!(e.scans[0].table, "sized.s.a");
+        assert_eq!(e.estimated_scan_bytes, Some(1000));
+    }
+
+    #[tokio::test]
     async fn explain_does_not_register_with_tracker() {
         let (svc, tracker) = service();
         svc.explain("alice", &req("SELECT id FROM sized.s.a"))

@@ -1,14 +1,17 @@
 //! Bounded results: retention of at most `max_rows` rows at completion, and
 //! pages over the retained rows limited by bytes and cell size.
 
+use arrow::array::UInt32Array;
+use arrow::compute::take_record_batch;
 use arrow::record_batch::RecordBatch;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::trino::{encode_cell, materialize};
 
-/// The rows a finished statement keeps.
-#[derive(Debug, Default)]
+/// The rows a finished statement keeps. Cloning is cheap: the batches share
+/// their Arrow buffers.
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Retained {
     /// At most `max_rows` rows.
     pub(crate) batches: Vec<RecordBatch>,
@@ -25,7 +28,17 @@ impl Retained {
     }
 }
 
-/// Keeps the first `max_rows` rows of `batches`, dropping the rest.
+/// Copies `batch` into freshly allocated buffers, so the kept rows no longer
+/// pin the (possibly much larger) buffers they were sliced from. A batch that
+/// cannot be copied is kept as is.
+fn compact(batch: RecordBatch) -> RecordBatch {
+    let indices = UInt32Array::from_iter_values(0..batch.num_rows() as u32);
+    take_record_batch(&batch, &indices).unwrap_or(batch)
+}
+
+/// Keeps the first `max_rows` rows of `batches`, dropping the rest. The kept
+/// rows are copied out of the source buffers, so a statement retains memory
+/// for at most `max_rows` rows even when an operator emitted one large batch.
 pub(crate) fn retain(batches: Vec<RecordBatch>, max_rows: usize) -> Retained {
     let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
     let mut kept = Vec::new();
@@ -36,9 +49,9 @@ pub(crate) fn retain(batches: Vec<RecordBatch>, max_rows: usize) -> Retained {
         }
         if batch.num_rows() <= remaining {
             remaining -= batch.num_rows();
-            kept.push(batch);
+            kept.push(compact(batch));
         } else {
-            kept.push(batch.slice(0, remaining));
+            kept.push(compact(batch.slice(0, remaining)));
             remaining = 0;
         }
     }
@@ -146,6 +159,24 @@ mod tests {
         assert!(r.truncated);
         let r = retain(vec![batch(0, 3)], 3);
         assert_eq!((r.kept_rows(), r.total_rows, r.truncated), (3, 3, false));
+    }
+
+    #[test]
+    fn retain_compacts_rows_out_of_a_large_batch() {
+        let source = batch(0, 1_000_000);
+        let source_bytes = source.get_array_memory_size();
+        let r = retain(vec![source], 10);
+        assert_eq!(
+            (r.kept_rows(), r.total_rows, r.truncated),
+            (10, 1_000_000, true)
+        );
+        let kept_bytes: usize = r.batches.iter().map(|b| b.get_array_memory_size()).sum();
+        assert!(
+            kept_bytes * 100 < source_bytes,
+            "kept {kept_bytes} bytes of a {source_bytes}-byte source"
+        );
+        let p = page(&r, 0, 1 << 20, 8192);
+        assert_eq!(p.rows[9][0], Value::from(9));
     }
 
     #[test]

@@ -192,64 +192,70 @@ impl Statement {
         true
     }
 
-    /// The status document.
+    /// The status document. The first page is encoded after the lock is
+    /// released, from a cheap clone of the retained rows.
     pub(crate) fn status(&self, limits: &AgentLimits) -> StatementStatus {
-        let inner = self.lock();
-        let elapsed = inner
-            .ended
-            .unwrap_or_else(Instant::now)
-            .duration_since(self.created);
-        let mut status = StatementStatus {
-            id: self.id.clone(),
-            state: inner.phase.state(),
-            queue_position: None,
-            elapsed_ms: elapsed.as_millis() as u64,
-            update_type: None,
-            columns: None,
-            total_rows: None,
-            truncated: false,
-            max_rows: self.max_rows,
-            first_page: None,
-            error: None,
-        };
-        match &inner.phase {
-            Phase::Queued(position) => status.queue_position = *position,
-            Phase::Running => {}
-            Phase::Finished(output) => {
-                status.update_type = output.update_type.clone();
-                status.columns = output.columns.clone();
-                status.total_rows = Some(output.retained.total_rows);
-                status.truncated = output.retained.truncated;
-                status.first_page = Some(page(
-                    &output.retained,
-                    0,
-                    limits.default_page_bytes,
-                    limits.max_cell_bytes,
-                ));
+        let (mut status, retained) = {
+            let inner = self.lock();
+            let elapsed = inner
+                .ended
+                .unwrap_or_else(Instant::now)
+                .duration_since(self.created);
+            let mut status = StatementStatus {
+                id: self.id.clone(),
+                state: inner.phase.state(),
+                queue_position: None,
+                elapsed_ms: elapsed.as_millis() as u64,
+                update_type: None,
+                columns: None,
+                total_rows: None,
+                truncated: false,
+                max_rows: self.max_rows,
+                first_page: None,
+                error: None,
+            };
+            let mut retained = None;
+            match &inner.phase {
+                Phase::Queued(position) => status.queue_position = *position,
+                Phase::Running => {}
+                Phase::Finished(output) => {
+                    status.update_type = output.update_type.clone();
+                    status.columns = output.columns.clone();
+                    status.total_rows = Some(output.retained.total_rows);
+                    status.truncated = output.retained.truncated;
+                    retained = Some(output.retained.clone());
+                }
+                Phase::Failed(err) | Phase::Cancelled(err) => status.error = Some(err.clone()),
             }
-            Phase::Failed(err) | Phase::Cancelled(err) => status.error = Some(err.clone()),
-        }
+            (status, retained)
+        };
+        status.first_page =
+            retained.map(|r| page(&r, 0, limits.default_page_bytes, limits.max_cell_bytes));
         status
     }
 }
 
 impl Statement {
-    /// The page of retained rows starting at row `cursor`.
+    /// The page of retained rows starting at row `cursor`. The rows are
+    /// encoded after the lock is released.
     pub(crate) fn page(
         &self,
         cursor: u64,
         max_bytes: usize,
         max_cell_bytes: usize,
     ) -> Result<ResultPage, AgentError> {
-        let inner = self.lock();
-        let Phase::Finished(output) = &inner.phase else {
-            return Err(AgentError::new(
-                AgentErrorCode::InvalidArgument,
-                format!("statement is {:?}, not finished", inner.phase.state()),
-            )
-            .with_hint("poll the statement until its state is finished"));
+        let retained = {
+            let inner = self.lock();
+            let Phase::Finished(output) = &inner.phase else {
+                return Err(AgentError::new(
+                    AgentErrorCode::InvalidArgument,
+                    format!("statement is {:?}, not finished", inner.phase.state()),
+                )
+                .with_hint("poll the statement until its state is finished"));
+            };
+            output.retained.clone()
         };
-        let kept = output.retained.kept_rows();
+        let kept = retained.kept_rows();
         if cursor > kept {
             return Err(AgentError::new(
                 AgentErrorCode::InvalidArgument,
@@ -257,6 +263,6 @@ impl Statement {
             )
             .with_hint(format!("cursor must be in 0..={kept}")));
         }
-        Ok(page(&output.retained, cursor, max_bytes, max_cell_bytes))
+        Ok(page(&retained, cursor, max_bytes, max_cell_bytes))
     }
 }

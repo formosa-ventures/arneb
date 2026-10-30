@@ -263,7 +263,15 @@ Every response that returns data is bounded by rows and by bytes. When
 something is cut, the response says so (`truncated`) and gives the full
 count when it is known. A statement keeps at most `max_rows` rows after it
 finishes, plus its total row count. Cells longer than `max_cell_bytes` are
-truncated.
+truncated. A page holds as many rows as fit in `max_bytes`, but always at
+least one, so a single wide row can make a page larger than `max_bytes`
+(each of its cells is still capped at `max_cell_bytes`).
+
+`max_rows` bounds what a statement retains and returns, not what the query
+reads or materializes. The statement runs to completion to count
+`total_rows`, and its full result is collected on the coordinator before
+the rows beyond `max_rows` are dropped. To explore a large table, add a
+`LIMIT` to the SQL or use `sample`.
 
 A request value above its ceiling is refused with `invalid_argument` and a
 hint naming the ceiling; it is never silently clamped. That includes
@@ -280,9 +288,14 @@ query parameter is also `invalid_argument`.
 | `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 |
 | `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 |
 
-A user may hold 32 live statements and the server 1024 (`overloaded`
-beyond that). After `idle_timeout_secs` with no request for a statement, a
-finished one is dropped and a running one is cancelled as abandoned.
+A user may hold 32 statements and the server 1024. At a cap, a new
+submission evicts the least-recently-accessed statement that has ended
+(finished, failed or cancelled; the user's own for the per-user cap), which
+from then on answers `not_found`. So an unfetched finished result can be
+lost once the user submits 32 newer statements. When every held statement
+is still queued or running, the submission is refused with `overloaded`.
+After `idle_timeout_secs` with no request for a statement, a finished one
+is dropped and a running one is cancelled as abandoned.
 
 ### Querying errors
 

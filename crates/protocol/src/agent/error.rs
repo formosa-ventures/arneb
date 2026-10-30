@@ -76,6 +76,18 @@ pub struct AgentError {
 /// Hint for an overloaded rejection.
 const OVERLOADED_HINT: &str = "retry after a running statement finishes";
 
+// Statement-path hints. `<…>` marks a placeholder the agent fills in from
+// its own statement; it is never a literal path segment.
+const COLUMN_NOT_FOUND_HINT: &str =
+    "list columns with GET /api/v2/catalogs/<catalog>/schemas/<schema>/tables/<table>, \
+     using the names from your statement";
+const TABLE_NOT_FOUND_HINT: &str =
+    "list tables with GET /api/v2/catalogs/<catalog>/schemas/<schema>/tables, \
+     using the names from your statement";
+const SCHEMA_NOT_FOUND_HINT: &str = "list schemas with GET /api/v2/catalogs/<catalog>/schemas, \
+     using the catalog name from your statement";
+const CATALOG_NOT_FOUND_HINT: &str = "list catalogs with GET /api/v2/catalogs";
+
 impl AgentError {
     /// An error with only a code and a message.
     pub fn new(code: AgentErrorCode, message: impl Into<String>) -> Self {
@@ -138,14 +150,10 @@ impl AgentError {
             C::ColumnNotFound if !err.candidates.is_empty() => {
                 Some(format!("did you mean: {}?", err.candidates.join(", ")))
             }
-            C::ColumnNotFound => Some(
-                "list columns with GET /api/v2/catalogs/{catalog}/schemas/{schema}/tables/{table}"
-                    .to_string(),
-            ),
-            C::TableNotFound => Some(
-                "list tables with GET /api/v2/catalogs/{catalog}/schemas/{schema}/tables"
-                    .to_string(),
-            ),
+            C::ColumnNotFound => Some(COLUMN_NOT_FOUND_HINT.to_string()),
+            C::TableNotFound => Some(TABLE_NOT_FOUND_HINT.to_string()),
+            C::SchemaNotFound => Some(SCHEMA_NOT_FOUND_HINT.to_string()),
+            C::CatalogNotFound => Some(CATALOG_NOT_FOUND_HINT.to_string()),
             C::SyntaxError => {
                 location.map(|l| format!("check the SQL near line {}, column {}", l.line, l.column))
             }
@@ -224,13 +232,30 @@ mod tests {
         assert_eq!(
             AgentError::from_trino(&e).hint.as_deref(),
             Some(
-                "list columns with GET /api/v2/catalogs/{catalog}/schemas/{schema}/tables/{table}"
+                "list columns with GET /api/v2/catalogs/<catalog>/schemas/<schema>/tables/<table>, \
+                 using the names from your statement"
             )
         );
         let e = trino("TABLE_NOT_FOUND", "USER_ERROR");
         assert_eq!(
             AgentError::from_trino(&e).hint.as_deref(),
-            Some("list tables with GET /api/v2/catalogs/{catalog}/schemas/{schema}/tables")
+            Some(
+                "list tables with GET /api/v2/catalogs/<catalog>/schemas/<schema>/tables, \
+                 using the names from your statement"
+            )
+        );
+        let e = trino("SCHEMA_NOT_FOUND", "USER_ERROR");
+        assert_eq!(
+            AgentError::from_trino(&e).hint.as_deref(),
+            Some(
+                "list schemas with GET /api/v2/catalogs/<catalog>/schemas, \
+                 using the catalog name from your statement"
+            )
+        );
+        let e = trino("CATALOG_NOT_FOUND", "USER_ERROR");
+        assert_eq!(
+            AgentError::from_trino(&e).hint.as_deref(),
+            Some("list catalogs with GET /api/v2/catalogs")
         );
         let mut e = trino("SYNTAX_ERROR", "USER_ERROR");
         assert_eq!(AgentError::from_trino(&e).hint, None);

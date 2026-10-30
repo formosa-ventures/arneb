@@ -40,7 +40,7 @@ The listings accept `?prefix=&limit=`.
 
 **D3. Statement ids are query-tracker ids.** The `QueryId` string is the statement id, so `/api/v2/queries/{id}` shows the same query.
 
-**D4. Retention.** A statement keeps at most `max_rows` rows after it finishes, and its total row count; the rest are dropped at completion. Memory during execution is bounded by the existing query memory limit, as on the Trino path.
+**D4. Retention.** A statement keeps at most `max_rows` rows after it finishes, and its total row count; the rest are dropped at completion. The kept rows are copied out of the operator's output buffers, so a finished statement holds memory for at most `max_rows` rows. `max_rows` does not bound execution: the query reads and materializes its whole result on the coordinator before truncation, and that final collect is not reserved against the memory pool (the distributed executor returns the whole result as one `Vec`). Operators stay bounded by the existing query memory limit, as on the Trino path. Agents should add `LIMIT` or use `sample` to explore; an execution-side row limit is deferred.
 
 **D5. Inline first page.** `submit` and `status` accept `wait_ms`, default 0, capped at `max_wait_ms`. A statement that finishes inside the wait carries its first page inline.
 
@@ -89,7 +89,7 @@ The existing `forbidden`, `overloaded`, `invalid_argument`, `not_found` and `int
 
 ## Risks / Trade-offs
 
-- [A `SELECT *` over a large table still runs to completion to count `total_rows`] -> bounded in memory by `max_rows` and the query memory limit; cancel or the idle reaper stops it.
+- [A `SELECT *` over a large table still runs to completion to count `total_rows`, and its full result is materialized on the coordinator before truncation] -> `max_rows` bounds only what is retained afterwards; operators stay under the query memory limit, but the final collect is not reserved against the pool. Docs steer agents to `LIMIT` or `sample`; cancel or the idle reaper stops a runaway statement. An execution-side row limit is deferred.
 - [Explain duplicates the run path's catalog-scoping logic] -> kept in step by tests; a shared helper is a follow-up.
 - [Name matching for describe and sample is exact-case, like `SHOW COLUMNS`] -> documented; listings' `prefix` is case-insensitive.
 - [Statements live in coordinator memory] -> lost on restart; the agent resubmits.

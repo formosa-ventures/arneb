@@ -60,6 +60,15 @@ impl QueryOutput {
     }
 }
 
+/// The catalogs one statement plans against.
+struct StatementScope {
+    catalogs: Arc<CatalogManager>,
+    /// The registry of the virtual catalogs when the statement reads them;
+    /// such statements run locally. `None` means the engine's registry, with
+    /// distribution.
+    virtual_registry: Option<ConnectorRegistry>,
+}
+
 /// Shared engine handles (the same ones the pgwire server holds).
 pub(crate) struct Engine {
     pub(crate) catalog_manager: Arc<CatalogManager>,
@@ -153,35 +162,57 @@ impl Engine {
             return Box::pin(self.control(stmt, session, depth)).await;
         }
 
+        let scope = self.statement_scope(session, sql).await?;
+        match &scope.virtual_registry {
+            Some(registry) => self.run_sql(sql, &scope.catalogs, registry, None).await,
+            None => {
+                self.run_sql(
+                    sql,
+                    &scope.catalogs,
+                    &self.connector_registry,
+                    self.distributed_executor.as_deref(),
+                )
+                .await
+            }
+        }
+    }
+
+    /// The catalogs `sql` plans against for this session, shared by
+    /// [`run`](Self::run) and [`plan_for_explain`](Self::plan_for_explain) so
+    /// the two cannot disagree: the access-checked root, scoped to the
+    /// session's catalog/schema defaults, or the virtual catalogs for
+    /// `system.runtime.queries` and the metadata schemas.
+    async fn statement_scope(
+        &self,
+        session: &ClientSession,
+        sql: &str,
+    ) -> Result<StatementScope, TrinoError> {
         let (catalog, schema) = self.session_defaults(session);
         let root = self.session_root(session)?;
-        let root = root.as_ref();
+        let virtual_scope = |(cm, registry): (CatalogManager, ConnectorRegistry)| StatementScope {
+            catalogs: Arc::new(cm),
+            virtual_registry: Some(registry),
+        };
         if crate::runtime_queries::references_runtime_queries(sql) {
-            let (cm, registry) = crate::runtime_queries::runtime_catalog(&self.query_tracker, root);
-            return self.run_sql(sql, &cm, &registry, None).await;
+            return Ok(virtual_scope(crate::runtime_queries::runtime_catalog(
+                &self.query_tracker,
+                &root,
+            )));
         }
         if metadata::references_virtual_metadata(sql) {
-            let (cm, registry) = metadata::build_virtual_catalogs(root, &catalog, sql).await;
-            return self.run_sql(sql, &cm, &registry, None).await;
+            return Ok(virtual_scope(
+                metadata::build_virtual_catalogs(&root, &catalog, sql).await,
+            ));
         }
-        if catalog == root.default_catalog() && schema == root.default_schema() {
-            self.run_sql(
-                sql,
-                root,
-                &self.connector_registry,
-                self.distributed_executor.as_deref(),
-            )
-            .await
+        let catalogs = if catalog == root.default_catalog() && schema == root.default_schema() {
+            root
         } else {
-            let view = root.with_session_defaults(catalog, schema);
-            self.run_sql(
-                sql,
-                &view,
-                &self.connector_registry,
-                self.distributed_executor.as_deref(),
-            )
-            .await
-        }
+            Arc::new(root.with_session_defaults(catalog, schema))
+        };
+        Ok(StatementScope {
+            catalogs,
+            virtual_registry: None,
+        })
     }
 
     /// Plans `sql` as `EXPLAIN` would, without executing it: the optimized
@@ -194,23 +225,8 @@ impl Engine {
         sql: &str,
     ) -> Result<(String, Vec<ScanEstimate>), TrinoError> {
         let sql = sql.trim().trim_end_matches(';').trim();
-        let (catalog, schema) = self.session_defaults(session);
-        let root = self.session_root(session)?;
-        let root = root.as_ref();
-        if crate::runtime_queries::references_runtime_queries(sql) {
-            let (cm, _) = crate::runtime_queries::runtime_catalog(&self.query_tracker, root);
-            return plan_text_and_scans(sql, &cm).await;
-        }
-        if metadata::references_virtual_metadata(sql) {
-            let (cm, _) = metadata::build_virtual_catalogs(root, &catalog, sql).await;
-            return plan_text_and_scans(sql, &cm).await;
-        }
-        if catalog == root.default_catalog() && schema == root.default_schema() {
-            plan_text_and_scans(sql, root).await
-        } else {
-            let view = root.with_session_defaults(catalog, schema);
-            plan_text_and_scans(sql, &view).await
-        }
+        let scope = self.statement_scope(session, sql).await?;
+        plan_text_and_scans(sql, &scope.catalogs).await
     }
 
     async fn run_sql(

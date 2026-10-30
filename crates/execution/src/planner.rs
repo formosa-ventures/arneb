@@ -1883,9 +1883,9 @@ fn rewrite_column_indices(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> P
 ///   the node's own expressions reference (parent needed becomes
 ///   irrelevant once the schema is rewritten). Output mapping is
 ///   identity since these nodes emit the same logical schema.
-/// - Join (INNER only): splits needed into per-side, recurses each,
-///   combines the per-side mappings into a joined mapping. Non-INNER
-///   joins bail out to preserve unmatched-row semantics.
+/// - Join (INNER, LEFT, CROSS): splits needed into per-side, recurses each,
+///   combines the per-side mappings into a joined mapping. RIGHT/FULL
+///   joins bail out.
 /// - Other variants: identity bail-out.
 pub fn prune_for_columns(
     plan: &arneb_planner::LogicalPlan,
@@ -2138,12 +2138,15 @@ pub fn prune_for_columns(
             condition,
             dynamic_filter_ids,
         } => {
-            // INNER and LEFT joins are safe to column-prune: both
+            // INNER, LEFT, and CROSS joins are safe to column-prune: all
             // preserve schema structure identically (left || right),
             // pruning columns from a child is independent of row
             // preservation. RIGHT/FULL bail out — they'd require
             // swapping semantics that the planner doesn't model.
-            if !matches!(join_type, ast::JoinType::Inner | ast::JoinType::Left) {
+            if !matches!(
+                join_type,
+                ast::JoinType::Inner | ast::JoinType::Left | ast::JoinType::Cross
+            ) {
                 return (plan.clone(), identity_map(n_out));
             }
             let left_n = left.schema().len();

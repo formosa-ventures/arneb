@@ -791,7 +791,7 @@ async fn run() -> Result<()> {
     }
     if !matches!(role, ServerRole::Worker) {
         let users = match &auth_method {
-            arneb_protocol::AuthMethod::ScramSha256(creds) => creds.len(),
+            arneb_protocol::AuthMethod::ScramSha256(creds) => creds.user_count(),
             arneb_protocol::AuthMethod::None => 0,
         };
         tracing::info!(

@@ -20,7 +20,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::num::NonZeroU32;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use aws_lc_rs::{constant_time, digest, hmac, pbkdf2};
@@ -231,6 +231,27 @@ impl FromStr for ScramVerifier {
     }
 }
 
+/// Where password authentication looks up users and API tokens.
+///
+/// Implemented by [`UserCredentials`] (the static `[[auth.users]]` list, no
+/// tokens) and by the coordinator's state store (users plus API tokens).
+/// Implementations must not log passwords or tokens.
+pub trait CredentialSource: Send + Sync + std::fmt::Debug {
+    /// Verifiers for `user` — the password first, then each live token — all
+    /// sharing one salt and iteration count. Empty when the user is unknown.
+    fn scram_verifiers(&self, user: &str) -> Vec<ScramVerifier>;
+    /// HTTP Basic: the user's password, or one of the user's live API tokens.
+    ///
+    /// A [token-shaped](is_token_shaped) password is checked only as a token
+    /// (a SHA-256 compare, no PBKDF2). Any other password costs one PBKDF2
+    /// derivation, against a decoy verifier when the user is unknown.
+    fn verify_password(&self, user: &str, password: &str) -> bool;
+    /// Bearer: the user owning this live token.
+    fn verify_token(&self, token: &str) -> Option<String>;
+    /// Number of users, for the startup log.
+    fn user_count(&self) -> usize;
+}
+
 /// The set of users allowed to connect under password authentication.
 pub struct UserCredentials {
     users: HashMap<String, ScramVerifier>,
@@ -305,6 +326,41 @@ impl UserCredentials {
     }
 }
 
+impl CredentialSource for UserCredentials {
+    fn scram_verifiers(&self, user: &str) -> Vec<ScramVerifier> {
+        self.users.get(user).cloned().into_iter().collect()
+    }
+
+    /// Config users have no API tokens, so a token-shaped password is
+    /// refused without running PBKDF2.
+    fn verify_password(&self, user: &str, password: &str) -> bool {
+        if is_token_shaped(password) {
+            return false;
+        }
+        UserCredentials::verify_password(self, user, password)
+    }
+
+    fn verify_token(&self, _token: &str) -> Option<String> {
+        None
+    }
+
+    fn user_count(&self) -> usize {
+        self.len()
+    }
+}
+
+/// Per-process secret for the decoy verifiers the pgwire handler serves to
+/// unknown users; stable for the process so a probed user always gets the
+/// same fake salt.
+fn handler_decoy_secret() -> &'static [u8; KEY_LEN] {
+    static SECRET: OnceLock<[u8; KEY_LEN]> = OnceLock::new();
+    SECRET.get_or_init(|| {
+        let mut secret = [0u8; KEY_LEN];
+        aws_lc_rs::rand::fill(&mut secret).expect("system random number generator failed");
+        secret
+    })
+}
+
 /// Deterministic fake verifier for a user that does not exist, derived from a
 /// per-process `secret`. Verifying against it costs the same PBKDF2 as a real
 /// user and never succeeds, so timing and salts do not reveal which users
@@ -344,8 +400,9 @@ pub enum AuthMethod {
     /// Accept every connection without a password (default).
     #[default]
     None,
-    /// Require SCRAM-SHA-256 password authentication.
-    ScramSha256(Arc<UserCredentials>),
+    /// Require SCRAM-SHA-256 password authentication against these users
+    /// (and their API tokens, if the source has any).
+    ScramSha256(Arc<dyn CredentialSource>),
 }
 
 impl AuthMethod {
@@ -367,7 +424,10 @@ impl AuthMethod {
 struct ScramExchange {
     user: String,
     known_user: bool,
-    verifier: ScramVerifier,
+    /// The user's verifiers (password first, then live tokens), all with
+    /// the salt and iterations sent in server-first; a single decoy for an
+    /// unknown user.
+    verifiers: Vec<ScramVerifier>,
     gs2_header: String,
     client_first_bare: String,
     server_first: String,
@@ -517,7 +577,7 @@ impl AuthStartupHandler {
 
     async fn scram_step<C>(
         &self,
-        creds: &UserCredentials,
+        creds: &dyn CredentialSource,
         client: &mut C,
         message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
@@ -562,7 +622,12 @@ impl AuthStartupHandler {
                     .get(METADATA_USER)
                     .cloned()
                     .ok_or(PgWireError::UserNameRequired)?;
-                let (verifier, known_user) = creds.lookup(&user);
+                let mut verifiers = creds.scram_verifiers(&user);
+                let known_user = !verifiers.is_empty();
+                if !known_user {
+                    verifiers.push(decoy_verifier(handler_decoy_secret(), &user));
+                }
+                let first = &verifiers[0];
 
                 let mut server_nonce = [0u8; 18];
                 aws_lc_rs::rand::fill(&mut server_nonce)
@@ -570,8 +635,8 @@ impl AuthStartupHandler {
                 let nonce = format!("{client_nonce}{}", STANDARD.encode(server_nonce));
                 let server_first = format!(
                     "r={nonce},s={},i={}",
-                    STANDARD.encode(&verifier.salt),
-                    verifier.iterations
+                    STANDARD.encode(&first.salt),
+                    first.iterations
                 );
                 client
                     .send(PgWireBackendMessage::Authentication(
@@ -581,7 +646,7 @@ impl AuthStartupHandler {
                 self.set_state(ScramState::AwaitingClientFinal(Box::new(ScramExchange {
                     user,
                     known_user,
-                    verifier,
+                    verifiers,
                     gs2_header,
                     client_first_bare,
                     server_first,
@@ -599,10 +664,17 @@ impl AuthStartupHandler {
                     "{},{},{}",
                     exchange.client_first_bare, exchange.server_first, without_proof
                 );
-                let proof_ok = exchange
-                    .verifier
-                    .verify_client_proof(auth_message.as_bytes(), &proof);
-                if !(proof_ok && exchange.known_user) {
+                // Check every verifier (no early exit) and remember the first
+                // that matched: it signs server-final, proving to the client
+                // that the server knows the credential the client used.
+                let mut matched = None;
+                for (i, v) in exchange.verifiers.iter().enumerate() {
+                    if v.verify_client_proof(auth_message.as_bytes(), &proof) && matched.is_none() {
+                        matched = Some(i);
+                    }
+                }
+                let matched = matched.filter(|_| exchange.known_user);
+                let Some(matched) = matched else {
                     tracing::warn!(
                         user = %exchange.user,
                         peer = %client.socket_addr(),
@@ -615,8 +687,9 @@ impl AuthStartupHandler {
                             exchange.user
                         ),
                     ));
-                }
-                let signature = exchange.verifier.server_signature(auth_message.as_bytes());
+                };
+                let signature =
+                    exchange.verifiers[matched].server_signature(auth_message.as_bytes());
                 let server_final = format!("v={}", STANDARD.encode(signature));
                 client
                     .send(PgWireBackendMessage::Authentication(
@@ -676,7 +749,7 @@ impl StartupHandler for AuthStartupHandler {
                 Ok(())
             }
             AuthMethod::ScramSha256(creds) => self
-                .scram_step(creds, client, message)
+                .scram_step(creds.as_ref(), client, message)
                 .await
                 .map_err(ensure_fatal),
         }

@@ -19,6 +19,9 @@ use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySche
 use arneb_connectors::ConnectorRegistry;
 use arneb_protocol::{AuthMethod, ProtocolConfig, ProtocolServer, ScramVerifier, UserCredentials};
 
+mod token_source;
+use token_source::TokenSource;
+
 fn users_table_state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", ArrowDataType::Int32, false),
@@ -241,4 +244,53 @@ async fn query_before_authentication_is_refused() {
         pos += 1 + len;
     }
     assert!(saw_error, "expected an ErrorResponse");
+}
+
+/// A server whose credential source issues API tokens for `alice`.
+async fn start_token_server() -> (u16, Arc<TokenSource>) {
+    let source = Arc::new(TokenSource::new(&[
+        ("alice", "alice-pw"),
+        ("bob", "bob-pw"),
+    ]));
+    let port = start_server(AuthMethod::ScramSha256(source.clone())).await;
+    (port, source)
+}
+
+async fn assert_can_query(port: u16, user: &str, password: &str) {
+    let client = connect(port, user, Some(password))
+        .await
+        .unwrap_or_else(|e| panic!("{user} should authenticate: {e}"));
+    let rows = client.query("SELECT id FROM users", &[]).await.unwrap();
+    assert_eq!(rows.len(), 3);
+}
+
+#[tokio::test]
+async fn pgwire_accepts_an_api_token_as_the_password() {
+    let (port, source) = start_token_server().await;
+    let token = source.issue("alice");
+    assert_can_query(port, "alice", &token).await;
+    // The token authenticates only its owner.
+    assert_invalid_password(connect(port, "bob", Some(&token)).await);
+    assert_invalid_password(connect(port, "mallory", Some(&token)).await);
+}
+
+#[tokio::test]
+async fn pgwire_still_accepts_the_password_when_the_user_has_tokens() {
+    let (port, source) = start_token_server().await;
+    let first = source.issue("alice");
+    let second = source.issue("alice");
+    assert_can_query(port, "alice", "alice-pw").await;
+    assert_can_query(port, "alice", &first).await;
+    assert_can_query(port, "alice", &second).await;
+    assert_invalid_password(connect(port, "alice", Some("bob-pw")).await);
+}
+
+#[tokio::test]
+async fn pgwire_refuses_a_revoked_token() {
+    let (port, source) = start_token_server().await;
+    let token = source.issue("alice");
+    assert_can_query(port, "alice", &token).await;
+    source.revoke(&token);
+    assert_invalid_password(connect(port, "alice", Some(&token)).await);
+    assert_can_query(port, "alice", "alice-pw").await;
 }

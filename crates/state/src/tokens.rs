@@ -123,22 +123,42 @@ impl StateStore {
     }
 
     /// Looks up `token` and checks its secret against the stored hash in
-    /// constant time. Expiry is the caller's concern.
-    #[cfg(test)]
-    pub(crate) fn check_token(&self, token: &str) -> Option<TokenInfo> {
+    /// constant time. Returns the token's facts only when it is live at
+    /// `now_ms` (not expired). An unknown id still runs the comparison,
+    /// against a fixed dummy hash.
+    pub(crate) fn check_token_at(&self, token: &str, now_ms: u64) -> Option<TokenInfo> {
         if !arneb_protocol::is_token_shaped(token) {
             return None;
         }
         let (id, secret) = token["arneb_".len()..].split_once('_')?;
+        let presented = sha256(secret.as_bytes());
         let guard = self.data.lock().unwrap_or_else(|p| p.into_inner());
-        let record = guard.tokens.iter().find(|t| t.id == id)?;
-        aws_lc_rs::constant_time::verify_slices_are_equal(
-            &sha256(secret.as_bytes()),
-            &record.secret_sha256,
-        )
-        .ok()?;
-        Some(info_of(record))
+        let record = guard.tokens.iter().find(|t| t.id == id);
+        let expected = record.map_or(&DUMMY_SECRET_SHA256, |r| &r.secret_sha256);
+        let matches =
+            aws_lc_rs::constant_time::verify_slices_are_equal(&presented, expected).is_ok();
+        let record = record.filter(|r| matches && is_live(r, now_ms))?;
+        // A token never outlives its user.
+        guard
+            .users
+            .iter()
+            .any(|u| u.name == record.user)
+            .then(|| info_of(record))
     }
+
+    /// [`StateStore::check_token_at`] at the current time.
+    pub(crate) fn check_token(&self, token: &str) -> Option<TokenInfo> {
+        self.check_token_at(token, now_ms())
+    }
+}
+
+/// Compared against when a token id is unknown, so a miss costs the same
+/// as a hit. No secret hashes to it in practice.
+const DUMMY_SECRET_SHA256: [u8; 32] = [0u8; 32];
+
+/// Whether `t` has not expired at `now_ms`.
+pub(crate) fn is_live(t: &TokenRecord, now_ms: u64) -> bool {
+    t.expires_ms.is_none_or(|e| now_ms < e)
 }
 
 fn info_of(t: &TokenRecord) -> TokenInfo {
@@ -157,7 +177,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))

@@ -82,10 +82,27 @@ impl Default for StateData {
 
 /// Durable coordinator state. Persistent when opened with a path, in-memory
 /// otherwise. Share as `Arc<StateStore>`.
-#[derive(Debug)]
 pub struct StateStore {
     path: Option<PathBuf>,
     pub(crate) data: Mutex<StateData>,
+    /// Per-process secret for decoy verifiers of unknown users.
+    pub(crate) decoy_secret: [u8; 32],
+}
+
+/// Shows only counts: the state holds verifiers and token hashes, which must
+/// not end up in logs.
+impl std::fmt::Debug for StateStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("StateStore");
+        s.field("path", &self.path);
+        // `try_lock`: formatting must never block on (or deadlock against)
+        // a holder of the state lock.
+        if let Ok(guard) = self.data.try_lock() {
+            s.field("users", &guard.users.len())
+                .field("tokens", &guard.tokens.len());
+        }
+        s.finish_non_exhaustive()
+    }
 }
 
 impl StateStore {
@@ -97,9 +114,12 @@ impl StateStore {
             Some(p) => Self::load(p)?,
             None => StateData::default(),
         };
+        let mut decoy_secret = [0u8; 32];
+        aws_lc_rs::rand::fill(&mut decoy_secret).map_err(|_| StateError::Random)?;
         Ok(StateStore {
             path: path.map(Path::to_path_buf),
             data: Mutex::new(data),
+            decoy_secret,
         })
     }
 

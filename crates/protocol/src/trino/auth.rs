@@ -21,6 +21,10 @@
 //!   queue in front of a legitimate client whose cache entry expired. The
 //!   TTL is deliberately not refreshed on a hit, so a revoked or changed
 //!   password still stops working within [`CACHE_TTL`].
+//! - A [token-shaped](crate::auth::is_token_shaped) password is an API
+//!   token: it is checked with a SHA-256 compare on every request, bypassing
+//!   the cache, the limiter and the queue, so a revoked token is refused at
+//!   once.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,7 +41,7 @@ use serde_json::json;
 use tokio::sync::{OnceCell, Semaphore};
 
 use super::session::claimed_users;
-use crate::auth::{hmac_sha256, AuthConfigError, UserCredentials};
+use crate::auth::{hmac_sha256, is_token_shaped, AuthConfigError, CredentialSource};
 
 const CACHE_TTL: Duration = Duration::from_secs(300);
 const CACHE_CAPACITY: usize = 1024;
@@ -63,10 +67,12 @@ type VerifyCache = HashMap<CredKey, Instant>;
 /// Verifications queued or running, one shared result cell per credential.
 type InFlight = HashMap<CredKey, Arc<OnceCell<bool>>>;
 
-/// Outcome of [`Authenticator::verify`].
+/// Outcome of [`BasicAuthenticator::check`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verdict {
+pub enum BasicVerdict {
+    /// The credentials are valid.
     Valid,
+    /// Wrong password, unknown user, or a dead token.
     Invalid,
     /// The verification queue is full; the client should retry.
     Overloaded,
@@ -76,10 +82,11 @@ enum Verdict {
 #[derive(Debug, Clone)]
 pub(crate) struct AuthUser(pub(crate) String);
 
-/// Password verifier plus the success cache.
+/// HTTP Basic credential checker: a success cache, a PBKDF2 limiter and a
+/// single-flight map in front of a [`CredentialSource`]. Cheap to clone.
 #[derive(Clone)]
-pub(crate) struct Authenticator {
-    creds: Arc<UserCredentials>,
+pub struct BasicAuthenticator {
+    creds: Arc<dyn CredentialSource>,
     cache_key: [u8; 32],
     cache: Arc<Mutex<VerifyCache>>,
     /// Number of full (PBKDF2) verifications; read by tests.
@@ -114,9 +121,16 @@ impl Drop for FlightGuard<'_> {
     }
 }
 
-impl Authenticator {
-    pub(crate) fn new(
-        creds: Arc<UserCredentials>,
+impl BasicAuthenticator {
+    /// Build an authenticator over `creds`.
+    pub fn new(creds: Arc<dyn CredentialSource>) -> Result<Self, AuthConfigError> {
+        Self::with_counter(creds, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Like [`BasicAuthenticator::new`], counting PBKDF2 verifications in
+    /// `verifications`.
+    pub(crate) fn with_counter(
+        creds: Arc<dyn CredentialSource>,
         verifications: Arc<AtomicU64>,
     ) -> Result<Self, AuthConfigError> {
         let mut key = [0u8; 32];
@@ -144,11 +158,21 @@ impl Authenticator {
     /// with at most [`MAX_QUEUED_VERIFICATIONS`] more waiting, so a flood of
     /// bad credentials can neither stall the async workers, use more than a
     /// few cores, nor build an unbounded queue.
-    async fn verify(&self, user: &str, password: &str) -> Verdict {
+    ///
+    /// A token-shaped password skips all of that: it is checked directly
+    /// (one SHA-256 compare) and never cached, so revocation is immediate.
+    pub async fn check(&self, user: &str, password: &str) -> BasicVerdict {
+        if is_token_shaped(password) {
+            return if self.creds.verify_token(password).as_deref() == Some(user) {
+                BasicVerdict::Valid
+            } else {
+                BasicVerdict::Invalid
+            };
+        }
         let digest = hmac_sha256(&self.cache_key, password.as_bytes());
         let key = (user.to_owned(), digest);
         if self.is_cached(&key, Instant::now()) {
-            return Verdict::Valid;
+            return BasicVerdict::Valid;
         }
         let cell = {
             let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
@@ -156,7 +180,7 @@ impl Authenticator {
                 Some(cell) => Arc::clone(cell),
                 None => {
                     if map.len() >= MAX_CONCURRENT_VERIFICATIONS + MAX_QUEUED_VERIFICATIONS {
-                        return Verdict::Overloaded;
+                        return BasicVerdict::Overloaded;
                     }
                     let cell = Arc::new(OnceCell::new());
                     map.insert(key.clone(), Arc::clone(&cell));
@@ -177,9 +201,9 @@ impl Authenticator {
             .await;
         drop(guard);
         if ok {
-            Verdict::Valid
+            BasicVerdict::Valid
         } else {
-            Verdict::Invalid
+            BasicVerdict::Invalid
         }
     }
 
@@ -276,9 +300,9 @@ fn basic_credentials(req: &Request) -> Option<(String, String)> {
 }
 
 /// Axum middleware enforcing Basic auth when the server has an
-/// [`Authenticator`].
+/// [`BasicAuthenticator`].
 pub(crate) async fn require_auth(
-    State(auth): State<Option<Authenticator>>,
+    State(auth): State<Option<BasicAuthenticator>>,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -294,13 +318,13 @@ pub(crate) async fn require_auth(
     if user.is_empty() {
         return unauthorized("Invalid credentials");
     }
-    match auth.verify(&user, &password).await {
-        Verdict::Valid => {}
-        Verdict::Invalid => {
+    match auth.check(&user, &password).await {
+        BasicVerdict::Valid => {}
+        BasicVerdict::Invalid => {
             tracing::warn!(user = %user, "Trino password authentication failed");
             return unauthorized("Invalid credentials");
         }
-        Verdict::Overloaded => {
+        BasicVerdict::Overloaded => {
             tracing::warn!(user = %user, "Trino authentication queue full; returning 503");
             return overloaded();
         }
@@ -321,16 +345,16 @@ pub(crate) async fn require_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::ScramVerifier;
+    use crate::auth::{ScramVerifier, UserCredentials};
 
-    fn authenticator() -> (Authenticator, Arc<AtomicU64>) {
+    fn authenticator() -> (BasicAuthenticator, Arc<AtomicU64>) {
         let creds = UserCredentials::new(vec![(
             "alice".to_owned(),
             ScramVerifier::generate("alice-pw").unwrap(),
         )])
         .unwrap();
         let counter = Arc::new(AtomicU64::new(0));
-        let auth = Authenticator::new(Arc::new(creds), Arc::clone(&counter)).unwrap();
+        let auth = BasicAuthenticator::with_counter(Arc::new(creds), Arc::clone(&counter)).unwrap();
         (auth, counter)
     }
 
@@ -343,7 +367,7 @@ mod tests {
             .unwrap();
         let pending = tokio::spawn({
             let auth = auth.clone();
-            async move { auth.verify("alice", "wrong").await == Verdict::Valid }
+            async move { auth.check("alice", "wrong").await == BasicVerdict::Valid }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!pending.is_finished(), "verification must wait for a slot");
@@ -361,24 +385,24 @@ mod tests {
     #[tokio::test]
     async fn cache_hits_skip_the_limiter() {
         let (auth, counter) = authenticator();
-        assert_eq!(auth.verify("alice", "alice-pw").await, Verdict::Valid);
+        assert_eq!(auth.check("alice", "alice-pw").await, BasicVerdict::Valid);
         let _held = Arc::clone(&auth.limiter)
             .acquire_many_owned(MAX_CONCURRENT_VERIFICATIONS as u32)
             .await
             .unwrap();
         let hit =
-            tokio::time::timeout(Duration::from_secs(1), auth.verify("alice", "alice-pw")).await;
-        assert_eq!(hit.ok(), Some(Verdict::Valid));
+            tokio::time::timeout(Duration::from_secs(1), auth.check("alice", "alice-pw")).await;
+        assert_eq!(hit.ok(), Some(BasicVerdict::Valid));
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
-    fn hold_all_slots(auth: &Authenticator) -> tokio::sync::OwnedSemaphorePermit {
+    fn hold_all_slots(auth: &BasicAuthenticator) -> tokio::sync::OwnedSemaphorePermit {
         Arc::clone(&auth.limiter)
             .try_acquire_many_owned(MAX_CONCURRENT_VERIFICATIONS as u32)
             .unwrap()
     }
 
-    fn in_flight_len(auth: &Authenticator) -> usize {
+    fn in_flight_len(auth: &BasicAuthenticator) -> usize {
         auth.in_flight.lock().unwrap().len()
     }
 
@@ -388,7 +412,10 @@ mod tests {
 
     #[tokio::test]
     async fn identical_concurrent_misses_verify_once() {
-        for (password, expected) in [("alice-pw", Verdict::Valid), ("wrong", Verdict::Invalid)] {
+        for (password, expected) in [
+            ("alice-pw", BasicVerdict::Valid),
+            ("wrong", BasicVerdict::Invalid),
+        ] {
             let (auth, counter) = authenticator();
             // Hold every slot so all N requests are in flight together,
             // more than the slot count (each would otherwise run PBKDF2).
@@ -396,7 +423,7 @@ mod tests {
             let tasks: Vec<_> = (0..MAX_CONCURRENT_VERIFICATIONS * 4)
                 .map(|_| {
                     let auth = auth.clone();
-                    tokio::spawn(async move { auth.verify("alice", password).await })
+                    tokio::spawn(async move { auth.check("alice", password).await })
                 })
                 .collect();
             settle().await;
@@ -416,7 +443,7 @@ mod tests {
         let held = hold_all_slots(&auth);
         let task = tokio::spawn({
             let auth = auth.clone();
-            async move { auth.verify("alice", "wrong").await }
+            async move { auth.check("alice", "wrong").await }
         });
         settle().await;
         assert_eq!(in_flight_len(&auth), 1);
@@ -429,13 +456,13 @@ mod tests {
     #[tokio::test]
     async fn full_queue_rejects_new_misses_but_not_hits_or_joins() {
         let (auth, counter) = authenticator();
-        assert_eq!(auth.verify("alice", "alice-pw").await, Verdict::Valid);
+        assert_eq!(auth.check("alice", "alice-pw").await, BasicVerdict::Valid);
         let held = hold_all_slots(&auth);
         let bound = MAX_CONCURRENT_VERIFICATIONS + MAX_QUEUED_VERIFICATIONS;
         let flood: Vec<_> = (0..bound)
             .map(|i| {
                 let auth = auth.clone();
-                tokio::spawn(async move { auth.verify("alice", &format!("bad-{i}")).await })
+                tokio::spawn(async move { auth.check("alice", &format!("bad-{i}")).await })
             })
             .collect();
         settle().await;
@@ -443,24 +470,24 @@ mod tests {
 
         // A new distinct miss is refused at once instead of queueing.
         let rejected =
-            tokio::time::timeout(Duration::from_secs(1), auth.verify("alice", "bad-new")).await;
-        assert_eq!(rejected.ok(), Some(Verdict::Overloaded));
+            tokio::time::timeout(Duration::from_secs(1), auth.check("alice", "bad-new")).await;
+        assert_eq!(rejected.ok(), Some(BasicVerdict::Overloaded));
         // A cached credential never touches the queue.
         let hit =
-            tokio::time::timeout(Duration::from_secs(1), auth.verify("alice", "alice-pw")).await;
-        assert_eq!(hit.ok(), Some(Verdict::Valid));
+            tokio::time::timeout(Duration::from_secs(1), auth.check("alice", "alice-pw")).await;
+        assert_eq!(hit.ok(), Some(BasicVerdict::Valid));
         // An identical miss joins its existing flight rather than being refused.
         let join = tokio::spawn({
             let auth = auth.clone();
-            async move { auth.verify("alice", "bad-0").await }
+            async move { auth.check("alice", "bad-0").await }
         });
         settle().await;
         assert!(!join.is_finished());
 
         drop(held);
-        assert_eq!(join.await.unwrap(), Verdict::Invalid);
+        assert_eq!(join.await.unwrap(), BasicVerdict::Invalid);
         for t in flood {
-            assert_eq!(t.await.unwrap(), Verdict::Invalid);
+            assert_eq!(t.await.unwrap(), BasicVerdict::Invalid);
         }
         assert_eq!(counter.load(Ordering::Relaxed), 1 + bound as u64);
         assert_eq!(in_flight_len(&auth), 0);

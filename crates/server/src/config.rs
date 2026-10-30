@@ -2154,7 +2154,7 @@ password_hash = "{hash}"
         assert_eq!(config.auth.auth_type, AuthType::Password);
         assert_eq!(config.auth.users.len(), 2);
         match config.auth.to_auth_method().unwrap() {
-            AuthMethod::ScramSha256(creds) => assert_eq!(creds.len(), 2),
+            AuthMethod::ScramSha256(creds) => assert_eq!(creds.user_count(), 2),
             other => panic!("expected password auth, got {other:?}"),
         }
         // The Debug output must never contain the stored verifier.

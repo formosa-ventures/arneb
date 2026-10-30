@@ -155,8 +155,9 @@ impl AccessControlConfig {
 /// metrics_auth = false       # ARNEB_WEB_METRICS_AUTH
 /// ```
 ///
-/// The Web UI has no login and shows query text, so under
-/// `[auth] type = "password"` it binds to `127.0.0.1` unless this is set.
+/// Under `[auth] type = "password"` the Web UI and `/api/v1` require sign-in,
+/// but the Web port serves plain HTTP and shows query text, so it binds to
+/// `127.0.0.1` unless this is set.
 /// The port stays at the pgwire port + 1000.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]

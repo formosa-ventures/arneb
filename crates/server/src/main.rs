@@ -1076,8 +1076,9 @@ async fn run() -> Result<()> {
             tracing::warn!(
                 target: "arneb::config",
                 web_bind_address = %web_addr,
-                "the Web UI has no login and shows query text; it is reachable beyond \
-                 loopback while [auth] type = \"password\""
+                "the Web UI and API require sign-in under [auth] type = \"password\", but \
+                 serves plain HTTP (credentials and query text are unencrypted) and is \
+                 reachable beyond loopback"
             );
         }
     }

@@ -113,6 +113,11 @@ impl PlanningContext {
         found.ok_or_else(|| PlanError::ColumnNotFound {
             name: table.map_or_else(|| name.to_string(), |table| format!("{table}.{name}")),
             location,
+            candidates: arneb_common::suggest::nearest(
+                name,
+                self.columns.iter().map(|(_, c)| c.name.as_str()),
+                3,
+            ),
         })
     }
 
@@ -4443,6 +4448,26 @@ mod tests {
         match err {
             PlanError::TableNotFound(name) => assert_eq!(name, "nonexistent"),
             _ => panic!("expected TableNotFound, got: {err:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_column_has_location_and_candidates() {
+        let err = plan_sql("SELECT nmae FROM users").await.unwrap_err();
+        match err {
+            PlanError::ColumnNotFound {
+                name,
+                location,
+                candidates,
+            } => {
+                assert_eq!(name, "nmae");
+                assert_eq!(
+                    location,
+                    Some(arneb_common::error::Location { line: 1, column: 8 })
+                );
+                assert_eq!(candidates.first().map(String::as_str), Some("name"));
+            }
+            _ => panic!("expected ColumnNotFound, got: {err:?}"),
         }
     }
 

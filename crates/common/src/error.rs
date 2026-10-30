@@ -57,14 +57,21 @@ pub enum ParseError {
 }
 
 impl ParseError {
-    /// Returns the source location associated with this error, if any.
+    /// Returns the source location embedded in this error, if any.
     ///
-    /// `ParseError` variants currently do not carry location information —
-    /// syntax errors are sourced from the upstream parser and are kept
-    /// position-free at this layer. Wire location through here when a
-    /// future variant (e.g., `InvalidIdentifier { location }`) is added.
+    /// sqlparser reports positions as trailing text of the form
+    /// `Line: N, Column: M`; this parses that suffix.
     pub fn location(&self) -> Option<Location> {
-        None
+        let msg = match self {
+            ParseError::InvalidSyntax(m) | ParseError::UnsupportedFeature(m) => m,
+        };
+        let rest = &msg[msg.rfind("Line: ")? + "Line: ".len()..];
+        let (line, rest) = rest.split_once(", Column: ")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        Some(Location {
+            line: line.trim().parse().ok()?,
+            column: digits.parse().ok()?,
+        })
     }
 }
 
@@ -92,6 +99,8 @@ pub enum PlanError {
         name: String,
         /// Source position of the column reference, if known.
         location: Option<Location>,
+        /// Nearest in-scope column names ("did you mean"), best first.
+        candidates: Vec<String>,
     },
 
     /// An expression has incompatible types.
@@ -201,6 +210,7 @@ impl PlanError {
         Self::ColumnNotFound {
             name: name.into(),
             location: None,
+            candidates: Vec::new(),
         }
     }
 
@@ -390,6 +400,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_error_location_is_read_from_sqlparser_text() {
+        let e =
+            ParseError::InvalidSyntax("Expected: ..., found: FORM at Line: 2, Column: 8".into());
+        assert_eq!(e.location(), Some(Location { line: 2, column: 8 }));
+        assert_eq!(ParseError::InvalidSyntax("nope".into()).location(), None);
+    }
+
+    #[test]
     fn plan_error_location_accessor() {
         let loc = Location {
             line: 3,
@@ -398,6 +416,7 @@ mod tests {
         let err = PlanError::ColumnNotFound {
             name: "l_shipdate".to_string(),
             location: Some(loc),
+            candidates: vec![],
         };
         assert_eq!(err.location(), Some(loc));
 

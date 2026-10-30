@@ -320,6 +320,24 @@ pub fn decoy_verifier(secret: &[u8; 32], user: &str) -> ScramVerifier {
     }
 }
 
+/// Whether `s` has the exact shape of an Arneb API token:
+/// `arneb_<16 lowercase hex>_<43 base64url characters, no padding>`.
+/// Session tokens (`arneb_s_...`) deliberately do not match.
+pub fn is_token_shaped(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("arneb_") else {
+        return false;
+    };
+    let Some((id, secret)) = rest.split_once('_') else {
+        return false;
+    };
+    id.len() == 16
+        && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && secret.len() == 43
+        && secret
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// How clients authenticate on the pgwire port.
 #[derive(Debug, Clone, Default)]
 pub enum AuthMethod {
@@ -682,6 +700,36 @@ pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; KEY_LEN] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_shape_accepts_only_the_documented_form() {
+        let id = "0123456789abcdef";
+        let secret = "A".repeat(43);
+        assert!(is_token_shaped(&format!("arneb_{id}_{secret}")));
+        let mixed = "aZ09-_".repeat(7) + "a"; // 43 chars incl. '-' and '_'
+        assert_eq!(mixed.len(), 43);
+        // '_' inside the secret is fine: only the first '_' splits the id.
+        assert!(is_token_shaped(&format!("arneb_{id}_{mixed}")));
+
+        assert!(!is_token_shaped(&format!("other_{id}_{secret}")));
+        assert!(!is_token_shaped(&format!("arneb_{}_{secret}", &id[..15])));
+        assert!(!is_token_shaped(&format!("arneb_{id}0_{secret}")));
+        assert!(!is_token_shaped(&format!(
+            "arneb_{}_{secret}",
+            id.to_uppercase()
+        )));
+        assert!(!is_token_shaped(&format!(
+            "arneb_0123456789abcdeg_{secret}"
+        )));
+        assert!(!is_token_shaped(&format!("arneb_{id}_{}", &secret[..42])));
+        assert!(!is_token_shaped(&format!("arneb_{id}_{secret}A")));
+        assert!(!is_token_shaped(&format!("arneb_{id}_{}=", &secret[..42])));
+        assert!(!is_token_shaped(&format!("arneb_{id}_{secret}_extra")));
+        assert!(!is_token_shaped(&format!("arneb_{id}_{}+", &secret[..42])));
+        assert!(!is_token_shaped(&format!("arneb_s_{secret}")));
+        assert!(!is_token_shaped(""));
+        assert!(!is_token_shaped("arneb_"));
+    }
 
     #[test]
     fn verify_password_checks_the_stored_key() {

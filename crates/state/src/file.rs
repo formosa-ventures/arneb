@@ -44,12 +44,30 @@ pub(crate) struct UserRecord {
     pub from_config: bool,
 }
 
+/// A stored API token. Holds only a hash of the secret and a SCRAM verifier
+/// of the full token, never the token itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TokenRecord {
+    pub id: String,
+    pub user: String,
+    pub name: Option<String>,
+    pub created_ms: u64,
+    pub expires_ms: Option<u64>,
+    /// SHA-256 of the secret segment, for constant-time lookup checks.
+    pub secret_sha256: [u8; 32],
+    /// `ScramVerifier` (Display form) of the full token, sharing the user's
+    /// salt and iteration count.
+    pub scram: String,
+}
+
 /// Everything persisted in the state file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StateData {
     pub version: u32,
     #[serde(default)]
     pub users: Vec<UserRecord>,
+    #[serde(default)]
+    pub tokens: Vec<TokenRecord>,
 }
 
 impl Default for StateData {
@@ -57,18 +75,17 @@ impl Default for StateData {
         Self {
             version: STATE_VERSION,
             users: Vec::new(),
+            tokens: Vec::new(),
         }
     }
 }
 
 /// Durable coordinator state. Persistent when opened with a path, in-memory
 /// otherwise. Share as `Arc<StateStore>`.
-// Tasks 3-4 add the readers of `data`; drop this allow when they land.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct StateStore {
     path: Option<PathBuf>,
-    data: Mutex<StateData>,
+    pub(crate) data: Mutex<StateData>,
 }
 
 impl StateStore {

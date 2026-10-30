@@ -12,7 +12,9 @@ mod timeout;
 pub mod tls;
 pub mod trino;
 
-pub use auth::{decoy_verifier, AuthConfigError, AuthMethod, ScramVerifier, UserCredentials};
+pub use auth::{
+    decoy_verifier, is_token_shaped, AuthConfigError, AuthMethod, ScramVerifier, UserCredentials,
+};
 pub use server::{ProtocolConfig, ProtocolServer};
 pub use tls::{PgwireTls, PgwireTlsMode, ServerTls, TlsConfigError};
 pub use trino::{TrinoConfig, TrinoServer};

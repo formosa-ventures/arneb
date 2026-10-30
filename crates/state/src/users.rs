@@ -60,6 +60,7 @@ fn apply_seed(data: &mut StateData, users: &[(String, ScramVerifier)], reseed: b
             Some(existing) if existing.scram == scram => {}
             Some(existing) if reseed && existing.from_config => {
                 *existing = record();
+                data.tokens.retain(|t| &t.user != name);
                 report.seeded.push(name.clone());
             }
             Some(_) => report.diverged.push(name.clone()),
@@ -68,8 +69,14 @@ fn apply_seed(data: &mut StateData, users: &[(String, ScramVerifier)], reseed: b
     // Config users that vanished from the config file.
     let in_config = |n: &str| users.iter().any(|(u, _)| u == n);
     if reseed {
-        // Task 3 drops the API tokens of every user removed here.
+        let dropped: Vec<String> = data
+            .users
+            .iter()
+            .filter(|u| u.from_config && !in_config(&u.name))
+            .map(|u| u.name.clone())
+            .collect();
         data.users.retain(|u| !u.from_config || in_config(&u.name));
+        data.tokens.retain(|t| !dropped.contains(&t.user));
     } else {
         for u in &data.users {
             if u.from_config && !in_config(&u.name) {
@@ -181,7 +188,8 @@ mod tests {
         store
             .seed_users(&cfg(&[("alice", "old"), ("carol", "c")]), false)
             .unwrap();
-        // Tokens do not exist yet (Task 3); assert the user replacement.
+        let ta = store.issue_token("alice", None, None).unwrap();
+        let tc = store.issue_token("carol", None, None).unwrap();
         let r = store.seed_users(&cfg(&[("alice", "new")]), true).unwrap();
         assert_eq!(r.seeded, vec!["alice"]);
         assert!(r.diverged.is_empty());
@@ -189,6 +197,16 @@ mod tests {
         assert_eq!(s.len(), 1, "carol left the config and is dropped");
         assert_eq!(s[0].0, "alice");
         assert_eq!(s[0].1, v("new").to_string());
+        assert!(
+            store.list_tokens("alice").is_empty(),
+            "replaced user's tokens"
+        );
+        assert!(
+            store.list_tokens("carol").is_empty(),
+            "removed user's tokens"
+        );
+        assert_eq!(store.check_token(&ta.token), None);
+        assert_eq!(store.check_token(&tc.token), None);
     }
 
     #[test]

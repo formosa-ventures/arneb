@@ -55,6 +55,7 @@ register.
 | Deployment `<release>-worker` | `worker.replicas` workers (default 2). Each registers under its pod name and advertises its pod IP. |
 | ConfigMap `<release>-config` | `config` as `/etc/arneb/config.toml` on every pod. |
 | Secret `<release>-cluster` | The cluster secret, unless `clusterSecret.existingSecret` is set. |
+| PersistentVolumeClaim `<release>-coordinator-state` | The coordinator's [state file](/guide/configuration#state) (API tokens), unless `coordinator.state.persistence.enabled` is false or `existingClaim` is set. |
 | PodDisruptionBudget `<release>-worker` | At most one worker disrupted at a time. |
 
 The chart sets each pod's role, bind address and pgwire port, and sets
@@ -87,6 +88,9 @@ other pod in the namespace that runs Arneb.
 | `extraVolumes`, `extraVolumeMounts` | `[]` | Extra volumes on every pod, e.g. TLS certificates. |
 | `coordinator.service.type` | `ClusterIP` | Use `LoadBalancer` to reach the coordinator from outside the cluster. |
 | `coordinator.trino.enabled` | `true` | Trino client protocol listener. |
+| `coordinator.state.persistence.enabled` | `true` | Keep the coordinator state on a PVC. When false it is an `emptyDir` and API tokens are lost when the pod restarts. |
+| `coordinator.state.persistence.size` / `.storageClass` | `1Gi` / `""` | An empty `storageClass` uses the cluster default. |
+| `coordinator.state.persistence.existingClaim` | `""` | Use this PVC instead of creating one. Ignored when `enabled` is false. |
 | `worker.replicas` | `2` | Number of workers. |
 | `worker.drainTimeoutSecs` | `120` | `ARNEB_DRAIN_TIMEOUT_SECS` on workers. |
 | `worker.terminationGracePeriodSeconds` | drain timeout + 30 | Must stay above the drain timeout. |
@@ -115,6 +119,20 @@ restarts every pod.
   [Securing the Cluster](/guide/distributed#securing-the-cluster).
 - With password auth, the Web UI binds to `127.0.0.1` unless `[web]
   bind_address` is set, so the Service's web port only answers when it is.
+
+## Coordinator state
+
+Under `[auth] type = "password"` the coordinator keeps its users and
+[API tokens](/guide/http-api#api-tokens) in a state file. The chart mounts a
+volume at `/var/lib/arneb` on the coordinator only and sets
+`ARNEB_STATE_PATH=/var/lib/arneb/state.json`, so tokens survive a pod
+restart and an upgrade. Workers have no state volume.
+
+The chart's own PVC is deleted by `helm uninstall`, and with it every
+token. For production, create the PVC yourself and set
+`coordinator.state.persistence.existingClaim` so it outlives the release.
+The volume holds credential verifiers: restrict who can read it. The state
+file is mode `0600`.
 
 ## Restarts and upgrades
 

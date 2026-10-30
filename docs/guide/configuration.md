@@ -446,8 +446,8 @@ disable the listener with `--no-trino` / `ARNEB_TRINO_ENABLED=false`.
 <a id="auth-limitations"></a>
 Limitations:
 
-- The **Web UI** has no login. Under password auth it binds to `127.0.0.1`
-  by default; see [Web UI](#web-ui).
+- The **Web UI and Web API** need a sign-in under password auth, and bind to
+  `127.0.0.1` by default; see [Web UI](#web-ui) and [HTTP API](/guide/http-api).
 - The **Flight RPC** port is protected by [Cluster security](#cluster-security),
   not by `[auth]`.
 - Channel binding (`SCRAM-SHA-256-PLUS`) and client-certificate
@@ -510,14 +510,19 @@ trino --server https://localhost:8080 --truststore-path .dev-certs/ca.crt --user
 
 ## Web UI
 
-The Web UI (pgwire port + 1000) has no login and shows query text and
-cluster state. It also serves Prometheus metrics at `/metrics` (see
-[Observability](/guide/observability)). Because of this, where it listens
-depends on `[auth]`:
+The Web UI and Web API (pgwire port + 1000) show query text and cluster
+state, and let a caller cancel queries. Under `[auth] type = "password"`
+the Web UI asks you to sign in, and every `/api/v1` and `/api/v2` route
+except the health and sign-in routes needs credentials; see
+[HTTP API](/guide/http-api). The port also serves Prometheus metrics at
+`/metrics` (see [Observability](/guide/observability)), which stays
+unauthenticated unless `metrics_auth` is set. Where it listens depends on
+`[auth]`:
 
 ```toml
 [web]
 bind_address = "0.0.0.0"   # optional; ARNEB_WEB_BIND_ADDRESS
+metrics_auth = false       # optional; ARNEB_WEB_METRICS_AUTH
 ```
 
 | `[auth] type` | `[web] bind_address` | Web UI binds to |
@@ -531,6 +536,44 @@ Startup logs the effective address and the reason (`default`,
 when an explicit non-loopback address is used under password auth. In
 docker or Kubernetes, set `[web] bind_address` (or reach the Web UI through
 a port-forward) if you need it from outside the container.
+
+`metrics_auth = true` makes `/metrics` require the same credentials as the
+rest of the Web API (a bearer API token or Basic), so a scraper needs a
+token. It has no effect under `type = "none"`. The default keeps `/metrics`
+open so existing scrapers keep working.
+
+**Upgrading.** Under `[auth] type = "password"`, `/api/v1/*` (except
+`/api/v1/info`) now needs credentials, and the Web UI asks you to sign in.
+`/api/v1` query list, detail and cancel now apply the `queries` rules from
+[access control](/guide/access-control). Scrapers of `/api/v1` need a token
+(or Basic). Under `type = "none"` nothing changes.
+
+## State
+
+```toml
+[state]
+path = "/var/lib/arneb/state.json"   # optional; ARNEB_STATE_PATH
+```
+
+The coordinator (or standalone server) keeps its users and
+[API tokens](/guide/http-api#api-tokens) in one JSON state file. Workers never
+open it. Every write is atomic (write, fsync, rename) and the file is
+created with mode `0600`. The path's directory must be writable.
+
+- **The config file is a seed.** `[[auth.users]]` seeds the state on first
+  start. Afterwards the state wins: if the config's users later differ from
+  the state, startup logs a WARN on `arneb::config` naming the user and keeps
+  the state. Start once with `--reseed-state` to overwrite the state's
+  config-seeded users with the config.
+- **No `path`** keeps the state in memory. Startup logs a WARN, `no [state]
+  path: API tokens are lost on restart`, and the token API says so when it
+  issues a token.
+- The effective path (and `--reseed-state`) is logged on `arneb::config`.
+- The state store is only used under `[auth] type = "password"`. Under
+  `none`, `[state]` and `--reseed-state` have no effect (`--reseed-state`
+  logs a WARN).
+- On Kubernetes the chart mounts a volume for it; see
+  [Kubernetes](/guide/kubernetes#coordinator-state).
 
 ## Observability
 
@@ -558,6 +601,8 @@ Options:
   --config <PATH>    Path to configuration file
   --port <PORT>      Override the pgwire port
   --role <ROLE>      Server role: standalone, coordinator, or worker
+  --reseed-state     Overwrite config-seeded users in the state file with
+                     the [[auth.users]] from the config
 ```
 
 ## Example: Standalone with Local Files

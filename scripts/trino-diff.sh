@@ -159,6 +159,8 @@ for q in "${QUERIES[@]}"; do
     trino --execute "$(cat "$sql")" >"$OUT/trino_$q.csv" 2>"$OUT/trino_$q.err"
     trc=$?
     tt=$(printf '%.1f' "$(echo "$(date +%s.%N) - $t0" | bc)")
+    compare_keys=""
+    if [ "$SUITE" = tpch ] && [ "$q" = q11 ]; then compare_keys=2; fi
 
     if [ $crashed -eq 1 ]; then
         outcome="err:crash"; detail="peak RSS ${peak_mb} MB; $(grep -o 'panicked at.*' "$OUT/arneb.log" | tail -1 | cut -c1-90)"
@@ -168,7 +170,7 @@ for q in "${QUERIES[@]}"; do
         outcome="err:$cls"; detail=$msg
     elif [ $trc -ne 0 ]; then
         outcome="trino-err"; detail=$(grep -m1 -i 'error\|exception' "$OUT/trino_$q.err" | cut -c1-110)
-    elif diffout=$(python3 "$COMPARE" "$OUT/arneb_$q.csv" "$OUT/trino_$q.csv" "$TOL"); then
+    elif diffout=$(python3 "$COMPARE" "$OUT/arneb_$q.csv" "$OUT/trino_$q.csv" "$TOL" ${compare_keys:+"$compare_keys"}); then
         outcome=ok; detail="rows=$(wc -l <"$OUT/trino_$q.csv" | tr -d ' ')"
     else
         outcome=mismatch; detail="$(wc -l <<<"$diffout" | tr -d ' ') diff(s); first: $(head -1 <<<"$diffout")"

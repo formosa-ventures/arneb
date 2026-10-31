@@ -647,6 +647,38 @@ open so existing scrapers keep working.
 [access control](/guide/access-control). Scrapers of `/api/v1` need a token
 (or Basic). Under `type = "none"` nothing changes.
 
+### Upgrading to v0.2.0 (manage API)
+
+- **Write privileges.** `INSERT`, `DELETE` and `OWNERSHIP` are checked
+  against the `tables` rules on every protocol, and a `read-only` catalog
+  refuses writes (SQLSTATE `42501`, `PERMISSION_DENIED`, `forbidden`). A
+  rules file whose `tables` section grants only `SELECT` now refuses DDL and
+  DML; without a `tables` section nothing changes. See
+  [access control](/guide/access-control#supported-rules).
+- **`DELETE /api/v2/queries/{id}` answers `200` with a body** (the
+  [manage envelope](/guide/http-api#dry-runs-and-the-response-envelope))
+  instead of `204`, and now stops the query on pgwire and Trino too. Clients
+  that check for `204` must accept `200`. `DELETE /api/v1/queries/{id}` of a
+  query that already ended answers `204`.
+- **Observe is gated by `system_information`.** Once the rules file has a
+  `system_information` section, the cluster, worker, admission and audit
+  views need a rule that allows `read` (or the manage privilege). Without
+  the section, or without a rules file, they stay open as before.
+- **An admission controller always exists.** It is built even for
+  `max_running_queries = 0`, so the admission gauges are now reported at cap
+  0 (see [Observability](/guide/observability)).
+- **Stored admission limits pin values.** A limit set with `PUT
+  /api/v2/admission` is kept in the state file and wins over `[admission]`
+  and `ARNEB_MAX_*_QUERIES` at every start, each overridden knob logging a
+  WARN. To go back to the config, stop the server and remove
+  `settings.admission` from the state file.
+- **New state.** The state file gains `cordons` and `settings` (readable by
+  older binaries, whose next write drops them), and the coordinator writes
+  [`audit.jsonl`](#audit-log) next to it. With no `[state] path` these live
+  in memory and are lost on restart.
+- **Revoking a token with a malformed id is `400 invalid_argument`**, and
+  the refusal is not audited.
+
 ## State
 
 ```toml

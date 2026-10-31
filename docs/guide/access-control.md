@@ -175,6 +175,9 @@ password auth, then a `queries` rule that allows `kill` for that owner (or no
   [manage envelope](/guide/http-api#dry-runs-and-the-response-envelope)
   instead of `204`, and stops the query on its protocol.
 
+The full list, with the state-file and admission changes, is in
+[Upgrading to v0.2.0 (manage API)](/guide/configuration#upgrading-to-v020-manage-api).
+
 ## Limits
 
 - The Web API (Web UI port) applies the `queries` rules to the query list,

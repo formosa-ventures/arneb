@@ -17,12 +17,17 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 use crate::security::ClusterSecurity;
-use crate::task_submission::{connect, drain_ack};
+use crate::task_submission::connect;
 
 /// A catalog generation and its specs, as JSON objects (the server crate's
 /// `CatalogConfig`, raw secrets included). Encoded as JSON.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogSet {
+    /// The epoch of the coordinator the set comes from, chosen at random at
+    /// each start (Ruling R6). A set from another epoch than the one a
+    /// worker holds replaces it even with a lower generation.
+    #[serde(default)]
+    pub epoch: u64,
     /// The catalog generation the set belongs to.
     pub generation: u64,
     /// One spec per catalog.
@@ -32,6 +37,7 @@ pub struct CatalogSet {
 impl std::fmt::Debug for CatalogSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CatalogSet")
+            .field("epoch", &self.epoch)
             .field("generation", &self.generation)
             .field("catalogs", &self.catalogs.len())
             .finish()
@@ -57,32 +63,49 @@ impl CatalogSet {
     }
 }
 
-/// Worker-side handler for `sync_catalogs`: applies a pushed set. An `Err`
-/// is returned to the coordinator as `Internal`.
+/// Worker-side handler for `sync_catalogs`: applies a pushed set and
+/// returns the names of the catalogs that failed to build (Ruling R7). An
+/// `Err` is returned to the coordinator as `Internal`.
 pub type CatalogSyncCallback =
-    Arc<dyn Fn(CatalogSet) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+    Arc<dyn Fn(CatalogSet) -> BoxFuture<'static, Result<Vec<String>, String>> + Send + Sync>;
+
+/// The worker's answer to `sync_catalogs`, encoded as JSON: the names of
+/// the catalogs that failed to build (never their specs).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CatalogSyncReply {
+    #[serde(default)]
+    pub(crate) failed: Vec<String>,
+}
 
 /// Coordinator-side source for `get_catalogs`: the live catalog set.
 pub type CatalogSourceCallback = Arc<dyn Fn() -> CatalogSet + Send + Sync>;
 
 /// Coordinator → worker: push `set` to the worker at `addr` and wait until
-/// it applied it.
+/// it applied it. `Ok` lists the catalogs that failed to build on the
+/// worker (the set still applied; Ruling R7).
 pub async fn push_catalogs(
     addr: &str,
     set: &CatalogSet,
     security: &ClusterSecurity,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
+    use futures::StreamExt;
     let mut client = connect(addr, security).await?;
     let action = Action {
         r#type: "sync_catalogs".to_string(),
         body: set.encode().into(),
     };
-    let stream = client
+    let mut stream = client
         .do_action(action)
         .await
         .map_err(|e| format!("sync_catalogs RPC failed: {}", e.message()))?
         .into_inner();
-    drain_ack(stream, "sync_catalogs").await
+    match stream.next().await {
+        Some(Ok(result)) => Ok(serde_json::from_slice::<CatalogSyncReply>(&result.body)
+            .unwrap_or_default()
+            .failed),
+        Some(Err(e)) => Err(format!("sync_catalogs response error: {}", e.message())),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Worker → coordinator: fetch the coordinator's live catalog set.
@@ -122,6 +145,7 @@ mod tests {
 
     fn sample_set() -> CatalogSet {
         CatalogSet {
+            epoch: 42,
             generation: 7,
             catalogs: vec![
                 serde_json::json!({"name": "lake", "type": "hive", "metastore_uri": "h:9083"}),
@@ -140,6 +164,12 @@ mod tests {
                 .unwrap();
         });
         format!("http://{addr}")
+    }
+
+    #[test]
+    fn catalog_set_epoch_defaults_to_zero() {
+        let set = CatalogSet::decode(br#"{"generation":3,"catalogs":[]}"#).unwrap();
+        assert_eq!((set.epoch, set.generation), (0, 3));
     }
 
     #[test]
@@ -194,6 +224,7 @@ mod tests {
         let state = FlightState::with_heartbeat_callback(Arc::new(|_| {
             Ok(crate::HeartbeatReply {
                 catalog_generation: Some(3),
+                catalog_epoch: Some(42),
             })
         }));
         let addr = serve(state).await;
@@ -202,6 +233,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply.catalog_generation, Some(3));
+        assert_eq!(reply.catalog_epoch, Some(42));
     }
 
     #[tokio::test]
@@ -211,13 +243,23 @@ mod tests {
         let mut state = FlightState::new();
         state.set_catalog_sync_callback(Arc::new(move |set: CatalogSet| {
             s.lock().unwrap().push(set);
-            Box::pin(async { Ok(()) })
+            Box::pin(async { Ok(vec![]) })
         }));
         let addr = serve(state).await;
-        push_catalogs(&addr, &sample_set(), &ClusterSecurity::default())
+        let failed = push_catalogs(&addr, &sample_set(), &ClusterSecurity::default())
             .await
             .unwrap();
+        assert!(failed.is_empty());
         assert_eq!(*seen.lock().unwrap(), vec![sample_set()]);
+
+        // Ruling R7: an applied set with build failures is Ok, listing them.
+        let mut state = FlightState::new();
+        state.set_catalog_sync_callback(Arc::new(|_| Box::pin(async { Ok(vec!["pg".into()]) })));
+        let addr = serve(state).await;
+        let failed = push_catalogs(&addr, &sample_set(), &ClusterSecurity::default())
+            .await
+            .unwrap();
+        assert_eq!(failed, vec!["pg".to_string()]);
 
         // A failed apply reaches the coordinator as an error.
         let mut state = FlightState::new();

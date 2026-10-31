@@ -178,15 +178,8 @@ impl FlightState {
     }
 
     /// Install the `sync_catalogs` handler (workers): applies a catalog set
-    /// the coordinator pushes.
-    pub fn set_catalog_sync_callback(
-        &mut self,
-        callback: Arc<
-            dyn Fn(CatalogSet) -> futures::future::BoxFuture<'static, Result<(), String>>
-                + Send
-                + Sync,
-        >,
-    ) {
+    /// the coordinator pushes and returns the catalogs that failed to build.
+    pub fn set_catalog_sync_callback(&mut self, callback: CatalogSyncCallback) {
         self.catalog_sync_callback = Some(callback);
     }
 
@@ -584,9 +577,12 @@ impl FlightService for TrinoFlightService {
                     catalogs = set.catalogs.len(),
                     "received catalog sync"
                 );
-                callback(set).await.map_err(Status::internal)?;
+                let failed = callback(set).await.map_err(Status::internal)?;
+                let reply = crate::catalog_sync::CatalogSyncReply { failed };
                 let result = arrow_flight::Result {
-                    body: "catalogs_synced".into(),
+                    body: serde_json::to_vec(&reply)
+                        .expect("CatalogSyncReply serialization should not fail")
+                        .into(),
                 };
                 let stream = futures::stream::once(async { Ok(result) });
                 Ok(Response::new(Box::pin(stream)))

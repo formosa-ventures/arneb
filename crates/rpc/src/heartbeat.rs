@@ -105,6 +105,11 @@ pub struct HeartbeatReply {
     /// the coordinator does not serve catalogs.
     #[serde(default)]
     pub catalog_generation: Option<u64>,
+    /// The coordinator's epoch, chosen at random at each start (Ruling R6).
+    /// A worker holding a set from another epoch pulls, whatever the
+    /// generations.
+    #[serde(default)]
+    pub catalog_epoch: Option<u64>,
 }
 
 impl HeartbeatReply {
@@ -233,6 +238,7 @@ mod tests {
         assert_eq!(HeartbeatReply::decode(b"").catalog_generation, None);
         let reply = HeartbeatReply {
             catalog_generation: Some(3),
+            catalog_epoch: Some(9),
         };
         assert_eq!(HeartbeatReply::decode(&reply.encode()), reply);
         assert_eq!(

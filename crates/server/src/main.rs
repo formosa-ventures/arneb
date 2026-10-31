@@ -377,6 +377,10 @@ async fn run() -> Result<()> {
     );
     if matches!(role, ServerRole::Worker) {
         start_worker_catalogs(&live_catalogs, &config.catalogs);
+    } else {
+        // Ruling R6: a fresh epoch per start, so workers replace their set
+        // after a coordinator restart even when its generation went back.
+        live_catalogs.set_epoch(coordinator_epoch());
     }
 
     // 8. Set up Flight RPC server + heartbeat handling
@@ -471,6 +475,7 @@ async fn run() -> Result<()> {
                     )?;
                     Ok(arneb_rpc::HeartbeatReply {
                         catalog_generation: Some(live.generation()),
+                        catalog_epoch: Some(live.epoch()),
                     })
                 },
             ));
@@ -1559,13 +1564,22 @@ fn start_worker_catalogs(
     ignored
 }
 
+/// A random, nonzero coordinator epoch (Ruling R6), from the system RNG the
+/// Web sessions use.
+fn coordinator_epoch() -> u64 {
+    let mut bytes = [0u8; 8];
+    aws_lc_rs::rand::fill(&mut bytes).expect("system random number generator failed");
+    u64::from_le_bytes(bytes).max(1)
+}
+
 /// The `sync_catalogs` handler: applies a set the coordinator pushed. A
-/// stale set (not newer than the applied one) is acknowledged unchanged; a
-/// catalog that failed to build is reported back (the rest still apply).
+/// stale set (same epoch, not newer) is acknowledged unchanged. An applied
+/// set is Ok even when some catalogs failed to build; their names are
+/// returned (Ruling R7).
 async fn apply_pushed_catalogs(
     live: &catalogs::LiveCatalogs,
     set: arneb_rpc::CatalogSet,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let generation = set.generation;
     let report = live.apply_remote(set).await;
     if !report.applied {
@@ -1575,7 +1589,7 @@ async fn apply_pushed_catalogs(
             applied_generation = live.generation(),
             "ignored a catalog push that is not newer"
         );
-        return Ok(());
+        return Ok(Vec::new());
     }
     tracing::info!(
         target: "arneb::cluster",
@@ -1584,18 +1598,7 @@ async fn apply_pushed_catalogs(
         failed = report.failed.len(),
         "catalogs pushed by the coordinator applied"
     );
-    if report.failed.is_empty() {
-        return Ok(());
-    }
-    let failed: Vec<String> = report
-        .failed
-        .iter()
-        .map(|(name, e)| format!("{name}: {e}"))
-        .collect();
-    Err(format!(
-        "applied generation {generation}, but some catalogs failed to build: {}",
-        failed.join("; ")
-    ))
+    Ok(report.failed.into_iter().map(|(name, _)| name).collect())
 }
 
 /// Loads the external catalogs: from the state store when one is open
@@ -1838,11 +1841,13 @@ mod tests {
         let mut state = arneb_rpc::FlightState::with_heartbeat_callback(Arc::new(|_| {
             Ok(arneb_rpc::HeartbeatReply {
                 catalog_generation: Some(3),
+                catalog_epoch: None,
             })
         }));
         state.set_catalog_source(Arc::new(move || {
             f.fetch_add(1, Ordering::SeqCst);
             arneb_rpc::CatalogSet {
+                epoch: 0,
                 generation: 3,
                 catalogs: vec![],
             }
@@ -1866,6 +1871,131 @@ mod tests {
         }
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
         assert_eq!(live.generation(), 3);
+    }
+
+    /// A coordinator Flight server serving `set` (its heartbeat reply
+    /// follows it), counting `get_catalogs` calls. Returns its address.
+    async fn fake_coordinator(
+        set: Arc<std::sync::Mutex<arneb_rpc::CatalogSet>>,
+        fetches: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> String {
+        let s = set.clone();
+        let mut state = arneb_rpc::FlightState::with_heartbeat_callback(Arc::new(move |_| {
+            let s = s.lock().unwrap();
+            Ok(arneb_rpc::HeartbeatReply {
+                catalog_generation: Some(s.generation),
+                catalog_epoch: Some(s.epoch),
+            })
+        }));
+        state.set_catalog_source(Arc::new(move || {
+            fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            set.lock().unwrap().clone()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(arneb_rpc::__serve_flight_for_test(listener, state));
+        addr
+    }
+
+    fn memory_built() -> catalogs::BuiltCatalog {
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalogs::BuiltCatalog {
+            provider: catalog.clone(),
+            connector: Arc::new(MemoryConnectorFactory::new(catalog, "default")),
+        }
+    }
+
+    /// Ruling R6: a coordinator restarted with a lower generation (new
+    /// epoch, e.g. an in-memory state) is followed within one heartbeat;
+    /// so is a no-store coordinator restarted with a changed config (new
+    /// epoch, generation 1 again).
+    #[tokio::test]
+    async fn coordinator_restart_with_a_new_epoch_converges() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let lake: config::CatalogConfig = serde_json::from_value(serde_json::json!({
+            "name": "lake", "type": "hive", "metastore_uri": "127.0.0.1:1"
+        }))
+        .unwrap();
+        let set = Arc::new(std::sync::Mutex::new(arneb_rpc::CatalogSet {
+            epoch: 100,
+            generation: 5,
+            catalogs: vec![serde_json::to_value(&lake).unwrap()],
+        }));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let addr = fake_coordinator(set.clone(), fetches.clone()).await;
+        let target = HeartbeatTarget {
+            coordinator_address: addr.clone(),
+            message: arneb_rpc::HeartbeatMessage::new("w1".into(), "http://localhost:1".into(), 8),
+        };
+        let live = empty_live();
+        // The worker already holds (100, 5) with `lake` installed.
+        live.install(lake.clone(), memory_built());
+        let held = set.lock().unwrap().clone();
+        live.apply_remote(held).await;
+        assert_eq!((live.epoch(), live.generation()), (100, 5));
+        let puller = catalogs::CatalogPuller::from_coordinator(addr, live.clone());
+        let beat = || async {
+            let reply = target.send(arneb_rpc::WorkerState::Active).await.unwrap();
+            puller.after_heartbeat(&reply).await
+        };
+        assert!(!beat().await, "in sync: no pull");
+
+        // Restart with an in-memory state: new epoch, lower generation.
+        *set.lock().unwrap() = arneb_rpc::CatalogSet {
+            epoch: 200,
+            generation: 2,
+            catalogs: vec![],
+        };
+        assert!(beat().await);
+        assert_eq!((live.epoch(), live.generation()), (200, 2));
+        assert!(live.specs().is_empty(), "the whole set was replaced");
+        assert!(!beat().await, "converged");
+
+        // A no-store coordinator: generation 1 at every start, new epoch,
+        // changed config (`lake` back).
+        *set.lock().unwrap() = arneb_rpc::CatalogSet {
+            epoch: 300,
+            generation: 1,
+            catalogs: vec![serde_json::to_value(&lake).unwrap()],
+        };
+        live.apply_remote(arneb_rpc::CatalogSet {
+            epoch: 250,
+            generation: 1,
+            catalogs: vec![],
+        })
+        .await;
+        assert_eq!((live.epoch(), live.generation()), (250, 1));
+        assert!(beat().await, "same generation, new epoch: pulls");
+        assert_eq!((live.epoch(), live.generation()), (300, 1));
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    /// Rulings R6, R7: a push from the same epoch that is not newer is
+    /// acknowledged and changes nothing; an applied push whose catalogs
+    /// fail to build is Ok and lists them by name.
+    #[tokio::test]
+    async fn same_epoch_stale_push_is_ignored_and_failures_are_listed() {
+        let live = empty_live();
+        let push = |generation, catalogs| arneb_rpc::CatalogSet {
+            epoch: 7,
+            generation,
+            catalogs,
+        };
+        assert!(apply_pushed_catalogs(&live, push(5, vec![]))
+            .await
+            .unwrap()
+            .is_empty());
+        let bad = serde_json::json!({"name": "bad", "type": "mysql", "password": "s3cret"});
+        let failed = apply_pushed_catalogs(&live, push(3, vec![bad.clone()]))
+            .await
+            .unwrap();
+        assert!(failed.is_empty(), "stale: not applied, nothing built");
+        assert_eq!(live.generation(), 5);
+        let failed = apply_pushed_catalogs(&live, push(6, vec![bad]))
+            .await
+            .unwrap();
+        assert_eq!(failed, vec!["bad".to_string()]);
+        assert_eq!(live.generation(), 6);
     }
 
     /// Which `tracing` target an [`enabled`] probe checks.

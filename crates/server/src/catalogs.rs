@@ -88,6 +88,10 @@ pub struct LiveCatalogs {
     /// The installed specs, by name.
     specs: RwLock<BTreeMap<String, CatalogConfig>>,
     generation: AtomicU64,
+    /// On a coordinator, its own epoch (random per start); on a worker, the
+    /// epoch of the coordinator its set came from (0 before the first).
+    /// Ruling R6.
+    epoch: AtomicU64,
     /// Serializes [`apply_set`](Self::apply_set) calls, which build outside
     /// any other lock.
     applying: tokio::sync::Mutex<()>,
@@ -117,6 +121,7 @@ impl LiveCatalogs {
             global_storage,
             specs: RwLock::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
             applying: tokio::sync::Mutex::new(()),
         })
     }
@@ -124,6 +129,17 @@ impl LiveCatalogs {
     /// The catalog generation the installed set belongs to.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    /// The coordinator epoch: this coordinator's own, or on a worker the one
+    /// its set came from (Ruling R6).
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Sets this coordinator's epoch, once at startup before it serves.
+    pub fn set_epoch(&self, epoch: u64) {
+        self.epoch.store(epoch, Ordering::SeqCst);
     }
 
     /// Sets the catalog generation (after a change was persisted).
@@ -140,6 +156,7 @@ impl LiveCatalogs {
     /// generation is read first: [`apply_set`](Self::apply_set) advances it
     /// only after installing, so the specs are never older than it says.
     pub fn snapshot(&self) -> arneb_rpc::CatalogSet {
+        let epoch = self.epoch();
         let generation = self.generation();
         let catalogs = self
             .specs()
@@ -147,14 +164,18 @@ impl LiveCatalogs {
             .filter_map(|spec| serde_json::to_value(spec).ok())
             .collect();
         arneb_rpc::CatalogSet {
+            epoch,
             generation,
             catalogs,
         }
     }
 
-    /// Applies a set from the coordinator (a push or a pull) with
-    /// [`apply_set`](Self::apply_set). A spec that does not decode is
-    /// skipped with a WARN and listed as failed.
+    /// Applies a set from the coordinator (a push or a pull). Within the
+    /// epoch held, only a newer generation applies, so a stale push loses;
+    /// a set from another epoch (a restarted coordinator) always applies
+    /// and replaces the whole set, even at a lower generation (Ruling R6).
+    /// A spec that does not decode is skipped with a WARN and listed as
+    /// failed.
     pub async fn apply_remote(&self, set: arneb_rpc::CatalogSet) -> ApplyReport {
         let mut specs = Vec::with_capacity(set.catalogs.len());
         let mut undecodable = Vec::new();
@@ -177,7 +198,7 @@ impl LiveCatalogs {
                 }
             }
         }
-        let mut report = self.apply_set(set.generation, specs).await;
+        let mut report = self.apply(Some(set.epoch), set.generation, specs).await;
         if report.applied {
             report.failed.extend(undecodable);
         }
@@ -270,8 +291,21 @@ impl LiveCatalogs {
     /// one keeps its previous version); the rest still apply and the
     /// generation still advances.
     pub async fn apply_set(&self, generation: u64, specs: Vec<CatalogConfig>) -> ApplyReport {
+        self.apply(None, generation, specs).await
+    }
+
+    /// [`apply_set`](Self::apply_set), except that a set from `epoch` other
+    /// than the one held applies whatever its generation, and then records
+    /// `epoch`. `None` checks the generation only and keeps the epoch.
+    async fn apply(
+        &self,
+        epoch: Option<u64>,
+        generation: u64,
+        specs: Vec<CatalogConfig>,
+    ) -> ApplyReport {
         let _applying = self.applying.lock().await;
-        if generation <= self.generation() {
+        let same_epoch = epoch.is_none_or(|e| e == self.epoch());
+        if same_epoch && generation <= self.generation() {
             return ApplyReport::default();
         }
         let installed = self.read_specs().clone();
@@ -312,7 +346,12 @@ impl LiveCatalogs {
             self.remove(name);
             tracing::info!(catalog = %name, generation, "removed catalog");
         }
+        // Generation before epoch: a reader seeing the new epoch also sees
+        // the generation that goes with it.
         self.set_generation(generation);
+        if let Some(e) = epoch {
+            self.set_epoch(e);
+        }
         ApplyReport {
             applied: true,
             failed,
@@ -412,20 +451,24 @@ impl CatalogPuller {
     }
 
     /// After a heartbeat: pulls when the reply names another catalog
-    /// generation than the applied one. True when it pulled.
+    /// generation or coordinator epoch than the applied ones (Ruling R6).
+    /// True when it pulled.
     pub async fn after_heartbeat(&self, reply: &arneb_rpc::HeartbeatReply) -> bool {
         let Some(generation) = reply.catalog_generation else {
             return false;
         };
-        let applied = self.inner.live.generation();
-        if generation == applied {
+        let live = &self.inner.live;
+        let (applied, applied_epoch) = (live.generation(), live.epoch());
+        let epoch_differs = reply.catalog_epoch.is_some_and(|e| e != applied_epoch);
+        if generation == applied && !epoch_differs {
             return false;
         }
         tracing::debug!(
             target: "arneb::cluster",
             coordinator_generation = generation,
             applied_generation = applied,
-            "catalog generation differs from the coordinator's, pulling"
+            epoch_differs,
+            "catalog generation or epoch differs from the coordinator's, pulling"
         );
         if let Err(e) = self.pull().await {
             tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
@@ -730,6 +773,7 @@ mod tests {
     async fn apply_remote_skips_undecodable_specs() {
         let (live, _, _) = live();
         let set = arneb_rpc::CatalogSet {
+            epoch: 0,
             generation: 4,
             catalogs: vec![serde_json::json!({"name": "bad", "type": 7})],
         };
@@ -749,6 +793,54 @@ mod tests {
             provider: catalog.clone(),
             connector: Arc::new(MemoryConnectorFactory::new(catalog, "default")),
         }
+    }
+
+    fn set(epoch: u64, generation: u64, catalogs: Vec<serde_json::Value>) -> arneb_rpc::CatalogSet {
+        arneb_rpc::CatalogSet {
+            epoch,
+            generation,
+            catalogs,
+        }
+    }
+
+    /// Ruling R6: within one coordinator epoch only a newer generation
+    /// applies (a stale push loses); a set from another epoch replaces the
+    /// whole set, even at a lower or equal generation.
+    #[tokio::test]
+    async fn apply_remote_follows_the_coordinator_epoch() {
+        let (live, _, connectors) = live();
+        live.install(hive("old"), fake_built());
+        assert!(
+            live.apply_remote(set(11, 5, vec![serde_json::to_value(hive("old")).unwrap()]))
+                .await
+                .applied
+        );
+        assert_eq!((live.epoch(), live.generation()), (11, 5));
+        // Same epoch, older generation: ignored.
+        assert!(!live.apply_remote(set(11, 3, vec![])).await.applied);
+        assert_eq!(live.specs().len(), 1);
+        // A restarted coordinator (new epoch) with a lower generation wins.
+        let report = live.apply_remote(set(22, 2, vec![])).await;
+        assert!(report.applied);
+        assert_eq!((live.epoch(), live.generation()), (22, 2));
+        assert!(live.specs().is_empty());
+        assert!(connectors.get("old").is_none());
+        // A no-store coordinator restarted with a changed config: new epoch,
+        // generation 1 again; the changed set is applied.
+        let mysql = serde_json::json!({"name": "changed", "type": "mysql"});
+        let report = live.apply_remote(set(33, 2, vec![mysql])).await;
+        assert!(report.applied);
+        assert_eq!(
+            report.failed.len(),
+            1,
+            "the new spec was built (and failed)"
+        );
+        assert_eq!((live.epoch(), live.generation()), (33, 2));
+        // Repeating the same (epoch, generation) is stale.
+        assert!(!live.apply_remote(set(33, 2, vec![])).await.applied);
+        // The coordinator's own path (no epoch) keeps the epoch.
+        assert!(live.apply_set(3, vec![]).await.applied);
+        assert_eq!(live.epoch(), 33);
     }
 
     /// A TCP port with nothing listening on it.

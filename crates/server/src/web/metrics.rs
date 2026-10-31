@@ -123,6 +123,7 @@ mod tests {
             credentials: None,
             state: None,
             access_rules: None,
+            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), false),
             metrics_auth: false,
             basic: None,
             sessions: crate::web::SessionStore::new(),

@@ -26,6 +26,7 @@ use super::api::{
 };
 use super::auth::{decode_basic, AuthVia, Identity};
 use super::error::{ApiError, ErrorCode};
+use super::privilege::{Authorizer, Layer};
 use super::session::{SESSION_PREFIX, SESSION_TTL};
 use super::WebState;
 
@@ -215,10 +216,32 @@ struct WhoAmI {
     user: String,
     /// `token`, `session`, `basic` or `unauthenticated`.
     via: &'static str,
+    privileges: Privileges,
 }
 
-async fn whoami(Extension(who): Extension<Identity>) -> Json<WhoAmI> {
+/// What the caller may do beyond querying (manage-api D11).
+#[derive(Serialize)]
+pub(super) struct Privileges {
+    observe: bool,
+    manage: bool,
+}
+
+impl Privileges {
+    /// The layers `who` holds.
+    pub(super) fn of(authorizer: &Authorizer, who: &Identity) -> Self {
+        Self {
+            observe: authorizer.allows(who, Layer::Observe),
+            manage: authorizer.allows(who, Layer::Manage),
+        }
+    }
+}
+
+async fn whoami(
+    State(state): State<WebState>,
+    Extension(who): Extension<Identity>,
+) -> Json<WhoAmI> {
     Json(WhoAmI {
+        privileges: Privileges::of(&state.authorizer, &who),
         via: match who.via {
             AuthVia::Token => "token",
             AuthVia::Session => "session",
@@ -532,12 +555,20 @@ async fn cancel_query(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn cluster(State(state): State<WebState>) -> Json<ClusterResponse> {
-    Json(api::cluster_response(&state))
+async fn cluster(
+    State(state): State<WebState>,
+    Extension(who): Extension<Identity>,
+) -> Result<Json<ClusterResponse>, ApiError> {
+    state.authorizer.check(&who, Layer::Observe)?;
+    Ok(Json(api::cluster_response(&state)))
 }
 
-async fn workers(State(state): State<WebState>) -> Json<Vec<WorkerResponse>> {
-    Json(api::workers_response(&state))
+async fn workers(
+    State(state): State<WebState>,
+    Extension(who): Extension<Identity>,
+) -> Result<Json<Vec<WorkerResponse>>, ApiError> {
+    state.authorizer.check(&who, Layer::Observe)?;
+    Ok(Json(api::workers_response(&state)))
 }
 
 async fn info(State(state): State<WebState>) -> Json<InfoResponse> {
@@ -560,13 +591,18 @@ mod tests {
 
     fn web_state(password: bool, persistent_path: Option<&std::path::Path>) -> WebState {
         let store = Arc::new(arneb_state::StateStore::open(persistent_path).unwrap());
-        let users: Vec<(String, ScramVerifier)> = [("alice", "secret"), ("bob", "hunter2")]
-            .into_iter()
-            .map(|(user, pw)| {
-                let v = ScramVerifier::from_password(pw, b"0123456789abcdef", 4096);
-                (user.to_string(), v)
-            })
-            .collect();
+        let users: Vec<(String, ScramVerifier)> = [
+            ("alice", "secret"),
+            ("bob", "hunter2"),
+            ("root", "rootpw"),
+            ("ops", "opspw"),
+        ]
+        .into_iter()
+        .map(|(user, pw)| {
+            let v = ScramVerifier::from_password(pw, b"0123456789abcdef", 4096);
+            (user.to_string(), v)
+        })
+        .collect();
         store.seed_users(&users, false).unwrap();
         let credentials: Option<Arc<dyn CredentialSource>> =
             password.then(|| store.clone() as Arc<dyn CredentialSource>);
@@ -585,11 +621,24 @@ mod tests {
             credentials,
             state: password.then_some(store),
             access_rules: None,
+            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), false),
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent: None,
             mcp: None,
         }
+    }
+
+    /// `state` with `rules` and `admin_users` behind its authorizer.
+    fn with_authz(mut state: WebState, rules: Option<&str>, admins: &[&str]) -> WebState {
+        let rules = rules.map(|r| Arc::new(arneb_catalog::AccessRules::from_json(r).unwrap()));
+        state.access_rules = rules.clone();
+        state.authorizer = crate::web::privilege::Authorizer::new(
+            rules,
+            admins.iter().map(|a| a.to_string()).collect(),
+            state.credentials.is_some(),
+        );
+        state
     }
 
     fn basic(user: &str, password: &str) -> String {
@@ -727,7 +776,10 @@ mod tests {
 
         let session = login(&state, "alice", "secret").await;
         let (_, me) = call(&state, Method::GET, "/api/v2/whoami", Some(&session), None).await;
-        assert_eq!(me, json!({"user": "alice", "via": "session"}));
+        assert_eq!(
+            me,
+            json!({"user": "alice", "via": "session", "privileges": {"observe": true, "manage": false}})
+        );
 
         let (status, issued) = call(
             &state,
@@ -813,7 +865,10 @@ mod tests {
         let bearer = format!("Bearer {}", issued["token"].as_str().unwrap());
         let (status, me) = call(&state, Method::GET, "/api/v2/whoami", Some(&bearer), None).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(me, json!({"user": "alice", "via": "token"}));
+        assert_eq!(
+            me,
+            json!({"user": "alice", "via": "token", "privileges": {"observe": true, "manage": false}})
+        );
         // A token may manage its owner's tokens, but is not a session.
         let (status, _) = call(&state, Method::GET, "/api/v2/tokens", Some(&bearer), None).await;
         assert_eq!(status, StatusCode::OK);
@@ -836,7 +891,10 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(me, json!({"user": "bob", "via": "basic"}));
+        assert_eq!(
+            me,
+            json!({"user": "bob", "via": "basic", "privileges": {"observe": true, "manage": false}})
+        );
     }
 
     #[tokio::test]
@@ -853,7 +911,10 @@ mod tests {
             assert_eq!(body["error"]["code"], "auth_disabled", "{path}");
         }
         let (_, me) = call(&state, Method::GET, "/api/v2/whoami", None, None).await;
-        assert_eq!(me, json!({"user": "anonymous", "via": "unauthenticated"}));
+        assert_eq!(
+            me,
+            json!({"user": "anonymous", "via": "unauthenticated", "privileges": {"observe": true, "manage": false}})
+        );
     }
 
     #[tokio::test]
@@ -1098,5 +1159,68 @@ mod tests {
         // Another user is unaffected.
         let bob = basic("bob", "hunter2");
         assert_eq!(issue(&state, &bob, json!({})).await.0, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_privileges() {
+        let state = with_authz(web_state(true, None), None, &["root"]);
+        for (user, pw, observe, manage) in [
+            ("alice", "secret", true, false),
+            ("root", "rootpw", true, true),
+        ] {
+            let (_, me) = call(
+                &state,
+                Method::GET,
+                "/api/v2/whoami",
+                Some(&basic(user, pw)),
+                None,
+            )
+            .await;
+            assert_eq!(
+                me["privileges"],
+                json!({"observe": observe, "manage": manage}),
+                "{user}"
+            );
+        }
+        // Under none, nobody manages, even by name.
+        let state = with_authz(web_state(false, None), None, &["root"]);
+        let req = axum::http::Request::builder()
+            .uri("/api/v2/whoami")
+            .header("x-arneb-user", "root")
+            .body(Body::empty())
+            .unwrap();
+        let resp = build_router(state).oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let me: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(me["privileges"], json!({"observe": true, "manage": false}));
+    }
+
+    #[tokio::test]
+    async fn cluster_needs_observe_when_the_section_exists() {
+        let state = with_authz(
+            web_state(true, None),
+            Some(r#"{"system_information":[{"user":"ops","allow":["read"]}]}"#),
+            &[],
+        );
+        let alice = basic("alice", "secret");
+        let ops = basic("ops", "opspw");
+        for path in [
+            "/api/v2/cluster",
+            "/api/v2/cluster/workers",
+            "/api/v1/cluster",
+            "/api/v1/cluster/workers",
+        ] {
+            let (status, body) = call(&state, Method::GET, path, Some(&alice), None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(body["error"]["code"], "forbidden", "{path}");
+            assert!(body["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("allows read for user alice"));
+            let (status, _) = call(&state, Method::GET, path, Some(&ops), None).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+        }
     }
 }

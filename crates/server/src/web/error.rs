@@ -51,6 +51,8 @@ pub enum ErrorCode {
     ExceededTime,
     /// The statement was cancelled (409).
     Cancelled,
+    /// A manage action under `[auth] type = "none"` (403).
+    ManageRequiresAuth,
 }
 
 impl ErrorCode {
@@ -58,7 +60,7 @@ impl ErrorCode {
     pub fn status(self) -> StatusCode {
         match self {
             Self::Unauthenticated => StatusCode::UNAUTHORIZED,
-            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::Forbidden | Self::ManageRequiresAuth => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::InvalidArgument
             | Self::SyntaxError
@@ -197,6 +199,7 @@ mod tests {
             (ErrorCode::ExceededMemory, 400, "exceeded_memory"),
             (ErrorCode::ExceededTime, 400, "exceeded_time"),
             (ErrorCode::Cancelled, 409, "cancelled"),
+            (ErrorCode::ManageRequiresAuth, 403, "manage_requires_auth"),
         ] {
             let resp = ApiError::new(code, "m").with_hint("h").into_response();
             assert_eq!(resp.status().as_u16(), status);

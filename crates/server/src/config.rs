@@ -120,6 +120,7 @@ impl StateConfig {
 /// ```toml
 /// [access_control]
 /// rules_file = "/etc/arneb/rules.json"   # ARNEB_ACCESS_CONTROL_RULES_FILE
+/// admin_users = ["root"]                 # ARNEB_ADMIN_USERS (comma list)
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -127,6 +128,8 @@ pub struct AccessControlConfig {
     /// A rules file in Trino's file-based access control format. Unset:
     /// every user may read every table.
     pub rules_file: Option<std::path::PathBuf>,
+    /// Users who hold the manage privilege (password auth only).
+    pub admin_users: Vec<String>,
 }
 
 impl AccessControlConfig {
@@ -140,6 +143,15 @@ impl AccessControlConfig {
                 "ARNEB_ACCESS_CONTROL_RULES_FILE is set but empty"
             );
             self.rules_file = Some(v.into());
+        }
+        // An empty value counts as unset; a list is trimmed, blanks dropped.
+        if let Some(v) = env("ARNEB_ADMIN_USERS").filter(|v| !v.trim().is_empty()) {
+            self.admin_users = v
+                .split(',')
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_owned)
+                .collect();
         }
         Ok(())
     }
@@ -3060,7 +3072,7 @@ password = "hunter2"
         )]))
         .unwrap();
         let rules = cfg.load_rules().unwrap().unwrap();
-        assert_eq!(rules.section_sizes(), [None, None, Some(1), None]);
+        assert_eq!(rules.section_sizes(), [None, None, Some(1), None, None]);
 
         cfg.rules_file = Some(dir.join("missing.json"));
         assert!(cfg
@@ -3072,5 +3084,19 @@ password = "hunter2"
             .apply_env(env_from(&[("ARNEB_ACCESS_CONTROL_RULES_FILE", "")]))
             .is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn admin_users_parse_and_env_override() {
+        let mut cfg: AccessControlConfig =
+            toml::from_str(r#"admin_users = ["root", "ops"]"#).unwrap();
+        assert_eq!(cfg.admin_users, ["root", "ops"]);
+        cfg.apply_env(env_from(&[("ARNEB_ADMIN_USERS", "")]))
+            .unwrap();
+        assert_eq!(cfg.admin_users, ["root", "ops"], "empty counts as unset");
+        cfg.apply_env(env_from(&[("ARNEB_ADMIN_USERS", " a, ,b ")]))
+            .unwrap();
+        assert_eq!(cfg.admin_users, ["a", "b"]);
+        assert!(toml::from_str::<AccessControlConfig>("admin_user = []").is_err());
     }
 }

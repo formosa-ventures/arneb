@@ -78,6 +78,7 @@ Everyone can run queries and sees only their own.
 | `schemas` | `user`, `catalog`, `schema`, `owner` | Owning a schema makes it visible in listings. |
 | `tables` | `user`, `catalog`, `schema`, `table`, `privileges` | Reading a table needs `SELECT` or `OWNERSHIP`. Any privilege makes the table visible. |
 | `queries` | `user`, `queryOwner`, `allow` | `execute` is needed to run any statement. `view` shows another user's queries in `system.runtime.queries`. A rule with `queryOwner` cannot allow `execute`. |
+| `system_information` | `user`, `allow` | `allow` lists `read` and/or `write`. `read` opens the observe layer (cluster, workers, admission, audit views); `write` grants the manage layer. `write` does not imply `read` in the rules file, but a user who manages can always observe. `group` and `role` are refused. |
 
 Privileges other than `SELECT` and `OWNERSHIP` (`INSERT`, `DELETE`,
 `UPDATE`, `GRANT_SELECT`) are accepted but grant no read, since Arneb does
@@ -89,8 +90,47 @@ is refused at startup instead of being enforced partially:
 - `group` and `role` matching (Arneb has no group or role provider);
 - row filters (`filter`, `filter_environment`) and column masks or
   restrictions (`columns`);
-- other sections, such as `impersonation`, `system_information`,
-  `functions` or `procedures`.
+- other sections, such as `impersonation`, `functions` or `procedures`.
+
+## Privilege layers
+
+Two layers sit above the query rules:
+
+- **Observe** covers the cluster, worker, admission and audit views.
+  - Under `[auth] type = "none"` it is open.
+  - Under password auth it is open unless the rules file has a
+    `system_information` section. Then the user needs a rule that allows
+    `read`, or the manage layer.
+  - Query visibility stays on the `queries` `view` rules.
+- **Manage** covers actions that change system state.
+  - It needs password auth. Under `none`, every manage call is refused with
+    `manage_requires_auth`.
+  - The user must be in `[access_control] admin_users`, or match a
+    `system_information` rule that allows `write`. Nothing grants it by
+    default, even without a rules file.
+
+```toml
+[access_control]
+admin_users = ["root"]   # ARNEB_ADMIN_USERS="root,ops"
+```
+
+`GET /api/v2/whoami` and the MCP `whoami` tool report what the caller holds
+as `privileges: {"observe": bool, "manage": bool}`.
+
+A refusal is `403 forbidden` and its `hint` names what would grant it:
+
+- manage: `needs a system_information rule that allows write for user <u>,
+  or <u> in [access_control] admin_users`;
+- observe: `needs a system_information rule that allows read for user <u>`;
+- cancelling another user's query: `needs a queries rule that allows kill
+  for queryOwner <owner>, or the manage privilege`.
+
+A query's owner may always cancel it. Cancelling another user's query needs
+password auth, then a `queries` rule that allows `kill` for that owner (or no
+`queries` section), or the manage layer.
+
+`system_information` is a rules-file section, so
+`ARNEB_ACCESS_CONTROL_RULES_FILE` still decides whether rules apply at all.
 
 ## What users see
 

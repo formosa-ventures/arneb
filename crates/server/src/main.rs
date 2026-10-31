@@ -822,7 +822,7 @@ async fn run() -> Result<()> {
         None
     };
     if let (Some(rules), Some(path)) = (&access_rules, &config.access_control.rules_file) {
-        let [catalogs, schemas, tables, queries] = rules
+        let [catalogs, schemas, tables, queries, system_information] = rules
             .section_sizes()
             .map(|n| n.map_or_else(|| "absent (allow all)".to_owned(), |n| n.to_string()));
         tracing::info!(
@@ -832,6 +832,7 @@ async fn run() -> Result<()> {
             schemas = %schemas,
             tables = %tables,
             queries = %queries,
+            system_information = %system_information,
             "access control rules loaded"
         );
         if matches!(auth_method, arneb_protocol::AuthMethod::None) {
@@ -900,6 +901,46 @@ async fn run() -> Result<()> {
     let state_for_web = state_store.clone();
     let credentials_for_web: Option<Arc<dyn arneb_protocol::CredentialSource>> =
         state_store.clone().map(|s| s as _);
+
+    // Privilege layers (manage-api D1). Admin users are only meaningful
+    // under password auth; say so rather than silently ignoring them.
+    if !matches!(role, ServerRole::Worker) {
+        let admins = &config.access_control.admin_users;
+        tracing::info!(
+            target: "arneb::config",
+            admin_users = %if admins.is_empty() { "none".to_owned() } else { admins.join(",") },
+            auth = if password_users.is_some() { "password" } else { "none" },
+            "manage privileges effective settings ([access_control] admin_users / ARNEB_ADMIN_USERS)"
+        );
+        match &credentials_for_web {
+            None if !admins.is_empty() => tracing::warn!(
+                target: "arneb::config",
+                "[access_control] admin_users is set but [auth] type = \"none\": manage \
+                 actions need an authenticated user, so it has no effect"
+            ),
+            Some(creds) => {
+                let unknown: Vec<&str> = admins
+                    .iter()
+                    .filter(|u| creds.scram_verifiers(u).is_empty())
+                    .map(String::as_str)
+                    .collect();
+                if !unknown.is_empty() {
+                    tracing::warn!(
+                        target: "arneb::config",
+                        "[access_control] admin_users names users that are not in the state \
+                         store: {}",
+                        unknown.join(", ")
+                    );
+                }
+            }
+            None => {}
+        }
+    }
+    let authorizer = web::privilege::Authorizer::new(
+        access_rules.clone(),
+        config.access_control.admin_users.clone(),
+        password_users.is_some(),
+    );
 
     // admission-control D5/D8: one controller for the process, shared by
     // pgwire, the Trino listener and the Web UI. Workers have none; their
@@ -1108,6 +1149,7 @@ async fn run() -> Result<()> {
         credentials: credentials_for_web,
         state: state_for_web,
         access_rules: access_rules.clone(),
+        authorizer,
         metrics_auth: config.web.metrics_auth,
         sessions: web::SessionStore::new(),
         mcp: (serves_clients && agent_service.is_some() && config.mcp.enabled)

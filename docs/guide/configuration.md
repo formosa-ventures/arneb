@@ -529,11 +529,13 @@ Limitations:
 ```toml
 [access_control]
 rules_file = "/etc/arneb/rules.json"
+admin_users = ["root"]
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `rules_file` | path | unset | Rules in Trino's file-based access control format (`ARNEB_ACCESS_CONTROL_RULES_FILE`). Read at startup on the coordinator and standalone server; an unreadable or unsupported file stops startup. Unset: every user reads every table. |
+| `admin_users` | list of strings | `[]` | Users who hold the manage privilege (`ARNEB_ADMIN_USERS`, comma-separated; whitespace is trimmed, blanks are dropped, an empty value counts as unset). Only effective under `[auth] type = "password"`; under `none` a WARN is logged at startup. Names that are not users in the state store are also warned about. |
 
 See [Access Control](/guide/access-control) for the rule format.
 

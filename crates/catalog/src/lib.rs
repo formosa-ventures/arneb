@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
-pub use access::{AccessRules, CatalogAccess, RulesError};
+pub use access::{AccessRules, CatalogAccess, RulesError, TablePrivilege};
 
 use arneb_common::error::CatalogError;
 use arneb_common::types::{ColumnInfo, ScalarValue, TableReference};

@@ -23,6 +23,7 @@ use crate::web::agent::{service, wait};
 use crate::web::api::{self, BoundedParams, BoundedQuery};
 use crate::web::auth::AuthVia;
 use crate::web::error::ApiError;
+use crate::web::privilege::Layer;
 use crate::web::v2;
 
 /// Arguments of `list_catalogs`.
@@ -289,7 +290,7 @@ impl ArnebMcp {
     #[tool(
         description = "Who the server thinks you are: the user, how the request authenticated \
                        (token, session, basic or unauthenticated), the auth mode, and the \
-                       server version and role.",
+                       server version and role, and your `privileges` (`observe`, `manage`).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn whoami(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
@@ -300,6 +301,7 @@ impl ArnebMcp {
             "version": env!("CARGO_PKG_VERSION"),
             "role": self.state.role,
             "auth": if self.state.credentials.is_some() { "password" } else { "none" },
+            "privileges": v2::Privileges::of(&self.state.authorizer, &who),
         }))
     }
     /// `list_catalogs`: `GET /api/v2/catalogs`.
@@ -633,8 +635,13 @@ impl ArnebMcp {
         &self,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        identity(&ctx)?;
-        ok(&api::cluster_response(&self.state))
+        let who = identity(&ctx)?;
+        respond(
+            self.state
+                .authorizer
+                .check(&who, Layer::Observe)
+                .map(|_| api::cluster_response(&self.state)),
+        )
     }
 
     /// `list_workers`: `GET /api/v2/cluster/workers`.
@@ -647,8 +654,13 @@ impl ArnebMcp {
         &self,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        identity(&ctx)?;
-        ok(&serde_json::json!({"workers": api::workers_response(&self.state)}))
+        let who = identity(&ctx)?;
+        respond(
+            self.state
+                .authorizer
+                .check(&who, Layer::Observe)
+                .map(|_| serde_json::json!({"workers": api::workers_response(&self.state)})),
+        )
     }
 
     /// `list_tokens`: `GET /api/v2/tokens`.
@@ -860,6 +872,7 @@ mod tests {
             credentials: None,
             state: None,
             access_rules: None,
+            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), false),
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent: Some(agent),
@@ -1368,6 +1381,14 @@ mod tests {
             w["workers"],
             api_get(&f, "alice", "/api/v2/cluster/workers").await
         );
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_privileges_over_mcp() {
+        // Under none: observe, never manage.
+        let f = fixture(false);
+        let w = tool_ok(&f, "alice", "whoami", json!({})).await;
+        assert_eq!(w["privileges"], json!({"observe": true, "manage": false}));
     }
 
     /// A raw JSON-RPC request; the whole response body.

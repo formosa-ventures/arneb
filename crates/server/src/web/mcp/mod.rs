@@ -247,6 +247,7 @@ mod tests {
             credentials,
             state: password.then_some(store),
             access_rules: None,
+            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), false),
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent: None,
@@ -352,6 +353,26 @@ mod tests {
         let (status, _, body) = rpc(router, Some(auth), "arneb.example.com", &whoami_body()).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         body["result"]["structuredContent"].clone()
+    }
+
+    #[tokio::test]
+    async fn whoami_privileges_follow_admin_users_and_the_section() {
+        let mut state = mcp_state(true, default_settings());
+        state.authorizer = crate::web::privilege::Authorizer::new(
+            Some(Arc::new(
+                arneb_catalog::AccessRules::from_json(
+                    r#"{"system_information":[{"user":"bob","allow":["read"]}]}"#,
+                )
+                .unwrap(),
+            )),
+            vec!["alice".into()],
+            true,
+        );
+        let router = build_router(state);
+        let w = whoami(router.clone(), &basic("alice", "secret")).await;
+        assert_eq!(w["privileges"], json!({"observe": true, "manage": true}));
+        let w = whoami(router, &basic("bob", "hunter2")).await;
+        assert_eq!(w["privileges"], json!({"observe": true, "manage": false}));
     }
 
     #[tokio::test]

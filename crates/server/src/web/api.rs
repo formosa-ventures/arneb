@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use super::auth::{AuthVia, Identity};
 use super::error::{ApiError, ErrorCode};
+use super::privilege::Layer;
 use super::WebState;
 
 /// JSON response for a query.
@@ -353,8 +354,12 @@ fn admission_counters(
         })
 }
 
-async fn cluster_overview(State(state): State<WebState>) -> Json<ClusterResponse> {
-    Json(cluster_response(&state))
+async fn cluster_overview(
+    State(state): State<WebState>,
+    Extension(who): Extension<Identity>,
+) -> Result<Json<ClusterResponse>, ApiError> {
+    state.authorizer.check(&who, Layer::Observe)?;
+    Ok(Json(cluster_response(&state)))
 }
 
 /// The cluster overview. Shared with `/api/v2`.
@@ -370,8 +375,12 @@ pub(super) fn cluster_response(state: &WebState) -> ClusterResponse {
     }
 }
 
-async fn list_workers(State(state): State<WebState>) -> Json<Vec<WorkerResponse>> {
-    Json(workers_response(&state))
+async fn list_workers(
+    State(state): State<WebState>,
+    Extension(who): Extension<Identity>,
+) -> Result<Json<Vec<WorkerResponse>>, ApiError> {
+    state.authorizer.check(&who, Layer::Observe)?;
+    Ok(Json(workers_response(&state)))
 }
 
 /// The alive workers. Shared with `/api/v2`.

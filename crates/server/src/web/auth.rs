@@ -215,7 +215,14 @@ mod tests {
     fn web_state(password: bool, rules: Option<&str>, metrics_auth: bool) -> WebState {
         let credentials: Option<Arc<dyn CredentialSource>> =
             password.then(|| Arc::new(TestCreds) as _);
+        let access_rules =
+            rules.map(|r| Arc::new(arneb_catalog::AccessRules::from_json(r).unwrap()));
         WebState {
+            authorizer: crate::web::privilege::Authorizer::new(
+                access_rules.clone(),
+                Vec::new(),
+                password,
+            ),
             query_tracker: Arc::new(arneb_scheduler::QueryTracker::new()),
             node_registry: arneb_scheduler::NodeRegistry::new(30),
             start_time: std::time::Instant::now(),
@@ -229,8 +236,7 @@ mod tests {
                 .map(|c| arneb_protocol::BasicAuthenticator::new(c).unwrap()),
             credentials,
             state: None,
-            access_rules: rules
-                .map(|r| Arc::new(arneb_catalog::AccessRules::from_json(r).unwrap())),
+            access_rules,
             metrics_auth,
             sessions: SessionStore::new(),
             agent: None,

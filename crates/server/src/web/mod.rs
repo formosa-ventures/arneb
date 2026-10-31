@@ -7,6 +7,7 @@ pub mod error;
 mod frontend;
 pub mod mcp;
 mod metrics;
+pub mod privilege;
 pub mod session;
 mod v2;
 
@@ -41,6 +42,8 @@ pub struct WebState {
     pub state: Option<Arc<arneb_state::StateStore>>,
     /// Access rules shared with pgwire and Trino.
     pub access_rules: Option<Arc<arneb_catalog::AccessRules>>,
+    /// The observe and manage privilege layers and the kill rule.
+    pub authorizer: privilege::Authorizer,
     /// `[web] metrics_auth`: require credentials for `/metrics`.
     pub metrics_auth: bool,
     /// HTTP Basic checker over `credentials` (cache + PBKDF2 limiter); `Some`

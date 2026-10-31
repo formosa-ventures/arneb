@@ -365,18 +365,18 @@ async fn run() -> Result<()> {
 
     // 6.5. External catalogs (Hive, with Iceberg tables in the same
     // metastore redirected to the Iceberg reader, and PostgreSQL), kept live
-    // so they can change at runtime. Workers build them from the config
-    // here, so they can create data sources for the scans they are sent;
-    // the coordinator and standalone build them once the state store is
-    // open (runtime-config Rulings R2, R4). An unreachable catalog is
-    // skipped with a WARN; the server keeps serving.
+    // so they can change at runtime. The coordinator and standalone build
+    // them once the state store is open (runtime-config Rulings R2, R4).
+    // Workers ignore their own [[catalogs]]: they start empty at generation
+    // 0 and take the coordinator's set over Flight (D8). An unreachable
+    // catalog is skipped with a WARN; the server keeps serving.
     let live_catalogs = catalogs::LiveCatalogs::new(
         catalog_manager.clone(),
         connector_registry.clone(),
         config.storage.clone(),
     );
     if matches!(role, ServerRole::Worker) {
-        load_catalogs(None, &live_catalogs, &config.catalogs, reseed_state).await?;
+        start_worker_catalogs(&live_catalogs, &config.catalogs);
     }
 
     // 8. Set up Flight RPC server + heartbeat handling
@@ -451,13 +451,16 @@ async fn run() -> Result<()> {
 
     let mut flight_state = match role {
         ServerRole::Coordinator | ServerRole::Standalone => {
-            // Coordinator receives heartbeats from workers.
+            // Coordinator receives heartbeats from workers. The reply names
+            // the live catalog generation; a worker holding another one pulls
+            // the set with `get_catalogs` (runtime-config D8).
             let registry = node_registry.clone();
+            let live = live_catalogs.clone();
             let mut state = arneb_rpc::FlightState::with_heartbeat_callback(std::sync::Arc::new(
                 move |msg: arneb_rpc::HeartbeatMessage| {
                     if msg.state == arneb_rpc::WorkerState::Stopped {
                         registry.deregister(&msg.worker_id);
-                        return Ok(());
+                        return Ok(arneb_rpc::HeartbeatReply::default());
                     }
                     registry.admit(
                         msg.worker_id,
@@ -465,9 +468,18 @@ async fn run() -> Result<()> {
                         msg.max_splits,
                         &msg.version,
                         msg.state == arneb_rpc::WorkerState::Draining,
-                    )
+                    )?;
+                    Ok(arneb_rpc::HeartbeatReply {
+                        catalog_generation: Some(live.generation()),
+                    })
                 },
             ));
+            // Only a coordinator has workers to serve its catalogs to; the
+            // set carries raw secrets, so standalone does not expose it.
+            if matches!(role, ServerRole::Coordinator) {
+                let live = live_catalogs.clone();
+                state.set_catalog_source(Arc::new(move || live.snapshot()));
+            }
             // A1.3: route worker DF reports into the per-query
             // `DynamicFilterService`. The callback is sync (`Fn`),
             // so spawn the async `report_partition` call. Errors are
@@ -513,7 +525,14 @@ async fn run() -> Result<()> {
             // A1.3: the `df_notify_callback` is set later after the
             // TaskManager is built (TaskManager owns the per-task
             // collector map).
-            arneb_rpc::FlightState::new()
+            let mut state = arneb_rpc::FlightState::new();
+            // runtime-config D8: apply a catalog set the coordinator pushes.
+            let live = live_catalogs.clone();
+            state.set_catalog_sync_callback(Arc::new(move |set: arneb_rpc::CatalogSet| {
+                let live = live.clone();
+                Box::pin(async move { apply_pushed_catalogs(&live, set).await })
+            }));
+            state
         }
     };
 
@@ -596,6 +615,21 @@ async fn run() -> Result<()> {
         _ => None,
     };
 
+    // Where and as whom a worker heartbeats; built here so the task
+    // manager's catalog puller shares the worker id and coordinator.
+    let heartbeat_target = match role {
+        ServerRole::Worker => HeartbeatTarget::from_config(&config, &rpc_addr),
+        _ => None,
+    };
+    // runtime-config D8: the heartbeat loop and the task manager pull the
+    // coordinator's catalogs through one single-flight puller. None off
+    // workers (standalone has no workers).
+    let catalog_puller = heartbeat_target.as_ref().map(|target| {
+        catalogs::CatalogPuller::from_coordinator(
+            target.coordinator_address.clone(),
+            live_catalogs.clone(),
+        )
+    });
     let mut worker_tasks: Option<task_manager::TaskManager> = None;
     if matches!(role, ServerRole::Worker) {
         // Phase A (2026-05-23): the count-based `[memory]
@@ -653,6 +687,12 @@ async fn run() -> Result<()> {
             coord_address_for_publisher,
         )
         .with_query_memory_limit(query_memory_limit);
+        let tm = match (&catalog_puller, &heartbeat_target) {
+            (Some(puller), Some(target)) => {
+                tm.with_catalog_puller(puller.clone(), target.message.worker_id.clone())
+            }
+            _ => tm,
+        };
         let tm_for_task = tm.clone();
         flight_state.set_task_callback(Arc::new(move |descriptor| {
             tm_for_task.handle_task(descriptor);
@@ -1220,10 +1260,6 @@ async fn run() -> Result<()> {
     }
 
     // 11. Run services based on role
-    let heartbeat_target = match role {
-        ServerRole::Worker => HeartbeatTarget::from_config(&config, &rpc_addr),
-        _ => None,
-    };
     let (worker_state, worker_state_rx) =
         tokio::sync::watch::channel(arneb_rpc::WorkerState::Active);
     let flight_state_clone = flight_state.clone();
@@ -1282,6 +1318,7 @@ async fn run() -> Result<()> {
         // Worker heartbeat loop
         _ = worker_heartbeat_loop(
             heartbeat_target.as_ref(),
+            catalog_puller.as_ref(),
             role,
             worker_state_rx,
             heartbeat.interval_secs,
@@ -1350,8 +1387,9 @@ impl HeartbeatTarget {
         })
     }
 
-    /// Send one heartbeat reporting `state`, logging a failure.
-    async fn send(&self, state: arneb_rpc::WorkerState) {
+    /// Send one heartbeat reporting `state`, logging a failure. Returns
+    /// the coordinator's reply, or `None` on a failure.
+    async fn send(&self, state: arneb_rpc::WorkerState) -> Option<arneb_rpc::HeartbeatReply> {
         let mut message = self.message.clone();
         message.state = state;
         let worker_id = &message.worker_id;
@@ -1362,8 +1400,9 @@ impl HeartbeatTarget {
         )
         .await
         {
-            Ok(()) => {
+            Ok(reply) => {
                 tracing::debug!(worker_id = %worker_id, ?state, "heartbeat sent");
+                return Some(reply);
             }
             Err(
                 e @ (arneb_rpc::HeartbeatError::Unauthenticated(_)
@@ -1387,14 +1426,18 @@ impl HeartbeatTarget {
                 );
             }
         }
+        None
     }
 }
 
 /// Send a heartbeat every `interval_secs`, and at once whenever `state`
-/// changes (a drain starting). Pending forever off workers; returns at once
+/// changes (a drain starting). A reply naming another catalog generation
+/// than the applied one starts a pull in the background, so a slow pull
+/// never delays a heartbeat. Pending forever off workers; returns at once
 /// on a worker with no heartbeat target, which stops the server.
 async fn worker_heartbeat_loop(
     target: Option<&HeartbeatTarget>,
+    catalogs: Option<&catalogs::CatalogPuller>,
     role: ServerRole,
     mut state: tokio::sync::watch::Receiver<arneb_rpc::WorkerState>,
     interval_secs: u64,
@@ -1412,7 +1455,10 @@ async fn worker_heartbeat_loop(
     );
     loop {
         let current = *state.borrow_and_update();
-        target.send(current).await;
+        if let (Some(reply), Some(puller)) = (target.send(current).await, catalogs) {
+            let puller = puller.clone();
+            tokio::spawn(async move { puller.after_heartbeat(&reply).await });
+        }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
             changed = state.changed() => {
@@ -1492,6 +1538,64 @@ async fn run_until_shutdown(
     {
         tracing::warn!(worker_id = %worker_id, "stopped heartbeat timed out");
     }
+}
+
+/// A worker's catalogs at startup (runtime-config D8): none. Its own
+/// `[[catalogs]]` are ignored, with one INFO naming them; the set comes from
+/// the coordinator. Returns the ignored names.
+fn start_worker_catalogs(
+    live: &catalogs::LiveCatalogs,
+    specs: &[config::CatalogConfig],
+) -> Vec<String> {
+    let ignored: Vec<String> = specs.iter().map(|c| c.name.clone()).collect();
+    if !ignored.is_empty() {
+        tracing::info!(
+            target: "arneb::config",
+            catalogs = ?ignored,
+            "[[catalogs]] is ignored on a worker: catalogs come from the coordinator"
+        );
+    }
+    debug_assert_eq!(live.generation(), 0, "a worker starts at generation 0");
+    ignored
+}
+
+/// The `sync_catalogs` handler: applies a set the coordinator pushed. A
+/// stale set (not newer than the applied one) is acknowledged unchanged; a
+/// catalog that failed to build is reported back (the rest still apply).
+async fn apply_pushed_catalogs(
+    live: &catalogs::LiveCatalogs,
+    set: arneb_rpc::CatalogSet,
+) -> Result<(), String> {
+    let generation = set.generation;
+    let report = live.apply_remote(set).await;
+    if !report.applied {
+        tracing::debug!(
+            target: "arneb::cluster",
+            generation,
+            applied_generation = live.generation(),
+            "ignored a catalog push that is not newer"
+        );
+        return Ok(());
+    }
+    tracing::info!(
+        target: "arneb::cluster",
+        generation,
+        catalogs = live.specs().len(),
+        failed = report.failed.len(),
+        "catalogs pushed by the coordinator applied"
+    );
+    if report.failed.is_empty() {
+        return Ok(());
+    }
+    let failed: Vec<String> = report
+        .failed
+        .iter()
+        .map(|(name, e)| format!("{name}: {e}"))
+        .collect();
+    Err(format!(
+        "applied generation {generation}, but some catalogs failed to build: {}",
+        failed.join("; ")
+    ))
 }
 
 /// Loads the external catalogs: from the state store when one is open
@@ -1705,6 +1809,63 @@ mod tests {
         let live = empty_live();
         load_catalogs(None, &live, &[], false).await.unwrap();
         assert_eq!(live.generation(), 1);
+    }
+
+    /// runtime-config D8: workers ignore their own `[[catalogs]]`; they
+    /// start empty at generation 0 and take the coordinator's set.
+    #[tokio::test]
+    async fn worker_ignores_config_catalogs() {
+        let spec: config::CatalogConfig = serde_json::from_value(serde_json::json!({
+            "name": "lake", "type": "hive", "metastore_uri": "127.0.0.1:1"
+        }))
+        .unwrap();
+        let live = empty_live();
+        let ignored = start_worker_catalogs(&live, std::slice::from_ref(&spec));
+        assert_eq!(ignored, vec!["lake".to_string()]);
+        assert!(live.specs().is_empty());
+        assert_eq!(live.generation(), 0);
+        assert!(start_worker_catalogs(&live, &[]).is_empty());
+    }
+
+    /// runtime-config D8, Review Focus 4: a worker whose applied generation
+    /// (0) differs from the coordinator's (3) pulls once and records 3; a
+    /// second heartbeat naming 3 does not pull.
+    #[tokio::test]
+    async fn heartbeat_generation_mismatch_pulls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let f = fetches.clone();
+        let mut state = arneb_rpc::FlightState::with_heartbeat_callback(Arc::new(|_| {
+            Ok(arneb_rpc::HeartbeatReply {
+                catalog_generation: Some(3),
+            })
+        }));
+        state.set_catalog_source(Arc::new(move || {
+            f.fetch_add(1, Ordering::SeqCst);
+            arneb_rpc::CatalogSet {
+                generation: 3,
+                catalogs: vec![],
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(arneb_rpc::__serve_flight_for_test(listener, state));
+
+        let target = HeartbeatTarget {
+            coordinator_address: addr.clone(),
+            message: arneb_rpc::HeartbeatMessage::new("w1".into(), "http://localhost:1".into(), 8),
+        };
+        let live = empty_live();
+        let puller = catalogs::CatalogPuller::from_coordinator(addr, live.clone());
+        for _ in 0..2 {
+            let reply = target
+                .send(arneb_rpc::WorkerState::Active)
+                .await
+                .expect("heartbeat reply");
+            puller.after_heartbeat(&reply).await;
+        }
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(live.generation(), 3);
     }
 
     /// Which `tracing` target an [`enabled`] probe checks.

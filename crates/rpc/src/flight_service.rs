@@ -16,8 +16,9 @@ use futures::Stream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::catalog_sync::{CatalogSet, CatalogSourceCallback, CatalogSyncCallback};
 use crate::dynamic_filter::{NotifyDynamicFilterRequest, ReportDynamicFilterRequest};
-use crate::heartbeat::HeartbeatMessage;
+use crate::heartbeat::{HeartbeatMessage, HeartbeatReply};
 use crate::output_buffer::{BroadcastOutputBuffer, OutputBuffer};
 use crate::task_descriptor::TaskDescriptor;
 
@@ -40,10 +41,12 @@ pub enum TaskStatusResponse {
 /// the task ID is unknown (never submitted or already cleaned up).
 pub type TaskStatusCallback = Arc<dyn Fn(&str) -> Option<TaskStatusResponse> + Send + Sync>;
 
-/// Callback invoked when a heartbeat is received. An `Err` refuses the
-/// worker (e.g. a version mismatch) and is returned to it as
-/// `FailedPrecondition` with that message.
-pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatMessage) -> Result<(), String> + Send + Sync>;
+/// Callback invoked when a heartbeat is received. `Ok` is the reply sent
+/// back to the worker; an `Err` refuses the worker (e.g. a version
+/// mismatch) and is returned to it as `FailedPrecondition` with that
+/// message.
+pub type HeartbeatCallback =
+    Arc<dyn Fn(HeartbeatMessage) -> Result<HeartbeatReply, String> + Send + Sync>;
 
 /// Callback invoked when a task submission is received.
 pub type TaskCallback = Arc<dyn Fn(TaskDescriptor) + Send + Sync>;
@@ -104,6 +107,8 @@ pub struct FlightState {
     df_notify_callback: Option<DfNotifyCallback>,
     cancel_query_callback: Option<CancelQueryCallback>,
     release_query_callback: Option<ReleaseQueryCallback>,
+    catalog_sync_callback: Option<CatalogSyncCallback>,
+    catalog_source: Option<CatalogSourceCallback>,
 }
 
 impl Default for FlightState {
@@ -117,6 +122,8 @@ impl Default for FlightState {
             df_notify_callback: None,
             cancel_query_callback: None,
             release_query_callback: None,
+            catalog_sync_callback: None,
+            catalog_source: None,
         }
     }
 }
@@ -168,6 +175,25 @@ impl FlightState {
 
     pub fn set_df_notify_callback(&mut self, callback: DfNotifyCallback) {
         self.df_notify_callback = Some(callback);
+    }
+
+    /// Install the `sync_catalogs` handler (workers): applies a catalog set
+    /// the coordinator pushes.
+    pub fn set_catalog_sync_callback(
+        &mut self,
+        callback: Arc<
+            dyn Fn(CatalogSet) -> futures::future::BoxFuture<'static, Result<(), String>>
+                + Send
+                + Sync,
+        >,
+    ) {
+        self.catalog_sync_callback = Some(callback);
+    }
+
+    /// Install the `get_catalogs` source (coordinator): the live catalog set
+    /// a worker pulls.
+    pub fn set_catalog_source(&mut self, source: Arc<dyn Fn() -> CatalogSet + Send + Sync>) {
+        self.catalog_source = Some(source);
     }
 
     /// Register a partitioned output buffer for a task. A2.1.2 renamed
@@ -446,11 +472,14 @@ impl FlightService for TrinoFlightService {
                     "received heartbeat"
                 );
 
-                if let Some(ref callback) = self.state.heartbeat_callback {
-                    callback(msg).map_err(Status::failed_precondition)?;
-                }
+                let reply = match self.state.heartbeat_callback {
+                    Some(ref callback) => callback(msg).map_err(Status::failed_precondition)?,
+                    None => HeartbeatReply::default(),
+                };
 
-                let result = arrow_flight::Result { body: "ok".into() };
+                let result = arrow_flight::Result {
+                    body: reply.encode().into(),
+                };
                 let stream = futures::stream::once(async { Ok(result) });
                 Ok(Response::new(Box::pin(stream)))
             }
@@ -537,6 +566,39 @@ impl FlightService for TrinoFlightService {
 
                 let result = arrow_flight::Result {
                     body: "df_notify_accepted".into(),
+                };
+                let stream = futures::stream::once(async { Ok(result) });
+                Ok(Response::new(Box::pin(stream)))
+            }
+            "sync_catalogs" => {
+                let set = CatalogSet::decode(&action.body)
+                    .map_err(|e| Status::invalid_argument(format!("bad catalog set: {e}")))?;
+                let Some(ref callback) = self.state.catalog_sync_callback else {
+                    return Err(Status::unavailable(
+                        "this node takes no catalog sync (not a worker)",
+                    ));
+                };
+                // Never log the set: its specs carry raw secrets.
+                tracing::debug!(
+                    generation = set.generation,
+                    catalogs = set.catalogs.len(),
+                    "received catalog sync"
+                );
+                callback(set).await.map_err(Status::internal)?;
+                let result = arrow_flight::Result {
+                    body: "catalogs_synced".into(),
+                };
+                let stream = futures::stream::once(async { Ok(result) });
+                Ok(Response::new(Box::pin(stream)))
+            }
+            "get_catalogs" => {
+                let Some(ref source) = self.state.catalog_source else {
+                    return Err(Status::unavailable(
+                        "this node serves no catalogs (not a coordinator)",
+                    ));
+                };
+                let result = arrow_flight::Result {
+                    body: source().encode().into(),
                 };
                 let stream = futures::stream::once(async { Ok(result) });
                 Ok(Response::new(Box::pin(stream)))

@@ -10,7 +10,10 @@ use crate::dynamic_filter::{NotifyDynamicFilterRequest, ReportDynamicFilterReque
 use crate::security::{cluster_security, ClusterSecurity, FlightClient};
 use crate::task_descriptor::TaskDescriptor;
 
-async fn connect(address: &str, security: &ClusterSecurity) -> Result<FlightClient, String> {
+pub(crate) async fn connect(
+    address: &str,
+    security: &ClusterSecurity,
+) -> Result<FlightClient, String> {
     let client = crate::security::connect(address, security).await?;
     // A Bloom dynamic-filter Domain serialises to ~20 MB (fixed-size
     // 2^26-bit filter), which blows past tonic's 4 MB default message cap
@@ -21,7 +24,7 @@ async fn connect(address: &str, security: &ClusterSecurity) -> Result<FlightClie
         .max_encoding_message_size(crate::MAX_FLIGHT_MESSAGE_BYTES))
 }
 
-async fn drain_ack(
+pub(crate) async fn drain_ack(
     mut stream: tonic::Streaming<arrow_flight::Result>,
     label: &str,
 ) -> Result<(), String> {

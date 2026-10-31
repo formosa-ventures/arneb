@@ -214,6 +214,11 @@ pub struct TaskManager {
     /// task buffer key, so `cancel_query` can stop a query on this node
     /// (admission-control D4). Entries are removed by the task's cleanup.
     query_tasks: Arc<Mutex<QueryTasks>>,
+    /// runtime-config D8: pulls the coordinator's catalogs when a task
+    /// names a catalog with no connector here, plus this worker's id for
+    /// the error when the pull does not bring it. `None` keeps the old
+    /// behaviour (the scan is skipped and planning reports it).
+    catalog_puller: Option<(crate::catalogs::CatalogPuller, String)>,
 }
 
 impl TaskManager {
@@ -270,7 +275,36 @@ impl TaskManager {
             query_memory_limit: None,
             query_pools: Arc::new(Mutex::new(HashMap::new())),
             query_tasks: Arc::new(Mutex::new(QueryTasks::default())),
+            catalog_puller: None,
         }
+    }
+
+    /// Pull the coordinator's catalogs once per task when a scan names a
+    /// catalog this worker has no connector for (runtime-config D8), and
+    /// fail with `catalog '<name>' is not registered on worker <worker_id>`
+    /// when the pull does not bring it.
+    pub fn with_catalog_puller(
+        mut self,
+        puller: crate::catalogs::CatalogPuller,
+        worker_id: String,
+    ) -> Self {
+        self.catalog_puller = Some((puller, worker_id));
+        self
+    }
+
+    /// Register a data source for every scan in a task's plan.
+    async fn register_data_sources(
+        &self,
+        plan: &LogicalPlan,
+        ctx: &mut arneb_execution::ExecutionContext,
+    ) -> Result<(), String> {
+        let mut sources = TaskSources {
+            catalog_manager: &self.catalog_manager,
+            connector_registry: &self.connector_registry,
+            puller: self.catalog_puller.as_ref(),
+            pulled: false,
+        };
+        sources.register(plan, ctx).await
     }
 
     /// Remember `handle` as part of task `task_key` of `query_id`, so
@@ -745,13 +779,7 @@ impl TaskManager {
             // never published in distributed mode, leaving every DF dormant.
             // Gated ARNEB_DISTRIBUTED_DF (default off) until validated.
             .with_dynamic_filtering_enabled(distributed_df_enabled());
-        register_task_data_sources(
-            &plan,
-            &self.catalog_manager,
-            &self.connector_registry,
-            &mut exec_ctx,
-        )
-        .await?;
+        self.register_data_sources(&plan, &mut exec_ctx).await?;
 
         // W2 (2026-05-20): if the coord told us about upstream stages, hand
         // them to the physical planner so it can wire `ExchangeNode`
@@ -1184,68 +1212,108 @@ impl TaskManager {
     }
 }
 
-/// Register data sources for a task's plan using actual connectors.
-#[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
-#[async_recursion::async_recursion]
-async fn register_task_data_sources(
-    plan: &LogicalPlan,
-    catalog_manager: &CatalogManager,
-    connector_registry: &ConnectorRegistry,
-    ctx: &mut arneb_execution::ExecutionContext,
-) -> Result<(), String> {
-    match plan {
-        LogicalPlan::TableScan {
-            table,
-            schema,
-            properties,
-            ..
-        } => {
-            let key = table.to_string();
-            let connector_name = table
-                .catalog
-                .as_deref()
-                .unwrap_or(catalog_manager.default_catalog());
+/// What a task's scans resolve connectors through.
+struct TaskSources<'a> {
+    catalog_manager: &'a CatalogManager,
+    connector_registry: &'a ConnectorRegistry,
+    puller: Option<&'a (crate::catalogs::CatalogPuller, String)>,
+    /// Whether this task already pulled the coordinator's catalogs.
+    pulled: bool,
+}
 
-            if let Some(factory) = connector_registry.get(connector_name) {
-                // Surface connector errors to the coordinator instead of
-                // degrading them to a generic "data source not found".
-                let ds = factory
-                    .create_data_source(table, schema, properties)
-                    .await
-                    .map_err(|e| format!("failed to create data source for '{key}': {e}"))?;
-                ctx.register_data_source(key, ds);
+impl TaskSources<'_> {
+    /// The connector for `catalog`, pulling the coordinator's catalogs once
+    /// per task on a miss when a puller is set.
+    async fn connector(
+        &mut self,
+        catalog: &str,
+    ) -> Result<Option<Arc<dyn arneb_connectors::ConnectorFactory>>, String> {
+        if let Some(factory) = self.connector_registry.get(catalog) {
+            return Ok(Some(factory));
+        }
+        let Some((puller, worker_id)) = self.puller else {
+            return Ok(None);
+        };
+        if !self.pulled {
+            self.pulled = true;
+            tracing::info!(
+                target: "arneb::cluster",
+                catalog = %catalog,
+                "task names a catalog not registered here, pulling catalogs"
+            );
+            if let Err(e) = puller.pull().await {
+                tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
             }
-            Ok(())
-        }
-        LogicalPlan::Filter { input, .. }
-        | LogicalPlan::Projection { input, .. }
-        | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Limit { input, .. }
-        | LogicalPlan::Aggregate { input, .. }
-        // A1 map-side fuse puts a PartialAggregate directly over the scan in
-        // a SOURCE fragment, so we must recurse through it (and its Final
-        // counterpart) to reach the TableScan and register its data source.
-        | LogicalPlan::PartialAggregate { input, .. }
-        | LogicalPlan::FinalAggregate { input, .. }
-        | LogicalPlan::Distinct { input, .. }
-        | LogicalPlan::Explain { input, .. } => {
-            register_task_data_sources(input, catalog_manager, connector_registry, ctx).await
-        }
-        LogicalPlan::Join { left, right, .. }
-        | LogicalPlan::SemiJoin { left, right, .. }
-        | LogicalPlan::AntiJoin { left, right, .. }
-        | LogicalPlan::Intersect { left, right, .. }
-        | LogicalPlan::Except { left, right, .. } => {
-            register_task_data_sources(left, catalog_manager, connector_registry, ctx).await?;
-            register_task_data_sources(right, catalog_manager, connector_registry, ctx).await
-        }
-        LogicalPlan::UnionAll { inputs } => {
-            for input in inputs {
-                register_task_data_sources(input, catalog_manager, connector_registry, ctx).await?;
+            if let Some(factory) = self.connector_registry.get(catalog) {
+                return Ok(Some(factory));
             }
-            Ok(())
         }
-        _ => Ok(()),
+        Err(format!(
+            "catalog '{catalog}' is not registered on worker {worker_id}"
+        ))
+    }
+
+    /// Register data sources for a task's plan using actual connectors.
+    #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
+    #[async_recursion::async_recursion]
+    async fn register(
+        &mut self,
+        plan: &LogicalPlan,
+        ctx: &mut arneb_execution::ExecutionContext,
+    ) -> Result<(), String> {
+        match plan {
+            LogicalPlan::TableScan {
+                table,
+                schema,
+                properties,
+                ..
+            } => {
+                let key = table.to_string();
+                let connector_name = table
+                    .catalog
+                    .as_deref()
+                    .unwrap_or(self.catalog_manager.default_catalog())
+                    .to_owned();
+
+                if let Some(factory) = self.connector(&connector_name).await? {
+                    // Surface connector errors to the coordinator instead of
+                    // degrading them to a generic "data source not found".
+                    let ds = factory
+                        .create_data_source(table, schema, properties)
+                        .await
+                        .map_err(|e| format!("failed to create data source for '{key}': {e}"))?;
+                    ctx.register_data_source(key, ds);
+                }
+                Ok(())
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Projection { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            // A1 map-side fuse puts a PartialAggregate directly over the scan in
+            // a SOURCE fragment, so we must recurse through it (and its Final
+            // counterpart) to reach the TableScan and register its data source.
+            | LogicalPlan::PartialAggregate { input, .. }
+            | LogicalPlan::FinalAggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::Explain { input, .. } => self.register(input, ctx).await,
+            LogicalPlan::Join { left, right, .. }
+            | LogicalPlan::SemiJoin { left, right, .. }
+            | LogicalPlan::AntiJoin { left, right, .. }
+            | LogicalPlan::Intersect { left, right, .. }
+            | LogicalPlan::Except { left, right, .. } => {
+                self.register(left, ctx).await?;
+                self.register(right, ctx).await
+            }
+            LogicalPlan::UnionAll { inputs } => {
+                for input in inputs {
+                    self.register(input, ctx).await?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1318,6 +1386,96 @@ mod tests {
             node,
         )
         .with_query_memory_limit(limit)
+    }
+
+    /// A scan of `cat1.default.users`.
+    fn cat1_scan() -> LogicalPlan {
+        LogicalPlan::TableScan {
+            table: arneb_common::types::TableReference {
+                catalog: Some("cat1".into()),
+                schema: Some("default".into()),
+                table: "users".into(),
+            },
+            schema: vec![],
+            alias: None,
+            properties: Default::default(),
+            dynamic_filters_consumed: vec![],
+        }
+    }
+
+    /// runtime-config D8: a task naming a catalog this worker does not have
+    /// yet pulls the coordinator's set once and retries; when the pull does
+    /// not bring it, the error names the catalog and the worker.
+    #[tokio::test]
+    async fn task_with_unknown_catalog_pulls_once() {
+        use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
+        use arneb_execution::memory_pool::UnboundedMemoryPool;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let registry = Arc::new(ConnectorRegistry::new());
+        let catalogs = crate::catalogs::LiveCatalogs::new(
+            Arc::new(CatalogManager::new("memory", "default")),
+            registry.clone(),
+            crate::config::StorageConfig::default(),
+        );
+        let manager = |puller: crate::catalogs::CatalogPuller| {
+            TaskManager::new(
+                FlightState::new(),
+                Arc::new(CatalogManager::new("memory", "default")),
+                registry.clone(),
+                Arc::new(UnboundedMemoryPool::new()),
+            )
+            .with_catalog_puller(puller, "w1".into())
+        };
+
+        // The pull installs `cat1`: the scan registers after one pull.
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let (r, n) = (registry.clone(), pulls.clone());
+        let puller = crate::catalogs::CatalogPuller::new(catalogs.clone(), move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            let mem = Arc::new(MemoryCatalog::new());
+            let schema = Arc::new(MemorySchema::new());
+            schema.register_table(
+                "users",
+                Arc::new(arneb_connectors::memory::MemoryTable::new(vec![], vec![])),
+            );
+            mem.register_schema("default", schema);
+            r.register(
+                "cat1",
+                Arc::new(MemoryConnectorFactory::new(mem, "default")),
+            );
+            Box::pin(async { Ok(()) })
+        });
+        let tm = manager(puller);
+        let mut ctx = arneb_execution::ExecutionContext::new();
+        tm.register_data_sources(&cat1_scan(), &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(pulls.load(Ordering::SeqCst), 1);
+        // Now registered: no further pull.
+        tm.register_data_sources(&cat1_scan(), &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(pulls.load(Ordering::SeqCst), 1);
+
+        // A pull that brings nothing: one pull per task, then the error.
+        registry.deregister("cat1");
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let n = pulls.clone();
+        let puller = crate::catalogs::CatalogPuller::new(catalogs.clone(), move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        });
+        let tm = manager(puller);
+        let two_scans = LogicalPlan::UnionAll {
+            inputs: vec![cat1_scan(), cat1_scan()],
+        };
+        let err = tm
+            .register_data_sources(&two_scans, &mut arneb_execution::ExecutionContext::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err, "catalog 'cat1' is not registered on worker w1");
+        assert_eq!(pulls.load(Ordering::SeqCst), 1);
     }
 
     /// admission-control D1: each query gets its own pool on the node; one

@@ -136,6 +136,54 @@ impl LiveCatalogs {
         self.read_specs().values().cloned().collect()
     }
 
+    /// The generation and the installed specs, for a worker to apply. The
+    /// generation is read first: [`apply_set`](Self::apply_set) advances it
+    /// only after installing, so the specs are never older than it says.
+    pub fn snapshot(&self) -> arneb_rpc::CatalogSet {
+        let generation = self.generation();
+        let catalogs = self
+            .specs()
+            .iter()
+            .filter_map(|spec| serde_json::to_value(spec).ok())
+            .collect();
+        arneb_rpc::CatalogSet {
+            generation,
+            catalogs,
+        }
+    }
+
+    /// Applies a set from the coordinator (a push or a pull) with
+    /// [`apply_set`](Self::apply_set). A spec that does not decode is
+    /// skipped with a WARN and listed as failed.
+    pub async fn apply_remote(&self, set: arneb_rpc::CatalogSet) -> ApplyReport {
+        let mut specs = Vec::with_capacity(set.catalogs.len());
+        let mut undecodable = Vec::new();
+        for value in set.catalogs {
+            let name = value
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("<unnamed>")
+                .to_owned();
+            match serde_json::from_value::<CatalogConfig>(value) {
+                Ok(spec) => specs.push(spec),
+                Err(e) => {
+                    // Only the error's category: its text may quote a value.
+                    tracing::warn!(
+                        catalog = %name,
+                        error = ?e.classify(),
+                        "catalog definition from the coordinator is invalid, skipping"
+                    );
+                    undecodable.push((name, "invalid catalog definition".to_owned()));
+                }
+            }
+        }
+        let mut report = self.apply_set(set.generation, specs).await;
+        if report.applied {
+            report.failed.extend(undecodable);
+        }
+        report
+    }
+
     fn read_specs(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, CatalogConfig>> {
         self.specs.read().unwrap_or_else(|p| p.into_inner())
     }
@@ -269,6 +317,120 @@ impl LiveCatalogs {
             applied: true,
             failed,
         }
+    }
+}
+
+/// How a worker pulls its catalogs from the coordinator (runtime-config
+/// D8). Cloneable; the heartbeat loop and the task manager share one, and
+/// concurrent [`pull`](Self::pull)s share a single fetch.
+#[derive(Clone)]
+pub struct CatalogPuller {
+    inner: Arc<PullerInner>,
+}
+
+type PullFuture = futures::future::Shared<futures::future::BoxFuture<'static, Result<(), String>>>;
+
+struct PullerInner {
+    live: Arc<LiveCatalogs>,
+    pull: Box<dyn Fn() -> futures::future::BoxFuture<'static, Result<(), String>> + Send + Sync>,
+    in_flight: std::sync::Mutex<Option<PullFuture>>,
+}
+
+impl CatalogPuller {
+    /// A puller whose fetch-and-apply is `pull`; `live` is the set whose
+    /// generation a heartbeat reply is compared with.
+    pub fn new(
+        live: Arc<LiveCatalogs>,
+        pull: impl Fn() -> futures::future::BoxFuture<'static, Result<(), String>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            inner: Arc::new(PullerInner {
+                live,
+                pull: Box::new(pull),
+                in_flight: std::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Pulls with `get_catalogs` from `coordinator` (under the installed
+    /// cluster security) and applies the set to `live`.
+    pub fn from_coordinator(coordinator: String, live: Arc<LiveCatalogs>) -> Self {
+        let target = live.clone();
+        Self::new(live, move || {
+            let (coordinator, live) = (coordinator.clone(), target.clone());
+            Box::pin(async move {
+                let set =
+                    arneb_rpc::fetch_catalogs(&coordinator, arneb_rpc::cluster_security()).await?;
+                let generation = set.generation;
+                let report = live.apply_remote(set).await;
+                if report.applied {
+                    tracing::info!(
+                        target: "arneb::cluster",
+                        generation,
+                        catalogs = live.specs().len(),
+                        failed = report.failed.len(),
+                        "catalogs pulled from the coordinator"
+                    );
+                }
+                Ok(())
+            })
+        })
+    }
+
+    /// Fetches the coordinator's set and applies it. A pull already running
+    /// is joined instead of starting another.
+    pub async fn pull(&self) -> Result<(), String> {
+        use futures::FutureExt;
+        let fut = {
+            let mut slot = self
+                .inner
+                .in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match slot.as_ref() {
+                Some(f) => f.clone(),
+                None => {
+                    let f = (self.inner.pull)().shared();
+                    *slot = Some(f.clone());
+                    f
+                }
+            }
+        };
+        let result = fut.clone().await;
+        let mut slot = self
+            .inner
+            .in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_some_and(|f| f.ptr_eq(&fut)) {
+            *slot = None;
+        }
+        result
+    }
+
+    /// After a heartbeat: pulls when the reply names another catalog
+    /// generation than the applied one. True when it pulled.
+    pub async fn after_heartbeat(&self, reply: &arneb_rpc::HeartbeatReply) -> bool {
+        let Some(generation) = reply.catalog_generation else {
+            return false;
+        };
+        let applied = self.inner.live.generation();
+        if generation == applied {
+            return false;
+        }
+        tracing::debug!(
+            target: "arneb::cluster",
+            coordinator_generation = generation,
+            applied_generation = applied,
+            "catalog generation differs from the coordinator's, pulling"
+        );
+        if let Err(e) = self.pull().await {
+            tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
+        }
+        true
     }
 }
 
@@ -531,6 +693,54 @@ mod tests {
             StorageConfig::default(),
         );
         (live, manager, connectors)
+    }
+
+    /// Concurrent pulls share one fetch; a later pull fetches again.
+    #[tokio::test]
+    async fn concurrent_pulls_share_one_fetch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (live, _, _) = live();
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let (n, gate) = (fetches.clone(), Arc::new(tokio::sync::Notify::new()));
+        let g = gate.clone();
+        let puller = CatalogPuller::new(live, move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            let g = g.clone();
+            Box::pin(async move {
+                g.notified().await;
+                Ok(())
+            })
+        });
+        let (a, b) = (puller.clone(), puller.clone());
+        let ta = tokio::spawn(async move { a.pull().await });
+        let tb = tokio::spawn(async move { b.pull().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.notify_one();
+        ta.await.unwrap().unwrap();
+        tb.await.unwrap().unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        gate.notify_one();
+        puller.pull().await.unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    /// A set from the coordinator: an undecodable spec is skipped and
+    /// reported, the generation advances, and a stale set changes nothing.
+    #[tokio::test]
+    async fn apply_remote_skips_undecodable_specs() {
+        let (live, _, _) = live();
+        let set = arneb_rpc::CatalogSet {
+            generation: 4,
+            catalogs: vec![serde_json::json!({"name": "bad", "type": 7})],
+        };
+        let report = live.apply_remote(set.clone()).await;
+        assert!(report.applied);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, "bad");
+        assert_eq!(live.generation(), 4);
+        assert!(!live.apply_remote(set).await.applied, "not newer");
+        let snap = live.snapshot();
+        assert_eq!((snap.generation, snap.catalogs.len()), (4, 0));
     }
 
     fn fake_built() -> BuiltCatalog {

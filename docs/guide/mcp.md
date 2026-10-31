@@ -49,9 +49,9 @@ poll, fetch, cancel.
 | `list_catalogs` | `prefix?`, `limit?` | names, `total`, `truncated` | `GET /catalogs` |
 | `list_schemas` | `catalog`, `prefix?`, `limit?` | same | `GET /catalogs/{c}/schemas` |
 | `list_tables` | `catalog`, `schema`, `prefix?`, `limit?` | same | `GET …/tables` |
-| `describe_table` | `catalog`, `schema`, `table` | columns, row count, size | `GET …/tables/{t}` |
+| `describe_table` | `catalog`, `schema`, `table`, `limit?` | columns, `truncated`, row count, size | `GET …/tables/{t}` |
 | `sample_table` | `catalog`, `schema`, `table`, `rows?` | a finished statement with a first page | `GET …/sample` |
-| `explain_query` | `sql`, `catalog?`, `schema?` | plan text and scan estimates | `POST /explain` |
+| `explain_query` | `sql`, `catalog?`, `schema?` | plan text, `plan_truncated`, scan estimates | `POST /explain` |
 | `submit_query` | `sql`, `catalog?`, `schema?`, `max_rows?`, `wait_ms?` | statement status | `POST /statements` |
 | `get_query_status` | `id`, `wait_ms?` | statement status | `GET /statements/{id}` |
 | `fetch_results` | `id`, `cursor?`, `max_bytes?` | a page of rows and `next_cursor` | `GET /statements/{id}/results` |
@@ -83,7 +83,10 @@ read-only. `cancel_query` and `revoke_token` are destructive and idempotent.
    finished with its first page.
 5. If it is `queued` or `running`, `get_query_status` with `wait_ms` until it
    is `finished`, `failed` or `cancelled`.
-6. `fetch_results` with the previous page's `next_cursor`, until it is null.
+6. A finished status carries `first_page`. Start `fetch_results` from
+   `first_page.next_cursor` and repeat with each page's `next_cursor` until
+   it is null (a null `first_page.next_cursor` means you already have every
+   row).
 7. `cancel_query` for a statement that is no longer needed.
 
 A statement that fails after it was submitted, including a SQL syntax error,
@@ -99,6 +102,8 @@ never clamped. The ceilings come from `[agent_api]`.
 | Argument | Default | Ceiling | Source |
 |---|---|---|---|
 | `limit` of `list_catalogs`, `list_schemas`, `list_tables` | 1000 | 10000 | `[agent_api] default_max_rows`, `max_rows` |
+| `limit` of `describe_table` (columns) | 1000 | 10000 | `[agent_api] default_max_rows`, `max_rows` |
+| plan text of `explain_query` | 262144 bytes, cut and flagged `plan_truncated` | none | `[agent_api] default_page_bytes` |
 | `rows` of `sample_table` | 10 | 100 | fixed |
 | `max_rows` of `submit_query` | 1000 | 10000 | `[agent_api] default_max_rows`, `max_rows` |
 | `wait_ms` | 0 | 10000 | ceiling is `[agent_api] max_wait_ms` |
@@ -116,9 +121,14 @@ Differences from the HTTP routes:
   rather than the 256 KiB of `/api/v2`. It applies to `fetch_results` when
   `max_bytes` is omitted, and to the inline first page of `submit_query`,
   `get_query_status` and `sample_table`. Ask for more with `max_bytes`, up to
-  the `[agent_api] max_page_bytes` ceiling.
+  the `[agent_api] max_page_bytes` ceiling. The budget counts the bytes of
+  the rows only. The status fields, the `columns` list and the text copy of
+  the JSON that the MCP library adds to every result come on top, so a full
+  page roughly doubles in what the agent receives.
 - **Bounded history.** `list_queries` returns the newest queries first, at
-  most `limit`, and sets `truncated` when more matched. `state` is one of
+  most `limit`, and sets `truncated` when more matched. Each query's `state`
+  is lowercase (`queued`, `running`, `finished`, ...), unlike
+  `/api/v2/queries`, which keeps `Finished`. The `state` filter is one of
   `queued`, `running`, `finished`, `failed` or `cancelled` (any case); another
   value is `invalid_argument`. `user` keeps one owner's queries and
   `min_elapsed_ms` keeps only slow ones. The `sql` of a query in this tool and
@@ -160,6 +170,7 @@ text message that names the field.
 [mcp]
 enabled            = true
 allowed_hosts      = ["db.internal"]   # omit for the default
+allowed_origins    = ["https://app.example:443"]   # omit to refuse any Origin
 default_page_bytes = 32768
 ```
 
@@ -178,6 +189,30 @@ DNS-rebinding attacks from a browser page.
   `127.0.0.1`, `::1`). A remote client then needs `allowed_hosts` set.
 - Entries are `host` or `host:port`. A `*` anywhere in the list means any
   host. An empty list is a startup error.
+
+### Origin check
+
+`/mcp` also checks the browser `Origin` header, as the MCP transport
+requires. A request without `Origin` (a CLI or desktop MCP client) always
+passes. By default every request that carries an `Origin` is refused with
+`403`, so a web page cannot drive `/mcp` from a visitor's browser. To allow a
+browser-based client, list its origins in `allowed_origins`: each entry has a
+scheme, as in `https://app.example:443`, `http://localhost:*` (any port) or
+`null`. An entry without a port currently matches any port; give the port
+explicitly.
+
+## Security
+
+- **Tool results are kept out of debug logs.** The MCP library logs every
+  tool result at `debug`, and a result can hold rows or a new API token from
+  `create_token`. Arneb therefore caps the `rmcp` log target at `info`, even
+  under `RUST_LOG=debug`. Only a `RUST_LOG` that names `rmcp` itself (for
+  example `RUST_LOG=info,rmcp=debug`) lifts the cap; do that only on a
+  machine whose logs are as private as the tokens.
+- **Host and Origin checks** stop DNS rebinding and cross-site calls; see
+  [Host allow-list](#host-allow-list) and [Origin check](#origin-check).
+- **Plain HTTP.** Put TLS in front of the Web port for remote clients (see
+  [Connect](#connect)).
 
 ## Stateless behavior
 

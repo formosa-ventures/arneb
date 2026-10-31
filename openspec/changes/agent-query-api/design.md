@@ -93,6 +93,7 @@ The existing `forbidden`, `overloaded`, `invalid_argument`, `not_found` and `int
 - [Explain and run could disagree on catalog scoping] -> both call one `Engine::statement_scope` helper.
 - [Name matching for describe and sample is exact-case, like `SHOW COLUMNS`] -> documented; listings' `prefix` is case-insensitive.
 - [Statements live in coordinator memory] -> lost on restart; the agent resubmits.
+- [Row width is not bounded] -> known gap: a status lists every result column, and a page holds at least one row even when that row exceeds `max_bytes`; describe (`limit`) and explain (plan cut at `default_page_bytes`) are bounded.
 
 ## Migration Plan
 

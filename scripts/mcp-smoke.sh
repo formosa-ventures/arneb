@@ -16,6 +16,9 @@
 #   ARNEB_LONG_SQL   the long statement to cancel (default: 3-way self-join
 #                    of lineitem)
 #   ARNEB_SMOKE_TIMEOUT_SECS  per-statement timeout (default 900)
+#
+# Step 10 creates an API token for the first user, uses it and revokes it;
+# the token itself is never printed.
 
 set -euo pipefail
 
@@ -56,12 +59,15 @@ check() { # $1 = jq filter that must be true on $LAST, $2 = message
     printf '%s' "$LAST" | jq -e "$1" >/dev/null 2>&1 || fail "$2"
 }
 
-# post <AUTH1|AUTH2|NONE> <json-body>: raw response body to $LAST, HTTP status to $CODE.
+NEW_TOKEN=""
+# post <AUTH1|AUTH2|NEW|NONE> <json-body>: raw response body to $LAST, HTTP
+# status to $CODE. NEW is the token minted in step 10 (never printed).
 post() {
     local out auth=()
     case "$1" in
         AUTH1) auth=("${AUTH1[@]}") ;;
         AUTH2) auth=("${AUTH2[@]}") ;;
+        NEW) auth=(-H "Authorization: Bearer $NEW_TOKEN") ;;
     esac
     out=$(curl -sS -w '\n%{http_code}' ${auth[@]+"${auth[@]}"} -X POST "$MCP" \
         -H 'Content-Type: application/json' \
@@ -72,7 +78,7 @@ post() {
     LAST="${out%$'\n'*}"
 }
 
-# rpc <AUTH1|AUTH2> <method> <params-json>: JSON-RPC call, $LAST = response.
+# rpc <AUTH1|AUTH2|NEW> <method> <params-json>: JSON-RPC call, $LAST = response.
 rpc() {
     RID=$(( RID + 1 ))
     post "$1" "$(jq -nc --argjson id "$RID" --arg m "$2" --argjson p "$3" \
@@ -81,7 +87,7 @@ rpc() {
     check '.error == null' "JSON-RPC error"
 }
 
-# tool <AUTH1|AUTH2> <name> [args-json]: tools/call; $LAST = the full result.
+# tool <AUTH1|AUTH2|NEW> <name> [args-json]: tools/call; $LAST = the full result.
 # Use `sc` to reduce it to the structuredContent.
 tool() {
     local targs="${3:-}"
@@ -130,11 +136,19 @@ for t in whoami list_catalogs list_schemas list_tables describe_table sample_tab
     list_workers list_tokens create_token revoke_token; do
     check "any(.result.tools[]; .name == \"$t\")" "tool $t missing"
 done
+tool_ok AUTH1 whoami
+check '.user | type == "string" and length > 0' "whoami has no user"
+check '.auth == "password"' "whoami auth is not password"
+check '.via == "token" or .via == "basic"' "whoami via is not token or basic"
+USER1=$(printf '%s' "$LAST" | jq -r '.user')
+echo "  whoami: $(printf '%s' "$LAST" | jq -c '{user, via, role}')"
 pass
 
 STEP="2 no credentials"
 post NONE '{"jsonrpc":"2.0","id":99,"method":"tools/list","params":{}}'
 [ "$CODE" = 401 ] || fail "no credentials got HTTP $CODE, want 401"
+post NONE '{"jsonrpc":"2.0","id":98,"method":"tools/call","params":{"name":"whoami","arguments":{}}}'
+[ "$CODE" = 401 ] || fail "whoami without credentials got HTTP $CODE, want 401"
 LAST=""
 pass
 
@@ -241,4 +255,27 @@ pass
 STEP="9 ownership"
 tool_err AUTH2 get_query_status "$(jq -nc --arg id "$OWNED_ID" '{id:$id}')"
 check '.error.code == "not_found"' "code is not not_found"
+pass
+
+STEP="10 token flow"
+tool_ok AUTH1 create_token '{"name":"mcp-smoke","expires_in_days":1}'
+NEW_TOKEN=$(printf '%s' "$LAST" | jq -r '.token // empty')
+TOKEN_ID=$(printf '%s' "$LAST" | jq -r '.id // empty')
+# The secret must never reach the output, including a FAIL dump.
+LAST=$(printf '%s' "$LAST" | jq -c 'if has("token") then .token = "<redacted>" else . end')
+[ -n "$NEW_TOKEN" ] && [ -n "$TOKEN_ID" ] || fail "create_token returned no token or id"
+case "$NEW_TOKEN" in arneb_*) ;; *) fail "new token does not start with arneb_" ;; esac
+tool_ok AUTH1 list_tokens
+check "any(.tokens[]; .id == \"$TOKEN_ID\" and .name == \"mcp-smoke\")" "list_tokens lacks the new token"
+check 'all(.tokens[]; has("token") | not)' "list_tokens exposes a secret"
+tool_ok NEW whoami
+check ".user == \"$USER1\"" "whoami with the new token is not $USER1"
+check '.via == "token"' "whoami with the new token is not via token"
+tool_ok AUTH1 revoke_token "$(jq -nc --arg id "$TOKEN_ID" '{id:$id}')"
+check ".revoked == \"$TOKEN_ID\"" "revoke_token did not answer revoked"
+post NEW '{"jsonrpc":"2.0","id":97,"method":"tools/call","params":{"name":"whoami","arguments":{}}}'
+[ "$CODE" = 401 ] || fail "revoked token got HTTP $CODE, want 401"
+LAST=""
+NEW_TOKEN=""
+echo "  token id=$TOKEN_ID created, used, revoked"
 pass

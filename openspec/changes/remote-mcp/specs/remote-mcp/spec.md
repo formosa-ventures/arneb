@@ -38,7 +38,7 @@ With `[mcp] enabled = false`, `/mcp` and its subpaths SHALL NOT be served and SH
 - **THEN** the response is `404` and carries no JSON-RPC body
 
 ### Requirement: Host validation
-`/mcp` SHALL accept a request only when its `Host` header matches `[mcp] allowed_hosts` (`host` or `host:port`). A `*` anywhere in the list SHALL allow any host. When `allowed_hosts` is unset, any host SHALL be allowed under password auth and only `localhost`, `127.0.0.1` and `::1` under `type = "none"`. `allowed_hosts = []` SHALL stop startup, and an empty `ARNEB_MCP_ALLOWED_HOSTS` SHALL count as unset.
+`/mcp` SHALL accept a request only when its `Host` header matches `[mcp] allowed_hosts` (`host` or `host:port`). A `*` anywhere in the list SHALL allow any host. When `allowed_hosts` is unset, any host SHALL be allowed under password auth and only `localhost`, `127.0.0.1` and `::1` under `type = "none"`. `allowed_hosts = []` (or a list of only blank entries) SHALL stop startup, blank entries SHALL be dropped, and an empty `ARNEB_MCP_ALLOWED_HOSTS` SHALL count as unset.
 
 #### Scenario: Loopback default without auth
 - **WHEN** auth is `none`, `allowed_hosts` is unset, and a request has `Host: evil.example`
@@ -52,6 +52,28 @@ With `[mcp] enabled = false`, `/mcp` and its subpaths SHALL NOT be served and SH
 - **WHEN** `allowed_hosts = ["a.example", "*"]`
 - **THEN** any host is accepted
 
+### Requirement: Origin validation
+`/mcp` SHALL refuse, without running a tool, a request whose `Origin` header is not in `[mcp] allowed_origins` (`ARNEB_MCP_ALLOWED_ORIGINS`, comma-separated). When `allowed_origins` is unset, every request that carries an `Origin` SHALL be refused. A request without an `Origin` header SHALL pass. Each entry SHALL have a scheme (`scheme://host[:port]`, `:*` for any port) or be `null`; an entry without one, or an empty list, SHALL stop startup, and an empty `ARNEB_MCP_ALLOWED_ORIGINS` SHALL count as unset.
+
+#### Scenario: Default refuses a browser origin
+- **WHEN** `allowed_origins` is unset and a request has `Origin: https://evil.example`
+- **THEN** the tool does not run, and the same request without `Origin` is answered `200`
+
+#### Scenario: Explicit origin list
+- **WHEN** `allowed_origins = ["https://app.example:443"]`
+- **THEN** `Origin: https://app.example:443` is accepted and `Origin: https://evil.example` is refused
+
+### Requirement: Debug logging excludes tool results
+The server SHALL cap the `rmcp` log target at `info`, appended after the base `RUST_LOG` filter, unless `RUST_LOG` names an `rmcp` target itself, so that `RUST_LOG=debug` does not log tool results such as a new API token.
+
+#### Scenario: Global debug
+- **WHEN** `RUST_LOG=debug`
+- **THEN** the effective filter is `debug,rmcp=info` and rmcp debug events are disabled
+
+#### Scenario: Operator opts in
+- **WHEN** `RUST_LOG=info,rmcp=debug`
+- **THEN** the filter is used unchanged
+
 ### Requirement: Identity-scoped tools
 Every tool SHALL run as the request's authenticated identity and SHALL call the same function, with the same validation, as the matching `/api/v2` route, so visibility, access rules, admission and limits are those of the route. The server SHALL expose exactly these tools: `cancel_query`, `create_token`, `describe_table`, `explain_query`, `fetch_results`, `get_cluster`, `get_query`, `get_query_status`, `list_catalogs`, `list_queries`, `list_schemas`, `list_tables`, `list_tokens`, `list_workers`, `revoke_token`, `sample_table`, `submit_query` and `whoami`.
 
@@ -64,7 +86,7 @@ Every tool SHALL run as the request's authenticated identity and SHALL call the 
 - **THEN** the result is an error with code `not_found`
 
 ### Requirement: Discovery tools
-`list_catalogs`, `list_schemas` and `list_tables` SHALL return the H2 listing body for the objects the caller may see, `describe_table` the columns and statistics, `sample_table` a finished statement with a first page (default 10 rows, at most 100), and `explain_query` the plan and scan estimates without running the query.
+`list_catalogs`, `list_schemas` and `list_tables` SHALL return the H2 listing body for the objects the caller may see, `describe_table` the columns (at most `limit`, with `truncated`) and statistics, `sample_table` a finished statement with a first page (default 10 rows, at most 100), and `explain_query` the plan (cut at `[agent_api] default_page_bytes`, with `plan_truncated`) and scan estimates without running the query.
 
 #### Scenario: Explain does not execute
 - **WHEN** alice calls `explain_query` for a query over a table
@@ -97,11 +119,15 @@ Every tool result SHALL be bounded. A tool page SHALL default to `[mcp] default_
 - **THEN** the result is an error with code `invalid_argument`
 
 ### Requirement: Bounded query history
-`list_queries` SHALL return the queries the caller may view, newest first, at most `limit` (default 50), with `truncated` true when more matched. `limit` of 0 or above 500 SHALL be `invalid_argument`. `state` SHALL be one of `queued`, `running`, `finished`, `failed` or `cancelled` in any case, and another value SHALL be `invalid_argument`. `user` and `min_elapsed_ms` SHALL filter. The `sql` of each query in `list_queries` and `get_query` SHALL be cut at `max_cell_bytes` on a character boundary with `sql_truncated` true when cut.
+`list_queries` SHALL return the queries the caller may view, newest first, at most `limit` (default 50), with `truncated` true when more matched. `limit` of 0 or above 500 SHALL be `invalid_argument`. `state` SHALL be one of `queued`, `running`, `finished`, `failed` or `cancelled` in any case, and another value SHALL be `invalid_argument`. `user` and `min_elapsed_ms` SHALL filter. Each query's `state` SHALL be lowercase in `list_queries` and `get_query`; `/api/v2/queries` SHALL be unchanged. Queries created in the same millisecond SHALL be ordered by query id. The `sql` of each query in `list_queries` and `get_query` SHALL be cut at `max_cell_bytes` on a character boundary with `sql_truncated` true when cut.
 
 #### Scenario: Newest first and truncated
 - **WHEN** more queries exist than `limit` allows
 - **THEN** the newest `limit` are returned in descending creation order and `truncated` is true
+
+#### Scenario: Lowercase state
+- **WHEN** alice lists queries with `state: "FINISHED"`
+- **THEN** each returned query has `state: "finished"`
 
 #### Scenario: Slow-query view
 - **WHEN** `list_queries` is called with `min_elapsed_ms`
@@ -149,7 +175,7 @@ A failed tool call SHALL be a tool result with `isError: true` whose `structured
 - **THEN** the result has `isError` true and its text names `table`
 
 ### Requirement: Agent-facing copy
-The server SHALL send `instructions` of at most 1500 characters that name the workflow (discover, describe or sample, explain, submit, poll, fetch, cancel), the result caps and how to use an error's `hint` and `candidates`. Every tool description SHALL be 40 to 600 characters and SHALL name the follow-up tool where the workflow has one, and every input property SHALL have a description. Tools SHALL carry the annotations: `readOnlyHint` on `whoami`, `list_*`, `get_*`, `describe_table`, `sample_table`, `explain_query` and `fetch_results`; `destructiveHint` and `idempotentHint` on `cancel_query` and `revoke_token`; `openWorldHint` false on all.
+The server SHALL send `instructions` of at most 1500 characters that name the workflow (discover, describe or sample, explain, submit, poll, fetch, cancel), the result caps, that fetching starts from `first_page.next_cursor`, and how to use an error's `hint` and `candidates`. Every tool description SHALL be 40 to 600 characters and SHALL name the follow-up tool where the workflow has one, and every input property SHALL have a description. Tools SHALL carry the annotations: `readOnlyHint` on `whoami`, `list_*`, `get_*`, `describe_table`, `sample_table`, `explain_query` and `fetch_results`; `destructiveHint` and `idempotentHint` on `cancel_query` and `revoke_token`; `openWorldHint` false on all.
 
 #### Scenario: Tool list contract
 - **WHEN** a client calls `tools/list`
@@ -160,11 +186,11 @@ The server SHALL send `instructions` of at most 1500 characters that name the wo
 - **THEN** `instructions` is at most 1500 characters and names the workflow tools in order
 
 ### Requirement: Configuration
-`[mcp]` SHALL accept `enabled` (default true), `allowed_hosts` and `default_page_bytes` (default 32768), with `ARNEB_MCP_ENABLED`, `ARNEB_MCP_ALLOWED_HOSTS` (comma-separated) and `ARNEB_MCP_DEFAULT_PAGE_BYTES` overriding the file. An unknown key, a `default_page_bytes` of 0 or above `[agent_api] max_page_bytes`, an empty `allowed_hosts` list or an invalid boolean SHALL stop startup. The effective values SHALL be logged once on `arneb::config`.
+`[mcp]` SHALL accept `enabled` (default true), `allowed_hosts`, `allowed_origins` and `default_page_bytes` (default 32768), with `ARNEB_MCP_ENABLED`, `ARNEB_MCP_ALLOWED_HOSTS`, `ARNEB_MCP_ALLOWED_ORIGINS` (both comma-separated) and `ARNEB_MCP_DEFAULT_PAGE_BYTES` overriding the file. An unknown key, a `default_page_bytes` of 0 or above `[agent_api] max_page_bytes`, an empty `allowed_hosts` or `allowed_origins` list, an origin without a scheme or an invalid boolean SHALL stop startup. The effective values SHALL be logged once on `arneb::config`.
 
 #### Scenario: Defaults
 - **WHEN** the config has no `[mcp]` section
-- **THEN** MCP is enabled, `allowed_hosts` is unset and `default_page_bytes` is 32768
+- **THEN** MCP is enabled, `allowed_hosts` and `allowed_origins` are unset and `default_page_bytes` is 32768
 
 #### Scenario: Environment wins
 - **WHEN** the file sets `default_page_bytes = 1000` and `ARNEB_MCP_DEFAULT_PAGE_BYTES=4096`

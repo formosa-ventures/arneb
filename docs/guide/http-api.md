@@ -483,7 +483,9 @@ Each worker has two states:
   It is `unknown` for an id that is not registered.
 - `scheduling` is the coordinator's: `schedulable`, `cordoned`, `draining`
   (drain requested, distributed queries still run on it) or `drained`
-  (drain requested, none runs on it).
+  (drain requested, none runs on it). `drained` means no distributed query
+  of this coordinator holds the worker any more; after a cancel, the
+  worker's own task teardown may lag briefly behind it.
 
 | Method and path | Privilege | Description |
 |---|---|---|

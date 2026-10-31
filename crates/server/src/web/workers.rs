@@ -121,6 +121,11 @@ fn stored_cordons(state: &WebState) -> HashMap<String, CordonRecord> {
         .collect()
 }
 
+/// The stored cordon on `id`, if any.
+fn stored_cordon(state: &WebState, id: &str) -> Option<CordonRecord> {
+    state.state.as_ref().and_then(|s| s.cordon(id))
+}
+
 fn view(
     registry: &NodeRegistry,
     id: &str,
@@ -150,11 +155,8 @@ fn view(
 /// cordoned.
 fn find_worker(state: &WebState, id: &str) -> Option<WorkerView> {
     let registry = &state.node_registry;
-    let info = registry
-        .all_workers()
-        .into_iter()
-        .find(|w| w.worker_id == id);
-    let record = stored_cordons(state).remove(id);
+    let info = registry.worker(id);
+    let record = stored_cordon(state, id);
     if info.is_none() && record.is_none() && registry.cordon_of(id).is_none() {
         return None;
     }
@@ -252,8 +254,12 @@ pub(super) async fn worker_action_for(
 }
 
 fn has_cordon(registry: &NodeRegistry, store: &StateStore, id: &str) -> bool {
-    registry.cordon_of(id).is_some() || store.cordons().iter().any(|c| c.worker_id == id)
+    registry.cordon_of(id).is_some() || store.cordon(id).is_some()
 }
+
+/// Serializes cordon changes (plan + persist + registry update). Blocking:
+/// held only inside `apply`, which runs in `spawn_blocking`.
+static CORDON_CHANGES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct WorkerAction {
     id: String,
@@ -357,8 +363,11 @@ impl ManageAction for WorkerAction {
     }
 
     /// Persists first, then updates the registry, so a failed write
-    /// changes nothing.
+    /// changes nothing. Plan, persist and registry update run under
+    /// [`CORDON_CHANGES`], so concurrent calls cannot leave the store and
+    /// the registry disagreeing.
     fn apply(self, state: &WebState) -> Result<Applied<WorkerView>, ApiError> {
+        let _serialized = CORDON_CHANGES.lock().unwrap_or_else(|p| p.into_inner());
         let preview = self.plan(state);
         if preview.changed {
             match self.op.mode() {
@@ -375,6 +384,8 @@ impl ManageAction for WorkerAction {
                     self.store.clear_cordon(&self.id).map_err(persist_failed)?;
                 }
             }
+            #[cfg(test)]
+            tests::pause_after_persist(&self.id, self.op);
             state.node_registry.set_cordon(&self.id, self.op.mode());
         }
         let result = find_worker(state, &self.id).unwrap_or_else(|| {
@@ -939,6 +950,51 @@ mod tests {
             serde_json::to_value(&audited.entries[0].record.outcome).unwrap(),
             json!({"error": "internal"})
         );
+    }
+
+    /// The worker id whose cordon `apply` sleeps between persisting and
+    /// updating the registry, to widen the race window in a test.
+    static PAUSED_ID: &str = "race-w";
+
+    pub(super) fn pause_after_persist(id: &str, op: WorkerOp) {
+        if id == PAUSED_ID && op == WorkerOp::Cordon {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// Concurrent calls on one id leave the store and the registry agreeing.
+    /// A cordon pauses after its persist; an uncordon starting meanwhile must
+    /// wait for it, or it would clear the store and the cordon would then
+    /// land in the registry alone.
+    #[test]
+    fn concurrent_changes_keep_store_and_registry_in_step() {
+        let state = cluster(None);
+        state
+            .node_registry
+            .heartbeat(PAUSED_ID.into(), "http://127.0.0.1:3".into(), 256);
+        let store = state.state.clone().unwrap();
+        let run = |op: WorkerOp| {
+            let (state, store) = (state.clone(), Arc::clone(&store));
+            std::thread::spawn(move || {
+                let action = WorkerAction {
+                    id: PAUSED_ID.into(),
+                    op,
+                    by: "root".into(),
+                    store,
+                };
+                action.apply(&state).unwrap()
+            })
+        };
+        let cordon = run(WorkerOp::Cordon);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let uncordon = run(WorkerOp::Uncordon);
+        assert!(cordon.join().unwrap().preview.changed);
+        assert!(
+            uncordon.join().unwrap().preview.changed,
+            "uncordon ran after the cordon"
+        );
+        assert_eq!(store.cordon(PAUSED_ID), None);
+        assert_eq!(state.node_registry.cordon_of(PAUSED_ID), None);
     }
 
     #[tokio::test]

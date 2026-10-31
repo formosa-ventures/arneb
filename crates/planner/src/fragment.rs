@@ -1430,6 +1430,11 @@ impl PlanFragmenter {
         self
     }
 
+    /// The worker count the fan-out is sized for.
+    pub fn worker_count(&self) -> usize {
+        self.worker_count
+    }
+
     /// `dist-adaptive-partition`: set the partition-count policy knobs
     /// (target rows-per-partition + a hard cap). Resolved by the server from
     /// `ARNEB_HASH_PARTITION_TARGET_ROWS` / `ARNEB_MAX_HASH_PARTITIONS`.

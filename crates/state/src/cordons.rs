@@ -34,6 +34,15 @@ impl StateStore {
         self.snapshot().cordons.clone()
     }
 
+    /// The stored cordon on `worker_id`, if any.
+    pub fn cordon(&self, worker_id: &str) -> Option<CordonRecord> {
+        self.snapshot()
+            .cordons
+            .iter()
+            .find(|c| c.worker_id == worker_id)
+            .cloned()
+    }
+
     /// Stores `record`, replacing any cordon on the same `worker_id`.
     pub fn set_cordon(&self, record: CordonRecord) -> Result<(), StateError> {
         self.mutate(|d| {
@@ -86,6 +95,8 @@ mod tests {
 
         let store = StateStore::open(Some(&p)).unwrap();
         assert_eq!(store.cordons(), vec![record("w1", CordonKind::Drain)]);
+        assert_eq!(store.cordon("w1"), Some(record("w1", CordonKind::Drain)));
+        assert_eq!(store.cordon("w2"), None);
     }
 
     #[test]

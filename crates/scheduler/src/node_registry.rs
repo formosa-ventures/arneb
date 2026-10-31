@@ -451,6 +451,16 @@ impl NodeRegistry {
         all
     }
 
+    /// Registered worker `worker_id`, alive or not, with liveness
+    /// re-evaluated against the heartbeat deadline.
+    pub fn worker(&self, worker_id: &str) -> Option<WorkerInfo> {
+        let timeout = self.heartbeat_timeout();
+        let mut workers = self.workers.write().unwrap();
+        let worker = workers.get_mut(worker_id)?;
+        expire(worker, Instant::now(), timeout);
+        Some(worker.clone())
+    }
+
     /// Returns the total number of registered workers (alive or dead).
     pub fn total_count(&self) -> usize {
         self.workers.read().unwrap().len()
@@ -798,6 +808,8 @@ mod tests {
         assert_eq!(registry.scheduling_state("w9"), SchedulingState::Cordoned);
         registry.heartbeat("w9".into(), "host9:9090".into(), 256);
         assert!(registry.is_known("w9"));
+        assert_eq!(registry.worker("w9").unwrap().address, "host9:9090");
+        assert!(registry.worker("w8").is_none());
         assert!(registry.active_workers().is_empty());
         assert_eq!(ids(registry.alive_workers()), vec!["w9"]);
     }

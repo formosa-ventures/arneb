@@ -1,6 +1,7 @@
 //! File-based access control end to end (file-based-access-control): the
 //! same rules checked through pgwire and the Trino protocol, for table
-//! reads, metadata listings, `execute` and `system.runtime.queries`.
+//! reads, metadata listings, `execute` and `system.runtime.queries`; and
+//! a tracker kill stopping a running statement on either protocol.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,11 +14,16 @@ use tokio::net::TcpListener;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 use arneb_catalog::{AccessRules, CatalogManager};
+use arneb_common::error::ArnebError;
 use arneb_common::types::{ColumnInfo, DataType};
 use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable};
 use arneb_connectors::ConnectorRegistry;
-use arneb_protocol::{ProtocolConfig, ProtocolServer, TrinoConfig, TrinoServer};
-use arneb_scheduler::QueryTracker;
+use arneb_execution::ExecutionContext;
+use arneb_planner::LogicalPlan;
+use arneb_protocol::{
+    DistributedExecutor, ProtocolConfig, ProtocolServer, TrinoConfig, TrinoServer,
+};
+use arneb_scheduler::{KillOutcome, QueryState, QueryTracker};
 
 const RULES: &str = r#"{
     "catalogs": [
@@ -85,11 +91,37 @@ fn rules() -> Option<Arc<AccessRules>> {
     Some(Arc::new(AccessRules::from_json(RULES).unwrap()))
 }
 
+/// Executes every plan by never returning on its own.
+struct HangingExecutor;
+
+#[async_trait::async_trait]
+impl DistributedExecutor for HangingExecutor {
+    async fn execute(
+        &self,
+        _plan: LogicalPlan,
+        _exec_ctx: &ExecutionContext,
+    ) -> Result<Vec<RecordBatch>, ArnebError> {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        Ok(Vec::new())
+    }
+
+    fn has_workers(&self) -> bool {
+        true
+    }
+}
+
 async fn pg_server(tracker: Arc<QueryTracker>) -> u16 {
+    pg_server_with(tracker, None).await
+}
+
+async fn pg_server_with(
+    tracker: Arc<QueryTracker>,
+    executor: Option<Arc<dyn DistributedExecutor>>,
+) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (cm, cr) = state();
-    let server = ProtocolServer::new(
+    let mut server = ProtocolServer::new(
         ProtocolConfig {
             bind_address: format!("127.0.0.1:{port}"),
         },
@@ -98,6 +130,9 @@ async fn pg_server(tracker: Arc<QueryTracker>) -> u16 {
     )
     .with_query_tracker(tracker)
     .with_access_rules(rules());
+    if let Some(executor) = executor {
+        server = server.with_distributed_executor(executor);
+    }
     tokio::spawn(async move {
         let _ = server.serve(listener).await;
     });
@@ -134,10 +169,17 @@ async fn pg_error(client: &tokio_postgres::Client, sql: &str) -> (String, String
 }
 
 async fn trino_server(tracker: Arc<QueryTracker>) -> String {
+    trino_server_with(tracker, None).await
+}
+
+async fn trino_server_with(
+    tracker: Arc<QueryTracker>,
+    executor: Option<Arc<dyn DistributedExecutor>>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (cm, cr) = state();
-    let server = TrinoServer::new(
+    let mut server = TrinoServer::new(
         TrinoConfig {
             bind_address: format!("127.0.0.1:{port}"),
             max_wait: Duration::from_millis(50),
@@ -148,6 +190,9 @@ async fn trino_server(tracker: Arc<QueryTracker>) -> String {
     )
     .with_query_tracker(tracker)
     .with_access_rules(rules());
+    if let Some(executor) = executor {
+        server = server.with_distributed_executor(executor);
+    }
     tokio::spawn(async move {
         let _ = server.serve(listener).await;
     });
@@ -403,4 +448,77 @@ async fn trino_refuses_explain_of_a_write() {
         .await
         .unwrap_err();
     assert_eq!(err["errorName"], "PERMISSION_DENIED", "{err}");
+}
+
+/// The only tracked query, once it is running.
+async fn running_query(tracker: &QueryTracker) -> arneb_common::identifiers::QueryId {
+    for _ in 0..200 {
+        if let Some(q) = tracker
+            .list_queries(Some(QueryState::Running))
+            .into_iter()
+            .next()
+        {
+            return q.query_id;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("no query reached RUNNING");
+}
+
+#[tokio::test]
+async fn tracker_kill_stops_a_pgwire_statement() {
+    let tracker = Arc::new(QueryTracker::new());
+    let port = pg_server_with(Arc::clone(&tracker), Some(Arc::new(HangingExecutor))).await;
+    let alice = pg(port, "alice").await;
+    let statement = tokio::spawn(async move {
+        let err = alice
+            .simple_query("SELECT n FROM open_t")
+            .await
+            .unwrap_err();
+        let db = err.as_db_error().expect("a server error");
+        (db.code().code().to_owned(), db.message().to_owned())
+    });
+    let id = running_query(&tracker).await;
+    assert_eq!(
+        tracker.kill_query(&id, "root").unwrap(),
+        KillOutcome::Killed {
+            was: QueryState::Running
+        }
+    );
+    let (code, message) = tokio::time::timeout(Duration::from_secs(2), statement)
+        .await
+        .expect("the statement stopped within 2 s")
+        .unwrap();
+    assert_eq!(code, "57014");
+    assert_eq!(message, "canceling statement due to user request");
+    assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
+}
+
+#[tokio::test]
+async fn tracker_kill_stops_a_trino_query() {
+    let tracker = Arc::new(QueryTracker::new());
+    let base = trino_server_with(Arc::clone(&tracker), Some(Arc::new(HangingExecutor))).await;
+    let http = reqwest::Client::new();
+    let doc: Value = http
+        .post(format!("{base}/v1/statement"))
+        .header("X-Trino-User", "alice")
+        .body("SELECT n FROM open_t")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let next = doc["nextUri"].as_str().unwrap().to_owned();
+    let id = running_query(&tracker).await;
+    assert!(matches!(
+        tracker.kill_query(&id, "root").unwrap(),
+        KillOutcome::Killed { .. }
+    ));
+    let polled: Value = http.get(&next).send().await.unwrap().json().await.unwrap();
+    assert_eq!(polled["stats"]["state"], "FAILED", "{polled}");
+    assert_eq!(polled["error"]["errorName"], "USER_CANCELED");
+    let message = polled["error"]["message"].as_str().unwrap();
+    assert!(message.contains("killed by root"), "{message}");
+    assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
 }

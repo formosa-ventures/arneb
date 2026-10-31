@@ -33,7 +33,6 @@ pub struct Grant(());
 
 /// Why a kill was allowed (manage-api D2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by the cancel routes (manage-api task 4)
 pub enum KillGrant {
     /// The caller owns the query.
     Owner,
@@ -43,7 +42,6 @@ pub enum KillGrant {
     Manage,
 }
 
-#[allow(dead_code)] // consumed by the cancel routes (manage-api task 4)
 impl KillGrant {
     /// The proof value for this grant.
     pub fn grant(self) -> Grant {
@@ -137,7 +135,6 @@ impl Authorizer {
     /// mode); otherwise `none` auth refuses; otherwise a `queries` rule
     /// allowing `kill`, or no `queries` rules; otherwise manage; otherwise
     /// `forbidden`.
-    #[allow(dead_code)] // consumed by the cancel routes (manage-api task 4)
     pub fn check_kill(&self, who: &Identity, owner: Option<&str>) -> Result<KillGrant, ApiError> {
         let owner = owner.unwrap_or_default();
         if who.user == owner {

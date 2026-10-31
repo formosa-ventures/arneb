@@ -45,11 +45,28 @@ fn advance_machine(m: &mut QueryStateMachine, target: QueryState) -> Result<(), 
     Ok(())
 }
 
+/// Stops a running query on the protocol that runs it. The argument is the
+/// name of the user who killed it. Called at most once, never under the
+/// tracker's lock, so it may call back into the tracker.
+pub type Canceller = Box<dyn FnOnce(&str) + Send + Sync>;
+
+/// What [`QueryTracker::kill_query`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillOutcome {
+    /// The query was stopped; `was` is its state before the kill.
+    Killed { was: QueryState },
+    /// The query had already ended (or ended on its own during the kill)
+    /// in this state; nothing was changed.
+    AlreadyEnded(QueryState),
+}
+
 struct Entry {
     machine: QueryStateMachine,
     source: String,
     user: Option<String>,
     rows: Option<u64>,
+    /// Dropped (uncalled) when the query turns terminal.
+    canceller: Option<Canceller>,
 }
 
 struct Inner {
@@ -103,6 +120,7 @@ impl QueryTracker {
                 source: source.to_string(),
                 user,
                 rows: None,
+                canceller: None,
             },
         );
         id
@@ -158,6 +176,49 @@ impl QueryTracker {
         self.update(id, |e| e.machine.fail(error))
     }
 
+    /// Register how to stop query `id` on the protocol running it. Dropped
+    /// without being called when the query is unknown or already terminal.
+    pub fn set_canceller(&self, id: &QueryId, canceller: Canceller) {
+        let mut inner = self.inner.write().unwrap();
+        match inner.queries.get_mut(id) {
+            Some(e) if !e.machine.state.is_terminal() => e.canceller = Some(canceller),
+            _ => {
+                drop(inner);
+                drop(canceller);
+            }
+        }
+    }
+
+    /// Stop query `id` on behalf of user `by`: call its canceller (outside
+    /// the lock) and mark it cancelled. A query that already ended, or ends
+    /// on its own during the kill, is [`KillOutcome::AlreadyEnded`].
+    pub fn kill_query(&self, id: &QueryId, by: &str) -> Result<KillOutcome, ExecutionError> {
+        let (was, canceller) = {
+            let mut inner = self.inner.write().unwrap();
+            let entry = inner
+                .queries
+                .get_mut(id)
+                .ok_or_else(|| ExecutionError::InvalidOperation(format!("query {id} not found")))?;
+            let was = entry.machine.state;
+            if was.is_terminal() {
+                return Ok(KillOutcome::AlreadyEnded(was));
+            }
+            (was, entry.canceller.take())
+        };
+        if let Some(cancel) = canceller {
+            cancel(by);
+        }
+        if self.cancel_query(id).is_ok() {
+            return Ok(KillOutcome::Killed { was });
+        }
+        // Already terminal: cancelled by the canceller itself (or by a
+        // concurrent kill), or it ended on its own meanwhile.
+        Ok(match self.get_query(id).map(|q| q.state) {
+            Some(state) if state != QueryState::Cancelled => KillOutcome::AlreadyEnded(state),
+            _ => KillOutcome::Killed { was },
+        })
+    }
+
     pub fn active_count(&self) -> usize {
         let inner = self.inner.read().unwrap();
         inner
@@ -181,6 +242,8 @@ impl QueryTracker {
             .get_mut(id)
             .ok_or_else(|| ExecutionError::InvalidOperation(format!("query {id} not found")))?;
         let was_terminal = entry.machine.state.is_terminal();
+        // A terminal query's canceller is dropped after the lock is released.
+        let mut dropped_canceller = None;
         let was_started = entry.machine.started.is_some();
         // A failed step may still have moved the machine; report either way.
         let result = f(entry);
@@ -191,8 +254,13 @@ impl QueryTracker {
         let ended = !was_terminal && m.state.is_terminal();
         if ended {
             report_end(entry);
+            dropped_canceller = entry.canceller.take();
         }
-        result?;
+        if let Err(e) = result {
+            drop(inner);
+            drop(dropped_canceller);
+            return Err(e);
+        }
         if ended {
             inner.finished.push_back(*id);
             while inner.finished.len() > self.history_limit {
@@ -201,6 +269,8 @@ impl QueryTracker {
                 }
             }
         }
+        drop(inner);
+        drop(dropped_canceller);
         Ok(())
     }
 }
@@ -406,5 +476,97 @@ mod tests {
             .map(|q| q.query_id)
             .collect();
         assert_eq!(ids, vec![second, first]);
+    }
+
+    #[test]
+    fn kill_calls_the_canceller_once_and_marks_cancelled() {
+        use std::sync::Mutex;
+        let tracker = QueryTracker::with_history_limit(10);
+        let id = tracker.create_query("SELECT 1".into());
+        tracker.advance_to(&id, QueryState::Running).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&calls);
+        tracker.set_canceller(
+            &id,
+            Box::new(move |by| seen.lock().unwrap().push(by.to_owned())),
+        );
+        assert_eq!(
+            tracker.kill_query(&id, "root").unwrap(),
+            KillOutcome::Killed {
+                was: QueryState::Running
+            }
+        );
+        assert_eq!(*calls.lock().unwrap(), ["root"]);
+        assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
+        assert_eq!(
+            tracker.kill_query(&id, "root").unwrap(),
+            KillOutcome::AlreadyEnded(QueryState::Cancelled)
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1, "called once");
+        let missing = QueryId::new();
+        assert!(tracker.kill_query(&missing, "root").is_err());
+    }
+
+    #[test]
+    fn terminal_query_drops_its_canceller() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct DropGuard(Arc<AtomicBool>);
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let tracker = QueryTracker::with_history_limit(10);
+        let id = tracker.create_query("SELECT 1".into());
+        let (dropped, called) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let guard = DropGuard(Arc::clone(&dropped));
+        let flag = Arc::clone(&called);
+        tracker.set_canceller(
+            &id,
+            Box::new(move |_| {
+                let _guard = &guard;
+                flag.store(true, Ordering::SeqCst);
+            }),
+        );
+        assert!(!dropped.load(Ordering::SeqCst));
+        tracker.finish_query(&id, 3).unwrap();
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "dropped at the terminal turn"
+        );
+        assert_eq!(
+            tracker.kill_query(&id, "root").unwrap(),
+            KillOutcome::AlreadyEnded(QueryState::Finished)
+        );
+        assert!(!called.load(Ordering::SeqCst), "never called");
+        // A canceller set on a terminal query is dropped at once.
+        let late = Arc::new(AtomicBool::new(false));
+        let guard = DropGuard(Arc::clone(&late));
+        tracker.set_canceller(&id, Box::new(move |_| drop(guard)));
+        assert!(late.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn canceller_may_reenter_the_tracker() {
+        let tracker = QueryTracker::with_history_limit(10);
+        let id = tracker.create_query("SELECT 1".into());
+        tracker.advance_to(&id, QueryState::Running).unwrap();
+        let inner = tracker.clone();
+        tracker.set_canceller(
+            &id,
+            Box::new(move |_| {
+                inner.cancel_query(&id).unwrap();
+            }),
+        );
+        assert_eq!(
+            tracker.kill_query(&id, "root").unwrap(),
+            KillOutcome::Killed {
+                was: QueryState::Running
+            }
+        );
+        assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
     }
 }

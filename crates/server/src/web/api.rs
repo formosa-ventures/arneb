@@ -118,6 +118,14 @@ const QUERY_STATES: [(&str, QueryState); 8] = [
     ("cancelled", QueryState::Cancelled),
 ];
 
+/// The lowercase name of `state`, as the bounded list reports it.
+pub(super) fn state_name(state: QueryState) -> &'static str {
+    QUERY_STATES
+        .iter()
+        .find(|(_, s)| *s == state)
+        .map_or("unknown", |(name, _)| name)
+}
+
 /// The [`QueryState`] named `s` (any case). A name selects exactly that
 /// state: `running` does not include `planning`, `starting` or
 /// `finishing`. An unknown name is `invalid_argument` listing all eight.
@@ -254,14 +262,6 @@ fn may_view(state: &WebState, who: &Identity, owner: Option<&str>) -> bool {
             .is_none_or(|r| r.can_view_query(&who.user, owner.unwrap_or_default()))
 }
 
-pub(super) fn may_kill(state: &WebState, who: &Identity, owner: Option<&str>) -> bool {
-    who.via == AuthVia::Unauthenticated
-        || state
-            .access_rules
-            .as_ref()
-            .is_none_or(|r| r.can_kill_query(&who.user, owner.unwrap_or_default()))
-}
-
 async fn list_queries(
     State(state): State<WebState>,
     Extension(who): Extension<Identity>,
@@ -297,12 +297,35 @@ pub(super) fn visible_query(
     who: &Identity,
     id: &str,
 ) -> Result<arneb_scheduler::QueryInfo, StatusCode> {
+    lookup_query(state, id, |q| may_view(state, who, q.user.as_deref()))
+}
+
+/// The query `id` for a cancel by `who` (manage-api D2): as
+/// [`visible_query`], except that a query `who` may kill (as a manager, or
+/// by a `queries` rule allowing `kill` without `view`) is found too, so a
+/// kill grant is never hidden behind `not_found`.
+pub(super) fn killable_query(
+    state: &WebState,
+    who: &Identity,
+    id: &str,
+) -> Result<arneb_scheduler::QueryInfo, StatusCode> {
+    lookup_query(state, id, |q| {
+        may_view(state, who, q.user.as_deref())
+            || state.authorizer.check_kill(who, q.user.as_deref()).is_ok()
+    })
+}
+
+fn lookup_query(
+    state: &WebState,
+    id: &str,
+    visible: impl FnOnce(&arneb_scheduler::QueryInfo) -> bool,
+) -> Result<arneb_scheduler::QueryInfo, StatusCode> {
     let uuid: uuid::Uuid = id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
     let query_id = arneb_common::identifiers::QueryId(uuid);
     state
         .query_tracker
         .get_query(&query_id)
-        .filter(|q| may_view(state, who, q.user.as_deref()))
+        .filter(visible)
         .ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -315,25 +338,31 @@ async fn get_query(
     Ok(Json(QueryResponse::from(info)))
 }
 
+/// `DELETE /api/v1/queries/{id}`: `204`, or an empty `400` / `404`.
+/// Under `[auth] type = "none"` any caller may cancel any query, as the
+/// Web UI always could (ruling R1). Under password auth it is the
+/// `/api/v2` cancel (the D2 kill rule, audited), mapped back to `204`, an
+/// empty `400` / `404`, or the error envelope (`403`, `503`).
 async fn cancel_query(
     State(state): State<WebState>,
     Extension(who): Extension<Identity>,
     Path(id): Path<String>,
 ) -> Response {
-    let info = match visible_query(&state, &who, &id) {
-        Ok(info) => info,
-        Err(status) => return status.into_response(),
-    };
-    if !may_kill(&state, &who, info.user.as_deref()) {
-        return ApiError::new(
-            ErrorCode::Forbidden,
-            "the access rules do not allow you to kill this query",
-        )
-        .into_response();
+    if who.via == AuthVia::Unauthenticated {
+        let info = match visible_query(&state, &who, &id) {
+            Ok(info) => info,
+            Err(status) => return status.into_response(),
+        };
+        return match state.query_tracker.kill_query(&info.query_id, &who.user) {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(_) => StatusCode::NOT_FOUND.into_response(),
+        };
     }
-    match state.query_tracker.cancel_query(&info.query_id) {
+    match super::v2::cancel_query_for(&state, &who, &id, false).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) if e.code == ErrorCode::InvalidArgument => StatusCode::BAD_REQUEST.into_response(),
+        Err(e) if e.code == ErrorCode::NotFound => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => e.into_response(),
     }
 }
 

@@ -203,6 +203,24 @@ impl AgentQueryService {
                 handle.abort();
             }
         }
+        // A kill through the tracker (manage-api D7). Weak references, so the
+        // tracker never keeps the statement or itself alive.
+        let (weak_statement, weak_tracker) =
+            (Arc::downgrade(&statement), Arc::downgrade(&self.tracker));
+        self.tracker.set_canceller(
+            &statement.tracker_id,
+            Box::new(move |by| {
+                if let (Some(statement), Some(tracker)) =
+                    (weak_statement.upgrade(), weak_tracker.upgrade())
+                {
+                    let error = AgentError::new(
+                        AgentErrorCode::Cancelled,
+                        format!("Statement was cancelled by {by}"),
+                    );
+                    cancel_statement(&tracker, &statement, error, "killed");
+                }
+            }),
+        );
         self.wait_for_end(&statement, wait).await;
         Ok(statement.status(&self.limits, page_bytes))
     }
@@ -473,14 +491,7 @@ impl AgentQueryService {
     /// Cancels a statement that is still queued or running: aborts its task
     /// (dropping its admission slot) and marks it cancelled in the tracker.
     fn cancel_statement(&self, statement: &Statement, error: AgentError, reason: &str) {
-        if !statement.end(Phase::Cancelled(error)) {
-            return;
-        }
-        if let Some(handle) = lock(&statement.abort).take() {
-            handle.abort();
-        }
-        let _ = self.tracker.cancel_query(&statement.tracker_id);
-        tracing::debug!(statement_id = %statement.id, reason, "agent statement cancelled");
+        cancel_statement(&self.tracker, statement, error, reason);
     }
 
     /// One reaper pass over statements idle for longer than `idle_timeout`.
@@ -512,6 +523,24 @@ impl AgentQueryService {
             }
         }
     }
+}
+
+/// [`AgentQueryService::cancel_statement`] over `tracker`, for the tracker's
+/// canceller, which holds no service.
+fn cancel_statement(
+    tracker: &QueryTracker,
+    statement: &Statement,
+    error: AgentError,
+    reason: &str,
+) {
+    if !statement.end(Phase::Cancelled(error)) {
+        return;
+    }
+    if let Some(handle) = lock(&statement.abort).take() {
+        handle.abort();
+    }
+    let _ = tracker.cancel_query(&statement.tracker_id);
+    tracing::debug!(statement_id = %statement.id, reason, "agent statement cancelled");
 }
 
 /// Id of the least-recently-accessed terminal statement among `statements`.
@@ -1249,6 +1278,47 @@ mod tests {
             .find(|q| q.query_id.to_string() == s.id)
             .unwrap();
         assert_eq!(info.state, QueryState::Cancelled);
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(dropped.load(Ordering::SeqCst), "execution was not aborted");
+    }
+
+    #[tokio::test]
+    async fn tracker_kill_cancels_an_agent_statement() {
+        let (svc, tracker) = service();
+        let (svc, dropped) = hanging(svc);
+        let s = svc
+            .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
+            .await
+            .unwrap();
+        wait_for_state(&svc, &s.id, StatementState::Running).await;
+        let id = tracker
+            .list_queries(None)
+            .into_iter()
+            .find(|q| q.query_id.to_string() == s.id)
+            .unwrap()
+            .query_id;
+        assert!(matches!(
+            tracker.kill_query(&id, "root").unwrap(),
+            arneb_scheduler::KillOutcome::Killed { .. }
+        ));
+        let status = svc
+            .status("alice", &s.id, Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(status.state, StatementState::Cancelled);
+        let error = status.error.unwrap();
+        assert_eq!(error.code, AgentErrorCode::Cancelled);
+        assert!(
+            error.message.contains("cancelled by root"),
+            "{}",
+            error.message
+        );
+        assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
         for _ in 0..100 {
             if dropped.load(Ordering::SeqCst) {
                 break;

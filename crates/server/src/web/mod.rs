@@ -6,6 +6,7 @@ mod audit;
 pub mod auth;
 pub mod error;
 mod frontend;
+mod manage;
 pub mod mcp;
 mod metrics;
 pub mod privilege;

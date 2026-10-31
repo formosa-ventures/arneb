@@ -138,7 +138,8 @@ password auth without `[tls]` is a startup error; disable the listener with
 | Code | HTTP | Meaning |
 |---|---|---|
 | `unauthenticated` | 401 | No valid credentials, or a wrong login. |
-| `forbidden` | 403 | Authenticated, but the access rules deny it (killing a query). |
+| `forbidden` | 403 | Authenticated, but the access rules deny it (killing another user's query, a manage action). |
+| `manage_requires_auth` | 403 | A manage action, or cancelling another user's query over `/api/v2`, under `[auth] type = "none"`. |
 | `not_found` | 404 | No such route, query or token, or one you may not see. |
 | `invalid_argument` | 400 (405 for a wrong method) | A malformed request. |
 | `auth_disabled` | 409 | The route needs `[auth] type = "password"`. |
@@ -167,7 +168,7 @@ All `/api/v2` routes need credentials, except `health` and `POST /sessions`.
 | `DELETE /api/v2/tokens/{id}` | Revoke the caller's token (`204`); an id that is not 16 lowercase hex is `invalid_argument`. |
 | `GET /api/v2/queries` | Queries the caller may view. Same parameters and body as `/api/v1/queries`. |
 | `GET /api/v2/queries/{id}` | One query; `404` if missing or hidden. |
-| `DELETE /api/v2/queries/{id}` | Cancel a query (`204`); `403` if the caller may view but not kill it. |
+| `DELETE /api/v2/queries/{id}[?dry_run=]` | [Cancel any query](#cancel-any-query) (`200`, the [manage envelope](#dry-runs-and-the-response-envelope)). |
 | `GET /api/v2/cluster` | Cluster overview. |
 | `GET /api/v2/cluster/workers` | Workers and their state. |
 | `GET /api/v2/info` | Server version and role. |
@@ -186,9 +187,10 @@ errors differ. The `/api/v1` routes are `/api/v1/queries`,
 `failed` or `cancelled` (any case). `running` does not include `planning`,
 `starting` or `finishing`. An unknown state filters nothing.
 
-Both versions apply the [`queries` access rules](/guide/access-control):
-a query the caller may not `view` is hidden (`404`), one they may view but
-not `kill` answers `403`, and a user may always kill their own.
+Both versions apply the [`queries` access rules](/guide/access-control)
+to the list and detail: a query the caller may not `view` is hidden
+(`404`). Cancelling follows the kill rule in
+[Cancel any query](#cancel-any-query).
 
 ## Querying
 
@@ -397,6 +399,70 @@ curl -s -H "$H" -X DELETE "$B/statements/0b9f…"
 
 ## Managing
 
+### Dry runs and the response envelope
+
+Every manage route takes `?dry_run=true|false` (default `false`; any other
+value is `invalid_argument`). A dry run is authorized and validated exactly
+like the real call, so a call you may not make is refused the same way as a
+dry run. It changes nothing and is not audited.
+
+Both dry and real runs answer `200` with one envelope:
+
+```json
+{"dry_run": false, "action": "query.cancel", "target": "0b9f…",
+ "summary": "cancelled query 0b9f… owned by bob; it was running",
+ "changed": true, "warning": null,
+ "result": {"query_id": "0b9f…", "owner": "bob",
+            "state_before": "running", "state": "cancelled"}}
+```
+
+- `summary` says what the call does (dry run) or did, in one sentence.
+- `changed` is `false` for a no-op, such as cancelling a query that already
+  ended. A no-op is not an error.
+- `warning` is `null`, or a sentence on a side effect worth knowing.
+- `result` is the action's result; a dry run has none.
+
+### Cancel any query
+
+`DELETE /api/v2/queries/{id}` cancels a query from any protocol (pgwire,
+Trino, `/api/v2` statements) and stops it there: a pgwire client gets
+`ERROR 57014 canceling statement due to user request`, a Trino client
+`USER_CANCELED` `Query was killed by <user>`, and an `/api/v2` statement
+turns `cancelled` with `Statement was cancelled by <user>`.
+
+Who may cancel, in this order:
+
+1. The query's owner, in any auth mode (under `none`, the owner is the
+   claimed `X-Arneb-User`). Not audited.
+2. Otherwise, under `[auth] type = "none"`: refused with
+   `manage_requires_auth`.
+3. A `queries` rule that allows `kill` for that owner, or no `queries`
+   section in the rules file.
+4. The manage privilege (`[access_control] admin_users`, or a
+   `system_information` rule that allows `write`).
+5. Otherwise `forbidden`, with a hint naming the rule that would allow it.
+
+Cancelling another user's query is [audited](#audit-log) as `query.cancel`,
+with `parameters.effect` `applied` or `already_ended`. A query the caller
+may neither view nor kill is `not_found`, as is one that does not exist; a
+manager finds every query.
+
+```bash
+curl -s -H "$H" -X DELETE "$B/queries/0b9f…?dry_run=true"
+# {"dry_run":true,"action":"query.cancel","target":"0b9f…",
+#  "summary":"cancels 1 query (0b9f…) owned by bob; it is running",
+#  "changed":true,"warning":null}
+```
+
+A query that already ended, or ends during the call, answers `200` with
+`changed: false` and a summary such as `query 0b9f… owned by bob already
+finished; nothing to cancel`.
+
+`DELETE /api/v1/queries/{id}` keeps its `204` / `403` / `404` answers and
+has no dry run. Under password auth it uses the rule above, audited the same
+way. Under `[auth] type = "none"` it is unchanged: any caller may cancel any
+query, as the Web UI always could; it now also stops the query.
+
 ### Audit log
 
 Under `[auth] type = "password"`, these actions are recorded in a durable
@@ -404,7 +470,8 @@ audit log, each entry synced to disk before the response returns:
 
 - issuing and revoking API tokens (`token.issue`, `token.revoke`), whether
   they succeed or fail;
-- the manage actions, except dry runs.
+- the manage actions, except dry runs;
+- cancelling another user's query (`query.cancel`).
 
 A refused request (no credentials, no privilege, a malformed body or token
 id) is not recorded. If the log cannot be written, audited actions are

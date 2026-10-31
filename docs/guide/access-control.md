@@ -171,15 +171,23 @@ password auth, then a `queries` rule that allows `kill` for that owner (or no
   DDL and DML. Without a `tables` section everything is still allowed.
 - A `read-only` catalog refuses writes.
 - `system_information` is now an accepted section.
+- `DELETE /api/v2/queries/{id}` now answers `200` with the
+  [manage envelope](/guide/http-api#dry-runs-and-the-response-envelope)
+  instead of `204`, and stops the query on its protocol.
 
 ## Limits
 
 - The Web API (Web UI port) applies the `queries` rules to the query list,
   query detail and cancel endpoints, under both `/api/v1` and `/api/v2`. A
-  query the caller may not `view` is hidden (`404`); one they may view but
-  not `kill` answers `403`. A user may always kill their own query. Under
-  `[auth] type = "none"` the Web API has no user, so these rules are not
-  applied there. See [HTTP API](/guide/http-api). Under password auth the Web
+  query the caller may not `view` is hidden (`404`). Cancelling follows the
+  kill rule: the owner always may; otherwise a `queries` rule that allows
+  `kill` for the owner (or no `queries` section), or the manage layer; a
+  query the caller may neither view nor kill is `404`, any other refusal
+  `403`. Under `[auth] type = "none"` the Web API has no authenticated user:
+  `/api/v1` keeps its open list, detail and cancel (any caller may cancel
+  any query), while `/api/v2` and MCP refuse cancelling another user's
+  query with `manage_requires_auth`. See
+  [Cancel any query](/guide/http-api#cancel-any-query). Under password auth the Web
   API also requires credentials, and the Web UI binds to `127.0.0.1` unless
   `[web] bind_address` is set.
 - Rules are checked on the coordinator. Workers run the plan fragments the

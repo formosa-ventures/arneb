@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use arneb_scheduler::KillOutcome;
 use arneb_state::{now_ms, StateError, StateStore};
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
@@ -27,6 +28,7 @@ use super::api::{
 use super::audit::{audited, AuditSubject};
 use super::auth::{decode_basic, AuthVia, Identity};
 use super::error::{ApiError, ErrorCode};
+use super::manage::{run_manage, Applied, DryRun, ManageAction, ManageOutcome, Preview};
 use super::privilege::{Authorizer, Layer};
 use super::session::{SESSION_PREFIX, SESSION_TTL};
 use super::WebState;
@@ -571,19 +573,155 @@ async fn cancel_query(
     State(state): State<WebState>,
     Extension(who): Extension<Identity>,
     Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    let info = api::visible_query(&state, &who, &id).map_err(lookup_error)?;
-    if !api::may_kill(&state, &who, info.user.as_deref()) {
-        return Err(ApiError::new(
-            ErrorCode::Forbidden,
-            "the access rules do not allow you to kill this query",
-        ));
+    params: Result<Query<DryRun>, QueryRejection>,
+) -> Result<Json<ManageOutcome<KillResult>>, ApiError> {
+    let Query(DryRun { dry_run }) = params.map_err(bad_query)?;
+    Ok(Json(cancel_query_for(&state, &who, &id, dry_run).await?))
+}
+
+/// The `result` of a `query.cancel`.
+#[derive(Serialize)]
+pub(super) struct KillResult {
+    query_id: String,
+    owner: Option<String>,
+    /// Lowercase, as the query list reports states.
+    state_before: String,
+    state: String,
+}
+
+/// Cancels query `id` for `who` under the kill rule (manage-api D2, D7):
+/// a query `who` may not see is `not_found` unless `who` manages; then
+/// [`Authorizer::check_kill`]. Audited unless `who` owns the query. A query
+/// that already ended is a no-op (`changed: false`). Shared with
+/// `/api/v1` and the MCP `cancel_query` tool.
+pub(super) async fn cancel_query_for(
+    state: &WebState,
+    who: &Identity,
+    id: &str,
+    dry_run: bool,
+) -> Result<ManageOutcome<KillResult>, ApiError> {
+    let info = api::killable_query(state, who, id).map_err(lookup_error)?;
+    let kill = state.authorizer.check_kill(who, info.user.as_deref())?;
+    let action = CancelQuery {
+        id: info.query_id,
+        owner: info.user,
+        by: who.user.clone(),
+        by_owner: kill.is_owner(),
+    };
+    run_manage(state, who, kill.grant(), dry_run, action).await
+}
+
+struct CancelQuery {
+    id: arneb_common::identifiers::QueryId,
+    owner: Option<String>,
+    by: String,
+    by_owner: bool,
+}
+
+impl CancelQuery {
+    fn owned_by(&self) -> String {
+        match &self.owner {
+            Some(owner) => format!("owned by {owner}"),
+            None => "with no owner".to_owned(),
+        }
     }
-    state
-        .query_tracker
-        .cancel_query(&info.query_id)
-        .map_err(|_| lookup_error(StatusCode::NOT_FOUND))?;
-    Ok(StatusCode::NO_CONTENT)
+
+    fn ended(&self, state: arneb_scheduler::QueryState) -> Preview {
+        Preview {
+            summary: format!(
+                "query {} {} already {}; nothing to cancel",
+                self.id,
+                self.owned_by(),
+                api::state_name(state)
+            ),
+            changed: false,
+            warning: None,
+        }
+    }
+
+    fn gone() -> ApiError {
+        lookup_error(StatusCode::NOT_FOUND)
+    }
+}
+
+impl ManageAction for CancelQuery {
+    type Output = KillResult;
+
+    fn action(&self) -> &'static str {
+        "query.cancel"
+    }
+
+    fn target(&self) -> String {
+        self.id.to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"owner": self.owner})
+    }
+
+    fn audited(&self) -> bool {
+        !self.by_owner
+    }
+
+    fn unchanged_effect(&self) -> &'static str {
+        "already_ended"
+    }
+
+    fn preview(&self, state: &WebState) -> Result<Preview, ApiError> {
+        let now = state
+            .query_tracker
+            .get_query(&self.id)
+            .ok_or_else(Self::gone)?
+            .state;
+        if now.is_terminal() {
+            return Ok(self.ended(now));
+        }
+        Ok(Preview {
+            summary: format!(
+                "cancels 1 query ({}) {}; it is {}",
+                self.id,
+                self.owned_by(),
+                api::state_name(now)
+            ),
+            changed: true,
+            warning: None,
+        })
+    }
+
+    fn apply(self, state: &WebState) -> Result<Applied<KillResult>, ApiError> {
+        let tracker = &state.query_tracker;
+        let outcome = tracker
+            .kill_query(&self.id, &self.by)
+            .map_err(|_| Self::gone())?;
+        let (before, preview) = match outcome {
+            KillOutcome::Killed { was } => (
+                was,
+                Preview {
+                    summary: format!(
+                        "cancelled query {} {}; it was {}",
+                        self.id,
+                        self.owned_by(),
+                        api::state_name(was)
+                    ),
+                    changed: true,
+                    warning: None,
+                },
+            ),
+            KillOutcome::AlreadyEnded(now) => (now, self.ended(now)),
+        };
+        let after = tracker
+            .get_query(&self.id)
+            .map_or(arneb_scheduler::QueryState::Cancelled, |q| q.state);
+        Ok(Applied {
+            preview,
+            result: KillResult {
+                query_id: self.id.to_string(),
+                owner: self.owner,
+                state_before: api::state_name(before).to_owned(),
+                state: api::state_name(after).to_owned(),
+            },
+        })
+    }
 }
 
 async fn cluster(
@@ -1075,7 +1213,7 @@ pub(super) mod tests {
         let (status, body) = call(&state, Method::GET, &missing, Some(&auth), None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "not_found");
-        let (status, _) = call(
+        let (status, body) = call(
             &state,
             Method::DELETE,
             &format!("/api/v2/queries/{other}"),
@@ -1083,7 +1221,9 @@ pub(super) mod tests {
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::NO_CONTENT, "no rules: allowed");
+        assert_eq!(status, StatusCode::OK, "no rules: allowed; {body}");
+        assert_eq!(body["action"], "query.cancel");
+        assert_eq!(body["result"]["state"], "cancelled");
     }
 
     async fn issue(state: &WebState, auth: &str, body: Value) -> (StatusCode, Value) {
@@ -1261,5 +1401,414 @@ pub(super) mod tests {
             let (status, _) = call(&state, Method::GET, path, Some(&ops), None).await;
             assert_eq!(status, StatusCode::OK, "{path}");
         }
+    }
+
+    const KILL_RULES: &str = r#"{"queries":[
+        {"user":"ops","queryOwner":"bob","allow":["kill"]},
+        {"allow":["execute","view"]}]}"#;
+
+    /// Password auth with [`KILL_RULES`] and `root` in `admin_users`.
+    fn kill_state() -> WebState {
+        with_authz(web_state(true, None), Some(KILL_RULES), &["root"])
+    }
+
+    fn creds(user: &str) -> String {
+        let pw = match user {
+            "alice" => "secret",
+            "bob" => "hunter2",
+            "root" => "rootpw",
+            "ops" => "opspw",
+            other => panic!("no password for {other}"),
+        };
+        basic(user, pw)
+    }
+
+    /// A running query of `owner`, with a canceller recording who killed it.
+    fn running(
+        state: &WebState,
+        owner: &str,
+    ) -> (
+        arneb_common::identifiers::QueryId,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let t = &state.query_tracker;
+        let id = t.create_query_from("SELECT 1".into(), "pgwire", Some(owner.into()));
+        t.advance_to(&id, arneb_scheduler::QueryState::Running)
+            .unwrap();
+        let killed_by = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&killed_by);
+        t.set_canceller(
+            &id,
+            Box::new(move |by| seen.lock().unwrap().push(by.to_owned())),
+        );
+        (id, killed_by)
+    }
+
+    async fn cancel_as(state: &WebState, user: &str, path: &str) -> (StatusCode, Value) {
+        call(state, Method::DELETE, path, Some(&creds(user)), None).await
+    }
+
+    /// A request under `[auth] type = "none"` claiming `user`.
+    async fn call_as(
+        state: &WebState,
+        method: Method,
+        path: &str,
+        user: &str,
+    ) -> (StatusCode, Value) {
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("x-arneb-user", user)
+            .body(Body::empty())
+            .unwrap();
+        let resp = build_router(state.clone()).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    fn audit_entries(state: &WebState) -> Vec<Value> {
+        let page = state.audit.query(&arneb_state::AuditQuery {
+            limit: 100,
+            before_seq: None,
+            user: None,
+            action: None,
+        });
+        page.entries
+            .into_iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect()
+    }
+
+    fn query_state(
+        state: &WebState,
+        id: &arneb_common::identifiers::QueryId,
+    ) -> arneb_scheduler::QueryState {
+        state.query_tracker.get_query(id).unwrap().state
+    }
+
+    #[tokio::test]
+    async fn owner_cancels_without_audit() {
+        let state = kill_state();
+        let (id, killed_by) = running(&state, "bob");
+        let (status, body) = cancel_as(&state, "bob", &format!("/api/v2/queries/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["dry_run"], false);
+        assert_eq!(body["action"], "query.cancel");
+        assert_eq!(body["target"], id.to_string());
+        assert_eq!(body["changed"], true);
+        assert_eq!(body["warning"], Value::Null);
+        assert_eq!(
+            body["result"],
+            json!({"query_id": id.to_string(), "owner": "bob",
+                   "state_before": "running", "state": "cancelled"})
+        );
+        assert_eq!(*killed_by.lock().unwrap(), ["bob"]);
+        assert!(
+            audit_entries(&state).is_empty(),
+            "an owner's cancel is not audited"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_rule_and_manage_cancel_others_and_are_audited() {
+        let state = kill_state();
+        let (bobs, bob_killed_by) = running(&state, "bob");
+        let (alices, _) = running(&state, "alice");
+        let (other_bobs, _) = running(&state, "bob");
+        let (status, body) = cancel_as(&state, "ops", &format!("/api/v2/queries/{bobs}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(*bob_killed_by.lock().unwrap(), ["ops"]);
+        let (status, body) = cancel_as(&state, "root", &format!("/api/v2/queries/{alices}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) =
+            cancel_as(&state, "alice", &format!("/api/v2/queries/{other_bobs}")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"]["code"], "forbidden");
+        assert_eq!(
+            body["error"]["hint"],
+            "cancelling a query of bob needs a queries rule that allows kill for \
+             queryOwner bob, or the manage privilege"
+        );
+        assert_eq!(
+            query_state(&state, &other_bobs),
+            arneb_scheduler::QueryState::Running
+        );
+
+        let entries = audit_entries(&state);
+        let seen: Vec<(&str, &str, &str)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e["user"].as_str().unwrap(),
+                    e["action"].as_str().unwrap(),
+                    e["target"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        let (bobs, alices) = (bobs.to_string(), alices.to_string());
+        assert_eq!(
+            seen,
+            [
+                ("root", "query.cancel", alices.as_str()),
+                ("ops", "query.cancel", bobs.as_str())
+            ]
+        );
+        for e in &entries {
+            assert_eq!(e["outcome"], "ok");
+            assert_eq!(e["parameters"]["effect"], "applied");
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_cancels_nothing() {
+        let state = kill_state();
+        let (id, killed_by) = running(&state, "alice");
+        let (status, body) = cancel_as(
+            &state,
+            "root",
+            &format!("/api/v2/queries/{id}?dry_run=true"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["dry_run"], true);
+        assert_eq!(body["changed"], true);
+        let summary = body["summary"].as_str().unwrap();
+        // `^cancels 1 query \(.+\) owned by alice`
+        let rest = summary
+            .strip_prefix("cancels 1 query (")
+            .unwrap_or_default();
+        assert!(
+            rest.find(") owned by alice").is_some_and(|i| i > 0),
+            "{summary}"
+        );
+        assert!(body.get("result").is_none(), "{body}");
+        assert_eq!(
+            query_state(&state, &id),
+            arneb_scheduler::QueryState::Running
+        );
+        assert!(killed_by.lock().unwrap().is_empty());
+        assert!(audit_entries(&state).is_empty());
+        // dry_run=false is the real call.
+        let (status, body) = cancel_as(
+            &state,
+            "root",
+            &format!("/api/v2/queries/{id}?dry_run=false"),
+        )
+        .await;
+        assert_eq!((status, &body["dry_run"]), (StatusCode::OK, &json!(false)));
+        assert_eq!(
+            query_state(&state, &id),
+            arneb_scheduler::QueryState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn forbidden_dry_run_is_refused_like_the_real_call() {
+        let state = kill_state();
+        let (bobs, killed_by) = running(&state, "bob");
+        let path = format!("/api/v2/queries/{bobs}");
+        let real = cancel_as(&state, "alice", &path).await;
+        let dry = cancel_as(&state, "alice", &format!("{path}?dry_run=true")).await;
+        assert_eq!(real.0, StatusCode::FORBIDDEN);
+        assert_eq!(dry, real);
+        assert_eq!(
+            query_state(&state, &bobs),
+            arneb_scheduler::QueryState::Running
+        );
+        assert!(killed_by.lock().unwrap().is_empty());
+        assert!(audit_entries(&state).is_empty());
+
+        // Under none: a non-owner is refused the same way, dry or not.
+        let state = with_authz(web_state(false, None), None, &["root"]);
+        let (bobs, killed_by) = running(&state, "bob");
+        let path = format!("/api/v2/queries/{bobs}");
+        let real = call_as(&state, Method::DELETE, &path, "root").await;
+        let dry = call_as(
+            &state,
+            Method::DELETE,
+            &format!("{path}?dry_run=true"),
+            "root",
+        )
+        .await;
+        assert_eq!(real.0, StatusCode::FORBIDDEN, "{}", real.1);
+        assert_eq!(real.1["error"]["code"], "manage_requires_auth");
+        assert_eq!(dry, real);
+        assert!(killed_by.lock().unwrap().is_empty());
+        // The owner may still cancel (and dry-run) their own.
+        let (status, body) = call_as(
+            &state,
+            Method::DELETE,
+            &format!("{path}?dry_run=true"),
+            "bob",
+        )
+        .await;
+        assert_eq!(
+            (status, &body["dry_run"]),
+            (StatusCode::OK, &json!(true)),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_ended_query_is_a_noop() {
+        let state = kill_state();
+        let t = &state.query_tracker;
+        let id = t.create_query_from("SELECT 1".into(), "pgwire", Some("alice".into()));
+        t.finish_query(&id, 1).unwrap();
+        let (status, body) = cancel_as(&state, "root", &format!("/api/v2/queries/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], false);
+        let summary = body["summary"].as_str().unwrap();
+        assert!(summary.contains("already finished"), "{summary}");
+        assert_eq!(body["result"]["state_before"], "finished");
+        assert_eq!(body["result"]["state"], "finished");
+        assert_eq!(
+            query_state(&state, &id),
+            arneb_scheduler::QueryState::Finished
+        );
+        let entries = audit_entries(&state);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["outcome"], "ok");
+        assert_eq!(entries[0]["parameters"]["effect"], "already_ended");
+        // The dry run says the same, unaudited.
+        let (_, dry) = cancel_as(
+            &state,
+            "root",
+            &format!("/api/v2/queries/{id}?dry_run=true"),
+        )
+        .await;
+        assert_eq!(
+            (&dry["changed"], &dry["summary"]),
+            (&json!(false), &body["summary"])
+        );
+        assert_eq!(audit_entries(&state).len(), 1);
+
+        let (status, body) = cancel_as(&state, "root", "/api/v2/queries/not-a-uuid").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_argument");
+        let missing = format!("/api/v2/queries/{}", uuid::Uuid::new_v4());
+        let (status, body) = cancel_as(&state, "root", &missing).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "not_found");
+        assert_eq!(audit_entries(&state).len(), 1, "refusals are not audited");
+    }
+
+    #[tokio::test]
+    async fn bad_dry_run_value_is_invalid_argument() {
+        let state = kill_state();
+        let (id, _) = running(&state, "alice");
+        let (status, body) = cancel_as(
+            &state,
+            "alice",
+            &format!("/api/v2/queries/{id}?dry_run=maybe"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_argument");
+        assert_eq!(
+            query_state(&state, &id),
+            arneb_scheduler::QueryState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_may_cancel_a_query_hidden_from_them() {
+        let state = with_authz(
+            web_state(true, None),
+            Some(r#"{"queries":[{"user":"alice|bob","allow":["execute"]}]}"#),
+            &["root"],
+        );
+        let (id, _) = running(&state, "bob");
+        let path = format!("/api/v2/queries/{id}");
+        let (status, body) = cancel_as(&state, "alice", &path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "hidden: {body}");
+        let (status, body) = cancel_as(&state, "root", &path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["result"]["state"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn v1_cancel_uses_the_same_rule() {
+        let state = kill_state();
+        let (bobs, killed_by) = running(&state, "bob");
+        let path = format!("/api/v1/queries/{bobs}");
+        let (status, body) = cancel_as(&state, "alice", &path).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"]["code"], "forbidden");
+        let (status, _) = cancel_as(&state, "root", &path).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(*killed_by.lock().unwrap(), ["root"]);
+        assert_eq!(
+            query_state(&state, &bobs),
+            arneb_scheduler::QueryState::Cancelled
+        );
+        let entries = audit_entries(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["user"], "root");
+        assert_eq!(entries[0]["action"], "query.cancel");
+        let (status, _) = cancel_as(&state, "root", "/api/v1/queries/not-a-uuid").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let missing = format!("/api/v1/queries/{}", uuid::Uuid::new_v4());
+        assert_eq!(
+            cancel_as(&state, "root", &missing).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Ruling R1: under `[auth] type = "none"`, `/api/v1` keeps its open
+    /// cancel (any caller, any query), and now really stops the query;
+    /// `/api/v2` follows the kill rule.
+    #[tokio::test]
+    async fn v1_cancel_under_none_stays_open() {
+        let state = with_authz(web_state(false, None), None, &[]);
+        let (bobs, killed_by) = running(&state, "bob");
+        let (status, body) = call_as(
+            &state,
+            Method::DELETE,
+            &format!("/api/v2/queries/{bobs}"),
+            "alice",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"]["code"], "manage_requires_auth");
+        let (status, _) = call_as(
+            &state,
+            Method::DELETE,
+            &format!("/api/v1/queries/{bobs}"),
+            "alice",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(*killed_by.lock().unwrap(), ["alice"]);
+        assert_eq!(
+            query_state(&state, &bobs),
+            arneb_scheduler::QueryState::Cancelled
+        );
+        // One's own query too, and an ended one is still 204.
+        let (alices, _) = running(&state, "alice");
+        let path = format!("/api/v1/queries/{alices}");
+        assert_eq!(
+            call_as(&state, Method::DELETE, &path, "alice").await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call_as(&state, Method::DELETE, &path, "alice").await.0,
+            StatusCode::NO_CONTENT
+        );
+        let missing = format!("/api/v1/queries/{}", uuid::Uuid::new_v4());
+        assert_eq!(
+            call_as(&state, Method::DELETE, &missing, "alice").await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            audit_entries(&state).is_empty(),
+            "nothing is audited under none"
+        );
     }
 }

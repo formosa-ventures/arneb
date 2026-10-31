@@ -244,28 +244,34 @@ pub(super) async fn worker_action_for(
     if !known {
         return Err(no_such_worker(id));
     }
+    // Held across the whole change, audit append included, so the audit
+    // order is the apply order (as for admission changes). The action keeps
+    // a share, so a request dropped mid-call still serializes its apply.
+    let serialized = Arc::new(Arc::clone(&state.cordon_changes).lock_owned().await);
     let action = WorkerAction {
         id: id.to_owned(),
         op,
         by: who.user.clone(),
         store,
+        _serialized: Arc::clone(&serialized),
     };
-    run_manage(state, who, grant, dry_run, action).await
+    let outcome = run_manage(state, who, grant, dry_run, action).await;
+    drop(serialized);
+    outcome
 }
 
 fn has_cordon(registry: &NodeRegistry, store: &StateStore, id: &str) -> bool {
     registry.cordon_of(id).is_some() || store.cordon(id).is_some()
 }
 
-/// Serializes cordon changes (plan + persist + registry update). Blocking:
-/// held only inside `apply`, which runs in `spawn_blocking`.
-static CORDON_CHANGES: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 struct WorkerAction {
     id: String,
     op: WorkerOp,
     by: String,
     store: Arc<StateStore>,
+    /// A share of [`WebState::cordon_changes`], taken in
+    /// [`worker_action_for`].
+    _serialized: Arc<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 /// `n` with the singular or plural noun.
@@ -363,11 +369,10 @@ impl ManageAction for WorkerAction {
     }
 
     /// Persists first, then updates the registry, so a failed write
-    /// changes nothing. Plan, persist and registry update run under
-    /// [`CORDON_CHANGES`], so concurrent calls cannot leave the store and
-    /// the registry disagreeing.
+    /// changes nothing. Runs under [`WebState::cordon_changes`], so
+    /// concurrent calls cannot leave the store and the registry
+    /// disagreeing.
     fn apply(self, state: &WebState) -> Result<Applied<WorkerView>, ApiError> {
-        let _serialized = CORDON_CHANGES.lock().unwrap_or_else(|p| p.into_inner());
         let preview = self.plan(state);
         if preview.changed {
             match self.op.mode() {
@@ -952,49 +957,83 @@ mod tests {
         );
     }
 
-    /// The worker id whose cordon `apply` sleeps between persisting and
-    /// updating the registry, to widen the race window in a test.
+    /// The worker id whose cordon `apply` stops between persisting and
+    /// updating the registry, until the test releases it.
     static PAUSED_ID: &str = "race-w";
 
+    /// The race test's handshake: `apply` sends on the first sender once it
+    /// is inside the change, then waits for the second channel.
+    type Gate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+    static PAUSE_GATE: std::sync::Mutex<Option<Gate>> = std::sync::Mutex::new(None);
+
     pub(super) fn pause_after_persist(id: &str, op: WorkerOp) {
-        if id == PAUSED_ID && op == WorkerOp::Cordon {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+        if id != PAUSED_ID || op != WorkerOp::Cordon {
+            return;
+        }
+        let gate = PAUSE_GATE.lock().unwrap().take();
+        if let Some((inside, release)) = gate {
+            inside.send(()).unwrap();
+            release.recv().unwrap();
         }
     }
 
-    /// Concurrent calls on one id leave the store and the registry agreeing.
-    /// A cordon pauses after its persist; an uncordon starting meanwhile must
-    /// wait for it, or it would clear the store and the cordon would then
-    /// land in the registry alone.
-    #[test]
-    fn concurrent_changes_keep_store_and_registry_in_step() {
+    /// Concurrent calls on one id leave the store and the registry agreeing,
+    /// and audit in the order they applied. A cordon stops after its
+    /// persist; an uncordon started meanwhile must wait for the whole cordon
+    /// (audit append included), or it would clear the store, the cordon
+    /// would then land in the registry alone, and the log could read
+    /// uncordon before cordon.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_changes_keep_store_and_registry_in_step() {
         let state = cluster(None);
         state
             .node_registry
             .heartbeat(PAUSED_ID.into(), "http://127.0.0.1:3".into(), 256);
         let store = state.state.clone().unwrap();
-        let run = |op: WorkerOp| {
-            let (state, store) = (state.clone(), Arc::clone(&store));
-            std::thread::spawn(move || {
-                let action = WorkerAction {
-                    id: PAUSED_ID.into(),
-                    op,
-                    by: "root".into(),
-                    store,
-                };
-                action.apply(&state).unwrap()
-            })
+        let root_id = Identity {
+            user: "root".into(),
+            via: crate::web::auth::AuthVia::Basic,
         };
-        let cordon = run(WorkerOp::Cordon);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let uncordon = run(WorkerOp::Uncordon);
-        assert!(cordon.join().unwrap().preview.changed);
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *PAUSE_GATE.lock().unwrap() = Some((inside_tx, release_rx));
+
+        let cordon = tokio::spawn({
+            let (state, who) = (state.clone(), root_id.clone());
+            async move { worker_action_for(&state, &who, PAUSED_ID, WorkerOp::Cordon, false).await }
+        });
+        tokio::task::spawn_blocking(move || inside_rx.recv().unwrap())
+            .await
+            .unwrap();
+        // The cordon is persisted and holds the change lock.
+        assert!(store.cordon(PAUSED_ID).is_some());
+
+        let mut uncordon = std::pin::pin!(worker_action_for(
+            &state,
+            &root_id,
+            PAUSED_ID,
+            WorkerOp::Uncordon,
+            false
+        ));
         assert!(
-            uncordon.join().unwrap().preview.changed,
+            futures::poll!(uncordon.as_mut()).is_pending(),
+            "the uncordon waits for the cordon"
+        );
+        // While it waits, it has neither touched the store nor audited.
+        assert!(store.cordon(PAUSED_ID).is_some());
+        assert!(audit_actions(&state).is_empty());
+
+        release_tx.send(()).unwrap();
+        assert!(cordon.await.unwrap().unwrap().changed);
+        assert!(
+            uncordon.await.unwrap().changed,
             "uncordon ran after the cordon"
         );
         assert_eq!(store.cordon(PAUSED_ID), None);
         assert_eq!(state.node_registry.cordon_of(PAUSED_ID), None);
+        // Newest first: the uncordon was applied and audited last.
+        let actions: Vec<String> = audit_actions(&state).into_iter().map(|a| a.0).collect();
+        assert_eq!(actions, ["worker.uncordon", "worker.cordon"]);
     }
 
     #[tokio::test]

@@ -1192,6 +1192,7 @@ async fn run() -> Result<()> {
         role: config.cluster.role.clone(),
         admission: admission.clone(),
         admission_changes: Default::default(),
+        cordon_changes: Default::default(),
         max_queued_queries: config.admission.max_queued_queries,
         memory_pool: memory_pool.clone(),
         memory_limit_bytes: budget.map(|b| b as u64),

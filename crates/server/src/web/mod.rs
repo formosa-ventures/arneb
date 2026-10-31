@@ -39,6 +39,10 @@ pub struct WebState {
     /// reading the current limits to applying the new ones, so a change's
     /// preview, audit `from` and result see one state.
     pub admission_changes: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes worker cordon, drain and uncordon (manage-api D8): held
+    /// across the whole change (preview, persist, registry update, audit
+    /// append), so the audit order is the apply order.
+    pub cordon_changes: Arc<tokio::sync::Mutex<()>>,
     /// Configured `[admission] max_queued_queries`, reported when there is
     /// no controller (a worker).
     pub max_queued_queries: usize,

@@ -340,15 +340,19 @@ async fn issue_token(
     if !persistent {
         hints.push("the server keeps state in memory only: this token is lost when it restarts");
     }
-    let _permit = ISSUE_PERMITS
+    let permit = ISSUE_PERMITS
         .acquire()
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal, "token issuance is unavailable"))?;
-    let issued =
-        tokio::task::spawn_blocking(move || store.issue_token(&who.user, name, expires_at_ms))
-            .await
-            .map_err(blocking_failed)?
-            .map_err(state_error)?;
+    // The permit moves into the blocking task, so it is held for as long as
+    // PBKDF2 runs even if the client disconnects and this future is dropped.
+    let issued = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        store.issue_token(&who.user, name, expires_at_ms)
+    })
+    .await
+    .map_err(blocking_failed)?
+    .map_err(state_error)?;
     Ok((
         StatusCode::CREATED,
         Json(IssuedTokenResponse {

@@ -1241,7 +1241,10 @@ impl TaskSources<'_> {
                 catalog = %catalog,
                 "task names a catalog not registered here, pulling catalogs"
             );
-            if let Err(e) = puller.pull().await {
+            // A fresh pull when the one joined fetched before the catalog
+            // existed; a catalog that failed to build is rebuilt (R8).
+            let registry = self.connector_registry;
+            if let Err(e) = puller.pull_until(|| registry.get(catalog).is_some()).await {
                 tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
             }
             if let Some(factory) = self.connector_registry.get(catalog) {
@@ -1476,6 +1479,141 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, "catalog 'cat1' is not registered on worker w1");
         assert_eq!(pulls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A memory-backed catalog holding `default.users`.
+    fn users_built() -> crate::catalogs::BuiltCatalog {
+        use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
+        let mem = Arc::new(MemoryCatalog::new());
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table(
+            "users",
+            Arc::new(arneb_connectors::memory::MemoryTable::new(vec![], vec![])),
+        );
+        mem.register_schema("default", schema);
+        crate::catalogs::BuiltCatalog {
+            provider: mem.clone(),
+            connector: Arc::new(MemoryConnectorFactory::new(mem, "default")),
+        }
+    }
+
+    fn worker_tm(
+        registry: Arc<ConnectorRegistry>,
+        puller: crate::catalogs::CatalogPuller,
+    ) -> TaskManager {
+        use arneb_execution::memory_pool::UnboundedMemoryPool;
+        TaskManager::new(
+            FlightState::new(),
+            Arc::new(CatalogManager::new("memory", "default")),
+            registry,
+            Arc::new(UnboundedMemoryPool::new()),
+        )
+        .with_catalog_puller(puller, "w1".into())
+    }
+
+    /// Ruling R8: `cat1` failed to build at generation 5; once its backend
+    /// is reachable, a task's pull-once fetches the same set (same epoch
+    /// and generation), rebuilds `cat1` and the scan registers.
+    #[tokio::test]
+    async fn failed_build_is_installed_by_the_task_pull_once_reachable() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let registry = Arc::new(ConnectorRegistry::new());
+        let reachable = Arc::new(AtomicBool::new(false));
+        let r = reachable.clone();
+        let live = crate::catalogs::LiveCatalogs::with_test_builder(
+            Arc::new(CatalogManager::new("memory", "default")),
+            registry.clone(),
+            Box::new(move |_| {
+                if r.load(Ordering::SeqCst) {
+                    Ok(users_built())
+                } else {
+                    Err(crate::catalogs::CatalogBuildError::Unreachable(
+                        "down".into(),
+                    ))
+                }
+            }),
+        );
+        let held = arneb_rpc::CatalogSet {
+            epoch: 9,
+            generation: 5,
+            catalogs: vec![serde_json::json!({
+                "name": "cat1", "type": "hive", "metastore_uri": "h:9083"
+            })],
+        };
+        assert!(live.apply_remote(held.clone()).await.applied);
+        assert!(live.has_failed_builds());
+        assert_eq!(live.generation(), 5);
+
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let (n, l) = (pulls.clone(), live.clone());
+        let puller = crate::catalogs::CatalogPuller::new(live.clone(), move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            let (l, s) = (l.clone(), held.clone());
+            Box::pin(async move {
+                l.apply_remote(s).await;
+                Ok(())
+            })
+        });
+        let tm = worker_tm(registry, puller);
+        // Still down: the task fails naming the catalog.
+        let err = tm
+            .register_data_sources(&cat1_scan(), &mut arneb_execution::ExecutionContext::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err, "catalog 'cat1' is not registered on worker w1");
+        // Reachable: the next task's pull rebuilds it.
+        reachable.store(true, Ordering::SeqCst);
+        tm.register_data_sources(&cat1_scan(), &mut arneb_execution::ExecutionContext::new())
+            .await
+            .unwrap();
+        assert_eq!(pulls.load(Ordering::SeqCst), 2);
+        assert!(!live.has_failed_builds());
+        assert_eq!(live.generation(), 5);
+    }
+
+    /// A task that joins a pull already running (whose fetch predates
+    /// `cat1`) and still misses `cat1` starts one fresh pull, which brings it.
+    #[tokio::test]
+    async fn task_joining_a_stale_pull_starts_a_fresh_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = Arc::new(ConnectorRegistry::new());
+        let live = crate::catalogs::LiveCatalogs::new(
+            Arc::new(CatalogManager::new("memory", "default")),
+            registry.clone(),
+            crate::config::StorageConfig::default(),
+        );
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let (n, g, r) = (pulls.clone(), gate.clone(), registry.clone());
+        let puller = crate::catalogs::CatalogPuller::new(live, move || {
+            let nth = n.fetch_add(1, Ordering::SeqCst);
+            let (g, r) = (g.clone(), r.clone());
+            Box::pin(async move {
+                if nth == 0 {
+                    // The heartbeat's pull: fetched before cat1 existed.
+                    g.notified().await;
+                } else {
+                    r.register("cat1", users_built().connector);
+                }
+                Ok(())
+            })
+        });
+        let heartbeat_pull = {
+            let p = puller.clone();
+            tokio::spawn(async move { p.pull().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let tm = worker_tm(registry, puller);
+        let task = tokio::spawn(async move {
+            tm.register_data_sources(&cat1_scan(), &mut arneb_execution::ExecutionContext::new())
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(pulls.load(Ordering::SeqCst), 1, "the task joined");
+        gate.notify_one();
+        heartbeat_pull.await.unwrap().unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(pulls.load(Ordering::SeqCst), 2, "one fresh pull");
     }
 
     /// admission-control D1: each query gets its own pool on the node; one

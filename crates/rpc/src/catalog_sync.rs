@@ -108,8 +108,30 @@ pub async fn push_catalogs(
     }
 }
 
-/// Worker → coordinator: fetch the coordinator's live catalog set.
+/// How long [`fetch_catalogs`] waits for the coordinator, connect included.
+pub const FETCH_CATALOGS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Worker → coordinator: fetch the coordinator's live catalog set. Gives up
+/// after [`FETCH_CATALOGS_TIMEOUT`], so a black-holed coordinator never
+/// leaves a pull pending.
 pub async fn fetch_catalogs(
+    coordinator: &str,
+    security: &ClusterSecurity,
+) -> Result<CatalogSet, String> {
+    tokio::time::timeout(
+        FETCH_CATALOGS_TIMEOUT,
+        fetch_catalogs_inner(coordinator, security),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "get_catalogs from {coordinator} timed out after {} s",
+            FETCH_CATALOGS_TIMEOUT.as_secs()
+        ))
+    })
+}
+
+async fn fetch_catalogs_inner(
     coordinator: &str,
     security: &ClusterSecurity,
 ) -> Result<CatalogSet, String> {

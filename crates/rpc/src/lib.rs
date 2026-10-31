@@ -28,6 +28,7 @@ pub const MAX_FLIGHT_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 pub use catalog_sync::{
     fetch_catalogs, push_catalogs, CatalogSet, CatalogSourceCallback, CatalogSyncCallback,
+    FETCH_CATALOGS_TIMEOUT,
 };
 pub use dynamic_filter::{NotifyDynamicFilterRequest, ReportDynamicFilterRequest};
 pub use exchange_client::ExchangeClient;

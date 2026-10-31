@@ -92,10 +92,21 @@ pub struct LiveCatalogs {
     /// epoch of the coordinator its set came from (0 before the first).
     /// Ruling R6.
     epoch: AtomicU64,
+    /// Catalogs of the applied set that failed to build (Ruling R8): a set
+    /// with the same epoch and generation rebuilds them instead of being
+    /// rejected as stale.
+    failed: RwLock<std::collections::BTreeSet<String>>,
     /// Serializes [`apply_set`](Self::apply_set) calls, which build outside
     /// any other lock.
     applying: tokio::sync::Mutex<()>,
+    /// Tests replace [`build`](Self::build) with this.
+    #[cfg(test)]
+    test_builder: Option<TestBuilder>,
 }
+
+#[cfg(test)]
+pub(crate) type TestBuilder =
+    Box<dyn Fn(&CatalogConfig) -> Result<BuiltCatalog, CatalogBuildError> + Send + Sync>;
 
 impl std::fmt::Debug for LiveCatalogs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -122,8 +133,33 @@ impl LiveCatalogs {
             specs: RwLock::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
+            failed: RwLock::new(Default::default()),
             applying: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            test_builder: None,
         })
+    }
+
+    /// [`new`](Self::new) whose [`build`](Self::build) is `builder`.
+    #[cfg(test)]
+    pub(crate) fn with_test_builder(
+        manager: Arc<CatalogManager>,
+        connectors: Arc<ConnectorRegistry>,
+        builder: TestBuilder,
+    ) -> Arc<Self> {
+        let mut live = Arc::into_inner(Self::new(manager, connectors, StorageConfig::default()))
+            .expect("fresh Arc");
+        live.test_builder = Some(builder);
+        Arc::new(live)
+    }
+
+    /// Whether a catalog of the applied set failed to build (Ruling R8).
+    pub fn has_failed_builds(&self) -> bool {
+        !self
+            .failed
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
     }
 
     /// The catalog generation the installed set belongs to.
@@ -216,6 +252,10 @@ impl LiveCatalogs {
     /// Builds the catalog `spec` describes (connects to its metastore or
     /// database) without installing it. Gives up after 10 s.
     pub async fn build(&self, spec: &CatalogConfig) -> Result<BuiltCatalog, CatalogBuildError> {
+        #[cfg(test)]
+        if let Some(builder) = &self.test_builder {
+            return builder(spec);
+        }
         match tokio::time::timeout(BUILD_TIMEOUT, self.build_inner(spec)).await {
             Ok(r) => r,
             Err(_) => Err(CatalogBuildError::Timeout),
@@ -269,6 +309,10 @@ impl LiveCatalogs {
         let name = spec.name.clone();
         self.connectors.register(name.clone(), built.connector);
         self.manager.register_catalog(name.clone(), built.provider);
+        self.failed
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&name);
         self.write_specs().insert(name, spec);
     }
 
@@ -305,7 +349,10 @@ impl LiveCatalogs {
     ) -> ApplyReport {
         let _applying = self.applying.lock().await;
         let same_epoch = epoch.is_none_or(|e| e == self.epoch());
-        if same_epoch && generation <= self.generation() {
+        // Ruling R8: the set already held is applied again (rebuilding only
+        // what is not installed) while some of it failed to build.
+        let retry = same_epoch && generation == self.generation() && self.has_failed_builds();
+        if same_epoch && generation <= self.generation() && !retry {
             return ApplyReport::default();
         }
         let installed = self.read_specs().clone();
@@ -346,6 +393,8 @@ impl LiveCatalogs {
             self.remove(name);
             tracing::info!(catalog = %name, generation, "removed catalog");
         }
+        *self.failed.write().unwrap_or_else(|p| p.into_inner()) =
+            failed.iter().map(|(name, _)| name.clone()).collect();
         // Generation before epoch: a reader seeing the new epoch also sees
         // the generation that goes with it.
         self.set_generation(generation);
@@ -373,7 +422,14 @@ struct PullerInner {
     live: Arc<LiveCatalogs>,
     pull: Box<dyn Fn() -> futures::future::BoxFuture<'static, Result<(), String>> + Send + Sync>,
     in_flight: std::sync::Mutex<Option<PullFuture>>,
+    /// When the last fetch started; rate-limits the heartbeat's retry of
+    /// failed builds (Ruling R8).
+    last_pull: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
+
+/// The least time between two heartbeat-triggered retries of catalogs that
+/// failed to build (Ruling R8).
+pub const FAILED_BUILD_RETRY: Duration = Duration::from_secs(30);
 
 impl CatalogPuller {
     /// A puller whose fetch-and-apply is `pull`; `live` is the set whose
@@ -390,6 +446,7 @@ impl CatalogPuller {
                 live,
                 pull: Box::new(pull),
                 in_flight: std::sync::Mutex::new(None),
+                last_pull: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -422,19 +479,41 @@ impl CatalogPuller {
     /// Fetches the coordinator's set and applies it. A pull already running
     /// is joined instead of starting another.
     pub async fn pull(&self) -> Result<(), String> {
+        self.pull_joined().await.0
+    }
+
+    /// [`pull`](Self::pull) for a task missing catalog `found` checks: when
+    /// it joined a pull that was already running (whose fetch may predate
+    /// the catalog) and the catalog is still missing, it starts one fresh
+    /// pull.
+    pub async fn pull_until(&self, found: impl Fn() -> bool) -> Result<(), String> {
+        let (result, joined) = self.pull_joined().await;
+        if joined && !found() {
+            return self.pull_joined().await.0;
+        }
+        result
+    }
+
+    /// The pull's result, and whether it joined one already running.
+    async fn pull_joined(&self) -> (Result<(), String>, bool) {
         use futures::FutureExt;
-        let fut = {
+        let (fut, joined) = {
             let mut slot = self
                 .inner
                 .in_flight
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             match slot.as_ref() {
-                Some(f) => f.clone(),
+                Some(f) => (f.clone(), true),
                 None => {
+                    *self
+                        .inner
+                        .last_pull
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(tokio::time::Instant::now());
                     let f = (self.inner.pull)().shared();
                     *slot = Some(f.clone());
-                    f
+                    (f, false)
                 }
             }
         };
@@ -447,12 +526,14 @@ impl CatalogPuller {
         if slot.as_ref().is_some_and(|f| f.ptr_eq(&fut)) {
             *slot = None;
         }
-        result
+        (result, joined)
     }
 
     /// After a heartbeat: pulls when the reply names another catalog
-    /// generation or coordinator epoch than the applied ones (Ruling R6).
-    /// True when it pulled.
+    /// generation or coordinator epoch than the applied ones (Ruling R6),
+    /// or, while catalogs of the applied set failed to build, at most once
+    /// per [`FAILED_BUILD_RETRY`] since the last fetch (Ruling R8). True
+    /// when it pulled.
     pub async fn after_heartbeat(&self, reply: &arneb_rpc::HeartbeatReply) -> bool {
         let Some(generation) = reply.catalog_generation else {
             return false;
@@ -461,7 +542,17 @@ impl CatalogPuller {
         let (applied, applied_epoch) = (live.generation(), live.epoch());
         let epoch_differs = reply.catalog_epoch.is_some_and(|e| e != applied_epoch);
         if generation == applied && !epoch_differs {
-            return false;
+            if !live.has_failed_builds() || !self.retry_due() {
+                return false;
+            }
+            tracing::debug!(
+                target: "arneb::cluster",
+                "retrying catalogs that failed to build"
+            );
+            if let Err(e) = self.pull().await {
+                tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
+            }
+            return true;
         }
         tracing::debug!(
             target: "arneb::cluster",
@@ -474,6 +565,16 @@ impl CatalogPuller {
             tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
         }
         true
+    }
+}
+
+impl CatalogPuller {
+    fn retry_due(&self) -> bool {
+        self.inner
+            .last_pull
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none_or(|at| at.elapsed() >= FAILED_BUILD_RETRY)
     }
 }
 
@@ -836,11 +937,100 @@ mod tests {
             "the new spec was built (and failed)"
         );
         assert_eq!((live.epoch(), live.generation()), (33, 2));
-        // Repeating the same (epoch, generation) is stale.
+        // Same epoch, older generation: stale even with failed builds.
+        assert!(!live.apply_remote(set(33, 1, vec![])).await.applied);
+        // Ruling R8: the same (epoch, generation) retries the failed build.
+        let mysql = serde_json::json!({"name": "changed", "type": "mysql"});
+        let report = live.apply_remote(set(33, 2, vec![mysql])).await;
+        assert!(report.applied, "retry while a build failed");
+        assert_eq!(report.failed.len(), 1);
+        // Once nothing failed, the same (epoch, generation) is stale.
+        assert!(live.apply_remote(set(33, 2, vec![])).await.applied, "retry");
+        assert!(!live.has_failed_builds());
         assert!(!live.apply_remote(set(33, 2, vec![])).await.applied);
         // The coordinator's own path (no epoch) keeps the epoch.
         assert!(live.apply_set(3, vec![]).await.applied);
         assert_eq!(live.epoch(), 33);
+    }
+
+    /// Ruling R8: while a catalog of the applied set failed to build, a
+    /// matching heartbeat retries the pull at most once per 30 s since the
+    /// last fetch; once nothing failed, it stops.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_retries_failed_builds_at_most_every_30s() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let reachable = Arc::new(AtomicBool::new(false));
+        let r = reachable.clone();
+        let live = LiveCatalogs::with_test_builder(
+            Arc::new(CatalogManager::new("memory", "default")),
+            Arc::new(ConnectorRegistry::new()),
+            Box::new(move |_| {
+                if r.load(Ordering::SeqCst) {
+                    Ok(fake_built())
+                } else {
+                    Err(CatalogBuildError::Unreachable("down".into()))
+                }
+            }),
+        );
+        let held = set(9, 4, vec![serde_json::to_value(hive("lake")).unwrap()]);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let (n, l, s) = (fetches.clone(), live.clone(), held.clone());
+        let puller = CatalogPuller::new(live.clone(), move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            let (l, s) = (l.clone(), s.clone());
+            Box::pin(async move {
+                l.apply_remote(s).await;
+                Ok(())
+            })
+        });
+        let reply = arneb_rpc::HeartbeatReply {
+            catalog_generation: Some(4),
+            catalog_epoch: Some(9),
+        };
+        // The first heartbeat pulls (generation differs); lake fails.
+        assert!(puller.after_heartbeat(&reply).await);
+        assert!(live.has_failed_builds());
+        assert_eq!(live.generation(), 4, "the generation still advances");
+        // In sync, but lake failed: no retry before 30 s.
+        assert!(!puller.after_heartbeat(&reply).await);
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(!puller.after_heartbeat(&reply).await);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(puller.after_heartbeat(&reply).await, "retry due");
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert!(live.has_failed_builds(), "still down");
+        // Reachable now: the next due retry installs it, then no more.
+        reachable.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(puller.after_heartbeat(&reply).await);
+        assert!(!live.has_failed_builds());
+        assert_eq!(live.specs().len(), 1);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(!puller.after_heartbeat(&reply).await);
+        assert_eq!(fetches.load(Ordering::SeqCst), 3);
+    }
+
+    /// A coordinator that accepts connections and never answers: the pull
+    /// fails within the 10 s fetch timeout instead of hanging, so later
+    /// pulls (which would join it) do not hang either.
+    #[tokio::test(start_paused = true)]
+    async fn a_black_holed_coordinator_fails_the_pull_in_time() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let (live, _, _) = live();
+        let puller = CatalogPuller::from_coordinator(addr, live);
+        let started = tokio::time::Instant::now();
+        let err = puller.pull().await.unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(started.elapsed() <= arneb_rpc::FETCH_CATALOGS_TIMEOUT + Duration::from_secs(1));
+        let err = puller.pull().await.unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
     }
 
     /// A TCP port with nothing listening on it.

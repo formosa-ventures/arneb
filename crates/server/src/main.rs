@@ -460,6 +460,8 @@ async fn run() -> Result<()> {
             // the set with `get_catalogs` (runtime-config D8).
             let registry = node_registry.clone();
             let live = live_catalogs.clone();
+            // Standalone serves no `get_catalogs`, so it names no generation.
+            let serves_catalogs = matches!(role, ServerRole::Coordinator);
             let mut state = arneb_rpc::FlightState::with_heartbeat_callback(std::sync::Arc::new(
                 move |msg: arneb_rpc::HeartbeatMessage| {
                     if msg.state == arneb_rpc::WorkerState::Stopped {
@@ -473,9 +475,13 @@ async fn run() -> Result<()> {
                         &msg.version,
                         msg.state == arneb_rpc::WorkerState::Draining,
                     )?;
-                    Ok(arneb_rpc::HeartbeatReply {
-                        catalog_generation: Some(live.generation()),
-                        catalog_epoch: Some(live.epoch()),
+                    Ok(if serves_catalogs {
+                        arneb_rpc::HeartbeatReply {
+                            catalog_generation: Some(live.generation()),
+                            catalog_epoch: Some(live.epoch()),
+                        }
+                    } else {
+                        arneb_rpc::HeartbeatReply::default()
                     })
                 },
             ));

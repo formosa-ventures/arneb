@@ -700,7 +700,7 @@ mod tests {
             AgentLimits::default(),
         );
         let d = svc
-            .describe_table("alice", "counted", "s", "stat")
+            .describe_table("alice", "counted", "s", "stat", None)
             .await
             .unwrap();
         assert_eq!(d.statistics.row_count, Some(42));
@@ -710,7 +710,7 @@ mod tests {
         let count = || listings.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(count(), 0, "a hit must not list the schema");
         let err = svc
-            .describe_table("alice", "counted", "s", "stta")
+            .describe_table("alice", "counted", "s", "stta", None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);

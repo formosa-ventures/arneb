@@ -341,7 +341,7 @@ My calls, on top of the spec. Task 8 copies them into `openspec/changes/runtime-
 
 **Files:**
 - Create: `crates/server/src/web/catalogs.rs`; register it in `web/v2.rs`
-- Modify: `crates/server/src/web/mod.rs` (`WebState.catalogs: Option<Arc<LiveCatalogs>>`, `WebState.node_registry` if not present), `crates/server/src/main.rs` (wire it)
+- Modify: `crates/server/src/web/mod.rs` (`WebState.catalogs: Option<Arc<LiveCatalogs>>`; the worker list comes from the existing `WebState.node_registry`), `crates/server/src/main.rs` (wire it)
 
 **Interfaces:**
 - Consumes:

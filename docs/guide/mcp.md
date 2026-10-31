@@ -110,9 +110,11 @@ never clamped. The ceilings come from `[agent_api]`.
 | `max_bytes` of `fetch_results` | 32768 | 4194304 | default is `[mcp] default_page_bytes`, ceiling is `[agent_api] max_page_bytes` |
 | `limit` of `list_queries` | 50 | 500 (0 is refused) | fixed |
 
-The tool descriptions and the server instructions quote the default
-`[agent_api]` numbers. If an operator changes that section, the text an
-agent reads goes stale; the server still enforces the configured values.
+The tool descriptions, their argument descriptions and the server
+instructions quote the configured numbers: they are filled from
+`[agent_api]` and `[mcp] default_page_bytes` when the server starts, so
+what an agent reads is what the server enforces. The table shows the
+defaults.
 
 Differences from the HTTP routes:
 

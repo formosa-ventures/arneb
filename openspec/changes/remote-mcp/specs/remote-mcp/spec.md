@@ -187,7 +187,7 @@ A failed tool call SHALL be a tool result with `isError: true` whose `structured
 - **THEN** the result has `isError` true and its text names `table`
 
 ### Requirement: Agent-facing copy
-The server SHALL send `instructions` of at most 1500 characters that name the workflow (discover, describe or sample, explain, submit, poll, fetch, cancel), the result caps, that fetching starts from `first_page.next_cursor`, and how to use an error's `hint` and `candidates`. Every tool description SHALL be 40 to 600 characters and SHALL name the follow-up tool where the workflow has one, and every input property SHALL have a description. Tools SHALL carry the annotations: `readOnlyHint` on `whoami`, `list_*`, `get_*`, `describe_table`, `sample_table`, `explain_query` and `fetch_results`; `destructiveHint` and `idempotentHint` on `cancel_query` and `revoke_token`; `openWorldHint` false on all.
+The server SHALL send `instructions` of at most 1500 characters that name the workflow (discover, describe or sample, explain, submit, poll, fetch, cancel), the result caps, that fetching starts from `first_page.next_cursor`, and how to use an error's `hint` and `candidates`. Every limit the instructions, tool descriptions or property descriptions quote SHALL be the configured value (`[agent_api]`, `[mcp] default_page_bytes`), not a hard-coded default. Every tool description SHALL be 40 to 600 characters and SHALL name the follow-up tool where the workflow has one, and every input property SHALL have a description. Tools SHALL carry the annotations: `readOnlyHint` on `whoami`, `list_*`, `get_*`, `describe_table`, `sample_table`, `explain_query` and `fetch_results`; `destructiveHint` and `idempotentHint` on `cancel_query` and `revoke_token`; `openWorldHint` false on all.
 
 #### Scenario: Tool list contract
 - **WHEN** a client calls `tools/list`
@@ -196,6 +196,10 @@ The server SHALL send `instructions` of at most 1500 characters that name the wo
 #### Scenario: Instructions
 - **WHEN** a client calls `initialize`
 - **THEN** `instructions` is at most 1500 characters and names the workflow tools in order
+
+#### Scenario: Copy follows the configuration
+- **WHEN** `[agent_api] max_rows = 500` and `max_wait_ms = 2000`
+- **THEN** the instructions and the `submit_query` copy quote 500 and 2000, and none of the copy quotes the default 10000
 
 ### Requirement: Configuration
 `[mcp]` SHALL accept `enabled` (default true), `allowed_hosts`, `allowed_origins` and `default_page_bytes` (default 32768), with `ARNEB_MCP_ENABLED`, `ARNEB_MCP_ALLOWED_HOSTS`, `ARNEB_MCP_ALLOWED_ORIGINS` (both comma-separated) and `ARNEB_MCP_DEFAULT_PAGE_BYTES` overriding the file. An unknown key, a `default_page_bytes` of 0 or above `[agent_api] max_page_bytes`, an empty `allowed_hosts` or `allowed_origins` list, an origin without a scheme or an invalid boolean SHALL stop startup. The effective values SHALL be logged once on `arneb::config`.

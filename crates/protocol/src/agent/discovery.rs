@@ -21,9 +21,9 @@ use crate::trino::{
 };
 
 /// Rows a sample returns when `rows` is not given.
-const DEFAULT_SAMPLE_ROWS: usize = 10;
+pub const DEFAULT_SAMPLE_ROWS: usize = 10;
 /// Most rows a sample may ask for.
-const MAX_SAMPLE_ROWS: usize = 100;
+pub const MAX_SAMPLE_ROWS: usize = 100;
 /// Nearest names offered in a not-found error.
 const MAX_CANDIDATES: usize = 3;
 

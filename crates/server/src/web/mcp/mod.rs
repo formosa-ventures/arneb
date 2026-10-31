@@ -9,6 +9,7 @@ mod tools;
 
 use std::sync::Arc;
 
+use arneb_protocol::agent::AgentLimits;
 use axum::http::{request::Parts, StatusCode};
 use rmcp::{
     handler::server::router::tool::ToolRouter,
@@ -49,7 +50,9 @@ impl From<&crate::config::McpConfig> for McpSettings {
 }
 
 /// What the agent reads on `initialize`: the intended workflow (at most
-/// 1500 characters; a test enforces it).
+/// 1500 characters once filled; a test enforces it). The `{…}`
+/// placeholders are filled from the configured limits (see
+/// [`tools::copy_values`]).
 const INSTRUCTIONS: &str = "\
 Arneb is a distributed SQL engine that queries many data sources through catalogs. \
 Names are catalog.schema.table.
@@ -58,22 +61,25 @@ Workflow:
 1. Discover: list_catalogs, list_schemas, list_tables.
 2. Learn the table: describe_table for columns and types, sample_table for a few real rows.
 3. Check the query: explain_query plans it without running it.
-4. Run it: submit_query with wait_ms (up to 10000) so short queries return finished.
+4. Run it: submit_query with wait_ms (up to {max_wait_ms}) so short queries return finished.
 5. If the state is queued or running, call get_query_status (with wait_ms) until it is finished, failed or cancelled.
 6. Read rows: a finished status carries first_page; start fetch_results from first_page.next_cursor and repeat with each next_cursor until it is null.
 7. Stop a statement you no longer need with cancel_query.
 
-Limits: a statement keeps at most max_rows rows (default 1000, ceiling 10000) and reports truncated when more existed. Pages are small by default; ask for more with max_bytes. Long cells and SQL text are cut. Listings take limit and report truncated.
+Limits: a statement keeps at most max_rows rows (default {default_max_rows}, ceiling {max_rows}) and reports truncated when more existed. Pages hold {page_bytes} bytes of rows by default; ask for up to {max_page_bytes} with max_bytes. Long cells and SQL text are cut. Listings take limit and report truncated.
 
 Errors: a failed tool call comes back as an error result with a code and a hint. Read the hint and any candidates (close matches for a misspelled table or column), fix the call, and retry. A SQL error after submit is a status with state failed, not an error result.
 
 Queries run as your user and see only what your user may see.";
 
-/// The MCP handler: one per request (the service is stateless).
+/// The MCP handler: one per request (the service is stateless), cloned
+/// from the one [`mcp_service`] builds.
 #[derive(Clone)]
 pub struct ArnebMcp {
     pub(crate) state: WebState,
     tool_router: ToolRouter<Self>,
+    /// [`INSTRUCTIONS`] filled from the configured limits.
+    instructions: Arc<str>,
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -81,7 +87,7 @@ impl ServerHandler for ArnebMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("arneb", env!("CARGO_PKG_VERSION")))
-            .with_instructions(INSTRUCTIONS)
+            .with_instructions(self.instructions.to_string())
     }
 }
 
@@ -142,13 +148,20 @@ pub(super) fn mcp_service(
         .enforce_origin_validation();
     config.legacy_session_mode = false;
     config.json_response = true;
+    // The copy quotes the configured limits; the agent service carries
+    // them on every node that serves `/mcp`.
+    let limits = state
+        .agent
+        .as_ref()
+        .map_or_else(AgentLimits::default, |a| a.limits().clone());
+    let values = tools::copy_values(&limits, settings.default_page_bytes);
+    let handler = ArnebMcp {
+        tool_router: ArnebMcp::configured_router(&values),
+        instructions: tools::fill(INSTRUCTIONS, &values).into(),
+        state,
+    };
     StreamableHttpService::new(
-        move || {
-            Ok(ArnebMcp {
-                state: state.clone(),
-                tool_router: ArnebMcp::tool_router(),
-            })
-        },
+        move || Ok(handler.clone()),
         Arc::new(NeverSessionManager::default()),
         config,
     )

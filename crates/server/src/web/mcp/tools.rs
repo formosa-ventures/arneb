@@ -2,13 +2,16 @@
 //! and makes the same service call, with the same validation, as the
 //! matching `/api/v2` route.
 
+use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arneb_protocol::agent::discovery::{DEFAULT_SAMPLE_ROWS, MAX_SAMPLE_ROWS};
 use arneb_protocol::agent::{
     AgentLimits, AgentQueryService, ExplainRequest, Explanation, ListRequest, SubmitRequest,
 };
 use rmcp::{
-    handler::server::wrapper::Parameters,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, ContentBlock},
     service::{RequestContext, RoleServer},
     tool, tool_router, ErrorData,
@@ -27,7 +30,7 @@ use crate::web::v2;
 struct ListCatalogsArgs {
     /// Keep only names starting with this (case-insensitive).
     prefix: Option<String>,
-    /// Most names to return (default 1000, at most 10000).
+    /// Most names to return (default {default_max_rows}, at most {max_rows}).
     limit: Option<usize>,
 }
 
@@ -38,7 +41,7 @@ struct ListSchemasArgs {
     catalog: String,
     /// Keep only names starting with this (case-insensitive).
     prefix: Option<String>,
-    /// Most names to return (default 1000, at most 10000).
+    /// Most names to return (default {default_max_rows}, at most {max_rows}).
     limit: Option<usize>,
 }
 
@@ -51,7 +54,7 @@ struct ListTablesArgs {
     schema: String,
     /// Keep only names starting with this (case-insensitive).
     prefix: Option<String>,
-    /// Most names to return (default 1000, at most 10000).
+    /// Most names to return (default {default_max_rows}, at most {max_rows}).
     limit: Option<usize>,
 }
 
@@ -64,7 +67,7 @@ struct TableArgs {
     schema: String,
     /// The table to describe.
     table: String,
-    /// Most columns to return (default 1000, at most 10000).
+    /// Most columns to return (default {default_max_rows}, at most {max_rows}).
     limit: Option<usize>,
 }
 
@@ -77,7 +80,7 @@ struct SampleArgs {
     schema: String,
     /// The table to sample.
     table: String,
-    /// Rows to return (default 10, at most 100).
+    /// Rows to return (default {sample_rows}, at most {max_sample_rows}).
     rows: Option<usize>,
 }
 
@@ -101,10 +104,10 @@ struct SubmitArgs {
     catalog: Option<String>,
     /// Default schema for unqualified names.
     schema: Option<String>,
-    /// Rows to keep for fetching (default 1000, at most 10000).
+    /// Rows to keep for fetching (default {default_max_rows}, at most {max_rows}).
     max_rows: Option<usize>,
     /// Milliseconds to wait for the statement to finish before answering
-    /// (default 0, at most 10000).
+    /// (default 0, at most {max_wait_ms}).
     wait_ms: Option<u64>,
 }
 
@@ -114,7 +117,7 @@ struct StatusArgs {
     /// The statement id from `submit_query`.
     id: String,
     /// Milliseconds to wait for the statement to finish before answering
-    /// (default 0, at most 10000).
+    /// (default 0, at most {max_wait_ms}).
     wait_ms: Option<u64>,
 }
 
@@ -126,7 +129,8 @@ struct FetchArgs {
     /// Row offset to start at (default 0); pass the previous page's
     /// `next_cursor`.
     cursor: Option<u64>,
-    /// Most bytes of rows in the page (default 32768, at most 4194304).
+    /// Most bytes of rows in the page (default {page_bytes}, at most
+    /// {max_page_bytes}).
     max_bytes: Option<usize>,
 }
 
@@ -149,7 +153,8 @@ struct ListQueriesArgs {
     /// Keep only queries that took (or have taken) at least this many
     /// milliseconds: the slow-query view.
     min_elapsed_ms: Option<u64>,
-    /// Most queries to return (default 50, at most 500).
+    /// Most queries to return (default {query_limit}, at most
+    /// {max_query_limit}).
     limit: Option<usize>,
 }
 
@@ -176,6 +181,60 @@ struct TokenIdArgs {
     id: String,
 }
 
+/// The configured numbers the agent-facing copy quotes, as `{name}`
+/// placeholders and their values. Tool descriptions, input-property
+/// descriptions and the server instructions are written with these
+/// placeholders and filled once, when the router is built, so the text an
+/// agent reads always matches what the server enforces.
+pub(super) fn copy_values(limits: &AgentLimits, page_bytes: usize) -> Vec<(&'static str, String)> {
+    vec![
+        ("{default_max_rows}", limits.default_max_rows.to_string()),
+        ("{max_rows}", limits.max_rows.to_string()),
+        ("{max_wait_ms}", limits.max_wait.as_millis().to_string()),
+        ("{page_bytes}", page_bytes.to_string()),
+        ("{max_page_bytes}", limits.max_page_bytes.to_string()),
+        (
+            "{sample_rows}",
+            DEFAULT_SAMPLE_ROWS.min(limits.max_rows).to_string(),
+        ),
+        (
+            "{max_sample_rows}",
+            MAX_SAMPLE_ROWS.min(limits.max_rows).to_string(),
+        ),
+        ("{query_limit}", api::DEFAULT_QUERY_LIMIT.to_string()),
+        ("{max_query_limit}", api::MAX_QUERY_LIMIT.to_string()),
+    ]
+}
+
+/// `text` with every placeholder of `values` replaced.
+pub(super) fn fill(text: &str, values: &[(&'static str, String)]) -> String {
+    values
+        .iter()
+        .fold(text.to_owned(), |t, (name, value)| t.replace(name, value))
+}
+
+/// Fills the placeholders in every `description` string of a JSON schema.
+fn fill_schema(value: &mut serde_json::Value, values: &[(&'static str, String)]) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, v) in map.iter_mut() {
+                match v {
+                    serde_json::Value::String(text) if key == "description" => {
+                        *text = fill(text, values);
+                    }
+                    other => fill_schema(other, values),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                fill_schema(v, values);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A tool result for a service outcome: the body, or the error envelope.
 fn respond<T: Serialize>(outcome: Result<T, ApiError>) -> Result<CallToolResult, ErrorData> {
     match outcome {
@@ -185,6 +244,25 @@ fn respond<T: Serialize>(outcome: Result<T, ApiError>) -> Result<CallToolResult,
 }
 
 impl ArnebMcp {
+    /// The tool router with its copy filled from `values` (see
+    /// [`copy_values`]): descriptions and input-schema descriptions. Built
+    /// once per service and cloned per request.
+    pub(super) fn configured_router(values: &[(&'static str, String)]) -> ToolRouter<Self> {
+        let mut router = Self::tool_router();
+        for route in router.map.values_mut() {
+            let tool = &mut route.attr;
+            if let Some(d) = tool.description.as_mut() {
+                *d = Cow::Owned(fill(d, values));
+            }
+            let mut schema = serde_json::Value::Object((*tool.input_schema).clone());
+            fill_schema(&mut schema, values);
+            if let serde_json::Value::Object(map) = schema {
+                tool.input_schema = Arc::new(map);
+            }
+        }
+        router
+    }
+
     /// The longest query text a result carries: the agent limit, or its
     /// default when this node has no agent service.
     fn cell_bytes(&self) -> usize {
@@ -227,8 +305,8 @@ impl ArnebMcp {
     /// `list_catalogs`: `GET /api/v2/catalogs`.
     #[tool(
         description = "List the catalogs you can see, sorted, with the total and whether the \
-                       list was cut at `limit` (default 1000, at most 10000). Next: \
-                       list_schemas.",
+                       list was cut at `limit` (default {default_max_rows}, at most {max_rows}). \
+                       Next: list_schemas.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_catalogs(
@@ -252,7 +330,8 @@ impl ArnebMcp {
     /// `list_schemas`: `GET /api/v2/catalogs/{c}/schemas`.
     #[tool(
         description = "List the schemas of a catalog, sorted, with the total and whether the \
-                       list was cut at `limit` (default 1000, at most 10000). Next: list_tables.",
+                       list was cut at `limit` (default {default_max_rows}, at most {max_rows}). \
+                       Next: list_tables.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_schemas(
@@ -278,8 +357,8 @@ impl ArnebMcp {
     /// `list_tables`: `GET /api/v2/catalogs/{c}/schemas/{s}/tables`.
     #[tool(
         description = "List the tables of a schema, sorted, with the total and whether the \
-                       list was cut at `limit` (default 1000, at most 10000). Next: \
-                       describe_table.",
+                       list was cut at `limit` (default {default_max_rows}, at most {max_rows}). \
+                       Next: describe_table.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_tables(
@@ -326,7 +405,8 @@ impl ArnebMcp {
 
     /// `sample_table`: `GET …/tables/{t}/sample`.
     #[tool(
-        description = "Read a few rows of a table (default 10, at most 100) and return the \
+        description = "Read a few rows of a table (default {sample_rows}, at most \
+                       {max_sample_rows}) and return the \
                        finished statement with its first page. Use it to see real values \
                        before writing a query; then submit_query.",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -390,9 +470,10 @@ impl ArnebMcp {
 
     /// `submit_query`: `POST /api/v2/statements`.
     #[tool(
-        description = "Run a SQL statement. Returns its status; with `wait_ms` (at most 10000) \
-                       a short query is already finished, with a first page of rows. At most \
-                       `max_rows` rows are kept and `truncated` says if more existed. A failed \
+        description = "Run a SQL statement. Returns its status; with `wait_ms` (at most \
+                       {max_wait_ms}) a short query is already finished, with a first page of \
+                       rows. At most `max_rows` (default {default_max_rows}, at most {max_rows}) \
+                       rows are kept and `truncated` says if more existed. A failed \
                        statement is a status with state `failed` and an error. Next: \
                        get_query_status until finished, then fetch_results starting from \
                        `first_page.next_cursor` (null means you have every row).",
@@ -424,7 +505,7 @@ impl ArnebMcp {
     /// `get_query_status`: `GET /api/v2/statements/{id}`.
     #[tool(
         description = "Get the status of a statement you submitted, optionally waiting up to \
-                       `wait_ms` (at most 10000) for it to finish. A finished one carries the \
+                       `wait_ms` (at most {max_wait_ms}) for it to finish. A finished one carries the \
                        columns and a first page of rows. Next: fetch_results starting from \
                        `first_page.next_cursor` while it is set, or cancel_query to stop it.",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -449,8 +530,8 @@ impl ArnebMcp {
     /// `fetch_results`: `GET /api/v2/statements/{id}/results`.
     #[tool(
         description = "Fetch a page of a finished statement's rows from `cursor`, at most \
-                       `max_bytes` of rows (default 32768, at most 4194304; long cells are \
-                       cut). Repeat with `next_cursor` until it is null.",
+                       `max_bytes` of rows (default {page_bytes}, at most {max_page_bytes}; long \
+                       cells are cut). Repeat with `next_cursor` until it is null.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn fetch_results(
@@ -497,7 +578,7 @@ impl ArnebMcp {
     /// `list_queries`: the bounded `GET /api/v2/queries`.
     #[tool(
         description = "List tracked queries (any protocol) you may see, newest first, at most \
-                       `limit` (default 50, at most 500); `truncated` says if more matched. \
+                       `limit` (default {query_limit}, at most {max_query_limit}); `truncated` says if more matched. \
                        Each `state` is lowercase: queued, planning, starting, running, \
                        finishing, finished, failed or cancelled. Filter by `state` (exactly \
                        one of those, so running excludes planning), `user`, or \
@@ -772,9 +853,17 @@ mod tests {
         page_bytes: usize,
         tracker: Arc<arneb_scheduler::QueryTracker>,
     ) -> Fixture {
+        fixture_limited(hang, page_bytes, tracker, AgentLimits::default())
+    }
+
+    fn fixture_limited(
+        hang: bool,
+        page_bytes: usize,
+        tracker: Arc<arneb_scheduler::QueryTracker>,
+        limits: AgentLimits,
+    ) -> Fixture {
         let (cm, registry) = engine_state();
-        let mut agent =
-            AgentQueryService::new(cm, registry, tracker.clone(), AgentLimits::default());
+        let mut agent = AgentQueryService::new(cm, registry, tracker.clone(), limits);
         if hang {
             agent = agent.with_distributed_executor(Arc::new(HangingExecutor));
         }
@@ -1417,6 +1506,105 @@ mod tests {
         assert!(desc("describe_table").contains("sample_table"));
         assert!(desc("explain_query").contains("submit_query"));
         assert!(desc("list_queries").contains("get_query"));
+    }
+
+    /// Every string an agent reads: the instructions, each tool's
+    /// description and each input property's description.
+    async fn agent_copy(f: &Fixture) -> Vec<String> {
+        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-06-18","capabilities":{},
+            "clientInfo":{"name":"t","version":"1"}}});
+        let v = rpc_raw(f, init).await;
+        let mut copy = vec![v["result"]["instructions"].as_str().unwrap().to_owned()];
+        let v = rpc_raw(
+            f,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        )
+        .await;
+        for t in v["result"]["tools"].as_array().unwrap() {
+            copy.push(t["description"].as_str().unwrap().to_owned());
+            for p in t["inputSchema"]["properties"]
+                .as_object()
+                .into_iter()
+                .flat_map(|m| m.values())
+            {
+                copy.push(p["description"].as_str().unwrap_or("").to_owned());
+            }
+        }
+        copy
+    }
+
+    /// #217 review: the copy quotes the configured limits, not the
+    /// defaults, so an agent that follows it is never refused.
+    #[tokio::test]
+    async fn copy_quotes_the_configured_limits() {
+        let limits = AgentLimits {
+            default_max_rows: 100,
+            max_rows: 500,
+            max_page_bytes: 1_048_576,
+            max_wait: Duration::from_millis(2000),
+            ..AgentLimits::default()
+        };
+        let f = fixture_limited(
+            false,
+            4096,
+            Arc::new(arneb_scheduler::QueryTracker::new()),
+            limits,
+        );
+        let copy = agent_copy(&f).await;
+        let all = copy.join("\n");
+        for text in &copy {
+            assert!(!text.contains('{'), "unfilled placeholder: {text}");
+            for default in ["10000", "1000,", "1000)", "32768", "4194304"] {
+                assert!(!text.contains(default), "default {default} in: {text}");
+            }
+        }
+        let instructions = &copy[0];
+        for configured in [
+            "up to 2000",
+            "default 100,",
+            "ceiling 500",
+            "4096",
+            "1048576",
+        ] {
+            assert!(
+                instructions.contains(configured),
+                "{configured}: {instructions}"
+            );
+        }
+        for configured in [
+            "at most 2000",
+            "at most 500",
+            "default 100,",
+            "default 4096",
+            "at most 1048576",
+        ] {
+            assert!(all.contains(configured), "{configured} missing");
+        }
+        // And the server enforces exactly those numbers.
+        let e = tool_err(
+            &f,
+            "alice",
+            "submit_query",
+            json!({"sql":"SELECT 1","max_rows":501}),
+        )
+        .await;
+        assert_eq!(e["code"], "invalid_argument");
+        let ok = tool_ok(
+            &f,
+            "alice",
+            "submit_query",
+            json!({"sql":"SELECT 1","max_rows":500,"wait_ms":2000}),
+        )
+        .await;
+        assert_eq!(ok["max_rows"], 500);
+
+        // The defaults appear under the default configuration.
+        let copy = agent_copy(&fixture(false)).await.join("\n");
+        for default in ["at most 10000", "default 32768", "at most 4194304"] {
+            assert!(copy.contains(default), "{default} missing");
+        }
+        assert!(!copy.contains('{'), "unfilled placeholder");
     }
 
     #[tokio::test]

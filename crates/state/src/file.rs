@@ -42,6 +42,9 @@ pub enum StateError {
     /// The audit log failed a write and has not been reopened since.
     #[error("the audit log is not writable: {0}")]
     AuditUnwritable(String),
+    /// No catalog with this name exists.
+    #[error("catalog {0:?} not found")]
+    CatalogNotFound(String),
 }
 
 /// A stored user with a SCRAM-SHA-256 verifier (never a plaintext password).
@@ -102,6 +105,14 @@ pub(crate) struct StateData {
     /// written before runtime config existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deleted_config_users: Vec<String>,
+    /// The catalog definitions, in name order. Absent in files written
+    /// before runtime config existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub catalogs: Vec<crate::CatalogRecord>,
+    /// Bumped by every catalog change; workers pull the set when theirs
+    /// differs. Absent (0) in files written before runtime config existed.
+    #[serde(default)]
+    pub catalog_generation: u64,
 }
 
 impl Default for StateData {
@@ -115,6 +126,8 @@ impl Default for StateData {
             rules: None,
             seeded: Default::default(),
             deleted_config_users: Vec::new(),
+            catalogs: Vec::new(),
+            catalog_generation: 0,
         }
     }
 }
@@ -142,6 +155,7 @@ impl std::fmt::Debug for StateStore {
             .field("tokens", &data.tokens.len())
             .field("cordons", &data.cordons.len())
             .field("rules", &data.rules.is_some())
+            .field("catalogs", &data.catalogs.len())
             .finish_non_exhaustive()
     }
 }

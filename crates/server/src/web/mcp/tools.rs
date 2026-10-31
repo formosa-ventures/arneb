@@ -1029,7 +1029,7 @@ mod tests {
         memory.register_schema("default", default_schema);
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", memory.clone());
-        let mut registry = ConnectorRegistry::new();
+        let registry = ConnectorRegistry::new();
         registry.register(
             "memory",
             Arc::new(MemoryConnectorFactory::new(memory, "default")),

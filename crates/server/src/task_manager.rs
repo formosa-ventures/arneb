@@ -1581,7 +1581,7 @@ mod tests {
         catalog.register_schema("default", mem_schema);
         let cm = Arc::new(CatalogManager::new("memory", "default"));
         cm.register_catalog("memory", catalog.clone());
-        let mut registry = ConnectorRegistry::new();
+        let registry = ConnectorRegistry::new();
         registry.register(
             "memory",
             Arc::new(MemoryConnectorFactory::new(catalog, "default")),

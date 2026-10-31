@@ -84,6 +84,7 @@ fn configure_jemalloc_decay() {
 #[cfg(target_env = "msvc")]
 fn configure_jemalloc_decay() {}
 
+mod catalogs;
 mod config;
 pub mod coordinator;
 mod drain;
@@ -287,7 +288,7 @@ async fn run() -> Result<()> {
     let mem_factory = MemoryConnectorFactory::new(mem_catalog.clone(), "default");
     catalog_manager.register_catalog("memory", mem_catalog);
 
-    let mut connector_registry = ConnectorRegistry::new();
+    let connector_registry = ConnectorRegistry::new();
     connector_registry.register("memory", Arc::new(mem_factory));
 
     // 6. Register file tables from config
@@ -353,73 +354,6 @@ async fn run() -> Result<()> {
         connector_registry.register("file", file_factory);
     }
 
-    // 6.5. Register external catalogs from config: Hive (Iceberg tables in
-    // the same metastore are redirected to the Iceberg reader by the Hive
-    // catalog) and PostgreSQL. Runs on every role, so workers can create
-    // data sources for the scans they are sent.
-    for catalog_cfg in &config.catalogs {
-        if catalog_cfg.catalog_type == "postgresql" {
-            register_postgresql_catalog(catalog_cfg, &catalog_manager, &mut connector_registry)
-                .await;
-            continue;
-        }
-        if catalog_cfg.catalog_type != "hive" {
-            tracing::warn!(
-                catalog = %catalog_cfg.name,
-                catalog_type = %catalog_cfg.catalog_type,
-                "unsupported catalog type, skipping"
-            );
-            continue;
-        }
-
-        let metastore_uri = match &catalog_cfg.metastore_uri {
-            Some(uri) => uri.clone(),
-            None => {
-                tracing::warn!(
-                    catalog = %catalog_cfg.name,
-                    "hive catalog missing metastore_uri, skipping"
-                );
-                continue;
-            }
-        };
-
-        // Per-catalog storage: merge catalog override with global config
-        let merged_storage =
-            config::StorageConfig::merge(&config.storage, catalog_cfg.storage.as_ref());
-        let catalog_storage_registry = Arc::new(StorageRegistry::with_config(
-            merged_storage.to_cloud_config(),
-        ));
-
-        match arneb_hive::catalog::HmsClient::new(&metastore_uri).await {
-            Ok(hms_client) => {
-                let hms_client = Arc::new(hms_client);
-                let hive_catalog = Arc::new(arneb_hive::catalog::HiveCatalogProvider::new(
-                    hms_client.clone(),
-                    catalog_storage_registry.clone(),
-                ));
-                catalog_manager.register_catalog(&catalog_cfg.name, hive_catalog);
-
-                let hive_connector =
-                    arneb_hive::datasource::HiveConnectorFactory::new(catalog_storage_registry);
-                connector_registry.register(&catalog_cfg.name, Arc::new(hive_connector));
-
-                tracing::info!(
-                    catalog = %catalog_cfg.name,
-                    metastore = %metastore_uri,
-                    "registered hive catalog"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    catalog = %catalog_cfg.name,
-                    metastore = %metastore_uri,
-                    error = %e,
-                    "failed to connect to hive metastore, skipping catalog"
-                );
-            }
-        }
-    }
-
     // 7. Create protocol server
     let listen_addr = format!("{}:{}", config.server.bind_address, config.server.port);
     let protocol_config = ProtocolConfig {
@@ -428,6 +362,22 @@ async fn run() -> Result<()> {
 
     let catalog_manager = Arc::new(catalog_manager);
     let connector_registry = Arc::new(connector_registry);
+
+    // 6.5. External catalogs (Hive, with Iceberg tables in the same
+    // metastore redirected to the Iceberg reader, and PostgreSQL), kept live
+    // so they can change at runtime. Workers and standalone build them from
+    // the config here, so workers can create data sources for the scans they
+    // are sent; the coordinator builds them once the state store is open
+    // (runtime-config Ruling R2). An unreachable catalog is skipped with a
+    // WARN; the server keeps serving.
+    let live_catalogs = catalogs::LiveCatalogs::new(
+        catalog_manager.clone(),
+        connector_registry.clone(),
+        config.storage.clone(),
+    );
+    if !matches!(role, ServerRole::Coordinator) {
+        load_config_catalogs(&live_catalogs, &config.catalogs).await;
+    }
 
     // 8. Set up Flight RPC server + heartbeat handling
     let heartbeat = config
@@ -816,6 +766,17 @@ async fn run() -> Result<()> {
     if let Some(store) = &state_store {
         let count = web::restore_worker_cordons(store, &node_registry);
         tracing::info!(target: "arneb::config", count, "restored worker cordons");
+    }
+    // runtime-config D1: under password auth the coordinator seeds the
+    // state store from [[catalogs]] once and serves the stored definitions
+    // from then on; without a state store it serves the config's.
+    if matches!(role, ServerRole::Coordinator) {
+        match &state_store {
+            Some(store) => {
+                load_stored_catalogs(store, &live_catalogs, &config.catalogs, reseed_state).await?
+            }
+            None => load_config_catalogs(&live_catalogs, &config.catalogs).await,
+        }
     }
     let auth_method = match &state_store {
         Some(store) => arneb_protocol::AuthMethod::ScramSha256(store.clone()),
@@ -1531,49 +1492,90 @@ async fn run_until_shutdown(
     }
 }
 
-/// Mount one `type = "postgresql"` catalog. Like an unreachable Hive
-/// Metastore, a bad config or unreachable database is logged and the
-/// catalog skipped; the server keeps serving.
-async fn register_postgresql_catalog(
-    catalog_cfg: &config::CatalogConfig,
-    catalog_manager: &CatalogManager,
-    connector_registry: &mut ConnectorRegistry,
-) {
-    let pg_config = match catalog_cfg.postgres_config() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(catalog = %catalog_cfg.name, error = %e, "invalid postgresql catalog, skipping");
-            return;
-        }
-    };
-    let target = pg_config.display_target();
-    match arneb_postgresql::PostgresCatalog::connect(&catalog_cfg.name, pg_config).await {
-        Ok(catalog) => {
-            let c = catalog.config();
-            tracing::info!(
-                catalog = %catalog_cfg.name,
-                target = %target,
-                max_connections = c.max_connections,
-                split_min_rows = c.split_min_rows,
-                max_splits = c.max_splits,
-                unconstrained_numeric_scale = c.unconstrained_numeric_scale,
-                connect_timeout_secs = c.connect_timeout_secs,
-                pool_wait_timeout_secs = c.pool_wait_timeout_secs,
-                domain_compaction_threshold = c.domain_compaction_threshold,
-                "registered postgresql catalog"
-            );
-            connector_registry.register(&catalog_cfg.name, Arc::new(catalog.connector_factory()));
-            catalog_manager.register_catalog(&catalog_cfg.name, Arc::new(catalog));
-        }
-        Err(e) => {
+/// Builds the config's `[[catalogs]]` as the live set at generation 1, so a
+/// coordinator without a state store never advertises generation 0 (which
+/// a fresh worker already holds; runtime-config Ruling R1).
+async fn load_config_catalogs(live: &catalogs::LiveCatalogs, specs: &[config::CatalogConfig]) {
+    let report = live
+        .apply_set(CONFIG_CATALOG_GENERATION, specs.to_vec())
+        .await;
+    tracing::info!(
+        target: "arneb::config",
+        source = "config",
+        catalogs = live.specs().len(),
+        failed = report.failed.len(),
+        generation = live.generation(),
+        "external catalogs loaded"
+    );
+}
+
+/// The generation of a catalog set built from the config file.
+const CONFIG_CATALOG_GENERATION: u64 = 1;
+
+/// Seeds the state store from `[[catalogs]]` (first start or `reseed`),
+/// logs one WARN per config catalog that diverges from the stored set, and
+/// builds the stored set as the live one.
+async fn load_stored_catalogs(
+    store: &arneb_state::StateStore,
+    live: &catalogs::LiveCatalogs,
+    specs: &[config::CatalogConfig],
+    reseed: bool,
+) -> Result<()> {
+    let config_specs = specs
+        .iter()
+        .map(|c| Ok((c.name.clone(), serde_json::to_value(c)?)))
+        .collect::<Result<Vec<_>, serde_json::Error>>()
+        .context("cannot serialize [[catalogs]]")?;
+    let report = store
+        .seed_catalogs(&config_specs, reseed)
+        .context("cannot seed the state store from [[catalogs]]")?;
+    for (names, how) in [
+        (&report.added, "is in the config but not in the state store"),
+        (&report.changed, "differs from its copy in the state store"),
+        (
+            &report.removed,
+            "was removed from the config but is still in the state store",
+        ),
+    ] {
+        for name in names {
             tracing::warn!(
-                catalog = %catalog_cfg.name,
-                target = %target,
-                error = %e,
-                "failed to connect to postgresql, skipping catalog"
+                target: "arneb::config",
+                catalog = %name,
+                "[[catalogs]] '{name}' {how}; the state store wins. Preview a re-seed with \
+                 POST /api/v2/state/reseed?dry_run=true"
             );
         }
     }
+    let (generation, records) = store.catalogs();
+    let stored = records
+        .into_iter()
+        .filter_map(
+            |r| match serde_json::from_value::<config::CatalogConfig>(r.spec) {
+                Ok(spec) => Some(spec),
+                Err(e) => {
+                    // The serde error names a field, never the spec's values.
+                    tracing::warn!(
+                        target: "arneb::config",
+                        catalog = %r.name,
+                        error = %e,
+                        "stored catalog definition is invalid, skipping"
+                    );
+                    None
+                }
+            },
+        )
+        .collect();
+    let applied = live.apply_set(generation, stored).await;
+    tracing::info!(
+        target: "arneb::config",
+        source = "state",
+        seeded = report.seeded,
+        catalogs = live.specs().len(),
+        failed = applied.failed.len(),
+        generation = live.generation(),
+        "external catalogs loaded"
+    );
+    Ok(())
 }
 
 /// The tracing filter: `rust_log` (when set and valid, else `info`), then
@@ -1606,6 +1608,38 @@ fn log_filter_directives(rust_log: Option<&str>, profile: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_live() -> Arc<catalogs::LiveCatalogs> {
+        catalogs::LiveCatalogs::new(
+            Arc::new(CatalogManager::new("memory", "default")),
+            Arc::new(ConnectorRegistry::new()),
+            config::StorageConfig::default(),
+        )
+    }
+
+    /// Ruling R1: a coordinator's catalog generation is never 0, which a
+    /// fresh worker holds, so every worker pulls on its first heartbeat.
+    #[tokio::test]
+    async fn coordinator_catalog_generation_is_never_zero() {
+        let live = empty_live();
+        load_config_catalogs(&live, &[]).await;
+        assert_eq!(live.generation(), 1, "config-built set, no state store");
+
+        let store = arneb_state::StateStore::open(None).unwrap();
+        let live = empty_live();
+        load_stored_catalogs(&store, &live, &[], false)
+            .await
+            .unwrap();
+        assert!(store.seeded().catalogs);
+        assert_eq!(live.generation(), 1, "seeded state with zero catalogs");
+        // A later start keeps the stored generation.
+        let live = empty_live();
+        load_stored_catalogs(&store, &live, &[], false)
+            .await
+            .unwrap();
+        assert_eq!(live.generation(), store.catalogs().0);
+        assert!(live.generation() >= 1);
+    }
 
     /// Which `tracing` target an [`enabled`] probe checks.
     #[derive(Clone, Copy)]

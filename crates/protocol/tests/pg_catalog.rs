@@ -67,7 +67,7 @@ fn state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
     file.register_schema("staging", staging);
     let cm = CatalogManager::new("file", "default");
     cm.register_catalog("file", file.clone());
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register(
         "file",
         Arc::new(MemoryConnectorFactory::new(file, "default")),

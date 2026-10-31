@@ -116,7 +116,7 @@ fn engine_state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
     let cm = CatalogManager::new("memory", "default");
     cm.register_catalog("memory", memory.clone());
     cm.register_catalog("lake", lake.clone());
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register(
         "memory",
         Arc::new(MemoryConnectorFactory::new(memory, "default")),

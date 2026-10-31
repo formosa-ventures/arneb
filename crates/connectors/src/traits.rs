@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use arneb_common::error::ConnectorError;
 use arneb_common::types::{ColumnInfo, TableReference};
@@ -66,10 +66,13 @@ pub trait ConnectorFactory: Send + Sync + Debug {
     }
 }
 
-/// Registry mapping connector names to their factories.
+/// Registry mapping connector names to their factories. Shared as
+/// `Arc<ConnectorRegistry>`; factories can be registered and removed at
+/// runtime through a shared reference. The lock is held only to clone or
+/// swap an `Arc`, so lookups stay cheap.
 #[derive(Debug, Default)]
 pub struct ConnectorRegistry {
-    factories: HashMap<String, Arc<dyn ConnectorFactory>>,
+    factories: RwLock<HashMap<String, Arc<dyn ConnectorFactory>>>,
 }
 
 impl ConnectorRegistry {
@@ -79,13 +82,30 @@ impl ConnectorRegistry {
     }
 
     /// Registers a connector factory under the given name.
-    pub fn register(&mut self, name: impl Into<String>, factory: Arc<dyn ConnectorFactory>) {
-        self.factories.insert(name.into(), factory);
+    /// Registers a connector factory under the given name, replacing any
+    /// factory already registered under it.
+    pub fn register(&self, name: impl Into<String>, factory: Arc<dyn ConnectorFactory>) {
+        self.factories
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(name.into(), factory);
+    }
+
+    /// Removes the factory registered under `name`, returning it.
+    pub fn deregister(&self, name: &str) -> Option<Arc<dyn ConnectorFactory>> {
+        self.factories
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(name)
     }
 
     /// Returns the factory for the given connector name, if registered.
     pub fn get(&self, name: &str) -> Option<Arc<dyn ConnectorFactory>> {
-        self.factories.get(name).cloned()
+        self.factories
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(name)
+            .cloned()
     }
 }
 
@@ -114,12 +134,24 @@ mod tests {
 
     #[test]
     fn registry_register_and_get() {
-        let mut registry = ConnectorRegistry::new();
+        let registry = ConnectorRegistry::new();
         let factory: Arc<dyn ConnectorFactory> = Arc::new(DummyFactory);
         registry.register("dummy", factory);
         let retrieved = registry.get("dummy");
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().name(), "dummy");
+    }
+
+    #[test]
+    fn registry_register_and_deregister_through_shared_ref() {
+        let registry = Arc::new(ConnectorRegistry::new());
+        let shared = Arc::clone(&registry);
+        shared.register("dummy", Arc::new(DummyFactory));
+        assert_eq!(registry.get("dummy").unwrap().name(), "dummy");
+        let removed = shared.deregister("dummy");
+        assert_eq!(removed.unwrap().name(), "dummy");
+        assert!(registry.get("dummy").is_none());
+        assert!(shared.deregister("dummy").is_none());
     }
 
     #[test]

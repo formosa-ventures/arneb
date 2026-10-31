@@ -94,7 +94,7 @@ fn create_server_with_users_table() -> (Arc<CatalogManager>, Arc<ConnectorRegist
     let catalog_manager = Arc::new(CatalogManager::new("memory", "default"));
     catalog_manager.register_catalog("memory", mem_catalog);
 
-    let mut connector_registry = ConnectorRegistry::new();
+    let connector_registry = ConnectorRegistry::new();
     connector_registry.register("memory", Arc::new(factory));
 
     (catalog_manager, Arc::new(connector_registry))

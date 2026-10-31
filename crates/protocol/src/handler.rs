@@ -2327,7 +2327,7 @@ mod tests {
         catalog.register_schema("default", schema);
         let catalog_manager = CatalogManager::new("memory", "default");
         catalog_manager.register_catalog("memory", catalog.clone());
-        let mut registry = ConnectorRegistry::new();
+        let registry = ConnectorRegistry::new();
         registry.register(
             "memory",
             Arc::new(MemoryConnectorFactory::new(catalog, "default")),
@@ -2403,7 +2403,7 @@ mod tests {
         let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", catalog);
-        let mut reg = ConnectorRegistry::new();
+        let reg = ConnectorRegistry::new();
         reg.register("memory", Arc::new(factory));
 
         let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
@@ -2503,7 +2503,7 @@ mod tests {
         let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
         let catalog_manager = CatalogManager::new("memory", "default");
         catalog_manager.register_catalog("memory", catalog);
-        let mut registry = ConnectorRegistry::new();
+        let registry = ConnectorRegistry::new();
         registry.register("memory", Arc::new(factory));
         (catalog_manager, registry)
     }
@@ -2665,7 +2665,7 @@ mod tests {
         let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", catalog);
-        let mut reg = ConnectorRegistry::new();
+        let reg = ConnectorRegistry::new();
         reg.register("memory", Arc::new(factory));
         (cm, reg)
     }
@@ -2789,7 +2789,7 @@ mod tests {
         let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", catalog);
-        let mut reg = ConnectorRegistry::new();
+        let reg = ConnectorRegistry::new();
         reg.register("memory", Arc::new(factory));
         (cm, reg)
     }
@@ -3045,7 +3045,7 @@ mod tests {
         catalog.register_schema("default", schema);
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", catalog.clone());
-        let mut reg = ConnectorRegistry::new();
+        let reg = ConnectorRegistry::new();
         reg.register(
             "memory",
             Arc::new(MemoryConnectorFactory::new(catalog, "default")),
@@ -3344,7 +3344,7 @@ mod tests {
         let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", catalog);
-        let mut reg = ConnectorRegistry::new();
+        let reg = ConnectorRegistry::new();
         reg.register("memory", Arc::new(factory));
         (cm, reg)
     }

@@ -6,7 +6,7 @@ use arneb_common::types::DataType;
 use arneb_common::ServerConfig;
 use arneb_connectors::{CloudStorageConfig, S3StorageConfig};
 use arneb_protocol::{AuthMethod, PgwireTlsMode, ScramVerifier, UserCredentials};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
@@ -1332,8 +1332,10 @@ impl MemoryConfig {
     }
 }
 
-/// External catalog configuration.
-#[derive(Debug, Clone, Deserialize)]
+/// External catalog configuration. `Serialize` writes the raw secrets
+/// (for the state file and the cluster RPC); responses and logs use
+/// `catalogs::redacted_spec`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct CatalogConfig {
     /// Catalog name (used in SQL: `SELECT * FROM <name>.schema.table`).
@@ -1491,7 +1493,7 @@ fn check_password_env_vars(catalogs: &[CatalogConfig]) -> Result<()> {
 }
 
 /// Global storage backend configuration.
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct StorageConfig {
     /// AWS S3 configuration.
@@ -1505,7 +1507,7 @@ pub struct StorageConfig {
 /// AWS S3 storage configuration.
 ///
 /// Credential resolution: config > env var (`AWS_ACCESS_KEY_ID`) > IAM role.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct S3Config {
     /// AWS region (e.g., "us-east-1").
@@ -1522,7 +1524,7 @@ pub struct S3Config {
 }
 
 /// Google Cloud Storage configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct GcsConfig {
     /// Path to service account JSON key file.
@@ -1530,7 +1532,7 @@ pub struct GcsConfig {
 }
 
 /// Azure Blob Storage configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct AzureConfig {
     /// Azure storage account name.
@@ -1662,8 +1664,9 @@ pub struct HeartbeatSettings {
     pub timeout_secs: u64,
 }
 
-/// A string that never appears in `Debug` output.
-#[derive(Clone, Deserialize, PartialEq, Eq)]
+/// A string that never appears in `Debug` output. `Serialize` writes the
+/// raw value (state file, cluster RPC); redact before returning it.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct RedactedString(pub String);
 

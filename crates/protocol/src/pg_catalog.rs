@@ -437,7 +437,7 @@ async fn build(
     }
     let catalog_manager = CatalogManager::new(database.clone(), default_schema.clone());
     catalog_manager.register_catalog(&database, catalog.clone());
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register(
         &database,
         Arc::new(MemoryConnectorFactory::new(catalog, &default_schema)),

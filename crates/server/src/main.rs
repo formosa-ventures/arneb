@@ -253,18 +253,13 @@ async fn run() -> Result<()> {
     // 4. Initialize tracing. `--profile` appends an `arneb::profile=info`
     // directive after the base filter (defaults to `RUST_LOG`, else
     // global `info`) so the flag works regardless of how the user
-    // configured the rest of the filter.
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let env_filter = if args.profile {
-        env_filter.add_directive(
-            "arneb::profile=info"
-                .parse()
-                .expect("static directive parses"),
-        )
-    } else {
-        env_filter
-    };
+    // configured the rest of the filter; `rmcp=info` is appended the same
+    // way (see `log_filter_directives`).
+    let rust_log = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok();
+    let env_filter = tracing_subscriber::EnvFilter::new(log_filter_directives(
+        rust_log.as_deref(),
+        args.profile,
+    ));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
     // 5. Create catalog manager + connector registry
     // Default catalog priority: first hive catalog > file (if tables configured) > memory
@@ -950,6 +945,12 @@ async fn run() -> Result<()> {
                 );
                 if hosts.is_empty() { "any".to_owned() } else { hosts.join(",") }
             },
+            allowed_origins = %{
+                let origins = web::mcp::resolve_allowed_origins(
+                    &web::mcp::McpSettings::from(&config.mcp),
+                );
+                if origins.is_empty() { "none".to_owned() } else { origins.join(",") }
+            },
             default_page_bytes = config.mcp.default_page_bytes,
             "mcp effective settings ([mcp] / ARNEB_MCP_*)"
         );
@@ -1456,9 +1457,86 @@ async fn register_postgresql_catalog(
     }
 }
 
+/// The tracing filter: `rust_log` (when set and valid, else `info`), then
+/// `arneb::profile=info` under `--profile`, then `rmcp=info` unless
+/// `rust_log` names an `rmcp` target. rmcp logs every tool result at debug,
+/// new API tokens included, so a global `debug` must not reach it; naming
+/// `rmcp` is the operator opting in.
+fn log_filter_directives(rust_log: Option<&str>, profile: bool) -> String {
+    let base = rust_log
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && tracing_subscriber::EnvFilter::try_new(s).is_ok())
+        .unwrap_or("info");
+    let mut directives = base.to_owned();
+    if profile {
+        directives.push_str(",arneb::profile=info");
+    }
+    let names_rmcp = base.split(',').any(|d| {
+        let target = d.split(['=', '[']).next().unwrap_or("").trim();
+        target == "rmcp" || target.starts_with("rmcp::")
+    });
+    if !names_rmcp {
+        directives.push_str(",rmcp=info");
+    }
+    directives
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether `directives` enable `level` events of `target`.
+    fn enabled(directives: &str, target_is_rmcp: bool, level: tracing::Level) -> bool {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_subscriber::EnvFilter::new(directives));
+        tracing::subscriber::with_default(subscriber, || {
+            if target_is_rmcp {
+                match level {
+                    tracing::Level::DEBUG => {
+                        tracing::enabled!(target: "rmcp::service", tracing::Level::DEBUG)
+                    }
+                    _ => tracing::enabled!(target: "rmcp::service", tracing::Level::INFO),
+                }
+            } else {
+                tracing::enabled!(target: "arneb::other", tracing::Level::DEBUG)
+            }
+        })
+    }
+
+    #[test]
+    fn rmcp_is_capped_at_info_unless_rust_log_names_it() {
+        use tracing::Level;
+        // Unset, invalid or empty RUST_LOG: global info, rmcp capped.
+        for unset in [None, Some(""), Some("bogus=[[[")] {
+            assert_eq!(log_filter_directives(unset, false), "info,rmcp=info");
+        }
+        // A global debug level does not reach rmcp's result logging.
+        let d = log_filter_directives(Some("debug"), false);
+        assert_eq!(d, "debug,rmcp=info");
+        assert!(enabled(&d, false, Level::DEBUG));
+        assert!(!enabled(&d, true, Level::DEBUG));
+        assert!(enabled(&d, true, Level::INFO));
+        // Naming rmcp (or a module of it) is the operator opting in.
+        for opted in [
+            "debug,rmcp=debug",
+            "info,rmcp::service=debug",
+            "rmcp[x]=debug",
+        ] {
+            assert_eq!(log_filter_directives(Some(opted), false), opted);
+        }
+        assert!(enabled("debug,rmcp=debug", true, Level::DEBUG));
+        // A target that only starts with the letters is not rmcp.
+        assert_eq!(
+            log_filter_directives(Some("rmcpx=debug"), false),
+            "rmcpx=debug,rmcp=info"
+        );
+        // `--profile` composes with both.
+        assert_eq!(
+            log_filter_directives(Some("warn"), true),
+            "warn,arneb::profile=info,rmcp=info"
+        );
+    }
 
     #[tokio::test]
     async fn failed_auxiliary_listener_keeps_the_server_up() {

@@ -499,6 +499,7 @@ impl AgentApiConfig {
 /// [mcp]
 /// enabled            = true      # ARNEB_MCP_ENABLED
 /// allowed_hosts      = ["db.internal", "db.internal:6432"]  # ARNEB_MCP_ALLOWED_HOSTS (comma-separated; "*" = any)
+/// allowed_origins    = ["https://app.example:443"]  # ARNEB_MCP_ALLOWED_ORIGINS (comma-separated; omit = refuse any Origin)
 /// default_page_bytes = 32768     # ARNEB_MCP_DEFAULT_PAGE_BYTES
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -511,6 +512,11 @@ pub struct McpConfig {
     /// rejected. `None` = any host under password auth, loopback under
     /// `[auth] type = "none"`.
     pub allowed_hosts: Option<Vec<String>>,
+    /// Accepted browser `Origin` values (`scheme://host[:port]`, `:*` for
+    /// any port, or `null`). A request without `Origin` always passes.
+    /// `None` = refuse every request that carries an `Origin`; an empty
+    /// list is rejected.
+    pub allowed_origins: Option<Vec<String>>,
     /// Page size of tool results when the caller gives no `max_bytes`.
     pub default_page_bytes: usize,
 }
@@ -520,6 +526,7 @@ impl Default for McpConfig {
         Self {
             enabled: true,
             allowed_hosts: None,
+            allowed_origins: None,
             default_page_bytes: 32 * 1024,
         }
     }
@@ -528,7 +535,15 @@ impl Default for McpConfig {
 impl McpConfig {
     /// Apply the `ARNEB_MCP_*` variables (looked up through `env`) over the
     /// file values (env > file > defaults).
+    /// File lists lose their blank entries the way the comma-separated env
+    /// values do; a list left empty is refused by [`Self::validate`].
     pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+        for entries in [&mut self.allowed_hosts, &mut self.allowed_origins]
+            .into_iter()
+            .flatten()
+        {
+            *entries = non_blank(entries.iter().map(String::as_str));
+        }
         if let Some(v) = env("ARNEB_MCP_ENABLED") {
             self.enabled = match v.trim().to_ascii_lowercase().as_str() {
                 "true" | "1" | "yes" | "on" => true,
@@ -538,12 +553,7 @@ impl McpConfig {
         }
         // An empty value counts as unset (file or default applies).
         if let Some(v) = env("ARNEB_MCP_ALLOWED_HOSTS").filter(|v| !v.trim().is_empty()) {
-            let hosts: Vec<String> = v
-                .split(',')
-                .map(str::trim)
-                .filter(|h| !h.is_empty())
-                .map(str::to_owned)
-                .collect();
+            let hosts = non_blank(v.split(','));
             if hosts.is_empty() {
                 bail!(
                     "ARNEB_MCP_ALLOWED_HOSTS '{v}' lists no hosts; unset it for the default \
@@ -551,6 +561,16 @@ impl McpConfig {
                 );
             }
             self.allowed_hosts = Some(hosts);
+        }
+        if let Some(v) = env("ARNEB_MCP_ALLOWED_ORIGINS").filter(|v| !v.trim().is_empty()) {
+            let origins = non_blank(v.split(','));
+            if origins.is_empty() {
+                bail!(
+                    "ARNEB_MCP_ALLOWED_ORIGINS '{v}' lists no origins; unset it to refuse \
+                     every request that carries an Origin"
+                );
+            }
+            self.allowed_origins = Some(origins);
         }
         if let Some(v) = env("ARNEB_MCP_DEFAULT_PAGE_BYTES") {
             self.default_page_bytes = v.trim().parse().map_err(|_| {
@@ -575,6 +595,24 @@ impl McpConfig {
                 );
             }
         }
+        if let Some(origins) = &self.allowed_origins {
+            if origins.iter().all(|o| o.trim().is_empty()) {
+                return Err(
+                    "[mcp] allowed_origins is empty; omit it to refuse every request that \
+                     carries an Origin"
+                        .into(),
+                );
+            }
+            if let Some(bad) = origins.iter().find(|o| {
+                let o = o.trim();
+                !o.is_empty() && !o.contains("://") && !o.eq_ignore_ascii_case("null")
+            }) {
+                return Err(format!(
+                    "[mcp] allowed_origins entry '{bad}' has no scheme; write it as \
+                     scheme://host[:port] (for example https://{bad}) or null"
+                ));
+            }
+        }
         if self.default_page_bytes == 0 {
             return Err("default_page_bytes must be greater than 0".into());
         }
@@ -586,6 +624,15 @@ impl McpConfig {
         }
         Ok(())
     }
+}
+
+/// The trimmed, non-blank entries of `entries`.
+fn non_blank<'a>(entries: impl Iterator<Item = &'a str>) -> Vec<String> {
+    entries
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// `[observability]` section.
@@ -2087,6 +2134,7 @@ pgwire = "required"
             McpConfig {
                 enabled: true,
                 allowed_hosts: None,
+                allowed_origins: None,
                 default_page_bytes: 32768
             }
         );
@@ -2134,6 +2182,72 @@ pgwire = "required"
         assert_eq!(c.allowed_hosts, Some(vec!["file.example".to_owned()]));
         let c = mcp("port = 5432", &[("ARNEB_MCP_ALLOWED_HOSTS", "  ")]).unwrap();
         assert_eq!(c.allowed_hosts, None);
+    }
+
+    #[test]
+    fn mcp_host_lists_drop_blank_entries() {
+        let c = mcp("[mcp]\nallowed_hosts = [\"\", \" a.example \"]\n", &[]).unwrap();
+        assert_eq!(c.allowed_hosts, Some(vec!["a.example".to_owned()]));
+        let err = mcp("[mcp]\nallowed_hosts = [\" \"]\n", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_hosts is empty"), "{err}");
+    }
+
+    #[test]
+    fn mcp_allowed_origins_file_env_and_validation() {
+        assert_eq!(mcp("port = 5432", &[]).unwrap().allowed_origins, None);
+        let file = "[mcp]\nallowed_origins = [\"https://app.example:443\", \"null\", \"\"]\n";
+        let c = mcp(file, &[]).unwrap();
+        assert_eq!(
+            c.allowed_origins,
+            Some(vec![
+                "https://app.example:443".to_owned(),
+                "null".to_owned()
+            ])
+        );
+        let c = mcp(
+            file,
+            &[(
+                "ARNEB_MCP_ALLOWED_ORIGINS",
+                "https://a.example, http://localhost:*",
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            c.allowed_origins,
+            Some(vec![
+                "https://a.example".to_owned(),
+                "http://localhost:*".to_owned()
+            ])
+        );
+        // Empty env = unset.
+        let c = mcp(file, &[("ARNEB_MCP_ALLOWED_ORIGINS", " ")]).unwrap();
+        assert_eq!(c.allowed_origins.unwrap().len(), 2);
+        let err = mcp("port = 5432", &[("ARNEB_MCP_ALLOWED_ORIGINS", " , ")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ARNEB_MCP_ALLOWED_ORIGINS"), "{err}");
+        for bad in ["[]", "[\" \"]"] {
+            let err = mcp(&format!("[mcp]\nallowed_origins = {bad}\n"), &[])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("allowed_origins is empty"), "{bad}: {err}");
+        }
+        let err = mcp("[mcp]\nallowed_origins = [\"app.example\"]\n", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("app.example") && err.contains("scheme"),
+            "{err}"
+        );
+        let err = mcp(
+            "port = 5432",
+            &[("ARNEB_MCP_ALLOWED_ORIGINS", "app.example")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("scheme"), "{err}");
     }
 
     #[test]

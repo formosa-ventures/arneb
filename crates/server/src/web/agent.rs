@@ -103,6 +103,11 @@ struct ResultsParams {
 }
 
 #[derive(Deserialize, Default)]
+struct DescribeParams {
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
 struct SampleParams {
     rows: Option<usize>,
 }
@@ -148,10 +153,12 @@ async fn describe_table(
     State(state): State<WebState>,
     Extension(who): Extension<Identity>,
     Path((catalog, schema, table)): Path<(String, String, String)>,
+    params: Result<Query<DescribeParams>, QueryRejection>,
 ) -> Result<Json<TableDescription>, ApiError> {
+    let DescribeParams { limit } = query(params)?;
     Ok(Json(
         service(&state)?
-            .describe_table(&who.user, &catalog, &schema, &table)
+            .describe_table(&who.user, &catalog, &schema, &table, limit)
             .await?,
     ))
 }

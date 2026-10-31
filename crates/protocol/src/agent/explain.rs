@@ -35,8 +35,11 @@ pub struct ScanEstimate {
 /// A planned query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Explanation {
-    /// The optimized logical plan, as `EXPLAIN` prints it.
+    /// The optimized logical plan, as `EXPLAIN` prints it, cut at
+    /// `default_page_bytes` on a character boundary.
     pub plan: String,
+    /// Whether `plan` was cut.
+    pub plan_truncated: bool,
     /// One entry per table scan in the plan.
     pub scans: Vec<ScanEstimate>,
     /// Sum of the scans' `size_bytes`; null (unknown) unless every scan
@@ -92,16 +95,32 @@ impl AgentQueryService {
             .plan_for_explain(&session, sql)
             .await
             .map_err(|e| AgentError::from_trino(&e))?;
+        let (plan, plan_truncated) = cut(plan, self.limits.default_page_bytes);
         let estimated_scan_bytes = scans
             .iter()
             .map(|s| s.size_bytes)
             .try_fold(0u64, |sum, size| size.map(|n| sum.saturating_add(n)));
         Ok(Explanation {
             plan,
+            plan_truncated,
             scans,
             estimated_scan_bytes,
         })
     }
+}
+
+/// `text` cut to at most `max_bytes` bytes on a character boundary, and
+/// whether it was cut.
+fn cut(mut text: String, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    (text, true)
 }
 
 #[cfg(test)]
@@ -179,6 +198,10 @@ mod tests {
     }
 
     fn service() -> (AgentQueryService, Arc<QueryTracker>) {
+        service_with(AgentLimits::default())
+    }
+
+    fn service_with(limits: AgentLimits) -> (AgentQueryService, Arc<QueryTracker>) {
         let schema = Arc::new(MemorySchema::new());
         schema.register_table("mem", Arc::new(MemoryTable::new(columns(), vec![])));
         let memory = Arc::new(MemoryCatalog::new());
@@ -196,7 +219,7 @@ mod tests {
             Arc::new(cm),
             Arc::new(registry),
             Arc::clone(&tracker),
-            AgentLimits::default(),
+            limits,
         );
         (svc, tracker)
     }
@@ -230,6 +253,29 @@ mod tests {
         let page = svc.results("alice", &status.id, 0, None).unwrap();
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0][0].as_str().unwrap(), explained.plan);
+        assert!(!explained.plan_truncated);
+    }
+
+    #[tokio::test]
+    async fn explain_plan_is_cut_at_the_page_budget() {
+        // A multi-byte literal puts character boundaries off the budget.
+        let sql = format!("SELECT '{}' AS t, id FROM sized.s.a", "測".repeat(40));
+        for budget in 60..=72 {
+            let (svc, _) = service_with(AgentLimits {
+                default_page_bytes: budget,
+                ..AgentLimits::default()
+            });
+            let e = svc.explain("alice", &req(&sql)).await.unwrap();
+            assert!(e.plan_truncated, "{budget}: {e:?}");
+            assert!(e.plan.len() <= budget, "{budget}: {} bytes", e.plan.len());
+            assert!(
+                e.plan.len() > budget - 3,
+                "{budget}: {} bytes",
+                e.plan.len()
+            );
+            assert!(std::str::from_utf8(e.plan.as_bytes()).is_ok());
+            assert_eq!(e.scans.len(), 1, "scan estimates are kept");
+        }
     }
 
     #[tokio::test]

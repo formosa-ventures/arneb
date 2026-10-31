@@ -65,6 +65,8 @@ struct TableArgs {
     schema: String,
     /// The table to describe.
     table: String,
+    /// Most columns to return (default 1000, at most 10000).
+    limit: Option<usize>,
 }
 
 /// Arguments of `sample_table`.
@@ -139,7 +141,8 @@ struct IdArgs {
 /// Arguments of `list_queries`.
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ListQueriesArgs {
-    /// Keep only this state: queued, running, finished, failed or cancelled.
+    /// Keep only this state: queued, running, finished, failed or cancelled
+    /// (any case).
     state: Option<String>,
     /// Keep only queries of this user.
     user: Option<String>,
@@ -330,7 +333,7 @@ impl ArnebMcp {
         respond(
             async {
                 Ok(service(&self.state)?
-                    .describe_table(&who.user, &a.catalog, &a.schema, &a.table)
+                    .describe_table(&who.user, &a.catalog, &a.schema, &a.table, a.limit)
                     .await?)
             }
             .await,
@@ -394,7 +397,8 @@ impl ArnebMcp {
                        a short query is already finished, with a first page of rows. At most \
                        `max_rows` rows are kept and `truncated` says if more existed. A failed \
                        statement is a status with state `failed` and an error. Next: \
-                       get_query_status until finished, then fetch_results.",
+                       get_query_status until finished, then fetch_results starting from \
+                       `first_page.next_cursor` (null means you have every row).",
         annotations(open_world_hint = false)
     )]
     async fn submit_query(
@@ -424,8 +428,8 @@ impl ArnebMcp {
     #[tool(
         description = "Get the status of a statement you submitted, optionally waiting up to \
                        `wait_ms` (at most 10000) for it to finish. A finished one carries the \
-                       columns and a first page of rows. Next: fetch_results while \
-                       `next_cursor` is set, or cancel_query to stop it.",
+                       columns and a first page of rows. Next: fetch_results starting from \
+                       `first_page.next_cursor` while it is set, or cancel_query to stop it.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_query_status(
@@ -491,8 +495,9 @@ impl ArnebMcp {
     #[tool(
         description = "List tracked queries (any protocol) you may see, newest first, at most \
                        `limit` (default 50, at most 500); `truncated` says if more matched. \
-                       Filter by `state` (queued, running, finished, failed, cancelled), `user`, \
-                       or `min_elapsed_ms` for slow queries. Long `sql` is cut and flagged with \
+                       Each `state` is lowercase, e.g. queued, running, finished, failed or \
+                       cancelled. Filter by `state` (one of those five, any case), `user`, or \
+                       `min_elapsed_ms` for slow queries. Long `sql` is cut and flagged with \
                        `sql_truncated`. Next: get_query.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
@@ -770,6 +775,7 @@ mod tests {
             agent: Some(agent),
             mcp: Some(McpSettings {
                 allowed_hosts: None,
+                allowed_origins: None,
                 default_page_bytes: page_bytes,
             }),
         };
@@ -856,6 +862,11 @@ mod tests {
                 "describe_table",
                 json!({"catalog":"memory","schema":"default","table":"small"}),
                 "/api/v2/catalogs/memory/schemas/default/tables/small",
+            ),
+            (
+                "describe_table",
+                json!({"catalog":"memory","schema":"default","table":"small","limit":1}),
+                "/api/v2/catalogs/memory/schemas/default/tables/small?limit=1",
             ),
         ];
         for (name, args, path) in cases {
@@ -1033,6 +1044,10 @@ mod tests {
                 "sample_table",
                 json!({"catalog":t.0,"schema":t.1,"table":"small","rows":101}),
             ),
+            (
+                "describe_table",
+                json!({"catalog":t.0,"schema":t.1,"table":"small","limit":10001}),
+            ),
         ];
         for (name, args) in cases {
             let e = tool_err(&f, "alice", name, args.clone()).await;
@@ -1052,6 +1067,7 @@ mod tests {
         )
         .await;
         assert!(x["plan"].is_string(), "{x}");
+        assert_eq!(x["plan_truncated"], false, "{x}");
         assert_eq!(f.tracker.list_queries(None).len(), before);
         let e = tool_err(
             &f,
@@ -1137,6 +1153,17 @@ mod tests {
         let r = tool_ok(&f, "alice", "list_queries", json!({"state": "FINISHED"})).await;
         assert_eq!(r["queries"].as_array().unwrap().len(), 5);
         assert_eq!(r["truncated"], false);
+        // States read the way the filter takes them: lowercase.
+        let finished = r["queries"][0].clone();
+        assert_eq!(finished["state"], "finished", "{finished}");
+        let r = tool_ok(&f, "alice", "list_queries", json!({"state": "queued"})).await;
+        assert_eq!(r["queries"][0]["state"], "queued");
+        let id = finished["query_id"].as_str().unwrap();
+        let one = tool_ok(&f, "alice", "get_query", json!({"id": id})).await;
+        assert_eq!(one["state"], "finished");
+        // `/api/v2/queries` keeps its own spelling.
+        let api = api_get(&f, "alice", &format!("/api/v2/queries/{id}")).await;
+        assert_eq!(api["state"], "Finished", "{api}");
         let r = tool_ok(&f, "alice", "list_queries", json!({"user": "carol"})).await;
         assert!(r["queries"].as_array().unwrap().is_empty());
     }
@@ -1147,10 +1174,10 @@ mod tests {
         let slow = f
             .tracker
             .create_query_from("SELECT slow".into(), "pgwire", None);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         f.tracker
             .create_query_from("SELECT fast".into(), "pgwire", None);
-        let r = tool_ok(&f, "alice", "list_queries", json!({"min_elapsed_ms": 200})).await;
+        let r = tool_ok(&f, "alice", "list_queries", json!({"min_elapsed_ms": 250})).await;
         let q = r["queries"].as_array().unwrap();
         assert_eq!(q.len(), 1, "{r}");
         assert_eq!(q[0]["query_id"], slow.to_string());
@@ -1317,6 +1344,9 @@ mod tests {
             "{d}"
         );
         assert!(desc("get_query_status").contains("fetch_results"));
+        for n in ["submit_query", "get_query_status"] {
+            assert!(desc(n).contains("first_page.next_cursor"), "{n}");
+        }
         assert!(desc("list_tables").contains("describe_table"));
         assert!(desc("list_catalogs").contains("list_schemas"));
         assert!(desc("list_schemas").contains("list_tables"));
@@ -1353,7 +1383,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("`{step}` missing or out of order in: {text}"));
             at += pos;
         }
-        for word in ["max_rows", "truncated", "hint", "candidates"] {
+        for word in [
+            "max_rows",
+            "truncated",
+            "hint",
+            "candidates",
+            "first_page.next_cursor",
+        ] {
             assert!(text.contains(word), "instructions omit `{word}`");
         }
     }

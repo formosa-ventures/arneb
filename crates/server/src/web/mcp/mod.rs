@@ -32,6 +32,8 @@ pub struct McpSettings {
     /// Accepted `Host` values; `None` = the default for the auth mode,
     /// `["*"]` = any.
     pub allowed_hosts: Option<Vec<String>>,
+    /// Accepted `Origin` values; `None` = refuse any request carrying one.
+    pub allowed_origins: Option<Vec<String>>,
     /// Page size of tool results when the caller gives no `max_bytes`.
     pub default_page_bytes: usize,
 }
@@ -40,6 +42,7 @@ impl From<&crate::config::McpConfig> for McpSettings {
     fn from(c: &crate::config::McpConfig) -> Self {
         Self {
             allowed_hosts: c.allowed_hosts.clone(),
+            allowed_origins: c.allowed_origins.clone(),
             default_page_bytes: c.default_page_bytes,
         }
     }
@@ -57,7 +60,7 @@ Workflow:
 3. Check the query: explain_query plans it without running it.
 4. Run it: submit_query with wait_ms (up to 10000) so short queries return finished.
 5. If the state is queued or running, call get_query_status (with wait_ms) until it is finished, failed or cancelled.
-6. Read rows: fetch_results with the cursor, repeating while next_cursor is not null.
+6. Read rows: a finished status carries first_page; start fetch_results from first_page.next_cursor and repeat with each next_cursor until it is null.
 7. Stop a statement you no longer need with cancel_query.
 
 Limits: a statement keeps at most max_rows rows (default 1000, ceiling 10000) and reports truncated when more existed. Pages are small by default; ask for more with max_bytes. Long cells and SQL text are cut. Listings take limit and report truncated.
@@ -84,14 +87,41 @@ impl ServerHandler for ArnebMcp {
 
 /// The `Host` values `/mcp` accepts (empty = any), per `[mcp] allowed_hosts`
 /// or its default: any host under password auth, loopback under `none`.
-/// `*` among the entries means any host.
+/// `*` among the entries means any host. Blank entries are ignored, and a
+/// list with none left gets the default (config validation refuses such a
+/// list; this is the second line).
 pub fn resolve_allowed_hosts(settings: &McpSettings, password_auth: bool) -> Vec<String> {
-    match &settings.allowed_hosts {
-        Some(hosts) if hosts.iter().any(|h| h.trim() == "*") => Vec::new(),
-        Some(hosts) => hosts.clone(),
-        None if password_auth => Vec::new(),
-        None => vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
+    let listed: Vec<String> = settings
+        .allowed_hosts
+        .iter()
+        .flatten()
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if listed.iter().any(|h| h == "*") {
+        Vec::new()
+    } else if !listed.is_empty() {
+        listed
+    } else if password_auth {
+        Vec::new()
+    } else {
+        vec!["localhost".into(), "127.0.0.1".into(), "::1".into()]
     }
+}
+
+/// The `Origin` values `/mcp` accepts, per `[mcp] allowed_origins`; empty
+/// (the default) refuses every request that carries an `Origin`. A request
+/// without one always passes.
+pub fn resolve_allowed_origins(settings: &McpSettings) -> Vec<String> {
+    settings
+        .allowed_origins
+        .iter()
+        .flatten()
+        .map(|o| o.trim())
+        .filter(|o| !o.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The `/mcp` service for `state`, configured by the resolved `settings`.
@@ -100,11 +130,16 @@ pub(super) fn mcp_service(
     settings: &McpSettings,
 ) -> StreamableHttpService<ArnebMcp, NeverSessionManager> {
     let hosts = resolve_allowed_hosts(settings, state.credentials.is_some());
-    let mut config = if hosts.is_empty() {
+    let config = if hosts.is_empty() {
         StreamableHttpServerConfig::default().disable_allowed_hosts()
     } else {
         StreamableHttpServerConfig::default().with_allowed_hosts(hosts)
     };
+    // Validation stays on with an empty list, so an unset (or emptied)
+    // list refuses any `Origin` instead of disabling the check.
+    let mut config = config
+        .with_allowed_origins(resolve_allowed_origins(settings))
+        .enforce_origin_validation();
     config.legacy_session_mode = false;
     config.json_response = true;
     StreamableHttpService::new(
@@ -203,6 +238,7 @@ mod tests {
     fn default_settings() -> Option<McpSettings> {
         Some(McpSettings {
             allowed_hosts: None,
+            allowed_origins: None,
             default_page_bytes: 32768,
         })
     }
@@ -226,6 +262,17 @@ mod tests {
         host: &str,
         body: &str,
     ) -> (StatusCode, HeaderMap, Value) {
+        rpc_from(router, auth, host, None, body).await
+    }
+
+    /// [`rpc`] with an optional `Origin` header.
+    async fn rpc_from(
+        router: axum::Router,
+        auth: Option<&str>,
+        host: &str,
+        origin: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, Value) {
         let mut req = axum::http::Request::builder()
             .method(Method::POST)
             .uri("/mcp")
@@ -235,6 +282,9 @@ mod tests {
             .header("mcp-protocol-version", "2025-06-18");
         if let Some(a) = auth {
             req = req.header(header::AUTHORIZATION, a);
+        }
+        if let Some(o) = origin {
+            req = req.header(header::ORIGIN, o);
         }
         let resp = router
             .oneshot(req.body(Body::from(body.to_owned())).unwrap())
@@ -313,6 +363,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whoami_with_a_token_as_the_basic_password() {
+        let state = mcp_state(true, default_settings());
+        let store = state.state.clone().unwrap();
+        let token = store.issue_token("alice", None, None).unwrap().token;
+        let router = build_router(state);
+        let w = whoami(router, &basic("alice", &token)).await;
+        assert_eq!(
+            (w["user"].as_str(), w["via"].as_str()),
+            (Some("alice"), Some("basic"))
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_is_refused_unless_allowed() {
+        let auth = basic("alice", "secret");
+        let call = |router: axum::Router, origin: Option<&'static str>| {
+            let auth = auth.clone();
+            async move {
+                rpc_from(
+                    router,
+                    Some(&auth),
+                    "arneb.example.com",
+                    origin,
+                    &whoami_body(),
+                )
+                .await
+            }
+        };
+        // Default: no Origin passes, any Origin is refused.
+        let router = build_router(mcp_state(true, default_settings()));
+        let (status, _, body) = call(router.clone(), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, _, body) = call(router.clone(), Some("https://evil.example")).await;
+        assert_ne!(status, StatusCode::OK);
+        assert!(body["result"].is_null(), "tool ran: {body}");
+        // Auth none: a browser page on loopback is refused too.
+        let router = build_router(mcp_state(false, default_settings()));
+        let (status, _, body) = rpc_from(
+            router,
+            None,
+            "127.0.0.1:6432",
+            Some("http://127.0.0.1:6432"),
+            &whoami_body(),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+        assert!(body["result"].is_null(), "tool ran: {body}");
+
+        // An explicit list admits exactly its origins.
+        let router = build_router(mcp_state(
+            true,
+            Some(McpSettings {
+                allowed_hosts: None,
+                allowed_origins: Some(vec!["https://app.example:443".into()]),
+                default_page_bytes: 32768,
+            }),
+        ));
+        for ok in ["https://app.example:443", "https://app.example"] {
+            let (status, _, body) = call(router.clone(), Some(ok)).await;
+            assert_eq!(status, StatusCode::OK, "{ok}: {body}");
+            assert_eq!(body["result"]["structuredContent"]["user"], "alice");
+        }
+        for refused in [
+            "https://evil.example",
+            "http://app.example",
+            "https://app.example:8443",
+        ] {
+            let (status, _, body) = call(router.clone(), Some(refused)).await;
+            assert_ne!(status, StatusCode::OK, "{refused}");
+            assert!(body["result"].is_null(), "tool ran for {refused}: {body}");
+        }
+        let (status, _, _) = call(router, None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn revoked_token_is_refused_on_next_call() {
         let state = mcp_state(true, default_settings());
         let store = state.state.clone().unwrap();
@@ -384,6 +510,7 @@ mod tests {
             true,
             Some(McpSettings {
                 allowed_hosts: Some(vec!["db.internal".into()]),
+                allowed_origins: None,
                 default_page_bytes: 32768,
             }),
         );
@@ -405,6 +532,7 @@ mod tests {
     fn star_among_other_hosts_means_any() {
         let s = |h: &[&str]| McpSettings {
             allowed_hosts: Some(h.iter().map(|x| x.to_string()).collect()),
+            allowed_origins: None,
             default_page_bytes: 1,
         };
         assert!(resolve_allowed_hosts(&s(&["a.example", "*"]), false).is_empty());
@@ -412,9 +540,23 @@ mod tests {
             resolve_allowed_hosts(&s(&["a.example"]), true),
             ["a.example"]
         );
+        // A list with no usable entry falls back to the mode default.
+        for blank in [&[][..], &[" ", ""][..]] {
+            assert_eq!(
+                resolve_allowed_hosts(&s(blank), false),
+                ["localhost", "127.0.0.1", "::1"],
+                "{blank:?}"
+            );
+            assert!(resolve_allowed_hosts(&s(blank), true).is_empty());
+        }
+        assert_eq!(
+            resolve_allowed_hosts(&s(&[" a.example ", ""]), false),
+            ["a.example"]
+        );
         assert!(resolve_allowed_hosts(
             &McpSettings {
                 allowed_hosts: None,
+                allowed_origins: None,
                 default_page_bytes: 1
             },
             true

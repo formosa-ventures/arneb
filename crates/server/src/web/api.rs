@@ -71,7 +71,8 @@ pub(super) const DEFAULT_QUERY_LIMIT: usize = 50;
 /// The largest accepted `limit`.
 pub(super) const MAX_QUERY_LIMIT: usize = 500;
 
-/// A tracked query with its `sql` cut to the cell budget.
+/// A tracked query with its `sql` cut to the cell budget and its `state`
+/// in lowercase, the spelling the `state` filter and the statement API use.
 #[derive(Serialize)]
 pub(super) struct BoundedQuery {
     #[serde(flatten)]
@@ -88,6 +89,7 @@ impl BoundedQuery {
     }
 
     fn cut(mut query: QueryResponse, max_cell_bytes: usize) -> Self {
+        query.state.make_ascii_lowercase();
         let sql_truncated = query.sql.len() > max_cell_bytes;
         if sql_truncated {
             let mut end = max_cell_bytes;
@@ -165,7 +167,13 @@ pub(super) fn bounded_queries(
         .map(QueryResponse::from)
         .filter(|q| params.min_elapsed_ms.is_none_or(|m| q.elapsed_ms >= m))
         .collect();
-    matched.sort_by_key(|q| std::cmp::Reverse(q.created_ms));
+    // Newest first; the id breaks ties of the same millisecond so the order
+    // (and the cut at `limit`) is stable across calls.
+    matched.sort_by(|a, b| {
+        b.created_ms
+            .cmp(&a.created_ms)
+            .then_with(|| a.query_id.cmp(&b.query_id))
+    });
     let truncated = matched.len() > limit;
     matched.truncate(limit);
     let queries = matched

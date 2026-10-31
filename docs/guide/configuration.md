@@ -175,7 +175,7 @@ default_page_bytes = 32768
 
 | `[mcp]` field | Env var | Default | Meaning |
 |---|---|---|---|
-| `enabled` | `ARNEB_MCP_ENABLED` | `true` | Serve `/mcp`. When `false`, `/mcp` answers `404`. |
+| `enabled` | `ARNEB_MCP_ENABLED` | `true` | Serve `/mcp`. When `false`, `/mcp` answers `404` (without asking for credentials, under any auth mode). |
 | `allowed_hosts` | `ARNEB_MCP_ALLOWED_HOSTS` (comma-separated) | unset | `Host` header values `/mcp` accepts, as `host` or `host:port`. Unset means any host under password auth and loopback (`localhost`, `127.0.0.1`, `::1`) under `type = "none"`. A `*` anywhere in the list means any host. |
 | `allowed_origins` | `ARNEB_MCP_ALLOWED_ORIGINS` (comma-separated) | unset | Browser `Origin` header values `/mcp` accepts. Each entry needs a scheme: `scheme://host`, `scheme://host:port`, `scheme://host:*` (any port), or `null`. A request without an `Origin` header always passes. Unset refuses every request that carries an `Origin`, so a browser page cannot call `/mcp`. |
 | `default_page_bytes` | `ARNEB_MCP_DEFAULT_PAGE_BYTES` | 32768 | Bytes per page of a tool result when the call names no `max_bytes`, including the inline first page of `submit_query`, `get_query_status` and `sample_table`. |

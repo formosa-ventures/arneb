@@ -31,11 +31,15 @@ The endpoint SHALL keep no MCP session: each `POST /mcp` SHALL be handled indepe
 - **THEN** the response is still `405` with `Allow: POST`
 
 ### Requirement: Disabled endpoint
-With `[mcp] enabled = false`, `/mcp` and its subpaths SHALL NOT be served and SHALL answer `404`.
+With `[mcp] enabled = false`, `/mcp` and its subpaths SHALL NOT be served and SHALL answer `404`, under any auth mode and without asking for credentials.
 
 #### Scenario: Disabled
 - **WHEN** MCP is disabled and a client posts `initialize` to `/mcp`
 - **THEN** the response is `404` and carries no JSON-RPC body
+
+#### Scenario: Disabled under password auth
+- **WHEN** MCP is disabled, `[auth] type = "password"`, and a client without credentials posts to `/mcp`
+- **THEN** the response is `404` with no `WWW-Authenticate` header, not `401`
 
 ### Requirement: Host validation
 `/mcp` SHALL accept a request only when its `Host` header matches `[mcp] allowed_hosts` (`host` or `host:port`). A `*` anywhere in the list SHALL allow any host. When `allowed_hosts` is unset, any host SHALL be allowed under password auth and only `localhost`, `127.0.0.1` and `::1` under `type = "none"`. `allowed_hosts = []` (or a list of only blank entries) SHALL stop startup, blank entries SHALL be dropped, and an empty `ARNEB_MCP_ALLOWED_HOSTS` SHALL count as unset.

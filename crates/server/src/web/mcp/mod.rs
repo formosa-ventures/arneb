@@ -618,6 +618,34 @@ mod tests {
         assert!(body["jsonrpc"].is_null(), "{body}");
     }
 
+    /// #217 review: under password auth a disabled `/mcp` is still the
+    /// documented 404, with no `WWW-Authenticate` challenge, while the API
+    /// keeps requiring credentials.
+    #[tokio::test]
+    async fn disabled_mcp_is_not_found_under_password_auth() {
+        let router = build_router(mcp_state(true, None));
+        for path in ["/mcp", "/mcp/x"] {
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::HOST, "arneb.example.com")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(INIT))
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+            assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_none());
+        }
+        let (status, _, _) = rpc(router.clone(), Some(&basic("alice", "secret")), "h", INIT).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let req = axum::http::Request::builder()
+            .uri("/api/v2/whoami")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn tool_error_uses_the_http_envelope() {
         use crate::web::error::ErrorCode;

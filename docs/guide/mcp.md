@@ -182,7 +182,7 @@ default_page_bytes = 32768
 ```
 
 With `enabled = false` (or `ARNEB_MCP_ENABLED=false`) `/mcp` is not served
-and answers `404`. The effective values are logged once on `arneb::config`
+and answers `404`, under password auth too (it asks for no credentials). The effective values are logged once on `arneb::config`
 at startup.
 
 ### Host allow-list

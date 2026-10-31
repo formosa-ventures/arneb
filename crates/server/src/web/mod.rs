@@ -12,6 +12,9 @@ mod metrics;
 pub mod privilege;
 pub mod session;
 mod v2;
+mod workers;
+
+pub use workers::restore_worker_cordons;
 
 pub use session::SessionStore;
 

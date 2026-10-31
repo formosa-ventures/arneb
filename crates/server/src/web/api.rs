@@ -230,8 +230,10 @@ pub(super) struct WorkerResponse {
     max_splits: usize,
     last_heartbeat_secs_ago: u64,
     version: String,
-    /// `active` or `draining`.
+    /// Lifecycle, reported by the worker: `active` or `draining`.
     state: &'static str,
+    /// Coordinator-side: `schedulable`, `cordoned`, `draining` or `drained`.
+    scheduling: &'static str,
 }
 
 /// JSON response for server info.
@@ -419,6 +421,7 @@ pub(super) fn workers_response(state: &WebState) -> Vec<WorkerResponse> {
         .alive_workers()
         .into_iter()
         .map(|w| WorkerResponse {
+            scheduling: state.node_registry.scheduling_state(&w.worker_id).as_str(),
             worker_id: w.worker_id,
             address: w.address,
             alive: w.alive,

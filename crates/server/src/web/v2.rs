@@ -63,6 +63,7 @@ pub fn routes() -> Router<WebState> {
         .route("/info", get(info))
         .merge(super::agent::routes())
         .merge(super::audit::routes())
+        .merge(super::workers::routes())
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
 }

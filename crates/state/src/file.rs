@@ -74,6 +74,9 @@ pub(crate) struct StateData {
     pub users: Vec<UserRecord>,
     #[serde(default)]
     pub tokens: Vec<TokenRecord>,
+    /// Absent in files written before worker cordons existed.
+    #[serde(default)]
+    pub cordons: Vec<crate::CordonRecord>,
 }
 
 impl Default for StateData {
@@ -82,6 +85,7 @@ impl Default for StateData {
             version: STATE_VERSION,
             users: Vec::new(),
             tokens: Vec::new(),
+            cordons: Vec::new(),
         }
     }
 }
@@ -107,6 +111,7 @@ impl std::fmt::Debug for StateStore {
             .field("path", &self.path)
             .field("users", &data.users.len())
             .field("tokens", &data.tokens.len())
+            .field("cordons", &data.cordons.len())
             .finish_non_exhaustive()
     }
 }

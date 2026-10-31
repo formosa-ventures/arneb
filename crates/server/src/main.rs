@@ -809,6 +809,12 @@ async fn run() -> Result<()> {
         }
         None
     };
+    // manage-api D8: stored cordons apply before the Flight server below
+    // accepts heartbeats, so a cordoned worker never gets a query on rejoin.
+    if let Some(store) = &state_store {
+        let count = web::restore_worker_cordons(store, &node_registry);
+        tracing::info!(target: "arneb::config", count, "restored worker cordons");
+    }
     let auth_method = match &state_store {
         Some(store) => arneb_protocol::AuthMethod::ScramSha256(store.clone()),
         None => config_auth,

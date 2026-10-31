@@ -170,7 +170,10 @@ All `/api/v2` routes need credentials, except `health` and `POST /sessions`.
 | `GET /api/v2/queries/{id}` | One query; `404` if missing or hidden. |
 | `DELETE /api/v2/queries/{id}[?dry_run=]` | [Cancel any query](#cancel-any-query) (`200`, the [manage envelope](#dry-runs-and-the-response-envelope)). |
 | `GET /api/v2/cluster` | Cluster overview. |
-| `GET /api/v2/cluster/workers` | Workers and their state. |
+| `GET /api/v2/cluster/workers` | The alive workers, with their lifecycle `state` and `scheduling`. |
+| `GET /api/v2/workers[?limit=]` | The [bounded worker listing](#workers). |
+| `GET /api/v2/workers/{id}` | One worker. |
+| `POST /api/v2/workers/{id}/cordon\|drain\|uncordon[?dry_run=]` | [Cordon, drain or uncordon](#workers) a worker. |
 | `GET /api/v2/info` | Server version and role. |
 | `GET /api/v2/audit` | The [audit log](#audit-log), newest first. |
 
@@ -462,6 +465,69 @@ finished; nothing to cancel`.
 has no dry run. Under password auth it uses the rule above, audited the same
 way. Under `[auth] type = "none"` it is unchanged: any caller may cancel any
 query, as the Web UI always could; it now also stops the query.
+
+### Workers
+
+A cordon takes a worker out of scheduling on the coordinator: it gets no
+new distributed query, and the queries it runs keep running. A drain is a
+cordon that also watches those queries until none is left. Both are kept in
+the state store and restored at startup, before workers can rejoin, so a
+worker that restarts under the same id stays cordoned. Without a `[state]
+path` the store is in memory, and each change warns that it is `lost on
+restart`.
+
+Each worker has two states:
+
+- `state` is the lifecycle the worker reports: `active`, or `draining`
+  after it got SIGTERM (see [Stopping a worker](/guide/distributed#stopping-a-worker)).
+  It is `unknown` for an id that is not registered.
+- `scheduling` is the coordinator's: `schedulable`, `cordoned`, `draining`
+  (drain requested, distributed queries still run on it) or `drained`
+  (drain requested, none runs on it).
+
+| Method and path | Privilege | Description |
+|---|---|---|
+| `GET /api/v2/workers?limit=` | observe | `{workers, truncated}`, sorted by id; `limit` defaults to `100`, at most `1000` (a larger value is `invalid_argument`). |
+| `GET /api/v2/workers/{id}` | observe | One worker, or `not_found`. |
+| `POST /api/v2/workers/{id}/cordon` | manage | Action `worker.cordon`. |
+| `POST /api/v2/workers/{id}/drain` | manage | Action `worker.drain`. |
+| `POST /api/v2/workers/{id}/uncordon` | manage | Action `worker.uncordon`. |
+
+The listing holds every registered worker, alive or not, and every id with
+a cordon, including a worker that never came back (`registered: false`).
+Each entry is:
+
+```json
+{"worker_id": "worker-1", "address": "http://10.0.0.5:9091",
+ "registered": true, "alive": true, "version": "0.1.7",
+ "state": "active", "scheduling": "draining", "running_queries": 2,
+ "cordoned_since_ms": 1767000000000, "cordoned_by": "root",
+ "last_heartbeat_secs_ago": 1}
+```
+
+The three actions answer with the [manage envelope](#dry-runs-and-the-response-envelope);
+`result` is the worker after the change. They are [audited](#audit-log).
+
+- Cordon or drain of an id the coordinator has never seen is `not_found`,
+  with a hint naming `GET /api/v2/workers`. Uncordon also takes an id that
+  only has a stored cordon, which removes it.
+- Cordoning a cordoned worker, draining a draining one or uncordoning one
+  that is not cordoned is a no-op (`changed: false`).
+- Cordoning or draining the last schedulable worker is allowed, with a
+  `warning` containing `no schedulable worker`. New distributed queries then
+  fail with `no workers available for distributed execution (2 cordoned;
+  uncordon one with POST /api/v2/workers/{id}/uncordon)` until a worker is
+  uncordoned.
+
+```bash
+curl -s -H "$H" -X POST "$B/workers/worker-1/drain?dry_run=true"
+# {"dry_run":true,"action":"worker.drain","target":"worker-1",
+#  "summary":"drains worker worker-1: no new queries; 2 running queries finish on it",
+#  "changed":true,"warning":null}
+```
+
+`GET /api/v1|v2/cluster/workers` stay arrays of the alive workers; each
+entry gains `scheduling`.
 
 ### Audit log
 

@@ -67,6 +67,12 @@ pub(super) trait ManageAction: Send + 'static {
         true
     }
 
+    /// Whether the change is kept in the state store. A change of a
+    /// persisted action warns (D5) while the store is in memory.
+    fn persisted(&self) -> bool {
+        false
+    }
+
     /// The audit `effect` of a real run that changed nothing.
     fn unchanged_effect(&self) -> &'static str {
         "no_change"
@@ -84,12 +90,35 @@ pub(super) trait ManageAction: Send + 'static {
 pub(super) const AUDIT_UNAVAILABLE_WARNING: &str =
     "the audit log is unavailable; the real call would be refused with audit_unavailable";
 
+/// The `warning` of a change to a [`ManageAction::persisted`] action while
+/// the state store is in memory.
+pub(super) const IN_MEMORY_WARNING: &str =
+    "the state store is in memory ([state] path is not set), so this change is lost on restart";
+
+/// Appends `note` to `preview`'s warning.
+fn add_warning(preview: &mut Preview, note: &str) {
+    preview.warning = Some(match preview.warning.take() {
+        Some(w) => format!("{w}; {note}"),
+        None => note.to_owned(),
+    });
+}
+
+/// `preview` plus the in-memory warning when it changes a persisted action
+/// and the state store is not on disk.
+fn warn_if_in_memory(state: &WebState, persisted: bool, preview: &mut Preview) {
+    let on_disk = state.state.as_ref().is_some_and(|s| s.is_persistent());
+    if persisted && preview.changed && !on_disk {
+        add_warning(preview, IN_MEMORY_WARNING);
+    }
+}
+
 /// Runs `action` for `who`, whose authorization `grant` proves. A dry run
 /// returns the preview and changes nothing (not audited, logged at DEBUG on
 /// `arneb::audit`; an audited action's preview warns when the audit log is
 /// not writable); a real run applies it in `spawn_blocking`, audited when
 /// [`ManageAction::audited`], with `parameters` plus an `effect` of
-/// `applied` or the action's unchanged effect.
+/// `applied` or the action's unchanged effect. Either warns when it changes
+/// a [`ManageAction::persisted`] action and the state store is in memory.
 pub(super) async fn run_manage<A: ManageAction>(
     state: &WebState,
     who: &Identity,
@@ -100,14 +129,12 @@ pub(super) async fn run_manage<A: ManageAction>(
     let _ = grant; // the proof only: authorization already passed
     let name = action.action();
     let target = action.target();
+    let persisted = action.persisted();
     if dry_run {
         let mut preview = action.preview(state)?;
+        warn_if_in_memory(state, persisted, &mut preview);
         if action.audited() && !state.audit.is_writable() {
-            let note = AUDIT_UNAVAILABLE_WARNING;
-            preview.warning = Some(match preview.warning.take() {
-                Some(w) => format!("{w}; {note}"),
-                None => note.to_owned(),
-            });
+            add_warning(&mut preview, AUDIT_UNAVAILABLE_WARNING);
         }
         tracing::debug!(
             target: "arneb::audit",
@@ -119,8 +146,9 @@ pub(super) async fn run_manage<A: ManageAction>(
         );
         return Ok(outcome(true, name, target, preview, None));
     }
-    let (state, who, audit_target) = (state.clone(), who.clone(), target.clone());
-    let applied = tokio::task::spawn_blocking(move || {
+    let (blocking_state, who, audit_target) = (state.clone(), who.clone(), target.clone());
+    let mut applied = tokio::task::spawn_blocking(move || {
+        let state = blocking_state;
         if !action.audited() {
             return action.apply(&state);
         }
@@ -151,6 +179,7 @@ pub(super) async fn run_manage<A: ManageAction>(
         tracing::error!(error = %e, action = name, "manage action task failed");
         ApiError::new(ErrorCode::Internal, "the manage action failed")
     })??;
+    warn_if_in_memory(state, persisted, &mut applied.preview);
     Ok(outcome(
         false,
         name,

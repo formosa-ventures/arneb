@@ -152,13 +152,13 @@ impl QueryCoordinator {
             eprintln!("[FRAGTRACE] === end fragment tree ===");
         }
 
-        // Draining workers finish what they run but get no new query.
-        let workers = self.node_registry.active_workers();
+        // Draining and cordoned workers finish what they run but get no new
+        // query. `_in_flight` counts this attempt on its workers until it
+        // ends, so a drain sees when they are done (manage-api D8).
+        let (workers, _in_flight) = self.node_registry.schedule_workers();
         if workers.is_empty() {
             return Err(AttemptError {
-                error: ExecutionError::InvalidOperation(
-                    "no workers available for distributed execution".to_string(),
-                ),
+                error: ExecutionError::InvalidOperation(no_workers_message(&self.node_registry)),
                 worker_ids: Vec::new(),
             });
         }
@@ -494,6 +494,28 @@ where
         );
         tokio::time::sleep(delay).await;
     }
+}
+
+/// The "no workers available" error, naming the alive workers an operator
+/// cordoned and how to undo it (manage-api D8).
+fn no_workers_message(registry: &NodeRegistry) -> String {
+    let alive: std::collections::HashSet<String> = registry
+        .alive_workers()
+        .into_iter()
+        .map(|w| w.worker_id)
+        .collect();
+    let cordoned = registry
+        .cordoned_ids()
+        .iter()
+        .filter(|id| alive.contains(*id))
+        .count();
+    let mut message = "no workers available for distributed execution".to_string();
+    if cordoned > 0 {
+        message.push_str(&format!(
+            " ({cordoned} cordoned; uncordon one with POST /api/v2/workers/{{id}}/uncordon)"
+        ));
+    }
+    message
 }
 
 /// How often a running distributed query checks its workers' liveness.
@@ -1755,6 +1777,46 @@ mod tests {
         drop(CancelGuard::new(q, vec![hung, a]));
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert_eq!(*seen.lock().unwrap(), vec![q]);
+    }
+
+    /// manage-api D8: a cordoned worker gets no task of a new query (the
+    /// query's guard cancels on exactly the workers it was given); with
+    /// every worker cordoned the query says why and how to undo it.
+    #[tokio::test]
+    async fn cordoned_workers_get_no_tasks() {
+        let (a, seen_a) = recording_worker().await;
+        let (b, seen_b) = recording_worker().await;
+        let registry = arneb_scheduler::NodeRegistry::new(30);
+        registry.heartbeat("w1".into(), a, 256);
+        registry.heartbeat("w2".into(), b, 256);
+        registry.set_cordon("w1", Some(arneb_scheduler::CordonMode::Cordon));
+        let coordinator =
+            QueryCoordinator::new(registry.clone(), DynamicFilterServiceRegistry::new());
+        let ctx = ExecutionContext::new();
+        // The recording workers run nothing, so the query fails; its guard
+        // then cancels it on the workers it was scheduled onto.
+        let _ = coordinator.execute(scan(), &ctx).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(seen_a.lock().unwrap().is_empty(), "w1 is cordoned");
+        assert_eq!(seen_b.lock().unwrap().len(), 1);
+        assert_eq!(
+            registry.in_flight("w2"),
+            0,
+            "the attempt released its guard"
+        );
+
+        registry.set_cordon("w2", Some(arneb_scheduler::CordonMode::Drain));
+        let err = coordinator
+            .execute(scan(), &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no workers available for distributed execution"),
+            "{err}"
+        );
+        assert!(err.contains("2 cordoned"), "{err}");
+        assert!(err.contains("POST /api/v2/workers/{id}/uncordon"), "{err}");
     }
 
     /// Dropping the future of a query whose tasks are dispatched (here: a

@@ -3,10 +3,20 @@ Arneb {{ .Chart.AppVersion }}: 1 coordinator, {{ .Values.worker.replicas }} work
 Connect with psql:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "arneb.fullname" . }} 5432:{{ .Values.coordinator.service.ports.pgwire }}
   psql -h 127.0.0.1 -p 5432
+{{- /* Password auth is set inside the TOML; a config Secret cannot be read, so assume it. */}}
+{{- $passwordAuth := or .Values.existingConfigSecret (regexMatch "(?m)^\\s*type\\s*=\\s*\"password\"" .Values.config) }}
 
 Registered workers (Web UI API, port {{ .Values.coordinator.service.ports.web }}):
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "arneb.fullname" . }} 6432:{{ .Values.coordinator.service.ports.web }}
+{{- if $passwordAuth }}
+  # {{ if .Values.existingConfigSecret }}If the config Secret sets {{ end }}[auth] type = "password", the API needs credentials.
+  # Mint an API token once with a configured user; the response shows it only once:
+  curl -s -X POST localhost:6432/api/v2/tokens -u '<user>:<password>' \
+    -H 'Content-Type: application/json' -d '{"name":"helm"}'
+  curl -s -H 'Authorization: Bearer <token>' localhost:6432/api/v1/cluster/workers
+{{- else }}
   curl -s localhost:6432/api/v1/cluster/workers
+{{- end }}
 
 Upgrading an existing release: [[auth.users]] still follow the config on every rollout; a changed
 password_hash or a removed user revokes that user's API tokens. persistence.enabled defaults to

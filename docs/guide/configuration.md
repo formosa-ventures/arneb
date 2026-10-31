@@ -675,16 +675,20 @@ it with [`GET /api/v2/audit`](/guide/http-api#audit-log).
 
 - **Compaction.** The file is rewritten atomically (temporary file, fsync,
   rename, directory fsync), keeping at most the newest `max_entries` entries
-  younger than `retention_days`. It runs at startup, and whenever the file
-  holds `max(max_entries / 10, 100)` more lines than `max_entries`. Reads
-  hide entries past `retention_days` at once.
+  younger than `retention_days`. The newest entry is always kept, so `seq`
+  keeps increasing across restarts. Compaction runs at startup when there is
+  something to drop, and whenever the file holds `max(max_entries / 10, 100)`
+  more lines than `max_entries`. Reads hide entries past `retention_days` at
+  once, the kept newest entry included.
 - **Torn lines.** A line that does not parse (for example, cut short by a
   crash) is skipped with a WARN on `arneb::audit` naming its line number.
-  Startup never fails on it, and compaction drops it.
+  Startup never fails on it, and the startup compaction drops it.
 - **A failed write.** If an entry cannot be written, the action it records
-  has already happened. The entry is logged at ERROR on `arneb::audit`, and
-  every later audited action is refused with `503 audit_unavailable` until
-  the file can be written again.
+  has already happened. The entry is logged in full at ERROR on
+  `arneb::audit`, and every later audited action is refused with
+  `503 audit_unavailable` until the file can be written again. At most one
+  entry is missing per action in flight when the log fails, and each is in
+  the ERROR log.
 - **No `[state] path`** keeps the log in memory, with a startup WARN; it is
   lost on restart. Under `type = "none"` nothing is audited and the log stays
   empty.

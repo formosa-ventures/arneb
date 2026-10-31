@@ -6,7 +6,9 @@
 //! entry is appended. A failed append cannot undo the action, so the entry
 //! goes to the ERROR log, the log is marked unwritable, and the action's
 //! real result is returned; later audited actions are refused until the
-//! log is writable again.
+//! log is writable again. So at most one entry is missing per action in
+//! flight when the log fails, and each is logged in full at ERROR on
+//! `arneb::audit`.
 
 use arneb_state::{AuditEntry, AuditOutcome, AuditQuery, AuditRecord};
 use axum::extract::rejection::QueryRejection;
@@ -76,15 +78,26 @@ pub(super) fn audited<T>(
             Err(e) => AuditOutcome::Error(e.code.name()),
         },
     };
-    let shown = serde_json::to_string(&record).unwrap_or_default();
-    if let Err(e) = state.audit.append(record) {
-        tracing::error!(
+    match state.audit.append(record) {
+        Ok(_) => {}
+        Err(arneb_state::StateError::AuditAppendFailed { entry, source }) => {
+            tracing::error!(
+                target: "arneb::audit",
+                seq = entry.seq,
+                time_ms = entry.time_ms,
+                entry = %serde_json::to_string(&entry).unwrap_or_default(),
+                error = %source,
+                "the action was applied but its audit entry could not be written; \
+                 audited actions are refused until the audit log is writable"
+            );
+        }
+        Err(e) => tracing::error!(
             target: "arneb::audit",
-            entry = %shown,
+            action,
+            user = %who.user,
             error = %e,
-            "the action was applied but its audit entry could not be written; \
-             audited actions are refused until the audit log is writable"
-        );
+            "the action was applied but its audit entry could not be written"
+        ),
     }
     out
 }
@@ -260,6 +273,28 @@ mod tests {
         let (_, body) = audit_log(&state, "?action=token.revoke&limit=1").await;
         assert_eq!(body["entries"][0]["outcome"], json!({"error": "not_found"}));
         assert_eq!(body["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn revoking_by_a_malformed_id_is_refused_unaudited() {
+        let state = state();
+        let (_, issued) = issue(&state).await;
+        let token = issued["token"].as_str().unwrap().to_owned();
+        for bad in [token.as_str(), "0123456789ABCDEF", "0123456789abcde"] {
+            let (status, body) = call(
+                &state,
+                Method::DELETE,
+                &format!("/api/v2/tokens/{bad}"),
+                Some(&alice()),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["code"], "invalid_argument");
+        }
+        let (_, body) = audit_log(&state, "").await;
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1, "{body}");
+        assert!(!body.to_string().contains(&token));
     }
 
     #[tokio::test]

@@ -39,6 +39,12 @@ pub enum StateError {
     /// The audit log failed a write and has not been reopened since.
     #[error("the audit log is not writable: {0}")]
     AuditUnwritable(String),
+    /// Appending `entry` to the audit log failed; its `seq` is used up.
+    #[error("appending audit entry {} failed: {source}", entry.seq)]
+    AuditAppendFailed {
+        entry: Box<crate::AuditEntry>,
+        source: Box<StateError>,
+    },
 }
 
 /// A stored user with a SCRAM-SHA-256 verifier (never a plaintext password).
@@ -247,22 +253,28 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StateErr
     file.sync_all().map_err(io)?;
     drop(file);
     std::fs::rename(&tmp, path).map_err(io)?;
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => Path::new("."),
-    };
     // The rename is the commit point: the new file is already in place,
     // so a failed directory fsync only weakens crash durability and must
     // not make the caller think the write failed.
-    if let Err(e) = StateStore::sync_dir(dir) {
+    if let Err(e) = sync_parent_dir(path) {
         tracing::warn!(
             target: "arneb::config",
             path = %path.display(),
             error = %e,
-            "state file was written but syncing its directory failed"
+            "file was written but syncing its directory failed"
         );
     }
     Ok(())
+}
+
+/// Fsyncs the directory holding `path`, so a created or renamed entry in
+/// it survives a crash.
+pub(crate) fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    StateStore::sync_dir(dir)
 }
 
 #[cfg(test)]

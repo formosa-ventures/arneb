@@ -164,7 +164,7 @@ All `/api/v2` routes need credentials, except `health` and `POST /sessions`.
 | `GET /api/v2/whoami` | `{"user","via"}`; `via` is `token`, `session`, `basic` or `unauthenticated`. |
 | `POST /api/v2/tokens` | Mint a token (see above). `201`. |
 | `GET /api/v2/tokens` | `{"tokens":[{"id","name","created_ms","expires_ms"}]}` for the caller. |
-| `DELETE /api/v2/tokens/{id}` | Revoke the caller's token (`204`). |
+| `DELETE /api/v2/tokens/{id}` | Revoke the caller's token (`204`); an id that is not 16 lowercase hex is `invalid_argument`. |
 | `GET /api/v2/queries` | Queries the caller may view. Same parameters and body as `/api/v1/queries`. |
 | `GET /api/v2/queries/{id}` | One query; `404` if missing or hidden. |
 | `DELETE /api/v2/queries/{id}` | Cancel a query (`204`); `403` if the caller may view but not kill it. |
@@ -406,8 +406,11 @@ audit log, each entry synced to disk before the response returns:
   they succeed or fail;
 - the manage actions, except dry runs.
 
-A refused request (no credentials, no privilege, a malformed body) is not
-recorded. Retention is set by [`[audit]`](/guide/configuration#audit-log).
+A refused request (no credentials, no privilege, a malformed body or token
+id) is not recorded. If the log cannot be written, audited actions are
+refused with `audit_unavailable` until it can; at most one entry is missing
+per action in flight when the log fails, and each is logged in full at ERROR
+on `arneb::audit`. Retention is set by [`[audit]`](/guide/configuration#audit-log).
 
 ```bash
 curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
@@ -424,8 +427,8 @@ curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
  "next_cursor":40,"truncated":true,"persistent":true,"writable":true}
 ```
 
-- `seq` increases by one per entry, across restarts. `time_ms` is
-  milliseconds since the Unix epoch.
+- `seq` increases with every entry, across restarts; a failed write can
+  leave a gap. `time_ms` is milliseconds since the Unix epoch.
 - `via` is how the user authenticated: `token`, `session` or `basic`.
 - `target` names what the action acted on. A token is named by its 16-hex
   id only; the token itself is never recorded.

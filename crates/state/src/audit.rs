@@ -4,7 +4,9 @@
 //!
 //! The newest `max_entries` entries are also kept in memory for reads; the
 //! file is the durable copy. Compaction rewrites the file atomically,
-//! dropping entries past `retention_days` and beyond `max_entries`.
+//! dropping entries past `retention_days` and beyond `max_entries`, but it
+//! always keeps the newest entry, so `seq` never goes back below a used
+//! value after a restart (reads still hide that entry once it expires).
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -14,7 +16,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::file::write_atomically;
+use crate::file::{sync_parent_dir, write_atomically};
 use crate::tokens::now_ms;
 use crate::StateError;
 
@@ -61,7 +63,8 @@ pub struct AuditRecord {
 /// A stored audit entry: a record with its sequence number and time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntry {
-    /// Increases by one per entry, across restarts.
+    /// Increases with every entry, across restarts; a failed write can
+    /// leave a gap.
     pub seq: u64,
     /// When the entry was appended (milliseconds since the Unix epoch).
     pub time_ms: u64,
@@ -103,6 +106,8 @@ struct Inner {
     next_seq: u64,
     /// Lines in the file, including ones compaction will drop.
     file_lines: usize,
+    /// Compact once `file_lines` reaches this.
+    compact_at: usize,
     writable: bool,
 }
 
@@ -136,20 +141,25 @@ impl AuditLog {
             entries: VecDeque::new(),
             next_seq: 1,
             file_lines: 0,
+            compact_at: 0,
             writable: true,
         };
         if let Some(p) = path {
-            let (loaded, max_seq) = load(p)?;
-            inner.next_seq = max_seq + 1;
-            inner.entries = keep(loaded, settings, now_ms());
-            // Startup compaction: drops expired, surplus and torn lines,
-            // so the file ends with a newline before the first append.
-            if p.exists() {
+            let loaded = load(p)?;
+            inner.next_seq = loaded.max_seq + 1;
+            let parsed = loaded.entries.len();
+            inner.entries = keep(loaded.entries, settings, now_ms());
+            inner.file_lines = parsed + loaded.bad_lines;
+            // Startup compaction, only when it drops something: expired or
+            // surplus entries, unreadable lines, or a torn last line (so
+            // the first append starts on a fresh line).
+            if inner.entries.len() < parsed || loaded.bad_lines > 0 || loaded.torn_tail {
                 write_atomically(p, &render(&inner.entries)?)?;
+                inner.file_lines = inner.entries.len();
             }
-            inner.file_lines = inner.entries.len();
             inner.file = Some(open_append(p)?);
         }
+        inner.compact_at = settings.max_entries.saturating_add(slack(settings));
         Ok(AuditLog {
             path: path.map(Path::to_path_buf),
             settings,
@@ -189,11 +199,6 @@ impl AuditLog {
     /// succeeds. Blocking.
     pub fn append(&self, record: AuditRecord) -> Result<AuditEntry, StateError> {
         let mut inner = self.lock();
-        if !inner.writable {
-            return Err(StateError::AuditUnwritable(
-                "an earlier append failed".into(),
-            ));
-        }
         let entry = AuditEntry {
             seq: inner.next_seq,
             time_ms: now_ms(),
@@ -202,10 +207,20 @@ impl AuditLog {
         // The seq is used up even when the write fails: a torn write may
         // have left part of it in the file.
         inner.next_seq += 1;
-        if let Err(e) = self.write_line(&mut inner, &entry) {
+        let written = if inner.writable {
+            self.write_line(&mut inner, &entry)
+        } else {
+            Err(StateError::AuditUnwritable(
+                "an earlier append failed".into(),
+            ))
+        };
+        if let Err(source) = written {
             inner.writable = false;
             inner.file = None;
-            return Err(e);
+            return Err(StateError::AuditAppendFailed {
+                entry: Box::new(entry),
+                source: Box::new(source),
+            });
         }
         inner.entries.push_back(entry.clone());
         while inner.entries.len() > self.settings.max_entries {
@@ -213,8 +228,7 @@ impl AuditLog {
         }
         if self.path.is_some() {
             inner.file_lines += 1;
-            let slack = (self.settings.max_entries / 10).max(100);
-            if inner.file_lines >= self.settings.max_entries.saturating_add(slack) {
+            if inner.file_lines >= inner.compact_at {
                 self.compact(&mut inner);
             }
         }
@@ -236,11 +250,12 @@ impl AuditLog {
 
     /// Rewrites the file with the retained entries and reopens the append
     /// handle (the old one points at the replaced file). A failed rewrite
-    /// keeps the old file and is retried on a later append.
+    /// keeps the old file and is retried after another `slack` appends.
     fn compact(&self, inner: &mut Inner) {
         let Some(path) = &self.path else { return };
-        let cutoff = cutoff_ms(self.settings, now_ms());
-        inner.entries.retain(|e| e.time_ms >= cutoff);
+        let slack = slack(self.settings);
+        let entries = std::mem::take(&mut inner.entries);
+        inner.entries = keep(entries.into(), self.settings, now_ms());
         let written = render(&inner.entries).and_then(|bytes| write_atomically(path, &bytes));
         if let Err(e) = written {
             tracing::warn!(
@@ -249,9 +264,11 @@ impl AuditLog {
                 error = %e,
                 "audit log compaction failed; keeping the uncompacted file"
             );
+            inner.compact_at = inner.file_lines.saturating_add(slack);
             return;
         }
         inner.file_lines = inner.entries.len();
+        inner.compact_at = self.settings.max_entries.saturating_add(slack);
         match open_append(path) {
             Ok(f) => inner.file = Some(f),
             Err(e) => {
@@ -302,14 +319,12 @@ impl AuditLog {
             return Err(e);
         }
         if let Some(path) = &self.path {
-            let mut file = open_append(path)?;
-            // A torn write may have left a partial line; end it so the next
-            // entry starts on its own line (the partial one is skipped at
-            // the next load and dropped by compaction).
-            if ends_without_newline(path).map_err(|e| self.io_error(e))? {
-                file.write_all(b"\n").map_err(|e| self.io_error(e))?;
+            let file = open_append(path)?;
+            // A torn write may have left a partial last line: cut it off so
+            // the next entry starts on its own line.
+            if let Some(keep) = torn_tail_start(path).map_err(|e| self.io_error(e))? {
+                file.set_len(keep).map_err(|e| self.io_error(e))?;
                 file.sync_data().map_err(|e| self.io_error(e))?;
-                inner.file_lines += 1;
             }
             inner.file = Some(file);
         }
@@ -355,24 +370,47 @@ fn cutoff_ms(settings: AuditSettings, now: u64) -> u64 {
     }
 }
 
+/// Lines beyond `max_entries` the file may grow before compaction.
+fn slack(settings: AuditSettings) -> usize {
+    (settings.max_entries / 10).max(100)
+}
+
 /// The retained entries of `loaded` (in file order): younger than the
-/// retention and at most the newest `max_entries`.
+/// retention and at most the newest `max_entries`. The newest entry is
+/// always kept, so its `seq` survives a restart.
 fn keep(loaded: Vec<AuditEntry>, settings: AuditSettings, now: u64) -> VecDeque<AuditEntry> {
     let cutoff = cutoff_ms(settings, now);
-    let mut kept: VecDeque<AuditEntry> =
-        loaded.into_iter().filter(|e| e.time_ms >= cutoff).collect();
+    let last = loaded.len().saturating_sub(1);
+    let mut kept: VecDeque<AuditEntry> = loaded
+        .into_iter()
+        .enumerate()
+        .filter(|(i, e)| e.time_ms >= cutoff || *i == last)
+        .map(|(_, e)| e)
+        .collect();
     while kept.len() > settings.max_entries {
         kept.pop_front();
     }
     kept
 }
 
-/// The parsed lines of `path` and the highest seq among them (`0` when
-/// none). A missing file is empty; an unparsable line is skipped.
-fn load(path: &Path) -> Result<(Vec<AuditEntry>, u64), StateError> {
+/// What [`load`] found in the file.
+#[derive(Default)]
+struct Loaded {
+    entries: Vec<AuditEntry>,
+    /// The highest seq among `entries` (`0` when none).
+    max_seq: u64,
+    /// Unparsable lines, skipped.
+    bad_lines: usize,
+    /// The file does not end with a newline.
+    torn_tail: bool,
+}
+
+/// The parsed lines of `path`. A missing file is empty; an unparsable line
+/// is skipped with a WARN.
+fn load(path: &Path) -> Result<Loaded, StateError> {
     let text = match std::fs::read(path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded::default()),
         Err(source) => {
             return Err(StateError::Io {
                 path: path.to_path_buf(),
@@ -380,27 +418,32 @@ fn load(path: &Path) -> Result<(Vec<AuditEntry>, u64), StateError> {
             })
         }
     };
-    let mut entries = Vec::new();
-    let mut max_seq = 0;
+    let mut loaded = Loaded {
+        torn_tail: text.last().is_some_and(|b| *b != b'\n'),
+        ..Loaded::default()
+    };
     for (i, line) in text.split(|b| *b == b'\n').enumerate() {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         match serde_json::from_slice::<AuditEntry>(line) {
             Ok(e) => {
-                max_seq = max_seq.max(e.seq);
-                entries.push(e);
+                loaded.max_seq = loaded.max_seq.max(e.seq);
+                loaded.entries.push(e);
             }
-            Err(e) => tracing::warn!(
-                target: "arneb::audit",
-                path = %path.display(),
-                line = i + 1,
-                error = %e,
-                "skipping an unreadable audit log line; the next compaction drops it"
-            ),
+            Err(e) => {
+                loaded.bad_lines += 1;
+                tracing::warn!(
+                    target: "arneb::audit",
+                    path = %path.display(),
+                    line = i + 1,
+                    error = %e,
+                    "skipping an unreadable audit log line; the next compaction drops it"
+                );
+            }
         }
     }
-    Ok((entries, max_seq))
+    Ok(loaded)
 }
 
 fn render(entries: &VecDeque<AuditEntry>) -> Result<Vec<u8>, StateError> {
@@ -413,8 +456,14 @@ fn render(entries: &VecDeque<AuditEntry>) -> Result<Vec<u8>, StateError> {
     Ok(out)
 }
 
-/// Opens `path` for appending, creating it with mode 0600.
+/// Opens `path` for appending with mode 0600 (tightening an existing
+/// file), creating it and syncing its directory when it is missing.
 fn open_append(path: &Path) -> Result<File, StateError> {
+    let io = |source| StateError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let created = !path.exists();
     let mut opts = std::fs::OpenOptions::new();
     opts.append(true).create(true);
     #[cfg(unix)]
@@ -422,22 +471,40 @@ fn open_append(path: &Path) -> Result<File, StateError> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    opts.open(path).map_err(|source| StateError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    let file = opts.open(path).map_err(io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(io)?;
+    }
+    if created {
+        sync_parent_dir(path).map_err(io)?;
+    }
+    Ok(file)
 }
 
-fn ends_without_newline(path: &Path) -> std::io::Result<bool> {
+/// Where a torn last line starts (the length to keep), or `None` when the
+/// file is empty or ends with a newline. Scans backwards in chunks.
+fn torn_tail_start(path: &Path) -> std::io::Result<Option<u64>> {
     use std::io::{Read, Seek, SeekFrom};
+    const CHUNK: u64 = 64 * 1024;
     let mut f = File::open(path)?;
-    if f.metadata()?.len() == 0 {
-        return Ok(false);
+    let len = f.metadata()?.len();
+    let mut end = len;
+    let mut buf = vec![0u8; CHUNK as usize];
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let n = usize::try_from(end - start).unwrap_or(buf.len());
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut buf[..n])?;
+        if let Some(i) = buf[..n].iter().rposition(|b| *b == b'\n') {
+            let keep = start + i as u64 + 1;
+            return Ok((keep < len).then_some(keep));
+        }
+        end = start;
     }
-    f.seek(SeekFrom::End(-1))?;
-    let mut last = [0u8];
-    f.read_exact(&mut last)?;
-    Ok(last[0] != b'\n')
+    Ok((len > 0).then_some(0))
 }
 
 #[cfg(test)]
@@ -674,6 +741,107 @@ mod tests {
         drop(log);
         let log = AuditLog::open(Some(&p), settings(100, 0)).unwrap();
         assert_eq!(log.len(), 2, "the failed append is not in the file");
+    }
+
+    #[test]
+    fn expired_newest_entry_is_kept_hidden_and_seq_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let old = now_ms() - 2 * DAY_MS;
+        std::fs::write(
+            &p,
+            format!("{}\n{}\n{}\n", line(1, old), line(2, old), line(3, old)),
+        )
+        .unwrap();
+        let log = AuditLog::open(Some(&p), settings(100, 1)).unwrap();
+        // Before any compaction runs at read time, an expired entry in
+        // memory is hidden from reads.
+        assert_eq!(all(&log), Vec::<u64>::new());
+        assert_eq!(log.len(), 1, "the newest entry is kept");
+        assert_eq!(lines(&p), 1);
+        drop(log);
+        let log = AuditLog::open(Some(&p), settings(100, 1)).unwrap();
+        assert_eq!(log.append(record("alice", "a")).unwrap().seq, 4);
+        assert_eq!(all(&log), vec![4]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_rewrites_only_when_something_is_dropped() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let now = now_ms();
+        let text = format!("{}\n{}\n", line(1, now), line(2, now));
+        std::fs::write(&p, &text).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let ino = std::fs::metadata(&p).unwrap().ino();
+        drop(AuditLog::open(Some(&p), settings(100, 0)).unwrap());
+        let meta = std::fs::metadata(&p).unwrap();
+        assert_eq!(meta.ino(), ino, "nothing to drop: no rewrite");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "mode is enforced");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+        // A torn tail counts as something to drop.
+        std::fs::write(&p, format!("{text}{{\"seq\":3,")).unwrap();
+        let ino = std::fs::metadata(&p).unwrap().ino();
+        drop(AuditLog::open(Some(&p), settings(100, 0)).unwrap());
+        assert_ne!(std::fs::metadata(&p).unwrap().ino(), ino);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+    }
+
+    #[test]
+    fn torn_write_is_cut_off_when_the_log_reopens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let log = AuditLog::open(Some(&p), settings(100, 0)).unwrap();
+        log.append(record("alice", "a")).unwrap();
+        // A write that died halfway, then the failure is noticed.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"{\"seq\":2,\"time").unwrap();
+        drop(f);
+        log.set_fail_appends(true);
+        let err = log.append(record("alice", "b")).unwrap_err();
+        match err {
+            StateError::AuditAppendFailed { entry, .. } => assert_eq!(entry.seq, 2),
+            other => panic!("expected AuditAppendFailed, got {other:?}"),
+        }
+        log.set_fail_appends(false);
+        log.ensure_writable().unwrap();
+        assert_eq!(log.append(record("alice", "c")).unwrap().seq, 3);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        for l in text.lines() {
+            serde_json::from_str::<AuditEntry>(l).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_appends_get_unique_seqs_in_file_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let log = std::sync::Arc::new(AuditLog::open(Some(&p), settings(1000, 0)).unwrap());
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let log = std::sync::Arc::clone(&log);
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        log.append(record(&format!("u{t}"), "a")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let in_file: Vec<u64> = std::fs::read_to_string(&p)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<AuditEntry>(l).unwrap().seq)
+            .collect();
+        let mut in_memory = all(&log);
+        in_memory.reverse();
+        assert_eq!(in_file, in_memory, "file order == memory order");
+        assert_eq!(in_file, (1..=400).collect::<Vec<_>>());
     }
 
     #[test]

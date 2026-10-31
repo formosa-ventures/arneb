@@ -48,7 +48,7 @@ The limits SHALL be `[agent_api]` fields with `ARNEB_AGENT_*` environment overri
 - **THEN** the effective `max_rows` is 500
 
 ### Requirement: Idle reaper
-After `idle_timeout_secs` with no request for a statement, the server SHALL drop a terminal statement and cancel a running one with the reason `abandoned`, releasing its admission slot.
+After `idle_timeout_secs` with no request for a statement, the server SHALL drop a terminal statement and cancel a running one with the reason `abandoned`, releasing its admission slot. A statement SHALL NOT count as idle while a request waits on it, and the server SHALL refuse to start unless `idle_timeout_secs` is at least twice `max_wait_ms`, with an error naming both.
 
 #### Scenario: Abandoned statement
 - **WHEN** a running statement is not polled for `idle_timeout_secs`

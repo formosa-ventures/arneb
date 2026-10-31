@@ -15,7 +15,8 @@ pub struct AgentLimits {
     pub max_cell_bytes: usize,
     /// Longest any request waits before answering "still running".
     pub max_wait: Duration,
-    /// Idle time after which a statement is reaped.
+    /// Idle time after which a statement is reaped. At least twice
+    /// `max_wait`, so a long-poll never outlasts it.
     pub idle_timeout: Duration,
 }
 
@@ -61,9 +62,11 @@ impl AgentLimits {
                 self.default_page_bytes, self.max_page_bytes
             ));
         }
-        if self.idle_timeout < self.max_wait {
+        // Twice the longest wait leaves a full max_wait of slack between a
+        // long-poll ending and the reaper seeing the statement as idle.
+        if self.idle_timeout < self.max_wait.saturating_mul(2) {
             return Err(format!(
-                "idle_timeout_secs ({}s) must not be shorter than max_wait_ms ({}ms)",
+                "idle_timeout_secs ({}s) must be at least twice max_wait_ms ({}ms)",
                 self.idle_timeout.as_secs(),
                 self.max_wait.as_millis()
             ));
@@ -97,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_shorter_than_max_wait_is_rejected() {
+    fn idle_timeout_under_twice_max_wait_is_rejected() {
         let l = AgentLimits {
             idle_timeout: Duration::from_secs(5),
             max_wait: Duration::from_secs(10),
@@ -110,6 +113,16 @@ mod tests {
         );
         let l = AgentLimits {
             idle_timeout: Duration::from_secs(10),
+            max_wait: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let err = l.validate().unwrap_err();
+        assert!(
+            err.contains("idle_timeout_secs") && err.contains("max_wait_ms"),
+            "equal values leave no slack: {err}"
+        );
+        let l = AgentLimits {
+            idle_timeout: Duration::from_secs(20),
             max_wait: Duration::from_secs(10),
             ..Default::default()
         };

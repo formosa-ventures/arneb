@@ -123,6 +123,8 @@ pub(crate) struct Inner {
     pub(crate) phase: Phase,
     pub(crate) last_access: Instant,
     pub(crate) ended: Option<Instant>,
+    /// Requests currently long-polling the statement.
+    pub(crate) waiters: usize,
 }
 
 /// A statement the service tracks between requests.
@@ -154,6 +156,7 @@ impl Statement {
                 phase: Phase::Queued(None),
                 last_access: now,
                 ended: None,
+                waiters: 0,
             }),
             done: watch::channel(false).0,
             abort: Mutex::new(None),
@@ -168,9 +171,22 @@ impl Statement {
         self.lock().phase.state().is_terminal()
     }
 
-    /// Time since the last client request.
+    /// Time since the last client request; zero while a request is
+    /// waiting on the statement.
     pub(crate) fn idle(&self) -> std::time::Duration {
-        self.lock().last_access.elapsed()
+        let inner = self.lock();
+        if inner.waiters > 0 {
+            return std::time::Duration::ZERO;
+        }
+        inner.last_access.elapsed()
+    }
+
+    /// Marks a request as waiting on the statement until the guard drops,
+    /// which also touches it. The reaper never sees a waited-on statement
+    /// as idle.
+    pub(crate) fn attach_waiter(&self) -> WaiterGuard<'_> {
+        self.lock().waiters += 1;
+        WaiterGuard { statement: self }
     }
 
     /// Records a client request against the statement.
@@ -233,6 +249,19 @@ impl Statement {
         status.first_page =
             retained.map(|r| page(&r, 0, limits.default_page_bytes, limits.max_cell_bytes));
         status
+    }
+}
+
+/// A request waiting on a statement; see [`Statement::attach_waiter`].
+pub(crate) struct WaiterGuard<'a> {
+    statement: &'a Statement,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.statement.lock();
+        inner.waiters = inner.waiters.saturating_sub(1);
+        inner.last_access = Instant::now();
     }
 }
 

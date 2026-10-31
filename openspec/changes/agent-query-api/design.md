@@ -64,7 +64,7 @@ The listings accept `?prefix=&limit=`.
 
 Two caps are constants: 32 statements per user and 1024 in total. At a cap the least-recently-accessed terminal statement is evicted; when all are queued or running, the submit is `overloaded`. A request value above its ceiling is refused with `invalid_argument`, not clamped.
 
-**D10. Idle timeout.** After `idle_timeout_secs` with no request for a statement, the reaper drops a terminal statement, or cancels a running one with the reason `abandoned`, which frees its admission slot.
+**D10. Idle timeout.** After `idle_timeout_secs` with no request for a statement, the reaper drops a terminal statement, or cancels a running one with the reason `abandoned`, which frees its admission slot. A statement with a request long-polling it is never idle, and `idle_timeout_secs` must be at least `2 × max_wait_ms` (validated at startup), which leaves a full `max_wait` of slack between a long-poll ending and the reaper deciding.
 
 **D11. Error codes.** Added to the H1 `ErrorCode`, all snake_case:
 

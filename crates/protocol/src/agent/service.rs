@@ -307,14 +307,16 @@ impl AgentQueryService {
     }
 
     /// Waits up to `wait` (capped at `max_wait`) for `statement` to end.
+    /// The statement counts as in use (not idle) for the whole wait, and is
+    /// touched when the wait ends.
     async fn wait_for_end(&self, statement: &Statement, wait: Duration) {
         let wait = wait.min(self.limits.max_wait);
         if wait.is_zero() || statement.is_terminal() {
             return;
         }
+        let _waiting = statement.attach_waiter();
         let mut done = statement.done.subscribe();
         let _ = tokio::time::timeout(wait, done.wait_for(|d| *d)).await;
-        statement.touch();
     }
 
     /// The statement task, in the order of the Trino submit path: (already
@@ -1362,6 +1364,32 @@ mod tests {
             let st = svc.status("alice", &s.id, Duration::ZERO).await.unwrap();
             assert!(!st.state.is_terminal(), "{:?}", st.state);
         }
+    }
+
+    /// A long-poll longer than the idle timeout does not get the statement
+    /// reaped under it (the limits bypass validation on purpose).
+    #[tokio::test(start_paused = true)]
+    async fn long_polled_statement_is_not_reaped() {
+        let (svc, _) = service_with(AgentLimits {
+            idle_timeout: Duration::from_secs(1),
+            max_wait: Duration::from_secs(5),
+            ..AgentLimits::default()
+        });
+        let (svc, dropped) = hanging(svc);
+        let _reaper = svc.spawn_reaper();
+        let s = svc
+            .submit("alice", req(HANGING_SQL), Duration::ZERO)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let st = svc
+                .status("alice", &s.id, Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert!(!st.state.is_terminal(), "{:?}", st.state);
+            yield_many().await;
+        }
+        assert!(!dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

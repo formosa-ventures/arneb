@@ -303,7 +303,9 @@ from then on answers `not_found`. So an unfetched finished result can be
 lost once the user submits 32 newer statements. When every held statement
 is still queued or running, the submission is refused with `overloaded`.
 After `idle_timeout_secs` with no request for a statement, a finished one
-is dropped and a running one is cancelled as abandoned.
+is dropped and a running one is cancelled as abandoned. A statement with a
+request long-polling it is never idle, and `idle_timeout_secs` must be at
+least twice `max_wait_ms`.
 
 ### Querying errors
 

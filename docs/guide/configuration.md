@@ -142,9 +142,10 @@ max_rows           = 10000
 | `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 | Idle time before a statement is reaped |
 
 All values must be greater than 0, `default_max_rows <= max_rows`,
-`default_page_bytes <= max_page_bytes`, and `idle_timeout_secs` must not be
-shorter than `max_wait_ms` (so a statement is not reaped while a request
-waits on it); a bad combination stops startup.
+`default_page_bytes <= max_page_bytes`, and `idle_timeout_secs` must be at
+least twice `max_wait_ms` (so a statement is never reaped around a request
+that long-polls it; a statement being waited on also never counts as idle);
+a bad combination stops startup.
 
 A catalog, schema or table listing returns `default_max_rows` names unless
 the request passes `limit`, which must be in `1..=max_rows`.

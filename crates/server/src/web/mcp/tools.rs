@@ -854,8 +854,19 @@ mod tests {
         tracker: Arc<arneb_scheduler::QueryTracker>,
         limits: AgentLimits,
     ) -> Fixture {
+        fixture_ruled(hang, page_bytes, tracker, limits, None)
+    }
+
+    fn fixture_ruled(
+        hang: bool,
+        page_bytes: usize,
+        tracker: Arc<arneb_scheduler::QueryTracker>,
+        limits: AgentLimits,
+        rules: Option<Arc<arneb_catalog::AccessRules>>,
+    ) -> Fixture {
         let (cm, registry) = engine_state();
-        let mut agent = AgentQueryService::new(cm, registry, tracker.clone(), limits);
+        let mut agent = AgentQueryService::new(cm, registry, tracker.clone(), limits)
+            .with_access_rules(rules.clone());
         if hang {
             agent = agent.with_distributed_executor(Arc::new(HangingExecutor));
         }
@@ -871,7 +882,7 @@ mod tests {
             basic: None,
             credentials: None,
             state: None,
-            access_rules: None,
+            access_rules: rules,
             authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), false),
             metrics_auth: false,
             sessions: SessionStore::new(),
@@ -1032,6 +1043,30 @@ mod tests {
         let c = tool_ok(&f, "alice", "cancel_query", json!({"id": id})).await;
         assert_eq!(c["state"], "finished");
         assert_eq!(c["first_page"], st["first_page"]);
+    }
+
+    #[tokio::test]
+    async fn submit_query_write_is_forbidden() {
+        let rules = arneb_catalog::AccessRules::from_json(
+            r#"{"tables": [{"user": "alice", "privileges": ["SELECT"]}]}"#,
+        )
+        .unwrap();
+        let f = fixture_ruled(
+            false,
+            32768,
+            Arc::new(arneb_scheduler::QueryTracker::new()),
+            AgentLimits::default(),
+            Some(Arc::new(rules)),
+        );
+        let s = tool_ok(
+            &f,
+            "alice",
+            "submit_query",
+            json!({"sql":"CREATE TABLE memory.default.t AS SELECT 1 AS x","wait_ms":5000}),
+        )
+        .await;
+        assert_eq!(s["state"], "failed", "{s}");
+        assert_eq!(s["error"]["code"], "forbidden", "{s}");
     }
 
     #[tokio::test]

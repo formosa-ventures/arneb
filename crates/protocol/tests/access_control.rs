@@ -21,17 +21,20 @@ use arneb_scheduler::QueryTracker;
 
 const RULES: &str = r#"{
     "catalogs": [
+        {"catalog": "memory", "allow": "all"},
         {"user": "alice", "catalog": "lake", "allow": "none"},
         {"allow": "read-only"}
     ],
     "schemas": [{"owner": false}],
     "tables": [
         {"user": "alice", "catalog": "memory", "table": "open_t", "privileges": ["SELECT"]},
+        {"user": "writer", "catalog": "memory", "privileges": ["SELECT", "INSERT", "DELETE"]},
+        {"user": "owner", "catalog": "memory", "privileges": ["OWNERSHIP"]},
         {"user": "admin", "privileges": ["SELECT"]}
     ],
     "queries": [
         {"user": "admin", "allow": ["execute", "view"]},
-        {"user": "alice", "allow": ["execute"]}
+        {"user": "alice|writer|owner", "allow": ["execute"]}
     ]
 }"#;
 
@@ -320,4 +323,67 @@ async fn runtime_queries_show_other_users_only_where_view_is_allowed() {
     assert_eq!(seen, vec![vec!["alice", "SELECT 41"]]);
     let seen = trino(&base, "admin", sql).await.unwrap();
     assert_eq!(seen.len(), 2, "{seen:?}");
+}
+
+const INSERT_SQL: &str = "INSERT INTO memory.default.open_t SELECT n FROM memory.default.open_t";
+
+#[tokio::test]
+async fn pgwire_refuses_writes_without_the_privilege() {
+    let port = pg_server(Arc::new(QueryTracker::new())).await;
+    let alice = pg(port, "alice").await;
+
+    let cases = [
+        (
+            "CREATE TABLE memory.default.t2 (n BIGINT)",
+            "Cannot create table memory.default.t2 (requires OWNERSHIP)",
+        ),
+        (INSERT_SQL, "requires INSERT"),
+        ("DELETE FROM memory.default.open_t", "requires DELETE"),
+        ("DROP VIEW memory.default.v", "requires OWNERSHIP"),
+        (
+            "CREATE TABLE t3 (n BIGINT)",
+            "Cannot create table memory.default.t3 (requires OWNERSHIP)",
+        ),
+    ];
+    for (sql, expected) in cases {
+        let (code, message) = pg_error(&alice, sql).await;
+        assert_eq!(code, "42501", "{sql}: {message}");
+        assert!(message.contains(expected), "{sql}: {message}");
+    }
+    let (code, message) = pg_error(&alice, &format!("EXPLAIN {INSERT_SQL}")).await;
+    assert_eq!(code, "42501", "{message}");
+
+    let writer = pg(port, "writer").await;
+    let (code, message) = pg_error(&writer, INSERT_SQL).await;
+    assert_ne!(code, "42501", "{message}");
+    let (code, message) = pg_error(&writer, "CREATE TABLE memory.default.t4 (n BIGINT)").await;
+    assert_eq!(code, "42501", "{message}");
+
+    let owner = pg(port, "owner").await;
+    let (code, message) = pg_error(&owner, "CREATE TABLE memory.default.t5 (n BIGINT)").await;
+    assert_ne!(code, "42501", "{message}");
+    let (code, message) = pg_error(&owner, "CREATE TABLE lake.sales.x (n BIGINT)").await;
+    assert_eq!(code, "42501", "{message}");
+    assert!(message.contains("catalog lake is read-only"), "{message}");
+}
+
+#[tokio::test]
+async fn trino_refuses_writes_without_the_privilege() {
+    let base = trino_server(Arc::new(QueryTracker::new())).await;
+    let err = trino(
+        &base,
+        "alice",
+        "CREATE TABLE memory.default.t2 AS SELECT n FROM memory.default.open_t",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err["errorName"], "PERMISSION_DENIED", "{err}");
+    let message = err["message"].as_str().unwrap();
+    assert!(message.contains("memory.default.t2"), "{message}");
+    assert!(message.contains("OWNERSHIP"), "{message}");
+
+    let err = trino(&base, "owner", "CREATE TABLE memory.default.t6 (n BIGINT)")
+        .await
+        .unwrap_err();
+    assert_ne!(err["errorName"], "PERMISSION_DENIED", "{err}");
 }

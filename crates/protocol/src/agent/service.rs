@@ -996,6 +996,22 @@ mod tests {
         assert!(s.error.is_some() && s.first_page.is_none());
     }
 
+    /// A user without OWNERSHIP on the target is refused with `forbidden`.
+    #[tokio::test]
+    async fn write_without_privilege_fails_forbidden() {
+        let (svc, _) = service();
+        let rules = arneb_catalog::AccessRules::from_json(
+            r#"{"tables": [{"user": "alice", "privileges": ["SELECT"]}]}"#,
+        )
+        .unwrap();
+        let svc = svc.with_access_rules(Some(Arc::new(rules)));
+        let s = run_to_end(&svc, "CREATE TABLE memory.default.t AS SELECT 1 AS x", None).await;
+        assert_eq!(s.state, StatementState::Failed);
+        let error = s.error.expect("an error body");
+        assert_eq!(error.code, AgentErrorCode::Forbidden, "{error:?}");
+        assert!(error.message.contains("requires OWNERSHIP"), "{error:?}");
+    }
+
     /// A finished statement without a result set reports its update type and
     /// an empty first page.
     #[test]

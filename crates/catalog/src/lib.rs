@@ -318,6 +318,41 @@ impl CatalogManager {
         }
     }
 
+    /// Fails with [`CatalogError::AccessDenied`] when the session user does
+    /// not hold `privilege` on `reference`; always passes without access
+    /// rules. Catalog and schema come from this manager's defaults, as in
+    /// [`CatalogManager::resolve_table`]. `verb` completes the message
+    /// (`insert into`, `delete from`, `create`, `drop`, ...).
+    pub fn check_table_privilege(
+        &self,
+        reference: &TableReference,
+        privilege: TablePrivilege,
+        verb: &str,
+    ) -> Result<(), CatalogError> {
+        let Some(a) = &self.access else {
+            return Ok(());
+        };
+        let catalog = reference
+            .catalog
+            .as_deref()
+            .unwrap_or(&self.default_catalog);
+        let schema = reference.schema.as_deref().unwrap_or(&self.default_schema);
+        let table = &reference.table;
+        if a.rules
+            .has_table_privilege(&a.user, catalog, schema, table, privilege)
+        {
+            return Ok(());
+        }
+        let reason = if a.rules.catalog_access(&a.user, catalog) == CatalogAccess::ReadOnly {
+            format!("catalog {catalog} is read-only")
+        } else {
+            format!("requires {privilege}")
+        };
+        Err(CatalogError::AccessDenied(format!(
+            "Cannot {verb} table {catalog}.{schema}.{table} ({reason})"
+        )))
+    }
+
     /// Whether the session user may see a query run by `owner`; always true
     /// without access rules.
     pub fn can_view_query(&self, owner: &str) -> bool {

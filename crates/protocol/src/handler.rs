@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use arneb_catalog::CatalogManager;
+use arneb_catalog::{CatalogManager, TablePrivilege};
 use arneb_common::error::{ArnebError, ExecutionError};
 use arneb_common::stream::collect_stream;
 use arneb_common::types::ScalarValue;
@@ -1102,6 +1102,31 @@ fn cap_plan_rows(plan: LogicalPlan, row_cap: usize) -> LogicalPlan {
     }
 }
 
+/// Checks the write privilege a DDL/DML plan needs on its target table
+/// (`INSERT`, `DELETE`, or `OWNERSHIP` for create/drop), recursing through
+/// `EXPLAIN` because analysis is where access is checked. Reads need
+/// nothing here: planning already checked every `SELECT` source.
+pub(crate) fn check_write_privileges(
+    plan: &LogicalPlan,
+    catalogs: &CatalogManager,
+) -> Result<(), ArnebError> {
+    use TablePrivilege::{Delete, Insert, Ownership};
+    let (name, privilege, verb) = match plan {
+        LogicalPlan::Explain { input, .. } => return check_write_privileges(input, catalogs),
+        LogicalPlan::InsertInto { table, .. } => (table, Insert, "insert into"),
+        LogicalPlan::DeleteFrom { table, .. } => (table, Delete, "delete from"),
+        LogicalPlan::CreateTable { name, .. } | LogicalPlan::CreateTableAsSelect { name, .. } => {
+            (name, Ownership, "create")
+        }
+        LogicalPlan::DropTable { name, .. } => (name, Ownership, "drop"),
+        LogicalPlan::CreateView { name, .. } => (name, Ownership, "create view"),
+        LogicalPlan::DropView { name, .. } => (name, Ownership, "drop view"),
+        _ => return Ok(()),
+    };
+    catalogs.check_table_privilege(name, privilege, verb)?;
+    Ok(())
+}
+
 /// [`execute_query_with_limit`] that, for a `SELECT`, stops producing rows
 /// after `row_cap` of them: the plan's root gets a `LIMIT row_cap`, so the
 /// query reads no more than it needs to return that many rows. Other
@@ -1148,6 +1173,8 @@ pub(crate) async fn execute_query_capped(
         }
         _ => logical_plan,
     };
+
+    check_write_privileges(&logical_plan, catalog_manager)?;
 
     // Step 2.5: Optimize logical plan
     let optimizer = LogicalOptimizer::default_rules();

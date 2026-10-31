@@ -76,13 +76,24 @@ Everyone can run queries and sees only their own.
 |---|---|---|
 | `catalogs` | `user`, `catalog`, `allow` | `allow` is `all`, `read-only` or `none` (`true` / `false` also work). `none` hides the catalog and blocks every read in it. |
 | `schemas` | `user`, `catalog`, `schema`, `owner` | Owning a schema makes it visible in listings. |
-| `tables` | `user`, `catalog`, `schema`, `table`, `privileges` | Reading a table needs `SELECT` or `OWNERSHIP`. Any privilege makes the table visible. |
+| `tables` | `user`, `catalog`, `schema`, `table`, `privileges` | Reading a table needs `SELECT`; `INSERT` and `DELETE` need the same-named privilege; `CREATE TABLE`, CTAS, `DROP TABLE`, `CREATE VIEW` and `DROP VIEW` need `OWNERSHIP`. `OWNERSHIP` implies every privilege. Any privilege makes the table visible. |
 | `queries` | `user`, `queryOwner`, `allow` | `execute` is needed to run any statement. `view` shows another user's queries in `system.runtime.queries`. A rule with `queryOwner` cannot allow `execute`. |
 | `system_information` | `user`, `allow` | `allow` lists `read` and/or `write`. `read` opens the observe layer (cluster, workers, admission, audit views); `write` grants the manage layer. `write` does not imply `read` in the rules file, but a user who manages can always observe. `group` and `role` are refused. |
 
-Privileges other than `SELECT` and `OWNERSHIP` (`INSERT`, `DELETE`,
-`UPDATE`, `GRANT_SELECT`) are accepted but grant no read, since Arneb does
-not execute writes yet.
+Writes are checked on the target table after planning, on every protocol
+(pgwire, Trino, the agent API and MCP). `EXPLAIN` of a write is checked like
+the write. A `read-only` catalog refuses every write
+(`Access Denied: Cannot create table lake.sales.x (catalog lake is
+read-only)`); a `none` catalog refuses everything. A refused write answers
+`Access Denied: Cannot <verb> table <catalog>.<schema>.<table> (requires
+<PRIVILEGE>)`: SQLSTATE `42501` on pgwire, `PERMISSION_DENIED` on Trino and
+`forbidden` in an agent or MCP statement status. The sources of CTAS and
+`INSERT ... SELECT` need `SELECT` as usual. `UPDATE` is accepted in rules
+files but maps to nothing, because the parser has no `UPDATE`;
+`GRANT_SELECT` grants no read.
+
+Connectors do not execute DDL or DML yet, so a permitted write still fails
+with the existing not-supported error.
 
 These Trino features are **not** supported, and a rules file that uses them
 is refused at startup instead of being enforced partially:
@@ -151,6 +162,14 @@ password auth, then a `queries` rule that allows `kill` for that owner (or no
   listed; their rows are filtered.
 - **`system.runtime.queries`** always shows the user's own queries, and
   another user's only where a `queries` rule allows `view`.
+
+## Upgrading to v0.2.0
+
+- Writes are now checked against `tables` rules on every protocol, so a
+  rules file with a `tables` section that grants only `SELECT` refuses
+  DDL and DML. Without a `tables` section everything is still allowed.
+- A `read-only` catalog refuses writes.
+- `system_information` is now an accepted section.
 
 ## Limits
 

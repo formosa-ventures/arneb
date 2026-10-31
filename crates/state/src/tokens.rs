@@ -339,7 +339,7 @@ mod tests {
     fn debug_output_redacts_the_token() {
         let store = store_with_alice();
         let t = store.issue_token("alice", None, None).unwrap();
-        let secret = t.token.rsplit_once('_').unwrap().1;
+        let (_, secret) = t.token["arneb_".len()..].split_once('_').unwrap();
         let dbg = format!("{t:?}");
         assert!(!dbg.contains(&t.token) && !dbg.contains(secret), "{dbg}");
         assert!(dbg.contains(&t.info.id));
@@ -367,7 +367,7 @@ mod tests {
         let v = ScramVerifier::from_password("pw", b"0123456789abcdef", 4096);
         store.seed_users(&[("alice".into(), v)], false).unwrap();
         let t = store.issue_token("alice", None, None).unwrap();
-        let secret = t.token.rsplit_once('_').unwrap().1;
+        let (_, secret) = t.token["arneb_".len()..].split_once('_').unwrap();
         let bytes = std::fs::read(&p).unwrap();
         let text = String::from_utf8_lossy(&bytes);
         assert!(!text.contains(secret));

@@ -129,8 +129,10 @@ Differences from the HTTP routes:
   most `limit`, and sets `truncated` when more matched. Each query's `state`
   is lowercase (`queued`, `running`, `finished`, ...), unlike
   `/api/v2/queries`, which keeps `Finished`. The `state` filter is one of
-  `queued`, `running`, `finished`, `failed` or `cancelled` (any case); another
-  value is `invalid_argument`. `user` keeps one owner's queries and
+  the eight states the list reports, `queued`, `planning`, `starting`,
+  `running`, `finishing`, `finished`, `failed` or `cancelled` (any case), and
+  keeps exactly that state: `running` does not include `planning`,
+  `starting` or `finishing`. Another value is `invalid_argument`. `user` keeps one owner's queries and
   `min_elapsed_ms` keeps only slow ones. The `sql` of a query in this tool and
   in `get_query` is cut at `max_cell_bytes` and flagged `sql_truncated`.
 - **Cancel is for your statements.** `cancel_query` takes a statement id from

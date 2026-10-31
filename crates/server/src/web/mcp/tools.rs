@@ -141,8 +141,9 @@ struct IdArgs {
 /// Arguments of `list_queries`.
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ListQueriesArgs {
-    /// Keep only this state: queued, running, finished, failed or cancelled
-    /// (any case).
+    /// Keep only this exact state (any case): queued, planning, starting,
+    /// running, finishing, finished, failed or cancelled. `running` does not
+    /// include planning, starting or finishing.
     state: Option<String>,
     /// Keep only queries of this user.
     user: Option<String>,
@@ -495,8 +496,9 @@ impl ArnebMcp {
     #[tool(
         description = "List tracked queries (any protocol) you may see, newest first, at most \
                        `limit` (default 50, at most 500); `truncated` says if more matched. \
-                       Each `state` is lowercase, e.g. queued, running, finished, failed or \
-                       cancelled. Filter by `state` (one of those five, any case), `user`, or \
+                       Each `state` is lowercase: queued, planning, starting, running, \
+                       finishing, finished, failed or cancelled. Filter by `state` (exactly \
+                       one of those, so running excludes planning), `user`, or \
                        `min_elapsed_ms` for slow queries. Long `sql` is cut and flagged with \
                        `sql_truncated`. Next: get_query.",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -1158,6 +1160,19 @@ mod tests {
         assert_eq!(finished["state"], "finished", "{finished}");
         let r = tool_ok(&f, "alice", "list_queries", json!({"state": "queued"})).await;
         assert_eq!(r["queries"][0]["state"], "queued");
+        // #217 review: every reported state is a filter, and `running`
+        // means exactly Running.
+        f.tracker
+            .transition_query(&ids[5], arneb_scheduler::QueryState::Planning)
+            .unwrap();
+        let r = tool_ok(&f, "alice", "list_queries", json!({"state": "planning"})).await;
+        let q = r["queries"].as_array().unwrap();
+        assert_eq!(q.len(), 1, "{r}");
+        assert_eq!(q[0]["state"], "planning");
+        let r = tool_ok(&f, "alice", "list_queries", json!({"state": "running"})).await;
+        assert!(r["queries"].as_array().unwrap().is_empty(), "{r}");
+        let e = tool_err(&f, "alice", "list_queries", json!({"state": "bogus"})).await;
+        assert!(e["hint"].as_str().unwrap().contains("finishing"), "{e}");
         let id = finished["query_id"].as_str().unwrap();
         let one = tool_ok(&f, "alice", "get_query", json!({"id": id})).await;
         assert_eq!(one["state"], "finished");

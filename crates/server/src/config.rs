@@ -188,13 +188,7 @@ impl WebConfig {
             self.bind_address = Some(v);
         }
         if let Some(v) = env("ARNEB_WEB_METRICS_AUTH") {
-            self.metrics_auth = match v.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "on" | "yes" => true,
-                "0" | "false" | "off" | "no" => false,
-                other => {
-                    bail!("invalid ARNEB_WEB_METRICS_AUTH value '{other}' (expected true/false)")
-                }
-            };
+            self.metrics_auth = parse_env_bool("ARNEB_WEB_METRICS_AUTH", &v)?;
         }
         Ok(())
     }
@@ -577,11 +571,7 @@ impl McpConfig {
             *entries = non_blank(entries.iter().map(String::as_str));
         }
         if let Some(v) = env("ARNEB_MCP_ENABLED") {
-            self.enabled = match v.trim().to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" | "on" => true,
-                "false" | "0" | "no" | "off" => false,
-                _ => bail!("invalid ARNEB_MCP_ENABLED value '{v}' (expected true or false)"),
-            };
+            self.enabled = parse_env_bool("ARNEB_MCP_ENABLED", &v)?;
         }
         // An empty value counts as unset (file or default applies).
         if let Some(v) = env("ARNEB_MCP_ALLOWED_HOSTS").filter(|v| !v.trim().is_empty()) {
@@ -655,6 +645,16 @@ impl McpConfig {
             ));
         }
         Ok(())
+    }
+}
+
+/// A boolean env value: `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`,
+/// trimmed and in any case. Anything else is an error naming `name`.
+fn parse_env_bool(name: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        other => bail!("invalid {name} value '{other}' (expected true/false)"),
     }
 }
 
@@ -908,11 +908,7 @@ impl TrinoProtocolConfig {
     /// Applies `ARNEB_TRINO_ENABLED` / `ARNEB_TRINO_PORT` (env > file).
     pub fn apply_env_overrides(&mut self) -> Result<()> {
         if let Ok(val) = std::env::var("ARNEB_TRINO_ENABLED") {
-            self.enabled = match val.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "on" | "yes" => true,
-                "0" | "false" | "off" | "no" => false,
-                other => bail!("invalid ARNEB_TRINO_ENABLED value '{other}' (expected true/false)"),
-            };
+            self.enabled = parse_env_bool("ARNEB_TRINO_ENABLED", &val)?;
         }
         if let Ok(val) = std::env::var("ARNEB_TRINO_PORT") {
             if arneb_common::config::is_service_link(&val) {
@@ -1845,6 +1841,18 @@ pub fn parse_data_type(type_name: &str) -> Result<DataType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_bools_share_one_spelling() {
+        for t in ["1", "true", "ON", " yes "] {
+            assert!(parse_env_bool("ARNEB_X", t).unwrap(), "{t}");
+        }
+        for f in ["0", "False", "off", "NO"] {
+            assert!(!parse_env_bool("ARNEB_X", f).unwrap(), "{f}");
+        }
+        let err = parse_env_bool("ARNEB_X", "maybe").unwrap_err().to_string();
+        assert!(err.contains("ARNEB_X") && err.contains("maybe"), "{err}");
+    }
 
     #[test]
     fn test_app_config_with_tables() {

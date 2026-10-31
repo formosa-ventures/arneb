@@ -179,6 +179,11 @@ errors differ. The `/api/v1` routes are `/api/v1/queries`,
 `/api/v1/queries/{id}` (GET, DELETE), `/api/v1/cluster`,
 `/api/v1/cluster/workers` and `/api/v1/info`.
 
+`?state=` on the query list keeps the queries in exactly that state, one of
+`queued`, `planning`, `starting`, `running`, `finishing`, `finished`,
+`failed` or `cancelled` (any case). `running` does not include `planning`,
+`starting` or `finishing`. An unknown state filters nothing.
+
 Both versions apply the [`queries` access rules](/guide/access-control):
 a query the caller may not `view` is hidden (`404`), one they may view but
 not `kill` answers `403`, and a user may always kill their own.

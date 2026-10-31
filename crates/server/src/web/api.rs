@@ -105,6 +105,34 @@ impl BoundedQuery {
     }
 }
 
+/// Every [`QueryState`] by the lowercase name the bounded list reports it
+/// under, in lifecycle order.
+const QUERY_STATES: [(&str, QueryState); 8] = [
+    ("queued", QueryState::Queued),
+    ("planning", QueryState::Planning),
+    ("starting", QueryState::Starting),
+    ("running", QueryState::Running),
+    ("finishing", QueryState::Finishing),
+    ("finished", QueryState::Finished),
+    ("failed", QueryState::Failed),
+    ("cancelled", QueryState::Cancelled),
+];
+
+/// The [`QueryState`] named `s` (any case). A name selects exactly that
+/// state: `running` does not include `planning`, `starting` or
+/// `finishing`. An unknown name is `invalid_argument` listing all eight.
+pub(super) fn parse_query_state(s: &str) -> Result<QueryState, ApiError> {
+    QUERY_STATES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(s.trim()))
+        .map(|(_, state)| *state)
+        .ok_or_else(|| {
+            let names: Vec<&str> = QUERY_STATES.iter().map(|(n, _)| *n).collect();
+            ApiError::new(ErrorCode::InvalidArgument, format!("unknown state {s:?}"))
+                .with_hint(format!("state is one of {}", names.join(", ")))
+        })
+}
+
 /// The bounded query list: newest first, with whether more matched.
 #[derive(Serialize)]
 pub(super) struct BoundedQueries {
@@ -139,20 +167,7 @@ pub(super) fn bounded_queries(
         )
         .with_hint(format!("use a limit between 1 and {MAX_QUERY_LIMIT}")));
     }
-    let state_filter = params
-        .state
-        .map(|s| match s.to_uppercase().as_str() {
-            "QUEUED" => Ok(QueryState::Queued),
-            "RUNNING" => Ok(QueryState::Running),
-            "FINISHED" => Ok(QueryState::Finished),
-            "FAILED" => Ok(QueryState::Failed),
-            "CANCELLED" => Ok(QueryState::Cancelled),
-            _ => Err(
-                ApiError::new(ErrorCode::InvalidArgument, format!("unknown state {s:?}"))
-                    .with_hint("state is one of queued, running, finished, failed, cancelled"),
-            ),
-        })
-        .transpose()?;
+    let state_filter = params.state.as_deref().map(parse_query_state).transpose()?;
     let mut matched: Vec<QueryResponse> = state
         .query_tracker
         .list_queries(state_filter)
@@ -260,14 +275,7 @@ pub(super) fn queries_response(
     who: &Identity,
     params: ListQueryParams,
 ) -> QueriesResponse {
-    let state_filter = params.state.and_then(|s| match s.to_uppercase().as_str() {
-        "QUEUED" => Some(QueryState::Queued),
-        "RUNNING" => Some(QueryState::Running),
-        "FINISHED" => Some(QueryState::Finished),
-        "FAILED" => Some(QueryState::Failed),
-        "CANCELLED" => Some(QueryState::Cancelled),
-        _ => None,
-    });
+    let state_filter = params.state.and_then(|s| parse_query_state(&s).ok());
 
     let queries = state
         .query_tracker
@@ -399,6 +407,22 @@ pub(super) fn info_response(state: &WebState) -> InfoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #217 review: every state the bounded list reports parses back to
+    /// itself, and nothing else does.
+    #[test]
+    fn every_reported_state_parses() {
+        for (name, state) in QUERY_STATES {
+            assert_eq!(format!("{state:?}").to_ascii_lowercase(), name);
+            assert_eq!(parse_query_state(name).unwrap(), state);
+            assert_eq!(parse_query_state(&name.to_uppercase()).unwrap(), state);
+        }
+        let e = parse_query_state("bogus").unwrap_err();
+        let hint = e.hint.clone().unwrap_or_default();
+        for (name, _) in QUERY_STATES {
+            assert!(hint.contains(name), "{hint}");
+        }
+    }
 
     /// #150 review: with no controller the overview reports the configured
     /// `max_queued_queries`, not 0; with one, the controller's limits.

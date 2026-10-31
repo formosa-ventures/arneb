@@ -44,7 +44,7 @@ The listings accept `?prefix=&limit=`.
 
 **D5. Inline first page.** `submit` and `status` accept `wait_ms`, default 0, capped at `max_wait_ms`. A statement that finishes inside the wait carries its first page inline.
 
-**D6. Sample is a short statement.** It submits `SELECT * FROM "c"."s"."t" LIMIT n` with `wait_ms = max_wait_ms`. `rows` defaults to 10 and is capped at 100.
+**D6. Sample is a short statement.** It submits `SELECT * FROM "c"."s"."t" LIMIT n` with `wait_ms = max_wait_ms`. `rows` defaults to 10 and is capped at 100 (refused above), then lowered to the server's `max_rows` when that is smaller, so a small configured ceiling shortens the sample rather than failing it with an error about `max_rows`, which the caller never sent.
 
 **D7. Explain is synchronous planning only.** It is not admitted, not tracked, and does not support `ANALYZE`; an agent submits `EXPLAIN ANALYZE` as a statement.
 

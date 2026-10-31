@@ -270,7 +270,9 @@ impl AgentQueryService {
     }
 
     /// Up to `rows` (default 10, at most 100) rows of a table, run as a
-    /// tracked statement and waited for up to `max_wait`.
+    /// tracked statement and waited for up to `max_wait`. The row count is
+    /// further capped at the server's `max_rows`, so a small configured
+    /// ceiling shortens the sample instead of failing it.
     pub async fn sample(
         &self,
         user: &str,
@@ -279,7 +281,7 @@ impl AgentQueryService {
         table: &str,
         rows: Option<usize>,
     ) -> Result<StatementStatus, AgentError> {
-        let rows = match rows {
+        let requested = match rows {
             None => DEFAULT_SAMPLE_ROWS,
             Some(n) if (1..=MAX_SAMPLE_ROWS).contains(&n) => n,
             Some(n) => {
@@ -290,6 +292,7 @@ impl AgentQueryService {
                 .with_hint(format!("rows must be in 1..={MAX_SAMPLE_ROWS}")))
             }
         };
+        let rows = requested.min(self.limits.max_rows);
         let root = self.scoped_root(user)?;
         let visible = tables_of(&root, catalog, schema).await?;
         if !visible.iter().any(|t| t == table) {
@@ -433,6 +436,11 @@ mod tests {
 
     /// `memory.default`: lineitem (10 rows), orders, `we"ird`, t01..t25.
     fn service(rules: Option<&str>) -> AgentQueryService {
+        service_limited(rules, AgentLimits::default())
+    }
+
+    /// [`service`] under `limits`.
+    fn service_limited(rules: Option<&str>, limits: AgentLimits) -> AgentQueryService {
         let schema = Arc::new(MemorySchema::new());
         schema.register_table("lineitem", int_table(10));
         schema.register_table("orders", int_table(3));
@@ -457,7 +465,7 @@ mod tests {
             Arc::new(cm),
             Arc::new(registry),
             Arc::new(QueryTracker::new()),
-            AgentLimits::default(),
+            limits,
         );
         match rules {
             Some(r) => svc.with_access_rules(Some(Arc::new(AccessRules::from_json(r).unwrap()))),
@@ -665,6 +673,33 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
+    }
+
+    #[tokio::test]
+    async fn sample_is_capped_at_a_small_server_max_rows() {
+        let limits = AgentLimits {
+            default_max_rows: 5,
+            max_rows: 5,
+            ..AgentLimits::default()
+        };
+        limits.validate().unwrap();
+        let svc = service_limited(None, limits);
+        for rows in [None, Some(3), Some(50)] {
+            let s = svc
+                .sample("alice", "memory", "default", "lineitem", rows)
+                .await
+                .unwrap();
+            assert_eq!(s.state, StatementState::Finished, "{rows:?}: {:?}", s.error);
+            let want = rows.unwrap_or(10).min(5);
+            assert_eq!(s.first_page.unwrap().rows.len(), want, "{rows:?}");
+            assert_eq!(s.max_rows, want);
+        }
+        // The caller's own ceiling still applies.
+        let err = svc
+            .sample("alice", "memory", "default", "lineitem", Some(101))
+            .await
+            .unwrap_err();
+        assert!(err.hint.unwrap().contains("rows must be"));
     }
 
     #[tokio::test]

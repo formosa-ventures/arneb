@@ -196,7 +196,7 @@ Only the submitting user can poll, fetch or cancel a statement.
 | `GET /api/v2/catalogs/{c}/schemas` | List schemas. |
 | `GET /api/v2/catalogs/{c}/schemas/{s}/tables` | List tables. |
 | `GET /api/v2/catalogs/{c}/schemas/{s}/tables/{t}` | Columns (with Trino types) and statistics. |
-| `GET /api/v2/catalogs/{c}/schemas/{s}/tables/{t}/sample?rows=` | Sample rows, as a statement status (default 10, at most 100). |
+| `GET /api/v2/catalogs/{c}/schemas/{s}/tables/{t}/sample?rows=` | Sample rows, as a statement status (default 10, at most 100; never more than the server's `max_rows`). |
 | `POST /api/v2/explain` | Plan a query without running it. |
 | `POST /api/v2/statements` | Submit a statement. `201` with a `Location` header. |
 | `GET /api/v2/statements/{id}?wait_ms=` | Poll a statement. |
@@ -280,7 +280,10 @@ capped.
 
 A request value above its ceiling is refused with `invalid_argument` and a
 hint naming the ceiling; it is never silently clamped. That includes
-`wait_ms`, `max_rows`, `max_bytes` and `rows`. A malformed JSON body or
+`wait_ms`, `max_rows`, `max_bytes` and `rows`. The one server-side cap is the
+sample: `rows` (or its default of 10) is lowered to the server's `max_rows`
+when that is smaller, so a small configured ceiling shortens a sample instead
+of failing it. A malformed JSON body or
 query parameter is also `invalid_argument`.
 
 | `[agent_api]` field | Env var | Default |

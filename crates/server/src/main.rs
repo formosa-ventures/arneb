@@ -899,6 +899,13 @@ async fn run() -> Result<()> {
         arneb_protocol::AuthMethod::ScramSha256(creds) => Some(Arc::clone(creds)),
         arneb_protocol::AuthMethod::None => None,
     };
+    // One Basic authenticator for the Trino and Web listeners, so both share
+    // one PBKDF2 limiter, one wait queue and one verification cache.
+    let basic_auth = password_users
+        .clone()
+        .map(arneb_protocol::BasicAuthenticator::new)
+        .transpose()
+        .context("HTTP Basic authentication")?;
     let state_for_web = state_store.clone();
     let credentials_for_web: Option<Arc<dyn arneb_protocol::CredentialSource>> =
         state_store.clone().map(|s| s as _);
@@ -1007,8 +1014,7 @@ async fn run() -> Result<()> {
         .with_query_tracker(query_tracker.clone())
         .with_access_rules(access_rules.clone())
         .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
-        .with_password_auth(password_users.clone())
-        .context("Trino listener authentication")?;
+        .with_authenticator(basic_auth.clone());
         if let Some(ref executor) = distributed_executor {
             trino = trino.with_distributed_executor(Arc::clone(executor));
         }
@@ -1047,11 +1053,9 @@ async fn run() -> Result<()> {
         max_queued_queries: config.admission.max_queued_queries,
         memory_pool: memory_pool.clone(),
         memory_limit_bytes: budget.map(|b| b as u64),
-        basic: credentials_for_web
-            .clone()
-            .map(arneb_protocol::BasicAuthenticator::new)
-            .transpose()
-            .context("Web API Basic authentication")?,
+        // Same source as `credentials_for_web` (the state store) whenever
+        // that is set: password auth makes the state store the auth method.
+        basic: credentials_for_web.as_ref().and(basic_auth),
         credentials: credentials_for_web,
         state: state_for_web,
         access_rules: access_rules.clone(),

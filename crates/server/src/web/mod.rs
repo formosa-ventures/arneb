@@ -42,7 +42,8 @@ pub struct WebState {
     /// `[web] metrics_auth`: require credentials for `/metrics`.
     pub metrics_auth: bool,
     /// HTTP Basic checker over `credentials` (cache + PBKDF2 limiter); `Some`
-    /// exactly when `credentials` is.
+    /// exactly when `credentials` is. The server passes the same instance to
+    /// the Trino listener, so the two ports share its limiter and cache.
     pub basic: Option<arneb_protocol::BasicAuthenticator>,
     /// Web sessions (bearer `arneb_s_…`), in memory.
     pub sessions: SessionStore,

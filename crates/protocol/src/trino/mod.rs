@@ -155,6 +155,17 @@ impl TrinoServer {
         Ok(self)
     }
 
+    /// Require HTTP Basic auth through `auth`, an authenticator the caller
+    /// shares with other listeners (one PBKDF2 limiter, queue and cache for
+    /// all of them). `None`: no auth, every `X-Trino-User` is trusted.
+    pub fn with_authenticator(mut self, auth: Option<BasicAuthenticator>) -> Self {
+        if let Some(a) = &auth {
+            self.verifications = Arc::clone(&a.verifications);
+        }
+        self.auth = auth;
+        self
+    }
+
     /// Count of full password verifications (cache misses); test hook.
     #[doc(hidden)]
     pub fn password_verifications(&self) -> Arc<AtomicU64> {

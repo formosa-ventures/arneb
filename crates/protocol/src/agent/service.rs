@@ -401,7 +401,18 @@ impl AgentQueryService {
         match result {
             Ok(output) => {
                 let retained = retain(output.batches, statement.max_rows);
-                let rows = retained.kept_rows();
+                // What the query produced, not what was kept: a truncated
+                // result records max_rows + 1, so it reads as more than the
+                // retained rows in the Web UI and system.runtime.queries.
+                let rows = retained.produced;
+                if retained.truncated {
+                    tracing::debug!(
+                        statement_id = %statement.id,
+                        produced = rows,
+                        kept = retained.kept_rows(),
+                        "agent statement result truncated"
+                    );
+                }
                 let finished = FinishedOutput {
                     columns: output.columns.map(|cols| {
                         cols.iter()
@@ -1431,6 +1442,22 @@ mod tests {
             yield_many().await;
         }
         assert!(!dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tracker_records_produced_rows_of_a_truncated_result() {
+        let (cm, registry) = engine_state_with(vec![big_table()]);
+        let tracker = Arc::new(QueryTracker::new());
+        let svc =
+            AgentQueryService::new(cm, registry, Arc::clone(&tracker), AgentLimits::default());
+        let s = run_to_end(&svc, "SELECT n FROM big", Some(100)).await;
+        assert!(s.truncated);
+        let info = tracker
+            .list_queries(None)
+            .into_iter()
+            .find(|q| q.query_id.to_string() == s.id)
+            .unwrap();
+        assert_eq!(info.rows, Some(101));
     }
 
     #[tokio::test]

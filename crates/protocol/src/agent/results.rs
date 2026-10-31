@@ -21,6 +21,9 @@ pub(crate) struct Retained {
     pub(crate) total_rows: Option<u64>,
     /// Whether rows beyond `max_rows` were dropped.
     pub(crate) truncated: bool,
+    /// Rows the query produced (at most `max_rows + 1`, since execution
+    /// stops there), whether kept or not.
+    pub(crate) produced: u64,
 }
 
 impl Retained {
@@ -62,6 +65,7 @@ pub(crate) fn retain(batches: Vec<RecordBatch>, max_rows: usize) -> Retained {
         batches: kept,
         total_rows: (!truncated).then_some(produced),
         truncated,
+        produced,
     }
 }
 

@@ -764,7 +764,7 @@ async fn run() -> Result<()> {
     }
 
     // Validate [auth] on every role (workers never open the state store).
-    let config_auth = config
+    let (config_auth, verifiers) = config
         .auth
         .to_auth_method()
         .context("invalid [auth] configuration")?;
@@ -775,10 +775,6 @@ async fn run() -> Result<()> {
     let state_store = if matches!(role, ServerRole::Coordinator | ServerRole::Standalone)
         && matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_))
     {
-        let verifiers = config
-            .auth
-            .user_verifiers()
-            .context("invalid [auth] configuration")?;
         let store = arneb_state::StateStore::open(config.state.path.as_deref())
             .context("cannot open the state store ([state] path / ARNEB_STATE_PATH)")?;
         let report = store

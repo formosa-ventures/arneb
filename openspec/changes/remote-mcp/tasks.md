@@ -21,4 +21,4 @@
 
 - [x] 4.1 `docs/guide/mcp.md`, sidebar entry, `[mcp]` in the configuration guide, pointer in the HTTP API guide
 - [x] 4.2 Tier 1: `cargo fmt`, `cargo clippy --workspace --all-targets` (pinned and 1.99.0), `cargo test --workspace`
-- [ ] 4.3 Tier 2: a real MCP client against a coordinator plus workers with password auth (the acceptance smoke)
+- [x] 4.3 Tier 2: a real MCP client against a coordinator plus workers with password auth (the acceptance smoke)

@@ -369,7 +369,7 @@ async fn cancel_query(
 }
 
 /// Admission counters for the overview: the controller's, or with none
-/// (admission unlimited) zero counters, `max_running` 0 (unlimited) and the
+/// (a worker) zero counters, `max_running` 0 (unlimited) and the
 /// configured `max_queued_queries`.
 fn admission_counters(
     admission: Option<&arneb_scheduler::AdmissionController>,

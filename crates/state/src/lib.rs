@@ -1,10 +1,11 @@
-//! Durable coordinator state (users, API tokens, worker cordons) kept in one atomic,
-//! versioned JSON file, and the audit log next to it. Only the coordinator /
-//! standalone server opens them.
+//! Durable coordinator state (users, API tokens, worker cordons, runtime
+//! settings) kept in one atomic, versioned JSON file, and the audit log next
+//! to it. Only the coordinator / standalone server opens them.
 
 mod audit;
 mod cordons;
 mod file;
+mod settings;
 mod tokens;
 mod users;
 
@@ -14,6 +15,7 @@ pub use audit::{
 };
 pub use cordons::{CordonKind, CordonRecord};
 pub use file::{StateError, StateStore};
+pub use settings::AdmissionLimits;
 pub use tokens::{now_ms, sha256, IssuedToken, TokenInfo, MAX_TOKENS_PER_USER};
 pub use users::SeedReport;
 

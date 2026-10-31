@@ -35,7 +35,7 @@ pools are not exported. The coordinator reports their liveness.
 `arneb_queries_running` and `arneb_admission_running` measure different
 things. The first counts every statement the engine is executing and exists
 even with `max_running_queries = 0`. The second counts admission slots in use
-and is absent when admission control is off. For "how busy is the
+(with `max_running_queries = 0` every query holds one). For "how busy is the
 coordinator", use `arneb_queries_running`; for "how close are we to the
 admission cap", use the admission pair.
 

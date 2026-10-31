@@ -484,6 +484,57 @@ impl AdmissionConfig {
     }
 }
 
+/// The admission limits a coordinator starts with (manage-api D9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAdmission {
+    /// The limits to apply.
+    pub limits: arneb_state::AdmissionLimits,
+    /// `"config"` (the `[admission]` seed) or `"state"` (a runtime value
+    /// stored in the state store).
+    pub source: &'static str,
+    /// Each knob whose config value a stored value overrides:
+    /// `(knob, config value, stored value)`.
+    pub diverging: Vec<(&'static str, usize, usize)>,
+}
+
+/// Pick the startup admission limits: a value stored at runtime wins over
+/// the config seed, and each knob it changes is reported as diverging.
+pub fn resolve_admission_limits(
+    config: &AdmissionConfig,
+    stored: Option<arneb_state::AdmissionLimits>,
+) -> ResolvedAdmission {
+    let Some(stored) = stored else {
+        return ResolvedAdmission {
+            limits: arneb_state::AdmissionLimits {
+                max_running_queries: config.max_running_queries,
+                max_queued_queries: config.max_queued_queries,
+            },
+            source: "config",
+            diverging: Vec::new(),
+        };
+    };
+    let diverging = [
+        (
+            "max_running_queries",
+            config.max_running_queries,
+            stored.max_running_queries,
+        ),
+        (
+            "max_queued_queries",
+            config.max_queued_queries,
+            stored.max_queued_queries,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, from_config, from_state)| from_config != from_state)
+    .collect();
+    ResolvedAdmission {
+        limits: stored,
+        source: "state",
+        diverging,
+    }
+}
+
 /// `[agent_api]` section: limits of the agent query API. After
 /// [`AppConfig::load`] the fields hold the effective values (env applied,
 /// validated).
@@ -2467,6 +2518,34 @@ pgwire = "required"
         );
         // Only the named knob moves; the others keep their defaults.
         assert_eq!(ms.max_running_queries, 8);
+    }
+
+    #[test]
+    fn stored_admission_wins_and_reports_divergence() {
+        let config = admission(
+            "[admission]\nmax_running_queries = 8\nmax_queued_queries = 256\n",
+            &[],
+        )
+        .unwrap();
+        let stored = arneb_state::AdmissionLimits {
+            max_running_queries: 4,
+            max_queued_queries: 256,
+        };
+        let r = resolve_admission_limits(&config, Some(stored));
+        assert_eq!(r.limits, stored);
+        assert_eq!(r.source, "state");
+        assert_eq!(r.diverging, vec![("max_running_queries", 8, 4)]);
+
+        let r = resolve_admission_limits(&config, None);
+        assert_eq!(
+            r.limits,
+            arneb_state::AdmissionLimits {
+                max_running_queries: 8,
+                max_queued_queries: 256,
+            }
+        );
+        assert_eq!(r.source, "config");
+        assert!(r.diverging.is_empty());
     }
 
     #[test]

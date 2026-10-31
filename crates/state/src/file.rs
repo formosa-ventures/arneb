@@ -77,6 +77,9 @@ pub(crate) struct StateData {
     /// Absent in files written before worker cordons existed.
     #[serde(default)]
     pub cordons: Vec<crate::CordonRecord>,
+    /// Runtime settings; absent in files written before they existed.
+    #[serde(default)]
+    pub settings: crate::settings::Settings,
 }
 
 impl Default for StateData {
@@ -86,6 +89,7 @@ impl Default for StateData {
             users: Vec::new(),
             tokens: Vec::new(),
             cordons: Vec::new(),
+            settings: Default::default(),
         }
     }
 }

@@ -980,27 +980,41 @@ async fn run() -> Result<()> {
     );
 
     // admission-control D5/D8: one controller for the process, shared by
-    // pgwire, the Trino listener and the Web UI. Workers have none; their
-    // admission stays the RSS probe, and this cap bounds what reaches them.
-    // `max_running_queries = 0` admits every query at once, so no queue can
-    // form whatever `max_queued_queries` says: build no controller, and
-    // statements skip admission (and its lock) entirely.
+    // pgwire, the Trino listener, the agent API and the Web UI. Workers have
+    // none; their admission stays the RSS probe, and this cap bounds what
+    // reaches them. manage-api D9: the controller is built whenever SQL is
+    // served, also for `max_running_queries = 0` (unlimited), so the limits
+    // can change at runtime; a value stored in the state store wins over
+    // the config seed.
     let serves_sql = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
     let admission_config = &config.admission;
-    let admission = (serves_sql && admission_config.max_running_queries > 0).then(|| {
+    let resolved_admission = config::resolve_admission_limits(
+        admission_config,
+        state_store.as_ref().and_then(|s| s.admission_limits()),
+    );
+    let admission = serves_sql.then(|| {
         arneb_scheduler::AdmissionController::new(
-            admission_config.max_running_queries,
-            admission_config.max_queued_queries,
+            resolved_admission.limits.max_running_queries,
+            resolved_admission.limits.max_queued_queries,
         )
     });
     if let Some(controller) = &admission {
         controller.spawn_snapshot_logger(std::time::Duration::from_secs(10));
     }
     if serves_sql {
+        for (knob, from_config, from_state) in &resolved_admission.diverging {
+            tracing::warn!(
+                target: "arneb::config",
+                "[admission] {knob} / ARNEB_{} = {from_config} is overridden by the runtime \
+                 value {from_state} in the state store",
+                knob.to_ascii_uppercase()
+            );
+        }
         tracing::info!(
             target: "arneb::config",
-            max_running_queries = admission_config.max_running_queries,
-            max_queued_queries = admission_config.max_queued_queries,
+            max_running_queries = resolved_admission.limits.max_running_queries,
+            max_queued_queries = resolved_admission.limits.max_queued_queries,
+            admission_source = resolved_admission.source,
             statement_timeout = %arneb_common::duration::format_pg_time_limit(
                 admission_config.statement_timeout
             ),

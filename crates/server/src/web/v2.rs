@@ -64,6 +64,7 @@ pub fn routes() -> Router<WebState> {
         .merge(super::agent::routes())
         .merge(super::audit::routes())
         .merge(super::workers::routes())
+        .merge(super::admission::routes())
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
 }
@@ -119,7 +120,7 @@ fn auth_disabled() -> ApiError {
 
 /// Parse a JSON request body; an empty body is `T::default()` when
 /// `allow_empty`.
-fn parse_body<T: serde::de::DeserializeOwned + Default>(
+pub(super) fn parse_body<T: serde::de::DeserializeOwned + Default>(
     body: &Bytes,
     allow_empty: bool,
 ) -> Result<T, ApiError> {

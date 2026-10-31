@@ -174,6 +174,8 @@ All `/api/v2` routes need credentials, except `health` and `POST /sessions`.
 | `GET /api/v2/workers[?limit=]` | The [bounded worker listing](#workers). |
 | `GET /api/v2/workers/{id}` | One worker. |
 | `POST /api/v2/workers/{id}/cordon\|drain\|uncordon[?dry_run=]` | [Cordon, drain or uncordon](#workers) a worker. |
+| `GET /api/v2/admission` | The [admission limits](#admission-limits) and counters. |
+| `PUT /api/v2/admission[?dry_run=]` | [Change the admission limits](#admission-limits). |
 | `GET /api/v2/info` | Server version and role. |
 | `GET /api/v2/audit` | The [audit log](#audit-log), newest first. |
 
@@ -530,6 +532,45 @@ curl -s -H "$H" -X POST "$B/workers/worker-1/drain?dry_run=true"
 
 `GET /api/v1|v2/cluster/workers` stay arrays of the alive workers; each
 entry gains `scheduling`.
+
+### Admission limits
+
+The [admission limits](/guide/configuration#admission-control) can change
+while the server runs. A change is kept in the state store and wins over
+`[admission]` at the next start (a WARN on `arneb::config` names each knob
+it overrides). Without a `[state] path` the store is in memory, and each
+change warns that it is `lost on restart`.
+
+| Method and path | Privilege | Description |
+|---|---|---|
+| `GET /api/v2/admission` | observe | `{max_running_queries, max_queued_queries, running_queries, queued_queries, source}`. |
+| `PUT /api/v2/admission` | manage | Action `admission.set`; body `{"max_running_queries"?, "max_queued_queries"?}`. |
+
+`source` is `config` until a limit is set at runtime, then `state`.
+`max_running_queries = 0` means unlimited.
+
+The `PUT` body needs at least one of the two fields; a field left out keeps
+its value. Each value is a non-negative integer, and an unknown field is
+`invalid_argument`. The answer is the [manage envelope](#dry-runs-and-the-response-envelope);
+`result` is the `GET` view after the change. The action is
+[audited](#audit-log) with `parameters` such as
+`{"max_running_queries": {"from": 8, "to": 2}, "effect": "applied"}`.
+Setting the values the server already has is a no-op (`changed: false`).
+
+- Lowering `max_running_queries` below the running count stops nothing: new
+  queries queue until fewer than the new cap run.
+- Raising it, or setting `0`, admits queued queries at once, in arrival
+  order, up to the new cap.
+- Lowering `max_queued_queries` keeps the queries already queued; new ones
+  are refused while the queue is at or over the new limit.
+
+```bash
+curl -s -H "$H" -X PUT "$B/admission?dry_run=true" \
+  -H 'Content-Type: application/json' -d '{"max_running_queries": 2}'
+# {"dry_run":true,"action":"admission.set","target":"admission",
+#  "summary":"sets max_running_queries 8 → 2 (5 queries running, 0 queued): running queries finish; new queries queue until fewer than 2 run",
+#  "changed":true,"warning":null}
+```
 
 ### Audit log
 

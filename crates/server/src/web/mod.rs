@@ -1,5 +1,6 @@
 //! Web UI module: REST API + embedded frontend.
 
+mod admission;
 mod agent;
 mod api;
 mod audit;
@@ -30,11 +31,12 @@ pub struct WebState {
     pub node_registry: NodeRegistry,
     pub start_time: std::time::Instant,
     pub role: String,
-    /// Admission controller shared with pgwire and Trino (coordinator /
-    /// standalone); `None` on workers or when admission is off.
+    /// Admission controller shared with pgwire, Trino and the agent API;
+    /// `Some` on every node that serves SQL (coordinator / standalone),
+    /// `None` on workers.
     pub admission: Option<arneb_scheduler::AdmissionController>,
     /// Configured `[admission] max_queued_queries`, reported when there is
-    /// no controller (`max_running_queries = 0`, i.e. unlimited).
+    /// no controller (a worker).
     pub max_queued_queries: usize,
     /// The node memory pool, for `/metrics`.
     pub memory_pool: Arc<dyn arneb_common::memory_pool::MemoryPool>,

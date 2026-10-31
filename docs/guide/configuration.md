@@ -243,9 +243,32 @@ client is cancelled on every worker: its tasks stop and their memory and
 output buffers are released. `arneb::cluster` logs `cancelling query on
 workers` on the coordinator and `query cancelled on worker` on each worker.
 
-The effective values are logged at startup on `arneb::config`. Set
-`max_running_queries = 0` and leave the other two unset to turn admission
-off.
+The effective values are logged at startup on `arneb::config`, with
+`admission_source = config|state`. Set `max_running_queries = 0` and leave
+the other two unset to turn admission off.
+
+**Runtime changes.** A manager can change `max_running_queries` and
+`max_queued_queries` while the server runs, with `PUT /api/v2/admission` or
+the MCP `set_admission_limits` tool (see
+[HTTP API](/guide/http-api#admission-limits)). The change applies at once:
+
+- lowering the cap below the running count stops nothing; new queries queue
+  until fewer than the new cap run;
+- raising it, or setting `0` (unlimited), admits queued queries at once, in
+  arrival order, up to the new cap;
+- a shorter queue keeps the queries already queued, and refuses new ones
+  while the queue is at or over the new limit.
+
+The new limits are kept in the state store (`[state] path`) and win over
+`[admission]` and the `ARNEB_*` variables at the next start. Each knob whose
+config value differs from the stored one logs a WARN on `arneb::config`:
+
+```text
+[admission] max_running_queries / ARNEB_MAX_RUNNING_QUERIES = 8 is overridden by the runtime value 4 in the state store
+```
+
+To go back to the config values, `PUT` them again. `statement_timeout` and
+`query_max_memory_per_node` change only at startup.
 
 ## Query History
 

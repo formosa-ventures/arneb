@@ -51,6 +51,12 @@ pub(crate) struct UserRecord {
     pub scram: String,
     /// True when the user was seeded from the config file.
     pub from_config: bool,
+    /// True when the user was ever seeded from the config file, including
+    /// after a runtime password change detached them (`from_config`
+    /// false). Deleting such a user records a tombstone. Absent (false) in
+    /// files written before runtime config existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub config_seeded: bool,
 }
 
 /// A stored API token. Holds only a hash of the secret and a SCRAM verifier
@@ -310,6 +316,7 @@ mod tests {
             name: "alice".into(),
             scram: "SCRAM-SHA-256$4096:salt$stored:server".into(),
             from_config: false,
+            config_seeded: false,
         }
     }
 

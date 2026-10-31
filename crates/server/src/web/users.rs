@@ -674,7 +674,7 @@ impl ManageAction for DeleteUser {
     fn preview(&self, _state: &WebState) -> Result<Preview, ApiError> {
         let user = existing_user(&self.store, &self.name)?;
         let mut warning = None;
-        if user.from_config {
+        if user.config_seeded {
             add_warning(
                 &mut warning,
                 format!(
@@ -1533,5 +1533,89 @@ mod tests {
         release.send(()).unwrap();
         let _next = state.config_changes.lock().await;
         assert_eq!(audit_json(&state).len(), 1);
+    }
+    #[tokio::test]
+    async fn deleting_a_detached_config_user_warns_about_the_tombstone() {
+        let state = node();
+        let (status, _) = call(
+            &state,
+            Method::PATCH,
+            "/api/v2/users/alice",
+            Some(&root()),
+            Some(json!({"password": "brand-new-pw"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, dry) = call(
+            &state,
+            Method::DELETE,
+            "/api/v2/users/alice?dry_run=true",
+            Some(&root()),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{dry}");
+        assert!(
+            dry["warning"].as_str().unwrap().contains("tombstone"),
+            "{dry}"
+        );
+        let (status, body) = call(
+            &state,
+            Method::DELETE,
+            "/api/v2/users/alice",
+            Some(&root()),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["result"]["tombstoned"], true);
+    }
+
+    /// The per-user token routes build their envelope outside `run_manage`:
+    /// a dry run still warns, and a real run is still refused, when the
+    /// audit log is not writable.
+    #[tokio::test]
+    async fn user_token_routes_respect_an_unwritable_audit_log() {
+        let state = node();
+        let alice = state
+            .state
+            .as_ref()
+            .unwrap()
+            .issue_token("alice", None, None)
+            .unwrap();
+        // One failed append marks the log unwritable.
+        state.audit.set_fail_appends(true);
+        let (status, _) = create(&state, "dave", "davepass1").await;
+        assert_eq!(status, StatusCode::OK, "applied; only its append failed");
+        assert!(!state.audit.is_writable());
+        let revoke = format!("/api/v2/users/alice/tokens/{}", alice.info.id);
+        for (method, path) in [
+            (Method::POST, "/api/v2/users/alice/tokens".to_owned()),
+            (Method::DELETE, revoke.clone()),
+        ] {
+            let (status, dry) = call(
+                &state,
+                method.clone(),
+                &format!("{path}?dry_run=true"),
+                Some(&root()),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {dry}");
+            let warning = dry["warning"].as_str().unwrap();
+            assert!(
+                warning.contains(crate::web::manage::AUDIT_UNAVAILABLE_WARNING),
+                "{path}: {warning}"
+            );
+            let (status, body) = call(&state, method, &path, Some(&root()), None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {body}");
+            assert_eq!(body["error"]["code"], "audit_unavailable", "{path}");
+        }
+        let store = state.state.as_ref().unwrap();
+        assert_eq!(
+            store.list_tokens("alice").len(),
+            1,
+            "nothing issued or revoked"
+        );
     }
 }

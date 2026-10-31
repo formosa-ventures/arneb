@@ -57,6 +57,10 @@ pub struct UserInfo {
     pub name: String,
     /// Whether the config file manages (seeded) the user.
     pub from_config: bool,
+    /// Whether the user was ever seeded from the config file (true also
+    /// after a password change detached them); deleting such a user
+    /// records a tombstone.
+    pub config_seeded: bool,
     /// The user's live (unexpired) API tokens.
     pub tokens: usize,
 }
@@ -142,6 +146,7 @@ impl StateStore {
                 name: name.to_owned(),
                 scram,
                 from_config: false,
+                config_seeded: false,
             });
             Ok(())
         })
@@ -172,9 +177,9 @@ impl StateStore {
         })
     }
 
-    /// Deletes `name` and all of their API tokens. Deleting a config-seeded
-    /// user records a tombstone, so seeding does not re-add them until a
-    /// reseed. An unknown name fails with [`StateError::UnknownUser`].
+    /// Deletes `name` and all of their API tokens. Deleting a user that was
+    /// ever seeded from the config (also one a password change detached)
+    /// records a tombstone, so seeding does not re-add them until a reseed. An unknown name fails with [`StateError::UnknownUser`].
     pub fn delete_user(&self, name: &str) -> Result<UserDeletion, StateError> {
         self.mutate(|data| {
             let at = data
@@ -182,7 +187,8 @@ impl StateStore {
                 .iter()
                 .position(|u| u.name == name)
                 .ok_or_else(|| StateError::UnknownUser(name.to_owned()))?;
-            let tombstoned = data.users.remove(at).from_config;
+            let removed = data.users.remove(at);
+            let tombstoned = removed.from_config || removed.config_seeded;
             if tombstoned && !data.deleted_config_users.iter().any(|n| n == name) {
                 data.deleted_config_users.push(name.to_owned());
             }
@@ -203,6 +209,7 @@ impl StateStore {
             .map(|u| UserInfo {
                 name: u.name.clone(),
                 from_config: u.from_config,
+                config_seeded: u.from_config || u.config_seeded,
                 tokens: crate::tokens::live_token_count(&data, &u.name, now),
             })
             .collect();
@@ -237,6 +244,7 @@ fn apply_seed(data: &mut StateData, users: &[(String, ScramVerifier)], reseed: b
             name: name.clone(),
             scram: scram.clone(),
             from_config: true,
+            config_seeded: true,
         };
         match data.users.iter_mut().find(|u| &u.name == name) {
             None => {
@@ -340,6 +348,7 @@ mod tests {
                     name: name.into(),
                     scram,
                     from_config: false,
+                    config_seeded: false,
                 });
                 Ok(())
             })
@@ -501,11 +510,13 @@ mod tests {
                 UserInfo {
                     name: "alice".into(),
                     from_config: true,
+                    config_seeded: true,
                     tokens: 0
                 },
                 UserInfo {
                     name: "dave".into(),
                     from_config: false,
+                    config_seeded: false,
                     tokens: 0
                 },
             ]
@@ -671,6 +682,31 @@ mod tests {
                 .unwrap()
                 .tokens,
             1
+        );
+    }
+    #[test]
+    fn deleting_a_detached_config_user_still_tombstones() {
+        use arneb_protocol::CredentialSource;
+        let store = StateStore::open(None).unwrap();
+        let config = cfg(&[("alice", "a"), ("bob", "b")]);
+        store.seed_users(&config, false).unwrap();
+        let change = store.set_user_password("alice", v("newpass")).unwrap();
+        assert!(change.detached);
+        let alice = store
+            .list_users()
+            .into_iter()
+            .find(|u| u.name == "alice")
+            .unwrap();
+        assert!(!alice.from_config && alice.config_seeded, "{alice:?}");
+        let gone = store.delete_user("alice").unwrap();
+        assert!(gone.tombstoned, "{gone:?}");
+        let r = store.seed_users(&config, false).unwrap();
+        assert_eq!(r.tombstoned, vec!["alice"]);
+        assert!(r.added.is_empty(), "{r:?}");
+        assert!(store.list_users().iter().all(|u| u.name != "alice"));
+        assert!(
+            !store.verify_password("alice", "a"),
+            "the config password stays dead"
         );
     }
 }

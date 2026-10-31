@@ -67,8 +67,8 @@ pub fn build_router(state: WebState) -> Router {
         .nest("/api/v2", v2::routes())
         .route("/metrics", axum::routing::get(metrics::metrics));
     // MCP is mounted before the auth layer below, so that wraps it too.
-    let router = if state.mcp.is_some() {
-        router.nest_service("/mcp", mcp::mcp_service(state.clone()))
+    let router = if let Some(settings) = &state.mcp {
+        router.nest_service("/mcp", mcp::mcp_service(state.clone(), settings))
     } else {
         // Not served (disabled, or a node without SQL): a plain 404 rather
         // than the SPA fallback's index.html.

@@ -68,7 +68,8 @@ impl ServerHandler for ArnebMcp {
 
 /// The `Host` values `/mcp` accepts (empty = any), per `[mcp] allowed_hosts`
 /// or its default: any host under password auth, loopback under `none`.
-fn resolve_allowed_hosts(settings: &McpSettings, password_auth: bool) -> Vec<String> {
+/// `*` among the entries means any host.
+pub fn resolve_allowed_hosts(settings: &McpSettings, password_auth: bool) -> Vec<String> {
     match &settings.allowed_hosts {
         Some(hosts) if hosts.iter().any(|h| h.trim() == "*") => Vec::new(),
         Some(hosts) => hosts.clone(),
@@ -77,13 +78,12 @@ fn resolve_allowed_hosts(settings: &McpSettings, password_auth: bool) -> Vec<Str
     }
 }
 
-/// The `/mcp` service for `state` (`state.mcp` must be `Some`).
-pub(super) fn mcp_service(state: WebState) -> StreamableHttpService<ArnebMcp, NeverSessionManager> {
-    let settings = state.mcp.clone().unwrap_or(McpSettings {
-        allowed_hosts: None,
-        default_page_bytes: 32 * 1024,
-    });
-    let hosts = resolve_allowed_hosts(&settings, state.credentials.is_some());
+/// The `/mcp` service for `state`, configured by the resolved `settings`.
+pub(super) fn mcp_service(
+    state: WebState,
+    settings: &McpSettings,
+) -> StreamableHttpService<ArnebMcp, NeverSessionManager> {
+    let hosts = resolve_allowed_hosts(settings, state.credentials.is_some());
     let mut config = if hosts.is_empty() {
         StreamableHttpServerConfig::default().disable_allowed_hosts()
     } else {
@@ -384,6 +384,57 @@ mod tests {
         assert!(body["result"].is_null(), "tool ran: {body}");
         let (status, _, _) = rpc(router, Some(&auth), "db.internal:6432", &whoami_body()).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn star_among_other_hosts_means_any() {
+        let s = |h: &[&str]| McpSettings {
+            allowed_hosts: Some(h.iter().map(|x| x.to_string()).collect()),
+            default_page_bytes: 1,
+        };
+        assert!(resolve_allowed_hosts(&s(&["a.example", "*"]), false).is_empty());
+        assert_eq!(
+            resolve_allowed_hosts(&s(&["a.example"]), true),
+            ["a.example"]
+        );
+        assert!(resolve_allowed_hosts(
+            &McpSettings {
+                allowed_hosts: None,
+                default_page_bytes: 1
+            },
+            true
+        )
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_subpaths_need_credentials_and_get_is_not_served() {
+        let router = build_router(mcp_state(true, default_settings()));
+        for path in ["/mcp/x", "/mcp/"] {
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::HOST, "h.example")
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/mcp")
+            .header(header::HOST, "h.example")
+            .header(header::ACCEPT, "text/event-stream")
+            .header(header::AUTHORIZATION, basic("alice", "secret"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert!(v["result"].is_null(), "{v}");
     }
 
     #[tokio::test]

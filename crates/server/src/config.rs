@@ -506,8 +506,9 @@ impl AgentApiConfig {
 pub struct McpConfig {
     /// Serve `/mcp` (coordinator and standalone).
     pub enabled: bool,
-    /// Accepted `Host` header values (`host` or `host:port`); `["*"]`
-    /// accepts any. `None` = any host under password auth, loopback under
+    /// Accepted `Host` header values (`host` or `host:port`); `"*"`
+    /// accepts any, also when mixed with other hosts. An empty list is
+    /// rejected. `None` = any host under password auth, loopback under
     /// `[auth] type = "none"`.
     pub allowed_hosts: Option<Vec<String>>,
     /// Page size of tool results when the caller gives no `max_bytes`.
@@ -535,14 +536,21 @@ impl McpConfig {
                 _ => bail!("invalid ARNEB_MCP_ENABLED value '{v}' (expected true or false)"),
             };
         }
-        if let Some(v) = env("ARNEB_MCP_ALLOWED_HOSTS") {
+        // An empty value counts as unset (file or default applies).
+        if let Some(v) = env("ARNEB_MCP_ALLOWED_HOSTS").filter(|v| !v.trim().is_empty()) {
             let hosts: Vec<String> = v
                 .split(',')
                 .map(str::trim)
                 .filter(|h| !h.is_empty())
                 .map(str::to_owned)
                 .collect();
-            self.allowed_hosts = (!hosts.is_empty()).then_some(hosts);
+            if hosts.is_empty() {
+                bail!(
+                    "ARNEB_MCP_ALLOWED_HOSTS '{v}' lists no hosts; unset it for the default \
+                     or use * for any host"
+                );
+            }
+            self.allowed_hosts = Some(hosts);
         }
         if let Some(v) = env("ARNEB_MCP_DEFAULT_PAGE_BYTES") {
             self.default_page_bytes = v.trim().parse().map_err(|_| {
@@ -558,6 +566,15 @@ impl McpConfig {
     /// `default_page_bytes` must be in `1..=max_page_bytes` (the agent API's
     /// ceiling).
     pub fn validate(&self, max_page_bytes: usize) -> std::result::Result<(), String> {
+        if let Some(hosts) = &self.allowed_hosts {
+            if hosts.iter().all(|h| h.trim().is_empty()) {
+                return Err(
+                    "[mcp] allowed_hosts is empty; omit it for the default or use \
+                            [\"*\"] for any host"
+                        .into(),
+                );
+            }
+        }
         if self.default_page_bytes == 0 {
             return Err("default_page_bytes must be greater than 0".into());
         }
@@ -2099,6 +2116,24 @@ pgwire = "required"
         let c = mcp(file, &[("ARNEB_MCP_ALLOWED_HOSTS", "*")]).unwrap();
         assert_eq!(c.allowed_hosts, Some(vec!["*".to_owned()]));
         assert!(mcp(file, &[("ARNEB_MCP_ENABLED", "maybe")]).is_err());
+    }
+
+    #[test]
+    fn mcp_refuses_empty_host_lists_and_treats_empty_env_as_unset() {
+        let err = mcp("[mcp]\nallowed_hosts = []\n", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_hosts is empty"), "{err}");
+        let err = mcp("port = 5432", &[("ARNEB_MCP_ALLOWED_HOSTS", " , ")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ARNEB_MCP_ALLOWED_HOSTS"), "{err}");
+        // Empty env = unset: the file value (or default) stays.
+        let file = "[mcp]\nallowed_hosts = [\"file.example\"]\n";
+        let c = mcp(file, &[("ARNEB_MCP_ALLOWED_HOSTS", "")]).unwrap();
+        assert_eq!(c.allowed_hosts, Some(vec!["file.example".to_owned()]));
+        let c = mcp("port = 5432", &[("ARNEB_MCP_ALLOWED_HOSTS", "  ")]).unwrap();
+        assert_eq!(c.allowed_hosts, None);
     }
 
     #[test]

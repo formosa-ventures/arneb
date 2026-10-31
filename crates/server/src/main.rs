@@ -943,13 +943,13 @@ async fn run() -> Result<()> {
         tracing::info!(
             target: "arneb::config",
             enabled = config.mcp.enabled,
-            allowed_hosts = %config
-                .mcp
-                .allowed_hosts
-                .as_ref()
-                .map_or_else(|| "default".to_owned(), |h| {
-                    if h.iter().any(|x| x.trim() == "*") { "any".to_owned() } else { h.join(",") }
-                }),
+            allowed_hosts = %{
+                let hosts = web::mcp::resolve_allowed_hosts(
+                    &web::mcp::McpSettings::from(&config.mcp),
+                    password_users.is_some(),
+                );
+                if hosts.is_empty() { "any".to_owned() } else { hosts.join(",") }
+            },
             default_page_bytes = config.mcp.default_page_bytes,
             "mcp effective settings ([mcp] / ARNEB_MCP_*)"
         );

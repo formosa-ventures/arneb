@@ -40,7 +40,7 @@ The listings accept `?prefix=&limit=`.
 
 **D3. Statement ids are query-tracker ids.** The `QueryId` string is the statement id, so `/api/v2/queries/{id}` shows the same query.
 
-**D4. Retention and the execution row cap.** A query submitted through the API is planned with `LIMIT max_rows + 1` at its root (merged with a root `LIMIT` by taking the smaller, and placed under root projections), so the physical planner turns it into a Top-K over a sort or a limit hint over a bare scan, and `LimitExec` stops pulling its input after the cap. Only `SELECT` statements are capped; other statements run as before. The one extra row tells whether the result was truncated. The cost is the exact count: `total_rows` is reported only when the result was not truncated and is `null` otherwise (agents run `count(*)` when they need it). A statement keeps at most `max_rows` rows, copied out of the operator's output buffers, so a finished statement holds memory for at most `max_rows` rows. Aggregations, joins and sorts still read their whole input, under the existing query memory limit as on the Trino path. The Trino and pgwire paths are unchanged.
+**D4. Retention and the execution row cap.** A query submitted through the API is planned with `LIMIT max_rows + 1` at its root (merged with a root `LIMIT` by taking the smaller, and placed under root projections), so the physical planner turns it into a Top-K over a sort or a limit hint over a bare scan, and `LimitExec` stops pulling its input after the cap. Only `SELECT` statements are capped; other statements run as before. The one extra row tells whether the result was truncated. The cost is the exact count: `total_rows` is reported only when the result was not truncated and is `null` otherwise (agents run `count(*)` when they need it). A statement keeps at most `max_rows` rows, copied out of the operator's output buffers, so a finished statement holds memory for at most `max_rows` rows. Retention is also bounded by bytes: each kept batch is measured with `get_array_memory_size` and charged against a per-statement cap (`max_retained_bytes`, 64 MiB) and a process-wide budget (`max_total_retained_bytes`, 1 GiB), held by an RAII reservation that is given back when the statement is evicted or reaped. Past either, the remaining rows are dropped and the statement still finishes, reporting `truncated_by` (`max_rows`, `max_retained_bytes` or `server_budget`) so an agent can narrow the query or retry. Without this a wide result (say 100 KB rows x 10,000) would pin about 1 GB per statement outside the memory pool for the idle timeout. Aggregations, joins and sorts still read their whole input, under the existing query memory limit as on the Trino path. The Trino and pgwire paths are unchanged.
 
 **D5. Inline first page.** `submit` and `status` accept `wait_ms`, default 0, capped at `max_wait_ms`. A statement that finishes inside the wait carries its first page inline.
 
@@ -59,6 +59,8 @@ The listings accept `?prefix=&limit=`.
 | `default_page_bytes` | `ARNEB_AGENT_DEFAULT_PAGE_BYTES` | 262144 |
 | `max_page_bytes` | `ARNEB_AGENT_MAX_PAGE_BYTES` | 4194304 |
 | `max_cell_bytes` | `ARNEB_AGENT_MAX_CELL_BYTES` | 8192 |
+| `max_retained_bytes` | `ARNEB_AGENT_MAX_RETAINED_BYTES` | 67108864 |
+| `max_total_retained_bytes` | `ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES` | 1073741824 |
 | `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 |
 | `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 |
 

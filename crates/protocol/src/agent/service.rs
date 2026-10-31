@@ -14,7 +14,7 @@ use arneb_scheduler::{AdmissionController, AdmissionPermit, QueryState, QueryTra
 
 use super::error::{AgentError, AgentErrorCode};
 use super::limits::AgentLimits;
-use super::results::{retain, ResultPage};
+use super::results::{retain, ResultPage, RetainedBudget};
 use super::statement::{Column, FinishedOutput, Phase, Statement, StatementStatus, SubmitRequest};
 use crate::handler::DistributedExecutor;
 use crate::trino::{
@@ -45,6 +45,8 @@ pub struct AgentQueryService {
     admission: Option<AdmissionController>,
     statement_timeout: Option<Duration>,
     statements: Arc<Mutex<HashMap<String, Arc<Statement>>>>,
+    /// `max_total_retained_bytes`, shared by every statement's results.
+    retained_budget: Arc<RetainedBudget>,
 }
 
 impl AgentQueryService {
@@ -67,6 +69,7 @@ impl AgentQueryService {
                 access_rules: None,
             }),
             tracker: query_tracker,
+            retained_budget: RetainedBudget::new(limits.max_total_retained_bytes),
             limits: Arc::new(limits),
             admission: None,
             statement_timeout: None,
@@ -400,16 +403,23 @@ impl AgentQueryService {
     fn complete(&self, statement: &Statement, result: Result<QueryOutput, TrinoError>) {
         match result {
             Ok(output) => {
-                let retained = retain(output.batches, statement.max_rows);
+                let retained = retain(
+                    output.batches,
+                    statement.max_rows,
+                    self.limits.max_retained_bytes,
+                    &self.retained_budget,
+                );
                 // What the query produced, not what was kept: a truncated
                 // result records max_rows + 1, so it reads as more than the
                 // retained rows in the Web UI and system.runtime.queries.
                 let rows = retained.produced;
-                if retained.truncated {
+                if let Some(by) = retained.truncated_by {
                     tracing::debug!(
                         statement_id = %statement.id,
                         produced = rows,
                         kept = retained.kept_rows(),
+                        retained_bytes = retained.bytes,
+                        truncated_by = ?by,
                         "agent statement result truncated"
                     );
                 }
@@ -540,6 +550,7 @@ mod tests {
     use arneb_execution::ExecutionContext;
     use arneb_planner::LogicalPlan;
 
+    use crate::agent::results::TruncatedBy;
     use crate::agent::statement::StatementState;
     use serde_json::{json, Value};
 
@@ -781,6 +792,82 @@ mod tests {
         assert_eq!(page.truncated_cells, 1);
     }
 
+    /// `wide(s)`: `rows` rows of a `width`-byte string.
+    fn wide_table(rows: usize, width: usize) -> (&'static str, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        let col: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![
+            "w".repeat(width);
+            rows
+        ]));
+        ("wide", RecordBatch::try_new(schema, vec![col]).unwrap())
+    }
+
+    #[tokio::test]
+    async fn retained_byte_cap_truncates_a_wide_result() {
+        let limits = AgentLimits {
+            max_retained_bytes: 100_000,
+            ..AgentLimits::default()
+        };
+        let svc = service_over(vec![wide_table(200, 10_000)], limits);
+        let s = run_to_end(&svc, "SELECT s FROM wide", Some(1000)).await;
+        assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
+        assert!(s.truncated);
+        assert_eq!(s.truncated_by, Some(TruncatedBy::MaxRetainedBytes));
+        assert_eq!(s.total_rows, None);
+        let rows = all_rows(&svc, s).await.len();
+        assert!(rows > 0 && rows < 10, "{rows}");
+        assert!(svc.retained_budget.used() <= 100_000);
+        // A result under both caps reports no truncation.
+        let s = run_to_end(&svc, "SELECT s FROM wide LIMIT 2", Some(1000)).await;
+        assert_eq!(
+            (s.truncated, s.truncated_by, s.total_rows),
+            (false, None, Some(2))
+        );
+        let s = run_to_end(&svc, "SELECT s FROM wide", Some(3)).await;
+        assert_eq!(s.truncated_by, Some(TruncatedBy::MaxRows));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_server_budget_truncates_until_a_statement_is_reaped() {
+        let sql = "SELECT s FROM wide";
+        // How much one full result retains.
+        let probe = service_over(vec![wide_table(10, 1000)], AgentLimits::default());
+        let s = run_to_end(&probe, sql, None).await;
+        assert_eq!(s.truncated_by, None);
+        let one = probe.retained_budget.used();
+        assert!(one > 0);
+
+        let budget = one + one / 2;
+        let svc = service_over(
+            vec![wide_table(10, 1000)],
+            AgentLimits {
+                max_retained_bytes: budget,
+                max_total_retained_bytes: budget,
+                idle_timeout: Duration::from_secs(1),
+                ..AgentLimits::default()
+            },
+        );
+        let first = run_to_end(&svc, sql, None).await;
+        assert_eq!(first.truncated_by, None);
+        assert_eq!(svc.retained_budget.used(), one);
+        let second = run_to_end(&svc, sql, None).await;
+        assert_eq!(second.state, StatementState::Finished);
+        assert_eq!(second.truncated_by, Some(TruncatedBy::ServerBudget));
+        assert_eq!(second.total_rows, None);
+        assert!(svc.retained_budget.used() <= budget);
+
+        // Reaping both gives their bytes back.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        svc.reap();
+        assert_eq!(svc.retained_budget.used(), 0);
+        let third = run_to_end(&svc, sql, None).await;
+        assert_eq!(third.truncated_by, None);
+    }
+
     #[tokio::test]
     async fn results_before_finish_is_invalid_argument() {
         let (svc, _) = service();
@@ -841,7 +928,7 @@ mod tests {
         statement.end(Phase::Finished(FinishedOutput {
             columns: None,
             update_type: Some("USE".into()),
-            retained: retain(Vec::new(), 10),
+            retained: retain(Vec::new(), 10, 1 << 20, &RetainedBudget::new(1 << 20)),
         }));
         let s = statement.status(&AgentLimits::default());
         assert_eq!(s.state, StatementState::Finished);

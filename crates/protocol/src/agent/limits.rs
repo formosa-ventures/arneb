@@ -13,6 +13,13 @@ pub struct AgentLimits {
     pub max_page_bytes: usize,
     /// Longest rendered cell; longer values are truncated.
     pub max_cell_bytes: usize,
+    /// Arrow memory one finished statement may retain; rows past it are
+    /// dropped (`truncated_by: max_retained_bytes`).
+    pub max_retained_bytes: usize,
+    /// Arrow memory all finished statements together may retain; a
+    /// statement that finds it exhausted keeps what fits
+    /// (`truncated_by: server_budget`).
+    pub max_total_retained_bytes: usize,
     /// Longest any request waits before answering "still running".
     pub max_wait: Duration,
     /// Idle time after which a statement is reaped. At least twice
@@ -28,6 +35,8 @@ impl Default for AgentLimits {
             default_page_bytes: 262_144,
             max_page_bytes: 4_194_304,
             max_cell_bytes: 8192,
+            max_retained_bytes: 64 << 20,
+            max_total_retained_bytes: 1 << 30,
             max_wait: Duration::from_millis(10_000),
             idle_timeout: Duration::from_secs(600),
         }
@@ -44,6 +53,11 @@ impl AgentLimits {
             ("default_page_bytes", self.default_page_bytes == 0),
             ("max_page_bytes", self.max_page_bytes == 0),
             ("max_cell_bytes", self.max_cell_bytes == 0),
+            ("max_retained_bytes", self.max_retained_bytes == 0),
+            (
+                "max_total_retained_bytes",
+                self.max_total_retained_bytes == 0,
+            ),
             ("max_wait_ms", self.max_wait.is_zero()),
             ("idle_timeout_secs", self.idle_timeout.is_zero()),
         ];
@@ -60,6 +74,12 @@ impl AgentLimits {
             return Err(format!(
                 "default_page_bytes ({}) must not exceed max_page_bytes ({})",
                 self.default_page_bytes, self.max_page_bytes
+            ));
+        }
+        if self.max_retained_bytes > self.max_total_retained_bytes {
+            return Err(format!(
+                "max_retained_bytes ({}) must not exceed max_total_retained_bytes ({})",
+                self.max_retained_bytes, self.max_total_retained_bytes
             ));
         }
         // Twice the longest wait leaves a full max_wait of slack between a
@@ -97,6 +117,15 @@ mod tests {
             ..Default::default()
         };
         assert!(l.validate().unwrap_err().contains("default_page_bytes"));
+        let l = AgentLimits {
+            max_retained_bytes: 2 << 30,
+            ..Default::default()
+        };
+        let err = l.validate().unwrap_err();
+        assert!(
+            err.contains("max_retained_bytes") && err.contains("max_total_retained_bytes"),
+            "{err}"
+        );
     }
 
     #[test]

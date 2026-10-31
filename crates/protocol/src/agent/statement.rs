@@ -13,7 +13,7 @@ use arneb_scheduler::QueueTicket;
 
 use super::error::{AgentError, AgentErrorCode};
 use super::limits::AgentLimits;
-use super::results::{page, ResultPage, Retained};
+use super::results::{page, ResultPage, Retained, TruncatedBy};
 
 /// Body of a statement submission.
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +85,9 @@ pub struct StatementStatus {
     pub total_rows: Option<u64>,
     /// Whether rows beyond the retained ones were dropped.
     pub truncated: bool,
+    /// Why rows were dropped, when `truncated`: `max_rows`,
+    /// `max_retained_bytes` or `server_budget`.
+    pub truncated_by: Option<TruncatedBy>,
     /// Rows kept for the client at most (the request's `max_rows`).
     pub max_rows: usize,
     /// The first page of rows, once finished.
@@ -229,6 +232,7 @@ impl Statement {
                 columns: None,
                 total_rows: None,
                 truncated: false,
+                truncated_by: None,
                 max_rows: self.max_rows,
                 first_page: None,
                 error: None,
@@ -243,7 +247,8 @@ impl Statement {
                     status.update_type = output.update_type.clone();
                     status.columns = output.columns.clone();
                     status.total_rows = output.retained.total_rows;
-                    status.truncated = output.retained.truncated;
+                    status.truncated = output.retained.truncated();
+                    status.truncated_by = output.retained.truncated_by;
                     retained = Some(output.retained.clone());
                 }
                 Phase::Failed(err) | Phase::Cancelled(err) => status.error = Some(err.clone()),

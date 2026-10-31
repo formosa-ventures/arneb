@@ -402,18 +402,35 @@ impl AdmissionConfig {
 /// default_page_bytes = 262144    # ARNEB_AGENT_DEFAULT_PAGE_BYTES
 /// max_page_bytes     = 4194304   # ARNEB_AGENT_MAX_PAGE_BYTES
 /// max_cell_bytes     = 8192      # ARNEB_AGENT_MAX_CELL_BYTES
+/// max_retained_bytes = 67108864  # ARNEB_AGENT_MAX_RETAINED_BYTES
+/// max_total_retained_bytes = 1073741824  # ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES
 /// max_wait_ms        = 10000     # ARNEB_AGENT_MAX_WAIT_MS
 /// idle_timeout_secs  = 600       # ARNEB_AGENT_IDLE_TIMEOUT_SECS
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentApiConfig {
+    /// Rows a statement retains when the request names no `max_rows`, and
+    /// the default listing `limit`.
     pub default_max_rows: usize,
+    /// Ceiling for a statement's `max_rows` and a listing's `limit`.
     pub max_rows: usize,
+    /// Response bytes per result page when the request names no limit.
     pub default_page_bytes: usize,
+    /// Ceiling for a requested page size.
     pub max_page_bytes: usize,
+    /// Longest cell, in bytes of a string's UTF-8 text (other values: of
+    /// their JSON); longer cells are cut.
     pub max_cell_bytes: usize,
+    /// Arrow memory one finished statement may retain; must not exceed
+    /// `max_total_retained_bytes`.
+    pub max_retained_bytes: usize,
+    /// Arrow memory all finished statements together may retain.
+    pub max_total_retained_bytes: usize,
+    /// Longest any request waits before answering "still running".
     pub max_wait_ms: u64,
+    /// Idle time before a statement is reaped; at least twice
+    /// `max_wait_ms`.
     pub idle_timeout_secs: u64,
 }
 
@@ -426,6 +443,8 @@ impl Default for AgentApiConfig {
             default_page_bytes: d.default_page_bytes,
             max_page_bytes: d.max_page_bytes,
             max_cell_bytes: d.max_cell_bytes,
+            max_retained_bytes: d.max_retained_bytes,
+            max_total_retained_bytes: d.max_total_retained_bytes,
             max_wait_ms: d.max_wait.as_millis() as u64,
             idle_timeout_secs: d.idle_timeout.as_secs(),
         }
@@ -441,6 +460,8 @@ impl AgentApiConfig {
             default_page_bytes: self.default_page_bytes,
             max_page_bytes: self.max_page_bytes,
             max_cell_bytes: self.max_cell_bytes,
+            max_retained_bytes: self.max_retained_bytes,
+            max_total_retained_bytes: self.max_total_retained_bytes,
             max_wait: std::time::Duration::from_millis(self.max_wait_ms),
             idle_timeout: std::time::Duration::from_secs(self.idle_timeout_secs),
         }
@@ -474,6 +495,16 @@ impl AgentApiConfig {
         )?;
         set(&env, "ARNEB_AGENT_MAX_PAGE_BYTES", &mut self.max_page_bytes)?;
         set(&env, "ARNEB_AGENT_MAX_CELL_BYTES", &mut self.max_cell_bytes)?;
+        set(
+            &env,
+            "ARNEB_AGENT_MAX_RETAINED_BYTES",
+            &mut self.max_retained_bytes,
+        )?;
+        set(
+            &env,
+            "ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES",
+            &mut self.max_total_retained_bytes,
+        )?;
         set(&env, "ARNEB_AGENT_MAX_WAIT_MS", &mut self.max_wait_ms)?;
         set(
             &env,
@@ -1951,6 +1982,35 @@ pgwire = "required"
         .unwrap_err()
         .to_string();
         assert!(err.contains("default_max_rows"), "{err}");
+    }
+
+    #[test]
+    fn agent_api_retained_byte_limits_from_file_and_env() {
+        let c = agent_api("port = 5432", &[]).unwrap();
+        assert_eq!(
+            (c.max_retained_bytes, c.max_total_retained_bytes),
+            (64 << 20, 1 << 30)
+        );
+        let file = "[agent_api]\nmax_retained_bytes = 1000\nmax_total_retained_bytes = 5000\n";
+        let c = agent_api(file, &[("ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES", "9000")]).unwrap();
+        assert_eq!(
+            (c.max_retained_bytes, c.max_total_retained_bytes),
+            (1000, 9000)
+        );
+        let err = agent_api(file, &[("ARNEB_AGENT_MAX_RETAINED_BYTES", "6000")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_total_retained_bytes"), "{err}");
+        let err = agent_api(
+            "[agent_api]\nmax_wait_ms = 10000\nidle_timeout_secs = 10\n",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("idle_timeout_secs") && err.contains("max_wait_ms"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -225,7 +225,7 @@ The reply is a status:
 {"id":"…","state":"finished","queue_position":null,"elapsed_ms":41,
  "update_type":null,
  "columns":[{"name":"l_orderkey","type":"bigint"},{"name":"l_quantity","type":"bigint"}],
- "total_rows":2,"truncated":false,"max_rows":100,
+ "total_rows":2,"truncated":false,"truncated_by":null,"max_rows":100,
  "first_page":{"rows":[[1,17],[2,36]],"…":"…"},"error":null}
 ```
 
@@ -280,6 +280,19 @@ is `true`. To count a large result, run `SELECT count(*)`. Aggregations,
 joins and sorts still read all their input; only the rows they emit are
 capped.
 
+Retained rows are also bounded by memory: a statement keeps at most
+`max_retained_bytes` of Arrow data, and all statements together at most
+`max_total_retained_bytes`. Rows past either are dropped as they are kept;
+the statement still finishes, with `truncated: true` and `total_rows: null`.
+`truncated_by` says which limit cut the result, so an agent can react:
+
+| `truncated_by` | Cause | What to do |
+|---|---|---|
+| `max_rows` | More than `max_rows` rows. | Add `LIMIT`, a filter or an aggregate, or raise `max_rows`. |
+| `max_retained_bytes` | The kept rows reached the per-statement byte limit. | Select fewer or narrower columns. |
+| `server_budget` | Retained results across the server hit the global budget. | Retry later; results free up as statements are evicted or reaped. |
+| `null` | Nothing was cut. | |
+
 A request value above its ceiling is refused with `invalid_argument` and a
 hint naming the ceiling; it is never silently clamped. That includes
 `wait_ms`, `max_rows`, `max_bytes` and `rows`. The one server-side cap is the
@@ -295,6 +308,8 @@ query parameter is also `invalid_argument`.
 | `default_page_bytes` | `ARNEB_AGENT_DEFAULT_PAGE_BYTES` | 262144 |
 | `max_page_bytes` | `ARNEB_AGENT_MAX_PAGE_BYTES` | 4194304 |
 | `max_cell_bytes` | `ARNEB_AGENT_MAX_CELL_BYTES` | 8192 |
+| `max_retained_bytes` | `ARNEB_AGENT_MAX_RETAINED_BYTES` | 67108864 (64 MiB) |
+| `max_total_retained_bytes` | `ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES` | 1073741824 (1 GiB) |
 | `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 |
 | `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 |
 

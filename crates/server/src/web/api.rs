@@ -192,20 +192,22 @@ async fn cancel_query(
     State(state): State<WebState>,
     Extension(who): Extension<Identity>,
     Path(id): Path<String>,
-) -> Result<StatusCode, Response> {
-    let info = visible_query(&state, &who, &id).map_err(IntoResponse::into_response)?;
+) -> Response {
+    let info = match visible_query(&state, &who, &id) {
+        Ok(info) => info,
+        Err(status) => return status.into_response(),
+    };
     if !may_kill(&state, &who, info.user.as_deref()) {
-        return Err(ApiError::new(
+        return ApiError::new(
             ErrorCode::Forbidden,
             "the access rules do not allow you to kill this query",
         )
-        .into_response());
+        .into_response();
     }
-    state
-        .query_tracker
-        .cancel_query(&info.query_id)
-        .map_err(|_| StatusCode::NOT_FOUND.into_response())?;
-    Ok(StatusCode::NO_CONTENT)
+    match state.query_tracker.cancel_query(&info.query_id) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Admission counters for the overview: the controller's, or with none

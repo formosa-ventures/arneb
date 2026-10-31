@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.9](https://github.com/formosa-ventures/arneb/compare/v0.1.8...v0.1.9) (2026-10-31)
+
+
+### Features
+
+* **sql-parser:** accept an alias on a parenthesized join ([#208](https://github.com/formosa-ventures/arneb/issues/208)) ([7f8a194](https://github.com/formosa-ventures/arneb/commit/7f8a1942c5738fd14b3d706f2020320ea7af7bd8))
+
+
+### Bug Fixes
+
+* keep column aliases on FROM tables and subqueries ([#211](https://github.com/formosa-ventures/arneb/issues/211)) ([3a044be](https://github.com/formosa-ventures/arneb/commit/3a044be893b1311c45ade45f1414ac451779f0bc))
+
 ## [0.1.8](https://github.com/formosa-ventures/arneb/compare/v0.1.7...v0.1.8) (2026-10-30)
 
 

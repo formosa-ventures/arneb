@@ -207,10 +207,16 @@ mod tests {
 
     fn mcp_state(password: bool, mcp: Option<McpSettings>) -> WebState {
         let store = Arc::new(arneb_state::StateStore::open(None).unwrap());
-        for (user, pw) in [("alice", "secret"), ("bob", "hunter2")] {
-            let v = ScramVerifier::from_password(pw, b"0123456789abcdef", 4096);
-            store.seed_users(&[(user.into(), v)], false).unwrap();
-        }
+        // One seed call: seeding follows the config, so a later call
+        // without a user deletes it.
+        let users: Vec<(String, ScramVerifier)> = [("alice", "secret"), ("bob", "hunter2")]
+            .into_iter()
+            .map(|(user, pw)| {
+                let v = ScramVerifier::from_password(pw, b"0123456789abcdef", 4096);
+                (user.into(), v)
+            })
+            .collect();
+        store.seed_users(&users, false).unwrap();
         let credentials: Option<Arc<dyn CredentialSource>> =
             password.then(|| store.clone() as Arc<dyn CredentialSource>);
         WebState {

@@ -57,11 +57,19 @@ impl RetainedBudget {
 
     /// Takes `bytes` from the budget, or nothing when they do not fit.
     fn try_take(&self, bytes: usize) -> bool {
-        self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|n| *n <= self.capacity)
-            })
-            .is_ok()
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let Some(next) = used.checked_add(bytes).filter(|n| *n <= self.capacity) else {
+                return false;
+            };
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(actual) => used = actual,
+            }
+        }
     }
 }
 

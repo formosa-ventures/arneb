@@ -8,6 +8,7 @@ use arneb_common::diagnostic::SourceFile;
 
 use super::error::{AgentError, AgentErrorCode};
 use super::service::AgentQueryService;
+use super::truncate_on_char_boundary;
 use crate::trino::{parse_control, ClientSession, TrinoError};
 
 /// Body of an explain request.
@@ -95,7 +96,8 @@ impl AgentQueryService {
             .plan_for_explain(&session, sql)
             .await
             .map_err(|e| AgentError::from_trino(&e))?;
-        let (plan, plan_truncated) = cut(plan, self.limits.default_page_bytes);
+        let mut plan = plan;
+        let plan_truncated = truncate_on_char_boundary(&mut plan, self.limits.default_page_bytes);
         let estimated_scan_bytes = scans
             .iter()
             .map(|s| s.size_bytes)
@@ -107,20 +109,6 @@ impl AgentQueryService {
             estimated_scan_bytes,
         })
     }
-}
-
-/// `text` cut to at most `max_bytes` bytes on a character boundary, and
-/// whether it was cut.
-fn cut(mut text: String, max_bytes: usize) -> (String, bool) {
-    if text.len() <= max_bytes {
-        return (text, false);
-    }
-    let mut end = max_bytes;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    (text, true)
 }
 
 #[cfg(test)]

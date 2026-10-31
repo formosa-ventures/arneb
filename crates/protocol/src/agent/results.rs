@@ -239,7 +239,7 @@ pub struct ResultPage {
 /// escapes never count; any other value (number, array, map, …) is measured
 /// and cut as its serialized JSON, becoming a string when cut.
 fn cut_cell(cell: &mut Value, max_cell_bytes: usize) -> bool {
-    let text = match &mut *cell {
+    let mut text = match &mut *cell {
         Value::String(s) if s.len() <= max_cell_bytes => return false,
         Value::String(s) => std::mem::take(s),
         other => {
@@ -250,11 +250,9 @@ fn cut_cell(cell: &mut Value, max_cell_bytes: usize) -> bool {
             serialized
         }
     };
-    let mut end = max_cell_bytes;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    *cell = Value::String(format!("{}…", &text[..end]));
+    super::truncate_on_char_boundary(&mut text, max_cell_bytes);
+    text.push('…');
+    *cell = Value::String(text);
     true
 }
 

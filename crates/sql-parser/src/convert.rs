@@ -1315,27 +1315,54 @@ fn convert_table_with_joins(twj: sp::TableWithJoins) -> Result<ast::TableWithJoi
     Ok(ast::TableWithJoins { relation, joins })
 }
 
+fn convert_table_alias_columns(alias: &sp::TableAlias) -> Result<Vec<String>, ParseError> {
+    alias
+        .columns
+        .iter()
+        .map(|column| {
+            if column.data_type.is_some() {
+                return Err(ParseError::UnsupportedFeature(
+                    "typed column alias in FROM".to_string(),
+                ));
+            }
+            Ok(column.name.value.clone())
+        })
+        .collect()
+}
+
 /// Convert a `sqlparser` [`sp::TableFactor`] into a arneb [`ast::TableFactor`].
 fn convert_table_factor(factor: sp::TableFactor) -> Result<ast::TableFactor, ParseError> {
     match factor {
         sp::TableFactor::Table { name, alias, .. } => {
             let table_ref = object_name_to_table_reference(&name)?;
+            let column_aliases = alias
+                .as_ref()
+                .map(convert_table_alias_columns)
+                .transpose()?
+                .unwrap_or_default();
             let alias_name = alias.map(|a| a.name.value);
             Ok(ast::TableFactor::Table {
                 name: table_ref,
                 alias: alias_name,
+                column_aliases,
             })
         }
         sp::TableFactor::Derived {
             subquery, alias, ..
         } => {
             let q = convert_query(*subquery)?;
+            let column_aliases = alias
+                .as_ref()
+                .map(convert_table_alias_columns)
+                .transpose()?
+                .unwrap_or_default();
             let alias_name = alias
                 .map(|a| a.name.value)
                 .unwrap_or_else(|| "subquery".to_string());
             Ok(ast::TableFactor::Subquery {
                 query: Box::new(q),
                 alias: alias_name,
+                column_aliases,
             })
         }
         sp::TableFactor::NestedJoin {

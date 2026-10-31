@@ -1170,9 +1170,27 @@ impl ExecutionPlan for ProjectionExec {
 
     fn inject_dynamic_filter(&self, filter: PlanExpr, target_index: usize) {
         // Map the output-column index back to the input column it projects.
-        // Only a direct `Column` passthrough can carry the filter further; a
-        // computed/renamed expression cannot be targeted, so drop.
-        if let Some(PlanExpr::Column { index, .. }) = self.exprs.get(target_index) {
+        // A direct column may have a new output name. Use the expression's
+        // source name, whose index is in this projection's input space.
+        if let Some(PlanExpr::Column {
+            index,
+            name: source_name,
+            ..
+        }) = self.exprs.get(target_index)
+        {
+            let mut filter = filter;
+            if let PlanExpr::InList { expr, .. } = &mut filter {
+                if let PlanExpr::Column { name, .. } = expr.as_mut() {
+                    debug_assert_eq!(
+                        self.output_schema
+                            .get(target_index)
+                            .map(|c| c.name.as_str()),
+                        Some(name.as_str()),
+                        "dynamic-filter provenance descent misrouted at projection"
+                    );
+                    *name = source_name.clone();
+                }
+            }
             self.input.inject_dynamic_filter(filter, *index);
         }
     }

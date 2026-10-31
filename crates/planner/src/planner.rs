@@ -137,6 +137,47 @@ impl PlanningContext {
     }
 }
 
+fn apply_table_column_aliases(
+    plan: LogicalPlan,
+    column_aliases: &[String],
+    qualifier: &str,
+) -> Result<LogicalPlan, PlanError> {
+    if column_aliases.is_empty() {
+        return Ok(plan);
+    }
+    let schema = plan.schema();
+    if column_aliases.len() != schema.len() {
+        return Err(PlanError::invalid_expression(format!(
+            "Column alias list has {} entries but '{qualifier}' has {} columns available",
+            column_aliases.len(),
+            schema.len()
+        )));
+    }
+    let exprs = schema
+        .iter()
+        .enumerate()
+        .map(|(index, column)| PlanExpr::Column {
+            index,
+            name: column.name.clone(),
+            span: None,
+        })
+        .collect();
+    let schema = schema
+        .iter()
+        .zip(column_aliases)
+        .map(|(column, alias)| ColumnInfo {
+            name: alias.clone(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+        })
+        .collect();
+    Ok(LogicalPlan::Projection {
+        input: Box::new(plan),
+        exprs,
+        schema,
+    })
+}
+
 impl<'a> QueryPlanner<'a> {
     pub fn new(catalog: &'a CatalogManager) -> Self {
         Self {
@@ -1535,7 +1576,11 @@ impl<'a> QueryPlanner<'a> {
         factor: &ast::TableFactor,
     ) -> Result<(LogicalPlan, PlanningContext), PlanError> {
         match factor {
-            ast::TableFactor::Table { name, alias } => {
+            ast::TableFactor::Table {
+                name,
+                alias,
+                column_aliases,
+            } => {
                 // Single-part names may resolve to a CTE before falling
                 // back to the catalog. When a CTE is referenced more than
                 // once in the same scope the plan is cloned (re-executed);
@@ -1544,6 +1589,11 @@ impl<'a> QueryPlanner<'a> {
                 if name.catalog.is_none() && name.schema.is_none() {
                     let cte_plan = self.cte_plans.lock().unwrap().get(&name.table).cloned();
                     if let Some(plan) = cte_plan {
+                        let plan = apply_table_column_aliases(
+                            plan,
+                            column_aliases,
+                            alias.as_deref().unwrap_or(&name.table),
+                        )?;
                         let schema = plan.schema();
                         let qualifier = alias.as_deref().unwrap_or(&name.table);
                         let mut ctx = PlanningContext::new();
@@ -1564,9 +1614,6 @@ impl<'a> QueryPlanner<'a> {
                 let schema = table_provider.schema();
                 let qualifier = alias.as_deref().unwrap_or(&name.table);
 
-                let mut ctx = PlanningContext::new();
-                ctx.add_table_columns(Some(qualifier), &schema);
-
                 let properties = table_provider.properties();
                 // Identity on the server's root catalog manager; on a
                 // per-session view (Trino `X-Trino-Catalog`/`-Schema`) the
@@ -1580,10 +1627,19 @@ impl<'a> QueryPlanner<'a> {
                     dynamic_filters_consumed: Vec::new(),
                 };
 
+                let plan = apply_table_column_aliases(plan, column_aliases, qualifier)?;
+                let mut ctx = PlanningContext::new();
+                ctx.add_table_columns(Some(qualifier), &plan.schema());
+
                 Ok((plan, ctx))
             }
-            ast::TableFactor::Subquery { query, alias } => {
+            ast::TableFactor::Subquery {
+                query,
+                alias,
+                column_aliases,
+            } => {
                 let plan = self.plan_query(query).await?;
+                let plan = apply_table_column_aliases(plan, column_aliases, alias)?;
                 let schema = plan.schema();
                 let mut ctx = PlanningContext::new();
                 ctx.add_table_columns(Some(alias.as_str()), &schema);

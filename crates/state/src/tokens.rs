@@ -95,18 +95,30 @@ impl StateStore {
         // PBKDF2 runs outside the writer lock, against the user's verifier
         // from a snapshot. If that verifier changed before the write (e.g. a
         // reseed), derive again once from the new one.
+        let too_many = || StateError::TooManyTokens {
+            user: user.to_string(),
+            limit: max_tokens,
+        };
         for attempt in 0..2 {
-            let user_scram = self
-                .snapshot()
+            // Cheap pre-checks on the snapshot, so a refused request never
+            // pays for PBKDF2. The checks inside `mutate` stay authoritative.
+            let snapshot = self.snapshot();
+            let user_scram = snapshot
                 .users
                 .iter()
                 .find(|u| u.name == user)
                 .map(|u| u.scram.clone())
                 .ok_or_else(|| StateError::UnknownUser(user.to_string()))?;
+            if live_token_count(&snapshot, user, now) >= max_tokens {
+                return Err(too_many());
+            }
+            drop(snapshot);
             let verifier: ScramVerifier = user_scram.parse().map_err(|e| StateError::Corrupt {
                 path: path.clone(),
                 message: format!("user {user:?} has an invalid verifier: {e}"),
             })?;
+            #[cfg(test)]
+            DERIVATIONS.with(|d| d.set(d.get() + 1));
             let scram =
                 ScramVerifier::from_password(&token, verifier.salt(), verifier.iterations())
                     .to_string();
@@ -117,17 +129,8 @@ impl StateStore {
                     Some(_) => {}
                 }
                 prune_expired(data, now);
-                if data
-                    .tokens
-                    .iter()
-                    .filter(|t| t.user == user && is_live(t, now))
-                    .count()
-                    >= max_tokens
-                {
-                    return Err(StateError::TooManyTokens {
-                        user: user.to_string(),
-                        limit: max_tokens,
-                    });
+                if live_token_count(data, user, now) >= max_tokens {
+                    return Err(too_many());
                 }
                 // 64 random bits: a collision is practically impossible, but
                 // never let one shadow an existing token.
@@ -216,6 +219,20 @@ impl StateStore {
 /// as a hit. No secret hashes to it in practice.
 const DUMMY_SECRET_SHA256: [u8; 32] = [0u8; 32];
 
+/// Live (unexpired at `now`) tokens held by `user`.
+fn live_token_count(data: &crate::file::StateData, user: &str, now: u64) -> usize {
+    data.tokens
+        .iter()
+        .filter(|t| t.user == user && is_live(t, now))
+        .count()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: PBKDF2 derivations run by `issue_token_capped` on this thread.
+    static DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether `t` has not expired at `now_ms`.
 pub(crate) fn is_live(t: &TokenRecord, now_ms: u64) -> bool {
     t.expires_ms.is_none_or(|e| now_ms < e)
@@ -231,13 +248,16 @@ fn info_of(t: &TokenRecord) -> TokenInfo {
     }
 }
 
-fn sha256(bytes: &[u8]) -> [u8; 32] {
+/// SHA-256 of `bytes`.
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(digest::digest(&digest::SHA256, bytes).as_ref());
     out
 }
 
-pub(crate) fn now_ms() -> u64 {
+/// The current time in milliseconds since the Unix epoch (saturating; 0 if
+/// the clock is before the epoch). The clock behind every token timestamp.
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -273,6 +293,26 @@ mod tests {
         store
             .issue_token_capped("alice", None, None, 2, now_ms())
             .unwrap();
+    }
+
+    #[test]
+    fn a_capped_or_unknown_user_is_refused_before_pbkdf2() {
+        let store = store_with_alice();
+        let start = DERIVATIONS.with(|d| d.get());
+        store
+            .issue_token_capped("alice", None, None, 1, now_ms())
+            .unwrap();
+        let before = DERIVATIONS.with(|d| d.get());
+        assert_eq!(before, start + 1, "the counter sees a real issuance");
+        assert!(matches!(
+            store.issue_token_capped("alice", None, None, 1, now_ms()),
+            Err(StateError::TooManyTokens { limit: 1, .. })
+        ));
+        assert!(matches!(
+            store.issue_token("nobody", None, None),
+            Err(StateError::UnknownUser(_))
+        ));
+        assert_eq!(DERIVATIONS.with(|d| d.get()), before, "no PBKDF2 ran");
     }
 
     #[test]
@@ -392,9 +432,12 @@ mod tests {
 
     #[test]
     fn revoking_someone_elses_token_is_not_found() {
-        let store = store_with_alice();
-        let v = ScramVerifier::from_password("pw", b"fedcba9876543210", 4096);
-        store.seed_users(&[("bob".into(), v)], false).unwrap();
+        let store = StateStore::open(None).unwrap();
+        let alice = ScramVerifier::from_password("pw", b"0123456789abcdef", 4096);
+        let bob = ScramVerifier::from_password("pw", b"fedcba9876543210", 4096);
+        store
+            .seed_users(&[("alice".into(), alice), ("bob".into(), bob)], false)
+            .unwrap();
         let t = store.issue_token("alice", None, None).unwrap();
         assert!(matches!(
             store.revoke_token("bob", &t.info.id),

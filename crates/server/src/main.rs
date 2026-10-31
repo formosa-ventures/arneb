@@ -160,9 +160,10 @@ struct CliArgs {
     #[arg(long)]
     profile: bool,
 
-    /// Overwrite state users that differ from the `[[auth.users]]` in the
-    /// config file (the file only seeds users on first start). Only
-    /// meaningful with `[auth] type = "password"`.
+    /// Let `[[auth.users]]` overwrite users created through the state store
+    /// whose name collides with a config user (revoking their tokens).
+    /// Config-seeded users follow the config on every start without it.
+    /// Only meaningful with `[auth] type = "password"`.
     #[arg(long)]
     reseed_state: bool,
 
@@ -758,20 +759,17 @@ async fn run() -> Result<()> {
     }
 
     // Validate [auth] on every role (workers never open the state store).
-    let config_auth = config
+    let (config_auth, verifiers) = config
         .auth
         .to_auth_method()
         .context("invalid [auth] configuration")?;
     // Password auth on a coordinator/standalone: users live in the state
-    // store, seeded from the config file; the same store serves pgwire,
-    // Trino and the Web API.
+    // store; config-seeded users follow the config file on every start
+    // (a changed hash or a removed user revokes tokens). The same store
+    // serves pgwire, Trino and the Web API.
     let state_store = if matches!(role, ServerRole::Coordinator | ServerRole::Standalone)
         && matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_))
     {
-        let verifiers = config
-            .auth
-            .user_verifiers()
-            .context("invalid [auth] configuration")?;
         let store = arneb_state::StateStore::open(config.state.path.as_deref())
             .context("cannot open the state store ([state] path / ARNEB_STATE_PATH)")?;
         let report = store
@@ -785,8 +783,11 @@ async fn run() -> Result<()> {
             persistent = store.is_persistent(),
             users = arneb_protocol::CredentialSource::user_count(&store),
             first_start = report.first_start,
-            seeded = ?report.seeded,
-            diverged = ?report.diverged,
+            added = ?report.added,
+            updated = ?report.updated,
+            removed = ?report.removed,
+            conflicts = ?report.conflicts,
+            revoked_tokens = report.revoked_tokens,
             reseed = reseed_state,
             "state store effective settings ([state] path / ARNEB_STATE_PATH / --reseed-state)"
         );
@@ -889,6 +890,13 @@ async fn run() -> Result<()> {
         arneb_protocol::AuthMethod::ScramSha256(creds) => Some(Arc::clone(creds)),
         arneb_protocol::AuthMethod::None => None,
     };
+    // One Basic authenticator for the Trino and Web listeners, so both share
+    // one PBKDF2 limiter, one wait queue and one verification cache.
+    let basic_auth = password_users
+        .clone()
+        .map(arneb_protocol::BasicAuthenticator::new)
+        .transpose()
+        .context("HTTP Basic authentication")?;
     let state_for_web = state_store.clone();
     let credentials_for_web: Option<Arc<dyn arneb_protocol::CredentialSource>> =
         state_store.clone().map(|s| s as _);
@@ -1030,8 +1038,7 @@ async fn run() -> Result<()> {
         .with_query_tracker(query_tracker.clone())
         .with_access_rules(access_rules.clone())
         .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
-        .with_password_auth(password_users.clone())
-        .context("Trino listener authentication")?;
+        .with_authenticator(basic_auth.clone());
         if let Some(ref executor) = distributed_executor {
             trino = trino.with_distributed_executor(Arc::clone(executor));
         }
@@ -1095,11 +1102,9 @@ async fn run() -> Result<()> {
         max_queued_queries: config.admission.max_queued_queries,
         memory_pool: memory_pool.clone(),
         memory_limit_bytes: budget.map(|b| b as u64),
-        basic: credentials_for_web
-            .clone()
-            .map(arneb_protocol::BasicAuthenticator::new)
-            .transpose()
-            .context("Web API Basic authentication")?,
+        // Same source as `credentials_for_web` (the state store) whenever
+        // that is set: password auth makes the state store the auth method.
+        basic: credentials_for_web.as_ref().and(basic_auth),
         credentials: credentials_for_web,
         state: state_for_web,
         access_rules: access_rules.clone(),

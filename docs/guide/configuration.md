@@ -630,11 +630,16 @@ The coordinator (or standalone server) keeps its users and
 open it. Every write is atomic (write, fsync, rename) and the file is
 created with mode `0600`. The path's directory must be writable.
 
-- **The config file is a seed.** `[[auth.users]]` seeds the state on first
-  start. Afterwards the state wins: if the config's users later differ from
-  the state, startup logs a WARN on `arneb::config` naming the user and keeps
-  the state. Start once with `--reseed-state` to overwrite the state's
-  config-seeded users with the config.
+- **Config users follow the config file.** On every start, the users from
+  `[[auth.users]]` are applied to the state. A new user is added. A changed
+  `password_hash` replaces the stored verifier and revokes all of that
+  user's API tokens, so the old password and its tokens stop working. A user
+  removed from the config is deleted together with their tokens. Each change
+  logs a line on `arneb::config` naming the user.
+- **Users created through the state store are never touched** by this. If a
+  config user has the same name as one of them, startup keeps the state user
+  and logs a WARN. Start once with `--reseed-state` to overwrite it with the
+  config user (revoking its tokens).
 - **No `path`** keeps the state in memory. Startup logs a WARN, `no [state]
   path: API tokens are lost on restart`, and the token API says so when it
   issues a token.
@@ -671,8 +676,8 @@ Options:
   --config <PATH>    Path to configuration file
   --port <PORT>      Override the pgwire port
   --role <ROLE>      Server role: standalone, coordinator, or worker
-  --reseed-state     Overwrite config-seeded users in the state file with
-                     the [[auth.users]] from the config
+  --reseed-state     Let [[auth.users]] overwrite state-created users of
+                     the same name (config users follow the config anyway)
 ```
 
 ## Example: Standalone with Local Files

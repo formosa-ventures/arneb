@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use arneb_state::{StateError, StateStore};
+use arneb_state::{now_ms, StateError, StateStore};
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
@@ -34,6 +34,8 @@ const MAX_TOKEN_NAME_CHARS: usize = 128;
 /// The accepted `expires_in_days` range.
 const EXPIRES_IN_DAYS: std::ops::RangeInclusive<i64> = 1..=3650;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+/// [`SESSION_TTL`] in milliseconds (8 hours: no truncation).
+const SESSION_TTL_MS: u64 = SESSION_TTL.as_secs() * 1000;
 
 /// Token issuances running PBKDF2 at once; the rest wait, so a burst cannot
 /// saturate the blocking pool.
@@ -140,13 +142,6 @@ struct SessionResponse {
     expires_ms: u64,
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 async fn create_session(
     State(state): State<WebState>,
     body: Result<Bytes, BytesRejection>,
@@ -173,7 +168,7 @@ async fn create_session(
         StatusCode::CREATED,
         Json(SessionResponse {
             token,
-            expires_ms: now_ms() + SESSION_TTL.as_millis() as u64,
+            expires_ms: now_ms().saturating_add(SESSION_TTL_MS),
         }),
     ))
 }
@@ -332,7 +327,7 @@ pub(super) async fn issue_token_for(
     let expires_at_ms = match req.expires_in_days {
         None => None,
         Some(days) => match days.as_i64().filter(|d| EXPIRES_IN_DAYS.contains(d)) {
-            Some(days) => Some(now_ms() + days as u64 * DAY_MS),
+            Some(days) => Some(now_ms().saturating_add(days.unsigned_abs() * DAY_MS)),
             None => {
                 return Err(ApiError::new(
                     ErrorCode::InvalidArgument,
@@ -359,14 +354,19 @@ pub(super) async fn issue_token_for(
     if !persistent {
         hints.push("the server keeps state in memory only: this token is lost when it restarts");
     }
-    let _permit = ISSUE_PERMITS
+    let permit = ISSUE_PERMITS
         .acquire()
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal, "token issuance is unavailable"))?;
-    let issued = tokio::task::spawn_blocking(move || store.issue_token(&user, name, expires_at_ms))
-        .await
-        .map_err(blocking_failed)?
-        .map_err(state_error)?;
+    // The permit moves into the blocking task, so it is held for as long as
+    // PBKDF2 runs even if the client disconnects and this future is dropped.
+    let issued = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        store.issue_token(&user, name, expires_at_ms)
+    })
+    .await
+    .map_err(blocking_failed)?
+    .map_err(state_error)?;
     Ok(IssuedTokenResponse {
         token: issued.token,
         id: issued.info.id,
@@ -560,10 +560,14 @@ mod tests {
 
     fn web_state(password: bool, persistent_path: Option<&std::path::Path>) -> WebState {
         let store = Arc::new(arneb_state::StateStore::open(persistent_path).unwrap());
-        for (user, pw) in [("alice", "secret"), ("bob", "hunter2")] {
-            let v = ScramVerifier::from_password(pw, b"0123456789abcdef", 4096);
-            store.seed_users(&[(user.into(), v)], false).unwrap();
-        }
+        let users: Vec<(String, ScramVerifier)> = [("alice", "secret"), ("bob", "hunter2")]
+            .into_iter()
+            .map(|(user, pw)| {
+                let v = ScramVerifier::from_password(pw, b"0123456789abcdef", 4096);
+                (user.to_string(), v)
+            })
+            .collect();
+        store.seed_users(&users, false).unwrap();
         let credentials: Option<Arc<dyn CredentialSource>> =
             password.then(|| store.clone() as Arc<dyn CredentialSource>);
         WebState {

@@ -93,8 +93,6 @@ pub struct StateStore {
     data: RwLock<Arc<StateData>>,
     /// Serializes writers; held across apply + persist + swap.
     writer: Mutex<()>,
-    /// Per-process secret for decoy verifiers of unknown users.
-    pub(crate) decoy_secret: [u8; 32],
 }
 
 /// Shows only counts: the state holds verifiers and token hashes, which must
@@ -125,13 +123,10 @@ impl StateStore {
             Some(p) => Self::load(p)?,
             None => StateData::default(),
         };
-        let mut decoy_secret = [0u8; 32];
-        aws_lc_rs::rand::fill(&mut decoy_secret).map_err(|_| StateError::Random)?;
         Ok(StateStore {
             path: path.map(Path::to_path_buf),
             data: RwLock::new(Arc::new(data)),
             writer: Mutex::new(()),
-            decoy_secret,
         })
     }
 

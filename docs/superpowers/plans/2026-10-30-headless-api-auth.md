@@ -27,6 +27,7 @@
 - **Runtime knobs.** Every runtime knob has an `ARNEB_*` override. Its effective value is logged on `arneb::config` at startup. Precedence is CLI > env > file > defaults.
 - **Coordinator only.** The state store lives on the coordinator or the standalone server. Workers never open it.
 - **The config file is a seed.** It seeds state on first start only. Afterwards the state wins. A divergence logs a WARN on `arneb::config` that names the object.
+  *Superseded in review (PR #215): config-seeded users now follow the config on every start, and a changed hash or removed user revokes their tokens. See D2 in `openspec/changes/headless-api-auth/design.md`. Task 2 below describes the original plan.*
 - **Format and durability.** The state format is the builder's choice. Every write must be atomic and survive a crash.
 - **Unchanged behavior under `[auth] type = "none"`.** pgwire and Trino behave as today, and the token endpoints return the structured error `auth_disabled`.
 - **Unauthenticated routes stay as they are.** `/metrics` stays unauthenticated by default. `[web] metrics_auth = true` requires credentials for it.

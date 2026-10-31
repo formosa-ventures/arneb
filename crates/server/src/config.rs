@@ -94,7 +94,8 @@ pub struct AppConfig {
 /// ```
 ///
 /// Unset: the state lives in memory only and API tokens are lost on restart.
-/// The config file seeds users on first start; afterwards the state wins.
+/// Config-seeded users follow `[[auth.users]]` on every start: a changed
+/// `password_hash` or a removed user revokes that user's tokens.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StateConfig {
@@ -809,8 +810,11 @@ impl AuthConfig {
             .collect()
     }
 
-    /// Validate the section and build the protocol-layer [`AuthMethod`].
-    pub fn to_auth_method(&self) -> Result<AuthMethod> {
+    /// Validate the section and build the protocol-layer [`AuthMethod`],
+    /// plus the parsed users (empty under `none`) that seed the state store.
+    /// Every `password_hash` is parsed and validated once, through
+    /// [`AuthConfig::user_verifiers`].
+    pub fn to_auth_method(&self) -> Result<(AuthMethod, Vec<(String, ScramVerifier)>)> {
         match self.auth_type {
             AuthType::None => {
                 if !self.users.is_empty() {
@@ -819,23 +823,13 @@ impl AuthConfig {
                         "[auth] users are configured but type = \"none\"; they are ignored"
                     );
                 }
-                Ok(AuthMethod::None)
+                Ok((AuthMethod::None, Vec::new()))
             }
             AuthType::Password => {
-                let users = self
-                    .users
-                    .iter()
-                    .map(|u| {
-                        let verifier: ScramVerifier = u
-                            .password_hash
-                            .parse()
-                            .map_err(|e| anyhow::anyhow!("[auth] user '{}': {e}", u.name))?;
-                        Ok((u.name.clone(), verifier))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let creds =
-                    UserCredentials::new(users).map_err(|e| anyhow::anyhow!("[auth] {e}"))?;
-                Ok(AuthMethod::ScramSha256(Arc::new(creds)))
+                let users = self.user_verifiers()?;
+                let creds = UserCredentials::new(users.iter().cloned())
+                    .map_err(|e| anyhow::anyhow!("[auth] {e}"))?;
+                Ok((AuthMethod::ScramSha256(Arc::new(creds)), users))
             }
         }
     }
@@ -2808,7 +2802,7 @@ format = "parquet"
         let config: AppConfig = toml::from_str("port = 5432\n").unwrap();
         assert_eq!(config.auth.auth_type, AuthType::None);
         assert!(matches!(
-            config.auth.to_auth_method().unwrap(),
+            config.auth.to_auth_method().unwrap().0,
             AuthMethod::None
         ));
     }
@@ -2835,12 +2829,32 @@ password_hash = "{hash}"
         let config: AppConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.auth.auth_type, AuthType::Password);
         assert_eq!(config.auth.users.len(), 2);
-        match config.auth.to_auth_method().unwrap() {
+        match config.auth.to_auth_method().unwrap().0 {
             AuthMethod::ScramSha256(creds) => assert_eq!(creds.user_count(), 2),
             other => panic!("expected password auth, got {other:?}"),
         }
         // The Debug output must never contain the stored verifier.
         assert!(!format!("{:?}", config.auth).contains(&hash));
+    }
+
+    #[test]
+    fn to_auth_method_validates_like_user_verifiers() {
+        let a = ScramVerifier::generate("a").unwrap().to_string();
+        let config: AppConfig = toml::from_str(&format!(
+            "[auth]\ntype = \"password\"\n\
+             [[auth.users]]\nname = \"\"\npassword_hash = \"{a}\"\n"
+        ))
+        .unwrap();
+        let err = config.auth.to_auth_method().unwrap_err().to_string();
+        assert!(err.contains("must not be empty"), "{err}");
+        let config: AppConfig = toml::from_str(&format!(
+            "[auth]\ntype = \"password\"\n\
+             [[auth.users]]\nname = \"alice\"\npassword_hash = \"{a}\"\n"
+        ))
+        .unwrap();
+        let (_, users) = config.auth.to_auth_method().unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].1.to_string(), a);
     }
 
     #[test]

@@ -4,7 +4,7 @@ The v0.2.0 headless agent interface (`docs/superpowers/specs/2026-10-30-headless
 
 ## What Changes
 
-- **Coordinator state store** (`arneb-state`). One versioned JSON file at `[state] path` / `ARNEB_STATE_PATH`, written atomically with mode `0600`. Users are seeded from `[[auth.users]]` on first start; afterwards the state wins, a divergence logs a WARN, and `--reseed-state` applies the config. Without a path the state is in memory and a WARN says tokens are lost on restart. Workers never open it.
+- **Coordinator state store** (`arneb-state`). One versioned JSON file at `[state] path` / `ARNEB_STATE_PATH`, written atomically with mode `0600`. Users from `[[auth.users]]` follow the config on every start: a changed `password_hash` or a removed user revokes that user's tokens. Users created through the state store are never touched; `--reseed-state` lets the config overwrite one whose name collides. Without a path the state is in memory and a WARN says tokens are lost on restart. Workers never open it.
 - **API tokens.** `arneb_<16 hex>_<43 base64url>`, shown once, stored as a SCRAM verifier, revocable, with an optional expiry and a cap of 100 live tokens per user. A token is accepted as the password on pgwire (SCRAM) and on Trino Basic; revocation is immediate on every protocol.
 - **Authenticated Web port.** Under `[auth] type = "password"`, every route except `/api/v1/info`, `/api/v2/health`, `POST /api/v2/sessions` and the static UI needs a bearer token, a session token or Basic. `/metrics` stays open unless `[web] metrics_auth = true`.
 - **`/api/v2`.** Health, sessions, `whoami`, token issue/list/revoke, and mirrors of the queries, cluster, workers and info endpoints, with a structured error envelope `{"error":{"code","message","hint"}}`.

@@ -120,7 +120,9 @@ the real call, changes nothing and is not audited; the result is the envelope
 then repeat without `dry_run`. Real actions are written to the audit log,
 which `list_audit_log` reads. `set_admission_limits` takes non-negative
 integers; the server refuses a negative value or an empty call with
-`invalid_argument`, as `PUT /api/v2/admission` does.
+`invalid_argument`, as `PUT /api/v2/admission` does. An argument of the wrong
+type (`1.5`, a string, a number above the 64-bit range) comes back as a text
+error naming the value and the expected type, not the `{code}` envelope.
 
 ## Limits
 

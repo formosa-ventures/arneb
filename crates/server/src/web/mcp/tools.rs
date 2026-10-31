@@ -1083,6 +1083,11 @@ mod tests {
     /// service that never finishes a statement, and rules that let every
     /// user execute and view but kill nothing; `root` manages.
     fn manage_fixture() -> Fixture {
+        manage_fixture_with(true)
+    }
+
+    /// [`manage_fixture`], with or without the agent service.
+    fn manage_fixture_with(with_agent: bool) -> Fixture {
         let tracker = Arc::new(arneb_scheduler::QueryTracker::new());
         let rules = r#"{"queries":[{"allow":["execute","view"]}]}"#;
         let mut state = crate::web::v2::tests::with_authz(
@@ -1096,7 +1101,7 @@ mod tests {
             .with_distributed_executor(Arc::new(HangingExecutor));
         state.query_tracker = tracker.clone();
         state.admission = Some(arneb_scheduler::AdmissionController::new(8, 256));
-        state.agent = Some(agent);
+        state.agent = with_agent.then_some(agent);
         state.mcp = Some(McpSettings {
             allowed_hosts: None,
             allowed_origins: None,
@@ -2038,6 +2043,11 @@ mod tests {
             "dry_run",
             "manage",
             "audited",
+            "observe access",
+            "queries kill rule",
+            "may see",
+            "SQL text",
+            "close matches",
             "max_rows",
             "truncated",
             "hint",
@@ -2139,6 +2149,48 @@ mod tests {
         }
     }
 
+    /// Polls `get_query_status` until the statement runs.
+    async fn wait_running(f: &Fixture, user: &str, id: &str) {
+        for _ in 0..200 {
+            let st = tool_ok(f, user, "get_query_status", json!({"id": id})).await;
+            if st["state"] == "running" {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("statement {id} never ran");
+    }
+
+    #[tokio::test]
+    async fn cancel_query_without_an_agent_service_uses_the_tracker() {
+        let f = manage_fixture_with(false);
+        let mine = f
+            .tracker
+            .create_query_from("SELECT 1".into(), "pgwire", Some("alice".into()));
+        let r = tool_ok(&f, "alice", "cancel_query", json!({"id": mine.to_string()})).await;
+        assert_eq!(r["action"], "query.cancel", "{r}");
+        assert_eq!(r["dry_run"], false);
+        let theirs = f
+            .tracker
+            .create_query_from("SELECT 2".into(), "pgwire", Some("bob".into()));
+        let e = tool_err(
+            &f,
+            "alice",
+            "cancel_query",
+            json!({"id": theirs.to_string()}),
+        )
+        .await;
+        assert_eq!(e["code"], "forbidden", "{e}");
+        let r = tool_ok(
+            &f,
+            "root",
+            "cancel_query",
+            json!({"id": theirs.to_string()}),
+        )
+        .await;
+        assert_eq!(r["changed"], true, "{r}");
+    }
+
     #[tokio::test]
     async fn cancel_query_widened() {
         let f = manage_fixture();
@@ -2157,7 +2209,7 @@ mod tests {
         };
         // Her own statement keeps the H3 status shape.
         let own = submit("alice").await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_running(&f, "alice", &own).await;
         let dry = tool_ok(
             &f,
             "alice",
@@ -2178,7 +2230,7 @@ mod tests {
 
         // A manager cancels another user's statement: the envelope, audited.
         let theirs = submit("alice").await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_running(&f, "alice", &theirs).await;
         let r = tool_ok(&f, "root", "cancel_query", json!({"id": theirs})).await;
         assert_eq!(r["dry_run"], false, "{r}");
         assert_eq!(r["result"]["state"], "cancelled", "{r}");
@@ -2217,5 +2269,30 @@ mod tests {
             let e = tool_err(&f, "root", "set_admission_limits", bad).await;
             assert_eq!(e["code"], "invalid_argument");
         }
+        // A value of the wrong type is rmcp's text error naming the field,
+        // not the `{code}` envelope.
+        for bad in [
+            json!({"max_running_queries": 1.5}),
+            json!({"max_queued_queries": "5"}),
+            json!({"max_running_queries": 9_223_372_036_854_775_808u64}),
+        ] {
+            // serde's message names the offending value and `i64`, not the
+            // field.
+            let value = bad
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .to_string();
+            let value = value.trim_matches('"').to_owned();
+            let r = tool(&f, "root", "set_admission_limits", bad).await;
+            assert_eq!(r["isError"], json!(true), "{r}");
+            assert!(r["structuredContent"]["error"].is_null(), "{r}");
+            let text = r["content"][0]["text"].as_str().unwrap_or("");
+            assert!(text.contains(&value) && text.contains("i64"), "{text}");
+        }
+        let a = tool_ok(&f, "root", "get_admission", json!({})).await;
+        assert_eq!(a["max_queued_queries"], 5);
     }
 }

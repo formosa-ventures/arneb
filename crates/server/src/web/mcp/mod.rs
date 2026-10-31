@@ -50,7 +50,7 @@ impl From<&crate::config::McpConfig> for McpSettings {
 }
 
 /// What the agent reads on `initialize`: the intended workflow (at most
-/// 1500 characters once filled; a test enforces it). The `{…}`
+/// 1900 characters once filled; a test enforces it). The `{…}`
 /// placeholders are filled from the configured limits (see
 /// [`tools::copy_values`]).
 const INSTRUCTIONS: &str = "\
@@ -70,6 +70,8 @@ Limits: a statement keeps at most max_rows rows (default {default_max_rows}, cei
 Errors: a failed tool call is an error result with a code and a hint. Read the hint and candidates (close matches for a misspelled name), fix the call, retry. A SQL error after submit is a status with state failed.
 
 Operations: list_workers, get_worker, get_admission and list_audit_log need observe access. Manage tools (cordon_worker, drain_worker, uncordon_worker, set_admission_limits, cancel_query on another's query) need the manage privilege or a queries kill rule (see whoami.privileges); each takes dry_run, so preview first. Actions are audited.
+
+Change configuration: users, tokens, catalogs, access rules and the slow-query threshold change at runtime (create_, update_, set_, drop_ tools). Every change takes dry_run and is audited. Catalog secrets come back as \"<redacted>\"; send them back unchanged unless the host or database changes. reseed_state replaces runtime changes with the config file.
 
 Queries run as your user and you see only what your user may see.";
 

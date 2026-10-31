@@ -28,6 +28,7 @@ use crate::web::error::{ApiError, ErrorCode};
 use crate::web::privilege::Layer;
 use crate::web::v2;
 use crate::web::workers::{self, WorkerOp};
+use crate::web::{catalogs, reseed, rules, settings, users};
 
 /// Arguments of `list_catalogs`.
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -300,6 +301,133 @@ fn fill_schema(value: &mut serde_json::Value, values: &[(&'static str, String)])
 }
 
 /// A tool result for a service outcome: the body, or the error envelope.
+/// Arguments of the tools that only preview or run with no other input
+/// (`clear_access_rules`, `reseed_state`).
+#[derive(Deserialize, schemars::JsonSchema)]
+struct DryRunArgs {
+    /// Preview only: report what the change would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
+/// Arguments of `set_access_rules`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SetRulesArgs {
+    /// The full access rules as a JSON object in Trino's file-based access
+    /// control format (catalogs, schemas, tables, queries,
+    /// system_information). It replaces all current rules.
+    rules: serde_json::Value,
+    /// Preview only: report what the change would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
+/// Arguments of `list_users` and `list_catalog_configs`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ListConfigArgs {
+    /// Most entries to return, up to 1000 (default 100).
+    limit: Option<usize>,
+}
+
+/// Arguments of `create_user` and `set_user_password`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct UserPasswordArgs {
+    /// The user name: 1 to 64 characters of letters, digits, `_`, `.`, `@`
+    /// or `-`.
+    name: String,
+    /// The password, 8 to 1024 characters. Never repeat it back to the user.
+    password: String,
+    /// Preview only: report what the change would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
+/// Arguments of `delete_user`, `drop_catalog`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct NameActionArgs {
+    /// The user or catalog name.
+    name: String,
+    /// Preview only: report what the change would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
+/// Arguments of `list_user_tokens`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct UserTokensArgs {
+    /// The user whose tokens to list.
+    name: String,
+    /// Most tokens to return, up to 1000 (default 100).
+    limit: Option<usize>,
+}
+
+/// Arguments of `issue_user_token`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct IssueUserTokenArgs {
+    /// The user to issue the token for.
+    name: String,
+    /// A label for the token, to tell tokens apart.
+    token_name: Option<String>,
+    /// Days until the token expires, 1 to 3650; omit for no expiry.
+    expires_in_days: Option<i64>,
+    /// Preview only: report what the change would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
+/// Arguments of `revoke_user_token`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct RevokeUserTokenArgs {
+    /// The user who owns the token.
+    name: String,
+    /// The token id from `list_user_tokens` (16 hex characters).
+    id: String,
+    /// Preview only: report what the change would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
+/// Arguments of `get_catalog_config`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct CatalogNameArgs {
+    /// The catalog name from `list_catalog_configs`.
+    name: String,
+}
+
+/// Arguments of `create_catalog`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct CreateCatalogArgs {
+    /// The catalog definition as a JSON object: name, type (such as hive or
+    /// postgresql) and the type's settings, as `[[catalogs]]` in the config.
+    spec: serde_json::Value,
+    /// Preview only: report what the change would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
+/// Arguments of `update_catalog`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct UpdateCatalogArgs {
+    /// The catalog to replace.
+    name: String,
+    /// The full new definition as a JSON object. A secret sent as
+    /// "<redacted>" keeps the stored one, unless the destination changes.
+    spec: serde_json::Value,
+    /// Preview only: report what the change would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
+/// Arguments of `update_settings`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct UpdateSettingsArgs {
+    /// The slow-query log threshold in milliseconds; 0 turns the log off.
+    slow_query_threshold_ms: Option<i64>,
+    /// Preview only: report what the change would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
 fn respond<T: Serialize>(outcome: Result<T, ApiError>) -> Result<CallToolResult, ErrorData> {
     match outcome {
         Ok(body) => ok(&body),
@@ -956,6 +1084,428 @@ impl ArnebMcp {
                 .map(|()| serde_json::json!({"revoked": a.id})),
         )
     }
+
+    /// `get_access_rules`: `GET /api/v2/access-rules`.
+    #[tool(
+        description = "The stored access rules (null when none) and whether they came from \
+                       the config file. Needs the manage privilege. Next: set_access_rules or \
+                       clear_access_rules.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_access_rules(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(rules::get_rules_for(&self.state, &who).await)
+    }
+
+    /// `set_access_rules`: `PUT /api/v2/access-rules`.
+    #[tool(
+        description = "Replace all access rules with `rules` (a JSON object in Trino's \
+                       file-based format), effective for the next statement. A change that \
+                       would remove your own manage privilege is refused. Needs the manage \
+                       privilege. Preview with dry_run first.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn set_access_rules(
+        &self,
+        Parameters(a): Parameters<SetRulesArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(
+            rules::set_rules_for(
+                &self.state,
+                &who,
+                a.dry_run.unwrap_or(false),
+                a.rules.to_string(),
+            )
+            .await,
+        )
+    }
+
+    /// `clear_access_rules`: `DELETE /api/v2/access-rules`.
+    #[tool(
+        description = "Remove every access rule, which means every user may do everything. A \
+                       change that would remove your own manage privilege is refused. Needs \
+                       the manage privilege. Preview with dry_run first.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn clear_access_rules(
+        &self,
+        Parameters(a): Parameters<DryRunArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(rules::clear_rules_for(&self.state, &who, a.dry_run.unwrap_or(false)).await)
+    }
+
+    /// `list_users`: `GET /api/v2/users`.
+    #[tool(
+        description = "List the users in name order (never passwords): `limit` defaults to \
+                       100, at most 1000; `truncated` says if more exist. Needs the manage \
+                       privilege. Next: create_user, list_user_tokens.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_users(
+        &self,
+        Parameters(a): Parameters<ListConfigArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(users::list_users_for(&self.state, &who, a.limit).await)
+    }
+
+    /// `create_user`: `POST /api/v2/users`.
+    #[tool(
+        description = "Create a user with a password. The password is not logged or audited \
+                       and never returned: do not repeat it back to the user. Needs the manage \
+                       privilege. Preview with dry_run first. Next: issue_user_token.",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn create_user(
+        &self,
+        Parameters(a): Parameters<UserPasswordArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(
+            users::create_user_for(
+                &self.state,
+                &who,
+                a.dry_run.unwrap_or(false),
+                a.name,
+                a.password,
+            )
+            .await,
+        )
+    }
+
+    /// `set_user_password`: `PATCH /api/v2/users/{name}`.
+    #[tool(
+        description = "Set a new password for a user; it revokes all of the user's tokens and \
+                       ends their sessions. The password is not logged or audited and never \
+                       returned: do not repeat it back to the user. Needs the manage \
+                       privilege. Preview with dry_run first.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn set_user_password(
+        &self,
+        Parameters(a): Parameters<UserPasswordArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(
+            users::set_password_for(
+                &self.state,
+                &who,
+                a.dry_run.unwrap_or(false),
+                a.name,
+                a.password,
+            )
+            .await,
+        )
+    }
+
+    /// `delete_user`: `DELETE /api/v2/users/{name}`.
+    #[tool(
+        description = "Delete a user and all of the user's tokens. Needs the manage \
+                       privilege. Preview with dry_run first.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn delete_user(
+        &self,
+        Parameters(a): Parameters<NameActionArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(users::delete_user_for(&self.state, &who, a.dry_run.unwrap_or(false), a.name).await)
+    }
+
+    /// `list_user_tokens`: `GET /api/v2/users/{name}/tokens`.
+    #[tool(
+        description = "List a user's live API tokens (id, name, created, expiry; never the \
+                       secret): `limit` defaults to 100, at most 1000. Needs the manage \
+                       privilege. Next: revoke_user_token.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_user_tokens(
+        &self,
+        Parameters(a): Parameters<UserTokensArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(users::list_user_tokens_for(&self.state, &who, a.name, a.limit).await)
+    }
+
+    /// `issue_user_token`: `POST /api/v2/users/{name}/tokens`.
+    #[tool(
+        description = "Issue an API token for a user, optionally labeled and expiring in \
+                       1..3650 days. The secret `token` is shown only in this result, once. \
+                       Needs the manage privilege. Preview with dry_run first.",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn issue_user_token(
+        &self,
+        Parameters(a): Parameters<IssueUserTokenArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        let headers = ctx
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .map(|p| p.headers.clone())
+            .unwrap_or_default();
+        let req = v2::IssueTokenRequest {
+            name: a.token_name,
+            expires_in_days: a.expires_in_days.map(serde_json::Value::from),
+        };
+        respond(
+            users::issue_user_token_for(
+                &self.state,
+                &who,
+                a.dry_run.unwrap_or(false),
+                a.name,
+                &headers,
+                req,
+            )
+            .await,
+        )
+    }
+
+    /// `revoke_user_token`: `DELETE /api/v2/users/{name}/tokens/{id}`.
+    #[tool(
+        description = "Revoke one of a user's API tokens by id; it stops working at once. A \
+                       token of another user is not_found. Needs the manage privilege. \
+                       Preview with dry_run first.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn revoke_user_token(
+        &self,
+        Parameters(a): Parameters<RevokeUserTokenArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(
+            users::revoke_user_token_for(
+                &self.state,
+                &who,
+                a.dry_run.unwrap_or(false),
+                a.name,
+                a.id,
+            )
+            .await,
+        )
+    }
+
+    /// `list_catalog_configs`: `GET /api/v2/catalog-configs`.
+    #[tool(
+        description = "List the catalog definitions in name order, secrets shown as \
+                       \"<redacted>\": `limit` defaults to 100, at most 1000. Needs the manage \
+                       privilege. Next: get_catalog_config, create_catalog.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_catalog_configs(
+        &self,
+        Parameters(a): Parameters<ListConfigArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(catalogs::list_catalog_configs_for(&self.state, &who, a.limit).await)
+    }
+
+    /// `get_catalog_config`: `GET /api/v2/catalog-configs/{name}`.
+    #[tool(
+        description = "Get one catalog definition, secrets shown as \"<redacted>\". Needs the \
+                       manage privilege. Next: update_catalog with the changed definition, \
+                       sending \"<redacted>\" back unchanged to keep a secret.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_catalog_config(
+        &self,
+        Parameters(a): Parameters<CatalogNameArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(catalogs::get_catalog_config_for(&self.state, &who, a.name).await)
+    }
+
+    /// `create_catalog`: `POST /api/v2/catalog-configs`.
+    #[tool(
+        description = "Add a catalog from `spec`: the coordinator connects to it first, then \
+                       saves it and pushes it to every live worker. Send real secrets, not \
+                       \"<redacted>\". Needs the manage privilege. Preview with dry_run first.",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn create_catalog(
+        &self,
+        Parameters(a): Parameters<CreateCatalogArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(
+            catalogs::create_catalog_for(&self.state, &who, a.dry_run.unwrap_or(false), a.spec)
+                .await,
+        )
+    }
+
+    /// `update_catalog`: `PUT /api/v2/catalog-configs/{name}`.
+    #[tool(
+        description = "Replace catalog `name` with `spec`. A secret sent as \"<redacted>\" keeps \
+                       the stored one, unless the host or database changes, then send the \
+                       secret again. A config-file catalog becomes a runtime one. Needs the \
+                       manage privilege. Preview with dry_run first.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn update_catalog(
+        &self,
+        Parameters(a): Parameters<UpdateCatalogArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(
+            catalogs::update_catalog_for(
+                &self.state,
+                &who,
+                a.dry_run.unwrap_or(false),
+                a.name,
+                a.spec,
+            )
+            .await,
+        )
+    }
+
+    /// `drop_catalog`: `DELETE /api/v2/catalog-configs/{name}`.
+    #[tool(
+        description = "Drop a catalog from the coordinator and every worker. Dropping the \
+                       default catalog is allowed, with a warning. Needs the manage \
+                       privilege. Preview with dry_run first.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn drop_catalog(
+        &self,
+        Parameters(a): Parameters<NameActionArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(
+            catalogs::drop_catalog_for(&self.state, &who, a.dry_run.unwrap_or(false), a.name).await,
+        )
+    }
+
+    /// `get_settings`: `GET /api/v2/settings`.
+    #[tool(
+        description = "The runtime settings (slow_query_threshold_ms, 0 meaning off) and \
+                       whether the value comes from config or from a runtime change. Next: \
+                       update_settings.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_settings(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(settings::get_settings_for(&self.state, &who).await)
+    }
+
+    /// `update_settings`: `PATCH /api/v2/settings`.
+    #[tool(
+        description = "Change the slow-query log threshold at runtime, persisted across \
+                       restarts: slow_query_threshold_ms, a non-negative integer, 0 for off. \
+                       Needs the manage privilege. Preview with dry_run first; read the \
+                       result with get_settings.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn update_settings(
+        &self,
+        Parameters(a): Parameters<UpdateSettingsArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        // Validation lives in `threshold_arg`, so MCP and HTTP refuse alike.
+        let respond_err = |e| Ok(tool_error(e));
+        let ms =
+            match settings::threshold_arg(a.slow_query_threshold_ms.map(serde_json::Value::from)) {
+                Ok(ms) => ms,
+                // Authorization first, as the route does, so a non-manager
+                // learns nothing about the arguments.
+                Err(e) => {
+                    return match self.state.authorizer.check(&who, Layer::Manage) {
+                        Ok(_) => respond_err(e),
+                        Err(denied) => respond_err(denied),
+                    };
+                }
+            };
+        respond(
+            settings::update_settings_for(&self.state, &who, a.dry_run.unwrap_or(false), ms).await,
+        )
+    }
+
+    /// `reseed_state`: `POST /api/v2/state/reseed`.
+    #[tool(
+        description = "Replace the runtime changes (catalogs, access rules, settings, users) \
+                       with what the config file says now; tokens, cordons and the audit log \
+                       stay. Refused if it would remove your own manage privilege. Needs the \
+                       manage privilege. Always preview with dry_run first.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reseed_state(
+        &self,
+        Parameters(a): Parameters<DryRunArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(reseed::reseed_for(&self.state, &who, a.dry_run.unwrap_or(false)).await)
+    }
 }
 
 fn via_name(via: AuthVia) -> &'static str {
@@ -1102,6 +1652,30 @@ mod tests {
         state.query_tracker = tracker.clone();
         state.admission = Some(arneb_scheduler::AdmissionController::new(8, 256));
         state.agent = with_agent.then_some(agent);
+        // A re-seed reads this config: password auth and `root`.
+        let config =
+            std::env::temp_dir().join(format!("arneb-mcp-reseed-{}.toml", std::process::id()));
+        let hash =
+            arneb_protocol::ScramVerifier::from_password("rootpw", b"0123456789abcdef", 4096);
+        std::fs::write(
+            &config,
+            format!(
+                "[auth]\ntype = \"password\"\n[[auth.users]]\nname = \"root\"\npassword_hash = \"{hash}\"\n"
+            ),
+        )
+        .unwrap();
+        state.config_path = Some(config);
+        state.catalogs = Some(crate::catalogs::LiveCatalogs::with_test_builder(
+            Arc::new(CatalogManager::new("memory", "default")),
+            Arc::new(ConnectorRegistry::new()),
+            Box::new(|_spec| {
+                let catalog = Arc::new(MemoryCatalog::new());
+                Ok(crate::catalogs::BuiltCatalog {
+                    provider: catalog.clone(),
+                    connector: Arc::new(MemoryConnectorFactory::new(catalog, "default")),
+                })
+            }),
+        ));
         state.mcp = Some(McpSettings {
             allowed_hosts: None,
             allowed_origins: None,
@@ -1755,31 +2329,49 @@ mod tests {
     }
 
     /// The exact tool set (D5), sorted.
-    const TOOL_NAMES: [&str; 25] = [
+    const TOOL_NAMES: [&str; 43] = [
         "cancel_query",
+        "clear_access_rules",
         "cordon_worker",
+        "create_catalog",
         "create_token",
+        "create_user",
+        "delete_user",
         "describe_table",
         "drain_worker",
+        "drop_catalog",
         "explain_query",
         "fetch_results",
+        "get_access_rules",
         "get_admission",
+        "get_catalog_config",
         "get_cluster",
         "get_query",
         "get_query_status",
+        "get_settings",
         "get_worker",
+        "issue_user_token",
         "list_audit_log",
+        "list_catalog_configs",
         "list_catalogs",
         "list_queries",
         "list_schemas",
         "list_tables",
         "list_tokens",
+        "list_user_tokens",
+        "list_users",
         "list_workers",
+        "reseed_state",
         "revoke_token",
+        "revoke_user_token",
         "sample_table",
+        "set_access_rules",
         "set_admission_limits",
+        "set_user_password",
         "submit_query",
         "uncordon_worker",
+        "update_catalog",
+        "update_settings",
         "whoami",
     ];
 
@@ -1790,6 +2382,22 @@ mod tests {
         "drain_worker",
         "uncordon_worker",
         "set_admission_limits",
+    ];
+
+    /// The runtime-config manage tools (D12): all take `dry_run`.
+    const CONFIG_MANAGE_TOOLS: [&str; 12] = [
+        "clear_access_rules",
+        "create_catalog",
+        "create_user",
+        "delete_user",
+        "drop_catalog",
+        "issue_user_token",
+        "reseed_state",
+        "revoke_user_token",
+        "set_access_rules",
+        "set_user_password",
+        "update_catalog",
+        "update_settings",
     ];
 
     #[tokio::test]
@@ -1839,13 +2447,22 @@ mod tests {
                 "cordon_worker",
                 "drain_worker",
                 "set_admission_limits",
+                "clear_access_rules",
+                "delete_user",
+                "drop_catalog",
+                "reseed_state",
+                "revoke_user_token",
+                "set_access_rules",
+                "set_user_password",
+                "update_catalog",
+                "update_settings",
             ]
             .contains(&name);
             if name == "uncordon_worker" {
                 assert_eq!(a["destructiveHint"], json!(false), "{name} destructive");
                 assert_eq!(a["idempotentHint"], json!(true), "{name} idempotent");
             }
-            if MANAGE_TOOLS.contains(&name) {
+            if MANAGE_TOOLS.contains(&name) || CONFIG_MANAGE_TOOLS.contains(&name) {
                 assert!(
                     t["inputSchema"]["properties"]["dry_run"].is_object(),
                     "{name} has no dry_run"
@@ -2028,7 +2645,7 @@ mod tests {
         let v = rpc_raw(&f, init).await;
         let text = v["result"]["instructions"].as_str().unwrap();
         assert!(
-            text.chars().count() <= 1500,
+            text.chars().count() <= 1900,
             "{} chars",
             text.chars().count()
         );
@@ -2302,5 +2919,417 @@ mod tests {
         }
         let a = tool_ok(&f, "root", "get_admission", json!({})).await;
         assert_eq!(a["max_queued_queries"], 5);
+    }
+
+    /// An `/api/v2` call as `user` with an optional body; the JSON answer
+    /// (status asserted `200`).
+    async fn api_send(
+        f: &Fixture,
+        user: &str,
+        method: Method,
+        path: &str,
+        body: Option<String>,
+    ) -> Value {
+        let (auth_header, auth_value) = authn(f, user);
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(auth_header, auth_value)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.unwrap_or_default()))
+            .unwrap();
+        let resp = f.router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{path}: {:?}", bytes);
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tool_list_has_43_tools() {
+        let f = fixture(false);
+        let v = rpc_raw(
+            &f,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+        )
+        .await;
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 43);
+    }
+
+    const RULES: &str =
+        r#"{"catalogs":[{"allow":"all"}],"queries":[{"allow":["execute","view"]}]}"#;
+
+    #[tokio::test]
+    async fn each_config_tool_matches_its_route() {
+        let _threshold = crate::web::settings::THRESHOLD_TEST_LOCK.lock().await;
+        let f = manage_fixture();
+        let rules: Value = serde_json::from_str(RULES).unwrap();
+
+        // Access rules.
+        assert_eq!(
+            tool_ok(&f, "root", "get_access_rules", json!({})).await,
+            api_get(&f, "root", "/api/v2/access-rules").await
+        );
+        let dry = tool_ok(
+            &f,
+            "root",
+            "set_access_rules",
+            json!({"rules": rules, "dry_run": true}),
+        )
+        .await;
+        assert_eq!(dry["dry_run"], true, "{dry}");
+        assert_eq!(
+            dry,
+            api_send(
+                &f,
+                "root",
+                Method::PUT,
+                "/api/v2/access-rules?dry_run=true",
+                Some(RULES.to_owned())
+            )
+            .await
+        );
+        let set = tool_ok(&f, "root", "set_access_rules", json!({"rules": rules})).await;
+        assert_eq!(set["changed"], true, "{set}");
+        assert_eq!(
+            tool_ok(&f, "root", "get_access_rules", json!({})).await,
+            api_get(&f, "root", "/api/v2/access-rules").await
+        );
+        let e = tool_err(&f, "root", "set_access_rules", json!({"rules": [1]})).await;
+        assert_eq!(e["code"], "invalid_argument", "{e}");
+        assert_eq!(
+            tool_ok(&f, "root", "clear_access_rules", json!({"dry_run": true})).await,
+            api_send(
+                &f,
+                "root",
+                Method::DELETE,
+                "/api/v2/access-rules?dry_run=true",
+                None
+            )
+            .await
+        );
+
+        // Users and their tokens.
+        assert_eq!(
+            tool_ok(&f, "root", "list_users", json!({})).await,
+            api_get(&f, "root", "/api/v2/users").await
+        );
+        let e = tool_err(&f, "root", "list_users", json!({"limit": 1001})).await;
+        assert_eq!(e["code"], "invalid_argument", "{e}");
+        let args = json!({"name": "dave", "password": "dave-password", "dry_run": true});
+        assert_eq!(
+            tool_ok(&f, "root", "create_user", args).await,
+            api_send(
+                &f,
+                "root",
+                Method::POST,
+                "/api/v2/users?dry_run=true",
+                Some(json!({"name":"dave","password":"dave-password"}).to_string())
+            )
+            .await
+        );
+        let made = tool_ok(
+            &f,
+            "root",
+            "create_user",
+            json!({"name": "dave", "password": "dave-password"}),
+        )
+        .await;
+        assert_eq!(made["result"]["name"], "dave", "{made}");
+        assert_eq!(
+            tool_ok(&f, "root", "list_users", json!({})).await,
+            api_get(&f, "root", "/api/v2/users").await
+        );
+        assert_eq!(
+            tool_ok(
+                &f,
+                "root",
+                "set_user_password",
+                json!({"name":"dave","password":"another-password","dry_run":true})
+            )
+            .await,
+            api_send(
+                &f,
+                "root",
+                Method::PATCH,
+                "/api/v2/users/dave?dry_run=true",
+                Some(json!({"password":"another-password"}).to_string())
+            )
+            .await
+        );
+        assert_eq!(
+            tool_ok(
+                &f,
+                "root",
+                "delete_user",
+                json!({"name":"dave","dry_run":true})
+            )
+            .await,
+            api_send(
+                &f,
+                "root",
+                Method::DELETE,
+                "/api/v2/users/dave?dry_run=true",
+                None
+            )
+            .await
+        );
+        let issued = tool_ok(
+            &f,
+            "root",
+            "issue_user_token",
+            json!({"name":"dave","token_name":"ci","expires_in_days":30}),
+        )
+        .await;
+        let id = issued["result"]["id"].as_str().unwrap().to_owned();
+        assert!(issued["result"]["token"].is_string(), "{issued}");
+        assert_eq!(
+            tool_ok(&f, "root", "list_user_tokens", json!({"name":"dave"})).await,
+            api_get(&f, "root", "/api/v2/users/dave/tokens").await
+        );
+        let dry = tool_ok(
+            &f,
+            "root",
+            "issue_user_token",
+            json!({"name":"dave","token_name":"ci","dry_run":true}),
+        )
+        .await;
+        assert_eq!(
+            dry["result"],
+            Value::Null,
+            "a dry run issues nothing: {dry}"
+        );
+        assert_eq!(
+            tool_ok(
+                &f,
+                "root",
+                "revoke_user_token",
+                json!({"name":"dave","id":id,"dry_run":true})
+            )
+            .await,
+            api_send(
+                &f,
+                "root",
+                Method::DELETE,
+                &format!("/api/v2/users/dave/tokens/{id}?dry_run=true"),
+                None
+            )
+            .await
+        );
+        let r = tool_ok(
+            &f,
+            "root",
+            "revoke_user_token",
+            json!({"name":"dave","id":id}),
+        )
+        .await;
+        assert_eq!(r["action"], "token.revoke", "{r}");
+
+        // Catalog definitions.
+        let spec = json!({"name":"extra","type":"postgresql",
+            "connection_url":"postgresql://u:s3cret-url@127.0.0.1:1/db","user":"u",
+            "password":"s3cret-pw"});
+        let created = tool_ok(&f, "root", "create_catalog", json!({"spec": spec})).await;
+        assert_eq!(created["result"]["name"], "extra", "{created}");
+        assert!(!created.to_string().contains("s3cret"), "{created}");
+        assert_eq!(
+            tool_ok(&f, "root", "list_catalog_configs", json!({})).await,
+            api_get(&f, "root", "/api/v2/catalog-configs").await
+        );
+        let got = tool_ok(&f, "root", "get_catalog_config", json!({"name":"extra"})).await;
+        assert_eq!(
+            got,
+            api_get(&f, "root", "/api/v2/catalog-configs/extra").await
+        );
+        assert!(!got.to_string().contains("s3cret"), "{got}");
+        assert!(got.to_string().contains("<redacted>"), "{got}");
+        // The redacted body goes back unchanged.
+        let back = tool_ok(
+            &f,
+            "root",
+            "update_catalog",
+            json!({"name":"extra","spec":got["spec"],"dry_run":true}),
+        )
+        .await;
+        assert_eq!(
+            back,
+            api_send(
+                &f,
+                "root",
+                Method::PUT,
+                "/api/v2/catalog-configs/extra?dry_run=true",
+                Some(got["spec"].to_string())
+            )
+            .await
+        );
+        assert_eq!(
+            tool_ok(
+                &f,
+                "root",
+                "drop_catalog",
+                json!({"name":"extra","dry_run":true})
+            )
+            .await,
+            api_send(
+                &f,
+                "root",
+                Method::DELETE,
+                "/api/v2/catalog-configs/extra?dry_run=true",
+                None
+            )
+            .await
+        );
+        let e = tool_err(&f, "root", "get_catalog_config", json!({"name":"nope"})).await;
+        assert_eq!(e["code"], "not_found", "{e}");
+        let dropped = tool_ok(&f, "root", "drop_catalog", json!({"name":"extra"})).await;
+        assert_eq!(dropped["action"], "catalog.drop", "{dropped}");
+
+        // Settings and re-seed.
+        assert_eq!(
+            tool_ok(&f, "root", "get_settings", json!({})).await,
+            api_get(&f, "root", "/api/v2/settings").await
+        );
+        assert_eq!(
+            tool_ok(
+                &f,
+                "root",
+                "update_settings",
+                json!({"slow_query_threshold_ms": 1234, "dry_run": true})
+            )
+            .await,
+            api_send(
+                &f,
+                "root",
+                Method::PATCH,
+                "/api/v2/settings?dry_run=true",
+                Some(json!({"slow_query_threshold_ms": 1234}).to_string())
+            )
+            .await
+        );
+        for bad in [json!({}), json!({"slow_query_threshold_ms": -1})] {
+            let e = tool_err(&f, "root", "update_settings", bad).await;
+            assert_eq!(e["code"], "invalid_argument", "{e}");
+        }
+        assert_eq!(
+            tool_ok(&f, "root", "reseed_state", json!({"dry_run": true})).await,
+            api_send(
+                &f,
+                "root",
+                Method::POST,
+                "/api/v2/state/reseed?dry_run=true",
+                None
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn config_tools_refused_for_non_manager() {
+        let f = manage_fixture();
+        let calls = [
+            ("get_access_rules", json!({})),
+            ("set_access_rules", json!({"rules": {}})),
+            ("clear_access_rules", json!({})),
+            ("list_users", json!({})),
+            ("create_user", json!({"name":"x","password":"password-1"})),
+            (
+                "set_user_password",
+                json!({"name":"alice","password":"password-1"}),
+            ),
+            ("delete_user", json!({"name":"alice"})),
+            ("list_user_tokens", json!({"name":"alice"})),
+            ("issue_user_token", json!({"name":"alice"})),
+            (
+                "revoke_user_token",
+                json!({"name":"alice","id":"0123456789abcdef"}),
+            ),
+            ("list_catalog_configs", json!({})),
+            ("get_catalog_config", json!({"name":"x"})),
+            (
+                "create_catalog",
+                json!({"spec": {"name":"x","type":"hive"}}),
+            ),
+            (
+                "update_catalog",
+                json!({"name":"x","spec": {"name":"x","type":"hive"}}),
+            ),
+            ("drop_catalog", json!({"name":"x"})),
+            ("update_settings", json!({"slow_query_threshold_ms": 5})),
+            ("reseed_state", json!({})),
+        ];
+        for (name, args) in &calls {
+            let e = tool_err(&f, "bob", name, args.clone()).await;
+            assert_eq!(e["code"], "forbidden", "{name}");
+            let mut dry = args.clone();
+            dry["dry_run"] = json!(true);
+            if CONFIG_MANAGE_TOOLS.contains(name) {
+                let e = tool_err(&f, "bob", name, dry).await;
+                assert_eq!(e["code"], "forbidden", "{name} dry");
+            }
+        }
+        // Nothing changed.
+        let users = tool_ok(&f, "root", "list_users", json!({})).await;
+        assert_eq!(users["users"].as_array().unwrap().len(), 5, "{users}");
+    }
+
+    #[tokio::test]
+    async fn create_user_tool_never_echoes_the_password() {
+        let f = manage_fixture();
+        let pw = "hunter2-not-for-echo";
+        let pw2 = "second-secret-pass";
+        let mut seen = Vec::new();
+        for (tool, args) in [
+            (
+                "create_user",
+                json!({"name":"erin","password":pw,"dry_run":true}),
+            ),
+            ("create_user", json!({"name":"erin","password":pw})),
+            (
+                "set_user_password",
+                json!({"name":"erin","password":pw2,"dry_run":true}),
+            ),
+            ("set_user_password", json!({"name":"erin","password":pw2})),
+        ] {
+            seen.push(tool_raw(&f, "root", tool, args).await.to_string());
+        }
+        // A refused password (too short) is not echoed either.
+        let short = "short";
+        seen.push(
+            tool_raw(
+                &f,
+                "root",
+                "create_user",
+                json!({"name":"frank","password":short}),
+            )
+            .await
+            .to_string(),
+        );
+        seen.push(
+            tool_ok(&f, "root", "list_users", json!({}))
+                .await
+                .to_string(),
+        );
+        seen.push(
+            tool_ok(&f, "root", "list_audit_log", json!({"limit": 100}))
+                .await
+                .to_string(),
+        );
+        for text in &seen {
+            for secret in [pw, pw2] {
+                assert!(!text.contains(secret), "a password leaked: {text}");
+            }
+        }
+        assert!(seen[4].contains("invalid_argument"), "{}", seen[4]);
+        assert!(!seen[4].contains("\"short\""), "{}", seen[4]);
+        let audit = tool_ok(
+            &f,
+            "root",
+            "list_audit_log",
+            json!({"action":"user.create"}),
+        )
+        .await;
+        assert_eq!(audit["entries"][0]["target"], "erin", "{audit}");
     }
 }

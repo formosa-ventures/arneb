@@ -19,7 +19,7 @@ pub use file::{StateError, StateStore};
 pub use rules::{RulesSeed, Seeded, StoredRules};
 pub use settings::AdmissionLimits;
 pub use tokens::{now_ms, sha256, IssuedToken, TokenInfo, MAX_TOKENS_PER_USER};
-pub use users::SeedReport;
+pub use users::{PasswordChange, SeedReport, UserDeletion, UserInfo};
 
 use arneb_protocol::{decoy_verifier, is_token_shaped, CredentialSource, ScramVerifier};
 

@@ -13,6 +13,7 @@ mod metrics;
 pub mod privilege;
 mod rules;
 pub mod session;
+mod users;
 mod v2;
 mod workers;
 

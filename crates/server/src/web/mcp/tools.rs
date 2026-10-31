@@ -907,7 +907,7 @@ impl ArnebMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let who = identity(&ctx)?;
-        respond(v2::list_tokens_for(&self.state, &who))
+        respond(v2::list_tokens_for(&self.state, &who.user))
     }
 
     /// `create_token`: `POST /api/v2/tokens`.
@@ -932,7 +932,7 @@ impl ArnebMcp {
             name: a.name,
             expires_in_days: a.expires_in_days.map(serde_json::Value::from),
         };
-        respond(v2::issue_token_for(&self.state, &who, &headers, req).await)
+        respond(v2::issue_token_for(&self.state, &who, v2::TokenTarget::Own, &headers, req).await)
     }
 
     /// `revoke_token`: `DELETE /api/v2/tokens/{id}`.
@@ -951,7 +951,7 @@ impl ArnebMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let who = identity(&ctx)?;
         respond(
-            v2::revoke_token_for(&self.state, &who, a.id.clone())
+            v2::revoke_token_for(&self.state, &who, v2::TokenTarget::Own, a.id.clone())
                 .await
                 .map(|()| serde_json::json!({"revoked": a.id})),
         )

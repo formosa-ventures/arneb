@@ -27,6 +27,9 @@ pub enum StateError {
     /// No user with this name exists.
     #[error("unknown user {0:?}")]
     UnknownUser(String),
+    /// A user with this name already exists.
+    #[error("user {0:?} already exists")]
+    UserExists(String),
     /// No token with this id exists.
     #[error("token {0:?} not found")]
     TokenNotFound(String),
@@ -88,6 +91,11 @@ pub(crate) struct StateData {
     /// written before runtime config existed.
     #[serde(default)]
     pub seeded: crate::Seeded,
+    /// Config-seeded users deleted at runtime (tombstones): seeding does
+    /// not re-add them until a reseed clears the list. Absent in files
+    /// written before runtime config existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_config_users: Vec<String>,
 }
 
 impl Default for StateData {
@@ -100,6 +108,7 @@ impl Default for StateData {
             settings: Default::default(),
             rules: None,
             seeded: Default::default(),
+            deleted_config_users: Vec::new(),
         }
     }
 }

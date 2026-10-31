@@ -143,24 +143,20 @@ pub(super) async fn run_manage<A: ManageAction>(
     let target = action.target();
     let persisted = action.persisted();
     if dry_run {
-        let mut preview = action.preview(state)?;
-        warn_if_in_memory(state, persisted, &mut preview);
-        if action.audited() && !state.audit.is_writable() {
-            add_warning(&mut preview, AUDIT_UNAVAILABLE_WARNING);
-        }
-        tracing::debug!(
-            target: "arneb::audit",
-            user = %who.user,
-            action = name,
-            target = %target,
-            summary = %preview.summary,
-            "manage dry run"
-        );
-        return Ok(outcome(true, name, target, preview, None));
+        let preview = action.preview(state)?;
+        return Ok(dry_run_outcome(
+            state,
+            who,
+            name,
+            target,
+            preview,
+            persisted,
+            action.audited(),
+        ));
     }
     let (blocking_state, who, audit_target) = (state.clone(), who.clone(), target.clone());
     let held = action.change_lock();
-    let mut applied = tokio::task::spawn_blocking(move || {
+    let applied = tokio::task::spawn_blocking(move || {
         let state = blocking_state;
         if !action.audited() {
             let applied = action.apply(&state);
@@ -203,14 +199,48 @@ pub(super) async fn run_manage<A: ManageAction>(
         tracing::error!(error = %e, action = name, "manage action task failed");
         ApiError::new(ErrorCode::Internal, "the manage action failed")
     })??;
+    Ok(applied_outcome(state, name, target, applied, persisted))
+}
+
+/// The envelope of a dry run of `name` on `target` (for an action that
+/// does not fit [`ManageAction`]): `preview`, plus the in-memory warning
+/// for a `persisted` change and the audit-unavailable warning for an
+/// `audited` one; logged at DEBUG on `arneb::audit`.
+pub(super) fn dry_run_outcome<T>(
+    state: &WebState,
+    who: &Identity,
+    name: &'static str,
+    target: String,
+    mut preview: Preview,
+    persisted: bool,
+    audited: bool,
+) -> ManageOutcome<T> {
+    warn_if_in_memory(state, persisted, &mut preview);
+    if audited && !state.audit.is_writable() {
+        add_warning(&mut preview, AUDIT_UNAVAILABLE_WARNING);
+    }
+    tracing::debug!(
+        target: "arneb::audit",
+        user = %who.user,
+        action = name,
+        target = %target,
+        summary = %preview.summary,
+        "manage dry run"
+    );
+    outcome(true, name, target, preview, None)
+}
+
+/// The envelope of a real run of `name` on `target` that `applied`, plus
+/// the in-memory warning for a `persisted` change.
+pub(super) fn applied_outcome<T>(
+    state: &WebState,
+    name: &'static str,
+    target: String,
+    mut applied: Applied<T>,
+    persisted: bool,
+) -> ManageOutcome<T> {
     warn_if_in_memory(state, persisted, &mut applied.preview);
-    Ok(outcome(
-        false,
-        name,
-        target,
-        applied.preview,
-        Some(applied.result),
-    ))
+    outcome(false, name, target, applied.preview, Some(applied.result))
 }
 
 fn outcome<T>(

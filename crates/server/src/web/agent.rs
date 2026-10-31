@@ -319,7 +319,7 @@ mod tests {
             credentials,
             state: password.then_some(store),
             access_rules: None,
-            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), false),
+            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), password),
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent,

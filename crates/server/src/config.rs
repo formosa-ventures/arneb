@@ -134,7 +134,8 @@ pub struct AccessControlConfig {
 
 impl AccessControlConfig {
     /// Apply `ARNEB_ACCESS_CONTROL_RULES_FILE` (env > file); an empty value
-    /// is an error.
+    /// is an error. `ARNEB_ADMIN_USERS` is a comma list, trimmed with blanks
+    /// dropped; a value with no names left counts as unset.
     pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
         if let Some(v) = env("ARNEB_ACCESS_CONTROL_RULES_FILE") {
             let v = v.trim();
@@ -145,13 +146,16 @@ impl AccessControlConfig {
             self.rules_file = Some(v.into());
         }
         // An empty value counts as unset; a list is trimmed, blanks dropped.
-        if let Some(v) = env("ARNEB_ADMIN_USERS").filter(|v| !v.trim().is_empty()) {
-            self.admin_users = v
+        if let Some(v) = env("ARNEB_ADMIN_USERS") {
+            let users: Vec<String> = v
                 .split(',')
                 .map(str::trim)
                 .filter(|u| !u.is_empty())
                 .map(str::to_owned)
                 .collect();
+            if !users.is_empty() {
+                self.admin_users = users;
+            }
         }
         Ok(())
     }
@@ -3094,6 +3098,13 @@ password = "hunter2"
         cfg.apply_env(env_from(&[("ARNEB_ADMIN_USERS", "")]))
             .unwrap();
         assert_eq!(cfg.admin_users, ["root", "ops"], "empty counts as unset");
+        cfg.apply_env(env_from(&[("ARNEB_ADMIN_USERS", " , ,")]))
+            .unwrap();
+        assert_eq!(
+            cfg.admin_users,
+            ["root", "ops"],
+            "all blanks counts as unset"
+        );
         cfg.apply_env(env_from(&[("ARNEB_ADMIN_USERS", " a, ,b ")]))
             .unwrap();
         assert_eq!(cfg.admin_users, ["a", "b"]);

@@ -219,6 +219,14 @@ mod tests {
         assert!(a.check(&alice, Layer::Observe).is_ok(), "admin observes");
         let a = Authorizer::new(sect, vec![], false);
         assert!(a.check(&who("alice", false), Layer::Observe).is_ok());
+        // A write-only rule in an existing section: manage implies observe.
+        let w = rules(
+            r#"{"system_information":[{"user":"ops","allow":["write"]},
+                {"user":"viewer","allow":["read"]}]}"#,
+        );
+        let a = Authorizer::new(w, vec![], true);
+        assert!(a.check(&who("ops", true), Layer::Observe).is_ok());
+        assert!(a.check(&alice, Layer::Observe).is_err());
     }
 
     #[test]
@@ -276,6 +284,18 @@ mod tests {
         let open = Authorizer::new(None, vec![], true);
         assert_eq!(
             open.check_kill(&who("alice", true), Some("bob")).unwrap(),
+            KillGrant::Rule
+        );
+        // 3b. A rules file without a queries section behaves the same.
+        let sys_only = Authorizer::new(
+            rules(r#"{"system_information":[{"user":"ops","allow":["read"]}]}"#),
+            vec![],
+            true,
+        );
+        assert_eq!(
+            sys_only
+                .check_kill(&who("alice", true), Some("bob"))
+                .unwrap(),
             KillGrant::Rule
         );
         let r = rules(

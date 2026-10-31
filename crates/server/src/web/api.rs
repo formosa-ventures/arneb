@@ -1,5 +1,6 @@
 //! REST API handlers.
 
+use arneb_protocol::agent::truncate_on_char_boundary;
 use arneb_scheduler::QueryState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -29,14 +30,25 @@ pub(super) struct QueryResponse {
     rows: Option<u64>,
 }
 
+/// Milliseconds since the Unix epoch (0 before it).
+fn epoch_ms(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Milliseconds `q` has run: from creation until its end, or until now.
+fn elapsed_ms(q: &arneb_scheduler::QueryInfo) -> u64 {
+    q.ended
+        .unwrap_or_else(std::time::SystemTime::now)
+        .duration_since(q.created)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 impl From<arneb_scheduler::QueryInfo> for QueryResponse {
     fn from(q: arneb_scheduler::QueryInfo) -> Self {
-        let epoch_ms = |t: std::time::SystemTime| {
-            t.duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-        };
-        let end = q.ended.unwrap_or_else(std::time::SystemTime::now);
+        let elapsed_ms = elapsed_ms(&q);
         Self {
             query_id: q.query_id.to_string(),
             state: format!("{:?}", q.state),
@@ -45,10 +57,7 @@ impl From<arneb_scheduler::QueryInfo> for QueryResponse {
             source: q.source,
             user: q.user,
             created_ms: epoch_ms(q.created),
-            elapsed_ms: end
-                .duration_since(q.created)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            elapsed_ms,
             rows: q.rows,
         }
     }
@@ -85,19 +94,9 @@ impl BoundedQuery {
     /// `info` with its `sql` cut to at most `max_cell_bytes` bytes, on a
     /// char boundary.
     pub(super) fn new(info: arneb_scheduler::QueryInfo, max_cell_bytes: usize) -> Self {
-        Self::cut(QueryResponse::from(info), max_cell_bytes)
-    }
-
-    fn cut(mut query: QueryResponse, max_cell_bytes: usize) -> Self {
+        let mut query = QueryResponse::from(info);
         query.state.make_ascii_lowercase();
-        let sql_truncated = query.sql.len() > max_cell_bytes;
-        if sql_truncated {
-            let mut end = max_cell_bytes;
-            while !query.sql.is_char_boundary(end) {
-                end -= 1;
-            }
-            query.sql.truncate(end);
-        }
+        let sql_truncated = truncate_on_char_boundary(&mut query.sql, max_cell_bytes);
         Self {
             query,
             sql_truncated,
@@ -168,7 +167,9 @@ pub(super) fn bounded_queries(
         .with_hint(format!("use a limit between 1 and {MAX_QUERY_LIMIT}")));
     }
     let state_filter = params.state.as_deref().map(parse_query_state).transpose()?;
-    let mut matched: Vec<QueryResponse> = state
+    // Filter, sort and cut on the tracker's records; only the survivors
+    // are converted.
+    let mut matched: Vec<arneb_scheduler::QueryInfo> = state
         .query_tracker
         .list_queries(state_filter)
         .into_iter()
@@ -179,21 +180,21 @@ pub(super) fn bounded_queries(
                 .as_deref()
                 .is_none_or(|u| q.user.as_deref() == Some(u))
         })
-        .map(QueryResponse::from)
-        .filter(|q| params.min_elapsed_ms.is_none_or(|m| q.elapsed_ms >= m))
+        .filter(|q| params.min_elapsed_ms.is_none_or(|m| elapsed_ms(q) >= m))
         .collect();
-    // Newest first; the id breaks ties of the same millisecond so the order
-    // (and the cut at `limit`) is stable across calls.
+    // Newest first by the reported millisecond; the id breaks ties of the
+    // same millisecond so the order (and the cut at `limit`) is stable
+    // across calls. Uuid order is the order of its hyphenated text.
     matched.sort_by(|a, b| {
-        b.created_ms
-            .cmp(&a.created_ms)
-            .then_with(|| a.query_id.cmp(&b.query_id))
+        epoch_ms(b.created)
+            .cmp(&epoch_ms(a.created))
+            .then_with(|| a.query_id.0.cmp(&b.query_id.0))
     });
     let truncated = matched.len() > limit;
     matched.truncate(limit);
     let queries = matched
         .into_iter()
-        .map(|q| BoundedQuery::cut(q, max_cell_bytes))
+        .map(|q| BoundedQuery::new(q, max_cell_bytes))
         .collect();
     Ok(BoundedQueries { queries, truncated })
 }

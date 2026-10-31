@@ -17,15 +17,15 @@ use super::WebState;
 pub(super) struct QueryResponse {
     query_id: String,
     state: String,
-    sql: String,
+    pub(super) sql: String,
     error: Option<String>,
     /// Protocol that submitted it (`pgwire`, `trino`).
     source: String,
     user: Option<String>,
     /// Milliseconds since the Unix epoch.
-    created_ms: u64,
+    pub(super) created_ms: u64,
     /// Milliseconds since creation, until now or the end.
-    elapsed_ms: u64,
+    pub(super) elapsed_ms: u64,
     rows: Option<u64>,
 }
 
@@ -64,6 +64,115 @@ pub(super) struct QueriesResponse {
 #[derive(serde::Deserialize, Default)]
 pub struct ListQueryParams {
     pub(super) state: Option<String>,
+}
+
+/// Most queries `list_queries` returns when `limit` is omitted.
+pub(super) const DEFAULT_QUERY_LIMIT: usize = 50;
+/// The largest accepted `limit`.
+pub(super) const MAX_QUERY_LIMIT: usize = 500;
+
+/// A tracked query with its `sql` cut to the cell budget.
+#[derive(Serialize)]
+pub(super) struct BoundedQuery {
+    #[serde(flatten)]
+    query: QueryResponse,
+    /// True when `sql` was cut at the cell budget.
+    sql_truncated: bool,
+}
+
+impl BoundedQuery {
+    /// `info` with its `sql` cut to at most `max_cell_bytes` bytes, on a
+    /// char boundary.
+    pub(super) fn new(info: arneb_scheduler::QueryInfo, max_cell_bytes: usize) -> Self {
+        Self::cut(QueryResponse::from(info), max_cell_bytes)
+    }
+
+    fn cut(mut query: QueryResponse, max_cell_bytes: usize) -> Self {
+        let sql_truncated = query.sql.len() > max_cell_bytes;
+        if sql_truncated {
+            let mut end = max_cell_bytes;
+            while !query.sql.is_char_boundary(end) {
+                end -= 1;
+            }
+            query.sql.truncate(end);
+        }
+        Self {
+            query,
+            sql_truncated,
+        }
+    }
+}
+
+/// The bounded query list: newest first, with whether more matched.
+#[derive(Serialize)]
+pub(super) struct BoundedQueries {
+    queries: Vec<BoundedQuery>,
+    /// True when more queries matched than `limit` allowed.
+    truncated: bool,
+}
+
+/// Filters of the bounded query list.
+#[derive(Default)]
+pub(super) struct BoundedParams {
+    pub(super) state: Option<String>,
+    pub(super) user: Option<String>,
+    pub(super) min_elapsed_ms: Option<u64>,
+    pub(super) limit: Option<usize>,
+}
+
+/// The queries `who` may see, newest first, at most `limit` (default 50,
+/// at most 500) of those matching `state` (an unknown one is refused),
+/// `user` and `min_elapsed_ms`. Same view rules as [`queries_response`].
+pub(super) fn bounded_queries(
+    state: &WebState,
+    who: &Identity,
+    params: BoundedParams,
+    max_cell_bytes: usize,
+) -> Result<BoundedQueries, ApiError> {
+    let limit = params.limit.unwrap_or(DEFAULT_QUERY_LIMIT);
+    if limit == 0 || limit > MAX_QUERY_LIMIT {
+        return Err(ApiError::new(
+            ErrorCode::InvalidArgument,
+            format!("limit {limit} is not valid"),
+        )
+        .with_hint(format!("use a limit between 1 and {MAX_QUERY_LIMIT}")));
+    }
+    let state_filter = params
+        .state
+        .map(|s| match s.to_uppercase().as_str() {
+            "QUEUED" => Ok(QueryState::Queued),
+            "RUNNING" => Ok(QueryState::Running),
+            "FINISHED" => Ok(QueryState::Finished),
+            "FAILED" => Ok(QueryState::Failed),
+            "CANCELLED" => Ok(QueryState::Cancelled),
+            _ => Err(
+                ApiError::new(ErrorCode::InvalidArgument, format!("unknown state {s:?}"))
+                    .with_hint("state is one of queued, running, finished, failed, cancelled"),
+            ),
+        })
+        .transpose()?;
+    let mut matched: Vec<QueryResponse> = state
+        .query_tracker
+        .list_queries(state_filter)
+        .into_iter()
+        .filter(|q| may_view(state, who, q.user.as_deref()))
+        .filter(|q| {
+            params
+                .user
+                .as_deref()
+                .is_none_or(|u| q.user.as_deref() == Some(u))
+        })
+        .map(QueryResponse::from)
+        .filter(|q| params.min_elapsed_ms.is_none_or(|m| q.elapsed_ms >= m))
+        .collect();
+    matched.sort_by_key(|q| std::cmp::Reverse(q.created_ms));
+    let truncated = matched.len() > limit;
+    matched.truncate(limit);
+    let queries = matched
+        .into_iter()
+        .map(|q| BoundedQuery::cut(q, max_cell_bytes))
+        .collect();
+    Ok(BoundedQueries { queries, truncated })
 }
 
 /// JSON response for cluster overview.

@@ -5,7 +5,8 @@
 use std::time::Duration;
 
 use arneb_protocol::agent::{
-    AgentError, AgentQueryService, ExplainRequest, ListRequest, StatementStatus, SubmitRequest,
+    AgentError, AgentLimits, AgentQueryService, ExplainRequest, ListRequest, StatementStatus,
+    SubmitRequest,
 };
 use rmcp::{
     handler::server::wrapper::Parameters,
@@ -17,8 +18,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{identity, ok, tool_error, ArnebMcp};
 use crate::web::agent::{service, wait};
+use crate::web::api::{self, BoundedParams, BoundedQuery};
 use crate::web::auth::AuthVia;
 use crate::web::error::ApiError;
+use crate::web::v2;
 
 /// Arguments of `list_catalogs`.
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -133,6 +136,43 @@ struct IdArgs {
     id: String,
 }
 
+/// Arguments of `list_queries`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ListQueriesArgs {
+    /// Keep only this state: queued, running, finished, failed or cancelled.
+    state: Option<String>,
+    /// Keep only queries of this user.
+    user: Option<String>,
+    /// Keep only queries that took (or have taken) at least this many
+    /// milliseconds: the slow-query view.
+    min_elapsed_ms: Option<u64>,
+    /// Most queries to return (default 50, at most 500).
+    limit: Option<usize>,
+}
+
+/// Arguments of `get_query`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct QueryIdArgs {
+    /// The query id (a UUID) from `list_queries`.
+    id: String,
+}
+
+/// Arguments of `create_token`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct CreateTokenArgs {
+    /// A label for the token (at most 128 characters).
+    name: Option<String>,
+    /// Days until it expires (1 to 3650); omit for no expiry.
+    expires_in_days: Option<i64>,
+}
+
+/// Arguments of `revoke_token`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct TokenIdArgs {
+    /// The token id from `list_tokens`.
+    id: String,
+}
+
 /// A tool result for a service outcome: the body, or the error envelope.
 fn respond<T: Serialize>(outcome: Result<T, ApiError>) -> Result<CallToolResult, ErrorData> {
     match outcome {
@@ -142,6 +182,17 @@ fn respond<T: Serialize>(outcome: Result<T, ApiError>) -> Result<CallToolResult,
 }
 
 impl ArnebMcp {
+    /// The longest query text a result carries: the agent limit, or its
+    /// default when this node has no agent service.
+    fn cell_bytes(&self) -> usize {
+        self.state
+            .agent
+            .as_ref()
+            .map_or(AgentLimits::default().max_cell_bytes, |a| {
+                a.limits().max_cell_bytes
+            })
+    }
+
     /// The MCP page budget of inline first pages and omitted `max_bytes`.
     fn page_bytes(&self, svc: &AgentQueryService) -> usize {
         self.state
@@ -435,6 +486,144 @@ impl ArnebMcp {
         let who = identity(&ctx)?;
         respond(async { Ok(service(&self.state)?.cancel(&who.user, &a.id)?) }.await)
     }
+
+    /// `list_queries`: the bounded `GET /api/v2/queries`.
+    #[tool(
+        description = "List tracked queries (any protocol) you may see, newest first, at most \
+                       `limit` (default 50, at most 500); `truncated` says if more matched. \
+                       Filter by `state` (queued, running, finished, failed, cancelled), `user`, \
+                       or `min_elapsed_ms` for slow queries. Long `sql` is cut and flagged with \
+                       `sql_truncated`. Next: get_query.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_queries(
+        &self,
+        Parameters(a): Parameters<ListQueriesArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        let params = BoundedParams {
+            state: a.state,
+            user: a.user,
+            min_elapsed_ms: a.min_elapsed_ms,
+            limit: a.limit,
+        };
+        respond(api::bounded_queries(
+            &self.state,
+            &who,
+            params,
+            self.cell_bytes(),
+        ))
+    }
+
+    /// `get_query`: `GET /api/v2/queries/{id}`.
+    #[tool(
+        description = "Get one tracked query by id: state, user, source, timings, rows, error \
+                       and its `sql` (cut and flagged with `sql_truncated` when long).",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_query(
+        &self,
+        Parameters(a): Parameters<QueryIdArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(
+            api::visible_query(&self.state, &who, &a.id)
+                .map(|info| BoundedQuery::new(info, self.cell_bytes()))
+                .map_err(v2::lookup_error),
+        )
+    }
+
+    /// `get_cluster`: `GET /api/v2/cluster`.
+    #[tool(
+        description = "Cluster overview: role, alive worker count and admission counters \
+                       (running and queued queries and their limits; 0 running limit means \
+                       unlimited).",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_cluster(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        identity(&ctx)?;
+        ok(&api::cluster_response(&self.state))
+    }
+
+    /// `list_workers`: `GET /api/v2/cluster/workers`.
+    #[tool(
+        description = "List the alive workers with address, version, heartbeat age and whether \
+                       they are active or draining.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_workers(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        identity(&ctx)?;
+        ok(&serde_json::json!({"workers": api::workers_response(&self.state)}))
+    }
+
+    /// `list_tokens`: `GET /api/v2/tokens`.
+    #[tool(
+        description = "List your live API tokens (id, name, created, expiry; never the secret). \
+                       Needs password auth.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_tokens(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(v2::list_tokens_for(&self.state, &who))
+    }
+
+    /// `create_token`: `POST /api/v2/tokens`.
+    #[tool(
+        description = "Create an API token for yourself, optionally named and expiring in \
+                       1..3650 days. The secret `token` is shown only in this result. A token \
+                       cannot mint one that outlives itself. Needs password auth.",
+        annotations(open_world_hint = false)
+    )]
+    async fn create_token(
+        &self,
+        Parameters(a): Parameters<CreateTokenArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        let headers = ctx
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .map(|p| p.headers.clone())
+            .unwrap_or_default();
+        let req = v2::IssueTokenRequest {
+            name: a.name,
+            expires_in_days: a.expires_in_days.map(serde_json::Value::from),
+        };
+        respond(v2::issue_token_for(&self.state, &who, &headers, req).await)
+    }
+
+    /// `revoke_token`: `DELETE /api/v2/tokens/{id}`.
+    #[tool(
+        description = "Revoke one of your API tokens by id. An unknown id is not_found. Needs password auth.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn revoke_token(
+        &self,
+        Parameters(a): Parameters<TokenIdArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(
+            v2::revoke_token_for(&self.state, &who, a.id.clone())
+                .await
+                .map(|()| serde_json::json!({"revoked": a.id})),
+        )
+    }
 }
 
 fn via_name(via: AuthVia) -> &'static str {
@@ -545,7 +734,18 @@ mod tests {
     }
 
     fn fixture_with(hang: bool, page_bytes: usize) -> Fixture {
-        let tracker = Arc::new(arneb_scheduler::QueryTracker::new());
+        fixture_tracked(
+            hang,
+            page_bytes,
+            Arc::new(arneb_scheduler::QueryTracker::new()),
+        )
+    }
+
+    fn fixture_tracked(
+        hang: bool,
+        page_bytes: usize,
+        tracker: Arc<arneb_scheduler::QueryTracker>,
+    ) -> Fixture {
         let (cm, registry) = engine_state();
         let mut agent =
             AgentQueryService::new(cm, registry, tracker.clone(), AgentLimits::default());
@@ -891,5 +1091,123 @@ mod tests {
         assert_eq!(v["result"]["isError"], json!(true), "{v}");
         let text = v["result"]["content"][0]["text"].as_str().unwrap_or("");
         assert!(text.contains("`id`"), "{v}");
+    }
+    fn history_fixture() -> Fixture {
+        fixture_tracked(
+            false,
+            32768,
+            Arc::new(arneb_scheduler::QueryTracker::with_history_limit(1000)),
+        )
+    }
+
+    #[tokio::test]
+    async fn list_queries_is_bounded_newest_first() {
+        let f = history_fixture();
+        let mut ids = Vec::new();
+        for i in 0..600 {
+            ids.push(f.tracker.create_query_from(
+                format!("SELECT {i}"),
+                "pgwire",
+                Some("alice".into()),
+            ));
+        }
+        for id in ids.iter().take(5) {
+            f.tracker.finish_query(id, 1).unwrap();
+        }
+        let r = tool_ok(&f, "alice", "list_queries", json!({})).await;
+        let q = r["queries"].as_array().unwrap();
+        assert_eq!(q.len(), 50);
+        assert_eq!(r["truncated"], true);
+        let created: Vec<u64> = q
+            .iter()
+            .map(|x| x["created_ms"].as_u64().unwrap())
+            .collect();
+        assert!(created.windows(2).all(|w| w[0] >= w[1]), "{created:?}");
+
+        let r = tool_ok(&f, "alice", "list_queries", json!({"limit": 500})).await;
+        assert_eq!(r["queries"].as_array().unwrap().len(), 500);
+        for bad in [
+            json!({"limit": 501}),
+            json!({"limit": 0}),
+            json!({"state": "bogus"}),
+        ] {
+            let e = tool_err(&f, "alice", "list_queries", bad).await;
+            assert_eq!(e["code"], "invalid_argument");
+        }
+        let r = tool_ok(&f, "alice", "list_queries", json!({"state": "FINISHED"})).await;
+        assert_eq!(r["queries"].as_array().unwrap().len(), 5);
+        assert_eq!(r["truncated"], false);
+        let r = tool_ok(&f, "alice", "list_queries", json!({"user": "carol"})).await;
+        assert!(r["queries"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn slow_queries_filter() {
+        let f = history_fixture();
+        let slow = f
+            .tracker
+            .create_query_from("SELECT slow".into(), "pgwire", None);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        f.tracker
+            .create_query_from("SELECT fast".into(), "pgwire", None);
+        let r = tool_ok(&f, "alice", "list_queries", json!({"min_elapsed_ms": 200})).await;
+        let q = r["queries"].as_array().unwrap();
+        assert_eq!(q.len(), 1, "{r}");
+        assert_eq!(q[0]["query_id"], slow.to_string());
+        let r = tool_ok(&f, "alice", "list_queries", json!({})).await;
+        assert_eq!(r["queries"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn long_sql_is_cut_and_flagged() {
+        let f = history_fixture();
+        let long = "測".repeat(20_000 / 3 + 1);
+        let id = f.tracker.create_query_from(long, "pgwire", None);
+        let short = f
+            .tracker
+            .create_query_from("SELECT 1".into(), "pgwire", None);
+        let r = tool_ok(&f, "alice", "list_queries", json!({})).await;
+        for q in r["queries"].as_array().unwrap() {
+            let sql = q["sql"].as_str().unwrap();
+            if q["query_id"] == id.to_string() {
+                assert!(sql.len() <= AgentLimits::default().max_cell_bytes);
+                assert!(sql.len() > AgentLimits::default().max_cell_bytes - 3);
+                assert!(sql.chars().all(|c| c == '測'));
+                assert_eq!(q["sql_truncated"], true);
+            } else {
+                assert_eq!(q["sql_truncated"], false);
+            }
+        }
+        let one = tool_ok(&f, "alice", "get_query", json!({"id": id.to_string()})).await;
+        assert_eq!(one["sql_truncated"], true);
+        let one = tool_ok(&f, "alice", "get_query", json!({"id": short.to_string()})).await;
+        assert_eq!(
+            (one["sql"].as_str(), one["sql_truncated"].as_bool()),
+            (Some("SELECT 1"), Some(false))
+        );
+        let e = tool_err(&f, "alice", "get_query", json!({"id": "nope"})).await;
+        assert_eq!(e["code"], "invalid_argument");
+        let e = tool_err(
+            &f,
+            "alice",
+            "get_query",
+            json!({"id": uuid::Uuid::new_v4().to_string()}),
+        )
+        .await;
+        assert_eq!(e["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn cluster_and_workers_match_the_api() {
+        let f = fixture(false);
+        assert_eq!(
+            tool_ok(&f, "alice", "get_cluster", json!({})).await,
+            api_get(&f, "alice", "/api/v2/cluster").await
+        );
+        let w = tool_ok(&f, "alice", "list_workers", json!({})).await;
+        assert_eq!(
+            w["workers"],
+            api_get(&f, "alice", "/api/v2/cluster/workers").await
+        );
     }
 }

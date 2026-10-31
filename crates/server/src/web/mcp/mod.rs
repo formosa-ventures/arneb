@@ -458,4 +458,139 @@ mod tests {
             json!({"error": {"code": "table_not_found", "message": "no table", "hint": "list_tables"}})
         );
     }
+    /// A `tools/call` with `auth`; the JSON-RPC `result`.
+    async fn call_tool(router: axum::Router, auth: &str, name: &str, args: Value) -> Value {
+        let body = json!({"jsonrpc":"2.0","id":9,"method":"tools/call",
+                          "params":{"name":name,"arguments":args}})
+        .to_string();
+        let (status, _, v) = rpc(router, Some(auth), "arneb.example.com", &body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        v["result"].clone()
+    }
+
+    fn with_rules(mut state: WebState, json: &str) -> WebState {
+        state.access_rules = Some(Arc::new(
+            arneb_catalog::AccessRules::from_json(json).unwrap(),
+        ));
+        state
+    }
+
+    #[tokio::test]
+    async fn list_queries_follows_view_rules() {
+        let state = with_rules(
+            mcp_state(true, default_settings()),
+            r#"{"queries": [{"user": "alice|bob", "allow": ["execute"]}]}"#,
+        );
+        let a = state.query_tracker.create_query_from(
+            "SELECT 'a'".into(),
+            "pgwire",
+            Some("alice".into()),
+        );
+        let b = state.query_tracker.create_query_from(
+            "SELECT 'b'".into(),
+            "pgwire",
+            Some("bob".into()),
+        );
+        let router = build_router(state);
+        let alice = basic("alice", "secret");
+        let r = call_tool(router.clone(), &alice, "list_queries", json!({})).await;
+        let q = r["structuredContent"]["queries"].as_array().unwrap();
+        assert_eq!(q.len(), 1, "{r}");
+        assert_eq!(q[0]["query_id"], a.to_string());
+        let r = call_tool(
+            router.clone(),
+            &alice,
+            "get_query",
+            json!({"id": b.to_string()}),
+        )
+        .await;
+        assert_eq!(r["isError"], true);
+        assert_eq!(r["structuredContent"]["error"]["code"], "not_found");
+        let r = call_tool(router, &alice, "get_query", json!({"id": a.to_string()})).await;
+        assert_ne!(r["isError"], true, "{r}");
+    }
+
+    #[tokio::test]
+    async fn token_tools_round_trip() {
+        let router = build_router(mcp_state(true, default_settings()));
+        let alice = basic("alice", "secret");
+        let bob = basic("bob", "hunter2");
+        let r = call_tool(
+            router.clone(),
+            &alice,
+            "create_token",
+            json!({"name": "ci", "expires_in_days": 1}),
+        )
+        .await;
+        assert_ne!(r["isError"], true, "{r}");
+        let issued = &r["structuredContent"];
+        let token = issued["token"].as_str().unwrap().to_owned();
+        let id = issued["id"].as_str().unwrap().to_owned();
+        assert!(token.starts_with("arneb_"));
+
+        let r = call_tool(router.clone(), &alice, "list_tokens", json!({})).await;
+        let tokens = r["structuredContent"]["tokens"].as_array().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0]["name"], "ci");
+        assert!(tokens[0].get("token").is_none());
+
+        let bearer = format!("Bearer {token}");
+        let (status, _, _) = rpc(router.clone(), Some(&bearer), "h.example", &whoami_body()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Another user's id is not_found and leaves the token alive.
+        let r = call_tool(router.clone(), &bob, "revoke_token", json!({"id": id})).await;
+        assert_eq!(r["isError"], true);
+        assert_eq!(r["structuredContent"]["error"]["code"], "not_found");
+
+        let r = call_tool(router.clone(), &alice, "revoke_token", json!({"id": id})).await;
+        assert_eq!(r["structuredContent"], json!({"revoked": id}));
+        let (status, _, _) = rpc(router, Some(&bearer), "h.example", &whoami_body()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn create_token_with_token_is_clamped() {
+        let router = build_router(mcp_state(true, default_settings()));
+        let r = call_tool(
+            router.clone(),
+            &basic("alice", "secret"),
+            "create_token",
+            json!({"expires_in_days": 1}),
+        )
+        .await;
+        let parent = r["structuredContent"].clone();
+        let bearer = format!("Bearer {}", parent["token"].as_str().unwrap());
+        let r = call_tool(
+            router,
+            &bearer,
+            "create_token",
+            json!({"expires_in_days": 30}),
+        )
+        .await;
+        assert_ne!(r["isError"], true, "{r}");
+        let child = &r["structuredContent"];
+        assert!(child["expires_ms"].as_u64().unwrap() <= parent["expires_ms"].as_u64().unwrap());
+        assert!(child["hint"].as_str().unwrap().contains("clamped"));
+    }
+
+    #[tokio::test]
+    async fn token_tools_are_auth_disabled_under_none() {
+        let router = build_router(mcp_state(false, default_settings()));
+        for (name, args) in [
+            ("create_token", json!({})),
+            ("list_tokens", json!({})),
+            ("revoke_token", json!({"id": "0123456789abcdef"})),
+        ] {
+            let body = json!({"jsonrpc":"2.0","id":9,"method":"tools/call",
+                              "params":{"name":name,"arguments":args}})
+            .to_string();
+            let (_, _, v) = rpc(router.clone(), None, "127.0.0.1:6432", &body).await;
+            assert_eq!(v["result"]["isError"], true, "{name}: {v}");
+            assert_eq!(
+                v["result"]["structuredContent"]["error"]["code"], "auth_disabled",
+                "{name}"
+            );
+        }
+    }
 }

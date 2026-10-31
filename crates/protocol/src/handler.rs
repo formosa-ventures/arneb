@@ -1057,6 +1057,70 @@ pub async fn execute_query_with_limit(
     ),
     ArnebError,
 > {
+    execute_query_capped(
+        sql,
+        catalog_manager,
+        connector_registry,
+        distributed_executor,
+        memory_pool,
+        query_memory_limit,
+        None,
+    )
+    .await
+}
+
+/// Caps the rows a query plan produces at `row_cap`: an existing root
+/// `LIMIT` keeps the smaller of the two, anything else gets a `LIMIT` on top.
+/// The cap goes below root projections (which keep the row count), so the
+/// physical planner can turn it into a Top-K over a sort or a limit hint over
+/// a bare scan.
+fn cap_plan_rows(plan: LogicalPlan, row_cap: usize) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Projection {
+            input,
+            exprs,
+            schema,
+        } => LogicalPlan::Projection {
+            input: Box::new(cap_plan_rows(*input, row_cap)),
+            exprs,
+            schema,
+        },
+        LogicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => LogicalPlan::Limit {
+            input,
+            limit: Some(limit.map_or(row_cap, |l| l.min(row_cap))),
+            offset,
+        },
+        plan => LogicalPlan::Limit {
+            input: Box::new(plan),
+            limit: Some(row_cap),
+            offset: None,
+        },
+    }
+}
+
+/// [`execute_query_with_limit`] that, for a `SELECT`, stops producing rows
+/// after `row_cap` of them: the plan's root gets a `LIMIT row_cap`, so the
+/// query reads no more than it needs to return that many rows. Other
+/// statements ignore `row_cap`.
+pub(crate) async fn execute_query_capped(
+    sql: &str,
+    catalog_manager: &CatalogManager,
+    connector_registry: &ConnectorRegistry,
+    distributed_executor: Option<&dyn DistributedExecutor>,
+    memory_pool: &Arc<dyn arneb_execution::memory_pool::MemoryPool>,
+    query_memory_limit: Option<usize>,
+    row_cap: Option<usize>,
+) -> Result<
+    (
+        Arc<dyn ExecutionPlan>,
+        Vec<arrow::record_batch::RecordBatch>,
+    ),
+    ArnebError,
+> {
     let memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> = match query_memory_limit {
         Some(limit) => Arc::new(arneb_execution::memory_pool::QueryMemoryPool::new(
             Arc::clone(memory_pool),
@@ -1078,6 +1142,12 @@ pub async fn execute_query_with_limit(
     // costs only an `Arc` clone.
     let planner = QueryPlanner::new(catalog_manager);
     let (logical_plan, analyzer_ctx) = planner.plan_statement_with_context(&statement).await?;
+    let logical_plan = match (row_cap, &statement) {
+        (Some(cap), arneb_sql_parser::ast::Statement::Query { .. }) => {
+            cap_plan_rows(logical_plan, cap)
+        }
+        _ => logical_plan,
+    };
 
     // Step 2.5: Optimize logical plan
     let optimizer = LogicalOptimizer::default_rules();

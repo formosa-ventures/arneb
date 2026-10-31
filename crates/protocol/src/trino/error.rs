@@ -1,7 +1,7 @@
 //! Mapping from [`ArnebError`] to the Trino `QueryError` JSON object.
 
 use arneb_common::diagnostic::{render_plan_error, SourceFile};
-use arneb_common::error::{ArnebError, CatalogError, ConnectorError, PlanError};
+use arneb_common::error::{ArnebError, CatalogError, ConnectorError, Location, PlanError};
 use serde_json::{json, Value};
 
 /// A Trino `QueryError`: the `(errorCode, errorName, errorType)` triple
@@ -13,6 +13,10 @@ pub(crate) struct TrinoError {
     pub(crate) code: i64,
     pub(crate) name: &'static str,
     pub(crate) kind: &'static str,
+    /// SQL position of the offending construct, when known.
+    pub(crate) location: Option<Location>,
+    /// Nearest-name suggestions (column typos only).
+    pub(crate) candidates: Vec<String>,
 }
 
 const USER_ERROR: &str = "USER_ERROR";
@@ -27,6 +31,8 @@ impl TrinoError {
             code,
             name,
             kind: USER_ERROR,
+            location: None,
+            candidates: Vec::new(),
         }
     }
 
@@ -38,6 +44,8 @@ impl TrinoError {
             code: 131075,
             name: "EXCEEDED_TIME_LIMIT",
             kind: INSUFFICIENT_RESOURCES,
+            location: None,
+            candidates: Vec::new(),
         }
     }
 
@@ -54,6 +62,8 @@ impl TrinoError {
             code: 131074,
             name: "QUERY_QUEUE_FULL",
             kind: INSUFFICIENT_RESOURCES,
+            location: None,
+            candidates: Vec::new(),
         }
     }
 
@@ -79,6 +89,8 @@ impl TrinoError {
             code: 65536,
             name: "GENERIC_INTERNAL_ERROR",
             kind: INTERNAL_ERROR,
+            location: None,
+            candidates: Vec::new(),
         }
     }
 
@@ -126,17 +138,29 @@ impl TrinoError {
             ArnebError::Connector(_) => (16777216, "CONNECTOR_ERROR", EXTERNAL),
             _ => (65536, "GENERIC_INTERNAL_ERROR", INTERNAL_ERROR),
         };
+        let (location, candidates) = match err {
+            ArnebError::Parse(e) => (e.location(), Vec::new()),
+            ArnebError::Plan(PlanError::ColumnNotFound {
+                location,
+                candidates,
+                ..
+            }) => (*location, candidates.clone()),
+            ArnebError::Plan(e) => (e.location(), Vec::new()),
+            _ => (None, Vec::new()),
+        };
         Self {
             message,
             code,
             name,
             kind,
+            location,
+            candidates,
         }
     }
 
     /// The `error` object of a `QueryResults` response.
     pub(crate) fn to_json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "message": self.message,
             "errorCode": self.code,
             "errorName": self.name,
@@ -147,7 +171,11 @@ impl TrinoError {
                 "suppressed": [],
                 "stack": [],
             },
-        })
+        });
+        if let Some(loc) = self.location {
+            v["errorLocation"] = json!({"lineNumber": loc.line, "columnNumber": loc.column});
+        }
+        v
     }
 }
 
@@ -190,5 +218,25 @@ mod tests {
         );
         assert_eq!(e.name, "EXCEEDED_LOCAL_MEMORY_LIMIT");
         assert_eq!(e.message, "resource exhausted: query memory limit exceeded");
+    }
+
+    #[test]
+    fn trino_json_carries_error_location() {
+        let err = ArnebError::Plan(PlanError::ColumnNotFound {
+            name: "x".into(),
+            location: Some(Location { line: 1, column: 8 }),
+            candidates: vec!["y".into()],
+        });
+        let e = TrinoError::from_arneb(&err, None);
+        assert_eq!(e.candidates, ["y"]);
+        assert_eq!(
+            e.to_json()["errorLocation"],
+            json!({"lineNumber": 1, "columnNumber": 8})
+        );
+        let e = TrinoError::from_arneb(
+            &ArnebError::Plan(PlanError::TableNotFound("t".into())),
+            None,
+        );
+        assert!(e.to_json().get("errorLocation").is_none());
     }
 }

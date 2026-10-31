@@ -119,6 +119,45 @@ runs the in-binary defaults.
 `ARNEB_NARROW_KEYS` is deliberately **not** a default: its column allowlist is a
 TPC-H-specific stopgap for the Hive connector's missing plan-time min/max stats.
 
+## Agent Query API
+
+The coordinator (or standalone node) bounds every agent query API response and
+wait with these limits. A request value above its ceiling is refused, not
+clamped. The effective values are logged once on `arneb::config` at startup.
+
+```toml
+[agent_api]
+default_max_rows   = 1000
+max_rows           = 10000
+```
+
+| `[agent_api]` field | Env var | Default | Meaning |
+|---|---|---|---|
+| `default_max_rows` | `ARNEB_AGENT_DEFAULT_MAX_ROWS` | 1000 | Rows a statement retains when the request names no `max_rows`, and the default listing `limit` |
+| `max_rows` | `ARNEB_AGENT_MAX_ROWS` | 10000 | Ceiling for a statement's `max_rows` and a listing's `limit` |
+| `default_page_bytes` | `ARNEB_AGENT_DEFAULT_PAGE_BYTES` | 262144 | Bytes per page when the request names no limit |
+| `max_page_bytes` | `ARNEB_AGENT_MAX_PAGE_BYTES` | 4194304 | Ceiling for a requested page size |
+| `max_cell_bytes` | `ARNEB_AGENT_MAX_CELL_BYTES` | 8192 | Longest cell, in bytes of a string's UTF-8 text (other values: of their JSON); longer cells are cut and end with `…` |
+| `max_retained_bytes` | `ARNEB_AGENT_MAX_RETAINED_BYTES` | 67108864 | Arrow memory one finished statement keeps; rows past it are dropped (`truncated_by: "max_retained_bytes"`) |
+| `max_total_retained_bytes` | `ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES` | 1073741824 | Arrow memory all finished statements keep together; when exhausted a statement keeps what fits (`truncated_by: "server_budget"`), and it frees up as statements are evicted or reaped |
+| `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 | Longest any request waits before answering "still running" |
+| `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 | Idle time before a statement is reaped |
+
+All values must be greater than 0, `default_max_rows <= max_rows`,
+`default_page_bytes <= max_page_bytes`,
+`max_retained_bytes <= max_total_retained_bytes`, and `idle_timeout_secs` must be at
+least twice `max_wait_ms` (so a statement is never reaped around a request
+that long-polls it; a statement being waited on also never counts as idle);
+a bad combination stops startup.
+
+A catalog, schema or table listing returns `default_max_rows` names unless
+the request passes `limit`, which must be in `1..=max_rows`.
+
+A query stops producing rows after `max_rows + 1` of them, so `max_rows`
+bounds what it emits as well as what it retains; a truncated result reports
+`total_rows` as `null`. A page always holds at least one row, so a single wide row can
+exceed the page byte limit; each cell is still capped at `max_cell_bytes`.
+
 ## Admission Control
 
 The coordinator (or standalone node) caps how many queries run at once,

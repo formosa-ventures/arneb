@@ -172,6 +172,7 @@ mod tests {
         let err = PlanError::ColumnNotFound {
             name: "unknown_col".to_string(),
             location: Some(Location { line: 1, column: 8 }),
+            candidates: vec![],
         };
         let out = render_plan_error(&err, &source);
         assert!(out.contains("query.sql:1:8"), "got: {out}");
@@ -192,6 +193,7 @@ mod tests {
         let err = PlanError::ColumnNotFound {
             name: "x".to_string(),
             location: Some(Location { line: 5, column: 1 }),
+            candidates: vec![],
         };
         let out = render_plan_error(&err, &source);
         assert!(out.contains("line 5:1"), "got: {out}");

@@ -41,7 +41,7 @@ fn format_node(plan: &LogicalPlan, stats: &CatalogStats, depth: usize, out: &mut
     out.push_str("  Estimates: rows=");
     out.push_str(&fmt_card(est));
     out.push('\n');
-    for child in children(plan) {
+    for child in plan_children(plan) {
         format_node(child, stats, depth + 1, out);
     }
 }
@@ -123,7 +123,8 @@ fn summarize_node(plan: &LogicalPlan) -> String {
     }
 }
 
-fn children(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
+/// The direct inputs of `plan`, in plan order.
+pub fn plan_children(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
     use LogicalPlan as L;
     match plan {
         L::TableScan { .. }

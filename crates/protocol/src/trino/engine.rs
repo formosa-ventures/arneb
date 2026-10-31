@@ -15,7 +15,8 @@ use super::metadata::{self, Cell, TableBuilder};
 use super::session::{url_encode, ClientSession};
 use super::statements::{bind_placeholders, like_match, parse_control, ControlStatement};
 use super::types::{trino_type_of, OutputColumn, TrinoType};
-use crate::handler::{execute_query_with_limit, DistributedExecutor};
+use crate::agent::explain::ScanEstimate;
+use crate::handler::{execute_query_capped, DistributedExecutor};
 
 /// The result of one statement, before paging.
 #[derive(Debug, Default)]
@@ -59,6 +60,15 @@ impl QueryOutput {
     }
 }
 
+/// The catalogs one statement plans against.
+struct StatementScope {
+    catalogs: Arc<CatalogManager>,
+    /// The registry of the virtual catalogs when the statement reads them;
+    /// such statements run locally. `None` means the engine's registry, with
+    /// distribution.
+    virtual_registry: Option<ConnectorRegistry>,
+}
+
 /// Shared engine handles (the same ones the pgwire server holds).
 pub(crate) struct Engine {
     pub(crate) catalog_manager: Arc<CatalogManager>,
@@ -93,7 +103,10 @@ impl Engine {
     /// The catalog manager this session plans against: the root, checked
     /// against the access rules for the session user. Fails when the rules
     /// do not let the user run statements.
-    fn session_root(&self, session: &ClientSession) -> Result<Arc<CatalogManager>, TrinoError> {
+    pub(crate) fn session_root(
+        &self,
+        session: &ClientSession,
+    ) -> Result<Arc<CatalogManager>, TrinoError> {
         let Some(rules) = &self.access_rules else {
             return Ok(Arc::clone(&self.catalog_manager));
         };
@@ -128,7 +141,19 @@ impl Engine {
         session: &ClientSession,
         sql: &str,
     ) -> Result<QueryOutput, TrinoError> {
-        self.run(session, sql, 0).await
+        self.run(session, sql, 0, None).await
+    }
+
+    /// [`run_statement`](Self::run_statement) for a client that keeps at most
+    /// `row_cap` rows: a query stops producing rows after `row_cap` of them,
+    /// so it reads no more than that needs.
+    pub(crate) async fn run_statement_capped(
+        &self,
+        session: &ClientSession,
+        sql: &str,
+        row_cap: usize,
+    ) -> Result<QueryOutput, TrinoError> {
+        self.run(session, sql, 0, Some(row_cap)).await
     }
 
     async fn run(
@@ -136,6 +161,7 @@ impl Engine {
         session: &ClientSession,
         sql: &str,
         depth: u8,
+        row_cap: Option<usize>,
     ) -> Result<QueryOutput, TrinoError> {
         let sql = sql.trim().trim_end_matches(';').trim();
         if sql.is_empty() {
@@ -149,35 +175,75 @@ impl Engine {
             return Box::pin(self.control(stmt, session, depth)).await;
         }
 
+        let scope = self.statement_scope(session, sql).await?;
+        match &scope.virtual_registry {
+            Some(registry) => {
+                self.run_sql(sql, &scope.catalogs, registry, None, row_cap)
+                    .await
+            }
+            None => {
+                self.run_sql(
+                    sql,
+                    &scope.catalogs,
+                    &self.connector_registry,
+                    self.distributed_executor.as_deref(),
+                    row_cap,
+                )
+                .await
+            }
+        }
+    }
+
+    /// The catalogs `sql` plans against for this session, shared by
+    /// [`run`](Self::run) and [`plan_for_explain`](Self::plan_for_explain) so
+    /// the two cannot disagree: the access-checked root, scoped to the
+    /// session's catalog/schema defaults, or the virtual catalogs for
+    /// `system.runtime.queries` and the metadata schemas.
+    async fn statement_scope(
+        &self,
+        session: &ClientSession,
+        sql: &str,
+    ) -> Result<StatementScope, TrinoError> {
         let (catalog, schema) = self.session_defaults(session);
         let root = self.session_root(session)?;
-        let root = root.as_ref();
+        let virtual_scope = |(cm, registry): (CatalogManager, ConnectorRegistry)| StatementScope {
+            catalogs: Arc::new(cm),
+            virtual_registry: Some(registry),
+        };
         if crate::runtime_queries::references_runtime_queries(sql) {
-            let (cm, registry) = crate::runtime_queries::runtime_catalog(&self.query_tracker, root);
-            return self.run_sql(sql, &cm, &registry, None).await;
+            return Ok(virtual_scope(crate::runtime_queries::runtime_catalog(
+                &self.query_tracker,
+                &root,
+            )));
         }
         if metadata::references_virtual_metadata(sql) {
-            let (cm, registry) = metadata::build_virtual_catalogs(root, &catalog, sql).await;
-            return self.run_sql(sql, &cm, &registry, None).await;
+            return Ok(virtual_scope(
+                metadata::build_virtual_catalogs(&root, &catalog, sql).await,
+            ));
         }
-        if catalog == root.default_catalog() && schema == root.default_schema() {
-            self.run_sql(
-                sql,
-                root,
-                &self.connector_registry,
-                self.distributed_executor.as_deref(),
-            )
-            .await
+        let catalogs = if catalog == root.default_catalog() && schema == root.default_schema() {
+            root
         } else {
-            let view = root.with_session_defaults(catalog, schema);
-            self.run_sql(
-                sql,
-                &view,
-                &self.connector_registry,
-                self.distributed_executor.as_deref(),
-            )
-            .await
-        }
+            Arc::new(root.with_session_defaults(catalog, schema))
+        };
+        Ok(StatementScope {
+            catalogs,
+            virtual_registry: None,
+        })
+    }
+
+    /// Plans `sql` as `EXPLAIN` would, without executing it: the optimized
+    /// logical plan's text (what `EXPLAIN <sql>` prints) and one estimate per
+    /// table scan, from the table provider's statistics. Plans against the
+    /// same scoped catalogs [`run`](Self::run) uses.
+    pub(crate) async fn plan_for_explain(
+        &self,
+        session: &ClientSession,
+        sql: &str,
+    ) -> Result<(String, Vec<ScanEstimate>), TrinoError> {
+        let sql = sql.trim().trim_end_matches(';').trim();
+        let scope = self.statement_scope(session, sql).await?;
+        plan_text_and_scans(sql, &scope.catalogs).await
     }
 
     async fn run_sql(
@@ -186,14 +252,16 @@ impl Engine {
         catalog_manager: &CatalogManager,
         registry: &ConnectorRegistry,
         distributed: Option<&dyn DistributedExecutor>,
+        row_cap: Option<usize>,
     ) -> Result<QueryOutput, TrinoError> {
-        let (plan, batches) = execute_query_with_limit(
+        let (plan, batches) = execute_query_capped(
             sql,
             catalog_manager,
             registry,
             distributed,
             &self.memory_pool,
             self.query_memory_limit,
+            row_cap,
         )
         .await
         .map_err(|e| TrinoError::from_arneb(&e, Some(&SourceFile::new("<query>", sql))))?;
@@ -372,7 +440,7 @@ impl Engine {
         }
         let bound = bind_placeholders(sql, params)
             .map_err(|m| TrinoError::user(0, "GENERIC_USER_ERROR", m))?;
-        Box::pin(self.run(session, &bound, depth + 1)).await
+        Box::pin(self.run(session, &bound, depth + 1, None)).await
     }
 }
 
@@ -390,4 +458,55 @@ fn schema_not_found(catalog: &str, schema: &str) -> TrinoError {
         "SCHEMA_NOT_FOUND",
         format!("Schema '{catalog}.{schema}' does not exist"),
     )
+}
+
+/// Parses, plans and optimizes `sql` over `cm`; returns the plan text and
+/// the scan estimates.
+async fn plan_text_and_scans(
+    sql: &str,
+    cm: &CatalogManager,
+) -> Result<(String, Vec<ScanEstimate>), TrinoError> {
+    let source = SourceFile::new("<query>", sql);
+    let fail = |e: arneb_common::error::ArnebError| TrinoError::from_arneb(&e, Some(&source));
+    let statement = arneb_sql_parser::parse(sql).map_err(|e| fail(e.into()))?;
+    let (plan, _) = arneb_planner::QueryPlanner::new(cm)
+        .plan_statement_with_context(&statement)
+        .await
+        .map_err(|e| fail(e.into()))?;
+    let plan = arneb_planner::LogicalOptimizer::default_rules()
+        .optimize(plan)
+        .map_err(|e| fail(e.into()))?;
+    let mut scans = Vec::new();
+    collect_scans(&plan, cm, &mut scans).await;
+    Ok((plan.to_string(), scans))
+}
+
+/// One estimate per `TableScan` under `plan` (no de-duplication).
+fn collect_scans<'a>(
+    plan: &'a arneb_planner::LogicalPlan,
+    cm: &'a CatalogManager,
+    out: &'a mut Vec<ScanEstimate>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        if let arneb_planner::LogicalPlan::TableScan { table, .. } = plan {
+            let stats = match cm.resolve_table(table).await {
+                Ok(provider) => provider.statistics(),
+                Err(_) => None,
+            };
+            let name = format!(
+                "{}.{}.{}",
+                table.catalog.as_deref().unwrap_or(cm.default_catalog()),
+                table.schema.as_deref().unwrap_or(cm.default_schema()),
+                table.table
+            );
+            out.push(ScanEstimate {
+                table: name,
+                row_count: stats.as_ref().and_then(|s| s.row_count),
+                size_bytes: stats.as_ref().and_then(|s| s.size_bytes),
+            });
+        }
+        for child in arneb_planner::plan_children(plan) {
+            collect_scans(child, cm, out).await;
+        }
+    })
 }

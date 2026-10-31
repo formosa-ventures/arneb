@@ -53,10 +53,16 @@ use crate::auth::{AuthConfigError, CredentialSource};
 use crate::handler::DistributedExecutor;
 use auth::AuthUser;
 pub use auth::{BasicAuthenticator, BasicVerdict};
-use engine::{Engine, QueryOutput};
-use error::TrinoError;
-use session::{ClientSession, HeaderFamily};
-use types::{column_json, encode_cell, materialize};
+pub(crate) use engine::{Engine, QueryOutput};
+pub(crate) use error::TrinoError;
+pub(crate) use metadata::{
+    build_virtual_catalogs, catalog_names, schema_names, table_columns, table_names, SYSTEM_CATALOG,
+};
+pub(crate) use session::ClientSession;
+use session::HeaderFamily;
+pub(crate) use statements::{parse_control, ControlStatement};
+use types::column_json;
+pub(crate) use types::{encode_cell, materialize, trino_type_of};
 
 /// Trino release whose client protocol this server mirrors. Reported in
 /// `/v1/info` as `<compat>-arneb-<version>` so clients that parse the leading
@@ -642,15 +648,15 @@ async fn submit(
 }
 
 /// A query's time limits from its session (admission-control D7).
-struct TimeLimits {
+pub(crate) struct TimeLimits {
     /// `query_max_execution_time`: from admission.
-    execution: Option<Duration>,
+    pub(crate) execution: Option<Duration>,
     /// `query_max_run_time`, else the server default: from submission.
-    run: Option<Duration>,
+    pub(crate) run: Option<Duration>,
 }
 
 impl TimeLimits {
-    fn from_session(
+    pub(crate) fn from_session(
         session: &ClientSession,
         server_default: Option<Duration>,
     ) -> Result<Self, TrinoError> {
@@ -679,7 +685,7 @@ impl TimeLimits {
         })
     }
 
-    fn exceeded(&self, property: &str) -> TrinoError {
+    pub(crate) fn exceeded(&self, property: &str) -> TrinoError {
         let limit = match property {
             "query_max_execution_time" => self.execution,
             _ => self.run,
@@ -692,7 +698,7 @@ impl TimeLimits {
     }
 
     /// Which limit fired during execution: the earlier deadline.
-    fn exceeded_during_execution(
+    pub(crate) fn exceeded_during_execution(
         &self,
         run_deadline: Option<tokio::time::Instant>,
         exec_deadline: Option<tokio::time::Instant>,
@@ -706,7 +712,7 @@ impl TimeLimits {
 }
 
 /// Await `fut` until `deadline`; `None` when the deadline passed first.
-async fn with_deadline<F: std::future::Future>(
+pub(crate) async fn with_deadline<F: std::future::Future>(
     deadline: Option<tokio::time::Instant>,
     fut: F,
 ) -> Option<F::Output> {
@@ -744,7 +750,7 @@ async fn admit(
 /// `EXECUTE IMMEDIATE` on the statement they run. Other control statements
 /// (`SHOW`, `USE`, `SET SESSION`, `PREPARE`, …) never queue; an `EXECUTE`
 /// that cannot be resolved fails in the engine, so it does not queue either.
-fn needs_admission(session: &ClientSession, sql: &str) -> bool {
+pub(crate) fn needs_admission(session: &ClientSession, sql: &str) -> bool {
     use statements::{parse_control, ControlStatement};
     let sql = sql.trim().trim_end_matches(';').trim();
     let target = match parse_control(sql) {

@@ -12,7 +12,7 @@ use arneb_protocol::agent::{
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock},
+    model::CallToolResult,
     service::{RequestContext, RoleServer},
     tool, tool_router, ErrorData,
 };
@@ -457,13 +457,10 @@ impl ArnebMcp {
         }
         .await;
         match outcome {
-            // The plan travels once, in `structuredContent`; the text block
-            // is a summary instead of a second copy of it.
-            Ok(x) => {
-                let mut result = ok(&x)?;
-                result.content = vec![ContentBlock::text(explain_summary(&x))];
-                Ok(result)
-            }
+            // Like every tool, the text block repeats the JSON: MCP clients
+            // that only show the model text content still see the plan, and
+            // the MCP page budget bounds both copies.
+            Ok(x) => ok(&x),
             Err(e) => Ok(tool_error(e)),
         }
     }
@@ -714,23 +711,6 @@ impl ArnebMcp {
                 .map(|()| serde_json::json!({"revoked": a.id})),
         )
     }
-}
-
-/// The text block of an `explain_query` result: what was planned, without
-/// the plan itself (that is `structuredContent.plan`).
-fn explain_summary(x: &Explanation) -> String {
-    let bytes = x
-        .estimated_scan_bytes
-        .map_or_else(|| "unknown".to_owned(), |b| b.to_string());
-    let tables: Vec<&str> = x.scans.iter().map(|s| s.table.as_str()).collect();
-    format!(
-        "Planned without running: {} scan(s) [{}], estimated_scan_bytes {bytes}. \
-         The {}-byte plan{} is in structuredContent.plan.",
-        x.scans.len(),
-        tables.join(", "),
-        x.plan.len(),
-        if x.plan_truncated { " (cut)" } else { "" },
-    )
 }
 
 fn via_name(via: AuthVia) -> &'static str {
@@ -1183,7 +1163,8 @@ mod tests {
         assert!(x["plan"].is_string(), "{x}");
         assert_eq!(x["plan_truncated"], false, "{x}");
         assert_eq!(f.tracker.list_queries(None).len(), before);
-        // #217 review: the plan is sent once; the text block summarizes.
+        // Text-only MCP clients see the plan too: the text block is the
+        // same JSON as `structuredContent`.
         let r = tool(
             &f,
             "alice",
@@ -1191,10 +1172,8 @@ mod tests {
             json!({"sql":"SELECT n FROM big"}),
         )
         .await;
-        let text = r["content"][0]["text"].as_str().unwrap();
-        assert!(!text.contains(x["plan"].as_str().unwrap()), "{text}");
-        assert!(text.contains("memory.default.big"), "{text}");
-        assert_eq!(r["content"].as_array().unwrap().len(), 1);
+        let text: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text, r["structuredContent"]);
         let e = tool_err(
             &f,
             "alice",

@@ -40,7 +40,7 @@ Stage H3 of the headless agent interface, built on H1 (`headless-api-auth`: iden
 | `list_tables` | `catalog, schema, prefix?, limit?` | listing body | `GET …/tables` |
 | `describe_table` | `catalog, schema, table, limit?` | describe body (`columns` at most `limit`, `truncated`) | `GET …/tables/{t}?limit=` |
 | `sample_table` | `catalog, schema, table, rows?` | statement status | `GET …/sample` |
-| `explain_query` | `sql, catalog?, schema?` | explain body (`plan` cut at `[mcp] default_page_bytes`, `plan_truncated`); the text block is a summary, not a second copy of the plan | `POST /explain` |
+| `explain_query` | `sql, catalog?, schema?` | explain body (`plan` cut at `[mcp] default_page_bytes`, `plan_truncated`) | `POST /explain` |
 | `submit_query` | `sql, catalog?, schema?, max_rows?, wait_ms?` | statement status | `POST /statements` |
 | `get_query_status` | `id, wait_ms?` | statement status | `GET /statements/{id}` |
 | `fetch_results` | `id, cursor?, max_bytes?` | result page | `GET /statements/{id}/results` |

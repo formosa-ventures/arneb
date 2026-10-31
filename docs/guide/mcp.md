@@ -127,11 +127,11 @@ Differences from the HTTP routes:
   the rows only. The status fields, the `columns` list and the text copy of
   the JSON that the MCP library adds to every result come on top, so a full
   page roughly doubles in what the agent receives.
-- **Plans are sent once.** `explain_query` cuts the plan at the same
+- **Plans fit the page budget.** `explain_query` cuts the plan at the same
   `[mcp] default_page_bytes` budget (`/api/v2/explain` keeps
-  `[agent_api] default_page_bytes`). Its plan is only in
-  `structuredContent.plan`; the text block is a one-line summary (scan
-  count, tables, estimated bytes, plan size), not a second copy.
+  `[agent_api] default_page_bytes`). Like every tool result, the text block
+  repeats the structured JSON, so clients that only pass text content to the
+  model still see the plan.
 - **Bounded history.** `list_queries` returns the newest queries first, at
   most `limit`, and sets `truncated` when more matched. Each query's `state`
   is lowercase (`queued`, `running`, `finished`, ...), unlike

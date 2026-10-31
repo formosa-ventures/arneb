@@ -14,7 +14,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aws_lc_rs::{constant_time, digest};
+use aws_lc_rs::constant_time;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
@@ -70,9 +70,7 @@ impl fmt::Debug for SessionStore {
 }
 
 fn token_digest(token: &str) -> TokenDigest {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(digest::digest(&digest::SHA256, token.as_bytes()).as_ref());
-    out
+    arneb_state::sha256(token.as_bytes())
 }
 
 impl SessionStore {

@@ -248,13 +248,16 @@ fn info_of(t: &TokenRecord) -> TokenInfo {
     }
 }
 
-fn sha256(bytes: &[u8]) -> [u8; 32] {
+/// SHA-256 of `bytes`.
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(digest::digest(&digest::SHA256, bytes).as_ref());
     out
 }
 
-pub(crate) fn now_ms() -> u64 {
+/// The current time in milliseconds since the Unix epoch (saturating; 0 if
+/// the clock is before the epoch). The clock behind every token timestamp.
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))

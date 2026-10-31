@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use arneb_state::{StateError, StateStore};
+use arneb_state::{now_ms, StateError, StateStore};
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
@@ -34,6 +34,8 @@ const MAX_TOKEN_NAME_CHARS: usize = 128;
 /// The accepted `expires_in_days` range.
 const EXPIRES_IN_DAYS: std::ops::RangeInclusive<i64> = 1..=3650;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+/// [`SESSION_TTL`] in milliseconds (8 hours: no truncation).
+const SESSION_TTL_MS: u64 = SESSION_TTL.as_secs() * 1000;
 
 /// Token issuances running PBKDF2 at once; the rest wait, so a burst cannot
 /// saturate the blocking pool.
@@ -139,13 +141,6 @@ struct SessionResponse {
     expires_ms: u64,
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 async fn create_session(
     State(state): State<WebState>,
     body: Result<Bytes, BytesRejection>,
@@ -172,7 +167,7 @@ async fn create_session(
         StatusCode::CREATED,
         Json(SessionResponse {
             token,
-            expires_ms: now_ms() + SESSION_TTL.as_millis() as u64,
+            expires_ms: now_ms().saturating_add(SESSION_TTL_MS),
         }),
     ))
 }
@@ -313,7 +308,7 @@ async fn issue_token(
     let expires_at_ms = match req.expires_in_days {
         None => None,
         Some(days) => match days.as_i64().filter(|d| EXPIRES_IN_DAYS.contains(d)) {
-            Some(days) => Some(now_ms() + days as u64 * DAY_MS),
+            Some(days) => Some(now_ms().saturating_add(days.unsigned_abs() * DAY_MS)),
             None => {
                 return Err(ApiError::new(
                     ErrorCode::InvalidArgument,

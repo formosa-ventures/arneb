@@ -768,6 +768,73 @@ pub fn fill_redacted(new: &mut CatalogConfig, stored: &CatalogConfig) {
     }
 }
 
+/// The secret fields of `spec` that are exactly `"<redacted>"` (the
+/// placeholder of [`redacted_spec`]), by name. A spec that still has one
+/// after [`fill_redacted`] would store and push the placeholder as a
+/// real secret.
+pub fn redacted_secrets(spec: &CatalogConfig) -> Vec<&'static str> {
+    let is_redacted = |v: &Option<String>| v.as_deref() == Some(REDACTED);
+    let mut found = Vec::new();
+    if spec.password.as_ref().is_some_and(|p| p.0 == REDACTED) {
+        found.push("password");
+    }
+    if let Some(url) = &spec.connection_url {
+        let userinfo = url_password_range(&url.0).is_some_and(|r| &url.0[r] == REDACTED);
+        let query = url_query_passwords(&url.0)
+            .into_iter()
+            .any(|(_, value)| &url.0[value] == REDACTED);
+        if userinfo || query {
+            found.push("connection_url password");
+        }
+    }
+    if let Some(storage) = &spec.storage {
+        if storage
+            .s3
+            .as_ref()
+            .is_some_and(|s3| is_redacted(&s3.secret_access_key))
+        {
+            found.push("storage.s3.secret_access_key");
+        }
+        if storage
+            .gcs
+            .as_ref()
+            .is_some_and(|gcs| is_redacted(&gcs.service_account_path))
+        {
+            found.push("storage.gcs.service_account_path");
+        }
+        if storage
+            .azure
+            .as_ref()
+            .is_some_and(|azure| is_redacted(&azure.access_key))
+        {
+            found.push("storage.azure.access_key");
+        }
+    }
+    found
+}
+
+/// Whether `a` and `b` send their secrets to the same places (Ruling R10):
+/// the same `connection_url` apart from its passwords (host, port,
+/// database, user, parameters), `metastore_uri`, S3 `endpoint` and
+/// `region`, and Azure `storage_account`.
+pub fn same_destination(a: &CatalogConfig, b: &CatalogConfig) -> bool {
+    fn destinations(spec: &CatalogConfig) -> serde_json::Value {
+        let redacted = redacted_spec(spec);
+        let storage = spec.storage.as_ref();
+        let s3 = storage.and_then(|s| s.s3.as_ref());
+        serde_json::json!({
+            "connection_url": redacted["connection_url"],
+            "metastore_uri": spec.metastore_uri,
+            "s3_endpoint": s3.and_then(|s| s.endpoint.as_deref()),
+            "s3_region": s3.and_then(|s| s.region.as_deref()),
+            "azure_account": storage
+                .and_then(|s| s.azure.as_ref())
+                .and_then(|a| a.storage_account.as_deref()),
+        })
+    }
+    destinations(a) == destinations(b)
+}
+
 /// The byte range of the password in `scheme://user:password@host/...`,
 /// if the URL's userinfo has one.
 fn url_password_range(url: &str) -> Option<std::ops::Range<usize>> {

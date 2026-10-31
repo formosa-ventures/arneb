@@ -38,7 +38,10 @@ use super::manage::{
 use super::privilege::Layer;
 use super::v2::{bad_body, bad_query, state_error};
 use super::WebState;
-use crate::catalogs::{fill_redacted, redacted_spec, validate_spec, BuiltCatalog, LiveCatalogs};
+use crate::catalogs::{
+    fill_redacted, redacted_secrets, redacted_spec, same_destination, validate_spec, BuiltCatalog,
+    LiveCatalogs, REDACTED,
+};
 use crate::config::CatalogConfig;
 
 /// Catalogs listed when the request names no `limit`.
@@ -229,6 +232,25 @@ fn decode_spec(
     })
 }
 
+/// Refuses a spec that still carries the `"<redacted>"` placeholder as a
+/// secret: it would be stored and pushed as the real value.
+fn no_placeholders(spec: &CatalogConfig, hint: &str) -> Result<(), ApiError> {
+    let left = redacted_secrets(spec);
+    if left.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ErrorCode::InvalidArgument,
+        format!("{} {REDACTED:?}, not a secret", left.join(", ")),
+    )
+    .with_hint(hint.to_owned()))
+}
+
+/// The hint of a placeholder that cannot be filled.
+const SEND_SECRETS: &str = "send the real secrets";
+/// The hint of a placeholder for a changed destination (Ruling R10).
+const SEND_AGAIN: &str = "send the secret again when you change where it is sent";
+
 fn validate(spec: &CatalogConfig) -> Result<(), ApiError> {
     validate_spec(spec).map_err(|e| ApiError::new(ErrorCode::InvalidArgument, e))
 }
@@ -330,6 +352,11 @@ pub(super) async fn create_catalog_for(
 ) -> Result<ManageOutcome<CatalogChange>, ApiError> {
     let grant = state.authorizer.check(who, Layer::Manage)?;
     let spec = decode_spec(spec, None)?;
+    // A "<redacted>" value is kept only by a PUT of the same catalog.
+    no_placeholders(
+        &spec,
+        &format!("{SEND_SECRETS}: a {REDACTED:?} value is kept only by a PUT of the same catalog"),
+    )?;
     validate(&spec)?;
     let (store, live) = (store(state)?, live(state)?);
     // Cheap pre-check, so a taken name never pays for a connection; the
@@ -371,9 +398,18 @@ pub(super) async fn update_catalog_for(
     let (store, live) = (store(state)?, live(state)?);
     let stored = existing_record(&store, &name)?;
     let mut spec = decode_spec(spec, Some(&name))?;
-    if let Some(stored_spec) = decode(&stored) {
-        fill_redacted(&mut spec, &stored_spec);
+    match decode(&stored) {
+        Some(stored_spec) => {
+            // Ruling R10: a kept secret is never sent somewhere new.
+            if !redacted_secrets(&spec).is_empty() && !same_destination(&spec, &stored_spec) {
+                no_placeholders(&spec, SEND_AGAIN)?;
+            }
+            fill_redacted(&mut spec, &stored_spec);
+        }
+        // Nothing to fill from.
+        None => no_placeholders(&spec, SEND_SECRETS)?,
     }
+    no_placeholders(&spec, SEND_SECRETS)?;
     validate(&spec)?;
     let built = probe(&live, &spec).await?;
     #[cfg(test)]
@@ -1339,5 +1375,133 @@ mod tests {
         assert_eq!(body["error"]["code"], "conflict");
         assert_eq!(body["error"]["hint"], "retry");
         assert_eq!(stored(&state, "pg").unwrap().spec["max_connections"], 7);
+    }
+
+    /// Important 1(a): a POST cannot store the placeholder as a secret
+    /// (an agent cloning catalog A's GET body into a create for B).
+    #[tokio::test]
+    async fn create_with_a_redacted_placeholder_is_refused() {
+        let (state, probed) = node();
+        let url = |u: &str| json!({"name": "pg", "type": "postgresql", "connection_url": u});
+        let hive = |storage: Value| json!({"name": "lake", "type": "hive", "metastore_uri": "h:9083", "storage": storage});
+        for spec in [
+            {
+                let mut s = pg_spec("pg", 1);
+                s["password"] = json!(REDACTED);
+                s
+            },
+            url("postgresql://arneb:<redacted>@127.0.0.1:1/arneb"),
+            url("postgresql://127.0.0.1:1/arneb?user=arneb&password=<redacted>"),
+            hive(json!({"s3": {"region": "r", "secret_access_key": REDACTED}})),
+            hive(json!({"gcs": {"service_account_path": REDACTED}})),
+            hive(json!({"azure": {"storage_account": "a", "access_key": REDACTED}})),
+        ] {
+            for dry_run in [true, false] {
+                let (status, body) = create(&state, spec.clone(), dry_run).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{spec}: {body}");
+                assert_eq!(body["error"]["code"], "invalid_argument");
+                assert!(
+                    body["error"]["hint"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("send the real secrets"),
+                    "{body}"
+                );
+            }
+        }
+        assert!(probed.lock().unwrap().is_empty(), "nothing was probed");
+        assert!(store_of(&state).catalogs().1.is_empty());
+        assert!(audit_json(&state).is_empty());
+    }
+
+    /// Important 1(b): a stored spec that does not decode has nothing to
+    /// fill a placeholder from.
+    #[tokio::test]
+    async fn update_of_an_undecodable_stored_spec_needs_real_secrets() {
+        let (state, _) = node();
+        store_of(&state)
+            .put_catalog(CatalogRecord {
+                name: "pg".into(),
+                spec: json!({"name": "pg", "type": 5}),
+                from_config: false,
+            })
+            .unwrap();
+        let mut spec = pg_spec("pg", 1);
+        spec["password"] = json!(REDACTED);
+        let (status, body) = update(&state, "pg", spec, false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["hint"], "send the real secrets");
+        assert_eq!(stored(&state, "pg").unwrap().spec["type"], 5);
+        let (status, body) = update(&state, "pg", pg_spec("pg", 1), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(stored(&state, "pg").unwrap().spec["password"], PG_SECRET);
+    }
+
+    /// Ruling R10: a PUT that changes where a kept secret is sent must
+    /// send it again.
+    #[tokio::test]
+    async fn put_that_changes_the_destination_needs_the_secret_again() {
+        let (state, _) = node();
+        let (status, body) = create(&state, pg_spec("pg", 5432), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, one) = get(&state, &format!("{BASE}/pg")).await;
+        let redacted = one["spec"].clone();
+
+        // Another host, password left redacted: refused.
+        let mut moved = redacted.clone();
+        moved["connection_url"] = json!("postgresql://arneb:<redacted>@evil.example:5432/arneb");
+        let (status, body) = update(&state, "pg", moved.clone(), false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_argument");
+        assert_eq!(
+            body["error"]["hint"],
+            "send the secret again when you change where it is sent"
+        );
+        // Only the top-level password redacted, URL without one: still refused.
+        let mut moved_pw = redacted.clone();
+        moved_pw["connection_url"] = json!("postgresql://arneb@evil.example:5432/arneb");
+        let (status, _) = update(&state, "pg", moved_pw, true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(stored(&state, "pg").unwrap().spec["password"], PG_SECRET);
+
+        // The same move with the real secrets: ok.
+        moved["connection_url"] = json!(format!(
+            "postgresql://arneb:{URL_SECRET}@evil.example:5432/arneb"
+        ));
+        moved["password"] = json!("new-pw-Lm55");
+        let (status, body) = update(&state, "pg", moved, false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            stored(&state, "pg").unwrap().spec["password"],
+            "new-pw-Lm55"
+        );
+
+        // Only max_connections changes, secrets redacted: ok, kept.
+        let (_, one) = get(&state, &format!("{BASE}/pg")).await;
+        let mut spec = one["spec"].clone();
+        spec["max_connections"] = json!(3);
+        let (status, body) = update(&state, "pg", spec, false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let record = stored(&state, "pg").unwrap();
+        assert_eq!(record.spec["password"], "new-pw-Lm55");
+        assert_eq!(record.spec["max_connections"], 3);
+
+        // Hive: a new metastore or S3 endpoint with a redacted S3 secret.
+        let lake = json!({"name": "lake", "type": "hive", "metastore_uri": "h:9083",
+            "storage": {"s3": {"region": "r", "endpoint": "http://s3.local",
+                               "secret_access_key": "s3-secret-Vv03"}}});
+        assert_eq!(create(&state, lake, false).await.0, StatusCode::OK);
+        let (_, one) = get(&state, &format!("{BASE}/lake")).await;
+        for (field, value) in [
+            ("/metastore_uri", json!("evil:9083")),
+            ("/storage/s3/endpoint", json!("http://evil.example")),
+        ] {
+            let mut spec = one["spec"].clone();
+            *spec.pointer_mut(field).unwrap() = value;
+            let (status, body) = update(&state, "lake", spec, true).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+        }
+        let (status, body) = update(&state, "lake", one["spec"].clone(), true).await;
+        assert_eq!(status, StatusCode::OK, "unchanged destination: {body}");
     }
 }

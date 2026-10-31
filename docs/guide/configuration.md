@@ -678,6 +678,30 @@ open so existing scrapers keep working.
   in memory and are lost on restart.
 - **Revoking a token with a malformed id is `400 invalid_argument`**, and
   the refusal is not audited.
+- **Under `[auth] type = "none"`, a Web API cancel now really stops the
+  query.** Before, cancelling a pgwire or Trino query only changed its
+  recorded state. Now any peer that can reach the Web port can stop any
+  query through `DELETE /api/v1/queries/{id}`, and `/api/v2` and MCP accept
+  a claimed `X-Arneb-User` as the query's owner. Do not expose the Web port
+  under `none`: bind it to loopback (`[web] bind_address = "127.0.0.1"`) or
+  use `[auth] type = "password"`.
+- **Under `none`, cancelling another user's query over `/api/v2` or MCP is
+  refused** with `403 manage_requires_auth` (it was allowed before). The
+  owner (the claimed `X-Arneb-User`) may still cancel it, and `/api/v1`
+  still lets any caller cancel any query.
+- **`DELETE /api/v1/queries/{id}` under password auth** follows the
+  [kill rule](/guide/http-api#cancel-any-query): cancelling another user's
+  query is audited, and the call can answer `503 audit_unavailable` (with an
+  error body and `Retry-After: 5`) while the audit log is unwritable.
+- **Hash fan-out counts only schedulable workers.** Distributed queries size
+  their hash partitions from the workers they are scheduled on, not from
+  every alive worker. A cordoned, draining or SIGTERM-draining worker no
+  longer counts, so queries use fewer partitions while one is out.
+- **`/metrics` is outside the observe layer.** A `system_information`
+  section does not hide the admission gauges, worker ids, `arneb_worker_up`
+  or heartbeat ages that `/metrics` serves. Set
+  [`metrics_auth = true`](#web-ui) (and keep the port private) if they must
+  not be public.
 
 ## State
 

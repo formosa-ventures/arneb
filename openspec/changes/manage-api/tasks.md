@@ -30,4 +30,4 @@
 
 - [x] 8.1 OpenSpec change, upgrade notes in `docs/guide/configuration.md`
 - [x] 8.2 Tier 1: `cargo fmt`, `cargo clippy --workspace --all-targets` (pinned and 1.99.0), `cargo test --workspace`
-- [ ] 8.3 Tier 2: `scripts/manage-smoke.sh` against a coordinator plus 2 workers with password auth, before and after a coordinator restart
+- [x] 8.3 Tier 2: `scripts/manage-smoke.sh` against a coordinator plus 2 workers with password auth, before and after a coordinator restart (run by the controller at aaf9751: steps 1–9, 9b and `--after-restart` 10 passed)

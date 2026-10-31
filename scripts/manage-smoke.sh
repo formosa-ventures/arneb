@@ -16,7 +16,11 @@
 #   ARNEB_USER2 / ARNEB_PASSWORD2             a user without manage, SELECT only (required)
 #   ARNEB_CATALOG         TPC-H catalog (default datalake)
 #   ARNEB_SCHEMA          TPC-H schema (default tpch)
-#   ARNEB_LONG_SQL        the long statement (default: 3-way self-join of lineitem)
+#   ARNEB_LONG_SQL        the long statement (default: 3-way self-join of lineitem).
+#                         It must run well over ~10 s on this stack: steps 4-6
+#                         expect it still running when the drain, the kill and
+#                         the second (queued) submit land. On a fast host at
+#                         SF1, pick a heavier statement.
 #   ARNEB_WORKER1 / ARNEB_WORKER2   worker ids (default worker-1 / worker-2)
 #   ARNEB_SMOKE_TIMEOUT_SECS  per-statement timeout (default 900)
 #   KEEP_CORDON=1         leave worker-1 cordoned at the end of the full run,
@@ -303,7 +307,16 @@ expect_code 200 "GET /admission"
 ORIG_RUN=$(printf '%s' "$LAST" | jq -r '.max_running_queries')
 ORIG_QUEUE=$(printf '%s' "$LAST" | jq -r '.max_queued_queries')
 check '.running_queries == 0' "queries are still running before the admission test"
-manage PUT "$API/admission" '{"max_running_queries": 1}'
+# The queue check needs a running cap of 1. If the cap is already 1, move it
+# off first so that setting it is a real change (changed == true).
+if [ "$ORIG_RUN" = 1 ]; then
+    manage PUT "$API/admission" '{"max_running_queries": 0}'
+    check '.changed == true' "moving the cap off 1 was not a change"
+fi
+# A queue of 0 would refuse the second statement instead of queuing it.
+TEST_QUEUE=$(( ORIG_QUEUE > 0 ? ORIG_QUEUE : 1 ))
+manage PUT "$API/admission" "$(jq -nc --argjson q "$TEST_QUEUE" \
+    '{max_running_queries:1, max_queued_queries:$q}')"
 check '.action == "admission.set" and .changed == true' "admission.set envelope is wrong"
 check '.result.max_running_queries == 1' "admission result does not report the new cap 1"
 submit "$LONG_SQL"

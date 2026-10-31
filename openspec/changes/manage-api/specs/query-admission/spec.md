@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Running cap with a FIFO queue
-Coordinator and standalone nodes SHALL admit at most `max_running_queries` plan-executing statements at once, across the pgwire and Trino listeners combined. A statement arriving over the cap SHALL wait in a FIFO queue of at most `max_queued_queries` entries and SHALL start when a running statement releases its slot, in arrival order. A queued statement SHALL hold no plan, memory reservation or worker task. A queued statement whose client goes away, or whose timeout expires while it waits, SHALL leave the queue without taking a slot. `max_running_queries = 0` SHALL mean unlimited. An admission controller SHALL exist whenever SQL is served, also when `max_running_queries = 0`, so the limits can change at runtime.
+Coordinator and standalone nodes SHALL admit at most `max_running_queries` plan-executing statements at once, across the pgwire and Trino listeners, the agent HTTP API and MCP combined (one shared controller). A statement arriving over the cap SHALL wait in a FIFO queue of at most `max_queued_queries` entries and SHALL start when a running statement releases its slot, in arrival order. A queued statement SHALL hold no plan, memory reservation or worker task. A queued statement whose client goes away, or whose timeout expires while it waits, SHALL leave the queue without taking a slot. `max_running_queries = 0` SHALL mean unlimited. An admission controller SHALL exist whenever SQL is served, also when `max_running_queries = 0`, so the limits can change at runtime.
 
 #### Scenario: Over the cap
 - **WHEN** `max_running_queries = 2` and four long queries are submitted at once

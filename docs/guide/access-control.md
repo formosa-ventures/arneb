@@ -114,6 +114,10 @@ Two layers sit above the query rules:
     `system_information` section. Then the user needs a rule that allows
     `read`, or the manage layer.
   - Query visibility stays on the `queries` `view` rules.
+  - `/metrics` is not part of it: the admission gauges, worker ids and
+    heartbeat ages served there ignore `system_information`. `/metrics` is
+    unauthenticated unless [`[web] metrics_auth`](/guide/configuration#web-ui)
+    is set, and then needs only valid credentials.
 - **Manage** covers actions that change system state.
   - It needs password auth. Under `none`, every manage call is refused with
     `manage_requires_auth`.
@@ -140,6 +144,12 @@ A refusal is `403 forbidden` and its `hint` names what would grant it:
 A query's owner may always cancel it. Cancelling another user's query needs
 password auth, then a `queries` rule that allows `kill` for that owner (or no
 `queries` section), or the manage layer.
+
+> **Under `[auth] type = "none"`, do not expose the Web port.** A cancel
+> really stops the query, any peer that reaches the Web port can stop any
+> query through `/api/v1`, and `/api/v2` and MCP accept a claimed
+> `X-Arneb-User` as the owner. Bind the Web UI to loopback
+> (`[web] bind_address = "127.0.0.1"`) or use password auth.
 
 `system_information` is a rules-file section, so
 `ARNEB_ACCESS_CONTROL_RULES_FILE` still decides whether rules apply at all.
@@ -188,7 +198,7 @@ The full list, with the state-file and admission changes, is in
   query the caller may neither view nor kill is `404`, any other refusal
   `403`. Under `[auth] type = "none"` the Web API has no authenticated user:
   `/api/v1` keeps its open list, detail and cancel (any caller may cancel
-  any query), while `/api/v2` and MCP refuse cancelling another user's
+  any query, and the cancel really stops it), while `/api/v2` and MCP refuse cancelling another user's
   query with `manage_requires_auth`. See
   [Cancel any query](/guide/http-api#cancel-any-query). Under password auth the Web
   API also requires credentials, and the Web UI binds to `127.0.0.1` unless

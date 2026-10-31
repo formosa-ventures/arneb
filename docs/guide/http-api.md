@@ -463,10 +463,17 @@ A query that already ended, or ends during the call, answers `200` with
 `changed: false` and a summary such as `query 0b9f… owned by bob already
 finished; nothing to cancel`.
 
-`DELETE /api/v1/queries/{id}` keeps its `204` / `403` / `404` answers and
-has no dry run. Under password auth it uses the rule above, audited the same
-way. Under `[auth] type = "none"` it is unchanged: any caller may cancel any
-query, as the Web UI always could; it now also stops the query.
+`DELETE /api/v1/queries/{id}` answers `204` / `403` / `404` and has no dry
+run. Under password auth it uses the rule above, audited the same way, so it
+can also answer `503 audit_unavailable` (with an error body and
+`Retry-After: 5`) while the audit log is unwritable. Under
+`[auth] type = "none"` any caller may cancel any query, as the Web UI always
+could, and the cancel now really stops it.
+
+Under `none`, any peer that can reach the Web port can therefore stop any
+query (`/api/v1`), and `/api/v2` and MCP accept a claimed `X-Arneb-User` as
+the owner. Do not expose the Web port under `none`: bind it to loopback or
+use password auth.
 
 ### Workers
 

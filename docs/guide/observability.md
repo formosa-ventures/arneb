@@ -9,6 +9,12 @@ The coordinator, or a standalone server, serves Prometheus metrics at
 curl -s http://127.0.0.1:6432/metrics
 ```
 
+`/metrics` is unauthenticated unless
+[`[web] metrics_auth`](/guide/configuration#web-ui) is set. It sits outside
+the [observe layer](/guide/access-control#privilege-layers): a
+`system_information` section does not hide the admission gauges, worker ids
+or heartbeat ages it serves.
+
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `arneb_queries_total` | counter | `outcome` | Statements that ended: `finished`, `failed`, or `cancelled` (cancel, `statement_timeout`, or the client left) |

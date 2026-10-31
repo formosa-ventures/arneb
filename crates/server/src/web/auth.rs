@@ -1,4 +1,4 @@
-//! Authentication for the Web port (`/api/*` and, with `[web]
+//! Authentication for the Web port (`/api/*`, `/mcp` and, with `[web]
 //! metrics_auth`, `/metrics`).
 //!
 //! Under `[auth] type = "password"`:
@@ -61,11 +61,14 @@ pub const PUBLIC_ROUTES: &[(Option<Method>, &str)] = &[
 ];
 
 /// Whether `method path` needs credentials under password auth: every
-/// `/api/` path except [`PUBLIC_ROUTES`], and `/metrics` when
-/// `metrics_auth`. The single place that decides what is public.
+/// `/api/` path except [`PUBLIC_ROUTES`], all of `/mcp`, and `/metrics`
+/// when `metrics_auth`. The single place that decides what is public.
 pub fn requires_auth(method: &Method, path: &str, metrics_auth: bool) -> bool {
     if path == "/metrics" {
         return metrics_auth;
+    }
+    if path == "/mcp" || path.starts_with("/mcp/") {
+        return true;
     }
     path.starts_with("/api/")
         && !PUBLIC_ROUTES
@@ -223,6 +226,7 @@ mod tests {
             metrics_auth,
             sessions: SessionStore::new(),
             agent: None,
+            mcp: None,
         }
     }
 

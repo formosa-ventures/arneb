@@ -5,6 +5,7 @@ mod api;
 pub mod auth;
 pub mod error;
 mod frontend;
+pub mod mcp;
 mod metrics;
 pub mod session;
 mod v2;
@@ -50,6 +51,9 @@ pub struct WebState {
     /// The agent query API service (`/api/v2` statements, discovery and
     /// explain); `None` on workers, where those routes answer `not_found`.
     pub agent: Option<arneb_protocol::agent::AgentQueryService>,
+    /// Resolved `[mcp]` settings; `Some` exactly when `/mcp` is served
+    /// (enabled, on a coordinator or standalone node).
+    pub mcp: Option<mcp::McpSettings>,
 }
 
 /// Build the axum Router with API and frontend routes.
@@ -58,10 +62,21 @@ pub struct WebState {
 /// here (including future `/api/*` nests) is covered; which paths are
 /// public is decided in one place, [`auth::requires_auth`].
 pub fn build_router(state: WebState) -> Router {
-    Router::new()
+    let router = Router::new()
         .nest("/api/v1", api::api_routes())
         .nest("/api/v2", v2::routes())
-        .route("/metrics", axum::routing::get(metrics::metrics))
+        .route("/metrics", axum::routing::get(metrics::metrics));
+    // MCP is mounted before the auth layer below, so that wraps it too.
+    let router = if state.mcp.is_some() {
+        router.nest_service("/mcp", mcp::mcp_service(state.clone()))
+    } else {
+        // Not served (disabled, or a node without SQL): a plain 404 rather
+        // than the SPA fallback's index.html.
+        router
+            .route("/mcp", axum::routing::any(mcp::not_served))
+            .route("/mcp/{*rest}", axum::routing::any(mcp::not_served))
+    };
+    router
         .fallback(frontend::static_handler)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

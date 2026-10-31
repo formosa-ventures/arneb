@@ -940,6 +940,19 @@ async fn run() -> Result<()> {
             idle_timeout_secs = config.agent_api.idle_timeout_secs,
             "agent_api effective settings ([agent_api] / ARNEB_AGENT_*)"
         );
+        tracing::info!(
+            target: "arneb::config",
+            enabled = config.mcp.enabled,
+            allowed_hosts = %config
+                .mcp
+                .allowed_hosts
+                .as_ref()
+                .map_or_else(|| "default".to_owned(), |h| {
+                    if h.iter().any(|x| x.trim() == "*") { "any".to_owned() } else { h.join(",") }
+                }),
+            default_page_bytes = config.mcp.default_page_bytes,
+            "mcp effective settings ([mcp] / ARNEB_MCP_*)"
+        );
         arneb_common::metrics::set_slow_query_threshold(
             config.observability.slow_query_threshold(),
         );
@@ -1089,6 +1102,8 @@ async fn run() -> Result<()> {
         access_rules: access_rules.clone(),
         metrics_auth: config.web.metrics_auth,
         sessions: web::SessionStore::new(),
+        mcp: (serves_clients && agent_service.is_some() && config.mcp.enabled)
+            .then(|| web::mcp::McpSettings::from(&config.mcp)),
         agent: agent_service,
     };
     let web_router = web::build_router(web_state);

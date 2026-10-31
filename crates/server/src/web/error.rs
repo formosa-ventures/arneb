@@ -145,9 +145,10 @@ impl From<AgentError> for ApiError {
     }
 }
 
+/// The `{"error": …}` body shared by the HTTP routes and MCP tool errors.
 #[derive(Serialize)]
-struct Envelope<'a> {
-    error: &'a ApiError,
+pub(crate) struct Envelope<'a> {
+    pub(crate) error: &'a ApiError,
 }
 
 impl IntoResponse for ApiError {

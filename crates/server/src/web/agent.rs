@@ -312,6 +312,7 @@ mod tests {
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent,
+            mcp: None,
         }
     }
 

@@ -64,6 +64,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub agent_api: AgentApiConfig,
 
+    /// MCP endpoint (`/mcp` on the Web port; coordinator/standalone only);
+    /// effective values after [`AppConfig::load`].
+    #[serde(default)]
+    pub mcp: McpConfig,
+
     /// Query metrics and the slow-query log (coordinator/standalone only);
     /// effective values after [`AppConfig::load`].
     #[serde(default)]
@@ -483,6 +488,86 @@ impl AgentApiConfig {
         self.limits()
             .validate()
             .map_err(|e| anyhow::anyhow!("invalid [agent_api] settings: {e}"))
+    }
+}
+
+/// `[mcp]` section: the MCP endpoint served at `/mcp` on the Web port.
+/// After [`AppConfig::load`] the fields hold the effective values (env
+/// applied, validated).
+///
+/// ```toml
+/// [mcp]
+/// enabled            = true      # ARNEB_MCP_ENABLED
+/// allowed_hosts      = ["db.internal", "db.internal:6432"]  # ARNEB_MCP_ALLOWED_HOSTS (comma-separated; "*" = any)
+/// default_page_bytes = 32768     # ARNEB_MCP_DEFAULT_PAGE_BYTES
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    /// Serve `/mcp` (coordinator and standalone).
+    pub enabled: bool,
+    /// Accepted `Host` header values (`host` or `host:port`); `["*"]`
+    /// accepts any. `None` = any host under password auth, loopback under
+    /// `[auth] type = "none"`.
+    pub allowed_hosts: Option<Vec<String>>,
+    /// Page size of tool results when the caller gives no `max_bytes`.
+    pub default_page_bytes: usize,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_hosts: None,
+            default_page_bytes: 32 * 1024,
+        }
+    }
+}
+
+impl McpConfig {
+    /// Apply the `ARNEB_MCP_*` variables (looked up through `env`) over the
+    /// file values (env > file > defaults).
+    pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+        if let Some(v) = env("ARNEB_MCP_ENABLED") {
+            self.enabled = match v.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => true,
+                "false" | "0" | "no" | "off" => false,
+                _ => bail!("invalid ARNEB_MCP_ENABLED value '{v}' (expected true or false)"),
+            };
+        }
+        if let Some(v) = env("ARNEB_MCP_ALLOWED_HOSTS") {
+            let hosts: Vec<String> = v
+                .split(',')
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_owned)
+                .collect();
+            self.allowed_hosts = (!hosts.is_empty()).then_some(hosts);
+        }
+        if let Some(v) = env("ARNEB_MCP_DEFAULT_PAGE_BYTES") {
+            self.default_page_bytes = v.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid ARNEB_MCP_DEFAULT_PAGE_BYTES value '{v}' \
+                     (expected a non-negative integer)"
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// `default_page_bytes` must be in `1..=max_page_bytes` (the agent API's
+    /// ceiling).
+    pub fn validate(&self, max_page_bytes: usize) -> std::result::Result<(), String> {
+        if self.default_page_bytes == 0 {
+            return Err("default_page_bytes must be greater than 0".into());
+        }
+        if self.default_page_bytes > max_page_bytes {
+            return Err(format!(
+                "default_page_bytes ({}) must not exceed [agent_api] max_page_bytes ({max_page_bytes})",
+                self.default_page_bytes
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1567,6 +1652,7 @@ impl AppConfig {
                         web: WebConfig::default(),
                         admission: AdmissionConfig::default(),
                         agent_api: AgentApiConfig::default(),
+                        mcp: McpConfig::default(),
                         observability: ObservabilityConfig::default(),
                         access_control: AccessControlConfig::default(),
                         state: StateConfig::default(),
@@ -1587,6 +1673,10 @@ impl AppConfig {
         admission.apply_env(|k| std::env::var(k).ok())?;
         let mut agent_api = config.agent_api;
         agent_api.apply_env(|k| std::env::var(k).ok())?;
+        let mut mcp = config.mcp;
+        mcp.apply_env(|k| std::env::var(k).ok())?;
+        mcp.validate(agent_api.max_page_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid [mcp] settings: {e}"))?;
         let mut observability = config.observability;
         observability.apply_env(|k| std::env::var(k).ok())?;
         let mut cluster = config.cluster;
@@ -1615,6 +1705,7 @@ impl AppConfig {
             web,
             admission,
             agent_api,
+            mcp,
             observability,
             access_control,
             state,
@@ -1959,6 +2050,71 @@ pgwire = "required"
             .unwrap_err()
             .to_string();
         assert!(err.contains("ARNEB_AGENT_MAX_WAIT_MS"), "{err}");
+    }
+
+    /// `[mcp]` with env overrides applied the way `load` does.
+    fn mcp(toml_text: &str, env: &[(&str, &str)]) -> Result<McpConfig> {
+        let config = toml::from_str::<AppConfig>(toml_text)?;
+        let mut c = config.mcp;
+        c.apply_env(env_from(env))?;
+        c.validate(config.agent_api.max_page_bytes)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(c)
+    }
+
+    #[test]
+    fn mcp_defaults() {
+        let c = mcp("port = 5432", &[]).unwrap();
+        assert_eq!(
+            c,
+            McpConfig {
+                enabled: true,
+                allowed_hosts: None,
+                default_page_bytes: 32768
+            }
+        );
+        let c = mcp("[mcp]\nenabled = false\nallowed_hosts = [\"a\"]\n", &[]).unwrap();
+        assert!(!c.enabled);
+        assert_eq!(c.allowed_hosts, Some(vec!["a".to_owned()]));
+    }
+
+    #[test]
+    fn mcp_env_overrides_file() {
+        let file = "[mcp]\nenabled = true\nallowed_hosts = [\"file.example\"]\ndefault_page_bytes = 1000\n";
+        let c = mcp(
+            file,
+            &[
+                ("ARNEB_MCP_ENABLED", "false"),
+                ("ARNEB_MCP_ALLOWED_HOSTS", "a.example, b.example:8443"),
+                ("ARNEB_MCP_DEFAULT_PAGE_BYTES", "4096"),
+            ],
+        )
+        .unwrap();
+        assert!(!c.enabled);
+        assert_eq!(
+            c.allowed_hosts,
+            Some(vec!["a.example".to_owned(), "b.example:8443".to_owned()])
+        );
+        assert_eq!(c.default_page_bytes, 4096);
+        let c = mcp(file, &[("ARNEB_MCP_ALLOWED_HOSTS", "*")]).unwrap();
+        assert_eq!(c.allowed_hosts, Some(vec!["*".to_owned()]));
+        assert!(mcp(file, &[("ARNEB_MCP_ENABLED", "maybe")]).is_err());
+    }
+
+    #[test]
+    fn mcp_validation_and_unknown_keys() {
+        let err = mcp("[mcp]\ndefault_page_bytes = 0\n", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("default_page_bytes"), "{err}");
+        let err = mcp(
+            "[agent_api]\nmax_page_bytes = 100000\ndefault_page_bytes = 1000\n[mcp]\ndefault_page_bytes = 200000\n",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max_page_bytes"), "{err}");
+        assert!(toml::from_str::<AppConfig>("[mcp]\nbogus = 1\n").is_err());
     }
 
     #[test]

@@ -127,6 +127,7 @@ mod tests {
             basic: None,
             sessions: crate::web::SessionStore::new(),
             agent: None,
+            mcp: None,
         };
         let text = render(&gauges(&state));
         for line in [

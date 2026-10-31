@@ -199,7 +199,7 @@ Only the submitting user can poll, fetch or cancel a statement.
 | `GET /api/v2/catalogs/{c}/schemas` | List schemas. |
 | `GET /api/v2/catalogs/{c}/schemas/{s}/tables` | List tables. |
 | `GET /api/v2/catalogs/{c}/schemas/{s}/tables/{t}?limit=` | Columns (with Trino types) and statistics. |
-| `GET /api/v2/catalogs/{c}/schemas/{s}/tables/{t}/sample?rows=` | Sample rows, as a statement status (default 10, at most 100). |
+| `GET /api/v2/catalogs/{c}/schemas/{s}/tables/{t}/sample?rows=` | Sample rows, as a statement status (default 10, at most 100; never more than the server's `max_rows`). |
 | `POST /api/v2/explain` | Plan a query without running it. |
 | `POST /api/v2/statements` | Submit a statement. `201` with a `Location` header. |
 | `GET /api/v2/statements/{id}?wait_ms=` | Poll a statement. |
@@ -234,11 +234,13 @@ The reply is a status:
 {"id":"…","state":"finished","queue_position":null,"elapsed_ms":41,
  "update_type":null,
  "columns":[{"name":"l_orderkey","type":"bigint"},{"name":"l_quantity","type":"bigint"}],
- "total_rows":2,"truncated":false,"max_rows":100,
+ "total_rows":2,"truncated":false,"truncated_by":null,"max_rows":100,
  "first_page":{"rows":[[1,17],[2,36]],"…":"…"},"error":null}
 ```
 
-`state` is `queued`, `running`, `finished`, `failed` or `cancelled`. A
+`state` is `queued`, `running`, `finished`, `failed` or `cancelled`.
+`queue_position` is the statement's current place in the admission queue
+(1 = next), read at each poll, and `null` unless it is queued. A
 statement that finishes inside `wait_ms` carries its first page inline;
 otherwise poll with `GET /statements/{id}?wait_ms=` (long-poll) until it is
 terminal, then fetch pages with `GET /statements/{id}/results?cursor=N`,
@@ -273,8 +275,10 @@ so; `scans` keeps one entry per table scan.
 
 Every response that returns data is bounded by rows and by bytes. When
 something is cut, the response says so (`truncated`) and gives the full
-count when it is known. A statement keeps at most `max_rows` rows. Cells longer than `max_cell_bytes` are
-truncated. A page holds as many rows as fit in `max_bytes`, but always at
+count when it is known. A statement keeps at most `max_rows` rows. A cell longer than `max_cell_bytes`
+is cut on a character boundary and ends with `…`, and the page counts it in
+`truncated_cells`. A string is measured as its UTF-8 text (JSON quoting and
+escapes do not count); any other value is measured as its JSON. A page holds as many rows as fit in `max_bytes`, but always at
 least one, so a single wide row can make a page larger than `max_bytes`
 (each of its cells is still capped at `max_cell_bytes`).
 
@@ -288,9 +292,25 @@ is `true`. To count a large result, run `SELECT count(*)`. Aggregations,
 joins and sorts still read all their input; only the rows they emit are
 capped.
 
+Retained rows are also bounded by memory: a statement keeps at most
+`max_retained_bytes` of Arrow data, and all statements together at most
+`max_total_retained_bytes`. Rows past either are dropped as they are kept;
+the statement still finishes, with `truncated: true` and `total_rows: null`.
+`truncated_by` says which limit cut the result, so an agent can react:
+
+| `truncated_by` | Cause | What to do |
+|---|---|---|
+| `max_rows` | More than `max_rows` rows. | Add `LIMIT`, a filter or an aggregate, or raise `max_rows`. |
+| `max_retained_bytes` | The kept rows reached the per-statement byte limit. | Select fewer or narrower columns. |
+| `server_budget` | Retained results across the server hit the global budget. | Retry later; results free up as statements are evicted or reaped. |
+| `null` | Nothing was cut. | |
+
 A request value above its ceiling is refused with `invalid_argument` and a
 hint naming the ceiling; it is never silently clamped. That includes
-`wait_ms`, `max_rows`, `max_bytes`, `rows` and `limit`. A malformed JSON body or
+`wait_ms`, `max_rows`, `max_bytes`, `rows` and `limit`. The one server-side cap is the
+sample: `rows` (or its default of 10) is lowered to the server's `max_rows`
+when that is smaller, so a small configured ceiling shortens a sample instead
+of failing it. A malformed JSON body or
 query parameter is also `invalid_argument`.
 
 | `[agent_api]` field | Env var | Default |
@@ -300,6 +320,8 @@ query parameter is also `invalid_argument`.
 | `default_page_bytes` | `ARNEB_AGENT_DEFAULT_PAGE_BYTES` | 262144 |
 | `max_page_bytes` | `ARNEB_AGENT_MAX_PAGE_BYTES` | 4194304 |
 | `max_cell_bytes` | `ARNEB_AGENT_MAX_CELL_BYTES` | 8192 |
+| `max_retained_bytes` | `ARNEB_AGENT_MAX_RETAINED_BYTES` | 67108864 (64 MiB) |
+| `max_total_retained_bytes` | `ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES` | 1073741824 (1 GiB) |
 | `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 |
 | `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 |
 
@@ -310,7 +332,9 @@ from then on answers `not_found`. So an unfetched finished result can be
 lost once the user submits 32 newer statements. When every held statement
 is still queued or running, the submission is refused with `overloaded`.
 After `idle_timeout_secs` with no request for a statement, a finished one
-is dropped and a running one is cancelled as abandoned.
+is dropped and a running one is cancelled as abandoned. A statement with a
+request long-polling it is never idle, and `idle_timeout_secs` must be at
+least twice `max_wait_ms`.
 
 ### Querying errors
 

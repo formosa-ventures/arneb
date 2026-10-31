@@ -23,7 +23,7 @@ The coordinator (or standalone server) SHALL serve `GET /api/v2/catalogs`, `GET 
 - **THEN** the first 10 columns are returned and `truncated` is true, and `limit` above `max_rows` is refused with `invalid_argument`
 
 ### Requirement: Table sample
-`GET .../tables/{t}/sample?rows=n` SHALL run `SELECT * FROM "c"."s"."t" LIMIT n` as the caller's statement, waiting up to `max_wait_ms`, and return its statement status. `rows` SHALL default to 10; a value above 100 SHALL be refused with `invalid_argument`.
+`GET .../tables/{t}/sample?rows=n` SHALL run `SELECT * FROM "c"."s"."t" LIMIT n` as the caller's statement, waiting up to `max_wait_ms`, and return its statement status. `rows` SHALL default to 10; a value above 100 SHALL be refused with `invalid_argument`. The row count SHALL then be lowered to the server's `max_rows` when that is smaller, and the sample SHALL NOT fail because of a limit the caller did not send.
 
 #### Scenario: Sample nation
 - **WHEN** alice samples `nation` with `rows=5`

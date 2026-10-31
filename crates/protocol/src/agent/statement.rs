@@ -9,10 +9,11 @@ use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
 use arneb_common::identifiers::QueryId;
+use arneb_scheduler::QueueTicket;
 
 use super::error::{AgentError, AgentErrorCode};
 use super::limits::AgentLimits;
-use super::results::{page, ResultPage, Retained};
+use super::results::{page, ResultPage, Retained, TruncatedBy};
 
 /// Body of a statement submission.
 #[derive(Debug, Clone, Deserialize)]
@@ -70,7 +71,8 @@ pub struct StatementStatus {
     pub id: String,
     /// Lifecycle state.
     pub state: StatementState,
-    /// Position in the admission queue when the statement was queued.
+    /// Current position in the admission queue (1 = next), read live at
+    /// status time; `None` unless the statement is waiting for admission.
     pub queue_position: Option<usize>,
     /// Time since submission (until completion, once terminal).
     pub elapsed_ms: u64,
@@ -83,6 +85,9 @@ pub struct StatementStatus {
     pub total_rows: Option<u64>,
     /// Whether rows beyond the retained ones were dropped.
     pub truncated: bool,
+    /// Why rows were dropped, when `truncated`: `max_rows`,
+    /// `max_retained_bytes` or `server_budget`.
+    pub truncated_by: Option<TruncatedBy>,
     /// Rows kept for the client at most (the request's `max_rows`).
     pub max_rows: usize,
     /// The first page of rows, once finished.
@@ -99,8 +104,8 @@ pub(crate) struct FinishedOutput {
 }
 
 pub(crate) enum Phase {
-    /// Waiting for admission; the position once it has been queued.
-    Queued(Option<usize>),
+    /// Waiting for admission; its queue ticket once it has been queued.
+    Queued(Option<QueueTicket>),
     Running,
     Finished(FinishedOutput),
     Failed(AgentError),
@@ -123,6 +128,8 @@ pub(crate) struct Inner {
     pub(crate) phase: Phase,
     pub(crate) last_access: Instant,
     pub(crate) ended: Option<Instant>,
+    /// Requests currently long-polling the statement.
+    pub(crate) waiters: usize,
 }
 
 /// A statement the service tracks between requests.
@@ -154,6 +161,7 @@ impl Statement {
                 phase: Phase::Queued(None),
                 last_access: now,
                 ended: None,
+                waiters: 0,
             }),
             done: watch::channel(false).0,
             abort: Mutex::new(None),
@@ -168,9 +176,22 @@ impl Statement {
         self.lock().phase.state().is_terminal()
     }
 
-    /// Time since the last client request.
+    /// Time since the last client request; zero while a request is
+    /// waiting on the statement.
     pub(crate) fn idle(&self) -> std::time::Duration {
-        self.lock().last_access.elapsed()
+        let inner = self.lock();
+        if inner.waiters > 0 {
+            return std::time::Duration::ZERO;
+        }
+        inner.last_access.elapsed()
+    }
+
+    /// Marks a request as waiting on the statement until the guard drops,
+    /// which also touches it. The reaper never sees a waited-on statement
+    /// as idle.
+    pub(crate) fn attach_waiter(&self) -> WaiterGuard<'_> {
+        self.lock().waiters += 1;
+        WaiterGuard { statement: self }
     }
 
     /// Records a client request against the statement.
@@ -211,19 +232,23 @@ impl Statement {
                 columns: None,
                 total_rows: None,
                 truncated: false,
+                truncated_by: None,
                 max_rows: self.max_rows,
                 first_page: None,
                 error: None,
             };
             let mut retained = None;
             match &inner.phase {
-                Phase::Queued(position) => status.queue_position = *position,
+                Phase::Queued(ticket) => {
+                    status.queue_position = ticket.as_ref().and_then(QueueTicket::position)
+                }
                 Phase::Running => {}
                 Phase::Finished(output) => {
                     status.update_type = output.update_type.clone();
                     status.columns = output.columns.clone();
                     status.total_rows = output.retained.total_rows;
-                    status.truncated = output.retained.truncated;
+                    status.truncated = output.retained.truncated();
+                    status.truncated_by = output.retained.truncated_by;
                     retained = Some(output.retained.clone());
                 }
                 Phase::Failed(err) | Phase::Cancelled(err) => status.error = Some(err.clone()),
@@ -233,6 +258,19 @@ impl Statement {
         status.first_page =
             retained.map(|r| page(&r, 0, limits.default_page_bytes, limits.max_cell_bytes));
         status
+    }
+}
+
+/// A request waiting on a statement; see [`Statement::attach_waiter`].
+pub(crate) struct WaiterGuard<'a> {
+    statement: &'a Statement,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.statement.lock();
+        inner.waiters = inner.waiters.saturating_sub(1);
+        inner.last_access = Instant::now();
     }
 }
 

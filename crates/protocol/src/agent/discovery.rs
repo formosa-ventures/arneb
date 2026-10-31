@@ -3,11 +3,12 @@
 //! come from the same access-scoped view `SHOW` uses, so an object the user
 //! may not see answers exactly like one that does not exist.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use arneb_catalog::CatalogManager;
+use arneb_catalog::{CatalogManager, TableProvider};
 use arneb_common::suggest::nearest;
 use arneb_common::TableReference;
 
@@ -230,36 +231,25 @@ impl AgentQueryService {
     ) -> Result<TableDescription, AgentError> {
         let limit = self.limit(limit)?;
         let root = self.scoped_root(user)?;
-        let visible = tables_of(&root, catalog, schema).await?;
-        let missing = || table_missing(catalog, schema, table, &visible);
-        if !visible.iter().any(|t| t == table) {
-            return Err(missing());
-        }
         // Virtual tables resolve against per-query metadata catalogs, as
         // SHOW COLUMNS does; they have no statistics.
-        let is_virtual = schema == "information_schema" || catalog == SYSTEM_CATALOG;
-        let columns = if is_virtual {
+        let (columns, statistics) = if is_virtual(catalog, schema) {
+            let visible = tables_of(&root, catalog, schema).await?;
+            let missing = || table_missing(catalog, schema, table, &visible);
+            if !visible.iter().any(|t| t == table) {
+                return Err(missing());
+            }
             let probe = format!("{catalog}.information_schema.columns system.jdbc");
             let (cm, _) = build_virtual_catalogs(&root, catalog, &probe).await;
-            table_columns(&cm, catalog, schema, table).await
+            let columns = table_columns(&cm, catalog, schema, table)
+                .await
+                .ok_or_else(missing)?;
+            (columns, None)
         } else {
-            table_columns(&root, catalog, schema, table).await
-        }
-        .ok_or_else(missing)?;
+            let provider = resolve_visible(&root, catalog, schema, table).await?;
+            (provider.schema(), provider.statistics())
+        };
         let truncated = columns.len() > limit;
-        let reference = TableReference {
-            catalog: Some(catalog.to_string()),
-            schema: Some(schema.to_string()),
-            table: table.to_string(),
-        };
-        let statistics = if is_virtual {
-            None
-        } else {
-            match root.resolve_table(&reference).await {
-                Ok(provider) => provider.statistics(),
-                Err(_) => None,
-            }
-        };
         Ok(TableDescription {
             catalog: catalog.to_string(),
             schema: schema.to_string(),
@@ -282,7 +272,9 @@ impl AgentQueryService {
     }
 
     /// Up to `rows` (default 10, at most 100) rows of a table, run as a
-    /// tracked statement and waited for up to `max_wait`.
+    /// tracked statement and waited for up to `max_wait`. The row count is
+    /// further capped at the server's `max_rows`, so a small configured
+    /// ceiling shortens the sample instead of failing it.
     pub async fn sample(
         &self,
         user: &str,
@@ -291,7 +283,7 @@ impl AgentQueryService {
         table: &str,
         rows: Option<usize>,
     ) -> Result<StatementStatus, AgentError> {
-        let rows = match rows {
+        let requested = match rows {
             None => DEFAULT_SAMPLE_ROWS,
             Some(n) if (1..=MAX_SAMPLE_ROWS).contains(&n) => n,
             Some(n) => {
@@ -302,10 +294,15 @@ impl AgentQueryService {
                 .with_hint(format!("rows must be in 1..={MAX_SAMPLE_ROWS}")))
             }
         };
+        let rows = requested.min(self.limits.max_rows);
         let root = self.scoped_root(user)?;
-        let visible = tables_of(&root, catalog, schema).await?;
-        if !visible.iter().any(|t| t == table) {
-            return Err(table_missing(catalog, schema, table, &visible));
+        if is_virtual(catalog, schema) {
+            let visible = tables_of(&root, catalog, schema).await?;
+            if !visible.iter().any(|t| t == table) {
+                return Err(table_missing(catalog, schema, table, &visible));
+            }
+        } else {
+            resolve_visible(&root, catalog, schema, table).await?;
         }
         let sql = format!(
             "SELECT * FROM {}.{}.{} LIMIT {rows}",
@@ -326,6 +323,37 @@ impl AgentQueryService {
         )
         .await
     }
+}
+
+/// Whether `catalog.schema` is one of the virtual metadata schemas.
+fn is_virtual(catalog: &str, schema: &str) -> bool {
+    schema == "information_schema" || catalog == SYSTEM_CATALOG
+}
+
+/// The provider of a real table the root's user may see, resolved directly.
+/// Only on a miss are the schemas and tables listed, to build the not-found
+/// error (at the right level, with candidates) exactly as a listing would.
+async fn resolve_visible(
+    root: &CatalogManager,
+    catalog: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Arc<dyn TableProvider>, AgentError> {
+    if root.catalog_visible(catalog)
+        && root.schema_visible(catalog, schema)
+        && root.table_visible(catalog, schema, table)
+    {
+        let reference = TableReference {
+            catalog: Some(catalog.to_string()),
+            schema: Some(schema.to_string()),
+            table: table.to_string(),
+        };
+        if let Ok(provider) = root.resolve_table(&reference).await {
+            return Ok(provider);
+        }
+    }
+    let visible = tables_of(root, catalog, schema).await?;
+    Err(table_missing(catalog, schema, table, &visible))
 }
 
 /// Visible schemas of `catalog`, or catalog_not_found.
@@ -445,6 +473,11 @@ mod tests {
 
     /// `memory.default`: lineitem (10 rows), orders, `we"ird`, t01..t25.
     fn service(rules: Option<&str>) -> AgentQueryService {
+        service_limited(rules, AgentLimits::default())
+    }
+
+    /// [`service`] under `limits`.
+    fn service_limited(rules: Option<&str>, limits: AgentLimits) -> AgentQueryService {
         let schema = Arc::new(MemorySchema::new());
         schema.register_table("lineitem", int_table(10));
         schema.register_table("orders", int_table(3));
@@ -469,7 +502,7 @@ mod tests {
             Arc::new(cm),
             Arc::new(registry),
             Arc::new(QueryTracker::new()),
-            AgentLimits::default(),
+            limits,
         );
         match rules {
             Some(r) => svc.with_access_rules(Some(Arc::new(AccessRules::from_json(r).unwrap()))),
@@ -626,6 +659,65 @@ mod tests {
         assert_eq!(d.statistics.size_bytes, Some(1024));
     }
 
+    /// A schema `s` with table `stat` that counts its listings.
+    #[derive(Debug)]
+    struct CountingSchema(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl SchemaProvider for CountingSchema {
+        async fn table_names(&self) -> Vec<String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec!["stat".into()]
+        }
+        async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+            StatsSchema.table(name).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingCatalog(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl CatalogProvider for CountingCatalog {
+        async fn schema_names(&self) -> Vec<String> {
+            vec!["s".into()]
+        }
+        async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+            (name == "s")
+                .then(|| Arc::new(CountingSchema(Arc::clone(&self.0))) as Arc<dyn SchemaProvider>)
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_and_sample_resolve_without_listing() {
+        let listings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cm = CatalogManager::new("counted", "s");
+        cm.register_catalog("counted", Arc::new(CountingCatalog(Arc::clone(&listings))));
+        let svc = AgentQueryService::new(
+            Arc::new(cm),
+            Arc::new(ConnectorRegistry::new()),
+            Arc::new(QueryTracker::new()),
+            AgentLimits::default(),
+        );
+        let d = svc
+            .describe_table("alice", "counted", "s", "stat")
+            .await
+            .unwrap();
+        assert_eq!(d.statistics.row_count, Some(42));
+        // The sample statement itself may fail (no connector); only the
+        // existence check matters here.
+        let _ = svc.sample("alice", "counted", "s", "stat", Some(1)).await;
+        let count = || listings.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(count(), 0, "a hit must not list the schema");
+        let err = svc
+            .describe_table("alice", "counted", "s", "stta")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound);
+        assert_eq!(err.candidates, vec!["stat".to_string()]);
+        assert_eq!(count(), 1, "a miss lists once for the candidates");
+    }
+
     #[tokio::test]
     async fn describe_bounds_columns_by_limit() {
         let infos: Vec<ColumnInfo> = (0..30)
@@ -728,6 +820,33 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
+    }
+
+    #[tokio::test]
+    async fn sample_is_capped_at_a_small_server_max_rows() {
+        let limits = AgentLimits {
+            default_max_rows: 5,
+            max_rows: 5,
+            ..AgentLimits::default()
+        };
+        limits.validate().unwrap();
+        let svc = service_limited(None, limits);
+        for rows in [None, Some(3), Some(50)] {
+            let s = svc
+                .sample("alice", "memory", "default", "lineitem", rows)
+                .await
+                .unwrap();
+            assert_eq!(s.state, StatementState::Finished, "{rows:?}: {:?}", s.error);
+            let want = rows.unwrap_or(10).min(5);
+            assert_eq!(s.first_page.unwrap().rows.len(), want, "{rows:?}");
+            assert_eq!(s.max_rows, want);
+        }
+        // The caller's own ceiling still applies.
+        let err = svc
+            .sample("alice", "memory", "default", "lineitem", Some(101))
+            .await
+            .unwrap_err();
+        assert!(err.hint.unwrap().contains("rows must be"));
     }
 
     #[tokio::test]

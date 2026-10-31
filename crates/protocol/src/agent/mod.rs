@@ -15,6 +15,6 @@ pub use discovery::{ColumnDescription, ListRequest, Listing, Named, TableDescrip
 pub use error::{AgentError, AgentErrorCode, SqlLocation};
 pub use explain::{ExplainRequest, Explanation, ScanEstimate};
 pub use limits::AgentLimits;
-pub use results::ResultPage;
+pub use results::{ResultPage, TruncatedBy};
 pub use service::AgentQueryService;
 pub use statement::{Column, StatementState, StatementStatus, SubmitRequest};

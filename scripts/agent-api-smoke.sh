@@ -157,10 +157,12 @@ submit "SELECT * FROM nation" 100
 wait_terminal
 check '.state == "finished"' "SELECT * FROM nation did not finish"
 check '.truncated == false and .total_rows == 25' "nation is not 25 untruncated rows"
+check '.truncated_by == null' "truncated_by is set for an untruncated result"
 submit "SELECT * FROM lineitem" 100
 wait_terminal
 check '.state == "finished"' "SELECT * did not finish"
 check '.truncated == true' "not truncated"
+check '.truncated_by == "max_rows"' "truncated_by is not max_rows"
 check '.total_rows == null' "total_rows is not null for a truncated result"
 ELAPSED=$(printf '%s' "$LAST" | jq -r '.elapsed_ms')
 ROWS=0

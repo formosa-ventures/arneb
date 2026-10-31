@@ -151,6 +151,8 @@ impl ArnebMcp {
     }
 
     /// `status` with its inline `first_page` re-paged to the MCP budget.
+    /// A cancel that lands between status and results surfaces as an error result;
+    /// that outcome is acceptable and not swallowed.
     fn repage(
         &self,
         svc: &AgentQueryService,
@@ -299,9 +301,11 @@ impl ArnebMcp {
         let who = identity(&ctx)?;
         respond(
             async {
-                Ok(service(&self.state)?
+                let svc = service(&self.state)?;
+                let status = svc
                     .sample(&who.user, &a.catalog, &a.schema, &a.table, a.rows)
-                    .await?)
+                    .await?;
+                Ok(self.repage(svc, &who.user, status)?)
             }
             .await,
         )
@@ -537,6 +541,10 @@ mod tests {
     }
 
     fn fixture(hang: bool) -> Fixture {
+        fixture_with(hang, 32768)
+    }
+
+    fn fixture_with(hang: bool, page_bytes: usize) -> Fixture {
         let tracker = Arc::new(arneb_scheduler::QueryTracker::new());
         let (cm, registry) = engine_state();
         let mut agent =
@@ -562,7 +570,7 @@ mod tests {
             agent: Some(agent),
             mcp: Some(McpSettings {
                 allowed_hosts: None,
-                default_page_bytes: 32768,
+                default_page_bytes: page_bytes,
             }),
         };
         Fixture {
@@ -571,8 +579,8 @@ mod tests {
         }
     }
 
-    /// A `tools/call` as `user`; the whole JSON-RPC `result`.
-    async fn tool(f: &Fixture, user: &str, name: &str, args: Value) -> Value {
+    /// A `tools/call` as `user`; the whole JSON-RPC response.
+    async fn tool_raw(f: &Fixture, user: &str, name: &str, args: Value) -> Value {
         let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
                           "params":{"name":name,"arguments":args}});
         let req = axum::http::Request::builder()
@@ -590,7 +598,12 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A `tools/call` as `user`; the JSON-RPC `result`.
+    async fn tool(f: &Fixture, user: &str, name: &str, args: Value) -> Value {
+        let v = tool_raw(f, user, name, args).await;
         assert!(v["error"].is_null(), "JSON-RPC error: {v}");
         v["result"].clone()
     }
@@ -649,7 +662,7 @@ mod tests {
             let via_tool = tool_ok(&f, "alice", name, args).await;
             assert_eq!(via_tool, api_get(&f, "alice", path).await, "{name}");
         }
-        // sample_table is whatever GET .../sample returns.
+        // sample_table is GET .../sample with its first page at the MCP budget.
         let s = tool_ok(
             &f,
             "alice",
@@ -848,5 +861,35 @@ mod tests {
         )
         .await;
         assert_eq!(e["code"], "column_not_found");
+    }
+
+    #[tokio::test]
+    async fn sample_table_first_page_is_mcp_budget() {
+        let f = fixture_with(false, 2048);
+        let s = tool_ok(
+            &f,
+            "alice",
+            "sample_table",
+            json!({"catalog":"memory","schema":"default","table":"big","rows":100}),
+        )
+        .await;
+        let page = &s["first_page"];
+        let rows = page["rows"].as_array().unwrap();
+        let bytes = serde_json::to_string(&page["rows"]).unwrap().len();
+        assert!(bytes <= 2048 + 120, "{bytes} bytes");
+        assert!(rows.len() < 100, "{} rows", rows.len());
+        assert!(page["next_cursor"].as_u64().is_some(), "{page}");
+    }
+
+    #[tokio::test]
+    async fn missing_argument_is_a_tool_error_naming_it() {
+        // rmcp reports unparsable arguments as an `isError` text result,
+        // not a JSON-RPC error.
+        let f = fixture(false);
+        let v = tool_raw(&f, "alice", "get_query_status", json!({})).await;
+        assert!(v["error"].is_null(), "{v}");
+        assert_eq!(v["result"]["isError"], json!(true), "{v}");
+        let text = v["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("`id`"), "{v}");
     }
 }

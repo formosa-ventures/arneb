@@ -122,6 +122,7 @@ mod tests {
             memory_limit_bytes: Some(1 << 20),
             credentials: None,
             state: None,
+            audit: crate::web::test_audit_log(),
             access_rules: None,
             authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), false),
             metrics_auth: false,

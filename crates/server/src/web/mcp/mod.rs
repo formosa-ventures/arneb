@@ -246,6 +246,7 @@ mod tests {
                 .map(|c| arneb_protocol::BasicAuthenticator::new(c).unwrap()),
             credentials,
             state: password.then_some(store),
+            audit: crate::web::test_audit_log(),
             access_rules: None,
             authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), password),
             metrics_auth: false,

@@ -143,6 +143,7 @@ password auth without `[tls]` is a startup error; disable the listener with
 | `invalid_argument` | 400 (405 for a wrong method) | A malformed request. |
 | `auth_disabled` | 409 | The route needs `[auth] type = "password"`. |
 | `overloaded` | 503 | Too many pending password checks or sessions; retry (`Retry-After: 1`). |
+| `audit_unavailable` | 503 | The [audit log](#audit-log) cannot be written, so audited actions are refused; retry (`Retry-After: 5`). |
 | `internal` | 500 | An unexpected failure; the server log has the detail. |
 
 The [querying](#querying) routes add the codes in
@@ -170,6 +171,7 @@ All `/api/v2` routes need credentials, except `health` and `POST /sessions`.
 | `GET /api/v2/cluster` | Cluster overview. |
 | `GET /api/v2/cluster/workers` | Workers and their state. |
 | `GET /api/v2/info` | Server version and role. |
+| `GET /api/v2/audit` | The [audit log](#audit-log), newest first. |
 
 The [querying](#querying) routes (`catalogs`, `explain`, `statements`) are
 listed in their own section.
@@ -392,6 +394,59 @@ curl -s -H "$H" "$B/statements/0b9f…/results?cursor=0&max_bytes=65536"
 # Changed your mind
 curl -s -H "$H" -X DELETE "$B/statements/0b9f…"
 ```
+
+## Managing
+
+### Audit log
+
+Under `[auth] type = "password"`, these actions are recorded in a durable
+audit log, each entry synced to disk before the response returns:
+
+- issuing and revoking API tokens (`token.issue`, `token.revoke`), whether
+  they succeed or fail;
+- the manage actions, except dry runs.
+
+A refused request (no credentials, no privilege, a malformed body) is not
+recorded. Retention is set by [`[audit]`](/guide/configuration#audit-log).
+
+```bash
+curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
+```
+
+```json
+{"entries":[
+  {"seq":42,"time_ms":1767000000000,"user":"alice","via":"basic",
+   "action":"token.issue","target":"0123456789abcdef",
+   "parameters":{"name":"ci","expires_ms":null},"outcome":"ok"},
+  {"seq":40,"time_ms":1766990000000,"user":"bob","via":"token",
+   "action":"token.issue","target":"",
+   "parameters":{"name":null,"expires_ms":null},"outcome":{"error":"invalid_argument"}}],
+ "next_cursor":40,"truncated":true,"persistent":true,"writable":true}
+```
+
+- `seq` increases by one per entry, across restarts. `time_ms` is
+  milliseconds since the Unix epoch.
+- `via` is how the user authenticated: `token`, `session` or `basic`.
+- `target` names what the action acted on. A token is named by its 16-hex
+  id only; the token itself is never recorded.
+- `outcome` is `"ok"`, or `{"error": "<code>"}` with the
+  [error code](#errors) the call returned.
+- `persistent` is `false` when the log is in memory (no `[state] path`), and
+  `writable` is `false` while audited actions are refused with
+  `audit_unavailable`.
+
+Parameters, all optional:
+
+| Parameter | Meaning |
+|---|---|
+| `limit` | Most entries to return; default `50`, at most `500`. A larger value is `invalid_argument`. |
+| `cursor` | The previous page's `next_cursor`: continue with older entries. |
+| `user` | Only this user's entries (exact match). |
+| `action` | Only this action's entries (exact match), for example `token.revoke`. |
+
+Reading the log needs the observe privilege: with a `system_information`
+section in the [access rules](/guide/access-control), only users it allows
+`read` (or managers) may read it.
 
 ## Security notes
 

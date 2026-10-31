@@ -2,6 +2,7 @@
 
 mod agent;
 mod api;
+mod audit;
 pub mod auth;
 pub mod error;
 mod frontend;
@@ -40,6 +41,9 @@ pub struct WebState {
     pub credentials: Option<Arc<dyn arneb_protocol::CredentialSource>>,
     /// The coordinator state store; `Some` only under password auth.
     pub state: Option<Arc<arneb_state::StateStore>>,
+    /// The audit log: next to the state file, or in memory (always empty
+    /// under `[auth] type = "none"`, where nothing is audited).
+    pub audit: Arc<arneb_state::AuditLog>,
     /// Access rules shared with pgwire and Trino.
     pub access_rules: Option<Arc<arneb_catalog::AccessRules>>,
     /// The observe and manage privilege layers and the kill rule.
@@ -58,6 +62,16 @@ pub struct WebState {
     /// Resolved `[mcp]` settings; `Some` exactly when `/mcp` is served
     /// (enabled, on a coordinator or standalone node).
     pub mcp: Option<mcp::McpSettings>,
+}
+
+/// An empty in-memory audit log, for `WebState`s built in tests.
+#[cfg(test)]
+pub(crate) fn test_audit_log() -> Arc<arneb_state::AuditLog> {
+    let settings = arneb_state::AuditSettings {
+        max_entries: 1000,
+        retention_days: 0,
+    };
+    Arc::new(arneb_state::AuditLog::open(None, settings).expect("in-memory audit log"))
 }
 
 /// Build the axum Router with API and frontend routes.

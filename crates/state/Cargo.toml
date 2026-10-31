@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Exposes `AuditLog::set_fail_appends` to other crates' tests.
+test-hooks = []
+
 [dependencies]
 arneb-protocol = { path = "../protocol" }
 aws-lc-rs = "1"

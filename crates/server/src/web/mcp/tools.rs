@@ -882,6 +882,7 @@ mod tests {
             basic: None,
             credentials: None,
             state: None,
+            audit: crate::web::test_audit_log(),
             access_rules: rules,
             authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), false),
             metrics_auth: false,

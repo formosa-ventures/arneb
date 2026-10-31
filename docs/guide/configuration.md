@@ -628,8 +628,9 @@ path = "/var/lib/arneb/state.json"   # optional; ARNEB_STATE_PATH
 ```
 
 The coordinator (or standalone server) keeps its users and
-[API tokens](/guide/http-api#api-tokens) in one JSON state file. Workers never
-open it. Every write is atomic (write, fsync, rename) and the file is
+[API tokens](/guide/http-api#api-tokens) in one JSON state file, and the
+[audit log](#audit-log) as `audit.jsonl` in the same directory. Workers never
+open them. Every write is atomic (write, fsync, rename) and the file is
 created with mode `0600`. The path's directory must be writable.
 
 - **Config users follow the config file.** On every start, the users from
@@ -642,8 +643,9 @@ created with mode `0600`. The path's directory must be writable.
   config user has the same name as one of them, startup keeps the state user
   and logs a WARN. Start once with `--reseed-state` to overwrite it with the
   config user (revoking its tokens).
-- **No `path`** keeps the state in memory. Startup logs a WARN, `no [state]
-  path: API tokens are lost on restart`, and the token API says so when it
+- **No `path`** keeps the state, and the audit log, in memory. Startup logs a
+  WARN, `no [state] path: API tokens, worker cordons, admission limits and
+  the audit log are lost on restart`, and the token API says so when it
   issues a token.
 - The effective path (and `--reseed-state`) is logged on `arneb::config`.
 - The state store is only used under `[auth] type = "password"`. Under
@@ -651,6 +653,44 @@ created with mode `0600`. The path's directory must be writable.
   logs an INFO line).
 - On Kubernetes the chart mounts a volume for it; see
   [Kubernetes](/guide/kubernetes#coordinator-state).
+
+## Audit Log
+
+```toml
+[audit]
+max_entries    = 10000   # ARNEB_AUDIT_MAX_ENTRIES
+retention_days = 90      # ARNEB_AUDIT_RETENTION_DAYS; 0 = no age limit
+```
+
+Under `[auth] type = "password"`, the coordinator records every audited
+action (token issue and revoke, and the manage actions) as one JSON line in
+`audit.jsonl`, in the directory of [`[state] path`](#state), mode `0600`.
+Each entry is written and synced to disk before the response returns. Read
+it with [`GET /api/v2/audit`](/guide/http-api#audit-log).
+
+| Knob | Env | Default | Meaning |
+|---|---|---|---|
+| `max_entries` | `ARNEB_AUDIT_MAX_ENTRIES` | `10000` | Most entries kept, `1` to `1000000`. |
+| `retention_days` | `ARNEB_AUDIT_RETENTION_DAYS` | `90` | Days an entry is kept; `0` keeps entries of any age. |
+
+- **Compaction.** The file is rewritten atomically (temporary file, fsync,
+  rename, directory fsync), keeping at most the newest `max_entries` entries
+  younger than `retention_days`. It runs at startup, and whenever the file
+  holds `max(max_entries / 10, 100)` more lines than `max_entries`. Reads
+  hide entries past `retention_days` at once.
+- **Torn lines.** A line that does not parse (for example, cut short by a
+  crash) is skipped with a WARN on `arneb::audit` naming its line number.
+  Startup never fails on it, and compaction drops it.
+- **A failed write.** If an entry cannot be written, the action it records
+  has already happened. The entry is logged at ERROR on `arneb::audit`, and
+  every later audited action is refused with `503 audit_unavailable` until
+  the file can be written again.
+- **No `[state] path`** keeps the log in memory, with a startup WARN; it is
+  lost on restart. Under `type = "none"` nothing is audited and the log stays
+  empty.
+- The effective values, the path and the number of entries loaded are logged
+  on `arneb::config` as `audit effective settings ([audit] / ARNEB_AUDIT_*)`.
+  An invalid value fails startup.
 
 ## Observability
 

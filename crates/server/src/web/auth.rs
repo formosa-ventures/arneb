@@ -44,6 +44,18 @@ pub enum AuthVia {
     Unauthenticated,
 }
 
+impl AuthVia {
+    /// `token`, `session`, `basic` or `unauthenticated`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Token => "token",
+            Self::Session => "session",
+            Self::Basic => "basic",
+            Self::Unauthenticated => "unauthenticated",
+        }
+    }
+}
+
 /// Who a request runs as; a request extension set by [`authenticate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
@@ -236,6 +248,7 @@ mod tests {
                 .map(|c| arneb_protocol::BasicAuthenticator::new(c).unwrap()),
             credentials,
             state: None,
+            audit: crate::web::test_audit_log(),
             access_rules,
             metrics_auth,
             sessions: SessionStore::new(),

@@ -794,7 +794,8 @@ async fn run() -> Result<()> {
         if !store.is_persistent() {
             tracing::warn!(
                 target: "arneb::config",
-                "no [state] path: API tokens are lost on restart"
+                "no [state] path: API tokens, worker cordons, admission limits and the audit \
+                 log are lost on restart"
             );
         }
         Some(Arc::new(store))
@@ -898,6 +899,36 @@ async fn run() -> Result<()> {
         .map(arneb_protocol::BasicAuthenticator::new)
         .transpose()
         .context("HTTP Basic authentication")?;
+    // The audit log (manage-api D6): `audit.jsonl` next to the state file,
+    // in memory without one, and an empty in-memory log under `none`
+    // (nothing is audited there).
+    let audit_path = state_store
+        .as_ref()
+        .and_then(|s| s.path())
+        .map(arneb_state::AuditLog::sibling_of);
+    let audit_log = Arc::new(
+        arneb_state::AuditLog::open(audit_path.as_deref(), config.audit.settings())
+            .context("cannot open the audit log (audit.jsonl next to [state] path)")?,
+    );
+    if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
+        tracing::info!(
+            target: "arneb::config",
+            path = %audit_path
+                .as_ref()
+                .map_or_else(|| "in-memory".to_owned(), |p| p.display().to_string()),
+            max_entries = config.audit.max_entries,
+            retention_days = config.audit.retention_days,
+            loaded = audit_log.len(),
+            "audit effective settings ([audit] / ARNEB_AUDIT_*)"
+        );
+        if state_store.as_ref().is_some_and(|s| !s.is_persistent()) {
+            tracing::warn!(
+                target: "arneb::config",
+                "the audit log is kept in memory (no [state] path): its entries are lost on \
+                 restart"
+            );
+        }
+    }
     let state_for_web = state_store.clone();
     let credentials_for_web: Option<Arc<dyn arneb_protocol::CredentialSource>> =
         state_store.clone().map(|s| s as _);
@@ -1148,6 +1179,7 @@ async fn run() -> Result<()> {
         basic: credentials_for_web.as_ref().and(basic_auth),
         credentials: credentials_for_web,
         state: state_for_web,
+        audit: audit_log,
         access_rules: access_rules.clone(),
         authorizer,
         metrics_auth: config.web.metrics_auth,

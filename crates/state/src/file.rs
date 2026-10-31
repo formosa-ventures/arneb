@@ -36,6 +36,9 @@ pub enum StateError {
     /// The system random number generator failed.
     #[error("random number generator failure")]
     Random,
+    /// The audit log failed a write and has not been reopened since.
+    #[error("the audit log is not writable: {0}")]
+    AuditUnwritable(String),
 }
 
 /// A stored user with a SCRAM-SHA-256 verifier (never a plaintext password).
@@ -204,58 +207,62 @@ impl StateStore {
         std::fs::File::open(dir).and_then(|d| d.sync_all())
     }
 
-    /// Writes `<path>.tmp` (mode 0600), fsyncs it, renames it over `path`,
-    /// then fsyncs the parent directory.
     fn persist(path: &Path, data: &StateData) -> Result<(), StateError> {
-        let io = |source| StateError::Io {
-            path: path.to_path_buf(),
-            source,
-        };
         let json = serde_json::to_vec_pretty(data).map_err(|e| StateError::Corrupt {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
-        let mut tmp_name = path.as_os_str().to_owned();
-        tmp_name.push(".tmp");
-        let tmp = PathBuf::from(tmp_name);
-
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(&tmp).map_err(io)?;
-        // `mode` only applies to a newly created file; tighten a reused
-        // leftover temp file too.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(io)?;
-        }
-        file.write_all(&json).map_err(io)?;
-        file.sync_all().map_err(io)?;
-        drop(file);
-        std::fs::rename(&tmp, path).map_err(io)?;
-        let dir = match path.parent() {
-            Some(d) if !d.as_os_str().is_empty() => d,
-            _ => Path::new("."),
-        };
-        // The rename is the commit point: the new file is already in place,
-        // so a failed directory fsync only weakens crash durability and must
-        // not make the caller think the write failed.
-        if let Err(e) = Self::sync_dir(dir) {
-            tracing::warn!(
-                target: "arneb::config",
-                path = %path.display(),
-                error = %e,
-                "state file was written but syncing its directory failed"
-            );
-        }
-        Ok(())
+        write_atomically(path, &json)
     }
+}
+
+/// Writes `bytes` to `<path>.tmp` (mode 0600), fsyncs it, renames it over
+/// `path`, then fsyncs the parent directory.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
+    let io = |source| StateError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp).map_err(io)?;
+    // `mode` only applies to a newly created file; tighten a reused
+    // leftover temp file too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(io)?;
+    }
+    file.write_all(bytes).map_err(io)?;
+    file.sync_all().map_err(io)?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(io)?;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    // The rename is the commit point: the new file is already in place,
+    // so a failed directory fsync only weakens crash durability and must
+    // not make the caller think the write failed.
+    if let Err(e) = StateStore::sync_dir(dir) {
+        tracing::warn!(
+            target: "arneb::config",
+            path = %path.display(),
+            error = %e,
+            "state file was written but syncing its directory failed"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

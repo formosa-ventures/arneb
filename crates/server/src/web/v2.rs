@@ -24,6 +24,7 @@ use super::api::{
     self, ClusterResponse, InfoResponse, ListQueryParams, QueriesResponse, QueryResponse,
     WorkerResponse,
 };
+use super::audit::{audited, AuditSubject};
 use super::auth::{decode_basic, AuthVia, Identity};
 use super::error::{ApiError, ErrorCode};
 use super::privilege::{Authorizer, Layer};
@@ -59,6 +60,7 @@ pub fn routes() -> Router<WebState> {
         .route("/cluster/workers", get(workers))
         .route("/info", get(info))
         .merge(super::agent::routes())
+        .merge(super::audit::routes())
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
 }
@@ -242,12 +244,7 @@ async fn whoami(
 ) -> Json<WhoAmI> {
     Json(WhoAmI {
         privileges: Privileges::of(&state.authorizer, &who),
-        via: match who.via {
-            AuthVia::Token => "token",
-            AuthVia::Session => "session",
-            AuthVia::Basic => "basic",
-            AuthVia::Unauthenticated => "unauthenticated",
-        },
+        via: who.via.as_str(),
         user: who.user,
     })
 }
@@ -383,13 +380,28 @@ pub(super) async fn issue_token_for(
         .map_err(|_| ApiError::new(ErrorCode::Internal, "token issuance is unavailable"))?;
     // The permit moves into the blocking task, so it is held for as long as
     // PBKDF2 runs even if the client disconnects and this future is dropped.
+    let (state, who) = (state.clone(), who.clone());
     let issued = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        store.issue_token(&user, name, expires_at_ms)
+        let parameters = serde_json::json!({"name": name, "expires_ms": expires_at_ms});
+        audited(
+            &state,
+            &who,
+            "token.issue",
+            || {
+                store
+                    .issue_token(&user, name, expires_at_ms)
+                    .map_err(state_error)
+            },
+            |out| AuditSubject {
+                // The id only: never the token itself.
+                target: out.map(|t| t.info.id.clone()).unwrap_or_default(),
+                parameters,
+            },
+        )
     })
     .await
-    .map_err(blocking_failed)?
-    .map_err(state_error)?;
+    .map_err(blocking_failed)??;
     Ok(IssuedTokenResponse {
         token: issued.token,
         id: issued.info.id,
@@ -501,11 +513,21 @@ pub(super) async fn revoke_token_for(
     id: String,
 ) -> Result<(), ApiError> {
     let store = token_store(state)?;
-    let user = who.user.clone();
-    tokio::task::spawn_blocking(move || store.revoke_token(&user, &id))
-        .await
-        .map_err(blocking_failed)?
-        .map_err(state_error)
+    let (state, who) = (state.clone(), who.clone());
+    tokio::task::spawn_blocking(move || {
+        audited(
+            &state,
+            &who,
+            "token.revoke",
+            || store.revoke_token(&who.user, &id).map_err(state_error),
+            |_| AuditSubject {
+                target: id.clone(),
+                parameters: serde_json::json!({}),
+            },
+        )
+    })
+    .await
+    .map_err(blocking_failed)?
 }
 
 async fn list_queries(
@@ -576,7 +598,7 @@ async fn info(State(state): State<WebState>) -> Json<InfoResponse> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
 
     use arneb_protocol::{CredentialSource, ScramVerifier};
@@ -589,7 +611,10 @@ mod tests {
 
     use crate::web::{build_router, SessionStore, WebState};
 
-    fn web_state(password: bool, persistent_path: Option<&std::path::Path>) -> WebState {
+    pub(in crate::web) fn web_state(
+        password: bool,
+        persistent_path: Option<&std::path::Path>,
+    ) -> WebState {
         let store = Arc::new(arneb_state::StateStore::open(persistent_path).unwrap());
         let users: Vec<(String, ScramVerifier)> = [
             ("alice", "secret"),
@@ -620,6 +645,7 @@ mod tests {
                 .map(|c| arneb_protocol::BasicAuthenticator::new(c).unwrap()),
             credentials,
             state: password.then_some(store),
+            audit: crate::web::test_audit_log(),
             access_rules: None,
             authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), password),
             metrics_auth: false,
@@ -630,7 +656,11 @@ mod tests {
     }
 
     /// `state` with `rules` and `admin_users` behind its authorizer.
-    fn with_authz(mut state: WebState, rules: Option<&str>, admins: &[&str]) -> WebState {
+    pub(in crate::web) fn with_authz(
+        mut state: WebState,
+        rules: Option<&str>,
+        admins: &[&str],
+    ) -> WebState {
         let rules = rules.map(|r| Arc::new(arneb_catalog::AccessRules::from_json(r).unwrap()));
         state.access_rules = rules.clone();
         state.authorizer = crate::web::privilege::Authorizer::new(
@@ -641,11 +671,11 @@ mod tests {
         state
     }
 
-    fn basic(user: &str, password: &str) -> String {
+    pub(in crate::web) fn basic(user: &str, password: &str) -> String {
         format!("Basic {}", STANDARD.encode(format!("{user}:{password}")))
     }
 
-    async fn call(
+    pub(in crate::web) async fn call(
         state: &WebState,
         method: Method,
         path: &str,

@@ -392,9 +392,12 @@ mod tests {
 
     #[test]
     fn revoking_someone_elses_token_is_not_found() {
-        let store = store_with_alice();
-        let v = ScramVerifier::from_password("pw", b"fedcba9876543210", 4096);
-        store.seed_users(&[("bob".into(), v)], false).unwrap();
+        let store = StateStore::open(None).unwrap();
+        let alice = ScramVerifier::from_password("pw", b"0123456789abcdef", 4096);
+        let bob = ScramVerifier::from_password("pw", b"fedcba9876543210", 4096);
+        store
+            .seed_users(&[("alice".into(), alice), ("bob".into(), bob)], false)
+            .unwrap();
         let t = store.issue_token("alice", None, None).unwrap();
         assert!(matches!(
             store.revoke_token("bob", &t.info.id),

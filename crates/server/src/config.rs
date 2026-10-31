@@ -84,7 +84,8 @@ pub struct AppConfig {
 /// ```
 ///
 /// Unset: the state lives in memory only and API tokens are lost on restart.
-/// The config file seeds users on first start; afterwards the state wins.
+/// Config-seeded users follow `[[auth.users]]` on every start: a changed
+/// `password_hash` or a removed user revokes that user's tokens.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StateConfig {

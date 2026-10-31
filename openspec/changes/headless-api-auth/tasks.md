@@ -1,7 +1,7 @@
 ## 1. State store
 
 - [x] 1.1 `crates/state` (`arneb-state`): versioned JSON file, atomic write, mode `0600`, in-memory fallback
-- [x] 1.2 Seed users from `[[auth.users]]`; divergence WARN; `--reseed-state`
+- [x] 1.2 Apply `[[auth.users]]` on every start (changed hash / removed user revokes tokens; state-created users untouched); `--reseed-state` for name collisions
 - [x] 1.3 Issue, list and revoke API tokens; 100-token cap; optional expiry; hashed storage
 - [x] 1.4 Open the store at startup on coordinator and standalone only; `[state] path` / `ARNEB_STATE_PATH`; log the effective settings
 

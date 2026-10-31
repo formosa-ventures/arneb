@@ -160,9 +160,10 @@ struct CliArgs {
     #[arg(long)]
     profile: bool,
 
-    /// Overwrite state users that differ from the `[[auth.users]]` in the
-    /// config file (the file only seeds users on first start). Only
-    /// meaningful with `[auth] type = "password"`.
+    /// Let `[[auth.users]]` overwrite users created through the state store
+    /// whose name collides with a config user (revoking their tokens).
+    /// Config-seeded users follow the config on every start without it.
+    /// Only meaningful with `[auth] type = "password"`.
     #[arg(long)]
     reseed_state: bool,
 
@@ -768,8 +769,9 @@ async fn run() -> Result<()> {
         .to_auth_method()
         .context("invalid [auth] configuration")?;
     // Password auth on a coordinator/standalone: users live in the state
-    // store, seeded from the config file; the same store serves pgwire,
-    // Trino and the Web API.
+    // store; config-seeded users follow the config file on every start
+    // (a changed hash or a removed user revokes tokens). The same store
+    // serves pgwire, Trino and the Web API.
     let state_store = if matches!(role, ServerRole::Coordinator | ServerRole::Standalone)
         && matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_))
     {
@@ -790,8 +792,11 @@ async fn run() -> Result<()> {
             persistent = store.is_persistent(),
             users = arneb_protocol::CredentialSource::user_count(&store),
             first_start = report.first_start,
-            seeded = ?report.seeded,
-            diverged = ?report.diverged,
+            added = ?report.added,
+            updated = ?report.updated,
+            removed = ?report.removed,
+            conflicts = ?report.conflicts,
+            revoked_tokens = report.revoked_tokens,
             reseed = reseed_state,
             "state store effective settings ([state] path / ARNEB_STATE_PATH / --reseed-state)"
         );

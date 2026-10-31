@@ -98,6 +98,9 @@ curl -s -X POST http://127.0.0.1:6432/api/v2/tokens \
   all refuse the token on the next request or connection. An already
   established pgwire connection is not closed: new connections and new
   requests are refused.
+- Changing a user's `password_hash` in `[[auth.users]]`, or removing the
+  user, revokes all of their tokens on the next start (see
+  [State](/guide/configuration#state)).
 - Tokens are stored in the [state file](/guide/configuration#state). With no
   `[state] path` they live in memory, the response carries
   `"persistent": false` and a hint, and they are lost when the coordinator

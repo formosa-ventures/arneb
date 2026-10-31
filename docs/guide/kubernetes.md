@@ -136,10 +136,10 @@ file is mode `0600`.
 
 ### Upgrading an existing release
 
-- The chart now sets `ARNEB_STATE_PATH`. After the first start the state
-  wins over the config file, so a changed `password_hash` in the ConfigMap
-  only logs a WARN. To apply it, set `coordinator.extraArgs:
-  ["--reseed-state"]` for one rollout, then remove it again.
+- The chart now sets `ARNEB_STATE_PATH`. Users from `[[auth.users]]` still
+  follow the ConfigMap on every rollout: a changed `password_hash` or a
+  removed user revokes that user's API tokens. See
+  [State](/guide/configuration#state).
 - `coordinator.state.persistence.enabled` defaults to `true`, so
   `helm upgrade` creates a PVC. On a cluster without a default StorageClass
   the `Recreate` rollout leaves the coordinator `Pending`: set

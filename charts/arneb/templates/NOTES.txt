@@ -8,8 +8,8 @@ Registered workers (Web UI API, port {{ .Values.coordinator.service.ports.web }}
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "arneb.fullname" . }} 6432:{{ .Values.coordinator.service.ports.web }}
   curl -s localhost:6432/api/v1/cluster/workers
 
-Upgrading an existing release: the state now wins over the config file. To apply a changed
-password_hash, set coordinator.extraArgs=["--reseed-state"] for one rollout. persistence.enabled
-defaults to true; without a default StorageClass set storageClass/existingClaim, or disable it.
+Upgrading an existing release: [[auth.users]] still follow the config on every rollout; a changed
+password_hash or a removed user revokes that user's API tokens. persistence.enabled defaults to
+true; without a default StorageClass set storageClass/existingClaim, or disable it.
 
 Coordinator state (users, API tokens): {{ if .Values.coordinator.state.persistence.enabled }}persisted on a volume mounted at /var/lib/arneb{{ else }}NOT persisted (emptyDir); it is lost when the pod restarts{{ end }}.

@@ -525,10 +525,14 @@ mod tests {
 
     fn web_state(password: bool, persistent_path: Option<&std::path::Path>) -> WebState {
         let store = Arc::new(arneb_state::StateStore::open(persistent_path).unwrap());
-        for (user, pw) in [("alice", "secret"), ("bob", "hunter2")] {
-            let v = ScramVerifier::from_password(pw, b"0123456789abcdef", 4096);
-            store.seed_users(&[(user.into(), v)], false).unwrap();
-        }
+        let users: Vec<(String, ScramVerifier)> = [("alice", "secret"), ("bob", "hunter2")]
+            .into_iter()
+            .map(|(user, pw)| {
+                let v = ScramVerifier::from_password(pw, b"0123456789abcdef", 4096);
+                (user.to_string(), v)
+            })
+            .collect();
+        store.seed_users(&users, false).unwrap();
         let credentials: Option<Arc<dyn CredentialSource>> =
             password.then(|| store.clone() as Arc<dyn CredentialSource>);
         WebState {

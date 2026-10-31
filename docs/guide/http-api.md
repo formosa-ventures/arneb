@@ -261,17 +261,20 @@ Explain plans only: it is not admitted or tracked, and does not run
 
 Every response that returns data is bounded by rows and by bytes. When
 something is cut, the response says so (`truncated`) and gives the full
-count when it is known. A statement keeps at most `max_rows` rows after it
-finishes, plus its total row count. Cells longer than `max_cell_bytes` are
+count when it is known. A statement keeps at most `max_rows` rows. Cells longer than `max_cell_bytes` are
 truncated. A page holds as many rows as fit in `max_bytes`, but always at
 least one, so a single wide row can make a page larger than `max_bytes`
 (each of its cells is still capped at `max_cell_bytes`).
 
-`max_rows` bounds what a statement retains and returns, not what the query
-reads or materializes. The statement runs to completion to count
-`total_rows`, and its full result is collected on the coordinator before
-the rows beyond `max_rows` are dropped. To explore a large table, add a
-`LIMIT` to the SQL or use `sample`.
+`max_rows` also bounds execution. A query stops producing rows once it has
+`max_rows + 1` of them (one extra, to tell whether there are more), so a
+`SELECT *` over a large table with `max_rows=100` reads only what it needs
+for 101 rows, and an `ORDER BY` keeps the top rows instead of sorting
+everything. The cost is that a truncated result has no exact count:
+`total_rows` is the row count when `truncated` is `false`, and `null` when it
+is `true`. To count a large result, run `SELECT count(*)`. Aggregations,
+joins and sorts still read all their input; only the rows they emit are
+capped.
 
 A request value above its ceiling is refused with `invalid_argument` and a
 hint naming the ceiling; it is never silently clamped. That includes

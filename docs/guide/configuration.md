@@ -149,9 +149,9 @@ waits on it); a bad combination stops startup.
 A catalog, schema or table listing returns `default_max_rows` names unless
 the request passes `limit`, which must be in `1..=max_rows`.
 
-`max_rows` bounds the rows a statement retains, not what its query reads:
-the full result is still collected on the coordinator before the extra rows
-are dropped. A page always holds at least one row, so a single wide row can
+A query stops producing rows after `max_rows + 1` of them, so `max_rows`
+bounds what it emits as well as what it retains; a truncated result reports
+`total_rows` as `null`. A page always holds at least one row, so a single wide row can
 exceed the page byte limit; each cell is still capped at `max_cell_bytes`.
 
 ## Admission Control

@@ -153,15 +153,16 @@ echo "  revenue api=$API_REVENUE psql=$PG_REVENUE"
 pass
 
 STEP="5 truncation"
-submit "SELECT count(*) FROM lineitem"
+submit "SELECT * FROM nation" 100
 wait_terminal
-check '.state == "finished"' "count(*) did not finish"
-COUNT=$(first_cell)
+check '.state == "finished"' "SELECT * FROM nation did not finish"
+check '.truncated == false and .total_rows == 25' "nation is not 25 untruncated rows"
 submit "SELECT * FROM lineitem" 100
 wait_terminal
 check '.state == "finished"' "SELECT * did not finish"
 check '.truncated == true' "not truncated"
-check ".total_rows == $COUNT" "total_rows is not count(*) = $COUNT"
+check '.total_rows == null' "total_rows is not null for a truncated result"
+ELAPSED=$(printf '%s' "$LAST" | jq -r '.elapsed_ms')
 ROWS=0
 CURSOR=0
 PAGES=0
@@ -175,7 +176,7 @@ while [ -n "$CURSOR" ] && [ "$CURSOR" != null ]; do
 done
 LAST=""
 [ "$ROWS" = 100 ] || fail "fetched $ROWS rows, want 100"
-echo "  total_rows=$COUNT rows=$ROWS pages=$PAGES"
+echo "  elapsed_ms=$ELAPSED rows=$ROWS pages=$PAGES"
 pass
 
 STEP="6 bad column"

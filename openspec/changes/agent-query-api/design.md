@@ -40,7 +40,7 @@ The listings accept `?prefix=&limit=`.
 
 **D3. Statement ids are query-tracker ids.** The `QueryId` string is the statement id, so `/api/v2/queries/{id}` shows the same query.
 
-**D4. Retention.** A statement keeps at most `max_rows` rows after it finishes, and its total row count; the rest are dropped at completion. The kept rows are copied out of the operator's output buffers, so a finished statement holds memory for at most `max_rows` rows. `max_rows` does not bound execution: the query reads and materializes its whole result on the coordinator before truncation, and that final collect is not reserved against the memory pool (the distributed executor returns the whole result as one `Vec`). Operators stay bounded by the existing query memory limit, as on the Trino path. Agents should add `LIMIT` or use `sample` to explore; an execution-side row limit is deferred.
+**D4. Retention and the execution row cap.** A query submitted through the API is planned with `LIMIT max_rows + 1` at its root (merged with a root `LIMIT` by taking the smaller, and placed under root projections), so the physical planner turns it into a Top-K over a sort or a limit hint over a bare scan, and `LimitExec` stops pulling its input after the cap. Only `SELECT` statements are capped; other statements run as before. The one extra row tells whether the result was truncated. The cost is the exact count: `total_rows` is reported only when the result was not truncated and is `null` otherwise (agents run `count(*)` when they need it). A statement keeps at most `max_rows` rows, copied out of the operator's output buffers, so a finished statement holds memory for at most `max_rows` rows. Aggregations, joins and sorts still read their whole input, under the existing query memory limit as on the Trino path. The Trino and pgwire paths are unchanged.
 
 **D5. Inline first page.** `submit` and `status` accept `wait_ms`, default 0, capped at `max_wait_ms`. A statement that finishes inside the wait carries its first page inline.
 
@@ -89,8 +89,8 @@ The existing `forbidden`, `overloaded`, `invalid_argument`, `not_found` and `int
 
 ## Risks / Trade-offs
 
-- [A `SELECT *` over a large table still runs to completion to count `total_rows`, and its full result is materialized on the coordinator before truncation] -> `max_rows` bounds only what is retained afterwards; operators stay under the query memory limit, but the final collect is not reserved against the pool. Docs steer agents to `LIMIT` or `sample`; cancel or the idle reaper stops a runaway statement. An execution-side row limit is deferred.
-- [Explain duplicates the run path's catalog-scoping logic] -> kept in step by tests; a shared helper is a follow-up.
+- [A truncated result has no exact `total_rows`] -> reported as `null`, documented, and agents run `count(*)` when they need the count. In exchange a truncated `SELECT *` reads only `max_rows + 1` rows.
+- [Explain and run could disagree on catalog scoping] -> both call one `Engine::statement_scope` helper.
 - [Name matching for describe and sample is exact-case, like `SHOW COLUMNS`] -> documented; listings' `prefix` is case-insensitive.
 - [Statements live in coordinator memory] -> lost on restart; the agent resubmits.
 

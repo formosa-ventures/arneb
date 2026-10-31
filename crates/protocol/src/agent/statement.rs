@@ -78,7 +78,8 @@ pub struct StatementStatus {
     pub update_type: Option<String>,
     /// Result columns, once finished.
     pub columns: Option<Vec<Column>>,
-    /// Rows the statement produced, once finished.
+    /// Rows in the result, once finished; `None` while running and when
+    /// `truncated`, since execution stops after `max_rows + 1` rows.
     pub total_rows: Option<u64>,
     /// Whether rows beyond the retained ones were dropped.
     pub truncated: bool,
@@ -221,7 +222,7 @@ impl Statement {
                 Phase::Finished(output) => {
                     status.update_type = output.update_type.clone();
                     status.columns = output.columns.clone();
-                    status.total_rows = Some(output.retained.total_rows);
+                    status.total_rows = output.retained.total_rows;
                     status.truncated = output.retained.truncated;
                     retained = Some(output.retained.clone());
                 }

@@ -15,8 +15,10 @@ use crate::trino::{encode_cell, materialize};
 pub(crate) struct Retained {
     /// At most `max_rows` rows.
     pub(crate) batches: Vec<RecordBatch>,
-    /// Rows the statement produced before truncation.
-    pub(crate) total_rows: u64,
+    /// Rows in the result when none were dropped; `None` when the result
+    /// was truncated, since execution stops after `max_rows + 1` rows and
+    /// never learns the full count.
+    pub(crate) total_rows: Option<u64>,
     /// Whether rows beyond `max_rows` were dropped.
     pub(crate) truncated: bool,
 }
@@ -40,7 +42,8 @@ fn compact(batch: RecordBatch) -> RecordBatch {
 /// rows are copied out of the source buffers, so a statement retains memory
 /// for at most `max_rows` rows even when an operator emitted one large batch.
 pub(crate) fn retain(batches: Vec<RecordBatch>, max_rows: usize) -> Retained {
-    let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+    let produced: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+    let truncated = produced > max_rows as u64;
     let mut kept = Vec::new();
     let mut remaining = max_rows;
     for batch in batches {
@@ -57,8 +60,8 @@ pub(crate) fn retain(batches: Vec<RecordBatch>, max_rows: usize) -> Retained {
     }
     Retained {
         batches: kept,
-        total_rows,
-        truncated: total_rows > max_rows as u64,
+        total_rows: (!truncated).then_some(produced),
+        truncated,
     }
 }
 
@@ -152,13 +155,16 @@ mod tests {
     }
 
     #[test]
-    fn retain_slices_across_batches_and_counts_total() {
+    fn retain_slices_across_batches_and_counts_untruncated_total() {
         let r = retain(vec![batch(0, 3), batch(3, 3), batch(6, 3)], 4);
         assert_eq!(r.kept_rows(), 4);
-        assert_eq!(r.total_rows, 9);
+        assert_eq!(r.total_rows, None);
         assert!(r.truncated);
         let r = retain(vec![batch(0, 3)], 3);
-        assert_eq!((r.kept_rows(), r.total_rows, r.truncated), (3, 3, false));
+        assert_eq!(
+            (r.kept_rows(), r.total_rows, r.truncated),
+            (3, Some(3), false)
+        );
     }
 
     #[test]
@@ -166,10 +172,7 @@ mod tests {
         let source = batch(0, 1_000_000);
         let source_bytes = source.get_array_memory_size();
         let r = retain(vec![source], 10);
-        assert_eq!(
-            (r.kept_rows(), r.total_rows, r.truncated),
-            (10, 1_000_000, true)
-        );
+        assert_eq!((r.kept_rows(), r.total_rows, r.truncated), (10, None, true));
         let kept_bytes: usize = r.batches.iter().map(|b| b.get_array_memory_size()).sum();
         assert!(
             kept_bytes * 100 < source_bytes,

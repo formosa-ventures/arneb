@@ -16,7 +16,7 @@ use super::session::{url_encode, ClientSession};
 use super::statements::{bind_placeholders, like_match, parse_control, ControlStatement};
 use super::types::{trino_type_of, OutputColumn, TrinoType};
 use crate::agent::explain::ScanEstimate;
-use crate::handler::{execute_query_with_limit, DistributedExecutor};
+use crate::handler::{execute_query_capped, DistributedExecutor};
 
 /// The result of one statement, before paging.
 #[derive(Debug, Default)]
@@ -141,7 +141,19 @@ impl Engine {
         session: &ClientSession,
         sql: &str,
     ) -> Result<QueryOutput, TrinoError> {
-        self.run(session, sql, 0).await
+        self.run(session, sql, 0, None).await
+    }
+
+    /// [`run_statement`](Self::run_statement) for a client that keeps at most
+    /// `row_cap` rows: a query stops producing rows after `row_cap` of them,
+    /// so it reads no more than that needs.
+    pub(crate) async fn run_statement_capped(
+        &self,
+        session: &ClientSession,
+        sql: &str,
+        row_cap: usize,
+    ) -> Result<QueryOutput, TrinoError> {
+        self.run(session, sql, 0, Some(row_cap)).await
     }
 
     async fn run(
@@ -149,6 +161,7 @@ impl Engine {
         session: &ClientSession,
         sql: &str,
         depth: u8,
+        row_cap: Option<usize>,
     ) -> Result<QueryOutput, TrinoError> {
         let sql = sql.trim().trim_end_matches(';').trim();
         if sql.is_empty() {
@@ -164,13 +177,17 @@ impl Engine {
 
         let scope = self.statement_scope(session, sql).await?;
         match &scope.virtual_registry {
-            Some(registry) => self.run_sql(sql, &scope.catalogs, registry, None).await,
+            Some(registry) => {
+                self.run_sql(sql, &scope.catalogs, registry, None, row_cap)
+                    .await
+            }
             None => {
                 self.run_sql(
                     sql,
                     &scope.catalogs,
                     &self.connector_registry,
                     self.distributed_executor.as_deref(),
+                    row_cap,
                 )
                 .await
             }
@@ -235,14 +252,16 @@ impl Engine {
         catalog_manager: &CatalogManager,
         registry: &ConnectorRegistry,
         distributed: Option<&dyn DistributedExecutor>,
+        row_cap: Option<usize>,
     ) -> Result<QueryOutput, TrinoError> {
-        let (plan, batches) = execute_query_with_limit(
+        let (plan, batches) = execute_query_capped(
             sql,
             catalog_manager,
             registry,
             distributed,
             &self.memory_pool,
             self.query_memory_limit,
+            row_cap,
         )
         .await
         .map_err(|e| TrinoError::from_arneb(&e, Some(&SourceFile::new("<query>", sql))))?;
@@ -421,7 +440,7 @@ impl Engine {
         }
         let bound = bind_placeholders(sql, params)
             .map_err(|m| TrinoError::user(0, "GENERIC_USER_ERROR", m))?;
-        Box::pin(self.run(session, &bound, depth + 1)).await
+        Box::pin(self.run(session, &bound, depth + 1, None)).await
     }
 }
 

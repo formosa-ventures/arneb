@@ -22,9 +22,10 @@ use crate::trino::{
     QueryOutput, TimeLimits, TrinoError,
 };
 
-/// Live (not yet terminal) statements one user may hold.
+/// Statements (running or finished) one user may hold; at the cap the least
+/// recently used finished one is evicted.
 const MAX_STATEMENTS_PER_USER: usize = 32;
-/// Live statements across all users.
+/// Statements across all users, evicted the same way.
 const MAX_STATEMENTS_TOTAL: usize = 1024;
 /// Longest interval between reaper passes.
 const MAX_REAPER_TICK: Duration = Duration::from_secs(30);
@@ -355,8 +356,12 @@ impl AgentQueryService {
         let _ = self
             .tracker
             .advance_to(&statement.tracker_id, QueryState::Running);
-        let run = std::panic::AssertUnwindSafe(self.engine.run_statement(&session, &statement.sql))
-            .catch_unwind();
+        let run = std::panic::AssertUnwindSafe(self.engine.run_statement_capped(
+            &session,
+            &statement.sql,
+            statement.max_rows + 1,
+        ))
+        .catch_unwind();
         let result = match with_deadline(exec_deadline, run).await {
             Some(outcome) => outcome
                 .unwrap_or_else(|_| Err(TrinoError::internal("statement execution panicked"))),
@@ -394,7 +399,7 @@ impl AgentQueryService {
         match result {
             Ok(output) => {
                 let retained = retain(output.batches, statement.max_rows);
-                let rows = retained.total_rows;
+                let rows = retained.kept_rows();
                 let finished = FinishedOutput {
                     columns: output.columns.map(|cols| {
                         cols.iter()
@@ -523,6 +528,7 @@ mod tests {
     use arneb_planner::LogicalPlan;
 
     use crate::agent::statement::StatementState;
+    use serde_json::{json, Value};
 
     /// `memory.default.lineitem(l_orderkey, l_quantity)`, two rows.
     fn engine_state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
@@ -619,11 +625,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_result_is_truncated_with_total() {
+    async fn large_result_is_truncated_without_total() {
         let svc = service_over(vec![big_table()], AgentLimits::default());
         let s = run_to_end(&svc, "SELECT n FROM big", Some(1000)).await;
         assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
-        assert_eq!(s.total_rows, Some(50_000));
+        assert_eq!(s.total_rows, None);
         assert!(s.truncated);
         assert_eq!(s.max_rows, 1000);
         let mut rows = s.first_page.as_ref().unwrap().rows.len();
@@ -634,6 +640,94 @@ mod tests {
             cursor = p.next_cursor;
         }
         assert_eq!(rows, 1000);
+    }
+
+    async fn all_rows(svc: &AgentQueryService, s: StatementStatus) -> Vec<Vec<Value>> {
+        let first = s.first_page.unwrap();
+        let mut rows = first.rows;
+        let mut cursor = first.next_cursor;
+        while let Some(c) = cursor {
+            let p = svc.results("alice", &s.id, c, None).unwrap();
+            rows.extend(p.rows);
+            cursor = p.next_cursor;
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn execution_stops_after_max_rows_plus_one() {
+        let svc = service_over(vec![big_table()], AgentLimits::default());
+        let session = ClientSession::for_agent("alice", None, None);
+        for sql in [
+            "SELECT n FROM big",
+            "SELECT n + 1 AS m FROM big",
+            "SELECT n FROM big ORDER BY n DESC",
+            "SELECT n FROM big LIMIT 20000",
+        ] {
+            let out = svc
+                .engine
+                .run_statement_capped(&session, sql, 101)
+                .await
+                .unwrap();
+            let produced: usize = out.batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(produced, 101, "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_order_by_keeps_the_top_rows() {
+        let svc = service_over(vec![big_table()], AgentLimits::default());
+        let s = run_to_end(&svc, "SELECT n FROM big ORDER BY n DESC", Some(3)).await;
+        assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
+        assert!(s.truncated);
+        assert_eq!(s.total_rows, None);
+        let rows = all_rows(&svc, s).await;
+        assert_eq!(
+            rows,
+            vec![
+                vec![json!(49_999)],
+                vec![json!(49_998)],
+                vec![json!(49_997)]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn result_of_exactly_max_rows_is_not_truncated() {
+        let svc = service_over(vec![big_table()], AgentLimits::default());
+        let s = run_to_end(&svc, "SELECT n FROM big LIMIT 100", Some(100)).await;
+        assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
+        assert!(!s.truncated);
+        assert_eq!(s.total_rows, Some(100));
+        let s = run_to_end(&svc, "SELECT n FROM big LIMIT 101", Some(100)).await;
+        assert!(s.truncated);
+        assert_eq!(s.total_rows, None);
+    }
+
+    #[tokio::test]
+    async fn sql_limit_and_offset_compose_with_max_rows() {
+        let svc = service_over(vec![big_table()], AgentLimits::default());
+        let s = run_to_end(
+            &svc,
+            "SELECT n FROM big ORDER BY n LIMIT 10 OFFSET 5",
+            Some(3),
+        )
+        .await;
+        assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
+        assert!(s.truncated);
+        let rows = all_rows(&svc, s).await;
+        assert_eq!(rows, vec![vec![json!(5)], vec![json!(6)], vec![json!(7)]]);
+        let s = run_to_end(
+            &svc,
+            "SELECT n FROM big ORDER BY n LIMIT 2 OFFSET 5",
+            Some(3),
+        )
+        .await;
+        assert!(!s.truncated);
+        assert_eq!(s.total_rows, Some(2));
+        let s = run_to_end(&svc, "SELECT count(*) AS c FROM big", Some(1)).await;
+        assert!(!s.truncated);
+        assert_eq!(all_rows(&svc, s).await, vec![vec![json!(50_000)]]);
     }
 
     #[tokio::test]

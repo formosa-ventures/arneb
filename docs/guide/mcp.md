@@ -96,14 +96,18 @@ Results are bounded the way the [HTTP API](/guide/http-api#limits-and-truncation
 bounds them, and a value above a ceiling is refused with `invalid_argument`,
 never clamped. The ceilings come from `[agent_api]`.
 
-| Argument | Default | Ceiling |
-|---|---|---|
-| `limit` of `list_catalogs`, `list_schemas`, `list_tables` | 1000 | 10000 |
-| `rows` of `sample_table` | 10 | 100 |
-| `max_rows` of `submit_query` | 1000 | 10000 |
-| `wait_ms` | 0 | 10000 |
-| `max_bytes` of `fetch_results` | 32768 | 4194304 |
-| `limit` of `list_queries` | 50 | 500 (0 is refused) |
+| Argument | Default | Ceiling | Source |
+|---|---|---|---|
+| `limit` of `list_catalogs`, `list_schemas`, `list_tables` | 1000 | 10000 | `[agent_api] default_max_rows`, `max_rows` |
+| `rows` of `sample_table` | 10 | 100 | fixed |
+| `max_rows` of `submit_query` | 1000 | 10000 | `[agent_api] default_max_rows`, `max_rows` |
+| `wait_ms` | 0 | 10000 | ceiling is `[agent_api] max_wait_ms` |
+| `max_bytes` of `fetch_results` | 32768 | 4194304 | default is `[mcp] default_page_bytes`, ceiling is `[agent_api] max_page_bytes` |
+| `limit` of `list_queries` | 50 | 500 (0 is refused) | fixed |
+
+The tool descriptions and the server instructions quote the default
+`[agent_api]` numbers. If an operator changes that section, the text an
+agent reads goes stale; the server still enforces the configured values.
 
 Differences from the HTTP routes:
 
@@ -179,9 +183,10 @@ DNS-rebinding attacks from a browser page.
 
 The endpoint keeps no MCP session. Every `POST /mcp` is independent and
 answers with a JSON body, so a coordinator restart or a load balancer never
-strands a client, and no session id is issued. `GET /mcp` is not a stream:
-it answers `405 Method Not Allowed` (`Allow: POST`), which the streamable
-HTTP transport permits, and the server never pushes notifications.
+strands a client, and no session id is issued. There is no
+server-sent stream: `GET /mcp` answers `405 Method Not Allowed`
+(`Allow: POST`) whatever its `Accept` header says, which the streamable HTTP
+transport permits. The server never pushes notifications.
 
 Statements created through `submit_query` do live in coordinator memory,
 exactly as with the HTTP API: they are lost on restart, and an idle one is

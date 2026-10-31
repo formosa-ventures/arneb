@@ -20,11 +20,15 @@ The coordinator (or standalone server) SHALL serve an MCP streamable-HTTP endpoi
 - **THEN** the users are `bob` and `anonymous`, with `via` `unauthenticated`
 
 ### Requirement: Stateless transport
-The endpoint SHALL keep no MCP session: each `POST /mcp` SHALL be handled independently and answered with a JSON body, and no session id SHALL be issued. `GET /mcp` SHALL NOT open a stream and SHALL answer `405`.
+The endpoint SHALL keep no MCP session: each `POST /mcp` SHALL be handled independently and answered with a JSON body, and no session id SHALL be issued. `GET /mcp` SHALL NOT open a stream: it SHALL answer `405` with `Allow: POST` whatever its `Accept` header.
 
 #### Scenario: GET is not a stream
 - **WHEN** an authenticated client sends `GET /mcp` with `Accept: text/event-stream`
-- **THEN** the response is not `200` and carries no JSON-RPC result
+- **THEN** the response is `405` and carries no JSON-RPC result
+
+#### Scenario: GET without the event-stream Accept
+- **WHEN** an authenticated client sends `GET /mcp` without `Accept: text/event-stream`
+- **THEN** the response is still `405` with `Allow: POST`
 
 ### Requirement: Disabled endpoint
 With `[mcp] enabled = false`, `/mcp` and its subpaths SHALL NOT be served and SHALL answer `404`.

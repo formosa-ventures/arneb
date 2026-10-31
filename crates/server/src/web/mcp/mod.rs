@@ -435,31 +435,38 @@ mod tests {
             let resp = router.clone().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
         }
-        let req = axum::http::Request::builder()
-            .method(Method::GET)
-            .uri("/mcp")
-            .header(header::HOST, "h.example")
-            .header(header::ACCEPT, "text/event-stream")
-            .header(header::AUTHORIZATION, basic("alice", "secret"))
-            .body(Body::empty())
-            .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
-        assert_ne!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        assert!(v["result"].is_null(), "{v}");
+        for (accept, expected) in [
+            (Some("text/event-stream"), StatusCode::METHOD_NOT_ALLOWED),
+            (None, StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let mut req = axum::http::Request::builder()
+                .method(Method::GET)
+                .uri("/mcp")
+                .header(header::HOST, "h.example")
+                .header(header::AUTHORIZATION, basic("alice", "secret"));
+            if let Some(a) = accept {
+                req = req.header(header::ACCEPT, a);
+            }
+            let resp = router
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), expected, "Accept: {accept:?}");
+            assert_eq!(resp.headers()[header::ALLOW], "POST");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            assert!(v["result"].is_null(), "{v}");
+        }
     }
 
     #[tokio::test]
     async fn disabled_mcp_is_not_mounted() {
         let router = build_router(mcp_state(false, None));
         let (status, _, body) = rpc(router, None, "127.0.0.1:6432", INIT).await;
-        assert!(
-            status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
-            "{status}"
-        );
+        assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body["jsonrpc"].is_null(), "{body}");
     }
 

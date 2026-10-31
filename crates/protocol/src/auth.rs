@@ -370,6 +370,12 @@ pub fn decoy_verifier(user: &str) -> ScramVerifier {
     }
 }
 
+/// Whether `id` has the shape of an API token id: 16 lowercase hex
+/// characters (the middle segment of a token).
+pub fn is_token_id(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Whether `s` has the exact shape of an Arneb API token:
 /// `arneb_<16 lowercase hex>_<43 base64url characters, no padding>`.
 /// Session tokens (`arneb_s_...`) deliberately do not match.
@@ -380,8 +386,7 @@ pub fn is_token_shaped(s: &str) -> bool {
     let Some((id, secret)) = rest.split_once('_') else {
         return false;
     };
-    id.len() == 16
-        && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    is_token_id(id)
         && secret.len() == 43
         && secret
             .bytes()

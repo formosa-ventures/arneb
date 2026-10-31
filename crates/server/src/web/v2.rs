@@ -515,7 +515,7 @@ pub(super) async fn revoke_token_for(
     let store = token_store(state)?;
     // A malformed id is refused before it is audited: the id is the audit
     // target, and a pasted token must never land in the audit log.
-    if !is_token_id(&id) {
+    if !arneb_protocol::is_token_id(&id) {
         return Err(
             ApiError::new(ErrorCode::InvalidArgument, "the token id is not valid").with_hint(
                 "a token id is 16 lowercase hex characters, as GET /api/v2/tokens lists",
@@ -537,11 +537,6 @@ pub(super) async fn revoke_token_for(
     })
     .await
     .map_err(blocking_failed)?
-}
-
-/// Whether `id` has the shape of a token id: 16 lowercase hex characters.
-fn is_token_id(id: &str) -> bool {
-    id.len() == 16 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 async fn list_queries(

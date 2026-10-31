@@ -8,7 +8,8 @@ mod tokens;
 mod users;
 
 pub use audit::{
-    AuditEntry, AuditLog, AuditOutcome, AuditPage, AuditQuery, AuditRecord, AuditSettings,
+    AuditAppendError, AuditEntry, AuditLog, AuditOutcome, AuditPage, AuditQuery, AuditRecord,
+    AuditSettings,
 };
 pub use file::{StateError, StateStore};
 pub use tokens::{now_ms, sha256, IssuedToken, TokenInfo, MAX_TOKENS_PER_USER};

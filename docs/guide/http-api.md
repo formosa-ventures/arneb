@@ -428,7 +428,8 @@ curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
 ```
 
 - `seq` increases with every entry, across restarts; a failed write can
-  leave a gap. `time_ms` is milliseconds since the Unix epoch.
+  leave a gap. After a crash, a seq that appears only in an ERROR line may be
+  reused. `time_ms` is milliseconds since the Unix epoch.
 - `via` is how the user authenticated: `token`, `session` or `basic`.
 - `target` names what the action acted on. A token is named by its 16-hex
   id only; the token itself is never recorded.

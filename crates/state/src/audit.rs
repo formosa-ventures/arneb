@@ -64,13 +64,25 @@ pub struct AuditRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntry {
     /// Increases with every entry, across restarts; a failed write can
-    /// leave a gap.
+    /// leave a gap. After a crash, a seq that appears only in an ERROR line
+    /// may be reused.
     pub seq: u64,
     /// When the entry was appended (milliseconds since the Unix epoch).
     pub time_ms: u64,
     /// The audited action.
     #[serde(flatten)]
     pub record: AuditRecord,
+}
+
+/// A failed [`AuditLog::append`]: the entry that could not be written (its
+/// `seq` is used up) and why.
+#[derive(Debug, thiserror::Error)]
+#[error("appending audit entry {} failed: {source}", entry.seq)]
+pub struct AuditAppendError {
+    /// The entry as it would have been written, for the error log.
+    pub entry: Box<AuditEntry>,
+    /// Why the write failed.
+    pub source: StateError,
 }
 
 /// A page request over the audit log.
@@ -197,7 +209,7 @@ impl AuditLog {
     /// Appends `record` as the next entry and syncs it to disk. On failure
     /// the log is marked unwritable until [`Self::ensure_writable`]
     /// succeeds. Blocking.
-    pub fn append(&self, record: AuditRecord) -> Result<AuditEntry, StateError> {
+    pub fn append(&self, record: AuditRecord) -> Result<AuditEntry, AuditAppendError> {
         let mut inner = self.lock();
         let entry = AuditEntry {
             seq: inner.next_seq,
@@ -217,9 +229,9 @@ impl AuditLog {
         if let Err(source) = written {
             inner.writable = false;
             inner.file = None;
-            return Err(StateError::AuditAppendFailed {
+            return Err(AuditAppendError {
                 entry: Box::new(entry),
-                source: Box::new(source),
+                source,
             });
         }
         inner.entries.push_back(entry.clone());
@@ -478,8 +490,18 @@ fn open_append(path: &Path) -> Result<File, StateError> {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(io)?;
     }
+    // Like the rename in `write_atomically`: the file exists either way, so
+    // a directory fsync some filesystems refuse (EINVAL on FUSE, SMB, NFS)
+    // only weakens crash durability.
     if created {
-        sync_parent_dir(path).map_err(io)?;
+        if let Err(e) = sync_parent_dir(path) {
+            tracing::warn!(
+                target: "arneb::audit",
+                path = %path.display(),
+                error = %e,
+                "audit log was created but syncing its directory failed"
+            );
+        }
     }
     Ok(file)
 }
@@ -801,10 +823,7 @@ mod tests {
         drop(f);
         log.set_fail_appends(true);
         let err = log.append(record("alice", "b")).unwrap_err();
-        match err {
-            StateError::AuditAppendFailed { entry, .. } => assert_eq!(entry.seq, 2),
-            other => panic!("expected AuditAppendFailed, got {other:?}"),
-        }
+        assert_eq!(err.entry.seq, 2);
         log.set_fail_appends(false);
         log.ensure_writable().unwrap();
         assert_eq!(log.append(record("alice", "c")).unwrap().seq, 3);
@@ -842,6 +861,19 @@ mod tests {
         in_memory.reverse();
         assert_eq!(in_file, in_memory, "file order == memory order");
         assert_eq!(in_file, (1..=400).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn failed_directory_fsync_on_create_still_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        crate::file::FAIL_DIR_SYNC.with(|f| f.set(true));
+        let log = AuditLog::open(Some(&p), settings(100, 0));
+        crate::file::FAIL_DIR_SYNC.with(|f| f.set(false));
+        let log = log.unwrap();
+        assert!(log.is_writable());
+        log.append(record("alice", "a")).unwrap();
+        assert_eq!(lines(&p), 1);
     }
 
     #[test]

@@ -39,12 +39,6 @@ pub enum StateError {
     /// The audit log failed a write and has not been reopened since.
     #[error("the audit log is not writable: {0}")]
     AuditUnwritable(String),
-    /// Appending `entry` to the audit log failed; its `seq` is used up.
-    #[error("appending audit entry {} failed: {source}", entry.seq)]
-    AuditAppendFailed {
-        entry: Box<crate::AuditEntry>,
-        source: Box<StateError>,
-    },
 }
 
 /// A stored user with a SCRAM-SHA-256 verifier (never a plaintext password).
@@ -120,7 +114,7 @@ impl std::fmt::Debug for StateStore {
 #[cfg(test)]
 thread_local! {
     /// Test hook: make the directory fsync after the rename fail.
-    static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl StateStore {

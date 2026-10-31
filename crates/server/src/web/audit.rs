@@ -78,26 +78,16 @@ pub(super) fn audited<T>(
             Err(e) => AuditOutcome::Error(e.code.name()),
         },
     };
-    match state.audit.append(record) {
-        Ok(_) => {}
-        Err(arneb_state::StateError::AuditAppendFailed { entry, source }) => {
-            tracing::error!(
-                target: "arneb::audit",
-                seq = entry.seq,
-                time_ms = entry.time_ms,
-                entry = %serde_json::to_string(&entry).unwrap_or_default(),
-                error = %source,
-                "the action was applied but its audit entry could not be written; \
-                 audited actions are refused until the audit log is writable"
-            );
-        }
-        Err(e) => tracing::error!(
+    if let Err(arneb_state::AuditAppendError { entry, source }) = state.audit.append(record) {
+        tracing::error!(
             target: "arneb::audit",
-            action,
-            user = %who.user,
-            error = %e,
-            "the action was applied but its audit entry could not be written"
-        ),
+            seq = entry.seq,
+            time_ms = entry.time_ms,
+            entry = %serde_json::to_string(&entry).unwrap_or_default(),
+            error = %source,
+            "the action was applied but its audit entry could not be written; \
+             audited actions are refused until the audit log is writable"
+        );
     }
     out
 }

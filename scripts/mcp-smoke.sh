@@ -172,7 +172,12 @@ fi
 pass
 
 STEP="4 explain and submit Q6"
-tool_ok AUTH1 explain_query "$(jq -nc --arg sql "$Q6" --arg c "$CATALOG" --arg s "$SCHEMA" '{sql:$sql, catalog:$c, schema:$s}')"
+tool AUTH1 explain_query "$(jq -nc --arg sql "$Q6" --arg c "$CATALOG" --arg s "$SCHEMA" '{sql:$sql, catalog:$c, schema:$s}')"
+check '.isError == false' "explain_query returned isError"
+# The plan travels once: in structuredContent, with a summary as the text.
+check '.content[0].text | contains("structuredContent.plan")' "explain text is not the summary"
+check '.structuredContent.plan as $p | .content[0].text | contains($p) | not' "explain text repeats the plan"
+LAST=$(printf '%s' "$LAST" | jq -c '.structuredContent')
 check '.plan | length > 0' "empty plan"
 submit "$Q6"
 wait_terminal

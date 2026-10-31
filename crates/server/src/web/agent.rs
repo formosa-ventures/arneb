@@ -184,7 +184,7 @@ async fn explain(
 ) -> Result<Json<Explanation>, ApiError> {
     let service = service(&state)?;
     let req: ExplainRequest = json_body(body)?;
-    Ok(Json(service.explain(&who.user, &req).await?))
+    Ok(Json(service.explain(&who.user, &req, None).await?))
 }
 
 async fn submit(

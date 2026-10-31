@@ -40,7 +40,7 @@ Stage H3 of the headless agent interface, built on H1 (`headless-api-auth`: iden
 | `list_tables` | `catalog, schema, prefix?, limit?` | listing body | `GET …/tables` |
 | `describe_table` | `catalog, schema, table, limit?` | describe body (`columns` at most `limit`, `truncated`) | `GET …/tables/{t}?limit=` |
 | `sample_table` | `catalog, schema, table, rows?` | statement status | `GET …/sample` |
-| `explain_query` | `sql, catalog?, schema?` | explain body (`plan` cut at `[agent_api] default_page_bytes`, `plan_truncated`) | `POST /explain` |
+| `explain_query` | `sql, catalog?, schema?` | explain body (`plan` cut at `[mcp] default_page_bytes`, `plan_truncated`); the text block is a summary, not a second copy of the plan | `POST /explain` |
 | `submit_query` | `sql, catalog?, schema?, max_rows?, wait_ms?` | statement status | `POST /statements` |
 | `get_query_status` | `id, wait_ms?` | statement status | `GET /statements/{id}` |
 | `fetch_results` | `id, cursor?, max_bytes?` | result page | `GET /statements/{id}/results` |
@@ -71,7 +71,7 @@ A statement that fails after submit, including a syntax error, is a normal statu
 - [The Web port is plain HTTP] -> documented: terminate TLS in a proxy for remote use.
 - [Statements live in coordinator memory, so an MCP client loses them on restart] -> same as the HTTP API; the agent resubmits.
 - [A stateless server cannot push progress] -> tools return a status and the agent polls with `wait_ms`.
-- [Some results are still not bounded in width] -> known gap, not fixed in H3: a statement status carries every result column in `columns`, and a page always holds at least one row, so one row wider than the page budget makes a page larger than `max_bytes` (each cell is still capped at `max_cell_bytes`). `describe_table` (`limit`) and `explain_query` (plan cut at `default_page_bytes`) are bounded.
+- [Some results are still not bounded in width] -> known gap, not fixed in H3: a statement status carries every result column in `columns`, and a page always holds at least one row, so one row wider than the page budget makes a page larger than `max_bytes` (each cell is still capped at `max_cell_bytes`). `describe_table` (`limit`) and `explain_query` (plan cut at `[mcp] default_page_bytes`) are bounded.
 - [The MCP library's version drives the wire format] -> pinned in the workspace; the contract test and the router tests exercise real JSON-RPC.
 
 ## Migration Plan

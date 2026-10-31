@@ -5,11 +5,11 @@
 use std::time::Duration;
 
 use arneb_protocol::agent::{
-    AgentLimits, AgentQueryService, ExplainRequest, ListRequest, SubmitRequest,
+    AgentLimits, AgentQueryService, ExplainRequest, Explanation, ListRequest, SubmitRequest,
 };
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::CallToolResult,
+    model::{CallToolResult, ContentBlock},
     service::{RequestContext, RoleServer},
     tool, tool_router, ErrorData,
 };
@@ -364,17 +364,28 @@ impl ArnebMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let who = identity(&ctx)?;
-        respond(
-            async {
-                let req = ExplainRequest {
-                    sql: a.sql,
-                    catalog: a.catalog,
-                    schema: a.schema,
-                };
-                Ok(service(&self.state)?.explain(&who.user, &req).await?)
+        let outcome: Result<Explanation, ApiError> = async {
+            let svc = service(&self.state)?;
+            let req = ExplainRequest {
+                sql: a.sql,
+                catalog: a.catalog,
+                schema: a.schema,
+            };
+            Ok(svc
+                .explain(&who.user, &req, Some(self.page_bytes(svc)))
+                .await?)
+        }
+        .await;
+        match outcome {
+            // The plan travels once, in `structuredContent`; the text block
+            // is a summary instead of a second copy of it.
+            Ok(x) => {
+                let mut result = ok(&x)?;
+                result.content = vec![ContentBlock::text(explain_summary(&x))];
+                Ok(result)
             }
-            .await,
-        )
+            Err(e) => Ok(tool_error(e)),
+        }
     }
 
     /// `submit_query`: `POST /api/v2/statements`.
@@ -622,6 +633,23 @@ impl ArnebMcp {
                 .map(|()| serde_json::json!({"revoked": a.id})),
         )
     }
+}
+
+/// The text block of an `explain_query` result: what was planned, without
+/// the plan itself (that is `structuredContent.plan`).
+fn explain_summary(x: &Explanation) -> String {
+    let bytes = x
+        .estimated_scan_bytes
+        .map_or_else(|| "unknown".to_owned(), |b| b.to_string());
+    let tables: Vec<&str> = x.scans.iter().map(|s| s.table.as_str()).collect();
+    format!(
+        "Planned without running: {} scan(s) [{}], estimated_scan_bytes {bytes}. \
+         The {}-byte plan{} is in structuredContent.plan.",
+        x.scans.len(),
+        tables.join(", "),
+        x.plan.len(),
+        if x.plan_truncated { " (cut)" } else { "" },
+    )
 }
 
 fn via_name(via: AuthVia) -> &'static str {
@@ -1066,6 +1094,18 @@ mod tests {
         assert!(x["plan"].is_string(), "{x}");
         assert_eq!(x["plan_truncated"], false, "{x}");
         assert_eq!(f.tracker.list_queries(None).len(), before);
+        // #217 review: the plan is sent once; the text block summarizes.
+        let r = tool(
+            &f,
+            "alice",
+            "explain_query",
+            json!({"sql":"SELECT n FROM big"}),
+        )
+        .await;
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains(x["plan"].as_str().unwrap()), "{text}");
+        assert!(text.contains("memory.default.big"), "{text}");
+        assert_eq!(r["content"].as_array().unwrap().len(), 1);
         let e = tool_err(
             &f,
             "alice",
@@ -1074,6 +1114,20 @@ mod tests {
         )
         .await;
         assert_eq!(e["code"], "column_not_found");
+    }
+
+    #[tokio::test]
+    async fn explain_query_plan_is_cut_at_the_mcp_budget() {
+        let f = fixture_with(false, 64);
+        let x = tool_ok(
+            &f,
+            "alice",
+            "explain_query",
+            json!({"sql":"SELECT n FROM big WHERE n = 'a' OR n = 'b' OR n = 'c'"}),
+        )
+        .await;
+        assert_eq!(x["plan_truncated"], true, "{x}");
+        assert!(x["plan"].as_str().unwrap().len() <= 64, "{x}");
     }
 
     #[tokio::test]

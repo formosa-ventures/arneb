@@ -94,7 +94,7 @@ Every tool SHALL run as the request's authenticated identity and SHALL call the 
 - **THEN** the result is an error with code `not_found`
 
 ### Requirement: Discovery tools
-`list_catalogs`, `list_schemas` and `list_tables` SHALL return the H2 listing body for the objects the caller may see, `describe_table` the columns (at most `limit`, with `truncated`) and statistics, `sample_table` a finished statement with a first page (default 10 rows, at most 100), and `explain_query` the plan (cut at `[agent_api] default_page_bytes`, with `plan_truncated`) and scan estimates without running the query.
+`list_catalogs`, `list_schemas` and `list_tables` SHALL return the H2 listing body for the objects the caller may see, `describe_table` the columns (at most `limit`, with `truncated`) and statistics, `sample_table` a finished statement with a first page (default 10 rows, at most 100), and `explain_query` the plan (cut at `[mcp] default_page_bytes`, with `plan_truncated`) and scan estimates without running the query, with the plan only in `structuredContent` and a short summary as the text block.
 
 #### Scenario: Explain does not execute
 - **WHEN** alice calls `explain_query` for a query over a table

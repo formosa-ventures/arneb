@@ -103,7 +103,7 @@ never clamped. The ceilings come from `[agent_api]`.
 |---|---|---|---|
 | `limit` of `list_catalogs`, `list_schemas`, `list_tables` | 1000 | 10000 | `[agent_api] default_max_rows`, `max_rows` |
 | `limit` of `describe_table` (columns) | 1000 | 10000 | `[agent_api] default_max_rows`, `max_rows` |
-| plan text of `explain_query` | 262144 bytes, cut and flagged `plan_truncated` | none | `[agent_api] default_page_bytes` |
+| plan text of `explain_query` | 32768 bytes, cut and flagged `plan_truncated` | none | `[mcp] default_page_bytes` |
 | `rows` of `sample_table` | 10 | 100 | fixed |
 | `max_rows` of `submit_query` | 1000 | 10000 | `[agent_api] default_max_rows`, `max_rows` |
 | `wait_ms` | 0 | 10000 | ceiling is `[agent_api] max_wait_ms` |
@@ -125,6 +125,11 @@ Differences from the HTTP routes:
   the rows only. The status fields, the `columns` list and the text copy of
   the JSON that the MCP library adds to every result come on top, so a full
   page roughly doubles in what the agent receives.
+- **Plans are sent once.** `explain_query` cuts the plan at the same
+  `[mcp] default_page_bytes` budget (`/api/v2/explain` keeps
+  `[agent_api] default_page_bytes`). Its plan is only in
+  `structuredContent.plan`; the text block is a one-line summary (scan
+  count, tables, estimated bytes, plan size), not a second copy.
 - **Bounded history.** `list_queries` returns the newest queries first, at
   most `limit`, and sets `truncated` when more matched. Each query's `state`
   is lowercase (`queued`, `running`, `finished`, ...), unlike

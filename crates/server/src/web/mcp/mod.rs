@@ -130,7 +130,6 @@ pub(super) fn ok<T: Serialize>(body: &T) -> Result<CallToolResult, ErrorData> {
 
 /// A failed tool result (`isError: true`) whose `structuredContent` is the
 /// same `{"error": …}` envelope the HTTP routes send.
-#[allow(dead_code)] // used by the tools added after `whoami`
 pub(super) fn tool_error(e: ApiError) -> CallToolResult {
     match serde_json::to_value(Envelope { error: &e }) {
         Ok(value) => CallToolResult::structured_error(value),

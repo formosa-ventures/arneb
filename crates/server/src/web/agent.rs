@@ -49,7 +49,7 @@ pub fn routes() -> Router<WebState> {
 }
 
 /// The service, or `not_found` where it is not served (workers).
-fn service(state: &WebState) -> Result<&AgentQueryService, ApiError> {
+pub(super) fn service(state: &WebState) -> Result<&AgentQueryService, ApiError> {
     state
         .agent
         .as_ref()
@@ -74,7 +74,10 @@ fn query<T>(params: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
 }
 
 /// `wait_ms` (default 0), refused above the configured ceiling.
-fn wait(service: &AgentQueryService, wait_ms: Option<u64>) -> Result<Duration, ApiError> {
+pub(super) fn wait(
+    service: &AgentQueryService,
+    wait_ms: Option<u64>,
+) -> Result<Duration, ApiError> {
     let max = service.limits().max_wait;
     let wait = Duration::from_millis(wait_ms.unwrap_or(0));
     if wait > max {

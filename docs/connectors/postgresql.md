@@ -51,9 +51,16 @@ name in upper case, with every non-alphanumeric character replaced by `_`. For
 example, the catalog `pg-prod` reads `ARNEB_CATALOG_PG_PROD_PASSWORD`.
 
 The catalog is registered on the coordinator **and on every worker**, so every
-node needs the same `[[catalogs]]` entry and network access to the database. If
-the database cannot be reached at startup, Arneb logs a warning, skips the
-catalog and keeps serving the rest. An unreachable Hive Metastore is handled the
+node needs network access to the database. Only the coordinator's
+`[[catalogs]]` counts: workers receive the catalog definitions from the
+coordinator (and ignore their own `[[catalogs]]`), and under password auth a
+catalog can also be added, changed or dropped at runtime through
+[`/api/v2/catalog-configs`](/guide/http-api#catalogs). The password then
+crosses the cluster RPC port; set
+[`[cluster] secret` and `[cluster.tls]`](/guide/configuration#cluster-security).
+`ARNEB_CATALOG_<NAME>_PASSWORD` is read on the coordinator only. If the
+database cannot be reached when a node builds the catalog, it logs a warning,
+skips the catalog and keeps serving the rest. An unreachable Hive Metastore is handled the
 same way. Each mounted catalog logs its effective settings, without the
 password, at startup.
 

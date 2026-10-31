@@ -6,7 +6,7 @@ mod tokens;
 mod users;
 
 pub use file::{StateError, StateStore};
-pub use tokens::{IssuedToken, TokenInfo, MAX_TOKENS_PER_USER};
+pub use tokens::{now_ms, sha256, IssuedToken, TokenInfo, MAX_TOKENS_PER_USER};
 pub use users::SeedReport;
 
 use arneb_protocol::{decoy_verifier, is_token_shaped, CredentialSource, ScramVerifier};
@@ -47,7 +47,7 @@ impl CredentialSource for StateStore {
             .find(|u| u.name == user)
             .and_then(|u| u.scram.parse::<ScramVerifier>().ok());
         let known = stored.is_some();
-        let verifier = stored.unwrap_or_else(|| decoy_verifier(&self.decoy_secret, user));
+        let verifier = stored.unwrap_or_else(|| decoy_verifier(user));
         let ok = verifier.verify_password(password);
         ok && known
     }

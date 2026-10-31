@@ -255,9 +255,6 @@ pub trait CredentialSource: Send + Sync + std::fmt::Debug {
 /// The set of users allowed to connect under password authentication.
 pub struct UserCredentials {
     users: HashMap<String, ScramVerifier>,
-    /// Per-process secret used to derive stable fake salts for unknown users,
-    /// so probing does not reveal which user names exist.
-    mock_secret: [u8; KEY_LEN],
 }
 
 impl Debug for UserCredentials {
@@ -289,12 +286,7 @@ impl UserCredentials {
         if map.is_empty() {
             return Err(AuthConfigError::NoUsers);
         }
-        let mut mock_secret = [0u8; KEY_LEN];
-        aws_lc_rs::rand::fill(&mut mock_secret).map_err(|_| AuthConfigError::Random)?;
-        Ok(Self {
-            users: map,
-            mock_secret,
-        })
+        Ok(Self { users: map })
     }
 
     /// Number of configured users.
@@ -321,7 +313,7 @@ impl UserCredentials {
     fn lookup(&self, user: &str) -> (ScramVerifier, bool) {
         match self.users.get(user) {
             Some(v) => (v.clone(), true),
-            None => (decoy_verifier(&self.mock_secret, user), false),
+            None => (decoy_verifier(user), false),
         }
     }
 }
@@ -349,10 +341,10 @@ impl CredentialSource for UserCredentials {
     }
 }
 
-/// Per-process secret for the decoy verifiers the pgwire handler serves to
-/// unknown users; stable for the process so a probed user always gets the
-/// same fake salt.
-fn handler_decoy_secret() -> &'static [u8; KEY_LEN] {
+/// The one per-process secret behind every decoy verifier (pgwire, Trino and
+/// Web Basic, config users and the state store alike); stable for the
+/// process so a probed user always gets the same fake salt on every path.
+fn decoy_secret() -> &'static [u8; KEY_LEN] {
     static SECRET: OnceLock<[u8; KEY_LEN]> = OnceLock::new();
     SECRET.get_or_init(|| {
         let mut secret = [0u8; KEY_LEN];
@@ -361,11 +353,13 @@ fn handler_decoy_secret() -> &'static [u8; KEY_LEN] {
     })
 }
 
-/// Deterministic fake verifier for a user that does not exist, derived from a
-/// per-process `secret`. Verifying against it costs the same PBKDF2 as a real
-/// user and never succeeds, so timing and salts do not reveal which users
-/// exist.
-pub fn decoy_verifier(secret: &[u8; 32], user: &str) -> ScramVerifier {
+/// Deterministic fake verifier for a user that does not exist, derived from
+/// the process-wide decoy secret. Verifying against it costs the same PBKDF2
+/// as a real user and never succeeds, so timing and salts do not reveal
+/// which users exist, and every credential source and protocol hands the
+/// same unknown user the same fake salt.
+pub fn decoy_verifier(user: &str) -> ScramVerifier {
+    let secret = decoy_secret();
     let salt = hmac_sha256(secret, user.as_bytes());
     let keys = hmac_sha256(secret, &salt);
     ScramVerifier {
@@ -625,7 +619,7 @@ impl AuthStartupHandler {
                 let mut verifiers = creds.scram_verifiers(&user);
                 let known_user = !verifiers.is_empty();
                 if !known_user {
-                    verifiers.push(decoy_verifier(handler_decoy_secret(), &user));
+                    verifiers.push(decoy_verifier(&user));
                 }
                 let first = &verifiers[0];
 

@@ -90,7 +90,7 @@ pub struct BasicAuthenticator {
     cache_key: [u8; 32],
     cache: Arc<Mutex<VerifyCache>>,
     /// Number of full (PBKDF2) verifications; read by tests.
-    verifications: Arc<AtomicU64>,
+    pub(crate) verifications: Arc<AtomicU64>,
     /// Slots for concurrent PBKDF2 verifications.
     limiter: Arc<Semaphore>,
     /// Single-flight map; its size bounds the verification queue.

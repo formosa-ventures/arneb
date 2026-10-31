@@ -14,7 +14,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aws_lc_rs::{constant_time, digest};
+use aws_lc_rs::constant_time;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
@@ -70,9 +70,7 @@ impl fmt::Debug for SessionStore {
 }
 
 fn token_digest(token: &str) -> TokenDigest {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(digest::digest(&digest::SHA256, token.as_bytes()).as_ref());
-    out
+    arneb_state::sha256(token.as_bytes())
 }
 
 impl SessionStore {
@@ -113,16 +111,20 @@ impl SessionStore {
             .filter(|(_, s)| s.user == user)
             .map(|(d, s)| (s.expires, *d))
             .collect();
-        if mine.len() >= MAX_SESSIONS_PER_USER {
+        // How many of the user's oldest sessions the new one replaces.
+        let evict = (mine.len() + 1).saturating_sub(MAX_SESSIONS_PER_USER);
+        // Check the global cap first (counting what the eviction frees), so
+        // a refused sign-in never ends one of the user's live sessions.
+        if sessions.len() - evict >= self.max_sessions {
+            return Err(SessionLimit);
+        }
+        if evict > 0 {
             // Every session lives the same TTL, so the earliest expiry is
             // the oldest session.
             mine.sort();
-            for (_, d) in &mine[..mine.len() + 1 - MAX_SESSIONS_PER_USER] {
+            for (_, d) in &mine[..evict] {
                 sessions.remove(d);
             }
-        }
-        if sessions.len() >= self.max_sessions {
-            return Err(SessionLimit);
         }
         sessions.insert(
             digest,
@@ -233,6 +235,43 @@ mod tests {
         assert_eq!(store.resolve_at(&newest, now).as_deref(), Some("alice"));
         assert_eq!(store.resolve_at(&bob, now).as_deref(), Some("bob"));
         assert_eq!(store.lock().len(), MAX_SESSIONS_PER_USER + 1);
+    }
+
+    #[test]
+    fn a_refused_sign_in_does_not_end_an_existing_session() {
+        let store = SessionStore::with_max_sessions(MAX_SESSIONS_PER_USER + 1);
+        let start = Instant::now();
+        let alice: Vec<String> = (0..MAX_SESSIONS_PER_USER - 1)
+            .map(|i| {
+                store
+                    .create_at("alice", start + Duration::from_secs(i as u64))
+                    .unwrap()
+            })
+            .collect();
+        store.create_at("bob", start).unwrap();
+        store.create_at("carol", start).unwrap();
+        // Full, and alice is under her own cap: refused, nothing evicted.
+        let now = start + Duration::from_secs(100);
+        assert_eq!(store.create_at("alice", now), Err(SessionLimit));
+        assert_eq!(store.create_at("dave", now), Err(SessionLimit));
+        assert_eq!(store.resolve_at(&alice[0], now).as_deref(), Some("alice"));
+        assert_eq!(store.lock().len(), MAX_SESSIONS_PER_USER + 1);
+
+        // A user at their own cap replaces their oldest even when the
+        // process is full: the count does not grow.
+        let store = SessionStore::with_max_sessions(MAX_SESSIONS_PER_USER);
+        let mine: Vec<String> = (0..MAX_SESSIONS_PER_USER)
+            .map(|i| {
+                store
+                    .create_at("alice", start + Duration::from_secs(i as u64))
+                    .unwrap()
+            })
+            .collect();
+        let newest = store.create_at("alice", now).unwrap();
+        assert_eq!(store.resolve_at(&mine[0], now), None, "oldest replaced");
+        assert_eq!(store.resolve_at(&mine[1], now).as_deref(), Some("alice"));
+        assert_eq!(store.resolve_at(&newest, now).as_deref(), Some("alice"));
+        assert_eq!(store.lock().len(), MAX_SESSIONS_PER_USER);
     }
 
     #[test]

@@ -47,7 +47,7 @@ impl CredentialSource for StateStore {
             .find(|u| u.name == user)
             .and_then(|u| u.scram.parse::<ScramVerifier>().ok());
         let known = stored.is_some();
-        let verifier = stored.unwrap_or_else(|| decoy_verifier(&self.decoy_secret, user));
+        let verifier = stored.unwrap_or_else(|| decoy_verifier(user));
         let ok = verifier.verify_password(password);
         ok && known
     }

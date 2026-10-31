@@ -205,8 +205,9 @@ explicitly.
 
 - **Tool results are kept out of debug logs.** The MCP library logs every
   tool result at `debug`, and a result can hold rows or a new API token from
-  `create_token`. Arneb therefore caps the `rmcp` log target at `info`, even
-  under `RUST_LOG=debug`. Only a `RUST_LOG` that names `rmcp` itself (for
+  `create_token`, and it logs three `info` lines for every request. Arneb
+  therefore caps the `rmcp` log target at `warn`, even under
+  `RUST_LOG=debug`; its warnings (a rejected `Origin` or `Host`) still log. Only a `RUST_LOG` that names `rmcp` itself (for
   example `RUST_LOG=info,rmcp=debug`) lifts the cap; do that only on a
   machine whose logs are as private as the tokens.
 - **Host and Origin checks** stop DNS rebinding and cross-site calls; see

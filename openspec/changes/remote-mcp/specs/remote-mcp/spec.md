@@ -64,11 +64,11 @@ With `[mcp] enabled = false`, `/mcp` and its subpaths SHALL NOT be served and SH
 - **THEN** `Origin: https://app.example:443` is accepted and `Origin: https://evil.example` is refused
 
 ### Requirement: Debug logging excludes tool results
-The server SHALL cap the `rmcp` log target at `info`, appended after the base `RUST_LOG` filter, unless `RUST_LOG` names an `rmcp` target itself, so that `RUST_LOG=debug` does not log tool results such as a new API token.
+The server SHALL cap the `rmcp` log target at `warn`, appended after the base `RUST_LOG` filter, unless `RUST_LOG` names an `rmcp` target itself, so that `RUST_LOG=debug` does not log tool results such as a new API token and the default level does not log three lines per request.
 
 #### Scenario: Global debug
 - **WHEN** `RUST_LOG=debug`
-- **THEN** the effective filter is `debug,rmcp=info` and rmcp debug events are disabled
+- **THEN** the effective filter is `debug,rmcp=warn` and rmcp debug events are disabled
 
 #### Scenario: Operator opts in
 - **WHEN** `RUST_LOG=info,rmcp=debug`

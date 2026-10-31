@@ -253,7 +253,7 @@ async fn run() -> Result<()> {
     // 4. Initialize tracing. `--profile` appends an `arneb::profile=info`
     // directive after the base filter (defaults to `RUST_LOG`, else
     // global `info`) so the flag works regardless of how the user
-    // configured the rest of the filter; `rmcp=info` is appended the same
+    // configured the rest of the filter; `rmcp=warn` is appended the same
     // way (see `log_filter_directives`).
     let rust_log = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok();
     let env_filter = tracing_subscriber::EnvFilter::new(log_filter_directives(
@@ -1458,10 +1458,11 @@ async fn register_postgresql_catalog(
 }
 
 /// The tracing filter: `rust_log` (when set and valid, else `info`), then
-/// `arneb::profile=info` under `--profile`, then `rmcp=info` unless
+/// `arneb::profile=info` under `--profile`, then `rmcp=warn` unless
 /// `rust_log` names an `rmcp` target. rmcp logs every tool result at debug,
-/// new API tokens included, so a global `debug` must not reach it; naming
-/// `rmcp` is the operator opting in.
+/// new API tokens included, so a global `debug` must not reach it, and it
+/// logs three info lines per stateless MCP request; naming `rmcp` is the
+/// operator opting in.
 fn log_filter_directives(rust_log: Option<&str>, profile: bool) -> String {
     let base = rust_log
         .map(str::trim)
@@ -1476,7 +1477,7 @@ fn log_filter_directives(rust_log: Option<&str>, profile: bool) -> String {
         target == "rmcp" || target.starts_with("rmcp::")
     });
     if !names_rmcp {
-        directives.push_str(",rmcp=info");
+        directives.push_str(",rmcp=warn");
     }
     directives
 }
@@ -1496,7 +1497,10 @@ mod tests {
                     tracing::Level::DEBUG => {
                         tracing::enabled!(target: "rmcp::service", tracing::Level::DEBUG)
                     }
-                    _ => tracing::enabled!(target: "rmcp::service", tracing::Level::INFO),
+                    tracing::Level::INFO => {
+                        tracing::enabled!(target: "rmcp::service", tracing::Level::INFO)
+                    }
+                    _ => tracing::enabled!(target: "rmcp::service", tracing::Level::WARN),
                 }
             } else {
                 tracing::enabled!(target: "arneb::other", tracing::Level::DEBUG)
@@ -1505,18 +1509,21 @@ mod tests {
     }
 
     #[test]
-    fn rmcp_is_capped_at_info_unless_rust_log_names_it() {
+    fn rmcp_is_capped_at_warn_unless_rust_log_names_it() {
         use tracing::Level;
         // Unset, invalid or empty RUST_LOG: global info, rmcp capped.
         for unset in [None, Some(""), Some("bogus=[[[")] {
-            assert_eq!(log_filter_directives(unset, false), "info,rmcp=info");
+            assert_eq!(log_filter_directives(unset, false), "info,rmcp=warn");
         }
         // A global debug level does not reach rmcp's result logging.
         let d = log_filter_directives(Some("debug"), false);
-        assert_eq!(d, "debug,rmcp=info");
+        assert_eq!(d, "debug,rmcp=warn");
         assert!(enabled(&d, false, Level::DEBUG));
         assert!(!enabled(&d, true, Level::DEBUG));
-        assert!(enabled(&d, true, Level::INFO));
+        // Nor its per-request info lines; its warnings (rejected Origin or
+        // Host) still log.
+        assert!(!enabled(&d, true, Level::INFO));
+        assert!(enabled(&d, true, Level::WARN));
         // Naming rmcp (or a module of it) is the operator opting in.
         for opted in [
             "debug,rmcp=debug",
@@ -1529,12 +1536,12 @@ mod tests {
         // A target that only starts with the letters is not rmcp.
         assert_eq!(
             log_filter_directives(Some("rmcpx=debug"), false),
-            "rmcpx=debug,rmcp=info"
+            "rmcpx=debug,rmcp=warn"
         );
         // `--profile` composes with both.
         assert_eq!(
             log_filter_directives(Some("warn"), true),
-            "warn,arneb::profile=info,rmcp=info"
+            "warn,arneb::profile=info,rmcp=warn"
         );
     }
 

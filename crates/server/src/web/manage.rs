@@ -79,9 +79,15 @@ pub(super) trait ManageAction: Send + 'static {
     fn apply(self, state: &WebState) -> Result<Applied<Self::Output>, ApiError>;
 }
 
+/// The dry-run `warning` of an audited action while the audit log is not
+/// writable.
+pub(super) const AUDIT_UNAVAILABLE_WARNING: &str =
+    "the audit log is unavailable; the real call would be refused with audit_unavailable";
+
 /// Runs `action` for `who`, whose authorization `grant` proves. A dry run
 /// returns the preview and changes nothing (not audited, logged at DEBUG on
-/// `arneb::audit`); a real run applies it in `spawn_blocking`, audited when
+/// `arneb::audit`; an audited action's preview warns when the audit log is
+/// not writable); a real run applies it in `spawn_blocking`, audited when
 /// [`ManageAction::audited`], with `parameters` plus an `effect` of
 /// `applied` or the action's unchanged effect.
 pub(super) async fn run_manage<A: ManageAction>(
@@ -95,7 +101,14 @@ pub(super) async fn run_manage<A: ManageAction>(
     let name = action.action();
     let target = action.target();
     if dry_run {
-        let preview = action.preview(state)?;
+        let mut preview = action.preview(state)?;
+        if action.audited() && !state.audit.is_writable() {
+            let note = AUDIT_UNAVAILABLE_WARNING;
+            preview.warning = Some(match preview.warning.take() {
+                Some(w) => format!("{w}; {note}"),
+                None => note.to_owned(),
+            });
+        }
         tracing::debug!(
             target: "arneb::audit",
             user = %who.user,

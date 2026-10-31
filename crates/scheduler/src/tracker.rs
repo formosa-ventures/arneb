@@ -67,6 +67,8 @@ struct Entry {
     rows: Option<u64>,
     /// Dropped (uncalled) when the query turns terminal.
     canceller: Option<Canceller>,
+    /// Who killed it through [`QueryTracker::kill_query`].
+    killed_by: Option<String>,
 }
 
 struct Inner {
@@ -121,6 +123,7 @@ impl QueryTracker {
                 user,
                 rows: None,
                 canceller: None,
+                killed_by: None,
             },
         );
         id
@@ -176,17 +179,30 @@ impl QueryTracker {
         self.update(id, |e| e.machine.fail(error))
     }
 
-    /// Register how to stop query `id` on the protocol running it. Dropped
-    /// without being called when the query is unknown or already terminal.
+    /// Register how to stop query `id` on the protocol running it. A query
+    /// already cancelled (killed before its protocol registered) has the
+    /// canceller called at once, outside the lock, with the killer's name
+    /// (`the server` when it was not killed by a user). Dropped without
+    /// being called when the query is unknown or ended otherwise.
     pub fn set_canceller(&self, id: &QueryId, canceller: Canceller) {
         let mut inner = self.inner.write().unwrap();
-        match inner.queries.get_mut(id) {
-            Some(e) if !e.machine.state.is_terminal() => e.canceller = Some(canceller),
+        let killed_by = match inner.queries.get_mut(id) {
+            Some(e) if !e.machine.state.is_terminal() => {
+                e.canceller = Some(canceller);
+                return;
+            }
+            Some(e) if e.machine.state == QueryState::Cancelled => e
+                .killed_by
+                .clone()
+                .unwrap_or_else(|| "the server".to_owned()),
             _ => {
                 drop(inner);
                 drop(canceller);
+                return;
             }
-        }
+        };
+        drop(inner);
+        canceller(&killed_by);
     }
 
     /// Stop query `id` on behalf of user `by`: call its canceller (outside
@@ -203,6 +219,7 @@ impl QueryTracker {
             if was.is_terminal() {
                 return Ok(KillOutcome::AlreadyEnded(was));
             }
+            entry.killed_by = Some(by.to_owned());
             (was, entry.canceller.take())
         };
         if let Some(cancel) = canceller {
@@ -547,6 +564,49 @@ mod tests {
         let guard = DropGuard(Arc::clone(&late));
         tracker.set_canceller(&id, Box::new(move |_| drop(guard)));
         assert!(late.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn kill_before_registration_runs_the_canceller_on_registration() {
+        use std::sync::Mutex;
+        let tracker = QueryTracker::with_history_limit(10);
+        let id = tracker.create_query("SELECT 1".into());
+        assert_eq!(
+            tracker.kill_query(&id, "root").unwrap(),
+            KillOutcome::Killed {
+                was: QueryState::Queued
+            }
+        );
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&calls);
+        tracker.set_canceller(
+            &id,
+            Box::new(move |by| seen.lock().unwrap().push(by.to_owned())),
+        );
+        assert_eq!(*calls.lock().unwrap(), ["root"], "run on registration");
+        // Cancelled without a kill: the canceller still runs, by the server.
+        let other = tracker.create_query("SELECT 2".into());
+        tracker.cancel_query(&other).unwrap();
+        let seen = Arc::clone(&calls);
+        tracker.set_canceller(
+            &other,
+            Box::new(move |by| seen.lock().unwrap().push(by.to_owned())),
+        );
+        assert_eq!(*calls.lock().unwrap(), ["root", "the server"]);
+    }
+
+    #[test]
+    fn query_ending_on_its_own_during_the_kill_already_ended() {
+        let tracker = QueryTracker::with_history_limit(10);
+        let id = tracker.create_query("SELECT 1".into());
+        tracker.advance_to(&id, QueryState::Running).unwrap();
+        let inner = tracker.clone();
+        tracker.set_canceller(&id, Box::new(move |_| inner.finish_query(&id, 1).unwrap()));
+        assert_eq!(
+            tracker.kill_query(&id, "root").unwrap(),
+            KillOutcome::AlreadyEnded(QueryState::Finished)
+        );
+        assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Finished);
     }
 
     #[test]

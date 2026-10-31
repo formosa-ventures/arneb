@@ -3,6 +3,7 @@
 //! reads, metadata listings, `execute` and `system.runtime.queries`; and
 //! a tracker kill stopping a running statement on either protocol.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,8 +92,20 @@ fn rules() -> Option<Arc<AccessRules>> {
     Some(Arc::new(AccessRules::from_json(RULES).unwrap()))
 }
 
-/// Executes every plan by never returning on its own.
-struct HangingExecutor;
+/// Executes every plan by never returning on its own; sets `dropped` when
+/// the execution future is dropped.
+#[derive(Default)]
+struct HangingExecutor {
+    dropped: Arc<AtomicBool>,
+}
+
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
 
 #[async_trait::async_trait]
 impl DistributedExecutor for HangingExecutor {
@@ -101,6 +114,7 @@ impl DistributedExecutor for HangingExecutor {
         _plan: LogicalPlan,
         _exec_ctx: &ExecutionContext,
     ) -> Result<Vec<RecordBatch>, ArnebError> {
+        let _guard = DropFlag(Arc::clone(&self.dropped));
         tokio::time::sleep(Duration::from_secs(3600)).await;
         Ok(Vec::new())
     }
@@ -468,7 +482,9 @@ async fn running_query(tracker: &QueryTracker) -> arneb_common::identifiers::Que
 #[tokio::test]
 async fn tracker_kill_stops_a_pgwire_statement() {
     let tracker = Arc::new(QueryTracker::new());
-    let port = pg_server_with(Arc::clone(&tracker), Some(Arc::new(HangingExecutor))).await;
+    let executor = Arc::new(HangingExecutor::default());
+    let dropped = Arc::clone(&executor.dropped);
+    let port = pg_server_with(Arc::clone(&tracker), Some(executor)).await;
     let alice = pg(port, "alice").await;
     let statement = tokio::spawn(async move {
         let err = alice
@@ -476,7 +492,8 @@ async fn tracker_kill_stops_a_pgwire_statement() {
             .await
             .unwrap_err();
         let db = err.as_db_error().expect("a server error");
-        (db.code().code().to_owned(), db.message().to_owned())
+        let error = (db.code().code().to_owned(), db.message().to_owned());
+        (error, alice)
     });
     let id = running_query(&tracker).await;
     assert_eq!(
@@ -485,19 +502,31 @@ async fn tracker_kill_stops_a_pgwire_statement() {
             was: QueryState::Running
         }
     );
-    let (code, message) = tokio::time::timeout(Duration::from_secs(2), statement)
+    let ((code, message), alice) = tokio::time::timeout(Duration::from_secs(2), statement)
         .await
         .expect("the statement stopped within 2 s")
         .unwrap();
     assert_eq!(code, "57014");
     assert_eq!(message, "canceling statement due to user request");
     assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the execution future was dropped"
+    );
+    // The connection stays usable. (Every plan here goes to the hanging
+    // executor, `SELECT 1` included, so use a statement answered without it.)
+    let rows = pg_rows(&alice.simple_query("SHOW statement_timeout").await.unwrap());
+    assert_eq!(rows.len(), 1, "{rows:?}");
 }
 
 #[tokio::test]
 async fn tracker_kill_stops_a_trino_query() {
     let tracker = Arc::new(QueryTracker::new());
-    let base = trino_server_with(Arc::clone(&tracker), Some(Arc::new(HangingExecutor))).await;
+    let base = trino_server_with(
+        Arc::clone(&tracker),
+        Some(Arc::new(HangingExecutor::default())),
+    )
+    .await;
     let http = reqwest::Client::new();
     let doc: Value = http
         .post(format!("{base}/v1/statement"))

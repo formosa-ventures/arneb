@@ -589,9 +589,10 @@ pub(super) struct KillResult {
     state: String,
 }
 
-/// Cancels query `id` for `who` under the kill rule (manage-api D2, D7):
-/// a query `who` may not see is `not_found` unless `who` manages; then
-/// [`Authorizer::check_kill`]. Audited unless `who` owns the query. A query
+/// Cancels query `id` for `who` under the kill rule (manage-api D2, D7,
+/// ruling R6): a query `who` may neither view nor kill is `not_found` (a
+/// manager, or a `queries` rule allowing `kill`, finds it by id even
+/// without `view`); then [`Authorizer::check_kill`]. Audited unless `who` owns the query. A query
 /// that already ended is a no-op (`changed: false`). Shared with
 /// `/api/v1` and the MCP `cancel_query` tool.
 pub(super) async fn cancel_query_for(
@@ -1809,6 +1810,70 @@ pub(super) mod tests {
         assert!(
             audit_entries(&state).is_empty(),
             "nothing is audited under none"
+        );
+    }
+
+    /// A failed append leaves the audit log unwritable: issue a token (an
+    /// audited action) while appends fail, so later calls see it closed.
+    async fn close_the_audit_log(state: &WebState) {
+        state.audit.set_fail_appends(true);
+        let (status, _) = call(
+            state,
+            Method::POST,
+            "/api/v2/tokens",
+            Some(&creds("bob")),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(!state.audit.is_writable());
+    }
+
+    #[tokio::test]
+    async fn dry_run_warns_when_the_audit_log_is_unavailable() {
+        let state = kill_state();
+        let (id, killed_by) = running(&state, "alice");
+        let path = format!("/api/v2/queries/{id}?dry_run=true");
+        let (_, body) = cancel_as(&state, "root", &path).await;
+        assert_eq!(body["warning"], Value::Null, "{body}");
+        close_the_audit_log(&state).await;
+        let (status, body) = cancel_as(&state, "root", &path).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["warning"],
+            crate::web::manage::AUDIT_UNAVAILABLE_WARNING,
+            "{body}"
+        );
+        assert_eq!(body["changed"], true);
+        // An owner's cancel is not audited: no warning.
+        let (_, body) = cancel_as(&state, "alice", &path).await;
+        assert_eq!(body["warning"], Value::Null, "{body}");
+        assert!(killed_by.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_unavailable_kills_nothing() {
+        let state = kill_state();
+        let (id, killed_by) = running(&state, "alice");
+        close_the_audit_log(&state).await;
+        let (status, body) = cancel_as(&state, "root", &format!("/api/v2/queries/{id}")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "audit_unavailable");
+        assert!(
+            killed_by.lock().unwrap().is_empty(),
+            "the canceller was not called"
+        );
+        assert_eq!(
+            query_state(&state, &id),
+            arneb_scheduler::QueryState::Running
+        );
+        // v1 under password auth is refused the same way.
+        let (status, _) = cancel_as(&state, "root", &format!("/api/v1/queries/{id}")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(killed_by.lock().unwrap().is_empty());
+        assert_eq!(
+            query_state(&state, &id),
+            arneb_scheduler::QueryState::Running
         );
     }
 }

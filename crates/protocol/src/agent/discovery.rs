@@ -274,7 +274,8 @@ impl AgentQueryService {
     /// Up to `rows` (default 10, at most 100) rows of a table, run as a
     /// tracked statement and waited for up to `max_wait`. The row count is
     /// further capped at the server's `max_rows`, so a small configured
-    /// ceiling shortens the sample instead of failing it.
+    /// ceiling shortens the sample instead of failing it. The first page
+    /// holds at most `page_bytes` (default `default_page_bytes`) of rows.
     pub async fn sample(
         &self,
         user: &str,
@@ -282,7 +283,9 @@ impl AgentQueryService {
         schema: &str,
         table: &str,
         rows: Option<usize>,
+        page_bytes: Option<usize>,
     ) -> Result<StatementStatus, AgentError> {
+        self.page_budget("page_bytes", page_bytes)?;
         let requested = match rows {
             None => DEFAULT_SAMPLE_ROWS,
             Some(n) if (1..=MAX_SAMPLE_ROWS).contains(&n) => n,
@@ -320,6 +323,7 @@ impl AgentQueryService {
                 max_rows: Some(rows),
             },
             wait,
+            page_bytes,
         )
         .await
     }
@@ -538,6 +542,7 @@ mod tests {
                     max_rows: None,
                 },
                 Duration::from_secs(30),
+                None,
             )
             .await
             .unwrap();
@@ -706,7 +711,9 @@ mod tests {
         assert_eq!(d.statistics.row_count, Some(42));
         // The sample statement itself may fail (no connector); only the
         // existence check matters here.
-        let _ = svc.sample("alice", "counted", "s", "stat", Some(1)).await;
+        let _ = svc
+            .sample("alice", "counted", "s", "stat", Some(1), None)
+            .await;
         let count = || listings.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(count(), 0, "a hit must not list the schema");
         let err = svc
@@ -798,25 +805,25 @@ mod tests {
     async fn sample_returns_bounded_rows_inline() {
         let svc = service(None);
         let s = svc
-            .sample("alice", "memory", "default", "lineitem", Some(5))
+            .sample("alice", "memory", "default", "lineitem", Some(5), None)
             .await
             .unwrap();
         assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
         assert_eq!(s.first_page.unwrap().rows.len(), 5);
         let s = svc
-            .sample("alice", "memory", "default", "lineitem", None)
+            .sample("alice", "memory", "default", "lineitem", None, None)
             .await
             .unwrap();
         assert_eq!(s.first_page.unwrap().rows.len(), 10);
         for bad in [0, 101] {
             let err = svc
-                .sample("alice", "memory", "default", "lineitem", Some(bad))
+                .sample("alice", "memory", "default", "lineitem", Some(bad), None)
                 .await
                 .unwrap_err();
             assert_eq!(err.code, AgentErrorCode::InvalidArgument);
         }
         let err = svc
-            .sample("alice", "memory", "default", "nosuch", Some(5))
+            .sample("alice", "memory", "default", "nosuch", Some(5), None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
@@ -833,7 +840,7 @@ mod tests {
         let svc = service_limited(None, limits);
         for rows in [None, Some(3), Some(50)] {
             let s = svc
-                .sample("alice", "memory", "default", "lineitem", rows)
+                .sample("alice", "memory", "default", "lineitem", rows, None)
                 .await
                 .unwrap();
             assert_eq!(s.state, StatementState::Finished, "{rows:?}: {:?}", s.error);
@@ -843,7 +850,7 @@ mod tests {
         }
         // The caller's own ceiling still applies.
         let err = svc
-            .sample("alice", "memory", "default", "lineitem", Some(101))
+            .sample("alice", "memory", "default", "lineitem", Some(101), None)
             .await
             .unwrap_err();
         assert!(err.hint.unwrap().contains("rows must be"));
@@ -870,7 +877,14 @@ mod tests {
     async fn sample_information_schema_table() {
         let svc = service(None);
         let s = svc
-            .sample("alice", "memory", "information_schema", "tables", Some(5))
+            .sample(
+                "alice",
+                "memory",
+                "information_schema",
+                "tables",
+                Some(5),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
@@ -947,7 +961,7 @@ mod tests {
     async fn sample_quotes_identifiers() {
         let svc = service(None);
         let s = svc
-            .sample("alice", "memory", "default", "we\"ird", Some(2))
+            .sample("alice", "memory", "default", "we\"ird", Some(2), None)
             .await
             .unwrap();
         assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);

@@ -28,7 +28,7 @@ Stage H3 of the headless agent interface, built on H1 (`headless-api-auth`: iden
 
 **D3. Enabled by default** on coordinator and standalone (`[mcp] enabled = true`, `ARNEB_MCP_ENABLED`). Disabled, or on a node without the agent service, `/mcp` and `/mcp/*` answer `404` (an explicit handler, so they never fall through to the Web UI fallback). Workers have no Web port.
 
-**D4. MCP page budget.** `[mcp] default_page_bytes` = 32768 (`ARNEB_MCP_DEFAULT_PAGE_BYTES`), required to be in `1..=[agent_api] max_page_bytes`. `fetch_results` uses it when `max_bytes` is omitted; `submit_query`, `get_query_status` and `sample_table` replace the inline `first_page` with `results(cursor 0, max_bytes = default_page_bytes)`. `/api/v2` defaults are unchanged. Reason: a 256 KiB default page is about 60k tokens of an agent's context.
+**D4. MCP page budget.** `[mcp] default_page_bytes` = 32768 (`ARNEB_MCP_DEFAULT_PAGE_BYTES`), required to be in `1..=[agent_api] max_page_bytes`. `fetch_results` uses it when `max_bytes` is omitted; `submit_query`, `get_query_status`, `sample_table` and `cancel_query` pass it to the service as the page budget (`page_bytes`) of the inline `first_page`, which is then the page `results(cursor 0, max_bytes = default_page_bytes)` would return. The page is built once, at that budget; the HTTP routes pass none and get `[agent_api] default_page_bytes`. `/api/v2` defaults are unchanged. Reason: a 256 KiB default page is about 60k tokens of an agent's context.
 
 **D5. Tool names and shapes** (stable; `structuredContent` is the `/api/v2` JSON body, wrapped in an object where the route returns an array):
 

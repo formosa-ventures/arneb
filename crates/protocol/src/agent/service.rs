@@ -163,13 +163,16 @@ impl AgentQueryService {
     }
 
     /// Submit a statement for `user`, waiting up to `wait` (capped at
-    /// `max_wait`) for it to finish.
+    /// `max_wait`) for it to finish. A finished status carries a first page
+    /// of at most `page_bytes` (default `default_page_bytes`) of rows.
     pub async fn submit(
         &self,
         user: &str,
         req: SubmitRequest,
         wait: Duration,
+        page_bytes: Option<usize>,
     ) -> Result<StatementStatus, AgentError> {
+        let page_bytes = self.page_budget("page_bytes", page_bytes)?;
         let sql = req.sql.trim();
         if sql.trim_end_matches(';').trim().is_empty() {
             return Err(AgentError::new(
@@ -201,20 +204,23 @@ impl AgentQueryService {
             }
         }
         self.wait_for_end(&statement, wait).await;
-        Ok(statement.status(&self.limits))
+        Ok(statement.status(&self.limits, page_bytes))
     }
 
     /// The status of `user`'s statement `id`, waiting up to `wait` (capped
-    /// at `max_wait`) for it to finish.
+    /// at `max_wait`) for it to finish. A finished status carries a first
+    /// page of at most `page_bytes` (default `default_page_bytes`) of rows.
     pub async fn status(
         &self,
         user: &str,
         id: &str,
         wait: Duration,
+        page_bytes: Option<usize>,
     ) -> Result<StatementStatus, AgentError> {
+        let page_bytes = self.page_budget("page_bytes", page_bytes)?;
         let statement = self.lookup(user, id)?;
         self.wait_for_end(&statement, wait).await;
-        Ok(statement.status(&self.limits))
+        Ok(statement.status(&self.limits, page_bytes))
     }
 
     /// A page of `user`'s finished statement `id`, starting at row `cursor`,
@@ -227,33 +233,50 @@ impl AgentQueryService {
         max_bytes: Option<usize>,
     ) -> Result<ResultPage, AgentError> {
         let statement = self.lookup(user, id)?;
-        let max_bytes = match max_bytes {
-            None => self.limits.default_page_bytes,
-            Some(n) if (1..=self.limits.max_page_bytes).contains(&n) => n,
-            Some(n) => {
-                return Err(AgentError::new(
-                    AgentErrorCode::InvalidArgument,
-                    format!("max_bytes {n} is out of range"),
-                )
-                .with_hint(format!(
-                    "max_bytes must be in 1..={}",
-                    self.limits.max_page_bytes
-                )))
-            }
-        };
+        let max_bytes = self.page_budget("max_bytes", max_bytes)?;
         statement.page(cursor, max_bytes, self.limits.max_cell_bytes)
     }
 
+    /// A page byte budget: `requested`, or `default_page_bytes` when none;
+    /// a value outside `1..=max_page_bytes` is `invalid_argument` naming
+    /// the `field`.
+    pub(crate) fn page_budget(
+        &self,
+        field: &str,
+        requested: Option<usize>,
+    ) -> Result<usize, AgentError> {
+        match requested {
+            None => Ok(self.limits.default_page_bytes),
+            Some(n) if (1..=self.limits.max_page_bytes).contains(&n) => Ok(n),
+            Some(n) => Err(AgentError::new(
+                AgentErrorCode::InvalidArgument,
+                format!("{field} {n} is out of range"),
+            )
+            .with_hint(format!(
+                "{field} must be in 1..={}",
+                self.limits.max_page_bytes
+            ))),
+        }
+    }
+
     /// Cancel `user`'s statement `id`. Idempotent: a terminal statement
-    /// keeps its state and its current status is returned.
-    pub fn cancel(&self, user: &str, id: &str) -> Result<StatementStatus, AgentError> {
+    /// keeps its state and its current status is returned, a finished one
+    /// with a first page of at most `page_bytes` (default
+    /// `default_page_bytes`) of rows.
+    pub fn cancel(
+        &self,
+        user: &str,
+        id: &str,
+        page_bytes: Option<usize>,
+    ) -> Result<StatementStatus, AgentError> {
+        let page_bytes = self.page_budget("page_bytes", page_bytes)?;
         let statement = self.lookup(user, id)?;
         self.cancel_statement(
             &statement,
             AgentError::new(AgentErrorCode::Cancelled, "Statement was cancelled"),
             "client",
         );
-        Ok(statement.status(&self.limits))
+        Ok(statement.status(&self.limits, page_bytes))
     }
 
     /// Checks the caps and registers a new statement with the tracker and
@@ -638,7 +661,7 @@ mod tests {
     ) -> StatementStatus {
         let mut r = req(sql);
         r.max_rows = max_rows;
-        svc.submit("alice", r, Duration::from_secs(30))
+        svc.submit("alice", r, Duration::from_secs(30), None)
             .await
             .unwrap()
     }
@@ -664,6 +687,56 @@ mod tests {
             cursor = p.next_cursor;
         }
         assert_eq!(rows, 1000);
+    }
+
+    /// #217 review: the caller's page budget shapes the inline first page
+    /// of submit, status, cancel and sample, matching `results` at cursor 0,
+    /// so a client never has to build the page twice.
+    #[tokio::test]
+    async fn page_bytes_sets_the_first_page() {
+        let svc = service_over(vec![big_table()], AgentLimits::default());
+        let mut r = req("SELECT n FROM big");
+        r.max_rows = Some(1000);
+        let s = svc
+            .submit("alice", r, Duration::from_secs(30), Some(64))
+            .await
+            .unwrap();
+        let small = s.first_page.unwrap();
+        assert_eq!(small, svc.results("alice", &s.id, 0, Some(64)).unwrap());
+        let full = svc.results("alice", &s.id, 0, None).unwrap();
+        assert!(small.rows.len() < full.rows.len(), "{}", small.rows.len());
+        let st = svc
+            .status("alice", &s.id, Duration::ZERO, Some(64))
+            .await
+            .unwrap();
+        assert_eq!(st.first_page.unwrap(), small);
+        let st = svc
+            .status("alice", &s.id, Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(st.first_page.unwrap(), full);
+        let c = svc.cancel("alice", &s.id, Some(64)).unwrap();
+        assert_eq!(c.first_page.unwrap(), small);
+        let sample = svc
+            .sample("alice", "memory", "default", "big", Some(100), Some(64))
+            .await
+            .unwrap();
+        assert_eq!(sample.first_page.unwrap().rows.len(), small.rows.len());
+        // Out-of-range budgets are refused before anything runs.
+        let before = lock(&svc.statements).len();
+        for bad in [0, AgentLimits::default().max_page_bytes + 1] {
+            let err = svc
+                .submit("alice", req("SELECT 1"), Duration::ZERO, Some(bad))
+                .await
+                .unwrap_err();
+            assert_invalid(err, "page_bytes must be in 1..=");
+            let err = svc
+                .status("alice", &s.id, Duration::ZERO, Some(bad))
+                .await
+                .unwrap_err();
+            assert_invalid(err, "page_bytes");
+        }
+        assert_eq!(lock(&svc.statements).len(), before);
     }
 
     async fn all_rows(svc: &AgentQueryService, s: StatementStatus) -> Vec<Vec<Value>> {
@@ -873,7 +946,7 @@ mod tests {
         let (svc, _) = service();
         let (svc, _dropped) = hanging(svc);
         let s = svc
-            .submit("alice", req(HANGING_SQL), Duration::ZERO)
+            .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
             .await
             .unwrap();
         let err = svc.results("alice", &s.id, 0, None).unwrap_err();
@@ -899,7 +972,10 @@ mod tests {
         for n in [0, 10_001] {
             let mut r = req("SELECT 1");
             r.max_rows = Some(n);
-            let err = svc.submit("alice", r, Duration::ZERO).await.unwrap_err();
+            let err = svc
+                .submit("alice", r, Duration::ZERO, None)
+                .await
+                .unwrap_err();
             assert_invalid(err, "1..=10000");
         }
         let (svc, _) = service();
@@ -930,7 +1006,10 @@ mod tests {
             update_type: Some("USE".into()),
             retained: retain(Vec::new(), 10, 1 << 20, &RetainedBudget::new(1 << 20)),
         }));
-        let s = statement.status(&AgentLimits::default());
+        let s = statement.status(
+            &AgentLimits::default(),
+            AgentLimits::default().default_page_bytes,
+        );
         assert_eq!(s.state, StatementState::Finished);
         assert_eq!(s.update_type.as_deref(), Some("USE"));
         assert_eq!(s.total_rows, Some(0));
@@ -995,7 +1074,7 @@ mod tests {
     async fn wait_for_state(svc: &AgentQueryService, id: &str, state: StatementState) {
         for _ in 0..100 {
             let s = svc
-                .status("alice", id, Duration::from_millis(50))
+                .status("alice", id, Duration::from_millis(50), None)
                 .await
                 .unwrap();
             if s.state == state {
@@ -1015,7 +1094,7 @@ mod tests {
     async fn submit_then_poll_reaches_finished() {
         let (svc, _) = service();
         let s = svc
-            .submit("alice", req("SELECT 1"), Duration::ZERO)
+            .submit("alice", req("SELECT 1"), Duration::ZERO, None)
             .await
             .unwrap();
         assert!(matches!(
@@ -1023,7 +1102,7 @@ mod tests {
             StatementState::Queued | StatementState::Running | StatementState::Finished
         ));
         let s = svc
-            .status("alice", &s.id, Duration::from_secs(2))
+            .status("alice", &s.id, Duration::from_secs(2), None)
             .await
             .unwrap();
         assert_eq!(s.state, StatementState::Finished);
@@ -1041,6 +1120,7 @@ mod tests {
                 "alice",
                 req("SELECT l_quantity FROM lineitem"),
                 Duration::from_secs(5),
+                None,
             )
             .await
             .unwrap();
@@ -1058,12 +1138,12 @@ mod tests {
         let svc = svc.with_admission(Some(admission.clone()));
         let _held = admission.admit("held").unwrap().wait().await;
         let s = svc
-            .submit("alice", req("SELECT 1"), Duration::ZERO)
+            .submit("alice", req("SELECT 1"), Duration::ZERO, None)
             .await
             .unwrap();
         let start = std::time::Instant::now();
         let s = svc
-            .status("alice", &s.id, Duration::from_millis(200))
+            .status("alice", &s.id, Duration::from_millis(200), None)
             .await
             .unwrap();
         let took = start.elapsed();
@@ -1081,13 +1161,13 @@ mod tests {
         let held = admission.admit("held").unwrap().wait().await;
         let ahead = admission.admit("ahead").unwrap();
         let s = svc
-            .submit("alice", req("SELECT 1"), Duration::ZERO)
+            .submit("alice", req("SELECT 1"), Duration::ZERO, None)
             .await
             .unwrap();
         let mut position = None;
         for _ in 0..100 {
             position = svc
-                .status("alice", &s.id, Duration::ZERO)
+                .status("alice", &s.id, Duration::ZERO, None)
                 .await
                 .unwrap()
                 .queue_position;
@@ -1098,14 +1178,17 @@ mod tests {
         }
         assert_eq!(position, Some(2));
         drop(ahead); // leaves the queue: the statement moves up
-        let st = svc.status("alice", &s.id, Duration::ZERO).await.unwrap();
+        let st = svc
+            .status("alice", &s.id, Duration::ZERO, None)
+            .await
+            .unwrap();
         assert_eq!(
             (st.state, st.queue_position),
             (StatementState::Queued, Some(1))
         );
         drop(held); // the slot goes to the statement
         let st = svc
-            .status("alice", &s.id, Duration::from_secs(5))
+            .status("alice", &s.id, Duration::from_secs(5), None)
             .await
             .unwrap();
         assert_eq!(
@@ -1125,7 +1208,7 @@ mod tests {
         let _held = admission.admit("held").unwrap().wait().await;
         let start = std::time::Instant::now();
         let s = svc
-            .submit("alice", req("SELECT 1"), Duration::from_secs(5))
+            .submit("alice", req("SELECT 1"), Duration::from_secs(5), None)
             .await
             .unwrap();
         assert!(start.elapsed() < Duration::from_secs(1));
@@ -1137,11 +1220,11 @@ mod tests {
         let (svc, tracker) = service();
         let (svc, dropped) = hanging(svc);
         let s = svc
-            .submit("alice", req(HANGING_SQL), Duration::ZERO)
+            .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
             .await
             .unwrap();
         wait_for_state(&svc, &s.id, StatementState::Running).await;
-        let c = svc.cancel("alice", &s.id).unwrap();
+        let c = svc.cancel("alice", &s.id, None).unwrap();
         assert_eq!(c.state, StatementState::Cancelled);
         assert_eq!(c.error.unwrap().code, AgentErrorCode::Cancelled);
         let info = tracker
@@ -1163,12 +1246,12 @@ mod tests {
     async fn cancel_is_idempotent_on_terminal_statement() {
         let (svc, tracker) = service();
         let s = svc
-            .submit("alice", req("SELECT 1"), Duration::from_secs(5))
+            .submit("alice", req("SELECT 1"), Duration::from_secs(5), None)
             .await
             .unwrap();
         assert_eq!(s.state, StatementState::Finished);
         for _ in 0..2 {
-            let c = svc.cancel("alice", &s.id).unwrap();
+            let c = svc.cancel("alice", &s.id, None).unwrap();
             assert_eq!(c.state, StatementState::Finished);
             assert_eq!(c.total_rows, Some(1));
         }
@@ -1178,11 +1261,11 @@ mod tests {
         // A cancelled statement stays cancelled.
         let (svc, _) = hanging(svc);
         let s = svc
-            .submit("alice", req(HANGING_SQL), Duration::ZERO)
+            .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
             .await
             .unwrap();
-        let first = svc.cancel("alice", &s.id).unwrap();
-        let second = svc.cancel("alice", &s.id).unwrap();
+        let first = svc.cancel("alice", &s.id, None).unwrap();
+        let second = svc.cancel("alice", &s.id, None).unwrap();
         assert_eq!(first.state, StatementState::Cancelled);
         assert_eq!(second.state, StatementState::Cancelled);
         assert_eq!(first.elapsed_ms, second.elapsed_ms);
@@ -1192,13 +1275,16 @@ mod tests {
     async fn other_users_statement_is_not_found() {
         let (svc, _) = service();
         let s = svc
-            .submit("alice", req("SELECT 1"), Duration::ZERO)
+            .submit("alice", req("SELECT 1"), Duration::ZERO, None)
             .await
             .unwrap();
         let random = QueryId::new().to_string();
-        let err = svc.status("bob", &s.id, Duration::ZERO).await.unwrap_err();
+        let err = svc
+            .status("bob", &s.id, Duration::ZERO, None)
+            .await
+            .unwrap_err();
         let missing = svc
-            .status("bob", &random, Duration::ZERO)
+            .status("bob", &random, Duration::ZERO, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
@@ -1207,13 +1293,13 @@ mod tests {
             missing.message.replace(&random, &s.id),
             "same message shape as for a random id"
         );
-        let err = svc.cancel("bob", &s.id).unwrap_err();
-        let missing = svc.cancel("bob", &random).unwrap_err();
+        let err = svc.cancel("bob", &s.id, None).unwrap_err();
+        let missing = svc.cancel("bob", &random, None).unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
         assert_eq!(err.message, missing.message.replace(&random, &s.id));
         // Alice still sees it, and bob's cancel did nothing.
         let s = svc
-            .status("alice", &s.id, Duration::from_secs(2))
+            .status("alice", &s.id, Duration::from_secs(2), None)
             .await
             .unwrap();
         assert_eq!(s.state, StatementState::Finished);
@@ -1229,7 +1315,7 @@ mod tests {
             "COMMIT",
         ] {
             let err = svc
-                .submit("alice", req(sql), Duration::ZERO)
+                .submit("alice", req(sql), Duration::ZERO, None)
                 .await
                 .unwrap_err();
             assert_eq!(err.code, AgentErrorCode::InvalidArgument, "{sql}");
@@ -1238,7 +1324,7 @@ mod tests {
         assert!(tracker.list_queries(None).is_empty());
         // SHOW is not a session statement.
         let s = svc
-            .submit("alice", req("SHOW CATALOGS"), Duration::from_secs(5))
+            .submit("alice", req("SHOW CATALOGS"), Duration::from_secs(5), None)
             .await
             .unwrap();
         assert_eq!(s.state, StatementState::Finished);
@@ -1248,7 +1334,7 @@ mod tests {
     async fn empty_sql_is_invalid_argument() {
         let (svc, tracker) = service();
         let err = svc
-            .submit("alice", req("  ; "), Duration::ZERO)
+            .submit("alice", req("  ; "), Duration::ZERO, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::InvalidArgument);
@@ -1263,6 +1349,7 @@ mod tests {
                 "alice",
                 req("SELECT l_quantiy FROM lineitem"),
                 Duration::from_secs(5),
+                None,
             )
             .await
             .unwrap();
@@ -1286,12 +1373,12 @@ mod tests {
         let svc = svc.with_admission(Some(admission.clone()));
         let _held = admission.admit("held").unwrap().wait().await;
         for _ in 0..MAX_STATEMENTS_PER_USER {
-            svc.submit("alice", req("SELECT 1"), Duration::ZERO)
+            svc.submit("alice", req("SELECT 1"), Duration::ZERO, None)
                 .await
                 .unwrap();
         }
         let err = svc
-            .submit("alice", req("SELECT 1"), Duration::ZERO)
+            .submit("alice", req("SELECT 1"), Duration::ZERO, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::Overloaded);
@@ -1301,7 +1388,7 @@ mod tests {
         );
         assert_eq!(tracker.list_queries(None).len(), MAX_STATEMENTS_PER_USER);
         // Another user is not affected.
-        svc.submit("bob", req("SELECT 1"), Duration::ZERO)
+        svc.submit("bob", req("SELECT 1"), Duration::ZERO, None)
             .await
             .unwrap();
     }
@@ -1314,12 +1401,12 @@ mod tests {
         let _held = admission.admit("held").unwrap().wait().await;
         for i in 0..MAX_STATEMENTS_TOTAL {
             let user = format!("user{}", i / MAX_STATEMENTS_PER_USER);
-            svc.submit(&user, req("SELECT 1"), Duration::ZERO)
+            svc.submit(&user, req("SELECT 1"), Duration::ZERO, None)
                 .await
                 .unwrap();
         }
         let err = svc
-            .submit("newcomer", req("SELECT 1"), Duration::ZERO)
+            .submit("newcomer", req("SELECT 1"), Duration::ZERO, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::Overloaded);
@@ -1332,7 +1419,7 @@ mod tests {
         let mut ids = Vec::new();
         for _ in 0..MAX_STATEMENTS_PER_USER {
             let s = svc
-                .submit("alice", req("SELECT 1"), Duration::from_secs(5))
+                .submit("alice", req("SELECT 1"), Duration::from_secs(5), None)
                 .await
                 .unwrap();
             assert_eq!(s.state, StatementState::Finished);
@@ -1340,20 +1427,20 @@ mod tests {
         }
         // Touch all but the first, so the first is least recently accessed.
         for id in &ids[1..] {
-            svc.status("alice", id, Duration::ZERO).await.unwrap();
+            svc.status("alice", id, Duration::ZERO, None).await.unwrap();
         }
         let s = svc
-            .submit("alice", req("SELECT 1"), Duration::from_secs(5))
+            .submit("alice", req("SELECT 1"), Duration::from_secs(5), None)
             .await
             .unwrap();
         assert_eq!(s.state, StatementState::Finished);
         let err = svc
-            .status("alice", &ids[0], Duration::ZERO)
+            .status("alice", &ids[0], Duration::ZERO, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
         for id in &ids[1..] {
-            svc.status("alice", id, Duration::ZERO).await.unwrap();
+            svc.status("alice", id, Duration::ZERO, None).await.unwrap();
         }
         // Eviction only forgets the statement; the tracker keeps its history.
         assert_eq!(
@@ -1370,30 +1457,30 @@ mod tests {
         let _held = admission.admit("held").unwrap().wait().await;
         // One terminal statement (SHOW takes no admission slot) ...
         let shown = svc
-            .submit("alice", req("SHOW CATALOGS"), Duration::from_secs(5))
+            .submit("alice", req("SHOW CATALOGS"), Duration::from_secs(5), None)
             .await
             .unwrap();
         assert_eq!(shown.state, StatementState::Finished);
         // ... and the rest live (queued behind the held slot).
         for _ in 1..MAX_STATEMENTS_PER_USER {
             let s = svc
-                .submit("alice", req("SELECT 1"), Duration::ZERO)
+                .submit("alice", req("SELECT 1"), Duration::ZERO, None)
                 .await
                 .unwrap();
             assert!(!s.state.is_terminal());
         }
         // At the cap with one terminal statement: it is evicted.
-        svc.submit("alice", req("SELECT 1"), Duration::ZERO)
+        svc.submit("alice", req("SELECT 1"), Duration::ZERO, None)
             .await
             .unwrap();
         let err = svc
-            .status("alice", &shown.id, Duration::ZERO)
+            .status("alice", &shown.id, Duration::ZERO, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
         // Now all 32 are live: overloaded.
         let err = svc
-            .submit("alice", req("SELECT 1"), Duration::ZERO)
+            .submit("alice", req("SELECT 1"), Duration::ZERO, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::Overloaded);
@@ -1406,26 +1493,26 @@ mod tests {
         let svc = svc.with_admission(Some(admission.clone()));
         let _held = admission.admit("held").unwrap().wait().await;
         let shown = svc
-            .submit("user0", req("SHOW CATALOGS"), Duration::from_secs(5))
+            .submit("user0", req("SHOW CATALOGS"), Duration::from_secs(5), None)
             .await
             .unwrap();
         assert_eq!(shown.state, StatementState::Finished);
         for i in 1..MAX_STATEMENTS_TOTAL {
             let user = format!("user{}", i / MAX_STATEMENTS_PER_USER);
-            svc.submit(&user, req("SELECT 1"), Duration::ZERO)
+            svc.submit(&user, req("SELECT 1"), Duration::ZERO, None)
                 .await
                 .unwrap();
         }
-        svc.submit("newcomer", req("SELECT 1"), Duration::ZERO)
+        svc.submit("newcomer", req("SELECT 1"), Duration::ZERO, None)
             .await
             .unwrap();
         let err = svc
-            .status("user0", &shown.id, Duration::ZERO)
+            .status("user0", &shown.id, Duration::ZERO, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
         let err = svc
-            .submit("other", req("SELECT 1"), Duration::ZERO)
+            .submit("other", req("SELECT 1"), Duration::ZERO, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::Overloaded);
@@ -1442,7 +1529,7 @@ mod tests {
         let svc = svc.with_admission(Some(admission.clone()));
         let _reaper = svc.spawn_reaper();
         let s = svc
-            .submit("alice", req(HANGING_SQL), Duration::ZERO)
+            .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
             .await
             .unwrap();
         wait_for_state(&svc, &s.id, StatementState::Running).await;
@@ -1456,7 +1543,10 @@ mod tests {
         let info = tracker.list_queries(None).pop().unwrap();
         assert_eq!(info.state, QueryState::Cancelled);
         // Kept for another idle period so the agent can learn why.
-        let st = svc.status("alice", &s.id, Duration::ZERO).await.unwrap();
+        let st = svc
+            .status("alice", &s.id, Duration::ZERO, None)
+            .await
+            .unwrap();
         assert_eq!(st.state, StatementState::Cancelled);
         let err = st.error.unwrap();
         assert_eq!(err.code, AgentErrorCode::Cancelled);
@@ -1471,7 +1561,7 @@ mod tests {
         });
         let _reaper = svc.spawn_reaper();
         let s = svc
-            .submit("alice", req("SELECT 1"), Duration::ZERO)
+            .submit("alice", req("SELECT 1"), Duration::ZERO, None)
             .await
             .unwrap();
         wait_for_state(&svc, &s.id, StatementState::Finished).await;
@@ -1480,7 +1570,7 @@ mod tests {
         yield_many().await;
 
         let err = svc
-            .status("alice", &s.id, Duration::ZERO)
+            .status("alice", &s.id, Duration::ZERO, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
@@ -1495,12 +1585,15 @@ mod tests {
         let (svc, _) = hanging(svc);
         let _reaper = svc.spawn_reaper();
         let s = svc
-            .submit("alice", req(HANGING_SQL), Duration::ZERO)
+            .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
             .await
             .unwrap();
         for _ in 0..6 {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let st = svc.status("alice", &s.id, Duration::ZERO).await.unwrap();
+            let st = svc
+                .status("alice", &s.id, Duration::ZERO, None)
+                .await
+                .unwrap();
             assert!(!st.state.is_terminal(), "{:?}", st.state);
         }
     }
@@ -1517,12 +1610,12 @@ mod tests {
         let (svc, dropped) = hanging(svc);
         let _reaper = svc.spawn_reaper();
         let s = svc
-            .submit("alice", req(HANGING_SQL), Duration::ZERO)
+            .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
             .await
             .unwrap();
         for _ in 0..3 {
             let st = svc
-                .status("alice", &s.id, Duration::from_secs(5))
+                .status("alice", &s.id, Duration::from_secs(5), None)
                 .await
                 .unwrap();
             assert!(!st.state.is_terminal(), "{:?}", st.state);
@@ -1551,7 +1644,7 @@ mod tests {
     async fn statement_id_is_the_tracker_query_id() {
         let (svc, tracker) = service();
         let s = svc
-            .submit("alice", req("SELECT 1"), Duration::from_secs(5))
+            .submit("alice", req("SELECT 1"), Duration::from_secs(5), None)
             .await
             .unwrap();
         let queries = tracker.list_queries(None);

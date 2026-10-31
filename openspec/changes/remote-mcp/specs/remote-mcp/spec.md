@@ -116,7 +116,7 @@ Every tool SHALL run as the request's authenticated identity and SHALL call the 
 - **THEN** the call succeeds and the status has `state` `failed` and an `error`
 
 ### Requirement: Bounded results
-Every tool result SHALL be bounded. A tool page SHALL default to `[mcp] default_page_bytes` bytes (32768) when `max_bytes` is omitted, and the inline first page of `submit_query`, `get_query_status` and `sample_table` SHALL follow it too. A request value above its ceiling (`limit`, `rows`, `max_rows`, `wait_ms`, `max_bytes`) SHALL be refused with `invalid_argument` and never clamped. Long cells SHALL be truncated at `max_cell_bytes`.
+Every tool result SHALL be bounded. A tool page SHALL default to `[mcp] default_page_bytes` bytes (32768) when `max_bytes` is omitted, and the inline first page of `submit_query`, `get_query_status`, `sample_table` and `cancel_query` SHALL be built once at that budget, equal to the `fetch_results` page at cursor 0. A request value above its ceiling (`limit`, `rows`, `max_rows`, `wait_ms`, `max_bytes`) SHALL be refused with `invalid_argument` and never clamped. Long cells SHALL be truncated at `max_cell_bytes`.
 
 #### Scenario: Default page is the MCP budget
 - **WHEN** a result of 50,000 ~100-byte rows is fetched without `max_bytes`

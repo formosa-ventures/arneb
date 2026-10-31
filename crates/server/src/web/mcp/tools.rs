@@ -5,8 +5,7 @@
 use std::time::Duration;
 
 use arneb_protocol::agent::{
-    AgentError, AgentLimits, AgentQueryService, ExplainRequest, ListRequest, StatementStatus,
-    SubmitRequest,
+    AgentLimits, AgentQueryService, ExplainRequest, ListRequest, SubmitRequest,
 };
 use rmcp::{
     handler::server::wrapper::Parameters,
@@ -204,22 +203,6 @@ impl ArnebMcp {
             .as_ref()
             .map_or(svc.limits().default_page_bytes, |m| m.default_page_bytes)
     }
-
-    /// `status` with its inline `first_page` re-paged to the MCP budget.
-    /// A cancel that lands between status and results surfaces as an error result;
-    /// that outcome is acceptable and not swallowed.
-    fn repage(
-        &self,
-        svc: &AgentQueryService,
-        user: &str,
-        mut status: StatementStatus,
-    ) -> Result<StatementStatus, AgentError> {
-        if status.first_page.is_some() {
-            let page = svc.results(user, &status.id, 0, Some(self.page_bytes(svc)))?;
-            status.first_page = Some(page);
-        }
-        Ok(status)
-    }
 }
 
 #[tool_router(vis = "pub(super)")]
@@ -357,10 +340,12 @@ impl ArnebMcp {
         respond(
             async {
                 let svc = service(&self.state)?;
-                let status = svc
-                    .sample(&who.user, &a.catalog, &a.schema, &a.table, a.rows)
-                    .await?;
-                Ok(self.repage(svc, &who.user, status)?)
+                let page_bytes = Some(self.page_bytes(svc));
+                Ok(svc
+                    .sample(
+                        &who.user, &a.catalog, &a.schema, &a.table, a.rows, page_bytes,
+                    )
+                    .await?)
             }
             .await,
         )
@@ -418,8 +403,8 @@ impl ArnebMcp {
                     schema: a.schema,
                     max_rows: a.max_rows,
                 };
-                let status = svc.submit(&who.user, req, wait).await?;
-                Ok(self.repage(svc, &who.user, status)?)
+                let page_bytes = Some(self.page_bytes(svc));
+                Ok(svc.submit(&who.user, req, wait, page_bytes).await?)
             }
             .await,
         )
@@ -443,8 +428,8 @@ impl ArnebMcp {
             async {
                 let svc = service(&self.state)?;
                 let wait: Duration = wait(svc, a.wait_ms)?;
-                let status = svc.status(&who.user, &a.id, wait).await?;
-                Ok(self.repage(svc, &who.user, status)?)
+                let page_bytes = Some(self.page_bytes(svc));
+                Ok(svc.status(&who.user, &a.id, wait, page_bytes).await?)
             }
             .await,
         )
@@ -489,7 +474,13 @@ impl ArnebMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let who = identity(&ctx)?;
-        respond(async { Ok(service(&self.state)?.cancel(&who.user, &a.id)?) }.await)
+        respond(
+            async {
+                let svc = service(&self.state)?;
+                Ok(svc.cancel(&who.user, &a.id, Some(self.page_bytes(svc)))?)
+            }
+            .await,
+        )
     }
 
     /// `list_queries`: the bounded `GET /api/v2/queries`.
@@ -927,6 +918,10 @@ mod tests {
         let st = tool_ok(&f, "alice", "get_query_status", json!({"id": id})).await;
         assert_eq!(st["first_page"]["rows"], first["rows"]);
         assert_eq!(st["first_page"]["next_cursor"], first["next_cursor"]);
+        // And so is cancelling a statement that already finished.
+        let c = tool_ok(&f, "alice", "cancel_query", json!({"id": id})).await;
+        assert_eq!(c["state"], "finished");
+        assert_eq!(c["first_page"], st["first_page"]);
     }
 
     #[tokio::test]

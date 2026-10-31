@@ -120,7 +120,7 @@ Differences from the HTTP routes:
   context, so the default page is `[mcp] default_page_bytes` (32768 bytes)
   rather than the 256 KiB of `/api/v2`. It applies to `fetch_results` when
   `max_bytes` is omitted, and to the inline first page of `submit_query`,
-  `get_query_status` and `sample_table`. Ask for more with `max_bytes`, up to
+  `get_query_status`, `sample_table` and `cancel_query`. Ask for more with `max_bytes`, up to
   the `[agent_api] max_page_bytes` ceiling. The budget counts the bytes of
   the rows only. The status fields, the `columns` list and the text copy of
   the JSON that the MCP library adds to every result come on top, so a full

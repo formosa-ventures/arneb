@@ -235,6 +235,7 @@ mod tests {
                     max_rows: None,
                 },
                 Duration::from_secs(30),
+                None,
             )
             .await
             .unwrap();

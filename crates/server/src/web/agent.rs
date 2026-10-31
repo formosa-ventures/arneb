@@ -172,7 +172,7 @@ async fn sample_table(
     let SampleParams { rows } = query(params)?;
     Ok(Json(
         service(&state)?
-            .sample(&who.user, &catalog, &schema, &table, rows)
+            .sample(&who.user, &catalog, &schema, &table, rows, None)
             .await?,
     ))
 }
@@ -196,7 +196,7 @@ async fn submit(
     let service = service(&state)?;
     let wait = wait(service, query(params)?.wait_ms)?;
     let req: SubmitRequest = json_body(body)?;
-    let status = service.submit(&who.user, req, wait).await?;
+    let status = service.submit(&who.user, req, wait, None).await?;
     let location = format!("/api/v2/statements/{}", status.id);
     let mut resp = (StatusCode::CREATED, Json(status)).into_response();
     if let Ok(value) = HeaderValue::from_str(&location) {
@@ -213,7 +213,7 @@ async fn status(
 ) -> Result<Json<StatementStatus>, ApiError> {
     let service = service(&state)?;
     let wait = wait(service, query(params)?.wait_ms)?;
-    Ok(Json(service.status(&who.user, &id, wait).await?))
+    Ok(Json(service.status(&who.user, &id, wait, None).await?))
 }
 
 async fn results(
@@ -233,7 +233,7 @@ async fn cancel(
     Extension(who): Extension<Identity>,
     Path(id): Path<String>,
 ) -> Result<Json<StatementStatus>, ApiError> {
-    Ok(Json(service(&state)?.cancel(&who.user, &id)?))
+    Ok(Json(service(&state)?.cancel(&who.user, &id, None)?))
 }
 
 #[cfg(test)]

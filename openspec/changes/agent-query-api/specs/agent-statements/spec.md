@@ -26,7 +26,7 @@ Only the submitting user SHALL poll, fetch or cancel a statement. Any other user
 - **THEN** the response is `404` with code `not_found`
 
 ### Requirement: Bounded results
-A statement's query SHALL stop producing rows after `max_rows + 1` of them, and the statement SHALL keep at most `max_rows` rows. Its status SHALL report `truncated`, and `total_rows` as the row count when not truncated and `null` when truncated. `GET /statements/{id}/results?cursor=&max_bytes=` SHALL return `{"rows","next_cursor","truncated_cells"}`, at most `max_bytes` of encoded rows (at least one row), where `cursor` is the row offset and `next_cursor` is `null` after the last retained row. A cell longer than `max_cell_bytes` SHALL be cut and counted in `truncated_cells`. A request value above its ceiling (`max_rows`, `max_bytes`, `wait_ms`, `rows`) SHALL be refused with `invalid_argument`, never clamped.
+A statement's query SHALL stop producing rows after `max_rows + 1` of them, and the statement SHALL keep at most `max_rows` rows. Its status SHALL report `truncated`, and `total_rows` as the row count when not truncated and `null` when truncated. `GET /statements/{id}/results?cursor=&max_bytes=` SHALL return `{"rows","next_cursor","truncated_cells"}`, at most `max_bytes` of encoded rows (at least one row), where `cursor` is the row offset and `next_cursor` is `null` after the last retained row. A cell longer than `max_cell_bytes` SHALL be cut on a character boundary, end with `…`, and be counted in `truncated_cells`; a string cell SHALL be measured and cut as its raw UTF-8 text and any other cell as its serialized JSON, and a cell that fits SHALL be returned unchanged and not counted. A request value above its ceiling (`max_rows`, `max_bytes`, `wait_ms`, `rows`) SHALL be refused with `invalid_argument`, never clamped.
 
 #### Scenario: SELECT * with max_rows
 - **WHEN** alice submits `SELECT * FROM lineitem` with `max_rows=100` and walks every page
@@ -35,6 +35,10 @@ A statement's query SHALL stop producing rows after `max_rows + 1` of them, and 
 #### Scenario: Result that fits
 - **WHEN** alice submits `SELECT * FROM nation` with `max_rows=100`
 - **THEN** `truncated` is false and `total_rows` is 25
+
+#### Scenario: Cell near the limit
+- **WHEN** a result holds an 8191-byte string and a 9000-byte string with `max_cell_bytes` 8192
+- **THEN** the first is returned unchanged, the second as its first 8192 bytes plus `…`, and `truncated_cells` is 1
 
 ### Requirement: Runtime limits
 The limits SHALL be `[agent_api]` fields with `ARNEB_AGENT_*` environment overrides (`default_max_rows` 1000, `max_rows` 10000, `default_page_bytes` 262144, `max_page_bytes` 4194304, `max_cell_bytes` 8192, `max_wait_ms` 10000, `idle_timeout_secs` 600), with precedence env over file over default, and the effective values SHALL be logged once on `arneb::config` at startup.

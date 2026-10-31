@@ -261,8 +261,10 @@ Explain plans only: it is not admitted or tracked, and does not run
 
 Every response that returns data is bounded by rows and by bytes. When
 something is cut, the response says so (`truncated`) and gives the full
-count when it is known. A statement keeps at most `max_rows` rows. Cells longer than `max_cell_bytes` are
-truncated. A page holds as many rows as fit in `max_bytes`, but always at
+count when it is known. A statement keeps at most `max_rows` rows. A cell longer than `max_cell_bytes`
+is cut on a character boundary and ends with `…`, and the page counts it in
+`truncated_cells`. A string is measured as its UTF-8 text (JSON quoting and
+escapes do not count); any other value is measured as its JSON. A page holds as many rows as fit in `max_bytes`, but always at
 least one, so a single wide row can make a page larger than `max_bytes`
 (each of its cells is still capped at `max_cell_bytes`).
 

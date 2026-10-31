@@ -76,18 +76,24 @@ pub struct ResultPage {
     pub truncated_cells: u64,
 }
 
-/// Replaces `cell` by its first `max_cell_bytes` bytes (plus `…`) when its
-/// serialized form is longer. Returns whether it was cut.
+/// Shortens `cell` to its first `max_cell_bytes` bytes (cut on a char
+/// boundary, plus `…`) when it is longer, and returns whether it was cut. A
+/// string is measured and cut as its raw UTF-8 text, so JSON quoting and
+/// escapes never count; any other value (number, array, map, …) is measured
+/// and cut as its serialized JSON, becoming a string when cut.
 fn cut_cell(cell: &mut Value, max_cell_bytes: usize) -> bool {
-    let serialized = cell.to_string();
-    if serialized.len() <= max_cell_bytes {
-        return false;
-    }
-    let text = match cell {
-        Value::String(s) => s.as_str(),
-        _ => serialized.as_str(),
+    let text = match &mut *cell {
+        Value::String(s) if s.len() <= max_cell_bytes => return false,
+        Value::String(s) => std::mem::take(s),
+        other => {
+            let serialized = other.to_string();
+            if serialized.len() <= max_cell_bytes {
+                return false;
+            }
+            serialized
+        }
     };
-    let mut end = max_cell_bytes.min(text.len());
+    let mut end = max_cell_bytes;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -192,6 +198,47 @@ mod tests {
         let p = page(&r, 0, 6, 8192); // each row "[0]" is 3 + 1 bytes
         assert_eq!(p.rows.len(), 1);
         assert_eq!(p.next_cursor, Some(1));
+    }
+
+    fn string_retained(values: Vec<String>) -> Retained {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let col: ArrayRef = Arc::new(StringArray::from(values));
+        retain(vec![RecordBatch::try_new(schema, vec![col]).unwrap()], 10)
+    }
+
+    #[test]
+    fn string_just_under_the_cell_limit_is_untouched() {
+        // Serialized it is 8193 bytes (quotes), but the raw text fits.
+        let value = "x".repeat(8191);
+        let p = page(&string_retained(vec![value.clone()]), 0, 1 << 20, 8192);
+        assert_eq!(p.truncated_cells, 0);
+        assert_eq!(p.rows[0][0], Value::from(value));
+    }
+
+    #[test]
+    fn escapes_do_not_count_toward_the_cell_limit() {
+        // 5000 raw bytes, 10002 serialized (`\"` per quote).
+        let value = "\"".repeat(5000);
+        let p = page(&string_retained(vec![value.clone()]), 0, 1 << 20, 8192);
+        assert_eq!(p.truncated_cells, 0);
+        assert_eq!(p.rows[0][0], Value::from(value));
+    }
+
+    #[test]
+    fn long_string_is_cut_to_the_cell_limit() {
+        let p = page(&string_retained(vec!["x".repeat(9000)]), 0, 1 << 20, 8192);
+        assert_eq!(p.truncated_cells, 1);
+        assert_eq!(p.rows[0][0], Value::from(format!("{}…", "x".repeat(8192))));
+    }
+
+    #[test]
+    fn non_string_cell_is_measured_serialized() {
+        let mut short = Value::from(123_456);
+        assert!(!cut_cell(&mut short, 6));
+        assert_eq!(short, Value::from(123_456));
+        let mut long = serde_json::json!([1, 2, 3, 4]);
+        assert!(cut_cell(&mut long, 4));
+        assert_eq!(long, Value::from("[1,2…"));
     }
 
     #[test]

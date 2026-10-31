@@ -207,7 +207,9 @@ impl QueryTracker {
 
     /// Stop query `id` on behalf of user `by`: call its canceller (outside
     /// the lock) and mark it cancelled. A query that already ended, or ends
-    /// on its own during the kill, is [`KillOutcome::AlreadyEnded`].
+    /// on its own during the kill, is [`KillOutcome::AlreadyEnded`]. The
+    /// first kill claims the query under the lock; a concurrent kill of the
+    /// same query is `AlreadyEnded(Cancelled)`, so only one reports a kill.
     pub fn kill_query(&self, id: &QueryId, by: &str) -> Result<KillOutcome, ExecutionError> {
         let (was, canceller) = {
             let mut inner = self.inner.write().unwrap();
@@ -219,6 +221,10 @@ impl QueryTracker {
             if was.is_terminal() {
                 return Ok(KillOutcome::AlreadyEnded(was));
             }
+            if entry.killed_by.is_some() {
+                // Another kill claimed it and is stopping it now.
+                return Ok(KillOutcome::AlreadyEnded(QueryState::Cancelled));
+            }
             entry.killed_by = Some(by.to_owned());
             (was, entry.canceller.take())
         };
@@ -228,8 +234,8 @@ impl QueryTracker {
         if self.cancel_query(id).is_ok() {
             return Ok(KillOutcome::Killed { was });
         }
-        // Already terminal: cancelled by the canceller itself (or by a
-        // concurrent kill), or it ended on its own meanwhile.
+        // Already terminal: cancelled by the canceller itself (or by the
+        // server), or it ended on its own meanwhile.
         Ok(match self.get_query(id).map(|q| q.state) {
             Some(state) if state != QueryState::Cancelled => KillOutcome::AlreadyEnded(state),
             _ => KillOutcome::Killed { was },
@@ -522,6 +528,44 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 1, "called once");
         let missing = QueryId::new();
         assert!(tracker.kill_query(&missing, "root").is_err());
+    }
+
+    /// Two kills of one query at once: the one that claims it reports the
+    /// kill; the other, landing while the canceller runs, already ended.
+    #[test]
+    fn concurrent_kills_report_one_kill() {
+        use std::sync::mpsc;
+        let tracker = Arc::new(QueryTracker::with_history_limit(10));
+        let id = tracker.create_query("SELECT 1".into());
+        tracker.advance_to(&id, QueryState::Running).unwrap();
+        let (inside_tx, inside_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        tracker.set_canceller(
+            &id,
+            Box::new(move |_| {
+                inside_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }),
+        );
+        let first = std::thread::spawn({
+            let tracker = Arc::clone(&tracker);
+            move || tracker.kill_query(&id, "root").unwrap()
+        });
+        inside_rx.recv().unwrap();
+        assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Running);
+        assert_eq!(
+            tracker.kill_query(&id, "ops").unwrap(),
+            KillOutcome::AlreadyEnded(QueryState::Cancelled)
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            first.join().unwrap(),
+            KillOutcome::Killed {
+                was: QueryState::Running
+            }
+        );
+        assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
     }
 
     #[test]

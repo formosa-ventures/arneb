@@ -89,6 +89,48 @@ impl QueryCoordinator {
         .await
     }
 
+    /// The workers of one attempt, counted in flight until the guard drops,
+    /// and a fragmenter whose fan-out is sized to exactly them (so neither a
+    /// cordoned nor a SIGTERM-draining worker is counted). No schedulable
+    /// worker is the "no workers available" error.
+    fn schedule_attempt(
+        &self,
+        exec_ctx: &ExecutionContext,
+    ) -> Result<
+        (
+            Vec<arneb_scheduler::WorkerInfo>,
+            arneb_scheduler::InFlightGuard,
+            arneb_planner::PlanFragmenter,
+        ),
+        AttemptError,
+    > {
+        let (workers, in_flight) = self.node_registry.schedule_workers();
+        if workers.is_empty() {
+            return Err(AttemptError {
+                error: ExecutionError::InvalidOperation(no_workers_message(&self.node_registry)),
+                worker_ids: Vec::new(),
+            });
+        }
+        // dist-adaptive-partition: feed the scheduled worker count + the
+        // resolved partition policy so the fragmenter sizes hash fan-out to
+        // the cluster and the intermediate's estimated cardinality instead
+        // of a fixed 2.
+        let worker_count = workers.len();
+        let (target_rows, max_partitions) = crate::config::resolve_hash_partition_policy();
+        tracing::info!(
+            worker_count,
+            hash_partition_target_rows = target_rows,
+            max_hash_partitions = max_partitions,
+            "adaptive hash-partition policy resolved"
+        );
+        let fragmenter = arneb_planner::PlanFragmenter::new()
+            .with_broadcast_threshold(exec_ctx.broadcast_max_build_bytes())
+            .with_stats(exec_ctx.catalog_stats().cloned())
+            .with_worker_count(worker_count)
+            .with_partition_policy(target_rows, max_partitions);
+        Ok((workers, in_flight, fragmenter))
+    }
+
     /// One run of [`Self::execute`]. A failure carries the workers the run
     /// used, so the caller can tell whether one of them was lost.
     async fn execute_once(
@@ -117,22 +159,11 @@ impl QueryCoordinator {
         // eligibility. Both default to `None`; broadcast detection is
         // inert until `ExecutionContext::with_broadcast_max_build_bytes`
         // is set (A2.4 measurement flips it on).
-        // dist-adaptive-partition: feed the live worker count + the resolved
-        // partition policy so the fragmenter sizes hash fan-out to the cluster
-        // and the intermediate's estimated cardinality instead of a fixed 2.
-        let worker_count = self.node_registry.alive_count();
-        let (target_rows, max_partitions) = crate::config::resolve_hash_partition_policy();
-        tracing::info!(
-            worker_count,
-            hash_partition_target_rows = target_rows,
-            max_hash_partitions = max_partitions,
-            "adaptive hash-partition policy resolved"
-        );
-        let mut fragmenter = arneb_planner::PlanFragmenter::new()
-            .with_broadcast_threshold(exec_ctx.broadcast_max_build_bytes())
-            .with_stats(exec_ctx.catalog_stats().cloned())
-            .with_worker_count(worker_count)
-            .with_partition_policy(target_rows, max_partitions);
+        // Draining and cordoned workers finish what they run but get no new
+        // query. `_in_flight` counts this attempt on its workers until it
+        // ends, so a drain sees when they are done (manage-api D8); a retry
+        // is a new attempt and schedules again.
+        let (workers, _in_flight, mut fragmenter) = self.schedule_attempt(exec_ctx)?;
         let mut root_fragment = fragmenter.fragment(plan.clone());
 
         // Cross-fragment column pruning (2026-05-26): for each
@@ -152,16 +183,6 @@ impl QueryCoordinator {
             eprintln!("[FRAGTRACE] === end fragment tree ===");
         }
 
-        // Draining workers finish what they run but get no new query.
-        let workers = self.node_registry.active_workers();
-        if workers.is_empty() {
-            return Err(AttemptError {
-                error: ExecutionError::InvalidOperation(
-                    "no workers available for distributed execution".to_string(),
-                ),
-                worker_ids: Vec::new(),
-            });
-        }
         // admission-control D4: from here on, any exit other than success
         // (an error, a panic, or this future being dropped by a cancel,
         // timeout or client disconnect) cancels the query on every worker.
@@ -494,6 +515,28 @@ where
         );
         tokio::time::sleep(delay).await;
     }
+}
+
+/// The "no workers available" error, naming the alive workers an operator
+/// cordoned and how to undo it (manage-api D8).
+fn no_workers_message(registry: &NodeRegistry) -> String {
+    let alive: std::collections::HashSet<String> = registry
+        .alive_workers()
+        .into_iter()
+        .map(|w| w.worker_id)
+        .collect();
+    let cordoned = registry
+        .cordoned_ids()
+        .iter()
+        .filter(|id| alive.contains(*id))
+        .count();
+    let mut message = "no workers available for distributed execution".to_string();
+    if cordoned > 0 {
+        message.push_str(&format!(
+            " ({cordoned} cordoned; uncordon one with POST /api/v2/workers/{{id}}/uncordon)"
+        ));
+    }
+    message
 }
 
 /// How often a running distributed query checks its workers' liveness.
@@ -1755,6 +1798,80 @@ mod tests {
         drop(CancelGuard::new(q, vec![hung, a]));
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert_eq!(*seen.lock().unwrap(), vec![q]);
+    }
+
+    /// manage-api D8: a cordoned worker gets no task of a new query (the
+    /// query's guard cancels on exactly the workers it was given); with
+    /// every worker cordoned the query says why and how to undo it.
+    #[tokio::test]
+    async fn cordoned_workers_get_no_tasks() {
+        let (a, seen_a) = recording_worker().await;
+        let (b, seen_b) = recording_worker().await;
+        let registry = arneb_scheduler::NodeRegistry::new(30);
+        registry.heartbeat("w1".into(), a, 256);
+        registry.heartbeat("w2".into(), b, 256);
+        registry.set_cordon("w1", Some(arneb_scheduler::CordonMode::Cordon));
+        let coordinator =
+            QueryCoordinator::new(registry.clone(), DynamicFilterServiceRegistry::new());
+        let ctx = ExecutionContext::new();
+        // The recording workers run nothing, so the query fails; its guard
+        // then cancels it on the workers it was scheduled onto.
+        let _ = coordinator.execute(scan(), &ctx).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(seen_a.lock().unwrap().is_empty(), "w1 is cordoned");
+        assert_eq!(seen_b.lock().unwrap().len(), 1);
+        assert_eq!(
+            registry.in_flight("w2"),
+            0,
+            "the attempt released its guard"
+        );
+
+        registry.set_cordon("w2", Some(arneb_scheduler::CordonMode::Drain));
+        let err = coordinator
+            .execute(scan(), &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no workers available for distributed execution"),
+            "{err}"
+        );
+        assert!(err.contains("2 cordoned"), "{err}");
+        assert!(err.contains("POST /api/v2/workers/{id}/uncordon"), "{err}");
+    }
+
+    /// The fan-out is sized for the scheduled workers only: a cordoned or
+    /// SIGTERM-draining worker is alive but not counted.
+    #[test]
+    fn the_fragmenter_is_sized_for_the_scheduled_workers() {
+        let registry = two_worker_registry();
+        registry.set_cordon("worker-1", Some(arneb_scheduler::CordonMode::Cordon));
+        let coordinator =
+            QueryCoordinator::new(registry.clone(), DynamicFilterServiceRegistry::new());
+        let ctx = ExecutionContext::new();
+        let (workers, guard, fragmenter) = coordinator.schedule_attempt(&ctx).ok().unwrap();
+        assert_eq!(registry.alive_count(), 2);
+        assert_eq!(workers.len(), 1);
+        assert_eq!(fragmenter.worker_count(), 1);
+        assert_eq!(
+            registry.in_flight("worker-2"),
+            1,
+            "the guard counts the attempt"
+        );
+        drop(guard);
+        assert_eq!(registry.in_flight("worker-2"), 0);
+
+        let own = env!("CARGO_PKG_VERSION");
+        registry.set_cordon("worker-1", None);
+        registry
+            .admit("worker-2".into(), "http://w2:9090".into(), 256, own, true)
+            .unwrap();
+        let (_, _guard, fragmenter) = coordinator.schedule_attempt(&ctx).ok().unwrap();
+        assert_eq!(
+            fragmenter.worker_count(),
+            1,
+            "a draining worker is not counted"
+        );
     }
 
     /// Dropping the future of a query whose tasks are dispatched (here: a

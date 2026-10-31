@@ -41,6 +41,34 @@ pub struct AccessRules {
     schemas: Option<Vec<SchemaRule>>,
     tables: Option<Vec<TableRule>>,
     queries: Option<Vec<QueryRule>>,
+    system_information: Option<Vec<SystemRule>>,
+}
+
+/// A privilege a `tables` rule can grant on a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TablePrivilege {
+    /// Read the table.
+    Select,
+    /// Insert rows.
+    Insert,
+    /// Delete rows.
+    Delete,
+    /// Update rows (accepted in rules files; Arneb has no `UPDATE`).
+    Update,
+    /// Own the table: implies every other privilege.
+    Ownership,
+}
+
+impl std::fmt::Display for TablePrivilege {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Select => "SELECT",
+            Self::Insert => "INSERT",
+            Self::Delete => "DELETE",
+            Self::Update => "UPDATE",
+            Self::Ownership => "OWNERSHIP",
+        })
+    }
 }
 
 impl AccessRules {
@@ -56,17 +84,20 @@ impl AccessRules {
             schemas: compile_all(file.schemas, SchemaRule::compile)?,
             tables: compile_all(file.tables, TableRule::compile)?,
             queries: compile_all(file.queries, QueryRule::compile)?,
+            system_information: compile_all(file.system_information, SystemRule::compile)?,
         })
     }
 
     /// Rules per section, in the order `catalogs`, `schemas`, `tables`,
-    /// `queries`; `None` for a section the file leaves out.
-    pub fn section_sizes(&self) -> [Option<usize>; 4] {
+    /// `queries`, `system_information`; `None` for a section the file
+    /// leaves out.
+    pub fn section_sizes(&self) -> [Option<usize>; 5] {
         [
             self.catalogs.as_ref().map(Vec::len),
             self.schemas.as_ref().map(Vec::len),
             self.tables.as_ref().map(Vec::len),
             self.queries.as_ref().map(Vec::len),
+            self.system_information.as_ref().map(Vec::len),
         ]
     }
 
@@ -83,13 +114,55 @@ impl AccessRules {
 
     /// Whether `user` may read `catalog.schema.table`.
     pub fn can_select(&self, user: &str, catalog: &str, schema: &str, table: &str) -> bool {
-        self.catalog_access(user, catalog) != CatalogAccess::None
-            && self
-                .table_privileges(user, catalog, schema, table)
-                .is_some_and(|p| {
-                    p.iter()
-                        .any(|p| matches!(p, Privilege::Select | Privilege::Ownership))
-                })
+        self.has_table_privilege(user, catalog, schema, table, TablePrivilege::Select)
+    }
+
+    /// Whether `user` holds `p` on `catalog.schema.table`. `Ownership`
+    /// implies every privilege; a `none` catalog denies everything and a
+    /// `read-only` catalog denies everything but `Select`. Without a
+    /// `tables` section everything is granted.
+    pub fn has_table_privilege(
+        &self,
+        user: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        p: TablePrivilege,
+    ) -> bool {
+        match self.catalog_access(user, catalog) {
+            CatalogAccess::None => return false,
+            CatalogAccess::ReadOnly if p != TablePrivilege::Select => return false,
+            _ => {}
+        }
+        self.table_privileges(user, catalog, schema, table)
+            .is_some_and(|granted| {
+                granted
+                    .iter()
+                    .filter_map(|g| g.table())
+                    .any(|g| g == p || g == TablePrivilege::Ownership)
+            })
+    }
+
+    /// Whether `user` may read system information (cluster, workers,
+    /// admission, audit). A file without the section allows everyone.
+    pub fn system_information_read(&self, user: &str) -> bool {
+        self.system_access(user, SystemAccess::Read, true)
+    }
+
+    /// Whether `user` may change system state. A file without the section
+    /// allows no one; write does not imply read.
+    pub fn system_information_write(&self, user: &str) -> bool {
+        self.system_access(user, SystemAccess::Write, false)
+    }
+
+    fn system_access(&self, user: &str, access: SystemAccess, absent: bool) -> bool {
+        let Some(rules) = &self.system_information else {
+            return absent;
+        };
+        rules
+            .iter()
+            .find(|r| r.user.matches(user))
+            .is_some_and(|r| r.allow.contains(&access))
     }
 
     /// Whether `catalog` is listed for `user`.
@@ -203,7 +276,13 @@ const UNSUPPORTED_FIELDS: &[(&str, &str)] = &[
     ("filter_environment", "row filters"),
     ("columns", "column masks and column restrictions"),
 ];
-const SECTIONS: &[&str] = &["catalogs", "schemas", "tables", "queries"];
+const SECTIONS: &[&str] = &[
+    "catalogs",
+    "schemas",
+    "tables",
+    "queries",
+    "system_information",
+];
 
 fn reject_unsupported(value: &serde_json::Value) -> Result<(), RulesError> {
     let Some(top) = value.as_object() else {
@@ -265,6 +344,7 @@ struct RulesFile {
     schemas: Option<Vec<SchemaRuleSpec>>,
     tables: Option<Vec<TableRuleSpec>>,
     queries: Option<Vec<QueryRuleSpec>>,
+    system_information: Option<Vec<SystemRuleSpec>>,
 }
 
 #[derive(Deserialize)]
@@ -342,6 +422,8 @@ impl SchemaRule {
     }
 }
 
+/// A privilege as written in a rules file. `GRANT_SELECT` parses but maps
+/// to no [`TablePrivilege`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum Privilege {
@@ -351,6 +433,19 @@ enum Privilege {
     Update,
     Ownership,
     GrantSelect,
+}
+
+impl Privilege {
+    fn table(self) -> Option<TablePrivilege> {
+        Some(match self {
+            Self::Select => TablePrivilege::Select,
+            Self::Insert => TablePrivilege::Insert,
+            Self::Delete => TablePrivilege::Delete,
+            Self::Update => TablePrivilege::Update,
+            Self::Ownership => TablePrivilege::Ownership,
+            Self::GrantSelect => return None,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -426,6 +521,36 @@ impl QueryRule {
     }
 }
 
+/// What a `system_information` rule allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SystemAccess {
+    Read,
+    Write,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemRuleSpec {
+    user: Option<String>,
+    allow: Vec<SystemAccess>,
+}
+
+#[derive(Debug)]
+struct SystemRule {
+    user: Pattern,
+    allow: Vec<SystemAccess>,
+}
+
+impl SystemRule {
+    fn compile(spec: SystemRuleSpec) -> Result<Self, RulesError> {
+        Ok(Self {
+            user: Pattern::compile(spec.user)?,
+            allow: spec.allow,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,7 +566,7 @@ mod tests {
         assert!(r.schema_visible("anyone", "hive", "tpch"));
         assert!(r.can_execute("anyone"));
         assert!(r.can_view_query("a", "b"));
-        assert_eq!(r.section_sizes(), [None; 4]);
+        assert_eq!(r.section_sizes(), [None; 5]);
     }
 
     #[test]
@@ -589,5 +714,54 @@ mod tests {
             r#"{"queries": [{"queryOwner": "x", "allow": ["execute"]}]}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn system_information_read_and_write() {
+        let r = rules(
+            r#"{"system_information":[{"user":"ops","allow":["read","write"]},
+                {"user":"viewer","allow":["read"]}]}"#,
+        );
+        assert!(r.system_information_read("ops") && r.system_information_write("ops"));
+        assert!(r.system_information_read("viewer") && !r.system_information_write("viewer"));
+        assert!(!r.system_information_read("carol") && !r.system_information_write("carol"));
+        let open = rules("{}");
+        assert!(open.system_information_read("anyone"));
+        assert!(!open.system_information_write("anyone"));
+        assert_eq!(r.section_sizes()[4], Some(2));
+    }
+
+    #[test]
+    fn system_information_refuses_group_and_unknown_allow() {
+        let err =
+            AccessRules::from_json(r#"{"system_information":[{"group":"ops","allow":["read"]}]}"#)
+                .unwrap_err();
+        assert!(matches!(err, RulesError::Unsupported(_)), "{err}");
+        let err =
+            AccessRules::from_json(r#"{"system_information":[{"allow":["kill"]}]}"#).unwrap_err();
+        assert!(matches!(err, RulesError::Invalid(_)), "{err}");
+    }
+
+    #[test]
+    fn table_privileges_and_ownership() {
+        let r = rules(
+            r#"{"catalogs":[{"catalog":"ro","allow":"read-only"},{"allow":"all"}],
+                "tables":[{"user":"w","privileges":["SELECT","INSERT"]},
+                          {"user":"o","privileges":["OWNERSHIP"]}]}"#,
+        );
+        use TablePrivilege::*;
+        assert!(r.has_table_privilege("w", "c", "s", "t", Insert));
+        assert!(!r.has_table_privilege("w", "c", "s", "t", Delete));
+        assert!(!r.has_table_privilege("w", "c", "s", "t", Ownership));
+        for p in [Select, Insert, Delete, Update, Ownership] {
+            assert!(r.has_table_privilege("o", "c", "s", "t", p), "{p}");
+        }
+        assert!(!r.has_table_privilege("o", "ro", "s", "t", Insert));
+        assert!(r.has_table_privilege("o", "ro", "s", "t", Select));
+        let open = rules("{}");
+        assert!(open.has_table_privilege("x", "c", "s", "t", Ownership));
+        assert_eq!(TablePrivilege::Ownership.to_string(), "OWNERSHIP");
+        let g = rules(r#"{"tables":[{"privileges":["GRANT_SELECT"]}]}"#);
+        assert!(!g.can_select("u", "c", "s", "t"));
     }
 }

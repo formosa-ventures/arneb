@@ -633,6 +633,17 @@ async fn submit(
         complete(&task_state, &task_query, result);
     });
     *query.abort.lock().unwrap() = Some(handle.abort_handle());
+    // A kill through the tracker (manage-api D7). Weak references, so the
+    // tracker never keeps the query or itself alive.
+    let (weak_query, weak_tracker) = (Arc::downgrade(&query), Arc::downgrade(&state.tracker));
+    state.tracker.set_canceller(
+        &query.tracker_id,
+        Box::new(move |by| {
+            if let (Some(query), Some(tracker)) = (weak_query.upgrade(), weak_tracker.upgrade()) {
+                cancel_query(&tracker, &query, TrinoError::killed_by(by), "killed");
+            }
+        }),
+    );
 
     let base = base_uri(&headers, state.scheme);
     let body = {
@@ -1027,7 +1038,7 @@ fn json_response(
     response
 }
 
-fn cancel_query(state: &AppState, query: &Query, error: TrinoError, reason: &str) {
+fn cancel_query(tracker: &QueryTracker, query: &Query, error: TrinoError, reason: &str) {
     if let Some(handle) = query.abort.lock().unwrap().take() {
         handle.abort();
     }
@@ -1039,7 +1050,7 @@ fn cancel_query(state: &AppState, query: &Query, error: TrinoError, reason: &str
             inner.phase = Phase::Failed(error);
             inner.ended = Some(Instant::now());
             inner.last = None;
-            let _ = state.tracker.cancel_query(&query.tracker_id);
+            let _ = tracker.cancel_query(&query.tracker_id);
         }
     }
     let _ = query.done.send(true);
@@ -1057,7 +1068,12 @@ async fn cancel(
     if not_owner(&user, &query) {
         return auth::forbidden("Query belongs to another user");
     }
-    cancel_query(&state, &query, TrinoError::canceled(), "client DELETE");
+    cancel_query(
+        &state.tracker,
+        &query,
+        TrinoError::canceled(),
+        "client DELETE",
+    );
     state.queries.lock().unwrap().remove(&id);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1071,7 +1087,7 @@ async fn kill(
     match query {
         Some(q) if not_owner(&user, &q) => auth::forbidden("Query belongs to another user"),
         Some(q) => {
-            cancel_query(&state, &q, TrinoError::canceled(), "kill");
+            cancel_query(&state.tracker, &q, TrinoError::canceled(), "kill");
             StatusCode::NO_CONTENT.into_response()
         }
         None => StatusCode::NOT_FOUND.into_response(),
@@ -1172,7 +1188,7 @@ async fn reaper(state: AppState) {
                 (inner.last_access.elapsed(), active)
             };
             if active && idle > state.config.client_timeout {
-                cancel_query(&state, &query, TrinoError::abandoned(), "abandoned");
+                cancel_query(&state.tracker, &query, TrinoError::abandoned(), "abandoned");
                 state.queries.lock().unwrap().remove(&query.id);
             } else if !active && idle > state.config.retention {
                 state.queries.lock().unwrap().remove(&query.id);

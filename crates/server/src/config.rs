@@ -83,6 +83,83 @@ pub struct AppConfig {
     /// [`AppConfig::load`].
     #[serde(default)]
     pub state: StateConfig,
+
+    /// Retention of the audit log (`audit.jsonl` next to the state file);
+    /// effective values after [`AppConfig::load`].
+    #[serde(default)]
+    pub audit: AuditConfig,
+}
+
+/// `[audit]` section: retention of the audit log, kept as `audit.jsonl` in
+/// the directory of `[state] path` (in memory without one).
+///
+/// ```toml
+/// [audit]
+/// max_entries    = 10000   # ARNEB_AUDIT_MAX_ENTRIES; 1..=1000000
+/// retention_days = 90      # ARNEB_AUDIT_RETENTION_DAYS; 0 = no age limit
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Most entries kept; older ones are dropped at compaction.
+    pub max_entries: usize,
+    /// Days an entry is kept; `0` means no age limit.
+    pub retention_days: u32,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 10_000,
+            retention_days: 90,
+        }
+    }
+}
+
+impl AuditConfig {
+    /// The accepted `max_entries` range.
+    pub const MAX_ENTRIES: std::ops::RangeInclusive<usize> = 1..=1_000_000;
+
+    /// Apply `ARNEB_AUDIT_MAX_ENTRIES` and `ARNEB_AUDIT_RETENTION_DAYS`
+    /// (env > file > defaults).
+    pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+        if let Some(v) = env("ARNEB_AUDIT_MAX_ENTRIES") {
+            self.max_entries = v.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid ARNEB_AUDIT_MAX_ENTRIES value '{v}' (expected a positive integer)"
+                )
+            })?;
+        }
+        if let Some(v) = env("ARNEB_AUDIT_RETENTION_DAYS") {
+            self.retention_days = v.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid ARNEB_AUDIT_RETENTION_DAYS value '{v}' \
+                     (expected a non-negative integer, 0 = no age limit)"
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// `max_entries` must be in [`Self::MAX_ENTRIES`].
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            Self::MAX_ENTRIES.contains(&self.max_entries),
+            "[audit] max_entries / ARNEB_AUDIT_MAX_ENTRIES = {} must be between {} and {}",
+            self.max_entries,
+            Self::MAX_ENTRIES.start(),
+            Self::MAX_ENTRIES.end()
+        );
+        Ok(())
+    }
+
+    /// The settings for [`arneb_state::AuditLog::open`].
+    pub fn settings(&self) -> arneb_state::AuditSettings {
+        arneb_state::AuditSettings {
+            max_entries: self.max_entries,
+            retention_days: self.retention_days,
+        }
+    }
 }
 
 /// `[state]` section: where the coordinator keeps its mutable state (users,
@@ -120,6 +197,7 @@ impl StateConfig {
 /// ```toml
 /// [access_control]
 /// rules_file = "/etc/arneb/rules.json"   # ARNEB_ACCESS_CONTROL_RULES_FILE
+/// admin_users = ["root"]                 # ARNEB_ADMIN_USERS (comma list)
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -127,11 +205,14 @@ pub struct AccessControlConfig {
     /// A rules file in Trino's file-based access control format. Unset:
     /// every user may read every table.
     pub rules_file: Option<std::path::PathBuf>,
+    /// Users who hold the manage privilege (password auth only).
+    pub admin_users: Vec<String>,
 }
 
 impl AccessControlConfig {
     /// Apply `ARNEB_ACCESS_CONTROL_RULES_FILE` (env > file); an empty value
-    /// is an error.
+    /// is an error. `ARNEB_ADMIN_USERS` is a comma list, trimmed with blanks
+    /// dropped; a value with no names left counts as unset.
     pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
         if let Some(v) = env("ARNEB_ACCESS_CONTROL_RULES_FILE") {
             let v = v.trim();
@@ -140,6 +221,18 @@ impl AccessControlConfig {
                 "ARNEB_ACCESS_CONTROL_RULES_FILE is set but empty"
             );
             self.rules_file = Some(v.into());
+        }
+        // An empty value counts as unset; a list is trimmed, blanks dropped.
+        if let Some(v) = env("ARNEB_ADMIN_USERS") {
+            let users: Vec<String> = v
+                .split(',')
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if !users.is_empty() {
+                self.admin_users = users;
+            }
         }
         Ok(())
     }
@@ -388,6 +481,57 @@ impl AdmissionConfig {
                 .map_err(|e| anyhow::anyhow!("invalid {name} value: {e}"))?;
         }
         Ok(())
+    }
+}
+
+/// The admission limits a coordinator starts with (manage-api D9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAdmission {
+    /// The limits to apply.
+    pub limits: arneb_state::AdmissionLimits,
+    /// `"config"` (the `[admission]` seed) or `"state"` (a runtime value
+    /// stored in the state store).
+    pub source: &'static str,
+    /// Each knob whose config value a stored value overrides:
+    /// `(knob, config value, stored value)`.
+    pub diverging: Vec<(&'static str, usize, usize)>,
+}
+
+/// Pick the startup admission limits: a value stored at runtime wins over
+/// the config seed, and each knob it changes is reported as diverging.
+pub fn resolve_admission_limits(
+    config: &AdmissionConfig,
+    stored: Option<arneb_state::AdmissionLimits>,
+) -> ResolvedAdmission {
+    let Some(stored) = stored else {
+        return ResolvedAdmission {
+            limits: arneb_state::AdmissionLimits {
+                max_running_queries: config.max_running_queries,
+                max_queued_queries: config.max_queued_queries,
+            },
+            source: "config",
+            diverging: Vec::new(),
+        };
+    };
+    let diverging = [
+        (
+            "max_running_queries",
+            config.max_running_queries,
+            stored.max_running_queries,
+        ),
+        (
+            "max_queued_queries",
+            config.max_queued_queries,
+            stored.max_queued_queries,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, from_config, from_state)| from_config != from_state)
+    .collect();
+    ResolvedAdmission {
+        limits: stored,
+        source: "state",
+        diverging,
     }
 }
 
@@ -1741,6 +1885,7 @@ impl AppConfig {
                         observability: ObservabilityConfig::default(),
                         access_control: AccessControlConfig::default(),
                         state: StateConfig::default(),
+                        audit: AuditConfig::default(),
                     }
                 }
             }
@@ -1770,6 +1915,9 @@ impl AppConfig {
         access_control.apply_env(|k| std::env::var(k).ok())?;
         let mut state = config.state;
         state.apply_env(|k| std::env::var(k).ok())?;
+        let mut audit = config.audit;
+        audit.apply_env(|k| std::env::var(k).ok())?;
+        audit.validate()?;
         let mut catalogs = config.catalogs;
         check_password_env_vars(&catalogs)?;
         for catalog in &mut catalogs {
@@ -1794,6 +1942,7 @@ impl AppConfig {
             observability,
             access_control,
             state,
+            audit,
         })
     }
 }
@@ -2372,6 +2521,34 @@ pgwire = "required"
     }
 
     #[test]
+    fn stored_admission_wins_and_reports_divergence() {
+        let config = admission(
+            "[admission]\nmax_running_queries = 8\nmax_queued_queries = 256\n",
+            &[],
+        )
+        .unwrap();
+        let stored = arneb_state::AdmissionLimits {
+            max_running_queries: 4,
+            max_queued_queries: 256,
+        };
+        let r = resolve_admission_limits(&config, Some(stored));
+        assert_eq!(r.limits, stored);
+        assert_eq!(r.source, "state");
+        assert_eq!(r.diverging, vec![("max_running_queries", 8, 4)]);
+
+        let r = resolve_admission_limits(&config, None);
+        assert_eq!(
+            r.limits,
+            arneb_state::AdmissionLimits {
+                max_running_queries: 8,
+                max_queued_queries: 256,
+            }
+        );
+        assert_eq!(r.source, "config");
+        assert!(r.diverging.is_empty());
+    }
+
+    #[test]
     fn test_observability_defaults_file_and_env() {
         let load = |toml_text: &str, env: &[(&str, &str)]| {
             let mut c = toml::from_str::<AppConfig>(toml_text)
@@ -2740,6 +2917,42 @@ format = "parquet"
     }
 
     #[test]
+    fn audit_config_defaults_env_and_validation() {
+        let audit = |toml_text: &str, env: &[(&str, &str)]| -> Result<AuditConfig> {
+            let mut c = toml::from_str::<AppConfig>(toml_text)?.audit;
+            c.apply_env(env_from(env))?;
+            c.validate()?;
+            Ok(c)
+        };
+        let c = audit("port = 5432", &[]).unwrap();
+        assert_eq!((c.max_entries, c.retention_days), (10_000, 90));
+        assert_eq!(
+            c.settings(),
+            arneb_state::AuditSettings {
+                max_entries: 10_000,
+                retention_days: 90
+            }
+        );
+        let c = audit("[audit]\nmax_entries = 5\nretention_days = 0\n", &[]).unwrap();
+        assert_eq!((c.max_entries, c.retention_days), (5, 0));
+        let c = audit(
+            "[audit]\nmax_entries = 5\n",
+            &[
+                ("ARNEB_AUDIT_MAX_ENTRIES", "7"),
+                ("ARNEB_AUDIT_RETENTION_DAYS", "3"),
+            ],
+        )
+        .unwrap();
+        assert_eq!((c.max_entries, c.retention_days), (7, 3));
+        let e = audit("[audit]\nmax_entries = 0\n", &[]).unwrap_err();
+        assert!(e.to_string().contains("between 1 and 1000000"), "{e}");
+        assert!(audit("[audit]\nmax_entries = 1000001\n", &[]).is_err());
+        assert!(audit("port = 5432", &[("ARNEB_AUDIT_MAX_ENTRIES", "0")]).is_err());
+        assert!(audit("port = 5432", &[("ARNEB_AUDIT_RETENTION_DAYS", "-1")]).is_err());
+        assert!(audit("[audit]\nmax_entires = 5\n", &[]).is_err());
+    }
+
+    #[test]
     fn metrics_auth_defaults_off_and_env_overrides() {
         let mut web = toml::from_str::<AppConfig>("port = 5432\n").unwrap().web;
         assert!(!web.metrics_auth);
@@ -3060,7 +3273,7 @@ password = "hunter2"
         )]))
         .unwrap();
         let rules = cfg.load_rules().unwrap().unwrap();
-        assert_eq!(rules.section_sizes(), [None, None, Some(1), None]);
+        assert_eq!(rules.section_sizes(), [None, None, Some(1), None, None]);
 
         cfg.rules_file = Some(dir.join("missing.json"));
         assert!(cfg
@@ -3072,5 +3285,26 @@ password = "hunter2"
             .apply_env(env_from(&[("ARNEB_ACCESS_CONTROL_RULES_FILE", "")]))
             .is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn admin_users_parse_and_env_override() {
+        let mut cfg: AccessControlConfig =
+            toml::from_str(r#"admin_users = ["root", "ops"]"#).unwrap();
+        assert_eq!(cfg.admin_users, ["root", "ops"]);
+        cfg.apply_env(env_from(&[("ARNEB_ADMIN_USERS", "")]))
+            .unwrap();
+        assert_eq!(cfg.admin_users, ["root", "ops"], "empty counts as unset");
+        cfg.apply_env(env_from(&[("ARNEB_ADMIN_USERS", " , ,")]))
+            .unwrap();
+        assert_eq!(
+            cfg.admin_users,
+            ["root", "ops"],
+            "all blanks counts as unset"
+        );
+        cfg.apply_env(env_from(&[("ARNEB_ADMIN_USERS", " a, ,b ")]))
+            .unwrap();
+        assert_eq!(cfg.admin_users, ["a", "b"]);
+        assert!(toml::from_str::<AccessControlConfig>("admin_user = []").is_err());
     }
 }

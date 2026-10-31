@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
-pub use access::{AccessRules, CatalogAccess, RulesError};
+pub use access::{AccessRules, CatalogAccess, RulesError, TablePrivilege};
 
 use arneb_common::error::CatalogError;
 use arneb_common::types::{ColumnInfo, ScalarValue, TableReference};
@@ -316,6 +316,41 @@ impl CatalogManager {
         } else {
             Err(CatalogError::AccessDenied("Cannot execute query".into()))
         }
+    }
+
+    /// Fails with [`CatalogError::AccessDenied`] when the session user does
+    /// not hold `privilege` on `reference`; always passes without access
+    /// rules. Catalog and schema come from this manager's defaults, as in
+    /// [`CatalogManager::resolve_table`]. `action` is the noun phrase of the message
+    /// (`insert into table`, `create table`, `create view`, ...).
+    pub fn check_table_privilege(
+        &self,
+        reference: &TableReference,
+        privilege: TablePrivilege,
+        action: &str,
+    ) -> Result<(), CatalogError> {
+        let Some(a) = &self.access else {
+            return Ok(());
+        };
+        let catalog = reference
+            .catalog
+            .as_deref()
+            .unwrap_or(&self.default_catalog);
+        let schema = reference.schema.as_deref().unwrap_or(&self.default_schema);
+        let table = &reference.table;
+        if a.rules
+            .has_table_privilege(&a.user, catalog, schema, table, privilege)
+        {
+            return Ok(());
+        }
+        let reason = if a.rules.catalog_access(&a.user, catalog) == CatalogAccess::ReadOnly {
+            format!("catalog {catalog} is read-only")
+        } else {
+            format!("requires {privilege}")
+        };
+        Err(CatalogError::AccessDenied(format!(
+            "Cannot {action} {catalog}.{schema}.{table} ({reason})"
+        )))
     }
 
     /// Whether the session user may see a query run by `owner`; always true

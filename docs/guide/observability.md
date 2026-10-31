@@ -9,6 +9,12 @@ The coordinator, or a standalone server, serves Prometheus metrics at
 curl -s http://127.0.0.1:6432/metrics
 ```
 
+`/metrics` is unauthenticated unless
+[`[web] metrics_auth`](/guide/configuration#web-ui) is set. It sits outside
+the [observe layer](/guide/access-control#privilege-layers): a
+`system_information` section does not hide the admission gauges, worker ids
+or heartbeat ages it serves.
+
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `arneb_queries_total` | counter | `outcome` | Statements that ended: `finished`, `failed`, or `cancelled` (cancel, `statement_timeout`, or the client left) |
@@ -35,7 +41,7 @@ pools are not exported. The coordinator reports their liveness.
 `arneb_queries_running` and `arneb_admission_running` measure different
 things. The first counts every statement the engine is executing and exists
 even with `max_running_queries = 0`. The second counts admission slots in use
-and is absent when admission control is off. For "how busy is the
+(with `max_running_queries = 0` every query holds one). For "how busy is the
 coordinator", use `arneb_queries_running`; for "how close are we to the
 admission cap", use the admission pair.
 

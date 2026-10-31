@@ -794,7 +794,8 @@ async fn run() -> Result<()> {
         if !store.is_persistent() {
             tracing::warn!(
                 target: "arneb::config",
-                "no [state] path: API tokens are lost on restart"
+                "no [state] path: API tokens, worker cordons, admission limits and the audit \
+                 log are lost on restart"
             );
         }
         Some(Arc::new(store))
@@ -808,6 +809,12 @@ async fn run() -> Result<()> {
         }
         None
     };
+    // manage-api D8: stored cordons apply before the Flight server below
+    // accepts heartbeats, so a cordoned worker never gets a query on rejoin.
+    if let Some(store) = &state_store {
+        let count = web::restore_worker_cordons(store, &node_registry);
+        tracing::info!(target: "arneb::config", count, "restored worker cordons");
+    }
     let auth_method = match &state_store {
         Some(store) => arneb_protocol::AuthMethod::ScramSha256(store.clone()),
         None => config_auth,
@@ -822,7 +829,7 @@ async fn run() -> Result<()> {
         None
     };
     if let (Some(rules), Some(path)) = (&access_rules, &config.access_control.rules_file) {
-        let [catalogs, schemas, tables, queries] = rules
+        let [catalogs, schemas, tables, queries, system_information] = rules
             .section_sizes()
             .map(|n| n.map_or_else(|| "absent (allow all)".to_owned(), |n| n.to_string()));
         tracing::info!(
@@ -832,6 +839,7 @@ async fn run() -> Result<()> {
             schemas = %schemas,
             tables = %tables,
             queries = %queries,
+            system_information = %system_information,
             "access control rules loaded"
         );
         if matches!(auth_method, arneb_protocol::AuthMethod::None) {
@@ -897,32 +905,116 @@ async fn run() -> Result<()> {
         .map(arneb_protocol::BasicAuthenticator::new)
         .transpose()
         .context("HTTP Basic authentication")?;
+    // The audit log (manage-api D6): `audit.jsonl` next to the state file,
+    // in memory without one, and an empty in-memory log under `none`
+    // (nothing is audited there).
+    let audit_path = state_store
+        .as_ref()
+        .and_then(|s| s.path())
+        .map(arneb_state::AuditLog::sibling_of);
+    let audit_log = Arc::new(
+        arneb_state::AuditLog::open(audit_path.as_deref(), config.audit.settings())
+            .context("cannot open the audit log (audit.jsonl next to [state] path)")?,
+    );
+    if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
+        tracing::info!(
+            target: "arneb::config",
+            path = %audit_path
+                .as_ref()
+                .map_or_else(|| "in-memory".to_owned(), |p| p.display().to_string()),
+            max_entries = config.audit.max_entries,
+            retention_days = config.audit.retention_days,
+            loaded = audit_log.len(),
+            "audit effective settings ([audit] / ARNEB_AUDIT_*)"
+        );
+        if state_store.as_ref().is_some_and(|s| !s.is_persistent()) {
+            tracing::warn!(
+                target: "arneb::config",
+                "the audit log is kept in memory (no [state] path): its entries are lost on \
+                 restart"
+            );
+        }
+    }
     let state_for_web = state_store.clone();
     let credentials_for_web: Option<Arc<dyn arneb_protocol::CredentialSource>> =
         state_store.clone().map(|s| s as _);
 
+    // Privilege layers (manage-api D1). Admin users are only meaningful
+    // under password auth; say so rather than silently ignoring them.
+    if !matches!(role, ServerRole::Worker) {
+        let admins = &config.access_control.admin_users;
+        tracing::info!(
+            target: "arneb::config",
+            admin_users = %if admins.is_empty() { "none".to_owned() } else { admins.join(",") },
+            auth = if password_users.is_some() { "password" } else { "none" },
+            "manage privileges effective settings ([access_control] admin_users / ARNEB_ADMIN_USERS)"
+        );
+        match &credentials_for_web {
+            None if !admins.is_empty() => tracing::warn!(
+                target: "arneb::config",
+                "[access_control] admin_users is set but [auth] type = \"none\": manage \
+                 actions need an authenticated user, so it has no effect"
+            ),
+            Some(creds) => {
+                let unknown: Vec<&str> = admins
+                    .iter()
+                    .filter(|u| creds.scram_verifiers(u).is_empty())
+                    .map(String::as_str)
+                    .collect();
+                if !unknown.is_empty() {
+                    tracing::warn!(
+                        target: "arneb::config",
+                        "[access_control] admin_users names users that are not in the state \
+                         store: {}",
+                        unknown.join(", ")
+                    );
+                }
+            }
+            None => {}
+        }
+    }
+    let authorizer = web::privilege::Authorizer::new(
+        access_rules.clone(),
+        config.access_control.admin_users.clone(),
+        password_users.is_some(),
+    );
+
     // admission-control D5/D8: one controller for the process, shared by
-    // pgwire, the Trino listener and the Web UI. Workers have none; their
-    // admission stays the RSS probe, and this cap bounds what reaches them.
-    // `max_running_queries = 0` admits every query at once, so no queue can
-    // form whatever `max_queued_queries` says: build no controller, and
-    // statements skip admission (and its lock) entirely.
+    // pgwire, the Trino listener, the agent API and the Web UI. Workers have
+    // none; their admission stays the RSS probe, and this cap bounds what
+    // reaches them. manage-api D9: the controller is built whenever SQL is
+    // served, also for `max_running_queries = 0` (unlimited), so the limits
+    // can change at runtime; a value stored in the state store wins over
+    // the config seed.
     let serves_sql = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
     let admission_config = &config.admission;
-    let admission = (serves_sql && admission_config.max_running_queries > 0).then(|| {
+    let resolved_admission = config::resolve_admission_limits(
+        admission_config,
+        state_store.as_ref().and_then(|s| s.admission_limits()),
+    );
+    let admission = serves_sql.then(|| {
         arneb_scheduler::AdmissionController::new(
-            admission_config.max_running_queries,
-            admission_config.max_queued_queries,
+            resolved_admission.limits.max_running_queries,
+            resolved_admission.limits.max_queued_queries,
         )
     });
     if let Some(controller) = &admission {
         controller.spawn_snapshot_logger(std::time::Duration::from_secs(10));
     }
     if serves_sql {
+        for (knob, from_config, from_state) in &resolved_admission.diverging {
+            tracing::warn!(
+                target: "arneb::config",
+                "[admission] {knob} / ARNEB_{} = {from_config} is overridden by the runtime \
+                 value {from_state} in the state store",
+                knob.to_ascii_uppercase()
+            );
+        }
         tracing::info!(
             target: "arneb::config",
-            max_running_queries = admission_config.max_running_queries,
-            max_queued_queries = admission_config.max_queued_queries,
+            max_running_queries = resolved_admission.limits.max_running_queries,
+            max_queued_queries = resolved_admission.limits.max_queued_queries,
+            admission_source = resolved_admission.source,
             statement_timeout = %arneb_common::duration::format_pg_time_limit(
                 admission_config.statement_timeout
             ),
@@ -1099,6 +1191,8 @@ async fn run() -> Result<()> {
         start_time: std::time::Instant::now(),
         role: config.cluster.role.clone(),
         admission: admission.clone(),
+        admission_changes: Default::default(),
+        cordon_changes: Default::default(),
         max_queued_queries: config.admission.max_queued_queries,
         memory_pool: memory_pool.clone(),
         memory_limit_bytes: budget.map(|b| b as u64),
@@ -1107,7 +1201,9 @@ async fn run() -> Result<()> {
         basic: credentials_for_web.as_ref().and(basic_auth),
         credentials: credentials_for_web,
         state: state_for_web,
+        audit: audit_log,
         access_rules: access_rules.clone(),
+        authorizer,
         metrics_auth: config.web.metrics_auth,
         sessions: web::SessionStore::new(),
         mcp: (serves_clients && agent_service.is_some() && config.mcp.enabled)

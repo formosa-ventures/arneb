@@ -138,11 +138,13 @@ password auth without `[tls]` is a startup error; disable the listener with
 | Code | HTTP | Meaning |
 |---|---|---|
 | `unauthenticated` | 401 | No valid credentials, or a wrong login. |
-| `forbidden` | 403 | Authenticated, but the access rules deny it (killing a query). |
+| `forbidden` | 403 | Authenticated, but the access rules deny it (killing another user's query, a manage action). |
+| `manage_requires_auth` | 403 | A manage action, or cancelling another user's query over `/api/v2`, under `[auth] type = "none"`. |
 | `not_found` | 404 | No such route, query or token, or one you may not see. |
 | `invalid_argument` | 400 (405 for a wrong method) | A malformed request. |
 | `auth_disabled` | 409 | The route needs `[auth] type = "password"`. |
 | `overloaded` | 503 | Too many pending password checks or sessions; retry (`Retry-After: 1`). |
+| `audit_unavailable` | 503 | The [audit log](#audit-log) cannot be written, so audited actions are refused; retry (`Retry-After: 5`). |
 | `internal` | 500 | An unexpected failure; the server log has the detail. |
 
 The [querying](#querying) routes add the codes in
@@ -163,13 +165,19 @@ All `/api/v2` routes need credentials, except `health` and `POST /sessions`.
 | `GET /api/v2/whoami` | `{"user","via"}`; `via` is `token`, `session`, `basic` or `unauthenticated`. |
 | `POST /api/v2/tokens` | Mint a token (see above). `201`. |
 | `GET /api/v2/tokens` | `{"tokens":[{"id","name","created_ms","expires_ms"}]}` for the caller. |
-| `DELETE /api/v2/tokens/{id}` | Revoke the caller's token (`204`). |
+| `DELETE /api/v2/tokens/{id}` | Revoke the caller's token (`204`); an id that is not 16 lowercase hex is `invalid_argument`. |
 | `GET /api/v2/queries` | Queries the caller may view. Same parameters and body as `/api/v1/queries`. |
 | `GET /api/v2/queries/{id}` | One query; `404` if missing or hidden. |
-| `DELETE /api/v2/queries/{id}` | Cancel a query (`204`); `403` if the caller may view but not kill it. |
+| `DELETE /api/v2/queries/{id}[?dry_run=]` | [Cancel any query](#cancel-any-query) (`200`, the [manage envelope](#dry-runs-and-the-response-envelope)). |
 | `GET /api/v2/cluster` | Cluster overview. |
-| `GET /api/v2/cluster/workers` | Workers and their state. |
+| `GET /api/v2/cluster/workers` | The alive workers, with their lifecycle `state` and `scheduling`. |
+| `GET /api/v2/workers[?limit=]` | The [bounded worker listing](#workers). |
+| `GET /api/v2/workers/{id}` | One worker. |
+| `POST /api/v2/workers/{id}/cordon\|drain\|uncordon[?dry_run=]` | [Cordon, drain or uncordon](#workers) a worker. |
+| `GET /api/v2/admission` | The [admission limits](#admission-limits) and counters. |
+| `PUT /api/v2/admission[?dry_run=]` | [Change the admission limits](#admission-limits). |
 | `GET /api/v2/info` | Server version and role. |
+| `GET /api/v2/audit` | The [audit log](#audit-log), newest first. |
 
 The [querying](#querying) routes (`catalogs`, `explain`, `statements`) are
 listed in their own section.
@@ -184,9 +192,10 @@ errors differ. The `/api/v1` routes are `/api/v1/queries`,
 `failed` or `cancelled` (any case). `running` does not include `planning`,
 `starting` or `finishing`. An unknown state filters nothing.
 
-Both versions apply the [`queries` access rules](/guide/access-control):
-a query the caller may not `view` is hidden (`404`), one they may view but
-not `kill` answers `403`, and a user may always kill their own.
+Both versions apply the [`queries` access rules](/guide/access-control)
+to the list and detail: a query the caller may not `view` is hidden
+(`404`). Cancelling follows the kill rule in
+[Cancel any query](#cancel-any-query).
 
 ## Querying
 
@@ -392,6 +401,242 @@ curl -s -H "$H" "$B/statements/0b9f…/results?cursor=0&max_bytes=65536"
 # Changed your mind
 curl -s -H "$H" -X DELETE "$B/statements/0b9f…"
 ```
+
+## Managing
+
+### Dry runs and the response envelope
+
+Every manage route takes `?dry_run=true|false` (default `false`; any other
+value is `invalid_argument`). A dry run is authorized and validated exactly
+like the real call, so a call you may not make is refused the same way as a
+dry run. It changes nothing and is not audited.
+
+Both dry and real runs answer `200` with one envelope:
+
+```json
+{"dry_run": false, "action": "query.cancel", "target": "0b9f…",
+ "summary": "cancelled query 0b9f… owned by bob; it was running",
+ "changed": true, "warning": null,
+ "result": {"query_id": "0b9f…", "owner": "bob",
+            "state_before": "running", "state": "cancelled"}}
+```
+
+- `summary` says what the call does (dry run) or did, in one sentence.
+- `changed` is `false` for a no-op, such as cancelling a query that already
+  ended. A no-op is not an error.
+- `warning` is `null`, or a sentence on a side effect worth knowing.
+- `result` is the action's result; a dry run has none.
+
+### Cancel any query
+
+`DELETE /api/v2/queries/{id}` cancels a query from any protocol (pgwire,
+Trino, `/api/v2` statements) and stops it there: a pgwire client gets
+`ERROR 57014 canceling statement due to user request`, a Trino client
+`USER_CANCELED` `Query was killed by <user>`, and an `/api/v2` statement
+turns `cancelled` with `Statement was cancelled by <user>`.
+
+Who may cancel, in this order:
+
+1. The query's owner, in any auth mode (under `none`, the owner is the
+   claimed `X-Arneb-User`). Not audited.
+2. Otherwise, under `[auth] type = "none"`: refused with
+   `manage_requires_auth`.
+3. A `queries` rule that allows `kill` for that owner, or no `queries`
+   section in the rules file.
+4. The manage privilege (`[access_control] admin_users`, or a
+   `system_information` rule that allows `write`).
+5. Otherwise `forbidden`, with a hint naming the rule that would allow it.
+
+Cancelling another user's query is [audited](#audit-log) as `query.cancel`,
+with `parameters.effect` `applied` or `already_ended`. A query the caller
+may neither view nor kill is `not_found`, as is one that does not exist; a
+manager finds every query.
+
+```bash
+curl -s -H "$H" -X DELETE "$B/queries/0b9f…?dry_run=true"
+# {"dry_run":true,"action":"query.cancel","target":"0b9f…",
+#  "summary":"cancels 1 query (0b9f…) owned by bob; it is running",
+#  "changed":true,"warning":null}
+```
+
+A query that already ended, or ends during the call, answers `200` with
+`changed: false` and a summary such as `query 0b9f… owned by bob already
+finished; nothing to cancel`.
+
+`DELETE /api/v1/queries/{id}` answers `204` / `403` / `404` and has no dry
+run. Under password auth it uses the rule above, audited the same way, so it
+can also answer `503 audit_unavailable` (with an error body and
+`Retry-After: 5`) while the audit log is unwritable. Under
+`[auth] type = "none"` any caller may cancel any query, as the Web UI always
+could, and the cancel now really stops it.
+
+Under `none`, any peer that can reach the Web port can therefore stop any
+query (`/api/v1`), and `/api/v2` and MCP accept a claimed `X-Arneb-User` as
+the owner. Do not expose the Web port under `none`: bind it to loopback or
+use password auth.
+
+### Workers
+
+A cordon takes a worker out of scheduling on the coordinator: it gets no
+new distributed query, and the queries it runs keep running. A drain is a
+cordon that also watches those queries until none is left. Both are kept in
+the state store and restored at startup, before workers can rejoin, so a
+worker that restarts under the same id stays cordoned. Without a `[state]
+path` the store is in memory, and each change warns that it is `lost on
+restart`.
+
+Each worker has two states:
+
+- `state` is the lifecycle the worker reports: `active`, or `draining`
+  after it got SIGTERM (see [Stopping a worker](/guide/distributed#stopping-a-worker)).
+  It is `unknown` for an id that is not registered.
+- `scheduling` is the coordinator's: `schedulable`, `cordoned`, `draining`
+  (drain requested, distributed queries still run on it) or `drained`
+  (drain requested, none runs on it). `drained` means no distributed query
+  of this coordinator holds the worker any more; after a cancel, the
+  worker's own task teardown may lag briefly behind it.
+
+| Method and path | Privilege | Description |
+|---|---|---|
+| `GET /api/v2/workers?limit=` | observe | `{workers, truncated}`, sorted by id; `limit` defaults to `100`, at most `1000` (a larger value is `invalid_argument`). |
+| `GET /api/v2/workers/{id}` | observe | One worker, or `not_found`. |
+| `POST /api/v2/workers/{id}/cordon` | manage | Action `worker.cordon`. |
+| `POST /api/v2/workers/{id}/drain` | manage | Action `worker.drain`. |
+| `POST /api/v2/workers/{id}/uncordon` | manage | Action `worker.uncordon`. |
+
+The listing holds every registered worker, alive or not, and every id with
+a cordon, including a worker that never came back (`registered: false`).
+Each entry is:
+
+```json
+{"worker_id": "worker-1", "address": "http://10.0.0.5:9091",
+ "registered": true, "alive": true, "version": "0.1.7",
+ "state": "active", "scheduling": "draining", "running_queries": 2,
+ "cordoned_since_ms": 1767000000000, "cordoned_by": "root",
+ "last_heartbeat_secs_ago": 1}
+```
+
+The three actions answer with the [manage envelope](#dry-runs-and-the-response-envelope);
+`result` is the worker after the change. They are [audited](#audit-log).
+
+- Cordon or drain of an id the coordinator has never seen is `not_found`,
+  with a hint naming `GET /api/v2/workers`. Uncordon also takes an id that
+  only has a stored cordon, which removes it.
+- Cordoning a cordoned worker, draining a draining one or uncordoning one
+  that is not cordoned is a no-op (`changed: false`).
+- Cordoning or draining the last schedulable worker is allowed, with a
+  `warning` containing `no schedulable worker`. New distributed queries then
+  fail with `no workers available for distributed execution (2 cordoned;
+  uncordon one with POST /api/v2/workers/{id}/uncordon)` until a worker is
+  uncordoned.
+
+```bash
+curl -s -H "$H" -X POST "$B/workers/worker-1/drain?dry_run=true"
+# {"dry_run":true,"action":"worker.drain","target":"worker-1",
+#  "summary":"drains worker worker-1: no new queries; 2 running queries finish on it",
+#  "changed":true,"warning":null}
+```
+
+`GET /api/v1|v2/cluster/workers` stay arrays of the alive workers; each
+entry gains `scheduling`.
+
+### Admission limits
+
+The [admission limits](/guide/configuration#admission-control) can change
+while the server runs. A change is kept in the state store and wins over
+`[admission]` at the next start (a WARN on `arneb::config` names each knob
+it overrides). Without a `[state] path` the store is in memory, and each
+change warns that it is `lost on restart`.
+
+| Method and path | Privilege | Description |
+|---|---|---|
+| `GET /api/v2/admission` | observe | `{max_running_queries, max_queued_queries, running_queries, queued_queries, source}`. |
+| `PUT /api/v2/admission` | manage | Action `admission.set`; body `{"max_running_queries"?, "max_queued_queries"?}`. |
+
+`source` is `config` until a limit is set at runtime, then `state`.
+`max_running_queries = 0` means unlimited. A stored value pins the limits
+across restarts and config edits; to go back to the config, stop the
+server and remove `settings.admission` from the state file.
+
+The `PUT` body needs at least one of the two fields; a field left out keeps
+its value. Each value is a non-negative integer of at most 2^63 − 1 (`null` is
+refused), and an unknown field is
+`invalid_argument`. The answer is the [manage envelope](#dry-runs-and-the-response-envelope);
+`result` is the `GET` view after the change. The action is
+[audited](#audit-log) with `parameters` such as
+`{"max_running_queries": {"from": 8, "to": 2}, "effect": "applied"}`.
+Setting the values the server already has is a no-op (`changed: false`).
+
+- Lowering `max_running_queries` below the running count stops nothing: new
+  queries queue until fewer than the new cap run.
+- Raising it, or setting `0`, admits queued queries at once, in arrival
+  order, up to the new cap.
+- Lowering `max_queued_queries` keeps the queries already queued; new ones
+  are refused while the queue is at or over the new limit.
+
+```bash
+curl -s -H "$H" -X PUT "$B/admission?dry_run=true" \
+  -H 'Content-Type: application/json' -d '{"max_running_queries": 2}'
+# {"dry_run":true,"action":"admission.set","target":"admission",
+#  "summary":"sets max_running_queries 8 → 2 (5 queries running, 0 queued): running queries finish; new queries queue until fewer than 2 run",
+#  "changed":true,"warning":null}
+```
+
+### Audit log
+
+Under `[auth] type = "password"`, these actions are recorded in a durable
+audit log, each entry synced to disk before the response returns:
+
+- issuing and revoking API tokens (`token.issue`, `token.revoke`), whether
+  they succeed or fail;
+- the manage actions, except dry runs;
+- cancelling another user's query (`query.cancel`).
+
+A refused request (no credentials, no privilege, a malformed body or token
+id) is not recorded. If the log cannot be written, audited actions are
+refused with `audit_unavailable` until it can; at most one entry is missing
+per action in flight when the log fails, and each is logged in full at ERROR
+on `arneb::audit`. Retention is set by [`[audit]`](/guide/configuration#audit-log).
+
+```bash
+curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
+```
+
+```json
+{"entries":[
+  {"seq":42,"time_ms":1767000000000,"user":"alice","via":"basic",
+   "action":"token.issue","target":"0123456789abcdef",
+   "parameters":{"name":"ci","expires_ms":null},"outcome":"ok"},
+  {"seq":40,"time_ms":1766990000000,"user":"bob","via":"token",
+   "action":"token.issue","target":"",
+   "parameters":{"name":null,"expires_ms":null},"outcome":{"error":"invalid_argument"}}],
+ "next_cursor":40,"truncated":true,"persistent":true,"writable":true}
+```
+
+- `seq` increases with every entry, across restarts; a failed write can
+  leave a gap. After a crash, a seq that appears only in an ERROR line may be
+  reused. `time_ms` is milliseconds since the Unix epoch.
+- `via` is how the user authenticated: `token`, `session` or `basic`.
+- `target` names what the action acted on. A token is named by its 16-hex
+  id only; the token itself is never recorded.
+- `outcome` is `"ok"`, or `{"error": "<code>"}` with the
+  [error code](#errors) the call returned.
+- `persistent` is `false` when the log is in memory (no `[state] path`), and
+  `writable` is `false` while audited actions are refused with
+  `audit_unavailable`.
+
+Parameters, all optional:
+
+| Parameter | Meaning |
+|---|---|
+| `limit` | Most entries to return; default `50`, at most `500`. A larger value is `invalid_argument`. |
+| `cursor` | The previous page's `next_cursor`: continue with older entries. |
+| `user` | Only this user's entries (exact match). |
+| `action` | Only this action's entries (exact match), for example `token.revoke`. |
+
+Reading the log needs the observe privilege: with a `system_information`
+section in the [access rules](/guide/access-control), only users it allows
+`read` (or managers) may read it.
 
 ## Security notes
 

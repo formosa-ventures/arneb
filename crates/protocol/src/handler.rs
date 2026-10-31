@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use arneb_catalog::CatalogManager;
+use arneb_catalog::{CatalogManager, TablePrivilege};
 use arneb_common::error::{ArnebError, ExecutionError};
 use arneb_common::stream::collect_stream;
 use arneb_common::types::ScalarValue;
@@ -202,6 +202,20 @@ impl TrackedStatement {
             let _ = t.fail_query(&id, error);
         }
     }
+
+    /// Killed through the tracker: record it as cancelled (a no-op when the
+    /// kill already did).
+    fn cancel(&mut self) {
+        if let Some((t, id)) = self.0.take() {
+            let _ = t.cancel_query(&id);
+        }
+    }
+
+    fn set_canceller(&self, canceller: arneb_scheduler::Canceller) {
+        if let Some((t, id)) = &self.0 {
+            t.set_canceller(id, canceller);
+        }
+    }
 }
 
 impl Drop for TrackedStatement {
@@ -357,34 +371,46 @@ impl ConnectionHandler {
     > {
         let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
         let mut tracked = TrackedStatement::start(&self.query_tracker, sql, user);
-        let result = self
-            .with_timeout(client, async {
-                let _admission = self.admit(sql).await?;
-                tracked.running();
-                // Snapshot after admission, so the reading statement shows
-                // itself as RUNNING.
-                let runtime = crate::runtime_queries::references_runtime_queries(sql).then(|| {
-                    crate::runtime_queries::runtime_catalog(&self.query_tracker, catalog_manager)
-                });
-                let (cm, registry, executor) = match &runtime {
-                    Some((cm, registry)) => (cm, registry, None),
-                    None => (
-                        catalog_manager.as_ref(),
-                        self.connector_registry.as_ref(),
-                        self.distributed_executor.as_deref(),
-                    ),
-                };
-                Ok(execute_query_with_limit(
-                    sql,
-                    cm,
-                    registry,
-                    executor,
-                    &self.memory_pool,
-                    self.query_memory_limit,
-                )
-                .await)
-            })
-            .await;
+        // A kill through the tracker (manage-api D7) aborts the statement
+        // future; the canceller holds only the abort handle.
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        tracked.set_canceller(Box::new(move |_by| abort.abort()));
+        let work = self.with_timeout(client, async {
+            let _admission = self.admit(sql).await?;
+            tracked.running();
+            // Snapshot after admission, so the reading statement shows
+            // itself as RUNNING.
+            let runtime = crate::runtime_queries::references_runtime_queries(sql).then(|| {
+                crate::runtime_queries::runtime_catalog(&self.query_tracker, catalog_manager)
+            });
+            let (cm, registry, executor) = match &runtime {
+                Some((cm, registry)) => (cm, registry, None),
+                None => (
+                    catalog_manager.as_ref(),
+                    self.connector_registry.as_ref(),
+                    self.distributed_executor.as_deref(),
+                ),
+            };
+            Ok(execute_query_with_limit(
+                sql,
+                cm,
+                registry,
+                executor,
+                &self.memory_pool,
+                self.query_memory_limit,
+            )
+            .await)
+        });
+        let Ok(result) = futures::future::Abortable::new(work, registration).await else {
+            tracked.cancel();
+            return Err(PgWireError::UserError(Box::new(
+                pgwire::error::ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "57014".to_owned(),
+                    "canceling statement due to user request".to_owned(),
+                ),
+            )));
+        };
         match &result {
             Ok(Ok((_, batches))) => {
                 tracked.finish(batches.iter().map(|b| b.num_rows() as u64).sum())
@@ -1102,6 +1128,31 @@ fn cap_plan_rows(plan: LogicalPlan, row_cap: usize) -> LogicalPlan {
     }
 }
 
+/// Checks the write privilege a DDL/DML plan needs on its target table
+/// (`INSERT`, `DELETE`, or `OWNERSHIP` for create/drop), recursing through
+/// `EXPLAIN` because analysis is where access is checked. Reads need
+/// nothing here: planning already checked every `SELECT` source.
+pub(crate) fn check_write_privileges(
+    plan: &LogicalPlan,
+    catalogs: &CatalogManager,
+) -> Result<(), ArnebError> {
+    use TablePrivilege::{Delete, Insert, Ownership};
+    let (name, privilege, verb) = match plan {
+        LogicalPlan::Explain { input, .. } => return check_write_privileges(input, catalogs),
+        LogicalPlan::InsertInto { table, .. } => (table, Insert, "insert into table"),
+        LogicalPlan::DeleteFrom { table, .. } => (table, Delete, "delete from table"),
+        LogicalPlan::CreateTable { name, .. } | LogicalPlan::CreateTableAsSelect { name, .. } => {
+            (name, Ownership, "create table")
+        }
+        LogicalPlan::DropTable { name, .. } => (name, Ownership, "drop table"),
+        LogicalPlan::CreateView { name, .. } => (name, Ownership, "create view"),
+        LogicalPlan::DropView { name, .. } => (name, Ownership, "drop view"),
+        _ => return Ok(()),
+    };
+    catalogs.check_table_privilege(name, privilege, verb)?;
+    Ok(())
+}
+
 /// [`execute_query_with_limit`] that, for a `SELECT`, stops producing rows
 /// after `row_cap` of them: the plan's root gets a `LIMIT row_cap`, so the
 /// query reads no more than it needs to return that many rows. Other
@@ -1148,6 +1199,8 @@ pub(crate) async fn execute_query_capped(
         }
         _ => logical_plan,
     };
+
+    check_write_privileges(&logical_plan, catalog_manager)?;
 
     // Step 2.5: Optimize logical plan
     let optimizer = LogicalOptimizer::default_rules();

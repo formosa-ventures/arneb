@@ -1466,10 +1466,13 @@ async fn register_postgresql_catalog(
 
 /// The tracing filter: `rust_log` (when set and valid, else `info`), then
 /// `arneb::profile=info` under `--profile`, then `rmcp=warn` unless
-/// `rust_log` names an `rmcp` target. rmcp logs every tool result at debug,
-/// new API tokens included, so a global `debug` must not reach it, and it
-/// logs three info lines per stateless MCP request; naming `rmcp` is the
-/// operator opting in.
+/// `rust_log` has a directive whose target is exactly `rmcp` (such as
+/// `rmcp=debug`). rmcp logs every tool result at debug, new API tokens
+/// included, so a global `debug` must not reach it, and it logs three info
+/// lines per stateless MCP request. A directive on the `rmcp` target itself
+/// is the operator opting in; one on a module (`rmcp::transport=warn`)
+/// keeps the cap, and tracing still applies it to that module because the
+/// most specific directive wins.
 fn log_filter_directives(rust_log: Option<&str>, profile: bool) -> String {
     let base = rust_log
         .map(str::trim)
@@ -1479,11 +1482,10 @@ fn log_filter_directives(rust_log: Option<&str>, profile: bool) -> String {
     if profile {
         directives.push_str(",arneb::profile=info");
     }
-    let names_rmcp = base.split(',').any(|d| {
-        let target = d.split(['=', '[']).next().unwrap_or("").trim();
-        target == "rmcp" || target.starts_with("rmcp::")
-    });
-    if !names_rmcp {
+    let opts_in = base
+        .split(',')
+        .any(|d| d.split(['=', '[']).next().unwrap_or("").trim() == "rmcp");
+    if !opts_in {
         directives.push_str(",rmcp=warn");
     }
     directives
@@ -1493,30 +1495,45 @@ fn log_filter_directives(rust_log: Option<&str>, profile: bool) -> String {
 mod tests {
     use super::*;
 
-    /// Whether `directives` enable `level` events of `target`.
-    fn enabled(directives: &str, target_is_rmcp: bool, level: tracing::Level) -> bool {
+    /// Which `tracing` target an [`enabled`] probe checks.
+    #[derive(Clone, Copy)]
+    enum Probe {
+        /// `rmcp::service`, which logs tool results at debug.
+        Service,
+        /// `rmcp::transport`.
+        Transport,
+        /// A non-rmcp target.
+        Other,
+    }
+
+    /// Whether `directives` enable `level` events of the `probe` target.
+    fn enabled(directives: &str, probe: Probe, level: tracing::Level) -> bool {
+        use tracing::Level;
         use tracing_subscriber::layer::SubscriberExt as _;
         let subscriber =
             tracing_subscriber::registry().with(tracing_subscriber::EnvFilter::new(directives));
-        tracing::subscriber::with_default(subscriber, || {
-            if target_is_rmcp {
-                match level {
-                    tracing::Level::DEBUG => {
-                        tracing::enabled!(target: "rmcp::service", tracing::Level::DEBUG)
-                    }
-                    tracing::Level::INFO => {
-                        tracing::enabled!(target: "rmcp::service", tracing::Level::INFO)
-                    }
-                    _ => tracing::enabled!(target: "rmcp::service", tracing::Level::WARN),
-                }
-            } else {
-                tracing::enabled!(target: "arneb::other", tracing::Level::DEBUG)
+        // `enabled!` needs constant targets and levels, hence the matches.
+        tracing::subscriber::with_default(subscriber, || match (probe, level) {
+            (Probe::Service, Level::DEBUG) => {
+                tracing::enabled!(target: "rmcp::service", Level::DEBUG)
             }
+            (Probe::Service, Level::INFO) => {
+                tracing::enabled!(target: "rmcp::service", Level::INFO)
+            }
+            (Probe::Service, _) => tracing::enabled!(target: "rmcp::service", Level::WARN),
+            (Probe::Transport, Level::DEBUG) => {
+                tracing::enabled!(target: "rmcp::transport", Level::DEBUG)
+            }
+            (Probe::Transport, Level::INFO) => {
+                tracing::enabled!(target: "rmcp::transport", Level::INFO)
+            }
+            (Probe::Transport, _) => tracing::enabled!(target: "rmcp::transport", Level::WARN),
+            (Probe::Other, _) => tracing::enabled!(target: "arneb::other", Level::DEBUG),
         })
     }
 
     #[test]
-    fn rmcp_is_capped_at_warn_unless_rust_log_names_it() {
+    fn rmcp_is_capped_at_warn_unless_rust_log_targets_rmcp() {
         use tracing::Level;
         // Unset, invalid or empty RUST_LOG: global info, rmcp capped.
         for unset in [None, Some(""), Some("bogus=[[[")] {
@@ -1525,21 +1542,30 @@ mod tests {
         // A global debug level does not reach rmcp's result logging.
         let d = log_filter_directives(Some("debug"), false);
         assert_eq!(d, "debug,rmcp=warn");
-        assert!(enabled(&d, false, Level::DEBUG));
-        assert!(!enabled(&d, true, Level::DEBUG));
+        assert!(enabled(&d, Probe::Other, Level::DEBUG));
+        assert!(!enabled(&d, Probe::Service, Level::DEBUG));
         // Nor its per-request info lines; its warnings (rejected Origin or
         // Host) still log.
-        assert!(!enabled(&d, true, Level::INFO));
-        assert!(enabled(&d, true, Level::WARN));
-        // Naming rmcp (or a module of it) is the operator opting in.
-        for opted in [
-            "debug,rmcp=debug",
-            "info,rmcp::service=debug",
-            "rmcp[x]=debug",
-        ] {
+        assert!(!enabled(&d, Probe::Service, Level::INFO));
+        assert!(enabled(&d, Probe::Service, Level::WARN));
+        // A directive on the `rmcp` target itself is the operator opting in.
+        for opted in ["debug,rmcp=debug", "rmcp[x]=debug", "rmcp"] {
             assert_eq!(log_filter_directives(Some(opted), false), opted);
         }
-        assert!(enabled("debug,rmcp=debug", true, Level::DEBUG));
+        assert!(enabled("debug,rmcp=debug", Probe::Service, Level::DEBUG));
+        // #217 review: a directive on an rmcp module keeps the cap for the
+        // rest of rmcp, and still applies to its module.
+        let d = log_filter_directives(Some("debug,rmcp::transport=warn"), false);
+        assert_eq!(d, "debug,rmcp::transport=warn,rmcp=warn");
+        assert!(!enabled(&d, Probe::Service, Level::DEBUG));
+        assert!(!enabled(&d, Probe::Service, Level::INFO));
+        assert!(enabled(&d, Probe::Transport, Level::WARN));
+        assert!(!enabled(&d, Probe::Transport, Level::INFO));
+        let d = log_filter_directives(Some("info,rmcp::service=debug"), false);
+        assert!(d.ends_with(",rmcp=warn"), "{d}");
+        // The module's own directive is the more specific one.
+        assert!(enabled(&d, Probe::Service, Level::DEBUG));
+        assert!(!enabled(&d, Probe::Transport, Level::INFO));
         // A target that only starts with the letters is not rmcp.
         assert_eq!(
             log_filter_directives(Some("rmcpx=debug"), false),

@@ -207,8 +207,13 @@ explicitly.
   tool result at `debug`, and a result can hold rows or a new API token from
   `create_token`, and it logs three `info` lines for every request. Arneb
   therefore caps the `rmcp` log target at `warn`, even under
-  `RUST_LOG=debug`; its warnings (a rejected `Origin` or `Host`) still log. Only a `RUST_LOG` that names `rmcp` itself (for
-  example `RUST_LOG=info,rmcp=debug`) lifts the cap; do that only on a
+  `RUST_LOG=debug`; its warnings (a rejected `Origin` or `Host`) still log.
+  A directive on an rmcp module, such as `RUST_LOG=debug,rmcp::transport=warn`,
+  keeps the cap for the rest of rmcp and still applies to that module. Only
+  a directive whose target is exactly `rmcp` (for example
+  `RUST_LOG=info,rmcp=debug`) lifts the cap. That is an explicit opt-in:
+  at `debug` rmcp logs tool results, new API tokens included, as does
+  naming its `rmcp::service` module at `debug`. Do either only on a
   machine whose logs are as private as the tokens.
 - **Host and Origin checks** stop DNS rebinding and cross-site calls; see
   [Host allow-list](#host-allow-list) and [Origin check](#origin-check).

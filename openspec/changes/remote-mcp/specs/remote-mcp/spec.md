@@ -64,7 +64,7 @@ With `[mcp] enabled = false`, `/mcp` and its subpaths SHALL NOT be served and SH
 - **THEN** `Origin: https://app.example:443` is accepted and `Origin: https://evil.example` is refused
 
 ### Requirement: Debug logging excludes tool results
-The server SHALL cap the `rmcp` log target at `warn`, appended after the base `RUST_LOG` filter, unless `RUST_LOG` names an `rmcp` target itself, so that `RUST_LOG=debug` does not log tool results such as a new API token and the default level does not log three lines per request.
+The server SHALL cap the `rmcp` log target at `warn`, appended after the base `RUST_LOG` filter, unless `RUST_LOG` has a directive whose target is exactly `rmcp`, so that `RUST_LOG=debug` does not log tool results such as a new API token and the default level does not log three lines per request.
 
 #### Scenario: Global debug
 - **WHEN** `RUST_LOG=debug`
@@ -73,6 +73,14 @@ The server SHALL cap the `rmcp` log target at `warn`, appended after the base `R
 #### Scenario: Operator opts in
 - **WHEN** `RUST_LOG=info,rmcp=debug`
 - **THEN** the filter is used unchanged
+
+#### Scenario: A module directive keeps the cap
+- **WHEN** `RUST_LOG=debug,rmcp::transport=warn`
+- **THEN** the effective filter is `debug,rmcp::transport=warn,rmcp=warn`, `rmcp::service` debug and info events are disabled, and `rmcp::transport` warnings are enabled
+
+#### Scenario: A look-alike target keeps the cap
+- **WHEN** `RUST_LOG=rmcpx=debug`
+- **THEN** the effective filter is `rmcpx=debug,rmcp=warn`
 
 ### Requirement: Identity-scoped tools
 Every tool SHALL run as the request's authenticated identity and SHALL call the same function, with the same validation, as the matching `/api/v2` route, so visibility, access rules, admission and limits are those of the route. The server SHALL expose exactly these tools: `cancel_query`, `create_token`, `describe_table`, `explain_query`, `fetch_results`, `get_cluster`, `get_query`, `get_query_status`, `list_catalogs`, `list_queries`, `list_schemas`, `list_tables`, `list_tokens`, `list_workers`, `revoke_token`, `sample_table`, `submit_query` and `whoami`.

@@ -373,7 +373,7 @@ impl AgentQueryService {
     }
 
     /// Takes an admission slot for a statement that executes a plan,
-    /// reporting it as queued (with its position) while it waits.
+    /// reporting it as queued (with its live position) while it waits.
     async fn admit(
         &self,
         statement: &Statement,
@@ -388,9 +388,9 @@ impl AgentQueryService {
         let pending = controller
             .admit_with(|| crate::handler::admission_label(&statement.sql))
             .map_err(|e| TrinoError::queue_full(e.to_string()))?;
-        if let Some(position) = pending.queue_position() {
-            if let Phase::Queued(p) = &mut statement.lock().phase {
-                *p = Some(position);
+        if let Some(ticket) = pending.ticket() {
+            if let Phase::Queued(t) = &mut statement.lock().phase {
+                *t = Some(ticket);
             }
         }
         Ok(Some(pending.wait().await))
@@ -973,6 +973,47 @@ mod tests {
         assert!(took < Duration::from_millis(200 + 500), "{took:?}");
         assert_eq!(s.state, StatementState::Queued);
         assert_eq!(s.queue_position, Some(1));
+    }
+
+    #[tokio::test]
+    async fn queue_position_is_live() {
+        let admission = AdmissionController::new(1, 10);
+        let (svc, _) = service();
+        let svc = svc.with_admission(Some(admission.clone()));
+        let held = admission.admit("held").unwrap().wait().await;
+        let ahead = admission.admit("ahead").unwrap();
+        let s = svc
+            .submit("alice", req("SELECT 1"), Duration::ZERO)
+            .await
+            .unwrap();
+        let mut position = None;
+        for _ in 0..100 {
+            position = svc
+                .status("alice", &s.id, Duration::ZERO)
+                .await
+                .unwrap()
+                .queue_position;
+            if position.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(position, Some(2));
+        drop(ahead); // leaves the queue: the statement moves up
+        let st = svc.status("alice", &s.id, Duration::ZERO).await.unwrap();
+        assert_eq!(
+            (st.state, st.queue_position),
+            (StatementState::Queued, Some(1))
+        );
+        drop(held); // the slot goes to the statement
+        let st = svc
+            .status("alice", &s.id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            (st.state, st.queue_position),
+            (StatementState::Finished, None)
+        );
     }
 
     #[tokio::test]

@@ -229,7 +229,9 @@ The reply is a status:
  "first_page":{"rows":[[1,17],[2,36]],"…":"…"},"error":null}
 ```
 
-`state` is `queued`, `running`, `finished`, `failed` or `cancelled`. A
+`state` is `queued`, `running`, `finished`, `failed` or `cancelled`.
+`queue_position` is the statement's current place in the admission queue
+(1 = next), read at each poll, and `null` unless it is queued. A
 statement that finishes inside `wait_ms` carries its first page inline;
 otherwise poll with `GET /statements/{id}?wait_ms=` (long-poll) until it is
 terminal, then fetch pages with `GET /statements/{id}/results?cursor=N`,

@@ -9,6 +9,7 @@ use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
 use arneb_common::identifiers::QueryId;
+use arneb_scheduler::QueueTicket;
 
 use super::error::{AgentError, AgentErrorCode};
 use super::limits::AgentLimits;
@@ -70,7 +71,8 @@ pub struct StatementStatus {
     pub id: String,
     /// Lifecycle state.
     pub state: StatementState,
-    /// Position in the admission queue when the statement was queued.
+    /// Current position in the admission queue (1 = next), read live at
+    /// status time; `None` unless the statement is waiting for admission.
     pub queue_position: Option<usize>,
     /// Time since submission (until completion, once terminal).
     pub elapsed_ms: u64,
@@ -99,8 +101,8 @@ pub(crate) struct FinishedOutput {
 }
 
 pub(crate) enum Phase {
-    /// Waiting for admission; the position once it has been queued.
-    Queued(Option<usize>),
+    /// Waiting for admission; its queue ticket once it has been queued.
+    Queued(Option<QueueTicket>),
     Running,
     Finished(FinishedOutput),
     Failed(AgentError),
@@ -233,7 +235,9 @@ impl Statement {
             };
             let mut retained = None;
             match &inner.phase {
-                Phase::Queued(position) => status.queue_position = *position,
+                Phase::Queued(ticket) => {
+                    status.queue_position = ticket.as_ref().and_then(QueueTicket::position)
+                }
                 Phase::Running => {}
                 Phase::Finished(output) => {
                     status.update_type = output.update_type.clone();

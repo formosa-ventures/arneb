@@ -22,14 +22,10 @@ use crate::config::{CatalogConfig, RedactedString, StorageConfig};
 const BUILD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The value that replaces a secret in [`redacted_spec`].
-// The catalog API (runtime-config D7) is the first caller outside tests.
-#[allow(dead_code)]
 pub const REDACTED: &str = "<redacted>";
 
 /// Catalog names a spec may not take: the startup-only catalogs and the
 /// metadata namespaces.
-// The catalog API (runtime-config D7) is the first caller outside tests.
-#[allow(dead_code)]
 const RESERVED_NAMES: [&str; 5] = [
     "memory",
     "file",
@@ -181,6 +177,11 @@ impl LiveCatalogs {
     /// Sets the catalog generation (after a change was persisted).
     pub fn set_generation(&self, g: u64) {
         self.generation.store(g, Ordering::SeqCst);
+    }
+
+    /// The default catalog's name (unqualified table names resolve in it).
+    pub fn default_catalog(&self) -> String {
+        self.manager.default_catalog().to_owned()
     }
 
     /// The installed specs, in name order (raw secrets included).
@@ -619,8 +620,6 @@ fn same_spec(a: &CatalogConfig, b: &CatalogConfig) -> bool {
 /// `[a-z0-9_]` starting with a letter and not reserved; the type is `hive`
 /// (with `metastore_uri`) or `postgresql` (with a valid `connection_url`
 /// and settings). The message never carries a secret.
-// The catalog API (runtime-config D7) is the first caller outside tests.
-#[allow(dead_code)]
 pub fn validate_spec(spec: &CatalogConfig) -> Result<(), String> {
     let name = spec.name.as_str();
     let well_formed = (1..=63).contains(&name.len())
@@ -658,8 +657,6 @@ pub fn validate_spec(spec: &CatalogConfig) -> Result<(), String> {
 /// `password`, the password inside `connection_url`, and the storage
 /// `secret_access_key`, `service_account_path` and Azure `access_key`.
 /// Every API response, MCP result and audit entry uses this form.
-// The catalog API (runtime-config D7) is the first caller outside tests.
-#[allow(dead_code)]
 pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
     let mut spec = spec.clone();
     let redact = |v: &mut Option<String>| {
@@ -699,8 +696,6 @@ pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
 /// Fills every secret of `new` that is exactly `"<redacted>"` from
 /// `stored`, so a spec read through the API can be sent back unchanged
 /// (D6). A secret `stored` lacks is cleared.
-// The catalog API (runtime-config D7) is the first caller outside tests.
-#[allow(dead_code)]
 pub fn fill_redacted(new: &mut CatalogConfig, stored: &CatalogConfig) {
     let is_redacted = |v: &Option<String>| v.as_deref() == Some(REDACTED);
     if new.password.as_ref().is_some_and(|p| p.0 == REDACTED) {
@@ -775,8 +770,6 @@ pub fn fill_redacted(new: &mut CatalogConfig, stored: &CatalogConfig) {
 
 /// The byte range of the password in `scheme://user:password@host/...`,
 /// if the URL's userinfo has one.
-// The catalog API (runtime-config D7) is the first caller outside tests.
-#[allow(dead_code)]
 fn url_password_range(url: &str) -> Option<std::ops::Range<usize>> {
     let authority_start = url.find("://")? + 3;
     let rest = &url[authority_start..];
@@ -789,8 +782,6 @@ fn url_password_range(url: &str) -> Option<std::ops::Range<usize>> {
 
 /// `(parameter, value)` byte ranges of every `password=` query parameter
 /// (libpq URIs accept the password there too).
-// The catalog API (runtime-config D7) is the first caller outside tests.
-#[allow(dead_code)]
 fn url_query_passwords(url: &str) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
     let Some(scheme_end) = url.find("://") else {
         return Vec::new();

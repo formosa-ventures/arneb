@@ -5,6 +5,7 @@ mod agent;
 mod api;
 mod audit;
 pub mod auth;
+mod catalogs;
 pub mod error;
 mod frontend;
 mod manage;
@@ -67,6 +68,10 @@ pub struct WebState {
     /// catalogs, settings, re-seed; runtime-config D10): held across the
     /// whole change, through the audit append.
     pub config_changes: Arc<tokio::sync::Mutex<()>>,
+    /// The live external catalogs, changed through
+    /// `/api/v2/catalog-configs` (runtime-config D7); `Some` on a
+    /// coordinator or standalone server.
+    pub catalogs: Option<Arc<crate::catalogs::LiveCatalogs>>,
     /// The observe and manage privilege layers and the kill rule.
     pub authorizer: privilege::Authorizer,
     /// `[web] metrics_auth`: require credentials for `/metrics`.

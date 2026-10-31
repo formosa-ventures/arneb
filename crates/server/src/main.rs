@@ -1233,6 +1233,9 @@ async fn run() -> Result<()> {
         audit: audit_log,
         rules: access_rules.clone(),
         config_changes: Default::default(),
+        // Workers serve no Web API; the catalog routes run on the node
+        // that owns the catalog definitions (runtime-config D7).
+        catalogs: (!matches!(role, ServerRole::Worker)).then(|| live_catalogs.clone()),
         authorizer,
         metrics_auth: config.web.metrics_auth,
         sessions: web::SessionStore::new(),

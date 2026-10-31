@@ -250,6 +250,7 @@ mod tests {
             audit: crate::web::test_audit_log(),
             rules,
             config_changes: Default::default(),
+            catalogs: None,
             metrics_auth,
             sessions: SessionStore::new(),
             agent: None,

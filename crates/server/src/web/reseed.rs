@@ -245,7 +245,7 @@ pub(super) async fn reseed_for(
         handle: state.rules.clone(),
         admission: state.admission.clone(),
         lock,
-        _admission_lock: admission_lock,
+        admission_lock,
     };
     run_manage(state, who, grant, dry_run, action).await
 }
@@ -261,7 +261,8 @@ struct Reseed {
     /// The node's admission controller (every node that serves SQL).
     admission: Option<arneb_scheduler::AdmissionController>,
     lock: Option<ChangeLock>,
-    _admission_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// `admission_changes` (real run only), taken after `lock`.
+    admission_lock: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 /// What applying the re-seed now does.
@@ -499,6 +500,12 @@ impl ManageAction for Reseed {
 
     fn change_lock(&self) -> Option<ChangeLock> {
         self.lock.clone()
+    }
+
+    /// `admission_changes`, held by `run_manage` through the audit append
+    /// so a queued admission change is audited after the re-seed.
+    fn take_secondary_lock(&mut self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.admission_lock.take()
     }
 
     /// Persists and swaps each object in turn (users, rules, settings,
@@ -989,6 +996,59 @@ mod tests {
         let (status, again) = reseed(&state, ("root", "rootpw"), false).await;
         assert_eq!(status, StatusCode::OK, "{again}");
         assert_eq!(again["changed"], false, "{again}");
+    }
+
+    /// An admission change queued behind a re-seed waits until the
+    /// re-seed's audit entry is appended, so the audit order is the apply
+    /// order.
+    #[tokio::test]
+    async fn queued_admission_change_is_audited_after_the_reseed() {
+        let _g = THRESHOLD_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = write_config(tmp.path(), Some(CONFIG_RULES));
+        let state = node(&config, &["root"]).await;
+        change_at_runtime(&state);
+        let (inside, release) =
+            crate::web::manage::test_hooks::stop_after_apply(&state.config_changes);
+        let reseeding = tokio::spawn({
+            let state = state.clone();
+            async move { reseed(&state, ("root", "rootpw"), false).await }
+        });
+        tokio::task::spawn_blocking(move || inside.recv().unwrap())
+            .await
+            .unwrap();
+        let admission = tokio::spawn({
+            let state = state.clone();
+            async move {
+                call(
+                    &state,
+                    Method::PUT,
+                    "/api/v2/admission",
+                    Some(&basic("root", "rootpw")),
+                    Some(json!({"max_running_queries": 3})),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !admission.is_finished(),
+            "the admission change waits for the re-seed's audit append"
+        );
+        release.send(()).unwrap();
+        let (status, body) = reseeding.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = admission.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Newest first.
+        let actions: Vec<String> = audit_actions(&state).into_iter().map(|(a, _)| a).collect();
+        assert_eq!(actions, vec!["admission.set", "state.reseed"]);
+        // The admission change applied on top of the re-seeded config limits.
+        assert_eq!(
+            audit_actions(&state)[0].1["max_running_queries"],
+            json!({"from": 8, "to": 3})
+        );
+        arneb_common::metrics::set_slow_query_threshold(slow_query_threshold_from_ms(10_000));
     }
 
     #[tokio::test]

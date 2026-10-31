@@ -91,6 +91,13 @@ pub(super) trait ManageAction: Send + 'static {
     fn change_lock(&self) -> Option<ChangeLock> {
         None
     }
+
+    /// A second lock guard the action holds (taken after the
+    /// [`change_lock`](Self::change_lock)'s), handed over so that
+    /// [`run_manage`] keeps it, too, until the audit entry is appended.
+    fn take_secondary_lock(&mut self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        None
+    }
 }
 
 /// A share of a change lock's guard (`WebState::admission_changes`,
@@ -136,7 +143,7 @@ pub(super) async fn run_manage<A: ManageAction>(
     who: &Identity,
     grant: Grant,
     dry_run: bool,
-    action: A,
+    mut action: A,
 ) -> Result<ManageOutcome<A::Output>, ApiError> {
     let _ = grant; // the proof only: authorization already passed
     let name = action.action();
@@ -156,10 +163,12 @@ pub(super) async fn run_manage<A: ManageAction>(
     }
     let (blocking_state, who, audit_target) = (state.clone(), who.clone(), target.clone());
     let held = action.change_lock();
+    let secondary = action.take_secondary_lock();
     let applied = tokio::task::spawn_blocking(move || {
         let state = blocking_state;
         if !action.audited() {
             let applied = action.apply(&state);
+            drop(secondary);
             drop(held);
             return applied;
         }
@@ -190,7 +199,8 @@ pub(super) async fn run_manage<A: ManageAction>(
                 }
             },
         );
-        // Released only once the entry is appended.
+        // Released only once the entry is appended, in reverse order.
+        drop(secondary);
         drop(held);
         applied
     })

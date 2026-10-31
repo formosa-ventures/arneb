@@ -180,7 +180,12 @@ mod tests {
             .with_ansi(false)
             .with_max_level(tracing::Level::TRACE)
             .finish();
-        let r = tracing::subscriber::with_default(sub, f);
+        // Tests on other threads (no subscriber) can cache a callsite as
+        // disabled; rebuild the interest cache once this one is installed.
+        let r = tracing::subscriber::with_default(sub, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         (r, out)
     }

@@ -35,6 +35,10 @@ pub struct WebState {
     /// `Some` on every node that serves SQL (coordinator / standalone),
     /// `None` on workers.
     pub admission: Option<arneb_scheduler::AdmissionController>,
+    /// Serializes runtime admission changes (manage-api D9): held from
+    /// reading the current limits to applying the new ones, so a change's
+    /// preview, audit `from` and result see one state.
+    pub admission_changes: Arc<tokio::sync::Mutex<()>>,
     /// Configured `[admission] max_queued_queries`, reported when there is
     /// no controller (a worker).
     pub max_queued_queries: usize,

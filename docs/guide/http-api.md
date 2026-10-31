@@ -547,10 +547,13 @@ change warns that it is `lost on restart`.
 | `PUT /api/v2/admission` | manage | Action `admission.set`; body `{"max_running_queries"?, "max_queued_queries"?}`. |
 
 `source` is `config` until a limit is set at runtime, then `state`.
-`max_running_queries = 0` means unlimited.
+`max_running_queries = 0` means unlimited. A stored value pins the limits
+across restarts and config edits; to go back to the config, stop the
+server and remove `settings.admission` from the state file.
 
 The `PUT` body needs at least one of the two fields; a field left out keeps
-its value. Each value is a non-negative integer, and an unknown field is
+its value. Each value is a non-negative integer of at most 2^63 − 1 (`null` is
+refused), and an unknown field is
 `invalid_argument`. The answer is the [manage envelope](#dry-runs-and-the-response-envelope);
 `result` is the `GET` view after the change. The action is
 [audited](#audit-log) with `parameters` such as

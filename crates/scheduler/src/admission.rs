@@ -547,6 +547,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn after_raising_one_release_grants_one_waiter() {
+        let c = AdmissionController::new(1, 10);
+        let first = admitted(&c).await;
+        let queued: Vec<_> = (0..3).map(|_| c.admit("q").unwrap()).collect();
+        let tickets: Vec<_> = queued.iter().map(|q| q.ticket().unwrap()).collect();
+        let positions = || tickets.iter().map(|t| t.position()).collect::<Vec<_>>();
+        let snap = c.set_limits(2, 10);
+        assert_eq!((snap.running, snap.queued), (2, 2));
+        assert_eq!(positions(), vec![None, Some(1), Some(2)]);
+        drop(first); // exactly one slot frees: exactly one waiter is granted
+        assert_eq!(positions(), vec![None, None, Some(1)]);
+        let snap = c.snapshot();
+        assert_eq!((snap.running, snap.queued), (2, 1));
+    }
+
+    #[tokio::test]
     async fn lowering_below_running_queues_new_queries() {
         let c = AdmissionController::new(4, 10);
         let mut running = Vec::new();

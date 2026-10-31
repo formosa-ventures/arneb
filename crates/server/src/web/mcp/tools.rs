@@ -876,6 +876,7 @@ mod tests {
             start_time: std::time::Instant::now(),
             role: "standalone".into(),
             admission: None,
+            admission_changes: Default::default(),
             max_queued_queries: 8,
             memory_pool: Arc::new(arneb_common::memory_pool::GreedyMemoryPool::new(1 << 20)),
             memory_limit_bytes: None,

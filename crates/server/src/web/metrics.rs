@@ -117,6 +117,7 @@ mod tests {
             start_time: std::time::Instant::now(),
             role: "coordinator".into(),
             admission: Some(arneb_scheduler::AdmissionController::new(4, 8)),
+            admission_changes: Default::default(),
             max_queued_queries: 8,
             memory_pool: pool,
             memory_limit_bytes: Some(1 << 20),

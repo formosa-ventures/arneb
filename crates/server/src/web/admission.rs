@@ -38,14 +38,25 @@ pub(super) struct AdmissionView {
 }
 
 /// The `PUT /api/v2/admission` body, or the `set_admission_limits` tool's
-/// arguments. The values are kept untyped so that a negative, fractional or
-/// non-numeric value gets the range hint.
+/// arguments. The values are kept untyped so that a negative, fractional,
+/// non-numeric or `null` value gets the range hint.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AdmissionUpdate {
+    #[serde(default, deserialize_with = "present")]
     pub max_running_queries: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "present")]
     pub max_queued_queries: Option<serde_json::Value>,
 }
+
+/// A field that is present is `Some`, also when it is `null`, so that
+/// `null` is refused instead of read as "keep the value".
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(d).map(Some)
+}
+
+/// The largest accepted limit, as in the config (a TOML integer is an i64).
+const MAX_LIMIT: u64 = i64::MAX as u64;
 
 fn controller(state: &WebState) -> Result<&AdmissionController, ApiError> {
     state.admission.as_ref().ok_or_else(|| {
@@ -90,15 +101,19 @@ fn knob(name: &str, value: Option<serde_json::Value>) -> Result<Option<usize>, A
     let Some(value) = value else {
         return Ok(None);
     };
-    match value.as_u64().and_then(|v| usize::try_from(v).ok()) {
+    match value
+        .as_u64()
+        .filter(|v| *v <= MAX_LIMIT)
+        .and_then(|v| usize::try_from(v).ok())
+    {
         Some(v) => Ok(Some(v)),
         None => Err(ApiError::new(
             ErrorCode::InvalidArgument,
             format!("{name} {value} is not valid"),
         )
         .with_hint(format!(
-            "{name} must be a non-negative integer (0 = unlimited for \
-                     max_running_queries)"
+            "{name} must be a non-negative integer of at most {MAX_LIMIT} \
+             (0 = unlimited for max_running_queries)"
         ))),
     }
 }
@@ -125,28 +140,33 @@ pub(super) async fn set_admission_for(
     let store = state.state.clone().ok_or_else(|| {
         ApiError::new(ErrorCode::Internal, "admission limits need the state store")
     })?;
+    // Held from reading `from` until the change (and its audit entry) is
+    // done, so preview, audit and apply see one state. The action keeps a
+    // share, so a request dropped mid-call still serializes its apply.
+    let serialized = Arc::new(Arc::clone(&state.admission_changes).lock_owned().await);
     let action = SetAdmission {
         max_running,
         max_queued,
         from: controller.snapshot(),
         controller,
         store,
+        _serialized: Arc::clone(&serialized),
     };
-    run_manage(state, who, grant, dry_run, action).await
+    let outcome = run_manage(state, who, grant, dry_run, action).await;
+    drop(serialized);
+    outcome
 }
-
-/// Serializes admission changes (plan + persist + controller update).
-/// Blocking: held only inside `apply`, which runs in `spawn_blocking`.
-static ADMISSION_CHANGES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct SetAdmission {
     max_running: Option<usize>,
     max_queued: Option<usize>,
-    /// The controller's limits when the action was built; the audit
-    /// `parameters` name them as `from`.
+    /// The controller's limits when the action was built, under
+    /// [`WebState::admission_changes`]; the audit `parameters` name them as
+    /// `from`.
     from: AdmissionSnapshot,
     controller: AdmissionController,
     store: Arc<StateStore>,
+    _serialized: Arc<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 /// `n` with the singular or plural noun.
@@ -264,11 +284,10 @@ impl ManageAction for SetAdmission {
     }
 
     /// Persists first, then updates the controller, so a failed write
-    /// changes nothing. Plan, persist and update run under
-    /// [`ADMISSION_CHANGES`], so concurrent calls cannot leave the store
-    /// and the controller disagreeing.
+    /// changes nothing. Runs under [`WebState::admission_changes`], so
+    /// concurrent calls cannot leave the store and the controller
+    /// disagreeing.
     fn apply(self, _state: &WebState) -> Result<Applied<AdmissionView>, ApiError> {
-        let _serialized = ADMISSION_CHANGES.lock().unwrap_or_else(|p| p.into_inner());
         let (preview, to) = self.plan();
         let snapshot = if preview.changed {
             self.store
@@ -464,7 +483,8 @@ mod tests {
             "send max_running_queries and/or max_queued_queries"
         );
 
-        for bad in [json!(-1), json!(1.5), json!("x")] {
+        let too_big = json!(i64::MAX as u64 + 1);
+        for bad in [json!(-1), json!(1.5), json!("x"), Value::Null, too_big] {
             let (status, body) = put(
                 &state,
                 "/api/v2/admission",
@@ -478,7 +498,7 @@ mod tests {
                 body["error"]["hint"]
                     .as_str()
                     .unwrap()
-                    .contains("non-negative integer"),
+                    .contains("max_running_queries must be a non-negative integer"),
                 "{body}"
             );
         }
@@ -530,6 +550,67 @@ mod tests {
         assert_eq!((snap.max_running, snap.max_queued), (8, 256));
         assert_eq!(state.state.as_ref().unwrap().admission_limits(), None);
         assert!(audit_entries(&state).is_empty());
+    }
+
+    fn audited_running(state: &WebState) -> Vec<Value> {
+        audit_entries(state)
+            .into_iter()
+            .rev()
+            .map(|e| e.parameters["max_running_queries"].clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sequential_puts_audit_a_chained_from() {
+        let state = node(None);
+        for to in [2, 5] {
+            let (status, body) = put(
+                &state,
+                "/api/v2/admission",
+                &root(),
+                json!({"max_running_queries": to}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        assert_eq!(
+            audited_running(&state),
+            vec![json!({"from": 8, "to": 2}), json!({"from": 2, "to": 5})]
+        );
+    }
+
+    /// `from` is read only once the change holds the lock: a change that
+    /// lands while it waits is what it audits as `from`.
+    #[tokio::test]
+    async fn from_is_read_under_the_change_lock() {
+        let state = node(None);
+        let held = state.admission_changes.clone().lock_owned().await;
+        let call = tokio::spawn({
+            let state = state.clone();
+            async move {
+                put(
+                    &state,
+                    "/api/v2/admission",
+                    &root(),
+                    json!({"max_running_queries": 2}),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!call.is_finished(), "the PUT waits for the lock");
+        state.admission.as_ref().unwrap().set_limits(5, 256);
+        drop(held);
+        let (status, body) = call.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["summary"]
+                .as_str()
+                .unwrap()
+                .starts_with("sets max_running_queries 5 → 2"),
+            "{body}"
+        );
+        assert_eq!(audited_running(&state), vec![json!({"from": 5, "to": 2})]);
     }
 
     #[tokio::test]

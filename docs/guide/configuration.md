@@ -245,7 +245,8 @@ workers` on the coordinator and `query cancelled on worker` on each worker.
 
 The effective values are logged at startup on `arneb::config`, with
 `admission_source = config|state`. Set `max_running_queries = 0` and leave
-the other two unset to turn admission off.
+the other two unset to turn admission off, unless limits were set at
+runtime (see below): then `PUT {"max_running_queries": 0}` instead.
 
 **Runtime changes.** A manager can change `max_running_queries` and
 `max_queued_queries` while the server runs, with `PUT /api/v2/admission` or
@@ -267,7 +268,10 @@ config value differs from the stored one logs a WARN on `arneb::config`:
 [admission] max_running_queries / ARNEB_MAX_RUNNING_QUERIES = 8 is overridden by the runtime value 4 in the state store
 ```
 
-To go back to the config values, `PUT` them again. `statement_timeout` and
+A stored value pins the limits across restarts and config edits: changing
+`[admission]` or the `ARNEB_*` variables has no effect on them until the
+stored value is gone. To go back to the config, stop the server and remove
+`settings.admission` from the state file. `statement_timeout` and
 `query_max_memory_per_node` change only at startup.
 
 ## Query History

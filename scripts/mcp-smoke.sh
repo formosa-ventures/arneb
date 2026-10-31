@@ -203,8 +203,9 @@ else
     fail "bad column did not end failed"
 fi
 check '.error.code == "column_not_found"' "code is not column_not_found"
+check '.error.location != null' "no location"
 check 'any(.error.candidates[]; . == "l_quantity")' "candidates lack l_quantity"
-echo "  error: $(printf '%s' "$LAST" | jq -c '.error | {code, candidates}')"
+echo "  error: $(printf '%s' "$LAST" | jq -c '.error | {code, location, candidates}')"
 pass
 
 STEP="7 long statement cancel"

@@ -2,8 +2,8 @@ apiVersion: v2
 name: arneb
 description: Arneb distributed SQL query engine (coordinator + workers)
 type: application
-version: 0.1.8 # x-release-please-version
-appVersion: "0.1.8" # x-release-please-version
+version: 0.1.9 # x-release-please-version
+appVersion: "0.1.9" # x-release-please-version
 home: https://arneb.io
 sources:
   - https://github.com/formosa-ventures/arneb

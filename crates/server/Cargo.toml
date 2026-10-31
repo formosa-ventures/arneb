@@ -73,6 +73,8 @@ axum = { workspace = true }
 tower-http = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
+rmcp = { workspace = true }
+schemars = { workspace = true }
 # Web API sessions: random tokens and their SHA-256 (already in the tree
 # through arneb-protocol / arneb-state).
 aws-lc-rs = "1"

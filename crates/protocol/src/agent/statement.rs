@@ -214,9 +214,10 @@ impl Statement {
         true
     }
 
-    /// The status document. The first page is encoded after the lock is
-    /// released, from a cheap clone of the retained rows.
-    pub(crate) fn status(&self, limits: &AgentLimits) -> StatementStatus {
+    /// The status document, with a first page of at most `page_bytes` of
+    /// rows once finished. The page is encoded after the lock is released,
+    /// from a cheap clone of the retained rows.
+    pub(crate) fn status(&self, limits: &AgentLimits, page_bytes: usize) -> StatementStatus {
         let (mut status, retained) = {
             let inner = self.lock();
             let elapsed = inner
@@ -255,8 +256,7 @@ impl Statement {
             }
             (status, retained)
         };
-        status.first_page =
-            retained.map(|r| page(&r, 0, limits.default_page_bytes, limits.max_cell_bytes));
+        status.first_page = retained.map(|r| page(&r, 0, page_bytes, limits.max_cell_bytes));
         status
     }
 }

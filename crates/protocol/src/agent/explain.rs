@@ -8,6 +8,7 @@ use arneb_common::diagnostic::SourceFile;
 
 use super::error::{AgentError, AgentErrorCode};
 use super::service::AgentQueryService;
+use super::truncate_on_char_boundary;
 use crate::trino::{parse_control, ClientSession, TrinoError};
 
 /// Body of an explain request.
@@ -35,8 +36,12 @@ pub struct ScanEstimate {
 /// A planned query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Explanation {
-    /// The optimized logical plan, as `EXPLAIN` prints it.
+    /// The optimized logical plan, as `EXPLAIN` prints it, cut at the
+    /// caller's `plan_bytes` (default `default_page_bytes`) on a character
+    /// boundary.
     pub plan: String,
+    /// Whether `plan` was cut.
+    pub plan_truncated: bool,
     /// One entry per table scan in the plan.
     pub scans: Vec<ScanEstimate>,
     /// Sum of the scans' `size_bytes`; null (unknown) unless every scan
@@ -45,12 +50,16 @@ pub struct Explanation {
 }
 
 impl AgentQueryService {
-    /// Plans `req.sql` for `user` without executing it.
+    /// Plans `req.sql` for `user` without executing it. The plan text is cut
+    /// at `plan_bytes` (default `default_page_bytes`; a value outside
+    /// `1..=max_page_bytes` is `invalid_argument`).
     pub async fn explain(
         &self,
         user: &str,
         req: &ExplainRequest,
+        plan_bytes: Option<usize>,
     ) -> Result<Explanation, AgentError> {
+        let plan_bytes = self.page_budget("plan_bytes", plan_bytes)?;
         let sql = req.sql.trim().trim_end_matches(';').trim();
         if sql.is_empty() {
             return Err(AgentError::new(
@@ -92,12 +101,15 @@ impl AgentQueryService {
             .plan_for_explain(&session, sql)
             .await
             .map_err(|e| AgentError::from_trino(&e))?;
+        let mut plan = plan;
+        let plan_truncated = truncate_on_char_boundary(&mut plan, plan_bytes);
         let estimated_scan_bytes = scans
             .iter()
             .map(|s| s.size_bytes)
             .try_fold(0u64, |sum, size| size.map(|n| sum.saturating_add(n)));
         Ok(Explanation {
             plan,
+            plan_truncated,
             scans,
             estimated_scan_bytes,
         })
@@ -179,6 +191,10 @@ mod tests {
     }
 
     fn service() -> (AgentQueryService, Arc<QueryTracker>) {
+        service_with(AgentLimits::default())
+    }
+
+    fn service_with(limits: AgentLimits) -> (AgentQueryService, Arc<QueryTracker>) {
         let schema = Arc::new(MemorySchema::new());
         schema.register_table("mem", Arc::new(MemoryTable::new(columns(), vec![])));
         let memory = Arc::new(MemoryCatalog::new());
@@ -196,7 +212,7 @@ mod tests {
             Arc::new(cm),
             Arc::new(registry),
             Arc::clone(&tracker),
-            AgentLimits::default(),
+            limits,
         );
         (svc, tracker)
     }
@@ -213,7 +229,7 @@ mod tests {
     async fn explain_text_matches_explain_statement() {
         let (svc, _) = service();
         let sql = "SELECT id FROM sized.s.a WHERE id > 3";
-        let explained = svc.explain("alice", &req(sql)).await.unwrap();
+        let explained = svc.explain("alice", &req(sql), None).await.unwrap();
         let status = svc
             .submit(
                 "alice",
@@ -224,12 +240,57 @@ mod tests {
                     max_rows: None,
                 },
                 Duration::from_secs(30),
+                None,
             )
             .await
             .unwrap();
         let page = svc.results("alice", &status.id, 0, None).unwrap();
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0][0].as_str().unwrap(), explained.plan);
+        assert!(!explained.plan_truncated);
+    }
+
+    /// #217 review: the caller's budget cuts the plan, so the MCP tool keeps
+    /// to its page budget; out-of-range budgets are refused.
+    #[tokio::test]
+    async fn explain_plan_is_cut_at_the_callers_budget() {
+        let (svc, _) = service_with(AgentLimits::default());
+        let sql = format!("SELECT '{}' AS t, id FROM sized.s.a", "x".repeat(200));
+        let full = svc.explain("alice", &req(&sql), None).await.unwrap();
+        assert!(!full.plan_truncated && full.plan.len() > 100, "{full:?}");
+        let cut = svc.explain("alice", &req(&sql), Some(100)).await.unwrap();
+        assert!(cut.plan_truncated);
+        assert_eq!(cut.plan, full.plan[..100]);
+        for bad in [0, AgentLimits::default().max_page_bytes + 1] {
+            let err = svc
+                .explain("alice", &req(&sql), Some(bad))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, AgentErrorCode::InvalidArgument);
+            assert!(err.hint.unwrap_or_default().contains("plan_bytes"));
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_plan_is_cut_at_the_page_budget() {
+        // A multi-byte literal puts character boundaries off the budget.
+        let sql = format!("SELECT '{}' AS t, id FROM sized.s.a", "測".repeat(40));
+        for budget in 60..=72 {
+            let (svc, _) = service_with(AgentLimits {
+                default_page_bytes: budget,
+                ..AgentLimits::default()
+            });
+            let e = svc.explain("alice", &req(&sql), None).await.unwrap();
+            assert!(e.plan_truncated, "{budget}: {e:?}");
+            assert!(e.plan.len() <= budget, "{budget}: {} bytes", e.plan.len());
+            assert!(
+                e.plan.len() > budget - 3,
+                "{budget}: {} bytes",
+                e.plan.len()
+            );
+            assert!(std::str::from_utf8(e.plan.as_bytes()).is_ok());
+            assert_eq!(e.scans.len(), 1, "scan estimates are kept");
+        }
     }
 
     #[tokio::test]
@@ -239,6 +300,7 @@ mod tests {
             .explain(
                 "alice",
                 &req("SELECT a.id FROM sized.s.a a JOIN sized.s.b b ON a.id = b.id"),
+                None,
             )
             .await
             .unwrap();
@@ -256,6 +318,7 @@ mod tests {
             .explain(
                 "alice",
                 &req("SELECT a.id FROM sized.s.a a JOIN mem m ON a.id = m.id"),
+                None,
             )
             .await
             .unwrap();
@@ -277,6 +340,7 @@ mod tests {
             .explain(
                 "alice",
                 &req("SELECT id FROM sized.s.b UNION ALL SELECT id FROM sized.s.b"),
+                None,
             )
             .await
             .unwrap();
@@ -292,7 +356,7 @@ mod tests {
             "USE memory.default",
             "DROP TABLE mem",
         ] {
-            let err = svc.explain("alice", &req(sql)).await.unwrap_err();
+            let err = svc.explain("alice", &req(sql), None).await.unwrap_err();
             assert_eq!(err.code, AgentErrorCode::InvalidArgument, "{sql}");
             assert_eq!(
                 err.hint.as_deref(),
@@ -301,7 +365,7 @@ mod tests {
             );
         }
         let err = svc
-            .explain("alice", &req("EXPLAIN SELECT 1"))
+            .explain("alice", &req("EXPLAIN SELECT 1"), None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::InvalidArgument);
@@ -312,7 +376,7 @@ mod tests {
     async fn explain_error_has_location() {
         let (svc, _) = service();
         let err = svc
-            .explain("alice", &req("SELECT nope FROM sized.s.a"))
+            .explain("alice", &req("SELECT nope FROM sized.s.a"), None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::ColumnNotFound);
@@ -326,7 +390,7 @@ mod tests {
             "SELECT table_name FROM information_schema.tables",
             "SELECT query_id FROM system.runtime.queries",
         ] {
-            let e = svc.explain("alice", &req(sql)).await.unwrap();
+            let e = svc.explain("alice", &req(sql), None).await.unwrap();
             assert_eq!(e.scans.len(), 1, "{sql}: {e:?}");
         }
     }
@@ -342,6 +406,7 @@ mod tests {
                     catalog: Some("sized".into()),
                     schema: Some("s".into()),
                 },
+                None,
             )
             .await
             .unwrap();
@@ -353,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn explain_does_not_register_with_tracker() {
         let (svc, tracker) = service();
-        svc.explain("alice", &req("SELECT id FROM sized.s.a"))
+        svc.explain("alice", &req("SELECT id FROM sized.s.a"), None)
             .await
             .unwrap();
         assert!(tracker.list_queries(None).is_empty());

@@ -14,6 +14,9 @@ The same API token also works as the password for
 [pgwire and the Trino listener](#tokens-as-passwords), so one credential
 covers every protocol.
 
+The same operations are also available as tools for AI agents over the
+[Model Context Protocol](/guide/mcp), at `/mcp` on this port.
+
 ## Authentication
 
 Authentication follows `[auth] type` (see
@@ -176,6 +179,11 @@ errors differ. The `/api/v1` routes are `/api/v1/queries`,
 `/api/v1/queries/{id}` (GET, DELETE), `/api/v1/cluster`,
 `/api/v1/cluster/workers` and `/api/v1/info`.
 
+`?state=` on the query list keeps the queries in exactly that state, one of
+`queued`, `planning`, `starting`, `running`, `finishing`, `finished`,
+`failed` or `cancelled` (any case). `running` does not include `planning`,
+`starting` or `finishing`. An unknown state filters nothing.
+
 Both versions apply the [`queries` access rules](/guide/access-control):
 a query the caller may not `view` is hidden (`404`), one they may view but
 not `kill` answers `403`, and a user may always kill their own.
@@ -198,7 +206,7 @@ Only the submitting user can poll, fetch or cancel a statement.
 | `GET /api/v2/catalogs` | List catalogs. |
 | `GET /api/v2/catalogs/{c}/schemas` | List schemas. |
 | `GET /api/v2/catalogs/{c}/schemas/{s}/tables` | List tables. |
-| `GET /api/v2/catalogs/{c}/schemas/{s}/tables/{t}` | Columns (with Trino types) and statistics. |
+| `GET /api/v2/catalogs/{c}/schemas/{s}/tables/{t}?limit=` | Columns (with Trino types) and statistics. |
 | `GET /api/v2/catalogs/{c}/schemas/{s}/tables/{t}/sample?rows=` | Sample rows, as a statement status (default 10, at most 100; never more than the server's `max_rows`). |
 | `POST /api/v2/explain` | Plan a query without running it. |
 | `POST /api/v2/statements` | Submit a statement. `201` with a `Location` header. |
@@ -209,6 +217,12 @@ Only the submitting user can poll, fetch or cancel a statement.
 The three listings take `?prefix=` (case-insensitive) and `?limit=`, and
 return `{"items":[{"name"}],"total","truncated"}`. Path segments are used
 literally (percent-decoded), with no case folding.
+
+A table description is `{"catalog","schema","table","columns","truncated",
+"statistics"}`. `columns` holds at most `?limit=` columns in table order
+(default `default_max_rows`, ceiling `max_rows`, the same bounds as the
+listings), and `truncated` is `true` when columns beyond the limit were
+dropped.
 
 ### Submit and poll
 
@@ -254,13 +268,16 @@ will come with write-privilege enforcement in a later release.
 curl -s -X POST http://127.0.0.1:6432/api/v2/explain \
   -H 'Content-Type: application/json' \
   -d '{"sql":"SELECT count(*) FROM lineitem","catalog":"datalake","schema":"tpch"}'
-# {"plan":"…","scans":[{"table":"datalake.tpch.lineitem","row_count":6001215,"size_bytes":…}],
+# {"plan":"…","plan_truncated":false,
+#  "scans":[{"table":"datalake.tpch.lineitem","row_count":6001215,"size_bytes":…}],
 #  "estimated_scan_bytes":…}
 ```
 
 Explain plans only: it is not admitted or tracked, and does not run
 `ANALYZE`. Submit `EXPLAIN ANALYZE ...` as a statement for that. A size is
-`null` when the connector does not know it.
+`null` when the connector does not know it. The plan text is cut at
+`default_page_bytes` (on a character boundary) and `plan_truncated` says
+so; `scans` keeps one entry per table scan.
 
 ### Limits and truncation
 
@@ -298,7 +315,7 @@ the statement still finishes, with `truncated: true` and `total_rows: null`.
 
 A request value above its ceiling is refused with `invalid_argument` and a
 hint naming the ceiling; it is never silently clamped. That includes
-`wait_ms`, `max_rows`, `max_bytes` and `rows`. The one server-side cap is the
+`wait_ms`, `max_rows`, `max_bytes`, `rows` and `limit`. The one server-side cap is the
 sample: `rows` (or its default of 10) is lowered to the server's `max_rows`
 when that is smaller, so a small configured ceiling shortens a sample instead
 of failing it. A malformed JSON body or

@@ -37,6 +37,7 @@ export default defineConfig({
             { text: 'Kubernetes', link: '/guide/kubernetes' },
             { text: 'Access Control', link: '/guide/access-control' },
             { text: 'HTTP API', link: '/guide/http-api' },
+            { text: 'MCP Server', link: '/guide/mcp' },
             { text: 'Observability', link: '/guide/observability' },
             { text: 'Performance', link: '/guide/performance' },
             { text: 'Trino Clients', link: '/guide/trino-clients' },

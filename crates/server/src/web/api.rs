@@ -1,5 +1,6 @@
 //! REST API handlers.
 
+use arneb_protocol::agent::truncate_on_char_boundary;
 use arneb_scheduler::QueryState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -17,26 +18,37 @@ use super::WebState;
 pub(super) struct QueryResponse {
     query_id: String,
     state: String,
-    sql: String,
+    pub(super) sql: String,
     error: Option<String>,
     /// Protocol that submitted it (`pgwire`, `trino`).
     source: String,
     user: Option<String>,
     /// Milliseconds since the Unix epoch.
-    created_ms: u64,
+    pub(super) created_ms: u64,
     /// Milliseconds since creation, until now or the end.
-    elapsed_ms: u64,
+    pub(super) elapsed_ms: u64,
     rows: Option<u64>,
+}
+
+/// Milliseconds since the Unix epoch (0 before it).
+fn epoch_ms(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Milliseconds `q` has run: from creation until its end, or until now.
+fn elapsed_ms(q: &arneb_scheduler::QueryInfo) -> u64 {
+    q.ended
+        .unwrap_or_else(std::time::SystemTime::now)
+        .duration_since(q.created)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl From<arneb_scheduler::QueryInfo> for QueryResponse {
     fn from(q: arneb_scheduler::QueryInfo) -> Self {
-        let epoch_ms = |t: std::time::SystemTime| {
-            t.duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-        };
-        let end = q.ended.unwrap_or_else(std::time::SystemTime::now);
+        let elapsed_ms = elapsed_ms(&q);
         Self {
             query_id: q.query_id.to_string(),
             state: format!("{:?}", q.state),
@@ -45,10 +57,7 @@ impl From<arneb_scheduler::QueryInfo> for QueryResponse {
             source: q.source,
             user: q.user,
             created_ms: epoch_ms(q.created),
-            elapsed_ms: end
-                .duration_since(q.created)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            elapsed_ms,
             rows: q.rows,
         }
     }
@@ -64,6 +73,130 @@ pub(super) struct QueriesResponse {
 #[derive(serde::Deserialize, Default)]
 pub struct ListQueryParams {
     pub(super) state: Option<String>,
+}
+
+/// Most queries `list_queries` returns when `limit` is omitted.
+pub(super) const DEFAULT_QUERY_LIMIT: usize = 50;
+/// The largest accepted `limit`.
+pub(super) const MAX_QUERY_LIMIT: usize = 500;
+
+/// A tracked query with its `sql` cut to the cell budget and its `state`
+/// in lowercase, the spelling the `state` filter and the statement API use.
+#[derive(Serialize)]
+pub(super) struct BoundedQuery {
+    #[serde(flatten)]
+    query: QueryResponse,
+    /// True when `sql` was cut at the cell budget.
+    sql_truncated: bool,
+}
+
+impl BoundedQuery {
+    /// `info` with its `sql` cut to at most `max_cell_bytes` bytes, on a
+    /// char boundary.
+    pub(super) fn new(info: arneb_scheduler::QueryInfo, max_cell_bytes: usize) -> Self {
+        let mut query = QueryResponse::from(info);
+        query.state.make_ascii_lowercase();
+        let sql_truncated = truncate_on_char_boundary(&mut query.sql, max_cell_bytes);
+        Self {
+            query,
+            sql_truncated,
+        }
+    }
+}
+
+/// Every [`QueryState`] by the lowercase name the bounded list reports it
+/// under, in lifecycle order.
+const QUERY_STATES: [(&str, QueryState); 8] = [
+    ("queued", QueryState::Queued),
+    ("planning", QueryState::Planning),
+    ("starting", QueryState::Starting),
+    ("running", QueryState::Running),
+    ("finishing", QueryState::Finishing),
+    ("finished", QueryState::Finished),
+    ("failed", QueryState::Failed),
+    ("cancelled", QueryState::Cancelled),
+];
+
+/// The [`QueryState`] named `s` (any case). A name selects exactly that
+/// state: `running` does not include `planning`, `starting` or
+/// `finishing`. An unknown name is `invalid_argument` listing all eight.
+pub(super) fn parse_query_state(s: &str) -> Result<QueryState, ApiError> {
+    QUERY_STATES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(s.trim()))
+        .map(|(_, state)| *state)
+        .ok_or_else(|| {
+            let names: Vec<&str> = QUERY_STATES.iter().map(|(n, _)| *n).collect();
+            ApiError::new(ErrorCode::InvalidArgument, format!("unknown state {s:?}"))
+                .with_hint(format!("state is one of {}", names.join(", ")))
+        })
+}
+
+/// The bounded query list: newest first, with whether more matched.
+#[derive(Serialize)]
+pub(super) struct BoundedQueries {
+    queries: Vec<BoundedQuery>,
+    /// True when more queries matched than `limit` allowed.
+    truncated: bool,
+}
+
+/// Filters of the bounded query list.
+#[derive(Default)]
+pub(super) struct BoundedParams {
+    pub(super) state: Option<String>,
+    pub(super) user: Option<String>,
+    pub(super) min_elapsed_ms: Option<u64>,
+    pub(super) limit: Option<usize>,
+}
+
+/// The queries `who` may see, newest first, at most `limit` (default 50,
+/// at most 500) of those matching `state` (an unknown one is refused),
+/// `user` and `min_elapsed_ms`. Same view rules as [`queries_response`].
+pub(super) fn bounded_queries(
+    state: &WebState,
+    who: &Identity,
+    params: BoundedParams,
+    max_cell_bytes: usize,
+) -> Result<BoundedQueries, ApiError> {
+    let limit = params.limit.unwrap_or(DEFAULT_QUERY_LIMIT);
+    if limit == 0 || limit > MAX_QUERY_LIMIT {
+        return Err(ApiError::new(
+            ErrorCode::InvalidArgument,
+            format!("limit {limit} is not valid"),
+        )
+        .with_hint(format!("use a limit between 1 and {MAX_QUERY_LIMIT}")));
+    }
+    let state_filter = params.state.as_deref().map(parse_query_state).transpose()?;
+    // Filter, sort and cut on the tracker's records; only the survivors
+    // are converted.
+    let mut matched: Vec<arneb_scheduler::QueryInfo> = state
+        .query_tracker
+        .list_queries(state_filter)
+        .into_iter()
+        .filter(|q| may_view(state, who, q.user.as_deref()))
+        .filter(|q| {
+            params
+                .user
+                .as_deref()
+                .is_none_or(|u| q.user.as_deref() == Some(u))
+        })
+        .filter(|q| params.min_elapsed_ms.is_none_or(|m| elapsed_ms(q) >= m))
+        .collect();
+    // Newest first by the reported millisecond; the id breaks ties of the
+    // same millisecond so the order (and the cut at `limit`) is stable
+    // across calls. Uuid order is the order of its hyphenated text.
+    matched.sort_by(|a, b| {
+        epoch_ms(b.created)
+            .cmp(&epoch_ms(a.created))
+            .then_with(|| a.query_id.0.cmp(&b.query_id.0))
+    });
+    let truncated = matched.len() > limit;
+    matched.truncate(limit);
+    let queries = matched
+        .into_iter()
+        .map(|q| BoundedQuery::new(q, max_cell_bytes))
+        .collect();
+    Ok(BoundedQueries { queries, truncated })
 }
 
 /// JSON response for cluster overview.
@@ -143,14 +276,7 @@ pub(super) fn queries_response(
     who: &Identity,
     params: ListQueryParams,
 ) -> QueriesResponse {
-    let state_filter = params.state.and_then(|s| match s.to_uppercase().as_str() {
-        "QUEUED" => Some(QueryState::Queued),
-        "RUNNING" => Some(QueryState::Running),
-        "FINISHED" => Some(QueryState::Finished),
-        "FAILED" => Some(QueryState::Failed),
-        "CANCELLED" => Some(QueryState::Cancelled),
-        _ => None,
-    });
+    let state_filter = params.state.and_then(|s| parse_query_state(&s).ok());
 
     let queries = state
         .query_tracker
@@ -282,6 +408,22 @@ pub(super) fn info_response(state: &WebState) -> InfoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #217 review: every state the bounded list reports parses back to
+    /// itself, and nothing else does.
+    #[test]
+    fn every_reported_state_parses() {
+        for (name, state) in QUERY_STATES {
+            assert_eq!(format!("{state:?}").to_ascii_lowercase(), name);
+            assert_eq!(parse_query_state(name).unwrap(), state);
+            assert_eq!(parse_query_state(&name.to_uppercase()).unwrap(), state);
+        }
+        let e = parse_query_state("bogus").unwrap_err();
+        let hint = e.hint.clone().unwrap_or_default();
+        for (name, _) in QUERY_STATES {
+            assert!(hint.contains(name), "{hint}");
+        }
+    }
 
     /// #150 review: with no controller the overview reports the configured
     /// `max_queued_queries`, not 0; with one, the controller's limits.

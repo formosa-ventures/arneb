@@ -263,15 +263,18 @@ fn blocking_failed(e: tokio::task::JoinError) -> ApiError {
     ApiError::new(ErrorCode::Internal, "the state store operation failed")
 }
 
+/// A token issuing request: the `POST /api/v2/tokens` body, or the
+/// `create_token` tool's arguments.
 #[derive(Deserialize, Default)]
-struct IssueTokenRequest {
-    name: Option<String>,
+pub(super) struct IssueTokenRequest {
+    pub(super) name: Option<String>,
     /// Kept untyped so a non-integer gets the range hint too.
-    expires_in_days: Option<serde_json::Value>,
+    pub(super) expires_in_days: Option<serde_json::Value>,
 }
 
+/// A freshly issued token; the plaintext is shown once.
 #[derive(Serialize)]
-struct IssuedTokenResponse {
+pub(super) struct IssuedTokenResponse {
     /// Shown once; the server keeps only a verifier.
     token: String,
     id: String,
@@ -291,8 +294,23 @@ async fn issue_token(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<IssuedTokenResponse>), ApiError> {
-    let store = token_store(&state)?;
+    token_store(&state)?;
     let req: IssueTokenRequest = parse_body(&body.map_err(bad_body)?, true)?;
+    let issued = issue_token_for(&state, &who, &headers, req).await?;
+    Ok((StatusCode::CREATED, Json(issued)))
+}
+
+/// Issues a token for `who`. `headers` are the request's, to find the
+/// credential that authenticated it (a token cannot mint a longer-lived
+/// child). Shared with the MCP `create_token` tool.
+pub(super) async fn issue_token_for(
+    state: &WebState,
+    who: &Identity,
+    headers: &HeaderMap,
+    req: IssueTokenRequest,
+) -> Result<IssuedTokenResponse, ApiError> {
+    let store = token_store(state)?;
+    let user = who.user.clone();
     let name = req
         .name
         .map(|n| n.trim().to_owned())
@@ -326,7 +344,7 @@ async fn issue_token(
     // A token cannot mint a child that outlives it.
     let mut hints = Vec::new();
     let mut expires_at_ms = expires_at_ms;
-    if let Some(parent_expiry) = authenticating_token_expiry(&store, &who, &headers)? {
+    if let Some(parent_expiry) = authenticating_token_expiry(&store, who, headers)? {
         if expires_at_ms.is_none_or(|e| e > parent_expiry) {
             expires_at_ms = Some(parent_expiry);
             hints.push("expires_ms was clamped to the expiry of the token that made this request");
@@ -344,23 +362,20 @@ async fn issue_token(
     // PBKDF2 runs even if the client disconnects and this future is dropped.
     let issued = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        store.issue_token(&who.user, name, expires_at_ms)
+        store.issue_token(&user, name, expires_at_ms)
     })
     .await
     .map_err(blocking_failed)?
     .map_err(state_error)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(IssuedTokenResponse {
-            token: issued.token,
-            id: issued.info.id,
-            name: issued.info.name,
-            created_ms: issued.info.created_ms,
-            expires_ms: issued.info.expires_ms,
-            persistent: (!persistent).then_some(false),
-            hint: (!hints.is_empty()).then(|| hints.join("; ")),
-        }),
-    ))
+    Ok(IssuedTokenResponse {
+        token: issued.token,
+        id: issued.info.id,
+        name: issued.info.name,
+        created_ms: issued.info.created_ms,
+        expires_ms: issued.info.expires_ms,
+        persistent: (!persistent).then_some(false),
+        hint: (!hints.is_empty()).then(|| hints.join("; ")),
+    })
 }
 
 /// The expiry of the API token that authenticated this request. `Ok(None)`
@@ -407,15 +422,16 @@ fn authenticating_token_expiry(
 }
 
 #[derive(Serialize)]
-struct TokenView {
+pub(super) struct TokenView {
     id: String,
     name: Option<String>,
     created_ms: u64,
     expires_ms: Option<u64>,
 }
 
+/// The caller's live tokens.
 #[derive(Serialize)]
-struct TokensResponse {
+pub(super) struct TokensResponse {
     tokens: Vec<TokenView>,
 }
 
@@ -423,7 +439,15 @@ async fn list_tokens(
     State(state): State<WebState>,
     Extension(who): Extension<Identity>,
 ) -> Result<Json<TokensResponse>, ApiError> {
-    let store = token_store(&state)?;
+    Ok(Json(list_tokens_for(&state, &who)?))
+}
+
+/// `who`'s live tokens. Shared with the MCP `list_tokens` tool.
+pub(super) fn list_tokens_for(
+    state: &WebState,
+    who: &Identity,
+) -> Result<TokensResponse, ApiError> {
+    let store = token_store(state)?;
     let tokens = store
         .list_tokens(&who.user)
         .into_iter()
@@ -434,7 +458,7 @@ async fn list_tokens(
             expires_ms: t.expires_ms,
         })
         .collect();
-    Ok(Json(TokensResponse { tokens }))
+    Ok(TokensResponse { tokens })
 }
 
 async fn revoke_token(
@@ -442,12 +466,23 @@ async fn revoke_token(
     Extension(who): Extension<Identity>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let store = token_store(&state)?;
-    tokio::task::spawn_blocking(move || store.revoke_token(&who.user, &id))
+    revoke_token_for(&state, &who, id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Revokes `who`'s token `id`; another user's id is `not_found`. Shared
+/// with the MCP `revoke_token` tool.
+pub(super) async fn revoke_token_for(
+    state: &WebState,
+    who: &Identity,
+    id: String,
+) -> Result<(), ApiError> {
+    let store = token_store(state)?;
+    let user = who.user.clone();
+    tokio::task::spawn_blocking(move || store.revoke_token(&user, &id))
         .await
         .map_err(blocking_failed)?
-        .map_err(state_error)?;
-    Ok(StatusCode::NO_CONTENT)
+        .map_err(state_error)
 }
 
 async fn list_queries(
@@ -461,7 +496,7 @@ async fn list_queries(
 
 /// The v1 lookup's status as an envelope: a malformed id is
 /// `invalid_argument`; a missing or hidden query is `not_found`.
-fn lookup_error(status: StatusCode) -> ApiError {
+pub(super) fn lookup_error(status: StatusCode) -> ApiError {
     if status == StatusCode::BAD_REQUEST {
         ApiError::new(ErrorCode::InvalidArgument, "the query id is not a UUID")
     } else {
@@ -553,6 +588,7 @@ mod tests {
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent: None,
+            mcp: None,
         }
     }
 

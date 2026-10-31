@@ -64,6 +64,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub agent_api: AgentApiConfig,
 
+    /// MCP endpoint (`/mcp` on the Web port; coordinator/standalone only);
+    /// effective values after [`AppConfig::load`].
+    #[serde(default)]
+    pub mcp: McpConfig,
+
     /// Query metrics and the slow-query log (coordinator/standalone only);
     /// effective values after [`AppConfig::load`].
     #[serde(default)]
@@ -183,13 +188,7 @@ impl WebConfig {
             self.bind_address = Some(v);
         }
         if let Some(v) = env("ARNEB_WEB_METRICS_AUTH") {
-            self.metrics_auth = match v.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "on" | "yes" => true,
-                "0" | "false" | "off" | "no" => false,
-                other => {
-                    bail!("invalid ARNEB_WEB_METRICS_AUTH value '{other}' (expected true/false)")
-                }
-            };
+            self.metrics_auth = parse_env_bool("ARNEB_WEB_METRICS_AUTH", &v)?;
         }
         Ok(())
     }
@@ -518,6 +517,156 @@ impl AgentApiConfig {
     }
 }
 
+/// `[mcp]` section: the MCP endpoint served at `/mcp` on the Web port.
+/// After [`AppConfig::load`] the fields hold the effective values (env
+/// applied, validated).
+///
+/// ```toml
+/// [mcp]
+/// enabled            = true      # ARNEB_MCP_ENABLED
+/// allowed_hosts      = ["db.internal", "db.internal:6432"]  # ARNEB_MCP_ALLOWED_HOSTS (comma-separated; "*" = any)
+/// allowed_origins    = ["https://app.example:443"]  # ARNEB_MCP_ALLOWED_ORIGINS (comma-separated; omit = refuse any Origin)
+/// default_page_bytes = 32768     # ARNEB_MCP_DEFAULT_PAGE_BYTES
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    /// Serve `/mcp` (coordinator and standalone).
+    pub enabled: bool,
+    /// Accepted `Host` header values (`host` or `host:port`); `"*"`
+    /// accepts any, also when mixed with other hosts. An empty list is
+    /// rejected. `None` = any host under password auth, loopback under
+    /// `[auth] type = "none"`.
+    pub allowed_hosts: Option<Vec<String>>,
+    /// Accepted browser `Origin` values (`scheme://host[:port]`, `:*` for
+    /// any port, or `null`). A request without `Origin` always passes.
+    /// `None` = refuse every request that carries an `Origin`; an empty
+    /// list is rejected.
+    pub allowed_origins: Option<Vec<String>>,
+    /// Page size of tool results when the caller gives no `max_bytes`.
+    pub default_page_bytes: usize,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_hosts: None,
+            allowed_origins: None,
+            default_page_bytes: 32 * 1024,
+        }
+    }
+}
+
+impl McpConfig {
+    /// Apply the `ARNEB_MCP_*` variables (looked up through `env`) over the
+    /// file values (env > file > defaults).
+    /// File lists lose their blank entries the way the comma-separated env
+    /// values do; a list left empty is refused by [`Self::validate`].
+    pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+        for entries in [&mut self.allowed_hosts, &mut self.allowed_origins]
+            .into_iter()
+            .flatten()
+        {
+            *entries = non_blank(entries.iter().map(String::as_str));
+        }
+        if let Some(v) = env("ARNEB_MCP_ENABLED") {
+            self.enabled = parse_env_bool("ARNEB_MCP_ENABLED", &v)?;
+        }
+        // An empty value counts as unset (file or default applies).
+        if let Some(v) = env("ARNEB_MCP_ALLOWED_HOSTS").filter(|v| !v.trim().is_empty()) {
+            let hosts = non_blank(v.split(','));
+            if hosts.is_empty() {
+                bail!(
+                    "ARNEB_MCP_ALLOWED_HOSTS '{v}' lists no hosts; unset it for the default \
+                     or use * for any host"
+                );
+            }
+            self.allowed_hosts = Some(hosts);
+        }
+        if let Some(v) = env("ARNEB_MCP_ALLOWED_ORIGINS").filter(|v| !v.trim().is_empty()) {
+            let origins = non_blank(v.split(','));
+            if origins.is_empty() {
+                bail!(
+                    "ARNEB_MCP_ALLOWED_ORIGINS '{v}' lists no origins; unset it to refuse \
+                     every request that carries an Origin"
+                );
+            }
+            self.allowed_origins = Some(origins);
+        }
+        if let Some(v) = env("ARNEB_MCP_DEFAULT_PAGE_BYTES") {
+            self.default_page_bytes = v.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid ARNEB_MCP_DEFAULT_PAGE_BYTES value '{v}' \
+                     (expected a non-negative integer)"
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// `default_page_bytes` must be in `1..=max_page_bytes` (the agent API's
+    /// ceiling).
+    pub fn validate(&self, max_page_bytes: usize) -> std::result::Result<(), String> {
+        if let Some(hosts) = &self.allowed_hosts {
+            if hosts.iter().all(|h| h.trim().is_empty()) {
+                return Err(
+                    "[mcp] allowed_hosts is empty; omit it for the default or use \
+                            [\"*\"] for any host"
+                        .into(),
+                );
+            }
+        }
+        if let Some(origins) = &self.allowed_origins {
+            if origins.iter().all(|o| o.trim().is_empty()) {
+                return Err(
+                    "[mcp] allowed_origins is empty; omit it to refuse every request that \
+                     carries an Origin"
+                        .into(),
+                );
+            }
+            if let Some(bad) = origins.iter().find(|o| {
+                let o = o.trim();
+                !o.is_empty() && !o.contains("://") && !o.eq_ignore_ascii_case("null")
+            }) {
+                return Err(format!(
+                    "[mcp] allowed_origins entry '{bad}' has no scheme; write it as \
+                     scheme://host[:port] (for example https://{bad}) or null"
+                ));
+            }
+        }
+        if self.default_page_bytes == 0 {
+            return Err("default_page_bytes must be greater than 0".into());
+        }
+        if self.default_page_bytes > max_page_bytes {
+            return Err(format!(
+                "default_page_bytes ({}) must not exceed [agent_api] max_page_bytes ({max_page_bytes})",
+                self.default_page_bytes
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A boolean env value: `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`,
+/// trimmed and in any case. Anything else is an error naming `name`.
+fn parse_env_bool(name: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        other => bail!("invalid {name} value '{other}' (expected true/false)"),
+    }
+}
+
+/// The trimmed, non-blank entries of `entries`.
+fn non_blank<'a>(entries: impl Iterator<Item = &'a str>) -> Vec<String> {
+    entries
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// `[observability]` section.
 ///
 /// ```toml
@@ -759,11 +908,7 @@ impl TrinoProtocolConfig {
     /// Applies `ARNEB_TRINO_ENABLED` / `ARNEB_TRINO_PORT` (env > file).
     pub fn apply_env_overrides(&mut self) -> Result<()> {
         if let Ok(val) = std::env::var("ARNEB_TRINO_ENABLED") {
-            self.enabled = match val.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "on" | "yes" => true,
-                "0" | "false" | "off" | "no" => false,
-                other => bail!("invalid ARNEB_TRINO_ENABLED value '{other}' (expected true/false)"),
-            };
+            self.enabled = parse_env_bool("ARNEB_TRINO_ENABLED", &val)?;
         }
         if let Ok(val) = std::env::var("ARNEB_TRINO_PORT") {
             if arneb_common::config::is_service_link(&val) {
@@ -1592,6 +1737,7 @@ impl AppConfig {
                         web: WebConfig::default(),
                         admission: AdmissionConfig::default(),
                         agent_api: AgentApiConfig::default(),
+                        mcp: McpConfig::default(),
                         observability: ObservabilityConfig::default(),
                         access_control: AccessControlConfig::default(),
                         state: StateConfig::default(),
@@ -1612,6 +1758,10 @@ impl AppConfig {
         admission.apply_env(|k| std::env::var(k).ok())?;
         let mut agent_api = config.agent_api;
         agent_api.apply_env(|k| std::env::var(k).ok())?;
+        let mut mcp = config.mcp;
+        mcp.apply_env(|k| std::env::var(k).ok())?;
+        mcp.validate(agent_api.max_page_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid [mcp] settings: {e}"))?;
         let mut observability = config.observability;
         observability.apply_env(|k| std::env::var(k).ok())?;
         let mut cluster = config.cluster;
@@ -1640,6 +1790,7 @@ impl AppConfig {
             web,
             admission,
             agent_api,
+            mcp,
             observability,
             access_control,
             state,
@@ -1690,6 +1841,18 @@ pub fn parse_data_type(type_name: &str) -> Result<DataType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_bools_share_one_spelling() {
+        for t in ["1", "true", "ON", " yes "] {
+            assert!(parse_env_bool("ARNEB_X", t).unwrap(), "{t}");
+        }
+        for f in ["0", "False", "off", "NO"] {
+            assert!(!parse_env_bool("ARNEB_X", f).unwrap(), "{f}");
+        }
+        let err = parse_env_bool("ARNEB_X", "maybe").unwrap_err().to_string();
+        assert!(err.contains("ARNEB_X") && err.contains("maybe"), "{err}");
+    }
 
     #[test]
     fn test_app_config_with_tables() {
@@ -2013,6 +2176,156 @@ pgwire = "required"
             .unwrap_err()
             .to_string();
         assert!(err.contains("ARNEB_AGENT_MAX_WAIT_MS"), "{err}");
+    }
+
+    /// `[mcp]` with env overrides applied the way `load` does.
+    fn mcp(toml_text: &str, env: &[(&str, &str)]) -> Result<McpConfig> {
+        let config = toml::from_str::<AppConfig>(toml_text)?;
+        let mut c = config.mcp;
+        c.apply_env(env_from(env))?;
+        c.validate(config.agent_api.max_page_bytes)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(c)
+    }
+
+    #[test]
+    fn mcp_defaults() {
+        let c = mcp("port = 5432", &[]).unwrap();
+        assert_eq!(
+            c,
+            McpConfig {
+                enabled: true,
+                allowed_hosts: None,
+                allowed_origins: None,
+                default_page_bytes: 32768
+            }
+        );
+        let c = mcp("[mcp]\nenabled = false\nallowed_hosts = [\"a\"]\n", &[]).unwrap();
+        assert!(!c.enabled);
+        assert_eq!(c.allowed_hosts, Some(vec!["a".to_owned()]));
+    }
+
+    #[test]
+    fn mcp_env_overrides_file() {
+        let file = "[mcp]\nenabled = true\nallowed_hosts = [\"file.example\"]\ndefault_page_bytes = 1000\n";
+        let c = mcp(
+            file,
+            &[
+                ("ARNEB_MCP_ENABLED", "false"),
+                ("ARNEB_MCP_ALLOWED_HOSTS", "a.example, b.example:8443"),
+                ("ARNEB_MCP_DEFAULT_PAGE_BYTES", "4096"),
+            ],
+        )
+        .unwrap();
+        assert!(!c.enabled);
+        assert_eq!(
+            c.allowed_hosts,
+            Some(vec!["a.example".to_owned(), "b.example:8443".to_owned()])
+        );
+        assert_eq!(c.default_page_bytes, 4096);
+        let c = mcp(file, &[("ARNEB_MCP_ALLOWED_HOSTS", "*")]).unwrap();
+        assert_eq!(c.allowed_hosts, Some(vec!["*".to_owned()]));
+        assert!(mcp(file, &[("ARNEB_MCP_ENABLED", "maybe")]).is_err());
+    }
+
+    #[test]
+    fn mcp_refuses_empty_host_lists_and_treats_empty_env_as_unset() {
+        let err = mcp("[mcp]\nallowed_hosts = []\n", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_hosts is empty"), "{err}");
+        let err = mcp("port = 5432", &[("ARNEB_MCP_ALLOWED_HOSTS", " , ")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ARNEB_MCP_ALLOWED_HOSTS"), "{err}");
+        // Empty env = unset: the file value (or default) stays.
+        let file = "[mcp]\nallowed_hosts = [\"file.example\"]\n";
+        let c = mcp(file, &[("ARNEB_MCP_ALLOWED_HOSTS", "")]).unwrap();
+        assert_eq!(c.allowed_hosts, Some(vec!["file.example".to_owned()]));
+        let c = mcp("port = 5432", &[("ARNEB_MCP_ALLOWED_HOSTS", "  ")]).unwrap();
+        assert_eq!(c.allowed_hosts, None);
+    }
+
+    #[test]
+    fn mcp_host_lists_drop_blank_entries() {
+        let c = mcp("[mcp]\nallowed_hosts = [\"\", \" a.example \"]\n", &[]).unwrap();
+        assert_eq!(c.allowed_hosts, Some(vec!["a.example".to_owned()]));
+        let err = mcp("[mcp]\nallowed_hosts = [\" \"]\n", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_hosts is empty"), "{err}");
+    }
+
+    #[test]
+    fn mcp_allowed_origins_file_env_and_validation() {
+        assert_eq!(mcp("port = 5432", &[]).unwrap().allowed_origins, None);
+        let file = "[mcp]\nallowed_origins = [\"https://app.example:443\", \"null\", \"\"]\n";
+        let c = mcp(file, &[]).unwrap();
+        assert_eq!(
+            c.allowed_origins,
+            Some(vec![
+                "https://app.example:443".to_owned(),
+                "null".to_owned()
+            ])
+        );
+        let c = mcp(
+            file,
+            &[(
+                "ARNEB_MCP_ALLOWED_ORIGINS",
+                "https://a.example, http://localhost:*",
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            c.allowed_origins,
+            Some(vec![
+                "https://a.example".to_owned(),
+                "http://localhost:*".to_owned()
+            ])
+        );
+        // Empty env = unset.
+        let c = mcp(file, &[("ARNEB_MCP_ALLOWED_ORIGINS", " ")]).unwrap();
+        assert_eq!(c.allowed_origins.unwrap().len(), 2);
+        let err = mcp("port = 5432", &[("ARNEB_MCP_ALLOWED_ORIGINS", " , ")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ARNEB_MCP_ALLOWED_ORIGINS"), "{err}");
+        for bad in ["[]", "[\" \"]"] {
+            let err = mcp(&format!("[mcp]\nallowed_origins = {bad}\n"), &[])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("allowed_origins is empty"), "{bad}: {err}");
+        }
+        let err = mcp("[mcp]\nallowed_origins = [\"app.example\"]\n", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("app.example") && err.contains("scheme"),
+            "{err}"
+        );
+        let err = mcp(
+            "port = 5432",
+            &[("ARNEB_MCP_ALLOWED_ORIGINS", "app.example")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("scheme"), "{err}");
+    }
+
+    #[test]
+    fn mcp_validation_and_unknown_keys() {
+        let err = mcp("[mcp]\ndefault_page_bytes = 0\n", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("default_page_bytes"), "{err}");
+        let err = mcp(
+            "[agent_api]\nmax_page_bytes = 100000\ndefault_page_bytes = 1000\n[mcp]\ndefault_page_bytes = 200000\n",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max_page_bytes"), "{err}");
+        assert!(toml::from_str::<AppConfig>("[mcp]\nbogus = 1\n").is_err());
     }
 
     #[test]

@@ -49,7 +49,7 @@ pub fn routes() -> Router<WebState> {
 }
 
 /// The service, or `not_found` where it is not served (workers).
-fn service(state: &WebState) -> Result<&AgentQueryService, ApiError> {
+pub(super) fn service(state: &WebState) -> Result<&AgentQueryService, ApiError> {
     state
         .agent
         .as_ref()
@@ -74,7 +74,10 @@ fn query<T>(params: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
 }
 
 /// `wait_ms` (default 0), refused above the configured ceiling.
-fn wait(service: &AgentQueryService, wait_ms: Option<u64>) -> Result<Duration, ApiError> {
+pub(super) fn wait(
+    service: &AgentQueryService,
+    wait_ms: Option<u64>,
+) -> Result<Duration, ApiError> {
     let max = service.limits().max_wait;
     let wait = Duration::from_millis(wait_ms.unwrap_or(0));
     if wait > max {
@@ -97,6 +100,11 @@ struct ResultsParams {
     #[serde(default)]
     cursor: u64,
     max_bytes: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
+struct DescribeParams {
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize, Default)]
@@ -145,10 +153,12 @@ async fn describe_table(
     State(state): State<WebState>,
     Extension(who): Extension<Identity>,
     Path((catalog, schema, table)): Path<(String, String, String)>,
+    params: Result<Query<DescribeParams>, QueryRejection>,
 ) -> Result<Json<TableDescription>, ApiError> {
+    let DescribeParams { limit } = query(params)?;
     Ok(Json(
         service(&state)?
-            .describe_table(&who.user, &catalog, &schema, &table)
+            .describe_table(&who.user, &catalog, &schema, &table, limit)
             .await?,
     ))
 }
@@ -162,7 +172,7 @@ async fn sample_table(
     let SampleParams { rows } = query(params)?;
     Ok(Json(
         service(&state)?
-            .sample(&who.user, &catalog, &schema, &table, rows)
+            .sample(&who.user, &catalog, &schema, &table, rows, None)
             .await?,
     ))
 }
@@ -174,7 +184,7 @@ async fn explain(
 ) -> Result<Json<Explanation>, ApiError> {
     let service = service(&state)?;
     let req: ExplainRequest = json_body(body)?;
-    Ok(Json(service.explain(&who.user, &req).await?))
+    Ok(Json(service.explain(&who.user, &req, None).await?))
 }
 
 async fn submit(
@@ -186,7 +196,7 @@ async fn submit(
     let service = service(&state)?;
     let wait = wait(service, query(params)?.wait_ms)?;
     let req: SubmitRequest = json_body(body)?;
-    let status = service.submit(&who.user, req, wait).await?;
+    let status = service.submit(&who.user, req, wait, None).await?;
     let location = format!("/api/v2/statements/{}", status.id);
     let mut resp = (StatusCode::CREATED, Json(status)).into_response();
     if let Ok(value) = HeaderValue::from_str(&location) {
@@ -203,7 +213,7 @@ async fn status(
 ) -> Result<Json<StatementStatus>, ApiError> {
     let service = service(&state)?;
     let wait = wait(service, query(params)?.wait_ms)?;
-    Ok(Json(service.status(&who.user, &id, wait).await?))
+    Ok(Json(service.status(&who.user, &id, wait, None).await?))
 }
 
 async fn results(
@@ -223,7 +233,7 @@ async fn cancel(
     Extension(who): Extension<Identity>,
     Path(id): Path<String>,
 ) -> Result<Json<StatementStatus>, ApiError> {
-    Ok(Json(service(&state)?.cancel(&who.user, &id)?))
+    Ok(Json(service(&state)?.cancel(&who.user, &id, None)?))
 }
 
 #[cfg(test)]
@@ -312,6 +322,7 @@ mod tests {
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent,
+            mcp: None,
         }
     }
 

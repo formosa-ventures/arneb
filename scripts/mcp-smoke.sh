@@ -176,6 +176,7 @@ tool AUTH1 explain_query "$(jq -nc --arg sql "$Q6" --arg c "$CATALOG" --arg s "$
 check '.isError == false' "explain_query returned isError"
 # The plan travels once: in structuredContent, with a summary as the text.
 check '.content[0].text | contains("structuredContent.plan")' "explain text is not the summary"
+# shellcheck disable=SC2016
 check '.structuredContent.plan as $p | .content[0].text | contains($p) | not' "explain text repeats the plan"
 LAST=$(printf '%s' "$LAST" | jq -c '.structuredContent')
 check '.plan | length > 0' "empty plan"
@@ -251,6 +252,11 @@ check '.queries | length >= 1 and length <= 5' "list_queries did not return 1 to
 check '.queries[0].query_id == "'"$LONG_ID"'"' "newest query is not the cancelled long statement"
 # shellcheck disable=SC2016
 check '[.queries[].created_ms] as $t | $t == ($t | sort | reverse)' "queries are not newest first"
+# Every reported state is a filter, and it keeps exactly that state.
+for st in planning finishing cancelled; do
+    tool_ok AUTH1 list_queries "$(jq -nc --arg s "$st" '{state:$s, limit:5}')"
+    check '[.queries[].state] | all(. == "'"$st"'")' "state filter $st kept other states"
+done
 tool_ok AUTH1 get_cluster
 check '.worker_count == 2' "get_cluster does not report 2 workers"
 tool_ok AUTH1 list_workers

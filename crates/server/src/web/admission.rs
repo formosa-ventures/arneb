@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
-use super::manage::{run_manage, Applied, DryRun, ManageAction, ManageOutcome, Preview};
+use super::manage::{
+    run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome, Preview,
+};
 use super::privilege::Layer;
 use super::v2::{bad_body, bad_query, parse_body};
 use super::WebState;
@@ -166,7 +168,7 @@ struct SetAdmission {
     from: AdmissionSnapshot,
     controller: AdmissionController,
     store: Arc<StateStore>,
-    _serialized: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    _serialized: ChangeLock,
 }
 
 /// `n` with the singular or plural noun.
@@ -281,6 +283,10 @@ impl ManageAction for SetAdmission {
 
     fn preview(&self, _state: &WebState) -> Result<Preview, ApiError> {
         Ok(self.plan().0)
+    }
+
+    fn change_lock(&self) -> Option<ChangeLock> {
+        Some(Arc::clone(&self._serialized))
     }
 
     /// Persists first, then updates the controller, so a failed write
@@ -558,6 +564,40 @@ mod tests {
             .rev()
             .map(|e| e.parameters["max_running_queries"].clone())
             .collect()
+    }
+
+    /// A request dropped while its change runs still holds the change lock
+    /// until the audit entry is appended.
+    #[tokio::test]
+    async fn dropped_request_holds_the_lock_until_audited() {
+        let state = node(None);
+        let (inside, release) =
+            crate::web::manage::test_hooks::stop_after_apply(&state.admission_changes);
+        let call = tokio::spawn({
+            let state = state.clone();
+            async move {
+                put(
+                    &state,
+                    "/api/v2/admission",
+                    &root(),
+                    json!({"max_running_queries": 3}),
+                )
+                .await
+            }
+        });
+        tokio::task::spawn_blocking(move || inside.recv().unwrap())
+            .await
+            .unwrap();
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert!(
+            state.admission_changes.try_lock().is_err(),
+            "the lock is held until the append"
+        );
+        assert!(audited_running(&state).is_empty());
+        release.send(()).unwrap();
+        let _next = state.admission_changes.lock().await;
+        assert_eq!(audited_running(&state).len(), 1);
     }
 
     #[tokio::test]

@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
-use super::manage::{run_manage, Applied, DryRun, ManageAction, ManageOutcome, Preview};
+use super::manage::{
+    run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome, Preview,
+};
 use super::privilege::Layer;
 use super::v2::bad_query;
 use super::WebState;
@@ -271,7 +273,7 @@ struct WorkerAction {
     store: Arc<StateStore>,
     /// A share of [`WebState::cordon_changes`], taken in
     /// [`worker_action_for`].
-    _serialized: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    _serialized: ChangeLock,
 }
 
 /// `n` with the singular or plural noun.
@@ -366,6 +368,10 @@ impl ManageAction for WorkerAction {
 
     fn preview(&self, state: &WebState) -> Result<Preview, ApiError> {
         Ok(self.plan(state))
+    }
+
+    fn change_lock(&self) -> Option<ChangeLock> {
+        Some(Arc::clone(&self._serialized))
     }
 
     /// Persists first, then updates the registry, so a failed write
@@ -1034,6 +1040,34 @@ mod tests {
         // Newest first: the uncordon was applied and audited last.
         let actions: Vec<String> = audit_actions(&state).into_iter().map(|a| a.0).collect();
         assert_eq!(actions, ["worker.uncordon", "worker.cordon"]);
+    }
+
+    /// A request dropped while its cordon runs still holds the change lock
+    /// until the audit entry is appended, so no later change can apply (and
+    /// audit) in between.
+    #[tokio::test]
+    async fn dropped_request_holds_the_lock_until_audited() {
+        let state = cluster(None);
+        let (inside, release) =
+            crate::web::manage::test_hooks::stop_after_apply(&state.cordon_changes);
+        let call = tokio::spawn({
+            let state = state.clone();
+            async move { post(&state, "/api/v2/workers/w1/cordon", Some(&root())).await }
+        });
+        tokio::task::spawn_blocking(move || inside.recv().unwrap())
+            .await
+            .unwrap();
+        // Applied, not yet audited; now the client goes away.
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert!(
+            state.cordon_changes.try_lock().is_err(),
+            "the lock is held until the append"
+        );
+        assert!(audit_actions(&state).is_empty());
+        release.send(()).unwrap();
+        let _next = state.cordon_changes.lock().await;
+        assert_eq!(audit_actions(&state)[0].0, "worker.cordon");
     }
 
     #[tokio::test]

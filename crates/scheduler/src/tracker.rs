@@ -180,13 +180,19 @@ impl QueryTracker {
     }
 
     /// Register how to stop query `id` on the protocol running it. A query
-    /// already cancelled (killed before its protocol registered) has the
-    /// canceller called at once, outside the lock, with the killer's name
-    /// (`the server` when it was not killed by a user). Dropped without
-    /// being called when the query is unknown or ended otherwise.
+    /// already cancelled (killed before its protocol registered), or one a
+    /// kill has claimed but not yet marked cancelled, has the canceller
+    /// called at once, outside the lock, with the killer's name (`the
+    /// server` when it was not killed by a user). Dropped without being
+    /// called when the query is unknown or ended otherwise.
     pub fn set_canceller(&self, id: &QueryId, canceller: Canceller) {
         let mut inner = self.inner.write().unwrap();
         let killed_by = match inner.queries.get_mut(id) {
+            // A kill in progress: stored, it would be dropped uncalled when
+            // the kill marks the query cancelled.
+            Some(e) if !e.machine.state.is_terminal() && e.killed_by.is_some() => {
+                e.killed_by.clone().unwrap_or_default()
+            }
             Some(e) if !e.machine.state.is_terminal() => {
                 e.canceller = Some(canceller);
                 return;
@@ -566,6 +572,46 @@ mod tests {
             }
         );
         assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
+    }
+
+    /// A canceller registered while a kill is in progress (claimed, not yet
+    /// cancelled) is called at once, not stored and then dropped uncalled.
+    #[test]
+    fn canceller_registered_during_a_kill_is_called() {
+        use std::sync::mpsc;
+        use std::sync::Mutex;
+        let tracker = Arc::new(QueryTracker::with_history_limit(10));
+        let id = tracker.create_query("SELECT 1".into());
+        tracker.advance_to(&id, QueryState::Running).unwrap();
+        let (inside_tx, inside_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        tracker.set_canceller(
+            &id,
+            Box::new(move |_| {
+                inside_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }),
+        );
+        let kill = std::thread::spawn({
+            let tracker = Arc::clone(&tracker);
+            move || tracker.kill_query(&id, "root").unwrap()
+        });
+        inside_rx.recv().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&calls);
+        tracker.set_canceller(
+            &id,
+            Box::new(move |by| seen.lock().unwrap().push(by.to_owned())),
+        );
+        assert_eq!(*calls.lock().unwrap(), ["root"], "called during the kill");
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            kill.join().unwrap(),
+            KillOutcome::Killed {
+                was: QueryState::Running
+            }
+        );
     }
 
     #[test]

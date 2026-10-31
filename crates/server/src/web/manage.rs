@@ -83,7 +83,19 @@ pub(super) trait ManageAction: Send + 'static {
 
     /// Do it. Blocking: [`run_manage`] calls it from `spawn_blocking`.
     fn apply(self, state: &WebState) -> Result<Applied<Self::Output>, ApiError>;
+
+    /// A share of the lock that serializes this kind of change, if any.
+    /// [`run_manage`] keeps it until the audit entry is appended, so a
+    /// request dropped mid-call still holds the lock across apply and
+    /// append, and the audit order stays the apply order.
+    fn change_lock(&self) -> Option<ChangeLock> {
+        None
+    }
 }
+
+/// A share of a change lock's guard (`WebState::admission_changes`,
+/// `WebState::cordon_changes`).
+pub(super) type ChangeLock = std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>;
 
 /// The dry-run `warning` of an audited action while the audit log is not
 /// writable.
@@ -147,32 +159,44 @@ pub(super) async fn run_manage<A: ManageAction>(
         return Ok(outcome(true, name, target, preview, None));
     }
     let (blocking_state, who, audit_target) = (state.clone(), who.clone(), target.clone());
+    let held = action.change_lock();
     let mut applied = tokio::task::spawn_blocking(move || {
         let state = blocking_state;
         if !action.audited() {
-            return action.apply(&state);
+            let applied = action.apply(&state);
+            drop(held);
+            return applied;
         }
         let parameters = action.parameters();
         let unchanged = action.unchanged_effect();
-        audited(
+        #[cfg(test)]
+        let lock_key = held.as_deref().map(test_hooks::key_of);
+        let applied = audited(
             &state,
             &who,
             name,
             || action.apply(&state),
-            |out| AuditSubject {
-                target: audit_target,
-                parameters: with_effect(
-                    parameters,
-                    out.ok().map(|a| {
-                        if a.preview.changed {
-                            "applied"
-                        } else {
-                            unchanged
-                        }
-                    }),
-                ),
+            |out| {
+                #[cfg(test)]
+                test_hooks::after_apply(lock_key);
+                AuditSubject {
+                    target: audit_target,
+                    parameters: with_effect(
+                        parameters,
+                        out.ok().map(|a| {
+                            if a.preview.changed {
+                                "applied"
+                            } else {
+                                unchanged
+                            }
+                        }),
+                    ),
+                }
             },
-        )
+        );
+        // Released only once the entry is appended.
+        drop(held);
+        applied
     })
     .await
     .map_err(|e| {
@@ -219,6 +243,55 @@ fn with_effect(parameters: serde_json::Value, effect: Option<&str>) -> serde_jso
         map.insert("effect".to_owned(), effect.into());
     }
     serde_json::Value::Object(map)
+}
+
+/// A test-only stop between a change's apply and its audit append.
+#[cfg(test)]
+pub(super) mod test_hooks {
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::Mutex;
+
+    /// `(lock key, inside, release)`: the change whose lock has this key
+    /// sends on `inside` once applied, then waits on `release`. One per
+    /// test state, so tests running in parallel do not share a gate.
+    type Gate = (usize, Sender<()>, Receiver<()>);
+    static AFTER_APPLY: Mutex<Vec<Gate>> = Mutex::new(Vec::new());
+
+    /// The key of a change lock: its mutex's address.
+    pub(in crate::web) fn key(lock: &std::sync::Arc<tokio::sync::Mutex<()>>) -> usize {
+        std::sync::Arc::as_ptr(lock) as usize
+    }
+
+    pub(super) fn key_of(guard: &tokio::sync::OwnedMutexGuard<()>) -> usize {
+        key(tokio::sync::OwnedMutexGuard::mutex(guard))
+    }
+
+    /// Stop the next change applied under `lock` after its apply; returns
+    /// `(inside, release)`.
+    pub(in crate::web) fn stop_after_apply(
+        lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
+    ) -> (Receiver<()>, Sender<()>) {
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        AFTER_APPLY
+            .lock()
+            .unwrap()
+            .push((key(lock), inside_tx, release_rx));
+        (inside_rx, release_tx)
+    }
+
+    pub(super) fn after_apply(lock_key: Option<usize>) {
+        let Some(lock_key) = lock_key else { return };
+        let gate = {
+            let mut gates = AFTER_APPLY.lock().unwrap();
+            let at = gates.iter().position(|(k, _, _)| *k == lock_key);
+            at.map(|at| gates.swap_remove(at))
+        };
+        if let Some((_, inside, release)) = gate {
+            inside.send(()).unwrap();
+            release.recv().unwrap();
+        }
+    }
 }
 
 #[cfg(test)]

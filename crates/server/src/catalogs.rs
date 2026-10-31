@@ -365,7 +365,14 @@ pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
         spec.password = Some(RedactedString(REDACTED.to_owned()));
     }
     if let Some(url) = &mut spec.connection_url {
-        if let Some(range) = url_password_range(&url.0) {
+        let mut ranges: Vec<_> = url_query_passwords(&url.0)
+            .into_iter()
+            .map(|(_, value)| value)
+            .chain(url_password_range(&url.0))
+            .collect();
+        // Replace from the end so the earlier ranges stay valid.
+        ranges.sort_by_key(|r| std::cmp::Reverse(r.start));
+        for range in ranges {
             url.0.replace_range(range, REDACTED);
         }
     }
@@ -394,6 +401,32 @@ pub fn fill_redacted(new: &mut CatalogConfig, stored: &CatalogConfig) {
         new.password = stored.password.clone();
     }
     if let Some(url) = &mut new.connection_url {
+        // The query comes after the userinfo, so fill it first: that keeps
+        // the userinfo range valid.
+        let stored_query_password = stored.connection_url.as_ref().and_then(|s| {
+            url_query_passwords(&s.0)
+                .first()
+                .map(|(_, value)| s.0[value.clone()].to_owned())
+        });
+        for (segment, value) in url_query_passwords(&url.0).into_iter().rev() {
+            if url.0[value.clone()] != *REDACTED {
+                continue;
+            }
+            match &stored_query_password {
+                Some(p) => url.0.replace_range(value, p),
+                // No stored password: drop the parameter and one separator.
+                None => {
+                    let drop = if url.0[..segment.start].ends_with('&') {
+                        segment.start - 1..segment.end
+                    } else if url.0[segment.end..].starts_with('&') {
+                        segment.start..segment.end + 1
+                    } else {
+                        segment.start - 1..segment.end
+                    };
+                    url.0.replace_range(drop, "");
+                }
+            }
+        }
         if let Some(range) = url_password_range(&url.0) {
             if &url.0[range.clone()] == REDACTED {
                 let stored_password = stored
@@ -446,6 +479,30 @@ fn url_password_range(url: &str) -> Option<std::ops::Range<usize>> {
     let at = authority.rfind('@')?;
     let colon = authority[..at].find(':')?;
     Some(authority_start + colon + 1..authority_start + at)
+}
+
+/// `(parameter, value)` byte ranges of every `password=` query parameter
+/// (libpq URIs accept the password there too).
+// The catalog API (runtime-config D7) is the first caller outside tests.
+#[allow(dead_code)]
+fn url_query_passwords(url: &str) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let Some(scheme_end) = url.find("://") else {
+        return Vec::new();
+    };
+    let Some(q) = url[scheme_end..].find('?').map(|i| scheme_end + i + 1) else {
+        return Vec::new();
+    };
+    let end = url[q..].find('#').map_or(url.len(), |i| q + i);
+    let mut out = Vec::new();
+    let mut start = q;
+    for param in url[q..end].split('&') {
+        if let Some(value) = param.strip_prefix("password=") {
+            let value_start = start + param.len() - value.len();
+            out.push((start..start + param.len(), value_start..start + param.len()));
+        }
+        start += param.len() + 1;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -567,6 +624,39 @@ mod tests {
         })));
         assert_eq!(plain["connection_url"], "postgresql://bob@h/db");
         assert!(plain["password"].is_null());
+        // libpq URIs also take the password as a query parameter.
+        let query = redacted_spec(&spec(serde_json::json!({
+            "name": "p", "type": "postgresql",
+            "connection_url":
+                "postgresql://bob:ui-secret-7@db/sales?sslmode=disable&password=q-secret-6&application_name=x"
+        })));
+        let text = query.to_string();
+        assert!(!text.contains("q-secret-6") && !text.contains("ui-secret-7"));
+        assert_eq!(
+            query["connection_url"],
+            "postgresql://bob:<redacted>@db/sales?sslmode=disable&password=<redacted>&application_name=x"
+        );
+        let only = redacted_spec(&spec(serde_json::json!({
+            "name": "p", "type": "postgresql",
+            "connection_url": "postgresql://bob@db/sales?password=q-secret-6"
+        })));
+        assert_eq!(
+            only["connection_url"],
+            "postgresql://bob@db/sales?password=<redacted>"
+        );
+    }
+
+    #[test]
+    fn catalog_config_debug_hides_every_secret() {
+        let mut s = secret_spec();
+        s.connection_url = None; // `RedactedString` already hides the URL
+        let shown = format!("{s:?}");
+        for raw in ["pw-secret-2", "s3-secret-3", "gcs-secret-4", "az-secret-5"] {
+            assert!(!shown.contains(raw), "a secret leaked into Debug");
+        }
+        let shown = format!("{:?}", secret_spec());
+        assert!(!shown.contains("url-secret-1"));
+        assert!(shown.contains("AKIA"), "non-secret fields still show");
     }
 
     #[test]
@@ -609,6 +699,39 @@ mod tests {
             "postgresql://bob@h/db"
         );
         assert!(orphan.password.is_none());
+
+        // A query-parameter password round-trips, and a redacted one the
+        // stored spec lacks is dropped with its separator.
+        let stored_q = spec(serde_json::json!({
+            "name": "p", "type": "postgresql",
+            "connection_url": "postgresql://bob:ui-secret-7@db/sales?sslmode=disable&password=q-secret-6"
+        }));
+        let mut back: CatalogConfig = serde_json::from_value(redacted_spec(&stored_q)).unwrap();
+        fill_redacted(&mut back, &stored_q);
+        assert_eq!(
+            back.connection_url.as_ref().unwrap().0,
+            stored_q.connection_url.as_ref().unwrap().0
+        );
+        for (sent, kept) in [
+            (
+                "postgresql://bob@h/db?password=<redacted>",
+                "postgresql://bob@h/db",
+            ),
+            (
+                "postgresql://bob@h/db?password=<redacted>&sslmode=disable",
+                "postgresql://bob@h/db?sslmode=disable",
+            ),
+            (
+                "postgresql://bob@h/db?sslmode=disable&password=<redacted>",
+                "postgresql://bob@h/db?sslmode=disable",
+            ),
+        ] {
+            let mut new = spec(serde_json::json!({
+                "name": "p", "type": "postgresql", "connection_url": sent
+            }));
+            fill_redacted(&mut new, &bare);
+            assert_eq!(new.connection_url.as_ref().unwrap().0, kept);
+        }
     }
 
     #[tokio::test]

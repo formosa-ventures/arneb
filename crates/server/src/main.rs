@@ -365,18 +365,18 @@ async fn run() -> Result<()> {
 
     // 6.5. External catalogs (Hive, with Iceberg tables in the same
     // metastore redirected to the Iceberg reader, and PostgreSQL), kept live
-    // so they can change at runtime. Workers and standalone build them from
-    // the config here, so workers can create data sources for the scans they
-    // are sent; the coordinator builds them once the state store is open
-    // (runtime-config Ruling R2). An unreachable catalog is skipped with a
-    // WARN; the server keeps serving.
+    // so they can change at runtime. Workers build them from the config
+    // here, so they can create data sources for the scans they are sent;
+    // the coordinator and standalone build them once the state store is
+    // open (runtime-config Rulings R2, R4). An unreachable catalog is
+    // skipped with a WARN; the server keeps serving.
     let live_catalogs = catalogs::LiveCatalogs::new(
         catalog_manager.clone(),
         connector_registry.clone(),
         config.storage.clone(),
     );
-    if !matches!(role, ServerRole::Coordinator) {
-        load_config_catalogs(&live_catalogs, &config.catalogs).await;
+    if matches!(role, ServerRole::Worker) {
+        load_catalogs(None, &live_catalogs, &config.catalogs, reseed_state).await?;
     }
 
     // 8. Set up Flight RPC server + heartbeat handling
@@ -767,16 +767,18 @@ async fn run() -> Result<()> {
         let count = web::restore_worker_cordons(store, &node_registry);
         tracing::info!(target: "arneb::config", count, "restored worker cordons");
     }
-    // runtime-config D1: under password auth the coordinator seeds the
-    // state store from [[catalogs]] once and serves the stored definitions
-    // from then on; without a state store it serves the config's.
-    if matches!(role, ServerRole::Coordinator) {
-        match &state_store {
-            Some(store) => {
-                load_stored_catalogs(store, &live_catalogs, &config.catalogs, reseed_state).await?
-            }
-            None => load_config_catalogs(&live_catalogs, &config.catalogs).await,
-        }
+    // runtime-config D1, R4: under password auth the coordinator or
+    // standalone server seeds the state store from [[catalogs]] once and
+    // serves the stored definitions from then on; without a state store it
+    // serves the config's.
+    if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
+        load_catalogs(
+            state_store.as_deref(),
+            &live_catalogs,
+            &config.catalogs,
+            reseed_state,
+        )
+        .await?;
     }
     let auth_method = match &state_store {
         Some(store) => arneb_protocol::AuthMethod::ScramSha256(store.clone()),
@@ -1492,6 +1494,24 @@ async fn run_until_shutdown(
     }
 }
 
+/// Loads the external catalogs: from the state store when one is open
+/// (coordinator or standalone under password auth; Ruling R4), else from
+/// the config's `[[catalogs]]` at generation 1. Workers never open a store.
+async fn load_catalogs(
+    store: Option<&arneb_state::StateStore>,
+    live: &catalogs::LiveCatalogs,
+    specs: &[config::CatalogConfig],
+    reseed: bool,
+) -> Result<()> {
+    match store {
+        Some(store) => load_stored_catalogs(store, live, specs, reseed).await,
+        None => {
+            load_config_catalogs(live, specs).await;
+            Ok(())
+        }
+    }
+}
+
 /// Builds the config's `[[catalogs]]` as the live set at generation 1, so a
 /// coordinator without a state store never advertises generation 0 (which
 /// a fresh worker already holds; runtime-config Ruling R1).
@@ -1639,6 +1659,52 @@ mod tests {
             .unwrap();
         assert_eq!(live.generation(), store.catalogs().0);
         assert!(live.generation() >= 1);
+    }
+
+    /// Ruling R4: with a state store open (coordinator or standalone under
+    /// password auth) the catalogs come from the store, so a runtime-created
+    /// catalog wins over the config; without one, from the config at
+    /// generation 1.
+    #[tokio::test]
+    async fn catalogs_load_from_the_state_store_when_one_is_open() {
+        let config_spec: config::CatalogConfig = serde_json::from_value(serde_json::json!({
+            "name": "from_cfg", "type": "mysql"
+        }))
+        .unwrap();
+        let store = arneb_state::StateStore::open(None).unwrap();
+        // First start seeds the (unbuildable) config catalog into the store.
+        let live = empty_live();
+        load_catalogs(
+            Some(&store),
+            &live,
+            std::slice::from_ref(&config_spec),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(store.seeded().catalogs);
+        assert_eq!(store.catalogs().1.len(), 1);
+        // A runtime change replaces it; the next start serves the store's
+        // set (empty) and its generation, not the config's.
+        let g = store.remove_catalog("from_cfg").unwrap();
+        let live = empty_live();
+        load_catalogs(
+            Some(&store),
+            &live,
+            std::slice::from_ref(&config_spec),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(live.generation(), g);
+        assert!(
+            store.catalogs().1.is_empty(),
+            "the store wins; nothing re-seeded"
+        );
+        // No store: the config path at generation 1.
+        let live = empty_live();
+        load_catalogs(None, &live, &[], false).await.unwrap();
+        assert_eq!(live.generation(), 1);
     }
 
     /// Which `tracing` target an [`enabled`] probe checks.

@@ -1507,7 +1507,7 @@ pub struct StorageConfig {
 /// AWS S3 storage configuration.
 ///
 /// Credential resolution: config > env var (`AWS_ACCESS_KEY_ID`) > IAM role.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct S3Config {
     /// AWS region (e.g., "us-east-1").
@@ -1524,7 +1524,7 @@ pub struct S3Config {
 }
 
 /// Google Cloud Storage configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct GcsConfig {
     /// Path to service account JSON key file.
@@ -1532,13 +1532,54 @@ pub struct GcsConfig {
 }
 
 /// Azure Blob Storage configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct AzureConfig {
     /// Azure storage account name.
     pub storage_account: Option<String>,
     /// Azure storage access key.
     pub access_key: Option<String>,
+}
+
+/// Shows whether the secret key is set, never its value.
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("allow_http", &self.allow_http)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Shows whether the key path is set, never its value.
+impl std::fmt::Debug for GcsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcsConfig")
+            .field(
+                "service_account_path",
+                &self.service_account_path.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Shows whether the access key is set, never its value.
+impl std::fmt::Debug for AzureConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureConfig")
+            .field("storage_account", &self.storage_account)
+            .field(
+                "access_key",
+                &self.access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl StorageConfig {

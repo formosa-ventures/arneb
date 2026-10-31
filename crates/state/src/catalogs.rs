@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::file::{StateError, StateStore};
 
-/// One stored catalog definition.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One stored catalog definition. `Debug` shows only the name and origin:
+/// the spec holds raw secrets.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatalogRecord {
     /// The catalog name (unique in the state).
     pub name: String,
@@ -21,6 +22,15 @@ pub struct CatalogRecord {
     pub spec: serde_json::Value,
     /// True when the catalog was seeded from the config file.
     pub from_config: bool,
+}
+
+impl std::fmt::Debug for CatalogRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogRecord")
+            .field("name", &self.name)
+            .field("from_config", &self.from_config)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What [`StateStore::seed_catalogs`] did or found.
@@ -261,6 +271,20 @@ mod tests {
         drop(store);
         let store = StateStore::open(Some(&p2)).unwrap();
         assert_eq!(store.catalogs(), before);
+    }
+
+    #[test]
+    fn catalog_record_debug_hides_the_spec() {
+        let record = CatalogRecord {
+            name: "pg".into(),
+            spec: json!({"password": "pw-secret-1", "connection_url": "postgresql://u:url-secret-2@h/d"}),
+            from_config: true,
+        };
+        let shown = format!("{record:?} {:?}", vec![record.clone()]);
+        assert!(shown.contains("pg"));
+        for raw in ["pw-secret-1", "url-secret-2"] {
+            assert!(!shown.contains(raw), "a secret leaked into Debug");
+        }
     }
 
     #[test]

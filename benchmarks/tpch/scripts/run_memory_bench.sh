@@ -41,6 +41,7 @@
 #   SKIP_TRINO=1 ./benchmarks/tpch/scripts/run_memory_bench.sh     # arneb only
 #   SKIP_ARNEB=1 ./benchmarks/tpch/scripts/run_memory_bench.sh     # trino only
 #   BENCH_MODE=both ./benchmarks/tpch/scripts/run_memory_bench.sh  # cold + warm
+#   BENCH_SCHEMA=tpcds QDIR=benchmarks/tpcds/queries ./benchmarks/tpch/scripts/run_memory_bench.sh
 #
 # BENCH_MODE — what state each timed run starts from (recorded per CSV row):
 #   cold  (default) the engine cluster is recreated AND the storage side is
@@ -68,6 +69,7 @@ PROJECT_DIR="$(cd "$BENCH_DIR/../.." && pwd)"
 # defaults below do not affect them.
 QDIR="${QDIR:-$BENCH_DIR/queries}"
 [[ "$QDIR" = /* ]] || QDIR="$PROJECT_DIR/$QDIR"
+BENCH_SCHEMA=${BENCH_SCHEMA:-tpch}
 RESULTS_DIR="$BENCH_DIR/results"
 mkdir -p "$RESULTS_DIR"
 
@@ -313,11 +315,11 @@ run_arneb_query() {
     # the cluster restart. Applied identically to Trino below.
     if [[ "$mode" == "warm" ]]; then
         psql -h 127.0.0.1 -p 5432 -t -A -F',' -q \
-            -c "SET search_path TO datalake.tpch" -f "$sql_file" >/dev/null 2>&1
+            -c "SET search_path TO datalake.$BENCH_SCHEMA" -f "$sql_file" >/dev/null 2>&1
     fi
     start=$(date +%s.%N)
     psql -h 127.0.0.1 -p 5432 -t -A -F',' -q \
-        -c "SET search_path TO datalake.tpch" \
+        -c "SET search_path TO datalake.$BENCH_SCHEMA" \
         -f "$sql_file" 2>"$err" | grep -v '^SET$' >"$out"
     local rc=${PIPESTATUS[0]}
     end=$(date +%s.%N)
@@ -342,11 +344,11 @@ run_trino_query() {
     # warm: untimed warm-up before the timed run (see run_arneb_query).
     # Warms Trino's JVM JIT + the page cache equally → fair, stable latency.
     if [[ "$mode" == "warm" ]]; then
-        docker exec arneb-trino-1 trino --server localhost:8080 --catalog hive --schema tpch \
+        docker exec arneb-trino-1 trino --server localhost:8080 --catalog hive --schema "$BENCH_SCHEMA" \
             --execute "$(cat "$sql_file")" --output-format CSV_UNQUOTED >/dev/null 2>&1
     fi
     start=$(date +%s.%N)
-    docker exec arneb-trino-1 trino --server localhost:8080 --catalog hive --schema tpch \
+    docker exec arneb-trino-1 trino --server localhost:8080 --catalog hive --schema "$BENCH_SCHEMA" \
         --execute "$(cat "$sql_file")" --output-format CSV_UNQUOTED \
         >"$out" 2>"$err"
     local rc=$?

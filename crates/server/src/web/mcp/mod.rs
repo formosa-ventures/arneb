@@ -45,10 +45,26 @@ impl From<&crate::config::McpConfig> for McpSettings {
     }
 }
 
-/// Placeholder agent guidance; the final copy lands with the instructions task.
-const INSTRUCTIONS: &str = "Arneb is a SQL engine. Discover catalogs, schemas and tables, \
-    describe a table, explain a query, submit it, poll its status and fetch result pages. \
-    Tool errors carry a code, a hint and, for typos, candidates; read them and retry.";
+/// What the agent reads on `initialize`: the intended workflow (at most
+/// 1500 characters; a test enforces it).
+const INSTRUCTIONS: &str = "\
+Arneb is a distributed SQL engine that queries many data sources through catalogs. \
+Names are catalog.schema.table.
+
+Workflow:
+1. Discover: list_catalogs, list_schemas, list_tables.
+2. Learn the table: describe_table for columns and types, sample_table for a few real rows.
+3. Check the query: explain_query plans it without running it.
+4. Run it: submit_query with wait_ms (up to 10000) so short queries return finished.
+5. If the state is queued or running, call get_query_status (with wait_ms) until it is finished, failed or cancelled.
+6. Read rows: fetch_results with the cursor, repeating while next_cursor is not null.
+7. Stop a statement you no longer need with cancel_query.
+
+Limits: a statement keeps at most max_rows rows (default 1000, ceiling 10000) and reports truncated when more existed. Pages are small by default; ask for more with max_bytes. Long cells and SQL text are cut. Listings take limit and report truncated.
+
+Errors: a failed tool call comes back as an error result with a code and a hint. Read the hint and any candidates (close matches for a misspelled table or column), fix the call, and retry. A SQL error after submit is a status with state failed, not an error result.
+
+Queries run as your user and see only what your user may see.";
 
 /// The MCP handler: one per request (the service is stateless).
 #[derive(Clone)]

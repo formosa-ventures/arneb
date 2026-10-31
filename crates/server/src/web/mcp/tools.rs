@@ -1210,4 +1210,151 @@ mod tests {
             api_get(&f, "alice", "/api/v2/cluster/workers").await
         );
     }
+
+    /// A raw JSON-RPC request; the whole response body.
+    async fn rpc_raw(f: &Fixture, body: Value) -> Value {
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::HOST, "127.0.0.1:6432")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = f.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The exact tool set (D5), sorted.
+    const TOOL_NAMES: [&str; 18] = [
+        "cancel_query",
+        "create_token",
+        "describe_table",
+        "explain_query",
+        "fetch_results",
+        "get_cluster",
+        "get_query",
+        "get_query_status",
+        "list_catalogs",
+        "list_queries",
+        "list_schemas",
+        "list_tables",
+        "list_tokens",
+        "list_workers",
+        "revoke_token",
+        "sample_table",
+        "submit_query",
+        "whoami",
+    ];
+
+    #[tokio::test]
+    async fn tool_list_contract() {
+        let f = fixture(false);
+        let v = rpc_raw(
+            &f,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+        )
+        .await;
+        let tools = v["result"]["tools"].as_array().expect("tools array");
+        let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        names.sort_unstable();
+        assert_eq!(names, TOOL_NAMES);
+
+        let by_name = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap();
+        for t in tools {
+            let name = t["name"].as_str().unwrap();
+            let d = t["description"].as_str().unwrap_or("");
+            assert!(
+                (40..=600).contains(&d.chars().count()),
+                "{name}: description is {} characters",
+                d.chars().count()
+            );
+            if let Some(props) = t["inputSchema"]["properties"].as_object() {
+                for (prop, schema) in props {
+                    let pd = schema["description"].as_str().unwrap_or("");
+                    assert!(!pd.trim().is_empty(), "{name}.{prop} has no description");
+                }
+            }
+            // D8: annotations.
+            let a = &t["annotations"];
+            assert_eq!(a["openWorldHint"], json!(false), "{name} open_world");
+            let read_only = name == "whoami"
+                || name.starts_with("list_")
+                || name.starts_with("get_")
+                || [
+                    "describe_table",
+                    "sample_table",
+                    "explain_query",
+                    "fetch_results",
+                ]
+                .contains(&name);
+            let destructive = ["revoke_token", "cancel_query"].contains(&name);
+            if read_only {
+                assert_eq!(a["readOnlyHint"], json!(true), "{name} read_only");
+            } else {
+                assert_ne!(
+                    a["readOnlyHint"],
+                    json!(true),
+                    "{name} must not be read_only"
+                );
+            }
+            if destructive {
+                assert_eq!(a["destructiveHint"], json!(true), "{name} destructive");
+                assert_eq!(a["idempotentHint"], json!(true), "{name} idempotent");
+            }
+        }
+
+        // D9: each step names the next tool.
+        let desc = |n: &str| by_name(n)["description"].as_str().unwrap().to_owned();
+        let d = desc("submit_query");
+        assert!(
+            d.contains("get_query_status") && d.contains("fetch_results"),
+            "{d}"
+        );
+        assert!(desc("get_query_status").contains("fetch_results"));
+        assert!(desc("list_tables").contains("describe_table"));
+        assert!(desc("list_catalogs").contains("list_schemas"));
+        assert!(desc("list_schemas").contains("list_tables"));
+        assert!(desc("describe_table").contains("sample_table"));
+        assert!(desc("explain_query").contains("submit_query"));
+        assert!(desc("list_queries").contains("get_query"));
+    }
+
+    #[tokio::test]
+    async fn instructions_follow_the_workflow_and_fit_the_budget() {
+        let f = fixture(false);
+        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-06-18","capabilities":{},
+            "clientInfo":{"name":"t","version":"1"}}});
+        let v = rpc_raw(&f, init).await;
+        let text = v["result"]["instructions"].as_str().unwrap();
+        assert!(
+            text.chars().count() <= 1500,
+            "{} chars",
+            text.chars().count()
+        );
+        let mut at = 0;
+        for step in [
+            "list_catalogs",
+            "describe_table",
+            "explain_query",
+            "submit_query",
+            "get_query_status",
+            "fetch_results",
+            "cancel_query",
+        ] {
+            let pos = text[at..]
+                .find(step)
+                .unwrap_or_else(|| panic!("`{step}` missing or out of order in: {text}"));
+            at += pos;
+        }
+        for word in ["max_rows", "truncated", "hint", "candidates"] {
+            assert!(text.contains(word), "instructions omit `{word}`");
+        }
+    }
 }

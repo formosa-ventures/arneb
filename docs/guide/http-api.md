@@ -14,6 +14,9 @@ The same API token also works as the password for
 [pgwire and the Trino listener](#tokens-as-passwords), so one credential
 covers every protocol.
 
+The same operations are also available as tools for AI agents over the
+[Model Context Protocol](/guide/mcp), at `/mcp` on this port.
+
 ## Authentication
 
 Authentication follows `[auth] type` (see

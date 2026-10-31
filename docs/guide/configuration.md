@@ -154,6 +154,32 @@ bounds what it emits as well as what it retains; a truncated result reports
 `total_rows` as `null`. A page always holds at least one row, so a single wide row can
 exceed the page byte limit; each cell is still capped at `max_cell_bytes`.
 
+## MCP
+
+The coordinator (or standalone node) serves a Model Context Protocol endpoint
+at `/mcp` on the Web port; see [MCP Server](/guide/mcp). It is on by default
+and has no effect on a worker, which has no Web port. The effective values
+are logged once on `arneb::config` at startup.
+
+```toml
+[mcp]
+enabled            = true
+allowed_hosts      = ["db.internal", "db.internal:6432"]
+default_page_bytes = 32768
+```
+
+| `[mcp]` field | Env var | Default | Meaning |
+|---|---|---|---|
+| `enabled` | `ARNEB_MCP_ENABLED` | `true` | Serve `/mcp`. When `false`, `/mcp` answers `404`. |
+| `allowed_hosts` | `ARNEB_MCP_ALLOWED_HOSTS` (comma-separated) | unset | `Host` header values `/mcp` accepts, as `host` or `host:port`. Unset means any host under password auth and loopback (`localhost`, `127.0.0.1`, `::1`) under `type = "none"`. A `*` anywhere in the list means any host. |
+| `default_page_bytes` | `ARNEB_MCP_DEFAULT_PAGE_BYTES` | 32768 | Bytes per page of a tool result when the call names no `max_bytes`, including the inline first page of `submit_query`, `get_query_status` and `sample_table`. |
+
+`allowed_hosts = []` is a startup error (omit it for the default, or use
+`["*"]`). An empty `ARNEB_MCP_ALLOWED_HOSTS` counts as unset. Env vars
+override the file. `default_page_bytes` must be in `1..=` `[agent_api]`
+`max_page_bytes`, so a bad value stops startup. Row, wait and cell limits of
+the tools are the `[agent_api]` ones above.
+
 ## Admission Control
 
 The coordinator (or standalone node) caps how many queries run at once,

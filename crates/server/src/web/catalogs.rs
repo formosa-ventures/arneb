@@ -617,40 +617,8 @@ impl ManageAction for ChangeCatalog {
         };
         self.live.set_generation(generation);
         let workers = push_to_workers(state, &self.live.snapshot());
-        let unsynced: Vec<String> = workers
-            .iter()
-            .filter(|w| !w.synced)
-            .map(|w| {
-                format!(
-                    "{} ({})",
-                    w.worker_id,
-                    w.error.as_deref().unwrap_or("no answer")
-                )
-            })
-            .collect();
-        if !unsynced.is_empty() {
-            add_warning(
-                &mut preview.warning,
-                format!(
-                    "{} did not confirm the change: {}; each picks it up on its next \
-                     heartbeat (a worker busy building catalogs can take longer than the \
-                     {} s push timeout)",
-                    plural(unsynced.len(), "worker"),
-                    unsynced.join(", "),
-                    PUSH_TIMEOUT.as_secs()
-                ),
-            );
-        }
-        for w in workers.iter().filter(|w| !w.failed_catalogs.is_empty()) {
-            add_warning(
-                &mut preview.warning,
-                format!(
-                    "worker {} applied the change but could not build catalogs {}; it retries \
-                     them on its heartbeat",
-                    w.worker_id,
-                    w.failed_catalogs.join(", ")
-                ),
-            );
+        for note in push_warnings(&workers) {
+            add_warning(&mut preview.warning, note);
         }
         tracing::info!(
             target: "arneb::config",
@@ -658,7 +626,7 @@ impl ManageAction for ChangeCatalog {
             action,
             generation,
             workers = workers.len(),
-            unsynced = unsynced.len(),
+            unsynced = workers.iter().filter(|w| !w.synced).count(),
             "catalog changed at runtime"
         );
         Ok(Applied {
@@ -672,10 +640,46 @@ impl ManageAction for ChangeCatalog {
     }
 }
 
+/// The `warning` notes of a push (Ruling R7): the workers that did not
+/// confirm it, and the catalogs a worker applied but could not build.
+pub(super) fn push_warnings(workers: &[WorkerSync]) -> Vec<String> {
+    let mut notes = Vec::new();
+    let unsynced: Vec<String> = workers
+        .iter()
+        .filter(|w| !w.synced)
+        .map(|w| {
+            format!(
+                "{} ({})",
+                w.worker_id,
+                w.error.as_deref().unwrap_or("no answer")
+            )
+        })
+        .collect();
+    if !unsynced.is_empty() {
+        notes.push(format!(
+            "{} did not confirm the change: {}; each picks it up on its next \
+             heartbeat (a worker busy building catalogs can take longer than the \
+             {} s push timeout)",
+            plural(unsynced.len(), "worker"),
+            unsynced.join(", "),
+            PUSH_TIMEOUT.as_secs()
+        ));
+    }
+    for w in workers.iter().filter(|w| !w.failed_catalogs.is_empty()) {
+        notes.push(format!(
+            "worker {} applied the change but could not build catalogs {}; it retries \
+             them on its heartbeat",
+            w.worker_id,
+            w.failed_catalogs.join(", ")
+        ));
+    }
+    notes
+}
+
 /// Pushes `set` to every live worker in parallel, at most 5 s each, and
 /// waits for all. Blocking: called from the manage action's
 /// `spawn_blocking`.
-fn push_to_workers(state: &WebState, set: &arneb_rpc::CatalogSet) -> Vec<WorkerSync> {
+pub(super) fn push_to_workers(state: &WebState, set: &arneb_rpc::CatalogSet) -> Vec<WorkerSync> {
     let mut workers = state.node_registry.alive_workers();
     if workers.is_empty() {
         return Vec::new();

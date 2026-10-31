@@ -12,8 +12,10 @@ mod manage;
 pub mod mcp;
 mod metrics;
 pub mod privilege;
+mod reseed;
 mod rules;
 pub mod session;
+mod settings;
 mod users;
 mod v2;
 mod workers;
@@ -68,6 +70,10 @@ pub struct WebState {
     /// catalogs, settings, re-seed; runtime-config D10): held across the
     /// whole change, through the audit append.
     pub config_changes: Arc<tokio::sync::Mutex<()>>,
+    /// The `--config` path the process started with (`None`: the default
+    /// `./arneb.toml` when present, else the defaults); a re-seed reloads
+    /// it with `AppConfig::load` (runtime-config D2, Ruling R3).
+    pub config_path: Option<std::path::PathBuf>,
     /// The live external catalogs, changed through
     /// `/api/v2/catalog-configs` (runtime-config D7); `Some` on a
     /// coordinator or standalone server.

@@ -319,6 +319,25 @@ impl ManageAction for SetAdmission {
     }
 }
 
+/// Applies the config's admission limits to `controller` once a re-seed
+/// cleared the stored ones (runtime-config D2): the same `set_limits` path
+/// as a runtime change, logged on `arneb::admission`.
+pub(super) fn apply_config_limits(
+    controller: &AdmissionController,
+    limits: AdmissionLimits,
+) -> AdmissionSnapshot {
+    let snapshot = controller.set_limits(limits.max_running_queries, limits.max_queued_queries);
+    tracing::info!(
+        target: "arneb::admission",
+        max_running_queries = limits.max_running_queries,
+        max_queued_queries = limits.max_queued_queries,
+        running = snapshot.running,
+        queued = snapshot.queued,
+        "admission limits reset to the config by a re-seed"
+    );
+    snapshot
+}
+
 async fn get_admission(
     State(state): State<WebState>,
     Extension(who): Extension<Identity>,

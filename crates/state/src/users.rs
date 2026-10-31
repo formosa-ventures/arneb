@@ -134,6 +134,23 @@ impl StateStore {
         Ok(report)
     }
 
+    /// What [`seed_users`](Self::seed_users) with the same arguments would
+    /// do now, without writing anything (a re-seed preview).
+    pub fn preview_seed_users(
+        &self,
+        users: &[(String, ScramVerifier)],
+        reseed: bool,
+    ) -> SeedReport {
+        let mut data = StateData::clone(&self.snapshot());
+        apply_seed(&mut data, users, reseed)
+    }
+
+    /// The config users deleted at runtime whose tombstone keeps seeding
+    /// from re-adding them (cleared by a reseed).
+    pub fn tombstones(&self) -> Vec<String> {
+        self.snapshot().deleted_config_users.clone()
+    }
+
     /// Creates the state user `name` (not seeded from the config) with
     /// `verifier`. An existing name fails with [`StateError::UserExists`].
     pub fn create_user(&self, name: &str, verifier: ScramVerifier) -> Result<(), StateError> {
@@ -632,6 +649,22 @@ mod tests {
         assert!(store.snapshot().deleted_config_users.is_empty());
         let err = store.delete_user("dave").unwrap_err();
         assert!(matches!(err, StateError::UnknownUser(_)), "{err:?}");
+    }
+
+    #[test]
+    fn preview_seed_users_reports_without_writing() {
+        let store = StateStore::open(None).unwrap();
+        store
+            .seed_users(&cfg(&[("alice", "a"), ("bob", "b")]), false)
+            .unwrap();
+        store.delete_user("bob").unwrap();
+        assert_eq!(store.tombstones(), vec!["bob"]);
+        let before = stored(&store);
+        let preview = store.preview_seed_users(&cfg(&[("alice", "a2"), ("bob", "b")]), true);
+        assert_eq!(preview.added, vec!["bob"]);
+        assert_eq!(preview.updated, vec!["alice"]);
+        assert_eq!(stored(&store), before, "a preview writes nothing");
+        assert_eq!(store.tombstones(), vec!["bob"]);
     }
 
     #[test]

@@ -1178,6 +1178,7 @@ mod tests {
             audit: crate::web::test_audit_log(),
             rules: rules.into(),
             config_changes: Default::default(),
+            config_path: None,
             catalogs: None,
             authorizer: crate::web::privilege::Authorizer::new(
                 Default::default(),

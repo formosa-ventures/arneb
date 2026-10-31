@@ -164,9 +164,12 @@ struct CliArgs {
     /// Let `[[auth.users]]` overwrite users created through the state store
     /// whose name collides with a config user (revoking their tokens).
     /// Config-seeded users follow the config on every start without it.
-    /// Also replaces the stored access rules with the
-    /// `[access_control] rules_file` (none when unset).
-    /// Only meaningful with `[auth] type = "password"`.
+    /// Also re-seeds the rest of the state from the config file, like
+    /// `POST /api/v2/state/reseed`: the stored access rules become the
+    /// `[access_control] rules_file` (none when unset), the stored catalogs
+    /// become `[[catalogs]]` (runtime-created ones are removed), the
+    /// runtime settings are cleared so the config values apply, and user
+    /// tombstones are cleared. Only meaningful with `[auth] type = "password"`.
     #[arg(long)]
     reseed_state: bool,
 
@@ -232,6 +235,7 @@ async fn run() -> Result<()> {
     let mut config =
         AppConfig::load(args.config.as_deref()).context("failed to load configuration")?;
     let reseed_state = args.reseed_state;
+    let args_config_path = args.config.clone();
 
     // 3. Apply CLI overrides
     if let Some(bind) = args.bind {
@@ -778,6 +782,7 @@ async fn run() -> Result<()> {
         let report = store
             .seed_users(&verifiers, reseed_state)
             .context("cannot seed the state store from [auth] users")?;
+        reseed_settings(&store, reseed_state)?;
         tracing::info!(
             target: "arneb::config",
             state_path = %store
@@ -1035,7 +1040,8 @@ async fn run() -> Result<()> {
             tracing::warn!(
                 target: "arneb::config",
                 "[admission] {knob} / ARNEB_{} = {from_config} is overridden by the runtime \
-                 value {from_state} in the state store",
+                 value {from_state} in the state store. Preview a re-seed with \
+                 POST /api/v2/state/reseed?dry_run=true",
                 knob.to_ascii_uppercase()
             );
         }
@@ -1085,12 +1091,28 @@ async fn run() -> Result<()> {
             default_page_bytes = config.mcp.default_page_bytes,
             "mcp effective settings ([mcp] / ARNEB_MCP_*)"
         );
-        arneb_common::metrics::set_slow_query_threshold(
-            config.observability.slow_query_threshold(),
+        // runtime-config D1/D9: a threshold stored at runtime wins.
+        let slow_query = config::resolve_slow_query_threshold(
+            config.observability.slow_query_threshold_ms,
+            state_store
+                .as_ref()
+                .and_then(|s| s.slow_query_threshold_ms()),
         );
+        if let Some((from_config, from_state)) = slow_query.diverging {
+            tracing::warn!(
+                target: "arneb::config",
+                "[observability] slow_query_threshold_ms / ARNEB_SLOW_QUERY_THRESHOLD_MS = \
+                 {from_config} is overridden by the runtime value {from_state} in the state \
+                 store. Preview a re-seed with POST /api/v2/state/reseed?dry_run=true"
+            );
+        }
+        arneb_common::metrics::set_slow_query_threshold(config::slow_query_threshold_from_ms(
+            slow_query.ms,
+        ));
         tracing::info!(
             target: "arneb::config",
-            slow_query_threshold_ms = config.observability.slow_query_threshold_ms,
+            slow_query_threshold_ms = slow_query.ms,
+            slow_query_source = slow_query.source,
             query_history_size = config.observability.query_history_size,
             "observability effective settings ([observability] / \
              ARNEB_SLOW_QUERY_THRESHOLD_MS (0 = slow-query log off) / ARNEB_QUERY_HISTORY_SIZE)"
@@ -1233,6 +1255,8 @@ async fn run() -> Result<()> {
         audit: audit_log,
         rules: access_rules.clone(),
         config_changes: Default::default(),
+        // Re-seed reloads the same file the process started with (Ruling R3).
+        config_path: args_config_path,
         // Workers serve no Web API; the catalog routes run on the node
         // that owns the catalog definitions (runtime-config D7).
         catalogs: (!matches!(role, ServerRole::Worker)).then(|| live_catalogs.clone()),
@@ -1610,6 +1634,17 @@ async fn apply_pushed_catalogs(
     Ok(report.failed.into_iter().map(|(name, _)| name).collect())
 }
 
+/// runtime-config D2: `--reseed-state` clears the runtime settings, so the
+/// config's admission limits and slow-query threshold apply.
+fn reseed_settings(store: &arneb_state::StateStore, reseed: bool) -> Result<()> {
+    if reseed {
+        store
+            .clear_settings()
+            .context("cannot clear the runtime settings in the state store")?;
+    }
+    Ok(())
+}
+
 /// Loads the external catalogs: from the state store when one is open
 /// (coordinator or standalone under password auth; Ruling R4), else from
 /// the config's `[[catalogs]]` at generation 1. Workers never open a store.
@@ -1821,6 +1856,87 @@ mod tests {
         let live = empty_live();
         load_catalogs(None, &live, &[], false).await.unwrap();
         assert_eq!(live.generation(), 1);
+    }
+
+    /// runtime-config D2: `--reseed-state` re-seeds every object at
+    /// startup: a runtime catalog is replaced by the config's, runtime
+    /// rules by the rules file, and the stored settings are cleared.
+    #[tokio::test]
+    async fn cli_reseed_state_covers_catalogs_and_rules() {
+        let config_spec: config::CatalogConfig = serde_json::from_value(serde_json::json!({
+            "name": "from_cfg", "type": "mysql"
+        }))
+        .unwrap();
+        let store = arneb_state::StateStore::open(None).unwrap();
+        let live = empty_live();
+        load_catalogs(
+            Some(&store),
+            &live,
+            std::slice::from_ref(&config_spec),
+            false,
+        )
+        .await
+        .unwrap();
+        // Runtime changes: a new catalog, the config one dropped, rules set,
+        // settings stored.
+        store.remove_catalog("from_cfg").unwrap();
+        store
+            .put_catalog(arneb_state::CatalogRecord {
+                name: "runtime".into(),
+                spec: serde_json::json!({"name": "runtime", "type": "mysql"}),
+                from_config: false,
+            })
+            .unwrap();
+        let runtime_rules = r#"{"catalogs":[{"allow":"all"}]}"#;
+        store
+            .set_access_rules(Some(arneb_state::StoredRules {
+                json: runtime_rules.into(),
+                from_config: false,
+            }))
+            .unwrap();
+        store.set_slow_query_threshold_ms(5).unwrap();
+
+        // A start without --reseed-state keeps them all.
+        let live = empty_live();
+        load_catalogs(
+            Some(&store),
+            &live,
+            std::slice::from_ref(&config_spec),
+            false,
+        )
+        .await
+        .unwrap();
+        reseed_settings(&store, false).unwrap();
+        let no_rules = config::AccessControlConfig::default();
+        config::resolve_access_rules(&no_rules, Some(&store), false).unwrap();
+        let names = |s: &arneb_state::StateStore| -> Vec<(String, bool)> {
+            s.catalogs()
+                .1
+                .into_iter()
+                .map(|c| (c.name, c.from_config))
+                .collect()
+        };
+        assert_eq!(names(&store), vec![("runtime".to_owned(), false)]);
+        assert!(store.access_rules().is_some());
+        assert_eq!(store.slow_query_threshold_ms(), Some(5));
+
+        // --reseed-state restores the config for all of them.
+        let live = empty_live();
+        load_catalogs(
+            Some(&store),
+            &live,
+            std::slice::from_ref(&config_spec),
+            true,
+        )
+        .await
+        .unwrap();
+        reseed_settings(&store, true).unwrap();
+        let resolved = config::resolve_access_rules(&no_rules, Some(&store), true).unwrap();
+        assert_eq!(names(&store), vec![("from_cfg".to_owned(), true)]);
+        assert_eq!(live.generation(), store.catalogs().0);
+        assert_eq!(store.access_rules(), None, "no rules file: no rules");
+        assert!(resolved.handle.current().is_none());
+        assert_eq!(store.slow_query_threshold_ms(), None);
     }
 
     /// runtime-config D8: workers ignore their own `[[catalogs]]`; they

@@ -949,11 +949,41 @@ impl ObservabilityConfig {
         );
         Ok(())
     }
+}
 
-    /// The slow-query threshold; `None` when the log is off.
-    pub fn slow_query_threshold(&self) -> Option<std::time::Duration> {
-        (self.slow_query_threshold_ms > 0)
-            .then(|| std::time::Duration::from_millis(self.slow_query_threshold_ms))
+/// A slow-query threshold in ms as a duration; `None` (log off) for `0`.
+pub fn slow_query_threshold_from_ms(ms: u64) -> Option<std::time::Duration> {
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// The slow-query threshold a coordinator starts with (runtime-config D1,
+/// D9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSlowQuery {
+    /// The threshold in ms to apply (`0` = log off).
+    pub ms: u64,
+    /// `"config"` (`[observability]`) or `"state"` (a runtime value stored
+    /// in the state store).
+    pub source: &'static str,
+    /// `(config value, stored value)` when a stored value overrides a
+    /// different config value.
+    pub diverging: Option<(u64, u64)>,
+}
+
+/// Pick the startup slow-query threshold: a value stored at runtime wins
+/// over the config, and a different config value is reported as diverging.
+pub fn resolve_slow_query_threshold(config_ms: u64, stored: Option<u64>) -> ResolvedSlowQuery {
+    match stored {
+        None => ResolvedSlowQuery {
+            ms: config_ms,
+            source: "config",
+            diverging: None,
+        },
+        Some(ms) => ResolvedSlowQuery {
+            ms,
+            source: "state",
+            diverging: (ms != config_ms).then_some((config_ms, ms)),
+        },
     }
 }
 
@@ -2693,13 +2723,16 @@ pgwire = "required"
         };
         let none = load("port = 5432", &[]).unwrap();
         assert_eq!(
-            none.slow_query_threshold(),
+            slow_query_threshold_from_ms(none.slow_query_threshold_ms),
             Some(std::time::Duration::from_secs(10))
         );
         let file = "[observability]\nslow_query_threshold_ms = 2500\n";
         assert_eq!(load(file, &[]).unwrap().slow_query_threshold_ms, 2500);
         let off = load(file, &[("ARNEB_SLOW_QUERY_THRESHOLD_MS", "0")]).unwrap();
-        assert_eq!(off.slow_query_threshold(), None);
+        assert_eq!(
+            slow_query_threshold_from_ms(off.slow_query_threshold_ms),
+            None
+        );
         let err = load(file, &[("ARNEB_SLOW_QUERY_THRESHOLD_MS", "soon")]).unwrap_err();
         assert!(
             err.to_string().contains("ARNEB_SLOW_QUERY_THRESHOLD_MS"),

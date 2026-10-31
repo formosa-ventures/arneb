@@ -70,6 +70,8 @@ pub fn routes() -> Router<WebState> {
         .merge(super::rules::routes())
         .merge(super::users::routes())
         .merge(super::catalogs::routes())
+        .merge(super::settings::routes())
+        .merge(super::reseed::routes())
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
 }
@@ -901,6 +903,7 @@ pub(super) mod tests {
             audit: crate::web::test_audit_log(),
             rules: Default::default(),
             config_changes: Default::default(),
+            config_path: None,
             catalogs: None,
             authorizer: crate::web::privilege::Authorizer::new(
                 Default::default(),

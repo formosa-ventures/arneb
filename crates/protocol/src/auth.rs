@@ -20,7 +20,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::num::NonZeroU32;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use aws_lc_rs::{constant_time, digest, hmac, pbkdf2};
@@ -139,6 +139,11 @@ impl ScramVerifier {
         self.iterations
     }
 
+    /// Salt of this verifier.
+    pub fn salt(&self) -> &[u8] {
+        &self.salt
+    }
+
     /// Check a client proof against this verifier (constant time).
     fn verify_client_proof(&self, auth_message: &[u8], client_proof: &[u8]) -> bool {
         if client_proof.len() != KEY_LEN {
@@ -226,12 +231,30 @@ impl FromStr for ScramVerifier {
     }
 }
 
+/// Where password authentication looks up users and API tokens.
+///
+/// Implemented by [`UserCredentials`] (the static `[[auth.users]]` list, no
+/// tokens) and by the coordinator's state store (users plus API tokens).
+/// Implementations must not log passwords or tokens.
+pub trait CredentialSource: Send + Sync + std::fmt::Debug {
+    /// Verifiers for `user` — the password first, then each live token — all
+    /// sharing one salt and iteration count. Empty when the user is unknown.
+    fn scram_verifiers(&self, user: &str) -> Vec<ScramVerifier>;
+    /// HTTP Basic: the user's password, or one of the user's live API tokens.
+    ///
+    /// A [token-shaped](is_token_shaped) password is checked only as a token
+    /// (a SHA-256 compare, no PBKDF2). Any other password costs one PBKDF2
+    /// derivation, against a decoy verifier when the user is unknown.
+    fn verify_password(&self, user: &str, password: &str) -> bool;
+    /// Bearer: the user owning this live token.
+    fn verify_token(&self, token: &str) -> Option<String>;
+    /// Number of users, for the startup log.
+    fn user_count(&self) -> usize;
+}
+
 /// The set of users allowed to connect under password authentication.
 pub struct UserCredentials {
     users: HashMap<String, ScramVerifier>,
-    /// Per-process secret used to derive stable fake salts for unknown users,
-    /// so probing does not reveal which user names exist.
-    mock_secret: [u8; KEY_LEN],
 }
 
 impl Debug for UserCredentials {
@@ -263,12 +286,7 @@ impl UserCredentials {
         if map.is_empty() {
             return Err(AuthConfigError::NoUsers);
         }
-        let mut mock_secret = [0u8; KEY_LEN];
-        aws_lc_rs::rand::fill(&mut mock_secret).map_err(|_| AuthConfigError::Random)?;
-        Ok(Self {
-            users: map,
-            mock_secret,
-        })
+        Ok(Self { users: map })
     }
 
     /// Number of configured users.
@@ -295,21 +313,79 @@ impl UserCredentials {
     fn lookup(&self, user: &str) -> (ScramVerifier, bool) {
         match self.users.get(user) {
             Some(v) => (v.clone(), true),
-            None => {
-                let salt = hmac_sha256(&self.mock_secret, user.as_bytes());
-                let keys = hmac_sha256(&self.mock_secret, &salt);
-                (
-                    ScramVerifier {
-                        iterations: DEFAULT_SCRAM_ITERATIONS,
-                        salt: salt[..SALT_LEN].to_vec(),
-                        stored_key: keys,
-                        server_key: keys,
-                    },
-                    false,
-                )
-            }
+            None => (decoy_verifier(user), false),
         }
     }
+}
+
+impl CredentialSource for UserCredentials {
+    fn scram_verifiers(&self, user: &str) -> Vec<ScramVerifier> {
+        self.users.get(user).cloned().into_iter().collect()
+    }
+
+    /// Config users have no API tokens, so a token-shaped password is
+    /// refused without running PBKDF2.
+    fn verify_password(&self, user: &str, password: &str) -> bool {
+        if is_token_shaped(password) {
+            return false;
+        }
+        UserCredentials::verify_password(self, user, password)
+    }
+
+    fn verify_token(&self, _token: &str) -> Option<String> {
+        None
+    }
+
+    fn user_count(&self) -> usize {
+        self.len()
+    }
+}
+
+/// The one per-process secret behind every decoy verifier (pgwire, Trino and
+/// Web Basic, config users and the state store alike); stable for the
+/// process so a probed user always gets the same fake salt on every path.
+fn decoy_secret() -> &'static [u8; KEY_LEN] {
+    static SECRET: OnceLock<[u8; KEY_LEN]> = OnceLock::new();
+    SECRET.get_or_init(|| {
+        let mut secret = [0u8; KEY_LEN];
+        aws_lc_rs::rand::fill(&mut secret).expect("system random number generator failed");
+        secret
+    })
+}
+
+/// Deterministic fake verifier for a user that does not exist, derived from
+/// the process-wide decoy secret. Verifying against it costs the same PBKDF2
+/// as a real user and never succeeds, so timing and salts do not reveal
+/// which users exist, and every credential source and protocol hands the
+/// same unknown user the same fake salt.
+pub fn decoy_verifier(user: &str) -> ScramVerifier {
+    let secret = decoy_secret();
+    let salt = hmac_sha256(secret, user.as_bytes());
+    let keys = hmac_sha256(secret, &salt);
+    ScramVerifier {
+        iterations: DEFAULT_SCRAM_ITERATIONS,
+        salt: salt[..SALT_LEN].to_vec(),
+        stored_key: keys,
+        server_key: keys,
+    }
+}
+
+/// Whether `s` has the exact shape of an Arneb API token:
+/// `arneb_<16 lowercase hex>_<43 base64url characters, no padding>`.
+/// Session tokens (`arneb_s_...`) deliberately do not match.
+pub fn is_token_shaped(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("arneb_") else {
+        return false;
+    };
+    let Some((id, secret)) = rest.split_once('_') else {
+        return false;
+    };
+    id.len() == 16
+        && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && secret.len() == 43
+        && secret
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// How clients authenticate on the pgwire port.
@@ -318,8 +394,9 @@ pub enum AuthMethod {
     /// Accept every connection without a password (default).
     #[default]
     None,
-    /// Require SCRAM-SHA-256 password authentication.
-    ScramSha256(Arc<UserCredentials>),
+    /// Require SCRAM-SHA-256 password authentication against these users
+    /// (and their API tokens, if the source has any).
+    ScramSha256(Arc<dyn CredentialSource>),
 }
 
 impl AuthMethod {
@@ -341,7 +418,10 @@ impl AuthMethod {
 struct ScramExchange {
     user: String,
     known_user: bool,
-    verifier: ScramVerifier,
+    /// The user's verifiers (password first, then live tokens), all with
+    /// the salt and iterations sent in server-first; a single decoy for an
+    /// unknown user.
+    verifiers: Vec<ScramVerifier>,
     gs2_header: String,
     client_first_bare: String,
     server_first: String,
@@ -491,7 +571,7 @@ impl AuthStartupHandler {
 
     async fn scram_step<C>(
         &self,
-        creds: &UserCredentials,
+        creds: &dyn CredentialSource,
         client: &mut C,
         message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
@@ -536,7 +616,12 @@ impl AuthStartupHandler {
                     .get(METADATA_USER)
                     .cloned()
                     .ok_or(PgWireError::UserNameRequired)?;
-                let (verifier, known_user) = creds.lookup(&user);
+                let mut verifiers = creds.scram_verifiers(&user);
+                let known_user = !verifiers.is_empty();
+                if !known_user {
+                    verifiers.push(decoy_verifier(&user));
+                }
+                let first = &verifiers[0];
 
                 let mut server_nonce = [0u8; 18];
                 aws_lc_rs::rand::fill(&mut server_nonce)
@@ -544,8 +629,8 @@ impl AuthStartupHandler {
                 let nonce = format!("{client_nonce}{}", STANDARD.encode(server_nonce));
                 let server_first = format!(
                     "r={nonce},s={},i={}",
-                    STANDARD.encode(&verifier.salt),
-                    verifier.iterations
+                    STANDARD.encode(&first.salt),
+                    first.iterations
                 );
                 client
                     .send(PgWireBackendMessage::Authentication(
@@ -555,7 +640,7 @@ impl AuthStartupHandler {
                 self.set_state(ScramState::AwaitingClientFinal(Box::new(ScramExchange {
                     user,
                     known_user,
-                    verifier,
+                    verifiers,
                     gs2_header,
                     client_first_bare,
                     server_first,
@@ -573,10 +658,17 @@ impl AuthStartupHandler {
                     "{},{},{}",
                     exchange.client_first_bare, exchange.server_first, without_proof
                 );
-                let proof_ok = exchange
-                    .verifier
-                    .verify_client_proof(auth_message.as_bytes(), &proof);
-                if !(proof_ok && exchange.known_user) {
+                // Check every verifier (no early exit) and remember the first
+                // that matched: it signs server-final, proving to the client
+                // that the server knows the credential the client used.
+                let mut matched = None;
+                for (i, v) in exchange.verifiers.iter().enumerate() {
+                    if v.verify_client_proof(auth_message.as_bytes(), &proof) && matched.is_none() {
+                        matched = Some(i);
+                    }
+                }
+                let matched = matched.filter(|_| exchange.known_user);
+                let Some(matched) = matched else {
                     tracing::warn!(
                         user = %exchange.user,
                         peer = %client.socket_addr(),
@@ -589,8 +681,9 @@ impl AuthStartupHandler {
                             exchange.user
                         ),
                     ));
-                }
-                let signature = exchange.verifier.server_signature(auth_message.as_bytes());
+                };
+                let signature =
+                    exchange.verifiers[matched].server_signature(auth_message.as_bytes());
                 let server_final = format!("v={}", STANDARD.encode(signature));
                 client
                     .send(PgWireBackendMessage::Authentication(
@@ -650,7 +743,7 @@ impl StartupHandler for AuthStartupHandler {
                 Ok(())
             }
             AuthMethod::ScramSha256(creds) => self
-                .scram_step(creds, client, message)
+                .scram_step(creds.as_ref(), client, message)
                 .await
                 .map_err(ensure_fatal),
         }
@@ -674,6 +767,36 @@ pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; KEY_LEN] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_shape_accepts_only_the_documented_form() {
+        let id = "0123456789abcdef";
+        let secret = "A".repeat(43);
+        assert!(is_token_shaped(&format!("arneb_{id}_{secret}")));
+        let mixed = "aZ09-_".repeat(7) + "a"; // 43 chars incl. '-' and '_'
+        assert_eq!(mixed.len(), 43);
+        // '_' inside the secret is fine: only the first '_' splits the id.
+        assert!(is_token_shaped(&format!("arneb_{id}_{mixed}")));
+
+        assert!(!is_token_shaped(&format!("other_{id}_{secret}")));
+        assert!(!is_token_shaped(&format!("arneb_{}_{secret}", &id[..15])));
+        assert!(!is_token_shaped(&format!("arneb_{id}0_{secret}")));
+        assert!(!is_token_shaped(&format!(
+            "arneb_{}_{secret}",
+            id.to_uppercase()
+        )));
+        assert!(!is_token_shaped(&format!(
+            "arneb_0123456789abcdeg_{secret}"
+        )));
+        assert!(!is_token_shaped(&format!("arneb_{id}_{}", &secret[..42])));
+        assert!(!is_token_shaped(&format!("arneb_{id}_{secret}A")));
+        assert!(!is_token_shaped(&format!("arneb_{id}_{}=", &secret[..42])));
+        assert!(!is_token_shaped(&format!("arneb_{id}_{secret}_extra")));
+        assert!(!is_token_shaped(&format!("arneb_{id}_{}+", &secret[..42])));
+        assert!(!is_token_shaped(&format!("arneb_s_{secret}")));
+        assert!(!is_token_shaped(""));
+        assert!(!is_token_shaped("arneb_"));
+    }
 
     #[test]
     fn verify_password_checks_the_stored_key() {

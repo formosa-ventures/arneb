@@ -458,10 +458,13 @@ dependencies = [
  "arneb-rpc",
  "arneb-scheduler",
  "arneb-sql-parser",
+ "arneb-state",
  "arrow",
  "async-recursion",
  "async-trait",
+ "aws-lc-rs",
  "axum",
+ "base64 0.23.1",
  "clap",
  "futures",
  "hive-metastore",
@@ -479,6 +482,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "toml 1.1.3+spec-1.1.0",
+ "tower",
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
@@ -494,6 +498,21 @@ dependencies = [
  "chrono",
  "serde",
  "sqlparser",
+]
+
+[[package]]
+name = "arneb-state"
+version = "0.1.8"
+dependencies = [
+ "arneb-protocol",
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

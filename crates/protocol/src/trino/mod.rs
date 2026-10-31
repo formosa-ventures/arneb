@@ -49,9 +49,10 @@ use arneb_connectors::ConnectorRegistry;
 use arneb_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
 use arneb_scheduler::{QueryState as TrackerState, QueryTracker};
 
-use crate::auth::{AuthConfigError, UserCredentials};
+use crate::auth::{AuthConfigError, CredentialSource};
 use crate::handler::DistributedExecutor;
-use auth::{AuthUser, Authenticator};
+use auth::AuthUser;
+pub use auth::{BasicAuthenticator, BasicVerdict};
 use engine::{Engine, QueryOutput};
 use error::TrinoError;
 use session::{ClientSession, HeaderFamily};
@@ -109,7 +110,7 @@ pub struct TrinoServer {
     memory_pool: Arc<dyn MemoryPool>,
     query_tracker: Arc<QueryTracker>,
     tls: Option<TlsAcceptor>,
-    auth: Option<Authenticator>,
+    auth: Option<BasicAuthenticator>,
     verifications: Arc<AtomicU64>,
     query_memory_limit: Option<usize>,
     admission: Option<arneb_scheduler::AdmissionController>,
@@ -146,12 +147,23 @@ impl TrinoServer {
     /// "password"`); default: none, every `X-Trino-User` is trusted.
     pub fn with_password_auth(
         mut self,
-        creds: Option<Arc<UserCredentials>>,
+        creds: Option<Arc<dyn CredentialSource>>,
     ) -> Result<Self, AuthConfigError> {
         self.auth = creds
-            .map(|c| Authenticator::new(c, Arc::clone(&self.verifications)))
+            .map(|c| BasicAuthenticator::with_counter(c, Arc::clone(&self.verifications)))
             .transpose()?;
         Ok(self)
+    }
+
+    /// Require HTTP Basic auth through `auth`, an authenticator the caller
+    /// shares with other listeners (one PBKDF2 limiter, queue and cache for
+    /// all of them). `None`: no auth, every `X-Trino-User` is trusted.
+    pub fn with_authenticator(mut self, auth: Option<BasicAuthenticator>) -> Self {
+        if let Some(a) = &auth {
+            self.verifications = Arc::clone(&a.verifications);
+        }
+        self.auth = auth;
+        self
     }
 
     /// Count of full password verifications (cache misses); test hook.
@@ -378,7 +390,7 @@ struct AppState {
     /// Scheme for `nextUri` / `infoUri` when the client sends no
     /// `X-Forwarded-Proto`: `https` when the listener serves TLS.
     scheme: &'static str,
-    auth: Option<Authenticator>,
+    auth: Option<BasicAuthenticator>,
     admission: Option<arneb_scheduler::AdmissionController>,
     statement_timeout: Option<Duration>,
 }

@@ -25,6 +25,7 @@ arneb-connectors = { path = "../connectors" }
 arneb-execution = { path = "../execution" }
 arneb-planner = { path = "../planner" }
 arneb-protocol = { path = "../protocol" }
+arneb-state = { path = "../state" }
 arneb-scheduler = { path = "../scheduler" }
 arneb-rpc = { path = "../rpc" }
 arneb-sql-parser = { path = "../sql-parser" }
@@ -72,6 +73,10 @@ axum = { workspace = true }
 tower-http = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
+# Web API sessions: random tokens and their SHA-256 (already in the tree
+# through arneb-protocol / arneb-state).
+aws-lc-rs = "1"
+base64 = "0.23"
 
 # HMS demo setup binary dependencies
 hive-metastore = { path = "../hive-metastore" }
@@ -83,6 +88,7 @@ object_store.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time", "signal", "test-util"] }
 pgwire = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
 arrow = { workspace = true }
 tempfile = "3"
 arneb-catalog = { path = "../catalog" }

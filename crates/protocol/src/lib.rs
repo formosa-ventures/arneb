@@ -12,10 +12,13 @@ mod timeout;
 pub mod tls;
 pub mod trino;
 
-pub use auth::{AuthConfigError, AuthMethod, ScramVerifier, UserCredentials};
+pub use auth::{
+    decoy_verifier, is_token_shaped, AuthConfigError, AuthMethod, CredentialSource, ScramVerifier,
+    UserCredentials,
+};
 pub use server::{ProtocolConfig, ProtocolServer};
 pub use tls::{PgwireTls, PgwireTlsMode, ServerTls, TlsConfigError};
-pub use trino::{TrinoConfig, TrinoServer};
+pub use trino::{BasicAuthenticator, BasicVerdict, TrinoConfig, TrinoServer};
 
 // Re-export the distributed executor trait for server crate to implement
 pub use handler::DistributedExecutor;

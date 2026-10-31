@@ -160,6 +160,13 @@ struct CliArgs {
     #[arg(long)]
     profile: bool,
 
+    /// Let `[[auth.users]]` overwrite users created through the state store
+    /// whose name collides with a config user (revoking their tokens).
+    /// Config-seeded users follow the config on every start without it.
+    /// Only meaningful with `[auth] type = "password"`.
+    #[arg(long)]
+    reseed_state: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -221,6 +228,7 @@ async fn run() -> Result<()> {
     // 2. Load config (file + env overrides)
     let mut config =
         AppConfig::load(args.config.as_deref()).context("failed to load configuration")?;
+    let reseed_state = args.reseed_state;
 
     // 3. Apply CLI overrides
     if let Some(bind) = args.bind {
@@ -755,10 +763,60 @@ async fn run() -> Result<()> {
         ));
     }
 
-    let auth_method = config
+    // Validate [auth] on every role (workers never open the state store).
+    let (config_auth, verifiers) = config
         .auth
         .to_auth_method()
         .context("invalid [auth] configuration")?;
+    // Password auth on a coordinator/standalone: users live in the state
+    // store; config-seeded users follow the config file on every start
+    // (a changed hash or a removed user revokes tokens). The same store
+    // serves pgwire, Trino and the Web API.
+    let state_store = if matches!(role, ServerRole::Coordinator | ServerRole::Standalone)
+        && matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_))
+    {
+        let store = arneb_state::StateStore::open(config.state.path.as_deref())
+            .context("cannot open the state store ([state] path / ARNEB_STATE_PATH)")?;
+        let report = store
+            .seed_users(&verifiers, reseed_state)
+            .context("cannot seed the state store from [auth] users")?;
+        tracing::info!(
+            target: "arneb::config",
+            state_path = %store
+                .path()
+                .map_or_else(|| "in-memory".to_owned(), |p| p.display().to_string()),
+            persistent = store.is_persistent(),
+            users = arneb_protocol::CredentialSource::user_count(&store),
+            first_start = report.first_start,
+            added = ?report.added,
+            updated = ?report.updated,
+            removed = ?report.removed,
+            conflicts = ?report.conflicts,
+            revoked_tokens = report.revoked_tokens,
+            reseed = reseed_state,
+            "state store effective settings ([state] path / ARNEB_STATE_PATH / --reseed-state)"
+        );
+        if !store.is_persistent() {
+            tracing::warn!(
+                target: "arneb::config",
+                "no [state] path: API tokens are lost on restart"
+            );
+        }
+        Some(Arc::new(store))
+    } else {
+        if reseed_state {
+            tracing::info!(
+                target: "arneb::config",
+                "--reseed-state ignored: it only applies with [auth] type = \"password\" \
+                 on a coordinator or standalone server"
+            );
+        }
+        None
+    };
+    let auth_method = match &state_store {
+        Some(store) => arneb_protocol::AuthMethod::ScramSha256(store.clone()),
+        None => config_auth,
+    };
     let access_rules = if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
         config
             .access_control
@@ -791,7 +849,7 @@ async fn run() -> Result<()> {
     }
     if !matches!(role, ServerRole::Worker) {
         let users = match &auth_method {
-            arneb_protocol::AuthMethod::ScramSha256(creds) => creds.len(),
+            arneb_protocol::AuthMethod::ScramSha256(creds) => creds.user_count(),
             arneb_protocol::AuthMethod::None => 0,
         };
         tracing::info!(
@@ -837,6 +895,16 @@ async fn run() -> Result<()> {
         arneb_protocol::AuthMethod::ScramSha256(creds) => Some(Arc::clone(creds)),
         arneb_protocol::AuthMethod::None => None,
     };
+    // One Basic authenticator for the Trino and Web listeners, so both share
+    // one PBKDF2 limiter, one wait queue and one verification cache.
+    let basic_auth = password_users
+        .clone()
+        .map(arneb_protocol::BasicAuthenticator::new)
+        .transpose()
+        .context("HTTP Basic authentication")?;
+    let state_for_web = state_store.clone();
+    let credentials_for_web: Option<Arc<dyn arneb_protocol::CredentialSource>> =
+        state_store.clone().map(|s| s as _);
 
     // admission-control D5/D8: one controller for the process, shared by
     // pgwire, the Trino listener and the Web UI. Workers have none; their
@@ -942,8 +1010,7 @@ async fn run() -> Result<()> {
         .with_query_tracker(query_tracker.clone())
         .with_access_rules(access_rules.clone())
         .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
-        .with_password_auth(password_users.clone())
-        .context("Trino listener authentication")?;
+        .with_authenticator(basic_auth.clone());
         if let Some(ref executor) = distributed_executor {
             trino = trino.with_distributed_executor(Arc::clone(executor));
         }
@@ -982,6 +1049,14 @@ async fn run() -> Result<()> {
         max_queued_queries: config.admission.max_queued_queries,
         memory_pool: memory_pool.clone(),
         memory_limit_bytes: budget.map(|b| b as u64),
+        // Same source as `credentials_for_web` (the state store) whenever
+        // that is set: password auth makes the state store the auth method.
+        basic: credentials_for_web.as_ref().and(basic_auth),
+        credentials: credentials_for_web,
+        state: state_for_web,
+        access_rules: access_rules.clone(),
+        metrics_auth: config.web.metrics_auth,
+        sessions: web::SessionStore::new(),
     };
     let web_router = web::build_router(web_state);
     let web_port = config.server.port + 1000; // default: pgwire port + 1000 (e.g., 5432 → 6432)
@@ -996,14 +1071,19 @@ async fn run() -> Result<()> {
             target: "arneb::config",
             web_bind_address = %web_addr,
             reason = web_reason,
-            "Web UI effective bind ([web] bind_address / ARNEB_WEB_BIND_ADDRESS)"
+            // Credentials exist only under password auth, so only then can
+            // `/metrics` require them.
+            metrics_auth = config.web.metrics_auth && password_users.is_some(),
+            "Web UI effective bind ([web] bind_address / ARNEB_WEB_BIND_ADDRESS) and \
+             /metrics auth ([web] metrics_auth / ARNEB_WEB_METRICS_AUTH)"
         );
         if password_users.is_some() && !config::is_loopback_host(&web_host) {
             tracing::warn!(
                 target: "arneb::config",
                 web_bind_address = %web_addr,
-                "the Web UI has no login and shows query text; it is reachable beyond \
-                 loopback while [auth] type = \"password\""
+                "the Web UI and API require sign-in under [auth] type = \"password\", but \
+                 serves plain HTTP (credentials and query text are unencrypted) and is \
+                 reachable beyond loopback"
             );
         }
     }

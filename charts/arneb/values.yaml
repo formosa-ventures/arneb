@@ -49,6 +49,16 @@ securityContext:
     drop: ["ALL"]
 
 coordinator:
+  # Users and API tokens the coordinator persists (ARNEB_STATE_PATH, file
+  # /var/lib/arneb/state.json). Only the coordinator mounts it. Without
+  # persistence it is an emptyDir, so tokens are lost when the pod restarts.
+  state:
+    persistence:
+      enabled: true
+      size: 1Gi
+      storageClass: ""
+      # Use an existing PVC instead of creating one.
+      existingClaim: ""
   service:
     type: ClusterIP
     annotations: {}

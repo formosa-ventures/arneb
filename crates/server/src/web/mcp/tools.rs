@@ -19,12 +19,15 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use super::{identity, ok, tool_error, ArnebMcp};
+use crate::web::admission::{self, AdmissionUpdate};
 use crate::web::agent::{service, wait};
 use crate::web::api::{self, BoundedParams, BoundedQuery};
+use crate::web::audit::{self, AuditParams};
 use crate::web::auth::AuthVia;
-use crate::web::error::ApiError;
+use crate::web::error::{ApiError, ErrorCode};
 use crate::web::privilege::Layer;
 use crate::web::v2;
+use crate::web::workers::{self, WorkerOp};
 
 /// Arguments of `list_catalogs`.
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -137,9 +140,65 @@ struct FetchArgs {
 
 /// Arguments of `cancel_query`.
 #[derive(Deserialize, schemars::JsonSchema)]
-struct IdArgs {
-    /// The statement id from `submit_query`.
+struct CancelArgs {
+    /// The id to cancel: a statement id from `submit_query`, or a query id
+    /// from `list_queries`.
     id: String,
+    /// Preview only: report what cancelling would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
+/// Arguments of `list_workers`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ListWorkersArgs {
+    /// Most workers to return: default {worker_limit}; at most
+    /// {max_worker_limit}.
+    limit: Option<usize>,
+}
+
+/// Arguments of `get_worker`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WorkerIdArgs {
+    /// The worker id from `list_workers`.
+    id: String,
+}
+
+/// Arguments of `cordon_worker`, `drain_worker` and `uncordon_worker`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WorkerActionArgs {
+    /// The worker id from `list_workers`.
+    id: String,
+    /// Preview only: report what the action would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
+/// Arguments of `set_admission_limits`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct AdmissionArgs {
+    /// New most queries running at once; 0 means unlimited. Omit to keep it.
+    max_running_queries: Option<i64>,
+    /// New most queries waiting to run. Omit to keep it. At least one limit
+    /// is required.
+    max_queued_queries: Option<i64>,
+    /// Preview only: report what the change would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
+/// Arguments of `list_audit_log`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct AuditArgs {
+    /// Most entries to return (default {audit_limit}, at most
+    /// {max_audit_limit}).
+    limit: Option<usize>,
+    /// The previous page's `next_cursor`: entries older than it.
+    cursor: Option<u64>,
+    /// Keep only actions by this user.
+    user: Option<String>,
+    /// Keep only this action, such as worker.cordon or query.cancel.
+    action: Option<String>,
 }
 
 /// Arguments of `list_queries`.
@@ -204,6 +263,10 @@ pub(super) fn copy_values(limits: &AgentLimits, page_bytes: usize) -> Vec<(&'sta
         ),
         ("{query_limit}", api::DEFAULT_QUERY_LIMIT.to_string()),
         ("{max_query_limit}", api::MAX_QUERY_LIMIT.to_string()),
+        ("{worker_limit}", workers::DEFAULT_WORKER_LIMIT.to_string()),
+        ("{max_worker_limit}", workers::MAX_WORKER_LIMIT.to_string()),
+        ("{audit_limit}", audit::DEFAULT_AUDIT_LIMIT.to_string()),
+        ("{max_audit_limit}", audit::MAX_AUDIT_LIMIT.to_string()),
     ]
 }
 
@@ -273,6 +336,21 @@ impl ArnebMcp {
             .map_or(AgentLimits::default().max_cell_bytes, |a| {
                 a.limits().max_cell_bytes
             })
+    }
+
+    /// A worker scheduling change as the caller: the shared path of the
+    /// cordon, drain and uncordon tools.
+    async fn worker_action(
+        &self,
+        a: WorkerActionArgs,
+        ctx: RequestContext<RoleServer>,
+        op: WorkerOp,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(
+            workers::worker_action_for(&self.state, &who, &a.id, op, a.dry_run.unwrap_or(false))
+                .await,
+        )
     }
 
     /// The MCP page budget of inline first pages and omitted `max_bytes`.
@@ -549,10 +627,14 @@ impl ArnebMcp {
         )
     }
 
-    /// `cancel_query`: `DELETE /api/v2/statements/{id}`.
+    /// `cancel_query`: `DELETE /api/v2/statements/{id}` or
+    /// `DELETE /api/v2/queries/{id}`.
     #[tool(
-        description = "Cancel a statement you submitted. Safe to repeat; a statement that has \
-                       already ended keeps its state. Returns the status after cancelling.",
+        description = "Cancel a query by id. Your own statement from submit_query returns its \
+                       status after cancelling (safe to repeat). Any other id, or a dry_run, \
+                       returns the manage envelope (dry_run, action, summary, changed, result); \
+                       cancelling another user's query needs the manage privilege or a kill \
+                       rule and is audited. A query that already ended is changed: false.",
         annotations(
             destructive_hint = true,
             idempotent_hint = true,
@@ -561,17 +643,27 @@ impl ArnebMcp {
     )]
     async fn cancel_query(
         &self,
-        Parameters(a): Parameters<IdArgs>,
+        Parameters(a): Parameters<CancelArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let who = identity(&ctx)?;
-        respond(
-            async {
-                let svc = service(&self.state)?;
-                Ok(svc.cancel(&who.user, &a.id, Some(self.page_bytes(svc)))?)
+        let dry_run = a.dry_run.unwrap_or(false);
+        if !dry_run {
+            // The caller's own agent statement keeps the H3 behavior and
+            // result; any other id is not found here and goes on.
+            if let Some(svc) = self.state.agent.as_ref() {
+                match svc.cancel(&who.user, &a.id, Some(self.page_bytes(svc))) {
+                    Ok(status) => return ok(&status),
+                    Err(e) => {
+                        let e = ApiError::from(e);
+                        if e.code != ErrorCode::NotFound {
+                            return Ok(tool_error(e));
+                        }
+                    }
+                }
             }
-            .await,
-        )
+        }
+        respond(v2::cancel_query_for(&self.state, &who, &a.id, dry_run).await)
     }
 
     /// `list_queries`: the bounded `GET /api/v2/queries`.
@@ -644,23 +736,164 @@ impl ArnebMcp {
         )
     }
 
-    /// `list_workers`: `GET /api/v2/cluster/workers`.
+    /// `list_workers`: `GET /api/v2/workers`.
     #[tool(
-        description = "List the alive workers with address, version, heartbeat age and whether \
-                       they are active or draining.",
+        description = "List the workers, sorted by id: `limit` defaults to {worker_limit}, at \
+                       most {max_worker_limit}; `truncated` says if more exist. Each has \
+                       its lifecycle `state` and its `scheduling` (schedulable, cordoned, \
+                       draining or drained). Next: get_worker, or cordon_worker to take one \
+                       out of rotation.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_workers(
         &self,
+        Parameters(a): Parameters<ListWorkersArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let who = identity(&ctx)?;
-        respond(
-            self.state
-                .authorizer
-                .check(&who, Layer::Observe)
-                .map(|_| serde_json::json!({"workers": api::workers_response(&self.state)})),
+        respond(workers::list_workers_for(&self.state, &who, a.limit))
+    }
+
+    /// `get_worker`: `GET /api/v2/workers/{id}`.
+    #[tool(
+        description = "Get one worker by id: address, version, heartbeat age, lifecycle state, \
+                       scheduling and the queries in flight on it.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_worker(
+        &self,
+        Parameters(a): Parameters<WorkerIdArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(workers::get_worker_for(&self.state, &who, &a.id))
+    }
+
+    /// `cordon_worker`: `POST /api/v2/workers/{id}/cordon`.
+    #[tool(
+        description = "Cordon a worker: it gets no new queries, running ones continue. Needs \
+                       the manage privilege. Preview with dry_run first. Next: drain_worker to \
+                       wait for its queries to finish, or uncordon_worker to undo.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
         )
+    )]
+    async fn cordon_worker(
+        &self,
+        Parameters(a): Parameters<WorkerActionArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.worker_action(a, ctx, WorkerOp::Cordon).await
+    }
+
+    /// `drain_worker`: `POST /api/v2/workers/{id}/drain`.
+    #[tool(
+        description = "Drain a worker: cordon it and watch its in-flight queries; scheduling \
+                       is draining until they finish, then drained, when it is safe to stop. \
+                       Needs the manage privilege. Preview with dry_run first. Next: \
+                       get_worker until drained, or uncordon_worker to undo.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn drain_worker(
+        &self,
+        Parameters(a): Parameters<WorkerActionArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.worker_action(a, ctx, WorkerOp::Drain).await
+    }
+
+    /// `uncordon_worker`: `POST /api/v2/workers/{id}/uncordon`.
+    #[tool(
+        description = "Return a cordoned or draining worker to scheduling so it gets new \
+                       queries again. Needs the manage privilege. Preview with dry_run first.",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn uncordon_worker(
+        &self,
+        Parameters(a): Parameters<WorkerActionArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.worker_action(a, ctx, WorkerOp::Uncordon).await
+    }
+
+    /// `get_admission`: `GET /api/v2/admission`.
+    #[tool(
+        description = "The admission limits (max_running_queries, 0 meaning unlimited, and \
+                       max_queued_queries), the running and queued counts, and whether the \
+                       limits come from config or from a runtime change. Next: \
+                       set_admission_limits.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_admission(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(admission::get_admission_for(&self.state, &who))
+    }
+
+    /// `set_admission_limits`: `PUT /api/v2/admission`.
+    #[tool(
+        description = "Change the admission limits at runtime, persisted across restarts. Give \
+                       one or both of max_running_queries and max_queued_queries (non-negative \
+                       integers). Lowering never stops a running query. Needs the manage \
+                       privilege. Preview with dry_run first; read the result with \
+                       get_admission.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn set_admission_limits(
+        &self,
+        Parameters(a): Parameters<AdmissionArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        // Validation (negatives, ranges, at least one field) lives in
+        // `set_admission_for`, so MCP and HTTP refuse identically.
+        let req = AdmissionUpdate {
+            max_running_queries: a.max_running_queries.map(serde_json::Value::from),
+            max_queued_queries: a.max_queued_queries.map(serde_json::Value::from),
+        };
+        respond(
+            admission::set_admission_for(&self.state, &who, req, a.dry_run.unwrap_or(false)).await,
+        )
+    }
+
+    /// `list_audit_log`: `GET /api/v2/audit`.
+    #[tool(
+        description = "Read the audit log of manage actions (worker, admission, query cancel \
+                       and token changes), newest first, at most `limit` (default \
+                       {audit_limit}, at most {max_audit_limit}). Continue with `next_cursor` \
+                       as `cursor`; `truncated` says if more exist. Filter by `user` or \
+                       `action`.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_audit_log(
+        &self,
+        Parameters(a): Parameters<AuditArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        let params = AuditParams {
+            limit: a.limit,
+            cursor: a.cursor,
+            user: a.user,
+            action: a.action,
+        };
+        respond(audit::audit_page_for(&self.state, &who, params))
     }
 
     /// `list_tokens`: `GET /api/v2/tokens`.
@@ -826,6 +1059,59 @@ mod tests {
     struct Fixture {
         router: axum::Router,
         tracker: Arc<arneb_scheduler::QueryTracker>,
+        /// Password auth (`alice`, `bob`, `root` with `root` a manager), as
+        /// opposed to `[auth] type = "none"` claiming `X-Arneb-User`.
+        password: bool,
+    }
+
+    /// The credentials of `user` on `f`.
+    fn authn(f: &Fixture, user: &str) -> (&'static str, String) {
+        if f.password {
+            let pw = match user {
+                "alice" => "secret",
+                "bob" => "hunter2",
+                "root" => "rootpw",
+                other => panic!("no password for {other}"),
+            };
+            ("authorization", crate::web::v2::tests::basic(user, pw))
+        } else {
+            ("x-arneb-user", user.to_owned())
+        }
+    }
+
+    /// Password auth with two workers, an admission controller, an agent
+    /// service that never finishes a statement, and rules that let every
+    /// user execute and view but kill nothing; `root` manages.
+    fn manage_fixture() -> Fixture {
+        let tracker = Arc::new(arneb_scheduler::QueryTracker::new());
+        let rules = r#"{"queries":[{"allow":["execute","view"]}]}"#;
+        let mut state = crate::web::v2::tests::with_authz(
+            crate::web::v2::tests::web_state(true, None),
+            Some(rules),
+            &["root"],
+        );
+        let (cm, registry) = engine_state();
+        let agent = AgentQueryService::new(cm, registry, tracker.clone(), AgentLimits::default())
+            .with_access_rules(state.access_rules.clone())
+            .with_distributed_executor(Arc::new(HangingExecutor));
+        state.query_tracker = tracker.clone();
+        state.admission = Some(arneb_scheduler::AdmissionController::new(8, 256));
+        state.agent = Some(agent);
+        state.mcp = Some(McpSettings {
+            allowed_hosts: None,
+            allowed_origins: None,
+            default_page_bytes: 32768,
+        });
+        for (id, port) in [("w1", 1), ("w2", 2)] {
+            state
+                .node_registry
+                .heartbeat(id.into(), format!("http://127.0.0.1:{port}"), 256);
+        }
+        Fixture {
+            router: build_router(state.clone()),
+            tracker,
+            password: true,
+        }
     }
 
     fn fixture(hang: bool) -> Fixture {
@@ -896,8 +1182,9 @@ mod tests {
             }),
         };
         Fixture {
-            router: build_router(state),
+            router: build_router(state.clone()),
             tracker,
+            password: false,
         }
     }
 
@@ -905,6 +1192,7 @@ mod tests {
     async fn tool_raw(f: &Fixture, user: &str, name: &str, args: Value) -> Value {
         let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
                           "params":{"name":name,"arguments":args}});
+        let (auth_header, auth_value) = authn(f, user);
         let req = axum::http::Request::builder()
             .method(Method::POST)
             .uri("/mcp")
@@ -912,7 +1200,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "application/json, text/event-stream")
             .header("mcp-protocol-version", "2025-06-18")
-            .header("x-arneb-user", user)
+            .header(auth_header, auth_value)
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = f.router.clone().oneshot(req).await.unwrap();
@@ -945,10 +1233,15 @@ mod tests {
     }
 
     async fn api_get(f: &Fixture, user: &str, path: &str) -> Value {
+        api_call(f, user, Method::GET, path).await
+    }
+
+    async fn api_call(f: &Fixture, user: &str, method: Method, path: &str) -> Value {
+        let (auth_header, auth_value) = authn(f, user);
         let req = axum::http::Request::builder()
-            .method(Method::GET)
+            .method(method)
             .uri(path)
-            .header("x-arneb-user", user)
+            .header(auth_header, auth_value)
             .body(Body::empty())
             .unwrap();
         let resp = f.router.clone().oneshot(req).await.unwrap();
@@ -1109,10 +1402,13 @@ mod tests {
         )
         .await;
         let id = s["id"].as_str().unwrap();
-        for name in ["get_query_status", "fetch_results", "cancel_query"] {
+        for name in ["get_query_status", "fetch_results"] {
             let e = tool_err(&f, "bob", name, json!({"id": id})).await;
             assert_eq!(e["code"], "not_found", "{name}");
         }
+        // Cancelling is a kill (D2): under `none` only the owner may.
+        let e = tool_err(&f, "bob", "cancel_query", json!({"id": id})).await;
+        assert_eq!(e["code"], "manage_requires_auth");
     }
 
     #[tokio::test]
@@ -1413,11 +1709,9 @@ mod tests {
             tool_ok(&f, "alice", "get_cluster", json!({})).await,
             api_get(&f, "alice", "/api/v2/cluster").await
         );
+        // `list_workers` is the bounded `/workers` listing.
         let w = tool_ok(&f, "alice", "list_workers", json!({})).await;
-        assert_eq!(
-            w["workers"],
-            api_get(&f, "alice", "/api/v2/cluster/workers").await
-        );
+        assert_eq!(w, api_get(&f, "alice", "/api/v2/workers").await);
     }
 
     #[tokio::test]
@@ -1448,15 +1742,20 @@ mod tests {
     }
 
     /// The exact tool set (D5), sorted.
-    const TOOL_NAMES: [&str; 18] = [
+    const TOOL_NAMES: [&str; 25] = [
         "cancel_query",
+        "cordon_worker",
         "create_token",
         "describe_table",
+        "drain_worker",
         "explain_query",
         "fetch_results",
+        "get_admission",
         "get_cluster",
         "get_query",
         "get_query_status",
+        "get_worker",
+        "list_audit_log",
         "list_catalogs",
         "list_queries",
         "list_schemas",
@@ -1465,8 +1764,19 @@ mod tests {
         "list_workers",
         "revoke_token",
         "sample_table",
+        "set_admission_limits",
         "submit_query",
+        "uncordon_worker",
         "whoami",
+    ];
+
+    /// The tools that change cluster state and take `dry_run`.
+    const MANAGE_TOOLS: [&str; 5] = [
+        "cancel_query",
+        "cordon_worker",
+        "drain_worker",
+        "uncordon_worker",
+        "set_admission_limits",
     ];
 
     #[tokio::test]
@@ -1510,7 +1820,24 @@ mod tests {
                     "fetch_results",
                 ]
                 .contains(&name);
-            let destructive = ["revoke_token", "cancel_query"].contains(&name);
+            let destructive = [
+                "revoke_token",
+                "cancel_query",
+                "cordon_worker",
+                "drain_worker",
+                "set_admission_limits",
+            ]
+            .contains(&name);
+            if name == "uncordon_worker" {
+                assert_eq!(a["destructiveHint"], json!(false), "{name} destructive");
+                assert_eq!(a["idempotentHint"], json!(true), "{name} idempotent");
+            }
+            if MANAGE_TOOLS.contains(&name) {
+                assert!(
+                    t["inputSchema"]["properties"]["dry_run"].is_object(),
+                    "{name} has no dry_run"
+                );
+            }
             if read_only {
                 assert_eq!(a["readOnlyHint"], json!(true), "{name} read_only");
             } else {
@@ -1543,6 +1870,13 @@ mod tests {
         assert!(desc("describe_table").contains("sample_table"));
         assert!(desc("explain_query").contains("submit_query"));
         assert!(desc("list_queries").contains("get_query"));
+        let cordon = desc("cordon_worker");
+        assert!(
+            cordon.contains("drain_worker") && cordon.contains("uncordon_worker"),
+            "{cordon}"
+        );
+        assert!(desc("list_workers").contains("cordon_worker"));
+        assert!(desc("set_admission_limits").contains("get_admission"));
     }
 
     /// Every string an agent reads: the instructions, each tool's
@@ -1569,6 +1903,23 @@ mod tests {
             }
         }
         copy
+    }
+
+    /// The description and property descriptions of tool `name`.
+    async fn tool_text(f: &Fixture, name: &str) -> String {
+        let v = rpc_raw(
+            f,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        )
+        .await;
+        let t = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap()
+            .clone();
+        format!("{} {}", t["description"], t["inputSchema"])
     }
 
     /// #217 review: the copy quotes the configured limits, not the
@@ -1636,6 +1987,17 @@ mod tests {
         .await;
         assert_eq!(ok["max_rows"], 500);
 
+        // The listings quote the configured ceilings.
+        for (tool, quoted) in [
+            ("list_workers", ["defaults to 100", "at most 1000"]),
+            ("list_audit_log", ["default 50", "at most 500"]),
+        ] {
+            let text = tool_text(&f, tool).await;
+            for q in quoted {
+                assert!(text.contains(q), "{tool}: {q} missing in {text}");
+            }
+        }
+
         // The defaults appear under the default configuration.
         let copy = agent_copy(&fixture(false)).await.join("\n");
         for default in ["at most 10000", "default 32768", "at most 4194304"] {
@@ -1673,6 +2035,9 @@ mod tests {
             at += pos;
         }
         for word in [
+            "dry_run",
+            "manage",
+            "audited",
             "max_rows",
             "truncated",
             "hint",
@@ -1680,6 +2045,177 @@ mod tests {
             "first_page.next_cursor",
         ] {
             assert!(text.contains(word), "instructions omit `{word}`");
+        }
+    }
+
+    #[tokio::test]
+    async fn manage_tools_match_the_api() {
+        let f = manage_fixture();
+        for (tool, path) in [
+            ("list_workers", "/api/v2/workers"),
+            ("get_admission", "/api/v2/admission"),
+            ("list_audit_log", "/api/v2/audit"),
+        ] {
+            assert_eq!(
+                tool_ok(&f, "root", tool, json!({})).await,
+                api_get(&f, "root", path).await,
+                "{tool}"
+            );
+        }
+        assert_eq!(
+            tool_ok(&f, "root", "get_worker", json!({"id":"w1"})).await,
+            api_get(&f, "root", "/api/v2/workers/w1").await
+        );
+        // Bounded: above the ceiling is refused, never clamped.
+        let e = tool_err(&f, "root", "list_workers", json!({"limit": 1001})).await;
+        assert_eq!(e["code"], "invalid_argument");
+        let e = tool_err(&f, "root", "list_audit_log", json!({"limit": 501})).await;
+        assert_eq!(e["code"], "invalid_argument");
+
+        let dry = tool_ok(
+            &f,
+            "root",
+            "cordon_worker",
+            json!({"id":"w1","dry_run":true}),
+        )
+        .await;
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(
+            dry,
+            api_call(
+                &f,
+                "root",
+                Method::POST,
+                "/api/v2/workers/w1/cordon?dry_run=true"
+            )
+            .await
+        );
+        // A dry run changes nothing.
+        let w = tool_ok(&f, "root", "get_worker", json!({"id":"w1"})).await;
+        assert_eq!(w["scheduling"], "schedulable");
+
+        // The real call cordons, is audited, and uncordon undoes it.
+        let c = tool_ok(&f, "root", "cordon_worker", json!({"id":"w1"})).await;
+        assert_eq!(c["result"]["scheduling"], "cordoned", "{c}");
+        let log = tool_ok(
+            &f,
+            "root",
+            "list_audit_log",
+            json!({"action":"worker.cordon"}),
+        )
+        .await;
+        assert_eq!(log["entries"][0]["user"], "root", "{log}");
+        let u = tool_ok(&f, "root", "uncordon_worker", json!({"id":"w1"})).await;
+        assert_eq!(u["result"]["scheduling"], "schedulable", "{u}");
+    }
+
+    #[tokio::test]
+    async fn manage_tools_refuse_non_managers() {
+        let f = manage_fixture();
+        let calls = [
+            ("cordon_worker", json!({"id":"w1"})),
+            ("drain_worker", json!({"id":"w1"})),
+            ("uncordon_worker", json!({"id":"w1"})),
+            ("set_admission_limits", json!({"max_queued_queries":5})),
+        ];
+        for (name, args) in &calls {
+            let e = tool_err(&f, "alice", name, args.clone()).await;
+            assert_eq!(e["code"], "forbidden", "{name}");
+            let mut dry = args.clone();
+            dry["dry_run"] = json!(true);
+            let e = tool_err(&f, "alice", name, dry).await;
+            assert_eq!(e["code"], "forbidden", "{name} dry");
+        }
+        let w = tool_ok(&f, "root", "get_worker", json!({"id":"w1"})).await;
+        assert_eq!(w["scheduling"], "schedulable");
+        let a = tool_ok(&f, "root", "get_admission", json!({})).await;
+        assert_eq!(a["max_queued_queries"], 256);
+
+        // Under `none` nobody manages.
+        let none = fixture(false);
+        for (name, args) in &calls {
+            let e = tool_err(&none, "alice", name, args.clone()).await;
+            assert_eq!(e["code"], "manage_requires_auth", "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_query_widened() {
+        let f = manage_fixture();
+        let submit = |user: &'static str| {
+            let f = &f;
+            async move {
+                let s = tool_ok(
+                    f,
+                    user,
+                    "submit_query",
+                    json!({"sql":"SELECT n FROM small"}),
+                )
+                .await;
+                s["id"].as_str().unwrap().to_owned()
+            }
+        };
+        // Her own statement keeps the H3 status shape.
+        let own = submit("alice").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let dry = tool_ok(
+            &f,
+            "alice",
+            "cancel_query",
+            json!({"id": own, "dry_run": true}),
+        )
+        .await;
+        assert_eq!(dry["dry_run"], true, "{dry}");
+        assert_eq!(dry["action"], "query.cancel");
+        let st = tool_ok(&f, "alice", "get_query_status", json!({"id": own})).await;
+        assert!(
+            matches!(st["state"].as_str(), Some("queued" | "running")),
+            "the dry run left the statement running: {st}"
+        );
+        let c = tool_ok(&f, "alice", "cancel_query", json!({"id": own})).await;
+        assert_eq!(c["state"], "cancelled", "{c}");
+        assert!(c["id"].is_string() && c["dry_run"].is_null());
+
+        // A manager cancels another user's statement: the envelope, audited.
+        let theirs = submit("alice").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let r = tool_ok(&f, "root", "cancel_query", json!({"id": theirs})).await;
+        assert_eq!(r["dry_run"], false, "{r}");
+        assert_eq!(r["result"]["state"], "cancelled", "{r}");
+        let log = tool_ok(
+            &f,
+            "root",
+            "list_audit_log",
+            json!({"action":"query.cancel"}),
+        )
+        .await;
+        assert_eq!(log["entries"][0]["target"], theirs, "{log}");
+
+        // A non-manager may not kill someone else's tracker query.
+        let id = f
+            .tracker
+            .create_query_from("SELECT 1".into(), "pgwire", Some("bob".into()));
+        let e = tool_err(&f, "alice", "cancel_query", json!({"id": id.to_string()})).await;
+        assert_eq!(e["code"], "forbidden", "{e}");
+    }
+
+    #[tokio::test]
+    async fn set_admission_limits_round_trip() {
+        let f = manage_fixture();
+        let r = tool_ok(
+            &f,
+            "root",
+            "set_admission_limits",
+            json!({"max_queued_queries": 5}),
+        )
+        .await;
+        assert_eq!(r["changed"], true, "{r}");
+        let a = tool_ok(&f, "root", "get_admission", json!({})).await;
+        assert_eq!(a["max_queued_queries"], 5);
+        assert_eq!(a["max_running_queries"], 8);
+        for bad in [json!({"max_running_queries": -1}), json!({})] {
+            let e = tool_err(&f, "root", "set_admission_limits", bad).await;
+            assert_eq!(e["code"], "invalid_argument");
         }
     }
 }

@@ -7,7 +7,10 @@
 # `tables` section grants user2 SELECT only, `admin_users = [<admin>]` and a
 # persistent `[state] path`. Uses curl and jq for the API and psql for the
 # pgwire checks. Prints `PASS <step>` per check and exits non-zero at the
-# first `FAIL <step>`. Passwords are never printed.
+# first `FAIL <step>`. Passwords are never printed, but they are passed on
+# the curl command line (`curl -u user:password`), where `ps` on the same
+# host can see them: run it only on a host you trust, with throwaway
+# passwords. scripts/runtime-config-smoke.sh keeps them off the command line.
 #
 # Environment:
 #   ARNEB_URL             Web port base URL, e.g. http://127.0.0.1:6432 (required)

@@ -30,11 +30,12 @@ Before H5 the access rules, catalogs and slow-query threshold were start-time sn
 |---|---|---|
 | Users | every start (H1 D2, unchanged) | config wins for config-seeded users |
 | Catalogs (`[[catalogs]]`) | the first start whose state has `seeded.catalogs == false` | state wins; each config catalog that is new, changed or gone relative to its seeded copy logs one WARN |
-| Access rules (`rules_file`) | the first start whose state has `seeded.rules == false` | state wins; a rules file whose text differs from the seeded copy logs one WARN |
+| Access rules (`rules_file`) | the first start whose state has `seeded.rules == false` | state wins; a rules file whose text differs from the current stored rules logs one WARN (R11) |
 | Settings (admission, slow-query threshold) | never copied; a stored value wins (H4 D9) | WARN per diverging knob (H4 D9, extended to `slow_query_threshold_ms`) |
 
 - An H4 state file has no `seeded` field. It loads as `seeded.catalogs = seeded.rules = false`, so the first H5 start seeds both.
-- Every divergence WARN ends with the hint `preview a re-seed with POST /api/v2/state/reseed?dry_run=true`.
+- Every divergence WARN ends with the hint `Preview a re-seed with POST /api/v2/state/reseed?dry_run=true`.
+- **R11.** The rules divergence WARN compares the rules file with the current stored rules, not only with the originally seeded copy. After a runtime `PUT` or `DELETE` the file no longer takes effect, so the WARN fires at every start until a re-seed (or until the file matches the stored rules). This is what the "no silent runtime changes" anti-goal asks for.
 - Not runtime-editable (startup-only): `[[tables]]` (the `file` catalog), the `memory` catalog, the default catalog and schema, `admin_users`, `[audit]` retention, ports, bind addresses and TLS. `[audit]` retention stays startup-only on purpose, so a manager cannot shorten the trail of their own actions.
 - **R4 (standalone).** A standalone server under `[auth] type = "password"` seeds and reads catalogs from the state store exactly like a coordinator. Only without a state store (`[auth] type = "none"`) does it build catalogs from the config.
 - **R5.** Config catalog names are not validated against D6's name rule at startup (only API input is), so existing configs such as `pg-prod` keep loading. Such a seeded catalog can be updated and dropped through the API, but not created.

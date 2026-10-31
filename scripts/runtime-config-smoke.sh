@@ -10,7 +10,10 @@
 # `tpch_mixed` schema). Takes the environment of scripts/manage-smoke.sh plus
 # PG_URL. Uses curl and jq for the API and psql for the pgwire checks.
 # Prints `PASS <step>` per check and exits non-zero at the first
-# `FAIL <step>`. Passwords, tokens and PG_URL are never printed.
+# `FAIL <step>`. Passwords, tokens and PG_URL are never printed, and never
+# put on a command line (where `ps` shows them): curl gets credentials and
+# bodies as a config on stdin, jq reads secrets from the environment, and
+# psql gets its password through PGPASSWORD.
 #
 # Environment:
 #   ARNEB_URL             Web port base URL, e.g. http://127.0.0.1:6432 (required)
@@ -26,7 +29,9 @@
 #   ARNEB_SMOKE_THRESHOLD_MS  slow-query threshold to set (default 54321)
 #   ARNEB_WORKER_LOGS     optional space-separated worker log files; when set,
 #                         step 2 checks each shows the catalog sync and a task,
-#                         and step 9 checks each shows a pull after the restart
+#                         and step 9 checks each shows a pull and a task written
+#                         after step 7 (the lines step 7 saw are skipped; a log
+#                         file step 7 did not see is read whole)
 #   ARNEB_SMOKE_STATE     where the run keeps non-secret values for the
 #                         restart check (default ${TMPDIR:-/tmp}/runtime-config-smoke.json)
 #
@@ -35,7 +40,9 @@
 #   scripts/runtime-config-smoke.sh --after-restart steps 8 to 10, after
 #       restarting the coordinator only and then one worker. Step 10 deletes
 #       the smoke user and re-seeds the state from the config file, which
-#       removes the catalog, the rules change and the threshold again.
+#       removes the catalog, the rules change and the threshold again, and
+#       also resets every stored setting, including admission limits set by
+#       `PUT /api/v2/admission` (for example by scripts/manage-smoke.sh).
 
 set -euo pipefail
 
@@ -97,23 +104,50 @@ check() { # $1 = jq filter that must be true on $LAST, $2 = message
     printf '%s' "$LAST" | jq -e "$1" >/dev/null 2>&1 || fail "$2"
 }
 
+# cfgq <text>: <text> as a double-quoted curl config value.
+cfgq() {
+    local v="${1//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '"%s"' "$v"
+}
+
+# curl_cfg <ADMIN|USER2|TOKEN> [body]: a curl config carrying the credentials
+# (Basic, or the smoke user's API token as a bearer) and the body, for
+# `curl -K -`. printf is a shell builtin, so none of it reaches an argv.
+curl_cfg() {
+    case "$1" in
+        ADMIN) printf 'user = %s\n' "$(cfgq "$ADMIN:$ARNEB_ADMIN_PASSWORD")" ;;
+        USER2) printf 'user = %s\n' "$(cfgq "$USER2:$ARNEB_PASSWORD2")" ;;
+        TOKEN) printf 'header = %s\n' "$(cfgq "Authorization: Bearer $TOKEN")" ;;
+        *) fail "curl_cfg: unknown identity $1" ;;
+    esac
+    if [ $# -ge 2 ]; then
+        printf 'data-raw = %s\n' "$(cfgq "$2")"
+    fi
+}
+
 # req <ADMIN|USER2|TOKEN> <method> <url> [json-body]: body to $LAST, status to
-# $CODE. TOKEN sends the smoke user's API token as a bearer.
+# $CODE.
 req() {
     local out
-    local -a auth
-    case "$1" in
-        ADMIN) auth=(-u "$ADMIN:$ARNEB_ADMIN_PASSWORD") ;;
-        USER2) auth=(-u "$USER2:$ARNEB_PASSWORD2") ;;
-        TOKEN) auth=(-H "Authorization: Bearer $TOKEN") ;;
-        *) fail "req: unknown identity $1" ;;
-    esac
     if [ $# -ge 4 ]; then
-        out=$(curl -sS -w '\n%{http_code}' "${auth[@]}" -X "$2" "$3" \
-            -H 'Content-Type: application/json' -d "$4") || fail "curl $2 $3"
+        out=$(curl_cfg "$1" "$4" | curl -sS -K - -w '\n%{http_code}' -X "$2" "$3" \
+            -H 'Content-Type: application/json') || fail "curl $2 $3"
     else
-        out=$(curl -sS -w '\n%{http_code}' "${auth[@]}" -X "$2" "$3") || fail "curl $2 $3"
+        out=$(curl_cfg "$1" | curl -sS -K - -w '\n%{http_code}' -X "$2" "$3") || fail "curl $2 $3"
     fi
+    CODE="${out##*$'\n'}"
+    LAST="${out%$'\n'*}"
+}
+
+# mcp_post <ADMIN|USER2> <json-rpc-body>: POST /mcp; body to $LAST, status to
+# $CODE.
+mcp_post() {
+    local out
+    out=$(curl_cfg "$1" "$2" | curl -sS -K - -w '\n%{http_code}' -X POST "$MCP" \
+        -H 'Content-Type: application/json' \
+        -H 'Accept: application/json, text/event-stream' \
+        -H 'MCP-Protocol-Version: 2025-06-18') || fail "curl POST /mcp"
     CODE="${out##*$'\n'}"
     LAST="${out%$'\n'*}"
 }
@@ -189,22 +223,11 @@ psql_as() {
 
 # mcp_tool <ADMIN|USER2> <name> [args-json]: tools/call, $LAST = result.
 mcp_tool() {
-    local user pw out targs="${3:-}"
-    case "$1" in
-        ADMIN) user="$ADMIN"; pw="$ARNEB_ADMIN_PASSWORD" ;;
-        *) user="$USER2"; pw="$ARNEB_PASSWORD2" ;;
-    esac
+    local targs="${3:-}"
     [ -n "$targs" ] || targs='{}'
     RID=$(( RID + 1 ))
-    out=$(curl -sS -w '\n%{http_code}' -u "$user:$pw" -X POST "$MCP" \
-        -H 'Content-Type: application/json' \
-        -H 'Accept: application/json, text/event-stream' \
-        -H 'MCP-Protocol-Version: 2025-06-18' \
-        -d "$(jq -nc --argjson id "$RID" --arg n "$2" --argjson a "$targs" \
-            '{jsonrpc:"2.0", id:$id, method:"tools/call", params:{name:$n, arguments:$a}}')") \
-        || fail "curl POST /mcp"
-    CODE="${out##*$'\n'}"
-    LAST="${out%$'\n'*}"
+    mcp_post "$1" "$(jq -nc --argjson id "$RID" --arg n "$2" --argjson a "$targs" \
+        '{jsonrpc:"2.0", id:$id, method:"tools/call", params:{name:$n, arguments:$a}}')"
     expect_code 200 "tools/call $2"
     check '.error == null' "tools/call $2 returned a JSON-RPC error"
     LAST=$(printf '%s' "$LAST" | jq -c '.result')
@@ -214,7 +237,13 @@ mcp_tool() {
 # matching line. No `grep -q`: an early exit would SIGPIPE sed, and pipefail
 # would turn a match into a failure.
 log_has() {
-    sed 's/\x1b\[[0-9;]*m//g' "$1" | grep -E "$2" >/dev/null
+    log_has_after "$1" 0 "$2"
+}
+
+# log_has_after <file> <lines> <extended-regex>: the same, ignoring the first
+# <lines> lines.
+log_has_after() {
+    tail -n "+$(( $2 + 1 ))" "$1" | sed 's/\x1b\[[0-9;]*m//g' | grep -E "$3" >/dev/null
 }
 
 # wait_workers <seconds>: wait until both workers are registered and
@@ -272,11 +301,16 @@ after_restart() {
     STEP="9 a restarted worker pulls the catalog"
     wait_workers 90
     count_check
+    local skip
     for log in ${WORKER_LOGS[@]+"${WORKER_LOGS[@]}"}; do
-        log_has "$log" 'catalogs pulled from the coordinator' || fail "$log shows no catalog pull"
-        log_has "$log" 'executing task' || fail "$log ran no task"
+        # Only lines written after step 7: the coordinator restart (new epoch)
+        # and the worker restart both come later, so each must pull again.
+        skip=$(jq -r --arg p "$log" '.logs[$p] // 0' "$SMOKE_STATE")
+        log_has_after "$log" "$skip" 'catalogs pulled from the coordinator' \
+            || fail "$log shows no catalog pull after line $skip (step 7)"
+        log_has_after "$log" "$skip" 'executing task' || fail "$log ran no task after line $skip (step 7)"
+        echo "  $log: a pull and a task after line $skip"
     done
-    [ "${#WORKER_LOGS[@]}" -gt 0 ] && echo "  every worker log shows a pull and a task"
     pass
 
     STEP="10 re-seed restores the config"
@@ -305,7 +339,16 @@ if [ "$AFTER_RESTART" = 1 ]; then
 fi
 
 STEP="0 setup"
-EXPECTED=$(PGCONNECT_TIMEOUT=10 psql -X -tAq "$PG_URL" -c "SELECT count(*) FROM $PGSCHEMA.$PGTABLE" 2>&1 | redact) \
+# psql gets PG_URL without its password, and the password through PGPASSWORD.
+PG_REST="${PG_URL#*://}"
+PG_USERINFO=""
+case "$PG_REST" in *@*) PG_USERINFO="${PG_REST%%@*}"; PG_REST="${PG_REST#*@}" ;; esac
+PG_PASS=""
+case "$PG_USERINFO" in *:*) PG_PASS="${PG_USERINFO#*:}"; PG_USERINFO="${PG_USERINFO%%:*}" ;; esac
+PG_PASS=$(printf '%b' "${PG_PASS//%/\\x}")   # percent-decode
+PG_NOPW_URL="${PG_URL%%://*}://${PG_USERINFO:+$PG_USERINFO@}$PG_REST"
+EXPECTED=$(PGPASSWORD="$PG_PASS" PGCONNECT_TIMEOUT=10 psql -X -tAq "$PG_NOPW_URL" \
+    -c "SELECT count(*) FROM $PGSCHEMA.$PGTABLE" 2>&1 | redact) \
     || fail "cannot count $PGSCHEMA.$PGTABLE through PG_URL: $EXPECTED"
 NEW_PW=$(openssl rand -hex 16)
 req ADMIN GET "$API/whoami"
@@ -317,8 +360,8 @@ wait_workers 60
 pass
 
 STEP="1 create a postgresql catalog"
-SPEC=$(jq -nc --arg n "$PGCAT" --arg u "$PG_URL" --arg s "$PGSCHEMA" \
-    '{name:$n, type:"postgresql", connection_url:$u, default_schema:$s, split_min_rows:100000}')
+SPEC=$(PG_URL="$PG_URL" jq -nc --arg n "$PGCAT" --arg s "$PGSCHEMA" \
+    '{name:$n, type:"postgresql", connection_url:env.PG_URL, default_schema:$s, split_min_rows:100000}')
 preview POST "$API/catalog-configs" "$SPEC"
 check '.action == "catalog.create" and .target == "'"$PGCAT"'"' "create preview envelope is wrong"
 req ADMIN GET "$API/catalogs"
@@ -371,7 +414,7 @@ case "$PSQL_OUT" in *42501*) ;; *) fail "pgwire refusal is not SQLSTATE 42501: $
 pass
 
 STEP="4 a runtime user and a token for them"
-manage POST "$API/users" "$(jq -nc --arg n "$NEWUSER" --arg p "$NEW_PW" '{name:$n, password:$p}')"
+manage POST "$API/users" "$(NEW_PW="$NEW_PW" jq -nc --arg n "$NEWUSER" '{name:$n, password:env.NEW_PW}')"
 check '.action == "user.create" and .changed == true' "user.create envelope is wrong"
 manage POST "$API/users/$NEWUSER/tokens" '{"name":"smoke"}'
 check '.action == "token.issue" and .target == "'"$NEWUSER"'"' "token.issue envelope is wrong"
@@ -397,19 +440,16 @@ case "$PSQL_OUT" in *28P01* | *"password authentication failed"*) ;; *) fail "pg
 pass
 
 STEP="5 $USER2 may not change the runtime config"
-forbidden POST "$API/catalog-configs" "$(jq -nc --arg u "$PG_URL" '{name:"smoke_denied", type:"postgresql", connection_url:$u}')"
-forbidden POST "$API/catalog-configs?dry_run=true" "$(jq -nc --arg u "$PG_URL" '{name:"smoke_denied", type:"postgresql", connection_url:$u}')"
+DENIED_SPEC=$(PG_URL="$PG_URL" jq -nc '{name:"smoke_denied", type:"postgresql", connection_url:env.PG_URL}')
+forbidden POST "$API/catalog-configs" "$DENIED_SPEC"
+forbidden POST "$API/catalog-configs?dry_run=true" "$DENIED_SPEC"
 forbidden PUT "$API/access-rules" '{}'
 forbidden DELETE "$API/access-rules"
 forbidden POST "$API/users" '{"name":"smoke_denied","password":"not-a-real-password"}'
 forbidden POST "$API/users/$NEWUSER/tokens" '{}'
 forbidden PATCH "$API/settings" '{"slow_query_threshold_ms": 1}'
-out=$(curl -sS -u "$ADMIN:$ARNEB_ADMIN_PASSWORD" -X POST "$MCP" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    -H 'MCP-Protocol-Version: 2025-06-18' \
-    -d '{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}') || fail "curl tools/list"
-LAST="$out"
+mcp_post ADMIN '{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}'
+expect_code 200 "tools/list"
 check '.result.tools | length == 43' "tools/list does not have exactly 43 tools"
 mcp_tool USER2 create_user "$(jq -nc --arg n smoke_denied '{name:$n, password:"not-a-real-password"}')"
 check '.isError == true and .structuredContent.error.code == "forbidden"' "MCP create_user as $USER2 is not forbidden"
@@ -453,6 +493,11 @@ for secret in "$NEW_PW" "$TOKEN" "$PG_URL" "$ARNEB_ADMIN_PASSWORD" "$PG_SECRET";
     case "$LAST" in *"$secret"*) fail "the audit log contains a password, token or connection secret" ;; esac
 done
 umask 077
-jq -nc --arg e "$EXPECTED" --argjson t "$THRESHOLD" '{expected:$e, threshold:$t}' >"$SMOKE_STATE"
+LOG_LINES='{}'
+for log in ${WORKER_LOGS[@]+"${WORKER_LOGS[@]}"}; do
+    LOG_LINES=$(printf '%s' "$LOG_LINES" | jq -c --arg p "$log" --argjson n "$(wc -l <"$log" | tr -d ' ')" '.[$p] = $n')
+done
+jq -nc --arg e "$EXPECTED" --argjson t "$THRESHOLD" --argjson l "$LOG_LINES" \
+    '{expected:$e, threshold:$t, logs:$l}' >"$SMOKE_STATE"
 echo "  restart the coordinator, then one worker, then run with --after-restart"
 pass

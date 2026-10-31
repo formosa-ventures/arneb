@@ -726,9 +726,11 @@ the source of truth from the config file to the [state store](#state):
   file has no seeded copy, so this happens once on upgrade). From then on
   the stored copies are used. Editing `[[catalogs]]` or the rules file no
   longer takes effect at a restart: each config catalog that is new,
-  changed or gone, and a rules file whose text differs, logs one WARN on
-  `arneb::config` at every start, ending `Preview a re-seed with POST
-  /api/v2/state/reseed?dry_run=true`. Apply the file with a
+  changed or gone relative to its seeded copy, and a rules file whose text
+  differs from the rules currently stored, logs one WARN on `arneb::config`
+  at every start, ending `Preview a re-seed with POST
+  /api/v2/state/reseed?dry_run=true`. After a runtime rules change the
+  rules WARN therefore fires at every start until a re-seed. Apply the file with a
   [re-seed](/guide/http-api#re-seed) or `--reseed-state`, which now
   re-seeds catalogs, rules, settings and users. A standalone server under
   password auth behaves like a coordinator here. Under `[auth] type =

@@ -1,11 +1,15 @@
 ## ADDED Requirements
 
 ### Requirement: The state store is the source of truth
-Under `[auth] type = "password"` the coordinator (and a standalone server) SHALL keep the catalogs, the access rules and the slow-query threshold in the state store. The first start whose state has no seeded copy of the catalogs SHALL copy `[[catalogs]]` into it, and the first start with no seeded copy of the rules SHALL copy the `rules_file`. On later starts the stored copies SHALL be used, and each config catalog that is new, changed or gone relative to its seeded copy, a rules file whose text differs from the seeded copy, and a config setting overridden by a stored value SHALL log one WARN on `arneb::config` naming the object and ending with `preview a re-seed with POST /api/v2/state/reseed?dry_run=true`. A state file without a `seeded` field SHALL load as not seeded. Under `[auth] type = "none"` the config SHALL be used as before.
+Under `[auth] type = "password"` the coordinator (and a standalone server) SHALL keep the catalogs, the access rules and the slow-query threshold in the state store. The first start whose state has no seeded copy of the catalogs SHALL copy `[[catalogs]]` into it, and the first start with no seeded copy of the rules SHALL copy the `rules_file`. On later starts the stored copies SHALL be used, and each config catalog that is new, changed or gone relative to its seeded copy, a rules file whose text differs from the current stored rules (including rules changed at runtime), and a config setting overridden by a stored value SHALL log one WARN on `arneb::config` naming the object and ending with `Preview a re-seed with POST /api/v2/state/reseed?dry_run=true`. A state file without a `seeded` field SHALL load as not seeded. Under `[auth] type = "none"` the config SHALL be used as before.
 
 #### Scenario: Upgrade seeds once
 - **WHEN** a coordinator starts on an H4 state file with `[[catalogs]]` naming `datalake`
 - **THEN** the state stores `datalake` with `from_config: true`, and the next start reads it from the state
+
+#### Scenario: Rules changed at runtime
+- **WHEN** a manager replaces the rules with `PUT /api/v2/access-rules` and the coordinator restarts with the rules file unchanged
+- **THEN** the stored rules are used and startup logs the rules divergence WARN, at every start until a re-seed
 
 #### Scenario: Config edit after seeding
 - **WHEN** an operator changes the `metastore_uri` of a seeded catalog in the config file and restarts

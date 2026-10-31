@@ -37,9 +37,12 @@ INFO arneb::config: access control rules loaded rules_file=/etc/arneb/rules.json
 ```
 
 The line also says where the rules came from (`source="state"` or
-`"config"`). When the file's text differs from the copy seeded into the
-state, every start logs a WARN that the state store's rules are used, ending
-`Preview a re-seed with POST /api/v2/state/reseed?dry_run=true`.
+`"config"`). When the file's text differs from the rules currently stored in
+the state, every start logs a WARN that the state store's rules are used,
+ending `Preview a re-seed with POST /api/v2/state/reseed?dry_run=true`. That
+includes rules changed at runtime: after a `PUT` or `DELETE` the WARN fires
+at every start until a re-seed copies the file again (or the file is edited
+to match).
 
 ## Changing rules at runtime
 

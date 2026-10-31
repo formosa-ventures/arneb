@@ -40,7 +40,7 @@ pub struct ProtocolServer {
     admission: Option<arneb_scheduler::AdmissionController>,
     statement_timeout: Option<std::time::Duration>,
     query_tracker: Arc<arneb_scheduler::QueryTracker>,
-    access_rules: Option<Arc<arneb_catalog::AccessRules>>,
+    access_rules: arneb_catalog::RulesHandle,
 }
 
 impl ProtocolServer {
@@ -61,7 +61,7 @@ impl ProtocolServer {
             admission: None,
             statement_timeout: None,
             query_tracker: Arc::new(arneb_scheduler::QueryTracker::new()),
-            access_rules: None,
+            access_rules: Default::default(),
         }
     }
 
@@ -126,9 +126,11 @@ impl ProtocolServer {
     }
 
     /// Check every statement against `rules` for the connection's user
-    /// (file-based-access-control). Default: none, every user reads all.
-    pub fn with_access_rules(mut self, rules: Option<Arc<arneb_catalog::AccessRules>>) -> Self {
-        self.access_rules = rules;
+    /// (file-based-access-control). Pass a [`arneb_catalog::RulesHandle`]
+    /// to share live rules: each statement uses the rules current when it
+    /// starts. Default: none, every user reads all.
+    pub fn with_access_rules(mut self, rules: impl Into<arneb_catalog::RulesHandle>) -> Self {
+        self.access_rules = rules.into();
         self
     }
 

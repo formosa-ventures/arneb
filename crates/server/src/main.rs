@@ -163,6 +163,8 @@ struct CliArgs {
     /// Let `[[auth.users]]` overwrite users created through the state store
     /// whose name collides with a config user (revoking their tokens).
     /// Config-seeded users follow the config on every start without it.
+    /// Also replaces the stored access rules with the
+    /// `[access_control] rules_file` (none when unset).
     /// Only meaningful with `[auth] type = "password"`.
     #[arg(long)]
     reseed_state: bool,
@@ -819,22 +821,35 @@ async fn run() -> Result<()> {
         Some(store) => arneb_protocol::AuthMethod::ScramSha256(store.clone()),
         None => config_auth,
     };
-    let access_rules = if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
-        config
-            .access_control
-            .load_rules()
-            .context("invalid [access_control] configuration")?
-            .map(Arc::new)
-    } else {
-        None
-    };
-    if let (Some(rules), Some(path)) = (&access_rules, &config.access_control.rules_file) {
+    // runtime-config D1: under password auth the rules file seeds the state
+    // store once and the stored copy wins; the handle is shared by every
+    // protocol and the Web API, so a runtime change applies everywhere.
+    let (access_rules, rules_source, rules_seed) =
+        if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
+            let resolved = config::resolve_access_rules(
+                &config.access_control,
+                state_store.as_deref(),
+                reseed_state,
+            )
+            .context("invalid [access_control] configuration")?;
+            (resolved.handle, resolved.source, resolved.seed)
+        } else {
+            (arneb_catalog::RulesHandle::default(), "config", None)
+        };
+    if let Some(rules) = access_rules.current() {
         let [catalogs, schemas, tables, queries, system_information] = rules
             .section_sizes()
             .map(|n| n.map_or_else(|| "absent (allow all)".to_owned(), |n| n.to_string()));
+        let rules_file = config
+            .access_control
+            .rules_file
+            .as_ref()
+            .map_or_else(|| "unset".to_owned(), |p| p.display().to_string());
         tracing::info!(
             target: "arneb::config",
-            rules_file = %path.display(),
+            rules_file = %rules_file,
+            source = rules_source,
+            seed = ?rules_seed,
             catalogs = %catalogs,
             schemas = %schemas,
             tables = %tables,
@@ -1202,7 +1217,8 @@ async fn run() -> Result<()> {
         credentials: credentials_for_web,
         state: state_for_web,
         audit: audit_log,
-        access_rules: access_rules.clone(),
+        rules: access_rules.clone(),
+        config_changes: Default::default(),
         authorizer,
         metrics_auth: config.web.metrics_auth,
         sessions: web::SessionStore::new(),

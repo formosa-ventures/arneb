@@ -250,8 +250,13 @@ mod tests {
             credentials,
             state: password.then_some(store),
             audit: crate::web::test_audit_log(),
-            access_rules: None,
-            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), password),
+            rules: Default::default(),
+            config_changes: Default::default(),
+            authorizer: crate::web::privilege::Authorizer::new(
+                Default::default(),
+                Vec::new(),
+                password,
+            ),
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent: None,
@@ -368,7 +373,8 @@ mod tests {
                     r#"{"system_information":[{"user":"bob","allow":["read"]}]}"#,
                 )
                 .unwrap(),
-            )),
+            ))
+            .into(),
             vec!["alice".into()],
             true,
         );
@@ -706,9 +712,9 @@ mod tests {
     }
 
     fn with_rules(mut state: WebState, json: &str) -> WebState {
-        state.access_rules = Some(Arc::new(
+        state.rules = arneb_catalog::RulesHandle::new(Some(Arc::new(
             arneb_catalog::AccessRules::from_json(json).unwrap(),
-        ));
+        )));
         state
     }
 

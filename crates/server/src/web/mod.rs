@@ -11,6 +11,7 @@ mod manage;
 pub mod mcp;
 mod metrics;
 pub mod privilege;
+mod rules;
 pub mod session;
 mod v2;
 mod workers;
@@ -58,8 +59,13 @@ pub struct WebState {
     /// The audit log: next to the state file, or in memory (always empty
     /// under `[auth] type = "none"`, where nothing is audited).
     pub audit: Arc<arneb_state::AuditLog>,
-    /// Access rules shared with pgwire and Trino.
-    pub access_rules: Option<Arc<arneb_catalog::AccessRules>>,
+    /// The live access rules, shared with pgwire, Trino, the agent API and
+    /// [`WebState::authorizer`]; changed through `/api/v2/access-rules`.
+    pub rules: arneb_catalog::RulesHandle,
+    /// Serializes every runtime-config change (rules, users, user tokens,
+    /// catalogs, settings, re-seed; runtime-config D10): held across the
+    /// whole change, through the audit append.
+    pub config_changes: Arc<tokio::sync::Mutex<()>>,
     /// The observe and manage privilege layers and the kill rule.
     pub authorizer: privilege::Authorizer,
     /// `[web] metrics_auth`: require credentials for `/metrics`.

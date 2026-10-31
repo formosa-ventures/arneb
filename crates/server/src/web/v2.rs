@@ -65,6 +65,7 @@ pub fn routes() -> Router<WebState> {
         .merge(super::audit::routes())
         .merge(super::workers::routes())
         .merge(super::admission::routes())
+        .merge(super::rules::routes())
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
 }
@@ -771,6 +772,7 @@ pub(super) mod tests {
             ("bob", "hunter2"),
             ("root", "rootpw"),
             ("ops", "opspw"),
+            ("carol", "carolpw"),
         ]
         .into_iter()
         .map(|(user, pw)| {
@@ -798,8 +800,13 @@ pub(super) mod tests {
             credentials,
             state: password.then_some(store),
             audit: crate::web::test_audit_log(),
-            access_rules: None,
-            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), password),
+            rules: Default::default(),
+            config_changes: Default::default(),
+            authorizer: crate::web::privilege::Authorizer::new(
+                Default::default(),
+                Vec::new(),
+                password,
+            ),
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent: None,
@@ -813,8 +820,10 @@ pub(super) mod tests {
         rules: Option<&str>,
         admins: &[&str],
     ) -> WebState {
-        let rules = rules.map(|r| Arc::new(arneb_catalog::AccessRules::from_json(r).unwrap()));
-        state.access_rules = rules.clone();
+        let rules = arneb_catalog::RulesHandle::new(
+            rules.map(|r| Arc::new(arneb_catalog::AccessRules::from_json(r).unwrap())),
+        );
+        state.rules = rules.clone();
         state.authorizer = crate::web::privilege::Authorizer::new(
             rules,
             admins.iter().map(|a| a.to_string()).collect(),

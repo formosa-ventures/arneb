@@ -56,6 +56,9 @@ pub enum ErrorCode {
     /// The audit log cannot be written, so audited actions are refused
     /// (503, `Retry-After: 5`).
     AuditUnavailable,
+    /// The change conflicts with the current state, such as one that would
+    /// remove the caller's own manage privilege (409).
+    Conflict,
 }
 
 impl ErrorCode {
@@ -85,7 +88,7 @@ impl ErrorCode {
             Self::CatalogNotFound | Self::SchemaNotFound | Self::TableNotFound => {
                 StatusCode::NOT_FOUND
             }
-            Self::Cancelled => StatusCode::CONFLICT,
+            Self::Cancelled | Self::Conflict => StatusCode::CONFLICT,
             Self::AuthDisabled => StatusCode::CONFLICT,
             Self::Overloaded | Self::AuditUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -215,6 +218,7 @@ mod tests {
             (ErrorCode::Cancelled, 409, "cancelled"),
             (ErrorCode::ManageRequiresAuth, 403, "manage_requires_auth"),
             (ErrorCode::AuditUnavailable, 503, "audit_unavailable"),
+            (ErrorCode::Conflict, 409, "conflict"),
         ] {
             let resp = ApiError::new(code, "m").with_hint("h").into_response();
             assert_eq!(resp.status().as_u16(), status);

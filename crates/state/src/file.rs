@@ -80,6 +80,14 @@ pub(crate) struct StateData {
     /// Runtime settings; absent in files written before they existed.
     #[serde(default)]
     pub settings: crate::settings::Settings,
+    /// The stored access rules; `None` allows everything. Absent in files
+    /// written before runtime config existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<crate::StoredRules>,
+    /// Which config objects were seeded; absent (nothing seeded) in files
+    /// written before runtime config existed.
+    #[serde(default)]
+    pub seeded: crate::Seeded,
 }
 
 impl Default for StateData {
@@ -90,6 +98,8 @@ impl Default for StateData {
             tokens: Vec::new(),
             cordons: Vec::new(),
             settings: Default::default(),
+            rules: None,
+            seeded: Default::default(),
         }
     }
 }
@@ -116,6 +126,7 @@ impl std::fmt::Debug for StateStore {
             .field("users", &data.users.len())
             .field("tokens", &data.tokens.len())
             .field("cordons", &data.cordons.len())
+            .field("rules", &data.rules.is_some())
             .finish_non_exhaustive()
     }
 }

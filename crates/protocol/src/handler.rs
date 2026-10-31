@@ -117,9 +117,10 @@ pub struct HandlerFactory {
     pub tls_required: bool,
     /// Records each statement (Web UI, `system.runtime.queries`, `/metrics`).
     pub query_tracker: Arc<arneb_scheduler::QueryTracker>,
-    /// Access rules checked for the connection's user; `None` allows all
-    /// (file-based-access-control).
-    pub access_rules: Option<Arc<arneb_catalog::AccessRules>>,
+    /// Access rules checked for the connection's user; empty allows all
+    /// (file-based-access-control). Live: each statement checks against the
+    /// rules current when it is planned (runtime-config D3).
+    pub access_rules: arneb_catalog::RulesHandle,
 }
 
 impl PgWireServerHandlers for HandlerFactory {
@@ -245,7 +246,7 @@ pub struct ConnectionHandler {
     /// See [`HandlerFactory::query_tracker`].
     pub query_tracker: Arc<arneb_scheduler::QueryTracker>,
     /// See [`HandlerFactory::access_rules`].
-    pub access_rules: Option<Arc<arneb_catalog::AccessRules>>,
+    pub access_rules: arneb_catalog::RulesHandle,
 }
 
 impl ConnectionHandler {
@@ -431,7 +432,9 @@ impl ConnectionHandler {
             || Arc::clone(&self.catalog_manager),
             |p| Arc::clone(&p.catalog_manager),
         );
-        let Some(rules) = &self.access_rules else {
+        // One snapshot per statement: planning and the privilege checks
+        // all see the rules current when the statement started.
+        let Some(rules) = self.access_rules.current() else {
             return Ok(base);
         };
         let user = client
@@ -439,7 +442,7 @@ impl ConnectionHandler {
             .get(pgwire::api::METADATA_USER)
             .cloned()
             .unwrap_or_default();
-        let view = base.with_access(user, Arc::clone(rules));
+        let view = base.with_access(user, rules);
         view.check_execute()
             .map_err(|e| arneb_error_to_pg_error(&e.into()))?;
         Ok(Arc::new(view))

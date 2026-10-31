@@ -1097,7 +1097,7 @@ mod tests {
         );
         let (cm, registry) = engine_state();
         let agent = AgentQueryService::new(cm, registry, tracker.clone(), AgentLimits::default())
-            .with_access_rules(state.access_rules.clone())
+            .with_access_rules(state.rules.clone())
             .with_distributed_executor(Arc::new(HangingExecutor));
         state.query_tracker = tracker.clone();
         state.admission = Some(arneb_scheduler::AdmissionController::new(8, 256));
@@ -1176,8 +1176,13 @@ mod tests {
             credentials: None,
             state: None,
             audit: crate::web::test_audit_log(),
-            access_rules: rules,
-            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), false),
+            rules: rules.into(),
+            config_changes: Default::default(),
+            authorizer: crate::web::privilege::Authorizer::new(
+                Default::default(),
+                Vec::new(),
+                false,
+            ),
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent: Some(agent),

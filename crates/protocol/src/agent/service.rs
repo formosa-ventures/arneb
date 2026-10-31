@@ -66,7 +66,7 @@ impl AgentQueryService {
                 memory_pool: Arc::new(UnboundedMemoryPool::new()),
                 query_memory_limit: None,
                 query_tracker: Arc::clone(&query_tracker),
-                access_rules: None,
+                access_rules: Default::default(),
             }),
             tracker: query_tracker,
             retained_budget: RetainedBudget::new(limits.max_total_retained_bytes),
@@ -139,8 +139,11 @@ impl AgentQueryService {
     }
 
     /// Check every statement against `rules` for the submitting user
-    /// (file-based-access-control). Default: none, every user reads all.
-    pub fn with_access_rules(self, rules: Option<Arc<arneb_catalog::AccessRules>>) -> Self {
+    /// (file-based-access-control). Pass a [`arneb_catalog::RulesHandle`]
+    /// to share live rules: each statement uses the rules current when it
+    /// starts. Default: none, every user reads all.
+    pub fn with_access_rules(self, rules: impl Into<arneb_catalog::RulesHandle>) -> Self {
+        let rules = rules.into();
         self.with_engine(|e| e.access_rules = rules)
     }
 

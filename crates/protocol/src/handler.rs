@@ -1113,12 +1113,12 @@ pub(crate) fn check_write_privileges(
     use TablePrivilege::{Delete, Insert, Ownership};
     let (name, privilege, verb) = match plan {
         LogicalPlan::Explain { input, .. } => return check_write_privileges(input, catalogs),
-        LogicalPlan::InsertInto { table, .. } => (table, Insert, "insert into"),
-        LogicalPlan::DeleteFrom { table, .. } => (table, Delete, "delete from"),
+        LogicalPlan::InsertInto { table, .. } => (table, Insert, "insert into table"),
+        LogicalPlan::DeleteFrom { table, .. } => (table, Delete, "delete from table"),
         LogicalPlan::CreateTable { name, .. } | LogicalPlan::CreateTableAsSelect { name, .. } => {
-            (name, Ownership, "create")
+            (name, Ownership, "create table")
         }
-        LogicalPlan::DropTable { name, .. } => (name, Ownership, "drop"),
+        LogicalPlan::DropTable { name, .. } => (name, Ownership, "drop table"),
         LogicalPlan::CreateView { name, .. } => (name, Ownership, "create view"),
         LogicalPlan::DropView { name, .. } => (name, Ownership, "drop view"),
         _ => return Ok(()),

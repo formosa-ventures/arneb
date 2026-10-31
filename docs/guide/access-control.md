@@ -85,8 +85,9 @@ Writes are checked on the target table after planning, on every protocol
 the write. A `read-only` catalog refuses every write
 (`Access Denied: Cannot create table lake.sales.x (catalog lake is
 read-only)`); a `none` catalog refuses everything. A refused write answers
-`Access Denied: Cannot <verb> table <catalog>.<schema>.<table> (requires
-<PRIVILEGE>)`: SQLSTATE `42501` on pgwire, `PERMISSION_DENIED` on Trino and
+`Access Denied: Cannot <action> <catalog>.<schema>.<name> (requires
+<PRIVILEGE>)`, where `<action>` is `insert into table`, `delete from table`,
+`create table`, `drop table`, `create view` or `drop view`: SQLSTATE `42501` on pgwire, `PERMISSION_DENIED` on Trino and
 `forbidden` in an agent or MCP statement status. The sources of CTAS and
 `INSERT ... SELECT` need `SELECT` as usual. `UPDATE` is accepted in rules
 files but maps to nothing, because the parser has no `UPDATE`;

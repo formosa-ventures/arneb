@@ -460,6 +460,10 @@ fn schema_not_found(catalog: &str, schema: &str) -> TrinoError {
     )
 }
 
+/// Must never be reached with a write plan: it does not run
+/// `check_write_privileges`. Callers gate on a plain `SELECT` (the
+/// Query-only gate in the agent explain path).
+///
 /// Parses, plans and optimizes `sql` over `cm`; returns the plan text and
 /// the scan estimates.
 async fn plan_text_and_scans(

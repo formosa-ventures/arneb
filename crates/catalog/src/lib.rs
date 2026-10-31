@@ -321,13 +321,13 @@ impl CatalogManager {
     /// Fails with [`CatalogError::AccessDenied`] when the session user does
     /// not hold `privilege` on `reference`; always passes without access
     /// rules. Catalog and schema come from this manager's defaults, as in
-    /// [`CatalogManager::resolve_table`]. `verb` completes the message
-    /// (`insert into`, `delete from`, `create`, `drop`, ...).
+    /// [`CatalogManager::resolve_table`]. `action` is the noun phrase of the message
+    /// (`insert into table`, `create table`, `create view`, ...).
     pub fn check_table_privilege(
         &self,
         reference: &TableReference,
         privilege: TablePrivilege,
-        verb: &str,
+        action: &str,
     ) -> Result<(), CatalogError> {
         let Some(a) = &self.access else {
             return Ok(());
@@ -349,7 +349,7 @@ impl CatalogManager {
             format!("requires {privilege}")
         };
         Err(CatalogError::AccessDenied(format!(
-            "Cannot {verb} table {catalog}.{schema}.{table} ({reason})"
+            "Cannot {action} {catalog}.{schema}.{table} ({reason})"
         )))
     }
 

@@ -339,7 +339,14 @@ async fn pgwire_refuses_writes_without_the_privilege() {
         ),
         (INSERT_SQL, "requires INSERT"),
         ("DELETE FROM memory.default.open_t", "requires DELETE"),
-        ("DROP VIEW memory.default.v", "requires OWNERSHIP"),
+        (
+            "DROP VIEW memory.default.v",
+            "Access Denied: Cannot drop view memory.default.v (requires OWNERSHIP)",
+        ),
+        (
+            "CREATE VIEW memory.default.v2 AS SELECT n FROM memory.default.open_t",
+            "Access Denied: Cannot create view memory.default.v2 (requires OWNERSHIP)",
+        ),
         (
             "CREATE TABLE t3 (n BIGINT)",
             "Cannot create table memory.default.t3 (requires OWNERSHIP)",
@@ -352,6 +359,7 @@ async fn pgwire_refuses_writes_without_the_privilege() {
     }
     let (code, message) = pg_error(&alice, &format!("EXPLAIN {INSERT_SQL}")).await;
     assert_eq!(code, "42501", "{message}");
+    assert!(message.contains("requires INSERT"), "{message}");
 
     let writer = pg(port, "writer").await;
     let (code, message) = pg_error(&writer, INSERT_SQL).await;
@@ -386,4 +394,13 @@ async fn trino_refuses_writes_without_the_privilege() {
         .await
         .unwrap_err();
     assert_ne!(err["errorName"], "PERMISSION_DENIED", "{err}");
+}
+
+#[tokio::test]
+async fn trino_refuses_explain_of_a_write() {
+    let base = trino_server(Arc::new(QueryTracker::new())).await;
+    let err = trino(&base, "alice", &format!("EXPLAIN {INSERT_SQL}"))
+        .await
+        .unwrap_err();
+    assert_eq!(err["errorName"], "PERMISSION_DENIED", "{err}");
 }

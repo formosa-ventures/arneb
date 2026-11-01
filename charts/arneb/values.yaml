@@ -21,6 +21,14 @@ config: ""
 # config that holds [auth] users or credentials.
 existingConfigSecret: ""
 
+auth:
+  # Set to true when the config sets [auth] type = "password". It only
+  # changes the post-install notes (they show the token flow instead of an
+  # unauthenticated curl); the server reads its auth from the config.
+  # With existingConfigSecret the chart cannot read the config, so set this
+  # yourself.
+  password: false
+
 # Shared secret every node presents on cluster RPC (ARNEB_CLUSTER_SECRET).
 # Without existingSecret, the chart generates a random one on install and
 # keeps it on upgrade.
@@ -49,6 +57,16 @@ securityContext:
     drop: ["ALL"]
 
 coordinator:
+  # Users and API tokens the coordinator persists (ARNEB_STATE_PATH, file
+  # /var/lib/arneb/state.json). Only the coordinator mounts it. Without
+  # persistence it is an emptyDir, so tokens are lost when the pod restarts.
+  state:
+    persistence:
+      enabled: true
+      size: 1Gi
+      storageClass: ""
+      # Use an existing PVC instead of creating one.
+      existingClaim: ""
   service:
     type: ClusterIP
     annotations: {}

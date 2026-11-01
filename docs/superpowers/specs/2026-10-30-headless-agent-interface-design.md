@@ -160,6 +160,11 @@ by the user.
   config file with the state. For each seeded object whose config entry now
   differs, it logs a WARN on `arneb::config` naming the object, so a
   ConfigMap edit is never silently ignored. *(my call)*
+  *For users (H1), a WARN was not enough: an edited `password_hash` or a
+  removed user must revoke access on restart, as it did before the state
+  store. Config-seeded users therefore follow the config on every start;
+  objects created at runtime are never touched by it. See D2 in
+  `openspec/changes/headless-api-auth/design.md`.*
 - **Re-seeding is explicit.** An explicit re-seed action replaces the state
   from the config file. It is a manage action, so it has a dry run and is
   audited. *(my call)*

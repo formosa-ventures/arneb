@@ -114,9 +114,14 @@ is refused at startup instead of being enforced partially:
 
 ## Limits
 
-- The Web UI has no login and shows every query. Under password auth it
-  binds to `127.0.0.1` unless `[web] bind_address` is set; keep it there,
-  or behind your own authentication, when rules are in use.
+- The Web API (Web UI port) applies the `queries` rules to the query list,
+  query detail and cancel endpoints, under both `/api/v1` and `/api/v2`. A
+  query the caller may not `view` is hidden (`404`); one they may view but
+  not `kill` answers `403`. A user may always kill their own query. Under
+  `[auth] type = "none"` the Web API has no user, so these rules are not
+  applied there. See [HTTP API](/guide/http-api). Under password auth the Web
+  API also requires credentials, and the Web UI binds to `127.0.0.1` unless
+  `[web] bind_address` is set.
 - Rules are checked on the coordinator. Workers run the plan fragments the
   coordinator has already checked, and the cluster secret keeps other
   callers off their RPC port (see

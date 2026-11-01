@@ -145,6 +145,19 @@ impl AccessRules {
     /// Whether `viewer` may see a query run by `owner`. Their own queries
     /// are always visible.
     pub fn can_view_query(&self, viewer: &str, owner: &str) -> bool {
+        self.owner_or_rule_allows(viewer, owner, QueryAccess::View)
+    }
+
+    /// Whether `viewer` may kill a query run by `owner`. Matching is the
+    /// same as [`can_view_query`](Self::can_view_query), checking `kill`;
+    /// the owner may always kill their own query.
+    pub fn can_kill_query(&self, viewer: &str, owner: &str) -> bool {
+        self.owner_or_rule_allows(viewer, owner, QueryAccess::Kill)
+    }
+
+    /// `viewer == owner`, or the first `queries` rule matching both allows
+    /// `access`.
+    fn owner_or_rule_allows(&self, viewer: &str, owner: &str, access: QueryAccess) -> bool {
         if viewer == owner {
             return true;
         }
@@ -156,7 +169,7 @@ impl AccessRules {
             .find(|r| {
                 r.user.matches(viewer) && r.query_owner.as_ref().is_none_or(|o| o.matches(owner))
             })
-            .is_some_and(|r| r.allow.contains(&QueryAccess::View))
+            .is_some_and(|r| r.allow.contains(&access))
     }
 
     fn table_privileges(
@@ -516,6 +529,32 @@ mod tests {
         assert!(
             r.can_view_query("bob", "bob"),
             "own queries are always visible"
+        );
+    }
+
+    #[test]
+    fn owner_can_always_kill_and_rules_grant_kill() {
+        let r = rules(
+            r#"{"queries": [
+                {"user": "admin", "allow": ["execute", "view", "kill"]},
+                {"user": "alice", "queryOwner": "bob", "allow": ["view"]},
+                {"user": "ops", "queryOwner": "bob|carol", "allow": ["kill"]},
+                {"user": "alice|bob|carol|ops", "allow": ["execute"]}
+            ]}"#,
+        );
+        assert!(r.can_kill_query("bob", "bob"), "owners kill their own");
+        assert!(r.can_kill_query("carol", "carol"));
+        assert!(r.can_kill_query("admin", "bob"));
+        assert!(r.can_kill_query("ops", "carol"));
+        assert!(!r.can_kill_query("ops", "alice"), "queryOwner must match");
+        assert!(
+            !r.can_kill_query("alice", "bob"),
+            "the first match (view only) decides"
+        );
+        assert!(!r.can_kill_query("bob", "alice"));
+        assert!(
+            rules("{}").can_kill_query("anyone", "bob"),
+            "no queries section allows everything"
         );
     }
 

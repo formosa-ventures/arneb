@@ -3,16 +3,18 @@
 use arneb_scheduler::QueryState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::Json;
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Extension, Router};
 use serde::Serialize;
 
+use super::auth::{AuthVia, Identity};
+use super::error::{ApiError, ErrorCode};
 use super::WebState;
 
 /// JSON response for a query.
 #[derive(Serialize)]
-struct QueryResponse {
+pub(super) struct QueryResponse {
     query_id: String,
     state: String,
     sql: String,
@@ -54,19 +56,19 @@ impl From<arneb_scheduler::QueryInfo> for QueryResponse {
 
 /// JSON response for the query list.
 #[derive(Serialize)]
-struct QueriesResponse {
+pub(super) struct QueriesResponse {
     queries: Vec<QueryResponse>,
 }
 
 /// Query parameters for listing queries.
 #[derive(serde::Deserialize, Default)]
 pub struct ListQueryParams {
-    state: Option<String>,
+    pub(super) state: Option<String>,
 }
 
 /// JSON response for cluster overview.
 #[derive(Serialize)]
-struct ClusterResponse {
+pub(super) struct ClusterResponse {
     worker_count: usize,
     role: String,
     /// Admission counters (admission-control D5); `max_running_queries`
@@ -79,7 +81,7 @@ struct ClusterResponse {
 
 /// JSON response for a worker.
 #[derive(Serialize)]
-struct WorkerResponse {
+pub(super) struct WorkerResponse {
     worker_id: String,
     address: String,
     alive: bool,
@@ -92,7 +94,7 @@ struct WorkerResponse {
 
 /// JSON response for server info.
 #[derive(Serialize)]
-struct InfoResponse {
+pub(super) struct InfoResponse {
     version: String,
     uptime_secs: u64,
     role: String,
@@ -107,10 +109,40 @@ pub fn api_routes() -> Router<WebState> {
         .route("/info", get(server_info))
 }
 
+/// The query rules apply to authenticated callers only: under `[auth] type
+/// = "none"` the API stays as open as the Web UI always was. With no rules
+/// file (or no `queries` section) everything is allowed.
+fn may_view(state: &WebState, who: &Identity, owner: Option<&str>) -> bool {
+    who.via == AuthVia::Unauthenticated
+        || state
+            .access_rules
+            .as_ref()
+            .is_none_or(|r| r.can_view_query(&who.user, owner.unwrap_or_default()))
+}
+
+pub(super) fn may_kill(state: &WebState, who: &Identity, owner: Option<&str>) -> bool {
+    who.via == AuthVia::Unauthenticated
+        || state
+            .access_rules
+            .as_ref()
+            .is_none_or(|r| r.can_kill_query(&who.user, owner.unwrap_or_default()))
+}
+
 async fn list_queries(
     State(state): State<WebState>,
+    Extension(who): Extension<Identity>,
     Query(params): Query<ListQueryParams>,
 ) -> Json<QueriesResponse> {
+    Json(queries_response(&state, &who, params))
+}
+
+/// The queries `who` may see, filtered by `?state=` (an unknown state
+/// filters nothing). Shared with `/api/v2`.
+pub(super) fn queries_response(
+    state: &WebState,
+    who: &Identity,
+    params: ListQueryParams,
+) -> QueriesResponse {
     let state_filter = params.state.and_then(|s| match s.to_uppercase().as_str() {
         "QUEUED" => Some(QueryState::Queued),
         "RUNNING" => Some(QueryState::Running),
@@ -124,37 +156,58 @@ async fn list_queries(
         .query_tracker
         .list_queries(state_filter)
         .into_iter()
+        .filter(|q| may_view(state, who, q.user.as_deref()))
         .map(QueryResponse::from)
         .collect();
 
-    Json(QueriesResponse { queries })
+    QueriesResponse { queries }
+}
+
+/// The query `id` if `who` may see it. A hidden query is `404` exactly
+/// like a missing one (the v1 empty body), never `403`.
+pub(super) fn visible_query(
+    state: &WebState,
+    who: &Identity,
+    id: &str,
+) -> Result<arneb_scheduler::QueryInfo, StatusCode> {
+    let uuid: uuid::Uuid = id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let query_id = arneb_common::identifiers::QueryId(uuid);
+    state
+        .query_tracker
+        .get_query(&query_id)
+        .filter(|q| may_view(state, who, q.user.as_deref()))
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn get_query(
     State(state): State<WebState>,
+    Extension(who): Extension<Identity>,
     Path(id): Path<String>,
 ) -> Result<Json<QueryResponse>, StatusCode> {
-    let uuid: uuid::Uuid = id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let query_id = arneb_common::identifiers::QueryId(uuid);
-    let info = state
-        .query_tracker
-        .get_query(&query_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
-
+    let info = visible_query(&state, &who, &id)?;
     Ok(Json(QueryResponse::from(info)))
 }
 
 async fn cancel_query(
     State(state): State<WebState>,
+    Extension(who): Extension<Identity>,
     Path(id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    let uuid: uuid::Uuid = id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let query_id = arneb_common::identifiers::QueryId(uuid);
-    state
-        .query_tracker
-        .cancel_query(&query_id)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
-    Ok(StatusCode::NO_CONTENT)
+) -> Response {
+    let info = match visible_query(&state, &who, &id) {
+        Ok(info) => info,
+        Err(status) => return status.into_response(),
+    };
+    if !may_kill(&state, &who, info.user.as_deref()) {
+        return ApiError::new(
+            ErrorCode::Forbidden,
+            "the access rules do not allow you to kill this query",
+        )
+        .into_response();
+    }
+    match state.query_tracker.cancel_query(&info.query_id) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Admission counters for the overview: the controller's, or with none
@@ -175,19 +228,29 @@ fn admission_counters(
 }
 
 async fn cluster_overview(State(state): State<WebState>) -> Json<ClusterResponse> {
+    Json(cluster_response(&state))
+}
+
+/// The cluster overview. Shared with `/api/v2`.
+pub(super) fn cluster_response(state: &WebState) -> ClusterResponse {
     let admission = admission_counters(state.admission.as_ref(), state.max_queued_queries);
-    Json(ClusterResponse {
+    ClusterResponse {
         worker_count: state.node_registry.alive_count(),
         role: state.role.clone(),
         running_queries: admission.running,
         queued_queries: admission.queued,
         max_running_queries: admission.max_running,
         max_queued_queries: admission.max_queued,
-    })
+    }
 }
 
 async fn list_workers(State(state): State<WebState>) -> Json<Vec<WorkerResponse>> {
-    let workers = state
+    Json(workers_response(&state))
+}
+
+/// The alive workers. Shared with `/api/v2`.
+pub(super) fn workers_response(state: &WebState) -> Vec<WorkerResponse> {
+    state
         .node_registry
         .alive_workers()
         .into_iter()
@@ -200,16 +263,20 @@ async fn list_workers(State(state): State<WebState>) -> Json<Vec<WorkerResponse>
             version: w.version,
             state: if w.draining { "draining" } else { "active" },
         })
-        .collect();
-    Json(workers)
+        .collect()
 }
 
 async fn server_info(State(state): State<WebState>) -> Json<InfoResponse> {
-    Json(InfoResponse {
+    Json(info_response(&state))
+}
+
+/// Server version, uptime and role. Shared with `/api/v2`.
+pub(super) fn info_response(state: &WebState) -> InfoResponse {
+    InfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_secs: state.start_time.elapsed().as_secs(),
         role: state.role.clone(),
-    })
+    }
 }
 
 #[cfg(test)]

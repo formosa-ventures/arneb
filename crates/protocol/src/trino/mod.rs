@@ -49,9 +49,10 @@ use arneb_connectors::ConnectorRegistry;
 use arneb_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
 use arneb_scheduler::{QueryState as TrackerState, QueryTracker};
 
-use crate::auth::{AuthConfigError, UserCredentials};
+use crate::auth::{AuthConfigError, CredentialSource};
 use crate::handler::DistributedExecutor;
-use auth::{AuthUser, Authenticator};
+use auth::AuthUser;
+pub use auth::{BasicAuthenticator, BasicVerdict, SlotError};
 use engine::{Engine, QueryOutput};
 use error::TrinoError;
 use session::{ClientSession, HeaderFamily};
@@ -109,8 +110,7 @@ pub struct TrinoServer {
     memory_pool: Arc<dyn MemoryPool>,
     query_tracker: Arc<QueryTracker>,
     tls: Option<TlsAcceptor>,
-    auth: Option<Authenticator>,
-    verifications: Arc<AtomicU64>,
+    auth: Option<BasicAuthenticator>,
     query_memory_limit: Option<usize>,
     admission: Option<arneb_scheduler::AdmissionController>,
     statement_timeout: Option<Duration>,
@@ -134,7 +134,6 @@ impl TrinoServer {
             query_tracker: Arc::new(QueryTracker::new()),
             tls: None,
             auth: None,
-            verifications: Arc::new(AtomicU64::new(0)),
             query_memory_limit: None,
             admission: None,
             statement_timeout: None,
@@ -145,19 +144,28 @@ impl TrinoServer {
     /// Require HTTP Basic auth against these users (`[auth] type =
     /// "password"`); default: none, every `X-Trino-User` is trusted.
     pub fn with_password_auth(
-        mut self,
-        creds: Option<Arc<UserCredentials>>,
+        self,
+        creds: Option<Arc<dyn CredentialSource>>,
     ) -> Result<Self, AuthConfigError> {
-        self.auth = creds
-            .map(|c| Authenticator::new(c, Arc::clone(&self.verifications)))
-            .transpose()?;
-        Ok(self)
+        let auth = creds.map(BasicAuthenticator::new).transpose()?;
+        Ok(self.with_authenticator(auth))
+    }
+
+    /// Require HTTP Basic auth through `auth`, an authenticator the caller
+    /// shares with other listeners (one PBKDF2 limiter, queue and cache for
+    /// all of them). `None`: no auth, every `X-Trino-User` is trusted.
+    pub fn with_authenticator(mut self, auth: Option<BasicAuthenticator>) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// Count of full password verifications (cache misses); test hook.
     #[doc(hidden)]
     pub fn password_verifications(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.verifications)
+        self.auth
+            .as_ref()
+            .map(|a| Arc::clone(&a.verifications))
+            .unwrap_or_default()
     }
 
     /// Serve HTTPS only with this acceptor (default: plain HTTP).
@@ -378,7 +386,7 @@ struct AppState {
     /// Scheme for `nextUri` / `infoUri` when the client sends no
     /// `X-Forwarded-Proto`: `https` when the listener serves TLS.
     scheme: &'static str,
-    auth: Option<Authenticator>,
+    auth: Option<BasicAuthenticator>,
     admission: Option<arneb_scheduler::AdmissionController>,
     statement_timeout: Option<Duration>,
 }

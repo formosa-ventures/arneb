@@ -12,9 +12,12 @@ use tokio::net::TcpListener;
 
 use arneb_catalog::CatalogManager;
 use arneb_connectors::ConnectorRegistry;
-use arneb_protocol::{ScramVerifier, TrinoConfig, TrinoServer, UserCredentials};
+use arneb_protocol::{CredentialSource, ScramVerifier, TrinoConfig, TrinoServer, UserCredentials};
 
-fn creds() -> Arc<UserCredentials> {
+mod token_source;
+use token_source::TokenSource;
+
+fn creds() -> Arc<dyn CredentialSource> {
     Arc::new(
         UserCredentials::new(vec![
             (
@@ -28,7 +31,7 @@ fn creds() -> Arc<UserCredentials> {
 }
 
 /// Start a server; returns its base URL and the verification counter.
-async fn start(auth: Option<Arc<UserCredentials>>) -> (String, Arc<AtomicU64>) {
+async fn start(auth: Option<Arc<dyn CredentialSource>>) -> (String, Arc<AtomicU64>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = TrinoServer::new(
@@ -330,4 +333,75 @@ async fn blank_trino_user_header_does_not_change_the_owner() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+async fn list_queries(base: &str, user: &str, password: &str) -> StatusCode {
+    client()
+        .get(format!("{base}/v1/query"))
+        .basic_auth(user, Some(password))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn trino_basic_accepts_an_api_token_as_the_password() {
+    let source = Arc::new(TokenSource::new(&[
+        ("alice", "alice-pw"),
+        ("bob", "bob-pw"),
+    ]));
+    let (base, counter) = start(Some(source.clone())).await;
+    let token = source.issue("alice");
+
+    let ok = submit(&base, Some(("alice", &token)), &[]).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let doc = drain(ok.json().await.unwrap(), ("alice", &token)).await;
+    assert_eq!(doc["stats"]["state"], "FINISHED");
+
+    // The token authenticates only its owner.
+    for user in ["bob", "mallory"] {
+        let resp = submit(&base, Some((user, &token)), &[]).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{user}");
+    }
+    // Tokens take the fast path: no PBKDF2 verification ran.
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+    // The password still works alongside the token.
+    assert_eq!(
+        list_queries(&base, "alice", "alice-pw").await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn revoked_token_is_refused_on_trino_basic_without_waiting_for_the_cache() {
+    let source = Arc::new(TokenSource::new(&[("alice", "alice-pw")]));
+    let (base, counter) = start(Some(source.clone())).await;
+    let token = source.issue("alice");
+    for _ in 0..3 {
+        assert_eq!(list_queries(&base, "alice", &token).await, StatusCode::OK);
+    }
+    source.revoke(&token);
+    assert_eq!(
+        list_queries(&base, "alice", &token).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn trino_basic_refuses_a_web_session_token_as_the_password() {
+    let source = Arc::new(TokenSource::new(&[("alice", "alice-pw")]));
+    let (base, _counter) = start(Some(source)).await;
+    // Session tokens (`arneb_s_<43 base64url>`) are for the Web UI only.
+    let session = format!("arneb_s_{}", "A".repeat(43));
+    assert!(!arneb_protocol::is_token_shaped(&session));
+    assert_eq!(
+        list_queries(&base, "alice", &session).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        list_queries(&base, "alice", "alice-pw").await,
+        StatusCode::OK
+    );
 }

@@ -1,0 +1,17 @@
+{{- if and .Values.coordinator.state.persistence.enabled (not .Values.coordinator.state.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "arneb.fullname" . }}-coordinator-state
+  labels:
+    {{- include "arneb.componentLabels" (dict "ctx" . "component" "coordinator") | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- with .Values.coordinator.state.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.coordinator.state.persistence.size }}
+{{- end }}

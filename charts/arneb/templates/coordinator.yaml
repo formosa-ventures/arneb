@@ -45,6 +45,8 @@ spec:
             {{- end }}
           env:
             {{- include "arneb.commonEnv" . | nindent 12 }}
+            - name: ARNEB_STATE_PATH
+              value: /var/lib/arneb/state.json
           {{- with .Values.envFrom }}
           envFrom:
             {{- toYaml . | nindent 12 }}
@@ -71,12 +73,21 @@ spec:
             periodSeconds: 10
           volumeMounts:
             {{- include "arneb.volumeMounts" . | nindent 12 }}
+            - name: state
+              mountPath: /var/lib/arneb
           {{- with .Values.coordinator.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
       volumes:
         {{- include "arneb.volumes" . | nindent 8 }}
+        - name: state
+          {{- if .Values.coordinator.state.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.coordinator.state.persistence.existingClaim | default (printf "%s-coordinator-state" (include "arneb.fullname" .)) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
       {{- with include "arneb.scheduling" .Values.coordinator }}
       {{- . | trim | nindent 6 }}
       {{- end }}

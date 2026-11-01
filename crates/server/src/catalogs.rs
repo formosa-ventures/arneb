@@ -253,13 +253,7 @@ impl LiveCatalogs {
     /// the global `[storage]` merged in, so the worker needs none of its
     /// own. Other types read no object storage and are unchanged.
     fn effective_spec(&self, spec: &CatalogConfig) -> CatalogConfig {
-        let mut effective = spec.clone();
-        if spec.catalog_type == "hive" {
-            let storage = self.storage_for(spec);
-            let empty = storage.s3.is_none() && storage.gcs.is_none() && storage.azure.is_none();
-            effective.storage = (!empty).then_some(storage);
-        }
-        effective
+        effective_spec(&self.global_storage, spec)
     }
 
     /// Marks this coordinator as serving its set over Flight without a
@@ -273,14 +267,7 @@ impl LiveCatalogs {
     /// effective specs: a hive spec with the global `[storage]` keys merged
     /// in, Ruling R12).
     pub fn served_secrets(&self) -> Vec<String> {
-        self.specs()
-            .iter()
-            .flat_map(|spec| {
-                secret_fields(&self.effective_spec(spec))
-                    .into_iter()
-                    .map(|field| format!("catalog '{}': {field}", spec.name))
-            })
-            .collect()
+        effective_secrets(&self.global_storage, &self.specs())
     }
 
     /// Whether `spec` may be served: always with a `[cluster] secret`;
@@ -1003,6 +990,32 @@ pub fn redacted_secrets(spec: &CatalogConfig) -> Vec<&'static str> {
         }
     }
     found
+}
+
+/// `spec` as a node whose global `[storage]` is `global` serves it (Ruling
+/// R12): a hive spec with the global storage merged in.
+fn effective_spec(global: &StorageConfig, spec: &CatalogConfig) -> CatalogConfig {
+    let mut effective = spec.clone();
+    if spec.catalog_type == "hive" {
+        let storage = StorageConfig::merge(global, spec.storage.as_ref());
+        let empty = storage.s3.is_none() && storage.gcs.is_none() && storage.azure.is_none();
+        effective.storage = (!empty).then_some(storage);
+    }
+    effective
+}
+
+/// The secrets `specs` would serve from a node whose global `[storage]` is
+/// `global`, as `catalog 'x': field` (effective specs, so the global keys
+/// merged into a hive spec count).
+pub fn effective_secrets(global: &StorageConfig, specs: &[CatalogConfig]) -> Vec<String> {
+    specs
+        .iter()
+        .flat_map(|spec| {
+            secret_fields(&effective_spec(global, spec))
+                .into_iter()
+                .map(|field| format!("catalog '{}': {field}", spec.name))
+        })
+        .collect()
 }
 
 /// The secrets `spec` carries, by field: `password`, a password in

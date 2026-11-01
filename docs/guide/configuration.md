@@ -764,12 +764,17 @@ the source of truth from the config file to the [state store](#state):
   - **Changed at runtime, and the rules file was also edited since it was
     last seeded:** startup refuses, since neither copy can be assumed to be
     the one you want. Restart with `--reseed-state` to take the config file
-    (catalogs, rules, settings and users), or revert the rules file to keep
-    the runtime rules.
+    (users, catalogs, rules and settings), or restore the rules file to its
+    last seeded version to keep the runtime rules (copy them into it
+    afterwards to make them the file's).
 
   An unreadable or invalid rules file stops startup, as before v0.2.0.
-  Apply `[[catalogs]]` with a [re-seed](/guide/http-api#re-seed) or
-  `--reseed-state`, which re-seeds catalogs, rules, settings and users. A
+  Every startup refusal (an invalid or edited rules file, a catalog secret
+  without `[cluster] secret`) happens before anything is written to the
+  state file, so fixing the config and restarting is enough. Apply
+  `[[catalogs]]` with a [re-seed](/guide/http-api#re-seed) or
+  `--reseed-state`, which replaces catalogs, rules, settings and users in
+  one atomic write of the state file. A
   standalone server under password auth behaves like a coordinator here.
   Under `[auth] type = "none"` nothing changes: there is no state store, and
   the config is used as before.
@@ -799,7 +804,12 @@ the source of truth from the config file to the [state store](#state):
   `password`, a password in `connection_url`, an S3 `secret_access_key` or
   an Azure `access_key`, including the global `[storage]` keys merged into
   every Hive catalog. The error names each catalog and field (never the
-  value). A catalog create, update or re-seed that would add such a secret
+  value). The check runs before anything is stored, on every catalog that
+  would be served (built or not): on a first start, removing the secret
+  from `[[catalogs]]` and restarting is enough; a secret already in the
+  state store has to be removed with a `PUT` on a server with a cluster
+  secret, or from `[[catalogs]]` followed by one start with
+  `--reseed-state`. A catalog create, update or re-seed that would add such a secret
   is refused the same way (`invalid_argument`, hint `set [cluster] secret
   ...`). Without secrets the coordinator starts with a WARN that cluster RPC
   is unauthenticated, and a worker without a secret WARNs that any peer can

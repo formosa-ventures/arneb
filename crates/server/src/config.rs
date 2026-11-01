@@ -268,6 +268,24 @@ pub struct ResolvedRules {
     pub seed: Option<arneb_state::RulesSeed>,
 }
 
+/// The startup refusal for a rules file edited since it was seeded while
+/// the stored rules were changed at runtime (Ruling R14).
+pub fn rules_file_changed(config: &AccessControlConfig) -> anyhow::Error {
+    let rules_file = config
+        .rules_file
+        .as_ref()
+        .map_or_else(|| "(unset)".to_owned(), |p| p.display().to_string());
+    anyhow::anyhow!(
+        "[access_control] rules_file {rules_file} changed since it was seeded, but the access \
+         rules in the state store were changed at runtime since then: refusing to pick one. \
+         Restart with --reseed-state to replace the stored state with the config file (the \
+         users, catalogs, rules and settings become the config's; re-seeded users' tokens \
+         are revoked), or restore the rules file to its last seeded version to keep the \
+         runtime rules (copying GET /api/v2/access-rules into the file then makes them the \
+         file's)"
+    )
+}
+
 /// Pick the startup access rules (runtime-config D1). Without a state store
 /// (`[auth] type = "none"`) they are the rules file's, as before. With one,
 /// the rules file seeds the state on its first start (or with `reseed`).
@@ -322,14 +340,7 @@ pub fn resolve_access_rules(
                  rules are used. Preview a re-seed with POST /api/v2/state/reseed?dry_run=true"
             );
         }
-        arneb_state::RulesSeed::FileChanged => bail!(
-            "[access_control] rules_file {} changed since it was seeded, but the access rules \
-             in the state store were changed at runtime since then: refusing to pick one. \
-             Restart with --reseed-state to replace the stored state with the config file \
-             (the catalogs, rules and settings become the config's), or revert the rules \
-             file to keep the runtime rules",
-            rules_file()
-        ),
+        arneb_state::RulesSeed::FileChanged => return Err(rules_file_changed(config)),
         arneb_state::RulesSeed::Seeded | arneb_state::RulesSeed::Unchanged => {}
     }
     let rules = match store.access_rules() {
@@ -3548,7 +3559,12 @@ password = "hunter2"
             .err()
             .unwrap()
             .to_string();
-        assert!(e.contains("--reseed-state") && e.contains("revert"), "{e}");
+        assert!(
+            e.contains("--reseed-state")
+                && e.contains("users")
+                && e.contains("restore the rules file"),
+            "{e}"
+        );
         assert_eq!(store.access_rules().unwrap().json, RULES_B, "unchanged");
         let r = resolve_access_rules(&edited, Some(&store), true).unwrap();
         assert_eq!(r.seed, Some(arneb_state::RulesSeed::Seeded));

@@ -63,8 +63,10 @@ reads, replaces and clears the rules through `GET`, `PUT` and `DELETE
   `rules_file` (with a WARN at every start) until a
   [re-seed](/guide/http-api#re-seed) copies the file again. If the rules
   file is also edited after a runtime change, startup refuses until you
-  restart with `--reseed-state` or revert the file. Rules never changed at
-  runtime follow the file: an edited `rules_file` applies at the next start.
+  restart with `--reseed-state` or restore the file to its last seeded
+  version. Rules never changed at runtime follow the file: an edited
+  `rules_file` applies at the next start. Runtime rules copied into the file
+  (compared as JSON) count as the file's again and follow its later edits.
 - Every change is audited (`access_rules.set`, `access_rules.clear`), with a
   SHA-256 of the rules instead of their text.
 - `GET` reports `from_config: true` while the rules are the seeded copy of

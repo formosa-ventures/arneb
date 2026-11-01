@@ -338,8 +338,6 @@ pub(crate) fn apply_seed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
-    use std::sync::{Arc, Mutex};
 
     fn v(pw: &str) -> ScramVerifier {
         ScramVerifier::from_password(pw, b"0123456789abcdef", 4096)
@@ -362,36 +360,7 @@ mod tests {
         out
     }
 
-    #[derive(Clone, Default)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
-    impl io::Write for Buf {
-        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Runs `f` and returns what it logged.
-    fn capture<R>(f: impl FnOnce() -> R) -> (R, String) {
-        let buf = Buf::default();
-        let sink = buf.clone();
-        let sub = tracing_subscriber::fmt()
-            .with_writer(move || sink.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
-        // Tests on other threads (no subscriber) can cache a callsite as
-        // disabled; rebuild the interest cache once this one is installed.
-        let r = tracing::subscriber::with_default(sub, || {
-            tracing::callsite::rebuild_interest_cache();
-            f()
-        });
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        (r, out)
-    }
+    use crate::test_log::capture;
 
     /// Adds a user the way the state store's own API would (not seeded).
     fn add_state_user(store: &StateStore, name: &str, pw: &str) {

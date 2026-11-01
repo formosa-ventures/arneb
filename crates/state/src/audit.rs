@@ -1138,33 +1138,7 @@ mod tests {
         assert_eq!(lines(&p), 1);
     }
 
-    /// Runs `f` and returns what it logged.
-    fn capture<R>(f: impl FnOnce() -> R) -> (R, String) {
-        #[derive(Clone, Default)]
-        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buf = Buf::default();
-        let sink = buf.clone();
-        let sub = tracing_subscriber::fmt()
-            .with_writer(move || sink.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
-        let r = tracing::subscriber::with_default(sub, || {
-            tracing::callsite::rebuild_interest_cache();
-            f()
-        });
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        (r, out)
-    }
+    use crate::test_log::capture;
 
     fn file_entries(p: &Path) -> Vec<AuditEntry> {
         std::fs::read_to_string(p)

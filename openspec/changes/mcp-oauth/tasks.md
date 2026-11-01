@@ -18,3 +18,10 @@
 
 - [x] 5.1 Keycloak dev realm (compose profile `oauth`), `scripts/mcp-oauth-smoke.sh`, Tier 2 run against a coordinator and two workers
 - [x] 5.2 Guides: `mcp`, `configuration` (`[oauth]`, upgrade notes), `http-api`, `kubernetes`
+
+## 6. Review round 2
+
+- [x] 6.1 JWKS fetch in a detached task (single-flight, throttled), background refetch from 80% of `jwks_cache_secs`, last good keys until `jwks_max_stale_secs`
+- [x] 6.2 Refuse ID tokens (`nonce` / `at_hash` / payload `typ: ID` without `at+jwt`), opt-in `require_access_token_typ`, client-id audience needs `required_scopes`
+- [x] 6.3 `email_verified` for `user_claim = "email"`; https for a discovered `jwks_uri` of a remote issuer; every key under a `kid` tried
+- [x] 6.4 `error="invalid_token"` on refused JWTs, metadata only at the derived path, challenges computed once

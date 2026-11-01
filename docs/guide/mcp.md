@@ -62,20 +62,44 @@ it needs a restart, and a bad value stops startup with a message naming it.
 
 ### What the server does
 
-- `GET /.well-known/oauth-protected-resource` (also with the `/mcp` suffix,
-  [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728)) answers without
+- The protected-resource metadata document
+  ([RFC 9728](https://www.rfc-editor.org/rfc/rfc9728)) answers without
   credentials with the `resource`, the `authorization_servers` (the issuer)
-  and the supported scopes.
-- A `/mcp` request without valid credentials gets `401` with
+  and the supported scopes. It is served only at the path derived from
+  `resource`, `/.well-known/oauth-protected-resource` followed by the
+  resource's path (`/.well-known/oauth-protected-resource/mcp` for
+  `https://db.example/mcp`); the bare well-known path and any other suffix
+  answer a plain `404`.
+- A `/mcp` request without credentials gets `401` with
   `WWW-Authenticate: Bearer realm="arneb", resource_metadata="…"`, which is
-  where an OAuth client starts. The `401` body is the same as everywhere
-  else.
+  where an OAuth client starts. A JWT that is presented but refused
+  (expired, wrong audience, bad signature, an ID token, ...) gets the same
+  `401` body with `error="invalid_token"` added to the challenge
+  ([RFC 6750](https://www.rfc-editor.org/rfc/rfc6750#section-3.1)), so a
+  client can refresh its token instead of starting over; the reason itself
+  is only logged at DEBUG on `arneb::oauth`. The `401` body is the same as
+  everywhere else.
 - A bearer that looks like a JWT (three dot-separated parts, not starting
-  with `arneb_`) is validated: the signature against the issuer's JWKS
-  (fetched from the discovery document, cached, refetched when a token names
-  an unknown `kid`), `iss`, `aud`, `exp` / `nbf`, and `required_scopes`.
-  Only asymmetric algorithms are accepted (RS256/384/512, PS256, ES256/384);
-  `none` and `HS*` are always refused.
+  with `arneb_`) is validated: the signature against the issuer's JWKS,
+  `iss`, `aud`, `exp` / `nbf`, that it is an access token, and
+  `required_scopes`. Every key published under the token's `kid` that fits
+  its algorithm is tried, so an algorithm migration (say RS256 and PS256
+  under one `kid`) keeps working. Only asymmetric algorithms are accepted
+  (RS256/384/512, PS256, ES256/384); `none` and `HS*` are always refused.
+- **Access tokens only.** A header `typ` of `at+jwt` (RFC 9068) is an access
+  token. Many IdPs (Keycloak, Entra ID, Okta) send `typ: JWT` instead, so
+  that is accepted too, but such a token is refused when it carries a claim
+  only OIDC ID tokens have: `nonce`, `at_hash`, or Keycloak's `typ: "ID"`.
+  Set `require_access_token_typ = true` when your IdP sends `at+jwt`, to
+  accept nothing else.
+- **Key cache.** The JWKS comes from the discovery document (a remote
+  issuer's discovered `jwks_uri` must be `https`) and is cached for
+  `jwks_cache_secs`. From 80% of that age it is refetched in the
+  background, so requests never wait for a routine refresh. If the IdP is
+  down then, the last good keys keep deciding until they are
+  `jwks_max_stale_secs` old (default 24 h). A token with an unknown `kid`
+  waits for a refetch, at most one per `jwks_min_refresh_secs`. A fetch
+  runs on its own: a client that disconnects never cancels it.
 - The token's `user_claim` is the Arneb user. That user runs the tools with
   their own access rules, and `whoami` reports `via: "oauth"`. Audit entries
   of manage actions carry `via: "oauth"`.
@@ -97,10 +121,18 @@ Design decisions you should know about:
   user could take over another Arneb user. The server logs a WARN at startup
   when the claim is not `sub`. With `sub` the Arneb user names are the IdP's
   subject ids.
+- **`user_claim = "email"` needs a verified address.** The token's
+  `email_verified` must be `true` (or the string `"true"`); otherwise the
+  answer is `403 forbidden`, "the identity's email address is not verified".
+  An IdP that does not send `email_verified` (Entra ID, for one) cannot be
+  used with `email`.
 - **The audience is the resource URL.** Tokens must be issued for this
   resource (RFC 8707): `aud` has to contain `audience`, which defaults to
   `resource`. Set `audience` only for an IdP that can emit nothing but a
-  client id.
+  client id. In that client-id mode an OIDC ID token for the same client
+  carries the same `aud`, so startup refuses an `audience` other than
+  `resource` unless `required_scopes` is set too (ID tokens carry no
+  scope).
 - **If the IdP is unreachable** and no cached key can decide, `/mcp` answers
   `503 auth_provider_unavailable` with `Retry-After: 5`, not `401`. API
   tokens, sessions and Basic keep working.

@@ -227,7 +227,7 @@ async fn end_session(
 #[derive(Serialize)]
 struct WhoAmI {
     user: String,
-    /// `token`, `session`, `basic` or `unauthenticated`.
+    /// `token`, `session`, `basic`, `oauth` or `unauthenticated`.
     via: &'static str,
     privileges: Privileges,
 }

@@ -120,6 +120,25 @@ restarts every pod.
 - With password auth, the Web UI binds to `127.0.0.1` unless `[web]
   bind_address` is set, so the Service's web port only answers when it is.
 
+## OAuth for MCP
+
+`[oauth]` (see [MCP Server: OAuth](/guide/mcp#oauth)) goes in the coordinator
+config like any other section, or in `ARNEB_OAUTH_*` through `extraEnv`.
+
+- **A TLS-terminating ingress is required** for anything but loopback. The
+  Web port speaks plain HTTP, so a `https` `resource` URL has to be served by
+  an ingress or proxy that terminates TLS in front of the coordinator's Web
+  port and forwards `/mcp` and `/.well-known/oauth-protected-resource`.
+  `resource` is the public URL of that ingress plus `/mcp`; the IdP must put
+  the same URL in the token's `aud`. Arneb refuses a plain-`http` `issuer` or
+  `resource` unless the host is loopback.
+- **The coordinator pod must reach the issuer** (discovery document and JWKS)
+  over `https`. The image ships CA certificates, so a public CA works; for a
+  private CA, mount the bundle and point `SSL_CERT_FILE` at it with
+  `extraEnv`.
+- The Web port binds to `127.0.0.1` under password auth unless `[web]
+  bind_address` is set; set it so the ingress can reach the Service.
+
 ## Coordinator state
 
 Under `[auth] type = "password"` the coordinator keeps its users and

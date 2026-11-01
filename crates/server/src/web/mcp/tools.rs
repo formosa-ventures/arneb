@@ -494,7 +494,7 @@ impl ArnebMcp {
     /// `whoami`: the caller, how it authenticated, and the server.
     #[tool(
         description = "Who the server thinks you are: the user, how the request authenticated \
-                       (token, session, basic or unauthenticated), the auth mode, and the \
+                       (token, session, basic, oauth or unauthenticated), the auth mode, and the \
                        server version and role, and your `privileges` (`observe`, `manage`).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]

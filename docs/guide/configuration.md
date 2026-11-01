@@ -189,6 +189,38 @@ override the file. `default_page_bytes` must be in `1..=` `[agent_api]`
 `max_page_bytes`, so a bad value stops startup. Row, wait and cell limits of
 the tools are the `[agent_api]` ones above.
 
+## OAuth
+
+`[oauth]` lets `/mcp` accept OAuth 2.0 access tokens from an external OpenID
+Connect provider; see [MCP Server: OAuth](/guide/mcp#oauth) for how it works
+and for the identity provider checklist. It is startup-only (a restart
+applies a change) and needs `[auth] type = "password"` and `[mcp] enabled =
+true`; otherwise startup fails naming the setting. Setting `issuer` turns it
+on. The effective values are logged once on `arneb::config`.
+
+```toml
+[oauth]
+issuer     = "https://idp.example/realms/arneb"
+resource   = "https://db.example/mcp"
+user_claim = "sub"
+```
+
+| `[oauth]` field | Env var | Default | Meaning |
+|---|---|---|---|
+| `issuer` | `ARNEB_OAUTH_ISSUER` | unset | Issuer URL of the IdP; the required `iss`, and the base of the discovery document. Setting it enables OAuth. `https`, or `http` for a loopback host. |
+| `resource` | `ARNEB_OAUTH_RESOURCE` | unset | Public URL of `/mcp`; required with `issuer`, must end in `/mcp`, no query or fragment. Published in the metadata document. |
+| `audience` | `ARNEB_OAUTH_AUDIENCE` | `resource` | Value `aud` must contain. |
+| `user_claim` | `ARNEB_OAUTH_USER_CLAIM` | `sub` | Claim holding the Arneb user name. |
+| `jwks_uri` | `ARNEB_OAUTH_JWKS_URI` | from discovery | The IdP's JWKS URL, when its discovery document cannot be used. |
+| `required_scopes` | `ARNEB_OAUTH_REQUIRED_SCOPES` (comma-separated) | none | Scopes a token must carry (`scope` string or `scp` array). A valid token without one gets `403` with `error="insufficient_scope"`. |
+| `leeway_secs` | `ARNEB_OAUTH_LEEWAY_SECS` | 60 | Clock-skew allowance for `exp` / `nbf`, `0` to `300`. |
+| `jwks_cache_secs` | `ARNEB_OAUTH_JWKS_CACHE_SECS` | 3600 | How long fetched signing keys are used, at least `60`. |
+| `jwks_min_refresh_secs` | `ARNEB_OAUTH_JWKS_MIN_REFRESH_SECS` | 30 | Minimum gap between JWKS fetches (a token with an unknown `kid` triggers one), `1` to `jwks_cache_secs`. |
+
+An empty env var counts as unset; env vars override the file. The server
+reaches the IdP over the network (5 s timeout per request), so its pod needs
+a route to the issuer.
+
 ## Admission Control
 
 The coordinator (or standalone node) caps how many queries run at once,
@@ -798,6 +830,29 @@ the source of truth from the config file to the [state store](#state):
   is needed. The worker ConfigMap may keep `[[catalogs]]` and `[storage]`,
   or drop both: workers take catalogs, defaults and catalog storage from
   the coordinator.
+
+### Upgrading to v0.2.0 (MCP OAuth)
+
+Nothing changes unless you add an `[oauth]` section: without it `/mcp`,
+every other route, and every response header are byte-identical to the
+previous release, and the `WWW-Authenticate` challenge stays
+`Bearer realm="arneb"`. With `[oauth]`:
+
+- **Only `/mcp` accepts JWTs.** `/api/*` and `/metrics` treat one as an
+  invalid bearer.
+- **Create the users first.** A valid token for a name with no Arneb user is
+  `403`; there is no auto-provisioning.
+- **Check `user_claim`.** The default is `sub`, so Arneb user names are
+  subject ids. `preferred_username` and `email` work but must not be
+  editable by users at your IdP.
+- **`[oauth]` is startup-only** and refuses to start without `[auth] type =
+  "password"` and `[mcp] enabled = true`. A plain-`http` issuer or resource
+  is refused unless the host is loopback.
+- **The Web port needs TLS in front** for any non-loopback `resource`; see
+  [Kubernetes](/guide/kubernetes#oauth-for-mcp).
+- **Revoking at the IdP is not enough for minted API tokens.** An OAuth
+  identity can create API tokens like any user; they outlive the IdP
+  session until revoked or until the Arneb user is deleted.
 
 ## State
 

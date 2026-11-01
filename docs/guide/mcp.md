@@ -29,13 +29,121 @@ are accepted too.
 - **The Web port is plain HTTP.** The bearer token crosses the network in
   the clear. For anything beyond the same machine, put a TLS-terminating
   proxy in front of the Web port and connect to its `https://` address.
-- **OAuth-only clients are not supported yet.** Clients that insist on an
-  OAuth flow, such as claude.ai custom connectors, have to wait for H6 of
-  the headless agent interface. Use a client that accepts a bearer header.
+- **OAuth-only clients** (claude.ai custom connectors, for example) need
+  `[oauth]` configured; see [OAuth](#oauth).
 
 Under `[auth] type = "none"` there is nothing to prove: the caller is the
 `X-Arneb-User` header or `anonymous`, and `/mcp` accepts only loopback
 `Host` values by default (see [Host allow-list](#host-allow-list)).
+
+## OAuth
+
+Clients that insist on an OAuth flow cannot send an API token. With an
+`[oauth]` section, `/mcp` also accepts OAuth 2.0 access tokens (JWTs) from an
+external OpenID Connect identity provider (IdP) such as Keycloak, Auth0,
+Okta or Entra ID. Arneb is only the resource server: it never issues tokens,
+serves a login page or registers clients. The client discovers the IdP from
+Arneb, signs the user in there, and sends the resulting token.
+
+```toml
+[auth]
+type = "password"          # required
+
+[oauth]
+issuer     = "https://idp.example/realms/arneb"
+resource   = "https://db.example/mcp"     # the public URL of /mcp
+user_claim = "sub"                        # default; see below
+```
+
+Every key, its env var and its default is in
+[Configuration](/guide/configuration#oauth). Setting `issuer` turns OAuth
+on; without it nothing changes. `[oauth]` is read at startup only; changing
+it needs a restart, and a bad value stops startup with a message naming it.
+
+### What the server does
+
+- `GET /.well-known/oauth-protected-resource` (also with the `/mcp` suffix,
+  [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728)) answers without
+  credentials with the `resource`, the `authorization_servers` (the issuer)
+  and the supported scopes.
+- A `/mcp` request without valid credentials gets `401` with
+  `WWW-Authenticate: Bearer realm="arneb", resource_metadata="…"`, which is
+  where an OAuth client starts. The `401` body is the same as everywhere
+  else.
+- A bearer that looks like a JWT (three dot-separated parts, not starting
+  with `arneb_`) is validated: the signature against the issuer's JWKS
+  (fetched from the discovery document, cached, refetched when a token names
+  an unknown `kid`), `iss`, `aud`, `exp` / `nbf`, and `required_scopes`.
+  Only asymmetric algorithms are accepted (RS256/384/512, PS256, ES256/384);
+  `none` and `HS*` are always refused.
+- The token's `user_claim` is the Arneb user. That user runs the tools with
+  their own access rules, and `whoami` reports `via: "oauth"`. Audit entries
+  of manage actions carry `via: "oauth"`.
+- API tokens, sessions and Basic credentials keep working on `/mcp` as before.
+
+Design decisions you should know about:
+
+- **`/mcp` only.** A JWT on `/api/*`, `/metrics` or the Web UI is just an
+  invalid bearer (`401`).
+- **The user must already exist.** Arneb does not create users from tokens. A
+  valid token for a name with no Arneb user is `403 forbidden` (not `401`,
+  which would send the client round its login flow again). Create the user
+  once with `POST /api/v2/users` or `[[auth.users]]`; the password is only
+  for pgwire and Basic, an OAuth-only user never uses it. Deleting the user
+  ends their OAuth access on the next request.
+- **`sub` is the default `user_claim`** because it is the only claim OIDC
+  guarantees stable and unique. `preferred_username` and `email` can be
+  edited by users at some IdPs; only use them when the IdP forbids that, or a
+  user could take over another Arneb user. The server logs a WARN at startup
+  when the claim is not `sub`. With `sub` the Arneb user names are the IdP's
+  subject ids.
+- **The audience is the resource URL.** Tokens must be issued for this
+  resource (RFC 8707): `aud` has to contain `audience`, which defaults to
+  `resource`. Set `audience` only for an IdP that can emit nothing but a
+  client id.
+- **If the IdP is unreachable** and no cached key can decide, `/mcp` answers
+  `503 auth_provider_unavailable` with `Retry-After: 5`, not `401`. API
+  tokens, sessions and Basic keep working.
+- **An OAuth identity has the same rights as the user**, including
+  `create_token`. Revoking the user at the IdP does not revoke Arneb API
+  tokens they minted earlier; revoke those through the API, or delete the
+  Arneb user.
+- **Plain `http`** is accepted for `issuer` and `resource` only on a
+  loopback host (local testing). Anything else must be `https`, and
+  `resource` must end in `/mcp`.
+
+### Identity provider checklist
+
+1. Create an OIDC realm / tenant whose access tokens are signed JWTs with an
+   asymmetric key (not opaque tokens, not HS256).
+2. Make the access token's `aud` contain exactly the `resource` URL. In
+   Keycloak that is an Audience mapper on the client with *Included Custom
+   Audience* set to the URL; in other IdPs an API / resource identifier.
+3. Make sure the claim named by `user_claim` is in the access token (not
+   only in the ID token), and that it equals an Arneb user name.
+4. Create the matching Arneb users.
+5. Allow the MCP client's redirect URI. MCP clients are public clients
+   using the authorization-code flow with PKCE; what a given client needs
+   (a registered client id, or dynamic client registration) is up to the
+   IdP and the client.
+6. Optionally set `required_scopes` to a scope the IdP grants only to
+   permitted clients.
+
+`docker/keycloak/arneb-realm.json` is a dev realm that does this (users
+`alice`, `bob`, `carol` with public, dev-only passwords; client
+`arneb-smoke` with the audience mapper, client `arneb-other` without). Start
+it with `docker compose --profile oauth up -d keycloak` and point `[oauth]`
+at `http://127.0.0.1:8180/realms/arneb`; `scripts/mcp-oauth-smoke.sh` runs
+the whole scenario against it.
+
+### Connecting claude.ai
+
+Custom connectors need a public `https` URL, so put a TLS-terminating proxy
+in front of the Web port (see [Kubernetes](/guide/kubernetes#oauth-for-mcp))
+and set `resource` to its address plus `/mcp`. In claude.ai, add a custom
+connector with that URL. claude.ai reads the metadata document, sends the
+user to the IdP to sign in, and calls `/mcp` with the token. The signed-in
+user must exist in Arneb, or every call is `403`.
 
 ## Tools
 

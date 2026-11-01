@@ -5,6 +5,9 @@
 bind_address = "0.0.0.0"
 
 [cluster]
+# Bench-only shared secret (every node must match). The coordinator refuses
+# to start without one while a catalog carries a secret (the S3 keys below).
+secret = "arneb-bench-cluster-secret-not-for-production"
 role = "worker"
 rpc_port = 9090
 coordinator_address = "arneb-coord:9090"

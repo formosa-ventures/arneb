@@ -4,7 +4,9 @@
 #
 # Runs the acceptance scenario of the runtime-config change against a live
 # distributed stack: a coordinator plus two workers with password auth,
-# `admin_users = [<admin>]`, a persistent `[state] path`, a rules file that
+# `admin_users = [<admin>]`, a persistent `[state] path`, the same
+# `[cluster] secret` on every node (PG_URL carries a password, which the
+# coordinator refuses to serve over unauthenticated cluster RPC), a rules file that
 # lets user2 read the TPC-H tables, and a PostgreSQL database for the new
 # catalog (the docker compose `postgres` service with the pg-tpch-seed
 # `tpch_mixed` schema). Takes the environment of scripts/manage-smoke.sh plus

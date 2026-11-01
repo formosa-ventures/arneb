@@ -77,6 +77,12 @@ Every catalog answer, MCP result and audit entry SHALL replace `password`, `secr
 ### Requirement: Workers receive catalogs from the coordinator
 Workers SHALL ignore `[[catalogs]]` in their own config, logging one INFO on `arneb::config` that names them, and SHALL take their catalogs from the coordinator over Flight under the cluster security. Each set SHALL carry the coordinator's default catalog and schema, which a worker SHALL use for a scan with no catalog or schema, and each hive spec SHALL carry the coordinator's global `[storage]` merged in, so a worker needs no catalog or storage config of its own. Every heartbeat reply SHALL carry the coordinator's catalog generation and an epoch chosen at random at each coordinator start; a worker whose applied `(epoch, generation)` differs SHALL pull the set. A pushed or pulled set from the same epoch SHALL apply only when its generation is newer, and a set from another epoch SHALL always apply. Applying a set SHALL build new or changed catalogs, swap them in and remove catalogs not in the set; a catalog that fails to build SHALL be skipped with a WARN, the applied generation SHALL still advance, and the worker SHALL retry the failed catalogs at most once per 30 s. A task that names a catalog the worker does not have SHALL pull once and retry before failing with `catalog '<name>' is not registered on worker <id>`.
 
+A coordinator without a `[cluster] secret` SHALL refuse to start while a served catalog's effective spec carries a secret (`password`, a `connection_url` password, an S3 `secret_access_key` or an Azure `access_key`), naming each catalog and field but never a value, and SHALL refuse a catalog create, update or re-seed that would serve one with `invalid_argument` and a hint to set `[cluster] secret`. Without such secrets it SHALL start and log a WARN on `arneb::config` that cluster RPC is unauthenticated; a worker without a secret SHALL log a WARN that `sync_catalogs` is unauthenticated.
+
+#### Scenario: Catalog secret without a cluster secret
+- **WHEN** a coordinator with no `[cluster] secret` starts with a postgresql catalog that has a `password`
+- **THEN** startup fails with an error naming `[cluster] secret` and `catalog 'pg': password`
+
 #### Scenario: Worker restarted
 - **WHEN** a worker restarts after catalog `pg2` was created
 - **THEN** its first heartbeat pulls the set, and a query on `pg2` runs on it

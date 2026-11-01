@@ -105,7 +105,11 @@ restarts every pod.
 - **Cluster secret.** Without `clusterSecret.existingSecret`, the chart
   generates a random 48-character secret on install and keeps it on
   upgrade. Every pod reads it as `ARNEB_CLUSTER_SECRET`. To rotate it,
-  update the Secret and restart all pods together.
+  update the Secret and restart all pods together. Keep it set: the
+  coordinator serves catalog passwords and storage keys to the workers over
+  cluster RPC, and without a secret it refuses to start while a catalog
+  carries one (see
+  [Upgrading to v0.2.0 (runtime config)](/guide/configuration#upgrading-to-v020-runtime-config)).
 - **Users and credentials.** A config with `[auth]` users or storage keys
   belongs in a Secret: create one with a `config.toml` key and set
   `existingConfigSecret`. Catalog passwords can also come from

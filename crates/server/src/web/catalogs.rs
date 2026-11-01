@@ -308,6 +308,27 @@ fn validate_update(spec: &CatalogConfig) -> Result<(), ApiError> {
     validate_spec_fields(spec).map_err(|e| ApiError::new(ErrorCode::InvalidArgument, e))
 }
 
+/// Refuses `spec` when it carries a secret and this coordinator serves its
+/// catalogs over Flight without a `[cluster] secret`: any peer that reaches
+/// the RPC port could read it with `get_catalogs`. Shared with the re-seed.
+pub(super) fn check_exposure(live: &LiveCatalogs, spec: &CatalogConfig) -> Result<(), ApiError> {
+    live.exposure_check(spec).map_err(|fields| {
+        ApiError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "catalog {:?} carries {}, but this coordinator serves catalog definitions \
+                 over cluster RPC without a [cluster] secret, so any peer could read them",
+                spec.name,
+                fields.join(", ")
+            ),
+        )
+        .with_hint(
+            "set [cluster] secret (or ARNEB_CLUSTER_SECRET) on every node and restart them, \
+             or leave the secret out of the catalog",
+        )
+    })
+}
+
 /// Builds `spec` on the coordinator (connects to it, at most 10 s).
 async fn probe(live: &LiveCatalogs, spec: &CatalogConfig) -> Result<BuiltCatalog, ApiError> {
     live.build(spec).await.map_err(|e| {
@@ -406,6 +427,7 @@ pub(super) async fn create_catalog_for(
     )?;
     validate(&spec)?;
     let (store, live) = (store(state)?, live(state)?);
+    check_exposure(&live, &spec)?;
     // Cheap pre-check, so a taken name never pays for a connection; the
     // action checks again under the lock.
     if find_record(&store, &spec.name).is_some() {
@@ -458,6 +480,7 @@ pub(super) async fn update_catalog_for(
     }
     no_placeholders(&spec, SEND_SECRETS)?;
     validate_update(&spec)?;
+    check_exposure(&live, &spec)?;
     let built = probe(&live, &spec).await?;
     #[cfg(test)]
     test_hooks::after_probe(state);
@@ -1448,6 +1471,40 @@ mod tests {
         let (status, body) = drop_catalog(&state, "pg-prod", false).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(stored(&state, "pg-prod").is_none());
+    }
+
+    /// A coordinator without a `[cluster] secret` refuses a catalog that
+    /// would serve a secret over Flight, on create and on update.
+    #[tokio::test]
+    async fn secrets_are_refused_without_a_cluster_secret() {
+        let (state, probed) = node();
+        let live = state.catalogs.clone().unwrap();
+        live.set_unauthenticated_flight(true);
+        let (status, body) = create(&state, pg_spec("pg", closed_port()), false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_argument");
+        assert!(body["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("[cluster] secret"));
+        assert!(!body.to_string().contains(PG_SECRET));
+        assert!(stored(&state, "pg").is_none());
+        assert!(
+            probed.lock().unwrap().is_empty(),
+            "refused before connecting"
+        );
+
+        let plain = json!({
+            "name": "pg", "type": "postgresql",
+            "connection_url": format!("postgresql://arneb@127.0.0.1:{}/arneb", closed_port()),
+        });
+        let (status, body) = create(&state, plain.clone(), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut with_password = plain;
+        with_password["password"] = json!(PG_SECRET);
+        let (status, body) = update(&state, "pg", with_password, false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(stored(&state, "pg").unwrap().spec["password"].is_null());
     }
 
     #[tokio::test]

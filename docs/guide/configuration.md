@@ -474,7 +474,11 @@ ca_path   = "/etc/arneb/ca.crt"       # CA that signed every node's certificate
   port can fetch them; without TLS they travel in the clear. Without a
   secret, any peer can also push a catalog set to a worker
   (`sync_catalogs`); the worker replaces it with the coordinator's on its
-  next heartbeat. Use both whenever a catalog carries credentials.
+  next heartbeat. So a coordinator without a secret refuses to start while
+  a catalog it serves carries a secret, refuses API changes that add one,
+  and otherwise starts with a WARN; a worker without a secret WARNs too
+  (see [Upgrading to v0.2.0 (runtime config)](#upgrading-to-v020-runtime-config)).
+  Use TLS as well whenever a catalog carries credentials.
 - The effective mode is logged on `arneb::config`
   (`cluster_auth="secret"|"off" cluster_tls="on"|"off"`). A short secret, a
   missing `[cluster.tls]` path, or an unreadable file stops startup.
@@ -770,12 +774,24 @@ the source of truth from the config file to the [state store](#state):
   (`ARNEB_CATALOG_<NAME>_PASSWORD`) are no longer read on workers. Only the
   alive workers get a push; a worker that joins later pulls on its first
   heartbeat.
-- **Set `[cluster] secret` and `[cluster.tls]` when catalogs carry
-  credentials.** The catalog definitions, passwords included, now cross the
-  cluster RPC port from the coordinator to the workers. The coordinator
-  serves them to any peer that passes [cluster security](#cluster-security):
-  with no secret on an open RPC port, anyone who reaches it can read every
-  catalog password, and without TLS they cross the network in the clear.
+- **A coordinator with catalog secrets needs `[cluster] secret`.** The
+  catalog definitions, passwords included, now cross the cluster RPC port
+  from the coordinator to the workers (`get_catalogs`, `sync_catalogs`).
+  Without a secret anyone who reaches the port could read every catalog
+  password and storage key, or replace a worker's catalogs. So a
+  coordinator without `[cluster] secret` (`ARNEB_CLUSTER_SECRET`) now
+  **refuses to start** while a served catalog carries a secret: a
+  `password`, a password in `connection_url`, an S3 `secret_access_key` or
+  an Azure `access_key`, including the global `[storage]` keys merged into
+  every Hive catalog. The error names each catalog and field (never the
+  value). A catalog create, update or re-seed that would add such a secret
+  is refused the same way (`invalid_argument`, hint `set [cluster] secret
+  ...`). Without secrets the coordinator starts with a WARN that cluster RPC
+  is unauthenticated, and a worker without a secret WARNs that any peer can
+  replace its catalogs. Set the same secret on every node (the Helm chart
+  already does) and add `[cluster.tls]`, or the secret and the catalog
+  passwords cross the network in the clear. A standalone server serves no
+  catalogs over RPC and is not affected.
 - **A resolved `ARNEB_CATALOG_<NAME>_PASSWORD` is stored in the state
   file.** The coordinator resolves it when it loads the config, so the
   seeded catalog keeps the password in `state.json` (mode `0600`). Rotating

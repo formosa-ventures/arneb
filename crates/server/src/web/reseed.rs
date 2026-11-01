@@ -215,6 +215,9 @@ pub(super) async fn reseed_for(
             ApiError::new(ErrorCode::Internal, "the config file could not be loaded")
         })??;
     guard_lockout(state, who, seed.rules.as_ref().map(|(_, r)| r.as_ref()))?;
+    for (spec, _) in &seed.catalogs {
+        super::catalogs::check_exposure(&live, spec)?;
+    }
     // D10: build what differs from the live set before taking the lock.
     let now = installed(&live);
     let builds = seed
@@ -955,6 +958,39 @@ mod tests {
             audit[0].1.get("effect").is_none(),
             "the failed run has no effect"
         );
+    }
+
+    /// Without a `[cluster] secret` a re-seed that would serve a catalog
+    /// secret over Flight is refused, like a catalog create.
+    #[tokio::test]
+    async fn reseed_refuses_secrets_without_a_cluster_secret() {
+        let _g = THRESHOLD_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = write_config(tmp.path(), Some(CONFIG_RULES));
+        let state = node(&config, &["root"]).await;
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(
+            "[[catalogs]]\nname = \"pg\"\ntype = \"postgresql\"\n\
+             connection_url = \"postgresql://u@127.0.0.1:1/db\"\npassword = \"pg-secret-Qw1\"\n",
+        );
+        std::fs::write(&config, text).unwrap();
+        state
+            .catalogs
+            .as_ref()
+            .unwrap()
+            .set_unauthenticated_flight(true);
+        let store = state.state.clone().unwrap();
+        let before = observe(&store);
+        for dry_run in [true, false] {
+            let (status, body) = reseed(&state, ("root", "rootpw"), dry_run).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("[cluster] secret"));
+            assert!(!body.to_string().contains("pg-secret-Qw1"));
+        }
+        assert_eq!(observe(&store), before);
     }
 
     #[tokio::test]

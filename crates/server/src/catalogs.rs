@@ -96,6 +96,10 @@ pub struct LiveCatalogs {
     /// last applied set (Ruling R12); `None` until a set that carries them
     /// arrives, and on a coordinator.
     pushed_defaults: RwLock<Option<(String, String)>>,
+    /// The coordinator serves its set over Flight `get_catalogs` without a
+    /// `[cluster] secret`, so no served spec may carry a secret
+    /// ([`exposure_check`](Self::exposure_check)).
+    unauthenticated_flight: std::sync::atomic::AtomicBool,
     /// Serializes [`apply_set`](Self::apply_set) calls, which build outside
     /// any other lock.
     applying: tokio::sync::Mutex<()>,
@@ -135,6 +139,7 @@ impl LiveCatalogs {
             epoch: AtomicU64::new(0),
             failed: RwLock::new(Default::default()),
             pushed_defaults: RwLock::new(None),
+            unauthenticated_flight: std::sync::atomic::AtomicBool::new(false),
             applying: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             test_builder: None,
@@ -246,6 +251,43 @@ impl LiveCatalogs {
             effective.storage = (!empty).then_some(storage);
         }
         effective
+    }
+
+    /// Marks this coordinator as serving its set over Flight without a
+    /// `[cluster] secret`: from then on [`exposure_check`](Self::exposure_check)
+    /// refuses a spec that would serve a secret.
+    pub fn set_unauthenticated_flight(&self, on: bool) {
+        self.unauthenticated_flight.store(on, Ordering::SeqCst);
+    }
+
+    /// The secrets the served set carries, as `catalog 'x': field` (the
+    /// effective specs: a hive spec with the global `[storage]` keys merged
+    /// in, Ruling R12).
+    pub fn served_secrets(&self) -> Vec<String> {
+        self.specs()
+            .iter()
+            .flat_map(|spec| {
+                secret_fields(&self.effective_spec(spec))
+                    .into_iter()
+                    .map(|field| format!("catalog '{}': {field}", spec.name))
+            })
+            .collect()
+    }
+
+    /// Whether `spec` may be served: always with a `[cluster] secret`;
+    /// without one only when its effective spec carries no secret (Flight
+    /// `get_catalogs` would hand it to any peer). `Err` names the secret
+    /// fields.
+    pub fn exposure_check(&self, spec: &CatalogConfig) -> Result<(), Vec<&'static str>> {
+        if !self.unauthenticated_flight.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let fields = secret_fields(&self.effective_spec(spec));
+        if fields.is_empty() {
+            Ok(())
+        } else {
+            Err(fields)
+        }
     }
 
     /// The generation, the installed specs (as effective specs, Ruling
@@ -897,6 +939,39 @@ pub fn redacted_secrets(spec: &CatalogConfig) -> Vec<&'static str> {
     found
 }
 
+/// The secrets `spec` carries, by field: `password`, a password in
+/// `connection_url` (userinfo or query parameter), `storage.s3.secret_access_key`
+/// and `storage.azure.access_key`. A GCS `service_account_path` is a path on
+/// the node, not the key itself, so it is not listed.
+pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    if spec.password.is_some() {
+        found.push("password");
+    }
+    if let Some(url) = &spec.connection_url {
+        if url_password_range(&url.0).is_some() || !url_query_passwords(&url.0).is_empty() {
+            found.push("connection_url password");
+        }
+    }
+    if let Some(storage) = &spec.storage {
+        if storage
+            .s3
+            .as_ref()
+            .is_some_and(|s3| s3.secret_access_key.is_some())
+        {
+            found.push("storage.s3.secret_access_key");
+        }
+        if storage
+            .azure
+            .as_ref()
+            .is_some_and(|azure| azure.access_key.is_some())
+        {
+            found.push("storage.azure.access_key");
+        }
+    }
+    found
+}
+
 /// Whether `a` and `b` send their secrets to the same places (Ruling R10):
 /// the same `connection_url` apart from its passwords (host, port,
 /// database, user, parameters), `metastore_uri`, S3 `endpoint` and
@@ -1470,6 +1545,64 @@ mod tests {
             fill_redacted(&mut back, &stored);
             assert_eq!(back.connection_url.as_ref().unwrap().0, url);
         }
+    }
+
+    /// Without a cluster secret no served spec may carry a secret, the
+    /// global `[storage]` keys a hive spec is served with included.
+    #[test]
+    fn exposure_check_refuses_secrets_over_unauthenticated_flight() {
+        let manager = Arc::new(CatalogManager::new("memory", "default"));
+        let storage: StorageConfig = serde_json::from_value(serde_json::json!({
+            "s3": {"region": "us-east-1", "secret_access_key": "global-s3-secret"}
+        }))
+        .unwrap();
+        let live = LiveCatalogs::with_test_builder_and_storage(
+            manager,
+            Arc::new(ConnectorRegistry::new()),
+            storage,
+            Box::new(|_| Ok(fake_built())),
+        );
+        let pg = spec(serde_json::json!({
+            "name": "p", "type": "postgresql", "connection_url": "postgresql://u@h/db"
+        }));
+        let mut pg_pw = pg.clone();
+        pg_pw.password = Some(RedactedString("pw".into()));
+        let pg_url = spec(serde_json::json!({
+            "name": "p", "type": "postgresql", "connection_url": "postgresql://u:p/w@h/db"
+        }));
+        // With a cluster secret everything may be served.
+        for s in [&pg, &pg_pw, &pg_url, &hive("lake")] {
+            assert_eq!(live.exposure_check(s), Ok(()));
+        }
+        live.set_unauthenticated_flight(true);
+        assert_eq!(live.exposure_check(&pg), Ok(()));
+        assert_eq!(live.exposure_check(&pg_pw), Err(vec!["password"]));
+        assert_eq!(
+            live.exposure_check(&pg_url),
+            Err(vec!["connection_url password"])
+        );
+        assert_eq!(
+            live.exposure_check(&hive("lake")),
+            Err(vec!["storage.s3.secret_access_key"]),
+            "the global [storage] key is served with every hive spec"
+        );
+        let gcs_only = spec(serde_json::json!({
+            "name": "g", "type": "postgresql", "connection_url": "postgresql://u@h/db",
+            "storage": {"gcs": {"service_account_path": "/keys/sa.json"}}
+        }));
+        assert_eq!(live.exposure_check(&gcs_only), Ok(()));
+
+        assert!(live.served_secrets().is_empty());
+        live.install(hive("lake"), fake_built());
+        live.install(pg_pw, fake_built());
+        assert_eq!(
+            live.served_secrets(),
+            vec![
+                "catalog 'lake': storage.s3.secret_access_key",
+                "catalog 'p': password"
+            ]
+        );
+        assert_eq!(secret_fields(&secret_spec()).len(), 4);
     }
 
     #[test]

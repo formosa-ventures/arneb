@@ -455,6 +455,7 @@ async fn run() -> Result<()> {
              cross the network unencrypted"
         );
     }
+    let has_cluster_secret = cluster_security.secret.is_some();
     arneb_rpc::install_cluster_security(cluster_security);
     let query_tracker = Arc::new(arneb_scheduler::QueryTracker::with_history_limit(
         config.observability.query_history_size,
@@ -843,6 +844,14 @@ async fn run() -> Result<()> {
         )
         .await?;
     }
+    // Before the Flight server starts: without a [cluster] secret,
+    // get_catalogs and sync_catalogs are open to any peer.
+    check_catalog_rpc_security(
+        &role,
+        has_cluster_secret,
+        &live_catalogs,
+        config.cluster.rpc_port,
+    )?;
     let auth_method = match &state_store {
         Some(store) => arneb_protocol::AuthMethod::ScramSha256(store.clone()),
         None => config_auth,
@@ -1612,6 +1621,58 @@ fn coordinator_epoch() -> u64 {
     u64::from_le_bytes(bytes).max(1)
 }
 
+/// Cluster RPC carries the catalog definitions (runtime-config D8): a
+/// coordinator serves them, raw secrets included, with `get_catalogs`, and
+/// a worker replaces its set on `sync_catalogs`. Without a `[cluster]
+/// secret` both are open to any peer that reaches the RPC port, so a
+/// coordinator refuses to start while a served catalog carries a secret
+/// (and refuses API changes that add one), and otherwise WARNs; a worker
+/// WARNs.
+fn check_catalog_rpc_security(
+    role: &ServerRole,
+    has_cluster_secret: bool,
+    live: &catalogs::LiveCatalogs,
+    rpc_port: u16,
+) -> Result<()> {
+    if has_cluster_secret {
+        return Ok(());
+    }
+    match role {
+        ServerRole::Coordinator => {
+            live.set_unauthenticated_flight(true);
+            let exposed = live.served_secrets();
+            if !exposed.is_empty() {
+                bail!(
+                    "refusing to start: the coordinator serves its catalog definitions to \
+                     workers over cluster RPC (port {rpc_port}), and without a [cluster] \
+                     secret any peer that reaches it can read them, secrets included ({}). \
+                     Set [cluster] secret (or ARNEB_CLUSTER_SECRET, at least 32 characters) \
+                     on every node, or remove these secrets from the catalogs",
+                    exposed.join(", ")
+                );
+            }
+            tracing::warn!(
+                target: "arneb::config",
+                rpc_port,
+                "no [cluster] secret: cluster RPC is unauthenticated, so any peer that reaches \
+                 the RPC port can read the catalog definitions (get_catalogs) and replace or \
+                 wipe a worker's catalogs (sync_catalogs). Catalogs that carry a secret are \
+                 refused until [cluster] secret (ARNEB_CLUSTER_SECRET) is set on every node"
+            );
+        }
+        ServerRole::Worker => tracing::warn!(
+            target: "arneb::config",
+            rpc_port,
+            "no [cluster] secret: cluster RPC is unauthenticated, so any peer that reaches \
+             the RPC port can replace or wipe this worker's catalogs (sync_catalogs). Set \
+             [cluster] secret (ARNEB_CLUSTER_SECRET) on every node"
+        ),
+        // Standalone serves no catalogs over RPC.
+        ServerRole::Standalone => {}
+    }
+    Ok(())
+}
+
 /// The `sync_catalogs` handler: applies a set the coordinator pushed. A
 /// stale set (same epoch, not newer) is acknowledged unchanged. An applied
 /// set is Ok even when some catalogs failed to build; their names are
@@ -1948,6 +2009,43 @@ mod tests {
 
     /// runtime-config D8: workers ignore their own `[[catalogs]]`; they
     /// start empty at generation 0 and take the coordinator's set.
+    /// A coordinator without a `[cluster] secret` refuses to start while a
+    /// served catalog carries a secret, and otherwise starts with
+    /// [`LiveCatalogs::exposure_check`] armed; a secret or another role
+    /// changes nothing.
+    #[tokio::test]
+    async fn coordinator_without_cluster_secret_refuses_served_secrets() {
+        let with_password: config::CatalogConfig = serde_json::from_value(serde_json::json!({
+            "name": "pg", "type": "postgresql",
+            "connection_url": "postgresql://u@127.0.0.1:1/db", "password": "pw-Zx9"
+        }))
+        .unwrap();
+        let live = empty_live();
+        live.install(with_password.clone(), memory_built());
+        let e = check_catalog_rpc_security(&ServerRole::Coordinator, false, &live, 9090)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("[cluster] secret") && e.contains("catalog 'pg': password"),
+            "{e}"
+        );
+        assert!(!e.contains("pw-Zx9"), "the error names fields, not values");
+        for (role, secret) in [
+            (ServerRole::Coordinator, true),
+            (ServerRole::Worker, false),
+            (ServerRole::Standalone, false),
+        ] {
+            let live = empty_live();
+            live.install(with_password.clone(), memory_built());
+            check_catalog_rpc_security(&role, secret, &live, 9090).unwrap();
+            assert_eq!(live.exposure_check(&with_password), Ok(()));
+        }
+        // No secret served: starts, and API changes that add one are refused.
+        let live = empty_live();
+        check_catalog_rpc_security(&ServerRole::Coordinator, false, &live, 9090).unwrap();
+        assert_eq!(live.exposure_check(&with_password), Err(vec!["password"]));
+    }
+
     #[tokio::test]
     async fn worker_ignores_config_catalogs() {
         let spec: config::CatalogConfig = serde_json::from_value(serde_json::json!({

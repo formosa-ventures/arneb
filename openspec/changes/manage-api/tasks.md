@@ -39,3 +39,4 @@
 - [x] 9.3 Audit intent entry before apply, completion after, `interrupted` at startup
 - [x] 9.4 Audit reads never wait for an fsync or a compaction (split writer and memory locks)
 - [x] 9.5 Audit log named after the state file (`<stem>.audit.jsonl`)
+- [x] 9.6 A kill before canceller registration: the statement cannot report rows afterwards

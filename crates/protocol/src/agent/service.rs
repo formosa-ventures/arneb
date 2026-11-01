@@ -213,11 +213,7 @@ impl AgentQueryService {
                 if let (Some(statement), Some(tracker)) =
                     (weak_statement.upgrade(), weak_tracker.upgrade())
                 {
-                    let error = AgentError::new(
-                        AgentErrorCode::Cancelled,
-                        format!("Statement was cancelled by {by}"),
-                    );
-                    cancel_statement(&tracker, &statement, error, "killed");
+                    cancel_statement(&tracker, &statement, killed_error(by), "killed");
                 }
             }),
         );
@@ -440,8 +436,17 @@ impl AgentQueryService {
         Ok(Some(pending.wait().await))
     }
 
-    /// Records the outcome, unless the statement was cancelled meanwhile.
+    /// Records the outcome, unless the statement was cancelled meanwhile. A
+    /// statement the tracker already marked cancelled (a kill that landed
+    /// before its canceller was registered) turns cancelled instead of
+    /// keeping its rows.
     fn complete(&self, statement: &Statement, result: Result<QueryOutput, TrinoError>) {
+        let (tracker, id) = (&self.tracker, &statement.tracker_id);
+        let killed = || {
+            tracker
+                .cancelled_by(id)
+                .map(|by| Phase::Cancelled(killed_error(&by)))
+        };
         match result {
             Ok(output) => {
                 let retained = retain(
@@ -476,14 +481,21 @@ impl AgentQueryService {
                     update_type: output.update_type,
                     retained,
                 };
-                if statement.end(Phase::Finished(finished)) {
-                    let _ = self.tracker.finish_query(&statement.tracker_id, rows);
-                }
+                statement.end_with(|| {
+                    match tracker.finish_query(id, rows).err().and_then(|_| killed()) {
+                        Some(cancelled) => cancelled,
+                        None => Phase::Finished(finished),
+                    }
+                });
             }
             Err(err) => {
-                if statement.end(Phase::Failed(AgentError::from_trino(&err))) {
-                    let _ = self.tracker.fail_query(&statement.tracker_id, err.message);
-                }
+                statement.end_with(|| {
+                    let failed = tracker.fail_query(id, err.message.clone());
+                    failed
+                        .err()
+                        .and_then(|_| killed())
+                        .unwrap_or_else(|| Phase::Failed(AgentError::from_trino(&err)))
+                });
             }
         }
     }
@@ -527,6 +539,14 @@ impl AgentQueryService {
 
 /// [`AgentQueryService::cancel_statement`] over `tracker`, for the tracker's
 /// canceller, which holds no service.
+/// The error of a statement killed through the tracker by `by`.
+fn killed_error(by: &str) -> AgentError {
+    AgentError::new(
+        AgentErrorCode::Cancelled,
+        format!("Statement was cancelled by {by}"),
+    )
+}
+
 fn cancel_statement(
     tracker: &QueryTracker,
     statement: &Statement,
@@ -1326,6 +1346,43 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(dropped.load(Ordering::SeqCst), "execution was not aborted");
+    }
+
+    /// A kill that lands before the canceller is registered, then the
+    /// statement finishes: it turns cancelled and keeps no rows.
+    #[tokio::test]
+    async fn a_statement_killed_before_registration_cannot_finish() {
+        let (svc, tracker) = service();
+        let statement = svc.register("alice", "SELECT 1".into(), 10).unwrap();
+        let id = statement.tracker_id;
+        assert!(matches!(
+            tracker.kill_query(&id, "root").unwrap(),
+            arneb_scheduler::KillOutcome::Killed { .. }
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "n",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let output = QueryOutput {
+            columns: None,
+            batches: vec![RecordBatch::try_new(schema, vec![column]).unwrap()],
+            update_type: None,
+            headers: Vec::new(),
+        };
+        svc.complete(&statement, Ok(output));
+        let status = svc
+            .status("alice", &statement.id, Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(status.state, StatementState::Cancelled);
+        let error = status.error.unwrap();
+        assert_eq!(error.code, AgentErrorCode::Cancelled);
+        assert_eq!(error.message, "Statement was cancelled by root");
+        let info = tracker.get_query(&id).unwrap();
+        assert_eq!(info.state, QueryState::Cancelled);
+        assert_eq!(info.rows, None);
     }
 
     #[tokio::test]

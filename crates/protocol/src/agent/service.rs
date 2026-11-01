@@ -600,8 +600,6 @@ impl AgentQueryService {
     }
 }
 
-/// [`AgentQueryService::cancel_statement`] over `tracker`, for the tracker's
-/// canceller, which holds no service.
 /// The error of a statement killed through the tracker by `by`.
 fn killed_error(by: &str) -> AgentError {
     AgentError::new(
@@ -610,6 +608,8 @@ fn killed_error(by: &str) -> AgentError {
     )
 }
 
+/// [`AgentQueryService::cancel_statement`] over `tracker`, for the tracker's
+/// canceller, which holds no service.
 fn cancel_statement(
     tracker: &QueryTracker,
     statement: &Statement,

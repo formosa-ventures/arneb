@@ -126,7 +126,7 @@ All tools are `open_world_hint = false`. Limits in the copy are filled from plac
 - **No `UPDATE` statement exists** in the parser or planner (D3).
 - **State store only under password.** `main.rs` opens it only under `[auth] type = "password"`. Manage is refused under `none`, so nothing needs persisting there. Under password with no `[state] path`, cordons, limits and the audit log live in memory, with the startup WARN and a per-response `warning`.
 - **Downgrade.** `StateData` gains `cordons` and `settings` with `#[serde(default)]`, and the version stays 1: an H1-H3 binary ignores unknown fields when reading, but its next write drops them. A downgrade therefore loses cordons and runtime limits, not users or tokens.
-- **Stored limits pin values.** A runtime limit stays in force across restarts and config edits; clearing it means removing `settings.admission` from the state file while the server is stopped.
+- **Stored limits pin values.** A runtime limit stays in force across restarts and config edits; `DELETE /api/v2/admission` (MCP `reset_admission_limits`) clears it and applies the config values at once.
 - **Listings stay bounded.** Every new listing takes `limit` with a ceiling and reports `truncated`; a value above the ceiling is `invalid_argument`, never clamped.
 
 ## Risks / Trade-offs

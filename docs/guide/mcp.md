@@ -89,7 +89,8 @@ it needs a restart, and a bad value stops startup with a message naming it.
 - **Access tokens only.** A header `typ` of `at+jwt` (RFC 9068) is an access
   token. Many IdPs (Keycloak, Entra ID, Okta) send `typ: JWT` instead, so
   that is accepted too, but such a token is refused when it carries a claim
-  only OIDC ID tokens have: `nonce`, `at_hash`, or Keycloak's `typ: "ID"`.
+  only OIDC ID tokens have (`nonce`, `at_hash`), or a Keycloak payload
+  `typ` other than an access token's (`ID`, `Refresh`, `Offline`, `Logout`).
   Set `require_access_token_typ = true` when your IdP sends `at+jwt`, to
   accept nothing else.
 - **Key cache.** The JWKS comes from the discovery document (a remote

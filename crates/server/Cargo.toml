@@ -99,3 +99,5 @@ arneb-catalog = { path = "../catalog" }
 arneb-hive = { path = "../hive" }
 arneb-connectors = { path = "../connectors" }
 orc-rust = { workspace = true }
+# Cross-checks the connection_url redaction against the driver's parser.
+tokio-postgres.workspace = true

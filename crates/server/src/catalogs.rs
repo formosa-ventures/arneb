@@ -909,16 +909,25 @@ pub fn same_destination(a: &CatalogConfig, b: &CatalogConfig) -> bool {
     destinations(a) == destinations(b)
 }
 
+/// Where the credentials of `scheme://user:password@host/...` end, found
+/// the way tokio-postgres finds them: everything after the scheme up to
+/// the first `@` anywhere is the userinfo, so an unencoded `/`, `?` or `#`
+/// in the password still belongs to it. `(after_scheme, at)`, with `at`
+/// `None` when the URL has no `@` (no credentials).
+fn url_userinfo(url: &str) -> Option<(usize, Option<usize>)> {
+    let after_scheme = url.find("://")? + 3;
+    let at = url[after_scheme..].find('@').map(|i| after_scheme + i);
+    Some((after_scheme, at))
+}
+
 /// The byte range of the password in `scheme://user:password@host/...`,
-/// if the URL's userinfo has one.
+/// if the URL's userinfo has one (the text after the userinfo's first `:`,
+/// as tokio-postgres splits it).
 fn url_password_range(url: &str) -> Option<std::ops::Range<usize>> {
-    let authority_start = url.find("://")? + 3;
-    let rest = &url[authority_start..];
-    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_len];
-    let at = authority.rfind('@')?;
-    let colon = authority[..at].find(':')?;
-    Some(authority_start + colon + 1..authority_start + at)
+    let (start, at) = url_userinfo(url)?;
+    let at = at?;
+    let colon = url[start..at].find(':')?;
+    Some(start + colon + 1..at)
 }
 
 /// Whether a query parameter key is `password` once percent-decoded:
@@ -946,13 +955,17 @@ fn is_password_key(key: &str) -> bool {
 /// `password` once percent-decoded (libpq URIs accept the password there
 /// too).
 fn url_query_passwords(url: &str) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
-    let Some(scheme_end) = url.find("://") else {
+    // As in tokio-postgres: the query starts at the first `?` after the
+    // userinfo (a `?` inside the password is not one), and runs to the end
+    // (a `#` is part of a value, not a fragment).
+    let Some((start, at)) = url_userinfo(url) else {
         return Vec::new();
     };
-    let Some(q) = url[scheme_end..].find('?').map(|i| scheme_end + i + 1) else {
+    let host = at.map_or(start, |at| at + 1);
+    let Some(q) = url[host..].find('?').map(|i| host + i + 1) else {
         return Vec::new();
     };
-    let end = url[q..].find('#').map_or(url.len(), |i| q + i);
+    let end = url.len();
     let mut out = Vec::new();
     let mut start = q;
     for param in url[q..end].split('&') {
@@ -1395,6 +1408,58 @@ mod tests {
         assert!(is_password_key("%70%61%73%73%77%6F%72%64"));
         assert!(!is_password_key("password%"));
         assert!(!is_password_key("passwor"));
+    }
+
+    /// tokio-postgres takes the credentials up to the first `@`, so an
+    /// unencoded `/`, `?` or `#` in the password is still the password
+    /// (and a `#` in a query value is part of it). The redaction finds the
+    /// same password the driver connects with, and round-trips it.
+    #[test]
+    fn password_with_url_delimiters_is_redacted() {
+        use std::str::FromStr;
+        for (url, redacted) in [
+            (
+                "postgresql://app:pa/ss@db:5432/x",
+                "postgresql://app:<redacted>@db:5432/x",
+            ),
+            (
+                "postgresql://app:pa?ss@db:5432/x",
+                "postgresql://app:<redacted>@db:5432/x",
+            ),
+            (
+                "postgresql://app:pa#ss@db:5432/x",
+                "postgresql://app:<redacted>@db:5432/x",
+            ),
+            (
+                "postgres://app:a/b?c#d:e@db/x?sslmode=disable",
+                "postgres://app:<redacted>@db/x?sslmode=disable",
+            ),
+            (
+                "postgresql://app@db/x?password=pa#ss&sslmode=disable",
+                "postgresql://app@db/x?password=<redacted>&sslmode=disable",
+            ),
+            (
+                "postgresql://app:pa?password=no@db/x?password=q/s#t",
+                "postgresql://app:<redacted>@db/x?password=<redacted>",
+            ),
+        ] {
+            let driver = tokio_postgres::Config::from_str(url).unwrap();
+            let password = String::from_utf8(driver.get_password().unwrap().to_vec()).unwrap();
+            let stored = spec(serde_json::json!({
+                "name": "p", "type": "postgresql", "connection_url": url
+            }));
+            let shown = redacted_spec(&stored);
+            assert_eq!(shown["connection_url"], redacted, "{url}");
+            assert!(
+                !shown.to_string().contains(&password),
+                "the driver's password leaked for {url}"
+            );
+            let mut back: CatalogConfig = serde_json::from_value(shown).unwrap();
+            assert_eq!(redacted_secrets(&back), vec!["connection_url password"]);
+            assert!(same_destination(&back, &stored));
+            fill_redacted(&mut back, &stored);
+            assert_eq!(back.connection_url.as_ref().unwrap().0, url);
+        }
     }
 
     #[test]

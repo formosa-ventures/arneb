@@ -399,6 +399,17 @@ together with its default catalog and schema and with its global `[storage]`
 merged into each Hive catalog, so a worker needs no catalog or storage
 config of its own.
 
+**Default catalog.** Unqualified table names resolve in the default catalog
+and its `default_schema` (`public` for PostgreSQL, `default` otherwise). It
+is picked at startup from the catalogs the node serves (under password auth,
+the state store's): the first `[[catalogs]]` entry when it is served, else
+the first served catalog by name, else `file` when `[[tables]]` are set,
+else `memory`. So it never names a catalog that is not defined, and a
+config edit that the state store does not follow does not move it. The
+effective value is logged on `arneb::config` at startup, and workers
+receive the same one. It changes only at a restart: dropping the default
+catalog at runtime leaves unqualified names failing until then.
+
 ## Cluster Configuration
 
 For distributed mode (worker nodes):

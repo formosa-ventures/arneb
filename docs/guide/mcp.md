@@ -39,7 +39,7 @@ Under `[auth] type = "none"` there is nothing to prove: the caller is the
 
 ## Tools
 
-Twenty-five tools. The server also sends `instructions` on connect, which tell
+Twenty-six tools. The server also sends `instructions` on connect, which tell
 the agent the intended order: discover, describe or sample, explain, submit,
 poll, fetch, cancel.
 
@@ -66,6 +66,7 @@ poll, fetch, cancel.
 | `uncordon_worker` | `id`, `dry_run?` | manage envelope | `POST /workers/{id}/uncordon` |
 | `get_admission` | none | limits, running and queued counts, `source` | `GET /admission` |
 | `set_admission_limits` | `max_running_queries?`, `max_queued_queries?`, `dry_run?` | manage envelope | `PUT /admission` |
+| `reset_admission_limits` | `dry_run?` | manage envelope | `DELETE /admission` |
 | `list_audit_log` | `limit?`, `cursor?`, `user?`, `action?` | `{entries, next_cursor, truncated, scope, ...}` (default 50, at most 500; without manage, only your own actions) | `GET /audit` |
 | `list_tokens` | none | your live tokens, never the secret | `GET /tokens` |
 | `create_token` | `name?`, `expires_in_days?` | the new token, shown once | `POST /tokens` |
@@ -78,8 +79,9 @@ description in the tool's input schema.
 Annotations tell a client which calls are safe to auto-approve. All tools set
 `openWorldHint = false`. `whoami`, the `list_*` and `get_*` tools,
 `describe_table`, `sample_table`, `explain_query` and `fetch_results` are
-read-only. `cancel_query`, `revoke_token`, `cordon_worker`, `drain_worker` and
-`set_admission_limits` are destructive and idempotent; `uncordon_worker` is
+read-only. `cancel_query`, `revoke_token`, `cordon_worker`, `drain_worker`,
+`set_admission_limits` and `reset_admission_limits` are destructive and
+idempotent; `uncordon_worker` is
 idempotent and not destructive.
 `submit_query` and `create_token` carry no read-only hint.
 
@@ -105,7 +107,8 @@ Only a bad request is an error result.
 ## Managing the cluster
 
 The manage tools (`cordon_worker`, `drain_worker`, `uncordon_worker`,
-`set_admission_limits`, and `cancel_query` on another user's query) call the
+`set_admission_limits`, `reset_admission_limits`, and `cancel_query` on
+another user's query) call the
 same functions as their `/api/v2` routes, with the same checks. `whoami`
 reports `privileges: {observe, manage}`. The observe tools (`list_workers`,
 `get_worker`, `get_admission`, `list_audit_log`) need no extra privilege under

@@ -3,7 +3,8 @@
 //!
 //! A change is persisted in the state store (`settings.admission`) before it
 //! is applied to the controller, and a stored value wins over the config
-//! seed at the next start (`config::resolve_admission_limits`).
+//! seed at the next start (`config::resolve_admission_limits`). A reset
+//! (`DELETE`) clears the stored value and returns to the config seed.
 
 use std::sync::Arc;
 
@@ -138,6 +139,39 @@ pub(super) async fn set_admission_for(
                 .with_hint("send max_running_queries and/or max_queued_queries"),
         );
     }
+    let change = AdmissionChange::Set {
+        max_running,
+        max_queued,
+    };
+    run_admission_change(state, who, grant, dry_run, change).await
+}
+
+/// Clears the stored admission limits for `who`, who needs manage (also for
+/// a dry run), and returns the controller to the config values
+/// (`[admission]` / `ARNEB_MAX_*_QUERIES`). Shared with the MCP
+/// `reset_admission_limits` tool.
+pub(super) async fn reset_admission_for(
+    state: &WebState,
+    who: &Identity,
+    dry_run: bool,
+) -> Result<ManageOutcome<AdmissionView>, ApiError> {
+    let grant = state.authorizer.check(who, Layer::Manage)?;
+    let change = AdmissionChange::Reset {
+        seed: AdmissionLimits {
+            max_running_queries: state.max_running_queries,
+            max_queued_queries: state.max_queued_queries,
+        },
+    };
+    run_admission_change(state, who, grant, dry_run, change).await
+}
+
+async fn run_admission_change(
+    state: &WebState,
+    who: &Identity,
+    grant: super::privilege::Grant,
+    dry_run: bool,
+    change: AdmissionChange,
+) -> Result<ManageOutcome<AdmissionView>, ApiError> {
     let controller = controller(state)?.clone();
     let store = state.state.clone().ok_or_else(|| {
         ApiError::new(ErrorCode::Internal, "admission limits need the state store")
@@ -146,8 +180,7 @@ pub(super) async fn set_admission_for(
     // the change (and its audit entry) is done, so preview, audit and apply
     // see one state.
     let action = SetAdmission {
-        max_running,
-        max_queued,
+        change,
         controller,
         store,
         changes: Arc::clone(&state.admission_changes),
@@ -155,9 +188,19 @@ pub(super) async fn set_admission_for(
     run_manage(state, who, grant, dry_run, action).await
 }
 
+/// What an admission change does.
+enum AdmissionChange {
+    /// `PUT`: the given knobs; one left out keeps its value.
+    Set {
+        max_running: Option<usize>,
+        max_queued: Option<usize>,
+    },
+    /// `DELETE`: clear the stored limits and return to the config `seed`.
+    Reset { seed: AdmissionLimits },
+}
+
 struct SetAdmission {
-    max_running: Option<usize>,
-    max_queued: Option<usize>,
+    change: AdmissionChange,
     controller: AdmissionController,
     store: Arc<StateStore>,
     /// [`WebState::admission_changes`].
@@ -167,9 +210,34 @@ struct SetAdmission {
 impl SetAdmission {
     /// The limits after the change, given the current ones.
     fn target_limits(&self, now: AdmissionSnapshot) -> AdmissionLimits {
-        AdmissionLimits {
-            max_running_queries: self.max_running.unwrap_or(now.max_running),
-            max_queued_queries: self.max_queued.unwrap_or(now.max_queued),
+        match self.change {
+            AdmissionChange::Set {
+                max_running,
+                max_queued,
+            } => AdmissionLimits {
+                max_running_queries: max_running.unwrap_or(now.max_running),
+                max_queued_queries: max_queued.unwrap_or(now.max_queued),
+            },
+            AdmissionChange::Reset { seed } => seed,
+        }
+    }
+
+    fn is_reset(&self) -> bool {
+        matches!(self.change, AdmissionChange::Reset { .. })
+    }
+
+    /// The knobs the audit `parameters` name: those a `PUT` gave, or both
+    /// for a reset.
+    fn named_knobs(&self) -> (Option<usize>, Option<usize>) {
+        match self.change {
+            AdmissionChange::Set {
+                max_running,
+                max_queued,
+            } => (max_running, max_queued),
+            AdmissionChange::Reset { seed } => (
+                Some(seed.max_running_queries),
+                Some(seed.max_queued_queries),
+            ),
         }
     }
 
@@ -177,6 +245,9 @@ impl SetAdmission {
     fn plan(&self) -> (Preview, AdmissionLimits) {
         let now = self.controller.snapshot();
         let to = self.target_limits(now);
+        // A reset of stored limits is a change even when the values match:
+        // it stops them from pinning the next start.
+        let unpins = self.is_reset() && self.store.admission_limits().is_some();
         let mut changes = Vec::new();
         if to.max_running_queries != now.max_running {
             changes.push(format!(
@@ -195,21 +266,42 @@ impl SetAdmission {
             count(now.running, "query", "queries"),
             now.queued
         );
-        if changes.is_empty() {
+        if changes.is_empty() && !unpins {
+            let summary = if self.is_reset() {
+                format!(
+                    "no admission limits are stored; the config values max_running_queries \
+                     {}, max_queued_queries {} already apply; nothing to change ({counters})",
+                    now.max_running, now.max_queued
+                )
+            } else {
+                format!(
+                    "admission limits are already max_running_queries {}, \
+                     max_queued_queries {}; nothing to change ({counters})",
+                    now.max_running, now.max_queued
+                )
+            };
             return (
                 Preview {
-                    summary: format!(
-                        "admission limits are already max_running_queries {}, \
-                         max_queued_queries {}; nothing to change ({counters})",
-                        now.max_running, now.max_queued
-                    ),
+                    summary,
                     changed: false,
                     warning: None,
                 },
                 to,
             );
         }
-        let mut summary = format!("sets {} ({counters})", changes.join(", "));
+        let mut summary = if self.is_reset() {
+            let values = if changes.is_empty() {
+                "the values stay".to_owned()
+            } else {
+                changes.join(", ")
+            };
+            format!(
+                "clears the stored admission limits and returns to the config values: \
+                 {values} ({counters})"
+            )
+        } else {
+            format!("sets {} ({counters})", changes.join(", "))
+        };
         let cap = to.max_running_queries;
         if cap != 0 && now.running >= cap {
             summary.push_str(&format!(
@@ -233,7 +325,11 @@ impl ManageAction for SetAdmission {
     type Output = AdmissionView;
 
     fn action(&self) -> &'static str {
-        "admission.set"
+        if self.is_reset() {
+            "admission.reset"
+        } else {
+            "admission.set"
+        }
     }
 
     fn target(&self) -> String {
@@ -244,14 +340,15 @@ impl ManageAction for SetAdmission {
     /// under [`WebState::admission_changes`], before applying.
     fn parameters(&self) -> serde_json::Value {
         let from = self.controller.snapshot();
+        let (max_running, max_queued) = self.named_knobs();
         let mut map = serde_json::Map::new();
-        if let Some(to) = self.max_running {
+        if let Some(to) = max_running {
             map.insert(
                 "max_running_queries".into(),
                 serde_json::json!({"from": from.max_running, "to": to}),
             );
         }
-        if let Some(to) = self.max_queued {
+        if let Some(to) = max_queued {
             map.insert(
                 "max_queued_queries".into(),
                 serde_json::json!({"from": from.max_queued, "to": to}),
@@ -279,9 +376,12 @@ impl ManageAction for SetAdmission {
     fn apply(self, _state: &WebState) -> Result<Applied<AdmissionView>, ApiError> {
         let (preview, to) = self.plan();
         let snapshot = if preview.changed {
-            self.store
-                .set_admission_limits(to)
-                .map_err(persist_failed("the admission limits"))?;
+            let saved = if self.is_reset() {
+                self.store.clear_admission_limits()
+            } else {
+                self.store.set_admission_limits(to)
+            };
+            saved.map_err(persist_failed("the admission limits"))?;
             let snapshot = self
                 .controller
                 .set_limits(to.max_running_queries, to.max_queued_queries);
@@ -291,7 +391,12 @@ impl ManageAction for SetAdmission {
                 max_queued_queries = to.max_queued_queries,
                 running = snapshot.running,
                 queued = snapshot.queued,
-                "admission limits changed at runtime"
+                "{}",
+                if self.is_reset() {
+                    "admission limits reset to the config values at runtime"
+                } else {
+                    "admission limits changed at runtime"
+                }
             );
             snapshot
         } else {
@@ -320,9 +425,23 @@ async fn put_admission(
     Ok(Json(set_admission_for(&state, &who, req, dry_run).await?))
 }
 
+async fn delete_admission(
+    State(state): State<WebState>,
+    Extension(who): Extension<Identity>,
+    params: Result<Query<DryRun>, QueryRejection>,
+) -> Result<Json<ManageOutcome<AdmissionView>>, ApiError> {
+    let Query(DryRun { dry_run }) = params.map_err(bad_query)?;
+    Ok(Json(reset_admission_for(&state, &who, dry_run).await?))
+}
+
 /// The admission routes, merged into `/api/v2`.
 pub(super) fn routes() -> Router<WebState> {
-    Router::new().route("/admission", get(get_admission).put(put_admission))
+    Router::new().route(
+        "/admission",
+        get(get_admission)
+            .put(put_admission)
+            .delete(delete_admission),
+    )
 }
 
 #[cfg(test)]
@@ -338,6 +457,7 @@ mod tests {
     fn node(path: Option<&std::path::Path>) -> WebState {
         let mut state = with_authz(web_state(true, path), None, &["root"]);
         state.admission = Some(AdmissionController::new(8, 256));
+        (state.max_running_queries, state.max_queued_queries) = (8, 256);
         state
     }
 
@@ -643,6 +763,112 @@ mod tests {
             "{body}"
         );
         assert_eq!(audited_running(&state), vec![json!({"from": 5, "to": 2})]);
+    }
+
+    #[tokio::test]
+    async fn delete_returns_to_the_config_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        let state = node(Some(&path));
+        let del = |auth: String, query: &'static str| {
+            let state = state.clone();
+            async move {
+                call(
+                    &state,
+                    Method::DELETE,
+                    &format!("/api/v2/admission{query}"),
+                    Some(&auth),
+                    None,
+                )
+                .await
+            }
+        };
+        // Nothing stored: a no-op.
+        let (status, body) = del(root(), "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["action"], "admission.reset");
+        assert_eq!(body["changed"], false, "{body}");
+        assert!(
+            body["summary"]
+                .as_str()
+                .unwrap()
+                .contains("no admission limits are stored"),
+            "{body}"
+        );
+        let (status, _) = put(
+            &state,
+            "/api/v2/admission",
+            &root(),
+            json!({"max_running_queries": 2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // Manage only, also for a dry run.
+        for query in ["", "?dry_run=true"] {
+            let (status, body) = del(alice(), query).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        }
+        // A dry run changes nothing.
+        let (status, dry) = del(root(), "?dry_run=true").await;
+        assert_eq!(status, StatusCode::OK, "{dry}");
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["changed"], true);
+        assert!(dry.get("result").is_none());
+        assert!(
+            dry["summary"]
+                .as_str()
+                .unwrap()
+                .starts_with("clears the stored admission limits and returns to the config values: max_running_queries 2 → 8"),
+            "{dry}"
+        );
+        assert!(state.state.as_ref().unwrap().admission_limits().is_some());
+        assert_eq!(snapshot(&state).max_running, 2);
+        // The real reset.
+        let (status, body) = del(root(), "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], true);
+        assert_eq!(body["result"]["max_running_queries"], 8);
+        assert_eq!(body["result"]["source"], "config");
+        assert_eq!(state.state.as_ref().unwrap().admission_limits(), None);
+        let snap = snapshot(&state);
+        assert_eq!((snap.max_running, snap.max_queued), (8, 256));
+        let last = audit_entries(&state).into_iter().next().unwrap();
+        assert_eq!(last.action, "admission.reset");
+        assert_eq!(
+            last.parameters,
+            json!({
+                "max_running_queries": {"from": 2, "to": 8},
+                "max_queued_queries": {"from": 256, "to": 256},
+                "effect": "applied",
+            })
+        );
+        // Stored values equal to the config still unpin (a later config
+        // change would otherwise stay overridden).
+        state
+            .state
+            .as_ref()
+            .unwrap()
+            .set_admission_limits(AdmissionLimits {
+                max_running_queries: 8,
+                max_queued_queries: 256,
+            })
+            .unwrap();
+        let (_, body) = del(root(), "").await;
+        assert_eq!(body["changed"], true, "{body}");
+        assert!(
+            body["summary"]
+                .as_str()
+                .unwrap()
+                .contains("the values stay"),
+            "{body}"
+        );
+        drop(state);
+        let store = StateStore::open(Some(&path)).unwrap();
+        assert_eq!(
+            store.admission_limits(),
+            None,
+            "the next start uses the config"
+        );
     }
 
     #[tokio::test]

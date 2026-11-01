@@ -670,8 +670,9 @@ open so existing scrapers keep working.
 - **Stored admission limits pin values.** A limit set with `PUT
   /api/v2/admission` is kept in the state file and wins over `[admission]`
   and `ARNEB_MAX_*_QUERIES` at every start, each overridden knob logging a
-  WARN. To go back to the config, stop the server and remove
-  `settings.admission` from the state file.
+  WARN. To go back to the config, call `DELETE /api/v2/admission` (MCP
+  `reset_admission_limits`), which clears the stored limits and applies the
+  config values at once.
 - **New state.** The state file gains `cordons` and `settings` (readable by
   older binaries, whose next write drops them), and the coordinator writes
   the [audit log](#audit-log) next to it (`state.json` →

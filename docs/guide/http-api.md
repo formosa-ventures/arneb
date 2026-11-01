@@ -176,6 +176,7 @@ All `/api/v2` routes need credentials, except `health` and `POST /sessions`.
 | `POST /api/v2/workers/{id}/cordon\|drain\|uncordon[?dry_run=]` | [Cordon, drain or uncordon](#workers) a worker. |
 | `GET /api/v2/admission` | The [admission limits](#admission-limits) and counters. |
 | `PUT /api/v2/admission[?dry_run=]` | [Change the admission limits](#admission-limits). |
+| `DELETE /api/v2/admission[?dry_run=]` | [Clear the stored limits](#admission-limits) and return to the config values. |
 | `GET /api/v2/info` | Server version and role. |
 | `GET /api/v2/audit` | The [audit log](#audit-log), newest first. |
 
@@ -553,11 +554,18 @@ change warns that it is `lost on restart`.
 |---|---|---|
 | `GET /api/v2/admission` | observe | `{max_running_queries, max_queued_queries, running_queries, queued_queries, source}`. |
 | `PUT /api/v2/admission` | manage | Action `admission.set`; body `{"max_running_queries"?, "max_queued_queries"?}`. |
+| `DELETE /api/v2/admission` | manage | Action `admission.reset`; no body. Clears the stored limits and applies the config values now. |
 
 `source` is `config` until a limit is set at runtime, then `state`.
 `max_running_queries = 0` means unlimited. A stored value pins the limits
-across restarts and config edits; to go back to the config, stop the
-server and remove `settings.admission` from the state file.
+across restarts and config edits. To go back to the config,
+`DELETE /api/v2/admission` (or the MCP `reset_admission_limits` tool)
+removes the stored limits and applies the `[admission]` /
+`ARNEB_MAX_*_QUERIES` values the server started with, at once and at every
+later start. It takes `?dry_run=true` like `PUT`, is
+[audited](#audit-log) with each knob's `{"from", "to"}`, and answers
+`changed: false` when no limits are stored and the config values already
+apply.
 
 The `PUT` body needs at least one of the two fields; a field left out keeps
 its value. Each value is a non-negative integer of at most 2^63 − 1 (`null` is

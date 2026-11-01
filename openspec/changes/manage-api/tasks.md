@@ -42,3 +42,4 @@
 - [x] 9.6 A kill before canceller registration: the statement cannot report rows afterwards
 - [x] 9.7 `run_manage` takes the change lock itself (`ManageAction::change_mutex`); shared `count` / `persist_failed`
 - [x] 9.8 Lock-free admission while no cap is set
+- [x] 9.9 `DELETE /api/v2/admission` and MCP `reset_admission_limits` (26 tools)

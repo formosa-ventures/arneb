@@ -59,7 +59,7 @@ Lookup and visibility: a query the caller may not `view` is `not_found`, unless 
  "changed": true, "warning": null, "result": { }}
 ```
 
-`changed: false` marks a no-op (cordoning a cordoned worker, cancelling an ended query); a no-op is not an error. `warning` is set when the action leaves no schedulable worker, and when the state store is in memory so the change is lost on restart (`ManageAction::persisted()` decides the second). Actions: `query.cancel`, `worker.cordon`, `worker.drain`, `worker.uncordon`, `admission.set`, `token.issue`, `token.revoke`. A no-op's audit entry (for an audited kind) carries `parameters.effect` such as `already_ended`; a default `unchanged_effect()` of `no_change` applies to the others.
+`changed: false` marks a no-op (cordoning a cordoned worker, cancelling an ended query); a no-op is not an error. `warning` is set when the action leaves no schedulable worker, and when the state store is in memory so the change is lost on restart (`ManageAction::persisted()` decides the second). Actions: `query.cancel`, `worker.cordon`, `worker.drain`, `worker.uncordon`, `admission.set`, `admission.reset`, `token.issue`, `token.revoke`. A no-op's audit entry (for an audited kind) carries `parameters.effect` such as `already_ended`; a default `unchanged_effect()` of `no_change` applies to the others.
 
 **D6. Durable audit log** (`arneb_state::AuditLog`).
 - *Location.* `<stem>.audit.jsonl` in the directory of `[state] path`, named after the state file (`prod.json` → `prod.audit.jsonl`) so two state files in one directory never share a log, mode `0600`. With an in-memory state store the log is in memory too, with a startup WARN. Under `none` it is an empty in-memory log with no WARN, because nothing is audited there.
@@ -96,10 +96,10 @@ Lookup and visibility: a query the caller may not `view` is `not_found`, unless 
 - *Lowering* below the running count never stops a running query: new queries queue until fewer than the new cap run (release grants a waiter only while `running < max_running`). *Raising*, or setting `0`, grants queued waiters at once up to the new cap. *A shorter queue* keeps the queued queries; new arrivals are refused while the queue is at or over the new limit.
 - *Persistence* in the state store (`settings.admission`). Stored values win over the config seed: each knob whose config value differs logs one WARN on `arneb::config` naming the knob and both values; the effective-settings line gains `admission_source = config|state`.
 - *Validation:* non-negative integers (at most 2^63 - 1; `null` refused). The `PUT` body is `{"max_running_queries"?, "max_queued_queries"?}`, unknown fields refused, at least one required.
-- *Routes:* `GET /api/v2/admission` (observe; `{max_running_queries, max_queued_queries, running_queries, queued_queries, source}`, `source` is `config` or `state`); `PUT /api/v2/admission[?dry_run=]` (manage; `result` is the same view after the change).
+- *Routes:* `GET /api/v2/admission` (observe; `{max_running_queries, max_queued_queries, running_queries, queued_queries, source}`, `source` is `config` or `state`); `PUT /api/v2/admission[?dry_run=]` (manage; `result` is the same view after the change); `DELETE /api/v2/admission[?dry_run=]` (manage, action `admission.reset`, review round 2): clears `settings.admission` first, then sets the controller to the config seed (`WebState::max_running_queries` / `max_queued_queries`); a change whenever limits are stored or the values differ.
 - *Out of scope.* `statement_timeout` stays startup-only: it is handed by value to three protocol builders, and the "admission limits" are the two counters.
 
-**D10. MCP tools.** Seven new tools, 25 in total; `cancel_query` is widened (an `id` that is the caller's own agent statement keeps the H3 behavior and result unless `dry_run` is set; any other id, or any dry run, goes through `cancel_query_for` and returns the D5 envelope); `list_workers` becomes the bounded listing.
+**D10. MCP tools.** Eight new tools, 26 in total (`reset_admission_limits` added in review round 2); `cancel_query` is widened (an `id` that is the caller's own agent statement keeps the H3 behavior and result unless `dry_run` is set; any other id, or any dry run, goes through `cancel_query_for` and returns the D5 envelope); `list_workers` becomes the bounded listing.
 
 | Tool | Arguments | Same as | Annotations |
 |---|---|---|---|
@@ -110,6 +110,7 @@ Lookup and visibility: a query the caller may not `view` is `not_found`, unless 
 | `uncordon_worker` | `id, dry_run?` | `POST /workers/{id}/uncordon` | idempotent, not destructive |
 | `get_admission` | none | `GET /admission` | read-only |
 | `set_admission_limits` | `max_running_queries?, max_queued_queries?, dry_run?` | `PUT /admission` | destructive, idempotent |
+| `reset_admission_limits` | `dry_run?` | `DELETE /admission` | destructive, idempotent |
 | `list_audit_log` | `limit?, cursor?, user?, action?` | `GET /audit` | read-only |
 | `cancel_query` | `id, dry_run?` | `DELETE /statements/{id}` or `DELETE /queries/{id}` | destructive, idempotent |
 

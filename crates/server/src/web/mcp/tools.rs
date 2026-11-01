@@ -187,6 +187,14 @@ struct AdmissionArgs {
     dry_run: Option<bool>,
 }
 
+/// Arguments of `reset_admission_limits`.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct DryRunArgs {
+    /// Preview only: report what the reset would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
 /// Arguments of `list_audit_log`.
 #[derive(Deserialize, schemars::JsonSchema)]
 struct AuditArgs {
@@ -874,6 +882,28 @@ impl ArnebMcp {
         )
     }
 
+    /// `reset_admission_limits`: `DELETE /api/v2/admission`.
+    #[tool(
+        description = "Clear the admission limits stored by set_admission_limits and return to \
+                       the configured values ([admission] / ARNEB_MAX_*_QUERIES), now and at \
+                       the next start. Lowering never stops a running query. Needs the manage \
+                       privilege. Preview with dry_run first; read the result with \
+                       get_admission.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reset_admission_limits(
+        &self,
+        Parameters(a): Parameters<DryRunArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(admission::reset_admission_for(&self.state, &who, a.dry_run.unwrap_or(false)).await)
+    }
+
     /// `list_audit_log`: `GET /api/v2/audit`.
     #[tool(
         description = "Read the audit log of manage actions (worker, admission, query cancel \
@@ -1104,6 +1134,7 @@ mod tests {
             .with_distributed_executor(Arc::new(HangingExecutor));
         state.query_tracker = tracker.clone();
         state.admission = Some(arneb_scheduler::AdmissionController::new(8, 256));
+        (state.max_running_queries, state.max_queued_queries) = (8, 256);
         state.agent = with_agent.then_some(agent);
         state.mcp = Some(McpSettings {
             allowed_hosts: None,
@@ -1172,6 +1203,7 @@ mod tests {
             admission: None,
             admission_changes: Default::default(),
             cordon_changes: Default::default(),
+            max_running_queries: 8,
             max_queued_queries: 8,
             memory_pool: Arc::new(arneb_common::memory_pool::GreedyMemoryPool::new(1 << 20)),
             memory_limit_bytes: None,
@@ -1751,7 +1783,7 @@ mod tests {
     }
 
     /// The exact tool set (D5), sorted.
-    const TOOL_NAMES: [&str; 25] = [
+    const TOOL_NAMES: [&str; 26] = [
         "cancel_query",
         "cordon_worker",
         "create_token",
@@ -1771,6 +1803,7 @@ mod tests {
         "list_tables",
         "list_tokens",
         "list_workers",
+        "reset_admission_limits",
         "revoke_token",
         "sample_table",
         "set_admission_limits",
@@ -1780,12 +1813,13 @@ mod tests {
     ];
 
     /// The tools that change cluster state and take `dry_run`.
-    const MANAGE_TOOLS: [&str; 5] = [
+    const MANAGE_TOOLS: [&str; 6] = [
         "cancel_query",
         "cordon_worker",
         "drain_worker",
         "uncordon_worker",
         "set_admission_limits",
+        "reset_admission_limits",
     ];
 
     #[tokio::test]
@@ -1835,6 +1869,7 @@ mod tests {
                 "cordon_worker",
                 "drain_worker",
                 "set_admission_limits",
+                "reset_admission_limits",
             ]
             .contains(&name);
             if name == "uncordon_worker" {
@@ -1886,6 +1921,7 @@ mod tests {
         );
         assert!(desc("list_workers").contains("cordon_worker"));
         assert!(desc("set_admission_limits").contains("get_admission"));
+        assert!(desc("reset_admission_limits").contains("get_admission"));
     }
 
     /// Every string an agent reads: the instructions, each tool's
@@ -2141,6 +2177,7 @@ mod tests {
             ("drain_worker", json!({"id":"w1"})),
             ("uncordon_worker", json!({"id":"w1"})),
             ("set_admission_limits", json!({"max_queued_queries":5})),
+            ("reset_admission_limits", json!({})),
         ];
         for (name, args) in &calls {
             let e = tool_err(&f, "alice", name, args.clone()).await;
@@ -2308,5 +2345,36 @@ mod tests {
         }
         let a = tool_ok(&f, "root", "get_admission", json!({})).await;
         assert_eq!(a["max_queued_queries"], 5);
+        assert_eq!(a["source"], "state");
+
+        // Reset: a dry run, then the real call, back to the config values.
+        let dry = tool_ok(
+            &f,
+            "root",
+            "reset_admission_limits",
+            json!({"dry_run": true}),
+        )
+        .await;
+        assert_eq!(
+            (dry["dry_run"].clone(), dry["changed"].clone()),
+            (json!(true), json!(true))
+        );
+        assert_eq!(
+            dry,
+            api_call(&f, "root", Method::DELETE, "/api/v2/admission?dry_run=true").await,
+            "MCP and HTTP agree"
+        );
+        let r = tool_ok(&f, "root", "reset_admission_limits", json!({})).await;
+        assert_eq!(r["action"], "admission.reset", "{r}");
+        assert_eq!(r["result"]["max_queued_queries"], 256);
+        assert_eq!(r["result"]["source"], "config");
+        let log = tool_ok(
+            &f,
+            "root",
+            "list_audit_log",
+            json!({"action":"admission.reset"}),
+        )
+        .await;
+        assert_eq!(log["entries"][0]["outcome"], "ok", "{log}");
     }
 }

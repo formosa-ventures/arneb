@@ -43,8 +43,13 @@ pub struct WebState {
     /// across the whole change (preview, persist, registry update, audit
     /// append), so the audit order is the apply order.
     pub cordon_changes: Arc<tokio::sync::Mutex<()>>,
+    /// Configured `[admission] max_running_queries` (after
+    /// `ARNEB_MAX_RUNNING_QUERIES`): the seed `DELETE /api/v2/admission`
+    /// returns to.
+    pub max_running_queries: usize,
     /// Configured `[admission] max_queued_queries`, reported when there is
-    /// no controller (a worker).
+    /// no controller (a worker), and the seed `DELETE /api/v2/admission`
+    /// returns to.
     pub max_queued_queries: usize,
     /// The node memory pool, for `/metrics`.
     pub memory_pool: Arc<dyn arneb_common::memory_pool::MemoryPool>,

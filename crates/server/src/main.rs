@@ -281,6 +281,35 @@ async fn run() -> Result<()> {
         .security(|k| std::env::var(k).ok())
         .context("invalid [cluster] security configuration")?;
     let has_cluster_secret = cluster_security.secret.is_some();
+    // Config checks that can refuse the start run before the state store
+    // below is written, so a refused start leaves the state untouched.
+    let heartbeat = config
+        .cluster
+        .heartbeat(|k| std::env::var(k).ok())
+        .context("invalid [cluster] heartbeat configuration")?;
+    let drain_timeout_secs = config
+        .cluster
+        .drain_timeout_secs(|k| std::env::var(k).ok())
+        .context("invalid [cluster] drain_timeout_secs")?;
+    config::check_cluster_transport(
+        cluster_security.secret.is_some(),
+        cluster_security.tls.is_some(),
+        &config.server.bind_address,
+    )?;
+    if matches!(role, ServerRole::Coordinator) {
+        config
+            .cluster
+            .query_retry(|k| std::env::var(k).ok())
+            .context("invalid [cluster] retry_policy")?;
+    }
+    // Client-facing TLS ([tls] / ARNEB_TLS_*): one certificate for pgwire and
+    // the Trino listener. Workers serve neither, so they skip loading it.
+    let server_tls = match (&config.tls_settings, role) {
+        (Some(t), ServerRole::Coordinator | ServerRole::Standalone) => Some(
+            ServerTls::load(&t.cert_path, &t.key_path).context("invalid [tls] configuration")?,
+        ),
+        _ => None,
+    };
     // Password auth on a coordinator/standalone: users live in the state
     // store; config-seeded users follow the config file on every start
     // (a changed hash or a removed user revokes tokens). The same store
@@ -472,14 +501,6 @@ async fn run() -> Result<()> {
     }
 
     // 8. Set up Flight RPC server + heartbeat handling
-    let heartbeat = config
-        .cluster
-        .heartbeat(|k| std::env::var(k).ok())
-        .context("invalid [cluster] heartbeat configuration")?;
-    let drain_timeout_secs = config
-        .cluster
-        .drain_timeout_secs(|k| std::env::var(k).ok())
-        .context("invalid [cluster] drain_timeout_secs")?;
     match role {
         ServerRole::Coordinator => tracing::info!(
             target: "arneb::config",
@@ -512,11 +533,6 @@ async fn run() -> Result<()> {
         cluster_tls = if cluster_security.tls.is_some() { "on" } else { "off" },
         "cluster RPC security effective mode ([cluster] secret / [cluster.tls] / ARNEB_CLUSTER_*)"
     );
-    config::check_cluster_transport(
-        cluster_security.secret.is_some(),
-        cluster_security.tls.is_some(),
-        &config.server.bind_address,
-    )?;
     if cluster_security.secret.is_some()
         && cluster_security.tls.is_none()
         && !config::is_loopback_host(&config.server.bind_address)
@@ -931,14 +947,6 @@ async fn run() -> Result<()> {
         );
     }
 
-    // Client-facing TLS ([tls] / ARNEB_TLS_*): one certificate for pgwire and
-    // the Trino listener. Workers serve neither, so they skip loading it.
-    let server_tls = match (&config.tls_settings, role) {
-        (Some(t), ServerRole::Coordinator | ServerRole::Standalone) => Some(
-            ServerTls::load(&t.cert_path, &t.key_path).context("invalid [tls] configuration")?,
-        ),
-        _ => None,
-    };
     if !matches!(role, ServerRole::Worker) {
         match &config.tls_settings {
             Some(t) => tracing::info!(
@@ -1706,7 +1714,8 @@ fn check_catalog_exposure(
 /// Startup with a state store (runtime-config D1, D2). Every fatal check
 /// runs first, against the state that would be served, so a refused start
 /// writes nothing: the rules file must load; rules changed at runtime must
-/// not meet a rules file edited since its seed (Ruling R14); and a
+/// not meet a rules file edited since its seed (Ruling R14), and must still
+/// parse when they stay in force; and a
 /// coordinator without a `[cluster] secret` must not serve a catalog
 /// secret ([`check_catalog_exposure`]). Then `reseed` replaces the users,
 /// rules, settings and catalogs with the config's in one write
@@ -1727,8 +1736,18 @@ fn prepare_state_store(
         .load_rules_text()
         .context("invalid [access_control] configuration")?;
     let rules_text = rules.as_ref().map(|(text, _)| text.as_str());
-    if store.preview_seed_rules(rules_text, reseed) == arneb_state::RulesSeed::FileChanged {
-        return Err(config::rules_file_changed(&config.access_control));
+    match store.preview_seed_rules(rules_text, reseed) {
+        arneb_state::RulesSeed::FileChanged => {
+            return Err(config::rules_file_changed(&config.access_control));
+        }
+        // The stored (runtime) rules stay in force: they must still parse.
+        arneb_state::RulesSeed::Diverged => {
+            if let Some(stored) = store.access_rules() {
+                arneb_catalog::AccessRules::from_json(&stored.json)
+                    .map_err(|e| anyhow::anyhow!("the access rules in the state store: {e}"))?;
+            }
+        }
+        _ => {}
     }
     let stored = store.seeded().catalogs && !reseed;
     let served = served_catalog_specs(Some(store), &config.catalogs, reseed);
@@ -2245,6 +2264,24 @@ mod tests {
         let users = vec![("bob".to_owned(), v("b"))];
         assert!(prepare_state_store(&store, &config, &users, &role, true, true).is_err());
         assert_eq!(observed(&store), before);
+
+        // Stored runtime rules that no longer parse refuse before any write.
+        let good = r#"{"catalogs":[{"allow":"all"}]}"#;
+        std::fs::write(&rules, good).unwrap();
+        let runtime_bad = arneb_state::StateStore::open(None).unwrap();
+        runtime_bad.seed_rules(Some(good), false).unwrap();
+        runtime_bad
+            .set_access_rules(Some(arneb_state::StoredRules {
+                json: r#"{"bogus_section":[]}"#.into(),
+                from_config: false,
+            }))
+            .unwrap();
+        let untouched = observed(&runtime_bad);
+        let e = prepare_state_store(&runtime_bad, &config, &users, &role, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("state store"), "{e}");
+        assert_eq!(observed(&runtime_bad), untouched);
 
         // A rules file edited since its seed while the rules were changed at
         // runtime refuses a plain start before any write, too.

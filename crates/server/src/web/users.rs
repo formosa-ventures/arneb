@@ -33,8 +33,8 @@ use serde::{Deserialize, Serialize};
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    applied_outcome, dry_run_outcome, run_manage, Applied, ChangeLock, DryRun, ManageAction,
-    ManageOutcome, Preview,
+    applied_outcome, config_change_lock, dry_run_outcome, run_manage, Applied, ChangeLock, DryRun,
+    ManageAction, ManageOutcome, Preview,
 };
 use super::privilege::Layer;
 use super::v2::{
@@ -214,12 +214,6 @@ async fn hash_password(password: String) -> Result<ScramVerifier, ApiError> {
     })
 }
 
-/// A share of `WebState::config_changes`, held until the audit entry is
-/// appended.
-async fn config_lock(state: &WebState) -> ChangeLock {
-    Arc::new(Arc::clone(&state.config_changes).lock_owned().await)
-}
-
 fn plural(n: usize, one: &str) -> String {
     if n == 1 {
         format!("{n} {one}")
@@ -280,7 +274,7 @@ pub(super) async fn create_user_for(
         return Err(user_exists(&name));
     }
     let verifier = hash_password(password).await?;
-    let lock = config_lock(state).await;
+    let lock = config_change_lock(state, who).await?;
     let action = CreateUser {
         name,
         verifier: Some(verifier),
@@ -309,7 +303,7 @@ pub(super) async fn set_password_for(
         (None, None)
     } else {
         let verifier = hash_password(password).await?;
-        (Some(verifier), Some(config_lock(state).await))
+        (Some(verifier), Some(config_change_lock(state, who).await?))
     };
     let action = SetPassword {
         name,
@@ -336,7 +330,7 @@ pub(super) async fn delete_user_for(
     let lock = if dry_run {
         None
     } else {
-        Some(config_lock(state).await)
+        Some(config_change_lock(state, who).await?)
     };
     let action = DeleteUser {
         name,
@@ -418,7 +412,7 @@ pub(super) async fn issue_user_token_for(
             state, who, ACTION, name, preview, true, true,
         ));
     }
-    let lock = config_lock(state).await;
+    let lock = config_change_lock(state, who).await?;
     let target = TokenTarget::User {
         name: name.clone(),
         _lock: lock,
@@ -473,7 +467,7 @@ pub(super) async fn revoke_user_token_for(
             state, who, ACTION, name, preview, true, true,
         ));
     }
-    let lock = config_lock(state).await;
+    let lock = config_change_lock(state, who).await?;
     let target = TokenTarget::User {
         name: name.clone(),
         _lock: lock,

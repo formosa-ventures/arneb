@@ -21,7 +21,8 @@ use serde::Serialize;
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome, Preview,
+    config_change_lock, run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome,
+    Preview,
 };
 use super::privilege::Layer;
 use super::v2::{bad_body, bad_query};
@@ -141,7 +142,7 @@ async fn change(
     // runtime-config D10: held from reading `from` until the audit entry is
     // appended. The action keeps a share, so a request dropped mid-call
     // still serializes its apply.
-    let serialized = Arc::new(Arc::clone(&state.config_changes).lock_owned().await);
+    let serialized = config_change_lock(state, who).await?;
     let action = ChangeRules {
         from: store.access_rules().map(|r| hex_sha256(&r.json)),
         to,

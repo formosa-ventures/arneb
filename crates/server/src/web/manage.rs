@@ -104,6 +104,23 @@ pub(super) trait ManageAction: Send + 'static {
 /// `WebState::cordon_changes`).
 pub(super) type ChangeLock = std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>;
 
+/// A share of `WebState::config_changes` (runtime-config D10) for `who`,
+/// held until the audit entry is appended. Manage is checked again once
+/// the lock is held, so a change queued behind a rules change that removed
+/// `who`'s manage privilege is refused with `forbidden`.
+pub(super) async fn config_change_lock(
+    state: &WebState,
+    who: &Identity,
+) -> Result<ChangeLock, ApiError> {
+    let guard = std::sync::Arc::clone(&state.config_changes)
+        .lock_owned()
+        .await;
+    state
+        .authorizer
+        .check(who, super::privilege::Layer::Manage)?;
+    Ok(std::sync::Arc::new(guard))
+}
+
 /// The dry-run `warning` of an audited action while the audit log is not
 /// writable.
 pub(super) const AUDIT_UNAVAILABLE_WARNING: &str =

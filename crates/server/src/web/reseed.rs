@@ -37,7 +37,8 @@ use super::auth::Identity;
 use super::catalogs::{push_to_workers, push_warnings, WorkerSync};
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome, Preview,
+    config_change_lock, run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome,
+    Preview,
 };
 use super::privilege::Layer;
 use super::v2::bad_query;
@@ -230,7 +231,7 @@ pub(super) async fn reseed_for(
     let (lock, admission_lock) = if dry_run {
         (None, None)
     } else {
-        let lock = Arc::new(Arc::clone(&state.config_changes).lock_owned().await);
+        let lock = config_change_lock(state, who).await?;
         // Admission changes have their own lock (manage-api D9); taken
         // after config_changes, which no admission change takes.
         let admission_lock = Arc::clone(&state.admission_changes).lock_owned().await;
@@ -378,6 +379,11 @@ impl Reseed {
             match stored.get(name.as_str()) {
                 None => catalogs.added.push(name.clone()),
                 Some(r) if r.spec != *json || !r.from_config => catalogs.changed.push(name.clone()),
+                // Stored as the config's but not served (its build failed
+                // at startup), and it builds now: installing it is a change.
+                Some(_) if matches!(self.built.get(name), Some(Ok(_))) => {
+                    catalogs.changed.push(name.clone())
+                }
                 Some(_) => {}
             }
             match self.built.get(name) {
@@ -722,12 +728,21 @@ mod tests {
     /// `admins` in admin_users, an admission controller, live catalogs
     /// whose build of `broken` fails.
     async fn node(config: &Path, admins: &[&str]) -> WebState {
+        node_with(config, admins, Default::default()).await
+    }
+
+    /// [`node`] whose `broken` builds once `broken_up` is set.
+    async fn node_with(
+        config: &Path,
+        admins: &[&str],
+        broken_up: Arc<std::sync::atomic::AtomicBool>,
+    ) -> WebState {
         let mut state = with_authz(web_state(true, None), Some(CONFIG_RULES), admins);
         let live = LiveCatalogs::with_test_builder(
             Arc::new(CatalogManager::new("lake", "default")),
             Arc::new(ConnectorRegistry::new()),
-            Box::new(|spec| {
-                if spec.name == "broken" {
+            Box::new(move |spec| {
+                if spec.name == "broken" && !broken_up.load(std::sync::atomic::Ordering::SeqCst) {
                     Err(CatalogBuildError::Unreachable("refused".into()))
                 } else {
                     Ok(fake_built())
@@ -993,6 +1008,36 @@ mod tests {
         assert_eq!(audit[0].1["catalogs"]["removed"], json!(["rt"]));
 
         // A second re-seed is a no-op.
+        let (status, again) = reseed(&state, ("root", "rootpw"), false).await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert_eq!(again["changed"], false, "{again}");
+    }
+
+    /// A config catalog stored but not served (its startup build failed)
+    /// that builds now is installed by a re-seed, which reports it as
+    /// changed instead of "nothing to change"; a second re-seed is a no-op.
+    #[tokio::test]
+    async fn reseed_installs_a_stored_catalog_that_builds_now() {
+        let _g = THRESHOLD_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = write_config(tmp.path(), Some(CONFIG_RULES));
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state = node_with(&config, &["root"], up.clone()).await;
+        let live = state.catalogs.clone().unwrap();
+        assert!(!live.specs().iter().any(|s| s.name == "broken"));
+        up.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (status, body) = reseed(&state, ("root", "rootpw"), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], true, "{body}");
+        assert_eq!(
+            body["result"]["catalogs"],
+            json!({"added": [], "changed": ["broken"], "removed": []})
+        );
+        let names: Vec<String> = live.specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["broken", "lake"]);
+        assert_eq!(audit_actions(&state)[0].1["effect"], "applied");
+
         let (status, again) = reseed(&state, ("root", "rootpw"), false).await;
         assert_eq!(status, StatusCode::OK, "{again}");
         assert_eq!(again["changed"], false, "{again}");

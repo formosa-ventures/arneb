@@ -81,7 +81,6 @@ impl ConnectorRegistry {
         Self::default()
     }
 
-    /// Registers a connector factory under the given name.
     /// Registers a connector factory under the given name, replacing any
     /// factory already registered under it.
     pub fn register(&self, name: impl Into<String>, factory: Arc<dyn ConnectorFactory>) {

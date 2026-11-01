@@ -33,7 +33,8 @@ use serde::{Deserialize, Serialize};
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome, Preview,
+    config_change_lock, run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome,
+    Preview,
 };
 use super::privilege::Layer;
 use super::v2::{bad_body, bad_query, state_error};
@@ -220,16 +221,60 @@ fn decode_spec(
             }
         }
     }
-    serde_json::from_value(spec).map_err(|e| {
+    let hint = "send the fields of a [[catalogs]] entry (name, type, ...)";
+    let decoded: CatalogConfig = serde_json::from_value(spec.clone()).map_err(|e| {
         let text = e.to_string();
         let message = if text.starts_with("missing field") || text.starts_with("unknown field") {
             format!("invalid catalog spec: {text}")
         } else {
             "invalid catalog spec: a field has the wrong type".to_owned()
         };
-        ApiError::new(ErrorCode::InvalidArgument, message)
-            .with_hint("send the fields of a [[catalogs]] entry (name, type, ...)")
-    })
+        ApiError::new(ErrorCode::InvalidArgument, message).with_hint(hint)
+    })?;
+    // Ruling R13: API and MCP input refuses a field the spec does not have
+    // (a typo would otherwise be dropped silently), at any depth. The TOML
+    // config and the state file stay lenient. Every field of the decoded
+    // spec serializes (`None` as null), so a key missing from its JSON form
+    // is unknown.
+    let known = serde_json::to_value(&decoded).map_err(|_| {
+        ApiError::new(ErrorCode::InvalidArgument, "invalid catalog spec").with_hint(hint)
+    })?;
+    if let Some(field) = unknown_field(&spec, &known, "") {
+        return Err(ApiError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid catalog spec: unknown field `{field}`"),
+        )
+        .with_hint(hint));
+    }
+    Ok(decoded)
+}
+
+/// The dotted path of the first key of `input` that `known` lacks, looking
+/// into nested objects both have.
+fn unknown_field(
+    input: &serde_json::Value,
+    known: &serde_json::Value,
+    prefix: &str,
+) -> Option<String> {
+    let (Some(input), Some(known)) = (input.as_object(), known.as_object()) else {
+        return None;
+    };
+    for (key, value) in input {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match known.get(key) {
+            None => return Some(path),
+            Some(k) => {
+                if let Some(found) = unknown_field(value, k, &path) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Refuses a spec that still carries the `"<redacted>"` placeholder as a
@@ -276,12 +321,6 @@ fn check_limit(limit: Option<usize>) -> Result<usize, ApiError> {
         .with_hint(format!("use a limit between 1 and {MAX_LIMIT}")));
     }
     Ok(limit)
-}
-
-/// A share of `WebState::config_changes`, held until the audit entry is
-/// appended.
-async fn config_lock(state: &WebState) -> ChangeLock {
-    Arc::new(Arc::clone(&state.config_changes).lock_owned().await)
 }
 
 fn plural(n: usize, one: &str) -> String {
@@ -370,7 +409,7 @@ pub(super) async fn create_catalog_for(
     let lock = if dry_run {
         None
     } else {
-        Some(config_lock(state).await)
+        Some(config_change_lock(state, who).await?)
     };
     let action = ChangeCatalog {
         name: spec.name.clone(),
@@ -417,7 +456,7 @@ pub(super) async fn update_catalog_for(
     let lock = if dry_run {
         None
     } else {
-        Some(config_lock(state).await)
+        Some(config_change_lock(state, who).await?)
     };
     let action = ChangeCatalog {
         name,
@@ -448,7 +487,7 @@ pub(super) async fn drop_catalog_for(
     let lock = if dry_run {
         None
     } else {
-        Some(config_lock(state).await)
+        Some(config_change_lock(state, who).await?)
     };
     let action = ChangeCatalog {
         name,
@@ -527,6 +566,7 @@ impl ManageAction for ChangeCatalog {
         let workers = Self::workers(state);
         let name = &self.name;
         let mut warning = None;
+        let changed = true;
         let summary = match &self.kind {
             Kind::Create { spec, .. } => {
                 if current.is_some() {
@@ -542,6 +582,26 @@ impl ManageAction for ChangeCatalog {
                 let current = current.ok_or_else(|| no_such_catalog(name))?;
                 if current != *probed {
                     return Err(changed_since_probe(name));
+                }
+                // The stored runtime spec, already served: nothing to do. A
+                // config-seeded one still detaches (Ruling R9), and one not
+                // served (its build failed) is installed.
+                let served = self
+                    .live
+                    .specs()
+                    .iter()
+                    .any(|s| s.name == *name && same_json(s, spec));
+                if !current.from_config
+                    && served
+                    && serde_json::to_value(spec).ok() == Some(current.spec.clone())
+                {
+                    return Ok(Preview {
+                        summary: format!(
+                            "catalog {name:?} already has this spec; nothing to change"
+                        ),
+                        changed: false,
+                        warning: None,
+                    });
                 }
                 if current.from_config {
                     add_warning(&mut warning, DETACH_WARNING.to_owned());
@@ -582,7 +642,7 @@ impl ManageAction for ChangeCatalog {
         };
         Ok(Preview {
             summary,
-            changed: true,
+            changed,
             warning,
         })
     }
@@ -592,9 +652,21 @@ impl ManageAction for ChangeCatalog {
     }
 
     /// Persists, installs on the coordinator, then pushes to the workers.
+    /// An update to the spec already stored and served changes nothing: no
+    /// generation bump, no push.
     fn apply(self, state: &WebState) -> Result<Applied<CatalogChange>, ApiError> {
         let mut preview = self.preview(state)?;
         let (action, name) = (self.action(), self.name);
+        if !preview.changed {
+            return Ok(Applied {
+                preview,
+                result: CatalogChange {
+                    name,
+                    generation: self.store.catalogs().0,
+                    workers: Vec::new(),
+                },
+            });
+        }
         let generation = match self.kind {
             Kind::Create { spec, built } | Kind::Update { spec, built, .. } => {
                 let record = CatalogRecord {
@@ -637,6 +709,14 @@ impl ManageAction for ChangeCatalog {
                 workers,
             },
         })
+    }
+}
+
+/// Whether `a` and `b` serialize the same (raw secrets included).
+fn same_json(a: &CatalogConfig, b: &CatalogConfig) -> bool {
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -1035,6 +1115,47 @@ mod tests {
         assert_eq!(resp["error"]["code"], "manage_requires_auth");
     }
 
+    /// Ruling R13: a typo in an API spec, top-level or inside `storage`,
+    /// is refused naming the field (never its value), and nothing is
+    /// probed or stored; a PUT is refused the same way.
+    #[tokio::test]
+    async fn unknown_spec_fields_are_refused() {
+        let (state, probed) = node();
+        let mut top = pg_spec("pg", closed_port());
+        top["max_conections"] = json!(4);
+        let (status, resp) = create(&state, top, false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert_eq!(resp["error"]["code"], "invalid_argument");
+        let message = resp["error"]["message"].as_str().unwrap();
+        assert!(message.contains("max_conections"), "{message}");
+
+        let nested = json!({
+            "name": "lake2",
+            "type": "hive",
+            "metastore_uri": "127.0.0.1:9083",
+            "storage": {"s3": {"endpoint": "http://s3:9000", "secret_acess_key": "typo-secret-77"}},
+        });
+        let (status, resp) = create(&state, nested.clone(), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        let message = resp["error"]["message"].as_str().unwrap();
+        assert!(message.contains("storage.s3.secret_acess_key"), "{message}");
+        assert!(!resp.to_string().contains("typo-secret-77"), "{resp}");
+        assert!(probed.lock().unwrap().is_empty(), "nothing was probed");
+        assert!(store_of(&state).catalogs().1.is_empty());
+
+        // A PUT of an existing catalog is refused the same way.
+        let (status, resp) = create(&state, pg_spec("pg", closed_port()), false).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let mut typo = pg_spec("pg", closed_port());
+        typo["pasword"] = json!("x");
+        let (status, resp) = update(&state, "pg", typo, false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pasword"));
+    }
+
     #[tokio::test]
     async fn create_with_unreachable_backend_is_invalid_argument_and_changes_nothing() {
         let state = connecting_node();
@@ -1200,6 +1321,80 @@ mod tests {
         assert_eq!(last.max_connections, Some(4));
         let live = state.catalogs.as_ref().unwrap();
         assert_eq!(live.specs()[0].max_connections, Some(4));
+    }
+
+    /// A PUT of the spec already stored and served (here a GET body sent
+    /// back) changes nothing: `changed: false`, audit effect `no_change`,
+    /// no generation bump and no push.
+    #[tokio::test]
+    async fn identical_put_is_a_no_op() {
+        let (state, _) = node();
+        let (status, created) = create(&state, pg_spec("pg", closed_port()), false).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let generation = store_of(&state).catalogs().0;
+        let (_, one) = get(&state, &format!("{BASE}/pg")).await;
+        let (status, body) = update(&state, "pg", one["spec"].clone(), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], false, "{body}");
+        assert_eq!(body["result"]["generation"], generation);
+        assert_eq!(body["result"]["workers"], json!([]));
+        assert_eq!(store_of(&state).catalogs().0, generation);
+        let live = state.catalogs.as_ref().unwrap();
+        assert_eq!(live.generation(), created["result"]["generation"]);
+        let audit = audit_json(&state);
+        let last = audit
+            .iter()
+            .find(|e| e["action"] == "catalog.update")
+            .expect("audited");
+        assert_eq!(last["parameters"]["effect"], "no_change", "{last}");
+        // The dry run says so too.
+        let (_, dry_body) = update(&state, "pg", one["spec"].clone(), true).await;
+        assert_eq!(dry_body["changed"], false, "{dry_body}");
+    }
+
+    /// A change queued on `config_changes` behind a rules change that drops
+    /// the caller's manage grant is refused with `forbidden` once it gets
+    /// the lock, and changes nothing.
+    #[tokio::test]
+    async fn queued_change_rechecks_manage_under_the_lock() {
+        let (mut state, _) = node();
+        let bob_manages = r#"{"system_information":[{"user":"bob","allow":["read","write"]}]}"#;
+        state = with_authz(state, Some(bob_manages), &["root"]);
+        let (status, body) = create(&state, pg_spec("pg", closed_port()), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let before = stored(&state, "pg").unwrap();
+
+        // A rules change holds the lock; bob's PUT queues behind it.
+        let held = Arc::clone(&state.config_changes).lock_owned().await;
+        let mut spec = pg_spec("pg", closed_port());
+        spec["max_connections"] = json!(3);
+        let queued = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                call(
+                    &state,
+                    Method::PUT,
+                    &format!("{BASE}/pg"),
+                    Some(&bob()),
+                    Some(spec),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!queued.is_finished(), "the PUT waits for the lock");
+        // The rules change applies (dropping bob's write) and releases.
+        state.rules.replace(Some(Arc::new(
+            arneb_catalog::AccessRules::from_json(
+                r#"{"system_information":[{"user":"bob","allow":["read"]}]}"#,
+            )
+            .unwrap(),
+        )));
+        drop(held);
+        let (status, body) = queued.await.unwrap();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"]["code"], "forbidden");
+        assert_eq!(stored(&state, "pg").unwrap(), before);
     }
 
     #[tokio::test]

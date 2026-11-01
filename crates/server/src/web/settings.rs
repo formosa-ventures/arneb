@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome, Preview,
+    config_change_lock, run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome,
+    Preview,
 };
 use super::privilege::Layer;
 use super::v2::{bad_body, bad_query, parse_body};
@@ -130,7 +131,7 @@ pub(super) async fn update_settings_for(
     })?;
     // runtime-config D10: held from reading `from` until the audit entry is
     // appended.
-    let serialized = Arc::new(Arc::clone(&state.config_changes).lock_owned().await);
+    let serialized = config_change_lock(state, who).await?;
     let action = UpdateSettings {
         from: current_threshold_ms(),
         to: slow_query_threshold_ms,

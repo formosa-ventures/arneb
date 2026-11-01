@@ -96,6 +96,11 @@ pub(crate) struct StateData {
     /// written before runtime config existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<crate::StoredRules>,
+    /// Where the stored rules came from: the fingerprint of the rules file
+    /// last seeded, and whether they were changed at runtime since. Absent
+    /// in files written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_origin: Option<crate::rules::RulesOrigin>,
     /// Which config objects were seeded; absent (nothing seeded) in files
     /// written before runtime config existed.
     #[serde(default)]
@@ -124,6 +129,7 @@ impl Default for StateData {
             cordons: Vec::new(),
             settings: Default::default(),
             rules: None,
+            rules_origin: None,
             seeded: Default::default(),
             deleted_config_users: Vec::new(),
             catalogs: Vec::new(),
@@ -142,6 +148,8 @@ pub struct StateStore {
     data: RwLock<Arc<StateData>>,
     /// Serializes writers; held across apply + persist + swap.
     writer: Mutex<()>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_writes: std::sync::atomic::AtomicBool,
 }
 
 /// Shows only counts: the state holds verifiers and token hashes, which must
@@ -179,6 +187,8 @@ impl StateStore {
             path: path.map(Path::to_path_buf),
             data: RwLock::new(Arc::new(data)),
             writer: Mutex::new(()),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -241,11 +251,26 @@ impl StateStore {
         let _writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         let mut next = StateData::clone(&self.snapshot());
         let out = f(&mut next)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StateError::Io {
+                path: self.path.clone().unwrap_or_default(),
+                source: std::io::Error::other("injected state write failure"),
+            });
+        }
         if let Some(path) = &self.path {
             Self::persist(path, &next)?;
         }
         *self.data.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(next);
         Ok(out)
+    }
+
+    /// Test hook: make every write fail (nothing is persisted or swapped
+    /// in) while `fail` is set.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn sync_dir(dir: &Path) -> std::io::Result<()> {

@@ -264,17 +264,18 @@ pub struct ResolvedRules {
     /// `"config"` (the rules file, no state store) or `"state"` (the copy in
     /// the state store, which wins under password auth).
     pub source: &'static str,
-    /// What seeding did; `None` without a state store, or when the rules
-    /// file could not be read on a later start.
+    /// What seeding did; `None` without a state store.
     pub seed: Option<arneb_state::RulesSeed>,
 }
 
 /// Pick the startup access rules (runtime-config D1). Without a state store
 /// (`[auth] type = "none"`) they are the rules file's, as before. With one,
-/// the rules file seeds the state on its first start (or with `reseed`),
-/// and the stored copy is used: a rules file whose text differs from it
-/// logs a WARN. A rules file that cannot be read or parsed is fatal when it
-/// would be seeded, and a WARN on a later start, which uses the state copy.
+/// the rules file seeds the state on its first start (or with `reseed`).
+/// On a later start, rules that came from the file follow it: a changed
+/// rules file is stored again (INFO). Rules changed at runtime are kept
+/// over a rules file unchanged since it was last seeded (WARN); a rules
+/// file edited since then refuses the start, naming `--reseed-state`. A
+/// rules file that cannot be read or parsed is fatal.
 pub fn resolve_access_rules(
     config: &AccessControlConfig,
     store: Option<&arneb_state::StateStore>,
@@ -287,42 +288,50 @@ pub fn resolve_access_rules(
             seed: None,
         });
     };
-    let seeds = reseed || !store.seeded().rules;
-    let seed = match config.load_rules_text() {
-        Ok(file) => {
-            let text = file.as_ref().map(|(text, _)| text.as_str());
-            let seed = store
-                .seed_rules(text, reseed)
-                .map_err(|e| anyhow::anyhow!("cannot seed the access rules: {e}"))?;
-            if seed == arneb_state::RulesSeed::Diverged {
-                let what = config.rules_file.as_ref().map_or_else(
-                    || "rules_file is not set, but the state store holds access rules".to_owned(),
-                    |p| {
-                        format!(
-                            "rules_file {} differs from the access rules in the state store",
-                            p.display()
-                        )
-                    },
-                );
-                tracing::warn!(
-                    target: "arneb::config",
-                    "[access_control] {what}; the state store's rules are used. \
-                     Preview a re-seed with POST /api/v2/state/reseed?dry_run=true"
-                );
-            }
-            Some(seed)
-        }
-        Err(e) if seeds => return Err(e),
-        Err(e) => {
+    let file = config.load_rules_text()?;
+    let text = file.as_ref().map(|(text, _)| text.as_str());
+    let seed = store
+        .seed_rules(text, reseed)
+        .map_err(|e| anyhow::anyhow!("cannot seed the access rules: {e}"))?;
+    let rules_file = || {
+        config
+            .rules_file
+            .as_ref()
+            .map_or_else(|| "(unset)".to_owned(), |p| p.display().to_string())
+    };
+    match seed {
+        arneb_state::RulesSeed::FollowedFile => tracing::info!(
+            target: "arneb::config",
+            rules_file = %rules_file(),
+            "[access_control] rules_file changed since it was seeded and the stored rules \
+             were never changed at runtime; the state store now holds the file's rules"
+        ),
+        arneb_state::RulesSeed::Diverged => {
+            let what = config.rules_file.as_ref().map_or_else(
+                || "rules_file is not set, but the state store holds access rules".to_owned(),
+                |p| {
+                    format!(
+                        "rules_file {} differs from the access rules in the state store",
+                        p.display()
+                    )
+                },
+            );
             tracing::warn!(
                 target: "arneb::config",
-                error = %e,
-                "[access_control] rules file is invalid; the state store's rules are used. \
-                 Preview a re-seed with POST /api/v2/state/reseed?dry_run=true"
+                "[access_control] {what} (they were changed at runtime); the state store's \
+                 rules are used. Preview a re-seed with POST /api/v2/state/reseed?dry_run=true"
             );
-            None
         }
-    };
+        arneb_state::RulesSeed::FileChanged => bail!(
+            "[access_control] rules_file {} changed since it was seeded, but the access rules \
+             in the state store were changed at runtime since then: refusing to pick one. \
+             Restart with --reseed-state to replace the stored state with the config file \
+             (the catalogs, rules and settings become the config's), or revert the rules \
+             file to keep the runtime rules",
+            rules_file()
+        ),
+        arneb_state::RulesSeed::Seeded | arneb_state::RulesSeed::Unchanged => {}
+    }
     let rules = match store.access_rules() {
         Some(stored) => Some(Arc::new(
             arneb_catalog::AccessRules::from_json(&stored.json)
@@ -333,7 +342,7 @@ pub fn resolve_access_rules(
     Ok(ResolvedRules {
         handle: arneb_catalog::RulesHandle::new(rules),
         source: "state",
-        seed,
+        seed: Some(seed),
     })
 }
 
@@ -3486,8 +3495,10 @@ password = "hunter2"
     const RULES_A: &str = r#"{"queries":[{"user":"alice","allow":["execute"]}]}"#;
     const RULES_B: &str = r#"{"queries":[{"user":"bob","allow":["execute"]}]}"#;
 
+    /// Rules from the file follow it: a tightened file applies on the next
+    /// start (the revoked user loses access).
     #[test]
-    fn rules_file_seeds_once_then_the_state_copy_wins() {
+    fn file_seeded_rules_follow_the_rules_file() {
         let tmp = tempfile::tempdir().unwrap();
         let state_path = tmp.path().join("state.json");
         let store = arneb_state::StateStore::open(Some(&state_path)).unwrap();
@@ -3498,22 +3509,54 @@ password = "hunter2"
         assert!(r.handle.current().unwrap().can_execute("alice"));
         drop(store);
 
-        // A later start with a changed file keeps the stored rules.
         let store = arneb_state::StateStore::open(Some(&state_path)).unwrap();
         let config = rules_config(tmp.path(), Some(RULES_B));
         let r = resolve_access_rules(&config, Some(&store), false).unwrap();
-        assert_eq!(r.seed, Some(arneb_state::RulesSeed::Diverged));
+        assert_eq!(r.seed, Some(arneb_state::RulesSeed::FollowedFile));
         let live = r.handle.current().unwrap();
-        assert!(live.can_execute("alice") && !live.can_execute("bob"));
+        assert!(live.can_execute("bob") && !live.can_execute("alice"));
 
         // --reseed-state copies the file again.
+        let config = rules_config(tmp.path(), Some(RULES_A));
         let r = resolve_access_rules(&config, Some(&store), true).unwrap();
         assert_eq!(r.seed, Some(arneb_state::RulesSeed::Seeded));
+        assert!(r.handle.current().unwrap().can_execute("alice"));
+    }
+
+    /// Rules changed at runtime: kept over an unchanged file (WARN), and a
+    /// file edited since the seed refuses the start until a re-seed.
+    #[test]
+    fn runtime_rules_and_an_edited_rules_file_refuse_the_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = arneb_state::StateStore::open(None).unwrap();
+        let config = rules_config(tmp.path(), Some(RULES_A));
+        resolve_access_rules(&config, Some(&store), false).unwrap();
+        store
+            .set_access_rules(Some(arneb_state::StoredRules {
+                json: RULES_B.into(),
+                from_config: false,
+            }))
+            .unwrap();
+
+        let r = resolve_access_rules(&config, Some(&store), false).unwrap();
+        assert_eq!(r.seed, Some(arneb_state::RulesSeed::Diverged));
         assert!(r.handle.current().unwrap().can_execute("bob"));
+
+        const RULES_C: &str = r#"{"queries":[{"user":"carol","allow":["execute"]}]}"#;
+        let edited = rules_config(tmp.path(), Some(RULES_C));
+        let e = resolve_access_rules(&edited, Some(&store), false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("--reseed-state") && e.contains("revert"), "{e}");
+        assert_eq!(store.access_rules().unwrap().json, RULES_B, "unchanged");
+        let r = resolve_access_rules(&edited, Some(&store), true).unwrap();
+        assert_eq!(r.seed, Some(arneb_state::RulesSeed::Seeded));
+        assert!(r.handle.current().unwrap().can_execute("carol"));
     }
 
     #[test]
-    fn a_bad_rules_file_is_fatal_on_the_first_start_and_a_warn_later() {
+    fn a_bad_rules_file_is_fatal() {
         let tmp = tempfile::tempdir().unwrap();
         let store = arneb_state::StateStore::open(None).unwrap();
         let bad = rules_config(tmp.path(), Some("{not json"));
@@ -3523,11 +3566,9 @@ password = "hunter2"
         let good = rules_config(tmp.path(), Some(RULES_A));
         resolve_access_rules(&good, Some(&store), false).unwrap();
         let bad = rules_config(tmp.path(), Some("{not json"));
-        let r = resolve_access_rules(&bad, Some(&store), false).unwrap();
-        assert_eq!(r.seed, None);
-        assert!(r.handle.current().unwrap().can_execute("alice"));
-        // A re-seed would copy the bad file, so it stays fatal.
+        assert!(resolve_access_rules(&bad, Some(&store), false).is_err());
         assert!(resolve_access_rules(&bad, Some(&store), true).is_err());
+        assert_eq!(store.access_rules().unwrap().json, RULES_A);
     }
 
     #[test]

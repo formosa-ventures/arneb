@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Exposes `AuditLog::set_fail_appends` to other crates' tests.
+# Exposes `AuditLog::set_fail_appends` and `StateStore::set_fail_writes` to
+# other crates' tests.
 test-hooks = []
 
 [dependencies]

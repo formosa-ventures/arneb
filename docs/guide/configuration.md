@@ -726,21 +726,34 @@ slow-query threshold can now change while the server runs (see
 [Runtime configuration](/guide/http-api#runtime-configuration)). That moves
 the source of truth from the config file to the [state store](#state):
 
-- **The state wins for catalogs and rules.** The first start on this version
-  copies `[[catalogs]]` and the `rules_file` into the state (an older state
-  file has no seeded copy, so this happens once on upgrade). From then on
-  the stored copies are used. Editing `[[catalogs]]` or the rules file no
-  longer takes effect at a restart: each config catalog that is new,
-  changed or gone relative to its seeded copy, and a rules file whose text
-  differs from the rules currently stored, logs one WARN on `arneb::config`
-  at every start, ending `Preview a re-seed with POST
-  /api/v2/state/reseed?dry_run=true`. After a runtime rules change the
-  rules WARN therefore fires at every start until a re-seed. Apply the file with a
-  [re-seed](/guide/http-api#re-seed) or `--reseed-state`, which now
-  re-seeds catalogs, rules, settings and users. A standalone server under
-  password auth behaves like a coordinator here. Under `[auth] type =
-  "none"` nothing changes: there is no state store, and the config is used
-  as before.
+- **The state wins for catalogs; rules from the file follow the file.**
+  The first start on this version copies `[[catalogs]]` and the
+  `rules_file` into the state (an older state file has no seeded copy, so
+  this happens once on upgrade). From then on the stored catalogs are used.
+  Editing `[[catalogs]]` no longer takes effect at a restart: each config
+  catalog that is new, changed or gone relative to its seeded copy logs one
+  WARN on `arneb::config` at every start, ending `Preview a re-seed with
+  POST /api/v2/state/reseed?dry_run=true`. The access rules depend on
+  whether they were changed at runtime:
+  - **Never changed at runtime** (they are the seeded copy of the file):
+    the file wins. A changed `rules_file` is stored again at the next start,
+    with an INFO line, so tightening the file revokes access on restart as
+    before.
+  - **Changed at runtime** (`PUT` or `DELETE /api/v2/access-rules`) and the
+    rules file is unchanged since it was last seeded: the runtime rules are
+    kept, with a WARN at every start until a re-seed.
+  - **Changed at runtime, and the rules file was also edited since it was
+    last seeded:** startup refuses, since neither copy can be assumed to be
+    the one you want. Restart with `--reseed-state` to take the config file
+    (catalogs, rules, settings and users), or revert the rules file to keep
+    the runtime rules.
+
+  An unreadable or invalid rules file stops startup, as before v0.2.0.
+  Apply `[[catalogs]]` with a [re-seed](/guide/http-api#re-seed) or
+  `--reseed-state`, which re-seeds catalogs, rules, settings and users. A
+  standalone server under password auth behaves like a coordinator here.
+  Under `[auth] type = "none"` nothing changes: there is no state store, and
+  the config is used as before.
 - **Workers ignore `[[catalogs]]`, and `[storage]` for catalogs.** A worker
   gets its catalogs from the coordinator over Flight: a push on every
   change, and a pull when its heartbeat shows it is behind (after it starts,
@@ -790,7 +803,7 @@ the source of truth from the config file to the [state store](#state):
   a storage endpoint, region or bucket, must send the password or key
   again instead of `"<redacted>"`.
 - **Downgrading.** An older binary reads the new state file, but its next
-  write drops `catalogs`, `rules`, `seeded`, `deleted_config_users` and
+  write drops `catalogs`, `rules`, `rules_origin`, `seeded`, `deleted_config_users` and
   `slow_query_threshold_ms`. After a downgrade (and a later upgrade) the
   catalogs and rules are seeded from the config file again, and users
   deleted at runtime that are still in the config come back.
@@ -820,9 +833,12 @@ created with mode `0600`. The path's directory must be writable.
   logs a line on `arneb::config` naming the user.
 - **Catalogs and access rules are seeded once.** The first start whose state
   has no seeded copy copies `[[catalogs]]` and the `rules_file` into it; from
-  then on the stored copies are used, they change through the
+  then on the stored catalogs are used, they change through the
   [runtime configuration](/guide/http-api#runtime-configuration) API, and a
-  config entry that differs logs a WARN at every start. See
+  config entry that differs logs a WARN at every start. Rules never changed
+  at runtime follow the rules file at every start; rules changed at runtime
+  are kept while the file is unchanged, and a file edited since then stops
+  startup until `--reseed-state`. See
   [Upgrading to v0.2.0 (runtime config)](#upgrading-to-v020-runtime-config).
   The state file then holds catalog passwords too.
 - **Users created through the state store are never touched** by this. If a

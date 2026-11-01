@@ -59,8 +59,12 @@ reads, replaces and clears the rules through `GET`, `PUT` and `DELETE
   planned after it, on pgwire, Trino, the agent API and MCP, including
   connections already open. A statement already running keeps the rules it
   was checked with.
-- It survives a restart: the stored rules win over `rules_file` until a
-  [re-seed](/guide/http-api#re-seed) copies the file again.
+- It survives a restart: rules changed at runtime win over an unchanged
+  `rules_file` (with a WARN at every start) until a
+  [re-seed](/guide/http-api#re-seed) copies the file again. If the rules
+  file is also edited after a runtime change, startup refuses until you
+  restart with `--reseed-state` or revert the file. Rules never changed at
+  runtime follow the file: an edited `rules_file` applies at the next start.
 - Every change is audited (`access_rules.set`, `access_rules.clear`), with a
   SHA-256 of the rules instead of their text.
 - `GET` reports `from_config: true` while the rules are the seeded copy of
@@ -230,9 +234,11 @@ password auth, then a `queries` rule that allows `kill` for that owner (or no
   [manage envelope](/guide/http-api#dry-runs-and-the-response-envelope)
   instead of `204`, and stops the query on its protocol.
 
-- Under password auth the rules file only seeds the rules: the stored rules
-  win at later starts, and they change at runtime (see
-  [Changing rules at runtime](#changing-rules-at-runtime)).
+- Under password auth the rules are kept in the state store and can change
+  at runtime (see [Changing rules at runtime](#changing-rules-at-runtime)).
+  While they are not changed at runtime they follow the rules file at every
+  start; after a runtime change they win over an unchanged file, and an
+  edited file then stops startup until `--reseed-state`.
 
 The full lists are in
 [Upgrading to v0.2.0 (manage API)](/guide/configuration#upgrading-to-v020-manage-api)

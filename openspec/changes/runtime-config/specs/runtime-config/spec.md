@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: The state store is the source of truth
-Under `[auth] type = "password"` the coordinator (and a standalone server) SHALL keep the catalogs, the access rules and the slow-query threshold in the state store. The first start whose state has no seeded copy of the catalogs SHALL copy `[[catalogs]]` into it, and the first start with no seeded copy of the rules SHALL copy the `rules_file`. On later starts the stored copies SHALL be used, and each config catalog that is new, changed or gone relative to its seeded copy, a rules file whose text differs from the current stored rules (including rules changed at runtime), and a config setting overridden by a stored value SHALL log one WARN on `arneb::config` naming the object and ending with `Preview a re-seed with POST /api/v2/state/reseed?dry_run=true`. A state file without a `seeded` field SHALL load as not seeded. Under `[auth] type = "none"` the config SHALL be used as before.
+Under `[auth] type = "password"` the coordinator (and a standalone server) SHALL keep the catalogs, the access rules and the slow-query threshold in the state store. The first start whose state has no seeded copy of the catalogs SHALL copy `[[catalogs]]` into it, and the first start with no seeded copy of the rules SHALL copy the `rules_file`. On later starts the stored catalogs SHALL be used. Stored rules that were never changed at runtime SHALL follow the rules file: a rules file whose text differs SHALL be stored again, with an INFO on `arneb::config`. Rules changed at runtime SHALL be kept while the rules file is unchanged since it was last seeded (the state SHALL keep a SHA-256 fingerprint of the seeded text); if the rules file changed since then, startup SHALL fail with an error naming `--reseed-state` and reverting the file. Each config catalog that is new, changed or gone relative to its seeded copy, rules changed at runtime that differ from the rules file, and a config setting overridden by a stored value SHALL log one WARN on `arneb::config` naming the object and ending with `Preview a re-seed with POST /api/v2/state/reseed?dry_run=true`. A state file without a `seeded` field SHALL load as not seeded. Under `[auth] type = "none"` the config SHALL be used as before.
 
 #### Scenario: Upgrade seeds once
 - **WHEN** a coordinator starts on an H4 state file with `[[catalogs]]` naming `datalake`
@@ -10,6 +10,14 @@ Under `[auth] type = "password"` the coordinator (and a standalone server) SHALL
 #### Scenario: Rules changed at runtime
 - **WHEN** a manager replaces the rules with `PUT /api/v2/access-rules` and the coordinator restarts with the rules file unchanged
 - **THEN** the stored rules are used and startup logs the rules divergence WARN, at every start until a re-seed
+
+#### Scenario: Tightened rules file
+- **WHEN** the rules were never changed at runtime and an operator removes bob's table rule from the rules file and restarts
+- **THEN** the state stores the file's rules and bob can no longer read the table
+
+#### Scenario: Rules changed at runtime and the file edited
+- **WHEN** a manager replaced the rules with `PUT /api/v2/access-rules` and an operator then edits the rules file and restarts
+- **THEN** startup fails with an error naming `--reseed-state`, and the stored rules are unchanged
 
 #### Scenario: Config edit after seeding
 - **WHEN** an operator changes the `metastore_uri` of a seeded catalog in the config file and restarts

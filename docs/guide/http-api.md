@@ -695,9 +695,11 @@ catalog as soon as the change returns.
 | `PUT /api/v2/catalog-configs/{name}` | manage | Action `catalog.update`; the body is the whole new spec. |
 | `DELETE /api/v2/catalog-configs/{name}` | manage | Action `catalog.drop`. |
 
-- Names are 1–63 characters of `a-z 0-9 _`, starting with a letter;
-  `memory`, `file`, `system`, `information_schema` and `pg_catalog` are
-  reserved. `type` is `hive` (needs `metastore_uri`) or `postgresql` (needs
+- A new name (`POST`) is 1–63 characters of `a-z 0-9 _`, starting with a
+  letter; `memory`, `file`, `system`, `information_schema` and `pg_catalog`
+  are reserved. A `PUT` or `DELETE` accepts any existing name, so a
+  config-seeded catalog such as `pg-prod` can still be updated (for example
+  to rotate its password) and dropped. `type` is `hive` (needs `metastore_uri`) or `postgresql` (needs
   `connection_url`). A field that is not a `[[catalogs]]` field, at any
   depth (a typo such as `max_conections` or `storage.s3.secret_acess_key`),
   is `invalid_argument` naming it. A `POST` of an existing name is

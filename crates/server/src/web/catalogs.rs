@@ -40,8 +40,8 @@ use super::privilege::Layer;
 use super::v2::{bad_body, bad_query, state_error};
 use super::WebState;
 use crate::catalogs::{
-    fill_redacted, redacted_secrets, redacted_spec, same_destination, validate_spec, BuiltCatalog,
-    LiveCatalogs, REDACTED,
+    fill_redacted, redacted_secrets, redacted_spec, same_destination, validate_spec,
+    validate_spec_fields, BuiltCatalog, LiveCatalogs, REDACTED,
 };
 use crate::config::CatalogConfig;
 
@@ -296,8 +296,16 @@ const SEND_SECRETS: &str = "send the real secrets";
 /// The hint of a placeholder for a changed destination (Ruling R10).
 const SEND_AGAIN: &str = "send the secret again when you change where it is sent";
 
+/// Checks a new catalog's spec, its name included.
 fn validate(spec: &CatalogConfig) -> Result<(), ApiError> {
     validate_spec(spec).map_err(|e| ApiError::new(ErrorCode::InvalidArgument, e))
+}
+
+/// Checks an existing catalog's new spec: the name already exists, so it
+/// is not held to the name rule (a config-seeded `pg-prod` stays
+/// updatable).
+fn validate_update(spec: &CatalogConfig) -> Result<(), ApiError> {
+    validate_spec_fields(spec).map_err(|e| ApiError::new(ErrorCode::InvalidArgument, e))
 }
 
 /// Builds `spec` on the coordinator (connects to it, at most 10 s).
@@ -449,7 +457,7 @@ pub(super) async fn update_catalog_for(
         None => no_placeholders(&spec, SEND_SECRETS)?,
     }
     no_placeholders(&spec, SEND_SECRETS)?;
-    validate(&spec)?;
+    validate_update(&spec)?;
     let built = probe(&live, &spec).await?;
     #[cfg(test)]
     test_hooks::after_probe(state);
@@ -1416,6 +1424,30 @@ mod tests {
         let (status, body) = update(&state, "pg", spec, false).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(!stored(&state, "pg").unwrap().from_config);
+    }
+
+    /// Config-seeded catalogs were never held to the `[a-z0-9_]` name rule:
+    /// a `pg-prod` from the file can still be updated (to rotate its
+    /// password) and dropped; only a create checks the name.
+    #[tokio::test]
+    async fn existing_names_outside_the_name_rule_can_be_updated_and_dropped() {
+        let (state, _) = node();
+        let spec = pg_spec("pg-prod", closed_port());
+        store_of(&state)
+            .seed_catalogs(&[("pg-prod".into(), spec.clone())], false)
+            .unwrap();
+        let (status, body) = create(&state, pg_spec("pg-new", 1), false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_argument");
+        let mut rotated = spec.clone();
+        rotated["password"] = json!("rotated-secret");
+        let (status, body) = update(&state, "pg-prod", rotated, false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let record = stored(&state, "pg-prod").unwrap();
+        assert_eq!(record.spec["password"], "rotated-secret");
+        let (status, body) = drop_catalog(&state, "pg-prod", false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(stored(&state, "pg-prod").is_none());
     }
 
     #[tokio::test]

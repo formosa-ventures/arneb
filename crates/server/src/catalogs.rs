@@ -693,7 +693,10 @@ fn same_spec(a: &CatalogConfig, b: &CatalogConfig) -> bool {
 /// Checks a runtime catalog spec (D6): the name is 1–63 characters of
 /// `[a-z0-9_]` starting with a letter and not reserved; the type is `hive`
 /// (with `metastore_uri`) or `postgresql` (with a valid `connection_url`
-/// and settings). The message never carries a secret.
+/// and settings). The message never carries a secret. Only a create checks
+/// the name: an update or drop of an existing catalog uses
+/// [`validate_spec_fields`], since config-seeded catalogs (such as
+/// `pg-prod`) were never held to the name rule.
 pub fn validate_spec(spec: &CatalogConfig) -> Result<(), String> {
     let name = spec.name.as_str();
     let well_formed = (1..=63).contains(&name.len())
@@ -709,6 +712,13 @@ pub fn validate_spec(spec: &CatalogConfig) -> Result<(), String> {
     if RESERVED_NAMES.contains(&name) {
         return Err(format!("catalog name {name:?} is reserved"));
     }
+    validate_spec_fields(spec)
+}
+
+/// [`validate_spec`] without the name rule: the type and its settings, for
+/// an update of a catalog that already exists under its name.
+pub fn validate_spec_fields(spec: &CatalogConfig) -> Result<(), String> {
+    let name = spec.name.as_str();
     match spec.catalog_type.as_str() {
         "hive" => {
             if spec.metastore_uri.as_deref().is_none_or(str::is_empty) {

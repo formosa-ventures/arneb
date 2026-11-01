@@ -77,7 +77,7 @@ Before H5 the access rules, catalogs and slow-query threshold were start-time sn
 **D6. Catalog definitions.**
 - A catalog spec is `config::CatalogConfig`, now also `Serialize` (and so are `StorageConfig` and `RedactedString`, which serialize the raw value for the state file and the RPC; their `Debug` stays redacted).
 - The state stores it as JSON in `CatalogRecord.spec`, so `arneb-state` does not depend on the server crate.
-- Names: 1–63 chars of `[a-z0-9_]`, starting with a letter. `memory`, `file`, `system`, `information_schema` and `pg_catalog` are reserved (`invalid_argument`).
+- Names (checked on create only; an update or drop takes any existing name, R5): 1–63 chars of `[a-z0-9_]`, starting with a letter. `memory`, `file`, `system`, `information_schema` and `pg_catalog` are reserved (`invalid_argument`).
 - Types: `hive` (needs `metastore_uri`) and `postgresql` (needs `connection_url`); anything else is `invalid_argument`.
 - `ARNEB_CATALOG_<NAME>_PASSWORD` is resolved on the coordinator when the config loads, so a seeded spec stores the resolved password. Workers never read catalog env vars.
 - **R13.** A spec decoded from API or MCP input refuses a field the spec does not have, at any depth (`max_conections`, `storage.s3.secret_acess_key`), with `invalid_argument` naming the field. The TOML config and the state file stay lenient, so existing configs keep loading.

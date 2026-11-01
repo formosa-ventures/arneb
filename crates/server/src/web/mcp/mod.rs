@@ -64,9 +64,9 @@ Workflow:
 4. Run it: submit_query with wait_ms (up to {max_wait_ms}) so short queries return finished.
 5. If the state is queued or running, call get_query_status (with wait_ms) until it is finished, failed or cancelled.
 6. Read rows: a finished status carries first_page; start fetch_results from first_page.next_cursor and repeat with each next_cursor until it is null.
-7. Stop a statement you no longer need with cancel_query.
+7. When done with a statement, cancel_query stops it or, once ended, frees its rows.
 
-Limits: a statement keeps at most max_rows rows (default {default_max_rows}, ceiling {max_rows}) and reports truncated when more existed. Pages hold {page_bytes} bytes of rows by default; ask for up to {max_page_bytes} with max_bytes. Long cells and SQL text are cut. Listings take limit and report truncated.
+Limits: a statement keeps at most max_rows rows (default {default_max_rows}, ceiling {max_rows}) and reports truncated when more existed. An unread result may be evicted when memory is short; its id then answers not_found, so resubmit. Pages hold {page_bytes} bytes of rows by default; ask for up to {max_page_bytes} with max_bytes. Long cells and SQL text are cut. Listings take limit and report truncated.
 
 Errors: a failed tool call comes back as an error result with a code and a hint. Read the hint and any candidates (close matches for a misspelled table or column), fix the call, and retry. A SQL error after submit is a status with state failed, not an error result.
 

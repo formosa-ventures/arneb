@@ -470,7 +470,8 @@ impl ArnebMcp {
         description = "Run a SQL statement. Returns its status; with `wait_ms` (at most \
                        {max_wait_ms}) a short query is already finished, with a first page of \
                        rows. At most `max_rows` (default {default_max_rows}, at most {max_rows}) \
-                       rows are kept and `truncated` says if more existed. A failed \
+                       rows are kept and `truncated` says if more existed (`truncated_by` names \
+                       the limit, `truncated_hint` what to do). A failed \
                        statement is a status with state `failed` and an error. Next: \
                        get_query_status until finished, then fetch_results starting from \
                        `first_page.next_cursor` (null means you have every row).",
@@ -549,11 +550,14 @@ impl ArnebMcp {
 
     /// `cancel_query`: `DELETE /api/v2/statements/{id}`.
     #[tool(
-        description = "Cancel a statement you submitted. Safe to repeat; a statement that has \
-                       already ended keeps its state. Returns the status after cancelling.",
+        description = "Cancel a statement you submitted, or release one that has ended. A \
+                       queued or running statement is cancelled and kept, so get_query_status \
+                       still reports it. An ended one is released with its rows: its final \
+                       status comes back without a first page and its id answers not_found \
+                       from then on. Call it once you are done with a result.",
         annotations(
             destructive_hint = true,
-            idempotent_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -566,7 +570,7 @@ impl ArnebMcp {
         respond(
             async {
                 let svc = service(&self.state)?;
-                Ok(svc.cancel(&who.user, &a.id, Some(self.page_bytes(svc)))?)
+                Ok(svc.cancel(&who.user, &a.id)?)
             }
             .await,
         )
@@ -1015,10 +1019,13 @@ mod tests {
         let st = tool_ok(&f, "alice", "get_query_status", json!({"id": id})).await;
         assert_eq!(st["first_page"]["rows"], first["rows"]);
         assert_eq!(st["first_page"]["next_cursor"], first["next_cursor"]);
-        // And so is cancelling a statement that already finished.
+        // Cancelling a statement that already finished releases it: its
+        // final status comes back without rows, and the id is gone after.
         let c = tool_ok(&f, "alice", "cancel_query", json!({"id": id})).await;
         assert_eq!(c["state"], "finished");
-        assert_eq!(c["first_page"], st["first_page"]);
+        assert!(c["first_page"].is_null(), "{c}");
+        let e = tool_err(&f, "alice", "cancel_query", json!({"id": id})).await;
+        assert_eq!(e["code"], "not_found", "{e}");
     }
 
     #[tokio::test]
@@ -1464,7 +1471,9 @@ mod tests {
             }
             if destructive {
                 assert_eq!(a["destructiveHint"], json!(true), "{name} destructive");
-                assert_eq!(a["idempotentHint"], json!(true), "{name} idempotent");
+                // A second cancel_query releases what the first cancelled.
+                let idempotent = name != "cancel_query";
+                assert_eq!(a["idempotentHint"], json!(idempotent), "{name} idempotent");
             }
         }
 

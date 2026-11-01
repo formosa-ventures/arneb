@@ -441,8 +441,9 @@ Who may cancel, in this order:
    claimed `X-Arneb-User`). Not audited.
 2. Otherwise, under `[auth] type = "none"`: refused with
    `manage_requires_auth`.
-3. A `queries` rule that allows `kill` for that owner, or no `queries`
-   section in the rules file.
+3. An explicit `queries` rule that allows `kill` for that owner. Without a
+   rules file or a `queries` section, no rule grants it, so only the owner
+   or a manager may cancel.
 4. The manage privilege (`[access_control] admin_users`, or a
    `system_information` rule that allows `write`).
 5. Otherwise `forbidden`, with a hint naming the rule that would allow it.

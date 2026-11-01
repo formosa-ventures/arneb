@@ -178,7 +178,8 @@ Differences from the HTTP routes:
   statement status. Any other id (a query id from `list_queries`), or any
   call with `dry_run`, works like `DELETE /api/v2/queries/{id}` and returns
   the manage envelope; killing another user's query needs the manage
-  privilege or a `queries` rule that allows `kill`.
+  privilege or an explicit `queries` rule that allows `kill` (with no
+  `queries` rules, only the owner or a manager may kill).
 - **Tokens need password auth.** `create_token`, `list_tokens` and
   `revoke_token` answer `auth_disabled` under `type = "none"`. A token that
   mints a token cannot outlive its parent: the expiry is clamped and the

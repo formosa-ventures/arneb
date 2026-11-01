@@ -28,7 +28,7 @@ Stage H4 of the headless agent interface, built on H1 (`headless-api-auth`: iden
 **D2. Kill rule** (`Authorizer::check_kill`), in this order:
 1. The caller owns the query: allowed (`KillGrant::Owner`), in any auth mode, including under `none` where the owner is the claimed `X-Arneb-User`.
 2. Otherwise, under `none`: `manage_requires_auth`.
-3. Otherwise, a rules file whose `queries` section allows `kill` for this owner, or no rules file or no `queries` section: allowed (`KillGrant::Rule`). This keeps the "a missing section allows everything" convention, and matches Trino file-based access control.
+3. Otherwise, a rules file whose `queries` section allows `kill` for this owner: allowed (`KillGrant::Rule`). No rules file, or no `queries` section, grants nothing here (review round 2): unlike Trino's "a missing section allows everything", the manage layer (`admin_users`) makes killing other users' queries a manage action by default. An explicit catch-all rule restores the open behavior.
 4. Otherwise, manage: allowed (`KillGrant::Manage`).
 5. Otherwise: `forbidden`.
 

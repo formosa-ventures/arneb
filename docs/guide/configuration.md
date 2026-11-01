@@ -689,6 +689,12 @@ open so existing scrapers keep working.
   refused** with `403 manage_requires_auth` (it was allowed before). The
   owner (the claimed `X-Arneb-User`) may still cancel it, and `/api/v1`
   still lets any caller cancel any query.
+- **Killing another user's query needs a rule or manage.** Under password
+  auth with no rules file, or a rules file without a `queries` section, only
+  the query's owner or a manager may cancel it (on `/api/v1`, `/api/v2` and
+  MCP `cancel_query`). An explicit `queries` rule that allows `kill` still
+  grants it; add `{"allow": ["execute", "view", "kill"]}` for the old
+  open behavior.
 - **`DELETE /api/v1/queries/{id}` under password auth** follows the
   [kill rule](/guide/http-api#cancel-any-query): cancelling another user's
   query is audited, and the call can answer `503 audit_unavailable` (with an

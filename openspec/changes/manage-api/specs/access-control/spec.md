@@ -43,8 +43,10 @@ a user's own queries, and another user's query only when the first
 Without a `queries` section every user SHALL run statements and see every
 query. A rule with `queryOwner` that allows `execute` SHALL be rejected.
 Cancelling a query SHALL be allowed to its owner, and to another user when
-the first rule matching the user and the owner allows `kill` (or there is no
-`queries` section) under password auth, or when the user has manage.
+the first rule of an explicit `queries` section matching the user and the
+owner allows `kill` under password auth, or when the user has manage.
+Without a rules file or a `queries` section, only the owner or a user with
+manage SHALL cancel a query.
 
 #### Scenario: No execute rule
 - **WHEN** the `queries` rules are `[{"user": "admin", "allow": ["execute", "view"]}]` and carol runs `SELECT 1`
@@ -57,6 +59,10 @@ the first rule matching the user and the owner allows `kill` (or there is no
 #### Scenario: Kill rule
 - **WHEN** the `queries` rules are `[{"user": "ops", "queryOwner": "alice", "allow": ["kill"]}, {"allow": ["execute"]}]` and ops cancels alice's query
 - **THEN** the cancel is allowed, and bob cancelling alice's query is `forbidden`
+
+#### Scenario: No queries rules
+- **WHEN** password auth is on, there is no rules file, `admin_users = ["root"]`, and alice cancels bob's query
+- **THEN** the cancel is `forbidden`; bob cancelling his own query, or root cancelling it, is allowed
 
 ## ADDED Requirements
 

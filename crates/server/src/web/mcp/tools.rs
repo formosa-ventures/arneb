@@ -633,8 +633,10 @@ impl ArnebMcp {
         description = "Cancel a query by id. Your own statement from submit_query returns its \
                        status after cancelling (safe to repeat). Any other id, or a dry_run, \
                        returns the manage envelope (dry_run, action, summary, changed, result); \
-                       cancelling another user's query needs the manage privilege or a kill \
-                       rule and is audited. A query that already ended is changed: false.",
+                       cancelling another user's query needs the manage privilege or an \
+                       explicit queries rule allowing kill (with no queries rules, only the \
+                       owner or a manager may), and is audited. A query that already ended is \
+                       changed: false.",
         annotations(
             destructive_hint = true,
             idempotent_hint = true,

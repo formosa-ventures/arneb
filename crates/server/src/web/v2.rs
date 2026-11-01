@@ -1226,9 +1226,13 @@ pub(super) mod tests {
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "no rules: allowed; {body}");
-        assert_eq!(body["action"], "query.cancel");
-        assert_eq!(body["result"]["state"], "cancelled");
+        // No rules: killing another user's query needs manage.
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "no rules: owner or manage; {body}"
+        );
+        assert_eq!(body["error"]["code"], "forbidden");
     }
 
     async fn issue(state: &WebState, auth: &str, body: Value) -> (StatusCode, Value) {

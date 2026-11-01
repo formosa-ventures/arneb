@@ -1,7 +1,7 @@
 //! API tokens: issue, list, revoke and (crate-internal) verify.
 
-use arneb_protocol::ScramVerifier;
-use aws_lc_rs::{digest, rand};
+use arneb_protocol::{sha256, ScramVerifier};
+use aws_lc_rs::rand;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
@@ -246,13 +246,6 @@ fn info_of(t: &TokenRecord) -> TokenInfo {
         created_ms: t.created_ms,
         expires_ms: t.expires_ms,
     }
-}
-
-/// SHA-256 of `bytes`.
-pub fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(digest::digest(&digest::SHA256, bytes).as_ref());
-    out
 }
 
 /// The current time in milliseconds since the Unix epoch (saturating; 0 if

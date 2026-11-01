@@ -750,7 +750,9 @@ impl StartupHandler for AuthStartupHandler {
     }
 }
 
-fn sha256(data: &[u8]) -> [u8; KEY_LEN] {
+/// SHA-256 of `data`. The one implementation shared with `arneb-state`
+/// (API token secrets) and the web session store.
+pub fn sha256(data: &[u8]) -> [u8; KEY_LEN] {
     let d = digest::digest(&digest::SHA256, data);
     let mut out = [0u8; KEY_LEN];
     out.copy_from_slice(d.as_ref());

@@ -35,7 +35,7 @@ password = "..."            # or ARNEB_CATALOG_PG_PASSWORD
 
 | Field | Default | Description |
 |---|---|---|
-| `connection_url` | required | `postgresql://host:port/database`. It may carry the user and password, but the separate fields are preferred. |
+| `connection_url` | required | `postgresql://host:port/database`. It may carry the user and password, but the separate fields are preferred. Percent-encode an `@` in a query value (`user=admin%40srv`): unencoded, the driver reads everything after it as the host, and the URL is refused. A `password` parameter may appear only once. |
 | `user`, `password` | from the URL | Credentials. The password is never logged. |
 | `default_schema` | `public` | The schema used for unqualified names when this is the default (first) catalog. |
 | `max_connections` | `8` | Connection pool size, per catalog **per node**. |

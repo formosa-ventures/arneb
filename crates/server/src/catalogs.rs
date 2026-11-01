@@ -821,7 +821,19 @@ pub fn validate_spec_fields(spec: &CatalogConfig) -> Result<(), String> {
             }
         }
         "postgresql" => {
-            spec.postgres_config().map_err(|e| e.to_string())?;
+            let pg = spec.postgres_config().map_err(|e| e.to_string())?;
+            pg.validate_url()
+                .map_err(|e| format!("catalog '{name}': {e}"))?;
+            if let Some(url) = &spec.connection_url {
+                // The driver takes the last; a GET → PUT round trip could not
+                // tell the redacted copies apart.
+                if url_query_passwords(&url.0).len() > 1 {
+                    return Err(format!(
+                        "catalog '{name}': connection_url sets the password parameter more \
+                         than once"
+                    ));
+                }
+            }
         }
         other => {
             return Err(format!(
@@ -852,6 +864,14 @@ pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
             .map(|(_, value)| value)
             .chain(url_password_range(&url.0))
             .collect();
+        // Also any `password=` after the first `?`, wherever the driver's
+        // userinfo heuristic ends (a URL with an unencoded `@` in a query
+        // value; refused by validation, but it may be stored).
+        let loose: Vec<_> = url_loose_query_passwords(&url.0)
+            .into_iter()
+            .filter(|l| !ranges.iter().any(|r| r.start < l.end && l.start < r.end))
+            .collect();
+        ranges.extend(loose);
         // Replace from the end so the earlier ranges stay valid.
         ranges.sort_by_key(|r| std::cmp::Reverse(r.start));
         for range in ranges {
@@ -1028,7 +1048,10 @@ pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
         found.push("password");
     }
     if let Some(url) = &spec.connection_url {
-        if url_password_range(&url.0).is_some() || !url_query_passwords(&url.0).is_empty() {
+        if url_password_range(&url.0).is_some()
+            || !url_query_passwords(&url.0).is_empty()
+            || !url_loose_query_passwords(&url.0).is_empty()
+        {
             found.push("connection_url password");
         }
     }
@@ -1137,6 +1160,31 @@ fn url_query_passwords(url: &str) -> Vec<(std::ops::Range<usize>, std::ops::Rang
             if is_password_key(key) {
                 let value_start = start + param.len() - value.len();
                 out.push((start..start + param.len(), value_start..start + param.len()));
+            }
+        }
+        start += param.len() + 1;
+    }
+    out
+}
+
+/// The value ranges of every `password` query parameter (key
+/// percent-decoded) after the first `?` past the scheme, ignoring the
+/// userinfo: the redaction and secret checks use these on top of the
+/// driver-faithful ranges, so a URL the driver misreads still hides them.
+fn url_loose_query_passwords(url: &str) -> Vec<std::ops::Range<usize>> {
+    let Some(scheme_end) = url.find("://") else {
+        return Vec::new();
+    };
+    let Some(q) = url[scheme_end..].find('?').map(|i| scheme_end + i + 1) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut start = q;
+    for param in url[q..].split('&') {
+        if let Some((key, value)) = param.split_once('=') {
+            if is_password_key(key) {
+                let value_start = start + param.len() - value.len();
+                out.push(value_start..start + param.len());
             }
         }
         start += param.len() + 1;
@@ -1682,6 +1730,43 @@ mod tests {
             ]
         );
         assert_eq!(secret_fields(&secret_spec()).len(), 4);
+    }
+
+    /// M2: an unencoded `@` in a query value makes the driver read the
+    /// rest as the host; the query password is still redacted and found as
+    /// a secret, and validation refuses the URL without echoing it.
+    #[test]
+    fn query_password_after_an_unencoded_at_is_redacted_and_refused() {
+        for url in [
+            "postgresql://db.internal:5432/sales?user=admin@srv&password=S3cret",
+            "postgresql://db/sales?user=admin@srv&password=S3cret",
+        ] {
+            let s = spec(serde_json::json!({
+                "name": "p", "type": "postgresql", "connection_url": url
+            }));
+            let shown = redacted_spec(&s).to_string();
+            assert!(!shown.contains("S3cret"), "{shown}");
+            assert_eq!(secret_fields(&s), vec!["connection_url password"]);
+            let e = validate_spec(&s).unwrap_err();
+            assert!(e.contains("%40") && !e.contains("S3cret"), "{e}");
+        }
+    }
+
+    /// M6: a URL that sets `password=` twice is refused, so a GET → PUT
+    /// round trip cannot change which one the driver uses.
+    #[test]
+    fn duplicate_query_passwords_are_refused() {
+        let s = spec(serde_json::json!({
+            "name": "p", "type": "postgresql",
+            "connection_url": "postgresql://u@db/x?password=a&sslmode=disable&pass%77ord=b"
+        }));
+        let e = validate_spec(&s).unwrap_err();
+        assert!(e.contains("more than once") && !e.contains("=a"), "{e}");
+        let shown = redacted_spec(&s);
+        assert_eq!(
+            shown["connection_url"],
+            "postgresql://u@db/x?password=<redacted>&sslmode=disable&pass%77ord=<redacted>"
+        );
     }
 
     #[test]

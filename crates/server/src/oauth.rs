@@ -1,21 +1,26 @@
 //! OAuth 2.0 resource-server side of `/mcp`: validates JWT access tokens
 //! against the issuer's JWKS.
 //!
-//! [`OAuthValidator`] holds a cache of the IdP's signing keys (by `kid`),
-//! refetches it when it expires or when a token names an unknown `kid`
-//! (at most once per `jwks_min_refresh`, single-flight), and checks
-//! signature, algorithm, `iss`, `aud`, `exp`, `nbf`, the user claim and the
+//! [`OAuthValidator`] holds a cache of the IdP's signing keys (by `kid`) and
+//! checks signature, algorithm, `iss`, `aud`, `exp`, `nbf`, that the token
+//! is an access token (not an OIDC ID token), the user claim and the
 //! required scopes. Only asymmetric algorithms are accepted (RS256/384/512,
 //! PS256, ES256/384); `none` and HS* are always refused.
+//!
+//! Key refreshes run in a detached task (single-flight, at most one start
+//! per `jwks_min_refresh`), so a request that is dropped mid-fetch never
+//! aborts the fetch. The set is refetched in the background from 80% of
+//! `jwks_cache` on (stale-while-revalidate); while that fails, the last good
+//! keys keep deciding for up to `jwks_max_stale` after they were fetched. A
+//! token naming an unknown `kid` waits for a refetch (throttled likewise).
 //!
 //! Tokens are never logged; a rejection is at most its reason code, on the
 //! `arneb::oauth` target at DEBUG.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
+use futures::future::{BoxFuture, FutureExt as _, Shared};
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, Jwk, KeyAlgorithm, PublicKeyUse};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -57,10 +62,16 @@ pub struct OAuthSettings {
     pub required_scopes: Vec<String>,
     /// Clock-skew allowance for `exp` / `nbf`.
     pub leeway: Duration,
-    /// How long fetched keys are used.
+    /// How long fetched keys are fresh; a background refetch starts at 80%.
     pub jwks_cache: Duration,
     /// Minimum gap between JWKS fetch attempts.
     pub jwks_min_refresh: Duration,
+    /// How long after a successful fetch its keys may still decide while
+    /// refetches fail (at least `jwks_cache`).
+    pub jwks_max_stale: Duration,
+    /// Require the `at+jwt` header `typ` (RFC 9068); off by default because
+    /// many IdPs send `typ: JWT` on access tokens.
+    pub require_access_token_typ: bool,
 }
 
 /// Why an [`OAuthConfig`] cannot become [`OAuthSettings`].
@@ -97,7 +108,16 @@ impl TryFrom<&OAuthConfig> for OAuthSettings {
             leeway: Duration::from_secs(c.leeway_secs),
             jwks_cache: Duration::from_secs(c.jwks_cache_secs),
             jwks_min_refresh: Duration::from_secs(c.jwks_min_refresh_secs),
+            jwks_max_stale: Duration::from_secs(c.jwks_max_stale_secs),
+            require_access_token_typ: c.require_access_token_typ,
         })
+    }
+}
+
+impl OAuthSettings {
+    /// Age of the key set from which a background refetch starts.
+    fn refresh_ahead(&self) -> Duration {
+        self.jwks_cache * 4 / 5
     }
 }
 
@@ -122,6 +142,9 @@ pub enum OAuthReject {
     /// A valid token that lacks a required scope.
     #[error("insufficient scope")]
     InsufficientScope,
+    /// `user_claim = "email"` and the token's `email_verified` is not true.
+    #[error("email not verified")]
+    UnverifiedEmail,
     /// The signing keys could not be fetched, so no verdict is possible.
     #[error("identity provider unavailable")]
     Unavailable,
@@ -147,9 +170,12 @@ struct CachedKey {
     key: DecodingKey,
 }
 
+/// A JWKS fetch running in its own task; resolves to whether it succeeded.
+type Flight = Shared<BoxFuture<'static, bool>>;
+
 #[derive(Default)]
 struct KeyCache {
-    keys: Vec<std::sync::Arc<CachedKey>>,
+    keys: Vec<Arc<CachedKey>>,
     /// When `keys` were fetched.
     fetched_at: Option<Instant>,
     /// Start of the latest fetch attempt (successful or not).
@@ -160,6 +186,9 @@ struct KeyCache {
     last_ok: bool,
     /// Discovered (or configured) JWKS URL.
     jwks_uri: Option<String>,
+    /// The fetch in flight, if any. It runs detached, so dropping the
+    /// request that started it (a client disconnect) never aborts it.
+    inflight: Option<Flight>,
 }
 
 enum Refresh {
@@ -171,13 +200,22 @@ enum Refresh {
     Throttled,
 }
 
-/// Validates OAuth access tokens; share as `Arc<OAuthValidator>`.
-pub struct OAuthValidator {
+/// What the detached fetch task needs.
+struct Inner {
     settings: OAuthSettings,
     http: Option<reqwest::Client>,
     cache: Mutex<KeyCache>,
-    /// Serialises fetches (single-flight).
-    refresh_lock: tokio::sync::Mutex<()>,
+}
+
+/// Validates OAuth access tokens; share as `Arc<OAuthValidator>`.
+pub struct OAuthValidator {
+    inner: Arc<Inner>,
+    /// `WWW-Authenticate` values, computed once.
+    challenge: String,
+    invalid_token_challenge: String,
+    insufficient_scope_challenge: String,
+    /// The one path the metadata document is served at.
+    metadata_path: String,
 }
 
 impl OAuthValidator {
@@ -198,22 +236,50 @@ impl OAuthValidator {
             )
             .ok();
         Self {
-            settings,
-            http,
-            cache: Mutex::new(KeyCache::default()),
-            refresh_lock: tokio::sync::Mutex::new(()),
+            challenge: challenge(&settings),
+            invalid_token_challenge: invalid_token_challenge(&settings),
+            insufficient_scope_challenge: insufficient_scope_challenge(&settings),
+            metadata_path: metadata_path(&settings.resource),
+            inner: Arc::new(Inner {
+                settings,
+                http,
+                cache: Mutex::new(KeyCache::default()),
+            }),
         }
     }
 
     /// The settings in effect.
     pub fn settings(&self) -> &OAuthSettings {
-        &self.settings
+        &self.inner.settings
+    }
+
+    /// `WWW-Authenticate` for a `/mcp` request without credentials.
+    pub fn challenge(&self) -> &str {
+        &self.challenge
+    }
+
+    /// `WWW-Authenticate` for a presented access token that is not valid
+    /// (RFC 6750 section 3.1 `invalid_token`), so a client can refresh it
+    /// instead of starting over.
+    pub fn invalid_token_challenge(&self) -> &str {
+        &self.invalid_token_challenge
+    }
+
+    /// `WWW-Authenticate` for a valid token that lacks a required scope.
+    pub fn insufficient_scope_challenge(&self) -> &str {
+        &self.insufficient_scope_challenge
+    }
+
+    /// The path of the protected-resource metadata document (RFC 9728
+    /// section 3.1), derived from `resource`.
+    pub fn metadata_path(&self) -> &str {
+        &self.metadata_path
     }
 
     /// Fetch the signing keys once, so the first request does not pay for
     /// it. Logs a WARN on failure; never errors.
     pub async fn warm(&self) {
-        let seen = self.cache.lock().unwrap().generation;
+        let seen = self.inner.cache.lock().unwrap().generation;
         if matches!(self.refresh(seen).await, Refresh::Failed) {
             tracing::warn!(
                 target: "arneb::oauth",
@@ -232,38 +298,75 @@ impl OAuthValidator {
     }
 
     async fn validate_inner(&self, token: &str) -> Result<OAuthPrincipal, OAuthReject> {
+        let settings = &self.inner.settings;
         if token.len() > MAX_TOKEN_BYTES {
             return Err(OAuthReject::Invalid("too_large"));
         }
-        let header = parse_header(token)?;
-        let alg = ALLOWED_ALGS
-            .iter()
-            .copied()
-            .find(|a| alg_name(*a) == header.alg)
-            .ok_or(OAuthReject::Invalid("bad_algorithm"))?;
-        let key = self.key_for(header.kid.as_deref()).await?;
-        check_key_matches(&key, alg)?;
+        // An unknown `alg` (`none` included) does not parse.
+        let header =
+            jsonwebtoken::decode_header(token).map_err(|_| OAuthReject::Invalid("malformed"))?;
+        let alg = header.alg;
+        if !ALLOWED_ALGS.contains(&alg) {
+            return Err(OAuthReject::Invalid("bad_algorithm"));
+        }
+        let typed_access_token = header.typ.as_deref().is_some_and(is_access_token_typ);
+        if settings.require_access_token_typ && !typed_access_token {
+            return Err(OAuthReject::Invalid("not_at_jwt"));
+        }
+        let keys = self.keys_for(header.kid.as_deref(), alg).await?;
 
         let mut v = Validation::new(alg);
         v.algorithms = vec![alg];
-        v.set_issuer(&[&self.settings.issuer]);
-        v.set_audience(&[&self.settings.audience]);
-        v.leeway = self.settings.leeway.as_secs();
+        v.set_issuer(&[&settings.issuer]);
+        v.set_audience(&[&settings.audience]);
+        v.leeway = settings.leeway.as_secs();
         v.validate_exp = true;
         v.validate_nbf = true;
         v.set_required_spec_claims(&["exp", "iss", "aud"]);
-        let data = jsonwebtoken::decode::<serde_json::Value>(token, &key.key, &v)
-            .map_err(|e| OAuthReject::Invalid(reason_code(e.kind())))?;
-        self.principal(&data.claims)
+        // Every key under the `kid` that fits `alg` (an IdP migrating
+        // algorithms may publish several); the first that verifies decides.
+        let mut claims = None;
+        for key in &keys {
+            match jsonwebtoken::decode::<serde_json::Value>(token, &key.key, &v) {
+                Ok(data) => {
+                    claims = Some(data.claims);
+                    break;
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::InvalidSignature) => continue,
+                // The signature verified; a claim is wrong.
+                Err(e) => return Err(OAuthReject::Invalid(reason_code(e.kind()))),
+            }
+        }
+        let claims = claims.ok_or(OAuthReject::Invalid("bad_signature"))?;
+        // An `at+jwt` header is an access token by definition (RFC 9068);
+        // otherwise refuse what can only be an OIDC ID token, which the IdP
+        // also signs, for the same issuer and possibly the same audience.
+        if !typed_access_token && looks_like_id_token(&claims) {
+            return Err(OAuthReject::Invalid("id_token"));
+        }
+        self.principal(&claims)
     }
 
     fn principal(&self, claims: &serde_json::Value) -> Result<OAuthPrincipal, OAuthReject> {
+        let settings = &self.inner.settings;
         let user = claims
-            .get(&self.settings.user_claim)
+            .get(&settings.user_claim)
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .ok_or(OAuthReject::Invalid("no_user_claim"))?
             .to_owned();
+        // An unverified address can be anyone's (self-registration, social
+        // login), so it must not name an Arneb user.
+        if settings.user_claim == "email" {
+            let verified = match claims.get("email_verified") {
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(serde_json::Value::String(s)) => s == "true",
+                _ => false,
+            };
+            if !verified {
+                return Err(OAuthReject::UnverifiedEmail);
+            }
+        }
         let mut scopes: Vec<String> = Vec::new();
         if let Some(s) = claims.get("scope").and_then(|v| v.as_str()) {
             scopes.extend(s.split_whitespace().map(str::to_owned));
@@ -277,8 +380,7 @@ impl OAuthValidator {
             }
             _ => {}
         }
-        if !self
-            .settings
+        if !settings
             .required_scopes
             .iter()
             .all(|r| scopes.iter().any(|s| s == r))
@@ -297,32 +399,42 @@ impl OAuthValidator {
         })
     }
 
-    /// The cached key for `kid`, refetching the set when it is stale or the
-    /// key is unknown (rate limited).
-    async fn key_for(&self, kid: Option<&str>) -> Result<std::sync::Arc<CachedKey>, OAuthReject> {
+    /// The cached keys for `kid` that can verify `alg`, refetching the set
+    /// when it is unusable or the key is unknown (rate limited).
+    async fn keys_for(
+        &self,
+        kid: Option<&str>,
+        alg: Algorithm,
+    ) -> Result<Vec<Arc<CachedKey>>, OAuthReject> {
+        let settings = &self.inner.settings;
         // At most one refresh per call: a second miss after it is final.
         let mut refreshed = false;
         loop {
-            let (found, expired, generation, last_ok) = {
-                let c = self.cache.lock().unwrap();
-                let expired = c
-                    .fetched_at
-                    .is_none_or(|t| t.elapsed() >= self.settings.jwks_cache);
-                let found = if expired {
-                    Lookup::Stale
+            let (found, usable, generation, last_ok) = {
+                let mut c = self.inner.cache.lock().unwrap();
+                let age = c.fetched_at.map(|t| t.elapsed());
+                let usable = age.is_some_and(|a| a < settings.jwks_max_stale);
+                if usable && age.is_some_and(|a| a >= settings.refresh_ahead()) {
+                    // Stale-while-revalidate: answer from these keys and
+                    // refetch in the background (throttled, single-flight).
+                    let _ = self.inner.start_fetch(&mut c);
+                }
+                let found = if usable {
+                    lookup(&c.keys, kid, alg)
                 } else {
-                    lookup(&c.keys, kid)
+                    Lookup::Stale
                 };
-                (found, expired, c.generation, c.last_ok)
+                (found, usable, c.generation, c.last_ok)
             };
             match found {
                 Lookup::Found(k) => return Ok(k),
+                Lookup::Incompatible => return Err(OAuthReject::Invalid("bad_algorithm")),
                 Lookup::Ambiguous | Lookup::Unknown | Lookup::Stale if refreshed => {
                     // Fresh keys were fetched and still none fits.
-                    return Err(if expired {
-                        OAuthReject::Unavailable
-                    } else {
+                    return Err(if usable {
                         OAuthReject::Invalid("unknown_key")
+                    } else {
+                        OAuthReject::Unavailable
                     });
                 }
                 _ => {}
@@ -334,7 +446,7 @@ impl OAuthValidator {
                     // Cannot refetch yet: with no usable keys, or when the
                     // last attempt failed (so nothing ruled the kid out),
                     // that means unavailable; otherwise the kid is unknown.
-                    return Err(if expired || !last_ok {
+                    return Err(if !usable || !last_ok {
                         OAuthReject::Unavailable
                     } else {
                         OAuthReject::Invalid("unknown_key")
@@ -344,60 +456,95 @@ impl OAuthValidator {
         }
     }
 
-    /// Fetch the key set unless a concurrent call just did (`seen` is the
-    /// generation the caller observed) or the previous attempt was too
-    /// recent.
+    /// Wait for a fetch of the key set: the one in flight, or a new one
+    /// unless a concurrent call just finished one (`seen` is the generation
+    /// the caller observed) or the previous attempt was too recent.
     async fn refresh(&self, seen: u64) -> Refresh {
-        let _flight = self.refresh_lock.lock().await;
-        let jwks_uri = {
-            let c = self.cache.lock().unwrap();
+        let flight = {
+            let mut c = self.inner.cache.lock().unwrap();
             if c.generation != seen {
-                // Someone else refreshed while we waited: share the outcome.
+                // Someone else refreshed meanwhile: share the outcome.
                 return if c.last_ok {
                     Refresh::Fetched
                 } else {
                     Refresh::Failed
                 };
             }
-            if c.last_attempt
-                .is_some_and(|t| t.elapsed() < self.settings.jwks_min_refresh)
-            {
-                return Refresh::Throttled;
+            match self.inner.start_fetch(&mut c) {
+                Some(flight) => flight,
+                None => return Refresh::Throttled,
             }
-            c.jwks_uri.clone()
         };
-        // Open the rate-limit window before the await: if this future is
-        // dropped mid-fetch (client disconnect), the window still counts and
-        // is treated as a failed attempt, so a flood of cancelled requests
-        // cannot drive one IdP fetch each.
-        let started = Instant::now();
-        {
-            let mut c = self.cache.lock().unwrap();
-            c.last_attempt = Some(started);
-            c.last_ok = false;
+        if flight.await {
+            Refresh::Fetched
+        } else {
+            Refresh::Failed
         }
-        let outcome = self.fetch(jwks_uri).await;
+    }
+}
+
+impl Inner {
+    /// The fetch in flight, else a new one in a detached task; `None` when
+    /// the previous attempt started less than `jwks_min_refresh` ago. Called
+    /// with the cache locked.
+    fn start_fetch(self: &Arc<Self>, c: &mut KeyCache) -> Option<Flight> {
+        if let Some(flight) = &c.inflight {
+            // A finished flight still listed means its task died before
+            // recording the outcome; start over rather than reuse it.
+            if flight.peek().is_none() {
+                return Some(flight.clone());
+            }
+            c.inflight = None;
+        }
+        if c.last_attempt
+            .is_some_and(|t| t.elapsed() < self.settings.jwks_min_refresh)
+        {
+            return None;
+        }
+        c.last_attempt = Some(Instant::now());
+        let inner = Arc::clone(self);
+        let known_uri = c.jwks_uri.clone();
+        let task = tokio::spawn(async move { inner.run_fetch(known_uri).await });
+        let flight = task.map(|r| r.unwrap_or(false)).boxed().shared();
+        c.inflight = Some(flight.clone());
+        Some(flight)
+    }
+
+    /// One fetch attempt, recorded in the cache; `true` on success.
+    async fn run_fetch(&self, known_uri: Option<String>) -> bool {
+        let outcome = self.fetch(known_uri).await;
         let mut c = self.cache.lock().unwrap();
-        c.last_attempt = Some(started);
         c.generation += 1;
+        c.inflight = None;
         match outcome {
             Ok((keys, uri)) => {
                 c.keys = keys;
                 c.fetched_at = Some(Instant::now());
                 c.jwks_uri = Some(uri);
                 c.last_ok = true;
-                Refresh::Fetched
+                true
             }
             Err(msg) => {
-                // The old keys stay usable until `jwks_cache` elapses.
-                tracing::warn!(target: "arneb::oauth", "fetching the signing keys failed: {msg}");
+                match c.fetched_at {
+                    Some(t) if t.elapsed() < self.settings.jwks_max_stale => tracing::warn!(
+                        target: "arneb::oauth",
+                        keys_age_secs = t.elapsed().as_secs(),
+                        max_stale_secs = self.settings.jwks_max_stale.as_secs(),
+                        "fetching the signing keys failed: {msg}; the previous keys stay in use \
+                         until they are jwks_max_stale_secs old"
+                    ),
+                    _ => tracing::warn!(
+                        target: "arneb::oauth",
+                        "fetching the signing keys failed: {msg}"
+                    ),
+                }
                 c.last_ok = false;
                 // A discovered URL may be stale (the IdP moved it): forget
                 // it so the next attempt rediscovers.
                 if self.settings.jwks_uri.is_none() {
                     c.jwks_uri = None;
                 }
-                Refresh::Failed
+                false
             }
         }
     }
@@ -405,7 +552,7 @@ impl OAuthValidator {
     async fn fetch(
         &self,
         known_uri: Option<String>,
-    ) -> Result<(Vec<std::sync::Arc<CachedKey>>, String), String> {
+    ) -> Result<(Vec<Arc<CachedKey>>, String), String> {
         let http = self.http.as_ref().ok_or("no HTTP client")?;
         let uri = match (&self.settings.jwks_uri, known_uri) {
             (Some(u), _) => u.clone(),
@@ -424,7 +571,7 @@ impl OAuthValidator {
             .filter(|j| !matches!(j.common.public_key_use, Some(PublicKeyUse::Encryption)))
             .filter_map(|j| {
                 let key = DecodingKey::from_jwk(&j).ok()?;
-                Some(std::sync::Arc::new(CachedKey {
+                Some(Arc::new(CachedKey {
                     kid: j.common.key_id.clone(),
                     alg: j.common.key_algorithm,
                     params: j.algorithm,
@@ -460,10 +607,25 @@ impl OAuthValidator {
         let uri = doc
             .jwks_uri
             .ok_or_else(|| "discovery has no jwks_uri".to_owned())?;
-        // Same rule as a configured `jwks_uri` (D9).
-        crate::config::check_oauth_url("the discovered jwks_uri", &uri, true)?;
+        check_discovered_jwks_uri(&self.settings.issuer, &uri)?;
         Ok(uri)
     }
+}
+
+/// A `jwks_uri` from a discovery document: the configured-URL rule (D9),
+/// and `https` whenever the issuer itself is not on loopback, so a remote
+/// document cannot point Arneb at plain-http services on its own host.
+fn check_discovered_jwks_uri(issuer: &str, uri: &str) -> Result<(), String> {
+    crate::config::check_oauth_url("the discovered jwks_uri", uri, true)?;
+    let issuer_on_loopback =
+        url::Url::parse(issuer).is_ok_and(|u| crate::config::is_loopback_url(&u));
+    let https = url::Url::parse(uri).is_ok_and(|u| u.scheme() == "https");
+    if !issuer_on_loopback && !https {
+        return Err(format!(
+            "the discovered jwks_uri '{uri}' must use https: the issuer is not on loopback"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -477,65 +639,62 @@ struct JwksDoc {
     keys: Vec<serde_json::Value>,
 }
 
-#[derive(Deserialize)]
-struct RawHeader {
-    alg: String,
-    #[serde(default)]
-    kid: Option<String>,
+/// The RFC 9068 media type of a JWT access token, as a header `typ`.
+fn is_access_token_typ(typ: &str) -> bool {
+    typ.eq_ignore_ascii_case("at+jwt") || typ.eq_ignore_ascii_case("application/at+jwt")
 }
 
-fn parse_header(token: &str) -> Result<RawHeader, OAuthReject> {
-    let seg = token.split('.').next().unwrap_or_default();
-    let bytes = URL_SAFE_NO_PAD
-        .decode(seg)
-        .map_err(|_| OAuthReject::Invalid("malformed"))?;
-    serde_json::from_slice(&bytes).map_err(|_| OAuthReject::Invalid("malformed"))
-}
-
-fn alg_name(a: Algorithm) -> &'static str {
-    match a {
-        Algorithm::RS256 => "RS256",
-        Algorithm::RS384 => "RS384",
-        Algorithm::RS512 => "RS512",
-        Algorithm::PS256 => "PS256",
-        Algorithm::ES256 => "ES256",
-        Algorithm::ES384 => "ES384",
-        _ => "",
-    }
+/// Claims only an OIDC ID token carries: `nonce` and `at_hash` (OIDC Core
+/// 2 and 3.1.3.6), or Keycloak's `typ: "ID"`.
+fn looks_like_id_token(claims: &serde_json::Value) -> bool {
+    claims.get("nonce").is_some()
+        || claims.get("at_hash").is_some()
+        || claims
+            .get("typ")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t.eq_ignore_ascii_case("ID"))
 }
 
 enum Lookup {
-    Found(std::sync::Arc<CachedKey>),
+    /// The keys that may have signed the token.
+    Found(Vec<Arc<CachedKey>>),
+    /// Keys exist for the `kid`, but none can verify the token's `alg`.
+    Incompatible,
     /// No `kid` in the token and several keys to choose from.
     Ambiguous,
     Unknown,
-    /// The cache is empty or expired.
+    /// The cache is empty or too old to use.
     Stale,
 }
 
-fn lookup(keys: &[std::sync::Arc<CachedKey>], kid: Option<&str>) -> Lookup {
-    match kid {
+fn lookup(keys: &[Arc<CachedKey>], kid: Option<&str>, alg: Algorithm) -> Lookup {
+    let named: Vec<_> = match kid {
         Some(k) => keys
             .iter()
-            .find(|c| c.kid.as_deref() == Some(k))
-            .map_or(Lookup::Unknown, |c| Lookup::Found(c.clone())),
-        None if keys.len() == 1 => Lookup::Found(keys[0].clone()),
-        None => Lookup::Ambiguous,
+            .filter(|c| c.kid.as_deref() == Some(k))
+            .cloned()
+            .collect(),
+        None if keys.len() == 1 => vec![keys[0].clone()],
+        None => return Lookup::Ambiguous,
+    };
+    if named.is_empty() {
+        return Lookup::Unknown;
+    }
+    let fitting: Vec<_> = named.into_iter().filter(|k| key_fits(k, alg)).collect();
+    if fitting.is_empty() {
+        Lookup::Incompatible
+    } else {
+        Lookup::Found(fitting)
     }
 }
 
-/// The JWK must be able to verify `alg`: same `alg` when declared, else the
-/// same key family and curve.
-fn check_key_matches(key: &CachedKey, alg: Algorithm) -> Result<(), OAuthReject> {
-    let bad = Err(OAuthReject::Invalid("bad_algorithm"));
+/// The JWK can verify `alg`: same `alg` when declared, else the same key
+/// family and curve.
+fn key_fits(key: &CachedKey, alg: Algorithm) -> bool {
     if let Some(declared) = key.alg {
-        return if key_alg(declared) == Some(alg) {
-            Ok(())
-        } else {
-            bad
-        };
+        return key_alg(declared) == Some(alg);
     }
-    let ok = match (&key.params, alg) {
+    match (&key.params, alg) {
         (
             AlgorithmParameters::RSA(_),
             Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 | Algorithm::PS256,
@@ -547,11 +706,6 @@ fn check_key_matches(key: &CachedKey, alg: Algorithm) -> Result<(), OAuthReject>
             ec.curve == EllipticCurve::P384
         }
         _ => false,
-    };
-    if ok {
-        Ok(())
-    } else {
-        bad
     }
 }
 
@@ -681,6 +835,11 @@ pub(crate) mod test_idp {
         /// An RSA-2048 key (RS256); the key material is generated once per
         /// test process and shared by all `rsa` keys.
         pub fn rsa(kid: &str) -> Self {
+            Self::rsa_with(kid, Algorithm::RS256)
+        }
+
+        /// The shared RSA key for `alg` (RS* or PS*), its JWK declaring it.
+        pub fn rsa_with(kid: &str, alg: Algorithm) -> Self {
             // jsonwebtoken derives RSA JWKs from PKCS#1 only; ours is PKCS#8,
             // so the JWK is assembled from the public components.
             let (der, n, e) = rsa_material();
@@ -696,13 +855,13 @@ pub(crate) mod test_idp {
                 lines.join("\n")
             );
             let jwk: Jwk = serde_json::from_value(serde_json::json!({
-                "kty": "RSA", "kid": kid, "alg": "RS256", "use": "sig",
+                "kty": "RSA", "kid": kid, "alg": alg, "use": "sig",
                 "n": URL_SAFE_NO_PAD.encode(n), "e": URL_SAFE_NO_PAD.encode(e),
             }))
             .unwrap();
             Self {
                 kid: kid.into(),
-                alg: Algorithm::RS256,
+                alg,
                 enc: EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
                 jwk,
             }
@@ -713,10 +872,17 @@ pub(crate) mod test_idp {
             jsonwebtoken::encode(&Header::new(self.alg), claims, &self.enc).unwrap()
         }
 
-        /// Sign `claims` with this key and the standard header (`kid`, `alg`).
+        /// Sign `claims` with this key and the standard header (`kid`, `alg`,
+        /// `typ: JWT`).
         pub fn sign(&self, claims: &serde_json::Value) -> String {
+            self.sign_typ(claims, Some("JWT"))
+        }
+
+        /// Sign `claims` with a header carrying `kid`, `alg` and `typ`.
+        pub fn sign_typ(&self, claims: &serde_json::Value, typ: Option<&str>) -> String {
             let mut h = Header::new(self.alg);
             h.kid = Some(self.kid.clone());
+            h.typ = typ.map(str::to_owned);
             jsonwebtoken::encode(&h, claims, &self.enc).unwrap()
         }
     }
@@ -727,6 +893,8 @@ pub(crate) mod test_idp {
         Ok,
         Fail500,
         Hang,
+        /// Answer normally after this many milliseconds.
+        Slow(u64),
     }
 
     struct Shared {
@@ -769,6 +937,12 @@ pub(crate) mod test_idp {
             )),
             Mode::Fail500 => Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
             Mode::Hang => std::future::pending().await,
+            Mode::Slow(ms) => {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                Ok(Json(
+                    serde_json::json!({ "keys": s.keys.lock().unwrap().clone() }),
+                ))
+            }
         }
     }
 
@@ -852,22 +1026,31 @@ pub(crate) mod test_idp {
 /// Well-known path prefix of RFC 9728 protected-resource metadata.
 pub const METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
 
+/// The path of `resource`'s metadata document (RFC 9728 section 3.1): the
+/// well-known segment followed by the resource's path, or the bare segment
+/// for a resource without a path.
+pub fn metadata_path(resource: &str) -> String {
+    match url::Url::parse(resource) {
+        Ok(u) if u.path() != "/" => format!("{METADATA_PATH}{}", u.path()),
+        _ => METADATA_PATH.to_owned(),
+    }
+}
+
 /// The metadata URL of `resource` (RFC 9728 section 3.1): the well-known
 /// segment inserted between the authority and the resource's path.
 pub fn metadata_url(resource: &str) -> String {
     match url::Url::parse(resource) {
         Ok(u) => {
-            let path = if u.path() == "/" { "" } else { u.path() };
             let authority = &u[..url::Position::BeforePath];
-            format!("{authority}{METADATA_PATH}{path}")
+            format!("{authority}{}", metadata_path(resource))
         }
         // Settings are validated at startup; this only guards a bad literal.
         Err(_) => format!("{}{METADATA_PATH}", resource.trim_end_matches('/')),
     }
 }
 
-/// `WWW-Authenticate` value for a `/mcp` request without valid credentials.
-pub fn challenge(settings: &OAuthSettings) -> String {
+/// `WWW-Authenticate` value for a `/mcp` request without credentials.
+fn challenge(settings: &OAuthSettings) -> String {
     let mut v = format!(
         r#"Bearer realm="arneb", resource_metadata="{}""#,
         metadata_url(&settings.resource)
@@ -881,8 +1064,17 @@ pub fn challenge(settings: &OAuthSettings) -> String {
     v
 }
 
+/// `WWW-Authenticate` value for a presented token that is not valid. The
+/// description is fixed: the reason stays in the DEBUG log (D10).
+fn invalid_token_challenge(settings: &OAuthSettings) -> String {
+    format!(
+        r#"Bearer realm="arneb", error="invalid_token", error_description="the access token is not valid", resource_metadata="{}""#,
+        metadata_url(&settings.resource)
+    )
+}
+
 /// `WWW-Authenticate` value for a valid token that lacks a required scope.
-pub fn insufficient_scope_challenge(settings: &OAuthSettings) -> String {
+fn insufficient_scope_challenge(settings: &OAuthSettings) -> String {
     format!(
         r#"Bearer realm="arneb", error="insufficient_scope", scope="{}", resource_metadata="{}""#,
         settings.required_scopes.join(" "),
@@ -894,6 +1086,8 @@ pub fn insufficient_scope_challenge(settings: &OAuthSettings) -> String {
 mod tests {
     use super::test_idp::{claims, now, Mode, TestIdp, TestKey};
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
     use jsonwebtoken::Header;
     use serde_json::json;
 
@@ -910,6 +1104,8 @@ mod tests {
             leeway: Duration::from_secs(0),
             jwks_cache: Duration::from_secs(3600),
             jwks_min_refresh: Duration::from_secs(30),
+            jwks_max_stale: Duration::from_secs(86400),
+            require_access_token_typ: false,
         }
     }
 
@@ -941,20 +1137,47 @@ mod tests {
             metadata_url("https://h/mcp/"),
             "https://h/.well-known/oauth-protected-resource/mcp/"
         );
+        assert_eq!(
+            metadata_url("https://h"),
+            "https://h/.well-known/oauth-protected-resource"
+        );
+        assert_eq!(
+            metadata_path("https://h/arneb/mcp"),
+            "/.well-known/oauth-protected-resource/arneb/mcp"
+        );
+        assert_eq!(
+            metadata_path("https://h/"),
+            "/.well-known/oauth-protected-resource"
+        );
     }
 
     #[test]
-    fn challenges_carry_metadata_and_scopes() {
+    fn challenges_are_computed_once_and_carry_metadata_and_scopes() {
+        let meta = "https://arneb.test/.well-known/oauth-protected-resource/mcp";
         let mut s = settings("https://idp.test");
+        let v = OAuthValidator::new(s.clone());
         assert_eq!(
-            challenge(&s),
-            r#"Bearer realm="arneb", resource_metadata="https://arneb.test/.well-known/oauth-protected-resource/mcp""#
+            v.challenge(),
+            format!(r#"Bearer realm="arneb", resource_metadata="{meta}""#)
+        );
+        assert_eq!(
+            v.invalid_token_challenge(),
+            format!(
+                r#"Bearer realm="arneb", error="invalid_token", error_description="the access token is not valid", resource_metadata="{meta}""#
+            )
+        );
+        assert_eq!(
+            v.metadata_path(),
+            "/.well-known/oauth-protected-resource/mcp"
         );
         s.required_scopes = vec!["a".into(), "b".into()];
-        assert!(challenge(&s).ends_with(r#"", scope="a b""#));
+        let v = OAuthValidator::new(s);
+        assert!(v.challenge().ends_with(r#"", scope="a b""#));
         assert_eq!(
-            insufficient_scope_challenge(&s),
-            r#"Bearer realm="arneb", error="insufficient_scope", scope="a b", resource_metadata="https://arneb.test/.well-known/oauth-protected-resource/mcp""#
+            v.insufficient_scope_challenge(),
+            format!(
+                r#"Bearer realm="arneb", error="insufficient_scope", scope="a b", resource_metadata="{meta}""#
+            )
         );
     }
 
@@ -1011,13 +1234,14 @@ mod tests {
             invalid("bad_signature")
         );
 
-        // alg=none and HS256 keyed with the public key are never accepted.
+        // alg=none (which does not even parse as a header) and HS256 keyed
+        // with the public key are never accepted.
         let none = format!(
             "{}.{}.",
             b64(&json!({"alg": "none", "kid": "k1"})),
             b64(&claims(&iss, AUD))
         );
-        assert_eq!(reject(none).await, invalid("bad_algorithm"));
+        assert_eq!(reject(none).await, invalid("malformed"));
         let hs = jsonwebtoken::encode(
             &{
                 let mut h = Header::new(Algorithm::HS256);
@@ -1155,12 +1379,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_refresh_keeps_old_keys_until_the_cache_expires() {
+    async fn failed_refreshes_keep_old_keys_until_max_stale() {
         let key = TestKey::ec("k1");
         let idp = TestIdp::start(&[&key]).await;
         let v = validator(&idp, |s| {
             s.jwks_cache = Duration::from_millis(200);
             s.jwks_min_refresh = Duration::from_millis(10);
+            s.jwks_max_stale = Duration::from_millis(500);
         });
         let t = key.sign(&claims(&idp.issuer(), AUD));
         v.validate(&t).await.unwrap();
@@ -1174,27 +1399,80 @@ mod tests {
             v.validate(&unknown).await.unwrap_err(),
             OAuthReject::Unavailable
         );
-        // ...and once the cache expires nothing can.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // ...past jwks_cache the old keys still decide (refetches fail)...
+        tokio::time::sleep(Duration::from_millis(230)).await;
+        v.validate(&t).await.unwrap();
+        // ...and past jwks_max_stale nothing can.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(v.validate(&t).await.unwrap_err(), OAuthReject::Unavailable);
+        // The IdP returns: the next fetch serves again.
+        idp.set_mode(Mode::Ok);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        v.validate(&t).await.unwrap();
     }
 
     #[tokio::test]
-    async fn a_cancelled_fetch_still_opens_the_rate_limit_window() {
+    async fn keys_are_refetched_in_the_background_before_they_expire() {
         let key = TestKey::ec("k1");
         let idp = TestIdp::start(&[&key]).await;
-        idp.set_mode(Mode::Hang);
+        let v = validator(&idp, |s| {
+            s.jwks_cache = Duration::from_millis(500);
+            s.jwks_min_refresh = Duration::from_millis(10);
+        });
+        let t = key.sign(&claims(&idp.issuer(), AUD));
+        v.validate(&t).await.unwrap();
+        assert_eq!(idp.jwks_hits(), 1);
+        // Below 80% of jwks_cache: no refetch.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        v.validate(&t).await.unwrap();
+        assert_eq!(idp.jwks_hits(), 1);
+        // From 80% on, a slow IdP does not hold the request: it answers from
+        // the cached keys and the refetch runs in the background.
+        idp.set_mode(Mode::Slow(300));
+        tokio::time::sleep(Duration::from_millis(320)).await;
+        let started = std::time::Instant::now();
+        v.validate(&t).await.unwrap();
+        assert!(started.elapsed() < Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(idp.jwks_hits(), 2);
+        // The refetch made the keys fresh again: no further hit right away.
+        v.validate(&t).await.unwrap();
+        assert_eq!(idp.jwks_hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_request_does_not_cancel_the_fetch() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        idp.set_mode(Mode::Slow(300));
+        // The default 30 s jwks_min_refresh: a lost fetch would mean 503s.
         let v = validator(&idp, |_| {});
         let t = key.sign(&claims(&idp.issuer(), AUD));
-        // Drop the validate future mid-fetch.
-        let r = tokio::time::timeout(Duration::from_millis(200), v.validate(&t)).await;
-        assert!(r.is_err());
-        assert_eq!(idp.jwks_hits(), 1);
-        idp.set_mode(Mode::Ok);
+        // Clients that disconnect mid-fetch (the futures are dropped)...
         for _ in 0..5 {
-            assert_eq!(v.validate(&t).await.unwrap_err(), OAuthReject::Unavailable);
+            let r = tokio::time::timeout(Duration::from_millis(50), v.validate(&t)).await;
+            assert!(r.is_err());
         }
-        assert_eq!(idp.jwks_hits(), 1, "no refetch inside the window");
+        // ...start one fetch between them, which completes on its own.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(idp.jwks_hits(), 1);
+        v.validate(&t).await.unwrap();
+        assert_eq!(idp.jwks_hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_request_joins_the_fetch_in_flight() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        idp.set_mode(Mode::Slow(300));
+        let v = validator(&idp, |_| {});
+        let t = key.sign(&claims(&idp.issuer(), AUD));
+        let r = tokio::time::timeout(Duration::from_millis(50), v.validate(&t)).await;
+        assert!(r.is_err());
+        // Inside the throttle window, a legitimate request waits for that
+        // fetch instead of being refused.
+        v.validate(&t).await.unwrap();
+        assert_eq!(idp.jwks_hits(), 1);
     }
 
     #[tokio::test]
@@ -1236,7 +1514,7 @@ mod tests {
         let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(1));
         let t = key.sign(&claims(&idp.issuer(), AUD));
         v.validate(&t).await.unwrap();
-        assert!(v.cache.lock().unwrap().jwks_uri.is_some());
+        assert!(v.inner.cache.lock().unwrap().jwks_uri.is_some());
         // The cached URL starts failing: it is forgotten, so the next
         // attempt goes back through discovery.
         idp.set_mode(Mode::Fail500);
@@ -1246,7 +1524,7 @@ mod tests {
             v.validate(&unknown).await.unwrap_err(),
             OAuthReject::Unavailable
         );
-        assert!(v.cache.lock().unwrap().jwks_uri.is_none());
+        assert!(v.inner.cache.lock().unwrap().jwks_uri.is_none());
         idp.set_mode(Mode::Ok);
         let rotated = TestKey::ec("k2");
         idp.set_keys(&[&key, &rotated]);
@@ -1254,7 +1532,7 @@ mod tests {
         v.validate(&rotated.sign(&claims(&idp.issuer(), AUD)))
             .await
             .unwrap();
-        assert!(v.cache.lock().unwrap().jwks_uri.is_some());
+        assert!(v.inner.cache.lock().unwrap().jwks_uri.is_some());
     }
 
     #[tokio::test]
@@ -1336,6 +1614,149 @@ mod tests {
         let s = OAuthSettings::try_from(&c).unwrap();
         assert_eq!(s.audience, AUD);
         assert_eq!(s.leeway, Duration::from_secs(60));
+        assert_eq!(s.jwks_max_stale, Duration::from_secs(86400));
+        assert!(!s.require_access_token_typ);
+    }
+
+    #[tokio::test]
+    async fn id_tokens_are_not_access_tokens() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let v = validator(&idp, |_| {});
+        let iss = idp.issuer();
+        let id_token = OAuthReject::Invalid("id_token");
+        // `typ: JWT` (Keycloak, Entra, Okta) with OIDC-only claims.
+        for (claim, value) in [
+            ("nonce", json!("n-0S6")),
+            ("at_hash", json!("77QmUPtjPfzWtF2AnpK9RQ")),
+            ("typ", json!("ID")),
+        ] {
+            let mut c = claims(&iss, AUD);
+            c[claim] = value;
+            assert_eq!(
+                v.validate(&key.sign(&c)).await.unwrap_err(),
+                id_token,
+                "{claim}"
+            );
+            assert_eq!(
+                v.validate(&key.sign_typ(&c, None)).await.unwrap_err(),
+                id_token,
+                "{claim} without typ"
+            );
+        }
+        // Keycloak's access tokens: `typ: JWT` header, payload `typ: Bearer`.
+        let mut c = claims(&iss, AUD);
+        c["typ"] = json!("Bearer");
+        v.validate(&key.sign(&c)).await.unwrap();
+        v.validate(&key.sign_typ(&c, None)).await.unwrap();
+        // An `at+jwt` header is an access token by definition (RFC 9068).
+        let mut c = claims(&iss, AUD);
+        c["nonce"] = json!("n");
+        v.validate(&key.sign_typ(&c, Some("at+jwt"))).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn require_access_token_typ_wants_at_jwt() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let v = validator(&idp, |s| s.require_access_token_typ = true);
+        let c = claims(&idp.issuer(), AUD);
+        for typ in [Some("at+jwt"), Some("application/at+jwt"), Some("AT+JWT")] {
+            v.validate(&key.sign_typ(&c, typ)).await.unwrap();
+        }
+        for typ in [Some("JWT"), None] {
+            assert_eq!(
+                v.validate(&key.sign_typ(&c, typ)).await.unwrap_err(),
+                OAuthReject::Invalid("not_at_jwt"),
+                "{typ:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_email_user_claim_needs_a_verified_email() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let v = validator(&idp, |s| s.user_claim = "email".into());
+        let mut c = claims(&idp.issuer(), AUD);
+        c["email"] = json!("alice@corp.example");
+        assert_eq!(
+            v.validate(&key.sign(&c)).await.unwrap_err(),
+            OAuthReject::UnverifiedEmail,
+            "no email_verified"
+        );
+        for no in [json!(false), json!("false"), json!(1), json!(null)] {
+            c["email_verified"] = no.clone();
+            assert_eq!(
+                v.validate(&key.sign(&c)).await.unwrap_err(),
+                OAuthReject::UnverifiedEmail,
+                "{no}"
+            );
+        }
+        for yes in [json!(true), json!("true")] {
+            c["email_verified"] = yes;
+            assert_eq!(
+                v.validate(&key.sign(&c)).await.unwrap().user,
+                "alice@corp.example"
+            );
+        }
+        // Other claims do not look at email_verified.
+        let v = validator(&idp, |s| s.user_claim = "preferred_username".into());
+        c["email_verified"] = json!(false);
+        assert_eq!(v.validate(&key.sign(&c)).await.unwrap().user, "alice");
+    }
+
+    #[test]
+    fn a_discovered_jwks_uri_of_a_remote_issuer_must_be_https() {
+        let remote = "https://idp.example/realms/arneb";
+        check_discovered_jwks_uri(remote, "https://idp.example/certs").unwrap();
+        // Any https host: IdPs serve keys from a CDN or another domain.
+        check_discovered_jwks_uri(remote, "https://keys.example.net/jwks").unwrap();
+        for bad in [
+            "http://127.0.0.1:8500/v1/agent/self",
+            "http://localhost/jwks",
+            "http://[::1]/jwks",
+            "http://idp.example/certs",
+        ] {
+            let err = check_discovered_jwks_uri(remote, bad).unwrap_err();
+            assert!(err.contains("https"), "{bad}: {err}");
+        }
+        // A loopback issuer (local testing) may keep plain http on loopback.
+        let local = "http://127.0.0.1:8180/realms/arneb";
+        check_discovered_jwks_uri(local, "http://127.0.0.1:8180/certs").unwrap();
+        check_discovered_jwks_uri(local, "http://idp.example/certs").unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn every_key_under_a_kid_is_tried() {
+        // An algorithm migration: RS256 and PS256 under one kid, RS256 first.
+        let rs = TestKey::rsa_with("k1", Algorithm::RS256);
+        let ps = TestKey::rsa_with("k1", Algorithm::PS256);
+        let idp = TestIdp::start(&[&rs, &ps]).await;
+        let v = validator(&idp, |_| {});
+        let c = claims(&idp.issuer(), AUD);
+        v.validate(&ps.sign(&c)).await.unwrap();
+        v.validate(&rs.sign(&c)).await.unwrap();
+        // A rotation reusing a kid: two EC keys, the token signed by the second.
+        let first = TestKey::ec("k2");
+        let second = TestKey::ec("k2");
+        let idp = TestIdp::start(&[&first, &second]).await;
+        let v = validator(&idp, |_| {});
+        let c = claims(&idp.issuer(), AUD);
+        v.validate(&second.sign(&c)).await.unwrap();
+        v.validate(&first.sign(&c)).await.unwrap();
+        // A key under the kid that verifies nothing is still bad_signature.
+        assert_eq!(
+            v.validate(&TestKey::ec("k2").sign(&c)).await.unwrap_err(),
+            OAuthReject::Invalid("bad_signature")
+        );
+        // ...and a claim error from the key that verified is reported as is.
+        let mut expired = claims(&idp.issuer(), AUD);
+        expired["exp"] = json!(now() - 600);
+        assert_eq!(
+            v.validate(&second.sign(&expired)).await.unwrap_err(),
+            OAuthReject::Invalid("expired")
+        );
     }
 
     #[test]

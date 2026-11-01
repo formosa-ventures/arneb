@@ -136,28 +136,21 @@ pub fn build_router(state: WebState) -> Router {
             .route("/mcp", axum::routing::any(mcp::not_served))
             .route("/mcp/{*rest}", axum::routing::any(mcp::not_served))
     };
-    // Discovery for OAuth clients; a plain 404 when OAuth is off (not the SPA).
-    let router = if state.oauth.is_some() {
-        router
-            .route(
-                crate::oauth::METADATA_PATH,
-                axum::routing::get(oauth_metadata::metadata),
-            )
-            .route(
-                "/.well-known/oauth-protected-resource/{*rest}",
-                axum::routing::get(oauth_metadata::metadata),
-            )
-    } else {
-        router
-            .route(
-                crate::oauth::METADATA_PATH,
-                axum::routing::any(mcp::not_served),
-            )
-            .route(
-                "/.well-known/oauth-protected-resource/{*rest}",
-                axum::routing::any(mcp::not_served),
-            )
-    };
+    // Discovery for OAuth clients. The handler answers only at the path
+    // derived from `resource`; everything under the well-known prefix is
+    // otherwise a plain 404 (not the SPA), also when OAuth is off.
+    let metadata_paths = [
+        crate::oauth::METADATA_PATH.to_owned(),
+        format!("{}/", crate::oauth::METADATA_PATH),
+        format!("{}/{{*rest}}", crate::oauth::METADATA_PATH),
+    ];
+    let router = metadata_paths.iter().fold(router, |router, path| {
+        if state.oauth.is_some() {
+            router.route(path, axum::routing::get(oauth_metadata::metadata))
+        } else {
+            router.route(path, axum::routing::any(mcp::not_served))
+        }
+    });
     router
         .fallback(frontend::static_handler)
         .layer(axum::middleware::from_fn_with_state(

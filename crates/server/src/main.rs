@@ -1074,6 +1074,15 @@ async fn run() -> Result<()> {
     // can change at runtime; a value stored in the state store wins over
     // the config seed.
     let serves_sql = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
+    // `[oauth]` resolved once; workers ignore it.
+    let oauth_settings = if serves_sql && config.oauth.enabled() {
+        Some(
+            oauth::OAuthSettings::try_from(&config.oauth)
+                .context("invalid [oauth] configuration")?,
+        )
+    } else {
+        None
+    };
     let admission_config = &config.admission;
     let resolved_admission = config::resolve_admission_limits(
         admission_config,
@@ -1157,9 +1166,7 @@ async fn run() -> Result<()> {
             oauth = if config.oauth.enabled() { "enabled" } else { "disabled" },
             "mcp effective settings ([mcp] / ARNEB_MCP_*)"
         );
-        if config.oauth.enabled() {
-            let o = oauth::OAuthSettings::try_from(&config.oauth)
-                .context("invalid [oauth] configuration")?;
+        if let Some(o) = &oauth_settings {
             tracing::info!(
                 target: "arneb::config",
                 oauth = "enabled",
@@ -1172,6 +1179,8 @@ async fn run() -> Result<()> {
                 leeway_secs = o.leeway.as_secs(),
                 jwks_cache_secs = o.jwks_cache.as_secs(),
                 jwks_min_refresh_secs = o.jwks_min_refresh.as_secs(),
+                jwks_max_stale_secs = o.jwks_max_stale.as_secs(),
+                require_access_token_typ = o.require_access_token_typ,
                 "oauth effective settings ([oauth] / ARNEB_OAUTH_*)"
             );
             if o.user_claim != "sub" {
@@ -1330,16 +1339,12 @@ async fn run() -> Result<()> {
     // OAuth for `/mcp`: coordinator/standalone only (workers ignore
     // `[oauth]`); keys are fetched in the background so startup never
     // waits on the IdP.
-    let oauth_validator = if serves_clients && config.oauth.enabled() {
-        let settings = oauth::OAuthSettings::try_from(&config.oauth)
-            .context("invalid [oauth] configuration")?;
+    let oauth_validator = oauth_settings.map(|settings| {
         let validator = Arc::new(oauth::OAuthValidator::new(settings));
         let warm = validator.clone();
         tokio::spawn(async move { warm.warm().await });
-        Some(validator)
-    } else {
-        None
-    };
+        validator
+    });
     let web_state = web::WebState {
         query_tracker: query_tracker.clone(),
         node_registry: node_registry.clone(),

@@ -945,6 +945,8 @@ impl McpConfig {
 /// leeway_secs            = 60                                  # ARNEB_OAUTH_LEEWAY_SECS (0..=300)
 /// jwks_cache_secs        = 3600                                # ARNEB_OAUTH_JWKS_CACHE_SECS (>= 60)
 /// jwks_min_refresh_secs  = 30                                  # ARNEB_OAUTH_JWKS_MIN_REFRESH_SECS
+/// jwks_max_stale_secs    = 86400                               # ARNEB_OAUTH_JWKS_MAX_STALE_SECS (>= jwks_cache_secs)
+/// require_access_token_typ = false                             # ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -954,7 +956,8 @@ pub struct OAuthConfig {
     /// Public URL of the MCP endpoint (the protected resource); must end in
     /// `/mcp`. Required with `issuer`.
     pub resource: Option<String>,
-    /// Required `aud` value; defaults to `resource`.
+    /// Required `aud` value; defaults to `resource`. A different value
+    /// (client-id mode) needs `required_scopes`.
     pub audience: Option<String>,
     /// Claim mapped to the Arneb user name. `sub` is the only claim OIDC
     /// guarantees stable and unique; others (`preferred_username`, `email`)
@@ -970,6 +973,11 @@ pub struct OAuthConfig {
     pub jwks_cache_secs: u64,
     /// Minimum gap between JWKS refetches (unknown `kid`), in seconds.
     pub jwks_min_refresh_secs: u64,
+    /// How long after a successful fetch the keys keep deciding while
+    /// refetches fail, in seconds (at least `jwks_cache_secs`).
+    pub jwks_max_stale_secs: u64,
+    /// Accept only tokens whose header `typ` is `at+jwt` (RFC 9068).
+    pub require_access_token_typ: bool,
 }
 
 impl Default for OAuthConfig {
@@ -984,6 +992,8 @@ impl Default for OAuthConfig {
             leeway_secs: 60,
             jwks_cache_secs: 3600,
             jwks_min_refresh_secs: 30,
+            jwks_max_stale_secs: 86400,
+            require_access_token_typ: false,
         }
     }
 }
@@ -997,15 +1007,9 @@ pub(crate) fn check_oauth_url(
 ) -> std::result::Result<(), String> {
     let url =
         url::Url::parse(value).map_err(|e| format!("{what} '{value}' is not a valid URL: {e}"))?;
-    let loopback = match url.host() {
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    };
     match url.scheme() {
         "https" => {}
-        "http" if loopback => {}
+        "http" if is_loopback_url(&url) => {}
         _ => {
             return Err(format!(
                 "{what} '{value}' must use https (http is allowed only for localhost or a \
@@ -1022,6 +1026,16 @@ pub(crate) fn check_oauth_url(
         ));
     }
     Ok(())
+}
+
+/// The URL's host is `localhost` or a loopback address.
+pub(crate) fn is_loopback_url(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 impl OAuthConfig {
@@ -1062,12 +1076,20 @@ impl OAuthConfig {
                 "ARNEB_OAUTH_JWKS_MIN_REFRESH_SECS",
                 &mut self.jwks_min_refresh_secs,
             ),
+            (
+                "ARNEB_OAUTH_JWKS_MAX_STALE_SECS",
+                &mut self.jwks_max_stale_secs,
+            ),
         ] {
             if let Some(v) = get(name) {
                 *slot = v.trim().parse().map_err(|_| {
                     anyhow::anyhow!("invalid {name} value '{v}' (expected a non-negative integer)")
                 })?;
             }
+        }
+        if let Some(v) = get("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP") {
+            self.require_access_token_typ =
+                parse_env_bool("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP", &v)?;
         }
         Ok(())
     }
@@ -1120,6 +1142,23 @@ impl OAuthConfig {
             return Err(format!(
                 "[oauth] jwks_min_refresh_secs ({}) must be in 1..=jwks_cache_secs ({})",
                 self.jwks_min_refresh_secs, self.jwks_cache_secs
+            ));
+        }
+        if self.jwks_max_stale_secs < self.jwks_cache_secs {
+            return Err(format!(
+                "[oauth] jwks_max_stale_secs ({}) must be at least jwks_cache_secs ({})",
+                self.jwks_max_stale_secs, self.jwks_cache_secs
+            ));
+        }
+        // An OIDC ID token for a client carries `aud` = that client id and
+        // no scope, so in client-id mode only a required scope tells an
+        // access token from an ID token whose shape gives nothing away.
+        if self.effective_audience() != Some(resource.as_str()) && self.required_scopes.is_empty() {
+            return Err(format!(
+                "[oauth] audience '{}' differs from resource, so ID tokens issued to that client \
+                 would carry the same aud: set required_scopes to a scope only access tokens \
+                 for Arneb carry",
+                self.effective_audience().unwrap_or_default()
             ));
         }
         Ok(())
@@ -2837,9 +2876,15 @@ pgwire = "required"
         assert!(!c.enabled());
         assert_eq!(c.user_claim, "sub");
         assert_eq!(
-            (c.leeway_secs, c.jwks_cache_secs, c.jwks_min_refresh_secs),
-            (60, 3600, 30)
+            (
+                c.leeway_secs,
+                c.jwks_cache_secs,
+                c.jwks_min_refresh_secs,
+                c.jwks_max_stale_secs
+            ),
+            (60, 3600, 30, 86400)
         );
+        assert!(!c.require_access_token_typ);
         assert_eq!(oauth("port = 5432", &[]).unwrap(), c);
     }
 
@@ -2863,6 +2908,23 @@ pgwire = "required"
         // An empty value counts as unset.
         let c = oauth(file, &[("ARNEB_OAUTH_ISSUER", "")]).unwrap();
         assert_eq!(c.issuer.as_deref(), Some("https://a"));
+        let c = oauth(
+            file,
+            &[
+                ("ARNEB_OAUTH_JWKS_MAX_STALE_SECS", "7200"),
+                ("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP", "true"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.jwks_max_stale_secs, 7200);
+        assert!(c.require_access_token_typ);
+        let err = oauth(file, &[("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP", "maybe")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2982,6 +3044,44 @@ pgwire = "required"
             (
                 OAuthConfig {
                     jwks_uri: Some("http://localhost:8180/certs".into()),
+                    ..oauth_ok()
+                },
+                None,
+            ),
+            (
+                OAuthConfig {
+                    jwks_max_stale_secs: 3599,
+                    ..oauth_ok()
+                },
+                Some("jwks_max_stale_secs"),
+            ),
+            (
+                OAuthConfig {
+                    jwks_max_stale_secs: 3600,
+                    ..oauth_ok()
+                },
+                None,
+            ),
+            // Client-id mode: ID tokens for the client share the aud, so a
+            // required scope must tell them apart.
+            (
+                OAuthConfig {
+                    audience: Some("arneb-client".into()),
+                    ..oauth_ok()
+                },
+                Some("required_scopes"),
+            ),
+            (
+                OAuthConfig {
+                    audience: Some("arneb-client".into()),
+                    required_scopes: vec!["arneb".into()],
+                    ..oauth_ok()
+                },
+                None,
+            ),
+            (
+                OAuthConfig {
+                    audience: Some("https://db.example/mcp".into()),
                     ..oauth_ok()
                 },
                 None,

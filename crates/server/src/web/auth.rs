@@ -144,8 +144,7 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
     let challenge = on_mcp
         .then_some(state.oauth.as_ref())
         .flatten()
-        .map(|o| crate::oauth::challenge(o.settings()));
-    let challenge = challenge.as_deref();
+        .map(|o| o.challenge());
     let Some(authorization) = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -211,9 +210,10 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
 }
 
 /// Validate an OAuth access token and map it to an existing Arneb user.
-/// `Err` is the response to send: the standard `401` (reason only in the
-/// DEBUG log), `403` for an unknown user or a missing scope, `503` while the
-/// issuer's keys cannot be fetched.
+/// `Err` is the response to send: the standard `401` body with an
+/// `error="invalid_token"` challenge (reason only in the DEBUG log), `403`
+/// for an unknown user, an unverified email or a missing scope, `503` while
+/// the issuer's keys cannot be fetched.
 async fn oauth_identity(
     state: &WebState,
     oauth: &crate::oauth::OAuthValidator,
@@ -263,12 +263,21 @@ async fn oauth_identity(
         Err(OAuthReject::InsufficientScope) => {
             let mut resp = ApiError::new(ErrorCode::Forbidden, "the token lacks a required scope")
                 .into_response();
-            let challenge = crate::oauth::insufficient_scope_challenge(oauth.settings());
-            if let Ok(v) = header::HeaderValue::from_str(&challenge) {
+            if let Ok(v) = header::HeaderValue::from_str(oauth.insufficient_scope_challenge()) {
                 resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
             }
             Err(Box::new(resp))
         }
+        Err(OAuthReject::UnverifiedEmail) => Err(Box::new(
+            ApiError::new(
+                ErrorCode::Forbidden,
+                "the identity's email address is not verified",
+            )
+            .with_hint(
+                "verify the address at the identity provider (email_verified must be true), or set [oauth] user_claim to `sub`",
+            )
+            .into_response(),
+        )),
         Err(OAuthReject::Unavailable) => Err(Box::new(
             ApiError::new(
                 ErrorCode::AuthProviderUnavailable,
@@ -278,9 +287,9 @@ async fn oauth_identity(
             .into_response(),
         )),
         // `validate` already logged the reason at DEBUG.
-        Err(OAuthReject::Invalid(_)) => Err(Box::new(unauthenticated(
-            Some(crate::oauth::challenge(oauth.settings())).as_deref(),
-        ))),
+        Err(OAuthReject::Invalid(_)) => Err(Box::new(unauthenticated(Some(
+            oauth.invalid_token_challenge(),
+        )))),
     }
 }
 
@@ -746,6 +755,8 @@ mod tests {
                     leeway: std::time::Duration::from_secs(0),
                     jwks_cache: std::time::Duration::from_secs(3600),
                     jwks_min_refresh: std::time::Duration::from_secs(30),
+                    jwks_max_stale: std::time::Duration::from_secs(86400),
+                    require_access_token_typ: false,
                 },
             )));
         }
@@ -755,10 +766,8 @@ mod tests {
     #[tokio::test]
     async fn metadata_document_is_public_and_exact() {
         let state = oauth_state(true);
-        for path in [
-            "/.well-known/oauth-protected-resource",
-            "/.well-known/oauth-protected-resource/mcp",
-        ] {
+        {
+            let path = "/.well-known/oauth-protected-resource/mcp";
             let req = axum::http::Request::builder()
                 .uri(path)
                 .body(Body::empty())
@@ -782,6 +791,19 @@ mod tests {
                 })
             );
         }
+        // RFC 9728 section 3.3: only the path derived from `resource` (here
+        // `/mcp`); the bare root and any other suffix are a plain 404.
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/",
+            "/.well-known/oauth-protected-resource/foo",
+            "/.well-known/oauth-protected-resource/mcp/extra",
+            "/.well-known/oauth-protected-resource/arneb/mcp",
+        ] {
+            let reply = get(&state, path, None).await;
+            assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
+            assert!(reply.body.is_empty(), "{path}");
+        }
         let off = oauth_state(false);
         for path in [
             "/.well-known/oauth-protected-resource",
@@ -794,7 +816,7 @@ mod tests {
     #[tokio::test]
     async fn mcp_401_advertises_resource_metadata() {
         let on = oauth_state(true);
-        let challenge = crate::oauth::challenge(on.oauth.as_ref().unwrap().settings());
+        let challenge = on.oauth.as_ref().unwrap().challenge().to_owned();
         let mcp = send(&on, Method::POST, "/mcp", &[]).await;
         let api = get(&on, "/api/v1/queries", None).await;
         assert_eq!(mcp.status, StatusCode::UNAUTHORIZED);
@@ -807,7 +829,7 @@ mod tests {
             api.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
             Some(r#"Bearer realm="arneb""#)
         );
-        // A bad credential on /mcp gets the same challenge.
+        // A bad non-JWT credential on /mcp gets the same challenge.
         let bad = send(
             &on,
             Method::POST,
@@ -866,6 +888,8 @@ mod tests {
                 leeway: std::time::Duration::from_secs(0),
                 jwks_cache: std::time::Duration::from_secs(3600),
                 jwks_min_refresh: std::time::Duration::from_secs(30),
+                jwks_max_stale: std::time::Duration::from_secs(86400),
+                require_access_token_typ: false,
             })));
             Self { state, idp, key }
         }
@@ -1039,33 +1063,111 @@ mod tests {
         let reply = mcp_call(&env.state, &auth, "whoami", serde_json::json!({})).await;
         assert_eq!(reply.status, StatusCode::FORBIDDEN);
         assert_eq!(reply.json()["error"]["code"], "forbidden");
-        let expected = crate::oauth::insufficient_scope_challenge(
-            env.state.oauth.as_ref().unwrap().settings(),
-        );
+        let expected = env
+            .state
+            .oauth
+            .as_ref()
+            .unwrap()
+            .insufficient_scope_challenge();
         assert_eq!(
             reply.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
-            Some(expected.as_str())
+            Some(expected)
         );
+        assert!(expected.contains(r#"error="insufficient_scope""#));
     }
 
     #[tokio::test]
-    async fn invalid_oauth_tokens_look_like_every_other_401() {
+    async fn invalid_oauth_tokens_get_the_401_body_and_an_invalid_token_challenge() {
         let env = OAuthEnv::new().await;
+        let oauth = env.state.oauth.as_ref().unwrap();
         let missing = send(&env.state, Method::POST, "/mcp", &[]).await;
         assert_eq!(missing.status, StatusCode::UNAUTHORIZED);
+        // No credentials: the bare discovery challenge, no error code.
+        assert_eq!(
+            missing
+                .www_authenticate
+                .as_ref()
+                .map(|v| v.to_str().unwrap()),
+            Some(oauth.challenge())
+        );
+        assert!(!oauth.challenge().contains("error="));
 
         let mut expired = claims(&env.idp.issuer(), RESOURCE);
         expired["exp"] = (crate::oauth::test_idp::now() - 3600).into();
         expired["scope"] = "arneb:query".into();
         let mut bad_aud = claims(&env.idp.issuer(), "http://elsewhere.test/mcp");
         bad_aud["scope"] = "arneb:query".into();
-        for claims in [expired, bad_aud] {
-            let auth = format!("Bearer {}", env.key.sign(&claims));
+        // An OIDC ID token of the same issuer (header `typ: JWT`, `nonce`).
+        let mut id_token = claims(&env.idp.issuer(), RESOURCE);
+        id_token["scope"] = "arneb:query".into();
+        id_token["nonce"] = "n-0S6".into();
+        let bad_sig =
+            crate::oauth::test_idp::TestKey::ec("k1").sign(&claims(&env.idp.issuer(), RESOURCE));
+        let mut tokens: Vec<String> = [expired, bad_aud, id_token]
+            .iter()
+            .map(|c| env.key.sign(c))
+            .collect();
+        tokens.push(bad_sig);
+        for token in tokens {
+            let auth = format!("Bearer {token}");
             let reply = mcp_call(&env.state, &auth, "whoami", serde_json::json!({})).await;
             assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
             assert_eq!(reply.body, missing.body);
-            assert_eq!(reply.www_authenticate, missing.www_authenticate);
+            let header = reply.www_authenticate.as_ref().map(|v| v.to_str().unwrap());
+            assert_eq!(header, Some(oauth.invalid_token_challenge()));
+            let header = header.unwrap();
+            assert!(header.contains(r#"error="invalid_token""#), "{header}");
+            assert!(header.contains("resource_metadata="), "{header}");
+            // Nothing of the token is echoed.
+            assert!(!header.contains("eyJ"), "{header}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_unverified_email_is_a_distinct_403() {
+        let mut env = OAuthEnv::new().await;
+        let mut settings = env.state.oauth.as_ref().unwrap().settings().clone();
+        settings.user_claim = "email".into();
+        env.state.oauth = Some(Arc::new(OAuthValidator::new(settings)));
+        env.state
+            .state
+            .as_ref()
+            .unwrap()
+            .create_user(
+                "alice@corp.example",
+                arneb_protocol::ScramVerifier::generate("secret").unwrap(),
+            )
+            .unwrap();
+        let mut c = claims(&env.idp.issuer(), RESOURCE);
+        c["scope"] = "arneb:query".into();
+        c["email"] = "alice@corp.example".into();
+        c["email_verified"] = false.into();
+        let reply = mcp_call(
+            &env.state,
+            &format!("Bearer {}", env.key.sign(&c)),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        let e = &reply.json()["error"];
+        assert_eq!(e["code"], "forbidden");
+        assert_eq!(e["message"], "the identity's email address is not verified");
+        assert!(e["hint"].as_str().unwrap().contains("email_verified"));
+
+        c["email_verified"] = true.into();
+        let reply = mcp_call(
+            &env.state,
+            &format!("Bearer {}", env.key.sign(&c)),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.json()["result"]["structuredContent"]["user"],
+            "alice@corp.example"
+        );
     }
 
     #[tokio::test]

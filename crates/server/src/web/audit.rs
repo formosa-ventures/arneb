@@ -92,6 +92,45 @@ pub(super) fn audited<T>(
     out
 }
 
+/// Appends an intent entry for the audited `action` of `who` before it
+/// runs: `parameters` plus `"effect": "pending"`, outcome ok. The entry
+/// that [`audited`] appends afterwards records the result, so a crash in
+/// between still leaves a record of what was started. A failed append
+/// refuses the action with `audit_unavailable` (nothing has run yet).
+/// Blocking (fsync).
+pub(super) fn append_intent(
+    state: &WebState,
+    who: &Identity,
+    action: &'static str,
+    target: String,
+    parameters: serde_json::Value,
+) -> Result<(), ApiError> {
+    let mut parameters = match parameters {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    parameters.insert("effect".to_owned(), "pending".into());
+    let record = AuditRecord {
+        user: who.user.clone(),
+        via: who.via.as_str().to_owned(),
+        action: action.to_owned(),
+        target,
+        parameters: serde_json::Value::Object(parameters),
+        outcome: AuditOutcome::Ok,
+    };
+    state.audit.append(record).map_err(|e| {
+        tracing::error!(
+            target: "arneb::audit",
+            user = %who.user,
+            action,
+            error = %e.source,
+            "refusing an audited action: its intent entry could not be written"
+        );
+        audit_unavailable()
+    })?;
+    Ok(())
+}
+
 /// `GET /api/v2/audit` query parameters.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]

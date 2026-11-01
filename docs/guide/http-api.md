@@ -784,6 +784,14 @@ with the loader's first line. A re-seed that would remove your own manage
 privilege, or delete your own user, is `conflict`. The config's `[auth]
 type` must still be `"password"`.
 
+The catalogs, rules, settings and users are replaced in one atomic write
+of the state file: a failed write is `internal` and changes nothing, and a
+crash leaves either the old state or the new one. Before that write the
+audit log gets a `state.reseed` entry with `"effect": "pending"` (the same
+parameters, names only); the usual entry with the result follows it. A
+`pending` entry with no result after it marks a re-seed interrupted by a
+crash: check the state with the dry run.
+
 ### Audit log
 
 Under `[auth] type = "password"`, these actions are recorded in a durable

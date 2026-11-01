@@ -89,51 +89,59 @@ impl StateStore {
         reseed: bool,
     ) -> Result<SeedReport, StateError> {
         let report = self.mutate(|data| Ok(apply_seed(data, users, reseed)))?;
-        for user in &report.added {
-            tracing::info!(
-                target: "arneb::config",
-                user = %user,
-                "user {user:?} added to the state from the config file"
-            );
-        }
-        for user in &report.updated {
-            tracing::warn!(
-                target: "arneb::config",
-                user = %user,
-                "user {user:?}: password_hash changed in the config file; \
-                 stored the new verifier and revoked all of the user's API tokens"
-            );
-        }
-        for user in &report.removed {
-            tracing::warn!(
-                target: "arneb::config",
-                user = %user,
-                "user {user:?} is no longer in the config file; \
-                 deleted the user and their API tokens"
-            );
-        }
-        for user in &report.tombstoned {
-            tracing::warn!(
-                target: "arneb::config",
-                user = %user,
-                "user {user:?} in the config file was deleted at runtime; not re-adding \
-                 it (its config entry is not in force). To restore the config's users, \
-                 preview a re-seed with POST /api/v2/state/reseed?dry_run=true"
-            );
-        }
-        for user in &report.conflicts {
-            tracing::warn!(
-                target: "arneb::config",
-                user = %user,
-                "user {user:?} in the config file collides with a user created \
-                 through the state store; kept the state user (its config \
-                 password_hash is not in force). Restart with --reseed-state to \
-                 overwrite it with the config"
-            );
-        }
+        log_seed_report(&report);
         Ok(report)
     }
+}
 
+/// Logs one line on `arneb::config` per user [`apply_seed`] changed or
+/// skipped.
+pub(crate) fn log_seed_report(report: &SeedReport) {
+    for user in &report.added {
+        tracing::info!(
+            target: "arneb::config",
+            user = %user,
+            "user {user:?} added to the state from the config file"
+        );
+    }
+    for user in &report.updated {
+        tracing::warn!(
+            target: "arneb::config",
+            user = %user,
+            "user {user:?}: password_hash changed in the config file; \
+             stored the new verifier and revoked all of the user's API tokens"
+        );
+    }
+    for user in &report.removed {
+        tracing::warn!(
+            target: "arneb::config",
+            user = %user,
+            "user {user:?} is no longer in the config file; \
+             deleted the user and their API tokens"
+        );
+    }
+    for user in &report.tombstoned {
+        tracing::warn!(
+            target: "arneb::config",
+            user = %user,
+            "user {user:?} in the config file was deleted at runtime; not re-adding \
+             it (its config entry is not in force). To restore the config's users, \
+             preview a re-seed with POST /api/v2/state/reseed?dry_run=true"
+        );
+    }
+    for user in &report.conflicts {
+        tracing::warn!(
+            target: "arneb::config",
+            user = %user,
+            "user {user:?} in the config file collides with a user created \
+             through the state store; kept the state user (its config \
+             password_hash is not in force). Restart with --reseed-state to \
+             overwrite it with the config"
+        );
+    }
+}
+
+impl StateStore {
     /// What [`seed_users`](Self::seed_users) with the same arguments would
     /// do now, without writing anything (a re-seed preview).
     pub fn preview_seed_users(
@@ -242,7 +250,11 @@ fn drop_tokens_of(data: &mut StateData, user: &str) -> usize {
     before - data.tokens.len()
 }
 
-fn apply_seed(data: &mut StateData, users: &[(String, ScramVerifier)], reseed: bool) -> SeedReport {
+pub(crate) fn apply_seed(
+    data: &mut StateData,
+    users: &[(String, ScramVerifier)],
+    reseed: bool,
+) -> SeedReport {
     let mut report = SeedReport {
         first_start: data.users.is_empty(),
         ..SeedReport::default()

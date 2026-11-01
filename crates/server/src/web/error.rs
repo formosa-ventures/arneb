@@ -56,6 +56,11 @@ pub enum ErrorCode {
     /// The audit log cannot be written, so audited actions are refused
     /// (503, `Retry-After: 5`).
     AuditUnavailable,
+    /// The OAuth issuer's signing keys cannot be fetched, so a bearer JWT
+    /// cannot be decided (503, `Retry-After: 5`).
+    // Constructed by the `/mcp` OAuth middleware (H6 Task 4).
+    #[allow(dead_code)]
+    AuthProviderUnavailable,
     /// The change conflicts with the current state, such as one that would
     /// remove the caller's own manage privilege (409).
     Conflict,
@@ -90,7 +95,9 @@ impl ErrorCode {
             }
             Self::Cancelled | Self::Conflict => StatusCode::CONFLICT,
             Self::AuthDisabled => StatusCode::CONFLICT,
-            Self::Overloaded | Self::AuditUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Overloaded | Self::AuditUnavailable | Self::AuthProviderUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -181,7 +188,7 @@ impl IntoResponse for ApiError {
             ErrorCode::Overloaded => {
                 headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
             }
-            ErrorCode::AuditUnavailable => {
+            ErrorCode::AuditUnavailable | ErrorCode::AuthProviderUnavailable => {
                 headers.insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
             }
             _ => {}
@@ -193,6 +200,13 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_provider_unavailable_is_503_with_retry_after() {
+        let resp = ApiError::new(ErrorCode::AuthProviderUnavailable, "m").into_response();
+        assert_eq!(resp.status().as_u16(), 503);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "5");
+    }
 
     #[tokio::test]
     async fn codes_map_to_statuses_and_the_envelope_shape() {
@@ -219,6 +233,11 @@ mod tests {
             (ErrorCode::ManageRequiresAuth, 403, "manage_requires_auth"),
             (ErrorCode::AuditUnavailable, 503, "audit_unavailable"),
             (ErrorCode::Conflict, 409, "conflict"),
+            (
+                ErrorCode::AuthProviderUnavailable,
+                503,
+                "auth_provider_unavailable",
+            ),
         ] {
             let resp = ApiError::new(code, "m").with_hint("h").into_response();
             assert_eq!(resp.status().as_u16(), status);

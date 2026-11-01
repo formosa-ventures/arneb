@@ -912,6 +912,7 @@ pub(super) mod tests {
             ),
             metrics_auth: false,
             sessions: SessionStore::new(),
+            oauth: None,
             agent: None,
             mcp: None,
         }

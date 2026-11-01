@@ -91,11 +91,17 @@ pub fn requires_auth(method: &Method, path: &str, metrics_auth: bool, mcp_served
             .any(|(m, p)| *p == path && m.as_ref().is_none_or(|m| m == method))
 }
 
-/// The one rejection for every missing or bad credential.
-fn unauthenticated() -> Response {
-    ApiError::new(ErrorCode::Unauthenticated, "authentication required")
+/// The one rejection for every missing or bad credential. `challenge`
+/// replaces the default `WWW-Authenticate` (OAuth discovery on `/mcp`); the
+/// body is the same either way.
+fn unauthenticated(challenge: Option<&str>) -> Response {
+    let mut resp = ApiError::new(ErrorCode::Unauthenticated, "authentication required")
         .with_hint("send `Authorization: Bearer <token>` or `Authorization: Basic`")
-        .into_response()
+        .into_response();
+    if let Some(value) = challenge.and_then(|c| header::HeaderValue::from_str(c).ok()) {
+        resp.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+    }
+    resp
 }
 
 /// Middleware: authenticate the request (see the module docs).
@@ -123,12 +129,18 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
     ) {
         return next.run(req).await;
     }
+    let path = req.uri().path();
+    let challenge = (path == "/mcp" || path.starts_with("/mcp/"))
+        .then_some(state.oauth.as_ref())
+        .flatten()
+        .map(|o| crate::oauth::challenge(o.settings()));
+    let challenge = challenge.as_deref();
     let Some(authorization) = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     else {
-        return unauthenticated();
+        return unauthenticated(challenge);
     };
     let (scheme, value) = authorization.split_once(' ').unwrap_or((authorization, ""));
     let value = value.trim();
@@ -146,7 +158,7 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
         }
     } else if scheme.eq_ignore_ascii_case("basic") {
         let Some((user, password)) = decode_basic(value) else {
-            return unauthenticated();
+            return unauthenticated(challenge);
         };
         match basic.check(&user, &password).await {
             BasicVerdict::Valid => Some(Identity {
@@ -171,7 +183,7 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
             req.extensions_mut().insert(identity);
             next.run(req).await
         }
-        None => unauthenticated(),
+        None => unauthenticated(challenge),
     }
 }
 
@@ -254,6 +266,7 @@ mod tests {
             catalogs: None,
             metrics_auth,
             sessions: SessionStore::new(),
+            oauth: None,
             agent: None,
             mcp: None,
         }
@@ -614,5 +627,104 @@ mod tests {
                 .unwrap();
             assert_eq!(&body[..], expect.as_bytes());
         }
+    }
+
+    fn oauth_state(enabled: bool) -> WebState {
+        let mut state = web_state(true, None, false);
+        state.mcp = Some(crate::web::mcp::McpSettings {
+            allowed_hosts: None,
+            allowed_origins: None,
+            default_page_bytes: 32768,
+        });
+        if enabled {
+            state.oauth = Some(Arc::new(crate::oauth::OAuthValidator::new(
+                crate::oauth::OAuthSettings {
+                    issuer: "https://idp.invalid".into(),
+                    resource: "https://arneb.test/mcp".into(),
+                    audience: "https://arneb.test/mcp".into(),
+                    user_claim: "sub".into(),
+                    jwks_uri: None,
+                    required_scopes: vec!["arneb:query".into()],
+                    leeway: std::time::Duration::from_secs(0),
+                    jwks_cache: std::time::Duration::from_secs(3600),
+                    jwks_min_refresh: std::time::Duration::from_secs(30),
+                },
+            )));
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn metadata_document_is_public_and_exact() {
+        let state = oauth_state(true);
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            let req = axum::http::Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let resp = build_router(state.clone()).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            assert_eq!(resp.headers()["access-control-allow-origin"], "*");
+            assert_eq!(resp.headers()[header::CACHE_CONTROL], "max-age=300");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "resource": "https://arneb.test/mcp",
+                    "authorization_servers": ["https://idp.invalid"],
+                    "bearer_methods_supported": ["header"],
+                    "scopes_supported": ["arneb:query"],
+                    "resource_name": "Arneb",
+                })
+            );
+        }
+        let off = oauth_state(false);
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            assert_eq!(get(&off, path, None).await.status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_401_advertises_resource_metadata() {
+        let on = oauth_state(true);
+        let challenge = crate::oauth::challenge(on.oauth.as_ref().unwrap().settings());
+        let mcp = send(&on, Method::POST, "/mcp", &[]).await;
+        let api = get(&on, "/api/v1/queries", None).await;
+        assert_eq!(mcp.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            mcp.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
+            Some(challenge.as_str())
+        );
+        assert_eq!(mcp.body, api.body);
+        assert_eq!(
+            api.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
+            Some(r#"Bearer realm="arneb""#)
+        );
+        // A bad credential on /mcp gets the same challenge.
+        let bad = send(
+            &on,
+            Method::POST,
+            "/mcp",
+            &[("authorization", "Bearer nope")],
+        )
+        .await;
+        assert_eq!(bad.www_authenticate, mcp.www_authenticate);
+
+        let off = oauth_state(false);
+        let mcp = send(&off, Method::POST, "/mcp", &[]).await;
+        assert_eq!(mcp.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            mcp.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
+            Some(r#"Bearer realm="arneb""#)
+        );
     }
 }

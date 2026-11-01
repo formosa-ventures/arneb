@@ -137,6 +137,7 @@ mod tests {
             metrics_auth: false,
             basic: None,
             sessions: crate::web::SessionStore::new(),
+            oauth: None,
             agent: None,
             mcp: None,
         };

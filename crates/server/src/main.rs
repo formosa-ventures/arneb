@@ -1271,6 +1271,8 @@ async fn run() -> Result<()> {
         authorizer,
         metrics_auth: config.web.metrics_auth,
         sessions: web::SessionStore::new(),
+        // Wired to the real validator by the OAuth middleware task.
+        oauth: None,
         mcp: (serves_clients && agent_service.is_some() && config.mcp.enabled)
             .then(|| web::mcp::McpSettings::from(&config.mcp)),
         agent: agent_service,

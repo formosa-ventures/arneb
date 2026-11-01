@@ -1761,6 +1761,7 @@ mod tests {
             ),
             metrics_auth: false,
             sessions: SessionStore::new(),
+            oauth: None,
             agent: Some(agent),
             mcp: Some(McpSettings {
                 allowed_hosts: None,

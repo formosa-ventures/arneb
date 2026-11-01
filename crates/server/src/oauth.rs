@@ -824,6 +824,47 @@ pub(crate) mod test_idp {
     }
 }
 
+/// Well-known path prefix of RFC 9728 protected-resource metadata.
+pub const METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
+
+/// The metadata URL of `resource` (RFC 9728 section 3.1): the well-known
+/// segment inserted between the authority and the resource's path.
+pub fn metadata_url(resource: &str) -> String {
+    match url::Url::parse(resource) {
+        Ok(u) => {
+            let path = if u.path() == "/" { "" } else { u.path() };
+            let authority = &u[..url::Position::BeforePath];
+            format!("{authority}{METADATA_PATH}{path}")
+        }
+        // Settings are validated at startup; this only guards a bad literal.
+        Err(_) => format!("{}{METADATA_PATH}", resource.trim_end_matches('/')),
+    }
+}
+
+/// `WWW-Authenticate` value for a `/mcp` request without valid credentials.
+pub fn challenge(settings: &OAuthSettings) -> String {
+    let mut v = format!(
+        r#"Bearer realm="arneb", resource_metadata="{}""#,
+        metadata_url(&settings.resource)
+    );
+    if !settings.required_scopes.is_empty() {
+        v.push_str(&format!(
+            r#", scope="{}""#,
+            settings.required_scopes.join(" ")
+        ));
+    }
+    v
+}
+
+/// `WWW-Authenticate` value for a valid token that lacks a required scope.
+pub fn insufficient_scope_challenge(settings: &OAuthSettings) -> String {
+    format!(
+        r#"Bearer realm="arneb", error="insufficient_scope", scope="{}", resource_metadata="{}""#,
+        settings.required_scopes.join(" "),
+        metadata_url(&settings.resource)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::test_idp::{claims, now, Mode, TestIdp, TestKey};
@@ -855,6 +896,41 @@ mod tests {
 
     fn b64(v: &serde_json::Value) -> String {
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap())
+    }
+
+    #[test]
+    fn metadata_url_for_resource_shapes() {
+        assert_eq!(
+            metadata_url("https://h/mcp"),
+            "https://h/.well-known/oauth-protected-resource/mcp"
+        );
+        assert_eq!(
+            metadata_url("https://h:8443/mcp"),
+            "https://h:8443/.well-known/oauth-protected-resource/mcp"
+        );
+        assert_eq!(
+            metadata_url("https://h/arneb/mcp"),
+            "https://h/.well-known/oauth-protected-resource/arneb/mcp"
+        );
+        assert_eq!(
+            metadata_url("https://h/mcp/"),
+            "https://h/.well-known/oauth-protected-resource/mcp/"
+        );
+    }
+
+    #[test]
+    fn challenges_carry_metadata_and_scopes() {
+        let mut s = settings("https://idp.test");
+        assert_eq!(
+            challenge(&s),
+            r#"Bearer realm="arneb", resource_metadata="https://arneb.test/.well-known/oauth-protected-resource/mcp""#
+        );
+        s.required_scopes = vec!["a".into(), "b".into()];
+        assert!(challenge(&s).ends_with(r#"", scope="a b""#));
+        assert_eq!(
+            insufficient_scope_challenge(&s),
+            r#"Bearer realm="arneb", error="insufficient_scope", scope="a b", resource_metadata="https://arneb.test/.well-known/oauth-protected-resource/mcp""#
+        );
     }
 
     #[tokio::test]

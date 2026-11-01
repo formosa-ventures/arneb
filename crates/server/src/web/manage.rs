@@ -3,6 +3,8 @@
 //! [`run_manage`], which answers a dry run from the action's preview and a
 //! real run by applying it, audited, off the async workers.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use super::audit::{audited, AuditSubject};
@@ -84,18 +86,36 @@ pub(super) trait ManageAction: Send + 'static {
     /// Do it. Blocking: [`run_manage`] calls it from `spawn_blocking`.
     fn apply(self, state: &WebState) -> Result<Applied<Self::Output>, ApiError>;
 
-    /// A share of the lock that serializes this kind of change, if any.
-    /// [`run_manage`] keeps it until the audit entry is appended, so a
-    /// request dropped mid-call still holds the lock across apply and
-    /// append, and the audit order stays the apply order.
-    fn change_lock(&self) -> Option<ChangeLock> {
+    /// The lock that serializes this kind of change, if any
+    /// (`WebState::admission_changes`, `WebState::cordon_changes`).
+    /// [`run_manage`] takes it before the preview (or the audit
+    /// `parameters`) is read and holds it in the blocking task until the
+    /// completion entry is appended, so a request dropped mid-call still
+    /// holds it across apply and append, and the audit order stays the
+    /// apply order.
+    fn change_mutex(&self) -> Option<&Arc<tokio::sync::Mutex<()>>> {
         None
     }
 }
 
-/// A share of a change lock's guard (`WebState::admission_changes`,
-/// `WebState::cordon_changes`).
-pub(super) type ChangeLock = std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>;
+/// `n` with the singular or plural noun.
+pub(super) fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The error of a manage change whose state-store write failed before
+/// anything was applied; `what` names it (`the cordon`).
+pub(super) fn persist_failed(
+    what: &'static str,
+) -> impl FnOnce(arneb_state::StateError) -> ApiError {
+    move |e| {
+        tracing::error!(error = %e, "cannot persist {what}");
+        ApiError::new(
+            ErrorCode::Internal,
+            format!("{what} could not be saved to the state store; nothing changed"),
+        )
+    }
+}
 
 /// The dry-run `warning` of an audited action while the audit log is not
 /// writable.
@@ -142,6 +162,12 @@ pub(super) async fn run_manage<A: ManageAction>(
     let name = action.action();
     let target = action.target();
     let persisted = action.persisted();
+    // Taken before anything is read, so preview, audit and apply see one
+    // state; released only once the completion entry is appended.
+    let held = match action.change_mutex() {
+        Some(m) => Some(Arc::clone(m).lock_owned().await),
+        None => None,
+    };
     if dry_run {
         let mut preview = action.preview(state)?;
         warn_if_in_memory(state, persisted, &mut preview);
@@ -159,7 +185,6 @@ pub(super) async fn run_manage<A: ManageAction>(
         return Ok(outcome(true, name, target, preview, None));
     }
     let (blocking_state, who, audit_target) = (state.clone(), who.clone(), target.clone());
-    let held = action.change_lock();
     let mut applied = tokio::task::spawn_blocking(move || {
         let state = blocking_state;
         if !action.audited() {
@@ -170,7 +195,7 @@ pub(super) async fn run_manage<A: ManageAction>(
         let parameters = action.parameters();
         let unchanged = action.unchanged_effect();
         #[cfg(test)]
-        let lock_key = held.as_deref().map(test_hooks::key_of);
+        let lock_key = held.as_ref().map(test_hooks::key_of);
         let intent = AuditSubject {
             target: audit_target.clone(),
             parameters: with_effect(parameters.clone(), None),

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome, Preview,
+    count, persist_failed, run_manage, Applied, DryRun, ManageAction, ManageOutcome, Preview,
 };
 use super::privilege::Layer;
 use super::v2::{bad_body, bad_query, parse_body};
@@ -142,38 +142,26 @@ pub(super) async fn set_admission_for(
     let store = state.state.clone().ok_or_else(|| {
         ApiError::new(ErrorCode::Internal, "admission limits need the state store")
     })?;
-    // Held from reading `from` until the change (and its audit entry) is
-    // done, so preview, audit and apply see one state. The action keeps a
-    // share, so a request dropped mid-call still serializes its apply.
-    let serialized = Arc::new(Arc::clone(&state.admission_changes).lock_owned().await);
+    // `run_manage` holds `admission_changes` from reading the limits until
+    // the change (and its audit entry) is done, so preview, audit and apply
+    // see one state.
     let action = SetAdmission {
         max_running,
         max_queued,
-        from: controller.snapshot(),
         controller,
         store,
-        _serialized: Arc::clone(&serialized),
+        changes: Arc::clone(&state.admission_changes),
     };
-    let outcome = run_manage(state, who, grant, dry_run, action).await;
-    drop(serialized);
-    outcome
+    run_manage(state, who, grant, dry_run, action).await
 }
 
 struct SetAdmission {
     max_running: Option<usize>,
     max_queued: Option<usize>,
-    /// The controller's limits when the action was built, under
-    /// [`WebState::admission_changes`]; the audit `parameters` name them as
-    /// `from`.
-    from: AdmissionSnapshot,
     controller: AdmissionController,
     store: Arc<StateStore>,
-    _serialized: ChangeLock,
-}
-
-/// `n` with the singular or plural noun.
-fn count(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
+    /// [`WebState::admission_changes`].
+    changes: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SetAdmission {
@@ -241,14 +229,6 @@ impl SetAdmission {
     }
 }
 
-fn persist_failed(e: arneb_state::StateError) -> ApiError {
-    tracing::error!(error = %e, "cannot persist the admission limits");
-    ApiError::new(
-        ErrorCode::Internal,
-        "the admission limits could not be saved to the state store; nothing changed",
-    )
-}
-
 impl ManageAction for SetAdmission {
     type Output = AdmissionView;
 
@@ -260,18 +240,21 @@ impl ManageAction for SetAdmission {
         "admission".to_owned()
     }
 
+    /// `from` is the controller's limits now: `run_manage` reads this
+    /// under [`WebState::admission_changes`], before applying.
     fn parameters(&self) -> serde_json::Value {
+        let from = self.controller.snapshot();
         let mut map = serde_json::Map::new();
         if let Some(to) = self.max_running {
             map.insert(
                 "max_running_queries".into(),
-                serde_json::json!({"from": self.from.max_running, "to": to}),
+                serde_json::json!({"from": from.max_running, "to": to}),
             );
         }
         if let Some(to) = self.max_queued {
             map.insert(
                 "max_queued_queries".into(),
-                serde_json::json!({"from": self.from.max_queued, "to": to}),
+                serde_json::json!({"from": from.max_queued, "to": to}),
             );
         }
         serde_json::Value::Object(map)
@@ -285,8 +268,8 @@ impl ManageAction for SetAdmission {
         Ok(self.plan().0)
     }
 
-    fn change_lock(&self) -> Option<ChangeLock> {
-        Some(Arc::clone(&self._serialized))
+    fn change_mutex(&self) -> Option<&Arc<tokio::sync::Mutex<()>>> {
+        Some(&self.changes)
     }
 
     /// Persists first, then updates the controller, so a failed write
@@ -298,7 +281,7 @@ impl ManageAction for SetAdmission {
         let snapshot = if preview.changed {
             self.store
                 .set_admission_limits(to)
-                .map_err(persist_failed)?;
+                .map_err(persist_failed("the admission limits"))?;
             let snapshot = self
                 .controller
                 .set_limits(to.max_running_queries, to.max_queued_queries);

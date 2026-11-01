@@ -999,6 +999,7 @@ mod tests {
         let root_id = Identity {
             user: "root".into(),
             via: crate::web::auth::AuthVia::Basic,
+            oauth_expires_ms: None,
         };
         let (inside_tx, inside_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();

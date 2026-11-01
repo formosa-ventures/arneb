@@ -67,6 +67,9 @@ impl AuthVia {
 pub struct Identity {
     pub user: String,
     pub via: AuthVia,
+    /// For [`AuthVia::OAuth`]: the access token's `exp` in epoch ms, which
+    /// bounds any API token this request mints. `None` otherwise.
+    pub oauth_expires_ms: Option<u64>,
 }
 
 /// Routes under `/api/` reachable without credentials: `(method, path)`,
@@ -117,6 +120,7 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
         req.extensions_mut().insert(Identity {
             user,
             via: AuthVia::Unauthenticated,
+            oauth_expires_ms: None,
         });
         return next.run(req).await;
     };
@@ -156,6 +160,7 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
             state.sessions.resolve(value).map(|user| Identity {
                 user,
                 via: AuthVia::Session,
+                oauth_expires_ms: None,
             })
         } else if let Some(oauth) = state
             .oauth
@@ -170,6 +175,7 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
             creds.verify_token(value).map(|user| Identity {
                 user,
                 via: AuthVia::Token,
+                oauth_expires_ms: None,
             })
         }
     } else if scheme.eq_ignore_ascii_case("basic") {
@@ -180,6 +186,7 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
             BasicVerdict::Valid => Some(Identity {
                 user,
                 via: AuthVia::Basic,
+                oauth_expires_ms: None,
             }),
             BasicVerdict::Invalid => None,
             BasicVerdict::Overloaded => {
@@ -216,6 +223,22 @@ async fn oauth_identity(
 
     match oauth.validate(token).await {
         Ok(principal) => {
+            if let Err(e) = super::users::validate_name(&principal.user) {
+                tracing::debug!(target: "arneb::oauth", error = ?e, "mapped user name is not valid");
+                return Err(Box::new(
+                    ApiError::new(
+                        ErrorCode::Forbidden,
+                        format!(
+                            "the identity's '{}' claim is not a valid Arneb user name",
+                            oauth.settings().user_claim
+                        ),
+                    )
+                    .with_hint(
+                        "set [oauth] user_claim to a claim that holds a valid user name, or seed the user in [[auth.users]]",
+                    )
+                    .into_response(),
+                ));
+            }
             if state
                 .state
                 .as_ref()
@@ -224,6 +247,7 @@ async fn oauth_identity(
                 Ok(Identity {
                     user: principal.user,
                     via: AuthVia::OAuth,
+                    oauth_expires_ms: Some(principal.expires_at_ms),
                 })
             } else {
                 Err(Box::new(
@@ -1070,6 +1094,67 @@ mod tests {
         assert_eq!(entries[0].record.user, "alice");
         assert_eq!(entries[0].record.via, "oauth");
         assert_eq!(entries[0].record.action, "settings.update");
+    }
+
+    #[tokio::test]
+    async fn oauth_minted_tokens_end_with_the_access_token() {
+        let env = OAuthEnv::new().await;
+        let mut c = claims(&env.idp.issuer(), RESOURCE);
+        let exp = c["exp"].as_u64().unwrap();
+        c["scope"] = "arneb:query".into();
+        let auth = format!("Bearer {}", env.key.sign(&c));
+        // No explicit expiry: the child ends with the JWT.
+        let reply = mcp_call(
+            &env.state,
+            &auth,
+            "create_token",
+            serde_json::json!({"name": "from-oauth"}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let out = reply.json()["result"]["structuredContent"].clone();
+        assert_eq!(out["expires_ms"].as_u64(), Some(exp * 1000), "{out}");
+        assert!(out["hint"].as_str().unwrap().contains("OAuth access token"));
+        // A later explicit expiry is clamped the same way.
+        let reply = mcp_call(
+            &env.state,
+            &auth,
+            "create_token",
+            serde_json::json!({"name": "later", "expires_in_days": 365}),
+        )
+        .await;
+        let out = reply.json()["result"]["structuredContent"].clone();
+        assert_eq!(out["expires_ms"].as_u64(), Some(exp * 1000), "{out}");
+        // Any expiry past the JWT's is clamped (a day is far beyond five minutes).
+        let reply = mcp_call(
+            &env.state,
+            &auth,
+            "create_token",
+            serde_json::json!({"name": "sooner", "expires_in_days": 1}),
+        )
+        .await;
+        let out = reply.json()["result"]["structuredContent"].clone();
+        assert_eq!(out["expires_ms"].as_u64(), Some(exp * 1000), "{out}");
+    }
+
+    #[tokio::test]
+    async fn invalid_mapped_user_name_is_a_distinct_403() {
+        let env = OAuthEnv::new().await;
+        let reply = mcp_call(
+            &env.state,
+            &env.bearer("auth0|x"),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        let e = &reply.json()["error"];
+        assert_eq!(e["code"], "forbidden");
+        assert_eq!(
+            e["message"],
+            "the identity's 'sub' claim is not a valid Arneb user name"
+        );
+        assert!(e["hint"].as_str().unwrap().contains("user_claim"));
     }
 
     #[tokio::test]

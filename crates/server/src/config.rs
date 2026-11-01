@@ -944,7 +944,11 @@ impl Default for OAuthConfig {
 
 /// `https`, or `http` for a loopback host (local testing); no query or
 /// fragment when `plain` is false.
-fn check_oauth_url(what: &str, value: &str, plain: bool) -> std::result::Result<(), String> {
+pub(crate) fn check_oauth_url(
+    what: &str,
+    value: &str,
+    plain: bool,
+) -> std::result::Result<(), String> {
     let url =
         url::Url::parse(value).map_err(|e| format!("{what} '{value}' is not a valid URL: {e}"))?;
     let loopback = match url.host() {
@@ -1041,6 +1045,18 @@ impl OAuthConfig {
         }
         if self.user_claim.trim().is_empty() {
             return Err("[oauth] user_claim must not be empty".into());
+        }
+        // RFC 6749 section 3.3: scope-token = 1*( %x21 / %x23-5B / %x5D-7E ).
+        if let Some(bad) = self.required_scopes.iter().find(|s| {
+            s.is_empty()
+                || !s
+                    .bytes()
+                    .all(|b| matches!(b, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
+        }) {
+            return Err(format!(
+                "[oauth] required_scopes entry '{bad}' is not a valid scope token (RFC 6749: \
+                 printable ASCII without space, '\"' or '\\')"
+            ));
         }
         if self.leeway_secs > 300 {
             return Err(format!(
@@ -2759,6 +2775,23 @@ pgwire = "required"
         // An empty value counts as unset.
         let c = oauth(file, &[("ARNEB_OAUTH_ISSUER", "")]).unwrap();
         assert_eq!(c.issuer.as_deref(), Some("https://a"));
+    }
+
+    #[test]
+    fn oauth_required_scopes_must_be_scope_tokens() {
+        for bad in ["a b", "a\"b", "a\\b", "caf\u{e9}", ""] {
+            let c = OAuthConfig {
+                required_scopes: vec![bad.into()],
+                ..oauth_ok()
+            };
+            let err = c.validate().unwrap_err();
+            assert!(err.contains("required_scopes"), "{bad:?}: {err}");
+        }
+        let c = OAuthConfig {
+            required_scopes: vec!["arneb:query".into(), "api://x/.default".into()],
+            ..oauth_ok()
+        };
+        c.validate().unwrap();
     }
 
     #[test]

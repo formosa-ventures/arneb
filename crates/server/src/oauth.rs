@@ -108,6 +108,8 @@ pub struct OAuthPrincipal {
     pub user: String,
     /// Scopes from `scope` (space separated) and/or `scp` (array).
     pub scopes: Vec<String>,
+    /// The token's `exp` in epoch milliseconds.
+    pub expires_at_ms: u64,
 }
 
 /// Why a bearer token was not accepted.
@@ -283,7 +285,16 @@ impl OAuthValidator {
         {
             return Err(OAuthReject::InsufficientScope);
         }
-        Ok(OAuthPrincipal { user, scopes })
+        let expires_at_ms = claims
+            .get("exp")
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+            .ok_or(OAuthReject::Invalid("no_exp"))?
+            .saturating_mul(1000);
+        Ok(OAuthPrincipal {
+            user,
+            scopes,
+            expires_at_ms,
+        })
     }
 
     /// The cached key for `kid`, refetching the set when it is stale or the
@@ -381,6 +392,11 @@ impl OAuthValidator {
                 // The old keys stay usable until `jwks_cache` elapses.
                 tracing::warn!(target: "arneb::oauth", "fetching the signing keys failed: {msg}");
                 c.last_ok = false;
+                // A discovered URL may be stale (the IdP moved it): forget
+                // it so the next attempt rediscovers.
+                if self.settings.jwks_uri.is_none() {
+                    c.jwks_uri = None;
+                }
                 Refresh::Failed
             }
         }
@@ -441,8 +457,12 @@ impl OAuthValidator {
             );
             return Err("discovery issuer mismatch".into());
         }
-        doc.jwks_uri
-            .ok_or_else(|| "discovery has no jwks_uri".into())
+        let uri = doc
+            .jwks_uri
+            .ok_or_else(|| "discovery has no jwks_uri".to_owned())?;
+        // Same rule as a configured `jwks_uri` (D9).
+        crate::config::check_oauth_url("the discovered jwks_uri", &uri, true)?;
+        Ok(uri)
     }
 }
 
@@ -688,6 +708,11 @@ pub(crate) mod test_idp {
             }
         }
 
+        /// Sign `claims` with this key and a header without `kid`.
+        pub fn sign_kidless(&self, claims: &serde_json::Value) -> String {
+            jsonwebtoken::encode(&Header::new(self.alg), claims, &self.enc).unwrap()
+        }
+
         /// Sign `claims` with this key and the standard header (`kid`, `alg`).
         pub fn sign(&self, claims: &serde_json::Value) -> String {
             let mut h = Header::new(self.alg);
@@ -709,6 +734,7 @@ pub(crate) mod test_idp {
         mode: Mutex<Mode>,
         hits: AtomicUsize,
         discovery_issuer: Mutex<String>,
+        discovery_jwks_uri: Mutex<Option<String>>,
         base: String,
     }
 
@@ -727,7 +753,8 @@ pub(crate) mod test_idp {
     async fn discovery(State(s): State<Arc<Shared>>) -> Json<serde_json::Value> {
         Json(serde_json::json!({
             "issuer": s.discovery_issuer.lock().unwrap().clone(),
-            "jwks_uri": format!("{}/jwks", s.base),
+            "jwks_uri": s.discovery_jwks_uri.lock().unwrap().clone()
+                .unwrap_or_else(|| format!("{}/jwks", s.base)),
         }))
     }
 
@@ -755,6 +782,7 @@ pub(crate) mod test_idp {
                 mode: Mutex::new(Mode::Ok),
                 hits: AtomicUsize::new(0),
                 discovery_issuer: Mutex::new(base.clone()),
+                discovery_jwks_uri: Mutex::new(None),
                 base,
             });
             let app = Router::new()
@@ -785,6 +813,11 @@ pub(crate) mod test_idp {
         /// Make the discovery document claim another issuer.
         pub fn set_discovery_issuer(&self, issuer: &str) {
             *self.shared.discovery_issuer.lock().unwrap() = issuer.into();
+        }
+
+        /// Make the discovery document point at another `jwks_uri`.
+        pub fn set_discovery_jwks_uri(&self, uri: &str) {
+            *self.shared.discovery_jwks_uri.lock().unwrap() = Some(uri.into());
         }
 
         /// Number of `/jwks` requests so far.
@@ -1043,12 +1076,12 @@ mod tests {
         let old = TestKey::ec("old");
         let new = TestKey::ec("new");
         let idp = TestIdp::start(&[&old]).await;
-        let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(50));
+        let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(1000));
         v.validate(&old.sign(&claims(&idp.issuer(), AUD)))
             .await
             .unwrap();
         assert_eq!(idp.jwks_hits(), 1);
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
 
         idp.set_keys(&[&old, &new]);
         v.validate(&new.sign(&claims(&idp.issuer(), AUD)))
@@ -1057,7 +1090,7 @@ mod tests {
         assert_eq!(idp.jwks_hits(), 2, "exactly one extra JWKS hit");
 
         // A flood of random kids inside the window refetches at most once.
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
         let before = idp.jwks_hits();
         let mut tasks = Vec::new();
         let v = std::sync::Arc::new(v);
@@ -1075,6 +1108,19 @@ mod tests {
             );
         }
         assert!(idp.jwks_hits() <= before + 1, "hits: {}", idp.jwks_hits());
+
+        // Right after the flood, inside the window, an unknown kid with keys
+        // present is `unknown_key` and costs no further JWKS hit.
+        let hits = idp.jwks_hits();
+        let mut k = TestKey::ec("x");
+        k.kid = "after-flood".into();
+        assert_eq!(
+            v.validate(&k.sign(&claims(&idp.issuer(), AUD)))
+                .await
+                .unwrap_err(),
+            OAuthReject::Invalid("unknown_key")
+        );
+        assert_eq!(idp.jwks_hits(), hits, "throttled: no extra JWKS hit");
     }
 
     #[tokio::test]
@@ -1082,7 +1128,7 @@ mod tests {
         let key = TestKey::ec("k1");
         let idp = TestIdp::start(&[&key]).await;
         idp.set_mode(Mode::Fail500);
-        let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(50));
+        let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(1000));
         let t = key.sign(&claims(&idp.issuer(), AUD));
         assert_eq!(v.validate(&t).await.unwrap_err(), OAuthReject::Unavailable);
         // Within the window nothing is refetched and there are no keys.
@@ -1090,7 +1136,7 @@ mod tests {
         assert_eq!(idp.jwks_hits(), 1);
 
         idp.set_mode(Mode::Ok);
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
         v.validate(&t).await.unwrap();
     }
 
@@ -1155,13 +1201,13 @@ mod tests {
     async fn throttled_after_a_failed_attempt_is_unavailable_not_unknown_key() {
         let key = TestKey::ec("k1");
         let idp = TestIdp::start(&[&key]).await;
-        let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(100));
+        let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(1000));
         v.validate(&key.sign(&claims(&idp.issuer(), AUD)))
             .await
             .unwrap();
         // Valid keys cached, IdP goes down, a rotated kid shows up.
         idp.set_mode(Mode::Fail500);
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
         let rotated = TestKey::ec("rotated").sign(&claims(&idp.issuer(), AUD));
         for _ in 0..3 {
             assert_eq!(
@@ -1181,6 +1227,80 @@ mod tests {
         let t = key.sign(&claims(&idp.issuer(), AUD));
         assert_eq!(v.validate(&t).await.unwrap_err(), OAuthReject::Unavailable);
         assert_eq!(idp.jwks_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_forgets_the_discovered_jwks_uri() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(1));
+        let t = key.sign(&claims(&idp.issuer(), AUD));
+        v.validate(&t).await.unwrap();
+        assert!(v.cache.lock().unwrap().jwks_uri.is_some());
+        // The cached URL starts failing: it is forgotten, so the next
+        // attempt goes back through discovery.
+        idp.set_mode(Mode::Fail500);
+        let unknown = TestKey::ec("zzz").sign(&claims(&idp.issuer(), AUD));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            v.validate(&unknown).await.unwrap_err(),
+            OAuthReject::Unavailable
+        );
+        assert!(v.cache.lock().unwrap().jwks_uri.is_none());
+        idp.set_mode(Mode::Ok);
+        let rotated = TestKey::ec("k2");
+        idp.set_keys(&[&key, &rotated]);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        v.validate(&rotated.sign(&claims(&idp.issuer(), AUD)))
+            .await
+            .unwrap();
+        assert!(v.cache.lock().unwrap().jwks_uri.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_configured_jwks_uri_is_kept_after_a_failure() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let uri = format!("{}/jwks", idp.issuer());
+        let v = validator(&idp, |s| {
+            s.jwks_uri = Some(uri);
+            s.jwks_min_refresh = Duration::from_millis(1);
+        });
+        idp.set_mode(Mode::Fail500);
+        let t = key.sign(&claims(&idp.issuer(), AUD));
+        assert_eq!(v.validate(&t).await.unwrap_err(), OAuthReject::Unavailable);
+        idp.set_mode(Mode::Ok);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        v.validate(&t).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_discovered_jwks_uri_must_be_https_or_loopback() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        idp.set_discovery_jwks_uri("http://idp.example.com/jwks");
+        let v = validator(&idp, |_| {});
+        let t = key.sign(&claims(&idp.issuer(), AUD));
+        assert_eq!(v.validate(&t).await.unwrap_err(), OAuthReject::Unavailable);
+        assert_eq!(idp.jwks_hits(), 0, "the insecure URL was never fetched");
+    }
+
+    #[tokio::test]
+    async fn kidless_tokens_need_exactly_one_key() {
+        let key = TestKey::ec("k1");
+        let other = TestKey::ec("k2");
+        let idp = TestIdp::start(&[&key]).await;
+        let v = validator(&idp, |_| {});
+        let c = claims(&idp.issuer(), AUD);
+        v.validate(&key.sign_kidless(&c)).await.unwrap();
+
+        let idp2 = TestIdp::start(&[&key, &other]).await;
+        let v2 = validator(&idp2, |_| {});
+        let c2 = claims(&idp2.issuer(), AUD);
+        assert_eq!(
+            v2.validate(&key.sign_kidless(&c2)).await.unwrap_err(),
+            OAuthReject::Invalid("unknown_key")
+        );
     }
 
     #[tokio::test]

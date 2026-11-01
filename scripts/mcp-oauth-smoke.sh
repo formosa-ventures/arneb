@@ -343,10 +343,15 @@ for f in "${ARNEB_COORD_LOG:-}" "${ARNEB_AUDIT_FILE:-}"; do
     fi
     for secret in "$JWT_ALICE" "$JWT_BOB" "$JWT_CAROL" "$JWT_OTHER" "$APITOK" "$PW_ALICE" "$PW_BOB" \
         "$PW_CAROL" "$ARNEB_ADMIN_PASSWORD" "$CAROL_ARNEB_PW" "$PROBE_PW"; do
+        # An empty pattern would match every line.
+        [ -n "$secret" ] || continue
         # The pattern comes from a pipe (-f), never from argv.
         if grep -F -f <(printf '%s\n' "$secret") "$f" >/dev/null; then fail "$f holds a secret this run used"; fi
     done
     echo "  $f: clean"
 done
-[ "$SCANNED" -gt 0 ] || echo "  (set ARNEB_COORD_LOG and ARNEB_AUDIT_FILE to scan them)"
-pass
+if [ "$SCANNED" -gt 0 ]; then
+    pass
+else
+    echo "SKIP $STEP: set ARNEB_COORD_LOG or ARNEB_AUDIT_FILE to scan them"
+fi

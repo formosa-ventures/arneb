@@ -147,7 +147,7 @@ fn check_limit(limit: Option<usize>, default: usize) -> Result<usize, ApiError> 
     Ok(limit)
 }
 
-fn validate_name(name: &str) -> Result<(), ApiError> {
+pub(super) fn validate_name(name: &str) -> Result<(), ApiError> {
     let ok_chars = name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '@' | '-'));

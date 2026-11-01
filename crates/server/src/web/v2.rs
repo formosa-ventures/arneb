@@ -475,6 +475,13 @@ pub(super) async fn issue_token_for(
             hints.push("expires_ms was clamped to the expiry of the token that made this request");
         }
     }
+    // An OAuth caller's tokens end with its access token's `exp`.
+    if let Some(exp) = who.oauth_expires_ms.filter(|_| who.via == AuthVia::OAuth) {
+        if expires_at_ms.is_none_or(|e| e > exp) {
+            expires_at_ms = Some(exp);
+            hints.push("expires_ms was clamped to the expiry of the OAuth access token that made this request");
+        }
+    }
     let persistent = store.is_persistent();
     if !persistent {
         hints.push("the server keeps state in memory only: this token is lost when it restarts");
@@ -1005,6 +1012,7 @@ pub(super) mod tests {
         let who = super::Identity {
             user: "alice".into(),
             via: super::AuthVia::Token,
+            oauth_expires_ms: None,
         };
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
@@ -1027,6 +1035,7 @@ pub(super) mod tests {
         let who = super::Identity {
             user: "alice".into(),
             via: super::AuthVia::Basic,
+            oauth_expires_ms: None,
         };
         headers.insert(
             header::AUTHORIZATION,

@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Configuration
-An `[oauth]` section SHALL enable OAuth on `/mcp` when `issuer` is set, with `resource` (the public URL of `/mcp`, ending in `/mcp`) required, `audience` defaulting to `resource`, `user_claim` defaulting to `sub`, and optional `jwks_uri`, `required_scopes`, `leeway_secs` (0 to 300, default 60), `jwks_cache_secs` (at least 60, default 3600) and `jwks_min_refresh_secs` (1 to `jwks_cache_secs`, default 30). Each key SHALL have an `ARNEB_OAUTH_*` override that wins over the file, and the effective values SHALL be logged on `arneb::config`. `issuer`, `resource` and `jwks_uri` SHALL be `https`, or `http` only for a loopback host. Startup SHALL fail with a message naming the setting when a value is invalid, or when `[oauth]` is used without `[auth] type = "password"` or with `[mcp] enabled = false`. A `user_claim` other than `sub` SHALL log a WARN at startup. Without `issuer` the server SHALL behave exactly as before.
+An `[oauth]` section SHALL enable OAuth on `/mcp` when `issuer` is set, with `resource` (the public URL of `/mcp`, ending in `/mcp`) required, `audience` defaulting to `resource`, `user_claim` defaulting to `sub`, and optional `jwks_uri`, `required_scopes` (RFC 6749 scope tokens), `leeway_secs` (0 to 300, default 60), `jwks_cache_secs` (at least 60, default 3600) and `jwks_min_refresh_secs` (1 to `jwks_cache_secs`, default 30). Each key SHALL have an `ARNEB_OAUTH_*` override that wins over the file, and the effective values SHALL be logged on `arneb::config`. `issuer`, `resource` and `jwks_uri` SHALL be `https`, or `http` only for a loopback host. Startup SHALL fail with a message naming the setting when a value is invalid, or when `[oauth]` is used without `[auth] type = "password"` or with `[mcp] enabled = false`. A `user_claim` other than `sub` SHALL log a WARN at startup. Without `issuer` the server SHALL behave exactly as before.
 
 #### Scenario: Missing resource
 - **WHEN** the config sets `issuer` and no `resource`
@@ -13,7 +13,7 @@ An `[oauth]` section SHALL enable OAuth on `/mcp` when `issuer` is set, with `re
 
 #### Scenario: Off by default
 - **WHEN** the config has no `[oauth]` section
-- **THEN** every response, `WWW-Authenticate` included, is unchanged
+- **THEN** every response, `WWW-Authenticate` included, is unchanged, except that `/.well-known/oauth-protected-resource[/...]` answers `404` instead of the single-page app
 
 ### Requirement: Protected-resource metadata
 With `[oauth]` enabled, `GET /.well-known/oauth-protected-resource` and `GET /.well-known/oauth-protected-resource/mcp` SHALL answer without credentials with a JSON document holding `resource`, `authorization_servers` (the issuer), `bearer_methods_supported` (`["header"]`) and, when `required_scopes` is set, `scopes_supported`. Without `[oauth]` the routes SHALL answer `404`. A `401` from `/mcp` SHALL carry `WWW-Authenticate: Bearer realm="arneb", resource_metadata="<url>"` naming that document, and its body SHALL be the same `unauthenticated` envelope as every other `401`.
@@ -34,7 +34,7 @@ A bearer on `/mcp` that has three dot-separated non-empty parts and does not sta
 - **THEN** `/mcp` answers `401`
 
 ### Requirement: Identity mapping
-The value of `user_claim` SHALL be the Arneb user, who must exist in the state store. The request SHALL run with that user's access rules and privileges, `whoami` SHALL report `via: "oauth"`, and audit entries SHALL record `via: "oauth"`. A valid token whose user does not exist SHALL answer `403 forbidden`. Deleting the user SHALL make their still-valid tokens answer `403` from the next request. A JWT on any route other than `/mcp` SHALL be an invalid bearer (`401`). API tokens, sessions and Basic credentials SHALL keep working on `/mcp`.
+The value of `user_claim` SHALL be the Arneb user, who must exist in the state store. The request SHALL run with that user's access rules and privileges, `whoami` SHALL report `via: "oauth"`, and audit entries SHALL record `via: "oauth"`. A valid token whose user does not exist, or whose `user_claim` value is not a valid Arneb user name, SHALL answer `403 forbidden` (with distinct messages). API tokens minted by an OAuth identity SHALL expire no later than the access token's `exp`. Deleting the user SHALL make their still-valid tokens answer `403` from the next request. A JWT on any route other than `/mcp` SHALL be an invalid bearer (`401`). API tokens, sessions and Basic credentials SHALL keep working on `/mcp`.
 
 #### Scenario: Unknown user
 - **WHEN** a valid token names `bob`, who has no Arneb user
@@ -45,8 +45,8 @@ The value of `user_claim` SHALL be the Arneb user, who must exist in the state s
 - **THEN** the answer is `401`
 
 #### Scenario: Audited as oauth
-- **WHEN** alice creates a user through the MCP `create_user` tool with a token
-- **THEN** `GET /api/v2/audit` has a `user.create` entry by alice with `via: "oauth"`
+- **WHEN** alice, a manager, changes a setting through the MCP `update_settings` tool with a token
+- **THEN** `GET /api/v2/audit` has a `settings.update` entry by alice with `via: "oauth"`
 
 ### Requirement: Identity provider unavailable
 When a JWT needs a key that is not cached and the JWKS or discovery document cannot be fetched, `/mcp` SHALL answer `503` with code `auth_provider_unavailable` and `Retry-After: 5`, never `401`. Requests with other credentials SHALL be unaffected.

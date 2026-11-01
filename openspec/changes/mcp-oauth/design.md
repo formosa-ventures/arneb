@@ -27,7 +27,7 @@ Stage H6 of the headless agent interface, on top of H1 (identity, API tokens, st
 
 **D6. IdP unreachable is `503 auth_provider_unavailable`** (`Retry-After: 5`), not `401`, when no cached key can decide. API tokens, sessions and Basic on `/mcp` keep working regardless.
 
-**D7. An OAuth identity has the same rights as the user**, including `create_token` (minting an API token). Revoking the user at the IdP does not revoke Arneb API tokens already minted; documented. Refusing `create_token` for `via = oauth` would be one check.
+**D7. An OAuth identity has the same rights as the user**, including `create_token` (minting an API token), whose expiry is clamped to the access token's `exp` so a child never outlives its parent. Revoking the user at the IdP does not revoke Arneb API tokens already minted; documented. Refusing `create_token` for `via = oauth` would be one check.
 
 **D8. `[oauth]` is startup-only config** (like ports and TLS), not state-store data; changing it needs a restart. It requires `[auth] type = "password"` and `[mcp] enabled`; otherwise startup fails with a named error.
 

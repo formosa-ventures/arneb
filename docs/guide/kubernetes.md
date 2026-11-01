@@ -129,6 +129,10 @@ config like any other section, or in `ARNEB_OAUTH_*` through `extraEnv`.
   Web port speaks plain HTTP, so a `https` `resource` URL has to be served by
   an ingress or proxy that terminates TLS in front of the coordinator's Web
   port and forwards `/mcp` and `/.well-known/oauth-protected-resource`.
+  The metadata document is served at the host root, whatever the path of
+  `resource`: for `resource = https://h/arneb/mcp` its URL is
+  `https://h/.well-known/oauth-protected-resource/arneb/mcp`, so a proxy that
+  forwards only `/arneb/*` must route that path too.
   `resource` is the public URL of that ingress plus `/mcp`; the IdP must put
   the same URL in the token's `aud`. Arneb refuses a plain-`http` `issuer` or
   `resource` unless the host is loopback.

@@ -210,7 +210,7 @@ user_claim = "sub"
 | `issuer` | `ARNEB_OAUTH_ISSUER` | unset | Issuer URL of the IdP; the required `iss`, and the base of the discovery document. Setting it enables OAuth. `https`, or `http` for a loopback host. |
 | `resource` | `ARNEB_OAUTH_RESOURCE` | unset | Public URL of `/mcp`; required with `issuer`, must end in `/mcp`, no query or fragment. Published in the metadata document. |
 | `audience` | `ARNEB_OAUTH_AUDIENCE` | `resource` | Value `aud` must contain. |
-| `user_claim` | `ARNEB_OAUTH_USER_CLAIM` | `sub` | Claim holding the Arneb user name. |
+| `user_claim` | `ARNEB_OAUTH_USER_CLAIM` | `sub` | Claim holding the Arneb user name: 1 to 64 characters of `A-Z a-z 0-9 _ . @ -`. A value outside that set (e.g. Auth0's `auth0\|...` subjects) answers `403`; use a claim that holds a valid name. |
 | `jwks_uri` | `ARNEB_OAUTH_JWKS_URI` | from discovery | The IdP's JWKS URL, when its discovery document cannot be used. |
 | `required_scopes` | `ARNEB_OAUTH_REQUIRED_SCOPES` (comma-separated) | none | Scopes a token must carry (`scope` string or `scp` array). A valid token without one gets `403` with `error="insufficient_scope"`. |
 | `leeway_secs` | `ARNEB_OAUTH_LEEWAY_SECS` | 60 | Clock-skew allowance for `exp` / `nbf`, `0` to `300`. |
@@ -836,7 +836,9 @@ the source of truth from the config file to the [state store](#state):
 Nothing changes unless you add an `[oauth]` section: without it `/mcp`,
 every other route, and every response header are byte-identical to the
 previous release, and the `WWW-Authenticate` challenge stays
-`Bearer realm="arneb"`. With `[oauth]`:
+`Bearer realm="arneb"`. The one difference is that
+`/.well-known/oauth-protected-resource[/...]` answers `404` instead of the
+single-page app. With `[oauth]`:
 
 - **Only `/mcp` accepts JWTs.** `/api/*` and `/metrics` treat one as an
   invalid bearer.
@@ -852,7 +854,8 @@ previous release, and the `WWW-Authenticate` challenge stays
   [Kubernetes](/guide/kubernetes#oauth-for-mcp).
 - **Revoking at the IdP is not enough for minted API tokens.** An OAuth
   identity can create API tokens like any user; they outlive the IdP
-  session until revoked or until the Arneb user is deleted.
+  session until revoked or until the Arneb user is deleted, but never the
+  access token that minted them: the expiry is clamped to the JWT's `exp`.
 
 ## State
 

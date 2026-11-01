@@ -105,9 +105,11 @@ Design decisions you should know about:
   `503 auth_provider_unavailable` with `Retry-After: 5`, not `401`. API
   tokens, sessions and Basic keep working.
 - **An OAuth identity has the same rights as the user**, including
-  `create_token`. Revoking the user at the IdP does not revoke Arneb API
-  tokens they minted earlier; revoke those through the API, or delete the
-  Arneb user.
+  `create_token`. A token minted this way never outlives the access token
+  that minted it: its expiry is clamped to the JWT's `exp` and the result's
+  `hint` says so. Revoking the user at the IdP does not revoke Arneb API
+  tokens they minted earlier (until that expiry); revoke those through the
+  API, or delete the Arneb user.
 - **Plain `http`** is accepted for `issuer` and `resource` only on a
   loopback host (local testing). Anything else must be `https`, and
   `resource` must end in `/mcp`.
@@ -120,7 +122,13 @@ Design decisions you should know about:
    Keycloak that is an Audience mapper on the client with *Included Custom
    Audience* set to the URL; in other IdPs an API / resource identifier.
 3. Make sure the claim named by `user_claim` is in the access token (not
-   only in the ID token), and that it equals an Arneb user name.
+   only in the ID token), and that it equals an Arneb user name. A user
+   name is 1 to 64 characters of `A-Z a-z 0-9 _ . @ -`; a value outside that
+   set (Auth0 subjects such as `auth0|64f...` contain `|`) answers `403`
+   with "the identity's 'sub' claim is not a valid Arneb user name". With
+   Auth0, point `user_claim` at a custom claim (added by an Action) holding a
+   valid name, or seed the user in `[[auth.users]]` under a valid name that
+   the claim carries.
 4. Create the matching Arneb users.
 5. Allow the MCP client's redirect URI. MCP clients are public clients
    using the authorization-code flow with PKCE; what a given client needs

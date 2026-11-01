@@ -191,10 +191,15 @@ impl TrackedStatement {
         }
     }
 
-    fn finish(&mut self, rows: u64) {
-        if let Some((t, id)) = self.0.take() {
-            let _ = t.finish_query(&id, rows);
-        }
+    /// Records `rows` and marks the query finished. Returns `false` when a
+    /// kill marked it cancelled first (after the work completed, before
+    /// this ran): the statement must then answer as cancelled, not with
+    /// its rows.
+    fn finish(&mut self, rows: u64) -> bool {
+        let Some((t, id)) = self.0.take() else {
+            return true;
+        };
+        t.finish_query(&id, rows).is_ok() || t.cancelled_by(&id).is_none()
     }
 
     fn fail(&mut self, error: String) {
@@ -224,6 +229,15 @@ impl Drop for TrackedStatement {
             let _ = t.cancel_query(&id);
         }
     }
+}
+
+/// SQLSTATE `57014`, as PostgreSQL answers a cancelled statement.
+fn user_cancelled() -> PgWireError {
+    PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+        "ERROR".to_owned(),
+        "57014".to_owned(),
+        "canceling statement due to user request".to_owned(),
+    )))
 }
 
 /// Per-connection handler that processes queries through the full pipeline.
@@ -403,17 +417,14 @@ impl ConnectionHandler {
         });
         let Ok(result) = futures::future::Abortable::new(work, registration).await else {
             tracked.cancel();
-            return Err(PgWireError::UserError(Box::new(
-                pgwire::error::ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "57014".to_owned(),
-                    "canceling statement due to user request".to_owned(),
-                ),
-            )));
+            return Err(user_cancelled());
         };
         match &result {
             Ok(Ok((_, batches))) => {
-                tracked.finish(batches.iter().map(|b| b.num_rows() as u64).sum())
+                if !tracked.finish(batches.iter().map(|b| b.num_rows() as u64).sum()) {
+                    // Killed after the work completed: no rows.
+                    return Err(user_cancelled());
+                }
             }
             Ok(Err(e)) => tracked.fail(e.to_string()),
             // Admission refusal or statement timeout.
@@ -2128,6 +2139,34 @@ async fn register_data_sources(
 
 #[cfg(test)]
 mod tests {
+    /// A kill that lands after the work completed but before `finish`:
+    /// the finish is refused, so the statement answers 57014, not rows.
+    #[test]
+    fn a_kill_after_the_work_completed_wins_over_the_rows() {
+        let tracker = Arc::new(arneb_scheduler::QueryTracker::new());
+        let mut tracked = TrackedStatement::start(&tracker, "SELECT 1", Some("bob".into()));
+        tracked.running();
+        let id = tracked.0.as_ref().unwrap().1;
+        assert!(matches!(
+            tracker.kill_query(&id, "root").unwrap(),
+            arneb_scheduler::KillOutcome::Killed { .. }
+        ));
+        assert!(
+            !tracked.finish(1),
+            "the killed statement must not return rows"
+        );
+        let info = tracker.get_query(&id).unwrap();
+        assert_eq!(info.state, arneb_scheduler::QueryState::Cancelled);
+        assert_eq!(info.rows, None);
+        match user_cancelled() {
+            PgWireError::UserError(e) => assert_eq!(e.code, "57014"),
+            other => panic!("{other:?}"),
+        }
+        // Not killed: finishes.
+        let mut ok = TrackedStatement::start(&tracker, "SELECT 1", None);
+        assert!(ok.finish(1));
+    }
+
     use super::*;
     use arneb_common::types::{ColumnInfo, DataType};
     use arneb_sql_parser::ast;

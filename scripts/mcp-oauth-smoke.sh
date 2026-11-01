@@ -69,8 +69,9 @@ CAROL_ARNEB_PW=""
 PROBE_PW=""
 pass() { echo "PASS $STEP"; }
 fail() {
-    echo "FAIL $STEP: $*"
-    [ -n "$LAST" ] && echo "  last response (HTTP ${CODE:-?}): $(printf '%s' "$LAST" | redact | head -c 2000)"
+    # stderr, so the message survives a command substitution (`X=$(kc_token ...)`).
+    echo "FAIL $STEP: $*" >&2
+    [ -n "$LAST" ] && echo "  last response (HTTP ${CODE:-?}): $(printf '%s' "$LAST" | redact | head -c 2000)" >&2
     exit 1
 }
 # redact: strip every secret this run knows from text it is about to print.
@@ -162,8 +163,9 @@ mcp_tool() {
     local targs="${3:-}"
     [ -n "$targs" ] || targs='{}'
     RID=$(( RID + 1 ))
-    mcp_post "$1" "$(jq -nc --argjson id "$RID" --arg n "$2" --argjson a "$targs" \
-        '{jsonrpc:"2.0", id:$id, method:"tools/call", params:{name:$n, arguments:$a}}')"
+    # The arguments may hold a password: jq gets them from the environment, not argv.
+    mcp_post "$1" "$(TARGS="$targs" jq -nc --argjson id "$RID" --arg n "$2" \
+        '{jsonrpc:"2.0", id:$id, method:"tools/call", params:{name:$n, arguments:(env.TARGS | fromjson)}}')"
     expect_code 200 "tools/call $2"
     check '.error == null' "tools/call $2 returned a JSON-RPC error"
     LAST=$(printf '%s' "$LAST" | jq -c '.result')
@@ -341,7 +343,8 @@ for f in "${ARNEB_COORD_LOG:-}" "${ARNEB_AUDIT_FILE:-}"; do
     fi
     for secret in "$JWT_ALICE" "$JWT_BOB" "$JWT_CAROL" "$JWT_OTHER" "$APITOK" "$PW_ALICE" "$PW_BOB" \
         "$PW_CAROL" "$ARNEB_ADMIN_PASSWORD" "$CAROL_ARNEB_PW" "$PROBE_PW"; do
-        if grep -F -e "$secret" "$f" >/dev/null; then fail "$f holds a secret this run used"; fi
+        # The pattern comes from a pipe (-f), never from argv.
+        if grep -F -f <(printf '%s\n' "$secret") "$f" >/dev/null; then fail "$f holds a secret this run used"; fi
     done
     echo "  $f: clean"
 done

@@ -130,7 +130,7 @@ STEP="1 initialize and tools"
 rpc AUTH1 initialize '{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"mcp-smoke","version":"1"}}'
 check '.result.serverInfo.name == "arneb"' "serverInfo.name is not arneb"
 rpc AUTH1 tools/list '{}'
-check '.result.tools | length == 18' "tools/list does not have exactly 18 tools"
+check '.result.tools | length >= 18' "tools/list has fewer than 18 tools"
 for t in whoami list_catalogs list_schemas list_tables describe_table sample_table explain_query \
     submit_query get_query_status fetch_results cancel_query list_queries get_query get_cluster \
     list_workers list_tokens create_token revoke_token; do

@@ -605,7 +605,9 @@ response returns:
 
 A refused request (no credentials, no privilege, a malformed body or token
 id) is not recorded. If the intent cannot be written, the action is refused
-with `audit_unavailable` before anything is applied. If only the completion
+with `audit_unavailable` before anything is applied (and, when the log
+reopens at once, its intent is closed with outcome
+`{"error": "audit_unavailable"}`). If only the completion
 fails, it is logged in full at ERROR on `arneb::audit`, the intent stays
 `pending`, and audited actions are refused with `audit_unavailable` until
 the log can be written again. Retention is set by

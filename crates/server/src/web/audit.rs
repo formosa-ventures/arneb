@@ -80,9 +80,23 @@ pub(super) fn audited<T>(
     if let Err(e) = state.audit.ensure_writable() {
         return Err(refuse(&e));
     }
+    let closing = AuditSubject {
+        target: intent.target.clone(),
+        parameters: intent.parameters.clone(),
+    };
     let begun = match state.audit.begin(record(intent, AuditOutcome::Pending)) {
         Ok(entry) => entry,
-        Err(e) => return Err(refuse(&e.source)),
+        Err(e) => {
+            // The intent may have reached the disk (a failed fsync): close
+            // it, best effort, as refused, so a restart does not report an
+            // action that never ran as interrupted. If this fails too, the
+            // restart reports it as one that may or may not have run.
+            let refused = AuditOutcome::Error(ErrorCode::AuditUnavailable.name());
+            if state.audit.ensure_writable().is_ok() {
+                let _ = state.audit.complete(e.entry.seq, record(closing, refused));
+            }
+            return Err(refuse(&e.source));
+        }
     };
     let out = run();
     let outcome = match &out {
@@ -422,6 +436,24 @@ mod tests {
         assert_eq!(entries.len(), 1, "{page}");
         assert_eq!(entries[0]["outcome"], "ok");
         assert!(entries[0]["intent_seq"].is_u64(), "{page}");
+    }
+
+    /// An intent whose write failed is closed as refused when the log
+    /// recovers at once, so it is never reported as interrupted.
+    #[tokio::test]
+    async fn a_failed_intent_is_closed_as_refused() {
+        let state = state();
+        state.audit.fail_next_append();
+        let (status, body) = issue(&state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(token_count(&state).await, 0, "nothing was applied");
+        let (_, page) = audit_log(&state, "").await;
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{page}");
+        assert_eq!(entries[0]["action"], "token.issue");
+        assert_eq!(entries[0]["outcome"], json!({"error": "audit_unavailable"}));
+        assert!(entries[0]["intent_seq"].is_u64(), "{page}");
+        assert_eq!(page["writable"], true);
     }
 
     #[tokio::test]

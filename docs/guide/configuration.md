@@ -785,7 +785,10 @@ the response returns. Read it with
   crash) is skipped with a WARN on `arneb::audit` naming its line number.
   Startup never fails on it, and the startup compaction drops it.
 - **A failed write.** If the intent cannot be written, the action is
-  refused with `503 audit_unavailable` and nothing is applied. If the
+  refused with `503 audit_unavailable` and nothing is applied; if the log
+  reopens at once, the intent is closed with outcome
+  `{"error": "audit_unavailable"}` (best effort), so a restart does not
+  report it as interrupted. If the
   completion cannot be written, the action has already happened: the entry
   is logged in full at ERROR on `arneb::audit`, its intent stays `pending`,
   and every later audited action is refused with `503 audit_unavailable`

@@ -791,6 +791,7 @@ async fn run() -> Result<()> {
             added = ?report.added,
             updated = ?report.updated,
             removed = ?report.removed,
+            adopted = ?report.adopted,
             conflicts = ?report.conflicts,
             revoked_tokens = report.revoked_tokens,
             reseed = reseed_state,

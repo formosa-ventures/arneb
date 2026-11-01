@@ -89,6 +89,29 @@ impl ColumnStatsLookup for PlanLookup<'_> {
     }
 }
 
+struct JoinLookup<'a> {
+    left: &'a LogicalPlan,
+    right: &'a LogicalPlan,
+    stats: &'a CatalogStats,
+}
+
+impl ColumnStatsLookup for JoinLookup<'_> {
+    fn lookup(&self, column: &str) -> Option<ColumnStatistics> {
+        PlanLookup {
+            input: self.left,
+            stats: self.stats,
+        }
+        .lookup(column)
+        .or_else(|| {
+            PlanLookup {
+                input: self.right,
+                stats: self.stats,
+            }
+            .lookup(column)
+        })
+    }
+}
+
 /// Estimates the output cardinality of `plan` in rows.
 ///
 /// Always returns a finite, non-negative `f64`. The result is clamped to
@@ -439,11 +462,22 @@ fn estimate_join(
     let inner_estimate = match condition {
         // Cross join has no condition — product is exact.
         JoinCondition::None => left_card * right_card,
-        // ON expression: best-effort uniform-NDV formula
-        // `(L * R) / max(ndv_l, ndv_r, 1)`.
+        // Use NDV only for equi-join atoms. Estimate the remaining ON
+        // predicates with the same selectivity model as a Filter.
         JoinCondition::On(expr) => {
-            let ndv = best_effort_join_ndv(expr, left, right, stats).max(1.0);
-            let est = (left_card * right_card) / ndv;
+            let mut equi = Vec::new();
+            let mut residual = Vec::new();
+            collect_join_atoms(expr, &mut equi, &mut residual);
+            let ndv = equi
+                .iter()
+                .map(|atom| best_effort_join_ndv(atom, left, right, stats))
+                .fold(1.0_f64, f64::max);
+            let lookup = JoinLookup { left, right, stats };
+            let selectivity = residual
+                .iter()
+                .map(|atom| selectivity::selectivity(atom, &lookup))
+                .product::<f64>();
+            let est = (left_card * right_card) / ndv * selectivity;
             if std::env::var("ARNEB_TRACE_FRAGMENTS")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false)
@@ -477,6 +511,35 @@ ndv={ndv:.0} keys=[{}]",
         ast::JoinType::Right => right_card.max(inner_estimate),
         ast::JoinType::Full => left_card + right_card + inner_estimate,
         ast::JoinType::Cross => left_card * right_card,
+    }
+}
+
+fn collect_join_atoms<'a>(
+    expr: &'a PlanExpr,
+    equi: &mut Vec<&'a PlanExpr>,
+    residual: &mut Vec<&'a PlanExpr>,
+) {
+    match expr {
+        PlanExpr::BinaryOp {
+            left,
+            op: ast::BinaryOp::And,
+            right,
+            ..
+        } => {
+            collect_join_atoms(left, equi, residual);
+            collect_join_atoms(right, equi, residual);
+        }
+        PlanExpr::BinaryOp {
+            left,
+            op: ast::BinaryOp::Eq,
+            right,
+            ..
+        } if matches!(**left, PlanExpr::Column { .. })
+            && matches!(**right, PlanExpr::Column { .. }) =>
+        {
+            equi.push(expr)
+        }
+        _ => residual.push(expr),
     }
 }
 
@@ -1423,5 +1486,117 @@ mod tests {
                  groups, no matter how large the aggregate's input"
             );
         }
+    }
+
+    // -- Join: non-equi ON atoms vs the same predicate in a Filter --
+    //
+    // A non-equi atom must shrink a join estimate exactly as much whether it
+    // sits in the ON clause or in a Filter above the join; otherwise the join
+    // reorderer's output-cardinality guard rejects an order only because the
+    // atom moved from a Filter into a join condition (TPC-DS q72).
+
+    fn bin(left: PlanExpr, op: AstBinaryOp, right: PlanExpr) -> PlanExpr {
+        PlanExpr::BinaryOp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+            span: None,
+        }
+    }
+
+    fn fact_stats() -> CatalogStats {
+        let mut stats = CatalogStats::new();
+        stats.insert(
+            TableReference::table("fa"),
+            make_stats_with_col(1_000, "a_k", 10),
+        );
+        stats.insert(
+            TableReference::table("fb"),
+            make_stats_with_col(2_000, "b_k", 10),
+        );
+        stats
+    }
+
+    // fa = [a_k, a_x] (0, 1), fb = [b_k, b_y, b_z] (2, 3, 4) in the joined schema.
+    fn fact_join(join_type: JoinType, condition: JoinCondition) -> LogicalPlan {
+        LogicalPlan::Join {
+            left: Box::new(make_scan("fa", vec!["a_k", "a_x"])),
+            right: Box::new(make_scan("fb", vec!["b_k", "b_y", "b_z"])),
+            join_type,
+            condition,
+            dynamic_filter_ids: Vec::new(),
+        }
+    }
+
+    fn keys_eq() -> PlanExpr {
+        eq(col_expr(0, "a_k"), col_expr(2, "b_k"))
+    }
+
+    fn x_lt_y() -> PlanExpr {
+        bin(col_expr(1, "a_x"), AstBinaryOp::Lt, col_expr(3, "b_y"))
+    }
+
+    fn assert_close(a: f64, b: f64) {
+        assert!(((a - b) / b).abs() < 1e-9, "estimates differ: {a} vs {b}");
+    }
+
+    #[test]
+    fn non_equi_on_atom_estimates_like_the_same_filter_over_the_join() {
+        let stats = fact_stats();
+        let in_on = fact_join(
+            JoinType::Inner,
+            JoinCondition::On(bin(keys_eq(), AstBinaryOp::And, x_lt_y())),
+        );
+        let in_filter = LogicalPlan::Filter {
+            input: Box::new(fact_join(JoinType::Inner, JoinCondition::On(keys_eq()))),
+            predicate: x_lt_y(),
+        };
+        let on_est = estimated_cardinality(&in_on, &stats);
+        let filter_est = estimated_cardinality(&in_filter, &stats);
+        assert!(
+            on_est
+                < estimated_cardinality(
+                    &fact_join(JoinType::Inner, JoinCondition::On(keys_eq())),
+                    &stats
+                ),
+            "the non-equi atom must reduce the estimate"
+        );
+        assert_close(on_est, filter_est);
+    }
+
+    #[test]
+    fn non_equi_only_on_estimates_like_a_filter_over_the_cross_product() {
+        let stats = fact_stats();
+        let in_on = fact_join(JoinType::Inner, JoinCondition::On(x_lt_y()));
+        let over_cross = LogicalPlan::Filter {
+            input: Box::new(fact_join(JoinType::Cross, JoinCondition::None)),
+            predicate: x_lt_y(),
+        };
+        let on_est = estimated_cardinality(&in_on, &stats);
+        assert!(on_est.is_finite());
+        assert!(on_est <= 1_000.0 * 2_000.0);
+        assert_close(on_est, estimated_cardinality(&over_cross, &stats));
+    }
+
+    #[test]
+    fn disjunction_of_non_equi_atoms_in_on_estimates_like_the_same_filter() {
+        let stats = fact_stats();
+        let either = bin(
+            x_lt_y(),
+            AstBinaryOp::Or,
+            bin(col_expr(1, "a_x"), AstBinaryOp::Gt, col_expr(4, "b_z")),
+        );
+        let in_on = fact_join(
+            JoinType::Inner,
+            JoinCondition::On(bin(keys_eq(), AstBinaryOp::And, either.clone())),
+        );
+        let in_filter = LogicalPlan::Filter {
+            input: Box::new(fact_join(JoinType::Inner, JoinCondition::On(keys_eq()))),
+            predicate: either,
+        };
+        assert_close(
+            estimated_cardinality(&in_on, &stats),
+            estimated_cardinality(&in_filter, &stats),
+        );
     }
 }

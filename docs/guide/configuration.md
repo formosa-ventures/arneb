@@ -757,6 +757,10 @@ the source of truth from the config file to the [state store](#state):
   - **Changed at runtime** (`PUT` or `DELETE /api/v2/access-rules`) and the
     rules file is unchanged since it was last seeded: the runtime rules are
     kept, with a WARN at every start until a re-seed.
+  - **Changed at runtime, then copied into the rules file:** once the file
+    holds the same rules as the state (compared as JSON, so formatting and
+    key order do not count), the rules count as the file's again and follow
+    later edits of it.
   - **Changed at runtime, and the rules file was also edited since it was
     last seeded:** startup refuses, since neither copy can be assumed to be
     the one you want. Restart with `--reseed-state` to take the config file

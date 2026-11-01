@@ -64,18 +64,84 @@ pub enum RulesSeed {
 
 /// The fingerprint of a rules file's text (`None`: no rules file), as
 /// stored in the state to tell whether the file changed since it was last
-/// seeded: the hex SHA-256 of `file:<text>`, or `none`.
+/// seeded: the hex SHA-256 of `file:<normalized text>`, or `none`. The text
+/// is normalized as JSON (key order and whitespace do not count), so only
+/// a change to the rules themselves is a change.
 pub fn rules_fingerprint(config_json: Option<&str>) -> String {
     match config_json {
         None => "none".to_owned(),
         Some(text) => {
             let mut bytes = b"file:".to_vec();
-            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(normalized(text).as_bytes());
             crate::tokens::sha256(&bytes)
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect()
         }
+    }
+}
+
+/// `text` re-serialized as compact JSON with sorted keys; unchanged when it
+/// is not JSON.
+fn normalized(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| text.to_owned())
+}
+
+/// Whether two rules texts (`None`: no rules) hold the same rules.
+fn same_rules(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b || normalized(a) == normalized(b),
+        _ => false,
+    }
+}
+
+/// What [`StateStore::seed_rules`] writes besides its result.
+enum RulesWrite {
+    None,
+    /// Store the file's rules as seeded from the file.
+    Seed,
+    /// Record the file's fingerprint, keeping the runtime rules.
+    Fingerprint(String),
+}
+
+/// What seeding `config_json` into `d` does, without doing it.
+fn plan_rules_seed(
+    d: &StateData,
+    config_json: Option<&str>,
+    reseed: bool,
+) -> (RulesSeed, RulesWrite) {
+    if !d.seeded.rules || reseed {
+        return (RulesSeed::Seeded, RulesWrite::Seed);
+    }
+    let fingerprint = rules_fingerprint(config_json);
+    if same_rules(d.rules.as_ref().map(|r| r.json.as_str()), config_json) {
+        // The stored rules equal the file's (also after a runtime change
+        // was copied into the file): from now on they follow the file.
+        let follows = d
+            .rules_origin
+            .as_ref()
+            .is_some_and(|o| !o.runtime && o.file_sha256 == fingerprint)
+            && d.rules.as_ref().map(|r| r.json.as_str()) == config_json;
+        let write = if follows {
+            RulesWrite::None
+        } else {
+            RulesWrite::Seed
+        };
+        return (RulesSeed::Unchanged, write);
+    }
+    if !rules_are_runtime(d) {
+        return (RulesSeed::FollowedFile, RulesWrite::Seed);
+    }
+    match d.rules_origin.as_ref().map(|o| o.file_sha256.as_str()) {
+        Some(seeded) if seeded == fingerprint => (RulesSeed::Diverged, RulesWrite::None),
+        // Set at runtime before the fingerprint was recorded (a state
+        // written by an earlier build): take this file as the seeded one,
+        // so a later edit of it is caught.
+        None | Some("") => (RulesSeed::Diverged, RulesWrite::Fingerprint(fingerprint)),
+        Some(_) => (RulesSeed::FileChanged, RulesWrite::None),
     }
 }
 
@@ -136,7 +202,9 @@ impl StateStore {
     /// - The first call on a state that was never seeded, or any call with
     ///   `reseed`: stores it with `from_config = true` (or clears the
     ///   rules), [`RulesSeed::Seeded`].
-    /// - Stored rules equal to the file's: [`RulesSeed::Unchanged`].
+    /// - Stored rules equal to the file's (as JSON): [`RulesSeed::Unchanged`];
+    ///   they are marked as the file's from then on, also when they were
+    ///   changed at runtime and then copied into the file.
     /// - Stored rules from the file, never changed at runtime: the file
     ///   wins and is stored, [`RulesSeed::FollowedFile`].
     /// - Rules changed at runtime: kept while the file is unchanged since
@@ -147,46 +215,29 @@ impl StateStore {
         config_json: Option<&str>,
         reseed: bool,
     ) -> Result<RulesSeed, StateError> {
-        let snapshot = self.snapshot();
-        if !snapshot.seeded.rules || reseed {
-            self.mutate(|d| {
+        let (outcome, write) = plan_rules_seed(&self.snapshot(), config_json, reseed);
+        match write {
+            RulesWrite::None => {}
+            RulesWrite::Seed => self.mutate(|d| {
                 apply_rules_seed(d, config_json);
                 Ok(())
-            })?;
-            return Ok(RulesSeed::Seeded);
-        }
-        let fingerprint = rules_fingerprint(config_json);
-        if snapshot.rules.as_ref().map(|r| r.json.as_str()) == config_json {
-            return Ok(RulesSeed::Unchanged);
-        }
-        if !rules_are_runtime(&snapshot) {
-            self.mutate(|d| {
-                apply_rules_seed(d, config_json);
+            })?,
+            RulesWrite::Fingerprint(file_sha256) => self.mutate(|d| {
+                d.rules_origin = Some(RulesOrigin {
+                    file_sha256,
+                    runtime: true,
+                });
                 Ok(())
-            })?;
-            return Ok(RulesSeed::FollowedFile);
+            })?,
         }
-        match snapshot
-            .rules_origin
-            .as_ref()
-            .map(|o| o.file_sha256.as_str())
-        {
-            Some(seeded) if seeded == fingerprint => Ok(RulesSeed::Diverged),
-            // Set at runtime before the fingerprint was recorded (a state
-            // written by an earlier build): take this file as the seeded
-            // one, so a later edit of it is caught.
-            None | Some("") => {
-                self.mutate(|d| {
-                    d.rules_origin = Some(RulesOrigin {
-                        file_sha256: fingerprint,
-                        runtime: true,
-                    });
-                    Ok(())
-                })?;
-                Ok(RulesSeed::Diverged)
-            }
-            Some(_) => Ok(RulesSeed::FileChanged),
-        }
+        Ok(outcome)
+    }
+
+    /// What [`seed_rules`](Self::seed_rules) with the same arguments would
+    /// return, without writing anything: startup checks it (a
+    /// [`RulesSeed::FileChanged`] refuses the start) before any write.
+    pub fn preview_seed_rules(&self, config_json: Option<&str>, reseed: bool) -> RulesSeed {
+        plan_rules_seed(&self.snapshot(), config_json, reseed).0
     }
 }
 
@@ -306,6 +357,62 @@ mod tests {
         assert_eq!(store.access_rules(), None);
     }
 
+    /// Runtime rules copied into the rules file follow the file from then
+    /// on: a later edit of the file is taken, not refused.
+    #[test]
+    fn runtime_rules_copied_into_the_file_follow_it_again() {
+        let store = StateStore::open(None).unwrap();
+        store.seed_rules(Some(A), false).unwrap();
+        store
+            .set_access_rules(Some(StoredRules {
+                json: B.into(),
+                from_config: false,
+            }))
+            .unwrap();
+        // The operator copies B into the file (reformatted) and restarts.
+        let b_reformatted = r#"{ "catalogs" : [ { "allow" : "none" } ] }"#;
+        assert_eq!(
+            store.preview_seed_rules(Some(b_reformatted), false),
+            RulesSeed::Unchanged
+        );
+        assert_eq!(
+            store.seed_rules(Some(b_reformatted), false).unwrap(),
+            RulesSeed::Unchanged
+        );
+        assert!(!store.rules_changed_at_runtime());
+        assert_eq!(store.access_rules(), file_rules(b_reformatted));
+        // Weeks later the file is tightened: it is followed.
+        const C: &str = r#"{"catalogs":[{"catalog":"c","allow":"all"}]}"#;
+        assert_eq!(
+            store.preview_seed_rules(Some(C), false),
+            RulesSeed::FollowedFile
+        );
+        assert_eq!(
+            store.seed_rules(Some(C), false).unwrap(),
+            RulesSeed::FollowedFile
+        );
+        assert_eq!(store.access_rules(), file_rules(C));
+    }
+
+    /// The preview never writes, and agrees with the seed.
+    #[test]
+    fn preview_seed_rules_writes_nothing() {
+        let store = StateStore::open(None).unwrap();
+        assert_eq!(store.preview_seed_rules(Some(A), false), RulesSeed::Seeded);
+        assert!(!store.seeded().rules);
+        store.seed_rules(Some(A), false).unwrap();
+        store.set_access_rules(None).unwrap();
+        assert_eq!(
+            store.preview_seed_rules(Some(B), false),
+            RulesSeed::FileChanged
+        );
+        assert_eq!(
+            store.preview_seed_rules(Some(A), false),
+            RulesSeed::Diverged
+        );
+        assert!(store.rules_changed_at_runtime());
+    }
+
     /// A state written before `rules_origin` existed: runtime rules
     /// (`from_config = false`) are kept and the current file becomes the
     /// seeded one, so a later edit of it is caught.
@@ -340,6 +447,13 @@ mod tests {
     #[test]
     fn fingerprints_tell_files_apart() {
         assert_eq!(rules_fingerprint(Some(A)), rules_fingerprint(Some(A)));
+        assert_eq!(
+            rules_fingerprint(Some(A)),
+            rules_fingerprint(Some(
+                "{ \"catalogs\": [ {\"allow\":\"all\", \"catalog\":\"tpch\"} ] }"
+            )),
+            "key order and whitespace do not count"
+        );
         assert_ne!(rules_fingerprint(Some(A)), rules_fingerprint(Some(B)));
         assert_ne!(rules_fingerprint(None), rules_fingerprint(Some("")));
         assert_eq!(rules_fingerprint(Some(A)).len(), 64);

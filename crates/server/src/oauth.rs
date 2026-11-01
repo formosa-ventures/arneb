@@ -205,6 +205,21 @@ struct Inner {
     settings: OAuthSettings,
     http: Option<reqwest::Client>,
     cache: Mutex<KeyCache>,
+    /// Test hook: make the next fetch panic.
+    #[cfg(test)]
+    panic_next_fetch: std::sync::atomic::AtomicBool,
+}
+
+/// Armed for the life of a fetch task; dropped without being disarmed
+/// (`mem::forget`) only when the task unwinds or is cancelled.
+struct FetchGuard(Option<Arc<Inner>>);
+
+impl Drop for FetchGuard {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.take() {
+            inner.record_lost_fetch();
+        }
+    }
 }
 
 /// Validates OAuth access tokens; share as `Arc<OAuthValidator>`.
@@ -244,6 +259,8 @@ impl OAuthValidator {
                 settings,
                 http,
                 cache: Mutex::new(KeyCache::default()),
+                #[cfg(test)]
+                panic_next_fetch: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -489,12 +506,7 @@ impl Inner {
     /// with the cache locked.
     fn start_fetch(self: &Arc<Self>, c: &mut KeyCache) -> Option<Flight> {
         if let Some(flight) = &c.inflight {
-            // A finished flight still listed means its task died before
-            // recording the outcome; start over rather than reuse it.
-            if flight.peek().is_none() {
-                return Some(flight.clone());
-            }
-            c.inflight = None;
+            return Some(flight.clone());
         }
         if c.last_attempt
             .is_some_and(|t| t.elapsed() < self.settings.jwks_min_refresh)
@@ -504,10 +516,30 @@ impl Inner {
         c.last_attempt = Some(Instant::now());
         let inner = Arc::clone(self);
         let known_uri = c.jwks_uri.clone();
-        let task = tokio::spawn(async move { inner.run_fetch(known_uri).await });
+        let task = tokio::spawn(async move {
+            // Records a failed attempt if the task ends without recording
+            // one (a panic, or the runtime shutting down), so the flight is
+            // never left listed and refreshes resume.
+            let guard = FetchGuard(Some(Arc::clone(&inner)));
+            let ok = inner.run_fetch(known_uri).await;
+            std::mem::forget(guard);
+            ok
+        });
         let flight = task.map(|r| r.unwrap_or(false)).boxed().shared();
         c.inflight = Some(flight.clone());
         Some(flight)
+    }
+
+    /// Record an attempt that ended without an outcome as failed.
+    fn record_lost_fetch(&self) {
+        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.generation += 1;
+        c.inflight = None;
+        c.last_ok = false;
+        tracing::warn!(
+            target: "arneb::oauth",
+            "fetching the signing keys ended without a result; recorded as a failed attempt"
+        );
     }
 
     /// One fetch attempt, recorded in the cache; `true` on success.
@@ -553,6 +585,13 @@ impl Inner {
         &self,
         known_uri: Option<String>,
     ) -> Result<(Vec<Arc<CachedKey>>, String), String> {
+        #[cfg(test)]
+        if self
+            .panic_next_fetch
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("test: the JWKS fetch panicked");
+        }
         let http = self.http.as_ref().ok_or("no HTTP client")?;
         let uri = match (&self.settings.jwks_uri, known_uri) {
             (Some(u), _) => u.clone(),
@@ -644,15 +683,21 @@ fn is_access_token_typ(typ: &str) -> bool {
     typ.eq_ignore_ascii_case("at+jwt") || typ.eq_ignore_ascii_case("application/at+jwt")
 }
 
-/// Claims only an OIDC ID token carries: `nonce` and `at_hash` (OIDC Core
-/// 2 and 3.1.3.6), or Keycloak's `typ: "ID"`.
+/// Keycloak's payload `typ` of signed tokens that are not access tokens
+/// (its access tokens say `Bearer`).
+const NON_ACCESS_TOKEN_TYPS: [&str; 4] = ["ID", "Refresh", "Offline", "Logout"];
+
+/// Claims only a non-access token carries: `nonce` and `at_hash` (OIDC Core
+/// 2 and 3.1.3.6), or a Keycloak payload `typ` of `ID`, `Refresh`,
+/// `Offline` or `Logout`.
 fn looks_like_id_token(claims: &serde_json::Value) -> bool {
     claims.get("nonce").is_some()
         || claims.get("at_hash").is_some()
-        || claims
-            .get("typ")
-            .and_then(|v| v.as_str())
-            .is_some_and(|t| t.eq_ignore_ascii_case("ID"))
+        || claims.get("typ").and_then(|v| v.as_str()).is_some_and(|t| {
+            NON_ACCESS_TOKEN_TYPS
+                .iter()
+                .any(|n| t.eq_ignore_ascii_case(n))
+        })
 }
 
 enum Lookup {
@@ -1461,6 +1506,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_panicking_fetch_is_a_failed_attempt_and_refreshes_resume() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(10));
+        let t = key.sign(&claims(&idp.issuer(), AUD));
+        // A waiter of the panicking fetch gets a verdict, not a hang...
+        v.inner
+            .panic_next_fetch
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(v.validate(&t).await.unwrap_err(), OAuthReject::Unavailable);
+        {
+            let c = v.inner.cache.lock().unwrap();
+            assert!(c.inflight.is_none(), "the dead flight is not left listed");
+            assert!(!c.last_ok);
+            assert_eq!(c.generation, 1);
+        }
+        // ...and the next attempt fetches normally.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        v.validate(&t).await.unwrap();
+        assert_eq!(idp.jwks_hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_background_refresh_does_not_stall_later_ones() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let v = validator(&idp, |s| {
+            s.jwks_cache = Duration::from_millis(200);
+            s.jwks_min_refresh = Duration::from_millis(10);
+        });
+        let t = key.sign(&claims(&idp.issuer(), AUD));
+        v.validate(&t).await.unwrap();
+        assert_eq!(idp.jwks_hits(), 1);
+        // Past 80% of jwks_cache the background refresh (nobody awaits it)
+        // panics; the request is still answered from the cached keys.
+        v.inner
+            .panic_next_fetch
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(170)).await;
+        v.validate(&t).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        {
+            let c = v.inner.cache.lock().unwrap();
+            assert!(c.inflight.is_none(), "the dead flight is not left listed");
+            assert!(!c.last_ok);
+        }
+        // The next request starts a fresh background refresh, which lands.
+        v.validate(&t).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(idp.jwks_hits(), 2);
+        assert!(v.inner.cache.lock().unwrap().last_ok);
+    }
+
+    #[tokio::test]
     async fn a_request_joins_the_fetch_in_flight() {
         let key = TestKey::ec("k1");
         let idp = TestIdp::start(&[&key]).await;
@@ -1630,6 +1729,11 @@ mod tests {
             ("nonce", json!("n-0S6")),
             ("at_hash", json!("77QmUPtjPfzWtF2AnpK9RQ")),
             ("typ", json!("ID")),
+            // Keycloak's other signed non-access tokens.
+            ("typ", json!("Refresh")),
+            ("typ", json!("Offline")),
+            ("typ", json!("Logout")),
+            ("typ", json!("logout")),
         ] {
             let mut c = claims(&iss, AUD);
             c[claim] = value;

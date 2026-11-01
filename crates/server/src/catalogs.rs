@@ -100,12 +100,16 @@ pub struct LiveCatalogs {
     /// `[cluster] secret`, so no served spec may carry a secret
     /// ([`exposure_check`](Self::exposure_check)).
     unauthenticated_flight: std::sync::atomic::AtomicBool,
-    /// Serializes [`apply_set`](Self::apply_set) calls, which build outside
-    /// any other lock.
+    /// Serializes the swap step of [`apply_set`](Self::apply_set) calls.
+    /// Builds run before it is taken, so an unreachable metastore never
+    /// holds up another push or pull.
     applying: tokio::sync::Mutex<()>,
     /// Tests replace [`build`](Self::build) with this.
     #[cfg(test)]
     test_builder: Option<TestBuilder>,
+    /// How long a test build of a catalog takes, by name.
+    #[cfg(test)]
+    test_build_delay: std::sync::Mutex<BTreeMap<String, Duration>>,
 }
 
 #[cfg(test)]
@@ -143,6 +147,8 @@ impl LiveCatalogs {
             applying: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             test_builder: None,
+            #[cfg(test)]
+            test_build_delay: Default::default(),
         })
     }
 
@@ -366,6 +372,15 @@ impl LiveCatalogs {
     pub async fn build(&self, spec: &CatalogConfig) -> Result<BuiltCatalog, CatalogBuildError> {
         #[cfg(test)]
         if let Some(builder) = &self.test_builder {
+            let delay = self
+                .test_build_delay
+                .lock()
+                .unwrap()
+                .get(&spec.name)
+                .copied();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             return builder(spec);
         }
         match tokio::time::timeout(BUILD_TIMEOUT, self.build_inner(spec)).await {
@@ -453,70 +468,112 @@ impl LiveCatalogs {
     /// [`apply_set`](Self::apply_set), except that a set from `epoch` other
     /// than the one held applies whatever its generation, and then records
     /// `epoch`. `None` checks the generation only and keeps the epoch.
+    ///
+    /// The new and changed catalogs are built in parallel without any
+    /// lock; `applying` is held only to re-check the generation and swap.
+    /// A set overtaken by a newer one while it was building changes
+    /// nothing. When another apply swapped in between, a catalog this set
+    /// skipped as unchanged may now differ: it is built (again outside the
+    /// lock) before the swap.
     async fn apply(
         &self,
         epoch: Option<u64>,
         generation: u64,
         specs: Vec<CatalogConfig>,
     ) -> ApplyReport {
-        let _applying = self.applying.lock().await;
-        let same_epoch = epoch.is_none_or(|e| e == self.epoch());
-        // Ruling R8: the set already held is applied again (rebuilding only
-        // what is not installed) while some of it failed to build.
-        let retry = same_epoch && generation == self.generation() && self.has_failed_builds();
-        if same_epoch && generation <= self.generation() && !retry {
+        if !self.applies(epoch, generation) {
             return ApplyReport::default();
         }
-        let installed = self.read_specs().clone();
-        let mut built = Vec::new();
-        let mut failed = Vec::new();
-        let mut wanted = std::collections::BTreeSet::new();
-        for spec in specs {
-            wanted.insert(spec.name.clone());
-            if installed
-                .get(&spec.name)
-                .is_some_and(|current| same_spec(current, &spec))
-            {
-                continue;
-            }
-            match self.build(&spec).await {
-                Ok(b) => built.push((spec, b)),
-                Err(e) => {
-                    tracing::warn!(
-                        catalog = %spec.name,
-                        catalog_type = %spec.catalog_type,
-                        error = %e,
-                        "failed to build catalog, skipping"
-                    );
-                    failed.push((spec.name.clone(), e.to_string()));
+        let wanted: std::collections::BTreeSet<String> =
+            specs.iter().map(|s| s.name.clone()).collect();
+        let mut built: BTreeMap<String, (CatalogConfig, BuiltCatalog)> = BTreeMap::new();
+        let mut failed: BTreeMap<String, String> = BTreeMap::new();
+        let mut installed = self.read_specs().clone();
+        loop {
+            let todo: Vec<&CatalogConfig> = specs
+                .iter()
+                .filter(|spec| {
+                    !built.contains_key(&spec.name)
+                        && !failed.contains_key(&spec.name)
+                        && !installed
+                            .get(&spec.name)
+                            .is_some_and(|current| same_spec(current, spec))
+                })
+                .collect();
+            let results = futures::future::join_all(
+                todo.into_iter()
+                    .map(|spec| async move { (spec, self.build(spec).await) }),
+            )
+            .await;
+            for (spec, result) in results {
+                match result {
+                    Ok(b) => {
+                        built.insert(spec.name.clone(), (spec.clone(), b));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            catalog = %spec.name,
+                            catalog_type = %spec.catalog_type,
+                            error = %e,
+                            "failed to build catalog, skipping"
+                        );
+                        failed.insert(spec.name.clone(), e.to_string());
+                    }
                 }
             }
+            let _applying = self.applying.lock().await;
+            // A newer set may have been applied while this one was building.
+            if !self.applies(epoch, generation) {
+                return ApplyReport::default();
+            }
+            let now = self.read_specs().clone();
+            let stale = specs.iter().any(|spec| {
+                !built.contains_key(&spec.name)
+                    && !failed.contains_key(&spec.name)
+                    && !now
+                        .get(&spec.name)
+                        .is_some_and(|current| same_spec(current, spec))
+            });
+            if stale {
+                // Another apply swapped in between: build what now differs.
+                installed = now;
+                continue;
+            }
+            for (_, (spec, b)) in std::mem::take(&mut built) {
+                tracing::info!(
+                    catalog = %spec.name,
+                    catalog_type = %spec.catalog_type,
+                    generation,
+                    "registered catalog"
+                );
+                self.install(spec, b);
+            }
+            for name in now.keys().filter(|n| !wanted.contains(*n)) {
+                self.remove(name);
+                tracing::info!(catalog = %name, generation, "removed catalog");
+            }
+            *self.failed.write().unwrap_or_else(|p| p.into_inner()) =
+                failed.keys().cloned().collect();
+            // Generation before epoch: a reader seeing the new epoch also sees
+            // the generation that goes with it.
+            self.set_generation(generation);
+            if let Some(e) = epoch {
+                self.set_epoch(e);
+            }
+            return ApplyReport {
+                applied: true,
+                failed: failed.into_iter().collect(),
+            };
         }
-        for (spec, b) in built {
-            tracing::info!(
-                catalog = %spec.name,
-                catalog_type = %spec.catalog_type,
-                generation,
-                "registered catalog"
-            );
-            self.install(spec, b);
-        }
-        for name in installed.keys().filter(|n| !wanted.contains(*n)) {
-            self.remove(name);
-            tracing::info!(catalog = %name, generation, "removed catalog");
-        }
-        *self.failed.write().unwrap_or_else(|p| p.into_inner()) =
-            failed.iter().map(|(name, _)| name.clone()).collect();
-        // Generation before epoch: a reader seeing the new epoch also sees
-        // the generation that goes with it.
-        self.set_generation(generation);
-        if let Some(e) = epoch {
-            self.set_epoch(e);
-        }
-        ApplyReport {
-            applied: true,
-            failed,
-        }
+    }
+
+    /// Whether a set at `(epoch, generation)` applies now: a newer
+    /// generation within the epoch held, any set from another epoch, or the
+    /// set already held while some of it failed to build (Ruling R8).
+    fn applies(&self, epoch: Option<u64>, generation: u64) -> bool {
+        let same_epoch = epoch.is_none_or(|e| e == self.epoch());
+        let retry = same_epoch && generation == self.generation() && self.has_failed_builds();
+        !same_epoch || generation > self.generation() || retry
     }
 }
 
@@ -1691,6 +1748,124 @@ mod tests {
             fill_redacted(&mut new, &bare);
             assert_eq!(new.connection_url.as_ref().unwrap().0, kept);
         }
+    }
+
+    /// [`live`] whose builds succeed after the per-name delays in
+    /// `delays`.
+    fn slow_live(delays: &[(&str, u64)]) -> Arc<LiveCatalogs> {
+        let live = LiveCatalogs::with_test_builder(
+            Arc::new(CatalogManager::new("memory", "default")),
+            Arc::new(ConnectorRegistry::new()),
+            Box::new(|_| Ok(fake_built())),
+        );
+        let mut delay = live.test_build_delay.lock().unwrap();
+        for (name, secs) in delays {
+            delay.insert((*name).to_owned(), Duration::from_secs(*secs));
+        }
+        drop(delay);
+        live
+    }
+
+    /// The new catalogs of a set build in parallel, and the apply lock is
+    /// not held while they do.
+    #[tokio::test(start_paused = true)]
+    async fn builds_run_in_parallel_outside_the_apply_lock() {
+        let live = slow_live(&[("a", 10), ("b", 10), ("c", 10)]);
+        let started = tokio::time::Instant::now();
+        let applying = tokio::spawn({
+            let live = live.clone();
+            async move {
+                live.apply_set(1, vec![hive("a"), hive("b"), hive("c")])
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!applying.is_finished());
+        assert!(
+            live.applying.try_lock().is_ok(),
+            "the apply lock is free while the catalogs build"
+        );
+        let report = applying.await.unwrap();
+        assert!(report.applied && report.failed.is_empty());
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(15),
+            "three 10 s builds took {took:?}: they did not run in parallel"
+        );
+        assert_eq!(live.specs().len(), 3);
+        assert_eq!(live.generation(), 1);
+    }
+
+    /// A newer set is not held up behind an older set's slow build, and the
+    /// older set, overtaken while it built, changes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_build_does_not_hold_up_a_newer_set() {
+        let live = slow_live(&[("slow", 60)]);
+        let older = tokio::spawn({
+            let live = live.clone();
+            async move { live.apply_set(1, vec![hive("slow")]).await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let newer = tokio::time::timeout(
+            Duration::from_secs(5),
+            live.apply_set(2, vec![hive("fast")]),
+        )
+        .await
+        .expect("the newer set applies while the older one still builds");
+        assert!(newer.applied);
+        assert!(!older.is_finished());
+        let older = older.await.unwrap();
+        assert_eq!(older, ApplyReport::default(), "overtaken: nothing applied");
+        assert_eq!(live.generation(), 2);
+        let names: Vec<String> = live.specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["fast"]);
+    }
+
+    /// Two applies of sets that differ in one catalog: the one that swaps
+    /// second rebuilds what the first changed under it.
+    #[tokio::test(start_paused = true)]
+    async fn an_apply_rebuilds_what_another_swapped_in_meanwhile() {
+        let live = slow_live(&[("b", 30)]);
+        live.install(hive("a"), fake_built());
+        // Epoch 7 later than the held 0, so both apply regardless of order.
+        let mut changed_a = hive("a");
+        changed_a.metastore_uri = Some("10.0.0.2:9083".into());
+        let slow = tokio::spawn({
+            let live = live.clone();
+            async move {
+                live.apply_remote(arneb_rpc::CatalogSet {
+                    epoch: 7,
+                    generation: 2,
+                    catalogs: vec![
+                        serde_json::to_value(hive("a")).unwrap(),
+                        serde_json::to_value(hive("b")).unwrap(),
+                    ],
+                    default_catalog: None,
+                    default_schema: None,
+                })
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // An older generation of another epoch swaps in first and changes a.
+        live.apply_remote(arneb_rpc::CatalogSet {
+            epoch: 6,
+            generation: 1,
+            catalogs: vec![serde_json::to_value(&changed_a).unwrap()],
+            default_catalog: None,
+            default_schema: None,
+        })
+        .await;
+        assert_eq!(live.epoch(), 6);
+        let report = slow.await.unwrap();
+        assert!(report.applied);
+        assert_eq!((live.epoch(), live.generation()), (7, 2));
+        let specs = live.specs();
+        assert_eq!(specs.len(), 2);
+        assert!(
+            same_spec(&specs[0], &hive("a")),
+            "a is the newer set's again"
+        );
     }
 
     #[tokio::test]

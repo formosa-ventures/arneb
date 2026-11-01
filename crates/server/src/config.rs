@@ -427,8 +427,10 @@ pub struct AgentApiConfig {
     /// Arrow memory one finished statement may retain; must not exceed
     /// `max_user_retained_bytes`.
     pub max_retained_bytes: usize,
-    /// Arrow memory one user's finished statements may retain together;
-    /// must not exceed `max_total_retained_bytes`.
+    /// Arrow memory one user's statements may retain together; must not
+    /// exceed `max_total_retained_bytes`. Raised to `max_retained_bytes`
+    /// when below it (a user could otherwise never retain one full
+    /// statement), with a warning at startup.
     pub max_user_retained_bytes: usize,
     /// Arrow memory all finished statements together may retain.
     pub max_total_retained_bytes: usize,
@@ -436,6 +438,11 @@ pub struct AgentApiConfig {
     pub max_wait_ms: u64,
     /// Idle time before a statement is reaped; at least `max_wait_ms`.
     pub idle_timeout_secs: u64,
+    /// The configured `max_user_retained_bytes` when it was below
+    /// `max_retained_bytes` and raised to it; logged as a warning once
+    /// tracing is up.
+    #[serde(skip)]
+    pub user_share_raised_from: Option<usize>,
 }
 
 impl Default for AgentApiConfig {
@@ -452,6 +459,7 @@ impl Default for AgentApiConfig {
             max_total_retained_bytes: d.max_total_retained_bytes,
             max_wait_ms: d.max_wait.as_millis() as u64,
             idle_timeout_secs: d.idle_timeout.as_secs(),
+            user_share_raised_from: None,
         }
     }
 }
@@ -522,6 +530,12 @@ impl AgentApiConfig {
             "ARNEB_AGENT_IDLE_TIMEOUT_SECS",
             &mut self.idle_timeout_secs,
         )?;
+        // Only the per-statement cap was raised (say to 512 MiB, with a
+        // larger total): follow it rather than refuse to start.
+        if self.max_user_retained_bytes < self.max_retained_bytes {
+            self.user_share_raised_from = Some(self.max_user_retained_bytes);
+            self.max_user_retained_bytes = self.max_retained_bytes;
+        }
         self.limits()
             .validate()
             .map_err(|e| anyhow::anyhow!("invalid [agent_api] settings: {e}"))
@@ -2017,10 +2031,26 @@ pgwire = "required"
             ),
             (1000, 3000, 9000)
         );
-        let err = agent_api(file, &[("ARNEB_AGENT_MAX_RETAINED_BYTES", "2500")])
+        // A per-statement cap above the share raises the share to it.
+        let c = agent_api(file, &[("ARNEB_AGENT_MAX_RETAINED_BYTES", "2500")]).unwrap();
+        assert_eq!(
+            (c.max_user_retained_bytes, c.user_share_raised_from),
+            (2500, Some(2000))
+        );
+        let c = agent_api(
+            "port = 5432",
+            &[
+                ("ARNEB_AGENT_MAX_RETAINED_BYTES", "536870912"),
+                ("ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES", "2147483648"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.max_user_retained_bytes, 536870912);
+        // ... but never past the total.
+        let err = agent_api(file, &[("ARNEB_AGENT_MAX_RETAINED_BYTES", "6000")])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("max_user_retained_bytes"), "{err}");
+        assert!(err.contains("max_total_retained_bytes"), "{err}");
         let err = agent_api(file, &[("ARNEB_AGENT_MAX_USER_RETAINED_BYTES", "6000")])
             .unwrap_err()
             .to_string();

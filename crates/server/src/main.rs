@@ -946,6 +946,16 @@ async fn run() -> Result<()> {
              ARNEB_MAX_QUEUED_QUERIES / ARNEB_STATEMENT_TIMEOUT / ARNEB_QUERY_MAX_MEMORY_BYTES)"
         );
         let agent_limits = config.agent_api.limits();
+        if let Some(configured) = config.agent_api.user_share_raised_from {
+            tracing::warn!(
+                target: "arneb::config",
+                configured,
+                effective = agent_limits.max_user_retained_bytes,
+                "[agent_api] max_user_retained_bytes (ARNEB_AGENT_MAX_USER_RETAINED_BYTES) \
+                 is below max_retained_bytes; raised to it so a user can retain one full \
+                 statement"
+            );
+        }
         tracing::info!(
             target: "arneb::config",
             default_max_rows = agent_limits.default_max_rows,

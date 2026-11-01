@@ -139,14 +139,16 @@ max_rows           = 10000
 | `max_page_bytes` | `ARNEB_AGENT_MAX_PAGE_BYTES` | 4194304 | Ceiling for a requested page size |
 | `max_cell_bytes` | `ARNEB_AGENT_MAX_CELL_BYTES` | 8192 | Longest cell, in bytes of a string's UTF-8 text (other values: of their JSON); longer cells are cut and end with `…` |
 | `max_retained_bytes` | `ARNEB_AGENT_MAX_RETAINED_BYTES` | 67108864 | Arrow memory one statement keeps, while collecting and after; rows past it are dropped (`truncated_by: "max_retained_bytes"`) |
-| `max_user_retained_bytes` | `ARNEB_AGENT_MAX_USER_RETAINED_BYTES` | 268435456 | Arrow memory one user's statements keep together, so one user cannot take the whole budget; when short, the user's own ended statements are evicted (least recently used, fully read first), then a statement keeps what fits (`truncated_by: "user_budget"`) |
-| `max_total_retained_bytes` | `ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES` | 1073741824 | Arrow memory all statements keep together; when short, any user's ended statements are evicted the same way, then a statement keeps what fits (`truncated_by: "server_budget"`); it frees up as statements are deleted, evicted or reaped |
+| `max_user_retained_bytes` | `ARNEB_AGENT_MAX_USER_RETAINED_BYTES` | 268435456 | Arrow memory one user's statements (running and ended) keep together, so one user cannot take the whole budget; when short, the user's own ended statements are evicted if that covers the shortfall (fully read first, then least recently used), otherwise a statement keeps what fits (`truncated_by: "user_budget"`) |
+| `max_total_retained_bytes` | `ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES` | 1073741824 | Arrow memory all statements (running and ended) keep together; when short, ended statements are evicted the same way (the user's own first) if that covers the shortfall, otherwise a statement keeps what fits (`truncated_by: "server_budget"`); it frees up as statements are deleted, evicted or reaped |
 | `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 | Longest any request waits before answering "still running" |
 | `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 | Idle time before a statement is reaped |
 
 All values must be greater than 0, `default_max_rows <= max_rows`,
 `default_page_bytes <= max_page_bytes`,
-`max_retained_bytes <= max_user_retained_bytes <= max_total_retained_bytes`, and `idle_timeout_secs` must not
+`max_user_retained_bytes <= max_total_retained_bytes` (a `max_user_retained_bytes`
+below `max_retained_bytes` is raised to it, with a warning, so a user can
+always retain one full statement), and `idle_timeout_secs` must not
 be shorter than `max_wait_ms` (a statement being waited on never counts as
 idle, so a long-poll cannot outlast it); a bad combination stops startup.
 

@@ -112,6 +112,10 @@ impl BatchSink for FirstSchema<'_> {
         }
         self.sink.push(batch);
     }
+
+    fn reset(&mut self) {
+        self.sink.reset();
+    }
 }
 
 impl Engine {

@@ -16,15 +16,16 @@ pub struct AgentLimits {
     /// Arrow memory one statement may retain, while collecting and after;
     /// rows past it are dropped (`truncated_by: max_retained_bytes`).
     pub max_retained_bytes: usize,
-    /// Arrow memory all finished statements of one user together may
-    /// retain, so one user cannot take the whole server budget; a statement
-    /// that finds it exhausted first evicts the user's own least recently
-    /// used ended statements, then keeps what fits
-    /// (`truncated_by: user_budget`).
+    /// Arrow memory one user's statements together may retain, running
+    /// ones (still collecting) and ended ones alike, so one user cannot take
+    /// the whole server budget. A statement that finds it short evicts the
+    /// user's own ended statements when that covers the shortfall, then
+    /// keeps what fits (`truncated_by: user_budget`).
     pub max_user_retained_bytes: usize,
-    /// Arrow memory all finished statements together may retain; a
-    /// statement that finds it exhausted first evicts the least recently
-    /// used ended statements (fully read ones first), then keeps what fits
+    /// Arrow memory all statements together may retain, running and ended.
+    /// A statement that finds it short evicts ended statements (its user's
+    /// own first, then fully read ones, then least recently used) when that
+    /// covers the shortfall, then keeps what fits
     /// (`truncated_by: server_budget`).
     pub max_total_retained_bytes: usize,
     /// Longest any request waits before answering "still running".

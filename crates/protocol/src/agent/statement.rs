@@ -89,6 +89,8 @@ pub struct StatementStatus {
     /// Why rows were dropped, when `truncated`: `max_rows`,
     /// `max_retained_bytes`, `user_budget` or `server_budget`.
     pub truncated_by: Option<TruncatedBy>,
+    /// What to do when not even the first row could be kept.
+    pub truncated_hint: Option<String>,
     /// Rows kept for the client at most (the request's `max_rows`).
     pub max_rows: usize,
     /// The first page of rows, once finished.
@@ -222,6 +224,12 @@ impl Statement {
     /// The status document. The first page is encoded after the lock is
     /// released, from a cheap clone of the retained rows.
     pub(crate) fn status(&self, limits: &AgentLimits) -> StatementStatus {
+        self.status_with(limits, true)
+    }
+
+    /// [`status`](Self::status), with `first_page` left `None` unless
+    /// `first_page` is set.
+    pub(crate) fn status_with(&self, limits: &AgentLimits, first_page: bool) -> StatementStatus {
         let (mut status, retained) = {
             let inner = self.lock();
             let elapsed = inner
@@ -238,6 +246,7 @@ impl Statement {
                 total_rows: None,
                 truncated: false,
                 truncated_by: None,
+                truncated_hint: None,
                 max_rows: self.max_rows,
                 first_page: None,
                 error: None,
@@ -254,11 +263,12 @@ impl Statement {
                     status.total_rows = output.retained.total_rows;
                     status.truncated = output.retained.truncated();
                     status.truncated_by = output.retained.truncated_by;
+                    status.truncated_hint = output.retained.hint.clone();
                     retained = Some(output.retained.clone());
                 }
                 Phase::Failed(err) | Phase::Cancelled(err) => status.error = Some(err.clone()),
             }
-            (status, retained)
+            (status, retained.filter(|_| first_page))
         };
         status.first_page =
             retained.map(|r| page(&r, 0, limits.default_page_bytes, limits.max_cell_bytes));

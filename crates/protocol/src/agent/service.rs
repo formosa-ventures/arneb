@@ -1,7 +1,7 @@
 //! The agent statement service: submit, poll and cancel statements that run
 //! through the Trino-protocol engine, with an idle-timeout reaper.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,6 +45,8 @@ pub struct AgentQueryService {
     admission: Option<AdmissionController>,
     statement_timeout: Option<Duration>,
     statements: Arc<Mutex<HashMap<String, Arc<Statement>>>>,
+    /// Recently evicted statements, so a poll for one says why it is gone.
+    evicted: Arc<Mutex<Evicted>>,
     /// `max_total_retained_bytes` (and `max_user_retained_bytes` per
     /// user), shared by every statement's results.
     retained_budget: Arc<RetainedBudget>,
@@ -78,6 +80,7 @@ impl AgentQueryService {
             admission: None,
             statement_timeout: None,
             statements: Arc::new(Mutex::new(HashMap::new())),
+            evicted: Arc::default(),
         }
     }
 
@@ -256,7 +259,8 @@ impl AgentQueryService {
     pub fn cancel(&self, user: &str, id: &str) -> Result<StatementStatus, AgentError> {
         let statement = self.lookup(user, id)?;
         if statement.is_terminal() {
-            let status = statement.status(&self.limits);
+            // No first page: the rows are being released, not read.
+            let status = statement.status_with(&self.limits, false);
             self.forget(user, id);
             return Ok(status);
         }
@@ -315,7 +319,9 @@ impl AgentQueryService {
             None
         };
         if let Some(id) = victim {
-            statements.remove(&id);
+            if let Some(s) = statements.remove(&id) {
+                lock(&self.evicted).record(&s, false);
+            }
             tracing::debug!(statement_id = %id, "agent statement evicted at the cap");
         }
         let tracker_id = self
@@ -328,11 +334,16 @@ impl AgentQueryService {
 
     /// `user`'s statement `id`, touched; any other user's is not found.
     fn lookup(&self, user: &str, id: &str) -> Result<Arc<Statement>, AgentError> {
-        let statement = lock(&self.statements)
+        let found = lock(&self.statements)
             .get(id)
             .filter(|s| s.user == user)
-            .cloned()
-            .ok_or_else(|| AgentError::statement_not_found(id))?;
+            .cloned();
+        let Some(statement) = found else {
+            return Err(match lock(&self.evicted).reason(user, id) {
+                Some(for_budget) => AgentError::statement_evicted(id, for_budget),
+                None => AgentError::statement_not_found(id),
+            });
+        };
         statement.touch();
         Ok(statement)
     }
@@ -417,13 +428,10 @@ impl AgentQueryService {
     /// for the server budget.
     fn collector(&self, statement: &Statement) -> Collector {
         let statements = Arc::clone(&self.statements);
+        let evicted = Arc::clone(&self.evicted);
         let user = statement.user.clone();
-        let evict: Evict = Box::new(move |short| {
-            let only = match short {
-                Shortfall::User => Some(user.as_str()),
-                Shortfall::Server => None,
-            };
-            evict_retained(&statements, only)
+        let evict: Evict = Box::new(move |short, needed| {
+            evict_retained(&statements, &evicted, &user, short, needed)
         });
         Collector::new(
             &statement.user,
@@ -545,40 +553,91 @@ impl AgentQueryService {
     }
 }
 
-/// Drops one ended statement that retains rows (only `user`'s when given)
-/// to free retained bytes: the least recently accessed, fully read ones
-/// first. Returns whether one was dropped.
-fn evict_retained(statements: &Mutex<HashMap<String, Arc<Statement>>>, user: Option<&str>) -> bool {
-    let evicted = {
+/// Ids of recently evicted statements (at most [`MAX_STATEMENTS_TOTAL`]),
+/// with their user and whether the retained-result budget evicted them.
+#[derive(Default)]
+struct Evicted(VecDeque<(String, String, bool)>);
+
+impl Evicted {
+    fn record(&mut self, statement: &Statement, for_budget: bool) {
+        if self.0.len() >= MAX_STATEMENTS_TOTAL {
+            self.0.pop_front();
+        }
+        self.0
+            .push_back((statement.id.clone(), statement.user.clone(), for_budget));
+    }
+
+    /// Whether `user`'s statement `id` was evicted for the budget, if it was
+    /// evicted at all.
+    fn reason(&self, user: &str, id: &str) -> Option<bool> {
+        self.0
+            .iter()
+            .find(|(i, u, _)| i == id && u == user)
+            .map(|(_, _, for_budget)| *for_budget)
+    }
+}
+
+/// Frees at least `needed` bytes of the `short` budget for `user` by
+/// dropping ended statements that retain rows, or drops nothing when the
+/// candidates cannot cover it. Candidates are `user`'s own (for the user's
+/// share), or anyone's (for the server budget, the user's own first), fully
+/// read ones first, then least recently accessed; one whose rows a page
+/// request still holds is skipped, since dropping it frees nothing yet.
+/// Victims are picked in one pass over the registry.
+fn evict_retained(
+    statements: &Mutex<HashMap<String, Arc<Statement>>>,
+    evicted: &Mutex<Evicted>,
+    user: &str,
+    short: Shortfall,
+    needed: usize,
+) -> bool {
+    let removed: Vec<(Arc<Statement>, usize)> = {
         let mut map = lock(statements);
-        let victim = map
+        let mut candidates: Vec<_> = map
             .values()
-            .filter(|s| user.is_none_or(|u| s.user == u))
+            .filter(|s| short == Shortfall::Server || s.user == user)
             .filter_map(|s| {
                 let inner = s.lock();
                 let Phase::Finished(output) = &inner.phase else {
                     return None;
                 };
-                (output.retained.bytes > 0)
-                    .then(|| ((!inner.read_to_end, inner.last_access), s.id.clone()))
+                let r = &output.retained;
+                (r.bytes > 0 && !r.pinned()).then(|| {
+                    let key = (s.user != user, !inner.read_to_end, inner.last_access);
+                    (key, s.id.clone(), r.bytes)
+                })
             })
-            .min()
-            .map(|(_, id)| id);
-        victim.and_then(|id| map.remove(&id))
-    };
-    // Dropped outside the registry lock: its reservation gives the bytes
-    // back here (or when an in-flight page request lets go of it).
-    match evicted {
-        Some(statement) => {
-            tracing::debug!(
-                statement_id = %statement.id,
-                user = %statement.user,
-                "agent statement evicted for retained-result budget"
-            );
-            true
+            .collect();
+        if candidates.iter().map(|c| c.2).sum::<usize>() < needed.max(1) {
+            return false;
         }
-        None => false,
+        candidates.sort_unstable();
+        let mut freed = 0;
+        let mut removed = Vec::new();
+        for (_, id, bytes) in candidates {
+            if freed >= needed.max(1) {
+                break;
+            }
+            if let Some(s) = map.remove(&id) {
+                freed += bytes;
+                removed.push((s, bytes));
+            }
+        }
+        removed
+    };
+    // Dropped outside the registry lock: their reservations give the bytes
+    // back here.
+    let mut log = lock(evicted);
+    for (statement, bytes) in &removed {
+        log.record(statement, true);
+        tracing::debug!(
+            statement_id = %statement.id,
+            user = %statement.user,
+            bytes,
+            "agent statement evicted for retained-result budget"
+        );
     }
+    !removed.is_empty()
 }
 
 /// Id of the least-recently-accessed terminal statement among `statements`.
@@ -978,7 +1037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_budget_evicts_fully_read_then_least_recently_used() {
+    async fn server_budget_evicts_own_then_fully_read_then_least_recently_used() {
         let sql = "SELECT s FROM wide";
         let one = one_wide_result().await;
         let svc = service_over(
@@ -1004,12 +1063,134 @@ mod tests {
         let c = run_as(&svc, "bob", sql).await;
         assert_eq!(c.truncated_by, None);
         assert!(alive(&a.id) && !alive(&b.id));
-        // Then the least recently used: a (c was touched later).
+        // bob needs room again: his own c goes before alice's older a.
         let d = run_as(&svc, "bob", sql).await;
         assert_eq!(d.truncated_by, None);
-        assert!(!alive(&a.id));
-        assert!(alive(&c.id) && alive(&d.id));
+        assert!(alive(&a.id) && !alive(&c.id) && alive(&d.id));
         assert!(svc.retained_budget.used() <= 2 * one + one / 2);
+        // Among other users' statements, the least recently used goes: a
+        // (alice's, older) before e (carol's).
+        let e = run_as(&svc, "carol", sql).await;
+        assert_eq!(e.truncated_by, None);
+        assert!(!alive(&a.id) && alive(&d.id) && alive(&e.id));
+        // Evicted statements say why they are gone.
+        let err = svc.results("alice", &a.id, 0, None).unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::NotFound);
+        assert!(err.message.contains("evicted"), "{}", err.message);
+        assert!(err.hint.is_some());
+        let err = svc.results("alice", "no-such-id", 0, None).unwrap_err();
+        assert!(!err.message.contains("evicted"));
+    }
+
+    #[tokio::test]
+    async fn eviction_that_cannot_cover_the_shortfall_evicts_nothing() {
+        let sql = "SELECT s FROM wide";
+        let one = one_wide_result().await;
+        let svc = service_over(
+            vec![wide_table(10, 1000)],
+            AgentLimits {
+                max_retained_bytes: one,
+                max_user_retained_bytes: one + one / 2,
+                ..AgentLimits::default()
+            },
+        );
+        let big = run_as(&svc, "alice", sql).await;
+        let small = run_as(&svc, "alice", "SELECT s FROM wide LIMIT 1").await;
+        assert_eq!((big.truncated_by, small.truncated_by), (None, None));
+        // A page request still holds big's rows, so evicting it frees nothing.
+        let pin = {
+            let statement = lock(&svc.statements).get(&big.id).cloned().unwrap();
+            let inner = statement.lock();
+            match &inner.phase {
+                Phase::Finished(output) => output.retained.clone(),
+                _ => unreachable!(),
+            }
+        };
+        // small alone cannot cover what the next statement lacks: keep it.
+        let next = run_as(&svc, "alice", sql).await;
+        assert_eq!(next.truncated_by, Some(TruncatedBy::UserBudget));
+        let alive = |id: &str| lock(&svc.statements).contains_key(id);
+        assert!(
+            alive(&big.id) && alive(&small.id),
+            "nothing was evicted for nothing"
+        );
+        // Once the pin is gone, big covers it and is evicted.
+        drop(pin);
+        let last = run_as(&svc, "alice", sql).await;
+        assert_eq!(last.truncated_by, None);
+        assert!(!alive(&big.id) && alive(&small.id));
+    }
+
+    /// A distributed executor that streams `batches` wide batches into the
+    /// sink, checking after each that the statement holds no more than
+    /// `cap` bytes, and simulates one retry (reset) halfway.
+    struct StreamingExecutor {
+        budget: Arc<RetainedBudget>,
+        cap: usize,
+        batches: usize,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DistributedExecutor for StreamingExecutor {
+        async fn execute(
+            &self,
+            _plan: LogicalPlan,
+            _exec_ctx: &ExecutionContext,
+        ) -> Result<Vec<RecordBatch>, ArnebError> {
+            unreachable!("the agent path streams through execute_into")
+        }
+
+        async fn execute_into(
+            &self,
+            _plan: LogicalPlan,
+            _exec_ctx: &ExecutionContext,
+            sink: &mut dyn crate::handler::BatchSink,
+        ) -> Result<(), ArnebError> {
+            let (_, wide) = wide_table(10, 5_000);
+            for attempt in 0..2 {
+                sink.reset();
+                let n = if attempt == 0 { 3 } else { self.batches };
+                for _ in 0..n {
+                    sink.push(wide.clone());
+                    let used = self.budget.used();
+                    self.peak.fetch_max(used, Ordering::SeqCst);
+                    assert!(used <= self.cap, "{used} > {}", self.cap);
+                }
+            }
+            Ok(())
+        }
+
+        fn has_workers(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn distributed_root_stage_streams_into_the_collector() {
+        let cap = 200_000;
+        let svc = service_over(
+            vec![wide_table(10, 5_000)],
+            AgentLimits {
+                max_retained_bytes: cap,
+                ..AgentLimits::default()
+            },
+        );
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let budget = Arc::clone(&svc.retained_budget);
+        let svc = svc.with_distributed_executor(Arc::new(StreamingExecutor {
+            budget,
+            cap,
+            batches: 100,
+            peak: Arc::clone(&peak),
+        }));
+        let s = run_to_end(&svc, "SELECT s FROM wide", Some(5000)).await;
+        assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
+        // Only the retried attempt counts: 100 batches of 10 rows.
+        assert_eq!(s.total_rows, Some(1000));
+        assert_eq!(s.truncated_by, Some(TruncatedBy::MaxRetainedBytes));
+        assert!(peak.load(Ordering::SeqCst) > 0);
+        assert!(svc.retained_budget.used() <= cap);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1327,7 +1508,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_is_idempotent_on_terminal_statement() {
+    async fn delete_releases_a_terminal_statement() {
         let (svc, tracker) = service();
         let s = svc
             .submit("alice", req("SELECT 1"), Duration::from_secs(5))
@@ -1339,6 +1520,7 @@ mod tests {
         let c = svc.cancel("alice", &s.id).unwrap();
         assert_eq!(c.state, StatementState::Finished);
         assert_eq!(c.total_rows, Some(1));
+        assert!(c.first_page.is_none(), "a release does not encode rows");
         let err = svc.cancel("alice", &s.id).unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
         let info = tracker.list_queries(None).pop().unwrap();

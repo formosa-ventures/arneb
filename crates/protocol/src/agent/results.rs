@@ -6,9 +6,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{Array, ArrayRef, GenericStringArray, OffsetSizeTrait, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BinaryArray, BinaryViewArray, GenericBinaryArray, GenericStringArray,
+    OffsetSizeTrait, StringArray, StringViewArray, UInt32Array,
+};
 use arrow::compute::take_record_batch;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use serde::Serialize;
 use serde_json::Value;
@@ -113,12 +116,17 @@ impl RetainedBudget {
         Ok(())
     }
 
-    /// Takes `bytes` for `user` even past the limits (a statement's first
-    /// row, whose cells are already cut to `max_cell_bytes`).
-    fn take_anyway(&self, user: &str, bytes: usize) {
-        let mut state = self.state();
-        state.used += bytes;
-        *state.by_user.entry(user.to_string()).or_default() += bytes;
+    /// How many bytes would have to be freed in the `short` budget for
+    /// `user` to take `bytes`.
+    fn missing(&self, user: &str, bytes: usize, short: Shortfall) -> usize {
+        let state = self.state();
+        match short {
+            Shortfall::User => {
+                let mine = state.by_user.get(user).copied().unwrap_or(0);
+                (mine + bytes).saturating_sub(self.user_capacity)
+            }
+            Shortfall::Server => (state.used + bytes).saturating_sub(self.capacity),
+        }
     }
 
     fn give_back(&self, user: &str, bytes: usize) {
@@ -152,9 +160,10 @@ impl Reservation {
         Ok(())
     }
 
-    fn grow_anyway(&mut self, bytes: usize) {
-        self.budget.take_anyway(&self.user, bytes);
-        self.bytes += bytes;
+    /// Gives every byte back (the collector restarts).
+    fn clear(&mut self) {
+        self.budget.give_back(&self.user, self.bytes);
+        self.bytes = 0;
     }
 }
 
@@ -168,8 +177,7 @@ impl Drop for Reservation {
 /// their Arrow buffers, and the clones share one budget reservation.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Retained {
-    /// At most `max_rows` rows and `max_retained_bytes` bytes (the first
-    /// row is always kept).
+    /// At most `max_rows` rows and `max_retained_bytes` bytes.
     pub(crate) batches: Vec<RecordBatch>,
     /// Rows in the result when execution was not capped, kept or not;
     /// `None` when the query produced more than `max_rows` rows, since
@@ -182,6 +190,8 @@ pub(crate) struct Retained {
     pub(crate) produced: u64,
     /// Arrow memory of the kept batches, charged to the budget.
     pub(crate) bytes: usize,
+    /// Why not even the first row was kept, when that happened.
+    pub(crate) hint: Option<String>,
     _reservation: Option<Arc<Reservation>>,
 }
 
@@ -194,6 +204,14 @@ impl Retained {
     /// Whether any produced row was dropped.
     pub(crate) fn truncated(&self) -> bool {
         self.truncated_by.is_some()
+    }
+
+    /// Whether a clone (a page being encoded) still holds the reservation,
+    /// so dropping this one would free nothing yet.
+    pub(crate) fn pinned(&self) -> bool {
+        self._reservation
+            .as_ref()
+            .is_some_and(|r| Arc::strong_count(r) > 1)
     }
 }
 
@@ -220,6 +238,14 @@ fn cell_prefix(s: &str, max_cell_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Raw bytes kept of a longer binary value: a multiple of 3, so their
+/// (padded, standard) base64 is an exact prefix of the whole value's, and
+/// longer than `max_cell_bytes`, so the page cuts it exactly as it would the
+/// whole value, and counts it.
+fn binary_prefix_len(max_cell_bytes: usize) -> usize {
+    3 * (max_cell_bytes / 4 + 1)
+}
+
 fn cut_strings<O: OffsetSizeTrait>(
     array: &GenericStringArray<O>,
     max_cell_bytes: usize,
@@ -234,50 +260,137 @@ fn cut_strings<O: OffsetSizeTrait>(
     Some(Arc::new(cut))
 }
 
-/// `batch` with every string longer than `max_cell_bytes` shortened to
-/// what a page can still show of it ([`cell_prefix`]), so an oversized
-/// value never stays in memory past retention. Other types are kept whole.
-fn cut_long_strings(batch: RecordBatch, max_cell_bytes: usize) -> RecordBatch {
-    let mut changed = false;
-    let columns: Vec<ArrayRef> = batch
+fn cut_binaries<O: OffsetSizeTrait>(
+    array: &GenericBinaryArray<O>,
+    keep: usize,
+) -> Option<ArrayRef> {
+    if !array.iter().flatten().any(|b| b.len() > keep) {
+        return None;
+    }
+    let cut: GenericBinaryArray<O> = array
+        .iter()
+        .map(|v| v.map(|b| &b[..b.len().min(keep)]))
+        .collect();
+    Some(Arc::new(cut))
+}
+
+/// `column` with every value longer than a page can show shortened to what
+/// it can still show, or `None` when nothing needs cutting (or the type is
+/// not cut: nested, dictionary and other values are kept whole). A
+/// fixed-size binary column becomes a variable-size one, which encodes the
+/// same.
+fn cut_column(column: &ArrayRef, max_cell_bytes: usize) -> Option<ArrayRef> {
+    let keep = binary_prefix_len(max_cell_bytes);
+    match column.data_type() {
+        DataType::Utf8 => cut_strings(column.as_string::<i32>(), max_cell_bytes),
+        DataType::LargeUtf8 => cut_strings(column.as_string::<i64>(), max_cell_bytes),
+        DataType::Utf8View => {
+            let a = column.as_string_view();
+            a.iter()
+                .flatten()
+                .any(|s| s.len() > max_cell_bytes)
+                .then(|| {
+                    let cut: StringViewArray = a
+                        .iter()
+                        .map(|v| v.map(|s| cell_prefix(s, max_cell_bytes)))
+                        .collect();
+                    Arc::new(cut) as ArrayRef
+                })
+        }
+        DataType::Binary => cut_binaries(column.as_binary::<i32>(), keep),
+        DataType::LargeBinary => cut_binaries(column.as_binary::<i64>(), keep),
+        DataType::BinaryView => {
+            let a = column.as_binary_view();
+            a.iter().flatten().any(|b| b.len() > keep).then(|| {
+                let cut: BinaryViewArray = a
+                    .iter()
+                    .map(|v| v.map(|b| &b[..b.len().min(keep)]))
+                    .collect();
+                Arc::new(cut) as ArrayRef
+            })
+        }
+        DataType::FixedSizeBinary(width) if *width as usize > keep => {
+            let a = column.as_fixed_size_binary();
+            let cut: BinaryArray = a.iter().map(|v| v.map(|b| &b[..keep])).collect();
+            Some(Arc::new(cut))
+        }
+        _ => None,
+    }
+}
+
+/// `batch` with `columns` in place of its own, the schema following their
+/// types.
+fn with_columns(batch: RecordBatch, columns: Vec<ArrayRef>) -> RecordBatch {
+    let schema = batch.schema();
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .zip(&columns)
+        .map(|(f, c)| f.as_ref().clone().with_data_type(c.data_type().clone()))
+        .collect();
+    let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    RecordBatch::try_new(schema, columns).unwrap_or(batch)
+}
+
+/// `batch` with every string and binary value longer than a page can show
+/// shortened to what it can still show ([`cut_column`]), so an oversized
+/// value never stays in memory past retention.
+fn cut_long_values(batch: RecordBatch, max_cell_bytes: usize) -> RecordBatch {
+    let cut: Vec<Option<ArrayRef>> = batch
+        .columns()
+        .iter()
+        .map(|c| cut_column(c, max_cell_bytes))
+        .collect();
+    if cut.iter().all(Option::is_none) {
+        return batch;
+    }
+    let columns = cut
+        .into_iter()
+        .zip(batch.columns())
+        .map(|(cut, c)| cut.unwrap_or_else(|| Arc::clone(c)))
+        .collect();
+    with_columns(batch, columns)
+}
+
+/// A one-row `row` as small as the page output allows: a cell longer than
+/// `max_cell_bytes` once encoded (a list, map, struct, …) becomes the cut
+/// string the page would show (cutting it again on a page changes
+/// nothing), and a dictionary column is decoded so the row no longer pins
+/// the dictionary. Every other cell is kept as is.
+fn render_first_row(row: RecordBatch, max_cell_bytes: usize) -> RecordBatch {
+    let columns = row
         .columns()
         .iter()
         .map(|column| {
-            let cut = match column.data_type() {
-                DataType::Utf8 => column
-                    .as_any()
-                    .downcast_ref::<GenericStringArray<i32>>()
-                    .and_then(|a| cut_strings(a, max_cell_bytes)),
-                DataType::LargeUtf8 => column
-                    .as_any()
-                    .downcast_ref::<GenericStringArray<i64>>()
-                    .and_then(|a| cut_strings(a, max_cell_bytes)),
-                _ => None,
-            };
-            changed |= cut.is_some();
-            cut.unwrap_or_else(|| Arc::clone(column))
+            let plain = materialize(column);
+            let mut cell = encode_cell(plain.as_ref(), 0);
+            if cut_cell(&mut cell, max_cell_bytes) {
+                let text = cell.as_str().unwrap_or_default();
+                Arc::new(StringArray::from(vec![text])) as ArrayRef
+            } else {
+                plain
+            }
         })
         .collect();
-    if !changed {
-        return batch;
-    }
-    RecordBatch::try_new(batch.schema(), columns).unwrap_or(batch)
+    compact(with_columns(row, columns))
 }
 
-/// Frees retained bytes for a collector by evicting one ended statement per
-/// call: one of the collecting user's own for [`Shortfall::User`], anyone's
-/// for [`Shortfall::Server`]. Returns `false` when there was nothing to
-/// evict.
-pub(crate) type Evict = Box<dyn FnMut(Shortfall) -> bool + Send>;
+/// Frees retained bytes for a collector by evicting ended statements that
+/// together hold at least `needed` bytes in the `short` budget (only the
+/// collecting user's own for [`Shortfall::User`]); evicts nothing and
+/// returns `false` when they cannot.
+pub(crate) type Evict = Box<dyn FnMut(Shortfall, usize) -> bool + Send>;
 
 /// Retains a statement's rows as the query produces them: at most
 /// `max_rows` rows and `max_retained_bytes` bytes (measured with
 /// [`BatchMemorySizer`], so a dictionary shared by several batches counts
-/// once), each kept batch charged to the budget as it arrives. When the
-/// budget is short it evicts ended statements and retries; once a limit
-/// stops it, it keeps counting the rows the query produces but drops their
-/// data, so the memory held never exceeds the limits (beyond the first row,
-/// which is always kept with its long strings cut to `max_cell_bytes`).
+/// once), each kept batch charged to the budget as it arrives. Strings and
+/// binaries are cut to what a page can show as they are kept. When the
+/// budget is short it evicts ended statements (only when that covers the
+/// shortfall) and retries; once a limit stops it, it keeps counting the
+/// rows the query produces but drops their data, so the memory held never
+/// exceeds the limits. A first row that does not fit as is is rendered to
+/// its cut page form and kept if that fits.
 pub(crate) struct Collector {
     max_rows: usize,
     max_bytes: usize,
@@ -290,6 +403,7 @@ pub(crate) struct Collector {
     produced: u64,
     /// The byte limit that stopped retention, once one has.
     stopped_by: Option<TruncatedBy>,
+    hint: Option<String>,
 }
 
 impl Collector {
@@ -316,6 +430,7 @@ impl Collector {
             kept_rows: 0,
             produced: 0,
             stopped_by: None,
+            hint: None,
         }
     }
 
@@ -325,20 +440,35 @@ impl Collector {
         self.reservation.bytes
     }
 
-    /// Charges `size` more bytes, evicting ended statements while a budget
-    /// is short; the limit that refused it otherwise.
+    /// Charges `size` more bytes, evicting ended statements when that frees
+    /// enough of a short budget; the limit that refused it otherwise.
     fn grow(&mut self, size: usize) -> Result<(), TruncatedBy> {
         if size > self.max_bytes.saturating_sub(self.reservation.bytes) {
             return Err(TruncatedBy::MaxRetainedBytes);
         }
         loop {
-            match self.reservation.try_grow(size) {
+            let short = match self.reservation.try_grow(size) {
                 Ok(()) => return Ok(()),
-                Err(short) if (self.evict)(short) => continue,
-                Err(Shortfall::User) => return Err(TruncatedBy::UserBudget),
-                Err(Shortfall::Server) => return Err(TruncatedBy::ServerBudget),
+                Err(short) => short,
+            };
+            let needed = self
+                .reservation
+                .budget
+                .missing(&self.reservation.user, size, short);
+            if !(self.evict)(short, needed) {
+                return Err(match short {
+                    Shortfall::User => TruncatedBy::UserBudget,
+                    Shortfall::Server => TruncatedBy::ServerBudget,
+                });
             }
         }
+    }
+
+    /// Bytes this statement may still take without evicting.
+    fn room(&self) -> usize {
+        self.max_bytes
+            .saturating_sub(self.reservation.bytes)
+            .min(self.reservation.budget.room(&self.reservation.user))
     }
 
     fn keep(&mut self, piece: RecordBatch) {
@@ -379,6 +509,7 @@ impl Collector {
             truncated_by,
             produced: self.produced,
             bytes: self.reservation.bytes,
+            hint: self.hint,
             batches: self.kept,
             _reservation: Some(Arc::new(self.reservation)),
         }
@@ -398,30 +529,47 @@ impl BatchSink for Collector {
         } else {
             batch.slice(0, take)
         };
-        let piece = compact(cut_long_strings(sliced, self.max_cell_bytes));
+        let piece = compact(cut_long_values(sliced, self.max_cell_bytes));
         let size = self.sizer.measure(&piece);
         let reason = match self.grow(size) {
             Ok(()) => return self.keep(piece),
             Err(reason) => reason,
         };
         // Out of room: keep the prefix that still fits, then stop.
-        let room = self
-            .max_bytes
-            .saturating_sub(self.reservation.bytes)
-            .min(self.reservation.budget.room(&self.reservation.user));
-        if let Some((prefix, prefix_size)) = self.prefix_within(&piece, size, room) {
-            if self.reservation.try_grow(prefix_size).is_ok() {
+        if let Some((prefix, prefix_size)) = self.prefix_within(&piece, size, self.room()) {
+            if self.grow(prefix_size).is_ok() {
                 self.keep(prefix);
             }
         }
+        let mut reason = reason;
         if self.kept_rows == 0 {
-            // Always return the first row: a single oversized row still
-            // comes back, its long strings already cut to max_cell_bytes.
-            let first = compact(piece.slice(0, 1));
-            self.reservation.grow_anyway(self.sizer.measure(&first));
-            self.keep(first);
+            // Not even one row fits as is: keep the first row in the form a
+            // page shows it, if that fits.
+            let first = render_first_row(compact(piece.slice(0, 1)), self.max_cell_bytes);
+            let first_size = self.sizer.measure(&first);
+            match self.grow(first_size) {
+                Ok(()) => self.keep(first),
+                Err(why) => {
+                    reason = why;
+                    self.hint = Some(format!(
+                        "the first row alone needs {first_size} bytes even with long values \
+                         cut to max_cell_bytes, more than this statement could retain \
+                         ({why:?}); select fewer columns, or release other results"
+                    ));
+                }
+            }
         }
         self.stopped_by = Some(reason);
+    }
+
+    fn reset(&mut self) {
+        self.reservation.clear();
+        self.sizer = BatchMemorySizer::default();
+        self.kept.clear();
+        self.kept_rows = 0;
+        self.produced = 0;
+        self.stopped_by = None;
+        self.hint = None;
     }
 }
 
@@ -520,7 +668,7 @@ pub(crate) fn retain(
         max_bytes,
         usize::MAX,
         budget,
-        Box::new(|_| false),
+        Box::new(|_, _| false),
     );
     batches.into_iter().for_each(|b| c.push(b));
     c.finish()
@@ -657,7 +805,7 @@ mod tests {
     fn collection_never_holds_more_than_the_byte_cap() {
         let budget = unbounded();
         let cap = 200_000;
-        let mut c = Collector::new("alice", 10_000, cap, 8192, &budget, Box::new(|_| false));
+        let mut c = Collector::new("alice", 10_000, cap, 8192, &budget, Box::new(|_, _| false));
         // 100 batches of 10 rows of 5 KB: about 5 MB produced in all.
         for _ in 0..100 {
             c.push(wide_batch(10, 5_000));
@@ -678,7 +826,14 @@ mod tests {
         let budget = unbounded();
         // One 80 MB value, over the default 64 MiB statement cap.
         let r = {
-            let mut c = Collector::new("alice", 1000, 64 << 20, 8192, &budget, Box::new(|_| false));
+            let mut c = Collector::new(
+                "alice",
+                1000,
+                64 << 20,
+                8192,
+                &budget,
+                Box::new(|_, _| false),
+            );
             c.push(wide_batch(1, 80 << 20));
             c.finish()
         };
@@ -689,12 +844,151 @@ mod tests {
         let p = page(&r, 0, 1 << 20, 8192);
         assert_eq!(p.truncated_cells, 1);
         assert_eq!(p.rows[0][0], Value::from(format!("{}…", "w".repeat(8192))));
-        // Even a statement cap smaller than one cut row keeps that row.
-        let mut c = Collector::new("alice", 1000, 10, 8192, &budget, Box::new(|_| false));
+        // A statement cap smaller than even the cut row keeps no row, never
+        // more than the cap, and says why.
+        let mut c = Collector::new("alice", 1000, 10, 8192, &budget, Box::new(|_, _| false));
         c.push(wide_batch(3, 100_000));
         let r = c.finish();
-        assert_eq!(r.kept_rows(), 1);
+        assert_eq!(r.kept_rows(), 0);
+        assert_eq!(r.bytes, 0);
         assert_eq!(r.truncated_by, Some(TruncatedBy::MaxRetainedBytes));
+        assert!(r.hint.unwrap().contains("first row alone"));
+    }
+
+    fn one_column(array: ArrayRef) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            array.data_type().clone(),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
+
+    /// The first page of `batch` when kept whole, and when collected under
+    /// a 1 MiB statement cap.
+    fn whole_and_collected(batch: RecordBatch) -> (ResultPage, Retained) {
+        let whole = page(&keep(vec![batch.clone()], 10), 0, 1 << 20, 8192);
+        let mut c = Collector::new(
+            "alice",
+            10,
+            1 << 20,
+            8192,
+            &unbounded(),
+            Box::new(|_, _| false),
+        );
+        c.push(batch);
+        (whole, c.finish())
+    }
+
+    #[test]
+    fn an_80_mb_binary_is_cut_at_keep_time_with_the_same_page() {
+        let value = vec![7u8; 80 << 20];
+        for array in [
+            Arc::new(BinaryArray::from(vec![value.as_slice()])) as ArrayRef,
+            Arc::new(arrow::array::LargeBinaryArray::from(vec![value.as_slice()])),
+            Arc::new(BinaryViewArray::from(vec![value.as_slice()])),
+        ] {
+            let ty = array.data_type().clone();
+            let (whole, r) = whole_and_collected(one_column(array));
+            assert_eq!((r.kept_rows(), r.truncated_by), (1, None), "{ty}");
+            assert!(r.bytes < 64 << 10, "{ty}: {}", r.bytes);
+            let p = page(&r, 0, 1 << 20, 8192);
+            assert_eq!(p, whole, "{ty}: the page is unchanged");
+            assert_eq!(p.truncated_cells, 1);
+        }
+        // A short binary is kept whole and not cut.
+        let (whole, r) = whole_and_collected(one_column(Arc::new(BinaryArray::from(vec![
+            b"abc".as_ref()
+        ]))));
+        assert_eq!(page(&r, 0, 1 << 20, 8192), whole);
+        assert_eq!(whole.truncated_cells, 0);
+    }
+
+    #[test]
+    fn a_large_list_first_row_is_kept_as_its_cut_page_form() {
+        use arrow::array::{Int64Builder, ListBuilder};
+        // One list of 2 million bigints (16 MB) under a 1 MiB cap.
+        let mut b = ListBuilder::new(Int64Builder::new());
+        b.values().append_slice(&vec![123_456_789; 2_000_000]);
+        b.append(true);
+        let list: ArrayRef = Arc::new(b.finish());
+        let id: ArrayRef = Arc::new(Int64Array::from(vec![42]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("l", list.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![id, list]).unwrap();
+        let (whole, r) = whole_and_collected(batch);
+        assert_eq!((r.kept_rows(), r.truncated_by), (1, None));
+        assert!(r.bytes < 64 << 10, "{}", r.bytes);
+        let p = page(&r, 0, 1 << 20, 8192);
+        assert_eq!(p, whole);
+        assert_eq!(p.rows[0][0], Value::from(42), "uncut cells keep their type");
+        assert_eq!(p.truncated_cells, 1);
+    }
+
+    #[test]
+    fn the_first_row_never_bypasses_the_user_share() {
+        let one = keep(vec![wide_batch(10, 1000)], 1000).bytes;
+        let budget = RetainedBudget::new(usize::MAX, one);
+        let full = retain(vec![wide_batch(10, 1000)], 1000, usize::MAX, &budget);
+        assert_eq!(full.truncated_by, None);
+        let mut c = Collector::new(
+            "alice",
+            1000,
+            usize::MAX,
+            8192,
+            &budget,
+            Box::new(|_, _| false),
+        );
+        c.push(wide_batch(1, 80 << 20));
+        let r = c.finish();
+        assert_eq!((r.kept_rows(), r.bytes), (0, 0));
+        assert_eq!(r.truncated_by, Some(TruncatedBy::UserBudget));
+        assert!(r.hint.is_some());
+        assert_eq!(budget.used_by("alice"), full.bytes);
+    }
+
+    #[test]
+    fn eviction_is_asked_for_the_shortfall_only() {
+        let one = keep(vec![wide_batch(10, 1000)], 1000).bytes;
+        let budget = RetainedBudget::new(usize::MAX, one + one / 2);
+        let _first = retain(vec![wide_batch(10, 1000)], 1000, usize::MAX, &budget);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let evict: Evict = {
+            let asked = Arc::clone(&asked);
+            Box::new(move |short, needed| {
+                asked.lock().unwrap().push((short, needed));
+                false
+            })
+        };
+        let mut c = Collector::new("alice", 1000, usize::MAX, 8192, &budget, evict);
+        c.push(wide_batch(10, 1000));
+        let asked = asked.lock().unwrap();
+        // The whole batch first: what is missing beyond the user's room.
+        assert_eq!(asked[0], (Shortfall::User, one - one / 2));
+    }
+
+    #[test]
+    fn reset_starts_a_retried_attempt_clean() {
+        let budget = unbounded();
+        let mut c = Collector::new(
+            "alice",
+            5,
+            usize::MAX,
+            8192,
+            &budget,
+            Box::new(|_, _| false),
+        );
+        c.push(batch(0, 10));
+        assert!(budget.used() > 0);
+        c.reset();
+        assert_eq!(budget.used(), 0);
+        c.push(batch(100, 3));
+        let r = c.finish();
+        assert_eq!((r.produced, r.kept_rows(), r.truncated_by), (3, 3, None));
+        assert_eq!(page(&r, 0, 1 << 20, 8192).rows[0][0], Value::from(100));
+        assert_eq!(budget.used(), r.bytes);
     }
 
     #[test]
@@ -709,7 +1003,7 @@ mod tests {
             usize::MAX,
             11,
             &unbounded(),
-            Box::new(|_| false),
+            Box::new(|_, _| false),
         );
         c.push(batch);
         assert_eq!(page(&c.finish(), 0, 1 << 20, 11), whole);
@@ -752,7 +1046,7 @@ mod tests {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let evict: Evict = {
             let (held, asked) = (Arc::clone(&held), Arc::clone(&asked));
-            Box::new(move |short| {
+            Box::new(move |short, _| {
                 asked.lock().unwrap().push(short);
                 held.lock().unwrap().take().is_some()
             })

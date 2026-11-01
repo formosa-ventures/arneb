@@ -228,7 +228,7 @@ The reply is a status:
 {"id":"…","state":"finished","queue_position":null,"elapsed_ms":41,
  "update_type":null,
  "columns":[{"name":"l_orderkey","type":"bigint"},{"name":"l_quantity","type":"bigint"}],
- "total_rows":2,"truncated":false,"truncated_by":null,"max_rows":100,
+ "total_rows":2,"truncated":false,"truncated_by":null,"truncated_hint":null,"max_rows":100,
  "first_page":{"rows":[[1,17],[2,36]],"…":"…"},"error":null}
 ```
 
@@ -243,8 +243,9 @@ where `cursor` is the row offset (default 0).
 `DELETE /statements/{id}` cancels a statement that is still queued or
 running; it stays, so a later poll shows `cancelled` and why. On a statement
 that has ended (finished, failed or cancelled) it releases it: the reply is
-its final status, its retained rows are freed at once (they no longer count
-against the server's budget), and the id answers `not_found` from then on.
+its final status (with `first_page: null`), the id answers `not_found` from
+then on, and its retained rows stop counting against the budgets, at once or,
+if a page fetch of it is in flight, once that fetch finishes.
 So a client that is done with a result should delete it rather than wait for
 the idle timeout.
 
@@ -295,18 +296,31 @@ input; only the rows they emit are capped.
 Retained rows are also bounded by memory, while the query runs and after:
 a statement keeps at most `max_retained_bytes` of Arrow data, one user's
 statements together at most `max_user_retained_bytes`, and all statements
-together at most `max_total_retained_bytes`. Rows are kept as the query
-produces them; strings are cut to what a page can show (`max_cell_bytes`)
-as they are kept, and a dictionary shared by several batches counts once.
-When the user's share or the server budget is short, the server first
-evicts statements that have ended and still hold rows: fully read ones
-first (the last page was fetched, or the first page held everything), then
-the least recently used; only the user's own for the user's share, anyone's
-for the server budget. An evicted statement answers `not_found`. When
-nothing is left to evict, the rows past the limit are dropped (still
-counted) and the statement finishes with `truncated: true`. The first row is
-always kept, so a single huge value still comes back, cut. `truncated_by`
-says which limit cut the result, so an agent can react:
+together at most `max_total_retained_bytes`; running statements count as
+they collect. Rows are kept as the query produces them, on a standalone
+server and on a coordinator with workers alike (the final stage streams
+into the statement). Strings and binary values are cut to what a page can
+show (`max_cell_bytes`) as they are kept, and a dictionary shared by
+several batches counts once.
+
+When the user's share or the server budget is short, the server evicts
+statements that have ended and still hold rows, but only when the
+evictable ones free enough to cover the shortfall (one a page fetch is
+reading is skipped). Victims are taken in this order: for the user's share,
+the user's own; for the server budget, the user's own first, then other
+users'. Within each, fully read ones go first (the last page was fetched,
+or the first page held everything), then the least recently used. An
+evicted statement answers `not_found` with a message saying it was evicted
+and a hint to resubmit it. When eviction cannot cover the shortfall, the
+rows past the limit are dropped (still counted) and the statement finishes
+with `truncated: true`.
+
+If not even the first row fits as is, it is kept in the form a page shows
+it: each oversized cell (a long list, map or struct, say) becomes its cut
+string. That form still has to fit the limits. When it does not, the
+statement keeps no rows, and `truncated_hint` says the first row alone was
+too large. `truncated_by` says which limit cut the result, so an agent can
+react:
 
 | `truncated_by` | Cause | What to do |
 |---|---|---|
@@ -340,7 +354,7 @@ query parameter is also `invalid_argument`.
 A user may hold 32 statements and the server 1024. At a cap, a new
 submission evicts the least-recently-accessed statement that has ended
 (finished, failed or cancelled; the user's own for the per-user cap), which
-from then on answers `not_found`. So an unfetched finished result can be
+from then on answers `not_found` with a message saying it was evicted. So an unfetched finished result can be
 lost once the user submits 32 newer statements. When every held statement
 is still queued or running, the submission is refused with `overloaded`.
 After `idle_timeout_secs` with no request for a statement, a finished one

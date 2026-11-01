@@ -5,8 +5,11 @@
 //! [`LiveCatalogs`] builds a catalog's provider and connector from its spec,
 //! installs both into the shared [`CatalogManager`] and [`ConnectorRegistry`],
 //! and remembers the installed specs plus the catalog generation they belong
-//! to. A query keeps the provider `Arc` it was planned with, so a change
-//! never disturbs a running statement.
+//! to. A statement pins the providers and connectors together when it
+//! starts ([`ConnectorRegistry::pinned`]; every install and remove here is
+//! one [`ConnectorRegistry::swap`]), so a change never disturbs a running
+//! statement on the coordinator. A worker resolves each task's connectors
+//! when the task starts.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -434,8 +437,11 @@ impl LiveCatalogs {
     /// the new provider always finds it.
     pub fn install(&self, spec: CatalogConfig, built: BuiltCatalog) {
         let name = spec.name.clone();
-        self.connectors.register(name.clone(), built.connector);
-        self.manager.register_catalog(name.clone(), built.provider);
+        // One swap: a statement pins both halves or neither.
+        self.connectors.swap(|| {
+            self.connectors.register(name.clone(), built.connector);
+            self.manager.register_catalog(name.clone(), built.provider);
+        });
         self.failed
             .write()
             .unwrap_or_else(|p| p.into_inner())
@@ -449,8 +455,10 @@ impl LiveCatalogs {
         if self.write_specs().remove(name).is_none() {
             return false;
         }
-        self.manager.deregister_catalog(name);
-        self.connectors.deregister(name);
+        self.connectors.swap(|| {
+            self.manager.deregister_catalog(name);
+            self.connectors.deregister(name);
+        });
         true
     }
 
@@ -782,7 +790,8 @@ async fn build_postgresql(spec: &CatalogConfig) -> Result<BuiltCatalog, CatalogB
     })
 }
 
-fn same_spec(a: &CatalogConfig, b: &CatalogConfig) -> bool {
+/// Whether `a` and `b` serialize the same (raw secrets included).
+pub(crate) fn same_spec(a: &CatalogConfig, b: &CatalogConfig) -> bool {
     match (serde_json::to_value(a), serde_json::to_value(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,

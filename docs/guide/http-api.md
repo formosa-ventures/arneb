@@ -733,9 +733,12 @@ catalog as soon as the change returns.
   it a runtime catalog; the preview warns that the config file no longer
   manages it. Dropping the default catalog is allowed, with a warning that
   unqualified table names then fail.
-- A query keeps the catalog it was planned with. A task that starts after a
-  change, for a query that was already running, uses the worker's current
-  catalogs.
+- A query keeps the catalog it was planned with on the coordinator: each
+  statement pins the catalogs and connectors together when it starts, and a
+  change swaps a catalog's provider and connector as one step. On workers a
+  task resolves its connectors when it starts (every scan of the task uses
+  the same one), so a task that starts after a change, for a query that
+  was already running, uses the worker's current catalogs.
 
 ```bash
 curl -s -H "$H" -X POST "$B/catalog-configs?dry_run=true" \

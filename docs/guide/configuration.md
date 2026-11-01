@@ -778,7 +778,9 @@ the response returns. Read it with
   keeps increasing across restarts. Compaction runs at startup when there is
   something to drop, and whenever the file holds `max(max_entries / 10, 100)`
   more lines than `max_entries`. Reads hide entries past `retention_days` at
-  once, the kept newest entry included.
+  once, the kept newest entry included. The `pending` intent of an action in
+  flight is never dropped, by age or by the cap, until its completion is
+  written.
 - **Torn lines.** A line that does not parse (for example, cut short by a
   crash) is skipped with a WARN on `arneb::audit` naming its line number.
   Startup never fails on it, and the startup compaction drops it.

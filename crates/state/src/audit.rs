@@ -164,6 +164,8 @@ pub struct AuditLog {
     fail_appends: AtomicBool,
     #[cfg(any(test, feature = "test-hooks"))]
     fail_completions: AtomicBool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_next_append: AtomicBool,
     /// `(inside, release)`: the next compaction sends on `inside` once it
     /// holds its snapshot, then waits on `release` before writing.
     #[cfg(test)]
@@ -225,6 +227,8 @@ impl AuditLog {
             fail_appends: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             fail_completions: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_next_append: AtomicBool::new(false),
             #[cfg(test)]
             compact_gate: Mutex::new(None),
         })
@@ -262,6 +266,7 @@ impl AuditLog {
         #[cfg(any(test, feature = "test-hooks"))]
         if self.fail_appends.load(Ordering::SeqCst)
             || (completion && self.fail_completions.load(Ordering::SeqCst))
+            || self.fail_next_append.swap(false, Ordering::SeqCst)
         {
             return Some(self.io_error(std::io::Error::other("injected audit append failure")));
         }
@@ -336,9 +341,7 @@ impl AuditLog {
                 }
             }
             entries.push_back(Arc::new(entry.clone()));
-            while entries.len() > self.settings.max_entries {
-                entries.pop_front();
-            }
+            trim_to_cap(&mut entries, self.settings.max_entries);
         }
         if self.path.is_some() {
             w.file_lines += 1;
@@ -506,6 +509,13 @@ impl AuditLog {
         self.fail_completions.store(fail, Ordering::SeqCst);
     }
 
+    /// Test hook: make only the next write fail (the log is then
+    /// unwritable until [`Self::ensure_writable`], which succeeds).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_append(&self) {
+        self.fail_next_append.store(true, Ordering::SeqCst);
+    }
+
     /// Test hook: stop the next compaction once it holds its snapshot;
     /// returns `(inside, release)`.
     #[cfg(test)]
@@ -588,7 +598,27 @@ fn retain_young(entries: &mut Entries, settings: AuditSettings, now: u64) {
     let Some(last) = entries.back().map(|e| e.seq) else {
         return;
     };
-    entries.retain(|e| e.time_ms >= cutoff || e.seq == last);
+    entries.retain(|e| e.time_ms >= cutoff || e.seq == last || is_open_intent(e));
+}
+
+/// A `pending` intent whose completion has not been written: an action in
+/// flight (or one whose completion failed). Never evicted by the cap or the
+/// retention, so a crash before its completion still leaves it on disk.
+fn is_open_intent(e: &AuditEntry) -> bool {
+    e.record.outcome == AuditOutcome::Pending && e.intent_seq.is_none()
+}
+
+/// Drops the oldest entries over `max_entries`, skipping open intents (they
+/// count toward the cap, but only finished entries are dropped for it).
+fn trim_to_cap(entries: &mut Entries, max_entries: usize) {
+    while entries.len() > max_entries {
+        match entries.iter().position(|e| !is_open_intent(e)) {
+            Some(at) => {
+                entries.remove(at);
+            }
+            None => return,
+        }
+    }
 }
 
 /// Entries older than this are past retention (`0` = no age limit).
@@ -1228,6 +1258,38 @@ mod tests {
         assert!(log.begin(record("root", "admission.set")).is_err());
         log.ensure_writable().unwrap();
         assert!(log.begin(record("root", "admission.set")).is_ok());
+    }
+
+    /// An intent in flight survives the cap and compaction, however many
+    /// entries are appended meanwhile.
+    #[test]
+    fn an_open_intent_is_never_evicted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let log = AuditLog::open(Some(&p), settings(100, 0)).unwrap();
+        let intent = log.begin(record("root", "worker.cordon")).unwrap();
+        // Enough to compact twice (at 200 lines, then again).
+        for _ in 0..400 {
+            log.append(record("alice", "a")).unwrap();
+        }
+        assert_eq!(log.len(), 100);
+        assert_eq!(
+            all(&log).last(),
+            Some(&intent.seq),
+            "the oldest kept is the intent"
+        );
+        assert!(lines(&p) <= 201);
+        assert!(file_entries(&p).iter().any(|e| e.seq == intent.seq));
+        // A crash now: the next start still reports it.
+        drop(log);
+        let (log, logged) = capture(|| AuditLog::open(Some(&p), settings(100, 0)).unwrap());
+        assert!(logged.contains("never completed"), "{logged}");
+        let page = log.query(&AuditQuery {
+            limit: 1,
+            ..AuditQuery::default()
+        });
+        assert_eq!(page.entries[0].intent_seq, Some(intent.seq));
+        assert_eq!(page.entries[0].record.outcome, AuditOutcome::Interrupted);
     }
 
     /// Reads never wait for a compaction (or an fsync): they take only the

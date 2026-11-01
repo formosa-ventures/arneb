@@ -1007,7 +1007,8 @@ async fn run() -> Result<()> {
             tracing::warn!(
                 target: "arneb::config",
                 "[admission] {knob} / ARNEB_{} = {from_config} is overridden by the runtime \
-                 value {from_state} in the state store",
+                 value {from_state} in the state store (DELETE /api/v2/admission returns to \
+                 the config)",
                 knob.to_ascii_uppercase()
             );
         }

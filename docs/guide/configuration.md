@@ -265,13 +265,15 @@ The new limits are kept in the state store (`[state] path`) and win over
 config value differs from the stored one logs a WARN on `arneb::config`:
 
 ```text
-[admission] max_running_queries / ARNEB_MAX_RUNNING_QUERIES = 8 is overridden by the runtime value 4 in the state store
+[admission] max_running_queries / ARNEB_MAX_RUNNING_QUERIES = 8 is overridden by the runtime value 4 in the state store (DELETE /api/v2/admission returns to the config)
 ```
 
 A stored value pins the limits across restarts and config edits: changing
 `[admission]` or the `ARNEB_*` variables has no effect on them until the
-stored value is gone. To go back to the config, stop the server and remove
-`settings.admission` from the state file. `statement_timeout` and
+stored value is gone. To go back to the config, call
+[`DELETE /api/v2/admission`](/guide/http-api#admission-limits) (MCP
+`reset_admission_limits`): it clears the stored limits and applies the
+config values the server started with, at once. `statement_timeout` and
 `query_max_memory_per_node` change only at startup.
 
 ## Query History

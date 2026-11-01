@@ -768,6 +768,10 @@ async fn run() -> Result<()> {
         .auth
         .to_auth_method()
         .context("invalid [auth] configuration")?;
+    if matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_)) {
+        // Fail startup, not the first unknown-user login, if the RNG is broken.
+        arneb_protocol::init_decoy_secret().context("cannot create the decoy secret for [auth]")?;
+    }
     // Password auth on a coordinator/standalone: users live in the state
     // store; config-seeded users follow the config file on every start
     // (a changed hash or a removed user revokes tokens). The same store

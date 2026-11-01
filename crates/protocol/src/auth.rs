@@ -353,6 +353,18 @@ fn decoy_secret() -> &'static [u8; KEY_LEN] {
     })
 }
 
+/// Creates the process-wide decoy secret now. Call once at startup when
+/// password auth is on so a failing system RNG fails startup with
+/// [`AuthConfigError::Random`] instead of panicking on the first login
+/// attempt for an unknown user. Idempotent.
+pub fn init_decoy_secret() -> Result<(), AuthConfigError> {
+    // Probe the RNG first: `decoy_secret` would panic on failure.
+    let mut probe = [0u8; KEY_LEN];
+    aws_lc_rs::rand::fill(&mut probe).map_err(|_| AuthConfigError::Random)?;
+    decoy_secret();
+    Ok(())
+}
+
 /// Deterministic fake verifier for a user that does not exist, derived from
 /// the process-wide decoy secret. Verifying against it costs the same PBKDF2
 /// as a real user and never succeeds, so timing and salts do not reveal

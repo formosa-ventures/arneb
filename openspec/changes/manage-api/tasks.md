@@ -41,3 +41,4 @@
 - [x] 9.5 Audit log named after the state file (`<stem>.audit.jsonl`)
 - [x] 9.6 A kill before canceller registration: the statement cannot report rows afterwards
 - [x] 9.7 `run_manage` takes the change lock itself (`ManageAction::change_mutex`); shared `count` / `persist_failed`
+- [x] 9.8 Lock-free admission while no cap is set

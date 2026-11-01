@@ -58,7 +58,7 @@ fn view(stored: Option<StoredRules>) -> RulesView {
 }
 
 fn hex_sha256(text: &str) -> String {
-    arneb_state::sha256(text.as_bytes())
+    arneb_protocol::sha256(text.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
@@ -627,7 +627,10 @@ mod tests {
         call.abort();
         assert!(call.await.unwrap_err().is_cancelled());
         assert!(state.config_changes.try_lock().is_err());
-        assert!(audit_entries(&state).is_empty());
+        // Only the intent is in the log until the completion is appended.
+        let entries = audit_entries(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome, arneb_state::AuditOutcome::Pending);
         release.send(()).unwrap();
         let _next = state.config_changes.lock().await;
         assert_eq!(audit_entries(&state).len(), 1);

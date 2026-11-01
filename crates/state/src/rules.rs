@@ -73,7 +73,7 @@ pub fn rules_fingerprint(config_json: Option<&str>) -> String {
         Some(text) => {
             let mut bytes = b"file:".to_vec();
             bytes.extend_from_slice(normalized(text).as_bytes());
-            crate::tokens::sha256(&bytes)
+            arneb_protocol::sha256(&bytes)
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect()

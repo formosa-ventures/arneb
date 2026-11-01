@@ -452,7 +452,7 @@ forbidden POST "$API/users/$NEWUSER/tokens" '{}'
 forbidden PATCH "$API/settings" '{"slow_query_threshold_ms": 1}'
 mcp_post ADMIN '{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}'
 expect_code 200 "tools/list"
-check '.result.tools | length == 43' "tools/list does not have exactly 43 tools"
+check '.result.tools | length == 44' "tools/list does not have exactly 44 tools"
 mcp_tool USER2 create_user "$(jq -nc --arg n smoke_denied '{name:$n, password:"not-a-real-password"}')"
 check '.isError == true and .structuredContent.error.code == "forbidden"' "MCP create_user as $USER2 is not forbidden"
 mcp_tool USER2 set_access_rules '{"rules":{}}'

@@ -52,7 +52,7 @@ use arneb_scheduler::{QueryState as TrackerState, QueryTracker};
 use crate::auth::{AuthConfigError, CredentialSource};
 use crate::handler::DistributedExecutor;
 use auth::AuthUser;
-pub use auth::{BasicAuthenticator, BasicVerdict};
+pub use auth::{BasicAuthenticator, BasicVerdict, SlotError};
 pub(crate) use engine::{Engine, QueryOutput};
 pub(crate) use error::TrinoError;
 pub(crate) use metadata::{
@@ -117,7 +117,6 @@ pub struct TrinoServer {
     query_tracker: Arc<QueryTracker>,
     tls: Option<TlsAcceptor>,
     auth: Option<BasicAuthenticator>,
-    verifications: Arc<AtomicU64>,
     query_memory_limit: Option<usize>,
     admission: Option<arneb_scheduler::AdmissionController>,
     statement_timeout: Option<Duration>,
@@ -141,7 +140,6 @@ impl TrinoServer {
             query_tracker: Arc::new(QueryTracker::new()),
             tls: None,
             auth: None,
-            verifications: Arc::new(AtomicU64::new(0)),
             query_memory_limit: None,
             admission: None,
             statement_timeout: None,
@@ -152,22 +150,17 @@ impl TrinoServer {
     /// Require HTTP Basic auth against these users (`[auth] type =
     /// "password"`); default: none, every `X-Trino-User` is trusted.
     pub fn with_password_auth(
-        mut self,
+        self,
         creds: Option<Arc<dyn CredentialSource>>,
     ) -> Result<Self, AuthConfigError> {
-        self.auth = creds
-            .map(|c| BasicAuthenticator::with_counter(c, Arc::clone(&self.verifications)))
-            .transpose()?;
-        Ok(self)
+        let auth = creds.map(BasicAuthenticator::new).transpose()?;
+        Ok(self.with_authenticator(auth))
     }
 
     /// Require HTTP Basic auth through `auth`, an authenticator the caller
     /// shares with other listeners (one PBKDF2 limiter, queue and cache for
     /// all of them). `None`: no auth, every `X-Trino-User` is trusted.
     pub fn with_authenticator(mut self, auth: Option<BasicAuthenticator>) -> Self {
-        if let Some(a) = &auth {
-            self.verifications = Arc::clone(&a.verifications);
-        }
         self.auth = auth;
         self
     }
@@ -175,7 +168,10 @@ impl TrinoServer {
     /// Count of full password verifications (cache misses); test hook.
     #[doc(hidden)]
     pub fn password_verifications(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.verifications)
+        self.auth
+            .as_ref()
+            .map(|a| Arc::clone(&a.verifications))
+            .unwrap_or_default()
     }
 
     /// Serve HTTPS only with this acceptor (default: plain HTTP).
@@ -778,6 +774,10 @@ pub(crate) fn needs_admission(session: &ClientSession, sql: &str) -> bool {
     crate::handler::needs_admission(&target)
 }
 
+/// Records the statement's outcome, unless it was cancelled meanwhile. A
+/// query the tracker already marked cancelled (a kill that landed before
+/// its canceller was registered) fails with `USER_CANCELED` instead of
+/// returning its rows.
 fn complete(state: &AppState, query: &Query, result: Result<QueryOutput, TrinoError>) {
     {
         let mut inner = query.inner.lock().unwrap();
@@ -785,26 +785,41 @@ fn complete(state: &AppState, query: &Query, result: Result<QueryOutput, TrinoEr
             return;
         }
         inner.ended = Some(Instant::now());
-        inner.phase = match result {
-            Ok(output) => {
-                let rows = output.batches.iter().map(|b| b.num_rows() as u64).sum();
-                let _ = state.tracker.finish_query(&query.tracker_id, rows);
-                Phase::Finished(Results {
+        inner.phase = ended_phase(&state.tracker, &query.tracker_id, result);
+    }
+    let _ = query.done.send(true);
+}
+
+/// Records `result` in the tracker and returns the query's terminal phase:
+/// `USER_CANCELED` when the tracker already marked it cancelled.
+fn ended_phase(
+    tracker: &QueryTracker,
+    id: &QueryId,
+    result: Result<QueryOutput, TrinoError>,
+) -> Phase {
+    let killed = || {
+        tracker
+            .cancelled_by(id)
+            .map(|by| TrinoError::killed_by(&by))
+    };
+    match result {
+        Ok(output) => {
+            let rows = output.batches.iter().map(|b| b.num_rows() as u64).sum();
+            match tracker.finish_query(id, rows).err().and_then(|_| killed()) {
+                Some(err) => Phase::Failed(err),
+                None => Phase::Finished(Results {
                     output,
                     batch: 0,
                     row: 0,
                     rows_returned: 0,
-                })
+                }),
             }
-            Err(err) => {
-                let _ = state
-                    .tracker
-                    .fail_query(&query.tracker_id, err.message.clone());
-                Phase::Failed(err)
-            }
-        };
+        }
+        Err(err) => {
+            let failed = tracker.fail_query(id, err.message.clone());
+            Phase::Failed(failed.err().and_then(|_| killed()).unwrap_or(err))
+        }
     }
-    let _ = query.done.send(true);
 }
 
 /// Under password auth, a query is only visible to the user who submitted it.
@@ -1196,5 +1211,66 @@ async fn reaper(state: AppState) {
                 state.queries.lock().unwrap().remove(&query.id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arneb_scheduler::KillOutcome;
+
+    fn rows() -> QueryOutput {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let column: arrow::array::ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![1, 2]));
+        QueryOutput {
+            columns: None,
+            batches: vec![arrow::record_batch::RecordBatch::try_new(schema, vec![column]).unwrap()],
+            update_type: None,
+            headers: Vec::new(),
+        }
+    }
+
+    /// A kill that lands before the canceller is registered, then the
+    /// statement finishes: it fails as killed and returns no rows.
+    #[test]
+    fn a_query_killed_before_registration_cannot_finish() {
+        let tracker = QueryTracker::new();
+        let id = tracker.create_query_from("SELECT n".into(), "trino", Some("bob".into()));
+        tracker.advance_to(&id, TrackerState::Running).unwrap();
+        assert!(matches!(
+            tracker.kill_query(&id, "root").unwrap(),
+            KillOutcome::Killed { .. }
+        ));
+        match ended_phase(&tracker, &id, Ok(rows())) {
+            Phase::Failed(err) => {
+                assert_eq!(err.name, "USER_CANCELED");
+                assert_eq!(err.message, "Query was killed by root");
+            }
+            Phase::Finished(_) => panic!("a killed query returned its rows"),
+            Phase::Running => unreachable!(),
+        }
+        let info = tracker.get_query(&id).unwrap();
+        assert_eq!(info.state, TrackerState::Cancelled);
+        assert_eq!(info.rows, None);
+        // A failure after the kill is reported as the kill too.
+        let id2 = tracker.create_query_from("SELECT n".into(), "trino", None);
+        tracker.kill_query(&id2, "root").unwrap();
+        let phase = ended_phase(&tracker, &id2, Err(TrinoError::internal("boom")));
+        assert!(matches!(phase, Phase::Failed(e) if e.name == "USER_CANCELED"));
+    }
+
+    #[test]
+    fn an_unkilled_query_finishes_with_its_rows() {
+        let tracker = QueryTracker::new();
+        let id = tracker.create_query_from("SELECT n".into(), "trino", None);
+        assert!(matches!(
+            ended_phase(&tracker, &id, Ok(rows())),
+            Phase::Finished(_)
+        ));
+        let info = tracker.get_query(&id).unwrap();
+        assert_eq!(info.state, TrackerState::Finished);
+        assert_eq!(info.rows, Some(2));
     }
 }

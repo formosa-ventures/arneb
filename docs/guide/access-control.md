@@ -159,7 +159,9 @@ is refused at startup instead of being enforced partially:
 
 Two layers sit above the query rules:
 
-- **Observe** covers the cluster, worker, admission and audit views.
+- **Observe** covers the cluster, worker, admission and audit views. The
+  audit view shows the whole log only to a manager; any other observer sees
+  only the entries of their own actions.
   - Under `[auth] type = "none"` it is open.
   - Under password auth it is open unless the rules file has a
     `system_information` section. Then the user needs a rule that allows
@@ -193,8 +195,12 @@ A refusal is `403 forbidden` and its `hint` names what would grant it:
   for queryOwner <owner>, or the manage privilege`.
 
 A query's owner may always cancel it. Cancelling another user's query needs
-password auth, then a `queries` rule that allows `kill` for that owner (or no
-`queries` section), or the manage layer.
+password auth, then an explicit `queries` rule that allows `kill` for that
+owner, or the manage layer. Without a rules file, or without a `queries`
+section, only the owner or a manager may cancel a query. This differs from
+Trino's file-based access control, where a missing section allows
+everything: add `{"allow": ["execute", "view", "kill"]}` to `queries` to let
+every user cancel every query.
 
 > **Under `[auth] type = "none"`, do not expose the Web port.** A cancel
 > really stops the query, any peer that reaches the Web port can stop any
@@ -251,8 +257,8 @@ and [Upgrading to v0.2.0 (runtime config)](/guide/configuration#upgrading-to-v02
 - The Web API (Web UI port) applies the `queries` rules to the query list,
   query detail and cancel endpoints, under both `/api/v1` and `/api/v2`. A
   query the caller may not `view` is hidden (`404`). Cancelling follows the
-  kill rule: the owner always may; otherwise a `queries` rule that allows
-  `kill` for the owner (or no `queries` section), or the manage layer; a
+  kill rule: the owner always may; otherwise an explicit `queries` rule that
+  allows `kill` for the owner, or the manage layer; a
   query the caller may neither view nor kill is `404`, any other refusal
   `403`. Under `[auth] type = "none"` the Web API has no authenticated user:
   `/api/v1` keeps its open list, detail and cancel (any caller may cancel

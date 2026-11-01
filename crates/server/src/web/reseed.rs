@@ -11,8 +11,8 @@
 //!   A catalog that fails to build is still stored (it came from the config)
 //!   and reported in the `warning`, like startup's skip-with-WARN.
 //! - Under `WebState::config_changes` it computes the plan, runs the lockout
-//!   guard (D3) against the config's rules, appends an intent audit entry
-//!   (`state.reseed`, `effect: pending`), then persists users, rules,
+//!   guard (D3) against the config's rules, then (after `run_manage` has
+//!   synced the `pending` intent entry, manage-api D6) persists users, rules,
 //!   settings and catalogs in one state write ([`StateStore::reseed`]), so
 //!   a failure or crash never leaves the state half re-seeded. Only then
 //!   does it swap each object in memory: users (tombstones cleared, the
@@ -488,9 +488,9 @@ impl ManageAction for Reseed {
         self.admission_lock.take()
     }
 
-    /// Appends the intent entry, persists users, rules, settings and
-    /// catalogs in one write, swaps each in memory, then pushes the
-    /// catalogs to the workers.
+    /// Persists users, rules, settings and catalogs in one write (the
+    /// intent entry is already synced by `run_manage`), swaps each in
+    /// memory, then pushes the catalogs to the workers.
     fn apply(self, state: &WebState) -> Result<Applied<ReseedReport>, ApiError> {
         let plan = self.plan()?;
         let mut preview = Self::preview_of(&plan);
@@ -515,15 +515,6 @@ impl ManageAction for Reseed {
                 },
             });
         }
-        // Intent first: a crash after the write below still leaves a record
-        // of the re-seed (and of the tokens it revoked).
-        super::audit::append_intent(
-            state,
-            &self.who,
-            "state.reseed",
-            "state".to_owned(),
-            self.parameters(),
-        )?;
         // One write for users, rules, settings and catalogs; nothing is
         // swapped in memory unless it succeeded.
         let rules_text = self.seed.rules.as_ref().map(|(text, _)| text.as_str());
@@ -889,7 +880,7 @@ mod tests {
 
     /// The re-seed is one state write after an intent entry: a failed
     /// write leaves the stored and live state exactly as they were, and the
-    /// audit log holds the intent and the failure.
+    /// audit log closes the intent as the failure.
     #[tokio::test]
     async fn a_failed_reseed_write_changes_nothing() {
         let _g = THRESHOLD_TEST_LOCK.lock().await;
@@ -920,12 +911,11 @@ mod tests {
         assert_eq!(state.rules.current().unwrap().section_sizes(), rules_before);
         assert_eq!(super::super::settings::current_threshold_ms(), 123);
 
+        // The intent (synced before the write) is closed as the failure.
         let audit = audit_actions(&state);
-        assert_eq!(audit.len(), 2, "{audit:?}");
-        assert_eq!(audit[1].0, "state.reseed");
-        assert_eq!(audit[1].1["effect"], "pending");
-        assert_eq!(audit[1].1["catalogs"]["removed"], json!(["rt"]));
+        assert_eq!(audit.len(), 1, "{audit:?}");
         assert_eq!(audit[0].0, "state.reseed");
+        assert_eq!(audit[0].1["catalogs"]["removed"], json!(["rt"]));
         assert!(
             audit[0].1.get("effect").is_none(),
             "the failed run has no effect"
@@ -1049,17 +1039,12 @@ mod tests {
         assert_eq!(state.sessions.resolve(&kept).as_deref(), Some("alice"));
         assert_eq!(state.sessions.resolve(&ended), None);
 
-        // Newest first: the result, then the intent written before it.
+        // The completion replaces the intent run_manage synced first.
         let audit = audit_actions(&state);
-        assert_eq!(audit.len(), 2);
-        for (action, _) in &audit {
-            assert_eq!(action, "state.reseed");
-        }
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].0, "state.reseed");
         assert_eq!(audit[0].1["effect"], "applied");
-        assert_eq!(audit[1].1["effect"], "pending");
-        for (_, parameters) in &audit {
-            assert_eq!(parameters["catalogs"]["removed"], json!(["rt"]));
-        }
+        assert_eq!(audit[0].1["catalogs"]["removed"], json!(["rt"]));
 
         // A second re-seed is a no-op.
         let (status, again) = reseed(&state, ("root", "rootpw"), false).await;
@@ -1141,11 +1126,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         // Newest first.
         let actions: Vec<String> = audit_actions(&state).into_iter().map(|(a, _)| a).collect();
-        assert_eq!(
-            actions,
-            vec!["admission.set", "state.reseed", "state.reseed"],
-            "the re-seed's result and intent entries, then the admission change"
-        );
+        assert_eq!(actions, vec!["admission.set", "state.reseed"]);
         // The admission change applied on top of the re-seeded config limits.
         assert_eq!(
             audit_actions(&state)[0].1["max_running_queries"],

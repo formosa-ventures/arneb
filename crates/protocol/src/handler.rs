@@ -44,6 +44,23 @@ pub trait DistributedExecutor: Send + Sync {
         exec_ctx: &ExecutionContext,
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, ArnebError>;
 
+    /// [`execute`](Self::execute) that hands the root stage's batches to
+    /// `sink` as they arrive instead of collecting them. An implementation
+    /// that re-runs a query (retry after a lost worker) calls
+    /// [`BatchSink::reset`] before each re-run. The default collects with
+    /// `execute` and then pushes.
+    async fn execute_into(
+        &self,
+        plan: LogicalPlan,
+        exec_ctx: &ExecutionContext,
+        sink: &mut dyn BatchSink,
+    ) -> Result<(), ArnebError> {
+        for batch in self.execute(plan, exec_ctx).await? {
+            sink.push(batch);
+        }
+        Ok(())
+    }
+
     /// Check if workers are available for distributed execution.
     fn has_workers(&self) -> bool;
 }
@@ -192,10 +209,15 @@ impl TrackedStatement {
         }
     }
 
-    fn finish(&mut self, rows: u64) {
-        if let Some((t, id)) = self.0.take() {
-            let _ = t.finish_query(&id, rows);
-        }
+    /// Records `rows` and marks the query finished. Returns `false` when a
+    /// kill marked it cancelled first (after the work completed, before
+    /// this ran): the statement must then answer as cancelled, not with
+    /// its rows.
+    fn finish(&mut self, rows: u64) -> bool {
+        let Some((t, id)) = self.0.take() else {
+            return true;
+        };
+        t.finish_query(&id, rows).is_ok() || t.cancelled_by(&id).is_none()
     }
 
     fn fail(&mut self, error: String) {
@@ -225,6 +247,15 @@ impl Drop for TrackedStatement {
             let _ = t.cancel_query(&id);
         }
     }
+}
+
+/// SQLSTATE `57014`, as PostgreSQL answers a cancelled statement.
+fn user_cancelled() -> PgWireError {
+    PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+        "ERROR".to_owned(),
+        "57014".to_owned(),
+        "canceling statement due to user request".to_owned(),
+    )))
 }
 
 /// Per-connection handler that processes queries through the full pipeline.
@@ -404,17 +435,14 @@ impl ConnectionHandler {
         });
         let Ok(result) = futures::future::Abortable::new(work, registration).await else {
             tracked.cancel();
-            return Err(PgWireError::UserError(Box::new(
-                pgwire::error::ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "57014".to_owned(),
-                    "canceling statement due to user request".to_owned(),
-                ),
-            )));
+            return Err(user_cancelled());
         };
         match &result {
             Ok(Ok((_, batches))) => {
-                tracked.finish(batches.iter().map(|b| b.num_rows() as u64).sum())
+                if !tracked.finish(batches.iter().map(|b| b.num_rows() as u64).sum()) {
+                    // Killed after the work completed: no rows.
+                    return Err(user_cancelled());
+                }
             }
             Ok(Err(e)) => tracked.fail(e.to_string()),
             // Admission refusal or statement timeout.
@@ -1156,10 +1184,41 @@ pub(crate) fn check_write_privileges(
     Ok(())
 }
 
-/// [`execute_query_with_limit`] that, for a `SELECT`, stops producing rows
-/// after `row_cap` of them: the plan's root gets a `LIMIT row_cap`, so the
-/// query reads no more than it needs to return that many rows. Other
-/// statements ignore `row_cap`.
+/// Takes a query's batches one at a time as they are produced, so the caller
+/// keeps only what it needs instead of a fully collected result.
+pub trait BatchSink: Send {
+    /// Takes the next batch.
+    fn push(&mut self, batch: arrow::record_batch::RecordBatch);
+
+    /// Forgets every batch taken so far: the query is being re-run from
+    /// the start (retry after a lost worker), so its rows will come again.
+    fn reset(&mut self);
+}
+
+impl BatchSink for Vec<arrow::record_batch::RecordBatch> {
+    fn push(&mut self, batch: arrow::record_batch::RecordBatch) {
+        Vec::push(self, batch);
+    }
+
+    fn reset(&mut self) {
+        self.clear();
+    }
+}
+
+/// A capped query: a `SELECT` produces at most `rows` rows, and every batch
+/// goes to `sink` as it arrives.
+pub(crate) struct RowCap<'a> {
+    pub(crate) rows: usize,
+    pub(crate) sink: &'a mut dyn BatchSink,
+}
+
+/// [`execute_query_with_limit`] that, given a [`RowCap`], stops a `SELECT`
+/// after `row_cap.rows` rows (the plan's root gets a `LIMIT`, so the query
+/// reads no more than it needs to return that many) and hands every batch
+/// to `row_cap.sink` as it is produced instead of returning it (the
+/// returned batches are then empty): from the local plan's stream, or from
+/// the distributed root stage through [`DistributedExecutor::execute_into`].
+/// Other statements ignore the row limit.
 pub(crate) async fn execute_query_capped(
     sql: &str,
     catalog_manager: &CatalogManager,
@@ -1167,7 +1226,7 @@ pub(crate) async fn execute_query_capped(
     distributed_executor: Option<&dyn DistributedExecutor>,
     memory_pool: &Arc<dyn arneb_execution::memory_pool::MemoryPool>,
     query_memory_limit: Option<usize>,
-    row_cap: Option<usize>,
+    row_cap: Option<RowCap<'_>>,
 ) -> Result<
     (
         Arc<dyn ExecutionPlan>,
@@ -1202,9 +1261,9 @@ pub(crate) async fn execute_query_capped(
     // costs only an `Arc` clone.
     let planner = QueryPlanner::new(catalog_manager);
     let (logical_plan, analyzer_ctx) = planner.plan_statement_with_context(&statement).await?;
-    let logical_plan = match (row_cap, &statement) {
+    let logical_plan = match (&row_cap, &statement) {
         (Some(cap), arneb_sql_parser::ast::Statement::Query { .. }) => {
-            cap_plan_rows(logical_plan, cap)
+            cap_plan_rows(logical_plan, cap.rows)
         }
         _ => logical_plan,
     };
@@ -1267,7 +1326,15 @@ pub(crate) async fn execute_query_capped(
     if let Some(executor) = distributed_executor {
         if executor.has_workers() {
             tracing::info!("routing query to distributed executor");
-            let batches = executor.execute(logical_plan, &exec_ctx).await?;
+            let batches = match row_cap {
+                Some(cap) => {
+                    executor
+                        .execute_into(logical_plan, &exec_ctx, cap.sink)
+                        .await?;
+                    Vec::new()
+                }
+                None => executor.execute(logical_plan, &exec_ctx).await?,
+            };
             // Create local physical plan just for schema (not executed)
             // Fall through to local if distributed fails
             let local_plan = exec_ctx.create_physical_plan(
@@ -1295,8 +1362,17 @@ pub(crate) async fn execute_query_capped(
 
     // Step 6: Execute (async). After the wrap above, top-level output
     // is always single-partition.
-    let stream = physical_plan.execute(0).await?;
-    let batches = collect_stream(stream).await?;
+    let mut stream = physical_plan.execute(0).await?;
+    let batches = match row_cap {
+        Some(cap) => {
+            use futures::StreamExt;
+            while let Some(batch) = stream.next().await {
+                cap.sink.push(batch?);
+            }
+            Vec::new()
+        }
+        None => collect_stream(stream).await?,
+    };
 
     Ok((physical_plan, batches))
 }
@@ -2137,6 +2213,34 @@ async fn register_data_sources(
 
 #[cfg(test)]
 mod tests {
+    /// A kill that lands after the work completed but before `finish`:
+    /// the finish is refused, so the statement answers 57014, not rows.
+    #[test]
+    fn a_kill_after_the_work_completed_wins_over_the_rows() {
+        let tracker = Arc::new(arneb_scheduler::QueryTracker::new());
+        let mut tracked = TrackedStatement::start(&tracker, "SELECT 1", Some("bob".into()));
+        tracked.running();
+        let id = tracked.0.as_ref().unwrap().1;
+        assert!(matches!(
+            tracker.kill_query(&id, "root").unwrap(),
+            arneb_scheduler::KillOutcome::Killed { .. }
+        ));
+        assert!(
+            !tracked.finish(1),
+            "the killed statement must not return rows"
+        );
+        let info = tracker.get_query(&id).unwrap();
+        assert_eq!(info.state, arneb_scheduler::QueryState::Cancelled);
+        assert_eq!(info.rows, None);
+        match user_cancelled() {
+            PgWireError::UserError(e) => assert_eq!(e.code, "57014"),
+            other => panic!("{other:?}"),
+        }
+        // Not killed: finishes.
+        let mut ok = TrackedStatement::start(&tracker, "SELECT 1", None);
+        assert!(ok.finish(1));
+    }
+
     use super::*;
     use arneb_common::types::{ColumnInfo, DataType};
     use arneb_sql_parser::ast;

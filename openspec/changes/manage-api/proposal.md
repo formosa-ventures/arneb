@@ -10,8 +10,8 @@ Stage H4 of the headless agent interface (`docs/superpowers/specs/2026-10-30-hea
 - **Workers.** `GET /api/v2/workers[/{id}]` and `POST /api/v2/workers/{id}/cordon|drain|uncordon`, persisted and restored at startup; a new `scheduling` field.
 - **Admission.** `GET|PUT /api/v2/admission` changes `max_running_queries` and `max_queued_queries` at runtime, persisted; a stored value wins over the config seed.
 - **Dry runs and envelope.** Every manage route takes `?dry_run=`; one response envelope for dry and real runs.
-- **Audit log.** `audit.jsonl` beside the state file, fsynced per entry, bounded by `[audit] max_entries` / `retention_days`, read through `GET /api/v2/audit`.
-- **MCP.** Seven new tools (25 in total), a widened `cancel_query` and a bounded `list_workers`.
+- **Audit log.** `<stem>.audit.jsonl` beside the state file, fsynced per entry, bounded by `[audit] max_entries` / `retention_days`, read through `GET /api/v2/audit`.
+- **MCP.** Eight new tools (26 in total), a widened `cancel_query` and a bounded `list_workers`.
 - **Config.** `[access_control] admin_users` (`ARNEB_ADMIN_USERS`), `[audit]` with `ARNEB_AUDIT_*`.
 
 ## Capabilities

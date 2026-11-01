@@ -3,6 +3,8 @@
 //! [`run_manage`], which answers a dry run from the action's preview and a
 //! real run by applying it, audited, off the async workers.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use super::audit::{audited, AuditSubject};
@@ -84,10 +86,22 @@ pub(super) trait ManageAction: Send + 'static {
     /// Do it. Blocking: [`run_manage`] calls it from `spawn_blocking`.
     fn apply(self, state: &WebState) -> Result<Applied<Self::Output>, ApiError>;
 
-    /// A share of the lock that serializes this kind of change, if any.
-    /// [`run_manage`] keeps it until the audit entry is appended, so a
-    /// request dropped mid-call still holds the lock across apply and
-    /// append, and the audit order stays the apply order.
+    /// The lock that serializes this kind of change, if any
+    /// (`WebState::admission_changes`, `WebState::cordon_changes`).
+    /// [`run_manage`] takes it before the preview (or the audit
+    /// `parameters`) is read and holds it in the blocking task until the
+    /// completion entry is appended, so a request dropped mid-call still
+    /// holds it across apply and append, and the audit order stays the
+    /// apply order.
+    fn change_mutex(&self) -> Option<&Arc<tokio::sync::Mutex<()>>> {
+        None
+    }
+
+    /// A share of `WebState::config_changes` the action took (with
+    /// [`config_change_lock`]) before it was built, for the runtime-config
+    /// changes (D10), which re-check manage once the lock is held.
+    /// [`run_manage`] keeps it until the completion entry is appended, like
+    /// a [`change_mutex`](Self::change_mutex).
     fn change_lock(&self) -> Option<ChangeLock> {
         None
     }
@@ -100,9 +114,27 @@ pub(super) trait ManageAction: Send + 'static {
     }
 }
 
-/// A share of a change lock's guard (`WebState::admission_changes`,
-/// `WebState::cordon_changes`).
+/// A share of a change lock's guard (`WebState::config_changes`).
 pub(super) type ChangeLock = std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>;
+
+/// `n` with the singular or plural noun.
+pub(super) fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The error of a manage change whose state-store write failed before
+/// anything was applied; `what` names it (`the cordon`).
+pub(super) fn persist_failed(
+    what: &'static str,
+) -> impl FnOnce(arneb_state::StateError) -> ApiError {
+    move |e| {
+        tracing::error!(error = %e, "cannot persist {what}");
+        ApiError::new(
+            ErrorCode::Internal,
+            format!("{what} could not be saved to the state store; nothing changed"),
+        )
+    }
+}
 
 /// A share of `WebState::config_changes` (runtime-config D10) for `who`,
 /// held until the audit entry is appended. Manage is checked again once
@@ -237,6 +269,12 @@ pub(super) async fn run_manage<A: ManageAction>(
     let name = action.action();
     let target = action.target();
     let persisted = action.persisted();
+    // Taken before anything is read, so preview, audit and apply see one
+    // state; released only once the completion entry is appended.
+    let held = match action.change_mutex() {
+        Some(m) => Some(Arc::clone(m).lock_owned().await),
+        None => None,
+    };
     if dry_run {
         let preview = action.preview(state)?;
         return Ok(dry_run_outcome(
@@ -250,24 +288,36 @@ pub(super) async fn run_manage<A: ManageAction>(
         ));
     }
     let (blocking_state, who, audit_target) = (state.clone(), who.clone(), target.clone());
-    let held = action.change_lock();
+    // runtime-config D10: a share of `config_changes` the action already
+    // holds (taken, with manage re-checked, before it was built), and the
+    // re-seed's admission lock; both kept until the completion entry.
+    let pre_held = action.change_lock();
     let secondary = action.take_secondary_lock();
     let applied = tokio::task::spawn_blocking(move || {
         let state = blocking_state;
         if !action.audited() {
             let applied = action.apply(&state);
             drop(secondary);
+            drop(pre_held);
             drop(held);
             return applied;
         }
         let parameters = action.parameters();
         let unchanged = action.unchanged_effect();
         #[cfg(test)]
-        let lock_key = held.as_deref().map(test_hooks::key_of);
+        let lock_key = held
+            .as_ref()
+            .or(pre_held.as_deref())
+            .map(test_hooks::key_of);
+        let intent = AuditSubject {
+            target: audit_target.clone(),
+            parameters: with_effect(parameters.clone(), None),
+        };
         let applied = audited(
             &state,
             &who,
             name,
+            intent,
             || action.apply(&state),
             |out| {
                 #[cfg(test)]
@@ -289,6 +339,7 @@ pub(super) async fn run_manage<A: ManageAction>(
         );
         // Released only once the entry is appended, in reverse order.
         drop(secondary);
+        drop(pre_held);
         drop(held);
         applied
     })
@@ -406,6 +457,20 @@ pub(super) mod test_hooks {
             .unwrap()
             .push((key(lock), inside_tx, release_rx));
         (inside_rx, release_tx)
+    }
+
+    /// Each audit entry's `outcome` as JSON text, newest first.
+    pub(in crate::web) fn outcomes(state: &crate::web::WebState) -> Vec<String> {
+        state
+            .audit
+            .query(&arneb_state::AuditQuery {
+                limit: 100,
+                ..arneb_state::AuditQuery::default()
+            })
+            .entries
+            .into_iter()
+            .map(|e| serde_json::to_string(&e.record.outcome).unwrap())
+            .collect()
     }
 
     pub(super) fn after_apply(lock_key: Option<usize>) {

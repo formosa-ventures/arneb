@@ -23,6 +23,10 @@ pub struct SeedReport {
     /// State-created users whose name is also in the config file, left
     /// alone (the config only manages users it seeded). Empty on a reseed.
     pub conflicts: Vec<String>,
+    /// State-created users whose stored verifier already equals the config's.
+    /// They are adopted (marked config-managed) so later config edits or
+    /// removals apply to them; their tokens are kept.
+    pub adopted: Vec<String>,
     /// Tokens revoked because their user was updated or removed.
     pub revoked_tokens: usize,
     /// Config users skipped because they were deleted at runtime (their
@@ -68,7 +72,10 @@ pub struct UserInfo {
 impl SeedReport {
     /// Whether the state was left exactly as it was.
     pub fn is_noop(&self) -> bool {
-        self.added.is_empty() && self.updated.is_empty() && self.removed.is_empty()
+        self.added.is_empty()
+            && self.updated.is_empty()
+            && self.removed.is_empty()
+            && self.adopted.is_empty()
     }
 }
 
@@ -79,7 +86,8 @@ impl StateStore {
     /// added, a changed `password_hash` replaces the stored verifier and
     /// revokes all of that user's tokens, and a user gone from the config
     /// is deleted with their tokens. Users created through the state store
-    /// are never touched, except that `reseed` lets a config user overwrite
+    /// are never touched, except that one whose verifier already equals the
+    /// config's is adopted (`from_config = true`), and that `reseed` lets a config user overwrite
     /// a state-created user of the same name (revoking their tokens).
     /// Without `reseed` such a name collision keeps the state user and logs
     /// a WARN. Every change logs one line on `arneb::config` naming the user.
@@ -102,6 +110,15 @@ pub(crate) fn log_seed_report(report: &SeedReport) {
             target: "arneb::config",
             user = %user,
             "user {user:?} added to the state from the config file"
+        );
+    }
+    for user in &report.adopted {
+        tracing::info!(
+            target: "arneb::config",
+            user = %user,
+            "user {user:?} created through the state store has the same \
+             password_hash as the config file; adopted it, so later config \
+             edits or removal of the user now apply to it"
         );
     }
     for user in &report.updated {
@@ -280,7 +297,15 @@ pub(crate) fn apply_seed(
                 data.users.push(record());
                 report.added.push(name.clone());
             }
-            Some(existing) if existing.scram == scram => {}
+            Some(existing) if existing.scram == scram => {
+                // Same verifier as a state-created user: take it over so
+                // later config edits/removals revoke it. Nothing changes
+                // for the user, so their tokens stay.
+                if !existing.from_config {
+                    existing.from_config = true;
+                    report.adopted.push(name.clone());
+                }
+            }
             Some(existing) if !existing.from_config && !reseed => {
                 report.conflicts.push(name.clone());
             }
@@ -506,6 +531,34 @@ mod tests {
             log.contains("dave") && log.contains("--reseed-state"),
             "{log}"
         );
+    }
+
+    #[test]
+    fn matching_state_user_is_adopted_then_follows_the_config() {
+        let store = StateStore::open(None).unwrap();
+        add_state_user(&store, "dave", "d");
+        let td = store.issue_token("dave", None, None).unwrap();
+        let (r, log) = capture(|| store.seed_users(&cfg(&[("dave", "d")]), false).unwrap());
+        assert_eq!(r.adopted, vec!["dave"]);
+        assert!(!r.is_noop());
+        assert!(r.conflicts.is_empty() && r.updated.is_empty());
+        assert_eq!(r.revoked_tokens, 0);
+        assert!(stored(&store)[0].2, "now config-managed");
+        assert_eq!(store.check_token(&td.token), Some(td.info.clone()));
+        assert!(log.contains("dave") && log.contains("adopted"), "{log}");
+        assert!(log.contains("arneb::config"), "{log}");
+        // Re-seeding the same config is a no-op again.
+        let r = store.seed_users(&cfg(&[("dave", "d")]), false).unwrap();
+        assert!(r.is_noop(), "{r:?}");
+        // A later hash change updates the user and revokes tokens.
+        let r = store.seed_users(&cfg(&[("dave", "new")]), false).unwrap();
+        assert_eq!(r.updated, vec!["dave"]);
+        assert!(r.conflicts.is_empty());
+        assert_eq!(store.check_token(&td.token), None);
+        // Removal from the config deletes him.
+        let r = store.seed_users(&[], false).unwrap();
+        assert_eq!(r.removed, vec!["dave"]);
+        assert!(stored(&store).is_empty());
     }
 
     #[test]

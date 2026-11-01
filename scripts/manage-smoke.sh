@@ -369,7 +369,7 @@ out=$(curl -sS -u "$ADMIN:$ARNEB_ADMIN_PASSWORD" -X POST "$MCP" \
     -H 'MCP-Protocol-Version: 2025-06-18' \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}') || fail "curl tools/list"
 LAST="$out"
-check '.result.tools | length == 43' "tools/list does not have exactly 43 tools"
+check '.result.tools | length == 44' "tools/list does not have exactly 44 tools"
 mcp_tool ADMIN get_worker "$(jq -nc --arg id "$W1" '{id:$id}')"
 check '.isError == false' "get_worker as admin returned isError"
 check '.structuredContent.scheduling == "schedulable"' "get_worker does not report $W1 schedulable"

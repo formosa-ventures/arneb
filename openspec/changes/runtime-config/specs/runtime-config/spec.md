@@ -103,18 +103,18 @@ A coordinator without a `[cluster] secret` SHALL refuse to start while a served 
 - **THEN** `GET /api/v2/settings` reports 54321 with `source: state`, also after a restart
 
 ### Requirement: Re-seed
-`POST /api/v2/state/reseed` (manage) and `--reseed-state` SHALL reload the config file the server was started with, env overrides applied, and replace the stored catalogs (removing runtime-created ones), the access rules (none without a rules file), the stored settings (cleared) and the config users, clearing the tombstones. Tokens, worker cordons, runtime-created users and the audit log SHALL be kept, except tokens that user seeding revokes. The dry run SHALL list the catalogs added, changed and removed, whether the rules change and the settings reset. A config that fails to load SHALL be `invalid_argument`, and a re-seed that removes the caller's manage privilege or deletes the caller's user SHALL be `conflict`. The API re-seed SHALL append a `state.reseed` audit entry with `effect: pending` before it changes anything, and SHALL persist the catalogs, rules, settings and users in one atomic state write; a failed write SHALL change nothing, stored or live.
+`POST /api/v2/state/reseed` (manage) and `--reseed-state` SHALL reload the config file the server was started with, env overrides applied, and replace the stored catalogs (removing runtime-created ones), the access rules (none without a rules file), the stored settings (cleared) and the config users, clearing the tombstones. Tokens, worker cordons, runtime-created users and the audit log SHALL be kept, except tokens that user seeding revokes. The dry run SHALL list the catalogs added, changed and removed, whether the rules change and the settings reset. A config that fails to load SHALL be `invalid_argument`, and a re-seed that removes the caller's manage privilege or deletes the caller's user SHALL be `conflict`. The API re-seed SHALL have its `state.reseed` intent synced to the audit log (outcome `pending`, the manage-api intent/completion mechanism) before it changes anything, and SHALL persist the catalogs, rules, settings and users in one atomic state write; a failed write SHALL change nothing, stored or live.
 
 #### Scenario: Re-seed removes a runtime catalog
 - **WHEN** a manager re-seeds after creating catalog `pg2`, which is not in the config
 - **THEN** `pg2` is gone on the coordinator and every worker, and the rules and threshold are the config's
 
 ### Requirement: MCP tools for the runtime configuration
-The MCP server SHALL offer 18 more tools, 43 in total, each calling the same function as its route: `list_catalog_configs`, `get_catalog_config`, `create_catalog`, `update_catalog`, `drop_catalog`, `get_access_rules`, `set_access_rules`, `clear_access_rules`, `list_users`, `create_user`, `set_user_password`, `delete_user`, `list_user_tokens`, `issue_user_token`, `revoke_user_token`, `get_settings`, `update_settings` and `reseed_state`. Every manage tool SHALL take `dry_run`. The descriptions of tools that take a password SHALL say that it is not logged or audited and that the agent should not repeat it back to the user.
+The MCP server SHALL offer 18 more tools, 44 in total, each calling the same function as its route: `list_catalog_configs`, `get_catalog_config`, `create_catalog`, `update_catalog`, `drop_catalog`, `get_access_rules`, `set_access_rules`, `clear_access_rules`, `list_users`, `create_user`, `set_user_password`, `delete_user`, `list_user_tokens`, `issue_user_token`, `revoke_user_token`, `get_settings`, `update_settings` and `reseed_state`. Every manage tool SHALL take `dry_run`. The descriptions of tools that take a password SHALL say that it is not logged or audited and that the agent should not repeat it back to the user.
 
 #### Scenario: Tool list
 - **WHEN** a client calls `tools/list`
-- **THEN** it receives 43 tools
+- **THEN** it receives 44 tools
 
 #### Scenario: Equal rights
 - **WHEN** bob, without manage, calls `create_user`

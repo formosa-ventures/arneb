@@ -221,6 +221,11 @@ impl AccessRules {
         self.owner_or_rule_allows(viewer, owner, QueryAccess::View)
     }
 
+    /// Whether the file has a `queries` section (even an empty one).
+    pub fn has_query_rules(&self) -> bool {
+        self.queries.is_some()
+    }
+
     /// Whether `viewer` may kill a query run by `owner`. Matching is the
     /// same as [`can_view_query`](Self::can_view_query), checking `kill`;
     /// the owner may always kill their own query.
@@ -734,6 +739,9 @@ mod tests {
             rules("{}").can_kill_query("anyone", "bob"),
             "no queries section allows everything"
         );
+        assert!(!rules("{}").has_query_rules());
+        assert!(rules(r#"{"queries": []}"#).has_query_rules());
+        assert!(r.has_query_rules());
     }
 
     #[test]

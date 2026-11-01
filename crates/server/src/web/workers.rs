@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome, Preview,
+    count, persist_failed, run_manage, Applied, DryRun, ManageAction, ManageOutcome, Preview,
 };
 use super::privilege::Layer;
 use super::v2::bad_query;
@@ -246,20 +246,16 @@ pub(super) async fn worker_action_for(
     if !known {
         return Err(no_such_worker(id));
     }
-    // Held across the whole change, audit append included, so the audit
-    // order is the apply order (as for admission changes). The action keeps
-    // a share, so a request dropped mid-call still serializes its apply.
-    let serialized = Arc::new(Arc::clone(&state.cordon_changes).lock_owned().await);
+    // `run_manage` holds `cordon_changes` across the whole change, audit
+    // append included, so the audit order is the apply order.
     let action = WorkerAction {
         id: id.to_owned(),
         op,
         by: who.user.clone(),
         store,
-        _serialized: Arc::clone(&serialized),
+        changes: Arc::clone(&state.cordon_changes),
     };
-    let outcome = run_manage(state, who, grant, dry_run, action).await;
-    drop(serialized);
-    outcome
+    run_manage(state, who, grant, dry_run, action).await
 }
 
 fn has_cordon(registry: &NodeRegistry, store: &StateStore, id: &str) -> bool {
@@ -271,14 +267,8 @@ struct WorkerAction {
     op: WorkerOp,
     by: String,
     store: Arc<StateStore>,
-    /// A share of [`WebState::cordon_changes`], taken in
-    /// [`worker_action_for`].
-    _serialized: ChangeLock,
-}
-
-/// `n` with the singular or plural noun.
-fn count(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
+    /// [`WebState::cordon_changes`].
+    changes: Arc<tokio::sync::Mutex<()>>,
 }
 
 const LAST_WORKER_WARNING: &str = "no schedulable worker is left: new distributed queries fail \
@@ -339,14 +329,6 @@ impl WorkerAction {
     }
 }
 
-fn persist_failed(e: arneb_state::StateError) -> ApiError {
-    tracing::error!(error = %e, "cannot persist a worker cordon");
-    ApiError::new(
-        ErrorCode::Internal,
-        "the cordon could not be saved to the state store; nothing changed",
-    )
-}
-
 impl ManageAction for WorkerAction {
     type Output = WorkerView;
 
@@ -370,8 +352,8 @@ impl ManageAction for WorkerAction {
         Ok(self.plan(state))
     }
 
-    fn change_lock(&self) -> Option<ChangeLock> {
-        Some(Arc::clone(&self._serialized))
+    fn change_mutex(&self) -> Option<&Arc<tokio::sync::Mutex<()>>> {
+        Some(&self.changes)
     }
 
     /// Persists first, then updates the registry, so a failed write
@@ -390,9 +372,11 @@ impl ManageAction for WorkerAction {
                         since_ms: now_ms(),
                         by: self.by.clone(),
                     })
-                    .map_err(persist_failed)?,
+                    .map_err(persist_failed("the cordon"))?,
                 None => {
-                    self.store.clear_cordon(&self.id).map_err(persist_failed)?;
+                    self.store
+                        .clear_cordon(&self.id)
+                        .map_err(persist_failed("the cordon"))?;
                 }
             }
             #[cfg(test)]
@@ -1025,9 +1009,14 @@ mod tests {
             futures::poll!(uncordon.as_mut()).is_pending(),
             "the uncordon waits for the cordon"
         );
-        // While it waits, it has neither touched the store nor audited.
+        // While it waits, it has neither touched the store nor audited:
+        // the log holds only the cordon's intent.
         assert!(store.cordon(PAUSED_ID).is_some());
-        assert!(audit_actions(&state).is_empty());
+        assert_eq!(audit_actions(&state).len(), 1);
+        assert_eq!(
+            crate::web::manage::test_hooks::outcomes(&state),
+            ["\"pending\""]
+        );
 
         release_tx.send(()).unwrap();
         assert!(cordon.await.unwrap().unwrap().changed);
@@ -1064,10 +1053,15 @@ mod tests {
             state.cordon_changes.try_lock().is_err(),
             "the lock is held until the append"
         );
-        assert!(audit_actions(&state).is_empty());
+        assert_eq!(
+            crate::web::manage::test_hooks::outcomes(&state),
+            ["\"pending\""],
+            "only the intent so far"
+        );
         release.send(()).unwrap();
         let _next = state.cordon_changes.lock().await;
         assert_eq!(audit_actions(&state)[0].0, "worker.cordon");
+        assert_eq!(crate::web::manage::test_hooks::outcomes(&state), ["\"ok\""]);
     }
 
     #[tokio::test]

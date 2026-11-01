@@ -138,24 +138,27 @@ max_rows           = 10000
 | `default_page_bytes` | `ARNEB_AGENT_DEFAULT_PAGE_BYTES` | 262144 | Bytes per page when the request names no limit |
 | `max_page_bytes` | `ARNEB_AGENT_MAX_PAGE_BYTES` | 4194304 | Ceiling for a requested page size |
 | `max_cell_bytes` | `ARNEB_AGENT_MAX_CELL_BYTES` | 8192 | Longest cell, in bytes of a string's UTF-8 text (other values: of their JSON); longer cells are cut and end with `…` |
-| `max_retained_bytes` | `ARNEB_AGENT_MAX_RETAINED_BYTES` | 67108864 | Arrow memory one finished statement keeps; rows past it are dropped (`truncated_by: "max_retained_bytes"`) |
-| `max_total_retained_bytes` | `ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES` | 1073741824 | Arrow memory all finished statements keep together; when exhausted a statement keeps what fits (`truncated_by: "server_budget"`), and it frees up as statements are evicted or reaped |
+| `max_retained_bytes` | `ARNEB_AGENT_MAX_RETAINED_BYTES` | 67108864 | Arrow memory one statement keeps, while collecting and after; rows past it are dropped (`truncated_by: "max_retained_bytes"`) |
+| `max_user_retained_bytes` | `ARNEB_AGENT_MAX_USER_RETAINED_BYTES` | 268435456 | Arrow memory one user's statements (running and ended) keep together, so one user cannot take the whole budget; when short, the user's own ended statements are evicted if that covers the shortfall (fully read first, then least recently used), otherwise a statement keeps what fits (`truncated_by: "user_budget"`) |
+| `max_total_retained_bytes` | `ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES` | 1073741824 | Arrow memory all statements (running and ended) keep together; when short, ended statements are evicted the same way (the user's own first) if that covers the shortfall, otherwise a statement keeps what fits (`truncated_by: "server_budget"`); it frees up as statements are deleted, evicted or reaped |
 | `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 | Longest any request waits before answering "still running" |
 | `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 | Idle time before a statement is reaped |
 
 All values must be greater than 0, `default_max_rows <= max_rows`,
 `default_page_bytes <= max_page_bytes`,
-`max_retained_bytes <= max_total_retained_bytes`, and `idle_timeout_secs` must be at
-least twice `max_wait_ms` (so a statement is never reaped around a request
-that long-polls it; a statement being waited on also never counts as idle);
-a bad combination stops startup.
+`max_user_retained_bytes <= max_total_retained_bytes` (a `max_user_retained_bytes`
+below `max_retained_bytes` is raised to it, with a warning, so a user can
+always retain one full statement), and `idle_timeout_secs` must not
+be shorter than `max_wait_ms` (a statement being waited on never counts as
+idle, so a long-poll cannot outlast it); a bad combination stops startup.
 
 A catalog, schema or table listing returns `default_max_rows` names unless
 the request passes `limit`, which must be in `1..=max_rows`.
 
 A query stops producing rows after `max_rows + 1` of them, so `max_rows`
-bounds what it emits as well as what it retains; a truncated result reports
-`total_rows` as `null`. A page always holds at least one row, so a single wide row can
+bounds what it emits as well as what it retains; a result cut by `max_rows`
+reports `total_rows` as `null` (one cut only by bytes still reports the
+count). A page always holds at least one row, so a single wide row can
 exceed the page byte limit; each cell is still capped at `max_cell_bytes`.
 
 ## MCP
@@ -265,13 +268,15 @@ The new limits are kept in the state store (`[state] path`) and win over
 config value differs from the stored one logs a WARN on `arneb::config`:
 
 ```text
-[admission] max_running_queries / ARNEB_MAX_RUNNING_QUERIES = 8 is overridden by the runtime value 4 in the state store
+[admission] max_running_queries / ARNEB_MAX_RUNNING_QUERIES = 8 is overridden by the runtime value 4 in the state store (DELETE /api/v2/admission returns to the config)
 ```
 
 A stored value pins the limits across restarts and config edits: changing
 `[admission]` or the `ARNEB_*` variables has no effect on them until the
-stored value is gone. To go back to the config, stop the server and remove
-`settings.admission` from the state file. `statement_timeout` and
+stored value is gone. To go back to the config, call
+[`DELETE /api/v2/admission`](/guide/http-api#admission-limits) (MCP
+`reset_admission_limits`): it clears the stored limits and applies the
+config values the server started with, at once. `statement_timeout` and
 `query_max_memory_per_node` change only at startup.
 
 ## Query History
@@ -701,11 +706,13 @@ open so existing scrapers keep working.
 - **Stored admission limits pin values.** A limit set with `PUT
   /api/v2/admission` is kept in the state file and wins over `[admission]`
   and `ARNEB_MAX_*_QUERIES` at every start, each overridden knob logging a
-  WARN. To go back to the config, stop the server and remove
-  `settings.admission` from the state file.
+  WARN. To go back to the config, call `DELETE /api/v2/admission` (MCP
+  `reset_admission_limits`), which clears the stored limits and applies the
+  config values at once.
 - **New state.** The state file gains `cordons` and `settings` (readable by
   older binaries, whose next write drops them), and the coordinator writes
-  [`audit.jsonl`](#audit-log) next to it. With no `[state] path` these live
+  the [audit log](#audit-log) next to it (`state.json` →
+  `state.audit.jsonl`). With no `[state] path` these live
   in memory and are lost on restart.
 - **Revoking a token with a malformed id is `400 invalid_argument`**, and
   the refusal is not audited.
@@ -720,6 +727,12 @@ open so existing scrapers keep working.
   refused** with `403 manage_requires_auth` (it was allowed before). The
   owner (the claimed `X-Arneb-User`) may still cancel it, and `/api/v1`
   still lets any caller cancel any query.
+- **Killing another user's query needs a rule or manage.** Under password
+  auth with no rules file, or a rules file without a `queries` section, only
+  the query's owner or a manager may cancel it (on `/api/v1`, `/api/v2` and
+  MCP `cancel_query`). An explicit `queries` rule that allows `kill` still
+  grants it; add `{"allow": ["execute", "view", "kill"]}` for the old
+  open behavior.
 - **`DELETE /api/v1/queries/{id}` under password auth** follows the
   [kill rule](/guide/http-api#cancel-any-query): cancelling another user's
   query is audited, and the call can answer `503 audit_unavailable` (with an
@@ -866,7 +879,9 @@ path = "/var/lib/arneb/state.json"   # optional; ARNEB_STATE_PATH
 
 The coordinator (or standalone server) keeps its users and
 [API tokens](/guide/http-api#api-tokens) in one JSON state file, and the
-[audit log](#audit-log) as `audit.jsonl` in the same directory. Workers never
+[audit log](#audit-log) in the same directory, named after the state file
+(`state.json` → `state.audit.jsonl`), so two state files in one directory
+keep separate audit logs. Workers never
 open them. Every write is atomic (write, fsync, rename) and the file is
 created with mode `0600`. The path's directory must be writable.
 
@@ -889,9 +904,12 @@ created with mode `0600`. The path's directory must be writable.
 - **Users created through the state store are never touched** by this. If a
   config user has the same name as one of them, startup keeps the state user
   and logs a WARN. Start once with `--reseed-state` to overwrite it with the
-  config user (revoking its tokens). `--reseed-state` re-seeds the
-  catalogs, the access rules and the stored settings too, like
-  [`POST /api/v2/state/reseed`](/guide/http-api#re-seed).
+  config user (revoking its tokens). The exception is a state-created user
+  whose stored verifier is identical to the config's `password_hash`: it is
+  adopted (marked config-managed, tokens kept) with an INFO line on
+  `arneb::config`, so later config edits or removal apply to it.
+  `--reseed-state` re-seeds the catalogs, the access rules and the stored
+  settings too, like [`POST /api/v2/state/reseed`](/guide/http-api#re-seed).
 - **No `path`** keeps the state, and the audit log, in memory. Startup logs a
   WARN, `no [state] path: API tokens, worker cordons, admission limits and
   the audit log are lost on restart`, and the token API says so when it
@@ -912,10 +930,14 @@ retention_days = 90      # ARNEB_AUDIT_RETENTION_DAYS; 0 = no age limit
 ```
 
 Under `[auth] type = "password"`, the coordinator records every audited
-action (token issue and revoke, and the manage actions) as one JSON line in
-`audit.jsonl`, in the directory of [`[state] path`](#state), mode `0600`.
-Each entry is written and synced to disk before the response returns. Read
-it with [`GET /api/v2/audit`](/guide/http-api#audit-log).
+action (token issue and revoke, and the manage actions) as JSON lines in
+`<stem>.audit.jsonl`, in the directory of [`[state] path`](#state) and named
+after its file (`/var/lib/arneb/prod.json` →
+`/var/lib/arneb/prod.audit.jsonl`), mode `0600`.
+An action writes an intent entry (outcome `pending`) before it is applied
+and a completion entry after; each is synced to disk, the completion before
+the response returns. Read it with
+[`GET /api/v2/audit`](/guide/http-api#audit-log).
 
 | Knob | Env | Default | Meaning |
 |---|---|---|---|
@@ -928,16 +950,26 @@ it with [`GET /api/v2/audit`](/guide/http-api#audit-log).
   keeps increasing across restarts. Compaction runs at startup when there is
   something to drop, and whenever the file holds `max(max_entries / 10, 100)`
   more lines than `max_entries`. Reads hide entries past `retention_days` at
-  once, the kept newest entry included.
+  once, the kept newest entry included. The `pending` intent of an action in
+  flight is never dropped, by age or by the cap, until its completion is
+  written.
 - **Torn lines.** A line that does not parse (for example, cut short by a
   crash) is skipped with a WARN on `arneb::audit` naming its line number.
   Startup never fails on it, and the startup compaction drops it.
-- **A failed write.** If an entry cannot be written, the action it records
-  has already happened. The entry is logged in full at ERROR on
-  `arneb::audit`, and every later audited action is refused with
-  `503 audit_unavailable` until the file can be written again. At most one
-  entry is missing per action in flight when the log fails, and each is in
-  the ERROR log.
+- **A failed write.** If the intent cannot be written, the action is
+  refused with `503 audit_unavailable` and nothing is applied; if the log
+  reopens at once, the intent is closed with outcome
+  `{"error": "audit_unavailable"}` (best effort), so a restart does not
+  report it as interrupted. If the
+  completion cannot be written, the action has already happened: the entry
+  is logged in full at ERROR on `arneb::audit`, its intent stays `pending`,
+  and every later audited action is refused with `503 audit_unavailable`
+  until the file can be written again.
+- **Interrupted actions.** An intent with no completion at startup (the
+  server stopped while applying it, or its completion failed) is logged at
+  WARN on `arneb::audit` and recorded once as an entry with outcome
+  `interrupted`: the action may or may not have been applied. So no applied
+  action is ever missing from the log.
 - **No `[state] path`** keeps the log in memory, with a startup WARN; it is
   lost on restart. Under `type = "none"` nothing is audited and the log stays
   empty.

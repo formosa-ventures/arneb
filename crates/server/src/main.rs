@@ -274,6 +274,10 @@ async fn run() -> Result<()> {
         .auth
         .to_auth_method()
         .context("invalid [auth] configuration")?;
+    if matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_)) {
+        // Fail startup, not the first unknown-user login, if the RNG is broken.
+        arneb_protocol::init_decoy_secret().context("cannot create the decoy secret for [auth]")?;
+    }
     // Cluster RPC security, read here so the startup checks below know
     // whether catalog secrets may be served; installed further down.
     let cluster_security = config
@@ -338,6 +342,7 @@ async fn run() -> Result<()> {
             added = ?report.added,
             updated = ?report.updated,
             removed = ?report.removed,
+            adopted = ?report.adopted,
             conflicts = ?report.conflicts,
             revoked_tokens = report.revoked_tokens,
             reseed = reseed_state,
@@ -970,18 +975,23 @@ async fn run() -> Result<()> {
             mode: t.pgwire,
         });
 
+    let serves_clients = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
     let password_users = match &auth_method {
         arneb_protocol::AuthMethod::ScramSha256(creds) => Some(Arc::clone(creds)),
         arneb_protocol::AuthMethod::None => None,
     };
-    // One Basic authenticator for the Trino and Web listeners, so both share
-    // one PBKDF2 limiter, one wait queue and one verification cache.
+    // Only the coordinator's Trino and Web listeners check Basic credentials
+    // (workers serve neither). They share one PBKDF2 limiter and success
+    // cache, but each gets its own wait queue (`sibling`), so a flood on one
+    // port cannot 503 the other.
     let basic_auth = password_users
         .clone()
+        .filter(|_| serves_clients)
         .map(arneb_protocol::BasicAuthenticator::new)
         .transpose()
         .context("HTTP Basic authentication")?;
-    // The audit log (manage-api D6): `audit.jsonl` next to the state file,
+    // The audit log (manage-api D6): `<state stem>.audit.jsonl` next to the
+    // state file,
     // in memory without one, and an empty in-memory log under `none`
     // (nothing is audited there).
     let audit_path = state_store
@@ -990,7 +1000,7 @@ async fn run() -> Result<()> {
         .map(arneb_state::AuditLog::sibling_of);
     let audit_log = Arc::new(
         arneb_state::AuditLog::open(audit_path.as_deref(), config.audit.settings())
-            .context("cannot open the audit log (audit.jsonl next to [state] path)")?,
+            .context("cannot open the audit log (<state stem>.audit.jsonl next to [state] path)")?,
     );
     if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
         tracing::info!(
@@ -1082,8 +1092,9 @@ async fn run() -> Result<()> {
             tracing::warn!(
                 target: "arneb::config",
                 "[admission] {knob} / ARNEB_{} = {from_config} is overridden by the runtime \
-                 value {from_state} in the state store. Preview a re-seed with \
-                 POST /api/v2/state/reseed?dry_run=true",
+                 value {from_state} in the state store (DELETE /api/v2/admission returns to \
+                 the config, as does a re-seed: POST /api/v2/state/reseed?dry_run=true \
+                 previews it)",
                 knob.to_ascii_uppercase()
             );
         }
@@ -1101,6 +1112,16 @@ async fn run() -> Result<()> {
              ARNEB_MAX_QUEUED_QUERIES / ARNEB_STATEMENT_TIMEOUT / ARNEB_QUERY_MAX_MEMORY_BYTES)"
         );
         let agent_limits = config.agent_api.limits();
+        if let Some(configured) = config.agent_api.user_share_raised_from {
+            tracing::warn!(
+                target: "arneb::config",
+                configured,
+                effective = agent_limits.max_user_retained_bytes,
+                "[agent_api] max_user_retained_bytes (ARNEB_AGENT_MAX_USER_RETAINED_BYTES) \
+                 is below max_retained_bytes; raised to it so a user can retain one full \
+                 statement"
+            );
+        }
         tracing::info!(
             target: "arneb::config",
             default_max_rows = agent_limits.default_max_rows,
@@ -1109,6 +1130,7 @@ async fn run() -> Result<()> {
             max_page_bytes = agent_limits.max_page_bytes,
             max_cell_bytes = agent_limits.max_cell_bytes,
             max_retained_bytes = agent_limits.max_retained_bytes,
+            max_user_retained_bytes = agent_limits.max_user_retained_bytes,
             max_total_retained_bytes = agent_limits.max_total_retained_bytes,
             max_wait_ms = config.agent_api.max_wait_ms,
             idle_timeout_secs = config.agent_api.idle_timeout_secs,
@@ -1189,7 +1211,6 @@ async fn run() -> Result<()> {
     // state (catalogs, connectors, memory pool, distributed executor) as
     // pgwire. Queries are registered with the tracker so they show in the
     // Web UI.
-    let serves_clients = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
     let trino_enabled = config.trino.enabled && serves_clients;
     let trino_addr = format!("{}:{}", config.server.bind_address, config.trino.port);
     // Fail closed: Trino clients only send passwords over HTTPS, so password
@@ -1223,7 +1244,7 @@ async fn run() -> Result<()> {
         .with_query_tracker(query_tracker.clone())
         .with_access_rules(access_rules.clone())
         .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
-        .with_authenticator(basic_auth.clone());
+        .with_authenticator(basic_auth.as_ref().map(|a| a.sibling()));
         if let Some(ref executor) = distributed_executor {
             trino = trino.with_distributed_executor(Arc::clone(executor));
         }
@@ -1286,12 +1307,15 @@ async fn run() -> Result<()> {
         admission: admission.clone(),
         admission_changes: Default::default(),
         cordon_changes: Default::default(),
+        max_running_queries: config.admission.max_running_queries,
         max_queued_queries: config.admission.max_queued_queries,
         memory_pool: memory_pool.clone(),
         memory_limit_bytes: budget.map(|b| b as u64),
         // Same source as `credentials_for_web` (the state store) whenever
         // that is set: password auth makes the state store the auth method.
-        basic: credentials_for_web.as_ref().and(basic_auth),
+        basic: credentials_for_web
+            .as_ref()
+            .and(basic_auth.as_ref().map(|a| a.sibling())),
         credentials: credentials_for_web,
         state: state_for_web,
         audit: audit_log,

@@ -39,8 +39,8 @@ use super::manage::{
 use super::privilege::Layer;
 use super::v2::{
     bad_body, bad_query, blocking_failed, issue_token_for, list_tokens_for, no_such_user,
-    revoke_token_for, state_error, IssueTokenRequest, IssuedTokenResponse, TokenTarget, TokenView,
-    ISSUE_PERMITS,
+    pbkdf2_slot, revoke_token_for, state_error, IssueTokenRequest, IssuedTokenResponse,
+    TokenTarget, TokenView,
 };
 use super::WebState;
 
@@ -170,13 +170,10 @@ fn user_exists(name: &str) -> ApiError {
 }
 
 /// A fresh SCRAM verifier for `password` (random 16-byte salt, the H1
-/// default iteration count), derived on the blocking pool behind
-/// [`ISSUE_PERMITS`].
-async fn hash_password(password: String) -> Result<ScramVerifier, ApiError> {
-    let permit = ISSUE_PERMITS
-        .acquire()
-        .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal, "password hashing is unavailable"))?;
+/// default iteration count), derived on the blocking pool behind the
+/// shared PBKDF2 limiter (`overloaded` while its queue is full).
+async fn hash_password(state: &WebState, password: String) -> Result<ScramVerifier, ApiError> {
+    let permit = pbkdf2_slot(state).await?;
     // The permit moves into the task, so it bounds PBKDF2 even if the
     // request is dropped.
     tokio::task::spawn_blocking(move || {
@@ -235,7 +232,7 @@ pub(super) async fn create_user_for(
     if find_user(&store, &name).is_some() {
         return Err(user_exists(&name));
     }
-    let verifier = hash_password(password).await?;
+    let verifier = hash_password(state, password).await?;
     let lock = config_change_lock(state, who).await?;
     let action = CreateUser {
         name,
@@ -264,7 +261,7 @@ pub(super) async fn set_password_for(
     let (verifier, lock) = if dry_run {
         (None, None)
     } else {
-        let verifier = hash_password(password).await?;
+        let verifier = hash_password(state, password).await?;
         (Some(verifier), Some(config_change_lock(state, who).await?))
     };
     let action = SetPassword {
@@ -1485,7 +1482,10 @@ mod tests {
         call.abort();
         assert!(call.await.unwrap_err().is_cancelled());
         assert!(state.config_changes.try_lock().is_err());
-        assert!(audit_json(&state).is_empty());
+        // Only the intent is in the log until the completion is appended.
+        let entries = audit_json(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["outcome"], "pending");
         release.send(()).unwrap();
         let _next = state.config_changes.lock().await;
         assert_eq!(audit_json(&state).len(), 1);
@@ -1539,11 +1539,17 @@ mod tests {
             .unwrap()
             .issue_token("alice", None, None)
             .unwrap();
-        // One failed append marks the log unwritable.
-        state.audit.set_fail_appends(true);
+        // One failed completion marks the log unwritable; then appends fail.
+        state.audit.set_fail_completions(true);
         let (status, _) = create(&state, "dave", "davepass1").await;
-        assert_eq!(status, StatusCode::OK, "applied; only its append failed");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "applied; only its completion failed"
+        );
         assert!(!state.audit.is_writable());
+        state.audit.set_fail_completions(false);
+        state.audit.set_fail_appends(true);
         let revoke = format!("/api/v2/users/alice/tokens/{}", alice.info.id);
         for (method, path) in [
             (Method::POST, "/api/v2/users/alice/tokens".to_owned()),

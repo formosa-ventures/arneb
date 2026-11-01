@@ -70,7 +70,7 @@ impl fmt::Debug for SessionStore {
 }
 
 fn token_digest(token: &str) -> TokenDigest {
-    arneb_state::sha256(token.as_bytes())
+    arneb_protocol::sha256(token.as_bytes())
 }
 
 impl SessionStore {

@@ -24,7 +24,7 @@
 
 ## 7. MCP
 
-- [x] 7.1 18 tools (43 in total), each calling its route's `*_for`
+- [x] 7.1 18 tools (44 in total), each calling its route's `*_for`
 
 ## 8. Docs and validation
 

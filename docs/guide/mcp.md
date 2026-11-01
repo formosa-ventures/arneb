@@ -66,7 +66,7 @@ poll, fetch, cancel.
 | `uncordon_worker` | `id`, `dry_run?` | manage envelope | `POST /workers/{id}/uncordon` |
 | `get_admission` | none | limits, running and queued counts, `source` | `GET /admission` |
 | `set_admission_limits` | `max_running_queries?`, `max_queued_queries?`, `dry_run?` | manage envelope | `PUT /admission` |
-| `list_audit_log` | `limit?`, `cursor?`, `user?`, `action?` | `{entries, next_cursor, truncated, ...}` (default 50, at most 500) | `GET /audit` |
+| `list_audit_log` | `limit?`, `cursor?`, `user?`, `action?` | `{entries, next_cursor, truncated, scope, ...}` (default 50, at most 500; without manage, only your own actions) | `GET /audit` |
 | `list_tokens` | none | your live tokens, never the secret | `GET /tokens` |
 | `create_token` | `name?`, `expires_in_days?` | the new token, shown once | `POST /tokens` |
 | `revoke_token` | `id` | `{revoked: id}` | `DELETE /tokens/{id}` |

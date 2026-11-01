@@ -108,7 +108,9 @@ is refused at startup instead of being enforced partially:
 
 Two layers sit above the query rules:
 
-- **Observe** covers the cluster, worker, admission and audit views.
+- **Observe** covers the cluster, worker, admission and audit views. The
+  audit view shows the whole log only to a manager; any other observer sees
+  only the entries of their own actions.
   - Under `[auth] type = "none"` it is open.
   - Under password auth it is open unless the rules file has a
     `system_information` section. Then the user needs a rule that allows

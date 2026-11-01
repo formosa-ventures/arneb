@@ -880,7 +880,8 @@ impl ArnebMcp {
                        and token changes), newest first, at most `limit` (default \
                        {audit_limit}, at most {max_audit_limit}). Continue with `next_cursor` \
                        as `cursor`; `truncated` says if more exist. Filter by `user` or \
-                       `action`.",
+                       `action`. Without the manage privilege you see only your own actions \
+                       (`scope`: own).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_audit_log(
@@ -2118,6 +2119,16 @@ mod tests {
         )
         .await;
         assert_eq!(log["entries"][0]["user"], "root", "{log}");
+        assert_eq!(log["scope"], "all");
+        // A non-manager reads only the entries of their own actions.
+        let own = tool_ok(&f, "alice", "list_audit_log", json!({"user":"root"})).await;
+        assert_eq!(own["entries"], json!([]), "{own}");
+        assert_eq!(own["scope"], "own");
+        assert_eq!(
+            own,
+            api_get(&f, "alice", "/api/v2/audit?user=root").await,
+            "MCP and HTTP agree"
+        );
         let u = tool_ok(&f, "root", "uncordon_worker", json!({"id":"w1"})).await;
         assert_eq!(u["result"]["scheduling"], "schedulable", "{u}");
     }

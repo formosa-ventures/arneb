@@ -611,7 +611,7 @@ curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
   {"seq":40,"time_ms":1766990000000,"user":"bob","via":"token",
    "action":"token.issue","target":"",
    "parameters":{"name":null,"expires_ms":null},"outcome":{"error":"invalid_argument"}}],
- "next_cursor":40,"truncated":true,"persistent":true,"writable":true}
+ "next_cursor":40,"truncated":true,"persistent":true,"writable":true,"scope":"all"}
 ```
 
 - `seq` increases with every entry, across restarts; a failed write can
@@ -637,7 +637,10 @@ Parameters, all optional:
 
 Reading the log needs the observe privilege: with a `system_information`
 section in the [access rules](/guide/access-control), only users it allows
-`read` (or managers) may read it.
+`read` (or managers) may read it. A caller with the manage privilege reads
+the whole log (`"scope": "all"`); anyone else reads only the entries of
+their own actions (`"scope": "own"`), so a `user` filter naming another
+user returns no entries.
 
 ## Security notes
 

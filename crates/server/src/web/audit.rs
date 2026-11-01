@@ -113,16 +113,22 @@ pub(super) struct AuditResponse {
     persistent: bool,
     /// Whether audited actions are accepted right now.
     writable: bool,
+    /// `all` for a caller with manage; `own` for anyone else, who sees only
+    /// the entries of their own actions.
+    scope: &'static str,
 }
 
-/// The audit log page for `who`, who needs observe. Shared with the MCP
-/// `list_audit_log` tool.
+/// The audit log page for `who`, who needs observe. A caller with manage
+/// reads the whole log; anyone else reads only the entries of their own
+/// actions (a `user` filter naming someone else matches nothing). Shared
+/// with the MCP `list_audit_log` tool.
 pub(super) fn audit_page_for(
     state: &WebState,
     who: &Identity,
     params: AuditParams,
 ) -> Result<AuditResponse, ApiError> {
     state.authorizer.check(who, Layer::Observe)?;
+    let full = state.authorizer.allows(who, Layer::Manage);
     let limit = params.limit.unwrap_or(DEFAULT_AUDIT_LIMIT);
     if limit == 0 || limit > MAX_AUDIT_LIMIT {
         return Err(ApiError::new(
@@ -131,18 +137,33 @@ pub(super) fn audit_page_for(
         )
         .with_hint(format!("use a limit between 1 and {MAX_AUDIT_LIMIT}")));
     }
-    let page = state.audit.query(&AuditQuery {
-        limit,
-        before_seq: params.cursor,
-        user: params.user,
-        action: params.action,
-    });
+    let user = match params.user {
+        Some(u) if !full && u != who.user => None,
+        Some(u) => Some(Some(u)),
+        None if full => Some(None),
+        None => Some(Some(who.user.clone())),
+    };
+    let page = match user {
+        Some(user) => state.audit.query(&AuditQuery {
+            limit,
+            before_seq: params.cursor,
+            user,
+            action: params.action,
+        }),
+        // Another user's entries, for a caller without manage: none.
+        None => arneb_state::AuditPage {
+            entries: Vec::new(),
+            next_cursor: None,
+            truncated: false,
+        },
+    };
     Ok(AuditResponse {
         entries: page.entries,
         next_cursor: page.next_cursor,
         truncated: page.truncated,
         persistent: state.audit.is_persistent(),
         writable: state.audit.is_writable(),
+        scope: if full { "all" } else { "own" },
     })
 }
 
@@ -310,6 +331,60 @@ mod tests {
         assert_eq!(body["error"]["code"], "forbidden");
         let (status, body) = audit_log(&state, "").await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn only_managers_read_other_users_entries() {
+        let state = state();
+        let (status, _) = issue(&state).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = call(
+            &state,
+            Method::POST,
+            "/api/v2/tokens",
+            Some(&basic("bob", "hunter2")),
+            Some(json!({"name": "bobs"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let users = |body: &Value| -> Vec<String> {
+            body["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["user"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // root manages: the whole log.
+        let (status, body) = audit_log(&state, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(users(&body), ["bob", "alice"]);
+        assert_eq!(body["scope"], "all");
+        // alice: only her own actions, whatever she filters by.
+        for query in ["", "?user=alice"] {
+            let (status, body) = call(
+                &state,
+                Method::GET,
+                &format!("/api/v2/audit{query}"),
+                Some(&alice()),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(users(&body), ["alice"], "{query}");
+            assert_eq!(body["scope"], "own");
+        }
+        let (status, body) = call(
+            &state,
+            Method::GET,
+            "/api/v2/audit?user=bob",
+            Some(&alice()),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(users(&body).is_empty(), "{body}");
+        assert!(!body.to_string().contains("bobs"), "{body}");
     }
 
     #[tokio::test]

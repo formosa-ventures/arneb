@@ -295,7 +295,7 @@ impl OAuthValidator {
         // At most one refresh per call: a second miss after it is final.
         let mut refreshed = false;
         loop {
-            let (found, expired, generation) = {
+            let (found, expired, generation, last_ok) = {
                 let c = self.cache.lock().unwrap();
                 let expired = c
                     .fetched_at
@@ -305,7 +305,7 @@ impl OAuthValidator {
                 } else {
                     lookup(&c.keys, kid)
                 };
-                (found, expired, c.generation)
+                (found, expired, c.generation, c.last_ok)
             };
             match found {
                 Lookup::Found(k) => return Ok(k),
@@ -323,9 +323,10 @@ impl OAuthValidator {
                 Refresh::Fetched => refreshed = true,
                 Refresh::Failed => return Err(OAuthReject::Unavailable),
                 Refresh::Throttled => {
-                    // Cannot refetch yet: with no usable keys that means
-                    // unavailable, with keys the kid is simply unknown.
-                    return Err(if expired {
+                    // Cannot refetch yet: with no usable keys, or when the
+                    // last attempt failed (so nothing ruled the kid out),
+                    // that means unavailable; otherwise the kid is unknown.
+                    return Err(if expired || !last_ok {
                         OAuthReject::Unavailable
                     } else {
                         OAuthReject::Invalid("unknown_key")
@@ -357,7 +358,16 @@ impl OAuthValidator {
             }
             c.jwks_uri.clone()
         };
+        // Open the rate-limit window before the await: if this future is
+        // dropped mid-fetch (client disconnect), the window still counts and
+        // is treated as a failed attempt, so a flood of cancelled requests
+        // cannot drive one IdP fetch each.
         let started = Instant::now();
+        {
+            let mut c = self.cache.lock().unwrap();
+            c.last_attempt = Some(started);
+            c.last_ok = false;
+        }
         let outcome = self.fetch(jwks_uri).await;
         let mut c = self.cache.lock().unwrap();
         c.last_attempt = Some(started);
@@ -1053,6 +1063,45 @@ mod tests {
         // ...and once the cache expires nothing can.
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(v.validate(&t).await.unwrap_err(), OAuthReject::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_fetch_still_opens_the_rate_limit_window() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        idp.set_mode(Mode::Hang);
+        let v = validator(&idp, |_| {});
+        let t = key.sign(&claims(&idp.issuer(), AUD));
+        // Drop the validate future mid-fetch.
+        let r = tokio::time::timeout(Duration::from_millis(200), v.validate(&t)).await;
+        assert!(r.is_err());
+        assert_eq!(idp.jwks_hits(), 1);
+        idp.set_mode(Mode::Ok);
+        for _ in 0..5 {
+            assert_eq!(v.validate(&t).await.unwrap_err(), OAuthReject::Unavailable);
+        }
+        assert_eq!(idp.jwks_hits(), 1, "no refetch inside the window");
+    }
+
+    #[tokio::test]
+    async fn throttled_after_a_failed_attempt_is_unavailable_not_unknown_key() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(100));
+        v.validate(&key.sign(&claims(&idp.issuer(), AUD)))
+            .await
+            .unwrap();
+        // Valid keys cached, IdP goes down, a rotated kid shows up.
+        idp.set_mode(Mode::Fail500);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let rotated = TestKey::ec("rotated").sign(&claims(&idp.issuer(), AUD));
+        for _ in 0..3 {
+            assert_eq!(
+                v.validate(&rotated).await.unwrap_err(),
+                OAuthReject::Unavailable
+            );
+        }
+        assert_eq!(idp.jwks_hits(), 2, "one failed fetch, then throttled");
     }
 
     #[tokio::test]

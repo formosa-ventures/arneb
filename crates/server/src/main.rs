@@ -945,6 +945,7 @@ async fn run() -> Result<()> {
             max_page_bytes = agent_limits.max_page_bytes,
             max_cell_bytes = agent_limits.max_cell_bytes,
             max_retained_bytes = agent_limits.max_retained_bytes,
+            max_user_retained_bytes = agent_limits.max_user_retained_bytes,
             max_total_retained_bytes = agent_limits.max_total_retained_bytes,
             max_wait_ms = config.agent_api.max_wait_ms,
             idle_timeout_secs = config.agent_api.idle_timeout_secs,

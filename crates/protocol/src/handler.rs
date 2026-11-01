@@ -1102,10 +1102,33 @@ fn cap_plan_rows(plan: LogicalPlan, row_cap: usize) -> LogicalPlan {
     }
 }
 
-/// [`execute_query_with_limit`] that, for a `SELECT`, stops producing rows
-/// after `row_cap` of them: the plan's root gets a `LIMIT row_cap`, so the
-/// query reads no more than it needs to return that many rows. Other
-/// statements ignore `row_cap`.
+/// Takes a query's batches one at a time as they are produced, so the caller
+/// keeps only what it needs instead of a fully collected result.
+pub(crate) trait BatchSink: Send {
+    /// Takes the next batch.
+    fn push(&mut self, batch: arrow::record_batch::RecordBatch);
+}
+
+impl BatchSink for Vec<arrow::record_batch::RecordBatch> {
+    fn push(&mut self, batch: arrow::record_batch::RecordBatch) {
+        Vec::push(self, batch);
+    }
+}
+
+/// A capped query: a `SELECT` produces at most `rows` rows, and every batch
+/// goes to `sink` as it arrives.
+pub(crate) struct RowCap<'a> {
+    pub(crate) rows: usize,
+    pub(crate) sink: &'a mut dyn BatchSink,
+}
+
+/// [`execute_query_with_limit`] that, given a [`RowCap`], stops a `SELECT`
+/// after `row_cap.rows` rows (the plan's root gets a `LIMIT`, so the query
+/// reads no more than it needs to return that many) and hands every batch
+/// to `row_cap.sink` instead of returning it; the returned batches are then
+/// empty. A local plan streams into the sink; a distributed one is handed
+/// over once the coordinator has its final batches. Other statements ignore
+/// the row limit.
 pub(crate) async fn execute_query_capped(
     sql: &str,
     catalog_manager: &CatalogManager,
@@ -1113,7 +1136,7 @@ pub(crate) async fn execute_query_capped(
     distributed_executor: Option<&dyn DistributedExecutor>,
     memory_pool: &Arc<dyn arneb_execution::memory_pool::MemoryPool>,
     query_memory_limit: Option<usize>,
-    row_cap: Option<usize>,
+    row_cap: Option<RowCap<'_>>,
 ) -> Result<
     (
         Arc<dyn ExecutionPlan>,
@@ -1142,9 +1165,9 @@ pub(crate) async fn execute_query_capped(
     // costs only an `Arc` clone.
     let planner = QueryPlanner::new(catalog_manager);
     let (logical_plan, analyzer_ctx) = planner.plan_statement_with_context(&statement).await?;
-    let logical_plan = match (row_cap, &statement) {
+    let logical_plan = match (&row_cap, &statement) {
         (Some(cap), arneb_sql_parser::ast::Statement::Query { .. }) => {
-            cap_plan_rows(logical_plan, cap)
+            cap_plan_rows(logical_plan, cap.rows)
         }
         _ => logical_plan,
     };
@@ -1205,7 +1228,10 @@ pub(crate) async fn execute_query_capped(
     if let Some(executor) = distributed_executor {
         if executor.has_workers() {
             tracing::info!("routing query to distributed executor");
-            let batches = executor.execute(logical_plan, &exec_ctx).await?;
+            let mut batches = executor.execute(logical_plan, &exec_ctx).await?;
+            if let Some(cap) = row_cap {
+                batches.drain(..).for_each(|b| cap.sink.push(b));
+            }
             // Create local physical plan just for schema (not executed)
             // Fall through to local if distributed fails
             let local_plan = exec_ctx.create_physical_plan(
@@ -1233,8 +1259,17 @@ pub(crate) async fn execute_query_capped(
 
     // Step 6: Execute (async). After the wrap above, top-level output
     // is always single-partition.
-    let stream = physical_plan.execute(0).await?;
-    let batches = collect_stream(stream).await?;
+    let mut stream = physical_plan.execute(0).await?;
+    let batches = match row_cap {
+        Some(cap) => {
+            use futures::StreamExt;
+            while let Some(batch) = stream.next().await {
+                cap.sink.push(batch?);
+            }
+            Vec::new()
+        }
+        None => collect_stream(stream).await?,
+    };
 
     Ok((physical_plan, batches))
 }

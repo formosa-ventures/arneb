@@ -13,11 +13,18 @@ pub struct AgentLimits {
     pub max_page_bytes: usize,
     /// Longest rendered cell; longer values are truncated.
     pub max_cell_bytes: usize,
-    /// Arrow memory one finished statement may retain; rows past it are
-    /// dropped (`truncated_by: max_retained_bytes`).
+    /// Arrow memory one statement may retain, while collecting and after;
+    /// rows past it are dropped (`truncated_by: max_retained_bytes`).
     pub max_retained_bytes: usize,
+    /// Arrow memory all finished statements of one user together may
+    /// retain, so one user cannot take the whole server budget; a statement
+    /// that finds it exhausted first evicts the user's own least recently
+    /// used ended statements, then keeps what fits
+    /// (`truncated_by: user_budget`).
+    pub max_user_retained_bytes: usize,
     /// Arrow memory all finished statements together may retain; a
-    /// statement that finds it exhausted keeps what fits
+    /// statement that finds it exhausted first evicts the least recently
+    /// used ended statements (fully read ones first), then keeps what fits
     /// (`truncated_by: server_budget`).
     pub max_total_retained_bytes: usize,
     /// Longest any request waits before answering "still running".
@@ -36,6 +43,7 @@ impl Default for AgentLimits {
             max_page_bytes: 4_194_304,
             max_cell_bytes: 8192,
             max_retained_bytes: 64 << 20,
+            max_user_retained_bytes: 256 << 20,
             max_total_retained_bytes: 1 << 30,
             max_wait: Duration::from_millis(10_000),
             idle_timeout: Duration::from_secs(600),
@@ -54,6 +62,7 @@ impl AgentLimits {
             ("max_page_bytes", self.max_page_bytes == 0),
             ("max_cell_bytes", self.max_cell_bytes == 0),
             ("max_retained_bytes", self.max_retained_bytes == 0),
+            ("max_user_retained_bytes", self.max_user_retained_bytes == 0),
             (
                 "max_total_retained_bytes",
                 self.max_total_retained_bytes == 0,
@@ -76,10 +85,16 @@ impl AgentLimits {
                 self.default_page_bytes, self.max_page_bytes
             ));
         }
-        if self.max_retained_bytes > self.max_total_retained_bytes {
+        if self.max_retained_bytes > self.max_user_retained_bytes {
             return Err(format!(
-                "max_retained_bytes ({}) must not exceed max_total_retained_bytes ({})",
-                self.max_retained_bytes, self.max_total_retained_bytes
+                "max_retained_bytes ({}) must not exceed max_user_retained_bytes ({})",
+                self.max_retained_bytes, self.max_user_retained_bytes
+            ));
+        }
+        if self.max_user_retained_bytes > self.max_total_retained_bytes {
+            return Err(format!(
+                "max_user_retained_bytes ({}) must not exceed max_total_retained_bytes ({})",
+                self.max_user_retained_bytes, self.max_total_retained_bytes
             ));
         }
         if self.idle_timeout < self.max_wait {
@@ -99,7 +114,10 @@ mod tests {
 
     #[test]
     fn defaults_are_valid() {
-        AgentLimits::default().validate().unwrap();
+        let l = AgentLimits::default();
+        l.validate().unwrap();
+        // One user cannot take the whole server budget.
+        assert!(l.max_user_retained_bytes < l.max_total_retained_bytes);
     }
 
     #[test]
@@ -116,12 +134,21 @@ mod tests {
         };
         assert!(l.validate().unwrap_err().contains("default_page_bytes"));
         let l = AgentLimits {
-            max_retained_bytes: 2 << 30,
+            max_retained_bytes: 512 << 20,
             ..Default::default()
         };
         let err = l.validate().unwrap_err();
         assert!(
-            err.contains("max_retained_bytes") && err.contains("max_total_retained_bytes"),
+            err.contains("max_retained_bytes") && err.contains("max_user_retained_bytes"),
+            "{err}"
+        );
+        let l = AgentLimits {
+            max_user_retained_bytes: 2 << 30,
+            ..Default::default()
+        };
+        let err = l.validate().unwrap_err();
+        assert!(
+            err.contains("max_user_retained_bytes") && err.contains("max_total_retained_bytes"),
             "{err}"
         );
     }

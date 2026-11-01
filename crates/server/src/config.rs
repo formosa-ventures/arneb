@@ -404,6 +404,7 @@ impl AdmissionConfig {
 /// max_page_bytes     = 4194304   # ARNEB_AGENT_MAX_PAGE_BYTES
 /// max_cell_bytes     = 8192      # ARNEB_AGENT_MAX_CELL_BYTES
 /// max_retained_bytes = 67108864  # ARNEB_AGENT_MAX_RETAINED_BYTES
+/// max_user_retained_bytes = 268435456  # ARNEB_AGENT_MAX_USER_RETAINED_BYTES
 /// max_total_retained_bytes = 1073741824  # ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES
 /// max_wait_ms        = 10000     # ARNEB_AGENT_MAX_WAIT_MS
 /// idle_timeout_secs  = 600       # ARNEB_AGENT_IDLE_TIMEOUT_SECS
@@ -424,8 +425,11 @@ pub struct AgentApiConfig {
     /// their JSON); longer cells are cut.
     pub max_cell_bytes: usize,
     /// Arrow memory one finished statement may retain; must not exceed
-    /// `max_total_retained_bytes`.
+    /// `max_user_retained_bytes`.
     pub max_retained_bytes: usize,
+    /// Arrow memory one user's finished statements may retain together;
+    /// must not exceed `max_total_retained_bytes`.
+    pub max_user_retained_bytes: usize,
     /// Arrow memory all finished statements together may retain.
     pub max_total_retained_bytes: usize,
     /// Longest any request waits before answering "still running".
@@ -444,6 +448,7 @@ impl Default for AgentApiConfig {
             max_page_bytes: d.max_page_bytes,
             max_cell_bytes: d.max_cell_bytes,
             max_retained_bytes: d.max_retained_bytes,
+            max_user_retained_bytes: d.max_user_retained_bytes,
             max_total_retained_bytes: d.max_total_retained_bytes,
             max_wait_ms: d.max_wait.as_millis() as u64,
             idle_timeout_secs: d.idle_timeout.as_secs(),
@@ -461,6 +466,7 @@ impl AgentApiConfig {
             max_page_bytes: self.max_page_bytes,
             max_cell_bytes: self.max_cell_bytes,
             max_retained_bytes: self.max_retained_bytes,
+            max_user_retained_bytes: self.max_user_retained_bytes,
             max_total_retained_bytes: self.max_total_retained_bytes,
             max_wait: std::time::Duration::from_millis(self.max_wait_ms),
             idle_timeout: std::time::Duration::from_secs(self.idle_timeout_secs),
@@ -499,6 +505,11 @@ impl AgentApiConfig {
             &env,
             "ARNEB_AGENT_MAX_RETAINED_BYTES",
             &mut self.max_retained_bytes,
+        )?;
+        set(
+            &env,
+            "ARNEB_AGENT_MAX_USER_RETAINED_BYTES",
+            &mut self.max_user_retained_bytes,
         )?;
         set(
             &env,
@@ -1981,16 +1992,36 @@ pgwire = "required"
     fn agent_api_retained_byte_limits_from_file_and_env() {
         let c = agent_api("port = 5432", &[]).unwrap();
         assert_eq!(
-            (c.max_retained_bytes, c.max_total_retained_bytes),
-            (64 << 20, 1 << 30)
+            (
+                c.max_retained_bytes,
+                c.max_user_retained_bytes,
+                c.max_total_retained_bytes
+            ),
+            (64 << 20, 256 << 20, 1 << 30)
         );
-        let file = "[agent_api]\nmax_retained_bytes = 1000\nmax_total_retained_bytes = 5000\n";
-        let c = agent_api(file, &[("ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES", "9000")]).unwrap();
+        let file = "[agent_api]\nmax_retained_bytes = 1000\n\
+                    max_user_retained_bytes = 2000\nmax_total_retained_bytes = 5000\n";
+        let c = agent_api(
+            file,
+            &[
+                ("ARNEB_AGENT_MAX_USER_RETAINED_BYTES", "3000"),
+                ("ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES", "9000"),
+            ],
+        )
+        .unwrap();
         assert_eq!(
-            (c.max_retained_bytes, c.max_total_retained_bytes),
-            (1000, 9000)
+            (
+                c.max_retained_bytes,
+                c.max_user_retained_bytes,
+                c.max_total_retained_bytes
+            ),
+            (1000, 3000, 9000)
         );
-        let err = agent_api(file, &[("ARNEB_AGENT_MAX_RETAINED_BYTES", "6000")])
+        let err = agent_api(file, &[("ARNEB_AGENT_MAX_RETAINED_BYTES", "2500")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_user_retained_bytes"), "{err}");
+        let err = agent_api(file, &[("ARNEB_AGENT_MAX_USER_RETAINED_BYTES", "6000")])
             .unwrap_err()
             .to_string();
         assert!(err.contains("max_total_retained_bytes"), "{err}");

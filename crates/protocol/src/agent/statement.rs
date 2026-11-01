@@ -80,13 +80,14 @@ pub struct StatementStatus {
     pub update_type: Option<String>,
     /// Result columns, once finished.
     pub columns: Option<Vec<Column>>,
-    /// Rows in the result, once finished; `None` while running and when
-    /// `truncated`, since execution stops after `max_rows + 1` rows.
+    /// Rows in the result, once finished, kept or not; `None` while running
+    /// and when the query produced more than `max_rows` rows, since
+    /// execution stops after `max_rows + 1` and never learns the full count.
     pub total_rows: Option<u64>,
     /// Whether rows beyond the retained ones were dropped.
     pub truncated: bool,
     /// Why rows were dropped, when `truncated`: `max_rows`,
-    /// `max_retained_bytes` or `server_budget`.
+    /// `max_retained_bytes`, `user_budget` or `server_budget`.
     pub truncated_by: Option<TruncatedBy>,
     /// Rows kept for the client at most (the request's `max_rows`).
     pub max_rows: usize,
@@ -130,6 +131,9 @@ pub(crate) struct Inner {
     pub(crate) ended: Option<Instant>,
     /// Requests currently long-polling the statement.
     pub(crate) waiters: usize,
+    /// Whether a page reaching the last retained row has been served;
+    /// such statements are evicted first when the retained budget is short.
+    pub(crate) read_to_end: bool,
 }
 
 /// A statement the service tracks between requests.
@@ -162,6 +166,7 @@ impl Statement {
                 last_access: now,
                 ended: None,
                 waiters: 0,
+                read_to_end: false,
             }),
             done: watch::channel(false).0,
             abort: Mutex::new(None),
@@ -257,6 +262,13 @@ impl Statement {
         };
         status.first_page =
             retained.map(|r| page(&r, 0, limits.default_page_bytes, limits.max_cell_bytes));
+        if status
+            .first_page
+            .as_ref()
+            .is_some_and(|p| p.next_cursor.is_none())
+        {
+            self.lock().read_to_end = true;
+        }
         status
     }
 }
@@ -302,6 +314,10 @@ impl Statement {
             )
             .with_hint(format!("cursor must be in 0..={kept}")));
         }
-        Ok(page(&retained, cursor, max_bytes, max_cell_bytes))
+        let page = page(&retained, cursor, max_bytes, max_cell_bytes);
+        if page.next_cursor.is_none() {
+            self.lock().read_to_end = true;
+        }
+        Ok(page)
     }
 }

@@ -10,7 +10,8 @@
 
 - [x] 3.1 Statement lifecycle over the Trino engine: submit, poll with `wait_ms`, cancel, per-user visibility, session statements refused
 - [x] 3.2 Bounded registry (32 per user, 1024 total) and the idle reaper
-- [x] 3.3 Bounded results: execution capped at `max_rows + 1` rows, `max_rows` retention with `total_rows` (`null` when truncated), byte-bounded pages with a cursor, cell truncation
+- [x] 3.3 Bounded results: execution capped at `max_rows + 1` rows, `max_rows` retention with `total_rows` (`null` when execution was capped), byte-bounded pages with a cursor, cell truncation
+- [x] 3.4 Retained-result budget: rows collected as produced under `max_retained_bytes`, a per-user share and a server budget, LRU eviction of ended statements (fully read first), the first row always kept, `DELETE` releasing an ended statement
 
 ## 4. Discovery and explain
 

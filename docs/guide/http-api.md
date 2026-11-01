@@ -285,23 +285,35 @@ least one, so a single wide row can make a page larger than `max_bytes`
 `max_rows + 1` of them (one extra, to tell whether there are more), so a
 `SELECT *` over a large table with `max_rows=100` reads only what it needs
 for 101 rows, and an `ORDER BY` keeps the top rows instead of sorting
-everything. The cost is that a truncated result has no exact count:
-`total_rows` is the row count when `truncated` is `false`, and `null` when it
-is `true`. To count a large result, run `SELECT count(*)`. Aggregations,
-joins and sorts still read all their input; only the rows they emit are
-capped.
+everything. The cost is that a result cut by `max_rows` has no exact count:
+`total_rows` is the number of rows the query produced when that is at most
+`max_rows` (even if a byte limit kept fewer of them), and `null` when
+execution stopped at `max_rows + 1`. To count a large result, run
+`SELECT count(*)`. Aggregations, joins and sorts still read all their
+input; only the rows they emit are capped.
 
-Retained rows are also bounded by memory: a statement keeps at most
-`max_retained_bytes` of Arrow data, and all statements together at most
-`max_total_retained_bytes`. Rows past either are dropped as they are kept;
-the statement still finishes, with `truncated: true` and `total_rows: null`.
-`truncated_by` says which limit cut the result, so an agent can react:
+Retained rows are also bounded by memory, while the query runs and after:
+a statement keeps at most `max_retained_bytes` of Arrow data, one user's
+statements together at most `max_user_retained_bytes`, and all statements
+together at most `max_total_retained_bytes`. Rows are kept as the query
+produces them; strings are cut to what a page can show (`max_cell_bytes`)
+as they are kept, and a dictionary shared by several batches counts once.
+When the user's share or the server budget is short, the server first
+evicts statements that have ended and still hold rows: fully read ones
+first (the last page was fetched, or the first page held everything), then
+the least recently used; only the user's own for the user's share, anyone's
+for the server budget. An evicted statement answers `not_found`. When
+nothing is left to evict, the rows past the limit are dropped (still
+counted) and the statement finishes with `truncated: true`. The first row is
+always kept, so a single huge value still comes back, cut. `truncated_by`
+says which limit cut the result, so an agent can react:
 
 | `truncated_by` | Cause | What to do |
 |---|---|---|
 | `max_rows` | More than `max_rows` rows. | Add `LIMIT`, a filter or an aggregate, or raise `max_rows`. |
 | `max_retained_bytes` | The kept rows reached the per-statement byte limit. | Select fewer or narrower columns. |
-| `server_budget` | Retained results across the server hit the global budget. | Retry later; results free up as statements are evicted or reaped. |
+| `user_budget` | Your statements' retained results reached your share. | `DELETE` statements you are done with, or wait for running ones to finish. |
+| `server_budget` | Retained results across the server hit the global budget. | Retry later; results free up as statements are deleted, evicted or reaped. |
 | `null` | Nothing was cut. | |
 
 A request value above its ceiling is refused with `invalid_argument` and a
@@ -320,6 +332,7 @@ query parameter is also `invalid_argument`.
 | `max_page_bytes` | `ARNEB_AGENT_MAX_PAGE_BYTES` | 4194304 |
 | `max_cell_bytes` | `ARNEB_AGENT_MAX_CELL_BYTES` | 8192 |
 | `max_retained_bytes` | `ARNEB_AGENT_MAX_RETAINED_BYTES` | 67108864 (64 MiB) |
+| `max_user_retained_bytes` | `ARNEB_AGENT_MAX_USER_RETAINED_BYTES` | 268435456 (256 MiB) |
 | `max_total_retained_bytes` | `ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES` | 1073741824 (1 GiB) |
 | `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 |
 | `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 |

@@ -32,7 +32,7 @@ Stage H1 of the headless agent interface. Before this change, `[auth]` verified 
 
 **D7. Auth is a single middleware with an explicit public list.** `requires_auth` is the one place that decides what is open, covering the nested v1 and v2 routers and the static UI. Under `none` the identity comes from `X-Arneb-User` or `anonymous`, and query rules are not applied.
 
-**D8. Blocking work off the async workers.** PBKDF2 checks go through the shared `BasicAuthenticator` (bounded concurrency, `overloaded` when saturated); token issue and revoke run under `spawn_blocking`, with at most four issuances in flight.
+**D8. Blocking work off the async workers.** PBKDF2 checks go through `BasicAuthenticator`: the Trino and Web listeners each get a `sibling` handle with its own wait queue (`overloaded` when full, so a flood on one port cannot 503 the other) over one shared four-slot PBKDF2 limiter and success cache, built only on a coordinator. Token issue and revoke run under `spawn_blocking`; issuance takes its slot from that same limiter, after the cheap unknown-user and token-cap pre-checks, so one bound covers all HTTP PBKDF2.
 
 **D9. Helm mounts a PVC at `/var/lib/arneb`.** Coordinator only, `ARNEB_STATE_PATH=/var/lib/arneb/state.json`. The chart's PVC is deleted on `helm uninstall`; `existingClaim` lets production keep it.
 

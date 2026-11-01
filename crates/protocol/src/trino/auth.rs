@@ -127,6 +127,27 @@ impl BasicAuthenticator {
         Self::with_counter(creds, Arc::new(AtomicU64::new(0)))
     }
 
+    /// Another handle for a second listener: it shares this one's PBKDF2
+    /// limiter (one CPU bound for the process), success cache and counter,
+    /// but has its own single-flight map, so its wait-queue budget
+    /// ([`MAX_QUEUED_VERIFICATIONS`]) is independent. A flood of bad
+    /// credentials on one listener then cannot make the other return `503`.
+    #[must_use]
+    pub fn sibling(&self) -> Self {
+        Self {
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            ..self.clone()
+        }
+    }
+
+    /// Takes one PBKDF2 slot from the shared limiter, for other work that
+    /// derives a PBKDF2 key on this process's behalf (API token issuance).
+    /// Move the permit into the blocking task so the slot is held for as
+    /// long as the derivation runs. `None` only if the limiter is closed.
+    pub async fn acquire_pbkdf2_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.limiter).acquire_owned().await.ok()
+    }
+
     /// Like [`BasicAuthenticator::new`], counting PBKDF2 verifications in
     /// `verifications`.
     pub(crate) fn with_counter(
@@ -491,6 +512,44 @@ mod tests {
         }
         assert_eq!(counter.load(Ordering::Relaxed), 1 + bound as u64);
         assert_eq!(in_flight_len(&auth), 0);
+    }
+
+    #[tokio::test]
+    async fn sibling_has_its_own_queue_but_shares_the_limiter_and_cache() {
+        let (auth, counter) = authenticator();
+        let other = auth.sibling();
+        let held = hold_all_slots(&auth);
+        let bound = MAX_CONCURRENT_VERIFICATIONS + MAX_QUEUED_VERIFICATIONS;
+        let flood: Vec<_> = (0..bound)
+            .map(|i| {
+                let auth = auth.clone();
+                tokio::spawn(async move { auth.check("alice", &format!("bad-{i}")).await })
+            })
+            .collect();
+        settle().await;
+        assert_eq!(in_flight_len(&auth), bound);
+        assert_eq!(in_flight_len(&other), 0);
+        assert_eq!(
+            auth.check("alice", "bad-new").await,
+            BasicVerdict::Overloaded
+        );
+        // The sibling still queues (its budget is untouched) ...
+        let queued = tokio::spawn({
+            let other = other.clone();
+            async move { other.check("alice", "alice-pw").await }
+        });
+        settle().await;
+        assert!(!queued.is_finished(), "waits on the shared limiter");
+        assert_eq!(in_flight_len(&other), 1);
+        drop(held);
+        assert_eq!(queued.await.unwrap(), BasicVerdict::Valid);
+        for t in flood {
+            let _ = t.await;
+        }
+        // ... and a success on one handle is a cache hit on the other.
+        let before = counter.load(Ordering::Relaxed);
+        assert_eq!(auth.check("alice", "alice-pw").await, BasicVerdict::Valid);
+        assert_eq!(counter.load(Ordering::Relaxed), before);
     }
 
     #[test]

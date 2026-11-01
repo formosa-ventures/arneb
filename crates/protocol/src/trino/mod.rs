@@ -111,7 +111,6 @@ pub struct TrinoServer {
     query_tracker: Arc<QueryTracker>,
     tls: Option<TlsAcceptor>,
     auth: Option<BasicAuthenticator>,
-    verifications: Arc<AtomicU64>,
     query_memory_limit: Option<usize>,
     admission: Option<arneb_scheduler::AdmissionController>,
     statement_timeout: Option<Duration>,
@@ -135,7 +134,6 @@ impl TrinoServer {
             query_tracker: Arc::new(QueryTracker::new()),
             tls: None,
             auth: None,
-            verifications: Arc::new(AtomicU64::new(0)),
             query_memory_limit: None,
             admission: None,
             statement_timeout: None,
@@ -146,22 +144,17 @@ impl TrinoServer {
     /// Require HTTP Basic auth against these users (`[auth] type =
     /// "password"`); default: none, every `X-Trino-User` is trusted.
     pub fn with_password_auth(
-        mut self,
+        self,
         creds: Option<Arc<dyn CredentialSource>>,
     ) -> Result<Self, AuthConfigError> {
-        self.auth = creds
-            .map(|c| BasicAuthenticator::with_counter(c, Arc::clone(&self.verifications)))
-            .transpose()?;
-        Ok(self)
+        let auth = creds.map(BasicAuthenticator::new).transpose()?;
+        Ok(self.with_authenticator(auth))
     }
 
     /// Require HTTP Basic auth through `auth`, an authenticator the caller
     /// shares with other listeners (one PBKDF2 limiter, queue and cache for
     /// all of them). `None`: no auth, every `X-Trino-User` is trusted.
     pub fn with_authenticator(mut self, auth: Option<BasicAuthenticator>) -> Self {
-        if let Some(a) = &auth {
-            self.verifications = Arc::clone(&a.verifications);
-        }
         self.auth = auth;
         self
     }
@@ -169,7 +162,10 @@ impl TrinoServer {
     /// Count of full password verifications (cache misses); test hook.
     #[doc(hidden)]
     pub fn password_verifications(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.verifications)
+        self.auth
+            .as_ref()
+            .map(|a| Arc::clone(&a.verifications))
+            .unwrap_or_default()
     }
 
     /// Serve HTTPS only with this acceptor (default: plain HTTP).

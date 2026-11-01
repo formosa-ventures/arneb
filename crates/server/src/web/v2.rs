@@ -37,12 +37,6 @@ const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// [`SESSION_TTL`] in milliseconds (8 hours: no truncation).
 const SESSION_TTL_MS: u64 = SESSION_TTL.as_secs() * 1000;
 
-/// Token issuances running PBKDF2 at once; the rest wait, so a burst cannot
-/// saturate the blocking pool.
-const MAX_CONCURRENT_ISSUES: usize = 4;
-static ISSUE_PERMITS: tokio::sync::Semaphore =
-    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_ISSUES);
-
 /// The `/api/v2` routes, nested at `/api/v2` by [`super::build_router`].
 pub fn routes() -> Router<WebState> {
     Router::new()
@@ -335,10 +329,20 @@ async fn issue_token(
     if !persistent {
         hints.push("the server keeps state in memory only: this token is lost when it restarts");
     }
-    let permit = ISSUE_PERMITS
-        .acquire()
+    // Refuse what is already doomed (unknown user, token cap) before
+    // queueing for a PBKDF2 slot, so a retry loop at the cap never waits
+    // behind running derivations.
+    store.check_can_issue(&who.user).map_err(state_error)?;
+    // The slot comes from the Basic authenticator's limiter: one CPU bound
+    // for every PBKDF2 derivation the HTTP listeners start.
+    let unavailable = || ApiError::new(ErrorCode::Internal, "token issuance is unavailable");
+    let permit = state
+        .basic
+        .as_ref()
+        .ok_or_else(unavailable)?
+        .acquire_pbkdf2_slot()
         .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal, "token issuance is unavailable"))?;
+        .ok_or_else(unavailable)?;
     // The permit moves into the blocking task, so it is held for as long as
     // PBKDF2 runs even if the client disconnects and this future is dropped.
     let issued = tokio::task::spawn_blocking(move || {
@@ -957,6 +961,61 @@ mod tests {
             Some(body),
         )
         .await
+    }
+
+    /// Takes every PBKDF2 slot of the shared limiter (4 today).
+    async fn hold_all_pbkdf2_slots(state: &WebState) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let basic = state.basic.as_ref().unwrap();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(basic.acquire_pbkdf2_slot().await.unwrap());
+        }
+        held
+    }
+
+    #[tokio::test]
+    async fn issuance_waits_on_the_shared_pbkdf2_limiter() {
+        let state = web_state(true, None);
+        let held = hold_all_pbkdf2_slots(&state).await;
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { issue(&state, &basic("alice", "secret"), json!({})).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!task.is_finished(), "issuance must wait for a shared slot");
+        drop(held);
+        assert_eq!(task.await.unwrap().0, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn capped_user_is_refused_without_waiting_for_a_slot() {
+        let state = web_state(true, None);
+        let store = state.state.clone().unwrap();
+        for _ in 0..arneb_state::MAX_TOKENS_PER_USER {
+            store.issue_token("alice", None, None).unwrap();
+        }
+        // Warm the Basic success cache: a cold login would itself need a slot.
+        let (status, _) = call(
+            &state,
+            Method::GET,
+            "/api/v2/whoami",
+            Some(&basic("alice", "secret")),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let _held = hold_all_pbkdf2_slots(&state).await;
+        let capped = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            issue(&state, &basic("alice", "secret"), json!({})),
+        )
+        .await
+        .expect("a capped user must not wait for a PBKDF2 slot");
+        assert_eq!(capped.0, StatusCode::BAD_REQUEST);
+        assert!(capped.1["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("live tokens"));
     }
 
     #[tokio::test]

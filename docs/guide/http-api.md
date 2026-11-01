@@ -186,8 +186,10 @@ not `kill` answers `403`, and a user may always kill their own.
   works on pgwire but not as Trino Basic, which treats token-shaped
   passwords as tokens. Do not choose such a password.
 - **No login lockout.** Repeated wrong passwords are not locked out.
-  Concurrent PBKDF2 checks are bounded (a burst gets `overloaded`), which
-  limits the cost, not the guessing. Use long passwords, or tokens, and
+  Concurrent PBKDF2 work is bounded by one process-wide limiter shared by
+  Basic checks (Web and Trino) and token issuance; each listener has its own
+  wait queue, so a burst on one port gets `overloaded` without affecting the
+  other. This limits the cost, not the guessing. Use long passwords, or tokens, and
   rate-limit at your proxy.
 - **Plaintext tokens** appear only in the issue response. The server never
   logs them.

@@ -896,14 +896,18 @@ async fn run() -> Result<()> {
             mode: t.pgwire,
         });
 
+    let serves_clients = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
     let password_users = match &auth_method {
         arneb_protocol::AuthMethod::ScramSha256(creds) => Some(Arc::clone(creds)),
         arneb_protocol::AuthMethod::None => None,
     };
-    // One Basic authenticator for the Trino and Web listeners, so both share
-    // one PBKDF2 limiter, one wait queue and one verification cache.
+    // Only the coordinator's Trino and Web listeners check Basic credentials
+    // (workers serve neither). They share one PBKDF2 limiter and success
+    // cache, but each gets its own wait queue (`sibling`), so a flood on one
+    // port cannot 503 the other.
     let basic_auth = password_users
         .clone()
+        .filter(|_| serves_clients)
         .map(arneb_protocol::BasicAuthenticator::new)
         .transpose()
         .context("HTTP Basic authentication")?;
@@ -981,7 +985,6 @@ async fn run() -> Result<()> {
     // state (catalogs, connectors, memory pool, distributed executor) as
     // pgwire. Queries are registered with the tracker so they show in the
     // Web UI.
-    let serves_clients = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
     let trino_enabled = config.trino.enabled && serves_clients;
     let trino_addr = format!("{}:{}", config.server.bind_address, config.trino.port);
     // Fail closed: Trino clients only send passwords over HTTPS, so password
@@ -1015,7 +1018,7 @@ async fn run() -> Result<()> {
         .with_query_tracker(query_tracker.clone())
         .with_access_rules(access_rules.clone())
         .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
-        .with_authenticator(basic_auth.clone());
+        .with_authenticator(basic_auth.as_ref().map(|a| a.sibling()));
         if let Some(ref executor) = distributed_executor {
             trino = trino.with_distributed_executor(Arc::clone(executor));
         }
@@ -1056,7 +1059,9 @@ async fn run() -> Result<()> {
         memory_limit_bytes: budget.map(|b| b as u64),
         // Same source as `credentials_for_web` (the state store) whenever
         // that is set: password auth makes the state store the auth method.
-        basic: credentials_for_web.as_ref().and(basic_auth),
+        basic: credentials_for_web
+            .as_ref()
+            .and(basic_auth.as_ref().map(|a| a.sibling())),
         credentials: credentials_for_web,
         state: state_for_web,
         access_rules: access_rules.clone(),

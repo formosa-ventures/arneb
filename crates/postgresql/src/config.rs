@@ -68,6 +68,30 @@ impl PostgresConfig {
         }
         let mut config = tokio_postgres::Config::from_str(&self.connection_url)
             .map_err(|_| "invalid connection_url".to_string())?;
+        // The driver ends the credentials at the first `@` anywhere, so an
+        // unencoded `@` in a query value (`?user=admin@srv&password=...`)
+        // turns the rest of the URL into the "host". Refuse that, without
+        // echoing the host (it may hold the password).
+        // Likewise an `@` inside a query value or a userinfo password makes
+        // the driver's user swallow the path or query, or leaves an `@` in
+        // the host. The parsed user and host are checked before `self.user`
+        // applies, and never echoed: either may hold part of a password.
+        let bad_host = config.get_hosts().iter().any(|h| match h {
+            tokio_postgres::config::Host::Tcp(h) => h.contains(['=', '&', '?', '/', '@']),
+            #[cfg(unix)]
+            tokio_postgres::config::Host::Unix(_) => false,
+        });
+        let bad_user = config
+            .get_user()
+            .is_some_and(|u| u.contains(['/', '?', '&', '=']));
+        if bad_host || bad_user {
+            return Err(
+                "invalid connection_url: an unencoded '@' splits it in the wrong \
+                        place; percent-encode an '@' in a user name, password or parameter \
+                        value as %40"
+                    .into(),
+            );
+        }
         if let Some(user) = &self.user {
             config.user(user);
         }
@@ -79,6 +103,12 @@ impl PostgresConfig {
         }
         config.application_name("arneb");
         Ok(config)
+    }
+
+    /// Checks that `connection_url` parses as the driver will read it. The
+    /// error never contains the password.
+    pub fn validate_url(&self) -> Result<(), String> {
+        self.driver_config().map(|_| ())
     }
 
     /// `host:port/database` for logs (no credentials).
@@ -171,5 +201,44 @@ mod tests {
             .driver_config()
             .is_err());
         assert!(PostgresConfig::new("mysql://h/d").driver_config().is_err());
+        // An unencoded `@` anywhere but before the host splits the URL in
+        // the wrong place; nothing of the password may show.
+        for (url, parts) in [
+            (
+                "postgresql://db.internal:5432/sales?user=admin@srv&password=S3cret",
+                &["S3cret"][..],
+            ),
+            (
+                "postgresql://db/sales?user=admin@srv&password=S3cret",
+                &["S3cret"],
+            ),
+            (
+                "postgresql://db.internal/sales?user=app&password=Xy@9zK",
+                &["Xy", "9zK"],
+            ),
+            (
+                "postgresql://db/sales?user=admin@srv/x&password=S3cret",
+                &["S3cret"],
+            ),
+            ("postgresql://u:p@ss@host/db", &["ss@"]),
+        ] {
+            let c = PostgresConfig::new(url);
+            let e = c.validate_url().unwrap_err();
+            assert_eq!(c.display_target(), "<invalid connection_url>", "{url}");
+            for part in parts {
+                assert!(
+                    !e.contains(part) && !format!("{c:?}").contains(part),
+                    "{url}: {e}"
+                );
+            }
+        }
+        assert!(
+            PostgresConfig::new("postgresql://db/sales?user=admin%40srv&password=x")
+                .validate_url()
+                .is_ok()
+        );
+        assert!(PostgresConfig::new("postgresql://u:p/w@[::1]:5432/db")
+            .validate_url()
+            .is_ok());
     }
 }

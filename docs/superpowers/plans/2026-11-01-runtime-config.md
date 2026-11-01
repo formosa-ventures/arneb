@@ -131,7 +131,7 @@ My calls, on top of the spec. Task 8 copies them into `openspec/changes/runtime-
   - Admission stays at `/api/v2/admission` (H4). The settings `GET` does not repeat it.
 - **D10. Locking.** One `WebState::config_changes: Arc<tokio::sync::Mutex<()>>` serializes every H5 action (rules, users, user tokens, catalogs, settings, re-seed). It is held through `ManageAction::change_lock` until the audit entry is appended (the H4 pattern). Catalog probes run *before* the lock is taken, so a slow HMS does not block other changes. Under the lock, the action re-checks that the spec it probed is still the one being applied (create: name still absent; update: stored spec unchanged since the probe), and otherwise answers `conflict`, hint `retry`.
 - **D11. Error code.** New `ErrorCode::Conflict` (`"conflict"`, HTTP 409).
-- **D12. MCP.** 18 new tools (43 in total), each calling its route's `*_for`:
+- **D12. MCP.** 18 new tools (44 in total), each calling its route's `*_for`:
   - catalogs: `list_catalog_configs`, `get_catalog_config`, `create_catalog`, `update_catalog`, `drop_catalog`;
   - access rules: `get_access_rules`, `set_access_rules`, `clear_access_rules`;
   - users: `list_users`, `create_user`, `set_user_password`, `delete_user`;

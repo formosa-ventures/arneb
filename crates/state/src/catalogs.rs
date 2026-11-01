@@ -125,18 +125,8 @@ impl StateStore {
                 .collect();
             return Ok(report);
         }
-        let records = config
-            .iter()
-            .map(|(name, spec)| CatalogRecord {
-                name: name.clone(),
-                spec: spec.clone(),
-                from_config: true,
-            })
-            .collect();
         self.mutate(|d| {
-            d.catalogs = sorted_unique(records);
-            d.seeded.catalogs = true;
-            bump(d);
+            apply_catalog_seed(d, config);
             Ok(())
         })?;
         Ok(CatalogSeedReport {
@@ -144,6 +134,25 @@ impl StateStore {
             ..Default::default()
         })
     }
+}
+
+/// Replaces `d`'s catalogs with the config's (`from_config = true`), marks
+/// them seeded and bumps the generation. Returns the new generation.
+pub(crate) fn apply_catalog_seed(
+    d: &mut crate::file::StateData,
+    config: &[(String, serde_json::Value)],
+) -> u64 {
+    let records = config
+        .iter()
+        .map(|(name, spec)| CatalogRecord {
+            name: name.clone(),
+            spec: spec.clone(),
+            from_config: true,
+        })
+        .collect();
+    d.catalogs = sorted_unique(records);
+    d.seeded.catalogs = true;
+    bump(d)
 }
 
 fn bump(d: &mut crate::file::StateData) -> u64 {

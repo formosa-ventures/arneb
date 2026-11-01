@@ -233,7 +233,7 @@ async fn cancel(
     Extension(who): Extension<Identity>,
     Path(id): Path<String>,
 ) -> Result<Json<StatementStatus>, ApiError> {
-    Ok(Json(service(&state)?.cancel(&who.user, &id, None)?))
+    Ok(Json(service(&state)?.cancel(&who.user, &id)?))
 }
 
 #[cfg(test)]
@@ -312,6 +312,7 @@ mod tests {
             admission: None,
             admission_changes: Default::default(),
             cordon_changes: Default::default(),
+            max_running_queries: 8,
             max_queued_queries: 8,
             memory_pool: Arc::new(arneb_common::memory_pool::GreedyMemoryPool::new(1 << 20)),
             memory_limit_bytes: None,

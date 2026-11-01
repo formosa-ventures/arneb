@@ -270,20 +270,131 @@ async fn run() -> Result<()> {
         args.profile,
     ));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
-    // 5. Create catalog manager + connector registry
-    // Default catalog priority: first hive catalog > file (if tables configured) > memory
-    let default_catalog = if let Some(first_catalog) = config.catalogs.first() {
-        first_catalog.name.as_str()
-    } else if !config.tables.is_empty() {
-        "file"
-    } else {
-        "memory"
+    // Validate [auth] on every role (workers never open the state store).
+    let (config_auth, verifiers) = config
+        .auth
+        .to_auth_method()
+        .context("invalid [auth] configuration")?;
+    if matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_)) {
+        // Fail startup, not the first unknown-user login, if the RNG is broken.
+        arneb_protocol::init_decoy_secret().context("cannot create the decoy secret for [auth]")?;
+    }
+    // Cluster RPC security, read here so the startup checks below know
+    // whether catalog secrets may be served; installed further down.
+    let cluster_security = config
+        .cluster
+        .security(|k| std::env::var(k).ok())
+        .context("invalid [cluster] security configuration")?;
+    let has_cluster_secret = cluster_security.secret.is_some();
+    // Config checks that can refuse the start run before the state store
+    // below is written, so a refused start leaves the state untouched.
+    let heartbeat = config
+        .cluster
+        .heartbeat(|k| std::env::var(k).ok())
+        .context("invalid [cluster] heartbeat configuration")?;
+    let drain_timeout_secs = config
+        .cluster
+        .drain_timeout_secs(|k| std::env::var(k).ok())
+        .context("invalid [cluster] drain_timeout_secs")?;
+    config::check_cluster_transport(
+        cluster_security.secret.is_some(),
+        cluster_security.tls.is_some(),
+        &config.server.bind_address,
+    )?;
+    if matches!(role, ServerRole::Coordinator) {
+        config
+            .cluster
+            .query_retry(|k| std::env::var(k).ok())
+            .context("invalid [cluster] retry_policy")?;
+    }
+    // Client-facing TLS ([tls] / ARNEB_TLS_*): one certificate for pgwire and
+    // the Trino listener. Workers serve neither, so they skip loading it.
+    let server_tls = match (&config.tls_settings, role) {
+        (Some(t), ServerRole::Coordinator | ServerRole::Standalone) => Some(
+            ServerTls::load(&t.cert_path, &t.key_path).context("invalid [tls] configuration")?,
+        ),
+        _ => None,
     };
-    let default_schema = config
-        .catalogs
-        .first()
-        .map(|c| c.effective_default_schema())
-        .unwrap_or("default");
+    // Password auth on a coordinator/standalone: users live in the state
+    // store; config-seeded users follow the config file on every start
+    // (a changed hash or a removed user revokes tokens). The same store
+    // serves pgwire, Trino and the Web API.
+    let state_store = if matches!(role, ServerRole::Coordinator | ServerRole::Standalone)
+        && matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_))
+    {
+        let store = arneb_state::StateStore::open(config.state.path.as_deref())
+            .context("cannot open the state store ([state] path / ARNEB_STATE_PATH)")?;
+        let report = prepare_state_store(
+            &store,
+            &config,
+            &verifiers,
+            &role,
+            has_cluster_secret,
+            reseed_state,
+        )?;
+        tracing::info!(
+            target: "arneb::config",
+            state_path = %store
+                .path()
+                .map_or_else(|| "in-memory".to_owned(), |p| p.display().to_string()),
+            persistent = store.is_persistent(),
+            users = arneb_protocol::CredentialSource::user_count(&store),
+            first_start = report.first_start,
+            added = ?report.added,
+            updated = ?report.updated,
+            removed = ?report.removed,
+            adopted = ?report.adopted,
+            conflicts = ?report.conflicts,
+            revoked_tokens = report.revoked_tokens,
+            reseed = reseed_state,
+            "state store effective settings ([state] path / ARNEB_STATE_PATH / --reseed-state)"
+        );
+        if !store.is_persistent() {
+            tracing::warn!(
+                target: "arneb::config",
+                "no [state] path: API tokens, worker cordons, admission limits and the audit \
+                 log are lost on restart"
+            );
+        }
+        Some(Arc::new(store))
+    } else {
+        if reseed_state {
+            tracing::info!(
+                target: "arneb::config",
+                "--reseed-state ignored: it only applies with [auth] type = \"password\" \
+                 on a coordinator or standalone server"
+            );
+        }
+        // No state store: the config's catalogs are what is served.
+        check_catalog_exposure(
+            &role,
+            has_cluster_secret,
+            &config.storage,
+            &config.catalogs,
+            false,
+            config.cluster.rpc_port,
+        )?;
+        None
+    };
+    // 5. Create catalog manager + connector registry. The default catalog
+    // and schema come from the catalogs this node will serve (the state
+    // store's under password auth), so they never name a catalog that is
+    // not defined (see `default_catalog_and_schema`).
+    let served_specs = match role {
+        // Workers ignore [[catalogs]] and resolve with the coordinator's
+        // pushed defaults (Ruling R12).
+        ServerRole::Worker => Vec::new(),
+        _ => served_catalog_specs(state_store.as_deref(), &config.catalogs, false),
+    };
+    let (default_catalog, default_schema) =
+        default_catalog_and_schema(&config.catalogs, &served_specs, !config.tables.is_empty());
+    tracing::info!(
+        target: "arneb::config",
+        default_catalog = %default_catalog,
+        default_schema = %default_schema,
+        "default catalog and schema (the first [[catalogs]] entry if served, else the \
+         first served catalog by name, else file or memory)"
+    );
     let catalog_manager = CatalogManager::new(default_catalog, default_schema);
 
     // Register memory catalog (empty)
@@ -396,14 +507,6 @@ async fn run() -> Result<()> {
     }
 
     // 8. Set up Flight RPC server + heartbeat handling
-    let heartbeat = config
-        .cluster
-        .heartbeat(|k| std::env::var(k).ok())
-        .context("invalid [cluster] heartbeat configuration")?;
-    let drain_timeout_secs = config
-        .cluster
-        .drain_timeout_secs(|k| std::env::var(k).ok())
-        .context("invalid [cluster] drain_timeout_secs")?;
     match role {
         ServerRole::Coordinator => tracing::info!(
             target: "arneb::config",
@@ -430,21 +533,12 @@ async fn run() -> Result<()> {
     // Cluster RPC security ([cluster] secret / [cluster.tls] / ARNEB_CLUSTER_*):
     // installed once, before any Flight connection, for every outbound call
     // and for this node's Flight server.
-    let cluster_security = config
-        .cluster
-        .security(|k| std::env::var(k).ok())
-        .context("invalid [cluster] security configuration")?;
     tracing::info!(
         target: "arneb::config",
         cluster_auth = if cluster_security.secret.is_some() { "secret" } else { "off" },
         cluster_tls = if cluster_security.tls.is_some() { "on" } else { "off" },
         "cluster RPC security effective mode ([cluster] secret / [cluster.tls] / ARNEB_CLUSTER_*)"
     );
-    config::check_cluster_transport(
-        cluster_security.secret.is_some(),
-        cluster_security.tls.is_some(),
-        &config.server.bind_address,
-    )?;
     if cluster_security.secret.is_some()
         && cluster_security.tls.is_none()
         && !config::is_loopback_host(&config.server.bind_address)
@@ -773,58 +867,6 @@ async fn run() -> Result<()> {
         ));
     }
 
-    // Validate [auth] on every role (workers never open the state store).
-    let (config_auth, verifiers) = config
-        .auth
-        .to_auth_method()
-        .context("invalid [auth] configuration")?;
-    // Password auth on a coordinator/standalone: users live in the state
-    // store; config-seeded users follow the config file on every start
-    // (a changed hash or a removed user revokes tokens). The same store
-    // serves pgwire, Trino and the Web API.
-    let state_store = if matches!(role, ServerRole::Coordinator | ServerRole::Standalone)
-        && matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_))
-    {
-        let store = arneb_state::StateStore::open(config.state.path.as_deref())
-            .context("cannot open the state store ([state] path / ARNEB_STATE_PATH)")?;
-        let report = store
-            .seed_users(&verifiers, reseed_state)
-            .context("cannot seed the state store from [auth] users")?;
-        reseed_settings(&store, reseed_state)?;
-        tracing::info!(
-            target: "arneb::config",
-            state_path = %store
-                .path()
-                .map_or_else(|| "in-memory".to_owned(), |p| p.display().to_string()),
-            persistent = store.is_persistent(),
-            users = arneb_protocol::CredentialSource::user_count(&store),
-            first_start = report.first_start,
-            added = ?report.added,
-            updated = ?report.updated,
-            removed = ?report.removed,
-            conflicts = ?report.conflicts,
-            revoked_tokens = report.revoked_tokens,
-            reseed = reseed_state,
-            "state store effective settings ([state] path / ARNEB_STATE_PATH / --reseed-state)"
-        );
-        if !store.is_persistent() {
-            tracing::warn!(
-                target: "arneb::config",
-                "no [state] path: API tokens, worker cordons, admission limits and the audit \
-                 log are lost on restart"
-            );
-        }
-        Some(Arc::new(store))
-    } else {
-        if reseed_state {
-            tracing::info!(
-                target: "arneb::config",
-                "--reseed-state ignored: it only applies with [auth] type = \"password\" \
-                 on a coordinator or standalone server"
-            );
-        }
-        None
-    };
     // manage-api D8: stored cordons apply before the Flight server below
     // accepts heartbeats, so a cordoned worker never gets a query on rejoin.
     if let Some(store) = &state_store {
@@ -840,9 +882,17 @@ async fn run() -> Result<()> {
             state_store.as_deref(),
             &live_catalogs,
             &config.catalogs,
-            reseed_state,
+            // `prepare_state_store` already applied --reseed-state.
+            false,
         )
         .await?;
+    }
+    // Before the Flight server starts: without a [cluster] secret,
+    // get_catalogs and sync_catalogs are open to any peer.
+    if matches!(role, ServerRole::Coordinator) && !has_cluster_secret {
+        // The startup check already refused served secrets; from now on the
+        // catalog API and the re-seed refuse a spec that would add one.
+        live_catalogs.set_unauthenticated_flight(true);
     }
     let auth_method = match &state_store {
         Some(store) => arneb_protocol::AuthMethod::ScramSha256(store.clone()),
@@ -853,12 +903,10 @@ async fn run() -> Result<()> {
     // protocol and the Web API, so a runtime change applies everywhere.
     let (access_rules, rules_source, rules_seed) =
         if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
-            let resolved = config::resolve_access_rules(
-                &config.access_control,
-                state_store.as_deref(),
-                reseed_state,
-            )
-            .context("invalid [access_control] configuration")?;
+            // `prepare_state_store` already applied --reseed-state.
+            let resolved =
+                config::resolve_access_rules(&config.access_control, state_store.as_deref(), false)
+                    .context("invalid [access_control] configuration")?;
             (resolved.handle, resolved.source, resolved.seed)
         } else {
             (arneb_catalog::RulesHandle::default(), "config", None)
@@ -905,14 +953,6 @@ async fn run() -> Result<()> {
         );
     }
 
-    // Client-facing TLS ([tls] / ARNEB_TLS_*): one certificate for pgwire and
-    // the Trino listener. Workers serve neither, so they skip loading it.
-    let server_tls = match (&config.tls_settings, role) {
-        (Some(t), ServerRole::Coordinator | ServerRole::Standalone) => Some(
-            ServerTls::load(&t.cert_path, &t.key_path).context("invalid [tls] configuration")?,
-        ),
-        _ => None,
-    };
     if !matches!(role, ServerRole::Worker) {
         match &config.tls_settings {
             Some(t) => tracing::info!(
@@ -936,18 +976,23 @@ async fn run() -> Result<()> {
             mode: t.pgwire,
         });
 
+    let serves_clients = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
     let password_users = match &auth_method {
         arneb_protocol::AuthMethod::ScramSha256(creds) => Some(Arc::clone(creds)),
         arneb_protocol::AuthMethod::None => None,
     };
-    // One Basic authenticator for the Trino and Web listeners, so both share
-    // one PBKDF2 limiter, one wait queue and one verification cache.
+    // Only the coordinator's Trino and Web listeners check Basic credentials
+    // (workers serve neither). They share one PBKDF2 limiter and success
+    // cache, but each gets its own wait queue (`sibling`), so a flood on one
+    // port cannot 503 the other.
     let basic_auth = password_users
         .clone()
+        .filter(|_| serves_clients)
         .map(arneb_protocol::BasicAuthenticator::new)
         .transpose()
         .context("HTTP Basic authentication")?;
-    // The audit log (manage-api D6): `audit.jsonl` next to the state file,
+    // The audit log (manage-api D6): `<state stem>.audit.jsonl` next to the
+    // state file,
     // in memory without one, and an empty in-memory log under `none`
     // (nothing is audited there).
     let audit_path = state_store
@@ -956,7 +1001,7 @@ async fn run() -> Result<()> {
         .map(arneb_state::AuditLog::sibling_of);
     let audit_log = Arc::new(
         arneb_state::AuditLog::open(audit_path.as_deref(), config.audit.settings())
-            .context("cannot open the audit log (audit.jsonl next to [state] path)")?,
+            .context("cannot open the audit log (<state stem>.audit.jsonl next to [state] path)")?,
     );
     if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
         tracing::info!(
@@ -1048,8 +1093,9 @@ async fn run() -> Result<()> {
             tracing::warn!(
                 target: "arneb::config",
                 "[admission] {knob} / ARNEB_{} = {from_config} is overridden by the runtime \
-                 value {from_state} in the state store. Preview a re-seed with \
-                 POST /api/v2/state/reseed?dry_run=true",
+                 value {from_state} in the state store (DELETE /api/v2/admission returns to \
+                 the config, as does a re-seed: POST /api/v2/state/reseed?dry_run=true \
+                 previews it)",
                 knob.to_ascii_uppercase()
             );
         }
@@ -1067,6 +1113,16 @@ async fn run() -> Result<()> {
              ARNEB_MAX_QUEUED_QUERIES / ARNEB_STATEMENT_TIMEOUT / ARNEB_QUERY_MAX_MEMORY_BYTES)"
         );
         let agent_limits = config.agent_api.limits();
+        if let Some(configured) = config.agent_api.user_share_raised_from {
+            tracing::warn!(
+                target: "arneb::config",
+                configured,
+                effective = agent_limits.max_user_retained_bytes,
+                "[agent_api] max_user_retained_bytes (ARNEB_AGENT_MAX_USER_RETAINED_BYTES) \
+                 is below max_retained_bytes; raised to it so a user can retain one full \
+                 statement"
+            );
+        }
         tracing::info!(
             target: "arneb::config",
             default_max_rows = agent_limits.default_max_rows,
@@ -1075,6 +1131,7 @@ async fn run() -> Result<()> {
             max_page_bytes = agent_limits.max_page_bytes,
             max_cell_bytes = agent_limits.max_cell_bytes,
             max_retained_bytes = agent_limits.max_retained_bytes,
+            max_user_retained_bytes = agent_limits.max_user_retained_bytes,
             max_total_retained_bytes = agent_limits.max_total_retained_bytes,
             max_wait_ms = config.agent_api.max_wait_ms,
             idle_timeout_secs = config.agent_api.idle_timeout_secs,
@@ -1182,7 +1239,6 @@ async fn run() -> Result<()> {
     // state (catalogs, connectors, memory pool, distributed executor) as
     // pgwire. Queries are registered with the tracker so they show in the
     // Web UI.
-    let serves_clients = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
     let trino_enabled = config.trino.enabled && serves_clients;
     let trino_addr = format!("{}:{}", config.server.bind_address, config.trino.port);
     // Fail closed: Trino clients only send passwords over HTTPS, so password
@@ -1216,7 +1272,7 @@ async fn run() -> Result<()> {
         .with_query_tracker(query_tracker.clone())
         .with_access_rules(access_rules.clone())
         .with_tls(server_tls.as_ref().map(ServerTls::trino_acceptor))
-        .with_authenticator(basic_auth.clone());
+        .with_authenticator(basic_auth.as_ref().map(|a| a.sibling()));
         if let Some(ref executor) = distributed_executor {
             trino = trino.with_distributed_executor(Arc::clone(executor));
         }
@@ -1292,12 +1348,15 @@ async fn run() -> Result<()> {
         admission: admission.clone(),
         admission_changes: Default::default(),
         cordon_changes: Default::default(),
+        max_running_queries: config.admission.max_running_queries,
         max_queued_queries: config.admission.max_queued_queries,
         memory_pool: memory_pool.clone(),
         memory_limit_bytes: budget.map(|b| b as u64),
         // Same source as `credentials_for_web` (the state store) whenever
         // that is set: password auth makes the state store the auth method.
-        basic: credentials_for_web.as_ref().and(basic_auth),
+        basic: credentials_for_web
+            .as_ref()
+            .and(basic_auth.as_ref().map(|a| a.sibling())),
         credentials: credentials_for_web,
         state: state_for_web,
         audit: audit_log,
@@ -1654,6 +1713,187 @@ fn coordinator_epoch() -> u64 {
     u64::from_le_bytes(bytes).max(1)
 }
 
+/// Cluster RPC carries the catalog definitions (runtime-config D8): a
+/// coordinator serves them, raw secrets included, with `get_catalogs`, and
+/// a worker replaces its set on `sync_catalogs`. Without a `[cluster]
+/// secret` both are open to any peer that reaches the RPC port, so a
+/// coordinator refuses to start while any catalog it would serve (`served`,
+/// built or not, with `global_storage` merged into hive specs) carries a
+/// secret, and otherwise WARNs; a worker WARNs. Runs before anything is
+/// written to the state store. `stored`: the specs come from the state
+/// store (already seeded), so removing a secret from the config alone does
+/// not help, and the message says so.
+fn check_catalog_exposure(
+    role: &ServerRole,
+    has_cluster_secret: bool,
+    global_storage: &config::StorageConfig,
+    served: &[config::CatalogConfig],
+    stored: bool,
+    rpc_port: u16,
+) -> Result<()> {
+    if has_cluster_secret {
+        return Ok(());
+    }
+    match role {
+        ServerRole::Coordinator => {
+            let exposed = catalogs::effective_secrets(global_storage, served);
+            if !exposed.is_empty() {
+                let remedy = if stored {
+                    "or, since these catalogs are stored in the state store, remove the \
+                     secrets through PUT /api/v2/catalog-configs on a server with a secret, or \
+                     remove them from [[catalogs]] and restart once with --reseed-state (the \
+                     users, catalogs, rules and settings become the config's)"
+                } else {
+                    "or remove these secrets from the catalogs"
+                };
+                bail!(
+                    "refusing to start: the coordinator serves its catalog definitions to \
+                     workers over cluster RPC (port {rpc_port}), and without a [cluster] \
+                     secret any peer that reaches it can read them, secrets included ({}). \
+                     Set [cluster] secret (or ARNEB_CLUSTER_SECRET, at least 32 characters) \
+                     on every node, {remedy}",
+                    exposed.join(", ")
+                );
+            }
+            tracing::warn!(
+                target: "arneb::config",
+                rpc_port,
+                "no [cluster] secret: cluster RPC is unauthenticated, so any peer that reaches \
+                 the RPC port can read the catalog definitions (get_catalogs) and replace or \
+                 wipe a worker's catalogs (sync_catalogs). Catalogs that carry a secret are \
+                 refused until [cluster] secret (ARNEB_CLUSTER_SECRET) is set on every node"
+            );
+        }
+        ServerRole::Worker => tracing::warn!(
+            target: "arneb::config",
+            rpc_port,
+            "no [cluster] secret: cluster RPC is unauthenticated, so any peer that reaches \
+             the RPC port can replace or wipe this worker's catalogs (sync_catalogs). Set \
+             [cluster] secret (ARNEB_CLUSTER_SECRET) on every node"
+        ),
+        // Standalone serves no catalogs over RPC.
+        ServerRole::Standalone => {}
+    }
+    Ok(())
+}
+
+/// Startup with a state store (runtime-config D1, D2). Every fatal check
+/// runs first, against the state that would be served, so a refused start
+/// writes nothing: the rules file must load; rules changed at runtime must
+/// not meet a rules file edited since its seed (Ruling R14), and must still
+/// parse when they stay in force; and a
+/// coordinator without a `[cluster] secret` must not serve a catalog
+/// secret ([`check_catalog_exposure`]). Then `reseed` replaces the users,
+/// rules, settings and catalogs with the config's in one write
+/// ([`arneb_state::StateStore::reseed`]); otherwise the config users are
+/// applied (catalogs and rules are seeded or compared later, by
+/// `load_catalogs` and `resolve_access_rules`). Returns what user seeding
+/// did.
+fn prepare_state_store(
+    store: &arneb_state::StateStore,
+    config: &config::AppConfig,
+    verifiers: &[(String, arneb_protocol::ScramVerifier)],
+    role: &ServerRole,
+    has_cluster_secret: bool,
+    reseed: bool,
+) -> Result<arneb_state::SeedReport> {
+    let rules = config
+        .access_control
+        .load_rules_text()
+        .context("invalid [access_control] configuration")?;
+    let rules_text = rules.as_ref().map(|(text, _)| text.as_str());
+    match store.preview_seed_rules(rules_text, reseed) {
+        arneb_state::RulesSeed::FileChanged => {
+            return Err(config::rules_file_changed(&config.access_control));
+        }
+        // The stored (runtime) rules stay in force: they must still parse.
+        arneb_state::RulesSeed::Diverged => {
+            if let Some(stored) = store.access_rules() {
+                arneb_catalog::AccessRules::from_json(&stored.json)
+                    .map_err(|e| anyhow::anyhow!("the access rules in the state store: {e}"))?;
+            }
+        }
+        _ => {}
+    }
+    let stored = store.seeded().catalogs && !reseed;
+    let served = served_catalog_specs(Some(store), &config.catalogs, reseed);
+    check_catalog_exposure(
+        role,
+        has_cluster_secret,
+        &config.storage,
+        &served,
+        stored,
+        config.cluster.rpc_port,
+    )?;
+    if !reseed {
+        return store
+            .seed_users(verifiers, false)
+            .context("cannot seed the state store from [auth] users");
+    }
+    let config_specs = config
+        .catalogs
+        .iter()
+        .map(|c| Ok((c.name.clone(), serde_json::to_value(c)?)))
+        .collect::<Result<Vec<_>, serde_json::Error>>()
+        .context("cannot serialize [[catalogs]]")?;
+    let outcome = store
+        .reseed(verifiers, rules_text, &config_specs)
+        .context("cannot re-seed the state store from the config file")?;
+    tracing::info!(
+        target: "arneb::config",
+        catalog_generation = outcome.catalog_generation,
+        "--reseed-state: users, catalogs, access rules and settings replaced with the \
+         config file's in one write"
+    );
+    Ok(outcome.users)
+}
+
+/// The external catalog specs this coordinator or standalone server will
+/// serve: with a state store, the config's on a seeding start (first start
+/// or `reseed`) and the stored ones otherwise (an undecodable record is
+/// skipped, as `load_stored_catalogs` does); without one, the config's.
+fn served_catalog_specs(
+    store: Option<&arneb_state::StateStore>,
+    config: &[config::CatalogConfig],
+    reseed: bool,
+) -> Vec<config::CatalogConfig> {
+    match store {
+        Some(store) if store.seeded().catalogs && !reseed => store
+            .catalogs()
+            .1
+            .into_iter()
+            .filter_map(|r| serde_json::from_value(r.spec).ok())
+            .collect(),
+        _ => config.to_vec(),
+    }
+}
+
+/// The default catalog and schema (unqualified table names resolve in
+/// them, and workers receive them with the catalog set): the first
+/// `[[catalogs]]` entry when it is among the `served` specs (as before
+/// runtime config), else the first served catalog by name, else `file`
+/// when `[[tables]]` are configured, else `memory`. The schema is the
+/// chosen catalog's `default_schema` (`public` for postgresql, `default`
+/// otherwise; `default` for `file` and `memory`).
+fn default_catalog_and_schema(
+    config: &[config::CatalogConfig],
+    served: &[config::CatalogConfig],
+    has_tables: bool,
+) -> (String, String) {
+    let chosen = config
+        .first()
+        .and_then(|first| served.iter().find(|s| s.name == first.name))
+        .or_else(|| served.iter().min_by(|a, b| a.name.cmp(&b.name)));
+    match chosen {
+        Some(spec) => (
+            spec.name.clone(),
+            spec.effective_default_schema().to_owned(),
+        ),
+        None if has_tables => ("file".to_owned(), "default".to_owned()),
+        None => ("memory".to_owned(), "default".to_owned()),
+    }
+}
+
 /// The `sync_catalogs` handler: applies a set the coordinator pushed. A
 /// stale set (same epoch, not newer) is acknowledged unchanged. An applied
 /// set is Ok even when some catalogs failed to build; their names are
@@ -1681,17 +1921,6 @@ async fn apply_pushed_catalogs(
         "catalogs pushed by the coordinator applied"
     );
     Ok(report.failed.into_iter().map(|(name, _)| name).collect())
-}
-
-/// runtime-config D2: `--reseed-state` clears the runtime settings, so the
-/// config's admission limits and slow-query threshold apply.
-fn reseed_settings(store: &arneb_state::StateStore, reseed: bool) -> Result<()> {
-    if reseed {
-        store
-            .clear_settings()
-            .context("cannot clear the runtime settings in the state store")?;
-    }
-    Ok(())
 }
 
 /// Loads the external catalogs: from the state store when one is open
@@ -1946,6 +2175,10 @@ mod tests {
         store.set_slow_query_threshold_ms(5).unwrap();
 
         // A start without --reseed-state keeps them all.
+        let config: config::AppConfig =
+            toml::from_str("[[catalogs]]\nname = \"from_cfg\"\ntype = \"mysql\"\n").unwrap();
+        let standalone = ServerRole::Standalone;
+        prepare_state_store(&store, &config, &[], &standalone, false, false).unwrap();
         let live = empty_live();
         load_catalogs(
             Some(&store),
@@ -1955,7 +2188,6 @@ mod tests {
         )
         .await
         .unwrap();
-        reseed_settings(&store, false).unwrap();
         let no_rules = config::AccessControlConfig::default();
         config::resolve_access_rules(&no_rules, Some(&store), false).unwrap();
         let names = |s: &arneb_state::StateStore| -> Vec<(String, bool)> {
@@ -1969,23 +2201,294 @@ mod tests {
         assert!(store.access_rules().is_some());
         assert_eq!(store.slow_query_threshold_ms(), Some(5));
 
-        // --reseed-state restores the config for all of them.
+        // --reseed-state restores the config for all of them, in one write;
+        // the loaders then run without re-seeding, as in `run`.
+        let before = store.catalogs().0;
+        prepare_state_store(&store, &config, &[], &standalone, false, true).unwrap();
+        assert_eq!(store.catalogs().0, before + 1, "one catalog write");
         let live = empty_live();
         load_catalogs(
             Some(&store),
             &live,
             std::slice::from_ref(&config_spec),
-            true,
+            false,
         )
         .await
         .unwrap();
-        reseed_settings(&store, true).unwrap();
-        let resolved = config::resolve_access_rules(&no_rules, Some(&store), true).unwrap();
+        let resolved = config::resolve_access_rules(&no_rules, Some(&store), false).unwrap();
         assert_eq!(names(&store), vec![("from_cfg".to_owned(), true)]);
         assert_eq!(live.generation(), store.catalogs().0);
         assert_eq!(store.access_rules(), None, "no rules file: no rules");
         assert!(resolved.handle.current().is_none());
         assert_eq!(store.slow_query_threshold_ms(), None);
+    }
+
+    /// Everything a startup could write, to compare before and after.
+    fn observed(store: &arneb_state::StateStore) -> String {
+        format!(
+            "{:?} {:?} {:?} {:?} {:?}",
+            store.list_users(),
+            store.catalogs(),
+            store.access_rules(),
+            store.slow_query_threshold_ms(),
+            store.seeded()
+        )
+    }
+
+    /// I1: the cluster-secret refusal runs before anything is stored, so
+    /// removing the secret from the config and restarting starts; a secret
+    /// already stored names the ways out.
+    #[tokio::test]
+    async fn exposure_refusal_writes_nothing_so_removing_the_secret_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        let with_secret: config::AppConfig = toml::from_str(
+            "[[catalogs]]\nname = \"pg\"\ntype = \"postgresql\"\n\
+             connection_url = \"postgresql://u@127.0.0.1:1/db\"\npassword = \"pw-Zx9\"\n",
+        )
+        .unwrap();
+        let coordinator = ServerRole::Coordinator;
+        let alice = vec![(
+            "alice".to_owned(),
+            arneb_protocol::ScramVerifier::from_password("pw", b"0123456789abcdef", 4096),
+        )];
+        let store = arneb_state::StateStore::open(Some(&path)).unwrap();
+        let e = prepare_state_store(&store, &with_secret, &alice, &coordinator, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("catalog 'pg': password") && !e.contains("pw-Zx9"),
+            "{e}"
+        );
+        assert!(!path.exists(), "nothing was written");
+        assert!(store.list_users().is_empty());
+        drop(store);
+
+        // The operator removes the password and restarts.
+        let without: config::AppConfig = toml::from_str(
+            "[[catalogs]]\nname = \"pg\"\ntype = \"postgresql\"\n\
+             connection_url = \"postgresql://u@127.0.0.1:1/db\"\n",
+        )
+        .unwrap();
+        let store = arneb_state::StateStore::open(Some(&path)).unwrap();
+        prepare_state_store(&store, &without, &alice, &coordinator, false, false).unwrap();
+        let live = empty_live();
+        load_catalogs(Some(&store), &live, &without.catalogs, false)
+            .await
+            .unwrap();
+        assert!(store.catalogs().1[0].spec["password"].is_null());
+        assert_eq!(store.list_users().len(), 1);
+
+        // A secret that is already stored: the message names the way out
+        // through the state store.
+        let config_specs = vec![(
+            "pg".to_owned(),
+            serde_json::to_value(&with_secret.catalogs[0]).unwrap(),
+        )];
+        store.seed_catalogs(&config_specs, true).unwrap();
+        let e = prepare_state_store(&store, &without, &alice, &coordinator, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("--reseed-state") && e.contains("state store"),
+            "{e}"
+        );
+        // With a cluster secret both start.
+        prepare_state_store(&store, &with_secret, &alice, &coordinator, true, false).unwrap();
+    }
+
+    /// I2: `--reseed-state` with a typo in the rules file refuses before any
+    /// write, so users, tokens, catalogs, rules and settings are untouched.
+    #[tokio::test]
+    async fn reseed_with_a_bad_rules_file_leaves_the_state_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules = tmp.path().join("rules.json");
+        std::fs::write(&rules, "{not json").unwrap();
+        let config: config::AppConfig = toml::from_str(&format!(
+            "[access_control]\nrules_file = {:?}\n[[catalogs]]\nname = \"lake\"\n\
+             type = \"hive\"\nmetastore_uri = \"h:9083\"\n",
+            rules.display().to_string()
+        ))
+        .unwrap();
+        let store = arneb_state::StateStore::open(Some(&tmp.path().join("state.json"))).unwrap();
+        let v =
+            |pw: &str| arneb_protocol::ScramVerifier::from_password(pw, b"0123456789abcdef", 4096);
+        store
+            .seed_users(&[("alice".to_owned(), v("a"))], false)
+            .unwrap();
+        store.seed_catalogs(&[], false).unwrap();
+        store.seed_rules(None, false).unwrap();
+        store
+            .set_access_rules(Some(arneb_state::StoredRules {
+                json: r#"{"catalogs":[{"allow":"all"}]}"#.into(),
+                from_config: false,
+            }))
+            .unwrap();
+        store.set_slow_query_threshold_ms(5).unwrap();
+        let before = observed(&store);
+        let role = ServerRole::Coordinator;
+        let users = vec![("bob".to_owned(), v("b"))];
+        assert!(prepare_state_store(&store, &config, &users, &role, true, true).is_err());
+        assert_eq!(observed(&store), before);
+
+        // Stored runtime rules that no longer parse refuse before any write.
+        let good = r#"{"catalogs":[{"allow":"all"}]}"#;
+        std::fs::write(&rules, good).unwrap();
+        let runtime_bad = arneb_state::StateStore::open(None).unwrap();
+        runtime_bad.seed_rules(Some(good), false).unwrap();
+        runtime_bad
+            .set_access_rules(Some(arneb_state::StoredRules {
+                json: r#"{"bogus_section":[]}"#.into(),
+                from_config: false,
+            }))
+            .unwrap();
+        let untouched = observed(&runtime_bad);
+        let e = prepare_state_store(&runtime_bad, &config, &users, &role, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("state store"), "{e}");
+        assert_eq!(observed(&runtime_bad), untouched);
+
+        // A rules file edited since its seed while the rules were changed at
+        // runtime refuses a plain start before any write, too.
+        std::fs::write(&rules, r#"{"catalogs":[{"allow":"none"}]}"#).unwrap();
+        let e = prepare_state_store(&store, &config, &users, &role, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--reseed-state") && e.contains("users"), "{e}");
+        assert_eq!(observed(&store), before);
+
+        // Fixed: the re-seed replaces everything.
+        prepare_state_store(&store, &config, &users, &role, true, true).unwrap();
+        assert_eq!(store.list_users()[0].name, "bob");
+        assert_eq!(store.catalogs().1[0].name, "lake");
+        assert!(!store.rules_changed_at_runtime());
+        assert_eq!(store.slow_query_threshold_ms(), None);
+    }
+
+    /// A coordinator without a `[cluster] secret` refuses to serve a catalog
+    /// secret, built or not, including global `[storage]` keys merged into
+    /// hive specs; a secret or another role changes nothing.
+    #[test]
+    fn coordinator_without_cluster_secret_refuses_served_secrets() {
+        let with_password: config::CatalogConfig = serde_json::from_value(serde_json::json!({
+            "name": "pg", "type": "postgresql",
+            "connection_url": "postgresql://u@127.0.0.1:1/db", "password": "pw-Zx9"
+        }))
+        .unwrap();
+        let none = config::StorageConfig::default();
+        let served = std::slice::from_ref(&with_password);
+        let e = check_catalog_exposure(&ServerRole::Coordinator, false, &none, served, false, 9090)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("[cluster] secret") && e.contains("catalog 'pg': password"),
+            "{e}"
+        );
+        assert!(!e.contains("pw-Zx9"), "the error names fields, not values");
+        for (role, secret) in [
+            (ServerRole::Coordinator, true),
+            (ServerRole::Worker, false),
+            (ServerRole::Standalone, false),
+        ] {
+            check_catalog_exposure(&role, secret, &none, served, false, 9090).unwrap();
+        }
+        let hive: config::CatalogConfig = serde_json::from_value(serde_json::json!({
+            "name": "lake", "type": "hive", "metastore_uri": "h:9083"
+        }))
+        .unwrap();
+        let keys: config::StorageConfig = serde_json::from_value(serde_json::json!({
+            "s3": {"secret_access_key": "k"}
+        }))
+        .unwrap();
+        let e = check_catalog_exposure(
+            &ServerRole::Coordinator,
+            false,
+            &keys,
+            std::slice::from_ref(&hive),
+            false,
+            9090,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("catalog 'lake': storage.s3.secret_access_key"),
+            "{e}"
+        );
+        check_catalog_exposure(&ServerRole::Coordinator, false, &none, &[hive], false, 9090)
+            .unwrap();
+    }
+
+    /// The default catalog follows the served catalogs: the first config
+    /// entry while it is served, else the first served name, else file or
+    /// memory; the schema is the chosen catalog's.
+    #[test]
+    fn default_catalog_comes_from_the_served_catalogs() {
+        let spec = |name: &str, kind: &str| -> config::CatalogConfig {
+            serde_json::from_value(serde_json::json!({
+                "name": name, "type": kind,
+                "metastore_uri": "h:9083", "connection_url": "postgresql://u@h/db"
+            }))
+            .unwrap()
+        };
+        let pair = |c: &str, s: &str| (c.to_owned(), s.to_owned());
+        let config = vec![spec("lake", "hive"), spec("pg", "postgresql")];
+        assert_eq!(
+            default_catalog_and_schema(&config, &config, false),
+            pair("lake", "default")
+        );
+        // The config's first catalog was dropped at runtime: the first
+        // served catalog by name, with its schema.
+        let served = vec![spec("zeta", "hive"), spec("pg", "postgresql")];
+        assert_eq!(
+            default_catalog_and_schema(&config, &served, true),
+            pair("pg", "public")
+        );
+        // Created at runtime with no config catalogs at all.
+        assert_eq!(
+            default_catalog_and_schema(&[], &served, false),
+            pair("pg", "public")
+        );
+        assert_eq!(
+            default_catalog_and_schema(&config, &[], true),
+            pair("file", "default")
+        );
+        assert_eq!(
+            default_catalog_and_schema(&[], &[], false),
+            pair("memory", "default")
+        );
+
+        // The served specs: the state store's once seeded, the config's on
+        // a seeding start or without a store.
+        let store = arneb_state::StateStore::open(None).unwrap();
+        let names = |specs: Vec<config::CatalogConfig>| -> Vec<String> {
+            specs.into_iter().map(|s| s.name).collect()
+        };
+        assert_eq!(
+            names(served_catalog_specs(Some(&store), &config, false)),
+            ["lake", "pg"]
+        );
+        store
+            .seed_catalogs(
+                &[(
+                    "zeta".into(),
+                    serde_json::to_value(spec("zeta", "hive")).unwrap(),
+                )],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            names(served_catalog_specs(Some(&store), &config, false)),
+            ["zeta"]
+        );
+        assert_eq!(
+            names(served_catalog_specs(Some(&store), &config, true)),
+            ["lake", "pg"]
+        );
+        assert_eq!(
+            names(served_catalog_specs(None, &config, false)),
+            ["lake", "pg"]
+        );
     }
 
     /// runtime-config D8: workers ignore their own `[[catalogs]]`; they

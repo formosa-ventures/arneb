@@ -33,22 +33,20 @@ use serde::{Deserialize, Serialize};
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    config_change_lock, run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome,
-    Preview,
+    add_warning, check_limit, config_change_lock, live_catalogs, plural, run_manage, state_store,
+    Applied, ChangeLock, DryRun, ManageAction, ManageOutcome, Preview,
 };
 use super::privilege::Layer;
 use super::v2::{bad_body, bad_query, state_error};
 use super::WebState;
 use crate::catalogs::{
-    fill_redacted, redacted_secrets, redacted_spec, same_destination, validate_spec, BuiltCatalog,
-    LiveCatalogs, REDACTED,
+    fill_redacted, redacted_secrets, redacted_spec, same_destination, same_spec, validate_spec,
+    validate_spec_fields, BuiltCatalog, LiveCatalogs, REDACTED,
 };
 use crate::config::CatalogConfig;
 
 /// Catalogs listed when the request names no `limit`.
 const DEFAULT_LIMIT: usize = 100;
-/// The largest accepted `limit` of the listing.
-const MAX_LIMIT: usize = 1000;
 /// How long a push to one worker may take.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -98,22 +96,6 @@ pub(super) struct WorkerSync {
     /// retries them on its heartbeat; Ruling R7).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     failed_catalogs: Vec<String>,
-}
-
-/// The state store behind the catalog routes (manage already passed, so
-/// the server runs password auth and has one).
-fn store(state: &WebState) -> Result<Arc<StateStore>, ApiError> {
-    state.state.clone().ok_or_else(|| {
-        tracing::error!("password auth is configured without a state store");
-        ApiError::new(ErrorCode::Internal, "the state store is unavailable")
-    })
-}
-
-fn live(state: &WebState) -> Result<Arc<LiveCatalogs>, ApiError> {
-    state.catalogs.clone().ok_or_else(|| {
-        tracing::error!("the catalog routes are served without live catalogs");
-        ApiError::new(ErrorCode::Internal, "the live catalogs are unavailable")
-    })
 }
 
 fn find_record(store: &StateStore, name: &str) -> Option<CatalogRecord> {
@@ -296,8 +278,37 @@ const SEND_SECRETS: &str = "send the real secrets";
 /// The hint of a placeholder for a changed destination (Ruling R10).
 const SEND_AGAIN: &str = "send the secret again when you change where it is sent";
 
+/// Checks a new catalog's spec, its name included.
 fn validate(spec: &CatalogConfig) -> Result<(), ApiError> {
     validate_spec(spec).map_err(|e| ApiError::new(ErrorCode::InvalidArgument, e))
+}
+
+/// Checks an existing catalog's new spec: the name already exists, so it
+/// is not held to the name rule (a config-seeded `pg-prod` stays
+/// updatable).
+fn validate_update(spec: &CatalogConfig) -> Result<(), ApiError> {
+    validate_spec_fields(spec).map_err(|e| ApiError::new(ErrorCode::InvalidArgument, e))
+}
+
+/// Refuses `spec` when it carries a secret and this coordinator serves its
+/// catalogs over Flight without a `[cluster] secret`: any peer that reaches
+/// the RPC port could read it with `get_catalogs`. Shared with the re-seed.
+pub(super) fn check_exposure(live: &LiveCatalogs, spec: &CatalogConfig) -> Result<(), ApiError> {
+    live.exposure_check(spec).map_err(|fields| {
+        ApiError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "catalog {:?} carries {}, but this coordinator serves catalog definitions \
+                 over cluster RPC without a [cluster] secret, so any peer could read them",
+                spec.name,
+                fields.join(", ")
+            ),
+        )
+        .with_hint(
+            "set [cluster] secret (or ARNEB_CLUSTER_SECRET) on every node and restart them, \
+             or leave the secret out of the catalog",
+        )
+    })
 }
 
 /// Builds `spec` on the coordinator (connects to it, at most 10 s).
@@ -311,33 +322,6 @@ async fn probe(live: &LiveCatalogs, spec: &CatalogConfig) -> Result<BuiltCatalog
     })
 }
 
-fn check_limit(limit: Option<usize>) -> Result<usize, ApiError> {
-    let limit = limit.unwrap_or(DEFAULT_LIMIT);
-    if limit == 0 || limit > MAX_LIMIT {
-        return Err(ApiError::new(
-            ErrorCode::InvalidArgument,
-            format!("limit {limit} is not valid"),
-        )
-        .with_hint(format!("use a limit between 1 and {MAX_LIMIT}")));
-    }
-    Ok(limit)
-}
-
-fn plural(n: usize, one: &str) -> String {
-    if n == 1 {
-        format!("{n} {one}")
-    } else {
-        format!("{n} {one}s")
-    }
-}
-
-fn add_warning(warning: &mut Option<String>, note: String) {
-    *warning = Some(match warning.take() {
-        Some(w) => format!("{w}; {note}"),
-        None => note,
-    });
-}
-
 /// Every catalog definition, in name order, at most `limit` (default 100,
 /// at most 1000), secrets redacted. Needs manage. Shared with the MCP
 /// `list_catalog_configs` tool.
@@ -347,9 +331,9 @@ pub(super) async fn list_catalog_configs_for(
     limit: Option<usize>,
 ) -> Result<CatalogConfigList, ApiError> {
     state.authorizer.check(who, Layer::Manage)?;
-    let limit = check_limit(limit)?;
-    let default_catalog = live(state)?.default_catalog();
-    let (generation, records) = store(state)?.catalogs();
+    let limit = check_limit(limit, DEFAULT_LIMIT)?;
+    let default_catalog = live_catalogs(state)?.default_catalog();
+    let (generation, records) = state_store(state)?.catalogs();
     let truncated = records.len() > limit;
     Ok(CatalogConfigList {
         generation,
@@ -370,8 +354,8 @@ pub(super) async fn get_catalog_config_for(
     name: String,
 ) -> Result<CatalogConfigView, ApiError> {
     state.authorizer.check(who, Layer::Manage)?;
-    let default_catalog = live(state)?.default_catalog();
-    let (generation, records) = store(state)?.catalogs();
+    let default_catalog = live_catalogs(state)?.default_catalog();
+    let (generation, records) = state_store(state)?.catalogs();
     records
         .iter()
         .find(|r| r.name == name)
@@ -397,7 +381,8 @@ pub(super) async fn create_catalog_for(
         &format!("{SEND_SECRETS}: a {REDACTED:?} value is kept only by a PUT of the same catalog"),
     )?;
     validate(&spec)?;
-    let (store, live) = (store(state)?, live(state)?);
+    let (store, live) = (state_store(state)?, live_catalogs(state)?);
+    check_exposure(&live, &spec)?;
     // Cheap pre-check, so a taken name never pays for a connection; the
     // action checks again under the lock.
     if find_record(&store, &spec.name).is_some() {
@@ -434,7 +419,7 @@ pub(super) async fn update_catalog_for(
     spec: serde_json::Value,
 ) -> Result<ManageOutcome<CatalogChange>, ApiError> {
     let grant = state.authorizer.check(who, Layer::Manage)?;
-    let (store, live) = (store(state)?, live(state)?);
+    let (store, live) = (state_store(state)?, live_catalogs(state)?);
     let stored = existing_record(&store, &name)?;
     let mut spec = decode_spec(spec, Some(&name))?;
     match decode(&stored) {
@@ -449,7 +434,8 @@ pub(super) async fn update_catalog_for(
         None => no_placeholders(&spec, SEND_SECRETS)?,
     }
     no_placeholders(&spec, SEND_SECRETS)?;
-    validate(&spec)?;
+    validate_update(&spec)?;
+    check_exposure(&live, &spec)?;
     let built = probe(&live, &spec).await?;
     #[cfg(test)]
     test_hooks::after_probe(state);
@@ -482,7 +468,7 @@ pub(super) async fn drop_catalog_for(
     name: String,
 ) -> Result<ManageOutcome<CatalogChange>, ApiError> {
     let grant = state.authorizer.check(who, Layer::Manage)?;
-    let (store, live) = (store(state)?, live(state)?);
+    let (store, live) = (state_store(state)?, live_catalogs(state)?);
     existing_record(&store, &name)?;
     let lock = if dry_run {
         None
@@ -590,7 +576,7 @@ impl ManageAction for ChangeCatalog {
                     .live
                     .specs()
                     .iter()
-                    .any(|s| s.name == *name && same_json(s, spec));
+                    .any(|s| s.name == *name && same_spec(s, spec));
                 if !current.from_config
                     && served
                     && serde_json::to_value(spec).ok() == Some(current.spec.clone())
@@ -709,14 +695,6 @@ impl ManageAction for ChangeCatalog {
                 workers,
             },
         })
-    }
-}
-
-/// Whether `a` and `b` serialize the same (raw secrets included).
-fn same_json(a: &CatalogConfig, b: &CatalogConfig) -> bool {
-    match (serde_json::to_value(a), serde_json::to_value(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
     }
 }
 
@@ -1416,6 +1394,64 @@ mod tests {
         let (status, body) = update(&state, "pg", spec, false).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(!stored(&state, "pg").unwrap().from_config);
+    }
+
+    /// Config-seeded catalogs were never held to the `[a-z0-9_]` name rule:
+    /// a `pg-prod` from the file can still be updated (to rotate its
+    /// password) and dropped; only a create checks the name.
+    #[tokio::test]
+    async fn existing_names_outside_the_name_rule_can_be_updated_and_dropped() {
+        let (state, _) = node();
+        let spec = pg_spec("pg-prod", closed_port());
+        store_of(&state)
+            .seed_catalogs(&[("pg-prod".into(), spec.clone())], false)
+            .unwrap();
+        let (status, body) = create(&state, pg_spec("pg-new", 1), false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_argument");
+        let mut rotated = spec.clone();
+        rotated["password"] = json!("rotated-secret");
+        let (status, body) = update(&state, "pg-prod", rotated, false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let record = stored(&state, "pg-prod").unwrap();
+        assert_eq!(record.spec["password"], "rotated-secret");
+        let (status, body) = drop_catalog(&state, "pg-prod", false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(stored(&state, "pg-prod").is_none());
+    }
+
+    /// A coordinator without a `[cluster] secret` refuses a catalog that
+    /// would serve a secret over Flight, on create and on update.
+    #[tokio::test]
+    async fn secrets_are_refused_without_a_cluster_secret() {
+        let (state, probed) = node();
+        let live = state.catalogs.clone().unwrap();
+        live.set_unauthenticated_flight(true);
+        let (status, body) = create(&state, pg_spec("pg", closed_port()), false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_argument");
+        assert!(body["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("[cluster] secret"));
+        assert!(!body.to_string().contains(PG_SECRET));
+        assert!(stored(&state, "pg").is_none());
+        assert!(
+            probed.lock().unwrap().is_empty(),
+            "refused before connecting"
+        );
+
+        let plain = json!({
+            "name": "pg", "type": "postgresql",
+            "connection_url": format!("postgresql://arneb@127.0.0.1:{}/arneb", closed_port()),
+        });
+        let (status, body) = create(&state, plain.clone(), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut with_password = plain;
+        with_password["password"] = json!(PG_SECRET);
+        let (status, body) = update(&state, "pg", with_password, false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(stored(&state, "pg").unwrap().spec["password"].is_null());
     }
 
     #[tokio::test]

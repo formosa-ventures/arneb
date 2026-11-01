@@ -155,7 +155,7 @@ user must exist in Arneb, or every call is `403`.
 
 ## Tools
 
-Forty-three tools. The server also sends `instructions` on connect, which tell
+Forty-four tools. The server also sends `instructions` on connect, which tell
 the agent the intended order: discover, describe or sample, explain, submit,
 poll, fetch, cancel.
 
@@ -171,7 +171,7 @@ poll, fetch, cancel.
 | `submit_query` | `sql`, `catalog?`, `schema?`, `max_rows?`, `wait_ms?` | statement status | `POST /statements` |
 | `get_query_status` | `id`, `wait_ms?` | statement status | `GET /statements/{id}` |
 | `fetch_results` | `id`, `cursor?`, `max_bytes?` | a page of rows and `next_cursor` | `GET /statements/{id}/results` |
-| `cancel_query` | `id`, `dry_run?` | your own statement: its status after cancelling; any other id, or a dry run: the manage envelope | `DELETE /statements/{id}` or `DELETE /queries/{id}` |
+| `cancel_query` | `id`, `dry_run?` | your own statement: its status after cancelling (an ended one is released, no rows); any other id, or a dry run: the manage envelope | `DELETE /statements/{id}` or `DELETE /queries/{id}` |
 | `list_queries` | `state?`, `user?`, `min_elapsed_ms?`, `limit?` | `{queries, truncated}` | `GET /queries`, bounded |
 | `get_query` | `id` | one tracked query | `GET /queries/{id}` |
 | `get_cluster` | none | role, workers, admission counters | `GET /cluster` |
@@ -182,7 +182,8 @@ poll, fetch, cancel.
 | `uncordon_worker` | `id`, `dry_run?` | manage envelope | `POST /workers/{id}/uncordon` |
 | `get_admission` | none | limits, running and queued counts, `source` | `GET /admission` |
 | `set_admission_limits` | `max_running_queries?`, `max_queued_queries?`, `dry_run?` | manage envelope | `PUT /admission` |
-| `list_audit_log` | `limit?`, `cursor?`, `user?`, `action?` | `{entries, next_cursor, truncated, ...}` (default 50, at most 500) | `GET /audit` |
+| `reset_admission_limits` | `dry_run?` | manage envelope | `DELETE /admission` |
+| `list_audit_log` | `limit?`, `cursor?`, `user?`, `action?` | `{entries, next_cursor, truncated, scope, ...}` (default 50, at most 500; without manage, only your own actions) | `GET /audit` |
 | `list_tokens` | none | your live tokens, never the secret | `GET /tokens` |
 | `create_token` | `name?`, `expires_in_days?` | the new token, shown once | `POST /tokens` |
 | `revoke_token` | `id` | `{revoked: id}` | `DELETE /tokens/{id}` |
@@ -212,12 +213,16 @@ description in the tool's input schema.
 Annotations tell a client which calls are safe to auto-approve. All tools set
 `openWorldHint = false`. `whoami`, the `list_*` and `get_*` tools,
 `describe_table`, `sample_table`, `explain_query` and `fetch_results` are
-read-only. `cancel_query`, `revoke_token`, `cordon_worker`, `drain_worker`,
-`set_admission_limits`, `set_access_rules`, `clear_access_rules`,
-`set_user_password`, `delete_user`, `revoke_user_token`, `update_catalog`,
-`drop_catalog`, `update_settings` and `reseed_state` are destructive and
-idempotent; `uncordon_worker` is idempotent and not destructive;
-`create_user`, `issue_user_token` and `create_catalog` are neither.
+read-only. `revoke_token`, `cordon_worker`, `drain_worker`,
+`set_admission_limits`, `reset_admission_limits`, `set_access_rules`,
+`clear_access_rules`, `set_user_password`, `delete_user`,
+`revoke_user_token`, `update_catalog`, `drop_catalog`, `update_settings` and
+`reseed_state` are destructive and idempotent; `uncordon_worker` is
+idempotent and not destructive; `create_user`, `issue_user_token` and
+`create_catalog` are neither. `cancel_query` is destructive but not
+idempotent: the first call cancels a running statement of yours and keeps
+it, a call on an ended one releases it with its rows, and a call after that
+only finds the tracked query that already ended (`changed: false`).
 `submit_query` and `create_token` carry no read-only hint.
 
 ### Typical session
@@ -233,7 +238,8 @@ idempotent; `uncordon_worker` is idempotent and not destructive;
    `first_page.next_cursor` and repeat with each page's `next_cursor` until
    it is null (a null `first_page.next_cursor` means you already have every
    row).
-7. `cancel_query` for a statement that is no longer needed.
+7. `cancel_query` once you are done with a statement: it stops a running
+   one, and frees the retained rows of one that has ended.
 
 A statement that fails after it was submitted, including a SQL syntax error,
 is a normal result whose status has `state: "failed"` and an `error` object.
@@ -242,7 +248,8 @@ Only a bad request is an error result.
 ## Managing the cluster
 
 The manage tools (`cordon_worker`, `drain_worker`, `uncordon_worker`,
-`set_admission_limits`, and `cancel_query` on another user's query) call the
+`set_admission_limits`, `reset_admission_limits`, and `cancel_query` on
+another user's query) call the
 same functions as their `/api/v2` routes, with the same checks. `whoami`
 reports `privileges: {observe, manage}`. The observe tools (`list_workers`,
 `get_worker`, `get_admission`, `list_audit_log`) need no extra privilege under
@@ -313,7 +320,7 @@ Differences from the HTTP routes:
   context, so the default page is `[mcp] default_page_bytes` (32768 bytes)
   rather than the 256 KiB of `/api/v2`. It applies to `fetch_results` when
   `max_bytes` is omitted, and to the inline first page of `submit_query`,
-  `get_query_status`, `sample_table` and `cancel_query`. Ask for more with `max_bytes`, up to
+  `get_query_status` and `sample_table` (`cancel_query` returns no rows). Ask for more with `max_bytes`, up to
   the `[agent_api] max_page_bytes` ceiling. The budget counts the bytes of
   the rows only. The status fields, the `columns` list and the text copy of
   the JSON that the MCP library adds to every result come on top, so a full
@@ -335,10 +342,20 @@ Differences from the HTTP routes:
   in `get_query` is cut at `max_cell_bytes` and flagged `sql_truncated`.
 - **Cancel.** `cancel_query` with the id of your own statement from
   `submit_query` works like `DELETE /api/v2/statements/{id}` and returns the
-  statement status. Any other id (a query id from `list_queries`), or any
-  call with `dry_run`, works like `DELETE /api/v2/queries/{id}` and returns
-  the manage envelope; killing another user's query needs the manage
-  privilege or a `queries` rule that allows `kill`.
+  statement status: a running statement is cancelled and kept, an ended one
+  is released with its rows. Any other id (a query id from `list_queries`,
+  or a statement already released or evicted), or any call with `dry_run`,
+  works like `DELETE /api/v2/queries/{id}` and returns the manage envelope;
+  killing another user's query needs the manage privilege or an explicit
+  `queries` rule that allows `kill` (with no `queries` rules, only the owner
+  or a manager may kill).
+- **Truncation and eviction.** The statement status is the `/api/v2` one, so
+  a truncated result carries `truncated_by` (which limit cut it, including
+  `user_budget` for your share of retained results) and `truncated_hint`
+  (what to do). An ended statement whose rows were evicted to make room
+  answers `not_found` from `get_query_status` and `fetch_results` with a
+  message saying so and a hint to resubmit; see
+  [eviction](/guide/http-api#limits-and-truncation).
 - **Tokens need password auth.** `create_token`, `list_tokens` and
   `revoke_token` answer `auth_disabled` under `type = "none"`. A token that
   mints a token cannot outlive its parent: the expiry is clamped and the

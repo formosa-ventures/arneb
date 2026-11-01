@@ -29,7 +29,7 @@
 //!   once.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,10 @@ const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
 /// queue: enough to absorb a burst of legitimate first polls, small enough
 /// that a flood is rejected (`503`) instead of delaying everyone.
 const MAX_QUEUED_VERIFICATIONS: usize = 64;
+/// Token issuances allowed to wait for a PBKDF2 slot (a budget separate from
+/// the per-listener verification queues); past that issuance is refused as
+/// overloaded, so an issue flood cannot queue ahead of Basic logins.
+const MAX_QUEUED_ISSUANCES: usize = 16;
 /// `Retry-After` (seconds) on the `503` returned when the queue is full.
 const OVERLOADED_RETRY_AFTER_SECS: &str = "1";
 
@@ -101,6 +105,17 @@ pub struct BasicAuthenticator {
     /// a verification that saw another value when it started does not
     /// cache its result, since it may have checked replaced credentials.
     epoch: Arc<AtomicU64>,
+    /// Issuances waiting for a slot via [`Self::acquire_pbkdf2_slot`].
+    slot_waiters: Arc<AtomicUsize>,
+}
+
+/// Why [`BasicAuthenticator::acquire_pbkdf2_slot`] gave no slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotError {
+    /// The issuance wait queue is full; the caller should retry later.
+    Overloaded,
+    /// The limiter is closed.
+    Closed,
 }
 
 /// One request's membership in an in-flight verification. On drop it
@@ -133,6 +148,58 @@ impl BasicAuthenticator {
         Self::with_counter(creds, Arc::new(AtomicU64::new(0)))
     }
 
+    /// Another handle for a second listener: it shares this one's PBKDF2
+    /// limiter (one CPU bound for the process), success cache and counter,
+    /// but has its own single-flight map, so its wait-queue budget
+    /// ([`MAX_QUEUED_VERIFICATIONS`]) is independent. A flood of bad
+    /// credentials on one listener then cannot make the other return `503`.
+    #[must_use]
+    pub fn sibling(&self) -> Self {
+        Self {
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            slot_waiters: Arc::new(AtomicUsize::new(0)),
+            ..self.clone()
+        }
+    }
+
+    /// Takes one PBKDF2 slot from the shared limiter, for other work that
+    /// derives a PBKDF2 key on this process's behalf (API token issuance).
+    /// At most [`MAX_QUEUED_ISSUANCES`] callers wait at once (a budget apart
+    /// from the verification queue); more get [`SlotError::Overloaded`].
+    /// Move the permit into the blocking task so the slot is held for as
+    /// long as the derivation runs.
+    pub async fn acquire_pbkdf2_slot(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, SlotError> {
+        struct Waiting<'a>(&'a AtomicUsize);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        if self.slot_waiters.fetch_add(1, Ordering::Relaxed) >= MAX_QUEUED_ISSUANCES {
+            self.slot_waiters.fetch_sub(1, Ordering::Relaxed);
+            return Err(SlotError::Overloaded);
+        }
+        let _waiting = Waiting(&self.slot_waiters);
+        Arc::clone(&self.limiter)
+            .acquire_owned()
+            .await
+            .map_err(|_| SlotError::Closed)
+    }
+
+    /// Size of the PBKDF2 limiter; test hook.
+    #[doc(hidden)]
+    pub fn pbkdf2_slot_count() -> usize {
+        MAX_CONCURRENT_VERIFICATIONS
+    }
+
+    /// Issuance wait-queue bound; test hook.
+    #[doc(hidden)]
+    pub fn max_queued_issuances() -> usize {
+        MAX_QUEUED_ISSUANCES
+    }
+
     /// Like [`BasicAuthenticator::new`], counting PBKDF2 verifications in
     /// `verifications`.
     pub(crate) fn with_counter(
@@ -149,6 +216,7 @@ impl BasicAuthenticator {
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_VERIFICATIONS)),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             epoch: Arc::new(AtomicU64::new(0)),
+            slot_waiters: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -522,6 +590,44 @@ mod tests {
         }
         assert_eq!(counter.load(Ordering::Relaxed), 1 + bound as u64);
         assert_eq!(in_flight_len(&auth), 0);
+    }
+
+    #[tokio::test]
+    async fn sibling_has_its_own_queue_but_shares_the_limiter_and_cache() {
+        let (auth, counter) = authenticator();
+        let other = auth.sibling();
+        let held = hold_all_slots(&auth);
+        let bound = MAX_CONCURRENT_VERIFICATIONS + MAX_QUEUED_VERIFICATIONS;
+        let flood: Vec<_> = (0..bound)
+            .map(|i| {
+                let auth = auth.clone();
+                tokio::spawn(async move { auth.check("alice", &format!("bad-{i}")).await })
+            })
+            .collect();
+        settle().await;
+        assert_eq!(in_flight_len(&auth), bound);
+        assert_eq!(in_flight_len(&other), 0);
+        assert_eq!(
+            auth.check("alice", "bad-new").await,
+            BasicVerdict::Overloaded
+        );
+        // The sibling still queues (its budget is untouched) ...
+        let queued = tokio::spawn({
+            let other = other.clone();
+            async move { other.check("alice", "alice-pw").await }
+        });
+        settle().await;
+        assert!(!queued.is_finished(), "waits on the shared limiter");
+        assert_eq!(in_flight_len(&other), 1);
+        drop(held);
+        assert_eq!(queued.await.unwrap(), BasicVerdict::Valid);
+        for t in flood {
+            let _ = t.await;
+        }
+        // ... and a success on one handle is a cache hit on the other.
+        let before = counter.load(Ordering::Relaxed);
+        assert_eq!(auth.check("alice", "alice-pw").await, BasicVerdict::Valid);
+        assert_eq!(counter.load(Ordering::Relaxed), before);
     }
 
     #[test]

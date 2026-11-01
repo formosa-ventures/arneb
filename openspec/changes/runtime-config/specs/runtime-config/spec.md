@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: The state store is the source of truth
-Under `[auth] type = "password"` the coordinator (and a standalone server) SHALL keep the catalogs, the access rules and the slow-query threshold in the state store. The first start whose state has no seeded copy of the catalogs SHALL copy `[[catalogs]]` into it, and the first start with no seeded copy of the rules SHALL copy the `rules_file`. On later starts the stored copies SHALL be used, and each config catalog that is new, changed or gone relative to its seeded copy, a rules file whose text differs from the current stored rules (including rules changed at runtime), and a config setting overridden by a stored value SHALL log one WARN on `arneb::config` naming the object and ending with `Preview a re-seed with POST /api/v2/state/reseed?dry_run=true`. A state file without a `seeded` field SHALL load as not seeded. Under `[auth] type = "none"` the config SHALL be used as before.
+Under `[auth] type = "password"` the coordinator (and a standalone server) SHALL keep the catalogs, the access rules and the slow-query threshold in the state store. The first start whose state has no seeded copy of the catalogs SHALL copy `[[catalogs]]` into it, and the first start with no seeded copy of the rules SHALL copy the `rules_file`. On later starts the stored catalogs SHALL be used. Stored rules that were never changed at runtime SHALL follow the rules file: a rules file whose text differs SHALL be stored again, with an INFO on `arneb::config`. Rules changed at runtime SHALL be kept while the rules file is unchanged since it was last seeded (the state SHALL keep a SHA-256 fingerprint of the seeded text); if the rules file changed since then, startup SHALL fail with an error naming `--reseed-state` and reverting the file. Each config catalog that is new, changed or gone relative to its seeded copy, rules changed at runtime that differ from the rules file, and a config setting overridden by a stored value SHALL log one WARN on `arneb::config` naming the object and ending with `Preview a re-seed with POST /api/v2/state/reseed?dry_run=true`. A state file without a `seeded` field SHALL load as not seeded. Under `[auth] type = "none"` the config SHALL be used as before.
 
 #### Scenario: Upgrade seeds once
 - **WHEN** a coordinator starts on an H4 state file with `[[catalogs]]` naming `datalake`
@@ -10,6 +10,14 @@ Under `[auth] type = "password"` the coordinator (and a standalone server) SHALL
 #### Scenario: Rules changed at runtime
 - **WHEN** a manager replaces the rules with `PUT /api/v2/access-rules` and the coordinator restarts with the rules file unchanged
 - **THEN** the stored rules are used and startup logs the rules divergence WARN, at every start until a re-seed
+
+#### Scenario: Tightened rules file
+- **WHEN** the rules were never changed at runtime and an operator removes bob's table rule from the rules file and restarts
+- **THEN** the state stores the file's rules and bob can no longer read the table
+
+#### Scenario: Rules changed at runtime and the file edited
+- **WHEN** a manager replaced the rules with `PUT /api/v2/access-rules` and an operator then edits the rules file and restarts
+- **THEN** startup fails with an error naming `--reseed-state`, and the stored rules are unchanged
 
 #### Scenario: Config edit after seeding
 - **WHEN** an operator changes the `metastore_uri` of a seeded catalog in the config file and restarts
@@ -45,7 +53,7 @@ Every change to the access rules, users, user tokens, catalogs, settings and the
 - **THEN** both uses succeed before the revoke, `/api/v2` answers `401` after it and pgwire refuses the login
 
 ### Requirement: Catalog definitions at runtime
-`/api/v2/catalog-configs` SHALL list, show, create (`POST`), update (`PUT`) and drop (`DELETE`) `hive` and `postgresql` catalogs. Names SHALL be 1–63 characters of `[a-z0-9_]` starting with a letter; `memory`, `file`, `system`, `information_schema` and `pg_catalog` SHALL be reserved. A create or update SHALL first build the catalog on the coordinator within 10 s, also for a dry run, and a failure SHALL be `invalid_argument` with nothing changed. A real change SHALL persist the spec with the catalog generation increased by one, install it on the coordinator and push the new set to every alive worker with a 5 s timeout each, reporting each worker as `synced` or not; a failed push SHALL NOT fail the call. A spec sent through the API or MCP SHALL be refused with `invalid_argument` naming any field the spec does not have, at any depth. A `PUT` of the spec already stored and served SHALL answer `changed: false` with no generation bump and no push. A `POST` of an existing name SHALL be `conflict`, and an update or drop of an unknown name `not_found`. The `/api/v2/catalogs` discovery routes SHALL list a new catalog as soon as the change returns. A running query SHALL keep the catalog it was planned with.
+`/api/v2/catalog-configs` SHALL list, show, create (`POST`), update (`PUT`) and drop (`DELETE`) `hive` and `postgresql` catalogs. A created name SHALL be 1–63 characters of `[a-z0-9_]` starting with a letter, and `memory`, `file`, `system`, `information_schema` and `pg_catalog` SHALL be reserved; an update or drop SHALL accept any existing name (a config-seeded `pg-prod` stays updatable). A create or update SHALL first build the catalog on the coordinator within 10 s, also for a dry run, and a failure SHALL be `invalid_argument` with nothing changed. A real change SHALL persist the spec with the catalog generation increased by one, install it on the coordinator and push the new set to every alive worker with a 5 s timeout each, reporting each worker as `synced` or not; a failed push SHALL NOT fail the call. A spec sent through the API or MCP SHALL be refused with `invalid_argument` naming any field the spec does not have, at any depth. A `PUT` of the spec already stored and served SHALL answer `changed: false` with no generation bump and no push. A `POST` of an existing name SHALL be `conflict`, and an update or drop of an unknown name `not_found`. The `/api/v2/catalogs` discovery routes SHALL list a new catalog as soon as the change returns. A running query SHALL keep, on the coordinator, the catalog provider and connector it was planned with; a worker task SHALL use the worker's catalogs as of the task's start for all of its scans.
 
 #### Scenario: Create and query across workers
 - **WHEN** a manager creates postgresql catalog `pg2` on a coordinator with two workers
@@ -69,6 +77,12 @@ Every catalog answer, MCP result and audit entry SHALL replace `password`, `secr
 ### Requirement: Workers receive catalogs from the coordinator
 Workers SHALL ignore `[[catalogs]]` in their own config, logging one INFO on `arneb::config` that names them, and SHALL take their catalogs from the coordinator over Flight under the cluster security. Each set SHALL carry the coordinator's default catalog and schema, which a worker SHALL use for a scan with no catalog or schema, and each hive spec SHALL carry the coordinator's global `[storage]` merged in, so a worker needs no catalog or storage config of its own. Every heartbeat reply SHALL carry the coordinator's catalog generation and an epoch chosen at random at each coordinator start; a worker whose applied `(epoch, generation)` differs SHALL pull the set. A pushed or pulled set from the same epoch SHALL apply only when its generation is newer, and a set from another epoch SHALL always apply. Applying a set SHALL build new or changed catalogs, swap them in and remove catalogs not in the set; a catalog that fails to build SHALL be skipped with a WARN, the applied generation SHALL still advance, and the worker SHALL retry the failed catalogs at most once per 30 s. A task that names a catalog the worker does not have SHALL pull once and retry before failing with `catalog '<name>' is not registered on worker <id>`.
 
+A coordinator without a `[cluster] secret` SHALL refuse to start while a served catalog's effective spec carries a secret (`password`, a `connection_url` password, an S3 `secret_access_key` or an Azure `access_key`), naming each catalog and field but never a value, and SHALL refuse a catalog create, update or re-seed that would serve one with `invalid_argument` and a hint to set `[cluster] secret`. Without such secrets it SHALL start and log a WARN on `arneb::config` that cluster RPC is unauthenticated; a worker without a secret SHALL log a WARN that `sync_catalogs` is unauthenticated.
+
+#### Scenario: Catalog secret without a cluster secret
+- **WHEN** a coordinator with no `[cluster] secret` starts with a postgresql catalog that has a `password`
+- **THEN** startup fails with an error naming `[cluster] secret` and `catalog 'pg': password`
+
 #### Scenario: Worker restarted
 - **WHEN** a worker restarts after catalog `pg2` was created
 - **THEN** its first heartbeat pulls the set, and a query on `pg2` runs on it
@@ -89,18 +103,18 @@ Workers SHALL ignore `[[catalogs]]` in their own config, logging one INFO on `ar
 - **THEN** `GET /api/v2/settings` reports 54321 with `source: state`, also after a restart
 
 ### Requirement: Re-seed
-`POST /api/v2/state/reseed` (manage) and `--reseed-state` SHALL reload the config file the server was started with, env overrides applied, and replace the stored catalogs (removing runtime-created ones), the access rules (none without a rules file), the stored settings (cleared) and the config users, clearing the tombstones. Tokens, worker cordons, runtime-created users and the audit log SHALL be kept, except tokens that user seeding revokes. The dry run SHALL list the catalogs added, changed and removed, whether the rules change and the settings reset. A config that fails to load SHALL be `invalid_argument`, and a re-seed that removes the caller's manage privilege or deletes the caller's user SHALL be `conflict`.
+`POST /api/v2/state/reseed` (manage) and `--reseed-state` SHALL reload the config file the server was started with, env overrides applied, and replace the stored catalogs (removing runtime-created ones), the access rules (none without a rules file), the stored settings (cleared) and the config users, clearing the tombstones. Tokens, worker cordons, runtime-created users and the audit log SHALL be kept, except tokens that user seeding revokes. The dry run SHALL list the catalogs added, changed and removed, whether the rules change and the settings reset. A config that fails to load SHALL be `invalid_argument`, and a re-seed that removes the caller's manage privilege or deletes the caller's user SHALL be `conflict`. The API re-seed SHALL have its `state.reseed` intent synced to the audit log (outcome `pending`, the manage-api intent/completion mechanism) before it changes anything, and SHALL persist the catalogs, rules, settings and users in one atomic state write; a failed write SHALL change nothing, stored or live.
 
 #### Scenario: Re-seed removes a runtime catalog
 - **WHEN** a manager re-seeds after creating catalog `pg2`, which is not in the config
 - **THEN** `pg2` is gone on the coordinator and every worker, and the rules and threshold are the config's
 
 ### Requirement: MCP tools for the runtime configuration
-The MCP server SHALL offer 18 more tools, 43 in total, each calling the same function as its route: `list_catalog_configs`, `get_catalog_config`, `create_catalog`, `update_catalog`, `drop_catalog`, `get_access_rules`, `set_access_rules`, `clear_access_rules`, `list_users`, `create_user`, `set_user_password`, `delete_user`, `list_user_tokens`, `issue_user_token`, `revoke_user_token`, `get_settings`, `update_settings` and `reseed_state`. Every manage tool SHALL take `dry_run`. The descriptions of tools that take a password SHALL say that it is not logged or audited and that the agent should not repeat it back to the user.
+The MCP server SHALL offer 18 more tools, 44 in total, each calling the same function as its route: `list_catalog_configs`, `get_catalog_config`, `create_catalog`, `update_catalog`, `drop_catalog`, `get_access_rules`, `set_access_rules`, `clear_access_rules`, `list_users`, `create_user`, `set_user_password`, `delete_user`, `list_user_tokens`, `issue_user_token`, `revoke_user_token`, `get_settings`, `update_settings` and `reseed_state`. Every manage tool SHALL take `dry_run`. The descriptions of tools that take a password SHALL say that it is not logged or audited and that the agent should not repeat it back to the user.
 
 #### Scenario: Tool list
 - **WHEN** a client calls `tools/list`
-- **THEN** it receives 43 tools
+- **THEN** it receives 44 tools
 
 #### Scenario: Equal rights
 - **WHEN** bob, without manage, calls `create_user`

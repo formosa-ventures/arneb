@@ -82,6 +82,7 @@ other pod in the namespace that runs Arneb.
 | `image.repository` / `image.tag` | `ghcr.io/formosa-ventures/arneb` / chart `appVersion` | Every node must run the same release. |
 | `config` | `""` | TOML shared by every pod. |
 | `existingConfigSecret` | `""` | Use key `config.toml` of this Secret instead of `config`. |
+| `auth.password` | `false` | Set to `true` when the config sets `[auth] type = "password"`. Only switches the post-install notes to the API-token flow; the server reads its auth from the config. The chart cannot read an `existingConfigSecret`, so set it yourself there. |
 | `clusterSecret.existingSecret` / `.key` | `""` / `secret` | Cluster secret to use instead of a generated one. |
 | `logLevel` | `info,arneb::profile=warn` | `RUST_LOG` for every pod. |
 | `extraEnv`, `envFrom` | `[]` | Extra environment, e.g. catalog passwords. |
@@ -105,7 +106,11 @@ restarts every pod.
 - **Cluster secret.** Without `clusterSecret.existingSecret`, the chart
   generates a random 48-character secret on install and keeps it on
   upgrade. Every pod reads it as `ARNEB_CLUSTER_SECRET`. To rotate it,
-  update the Secret and restart all pods together.
+  update the Secret and restart all pods together. Keep it set: the
+  coordinator serves catalog passwords and storage keys to the workers over
+  cluster RPC, and without a secret it refuses to start while a catalog
+  carries one (see
+  [Upgrading to v0.2.0 (runtime config)](/guide/configuration#upgrading-to-v020-runtime-config)).
 - **Users and credentials.** A config with `[auth]` users or storage keys
   belongs in a Secret: create one with a `config.toml` key and set
   `existingConfigSecret`. Catalog passwords can also come from
@@ -163,6 +168,9 @@ file is mode `0600`.
   follow the ConfigMap on every rollout: a changed `password_hash` or a
   removed user revokes that user's API tokens. See
   [State](/guide/configuration#state).
+- If your config lives in an `existingConfigSecret` with password auth, set
+  `auth.password=true` to get the API-token flow in the post-install notes
+  (earlier chart versions assumed it for any `existingConfigSecret`).
 - `coordinator.state.persistence.enabled` defaults to `true`, so
   `helm upgrade` creates a PVC. On a cluster without a default StorageClass
   the `Recreate` rollout leaves the coordinator `Pending`: set

@@ -11,7 +11,7 @@ Stage H5 of the headless agent interface (`docs/superpowers/specs/2026-10-30-hea
 - **Workers receive catalogs from the coordinator** over Flight: a push on every change, a catalog generation and coordinator epoch in every heartbeat reply (a mismatch pulls), and a pull-once retry when a task names an unknown catalog. Workers ignore their own `[[catalogs]]`.
 - **Settings.** `GET|PATCH /api/v2/settings` changes `slow_query_threshold_ms` at runtime, persisted.
 - **Re-seed.** `POST /api/v2/state/reseed` (and `--reseed-state` at startup) replaces catalogs, rules, settings and config users with the config file's.
-- **MCP.** 18 new tools (43 in total), each calling its route's function.
+- **MCP.** 18 new tools (44 in total), each calling its route's function.
 - **Error code** `conflict` (HTTP 409).
 
 ## Capabilities

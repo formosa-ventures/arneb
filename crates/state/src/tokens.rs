@@ -1,7 +1,7 @@
 //! API tokens: issue, list, revoke and (crate-internal) verify.
 
-use arneb_protocol::ScramVerifier;
-use aws_lc_rs::{digest, rand};
+use arneb_protocol::{sha256, ScramVerifier};
+use aws_lc_rs::rand;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
@@ -68,6 +68,39 @@ impl StateStore {
         self.issue_token_capped(user, name, expires_at_ms, MAX_TOKENS_PER_USER, now_ms())
     }
 
+    /// The cheap refusals `issue_token` would make before any PBKDF2: an
+    /// unknown user, or one already at the live-token cap. Callers that queue
+    /// for a PBKDF2 slot run this first, so a refused request never waits for
+    /// one. Advisory: `issue_token` rechecks authoritatively.
+    pub fn check_can_issue(&self, user: &str) -> Result<(), StateError> {
+        self.issue_precheck(user, MAX_TOKENS_PER_USER, now_ms())
+            .map(|_| ())
+    }
+
+    /// Snapshot pre-check shared by [`Self::check_can_issue`] and issuance;
+    /// returns the user's current verifier string.
+    fn issue_precheck(
+        &self,
+        user: &str,
+        max_tokens: usize,
+        now: u64,
+    ) -> Result<String, StateError> {
+        let snapshot = self.snapshot();
+        let user_scram = snapshot
+            .users
+            .iter()
+            .find(|u| u.name == user)
+            .map(|u| u.scram.clone())
+            .ok_or_else(|| StateError::UnknownUser(user.to_string()))?;
+        if live_token_count(&snapshot, user, now) >= max_tokens {
+            return Err(StateError::TooManyTokens {
+                user: user.to_string(),
+                limit: max_tokens,
+            });
+        }
+        Ok(user_scram)
+    }
+
     fn issue_token_capped(
         &self,
         user: &str,
@@ -102,17 +135,7 @@ impl StateStore {
         for attempt in 0..2 {
             // Cheap pre-checks on the snapshot, so a refused request never
             // pays for PBKDF2. The checks inside `mutate` stay authoritative.
-            let snapshot = self.snapshot();
-            let user_scram = snapshot
-                .users
-                .iter()
-                .find(|u| u.name == user)
-                .map(|u| u.scram.clone())
-                .ok_or_else(|| StateError::UnknownUser(user.to_string()))?;
-            if live_token_count(&snapshot, user, now) >= max_tokens {
-                return Err(too_many());
-            }
-            drop(snapshot);
+            let user_scram = self.issue_precheck(user, max_tokens, now)?;
             let verifier: ScramVerifier = user_scram.parse().map_err(|e| StateError::Corrupt {
                 path: path.clone(),
                 message: format!("user {user:?} has an invalid verifier: {e}"),
@@ -246,13 +269,6 @@ fn info_of(t: &TokenRecord) -> TokenInfo {
         created_ms: t.created_ms,
         expires_ms: t.expires_ms,
     }
-}
-
-/// SHA-256 of `bytes`.
-pub fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(digest::digest(&digest::SHA256, bytes).as_ref());
-    out
 }
 
 /// The current time in milliseconds since the Unix epoch (saturating; 0 if

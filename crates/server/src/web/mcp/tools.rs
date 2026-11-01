@@ -187,6 +187,15 @@ struct AdmissionArgs {
     dry_run: Option<bool>,
 }
 
+/// Arguments of the tools that only preview or run with no other input
+/// (`reset_admission_limits`, `clear_access_rules`, `reseed_state`).
+#[derive(Deserialize, schemars::JsonSchema)]
+struct DryRunArgs {
+    /// Preview only: report what the change would do and change nothing
+    /// (default false).
+    dry_run: Option<bool>,
+}
+
 /// Arguments of `list_audit_log`.
 #[derive(Deserialize, schemars::JsonSchema)]
 struct AuditArgs {
@@ -297,16 +306,6 @@ fn fill_schema(value: &mut serde_json::Value, values: &[(&'static str, String)])
         }
         _ => {}
     }
-}
-
-/// A tool result for a service outcome: the body, or the error envelope.
-/// Arguments of the tools that only preview or run with no other input
-/// (`clear_access_rules`, `reseed_state`).
-#[derive(Deserialize, schemars::JsonSchema)]
-struct DryRunArgs {
-    /// Preview only: report what the change would do and change nothing
-    /// (default false).
-    dry_run: Option<bool>,
 }
 
 /// Arguments of `set_access_rules`.
@@ -427,6 +426,7 @@ struct UpdateSettingsArgs {
     dry_run: Option<bool>,
 }
 
+/// A tool result for a service outcome: the body, or the error envelope.
 fn respond<T: Serialize>(outcome: Result<T, ApiError>) -> Result<CallToolResult, ErrorData> {
     match outcome {
         Ok(body) => ok(&body),
@@ -677,7 +677,8 @@ impl ArnebMcp {
         description = "Run a SQL statement. Returns its status; with `wait_ms` (at most \
                        {max_wait_ms}) a short query is already finished, with a first page of \
                        rows. At most `max_rows` (default {default_max_rows}, at most {max_rows}) \
-                       rows are kept and `truncated` says if more existed. A failed \
+                       rows are kept and `truncated` says if more existed (`truncated_by` names \
+                       the limit, `truncated_hint` what to do). A failed \
                        statement is a status with state `failed` and an error. Next: \
                        get_query_status until finished, then fetch_results starting from \
                        `first_page.next_cursor` (null means you have every row).",
@@ -757,14 +758,18 @@ impl ArnebMcp {
     /// `cancel_query`: `DELETE /api/v2/statements/{id}` or
     /// `DELETE /api/v2/queries/{id}`.
     #[tool(
-        description = "Cancel a query by id. Your own statement from submit_query returns its \
-                       status after cancelling (safe to repeat). Any other id, or a dry_run, \
-                       returns the manage envelope (dry_run, action, summary, changed, result); \
-                       cancelling another user's query needs the manage privilege or a kill \
-                       rule and is audited. A query that already ended is changed: false.",
+        description = "Cancel a query by id. Your own statement from submit_query: a queued \
+                       or running one is cancelled and kept (get_query_status still reports \
+                       it); an ended one is released with its rows, returning its final status \
+                       without a first page. Any other id (including a statement already \
+                       released), or a dry_run, returns the manage envelope (dry_run, action, \
+                       summary, changed, result); cancelling another user's query needs the \
+                       manage privilege or an explicit queries rule allowing kill (with no \
+                       queries rules, only the owner or a manager may), and is audited. A query \
+                       that already ended is changed: false.",
         annotations(
             destructive_hint = true,
-            idempotent_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -777,9 +782,10 @@ impl ArnebMcp {
         let dry_run = a.dry_run.unwrap_or(false);
         if !dry_run {
             // The caller's own agent statement keeps the H3 behavior and
-            // result; any other id is not found here and goes on.
+            // result; any other id (or one already released or evicted) is
+            // not found here and goes on to the tracker.
             if let Some(svc) = self.state.agent.as_ref() {
-                match svc.cancel(&who.user, &a.id, Some(self.page_bytes(svc))) {
+                match svc.cancel(&who.user, &a.id) {
                     Ok(status) => return ok(&status),
                     Err(e) => {
                         let e = ApiError::from(e);
@@ -999,13 +1005,36 @@ impl ArnebMcp {
         )
     }
 
+    /// `reset_admission_limits`: `DELETE /api/v2/admission`.
+    #[tool(
+        description = "Clear the admission limits stored by set_admission_limits and return to \
+                       the configured values ([admission] / ARNEB_MAX_*_QUERIES), now and at \
+                       the next start. Lowering never stops a running query. Needs the manage \
+                       privilege. Preview with dry_run first; read the result with \
+                       get_admission.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reset_admission_limits(
+        &self,
+        Parameters(a): Parameters<DryRunArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let who = identity(&ctx)?;
+        respond(admission::reset_admission_for(&self.state, &who, a.dry_run.unwrap_or(false)).await)
+    }
+
     /// `list_audit_log`: `GET /api/v2/audit`.
     #[tool(
         description = "Read the audit log of manage actions (worker, admission, query cancel \
                        and token changes), newest first, at most `limit` (default \
                        {audit_limit}, at most {max_audit_limit}). Continue with `next_cursor` \
                        as `cursor`; `truncated` says if more exist. Filter by `user` or \
-                       `action`.",
+                       `action`. Without the manage privilege you see only your own actions \
+                       (`scope`: own).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_audit_log(
@@ -1641,6 +1670,7 @@ mod tests {
             .with_distributed_executor(Arc::new(HangingExecutor));
         state.query_tracker = tracker.clone();
         state.admission = Some(arneb_scheduler::AdmissionController::new(8, 256));
+        (state.max_running_queries, state.max_queued_queries) = (8, 256);
         state.agent = with_agent.then_some(agent);
         // A re-seed reads this config: password auth and `root`.
         let config =
@@ -1733,6 +1763,7 @@ mod tests {
             admission: None,
             admission_changes: Default::default(),
             cordon_changes: Default::default(),
+            max_running_queries: 8,
             max_queued_queries: 8,
             memory_pool: Arc::new(arneb_common::memory_pool::GreedyMemoryPool::new(1 << 20)),
             memory_limit_bytes: None,
@@ -1912,10 +1943,16 @@ mod tests {
         let st = tool_ok(&f, "alice", "get_query_status", json!({"id": id})).await;
         assert_eq!(st["first_page"]["rows"], first["rows"]);
         assert_eq!(st["first_page"]["next_cursor"], first["next_cursor"]);
-        // And so is cancelling a statement that already finished.
+        // Cancelling a statement that already finished releases it: its
+        // final status comes back without rows, and the id is gone after.
         let c = tool_ok(&f, "alice", "cancel_query", json!({"id": id})).await;
         assert_eq!(c["state"], "finished");
-        assert_eq!(c["first_page"], st["first_page"]);
+        assert!(c["first_page"].is_null(), "{c}");
+        // Released, the id is only the tracked query now: nothing to cancel.
+        let again = tool_ok(&f, "alice", "cancel_query", json!({"id": id})).await;
+        assert_eq!(again["changed"], false, "{again}");
+        let e = tool_err(&f, "alice", "get_query_status", json!({"id": id})).await;
+        assert_eq!(e["code"], "not_found", "{e}");
     }
 
     #[tokio::test]
@@ -2320,7 +2357,7 @@ mod tests {
     }
 
     /// The exact tool set (D5), sorted.
-    const TOOL_NAMES: [&str; 43] = [
+    const TOOL_NAMES: [&str; 44] = [
         "cancel_query",
         "clear_access_rules",
         "cordon_worker",
@@ -2353,6 +2390,7 @@ mod tests {
         "list_users",
         "list_workers",
         "reseed_state",
+        "reset_admission_limits",
         "revoke_token",
         "revoke_user_token",
         "sample_table",
@@ -2367,12 +2405,13 @@ mod tests {
     ];
 
     /// The tools that change cluster state and take `dry_run`.
-    const MANAGE_TOOLS: [&str; 5] = [
+    const MANAGE_TOOLS: [&str; 6] = [
         "cancel_query",
         "cordon_worker",
         "drain_worker",
         "uncordon_worker",
         "set_admission_limits",
+        "reset_admission_limits",
     ];
 
     /// The runtime-config manage tools (D12): all take `dry_run`.
@@ -2447,6 +2486,7 @@ mod tests {
                 "set_user_password",
                 "update_catalog",
                 "update_settings",
+                "reset_admission_limits",
             ]
             .contains(&name);
             if name == "uncordon_worker" {
@@ -2470,7 +2510,9 @@ mod tests {
             }
             if destructive {
                 assert_eq!(a["destructiveHint"], json!(true), "{name} destructive");
-                assert_eq!(a["idempotentHint"], json!(true), "{name} idempotent");
+                // A second cancel_query releases what the first cancelled.
+                let idempotent = name != "cancel_query";
+                assert_eq!(a["idempotentHint"], json!(idempotent), "{name} idempotent");
             }
         }
 
@@ -2498,6 +2540,7 @@ mod tests {
         );
         assert!(desc("list_workers").contains("cordon_worker"));
         assert!(desc("set_admission_limits").contains("get_admission"));
+        assert!(desc("reset_admission_limits").contains("get_admission"));
     }
 
     /// Every string an agent reads: the instructions, each tool's
@@ -2731,6 +2774,16 @@ mod tests {
         )
         .await;
         assert_eq!(log["entries"][0]["user"], "root", "{log}");
+        assert_eq!(log["scope"], "all");
+        // A non-manager reads only the entries of their own actions.
+        let own = tool_ok(&f, "alice", "list_audit_log", json!({"user":"root"})).await;
+        assert_eq!(own["entries"], json!([]), "{own}");
+        assert_eq!(own["scope"], "own");
+        assert_eq!(
+            own,
+            api_get(&f, "alice", "/api/v2/audit?user=root").await,
+            "MCP and HTTP agree"
+        );
         let u = tool_ok(&f, "root", "uncordon_worker", json!({"id":"w1"})).await;
         assert_eq!(u["result"]["scheduling"], "schedulable", "{u}");
     }
@@ -2743,6 +2796,7 @@ mod tests {
             ("drain_worker", json!({"id":"w1"})),
             ("uncordon_worker", json!({"id":"w1"})),
             ("set_admission_limits", json!({"max_queued_queries":5})),
+            ("reset_admission_limits", json!({})),
         ];
         for (name, args) in &calls {
             let e = tool_err(&f, "alice", name, args.clone()).await;
@@ -2910,6 +2964,37 @@ mod tests {
         }
         let a = tool_ok(&f, "root", "get_admission", json!({})).await;
         assert_eq!(a["max_queued_queries"], 5);
+        assert_eq!(a["source"], "state");
+
+        // Reset: a dry run, then the real call, back to the config values.
+        let dry = tool_ok(
+            &f,
+            "root",
+            "reset_admission_limits",
+            json!({"dry_run": true}),
+        )
+        .await;
+        assert_eq!(
+            (dry["dry_run"].clone(), dry["changed"].clone()),
+            (json!(true), json!(true))
+        );
+        assert_eq!(
+            dry,
+            api_call(&f, "root", Method::DELETE, "/api/v2/admission?dry_run=true").await,
+            "MCP and HTTP agree"
+        );
+        let r = tool_ok(&f, "root", "reset_admission_limits", json!({})).await;
+        assert_eq!(r["action"], "admission.reset", "{r}");
+        assert_eq!(r["result"]["max_queued_queries"], 256);
+        assert_eq!(r["result"]["source"], "config");
+        let log = tool_ok(
+            &f,
+            "root",
+            "list_audit_log",
+            json!({"action":"admission.reset"}),
+        )
+        .await;
+        assert_eq!(log["entries"][0]["outcome"], "ok", "{log}");
     }
 
     /// An `/api/v2` call as `user` with an optional body; the JSON answer
@@ -2939,14 +3024,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_list_has_43_tools() {
+    async fn tool_list_has_44_tools() {
         let f = fixture(false);
         let v = rpc_raw(
             &f,
             json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
         )
         .await;
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 43);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 44);
     }
 
     const RULES: &str =

@@ -5,8 +5,11 @@
 //! [`LiveCatalogs`] builds a catalog's provider and connector from its spec,
 //! installs both into the shared [`CatalogManager`] and [`ConnectorRegistry`],
 //! and remembers the installed specs plus the catalog generation they belong
-//! to. A query keeps the provider `Arc` it was planned with, so a change
-//! never disturbs a running statement.
+//! to. A statement pins the providers and connectors together when it
+//! starts ([`ConnectorRegistry::pinned`]; every install and remove here is
+//! one [`ConnectorRegistry::swap`]), so a change never disturbs a running
+//! statement on the coordinator. A worker resolves each task's connectors
+//! when the task starts.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -96,12 +99,20 @@ pub struct LiveCatalogs {
     /// last applied set (Ruling R12); `None` until a set that carries them
     /// arrives, and on a coordinator.
     pushed_defaults: RwLock<Option<(String, String)>>,
-    /// Serializes [`apply_set`](Self::apply_set) calls, which build outside
-    /// any other lock.
+    /// The coordinator serves its set over Flight `get_catalogs` without a
+    /// `[cluster] secret`, so no served spec may carry a secret
+    /// ([`exposure_check`](Self::exposure_check)).
+    unauthenticated_flight: std::sync::atomic::AtomicBool,
+    /// Serializes the swap step of [`apply_set`](Self::apply_set) calls.
+    /// Builds run before it is taken, so an unreachable metastore never
+    /// holds up another push or pull.
     applying: tokio::sync::Mutex<()>,
     /// Tests replace [`build`](Self::build) with this.
     #[cfg(test)]
     test_builder: Option<TestBuilder>,
+    /// How long a test build of a catalog takes, by name.
+    #[cfg(test)]
+    test_build_delay: std::sync::Mutex<BTreeMap<String, Duration>>,
 }
 
 #[cfg(test)]
@@ -135,9 +146,12 @@ impl LiveCatalogs {
             epoch: AtomicU64::new(0),
             failed: RwLock::new(Default::default()),
             pushed_defaults: RwLock::new(None),
+            unauthenticated_flight: std::sync::atomic::AtomicBool::new(false),
             applying: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             test_builder: None,
+            #[cfg(test)]
+            test_build_delay: Default::default(),
         })
     }
 
@@ -239,13 +253,37 @@ impl LiveCatalogs {
     /// the global `[storage]` merged in, so the worker needs none of its
     /// own. Other types read no object storage and are unchanged.
     fn effective_spec(&self, spec: &CatalogConfig) -> CatalogConfig {
-        let mut effective = spec.clone();
-        if spec.catalog_type == "hive" {
-            let storage = self.storage_for(spec);
-            let empty = storage.s3.is_none() && storage.gcs.is_none() && storage.azure.is_none();
-            effective.storage = (!empty).then_some(storage);
+        effective_spec(&self.global_storage, spec)
+    }
+
+    /// Marks this coordinator as serving its set over Flight without a
+    /// `[cluster] secret`: from then on [`exposure_check`](Self::exposure_check)
+    /// refuses a spec that would serve a secret.
+    pub fn set_unauthenticated_flight(&self, on: bool) {
+        self.unauthenticated_flight.store(on, Ordering::SeqCst);
+    }
+
+    /// The secrets the served set carries, as `catalog 'x': field` (the
+    /// effective specs: a hive spec with the global `[storage]` keys merged
+    /// in, Ruling R12).
+    pub fn served_secrets(&self) -> Vec<String> {
+        effective_secrets(&self.global_storage, &self.specs())
+    }
+
+    /// Whether `spec` may be served: always with a `[cluster] secret`;
+    /// without one only when its effective spec carries no secret (Flight
+    /// `get_catalogs` would hand it to any peer). `Err` names the secret
+    /// fields.
+    pub fn exposure_check(&self, spec: &CatalogConfig) -> Result<(), Vec<&'static str>> {
+        if !self.unauthenticated_flight.load(Ordering::SeqCst) {
+            return Ok(());
         }
-        effective
+        let fields = secret_fields(&self.effective_spec(spec));
+        if fields.is_empty() {
+            Ok(())
+        } else {
+            Err(fields)
+        }
     }
 
     /// The generation, the installed specs (as effective specs, Ruling
@@ -324,6 +362,15 @@ impl LiveCatalogs {
     pub async fn build(&self, spec: &CatalogConfig) -> Result<BuiltCatalog, CatalogBuildError> {
         #[cfg(test)]
         if let Some(builder) = &self.test_builder {
+            let delay = self
+                .test_build_delay
+                .lock()
+                .unwrap()
+                .get(&spec.name)
+                .copied();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             return builder(spec);
         }
         match tokio::time::timeout(BUILD_TIMEOUT, self.build_inner(spec)).await {
@@ -377,8 +424,11 @@ impl LiveCatalogs {
     /// the new provider always finds it.
     pub fn install(&self, spec: CatalogConfig, built: BuiltCatalog) {
         let name = spec.name.clone();
-        self.connectors.register(name.clone(), built.connector);
-        self.manager.register_catalog(name.clone(), built.provider);
+        // One swap: a statement pins both halves or neither.
+        self.connectors.swap(|| {
+            self.connectors.register(name.clone(), built.connector);
+            self.manager.register_catalog(name.clone(), built.provider);
+        });
         self.failed
             .write()
             .unwrap_or_else(|p| p.into_inner())
@@ -392,8 +442,10 @@ impl LiveCatalogs {
         if self.write_specs().remove(name).is_none() {
             return false;
         }
-        self.manager.deregister_catalog(name);
-        self.connectors.deregister(name);
+        self.connectors.swap(|| {
+            self.manager.deregister_catalog(name);
+            self.connectors.deregister(name);
+        });
         true
     }
 
@@ -411,70 +463,112 @@ impl LiveCatalogs {
     /// [`apply_set`](Self::apply_set), except that a set from `epoch` other
     /// than the one held applies whatever its generation, and then records
     /// `epoch`. `None` checks the generation only and keeps the epoch.
+    ///
+    /// The new and changed catalogs are built in parallel without any
+    /// lock; `applying` is held only to re-check the generation and swap.
+    /// A set overtaken by a newer one while it was building changes
+    /// nothing. When another apply swapped in between, a catalog this set
+    /// skipped as unchanged may now differ: it is built (again outside the
+    /// lock) before the swap.
     async fn apply(
         &self,
         epoch: Option<u64>,
         generation: u64,
         specs: Vec<CatalogConfig>,
     ) -> ApplyReport {
-        let _applying = self.applying.lock().await;
-        let same_epoch = epoch.is_none_or(|e| e == self.epoch());
-        // Ruling R8: the set already held is applied again (rebuilding only
-        // what is not installed) while some of it failed to build.
-        let retry = same_epoch && generation == self.generation() && self.has_failed_builds();
-        if same_epoch && generation <= self.generation() && !retry {
+        if !self.applies(epoch, generation) {
             return ApplyReport::default();
         }
-        let installed = self.read_specs().clone();
-        let mut built = Vec::new();
-        let mut failed = Vec::new();
-        let mut wanted = std::collections::BTreeSet::new();
-        for spec in specs {
-            wanted.insert(spec.name.clone());
-            if installed
-                .get(&spec.name)
-                .is_some_and(|current| same_spec(current, &spec))
-            {
-                continue;
-            }
-            match self.build(&spec).await {
-                Ok(b) => built.push((spec, b)),
-                Err(e) => {
-                    tracing::warn!(
-                        catalog = %spec.name,
-                        catalog_type = %spec.catalog_type,
-                        error = %e,
-                        "failed to build catalog, skipping"
-                    );
-                    failed.push((spec.name.clone(), e.to_string()));
+        let wanted: std::collections::BTreeSet<String> =
+            specs.iter().map(|s| s.name.clone()).collect();
+        let mut built: BTreeMap<String, (CatalogConfig, BuiltCatalog)> = BTreeMap::new();
+        let mut failed: BTreeMap<String, String> = BTreeMap::new();
+        let mut installed = self.read_specs().clone();
+        loop {
+            let todo: Vec<&CatalogConfig> = specs
+                .iter()
+                .filter(|spec| {
+                    !built.contains_key(&spec.name)
+                        && !failed.contains_key(&spec.name)
+                        && !installed
+                            .get(&spec.name)
+                            .is_some_and(|current| same_spec(current, spec))
+                })
+                .collect();
+            let results = futures::future::join_all(
+                todo.into_iter()
+                    .map(|spec| async move { (spec, self.build(spec).await) }),
+            )
+            .await;
+            for (spec, result) in results {
+                match result {
+                    Ok(b) => {
+                        built.insert(spec.name.clone(), (spec.clone(), b));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            catalog = %spec.name,
+                            catalog_type = %spec.catalog_type,
+                            error = %e,
+                            "failed to build catalog, skipping"
+                        );
+                        failed.insert(spec.name.clone(), e.to_string());
+                    }
                 }
             }
+            let _applying = self.applying.lock().await;
+            // A newer set may have been applied while this one was building.
+            if !self.applies(epoch, generation) {
+                return ApplyReport::default();
+            }
+            let now = self.read_specs().clone();
+            let stale = specs.iter().any(|spec| {
+                !built.contains_key(&spec.name)
+                    && !failed.contains_key(&spec.name)
+                    && !now
+                        .get(&spec.name)
+                        .is_some_and(|current| same_spec(current, spec))
+            });
+            if stale {
+                // Another apply swapped in between: build what now differs.
+                installed = now;
+                continue;
+            }
+            for (_, (spec, b)) in std::mem::take(&mut built) {
+                tracing::info!(
+                    catalog = %spec.name,
+                    catalog_type = %spec.catalog_type,
+                    generation,
+                    "registered catalog"
+                );
+                self.install(spec, b);
+            }
+            for name in now.keys().filter(|n| !wanted.contains(*n)) {
+                self.remove(name);
+                tracing::info!(catalog = %name, generation, "removed catalog");
+            }
+            *self.failed.write().unwrap_or_else(|p| p.into_inner()) =
+                failed.keys().cloned().collect();
+            // Generation before epoch: a reader seeing the new epoch also sees
+            // the generation that goes with it.
+            self.set_generation(generation);
+            if let Some(e) = epoch {
+                self.set_epoch(e);
+            }
+            return ApplyReport {
+                applied: true,
+                failed: failed.into_iter().collect(),
+            };
         }
-        for (spec, b) in built {
-            tracing::info!(
-                catalog = %spec.name,
-                catalog_type = %spec.catalog_type,
-                generation,
-                "registered catalog"
-            );
-            self.install(spec, b);
-        }
-        for name in installed.keys().filter(|n| !wanted.contains(*n)) {
-            self.remove(name);
-            tracing::info!(catalog = %name, generation, "removed catalog");
-        }
-        *self.failed.write().unwrap_or_else(|p| p.into_inner()) =
-            failed.iter().map(|(name, _)| name.clone()).collect();
-        // Generation before epoch: a reader seeing the new epoch also sees
-        // the generation that goes with it.
-        self.set_generation(generation);
-        if let Some(e) = epoch {
-            self.set_epoch(e);
-        }
-        ApplyReport {
-            applied: true,
-            failed,
-        }
+    }
+
+    /// Whether a set at `(epoch, generation)` applies now: a newer
+    /// generation within the epoch held, any set from another epoch, or the
+    /// set already held while some of it failed to build (Ruling R8).
+    fn applies(&self, epoch: Option<u64>, generation: u64) -> bool {
+        let same_epoch = epoch.is_none_or(|e| e == self.epoch());
+        let retry = same_epoch && generation == self.generation() && self.has_failed_builds();
+        !same_epoch || generation > self.generation() || retry
     }
 }
 
@@ -683,7 +777,8 @@ async fn build_postgresql(spec: &CatalogConfig) -> Result<BuiltCatalog, CatalogB
     })
 }
 
-fn same_spec(a: &CatalogConfig, b: &CatalogConfig) -> bool {
+/// Whether `a` and `b` serialize the same (raw secrets included).
+pub(crate) fn same_spec(a: &CatalogConfig, b: &CatalogConfig) -> bool {
     match (serde_json::to_value(a), serde_json::to_value(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
@@ -693,7 +788,10 @@ fn same_spec(a: &CatalogConfig, b: &CatalogConfig) -> bool {
 /// Checks a runtime catalog spec (D6): the name is 1–63 characters of
 /// `[a-z0-9_]` starting with a letter and not reserved; the type is `hive`
 /// (with `metastore_uri`) or `postgresql` (with a valid `connection_url`
-/// and settings). The message never carries a secret.
+/// and settings). The message never carries a secret. Only a create checks
+/// the name: an update or drop of an existing catalog uses
+/// [`validate_spec_fields`], since config-seeded catalogs (such as
+/// `pg-prod`) were never held to the name rule.
 pub fn validate_spec(spec: &CatalogConfig) -> Result<(), String> {
     let name = spec.name.as_str();
     let well_formed = (1..=63).contains(&name.len())
@@ -709,6 +807,13 @@ pub fn validate_spec(spec: &CatalogConfig) -> Result<(), String> {
     if RESERVED_NAMES.contains(&name) {
         return Err(format!("catalog name {name:?} is reserved"));
     }
+    validate_spec_fields(spec)
+}
+
+/// [`validate_spec`] without the name rule: the type and its settings, for
+/// an update of a catalog that already exists under its name.
+pub fn validate_spec_fields(spec: &CatalogConfig) -> Result<(), String> {
+    let name = spec.name.as_str();
     match spec.catalog_type.as_str() {
         "hive" => {
             if spec.metastore_uri.as_deref().is_none_or(str::is_empty) {
@@ -716,7 +821,19 @@ pub fn validate_spec(spec: &CatalogConfig) -> Result<(), String> {
             }
         }
         "postgresql" => {
-            spec.postgres_config().map_err(|e| e.to_string())?;
+            let pg = spec.postgres_config().map_err(|e| e.to_string())?;
+            pg.validate_url()
+                .map_err(|e| format!("catalog '{name}': {e}"))?;
+            if let Some(url) = &spec.connection_url {
+                // The driver takes the last; a GET → PUT round trip could not
+                // tell the redacted copies apart.
+                if url_query_passwords(&url.0).len() > 1 {
+                    return Err(format!(
+                        "catalog '{name}': connection_url sets the password parameter more \
+                         than once"
+                    ));
+                }
+            }
         }
         other => {
             return Err(format!(
@@ -747,6 +864,14 @@ pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
             .map(|(_, value)| value)
             .chain(url_password_range(&url.0))
             .collect();
+        // Also any `password=` after the first `?`, wherever the driver's
+        // userinfo heuristic ends (a URL with an unencoded `@` in a query
+        // value; refused by validation, but it may be stored).
+        let loose: Vec<_> = url_loose_query_passwords(&url.0)
+            .into_iter()
+            .filter(|l| !ranges.iter().any(|r| r.start < l.end && l.start < r.end))
+            .collect();
+        ranges.extend(loose);
         // Replace from the end so the earlier ranges stay valid.
         ranges.sort_by_key(|r| std::cmp::Reverse(r.start));
         for range in ranges {
@@ -887,6 +1012,68 @@ pub fn redacted_secrets(spec: &CatalogConfig) -> Vec<&'static str> {
     found
 }
 
+/// `spec` as a node whose global `[storage]` is `global` serves it (Ruling
+/// R12): a hive spec with the global storage merged in.
+fn effective_spec(global: &StorageConfig, spec: &CatalogConfig) -> CatalogConfig {
+    let mut effective = spec.clone();
+    if spec.catalog_type == "hive" {
+        let storage = StorageConfig::merge(global, spec.storage.as_ref());
+        let empty = storage.s3.is_none() && storage.gcs.is_none() && storage.azure.is_none();
+        effective.storage = (!empty).then_some(storage);
+    }
+    effective
+}
+
+/// The secrets `specs` would serve from a node whose global `[storage]` is
+/// `global`, as `catalog 'x': field` (effective specs, so the global keys
+/// merged into a hive spec count).
+pub fn effective_secrets(global: &StorageConfig, specs: &[CatalogConfig]) -> Vec<String> {
+    specs
+        .iter()
+        .flat_map(|spec| {
+            secret_fields(&effective_spec(global, spec))
+                .into_iter()
+                .map(|field| format!("catalog '{}': {field}", spec.name))
+        })
+        .collect()
+}
+
+/// The secrets `spec` carries, by field: `password`, a password in
+/// `connection_url` (userinfo or query parameter), `storage.s3.secret_access_key`
+/// and `storage.azure.access_key`. A GCS `service_account_path` is a path on
+/// the node, not the key itself, so it is not listed.
+pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    if spec.password.is_some() {
+        found.push("password");
+    }
+    if let Some(url) = &spec.connection_url {
+        if url_password_range(&url.0).is_some()
+            || !url_query_passwords(&url.0).is_empty()
+            || !url_loose_query_passwords(&url.0).is_empty()
+        {
+            found.push("connection_url password");
+        }
+    }
+    if let Some(storage) = &spec.storage {
+        if storage
+            .s3
+            .as_ref()
+            .is_some_and(|s3| s3.secret_access_key.is_some())
+        {
+            found.push("storage.s3.secret_access_key");
+        }
+        if storage
+            .azure
+            .as_ref()
+            .is_some_and(|azure| azure.access_key.is_some())
+        {
+            found.push("storage.azure.access_key");
+        }
+    }
+    found
+}
+
 /// Whether `a` and `b` send their secrets to the same places (Ruling R10):
 /// the same `connection_url` apart from its passwords (host, port,
 /// database, user, parameters), `metastore_uri`, S3 `endpoint` and
@@ -909,16 +1096,25 @@ pub fn same_destination(a: &CatalogConfig, b: &CatalogConfig) -> bool {
     destinations(a) == destinations(b)
 }
 
+/// Where the credentials of `scheme://user:password@host/...` end, found
+/// the way tokio-postgres finds them: everything after the scheme up to
+/// the first `@` anywhere is the userinfo, so an unencoded `/`, `?` or `#`
+/// in the password still belongs to it. `(after_scheme, at)`, with `at`
+/// `None` when the URL has no `@` (no credentials).
+fn url_userinfo(url: &str) -> Option<(usize, Option<usize>)> {
+    let after_scheme = url.find("://")? + 3;
+    let at = url[after_scheme..].find('@').map(|i| after_scheme + i);
+    Some((after_scheme, at))
+}
+
 /// The byte range of the password in `scheme://user:password@host/...`,
-/// if the URL's userinfo has one.
+/// if the URL's userinfo has one (the text after the userinfo's first `:`,
+/// as tokio-postgres splits it).
 fn url_password_range(url: &str) -> Option<std::ops::Range<usize>> {
-    let authority_start = url.find("://")? + 3;
-    let rest = &url[authority_start..];
-    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_len];
-    let at = authority.rfind('@')?;
-    let colon = authority[..at].find(':')?;
-    Some(authority_start + colon + 1..authority_start + at)
+    let (start, at) = url_userinfo(url)?;
+    let at = at?;
+    let colon = url[start..at].find(':')?;
+    Some(start + colon + 1..at)
 }
 
 /// Whether a query parameter key is `password` once percent-decoded:
@@ -946,13 +1142,17 @@ fn is_password_key(key: &str) -> bool {
 /// `password` once percent-decoded (libpq URIs accept the password there
 /// too).
 fn url_query_passwords(url: &str) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
-    let Some(scheme_end) = url.find("://") else {
+    // As in tokio-postgres: the query starts at the first `?` after the
+    // userinfo (a `?` inside the password is not one), and runs to the end
+    // (a `#` is part of a value, not a fragment).
+    let Some((start, at)) = url_userinfo(url) else {
         return Vec::new();
     };
-    let Some(q) = url[scheme_end..].find('?').map(|i| scheme_end + i + 1) else {
+    let host = at.map_or(start, |at| at + 1);
+    let Some(q) = url[host..].find('?').map(|i| host + i + 1) else {
         return Vec::new();
     };
-    let end = url[q..].find('#').map_or(url.len(), |i| q + i);
+    let end = url.len();
     let mut out = Vec::new();
     let mut start = q;
     for param in url[q..end].split('&') {
@@ -960,6 +1160,31 @@ fn url_query_passwords(url: &str) -> Vec<(std::ops::Range<usize>, std::ops::Rang
             if is_password_key(key) {
                 let value_start = start + param.len() - value.len();
                 out.push((start..start + param.len(), value_start..start + param.len()));
+            }
+        }
+        start += param.len() + 1;
+    }
+    out
+}
+
+/// The value ranges of every `password` query parameter (key
+/// percent-decoded) after the first `?` past the scheme, ignoring the
+/// userinfo: the redaction and secret checks use these on top of the
+/// driver-faithful ranges, so a URL the driver misreads still hides them.
+fn url_loose_query_passwords(url: &str) -> Vec<std::ops::Range<usize>> {
+    let Some(scheme_end) = url.find("://") else {
+        return Vec::new();
+    };
+    let Some(q) = url[scheme_end..].find('?').map(|i| scheme_end + i + 1) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut start = q;
+    for param in url[q..].split('&') {
+        if let Some((key, value)) = param.split_once('=') {
+            if is_password_key(key) {
+                let value_start = start + param.len() - value.len();
+                out.push(value_start..start + param.len());
             }
         }
         start += param.len() + 1;
@@ -1397,6 +1622,153 @@ mod tests {
         assert!(!is_password_key("passwor"));
     }
 
+    /// tokio-postgres takes the credentials up to the first `@`, so an
+    /// unencoded `/`, `?` or `#` in the password is still the password
+    /// (and a `#` in a query value is part of it). The redaction finds the
+    /// same password the driver connects with, and round-trips it.
+    #[test]
+    fn password_with_url_delimiters_is_redacted() {
+        use std::str::FromStr;
+        for (url, redacted) in [
+            (
+                "postgresql://app:pa/ss@db:5432/x",
+                "postgresql://app:<redacted>@db:5432/x",
+            ),
+            (
+                "postgresql://app:pa?ss@db:5432/x",
+                "postgresql://app:<redacted>@db:5432/x",
+            ),
+            (
+                "postgresql://app:pa#ss@db:5432/x",
+                "postgresql://app:<redacted>@db:5432/x",
+            ),
+            (
+                "postgres://app:a/b?c#d:e@db/x?sslmode=disable",
+                "postgres://app:<redacted>@db/x?sslmode=disable",
+            ),
+            (
+                "postgresql://app@db/x?password=pa#ss&sslmode=disable",
+                "postgresql://app@db/x?password=<redacted>&sslmode=disable",
+            ),
+            (
+                "postgresql://app:pa?password=no@db/x?password=q/s#t",
+                "postgresql://app:<redacted>@db/x?password=<redacted>",
+            ),
+        ] {
+            let driver = tokio_postgres::Config::from_str(url).unwrap();
+            let password = String::from_utf8(driver.get_password().unwrap().to_vec()).unwrap();
+            let stored = spec(serde_json::json!({
+                "name": "p", "type": "postgresql", "connection_url": url
+            }));
+            let shown = redacted_spec(&stored);
+            assert_eq!(shown["connection_url"], redacted, "{url}");
+            assert!(
+                !shown.to_string().contains(&password),
+                "the driver's password leaked for {url}"
+            );
+            let mut back: CatalogConfig = serde_json::from_value(shown).unwrap();
+            assert_eq!(redacted_secrets(&back), vec!["connection_url password"]);
+            assert!(same_destination(&back, &stored));
+            fill_redacted(&mut back, &stored);
+            assert_eq!(back.connection_url.as_ref().unwrap().0, url);
+        }
+    }
+
+    /// Without a cluster secret no served spec may carry a secret, the
+    /// global `[storage]` keys a hive spec is served with included.
+    #[test]
+    fn exposure_check_refuses_secrets_over_unauthenticated_flight() {
+        let manager = Arc::new(CatalogManager::new("memory", "default"));
+        let storage: StorageConfig = serde_json::from_value(serde_json::json!({
+            "s3": {"region": "us-east-1", "secret_access_key": "global-s3-secret"}
+        }))
+        .unwrap();
+        let live = LiveCatalogs::with_test_builder_and_storage(
+            manager,
+            Arc::new(ConnectorRegistry::new()),
+            storage,
+            Box::new(|_| Ok(fake_built())),
+        );
+        let pg = spec(serde_json::json!({
+            "name": "p", "type": "postgresql", "connection_url": "postgresql://u@h/db"
+        }));
+        let mut pg_pw = pg.clone();
+        pg_pw.password = Some(RedactedString("pw".into()));
+        let pg_url = spec(serde_json::json!({
+            "name": "p", "type": "postgresql", "connection_url": "postgresql://u:p/w@h/db"
+        }));
+        // With a cluster secret everything may be served.
+        for s in [&pg, &pg_pw, &pg_url, &hive("lake")] {
+            assert_eq!(live.exposure_check(s), Ok(()));
+        }
+        live.set_unauthenticated_flight(true);
+        assert_eq!(live.exposure_check(&pg), Ok(()));
+        assert_eq!(live.exposure_check(&pg_pw), Err(vec!["password"]));
+        assert_eq!(
+            live.exposure_check(&pg_url),
+            Err(vec!["connection_url password"])
+        );
+        assert_eq!(
+            live.exposure_check(&hive("lake")),
+            Err(vec!["storage.s3.secret_access_key"]),
+            "the global [storage] key is served with every hive spec"
+        );
+        let gcs_only = spec(serde_json::json!({
+            "name": "g", "type": "postgresql", "connection_url": "postgresql://u@h/db",
+            "storage": {"gcs": {"service_account_path": "/keys/sa.json"}}
+        }));
+        assert_eq!(live.exposure_check(&gcs_only), Ok(()));
+
+        assert!(live.served_secrets().is_empty());
+        live.install(hive("lake"), fake_built());
+        live.install(pg_pw, fake_built());
+        assert_eq!(
+            live.served_secrets(),
+            vec![
+                "catalog 'lake': storage.s3.secret_access_key",
+                "catalog 'p': password"
+            ]
+        );
+        assert_eq!(secret_fields(&secret_spec()).len(), 4);
+    }
+
+    /// M2: an unencoded `@` in a query value makes the driver read the
+    /// rest as the host; the query password is still redacted and found as
+    /// a secret, and validation refuses the URL without echoing it.
+    #[test]
+    fn query_password_after_an_unencoded_at_is_redacted_and_refused() {
+        for url in [
+            "postgresql://db.internal:5432/sales?user=admin@srv&password=S3cret",
+            "postgresql://db/sales?user=admin@srv&password=S3cret",
+        ] {
+            let s = spec(serde_json::json!({
+                "name": "p", "type": "postgresql", "connection_url": url
+            }));
+            let shown = redacted_spec(&s).to_string();
+            assert!(!shown.contains("S3cret"), "{shown}");
+            assert_eq!(secret_fields(&s), vec!["connection_url password"]);
+            let e = validate_spec(&s).unwrap_err();
+            assert!(e.contains("%40") && !e.contains("S3cret"), "{e}");
+        }
+    }
+
+    /// M6: a URL that sets `password=` twice is refused, so a GET → PUT
+    /// round trip cannot change which one the driver uses.
+    #[test]
+    fn duplicate_query_passwords_are_refused() {
+        let s = spec(serde_json::json!({
+            "name": "p", "type": "postgresql",
+            "connection_url": "postgresql://u@db/x?password=a&sslmode=disable&pass%77ord=b"
+        }));
+        let e = validate_spec(&s).unwrap_err();
+        assert!(e.contains("more than once") && !e.contains("=a"), "{e}");
+        let shown = redacted_spec(&s);
+        assert_eq!(
+            shown["connection_url"],
+            "postgresql://u@db/x?password=<redacted>&sslmode=disable&pass%77ord=<redacted>"
+        );
+    }
+
     #[test]
     fn catalog_config_debug_hides_every_secret() {
         let mut s = secret_spec();
@@ -1483,6 +1855,124 @@ mod tests {
             fill_redacted(&mut new, &bare);
             assert_eq!(new.connection_url.as_ref().unwrap().0, kept);
         }
+    }
+
+    /// [`live`] whose builds succeed after the per-name delays in
+    /// `delays`.
+    fn slow_live(delays: &[(&str, u64)]) -> Arc<LiveCatalogs> {
+        let live = LiveCatalogs::with_test_builder(
+            Arc::new(CatalogManager::new("memory", "default")),
+            Arc::new(ConnectorRegistry::new()),
+            Box::new(|_| Ok(fake_built())),
+        );
+        let mut delay = live.test_build_delay.lock().unwrap();
+        for (name, secs) in delays {
+            delay.insert((*name).to_owned(), Duration::from_secs(*secs));
+        }
+        drop(delay);
+        live
+    }
+
+    /// The new catalogs of a set build in parallel, and the apply lock is
+    /// not held while they do.
+    #[tokio::test(start_paused = true)]
+    async fn builds_run_in_parallel_outside_the_apply_lock() {
+        let live = slow_live(&[("a", 10), ("b", 10), ("c", 10)]);
+        let started = tokio::time::Instant::now();
+        let applying = tokio::spawn({
+            let live = live.clone();
+            async move {
+                live.apply_set(1, vec![hive("a"), hive("b"), hive("c")])
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!applying.is_finished());
+        assert!(
+            live.applying.try_lock().is_ok(),
+            "the apply lock is free while the catalogs build"
+        );
+        let report = applying.await.unwrap();
+        assert!(report.applied && report.failed.is_empty());
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(15),
+            "three 10 s builds took {took:?}: they did not run in parallel"
+        );
+        assert_eq!(live.specs().len(), 3);
+        assert_eq!(live.generation(), 1);
+    }
+
+    /// A newer set is not held up behind an older set's slow build, and the
+    /// older set, overtaken while it built, changes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_build_does_not_hold_up_a_newer_set() {
+        let live = slow_live(&[("slow", 60)]);
+        let older = tokio::spawn({
+            let live = live.clone();
+            async move { live.apply_set(1, vec![hive("slow")]).await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let newer = tokio::time::timeout(
+            Duration::from_secs(5),
+            live.apply_set(2, vec![hive("fast")]),
+        )
+        .await
+        .expect("the newer set applies while the older one still builds");
+        assert!(newer.applied);
+        assert!(!older.is_finished());
+        let older = older.await.unwrap();
+        assert_eq!(older, ApplyReport::default(), "overtaken: nothing applied");
+        assert_eq!(live.generation(), 2);
+        let names: Vec<String> = live.specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["fast"]);
+    }
+
+    /// Two applies of sets that differ in one catalog: the one that swaps
+    /// second rebuilds what the first changed under it.
+    #[tokio::test(start_paused = true)]
+    async fn an_apply_rebuilds_what_another_swapped_in_meanwhile() {
+        let live = slow_live(&[("b", 30)]);
+        live.install(hive("a"), fake_built());
+        // Epoch 7 later than the held 0, so both apply regardless of order.
+        let mut changed_a = hive("a");
+        changed_a.metastore_uri = Some("10.0.0.2:9083".into());
+        let slow = tokio::spawn({
+            let live = live.clone();
+            async move {
+                live.apply_remote(arneb_rpc::CatalogSet {
+                    epoch: 7,
+                    generation: 2,
+                    catalogs: vec![
+                        serde_json::to_value(hive("a")).unwrap(),
+                        serde_json::to_value(hive("b")).unwrap(),
+                    ],
+                    default_catalog: None,
+                    default_schema: None,
+                })
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // An older generation of another epoch swaps in first and changes a.
+        live.apply_remote(arneb_rpc::CatalogSet {
+            epoch: 6,
+            generation: 1,
+            catalogs: vec![serde_json::to_value(&changed_a).unwrap()],
+            default_catalog: None,
+            default_schema: None,
+        })
+        .await;
+        assert_eq!(live.epoch(), 6);
+        let report = slow.await.unwrap();
+        assert!(report.applied);
+        assert_eq!((live.epoch(), live.generation()), (7, 2));
+        let specs = live.specs();
+        assert_eq!(specs.len(), 2);
+        assert!(
+            same_spec(&specs[0], &hive("a")),
+            "a is the newer set's again"
+        );
     }
 
     #[tokio::test]

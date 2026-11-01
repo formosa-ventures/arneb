@@ -89,14 +89,16 @@ pub struct AppConfig {
     #[serde(default)]
     pub state: StateConfig,
 
-    /// Retention of the audit log (`audit.jsonl` next to the state file);
+    /// Retention of the audit log (`<state stem>.audit.jsonl` next to the
+    /// state file);
     /// effective values after [`AppConfig::load`].
     #[serde(default)]
     pub audit: AuditConfig,
 }
 
-/// `[audit]` section: retention of the audit log, kept as `audit.jsonl` in
-/// the directory of `[state] path` (in memory without one).
+/// `[audit]` section: retention of the audit log, kept as
+/// `<state stem>.audit.jsonl` in the directory of `[state] path` (in memory
+/// without one).
 ///
 /// ```toml
 /// [audit]
@@ -269,17 +271,36 @@ pub struct ResolvedRules {
     /// `"config"` (the rules file, no state store) or `"state"` (the copy in
     /// the state store, which wins under password auth).
     pub source: &'static str,
-    /// What seeding did; `None` without a state store, or when the rules
-    /// file could not be read on a later start.
+    /// What seeding did; `None` without a state store.
     pub seed: Option<arneb_state::RulesSeed>,
+}
+
+/// The startup refusal for a rules file edited since it was seeded while
+/// the stored rules were changed at runtime (Ruling R14).
+pub fn rules_file_changed(config: &AccessControlConfig) -> anyhow::Error {
+    let rules_file = config
+        .rules_file
+        .as_ref()
+        .map_or_else(|| "(unset)".to_owned(), |p| p.display().to_string());
+    anyhow::anyhow!(
+        "[access_control] rules_file {rules_file} changed since it was seeded, but the access \
+         rules in the state store were changed at runtime since then: refusing to pick one. \
+         Restart with --reseed-state to replace the stored state with the config file (the \
+         users, catalogs, rules and settings become the config's; re-seeded users' tokens \
+         are revoked), or restore the rules file to its last seeded version to keep the \
+         runtime rules (copying GET /api/v2/access-rules into the file then makes them the \
+         file's)"
+    )
 }
 
 /// Pick the startup access rules (runtime-config D1). Without a state store
 /// (`[auth] type = "none"`) they are the rules file's, as before. With one,
-/// the rules file seeds the state on its first start (or with `reseed`),
-/// and the stored copy is used: a rules file whose text differs from it
-/// logs a WARN. A rules file that cannot be read or parsed is fatal when it
-/// would be seeded, and a WARN on a later start, which uses the state copy.
+/// the rules file seeds the state on its first start (or with `reseed`).
+/// On a later start, rules that came from the file follow it: a changed
+/// rules file is stored again (INFO). Rules changed at runtime are kept
+/// over a rules file unchanged since it was last seeded (WARN); a rules
+/// file edited since then refuses the start, naming `--reseed-state`. A
+/// rules file that cannot be read or parsed is fatal.
 pub fn resolve_access_rules(
     config: &AccessControlConfig,
     store: Option<&arneb_state::StateStore>,
@@ -292,42 +313,43 @@ pub fn resolve_access_rules(
             seed: None,
         });
     };
-    let seeds = reseed || !store.seeded().rules;
-    let seed = match config.load_rules_text() {
-        Ok(file) => {
-            let text = file.as_ref().map(|(text, _)| text.as_str());
-            let seed = store
-                .seed_rules(text, reseed)
-                .map_err(|e| anyhow::anyhow!("cannot seed the access rules: {e}"))?;
-            if seed == arneb_state::RulesSeed::Diverged {
-                let what = config.rules_file.as_ref().map_or_else(
-                    || "rules_file is not set, but the state store holds access rules".to_owned(),
-                    |p| {
-                        format!(
-                            "rules_file {} differs from the access rules in the state store",
-                            p.display()
-                        )
-                    },
-                );
-                tracing::warn!(
-                    target: "arneb::config",
-                    "[access_control] {what}; the state store's rules are used. \
-                     Preview a re-seed with POST /api/v2/state/reseed?dry_run=true"
-                );
-            }
-            Some(seed)
-        }
-        Err(e) if seeds => return Err(e),
-        Err(e) => {
+    let file = config.load_rules_text()?;
+    let text = file.as_ref().map(|(text, _)| text.as_str());
+    let seed = store
+        .seed_rules(text, reseed)
+        .map_err(|e| anyhow::anyhow!("cannot seed the access rules: {e}"))?;
+    let rules_file = || {
+        config
+            .rules_file
+            .as_ref()
+            .map_or_else(|| "(unset)".to_owned(), |p| p.display().to_string())
+    };
+    match seed {
+        arneb_state::RulesSeed::FollowedFile => tracing::info!(
+            target: "arneb::config",
+            rules_file = %rules_file(),
+            "[access_control] rules_file changed since it was seeded and the stored rules \
+             were never changed at runtime; the state store now holds the file's rules"
+        ),
+        arneb_state::RulesSeed::Diverged => {
+            let what = config.rules_file.as_ref().map_or_else(
+                || "rules_file is not set, but the state store holds access rules".to_owned(),
+                |p| {
+                    format!(
+                        "rules_file {} differs from the access rules in the state store",
+                        p.display()
+                    )
+                },
+            );
             tracing::warn!(
                 target: "arneb::config",
-                error = %e,
-                "[access_control] rules file is invalid; the state store's rules are used. \
-                 Preview a re-seed with POST /api/v2/state/reseed?dry_run=true"
+                "[access_control] {what} (they were changed at runtime); the state store's \
+                 rules are used. Preview a re-seed with POST /api/v2/state/reseed?dry_run=true"
             );
-            None
         }
-    };
+        arneb_state::RulesSeed::FileChanged => return Err(rules_file_changed(config)),
+        arneb_state::RulesSeed::Seeded | arneb_state::RulesSeed::Unchanged => {}
+    }
     let rules = match store.access_rules() {
         Some(stored) => Some(Arc::new(
             arneb_catalog::AccessRules::from_json(&stored.json)
@@ -338,7 +360,7 @@ pub fn resolve_access_rules(
     Ok(ResolvedRules {
         handle: arneb_catalog::RulesHandle::new(rules),
         source: "state",
-        seed,
+        seed: Some(seed),
     })
 }
 
@@ -638,6 +660,7 @@ pub fn resolve_admission_limits(
 /// max_page_bytes     = 4194304   # ARNEB_AGENT_MAX_PAGE_BYTES
 /// max_cell_bytes     = 8192      # ARNEB_AGENT_MAX_CELL_BYTES
 /// max_retained_bytes = 67108864  # ARNEB_AGENT_MAX_RETAINED_BYTES
+/// max_user_retained_bytes = 268435456  # ARNEB_AGENT_MAX_USER_RETAINED_BYTES
 /// max_total_retained_bytes = 1073741824  # ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES
 /// max_wait_ms        = 10000     # ARNEB_AGENT_MAX_WAIT_MS
 /// idle_timeout_secs  = 600       # ARNEB_AGENT_IDLE_TIMEOUT_SECS
@@ -658,15 +681,24 @@ pub struct AgentApiConfig {
     /// their JSON); longer cells are cut.
     pub max_cell_bytes: usize,
     /// Arrow memory one finished statement may retain; must not exceed
-    /// `max_total_retained_bytes`.
+    /// `max_user_retained_bytes`.
     pub max_retained_bytes: usize,
+    /// Arrow memory one user's statements may retain together; must not
+    /// exceed `max_total_retained_bytes`. Raised to `max_retained_bytes`
+    /// when below it (a user could otherwise never retain one full
+    /// statement), with a warning at startup.
+    pub max_user_retained_bytes: usize,
     /// Arrow memory all finished statements together may retain.
     pub max_total_retained_bytes: usize,
     /// Longest any request waits before answering "still running".
     pub max_wait_ms: u64,
-    /// Idle time before a statement is reaped; at least twice
-    /// `max_wait_ms`.
+    /// Idle time before a statement is reaped; at least `max_wait_ms`.
     pub idle_timeout_secs: u64,
+    /// The configured `max_user_retained_bytes` when it was below
+    /// `max_retained_bytes` and raised to it; logged as a warning once
+    /// tracing is up.
+    #[serde(skip)]
+    pub user_share_raised_from: Option<usize>,
 }
 
 impl Default for AgentApiConfig {
@@ -679,9 +711,11 @@ impl Default for AgentApiConfig {
             max_page_bytes: d.max_page_bytes,
             max_cell_bytes: d.max_cell_bytes,
             max_retained_bytes: d.max_retained_bytes,
+            max_user_retained_bytes: d.max_user_retained_bytes,
             max_total_retained_bytes: d.max_total_retained_bytes,
             max_wait_ms: d.max_wait.as_millis() as u64,
             idle_timeout_secs: d.idle_timeout.as_secs(),
+            user_share_raised_from: None,
         }
     }
 }
@@ -696,6 +730,7 @@ impl AgentApiConfig {
             max_page_bytes: self.max_page_bytes,
             max_cell_bytes: self.max_cell_bytes,
             max_retained_bytes: self.max_retained_bytes,
+            max_user_retained_bytes: self.max_user_retained_bytes,
             max_total_retained_bytes: self.max_total_retained_bytes,
             max_wait: std::time::Duration::from_millis(self.max_wait_ms),
             idle_timeout: std::time::Duration::from_secs(self.idle_timeout_secs),
@@ -737,6 +772,11 @@ impl AgentApiConfig {
         )?;
         set(
             &env,
+            "ARNEB_AGENT_MAX_USER_RETAINED_BYTES",
+            &mut self.max_user_retained_bytes,
+        )?;
+        set(
+            &env,
             "ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES",
             &mut self.max_total_retained_bytes,
         )?;
@@ -746,6 +786,12 @@ impl AgentApiConfig {
             "ARNEB_AGENT_IDLE_TIMEOUT_SECS",
             &mut self.idle_timeout_secs,
         )?;
+        // Only the per-statement cap was raised (say to 512 MiB, with a
+        // larger total): follow it rather than refuse to start.
+        if self.max_user_retained_bytes < self.max_retained_bytes {
+            self.user_share_raised_from = Some(self.max_user_retained_bytes);
+            self.max_user_retained_bytes = self.max_retained_bytes;
+        }
         self.limits()
             .validate()
             .map_err(|e| anyhow::anyhow!("invalid [agent_api] settings: {e}"))
@@ -2685,21 +2731,57 @@ pgwire = "required"
     fn agent_api_retained_byte_limits_from_file_and_env() {
         let c = agent_api("port = 5432", &[]).unwrap();
         assert_eq!(
-            (c.max_retained_bytes, c.max_total_retained_bytes),
-            (64 << 20, 1 << 30)
+            (
+                c.max_retained_bytes,
+                c.max_user_retained_bytes,
+                c.max_total_retained_bytes
+            ),
+            (64 << 20, 256 << 20, 1 << 30)
         );
-        let file = "[agent_api]\nmax_retained_bytes = 1000\nmax_total_retained_bytes = 5000\n";
-        let c = agent_api(file, &[("ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES", "9000")]).unwrap();
+        let file = "[agent_api]\nmax_retained_bytes = 1000\n\
+                    max_user_retained_bytes = 2000\nmax_total_retained_bytes = 5000\n";
+        let c = agent_api(
+            file,
+            &[
+                ("ARNEB_AGENT_MAX_USER_RETAINED_BYTES", "3000"),
+                ("ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES", "9000"),
+            ],
+        )
+        .unwrap();
         assert_eq!(
-            (c.max_retained_bytes, c.max_total_retained_bytes),
-            (1000, 9000)
+            (
+                c.max_retained_bytes,
+                c.max_user_retained_bytes,
+                c.max_total_retained_bytes
+            ),
+            (1000, 3000, 9000)
         );
+        // A per-statement cap above the share raises the share to it.
+        let c = agent_api(file, &[("ARNEB_AGENT_MAX_RETAINED_BYTES", "2500")]).unwrap();
+        assert_eq!(
+            (c.max_user_retained_bytes, c.user_share_raised_from),
+            (2500, Some(2000))
+        );
+        let c = agent_api(
+            "port = 5432",
+            &[
+                ("ARNEB_AGENT_MAX_RETAINED_BYTES", "536870912"),
+                ("ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES", "2147483648"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.max_user_retained_bytes, 536870912);
+        // ... but never past the total.
         let err = agent_api(file, &[("ARNEB_AGENT_MAX_RETAINED_BYTES", "6000")])
             .unwrap_err()
             .to_string();
         assert!(err.contains("max_total_retained_bytes"), "{err}");
+        let err = agent_api(file, &[("ARNEB_AGENT_MAX_USER_RETAINED_BYTES", "6000")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_total_retained_bytes"), "{err}");
         let err = agent_api(
-            "[agent_api]\nmax_wait_ms = 10000\nidle_timeout_secs = 10\n",
+            "[agent_api]\nmax_wait_ms = 10000\nidle_timeout_secs = 5\n",
             &[],
         )
         .unwrap_err()
@@ -2708,6 +2790,12 @@ pgwire = "required"
             err.contains("idle_timeout_secs") && err.contains("max_wait_ms"),
             "{err}"
         );
+        // Valid before the stricter rule and valid again now.
+        agent_api(
+            "[agent_api]\nmax_wait_ms = 10000\nidle_timeout_secs = 15\n",
+            &[],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3922,8 +4010,10 @@ password = "hunter2"
     const RULES_A: &str = r#"{"queries":[{"user":"alice","allow":["execute"]}]}"#;
     const RULES_B: &str = r#"{"queries":[{"user":"bob","allow":["execute"]}]}"#;
 
+    /// Rules from the file follow it: a tightened file applies on the next
+    /// start (the revoked user loses access).
     #[test]
-    fn rules_file_seeds_once_then_the_state_copy_wins() {
+    fn file_seeded_rules_follow_the_rules_file() {
         let tmp = tempfile::tempdir().unwrap();
         let state_path = tmp.path().join("state.json");
         let store = arneb_state::StateStore::open(Some(&state_path)).unwrap();
@@ -3934,22 +4024,59 @@ password = "hunter2"
         assert!(r.handle.current().unwrap().can_execute("alice"));
         drop(store);
 
-        // A later start with a changed file keeps the stored rules.
         let store = arneb_state::StateStore::open(Some(&state_path)).unwrap();
         let config = rules_config(tmp.path(), Some(RULES_B));
         let r = resolve_access_rules(&config, Some(&store), false).unwrap();
-        assert_eq!(r.seed, Some(arneb_state::RulesSeed::Diverged));
+        assert_eq!(r.seed, Some(arneb_state::RulesSeed::FollowedFile));
         let live = r.handle.current().unwrap();
-        assert!(live.can_execute("alice") && !live.can_execute("bob"));
+        assert!(live.can_execute("bob") && !live.can_execute("alice"));
 
         // --reseed-state copies the file again.
+        let config = rules_config(tmp.path(), Some(RULES_A));
         let r = resolve_access_rules(&config, Some(&store), true).unwrap();
         assert_eq!(r.seed, Some(arneb_state::RulesSeed::Seeded));
+        assert!(r.handle.current().unwrap().can_execute("alice"));
+    }
+
+    /// Rules changed at runtime: kept over an unchanged file (WARN), and a
+    /// file edited since the seed refuses the start until a re-seed.
+    #[test]
+    fn runtime_rules_and_an_edited_rules_file_refuse_the_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = arneb_state::StateStore::open(None).unwrap();
+        let config = rules_config(tmp.path(), Some(RULES_A));
+        resolve_access_rules(&config, Some(&store), false).unwrap();
+        store
+            .set_access_rules(Some(arneb_state::StoredRules {
+                json: RULES_B.into(),
+                from_config: false,
+            }))
+            .unwrap();
+
+        let r = resolve_access_rules(&config, Some(&store), false).unwrap();
+        assert_eq!(r.seed, Some(arneb_state::RulesSeed::Diverged));
         assert!(r.handle.current().unwrap().can_execute("bob"));
+
+        const RULES_C: &str = r#"{"queries":[{"user":"carol","allow":["execute"]}]}"#;
+        let edited = rules_config(tmp.path(), Some(RULES_C));
+        let e = resolve_access_rules(&edited, Some(&store), false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("--reseed-state")
+                && e.contains("users")
+                && e.contains("restore the rules file"),
+            "{e}"
+        );
+        assert_eq!(store.access_rules().unwrap().json, RULES_B, "unchanged");
+        let r = resolve_access_rules(&edited, Some(&store), true).unwrap();
+        assert_eq!(r.seed, Some(arneb_state::RulesSeed::Seeded));
+        assert!(r.handle.current().unwrap().can_execute("carol"));
     }
 
     #[test]
-    fn a_bad_rules_file_is_fatal_on_the_first_start_and_a_warn_later() {
+    fn a_bad_rules_file_is_fatal() {
         let tmp = tempfile::tempdir().unwrap();
         let store = arneb_state::StateStore::open(None).unwrap();
         let bad = rules_config(tmp.path(), Some("{not json"));
@@ -3959,11 +4086,9 @@ password = "hunter2"
         let good = rules_config(tmp.path(), Some(RULES_A));
         resolve_access_rules(&good, Some(&store), false).unwrap();
         let bad = rules_config(tmp.path(), Some("{not json"));
-        let r = resolve_access_rules(&bad, Some(&store), false).unwrap();
-        assert_eq!(r.seed, None);
-        assert!(r.handle.current().unwrap().can_execute("alice"));
-        // A re-seed would copy the bad file, so it stays fatal.
+        assert!(resolve_access_rules(&bad, Some(&store), false).is_err());
         assert!(resolve_access_rules(&bad, Some(&store), true).is_err());
+        assert_eq!(store.access_rules().unwrap().json, RULES_A);
     }
 
     #[test]

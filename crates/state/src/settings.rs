@@ -61,6 +61,15 @@ impl StateStore {
             Ok(())
         })
     }
+
+    /// Removes the stored admission limits, so the config seed applies at
+    /// the next start.
+    pub fn clear_admission_limits(&self) -> Result<(), StateError> {
+        self.mutate(|d| {
+            d.settings.admission = None;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -86,6 +95,10 @@ mod tests {
 
         let store = StateStore::open(Some(&p)).unwrap();
         assert_eq!(store.admission_limits(), Some(limits));
+        store.clear_admission_limits().unwrap();
+        drop(store);
+        let store = StateStore::open(Some(&p)).unwrap();
+        assert_eq!(store.admission_limits(), None, "cleared across reopen");
     }
 
     #[test]

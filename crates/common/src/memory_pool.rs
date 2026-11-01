@@ -40,33 +40,66 @@ use crate::error::ExecutionError;
 /// it once per column. Here every buffer, null buffer and child buffer is
 /// keyed by the start of its allocation and counted once.
 pub fn batch_memory_size(batch: &arrow::record_batch::RecordBatch) -> usize {
+    BatchMemorySizer::default().add(batch)
+}
+
+/// [`batch_memory_size`] across several batches: an allocation that more
+/// than one batch references (the shared dictionary of `take`n dictionary
+/// columns, the source buffers of slices, ...) counts once for all of them.
+#[derive(Debug, Default)]
+pub struct BatchMemorySizer {
+    seen: std::collections::HashSet<usize>,
+}
+
+impl BatchMemorySizer {
+    /// Bytes `batch` would add: its allocations not counted yet.
+    pub fn measure(&self, batch: &arrow::record_batch::RecordBatch) -> usize {
+        let mut new = std::collections::HashSet::new();
+        let mut total = 0;
+        for_each_allocation(batch, |key, bytes| {
+            if !self.seen.contains(&key) && new.insert(key) {
+                total += bytes;
+            }
+        });
+        total
+    }
+
+    /// Counts `batch`'s allocations and returns the bytes it added.
+    pub fn add(&mut self, batch: &arrow::record_batch::RecordBatch) -> usize {
+        let mut total = 0;
+        let seen = &mut self.seen;
+        for_each_allocation(batch, |key, bytes| {
+            if seen.insert(key) {
+                total += bytes;
+            }
+        });
+        total
+    }
+}
+
+/// Calls `f(key, capacity)` for every buffer, null buffer and child buffer
+/// of `batch`, where `key` identifies the allocation.
+fn for_each_allocation(batch: &arrow::record_batch::RecordBatch, mut f: impl FnMut(usize, usize)) {
     use arrow::array::{Array, ArrayData};
 
-    fn visit(data: &ArrayData, seen: &mut Vec<usize>, total: &mut usize) {
+    fn visit(data: &ArrayData, f: &mut impl FnMut(usize, usize)) {
         let mut add = |buffer: &arrow::buffer::Buffer| {
             // `data_ptr` is the start of the allocation, not of this slice, and
             // `capacity` is the whole allocation, so slices share one key.
-            let key = buffer.data_ptr().as_ptr() as usize;
-            if !seen.contains(&key) {
-                seen.push(key);
-                *total += buffer.capacity();
-            }
+            f(buffer.data_ptr().as_ptr() as usize, buffer.capacity());
         };
         data.buffers().iter().for_each(&mut add);
         if let Some(nulls) = data.nulls() {
             add(nulls.buffer());
         }
         for child in data.child_data() {
-            visit(child, seen, total);
+            visit(child, f);
         }
     }
 
-    let mut seen = Vec::new();
-    let mut total = 0;
     for column in batch.columns() {
-        visit(&column.to_data(), &mut seen, &mut total);
+        visit(&column.to_data(), &mut f);
     }
-    total
 }
 
 /// Read-only memory profile snapshot emitted by an optional diagnostic
@@ -657,6 +690,29 @@ mod tests {
             + b.values().inner().capacity()
             + arrow::array::Array::nulls(&b).unwrap().buffer().capacity();
         assert_eq!(batch_memory_size(&int64_batch(vec![a, b])), expected);
+    }
+
+    #[test]
+    fn sizer_counts_an_allocation_shared_across_batches_once() {
+        use arrow::buffer::{Buffer, ScalarBuffer};
+        let n = 1000;
+        let shared = Buffer::from_vec((0..2 * n as i64).collect::<Vec<i64>>());
+        let half = |i: usize| {
+            int64_batch(vec![arrow::array::Int64Array::new(
+                ScalarBuffer::new(shared.clone(), i * n, n),
+                None,
+            )])
+        };
+        let own = int64_batch(vec![arrow::array::Int64Array::from_iter_values(0..10)]);
+        let mut sizer = BatchMemorySizer::default();
+        assert_eq!(sizer.measure(&half(0)), shared.capacity());
+        assert_eq!(sizer.add(&half(0)), shared.capacity());
+        // The second slice adds nothing; measuring does not count.
+        assert_eq!(sizer.measure(&half(1)), 0);
+        assert_eq!(sizer.add(&half(1)), 0);
+        assert_eq!(sizer.measure(&own), batch_memory_size(&own));
+        assert_eq!(sizer.measure(&own), sizer.add(&own));
+        assert_eq!(sizer.add(&own), 0);
     }
 
     fn pool(limit: usize) -> Arc<dyn MemoryPool> {

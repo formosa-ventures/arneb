@@ -162,7 +162,27 @@ impl QueryTracker {
         self.update(id, |e| advance_machine(&mut e.machine, target))
     }
 
+    /// Who cancelled query `id`, once it is `Cancelled`: the killer's name
+    /// ([`Self::kill_query`]), or `the server`. `None` while it has not
+    /// been cancelled (or is unknown).
+    ///
+    /// A protocol whose statement ends after a kill marked it cancelled
+    /// (the kill landed before its canceller was registered) checks this
+    /// when [`Self::finish_query`] fails, and reports the statement
+    /// cancelled instead of returning its rows.
+    pub fn cancelled_by(&self, id: &QueryId) -> Option<String> {
+        let inner = self.inner.read().unwrap();
+        let e = inner.queries.get(id)?;
+        (e.machine.state == QueryState::Cancelled).then(|| {
+            e.killed_by
+                .clone()
+                .unwrap_or_else(|| "the server".to_owned())
+        })
+    }
+
     /// The query returned `rows` rows: record them and mark it `Finished`.
+    /// Fails, changing nothing, when the query already ended (a cancelled
+    /// query never turns `Finished`).
     pub fn finish_query(&self, id: &QueryId, rows: u64) -> Result<(), ExecutionError> {
         self.update(id, |e| {
             advance_machine(&mut e.machine, QueryState::Finished)?;
@@ -371,6 +391,41 @@ impl From<&Entry> for QueryInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A kill that lands before the protocol registers its canceller: the
+    /// query is marked cancelled, cannot then finish, and the canceller
+    /// registered afterwards runs at once with the killer's name.
+    #[test]
+    fn kill_before_registration_cannot_finish_and_cancels_on_register() {
+        let tracker = QueryTracker::new();
+        let id = tracker.create_query_from("SELECT 1".into(), "trino", Some("bob".into()));
+        tracker.advance_to(&id, QueryState::Running).unwrap();
+        assert_eq!(tracker.cancelled_by(&id), None);
+        // 1. The kill: nothing registered, nothing stopped yet.
+        assert_eq!(
+            tracker.kill_query(&id, "root").unwrap(),
+            KillOutcome::Killed {
+                was: QueryState::Running
+            }
+        );
+        // 2. The task finishes before registering: it cannot report rows.
+        assert!(tracker.finish_query(&id, 5).is_err());
+        let q = tracker.get_query(&id).unwrap();
+        assert_eq!(q.state, QueryState::Cancelled);
+        assert_eq!(q.rows, None);
+        assert_eq!(tracker.cancelled_by(&id).as_deref(), Some("root"));
+        // 3. The registration runs the canceller at once.
+        let called = Arc::new(std::sync::Mutex::new(None));
+        tracker.set_canceller(
+            &id,
+            Box::new({
+                let called = Arc::clone(&called);
+                move |by| *called.lock().unwrap() = Some(by.to_owned())
+            }),
+        );
+        assert_eq!(called.lock().unwrap().as_deref(), Some("root"));
+        assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
+    }
 
     #[test]
     fn create_and_list_queries() {

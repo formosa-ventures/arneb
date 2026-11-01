@@ -33,21 +33,19 @@ use serde::{Deserialize, Serialize};
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    applied_outcome, config_change_lock, dry_run_outcome, run_manage, Applied, ChangeLock, DryRun,
-    ManageAction, ManageOutcome, Preview,
+    add_warning, applied_outcome, check_limit, config_change_lock, dry_run_outcome, plural,
+    run_manage, state_store, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome, Preview,
 };
 use super::privilege::Layer;
 use super::v2::{
     bad_body, bad_query, blocking_failed, issue_token_for, list_tokens_for, no_such_user,
-    revoke_token_for, state_error, IssueTokenRequest, IssuedTokenResponse, TokenTarget, TokenView,
-    ISSUE_PERMITS,
+    pbkdf2_slot, revoke_token_for, state_error, IssueTokenRequest, IssuedTokenResponse,
+    TokenTarget, TokenView,
 };
 use super::WebState;
 
 /// Users listed when the request names no `limit`.
 const DEFAULT_USER_LIMIT: usize = 100;
-/// The largest accepted `limit` of the user and user-token listings.
-const MAX_USER_LIMIT: usize = 1000;
 /// Tokens listed when the request names no `limit`.
 const DEFAULT_TOKEN_LIMIT: usize = 100;
 /// The accepted length of a new user name, in characters.
@@ -118,33 +116,12 @@ pub(super) struct RevokedToken {
     id: String,
 }
 
-/// The state store behind the user routes (manage already passed, so the
-/// server runs password auth and has one).
-fn store(state: &WebState) -> Result<Arc<StateStore>, ApiError> {
-    state.state.clone().ok_or_else(|| {
-        tracing::error!("password auth is configured without a state store");
-        ApiError::new(ErrorCode::Internal, "the state store is unavailable")
-    })
-}
-
 fn find_user(store: &StateStore, name: &str) -> Option<UserInfo> {
     store.list_users().into_iter().find(|u| u.name == name)
 }
 
 fn existing_user(store: &StateStore, name: &str) -> Result<UserInfo, ApiError> {
     find_user(store, name).ok_or_else(|| no_such_user(name))
-}
-
-fn check_limit(limit: Option<usize>, default: usize) -> Result<usize, ApiError> {
-    let limit = limit.unwrap_or(default);
-    if limit == 0 || limit > MAX_USER_LIMIT {
-        return Err(ApiError::new(
-            ErrorCode::InvalidArgument,
-            format!("limit {limit} is not valid"),
-        )
-        .with_hint(format!("use a limit between 1 and {MAX_USER_LIMIT}")));
-    }
-    Ok(limit)
 }
 
 pub(super) fn validate_name(name: &str) -> Result<(), ApiError> {
@@ -193,13 +170,10 @@ fn user_exists(name: &str) -> ApiError {
 }
 
 /// A fresh SCRAM verifier for `password` (random 16-byte salt, the H1
-/// default iteration count), derived on the blocking pool behind
-/// [`ISSUE_PERMITS`].
-async fn hash_password(password: String) -> Result<ScramVerifier, ApiError> {
-    let permit = ISSUE_PERMITS
-        .acquire()
-        .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal, "password hashing is unavailable"))?;
+/// default iteration count), derived on the blocking pool behind the
+/// shared PBKDF2 limiter (`overloaded` while its queue is full).
+async fn hash_password(state: &WebState, password: String) -> Result<ScramVerifier, ApiError> {
+    let permit = pbkdf2_slot(state).await?;
     // The permit moves into the task, so it bounds PBKDF2 even if the
     // request is dropped.
     tokio::task::spawn_blocking(move || {
@@ -214,21 +188,6 @@ async fn hash_password(password: String) -> Result<ScramVerifier, ApiError> {
     })
 }
 
-fn plural(n: usize, one: &str) -> String {
-    if n == 1 {
-        format!("{n} {one}")
-    } else {
-        format!("{n} {one}s")
-    }
-}
-
-fn add_warning(warning: &mut Option<String>, note: String) {
-    *warning = Some(match warning.take() {
-        Some(w) => format!("{w}; {note}"),
-        None => note,
-    });
-}
-
 /// Every user, in name order, at most `limit` (default 100, at most 1000).
 /// Needs manage. Shared with the MCP `list_users` tool.
 pub(super) async fn list_users_for(
@@ -238,7 +197,7 @@ pub(super) async fn list_users_for(
 ) -> Result<UserList, ApiError> {
     state.authorizer.check(who, Layer::Manage)?;
     let limit = check_limit(limit, DEFAULT_USER_LIMIT)?;
-    let users = store(state)?.list_users();
+    let users = state_store(state)?.list_users();
     let truncated = users.len() > limit;
     Ok(UserList {
         users: users.into_iter().take(limit).map(UserView::from).collect(),
@@ -258,7 +217,7 @@ pub(super) async fn create_user_for(
     let grant = state.authorizer.check(who, Layer::Manage)?;
     validate_name(&name)?;
     validate_password(&password)?;
-    let store = store(state)?;
+    let store = state_store(state)?;
     if dry_run {
         let action = CreateUser {
             name,
@@ -273,7 +232,7 @@ pub(super) async fn create_user_for(
     if find_user(&store, &name).is_some() {
         return Err(user_exists(&name));
     }
-    let verifier = hash_password(password).await?;
+    let verifier = hash_password(state, password).await?;
     let lock = config_change_lock(state, who).await?;
     let action = CreateUser {
         name,
@@ -297,12 +256,12 @@ pub(super) async fn set_password_for(
 ) -> Result<ManageOutcome<PasswordChanged>, ApiError> {
     let grant = state.authorizer.check(who, Layer::Manage)?;
     validate_password(&password)?;
-    let store = store(state)?;
+    let store = state_store(state)?;
     existing_user(&store, &name)?;
     let (verifier, lock) = if dry_run {
         (None, None)
     } else {
-        let verifier = hash_password(password).await?;
+        let verifier = hash_password(state, password).await?;
         (Some(verifier), Some(config_change_lock(state, who).await?))
     };
     let action = SetPassword {
@@ -325,7 +284,7 @@ pub(super) async fn delete_user_for(
     name: String,
 ) -> Result<ManageOutcome<UserDeleted>, ApiError> {
     let grant = state.authorizer.check(who, Layer::Manage)?;
-    let store = store(state)?;
+    let store = state_store(state)?;
     existing_user(&store, &name)?;
     let lock = if dry_run {
         None
@@ -352,7 +311,7 @@ pub(super) async fn list_user_tokens_for(
 ) -> Result<UserTokens, ApiError> {
     state.authorizer.check(who, Layer::Manage)?;
     let limit = check_limit(limit, DEFAULT_TOKEN_LIMIT)?;
-    existing_user(store(state)?.as_ref(), &name)?;
+    existing_user(state_store(state)?.as_ref(), &name)?;
     let mut tokens = list_tokens_for(state, &name)?.tokens;
     let truncated = tokens.len() > limit;
     tokens.truncate(limit);
@@ -377,7 +336,7 @@ pub(super) async fn issue_user_token_for(
 ) -> Result<ManageOutcome<IssuedTokenResponse>, ApiError> {
     const ACTION: &str = "token.issue";
     state.authorizer.check(who, Layer::Manage)?;
-    let store = store(state)?;
+    let store = state_store(state)?;
     let user = existing_user(&store, &name)?;
     let spec = req.clone().validate()?;
     if user.tokens >= MAX_TOKENS_PER_USER {
@@ -442,7 +401,7 @@ pub(super) async fn revoke_user_token_for(
 ) -> Result<ManageOutcome<RevokedToken>, ApiError> {
     const ACTION: &str = "token.revoke";
     state.authorizer.check(who, Layer::Manage)?;
-    let store = store(state)?;
+    let store = state_store(state)?;
     existing_user(&store, &name)?;
     if dry_run {
         if !arneb_protocol::is_token_id(&id) {
@@ -1523,7 +1482,10 @@ mod tests {
         call.abort();
         assert!(call.await.unwrap_err().is_cancelled());
         assert!(state.config_changes.try_lock().is_err());
-        assert!(audit_json(&state).is_empty());
+        // Only the intent is in the log until the completion is appended.
+        let entries = audit_json(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["outcome"], "pending");
         release.send(()).unwrap();
         let _next = state.config_changes.lock().await;
         assert_eq!(audit_json(&state).len(), 1);
@@ -1577,11 +1539,17 @@ mod tests {
             .unwrap()
             .issue_token("alice", None, None)
             .unwrap();
-        // One failed append marks the log unwritable.
-        state.audit.set_fail_appends(true);
+        // One failed completion marks the log unwritable; then appends fail.
+        state.audit.set_fail_completions(true);
         let (status, _) = create(&state, "dave", "davepass1").await;
-        assert_eq!(status, StatusCode::OK, "applied; only its append failed");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "applied; only its completion failed"
+        );
         assert!(!state.audit.is_writable());
+        state.audit.set_fail_completions(false);
+        state.audit.set_fail_appends(true);
         let revoke = format!("/api/v2/users/alice/tokens/{}", alice.info.id);
         for (method, path) in [
             (Method::POST, "/api/v2/users/alice/tokens".to_owned()),

@@ -4,7 +4,9 @@
 #
 # Runs the acceptance scenario of the runtime-config change against a live
 # distributed stack: a coordinator plus two workers with password auth,
-# `admin_users = [<admin>]`, a persistent `[state] path`, a rules file that
+# `admin_users = [<admin>]`, a persistent `[state] path`, the same
+# `[cluster] secret` on every node (PG_URL carries a password, which the
+# coordinator refuses to serve over unauthenticated cluster RPC), a rules file that
 # lets user2 read the TPC-H tables, and a PostgreSQL database for the new
 # catalog (the docker compose `postgres` service with the pg-tpch-seed
 # `tpch_mixed` schema). Takes the environment of scripts/manage-smoke.sh plus
@@ -450,7 +452,7 @@ forbidden POST "$API/users/$NEWUSER/tokens" '{}'
 forbidden PATCH "$API/settings" '{"slow_query_threshold_ms": 1}'
 mcp_post ADMIN '{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}'
 expect_code 200 "tools/list"
-check '.result.tools | length == 43' "tools/list does not have exactly 43 tools"
+check '.result.tools | length == 44' "tools/list does not have exactly 44 tools"
 mcp_tool USER2 create_user "$(jq -nc --arg n smoke_denied '{name:$n, password:"not-a-real-password"}')"
 check '.isError == true and .structuredContent.error.code == "forbidden"' "MCP create_user as $USER2 is not forbidden"
 mcp_tool USER2 set_access_rules '{"rules":{}}'

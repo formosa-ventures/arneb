@@ -250,7 +250,7 @@ expect_code 200 "initialize with alice's token"
 check '.result.serverInfo.name != null' "initialize answered no serverInfo"
 mcp_post ALICE '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 expect_code 200 "tools/list"
-check '.result.tools | length == 43' "tools/list does not have exactly 43 tools"
+check '.result.tools | length == 44' "tools/list does not have exactly 44 tools"
 mcp_tool ALICE whoami
 check '.structuredContent.via == "oauth" and .structuredContent.user == "alice" and .structuredContent.privileges.manage == true' \
     "whoami is not alice via oauth with manage"

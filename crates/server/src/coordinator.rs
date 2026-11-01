@@ -10,7 +10,7 @@ use arneb_common::identifiers::{QueryId, StageId, TaskId};
 use arneb_common::stream::collect_stream;
 use arneb_common::DynamicFilterId;
 use arneb_planner::LogicalPlan;
-use arneb_protocol::DistributedExecutor;
+use arneb_protocol::{BatchSink, DistributedExecutor};
 use arneb_scheduler::{DynamicFilterService, DynamicFilterServiceRegistry, NodeRegistry};
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
@@ -84,7 +84,7 @@ impl QueryCoordinator {
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
         let retry = self.retry.filter(|_| !plan.writes_data());
         with_query_retry(retry, &self.node_registry, || {
-            self.execute_once(&plan, exec_ctx)
+            self.execute_once(&plan, exec_ctx, None)
         })
         .await
     }
@@ -131,13 +131,39 @@ impl QueryCoordinator {
         Ok((workers, in_flight, fragmenter))
     }
 
-    /// One run of [`Self::execute`]. A failure carries the workers the run
+    /// [`Self::execute`] that pushes the root stage's batches into `sink` as
+    /// they arrive instead of collecting them. A re-run after a lost worker
+    /// first resets the sink, so no row is kept twice.
+    pub async fn execute_into(
+        &self,
+        plan: LogicalPlan,
+        exec_ctx: &ExecutionContext,
+        sink: &mut dyn BatchSink,
+    ) -> Result<(), ExecutionError> {
+        let retry = self.retry.filter(|_| !plan.writes_data());
+        // Shared by the attempts; `push` is synchronous, so the lock is
+        // never held across an await.
+        let sink = std::sync::Mutex::new(sink);
+        with_query_retry(retry, &self.node_registry, || {
+            self.execute_once(&plan, exec_ctx, Some(&sink))
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// One run of [`Self::execute`] (or of [`Self::execute_into`], when
+    /// `sink` is given: the root batches go there, starting from a reset
+    /// sink, and none are returned). A failure carries the workers the run
     /// used, so the caller can tell whether one of them was lost.
     async fn execute_once(
         &self,
         plan: &LogicalPlan,
         exec_ctx: &ExecutionContext,
+        sink: Option<&std::sync::Mutex<&mut dyn BatchSink>>,
     ) -> Result<Vec<RecordBatch>, AttemptError> {
+        if let Some(sink) = sink {
+            sink.lock().unwrap_or_else(|e| e.into_inner()).reset();
+        }
         // The protocol layer records the statement in the query tracker;
         // this id only keys the distributed tasks.
         let query_id = QueryId::new();
@@ -391,18 +417,27 @@ impl QueryCoordinator {
                 } else {
                     physical_plan
                 };
-            let stream = physical_plan.execute(0).await?;
+            let mut stream = physical_plan.execute(0).await?;
             // A worker's memory-limit failure stays typed (pgwire 53200, Trino
             // EXCEEDED_LOCAL_MEMORY_LIMIT): the exchange restores it from the
             // status code and operators keep it when they re-raise it.
-            let batches = collect_stream(stream)
-                .await
-                .map_err(|e| ExecutionError::upstream("root stage collection failed", e))?;
-            Ok::<_, ExecutionError>(batches)
+            let collected = |e| ExecutionError::upstream("root stage collection failed", e);
+            let Some(sink) = sink else {
+                let batches = collect_stream(stream).await.map_err(collected)?;
+                let rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
+                return Ok::<_, ExecutionError>((batches, rows));
+            };
+            let mut rows = 0;
+            while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                let batch = batch.map_err(collected)?;
+                rows += batch.num_rows();
+                sink.lock().unwrap_or_else(|e| e.into_inner()).push(batch);
+            }
+            Ok((Vec::new(), rows))
         };
         // `biased`: when the stream breaks because its worker died, both
         // branches can be ready in the same poll; report the lost worker.
-        let batches = tokio::select! {
+        let (batches, rows) = tokio::select! {
             biased;
             lost = watch_workers(&self.node_registry, &worker_ids, WORKER_WATCH_INTERVAL) => {
                 Err(lost_worker_error(&lost))
@@ -413,7 +448,7 @@ impl QueryCoordinator {
 
         tracing::info!(
             query_id = %query_id,
-            rows = batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            rows,
             "distributed query complete"
         );
 
@@ -1472,6 +1507,17 @@ impl DistributedExecutor for QueryCoordinator {
         exec_ctx: &ExecutionContext,
     ) -> Result<Vec<RecordBatch>, ArnebError> {
         self.execute(plan, exec_ctx)
+            .await
+            .map_err(ArnebError::Execution)
+    }
+
+    async fn execute_into(
+        &self,
+        plan: LogicalPlan,
+        exec_ctx: &ExecutionContext,
+        sink: &mut dyn BatchSink,
+    ) -> Result<(), ArnebError> {
+        self.execute_into(plan, exec_ctx, sink)
             .await
             .map_err(ArnebError::Execution)
     }

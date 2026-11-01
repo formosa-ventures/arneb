@@ -1,18 +1,33 @@
-//! The durable audit log (manage-api D6): one JSON line per audited action
-//! in `audit.jsonl` next to the state file, appended with `O_APPEND` and
-//! `sync_data` before the caller answers.
+//! The durable audit log (manage-api D6): JSON lines in
+//! `<state stem>.audit.jsonl` next to the state file, appended with
+//! `O_APPEND` and `sync_data` before the caller answers.
+//!
+//! An audited action writes two entries: an intent ([`AuditLog::begin`],
+//! outcome `pending`) before it is applied, and a completion
+//! ([`AuditLog::complete`], with `intent_seq` naming the intent) after. A
+//! completed intent is dropped from memory (and so from the next
+//! compaction): reads show one entry per finished action. An intent with no
+//! completion at the next start (the process died in between) is reported
+//! at WARN on `arneb::audit` and completed as `interrupted`.
 //!
 //! The newest `max_entries` entries are also kept in memory for reads; the
 //! file is the durable copy. Compaction rewrites the file atomically,
 //! dropping entries past `retention_days` and beyond `max_entries`, but it
 //! always keeps the newest entry, so `seq` never goes back below a used
 //! value after a restart (reads still hide that entry once it expires).
+//!
+//! Locking: appends, reopening and compaction are serialized by a writer
+//! lock held across the file I/O. Reads ([`AuditLog::query`],
+//! [`AuditLog::len`], [`AuditLog::is_writable`]) take only a short memory
+//! lock (or an atomic) that is never held across I/O, so they never wait
+//! for an fsync or a compaction and may be called from async code.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,8 +36,8 @@ use crate::tokens::now_ms;
 use crate::StateError;
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
-/// The audit log's file name, in the directory of the state file.
-const AUDIT_FILE: &str = "audit.jsonl";
+/// The audit log's file name suffix, after the state file's stem.
+const AUDIT_SUFFIX: &str = ".audit.jsonl";
 
 /// Retention of the audit log (`[audit]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +56,13 @@ pub enum AuditOutcome {
     Ok,
     /// The action failed with this error code: `{"error": "<code>"}`.
     Error(String),
+    /// An intent entry: the action is about to be applied, or is being
+    /// applied: `"pending"`.
+    Pending,
+    /// The completion written at startup for an intent that never
+    /// completed (the process stopped after the intent was recorded): the
+    /// action may or may not have been applied: `"interrupted"`.
+    Interrupted,
 }
 
 /// One audited action, as the caller describes it.
@@ -63,12 +85,16 @@ pub struct AuditRecord {
 /// A stored audit entry: a record with its sequence number and time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntry {
-    /// Increases with every entry, across restarts; a failed write can
-    /// leave a gap. After a crash, a seq that appears only in an ERROR line
-    /// may be reused.
+    /// Increases with every entry, across restarts; a failed write, or an
+    /// intent dropped once completed, leaves a gap. After a crash, a seq
+    /// that appears only in an ERROR line may be reused.
     pub seq: u64,
     /// When the entry was appended (milliseconds since the Unix epoch).
     pub time_ms: u64,
+    /// On a completion entry: the `seq` of its intent entry. Absent on an
+    /// intent and on a single entry written with [`AuditLog::append`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_seq: Option<u64>,
     /// The audited action.
     #[serde(flatten)]
     pub record: AuditRecord,
@@ -109,28 +135,41 @@ pub struct AuditPage {
     pub truncated: bool,
 }
 
-struct Inner {
+/// The file side, under the writer lock.
+struct Writer {
     /// The append handle; `None` in memory, or after a failed write until
     /// [`AuditLog::ensure_writable`] reopens it.
     file: Option<File>,
-    /// The newest entries, oldest first, at most `max_entries`.
-    entries: VecDeque<AuditEntry>,
     next_seq: u64,
     /// Lines in the file, including ones compaction will drop.
     file_lines: usize,
     /// Compact once `file_lines` reaches this.
     compact_at: usize,
-    writable: bool,
 }
 
+/// The newest entries, oldest first, at most `max_entries`. Shared with
+/// compaction as cheap `Arc` clones, so it is never locked across I/O.
+type Entries = VecDeque<Arc<AuditEntry>>;
+
 /// The audit log. Persistent when opened with a path, in memory otherwise.
-/// Appends are serialized and blocking (write + `sync_data`).
+/// Appends are serialized and blocking (write + `sync_data`); reads do not
+/// wait for them.
 pub struct AuditLog {
     path: Option<PathBuf>,
     settings: AuditSettings,
-    inner: Mutex<Inner>,
+    writer: Mutex<Writer>,
+    entries: Mutex<Entries>,
+    writable: AtomicBool,
     #[cfg(any(test, feature = "test-hooks"))]
-    fail_appends: std::sync::atomic::AtomicBool,
+    fail_appends: AtomicBool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_completions: AtomicBool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_next_append: AtomicBool,
+    /// `(inside, release)`: the next compaction sends on `inside` once it
+    /// holds its snapshot, then waits on `release` before writing.
+    #[cfg(test)]
+    compact_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl std::fmt::Debug for AuditLog {
@@ -146,49 +185,74 @@ impl std::fmt::Debug for AuditLog {
 impl AuditLog {
     /// Opens the log. `None` keeps it in memory. An existing file is
     /// loaded (an unparsable line is skipped with a WARN naming its line
-    /// number) and compacted; a missing one is created, mode 0600.
+    /// number) and compacted; a missing one is created, mode 0600. An
+    /// intent entry with no completion is reported at WARN and completed
+    /// as [`AuditOutcome::Interrupted`].
     pub fn open(path: Option<&Path>, settings: AuditSettings) -> Result<AuditLog, StateError> {
-        let mut inner = Inner {
+        let mut writer = Writer {
             file: None,
-            entries: VecDeque::new(),
             next_seq: 1,
             file_lines: 0,
             compact_at: 0,
-            writable: true,
         };
+        let mut entries = VecDeque::new();
         if let Some(p) = path {
             let loaded = load(p)?;
-            inner.next_seq = loaded.max_seq + 1;
+            writer.next_seq = loaded.max_seq + 1;
             let parsed = loaded.entries.len();
-            inner.entries = keep(loaded.entries, settings, now_ms());
-            inner.file_lines = parsed + loaded.bad_lines;
+            let recovered = recover(loaded.entries, &mut writer.next_seq, p);
+            let kept = keep(recovered.entries, settings, now_ms());
+            writer.file_lines = parsed + loaded.bad_lines;
             // Startup compaction, only when it drops something: expired or
             // surplus entries, unreadable lines, or a torn last line (so
-            // the first append starts on a fresh line).
-            if inner.entries.len() < parsed || loaded.bad_lines > 0 || loaded.torn_tail {
-                write_atomically(p, &render(&inner.entries)?)?;
-                inner.file_lines = inner.entries.len();
+            // the first append starts on a fresh line); or when it records
+            // interrupted intents. Completed intents alone wait for the
+            // next compaction.
+            let dropped = kept.len() + recovered.completed < parsed;
+            if dropped || recovered.interrupted > 0 || loaded.bad_lines > 0 || loaded.torn_tail {
+                write_atomically(p, &render(kept.iter().map(|e| &**e))?)?;
+                writer.file_lines = kept.len();
             }
-            inner.file = Some(open_append(p)?);
+            entries = kept;
+            writer.file = Some(open_append(p)?);
         }
-        inner.compact_at = settings.max_entries.saturating_add(slack(settings));
+        writer.compact_at = settings.max_entries.saturating_add(slack(settings));
         Ok(AuditLog {
             path: path.map(Path::to_path_buf),
             settings,
-            inner: Mutex::new(inner),
+            writer: Mutex::new(writer),
+            entries: Mutex::new(entries),
+            writable: AtomicBool::new(true),
             #[cfg(any(test, feature = "test-hooks"))]
-            fail_appends: std::sync::atomic::AtomicBool::new(false),
+            fail_appends: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_completions: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_next_append: AtomicBool::new(false),
+            #[cfg(test)]
+            compact_gate: Mutex::new(None),
         })
     }
 
-    /// The audit log path for the state file `state_path`: `audit.jsonl`
-    /// in the same directory.
+    /// The audit log path for the state file `state_path`: its stem plus
+    /// `.audit.jsonl`, in the same directory (`prod.json` →
+    /// `prod.audit.jsonl`), so state files sharing a directory never share
+    /// an audit log.
     pub fn sibling_of(state_path: &Path) -> PathBuf {
-        state_path.with_file_name(AUDIT_FILE)
+        let mut name = state_path
+            .file_stem()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_else(|| "state".into());
+        name.push(AUDIT_SUFFIX);
+        state_path.with_file_name(name)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    fn lock_writer(&self) -> std::sync::MutexGuard<'_, Writer> {
+        self.writer.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn lock_entries(&self) -> std::sync::MutexGuard<'_, Entries> {
+        self.entries.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     fn io_error(&self, source: std::io::Error) -> StateError {
@@ -198,60 +262,101 @@ impl AuditLog {
         }
     }
 
-    fn injected_failure(&self) -> Option<StateError> {
+    fn injected_failure(&self, completion: bool) -> Option<StateError> {
         #[cfg(any(test, feature = "test-hooks"))]
-        if self.fail_appends.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.fail_appends.load(Ordering::SeqCst)
+            || (completion && self.fail_completions.load(Ordering::SeqCst))
+            || self.fail_next_append.swap(false, Ordering::SeqCst)
+        {
             return Some(self.io_error(std::io::Error::other("injected audit append failure")));
         }
+        let _ = completion;
         None
     }
 
-    /// Appends `record` as the next entry and syncs it to disk. On failure
-    /// the log is marked unwritable until [`Self::ensure_writable`]
-    /// succeeds. Blocking.
+    /// Appends `record` as one complete entry (no intent) and syncs it to
+    /// disk. On failure the log is marked unwritable until
+    /// [`Self::ensure_writable`] succeeds. Blocking.
     pub fn append(&self, record: AuditRecord) -> Result<AuditEntry, AuditAppendError> {
-        let mut inner = self.lock();
+        self.write_entry(record, None)
+    }
+
+    /// Records the intent of an action about to be applied: `record` with
+    /// outcome [`AuditOutcome::Pending`], synced to disk. Apply the action
+    /// only when this succeeds, then call [`Self::complete`] with the
+    /// returned entry's `seq`. Blocking.
+    pub fn begin(&self, mut record: AuditRecord) -> Result<AuditEntry, AuditAppendError> {
+        record.outcome = AuditOutcome::Pending;
+        self.write_entry(record, None)
+    }
+
+    /// Records the completion of the intent `intent_seq` (from
+    /// [`Self::begin`]) and drops the intent from memory. Blocking. On
+    /// failure the intent stays `pending` (and is completed as
+    /// `interrupted` at the next start) and the log is marked unwritable.
+    pub fn complete(
+        &self,
+        intent_seq: u64,
+        record: AuditRecord,
+    ) -> Result<AuditEntry, AuditAppendError> {
+        self.write_entry(record, Some(intent_seq))
+    }
+
+    fn write_entry(
+        &self,
+        record: AuditRecord,
+        intent_seq: Option<u64>,
+    ) -> Result<AuditEntry, AuditAppendError> {
+        let mut w = self.lock_writer();
         let entry = AuditEntry {
-            seq: inner.next_seq,
+            seq: w.next_seq,
             time_ms: now_ms(),
+            intent_seq,
             record,
         };
         // The seq is used up even when the write fails: a torn write may
         // have left part of it in the file.
-        inner.next_seq += 1;
-        let written = if inner.writable {
-            self.write_line(&mut inner, &entry)
+        w.next_seq += 1;
+        let written = if self.writable.load(Ordering::SeqCst) {
+            self.write_line(&mut w, &entry)
         } else {
             Err(StateError::AuditUnwritable(
                 "an earlier append failed".into(),
             ))
         };
         if let Err(source) = written {
-            inner.writable = false;
-            inner.file = None;
+            self.writable.store(false, Ordering::SeqCst);
+            w.file = None;
             return Err(AuditAppendError {
                 entry: Box::new(entry),
                 source,
             });
         }
-        inner.entries.push_back(entry.clone());
-        while inner.entries.len() > self.settings.max_entries {
-            inner.entries.pop_front();
+        {
+            // Still under the writer lock, so memory order is file order.
+            let mut entries = self.lock_entries();
+            if let Some(intent) = intent_seq {
+                if let Some(at) = entries.iter().rposition(|e| e.seq == intent) {
+                    entries.remove(at);
+                }
+            }
+            entries.push_back(Arc::new(entry.clone()));
+            trim_to_cap(&mut entries, self.settings.max_entries);
         }
         if self.path.is_some() {
-            inner.file_lines += 1;
-            if inner.file_lines >= inner.compact_at {
-                self.compact(&mut inner);
+            w.file_lines += 1;
+            if w.file_lines >= w.compact_at {
+                self.compact(&mut w);
             }
         }
         Ok(entry)
     }
 
-    fn write_line(&self, inner: &mut Inner, entry: &AuditEntry) -> Result<(), StateError> {
-        if let Some(e) = self.injected_failure() {
+    fn write_line(&self, w: &mut Writer, entry: &AuditEntry) -> Result<(), StateError> {
+        if let Some(e) = self.injected_failure(entry.intent_seq.is_some()) {
             return Err(e);
         }
-        let Some(file) = inner.file.as_mut() else {
+        let Some(file) = w.file.as_mut() else {
             return Ok(()); // in memory
         };
         let mut line = serde_json::to_vec(entry).map_err(|e| self.io_error(e.into()))?;
@@ -261,14 +366,31 @@ impl AuditLog {
     }
 
     /// Rewrites the file with the retained entries and reopens the append
-    /// handle (the old one points at the replaced file). A failed rewrite
-    /// keeps the old file and is retried after another `slack` appends.
-    fn compact(&self, inner: &mut Inner) {
+    /// handle (the old one points at the replaced file). Runs under the
+    /// writer lock, so no entry is appended meanwhile; the memory lock is
+    /// held only to apply retention and take a snapshot of `Arc`s, not
+    /// across the rewrite. A failed rewrite keeps the old file and is
+    /// retried after another `slack` appends.
+    fn compact(&self, w: &mut Writer) {
         let Some(path) = &self.path else { return };
         let slack = slack(self.settings);
-        let entries = std::mem::take(&mut inner.entries);
-        inner.entries = keep(entries.into(), self.settings, now_ms());
-        let written = render(&inner.entries).and_then(|bytes| write_atomically(path, &bytes));
+        let snapshot: Vec<Arc<AuditEntry>> = {
+            let mut entries = self.lock_entries();
+            retain_young(&mut entries, self.settings, now_ms());
+            entries.iter().cloned().collect()
+        };
+        #[cfg(test)]
+        if let Some((inside, release)) = self
+            .compact_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            let _ = inside.send(());
+            let _ = release.recv();
+        }
+        let written =
+            render(snapshot.iter().map(|e| &**e)).and_then(|bytes| write_atomically(path, &bytes));
         if let Err(e) = written {
             tracing::warn!(
                 target: "arneb::audit",
@@ -276,13 +398,13 @@ impl AuditLog {
                 error = %e,
                 "audit log compaction failed; keeping the uncompacted file"
             );
-            inner.compact_at = inner.file_lines.saturating_add(slack);
+            w.compact_at = w.file_lines.saturating_add(slack);
             return;
         }
-        inner.file_lines = inner.entries.len();
-        inner.compact_at = self.settings.max_entries.saturating_add(slack);
+        w.file_lines = snapshot.len();
+        w.compact_at = self.settings.max_entries.saturating_add(slack);
         match open_append(path) {
-            Ok(f) => inner.file = Some(f),
+            Ok(f) => w.file = Some(f),
             Err(e) => {
                 tracing::error!(
                     target: "arneb::audit",
@@ -290,44 +412,52 @@ impl AuditLog {
                     error = %e,
                     "cannot reopen the audit log after compaction"
                 );
-                inner.file = None;
-                inner.writable = false;
+                w.file = None;
+                self.writable.store(false, Ordering::SeqCst);
             }
         }
     }
 
     /// The entries matching `q`, newest first. Entries past
-    /// `retention_days` are hidden.
+    /// `retention_days` are hidden. Never waits for an append or a
+    /// compaction.
     pub fn query(&self, q: &AuditQuery) -> AuditPage {
         let cutoff = cutoff_ms(self.settings, now_ms());
-        let inner = self.lock();
-        let mut matching = inner.entries.iter().rev().filter(|e| {
+        let entries = self.lock_entries();
+        let mut matching = entries.iter().rev().filter(|e| {
             e.time_ms >= cutoff
                 && q.before_seq.is_none_or(|b| e.seq < b)
                 && q.user.as_ref().is_none_or(|u| &e.record.user == u)
                 && q.action.as_ref().is_none_or(|a| &e.record.action == a)
         });
-        let entries: Vec<AuditEntry> = matching.by_ref().take(q.limit).cloned().collect();
+        let page: Vec<AuditEntry> = matching
+            .by_ref()
+            .take(q.limit)
+            .map(|e| AuditEntry::clone(e))
+            .collect();
         let truncated = matching.next().is_some();
         AuditPage {
             next_cursor: if truncated {
-                entries.last().map(|e| e.seq)
+                page.last().map(|e| e.seq)
             } else {
                 None
             },
-            entries,
+            entries: page,
             truncated,
         }
     }
 
     /// A no-op while writable; otherwise reopens the file, and the log is
-    /// writable again when that succeeds.
+    /// writable again when that succeeds. Blocking.
     pub fn ensure_writable(&self) -> Result<(), StateError> {
-        let mut inner = self.lock();
-        if inner.writable {
+        if self.writable.load(Ordering::SeqCst) {
             return Ok(());
         }
-        if let Some(e) = self.injected_failure() {
+        let mut w = self.lock_writer();
+        if self.writable.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Some(e) = self.injected_failure(false) {
             return Err(e);
         }
         if let Some(path) = &self.path {
@@ -338,16 +468,16 @@ impl AuditLog {
                 file.set_len(keep).map_err(|e| self.io_error(e))?;
                 file.sync_data().map_err(|e| self.io_error(e))?;
             }
-            inner.file = Some(file);
+            w.file = Some(file);
         }
-        inner.writable = true;
+        self.writable.store(true, Ordering::SeqCst);
         tracing::info!(target: "arneb::audit", "the audit log is writable again");
         Ok(())
     }
 
-    /// Whether the next append is expected to succeed.
+    /// Whether the next append is expected to succeed. Lock-free.
     pub fn is_writable(&self) -> bool {
-        self.lock().writable
+        self.writable.load(Ordering::SeqCst)
     }
 
     /// Whether entries are written to disk.
@@ -357,7 +487,7 @@ impl AuditLog {
 
     /// Entries held in memory (the newest, at most `max_entries`).
     pub fn len(&self) -> usize {
-        self.lock().entries.len()
+        self.lock_entries().len()
     }
 
     /// Whether the log holds no entries.
@@ -369,8 +499,125 @@ impl AuditLog {
     /// keep failing) while `fail` is set.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_fail_appends(&self, fail: bool) {
-        self.fail_appends
-            .store(fail, std::sync::atomic::Ordering::SeqCst);
+        self.fail_appends.store(fail, Ordering::SeqCst);
+    }
+
+    /// Test hook: make every completion ([`Self::complete`]) fail while
+    /// `fail` is set; intents and single entries are still written.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_fail_completions(&self, fail: bool) {
+        self.fail_completions.store(fail, Ordering::SeqCst);
+    }
+
+    /// Test hook: make only the next write fail (the log is then
+    /// unwritable until [`Self::ensure_writable`], which succeeds).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_append(&self) {
+        self.fail_next_append.store(true, Ordering::SeqCst);
+    }
+
+    /// Test hook: stop the next compaction once it holds its snapshot;
+    /// returns `(inside, release)`.
+    #[cfg(test)]
+    fn stop_next_compaction(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.compact_gate.lock().unwrap() = Some((inside_tx, release_rx));
+        (inside_rx, release_tx)
+    }
+}
+
+/// What [`recover`] made of the loaded entries.
+struct Recovered {
+    /// The entries to keep, in file order, interrupted completions last.
+    entries: Vec<AuditEntry>,
+    /// Intents dropped because their completion is in the file.
+    completed: usize,
+    /// Intents with no completion, now completed as interrupted.
+    interrupted: usize,
+}
+
+/// Drops the intents of `loaded` that were completed, and completes each
+/// other intent as [`AuditOutcome::Interrupted`] (new seqs from
+/// `next_seq`), reporting it at WARN.
+fn recover(loaded: Vec<AuditEntry>, next_seq: &mut u64, path: &Path) -> Recovered {
+    let completed: HashSet<u64> = loaded.iter().filter_map(|e| e.intent_seq).collect();
+    let mut out = Recovered {
+        entries: Vec::with_capacity(loaded.len()),
+        completed: 0,
+        interrupted: 0,
+    };
+    let mut orphans = Vec::new();
+    for e in loaded {
+        if e.record.outcome == AuditOutcome::Pending && e.intent_seq.is_none() {
+            if completed.contains(&e.seq) {
+                out.completed += 1;
+            } else {
+                orphans.push(e);
+            }
+            continue;
+        }
+        out.entries.push(e);
+    }
+    let now = now_ms();
+    for intent in orphans {
+        tracing::warn!(
+            target: "arneb::audit",
+            path = %path.display(),
+            seq = intent.seq,
+            time_ms = intent.time_ms,
+            user = %intent.record.user,
+            action = %intent.record.action,
+            target = %intent.record.target,
+            "an audited action was recorded as intent but never completed \
+             (the server stopped while applying it); it may or may not have \
+             been applied, and is recorded as interrupted"
+        );
+        out.entries.push(AuditEntry {
+            seq: *next_seq,
+            time_ms: now,
+            intent_seq: Some(intent.seq),
+            record: AuditRecord {
+                outcome: AuditOutcome::Interrupted,
+                ..intent.record
+            },
+        });
+        *next_seq += 1;
+        out.interrupted += 1;
+    }
+    out
+}
+
+/// Drops the entries of `entries` past the retention, but always keeps the
+/// newest one.
+fn retain_young(entries: &mut Entries, settings: AuditSettings, now: u64) {
+    let cutoff = cutoff_ms(settings, now);
+    if cutoff == 0 {
+        return;
+    }
+    let Some(last) = entries.back().map(|e| e.seq) else {
+        return;
+    };
+    entries.retain(|e| e.time_ms >= cutoff || e.seq == last || is_open_intent(e));
+}
+
+/// A `pending` intent whose completion has not been written: an action in
+/// flight (or one whose completion failed). Never evicted by the cap or the
+/// retention, so a crash before its completion still leaves it on disk.
+fn is_open_intent(e: &AuditEntry) -> bool {
+    e.record.outcome == AuditOutcome::Pending && e.intent_seq.is_none()
+}
+
+/// Drops the oldest entries over `max_entries`, skipping open intents (they
+/// count toward the cap, but only finished entries are dropped for it).
+fn trim_to_cap(entries: &mut Entries, max_entries: usize) {
+    while entries.len() > max_entries {
+        match entries.iter().position(|e| !is_open_intent(e)) {
+            Some(at) => {
+                entries.remove(at);
+            }
+            None => return,
+        }
     }
 }
 
@@ -390,14 +637,14 @@ fn slack(settings: AuditSettings) -> usize {
 /// The retained entries of `loaded` (in file order): younger than the
 /// retention and at most the newest `max_entries`. The newest entry is
 /// always kept, so its `seq` survives a restart.
-fn keep(loaded: Vec<AuditEntry>, settings: AuditSettings, now: u64) -> VecDeque<AuditEntry> {
+fn keep(loaded: Vec<AuditEntry>, settings: AuditSettings, now: u64) -> Entries {
     let cutoff = cutoff_ms(settings, now);
     let last = loaded.len().saturating_sub(1);
-    let mut kept: VecDeque<AuditEntry> = loaded
+    let mut kept: Entries = loaded
         .into_iter()
         .enumerate()
         .filter(|(i, e)| e.time_ms >= cutoff || *i == last)
-        .map(|(_, e)| e)
+        .map(|(_, e)| Arc::new(e))
         .collect();
     while kept.len() > settings.max_entries {
         kept.pop_front();
@@ -458,7 +705,7 @@ fn load(path: &Path) -> Result<Loaded, StateError> {
     Ok(loaded)
 }
 
-fn render(entries: &VecDeque<AuditEntry>) -> Result<Vec<u8>, StateError> {
+fn render<'a>(entries: impl Iterator<Item = &'a AuditEntry>) -> Result<Vec<u8>, StateError> {
     let mut out = Vec::new();
     for e in entries {
         serde_json::to_writer(&mut out, e)
@@ -555,6 +802,7 @@ mod tests {
         let e = AuditEntry {
             seq,
             time_ms,
+            intent_seq: None,
             record: record("alice", "token.issue"),
         };
         serde_json::to_string(&e).unwrap()
@@ -580,6 +828,7 @@ mod tests {
         let mut e = AuditEntry {
             seq: 7,
             time_ms: 9,
+            intent_seq: None,
             record: record("alice", "token.revoke"),
         };
         assert_eq!(
@@ -594,14 +843,27 @@ mod tests {
     }
 
     #[test]
-    fn sibling_is_audit_jsonl_next_to_the_state_file() {
+    fn sibling_is_named_after_the_state_file_stem() {
         assert_eq!(
             AuditLog::sibling_of(Path::new("/var/lib/arneb/state.json")),
-            PathBuf::from("/var/lib/arneb/audit.jsonl")
+            PathBuf::from("/var/lib/arneb/state.audit.jsonl")
         );
         assert_eq!(
             AuditLog::sibling_of(Path::new("state.json")),
-            PathBuf::from("audit.jsonl")
+            PathBuf::from("state.audit.jsonl")
+        );
+        // Two state files in one directory get two audit logs.
+        assert_eq!(
+            AuditLog::sibling_of(Path::new("/var/lib/arneb/prod.json")),
+            PathBuf::from("/var/lib/arneb/prod.audit.jsonl")
+        );
+        assert_eq!(
+            AuditLog::sibling_of(Path::new("/var/lib/arneb/staging.json")),
+            PathBuf::from("/var/lib/arneb/staging.audit.jsonl")
+        );
+        assert_eq!(
+            AuditLog::sibling_of(Path::new("/srv/arneb-state")),
+            PathBuf::from("/srv/arneb-state.audit.jsonl")
         );
     }
 
@@ -874,6 +1136,199 @@ mod tests {
         assert!(log.is_writable());
         log.append(record("alice", "a")).unwrap();
         assert_eq!(lines(&p), 1);
+    }
+
+    /// Runs `f` and returns what it logged.
+    fn capture<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let r = tracing::subscriber::with_default(sub, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (r, out)
+    }
+
+    fn file_entries(p: &Path) -> Vec<AuditEntry> {
+        std::fs::read_to_string(p)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn intent_is_written_before_and_replaced_by_its_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let log = AuditLog::open(Some(&p), settings(100, 0)).unwrap();
+        let intent = log.begin(record("root", "worker.cordon")).unwrap();
+        assert_eq!(intent.record.outcome, AuditOutcome::Pending);
+        // On disk and visible before the action is applied.
+        let on_disk = file_entries(&p);
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].record.outcome, AuditOutcome::Pending);
+        assert_eq!(on_disk[0].intent_seq, None);
+        assert_eq!(all(&log), vec![intent.seq]);
+        let done = log
+            .complete(intent.seq, record("root", "worker.cordon"))
+            .unwrap();
+        assert_eq!(done.intent_seq, Some(intent.seq));
+        // Reads show the completion only.
+        assert_eq!(all(&log), vec![done.seq]);
+        assert_eq!(
+            serde_json::to_value(&done).unwrap()["intent_seq"],
+            serde_json::json!(intent.seq)
+        );
+        drop(log);
+        let (log, logged) = capture(|| AuditLog::open(Some(&p), settings(100, 0)).unwrap());
+        assert_eq!(all(&log), vec![done.seq], "the completed intent is dropped");
+        assert!(!logged.contains("never completed"), "{logged}");
+        assert_eq!(
+            lines(&p),
+            2,
+            "no startup rewrite for completed intents alone"
+        );
+    }
+
+    #[test]
+    fn an_intent_never_completed_is_reported_once_as_interrupted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let log = AuditLog::open(Some(&p), settings(100, 0)).unwrap();
+        log.append(record("alice", "token.issue")).unwrap();
+        let intent = log.begin(record("root", "worker.cordon")).unwrap();
+        // The process dies while applying the action.
+        drop(log);
+        let (log, logged) = capture(|| AuditLog::open(Some(&p), settings(100, 0)).unwrap());
+        assert!(logged.contains("WARN"), "{logged}");
+        assert!(logged.contains("never completed"), "{logged}");
+        assert!(logged.contains("worker.cordon"), "{logged}");
+        let page = log.query(&AuditQuery {
+            limit: 10,
+            ..AuditQuery::default()
+        });
+        assert_eq!(page.entries.len(), 2);
+        let e = &page.entries[0];
+        assert_eq!(e.seq, intent.seq + 1);
+        assert_eq!(e.intent_seq, Some(intent.seq));
+        assert_eq!(e.record.outcome, AuditOutcome::Interrupted);
+        assert_eq!(e.record.user, "root");
+        assert_eq!(
+            serde_json::to_value(e).unwrap()["outcome"],
+            serde_json::json!("interrupted")
+        );
+        assert_eq!(log.append(record("x", "y")).unwrap().seq, intent.seq + 2);
+        drop(log);
+        // Recorded, so the next start does not report it again.
+        let (_log, logged) = capture(|| AuditLog::open(Some(&p), settings(100, 0)).unwrap());
+        assert!(!logged.contains("never completed"), "{logged}");
+    }
+
+    #[test]
+    fn a_failed_completion_leaves_the_intent_pending() {
+        let log = AuditLog::open(None, settings(100, 0)).unwrap();
+        let intent = log.begin(record("root", "admission.set")).unwrap();
+        log.set_fail_completions(true);
+        let err = log
+            .complete(intent.seq, record("root", "admission.set"))
+            .unwrap_err();
+        assert_eq!(err.entry.intent_seq, Some(intent.seq));
+        assert!(!log.is_writable());
+        assert_eq!(all(&log), vec![intent.seq], "the intent stays, pending");
+        // An unwritable log refuses the next intent.
+        log.set_fail_completions(false);
+        assert!(log.begin(record("root", "admission.set")).is_err());
+        log.ensure_writable().unwrap();
+        assert!(log.begin(record("root", "admission.set")).is_ok());
+    }
+
+    /// An intent in flight survives the cap and compaction, however many
+    /// entries are appended meanwhile.
+    #[test]
+    fn an_open_intent_is_never_evicted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let log = AuditLog::open(Some(&p), settings(100, 0)).unwrap();
+        let intent = log.begin(record("root", "worker.cordon")).unwrap();
+        // Enough to compact twice (at 200 lines, then again).
+        for _ in 0..400 {
+            log.append(record("alice", "a")).unwrap();
+        }
+        assert_eq!(log.len(), 100);
+        assert_eq!(
+            all(&log).last(),
+            Some(&intent.seq),
+            "the oldest kept is the intent"
+        );
+        assert!(lines(&p) <= 201);
+        assert!(file_entries(&p).iter().any(|e| e.seq == intent.seq));
+        // A crash now: the next start still reports it.
+        drop(log);
+        let (log, logged) = capture(|| AuditLog::open(Some(&p), settings(100, 0)).unwrap());
+        assert!(logged.contains("never completed"), "{logged}");
+        let page = log.query(&AuditQuery {
+            limit: 1,
+            ..AuditQuery::default()
+        });
+        assert_eq!(page.entries[0].intent_seq, Some(intent.seq));
+        assert_eq!(page.entries[0].record.outcome, AuditOutcome::Interrupted);
+    }
+
+    /// Reads never wait for a compaction (or an fsync): they take only the
+    /// memory lock, which compaction does not hold while it rewrites.
+    #[test]
+    fn reads_do_not_wait_for_a_compaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let log = std::sync::Arc::new(AuditLog::open(Some(&p), settings(100, 0)).unwrap());
+        // `compact_at` is 100 + 100 lines: the 200th append compacts.
+        for _ in 0..199 {
+            log.append(record("alice", "a")).unwrap();
+        }
+        let (inside, release) = log.stop_next_compaction();
+        let appender = std::thread::spawn({
+            let log = std::sync::Arc::clone(&log);
+            move || log.append(record("alice", "a")).unwrap().seq
+        });
+        inside.recv().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let log = std::sync::Arc::clone(&log);
+            move || {
+                let page = log.query(&AuditQuery {
+                    limit: 1,
+                    ..AuditQuery::default()
+                });
+                let _ = done_tx.send((page.entries[0].seq, log.len(), log.is_writable()));
+            }
+        });
+        let read = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(!appender.is_finished(), "the compaction is still stopped");
+        assert_eq!(
+            read.expect("a read waited for the compaction"),
+            (200, 100, true)
+        );
+        release.send(()).unwrap();
+        assert_eq!(appender.join().unwrap(), 200);
+        assert_eq!(lines(&p), 100);
     }
 
     #[test]

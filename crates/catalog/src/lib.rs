@@ -455,6 +455,22 @@ impl CatalogManager {
         }
     }
 
+    /// Returns a view of this manager, keeping its defaults, reference
+    /// qualification and access checks, whose catalogs are frozen at the
+    /// ones registered now: a catalog registered, replaced or removed later
+    /// does not change it. A statement plans against such a view, so it
+    /// keeps the providers it started with (runtime catalog changes).
+    pub fn pinned(&self) -> Self {
+        let catalogs = self.catalogs.read().unwrap().clone();
+        Self {
+            catalogs: Arc::new(RwLock::new(catalogs)),
+            default_catalog: self.default_catalog.clone(),
+            default_schema: self.default_schema.clone(),
+            qualify_references: self.qualify_references,
+            access: self.access.clone(),
+        }
+    }
+
     /// Returns the default catalog name.
     pub fn default_catalog(&self) -> &str {
         &self.default_catalog
@@ -618,6 +634,35 @@ mod tests {
                 nullable: true,
             },
         ]
+    }
+
+    // -- Pinned view tests --
+
+    #[test]
+    fn pinned_view_keeps_the_catalogs_it_was_taken_with() {
+        let root = CatalogManager::new("lake", "sales");
+        let old: Arc<dyn CatalogProvider> = Arc::new(MemoryCatalog::new());
+        root.register_catalog("lake", Arc::clone(&old));
+        let session = root.with_session_defaults("lake", "other");
+        let pinned = session.pinned();
+        root.register_catalog("lake", Arc::new(MemoryCatalog::new()));
+        root.register_catalog("new", Arc::new(MemoryCatalog::new()));
+        root.deregister_catalog("lake");
+        assert!(Arc::ptr_eq(&pinned.catalog("lake").unwrap(), &old));
+        assert!(pinned.catalog("new").is_none());
+        assert!(root.catalog("lake").is_none());
+        assert_eq!(pinned.default_schema(), "other", "the view's defaults stay");
+        assert_eq!(
+            pinned
+                .qualify_table_reference(&TableReference {
+                    catalog: None,
+                    schema: None,
+                    table: "t".into(),
+                })
+                .schema
+                .as_deref(),
+            Some("other")
+        );
     }
 
     // -- Session view tests --

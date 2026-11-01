@@ -64,7 +64,7 @@ Every manage route SHALL take `dry_run` (`true` or `false`, default `false`; any
 - **THEN** the response is the same `403 forbidden` as without `dry_run`, and nothing is audited
 
 ### Requirement: Manage response envelope
-A manage call SHALL answer `200` with `{dry_run, action, target, summary, changed, warning, result}`. `changed` SHALL be `false` for a no-op, which is not an error. `warning` SHALL be set when the action leaves no schedulable worker, and when the state store is in memory so the change is lost on restart. Actions SHALL be named `query.cancel`, `worker.cordon`, `worker.drain`, `worker.uncordon`, `admission.set`, `token.issue` and `token.revoke`.
+A manage call SHALL answer `200` with `{dry_run, action, target, summary, changed, warning, result}`. `changed` SHALL be `false` for a no-op, which is not an error. `warning` SHALL be set when the action leaves no schedulable worker, and when the state store is in memory so the change is lost on restart. Actions SHALL be named `query.cancel`, `worker.cordon`, `worker.drain`, `worker.uncordon`, `admission.set`, `admission.reset`, `token.issue` and `token.revoke`.
 
 #### Scenario: No-op
 - **WHEN** an admin cordons a worker that is already cordoned
@@ -75,7 +75,11 @@ A manage call SHALL answer `200` with `{dry_run, action, target, summary, change
 - **THEN** the `warning` says the change is lost on restart
 
 ### Requirement: Durable audit log
-Under password auth every non-dry manage run that passed authorization, every cancellation of another user's query and every token issue and revoke SHALL be appended as one JSON line to `audit.jsonl` in the directory of `[state] path` (mode `0600`) and synced to disk before the response returns. An entry SHALL hold `seq`, `time_ms`, `user`, `via`, `action`, `target`, `parameters` and `outcome`, and name a token by its 16-hex id only. `seq` SHALL increase across restarts. Refused calls SHALL NOT be audited. `GET /api/v2/audit?limit=&cursor=&user=&action=` SHALL list entries newest first and need observe.
+Under password auth every non-dry manage run that passed authorization, every cancellation of another user's query and every token issue and revoke SHALL be appended to `<stem>.audit.jsonl` in the directory of `[state] path`, named after the state file (`prod.json` → `prod.audit.jsonl`, mode `0600`), as an intent entry (outcome `pending`) synced before the action is applied and a completion entry (with `intent_seq`) synced before the response returns. An entry SHALL hold `seq`, `time_ms`, `user`, `via`, `action`, `target`, `parameters` and `outcome`, and name a token by its 16-hex id only. `seq` SHALL increase across restarts. Refused calls SHALL NOT be audited. `GET /api/v2/audit?limit=&cursor=&user=&action=` SHALL list entries newest first and need observe. A caller with manage SHALL read every entry (`scope: "all"`); any other caller SHALL read only entries whose `user` is the caller (`scope: "own"`), as SHALL the MCP `list_audit_log` tool.
+
+#### Scenario: Audit entries of others are hidden
+- **WHEN** alice (observe, no manage) reads the audit log after bob issued a token
+- **THEN** she sees only her own entries and `scope` is `own`, and `?user=bob` returns no entries
 
 #### Scenario: Cordon is recorded
 - **WHEN** an admin cordons worker-1
@@ -90,22 +94,26 @@ Under password auth every non-dry manage run that passed authorization, every ca
 - **THEN** the next entry has `seq` 10 or more
 
 ### Requirement: Audit log retention and failure
-`[audit] max_entries` (default 10000, `1..=1000000`) and `retention_days` (default 90, `0` for no age limit) SHALL bound the log. Compaction SHALL rewrite the file atomically, keep the newest entry, and run at startup when it would drop something and whenever the file holds `max(max_entries / 10, 100)` more lines than `max_entries`. A line that cannot be parsed SHALL be skipped with a WARN naming its line number. If the log is not writable and cannot be reopened, an audited action SHALL be refused with `503 audit_unavailable` before anything is applied. If an append fails after the action was applied, the action's real result SHALL be returned, the full entry SHALL be logged at ERROR on `arneb::audit`, and later audited actions SHALL be refused until the log is writable. At most one entry per action in flight when the log fails SHALL be missing from the file, and each SHALL be in the ERROR log.
+`[audit] max_entries` (default 10000, `1..=1000000`) and `retention_days` (default 90, `0` for no age limit) SHALL bound the log. Compaction SHALL rewrite the file atomically, keep the newest entry, and run at startup when it would drop something and whenever the file holds `max(max_entries / 10, 100)` more lines than `max_entries`. A line that cannot be parsed SHALL be skipped with a WARN naming its line number. If the log is not writable and cannot be reopened, or the intent entry cannot be written, an audited action SHALL be refused with `503 audit_unavailable` before anything is applied. If the completion fails after the action was applied, the action's real result SHALL be returned, the full entry SHALL be logged at ERROR on `arneb::audit`, the intent SHALL stay `pending`, and later audited actions SHALL be refused until the log is writable. At startup, an intent with no completion SHALL be logged at WARN on `arneb::audit` and completed once with outcome `interrupted`. A completed intent SHALL NOT be listed. Reads SHALL NOT wait for an append's fsync or a compaction.
+
+#### Scenario: Crash between apply and completion
+- **WHEN** a cordon's intent is synced, the cordon is persisted, and the process dies before the completion
+- **THEN** the next start logs a WARN naming `worker.cordon`, and the log lists an `interrupted` entry for it
 
 #### Scenario: Compaction keeps the newest
 - **WHEN** every entry is older than `retention_days`
 - **THEN** reads hide them, and the file keeps the newest entry so `seq` continues
 
 #### Scenario: Torn line
-- **WHEN** the last line of `audit.jsonl` is cut short by a crash
+- **WHEN** the last line of the audit log is cut short by a crash
 - **THEN** startup succeeds, logs a WARN naming the line, and compaction drops it
 
 #### Scenario: Unwritable log
-- **WHEN** the log cannot be written and an admin cordons a worker
+- **WHEN** the log cannot be written (the intent fails) and an admin cordons a worker
 - **THEN** the response is `503 audit_unavailable` and the worker stays schedulable
 
 ### Requirement: Cancel any query
-`DELETE /api/v2/queries/{id}` SHALL cancel a query from any protocol and stop it there: pgwire answers `57014 canceling statement due to user request`, a Trino client `USER_CANCELED` `Query was killed by <user>`, and an agent statement turns `cancelled`. It SHALL answer `200` with the envelope and `result` `{query_id, owner, state_before, state}`. The owner SHALL always be allowed; otherwise the kill rule SHALL decide in this order: refused under `none`; a `queries` rule that allows `kill` for the owner, or no `queries` section; the manage privilege; otherwise `forbidden`. A caller whose rules grant `kill` but not `view` SHALL be able to cancel by id; a caller with neither SHALL get `not_found`. Cancelling a query that already ended SHALL answer `200` with `changed: false`. A kill that lands between a query's creation and its registration SHALL still stop it.
+`DELETE /api/v2/queries/{id}` SHALL cancel a query from any protocol and stop it there: pgwire answers `57014 canceling statement due to user request`, a Trino client `USER_CANCELED` `Query was killed by <user>`, and an agent statement turns `cancelled`. It SHALL answer `200` with the envelope and `result` `{query_id, owner, state_before, state}`. The owner SHALL always be allowed; otherwise the kill rule SHALL decide in this order: refused under `none`; an explicit `queries` rule that allows `kill` for the owner (no rules file or no `queries` section grants nothing); the manage privilege; otherwise `forbidden`. A caller whose rules grant `kill` but not `view` SHALL be able to cancel by id; a caller with neither SHALL get `not_found`. Cancelling a query that already ended SHALL answer `200` with `changed: false`. A kill that lands between a query's creation and its registration SHALL still stop it, and the query SHALL NOT then report success or rows: a statement that finishes after such a kill SHALL end as Trino `USER_CANCELED` or agent `cancelled`, and the tracker SHALL keep it `Cancelled`.
 
 #### Scenario: Admin kills a pgwire query
 - **WHEN** an admin cancels user2's running pgwire query
@@ -139,7 +147,11 @@ Under password auth every non-dry manage run that passed authorization, every ca
 - **THEN** the response is `400 invalid_argument`
 
 ### Requirement: Admission limits at runtime
-`GET /api/v2/admission` SHALL need observe and report `{max_running_queries, max_queued_queries, running_queries, queued_queries, source}`. `PUT /api/v2/admission` SHALL need manage, take `{"max_running_queries"?, "max_queued_queries"?}` with at least one non-negative integer field and no unknown field, apply at once, and persist the limits in the state store. `source` SHALL be `config` until a limit is set at runtime, then `state`.
+`GET /api/v2/admission` SHALL need observe and report `{max_running_queries, max_queued_queries, running_queries, queued_queries, source}`. `PUT /api/v2/admission` SHALL need manage, take `{"max_running_queries"?, "max_queued_queries"?}` with at least one non-negative integer field and no unknown field, apply at once, and persist the limits in the state store. `source` SHALL be `config` until a limit is set at runtime, then `state`. `DELETE /api/v2/admission[?dry_run=]` SHALL need manage (also for a dry run), clear the stored limits, apply the config values (`[admission]` after `ARNEB_MAX_*_QUERIES`) at once, and be audited as `admission.reset`; it SHALL be `changed: false` when nothing is stored and the config values already apply. The MCP `reset_admission_limits` tool SHALL make the same call.
+
+#### Scenario: Reset to the config
+- **WHEN** an admin set `max_running_queries` to 2 over a config value of 8, then calls `DELETE /api/v2/admission`
+- **THEN** the result reports `max_running_queries` 8 and `source` `config`, the state store holds no admission limits, and the next start uses the config value with no WARN
 
 #### Scenario: Change at runtime
 - **WHEN** an admin sends `PUT {"max_running_queries": 1}` and then starts two long queries
@@ -157,11 +169,11 @@ At startup a stored admission limit SHALL win over `[admission]` and its `ARNEB_
 - **THEN** the limit is 4, `source` is `state`, and startup logged a WARN naming `max_running_queries`
 
 ### Requirement: MCP manage tools
-The MCP server SHALL expose 25 tools in total. The manage tools `cordon_worker`, `drain_worker`, `uncordon_worker` and `set_admission_limits` SHALL take `dry_run`; `list_workers`, `get_worker`, `get_admission` and `list_audit_log` SHALL be read-only; `cancel_query` SHALL cancel an own agent statement as before, and any other id or any dry run through the same function as `DELETE /api/v2/queries/{id}`. Each tool SHALL make the same service call as its route, with the same rights, and report errors as `isError` results carrying the `/api/v2` envelope.
+The MCP server SHALL expose 26 tools in total. The manage tools `cordon_worker`, `drain_worker`, `uncordon_worker`, `set_admission_limits` and `reset_admission_limits` SHALL take `dry_run`; `list_workers`, `get_worker`, `get_admission` and `list_audit_log` SHALL be read-only; `cancel_query` SHALL cancel an own agent statement as before, and any other id or any dry run through the same function as `DELETE /api/v2/queries/{id}`. Each tool SHALL make the same service call as its route, with the same rights, and report errors as `isError` results carrying the `/api/v2` envelope.
 
 #### Scenario: Tool list
 - **WHEN** a client calls `tools/list`
-- **THEN** the result has 25 tools including `get_worker`, `cordon_worker` and `list_audit_log`
+- **THEN** the result has 26 tools including `get_worker`, `cordon_worker` and `list_audit_log`
 
 #### Scenario: Unprivileged tool call
 - **WHEN** a user without manage calls `cordon_worker`

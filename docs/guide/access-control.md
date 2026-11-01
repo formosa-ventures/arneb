@@ -59,8 +59,14 @@ reads, replaces and clears the rules through `GET`, `PUT` and `DELETE
   planned after it, on pgwire, Trino, the agent API and MCP, including
   connections already open. A statement already running keeps the rules it
   was checked with.
-- It survives a restart: the stored rules win over `rules_file` until a
-  [re-seed](/guide/http-api#re-seed) copies the file again.
+- It survives a restart: rules changed at runtime win over an unchanged
+  `rules_file` (with a WARN at every start) until a
+  [re-seed](/guide/http-api#re-seed) copies the file again. If the rules
+  file is also edited after a runtime change, startup refuses until you
+  restart with `--reseed-state` or restore the file to its last seeded
+  version. Rules never changed at runtime follow the file: an edited
+  `rules_file` applies at the next start. Runtime rules copied into the file
+  (compared as JSON) count as the file's again and follow its later edits.
 - Every change is audited (`access_rules.set`, `access_rules.clear`), with a
   SHA-256 of the rules instead of their text.
 - `GET` reports `from_config: true` while the rules are the seeded copy of
@@ -153,7 +159,9 @@ is refused at startup instead of being enforced partially:
 
 Two layers sit above the query rules:
 
-- **Observe** covers the cluster, worker, admission and audit views.
+- **Observe** covers the cluster, worker, admission and audit views. The
+  audit view shows the whole log only to a manager; any other observer sees
+  only the entries of their own actions.
   - Under `[auth] type = "none"` it is open.
   - Under password auth it is open unless the rules file has a
     `system_information` section. Then the user needs a rule that allows
@@ -187,8 +195,12 @@ A refusal is `403 forbidden` and its `hint` names what would grant it:
   for queryOwner <owner>, or the manage privilege`.
 
 A query's owner may always cancel it. Cancelling another user's query needs
-password auth, then a `queries` rule that allows `kill` for that owner (or no
-`queries` section), or the manage layer.
+password auth, then an explicit `queries` rule that allows `kill` for that
+owner, or the manage layer. Without a rules file, or without a `queries`
+section, only the owner or a manager may cancel a query. This differs from
+Trino's file-based access control, where a missing section allows
+everything: add `{"allow": ["execute", "view", "kill"]}` to `queries` to let
+every user cancel every query.
 
 > **Under `[auth] type = "none"`, do not expose the Web port.** A cancel
 > really stops the query, any peer that reaches the Web port can stop any
@@ -230,9 +242,11 @@ password auth, then a `queries` rule that allows `kill` for that owner (or no
   [manage envelope](/guide/http-api#dry-runs-and-the-response-envelope)
   instead of `204`, and stops the query on its protocol.
 
-- Under password auth the rules file only seeds the rules: the stored rules
-  win at later starts, and they change at runtime (see
-  [Changing rules at runtime](#changing-rules-at-runtime)).
+- Under password auth the rules are kept in the state store and can change
+  at runtime (see [Changing rules at runtime](#changing-rules-at-runtime)).
+  While they are not changed at runtime they follow the rules file at every
+  start; after a runtime change they win over an unchanged file, and an
+  edited file then stops startup until `--reseed-state`.
 
 The full lists are in
 [Upgrading to v0.2.0 (manage API)](/guide/configuration#upgrading-to-v020-manage-api)
@@ -243,8 +257,8 @@ and [Upgrading to v0.2.0 (runtime config)](/guide/configuration#upgrading-to-v02
 - The Web API (Web UI port) applies the `queries` rules to the query list,
   query detail and cancel endpoints, under both `/api/v1` and `/api/v2`. A
   query the caller may not `view` is hidden (`404`). Cancelling follows the
-  kill rule: the owner always may; otherwise a `queries` rule that allows
-  `kill` for the owner (or no `queries` section), or the manage layer; a
+  kill rule: the owner always may; otherwise an explicit `queries` rule that
+  allows `kill` for the owner, or the manage layer; a
   query the caller may neither view nor kill is `404`, any other refusal
   `403`. Under `[auth] type = "none"` the Web API has no authenticated user:
   `/api/v1` keeps its open list, detail and cancel (any caller may cancel

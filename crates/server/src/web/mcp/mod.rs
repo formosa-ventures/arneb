@@ -63,7 +63,7 @@ Workflow:
 4. Run: submit_query with wait_ms (up to {max_wait_ms}) so short queries return finished.
 5. If queued or running, call get_query_status (with wait_ms) until finished, failed or cancelled.
 6. Read rows: start fetch_results from first_page.next_cursor and repeat with each next_cursor until null.
-7. Stop a statement you no longer need with cancel_query.
+7. Done with a statement: cancel_query stops or frees it.
 
 Limits: a statement keeps at most max_rows rows (default {default_max_rows}, ceiling {max_rows}) and reports truncated when more existed. Pages hold {page_bytes} bytes of rows by default; max_bytes allows up to {max_page_bytes}. Long cells and SQL text are cut. Listings take limit.
 
@@ -243,6 +243,7 @@ mod tests {
             admission: None,
             admission_changes: Default::default(),
             cordon_changes: Default::default(),
+            max_running_queries: 8,
             max_queued_queries: 8,
             memory_pool: Arc::new(arneb_common::memory_pool::GreedyMemoryPool::new(1 << 20)),
             memory_limit_bytes: None,

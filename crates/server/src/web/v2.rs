@@ -43,11 +43,25 @@ const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// [`SESSION_TTL`] in milliseconds (8 hours: no truncation).
 const SESSION_TTL_MS: u64 = SESSION_TTL.as_secs() * 1000;
 
-/// Token issuances (and runtime password hashes) running PBKDF2 at once; the rest wait, so a burst cannot
-/// saturate the blocking pool.
-const MAX_CONCURRENT_ISSUES: usize = 4;
-pub(super) static ISSUE_PERMITS: tokio::sync::Semaphore =
-    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_ISSUES);
+/// A slot of the shared PBKDF2 limiter for a token issuance or a runtime
+/// password hash; `overloaded` while the wait queue is full. Shared with
+/// the user routes.
+pub(super) async fn pbkdf2_slot(
+    state: &WebState,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    state
+        .basic
+        .as_ref()
+        .ok_or_else(|| ApiError::new(ErrorCode::Internal, "token issuance is unavailable"))?
+        .acquire_pbkdf2_slot()
+        .await
+        .map_err(|e| match e {
+            arneb_protocol::SlotError::Overloaded => overloaded(),
+            arneb_protocol::SlotError::Closed => {
+                ApiError::new(ErrorCode::Internal, "token issuance is unavailable")
+            }
+        })
+}
 
 /// The `/api/v2` routes, nested at `/api/v2` by [`super::build_router`].
 pub fn routes() -> Router<WebState> {
@@ -486,21 +500,28 @@ pub(super) async fn issue_token_for(
     if !persistent {
         hints.push("the server keeps state in memory only: this token is lost when it restarts");
     }
-    let permit = ISSUE_PERMITS
-        .acquire()
-        .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal, "token issuance is unavailable"))?;
+    // Refuse what is already doomed (unknown user, token cap) before
+    // queueing for a PBKDF2 slot, so a retry loop at the cap never waits
+    // behind running derivations.
+    store.check_can_issue(&who.user).map_err(state_error)?;
+    // The slot comes from the Basic authenticator's limiter: one CPU bound
+    // for every PBKDF2 derivation the HTTP listeners start.
+    let permit = pbkdf2_slot(state).await?;
     // The permit moves into the blocking task, so it is held for as long as
     // PBKDF2 runs even if the client disconnects and this future is dropped.
     let (state, who) = (state.clone(), who.clone());
     let issued = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let parameters = serde_json::json!({"name": name, "expires_ms": expires_at_ms});
-        // Dropped (releasing a held change lock) once the entry is appended.
+        // The intent names the user (or nothing, for one's own token): the
+        // id is not known before the token is issued. Dropping `target`
+        // (releasing a held change lock) waits until the entry is appended.
+        let intent = target.audit_subject(None, parameters.clone());
         let issued = audited(
             &state,
             &who,
             "token.issue",
+            intent,
             || {
                 store
                     .issue_token(&user, name, expires_at_ms)
@@ -638,10 +659,12 @@ pub(super) async fn revoke_token_for(
     let (state, who) = (state.clone(), who.clone());
     tokio::task::spawn_blocking(move || {
         let user = target.user(&who).to_owned();
+        let intent = target.audit_subject(Some(&id), serde_json::json!({}));
         let revoked = audited(
             &state,
             &who,
             "token.revoke",
+            intent,
             || store.revoke_token(&user, &id).map_err(|e| target.error(e)),
             |_| target.audit_subject(Some(&id), serde_json::json!({})),
         );
@@ -899,6 +922,7 @@ pub(super) mod tests {
             admission: None,
             admission_changes: Default::default(),
             cordon_changes: Default::default(),
+            max_running_queries: 8,
             max_queued_queries: 8,
             memory_pool: Arc::new(arneb_common::memory_pool::GreedyMemoryPool::new(1 << 20)),
             memory_limit_bytes: None,
@@ -1348,9 +1372,13 @@ pub(super) mod tests {
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "no rules: allowed; {body}");
-        assert_eq!(body["action"], "query.cancel");
-        assert_eq!(body["result"]["state"], "cancelled");
+        // No rules: killing another user's query needs manage.
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "no rules: owner or manage; {body}"
+        );
+        assert_eq!(body["error"]["code"], "forbidden");
     }
 
     async fn issue(state: &WebState, auth: &str, body: Value) -> (StatusCode, Value) {
@@ -1362,6 +1390,103 @@ pub(super) mod tests {
             Some(body),
         )
         .await
+    }
+
+    /// Takes every PBKDF2 slot of the shared limiter.
+    async fn hold_all_pbkdf2_slots(state: &WebState) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let basic = state.basic.as_ref().unwrap();
+        let mut held = Vec::new();
+        for _ in 0..arneb_protocol::BasicAuthenticator::pbkdf2_slot_count() {
+            held.push(basic.acquire_pbkdf2_slot().await.unwrap());
+        }
+        held
+    }
+
+    /// Warms the Basic success cache for alice: a cold login would itself
+    /// need a limiter slot and mask what the test is after.
+    async fn warm_alice(state: &WebState) {
+        let (status, _) = call(
+            state,
+            Method::GET,
+            "/api/v2/whoami",
+            Some(&basic("alice", "secret")),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn issuance_waits_on_the_shared_pbkdf2_limiter() {
+        let state = web_state(true, None);
+        warm_alice(&state).await;
+        let held = hold_all_pbkdf2_slots(&state).await;
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { issue(&state, &basic("alice", "secret"), json!({})).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "authentication is cached, so only issuance can be waiting on a slot"
+        );
+        drop(held);
+        assert_eq!(task.await.unwrap().0, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn issuance_flood_is_bounded_and_answers_overloaded() {
+        let state = web_state(true, None);
+        warm_alice(&state).await;
+        let held = hold_all_pbkdf2_slots(&state).await;
+        let queued = arneb_protocol::BasicAuthenticator::max_queued_issuances();
+        let tasks: Vec<_> = (0..queued)
+            .map(|_| {
+                let state = state.clone();
+                tokio::spawn(
+                    async move { issue(&state, &basic("alice", "secret"), json!({})).await },
+                )
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            tasks.iter().all(|t| !t.is_finished()),
+            "within budget: waiting"
+        );
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            issue(&state, &basic("alice", "secret"), json!({})),
+        )
+        .await
+        .expect("an over-budget issuance must be refused at once");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "overloaded");
+        drop(held);
+        for t in tasks {
+            assert_eq!(t.await.unwrap().0, StatusCode::CREATED);
+        }
+    }
+
+    #[tokio::test]
+    async fn capped_user_is_refused_without_waiting_for_a_slot() {
+        let state = web_state(true, None);
+        let store = state.state.clone().unwrap();
+        for _ in 0..arneb_state::MAX_TOKENS_PER_USER {
+            store.issue_token("alice", None, None).unwrap();
+        }
+        warm_alice(&state).await;
+        let _held = hold_all_pbkdf2_slots(&state).await;
+        let capped = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            issue(&state, &basic("alice", "secret"), json!({})),
+        )
+        .await
+        .expect("a capped user must not wait for a PBKDF2 slot");
+        assert_eq!(capped.0, StatusCode::BAD_REQUEST);
+        assert!(capped.1["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("live tokens"));
     }
 
     #[tokio::test]
@@ -1940,9 +2065,10 @@ pub(super) mod tests {
     }
 
     /// A failed append leaves the audit log unwritable: issue a token (an
-    /// audited action) while appends fail, so later calls see it closed.
+    /// audited action) while completions fail, then keep every append
+    /// failing, so later calls see it closed.
     async fn close_the_audit_log(state: &WebState) {
-        state.audit.set_fail_appends(true);
+        state.audit.set_fail_completions(true);
         let (status, _) = call(
             state,
             Method::POST,
@@ -1953,6 +2079,8 @@ pub(super) mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
         assert!(!state.audit.is_writable());
+        state.audit.set_fail_completions(false);
+        state.audit.set_fail_appends(true);
     }
 
     #[tokio::test]

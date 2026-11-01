@@ -304,6 +304,7 @@ impl TaskManager {
             connector_registry: &self.connector_registry,
             puller: self.catalog_puller.as_ref(),
             pulled: false,
+            resolved: HashMap::new(),
         };
         sources.register(plan, ctx).await
     }
@@ -1220,6 +1221,9 @@ struct TaskSources<'a> {
     puller: Option<&'a (crate::catalogs::CatalogPuller, String)>,
     /// Whether this task already pulled the coordinator's catalogs.
     pulled: bool,
+    /// The connector each catalog resolved to, so every scan of one task
+    /// uses the same one even if the catalog changes mid-task.
+    resolved: HashMap<String, Arc<dyn arneb_connectors::ConnectorFactory>>,
 }
 
 impl TaskSources<'_> {
@@ -1253,9 +1257,25 @@ impl TaskSources<'_> {
         }
     }
 
-    /// The connector for `catalog`, pulling the coordinator's catalogs once
-    /// per task on a miss when a puller is set.
+    /// The connector for `catalog` (the one this task already resolved, so
+    /// all its scans share it), pulling the coordinator's catalogs once per
+    /// task on a miss when a puller is set.
     async fn connector(
+        &mut self,
+        catalog: &str,
+    ) -> Result<Option<Arc<dyn arneb_connectors::ConnectorFactory>>, String> {
+        if let Some(factory) = self.resolved.get(catalog) {
+            return Ok(Some(Arc::clone(factory)));
+        }
+        let found = self.lookup(catalog).await?;
+        if let Some(factory) = &found {
+            self.resolved
+                .insert(catalog.to_owned(), Arc::clone(factory));
+        }
+        Ok(found)
+    }
+
+    async fn lookup(
         &mut self,
         catalog: &str,
     ) -> Result<Option<Arc<dyn arneb_connectors::ConnectorFactory>>, String> {

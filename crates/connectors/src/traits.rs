@@ -70,9 +70,17 @@ pub trait ConnectorFactory: Send + Sync + Debug {
 /// `Arc<ConnectorRegistry>`; factories can be registered and removed at
 /// runtime through a shared reference. The lock is held only to clone or
 /// swap an `Arc`, so lookups stay cheap.
+///
+/// A catalog swap changes a connector and the matching catalog provider
+/// (held elsewhere, in a `CatalogManager`) together; [`swap`](Self::swap)
+/// and [`pinned`](Self::pinned) exclude each other, so a statement that
+/// pins both never sees one half-swapped.
 #[derive(Debug, Default)]
 pub struct ConnectorRegistry {
     factories: RwLock<HashMap<String, Arc<dyn ConnectorFactory>>>,
+    /// Written across a [`swap`](Self::swap), read across a
+    /// [`pinned`](Self::pinned) snapshot.
+    swaps: RwLock<()>,
 }
 
 impl ConnectorRegistry {
@@ -106,6 +114,36 @@ impl ConnectorRegistry {
             .get(name)
             .cloned()
     }
+
+    /// Runs `f`, which registers or removes connectors together with their
+    /// catalog providers, with every [`pinned`](Self::pinned) snapshot
+    /// excluded, so none sees the change half done.
+    pub fn swap<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _swap = self.swaps.write().unwrap_or_else(|p| p.into_inner());
+        f()
+    }
+
+    /// A frozen copy of the registered factories, taken together with what
+    /// `f` snapshots (such as the catalog providers) and never in the
+    /// middle of a [`swap`](Self::swap). A statement plans and executes
+    /// against the pair, so a catalog change while it runs does not give
+    /// it another connector than the provider it was planned with.
+    pub fn pinned<R>(&self, f: impl FnOnce() -> R) -> (ConnectorRegistry, R) {
+        let _swap = self.swaps.read().unwrap_or_else(|p| p.into_inner());
+        let pinned = f();
+        let factories = self
+            .factories
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        (
+            ConnectorRegistry {
+                factories: RwLock::new(factories),
+                swaps: RwLock::new(()),
+            },
+            pinned,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -129,6 +167,22 @@ mod tests {
         ) -> Result<Arc<dyn DataSource>, ConnectorError> {
             Err(ConnectorError::UnsupportedOperation("dummy".to_string()))
         }
+    }
+
+    #[test]
+    fn pinned_copy_keeps_the_factories_it_was_taken_with() {
+        let registry = ConnectorRegistry::new();
+        let old: Arc<dyn ConnectorFactory> = Arc::new(DummyFactory);
+        registry.register("c", Arc::clone(&old));
+        let (pinned, seen) = registry.pinned(|| 7);
+        assert_eq!(seen, 7);
+        registry.swap(|| {
+            registry.register("c", Arc::new(DummyFactory));
+            registry.register("d", Arc::new(DummyFactory));
+        });
+        assert!(Arc::ptr_eq(&pinned.get("c").unwrap(), &old));
+        assert!(pinned.get("d").is_none());
+        assert!(!Arc::ptr_eq(&registry.get("c").unwrap(), &old));
     }
 
     #[test]

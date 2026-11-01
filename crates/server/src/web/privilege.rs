@@ -34,7 +34,7 @@ pub struct Grant(());
 pub enum KillGrant {
     /// The caller owns the query.
     Owner,
-    /// A `queries` rule allows it, or there are no `queries` rules.
+    /// An explicit `queries` rule allows it.
     Rule,
     /// The caller has the manage privilege.
     Manage,
@@ -125,9 +125,13 @@ impl Authorizer {
 
     /// The kill rule for a query of `owner` (`None`: a query with no user,
     /// owner `""`), in this order: the owner may always kill (any auth
-    /// mode); otherwise `none` auth refuses; otherwise a `queries` rule
-    /// allowing `kill`, or no `queries` rules; otherwise manage; otherwise
-    /// `forbidden`.
+    /// mode); otherwise `none` auth refuses; otherwise an explicit `queries`
+    /// rule allowing `kill`; otherwise manage; otherwise `forbidden`.
+    ///
+    /// Unlike Trino's file-based ACL, a missing `queries` section (or no
+    /// rules file) grants no kill of another user's query: with a manage
+    /// layer (`admin_users`) in place, killing others is a manage action
+    /// unless the rules say otherwise.
     pub fn check_kill(&self, who: &Identity, owner: Option<&str>) -> Result<KillGrant, ApiError> {
         let owner = owner.unwrap_or_default();
         if who.user == owner {
@@ -139,7 +143,7 @@ impl Authorizer {
         let rules = self.rules.current();
         if rules
             .as_deref()
-            .is_none_or(|r| r.can_kill_query(&who.user, owner))
+            .is_some_and(|r| r.has_query_rules() && r.can_kill_query(&who.user, owner))
         {
             return Ok(KillGrant::Rule);
         }
@@ -275,11 +279,17 @@ mod tests {
             .check_kill(&who("alice", false), Some("bob"))
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::ManageRequiresAuth);
-        // 3. No rules, or no queries section: a rule-less allow.
-        let open = Authorizer::new(RulesHandle::default(), vec![], true);
+        // 3. No rules, or no queries section: only the owner or manage.
+        let open = Authorizer::new(RulesHandle::default(), vec!["root".into()], true);
+        let (c, _) = code(open.check_kill(&who("alice", true), Some("bob")));
+        assert_eq!(c, ErrorCode::Forbidden, "alice cannot kill bob's query");
+        assert!(open
+            .check_kill(&who("bob", true), Some("bob"))
+            .unwrap()
+            .is_owner());
         assert_eq!(
-            open.check_kill(&who("alice", true), Some("bob")).unwrap(),
-            KillGrant::Rule
+            open.check_kill(&who("root", true), Some("bob")).unwrap(),
+            KillGrant::Manage
         );
         // 3b. A rules file without a queries section behaves the same.
         let sys_only = Authorizer::new(
@@ -287,10 +297,16 @@ mod tests {
             vec![],
             true,
         );
+        let (c, _) = code(sys_only.check_kill(&who("alice", true), Some("bob")));
+        assert_eq!(c, ErrorCode::Forbidden);
+        // 3c. An explicit rule grants kill, also a catch-all one.
+        let all = Authorizer::new(
+            rules(r#"{"queries":[{"allow":["execute","view","kill"]}]}"#),
+            vec![],
+            true,
+        );
         assert_eq!(
-            sys_only
-                .check_kill(&who("alice", true), Some("bob"))
-                .unwrap(),
+            all.check_kill(&who("alice", true), Some("bob")).unwrap(),
             KillGrant::Rule
         );
         let r = rules(

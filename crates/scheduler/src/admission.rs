@@ -13,8 +13,14 @@
 //! later arrival can never overtake a queued query. A queued query whose
 //! future is dropped (client gone, timeout) leaves the queue, and a slot
 //! handed to it is passed on.
+//!
+//! While no cap is set (`max_running = 0`), admission takes a lock-free
+//! fast path: an atomic count of running queries, no mutex. A runtime
+//! change ([`AdmissionController::set_limits`]) flips it; queries admitted
+//! on the fast path count against a cap set later.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,14 +59,15 @@ struct State {
 }
 
 impl State {
-    fn has_room(&self) -> bool {
-        self.max_running == 0 || self.running < self.max_running
+    /// `fast` is the count of queries admitted on the lock-free path.
+    fn has_room(&self, fast: usize) -> bool {
+        self.max_running == 0 || self.running + fast < self.max_running
     }
 
     /// Grant waiters in FIFO order while the cap has room. A granted waiter
     /// counts as running from the hand-off on.
-    fn grant_waiters(&mut self) {
-        while self.has_room() {
+    fn grant_waiters(&mut self, fast: usize) {
+        while self.has_room(fast) {
             let Some(waiter) = self.queue.pop_front() else {
                 return;
             };
@@ -70,9 +77,9 @@ impl State {
         }
     }
 
-    fn snapshot(&self) -> AdmissionSnapshot {
+    fn snapshot(&self, fast: usize) -> AdmissionSnapshot {
         AdmissionSnapshot {
-            running: self.running,
+            running: self.running + fast,
             queued: self.queue.len(),
             max_running: self.max_running,
             max_queued: self.max_queued,
@@ -82,6 +89,11 @@ impl State {
 
 struct Shared {
     state: Mutex<State>,
+    /// `max_running == 0`: admit on the lock-free path. Written only under
+    /// `state`'s lock.
+    unlimited: AtomicBool,
+    /// Queries admitted on the lock-free path and still running.
+    fast_running: AtomicUsize,
 }
 
 impl Shared {
@@ -89,12 +101,44 @@ impl Shared {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn fast(&self) -> usize {
+        self.fast_running.load(Ordering::SeqCst)
+    }
+
     /// Return a freed slot and hand it to the first waiter still listening,
     /// but only while fewer than the (possibly lowered) cap run.
     fn release(&self) {
         let mut state = self.lock();
         state.running = state.running.saturating_sub(1);
-        state.grant_waiters();
+        state.grant_waiters(self.fast());
+    }
+
+    /// Return a slot taken on the lock-free path. Still unlimited: nothing
+    /// can be queued, so no lock. A cap set meanwhile counted this slot
+    /// (`set_limits` flips `unlimited` before it reads `fast_running`), so
+    /// hand the slot to the queue under the lock.
+    fn release_fast(&self) {
+        self.fast_running.fetch_sub(1, Ordering::SeqCst);
+        if !self.unlimited.load(Ordering::SeqCst) {
+            let mut state = self.lock();
+            state.grant_waiters(self.fast());
+        }
+    }
+
+    /// The lock-free admission while no cap is set; `false` to take the
+    /// locked path.
+    fn try_admit_fast(&self) -> bool {
+        if !self.unlimited.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.fast_running.fetch_add(1, Ordering::SeqCst);
+        if self.unlimited.load(Ordering::SeqCst) {
+            return true;
+        }
+        // A cap was set in between, and may have counted this slot: give
+        // it back like a finished query.
+        self.release_fast();
+        false
     }
 }
 
@@ -116,6 +160,8 @@ impl AdmissionController {
                     max_running,
                     max_queued,
                 }),
+                unlimited: AtomicBool::new(max_running == 0),
+                fast_running: AtomicUsize::new(0),
             }),
         }
     }
@@ -132,20 +178,25 @@ impl AdmissionController {
     /// the one case that logs it: a query admitted at once costs no
     /// allocation for its label.
     pub fn admit_with(&self, label: impl FnOnce() -> String) -> Result<Pending, AdmissionError> {
+        let admitted = |fast| Pending {
+            shared: Arc::clone(&self.shared),
+            inner: PendingInner::Admitted { fast },
+            label: String::new(),
+            since: Instant::now(),
+        };
+        if self.shared.try_admit_fast() {
+            return Ok(admitted(true));
+        }
         let mut state = self.shared.lock();
+        let fast = self.shared.fast();
         let unlimited = state.max_running == 0;
-        if unlimited || (state.running < state.max_running && state.queue.is_empty()) {
+        if unlimited || (state.running + fast < state.max_running && state.queue.is_empty()) {
             state.running += 1;
-            return Ok(Pending {
-                shared: Arc::clone(&self.shared),
-                inner: PendingInner::Admitted,
-                label: String::new(),
-                since: Instant::now(),
-            });
+            return Ok(admitted(false));
         }
         if state.queue.len() >= state.max_queued {
             return Err(AdmissionError::QueueFull {
-                running: state.running,
+                running: state.running + fast,
                 queued: state.queue.len(),
             });
         }
@@ -159,7 +210,7 @@ impl AdmissionController {
             target: "arneb::admission",
             query = %label,
             position,
-            running = state.running,
+            running = state.running + fast,
             max_running = state.max_running,
             "query queued"
         );
@@ -177,7 +228,8 @@ impl AdmissionController {
 
     /// Current counters and limits.
     pub fn snapshot(&self) -> AdmissionSnapshot {
-        self.shared.lock().snapshot()
+        let state = self.shared.lock();
+        state.snapshot(self.shared.fast())
     }
 
     /// Change the limits at runtime (manage-api D9) and return the counters
@@ -193,8 +245,14 @@ impl AdmissionController {
         let mut state = self.shared.lock();
         state.max_running = max_running;
         state.max_queued = max_queued;
-        state.grant_waiters();
-        state.snapshot()
+        // Flipped before `fast_running` is read below, so a lock-free
+        // admission either is counted or falls back to this lock.
+        self.shared
+            .unlimited
+            .store(max_running == 0, Ordering::SeqCst);
+        let fast = self.shared.fast();
+        state.grant_waiters(fast);
+        state.snapshot(self.shared.fast())
     }
 
     /// Log a DEBUG snapshot on `arneb::admission` every `every` while any
@@ -222,7 +280,8 @@ impl AdmissionController {
 }
 
 enum PendingInner {
-    Admitted,
+    /// `fast`: on the lock-free path.
+    Admitted { fast: bool },
     Queued {
         id: u64,
         grant: oneshot::Receiver<()>,
@@ -275,6 +334,7 @@ impl Pending {
     /// Wait for a slot. Cancel-safe: dropping this future leaves the queue
     /// (and passes on a slot granted in the meantime).
     pub async fn wait(mut self) -> AdmissionPermit {
+        let fast = matches!(self.inner, PendingInner::Admitted { fast: true });
         if let PendingInner::Queued { grant, .. } = &mut self.inner {
             // The sender is only dropped together with the controller.
             let _ = grant.await;
@@ -288,6 +348,7 @@ impl Pending {
         self.inner = PendingInner::Done;
         AdmissionPermit {
             shared: Arc::clone(&self.shared),
+            fast,
         }
     }
 }
@@ -297,7 +358,8 @@ impl Drop for Pending {
         match std::mem::replace(&mut self.inner, PendingInner::Done) {
             PendingInner::Done => {}
             // Admitted but never waited on: give the slot back.
-            PendingInner::Admitted => self.shared.release(),
+            PendingInner::Admitted { fast: true } => self.shared.release_fast(),
+            PendingInner::Admitted { fast: false } => self.shared.release(),
             PendingInner::Queued { id, mut grant, .. } => {
                 let still_queued = {
                     let mut state = self.shared.lock();
@@ -347,11 +409,17 @@ impl QueueTicket {
 /// A running query's slot; dropping it admits the next queued query.
 pub struct AdmissionPermit {
     shared: Arc<Shared>,
+    /// Taken on the lock-free path.
+    fast: bool,
 }
 
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
-        self.shared.release();
+        if self.fast {
+            self.shared.release_fast();
+        } else {
+            self.shared.release();
+        }
     }
 }
 
@@ -381,6 +449,57 @@ mod tests {
         let unlimited = AdmissionController::new(0, 0);
         let _a = unlimited.admit_with(label).unwrap();
         assert_eq!(built.get(), 1);
+    }
+
+    /// While no cap is set, admission never takes the controller lock.
+    #[tokio::test]
+    async fn unlimited_admission_is_lock_free() {
+        let c = AdmissionController::new(0, 0);
+        let held = c.shared.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let c = c.clone();
+            move || {
+                let pending = c.admit("q").unwrap();
+                let fast = matches!(pending.inner, PendingInner::Admitted { fast: true });
+                drop(pending);
+                tx.send(fast).unwrap();
+            }
+        });
+        let fast = rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        assert_eq!(fast, Ok(true), "admission waited for the lock");
+        assert_eq!(c.snapshot().running, 0);
+    }
+
+    /// Queries admitted on the lock-free path count against a cap set
+    /// later, and their slots go to the queue.
+    #[tokio::test]
+    async fn a_cap_set_later_counts_lock_free_queries() {
+        let c = AdmissionController::new(0, 10);
+        let a = admitted(&c).await;
+        let b = admitted(&c).await;
+        assert_eq!(c.snapshot().running, 2);
+        let snap = c.set_limits(1, 10);
+        assert_eq!((snap.running, snap.max_running), (2, 1));
+        let third = c.admit("third").unwrap();
+        assert_eq!(third.queue_position(), Some(1));
+        let ticket = third.ticket().unwrap();
+        drop(a);
+        assert_eq!(ticket.position(), Some(1), "2 - 1 still fills the cap of 1");
+        drop(b);
+        let third = tokio::time::timeout(Duration::from_secs(5), third.wait())
+            .await
+            .expect("the freed lock-free slot admitted the queued query");
+        assert_eq!(c.snapshot().running, 1);
+        drop(third);
+        // Back to unlimited: lock-free again.
+        c.set_limits(0, 10);
+        let p = c.admit("q").unwrap();
+        assert!(matches!(p.inner, PendingInner::Admitted { fast: true }));
+        assert_eq!(c.snapshot().running, 1);
+        drop(p);
+        assert_eq!(c.snapshot().running, 0);
     }
 
     #[tokio::test]

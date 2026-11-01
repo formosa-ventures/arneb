@@ -11,12 +11,16 @@
 //!   A catalog that fails to build is still stored (it came from the config)
 //!   and reported in the `warning`, like startup's skip-with-WARN.
 //! - Under `WebState::config_changes` it computes the plan, runs the lockout
-//!   guard (D3) against the config's rules, then persists and swaps each
-//!   object in turn: users (`seed_users(.., true)`, tombstones cleared, the
+//!   guard (D3) against the config's rules, then (after `run_manage` has
+//!   synced the `pending` intent entry, manage-api D6) persists users, rules,
+//!   settings and catalogs in one state write ([`StateStore::reseed`]), so
+//!   a failure or crash never leaves the state half re-seeded. Only then
+//!   does it swap each object in memory: users (tombstones cleared, the
 //!   cached logins and Web sessions of every updated or removed user end),
-//!   rules, settings (cleared; the config's admission limits and slow-query
-//!   threshold apply) and catalogs (installed at the store's generation and
-//!   pushed to every live worker, 5 s each).
+//!   rules, settings (the config's admission limits and slow-query threshold
+//!   apply) and catalogs (installed at the store's generation and pushed to
+//!   every live worker, 5 s each). The usual `state.reseed` entry with the
+//!   result follows.
 //! - Tokens, cordons and the audit log are left alone, except the tokens
 //!   user seeding revokes. Responses and audit entries carry names only.
 
@@ -37,8 +41,8 @@ use super::auth::Identity;
 use super::catalogs::{push_to_workers, push_warnings, WorkerSync};
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    config_change_lock, run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome,
-    Preview,
+    config_change_lock, guard_lockout, live_catalogs, run_manage, state_store, Applied, ChangeLock,
+    DryRun, ManageAction, ManageOutcome, Preview,
 };
 use super::privilege::Layer;
 use super::v2::bad_query;
@@ -153,45 +157,12 @@ fn load_seed(path: Option<&std::path::Path>) -> Result<Seed, ApiError> {
     })
 }
 
-fn store(state: &WebState) -> Result<Arc<StateStore>, ApiError> {
-    state.state.clone().ok_or_else(|| {
-        tracing::error!("password auth is configured without a state store");
-        ApiError::new(ErrorCode::Internal, "the state store is unavailable")
-    })
-}
-
-fn live(state: &WebState) -> Result<Arc<LiveCatalogs>, ApiError> {
-    state.catalogs.clone().ok_or_else(|| {
-        tracing::error!("the re-seed route is served without live catalogs");
-        ApiError::new(ErrorCode::Internal, "the live catalogs are unavailable")
-    })
-}
-
 /// The installed specs as JSON, by name.
 fn installed(live: &LiveCatalogs) -> BTreeMap<String, serde_json::Value> {
     live.specs()
         .iter()
         .filter_map(|s| Some((s.name.clone(), serde_json::to_value(s).ok()?)))
         .collect()
-}
-
-/// The lockout guard (D3): the config's rules must leave `who` manage.
-fn guard_lockout(
-    state: &WebState,
-    who: &Identity,
-    rules: Option<&AccessRules>,
-) -> Result<(), ApiError> {
-    if state.authorizer.would_manage(who, rules) {
-        return Ok(());
-    }
-    Err(ApiError::new(
-        ErrorCode::Conflict,
-        "this re-seed would remove your own manage privilege",
-    )
-    .with_hint(
-        "keep a system_information write rule for yourself, or ask a user in \
-         [access_control] admin_users",
-    ))
 }
 
 /// Re-seeds the state from the config file for `who`, who needs manage
@@ -202,7 +173,7 @@ pub(super) async fn reseed_for(
     dry_run: bool,
 ) -> Result<ManageOutcome<ReseedReport>, ApiError> {
     let grant = state.authorizer.check(who, Layer::Manage)?;
-    let (store, live) = (store(state)?, live(state)?);
+    let (store, live) = (state_store(state)?, live_catalogs(state)?);
     let path = state.config_path.clone();
     let seed = tokio::task::spawn_blocking(move || load_seed(path.as_deref()))
         .await
@@ -210,7 +181,15 @@ pub(super) async fn reseed_for(
             tracing::error!(error = %e, "config reload task failed");
             ApiError::new(ErrorCode::Internal, "the config file could not be loaded")
         })??;
-    guard_lockout(state, who, seed.rules.as_ref().map(|(_, r)| r.as_ref()))?;
+    guard_lockout(
+        state,
+        who,
+        seed.rules.as_ref().map(|(_, r)| r.as_ref()),
+        "re-seed",
+    )?;
+    for (spec, _) in &seed.catalogs {
+        super::catalogs::check_exposure(&live, spec)?;
+    }
     // D10: build what differs from the live set before taking the lock.
     let now = installed(&live);
     let builds = seed
@@ -238,7 +217,7 @@ pub(super) async fn reseed_for(
         (Some(lock), Some(admission_lock))
     };
     let action = Reseed {
-        who: who.user.clone(),
+        who: who.clone(),
         seed,
         built,
         store,
@@ -252,7 +231,7 @@ pub(super) async fn reseed_for(
 }
 
 struct Reseed {
-    who: String,
+    who: Identity,
     seed: Seed,
     /// The builds made before the lock, by catalog name.
     built: BTreeMap<String, Result<BuiltCatalog, String>>,
@@ -334,16 +313,11 @@ impl Plan {
     }
 }
 
-fn persist_failed(what: &str, done: &[&str], e: arneb_state::StateError) -> ApiError {
-    tracing::error!(error = %e, what, ?done, "cannot persist the re-seed");
-    let done = if done.is_empty() {
-        "nothing changed".to_owned()
-    } else {
-        format!("{} were already re-seeded", done.join(", "))
-    };
+fn persist_failed(e: arneb_state::StateError) -> ApiError {
+    tracing::error!(error = %e, "cannot persist the re-seed");
     ApiError::new(
         ErrorCode::Internal,
-        format!("the {what} could not be saved to the state store; {done}"),
+        "the re-seed could not be saved to the state store; nothing changed",
     )
     .with_hint("retry the re-seed")
 }
@@ -440,12 +414,12 @@ impl Reseed {
             removed: seeded.removed,
             tombstones_cleared: self.store.tombstones(),
         };
-        if users.removed.contains(&self.who) {
+        if users.removed.contains(&self.who.user) {
             return Err(ApiError::new(
                 ErrorCode::Conflict,
                 format!(
                     "this re-seed would delete your own user {:?}: it is not in the config file",
-                    self.who
+                    self.who.user
                 ),
             )
             .with_hint(
@@ -453,7 +427,7 @@ impl Reseed {
                  manager",
             ));
         }
-        if users.updated.contains(&self.who) {
+        if users.updated.contains(&self.who.user) {
             warnings.push(
                 "your password becomes the config file's: your API tokens are revoked and \
                  your Web sessions end"
@@ -514,8 +488,9 @@ impl ManageAction for Reseed {
         self.admission_lock.take()
     }
 
-    /// Persists and swaps each object in turn (users, rules, settings,
-    /// catalogs), then pushes the catalogs to the workers.
+    /// Persists users, rules, settings and catalogs in one write (the
+    /// intent entry is already synced by `run_manage`), swaps each in
+    /// memory, then pushes the catalogs to the workers.
     fn apply(self, state: &WebState) -> Result<Applied<ReseedReport>, ApiError> {
         let plan = self.plan()?;
         let mut preview = Self::preview_of(&plan);
@@ -540,48 +515,34 @@ impl ManageAction for Reseed {
                 },
             });
         }
-        let mut done = Vec::new();
+        // One write for users, rules, settings and catalogs; nothing is
+        // swapped in memory unless it succeeded.
+        let rules_text = self.seed.rules.as_ref().map(|(text, _)| text.as_str());
+        let outcome = self
+            .store
+            .reseed(&self.seed.users, rules_text, &self.config_specs())
+            .map_err(persist_failed)?;
+        let seeded = outcome.users;
+        let generation = outcome.catalog_generation;
 
         // Users: the store is the live credential source.
-        let seeded = self
-            .store
-            .seed_users(&self.seed.users, true)
-            .map_err(|e| persist_failed("users", &done, e))?;
         for user in seeded.updated.iter().chain(&seeded.removed) {
             if let Some(basic) = &state.basic {
                 basic.forget_user(user);
             }
             state.sessions.end_user(user);
         }
-        done.push("users");
-
         // Rules.
-        let rules_text = self.seed.rules.as_ref().map(|(text, _)| text.as_str());
-        self.store
-            .seed_rules(rules_text, true)
-            .map_err(|e| persist_failed("access rules", &done, e))?;
         self.handle
             .replace(self.seed.rules.as_ref().map(|(_, r)| Arc::clone(r)));
-        done.push("access rules");
-
         // Settings: cleared, so the config values apply.
-        self.store
-            .clear_settings()
-            .map_err(|e| persist_failed("settings", &done, e))?;
         if let Some(controller) = &self.admission {
             super::admission::apply_config_limits(controller, self.seed.admission);
         }
         arneb_common::metrics::set_slow_query_threshold(slow_query_threshold_from_ms(
             self.seed.slow_query_threshold_ms,
         ));
-        done.push("settings");
-
-        // Catalogs: stored as the config's, then installed at the store's
-        // generation and pushed.
-        self.store
-            .seed_catalogs(&self.config_specs(), true)
-            .map_err(|e| persist_failed("catalogs", &done, e))?;
-        let generation = self.store.catalogs().0;
+        // Catalogs: installed at the store's generation, then pushed.
         let wanted: Vec<&str> = self
             .seed
             .catalogs
@@ -917,6 +878,83 @@ mod tests {
         arneb_common::metrics::set_slow_query_threshold(slow_query_threshold_from_ms(10_000));
     }
 
+    /// The re-seed is one state write after an intent entry: a failed
+    /// write leaves the stored and live state exactly as they were, and the
+    /// audit log closes the intent as the failure.
+    #[tokio::test]
+    async fn a_failed_reseed_write_changes_nothing() {
+        let _g = THRESHOLD_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = write_config(tmp.path(), Some(CONFIG_RULES));
+        let state = node(&config, &["root"]).await;
+        change_at_runtime(&state);
+        let store = state.state.clone().unwrap();
+        let live = state.catalogs.clone().unwrap();
+        let before = observe(&store);
+        let generation = store.catalogs().0;
+        let live_before: Vec<String> = live.specs().into_iter().map(|s| s.name).collect();
+        let rules_before = state.rules.current().unwrap().section_sizes();
+
+        store.set_fail_writes(true);
+        let (status, body) = reseed(&state, ("root", "rootpw"), false).await;
+        store.set_fail_writes(false);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nothing changed"));
+        assert_eq!(observe(&store), before);
+        assert_eq!(store.catalogs().0, generation);
+        let live_after: Vec<String> = live.specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(live_after, live_before, "no catalog swapped");
+        assert_eq!(live.generation(), generation);
+        assert_eq!(state.rules.current().unwrap().section_sizes(), rules_before);
+        assert_eq!(super::super::settings::current_threshold_ms(), 123);
+
+        // The intent (synced before the write) is closed as the failure.
+        let audit = audit_actions(&state);
+        assert_eq!(audit.len(), 1, "{audit:?}");
+        assert_eq!(audit[0].0, "state.reseed");
+        assert_eq!(audit[0].1["catalogs"]["removed"], json!(["rt"]));
+        assert!(
+            audit[0].1.get("effect").is_none(),
+            "the failed run has no effect"
+        );
+    }
+
+    /// Without a `[cluster] secret` a re-seed that would serve a catalog
+    /// secret over Flight is refused, like a catalog create.
+    #[tokio::test]
+    async fn reseed_refuses_secrets_without_a_cluster_secret() {
+        let _g = THRESHOLD_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = write_config(tmp.path(), Some(CONFIG_RULES));
+        let state = node(&config, &["root"]).await;
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(
+            "[[catalogs]]\nname = \"pg\"\ntype = \"postgresql\"\n\
+             connection_url = \"postgresql://u@127.0.0.1:1/db\"\npassword = \"pg-secret-Qw1\"\n",
+        );
+        std::fs::write(&config, text).unwrap();
+        state
+            .catalogs
+            .as_ref()
+            .unwrap()
+            .set_unauthenticated_flight(true);
+        let store = state.state.clone().unwrap();
+        let before = observe(&store);
+        for dry_run in [true, false] {
+            let (status, body) = reseed(&state, ("root", "rootpw"), dry_run).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("[cluster] secret"));
+            assert!(!body.to_string().contains("pg-secret-Qw1"));
+        }
+        assert_eq!(observe(&store), before);
+    }
+
     #[tokio::test]
     async fn reseed_restores_config() {
         let _g = THRESHOLD_TEST_LOCK.lock().await;
@@ -1001,6 +1039,7 @@ mod tests {
         assert_eq!(state.sessions.resolve(&kept).as_deref(), Some("alice"));
         assert_eq!(state.sessions.resolve(&ended), None);
 
+        // The completion replaces the intent run_manage synced first.
         let audit = audit_actions(&state);
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, "state.reseed");

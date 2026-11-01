@@ -52,7 +52,7 @@ use arneb_scheduler::{QueryState as TrackerState, QueryTracker};
 use crate::auth::{AuthConfigError, CredentialSource};
 use crate::handler::DistributedExecutor;
 use auth::AuthUser;
-pub use auth::{BasicAuthenticator, BasicVerdict};
+pub use auth::{BasicAuthenticator, BasicVerdict, SlotError};
 use engine::{Engine, QueryOutput};
 use error::TrinoError;
 use session::{ClientSession, HeaderFamily};

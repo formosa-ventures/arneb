@@ -27,7 +27,7 @@
 //!   once.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,10 @@ const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
 /// queue: enough to absorb a burst of legitimate first polls, small enough
 /// that a flood is rejected (`503`) instead of delaying everyone.
 const MAX_QUEUED_VERIFICATIONS: usize = 64;
+/// Token issuances allowed to wait for a PBKDF2 slot (a budget separate from
+/// the per-listener verification queues); past that issuance is refused as
+/// overloaded, so an issue flood cannot queue ahead of Basic logins.
+const MAX_QUEUED_ISSUANCES: usize = 16;
 /// `Retry-After` (seconds) on the `503` returned when the queue is full.
 const OVERLOADED_RETRY_AFTER_SECS: &str = "1";
 
@@ -95,6 +99,17 @@ pub struct BasicAuthenticator {
     limiter: Arc<Semaphore>,
     /// Single-flight map; its size bounds the verification queue.
     in_flight: Arc<Mutex<InFlight>>,
+    /// Issuances waiting for a slot via [`Self::acquire_pbkdf2_slot`].
+    slot_waiters: Arc<AtomicUsize>,
+}
+
+/// Why [`BasicAuthenticator::acquire_pbkdf2_slot`] gave no slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotError {
+    /// The issuance wait queue is full; the caller should retry later.
+    Overloaded,
+    /// The limiter is closed.
+    Closed,
 }
 
 /// One request's membership in an in-flight verification. On drop it
@@ -136,16 +151,47 @@ impl BasicAuthenticator {
     pub fn sibling(&self) -> Self {
         Self {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            slot_waiters: Arc::new(AtomicUsize::new(0)),
             ..self.clone()
         }
     }
 
     /// Takes one PBKDF2 slot from the shared limiter, for other work that
     /// derives a PBKDF2 key on this process's behalf (API token issuance).
+    /// At most [`MAX_QUEUED_ISSUANCES`] callers wait at once (a budget apart
+    /// from the verification queue); more get [`SlotError::Overloaded`].
     /// Move the permit into the blocking task so the slot is held for as
-    /// long as the derivation runs. `None` only if the limiter is closed.
-    pub async fn acquire_pbkdf2_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        Arc::clone(&self.limiter).acquire_owned().await.ok()
+    /// long as the derivation runs.
+    pub async fn acquire_pbkdf2_slot(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, SlotError> {
+        struct Waiting<'a>(&'a AtomicUsize);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        if self.slot_waiters.fetch_add(1, Ordering::Relaxed) >= MAX_QUEUED_ISSUANCES {
+            self.slot_waiters.fetch_sub(1, Ordering::Relaxed);
+            return Err(SlotError::Overloaded);
+        }
+        let _waiting = Waiting(&self.slot_waiters);
+        Arc::clone(&self.limiter)
+            .acquire_owned()
+            .await
+            .map_err(|_| SlotError::Closed)
+    }
+
+    /// Size of the PBKDF2 limiter; test hook.
+    #[doc(hidden)]
+    pub fn pbkdf2_slot_count() -> usize {
+        MAX_CONCURRENT_VERIFICATIONS
+    }
+
+    /// Issuance wait-queue bound; test hook.
+    #[doc(hidden)]
+    pub fn max_queued_issuances() -> usize {
+        MAX_QUEUED_ISSUANCES
     }
 
     /// Like [`BasicAuthenticator::new`], counting PBKDF2 verifications in
@@ -163,6 +209,7 @@ impl BasicAuthenticator {
             verifications,
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_VERIFICATIONS)),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            slot_waiters: Arc::new(AtomicUsize::new(0)),
         })
     }
 

@@ -16,7 +16,7 @@ Registered workers (Web UI API, port {{ .Values.coordinator.service.ports.web }}
   curl -s localhost:6432/api/v1/cluster/workers
 {{- end }}
 
-Upgrading an existing release: [[auth.users]] still follow the config on every rollout; a changed
+Upgrading an existing release: with existingConfigSecret and password auth, set auth.password=true to see the token flow here. [[auth.users]] still follow the config on every rollout; a changed
 password_hash or a removed user revokes that user's API tokens. persistence.enabled defaults to
 true; without a default StorageClass set storageClass/existingClaim, or disable it.
 

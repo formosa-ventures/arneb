@@ -18,7 +18,7 @@ pub use auth::{
 };
 pub use server::{ProtocolConfig, ProtocolServer};
 pub use tls::{PgwireTls, PgwireTlsMode, ServerTls, TlsConfigError};
-pub use trino::{BasicAuthenticator, BasicVerdict, TrinoConfig, TrinoServer};
+pub use trino::{BasicAuthenticator, BasicVerdict, SlotError, TrinoConfig, TrinoServer};
 
 // Re-export the distributed executor trait for server crate to implement
 pub use handler::DistributedExecutor;

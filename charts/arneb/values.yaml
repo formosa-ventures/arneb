@@ -25,6 +25,8 @@ auth:
   # Set to true when the config sets [auth] type = "password". It only
   # changes the post-install notes (they show the token flow instead of an
   # unauthenticated curl); the server reads its auth from the config.
+  # With existingConfigSecret the chart cannot read the config, so set this
+  # yourself.
   password: false
 
 # Shared secret every node presents on cluster RPC (ARNEB_CLUSTER_SECRET).

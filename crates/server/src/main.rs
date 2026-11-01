@@ -1097,8 +1097,35 @@ async fn run() -> Result<()> {
                 if origins.is_empty() { "none".to_owned() } else { origins.join(",") }
             },
             default_page_bytes = config.mcp.default_page_bytes,
+            oauth = if config.oauth.enabled() { "enabled" } else { "disabled" },
             "mcp effective settings ([mcp] / ARNEB_MCP_*)"
         );
+        if config.oauth.enabled() {
+            let o = oauth::OAuthSettings::try_from(&config.oauth)
+                .context("invalid [oauth] configuration")?;
+            tracing::info!(
+                target: "arneb::config",
+                oauth = "enabled",
+                issuer = %o.issuer,
+                resource = %o.resource,
+                audience = %o.audience,
+                user_claim = %o.user_claim,
+                jwks = %o.jwks_uri.as_deref().unwrap_or("discovered"),
+                required_scopes = %o.required_scopes.join(" "),
+                leeway_secs = o.leeway.as_secs(),
+                jwks_cache_secs = o.jwks_cache.as_secs(),
+                jwks_min_refresh_secs = o.jwks_min_refresh.as_secs(),
+                "oauth effective settings ([oauth] / ARNEB_OAUTH_*)"
+            );
+            if o.user_claim != "sub" {
+                tracing::warn!(
+                    target: "arneb::config",
+                    user_claim = %o.user_claim,
+                    "[oauth] user_claim is not `sub`: the claim must not be editable by users \
+                     at the identity provider, or a user could take over another Arneb user"
+                );
+            }
+        }
         // runtime-config D1/D9: a threshold stored at runtime wins.
         let slow_query = config::resolve_slow_query_threshold(
             config.observability.slow_query_threshold_ms,
@@ -1244,6 +1271,19 @@ async fn run() -> Result<()> {
     }
 
     // 10. Set up Web UI (coordinator + standalone only)
+    // OAuth for `/mcp`: coordinator/standalone only (workers ignore
+    // `[oauth]`); keys are fetched in the background so startup never
+    // waits on the IdP.
+    let oauth_validator = if serves_clients && config.oauth.enabled() {
+        let settings = oauth::OAuthSettings::try_from(&config.oauth)
+            .context("invalid [oauth] configuration")?;
+        let validator = Arc::new(oauth::OAuthValidator::new(settings));
+        let warm = validator.clone();
+        tokio::spawn(async move { warm.warm().await });
+        Some(validator)
+    } else {
+        None
+    };
     let web_state = web::WebState {
         query_tracker: query_tracker.clone(),
         node_registry: node_registry.clone(),
@@ -1271,8 +1311,7 @@ async fn run() -> Result<()> {
         authorizer,
         metrics_auth: config.web.metrics_auth,
         sessions: web::SessionStore::new(),
-        // Wired to the real validator by the OAuth middleware task.
-        oauth: None,
+        oauth: oauth_validator,
         mcp: (serves_clients && agent_service.is_some() && config.mcp.enabled)
             .then(|| web::mcp::McpSettings::from(&config.mcp)),
         agent: agent_service,

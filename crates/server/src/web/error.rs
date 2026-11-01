@@ -58,8 +58,6 @@ pub enum ErrorCode {
     AuditUnavailable,
     /// The OAuth issuer's signing keys cannot be fetched, so a bearer JWT
     /// cannot be decided (503, `Retry-After: 5`).
-    // Constructed by the `/mcp` OAuth middleware (H6 Task 4).
-    #[allow(dead_code)]
     AuthProviderUnavailable,
     /// The change conflicts with the current state, such as one that would
     /// remove the caller's own manage privilege (409).

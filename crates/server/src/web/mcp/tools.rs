@@ -23,7 +23,6 @@ use crate::web::admission::{self, AdmissionUpdate};
 use crate::web::agent::{service, wait};
 use crate::web::api::{self, BoundedParams, BoundedQuery};
 use crate::web::audit::{self, AuditParams};
-use crate::web::auth::AuthVia;
 use crate::web::error::{ApiError, ErrorCode};
 use crate::web::privilege::Layer;
 use crate::web::v2;
@@ -503,7 +502,7 @@ impl ArnebMcp {
         let who = identity(&ctx)?;
         ok(&serde_json::json!({
             "user": who.user,
-            "via": via_name(who.via),
+            "via": who.via.as_str(),
             "version": env!("CARGO_PKG_VERSION"),
             "role": self.state.role,
             "auth": if self.state.credentials.is_some() { "password" } else { "none" },
@@ -1505,15 +1504,6 @@ impl ArnebMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let who = identity(&ctx)?;
         respond(reseed::reseed_for(&self.state, &who, a.dry_run.unwrap_or(false)).await)
-    }
-}
-
-fn via_name(via: AuthVia) -> &'static str {
-    match via {
-        AuthVia::Token => "token",
-        AuthVia::Session => "session",
-        AuthVia::Basic => "basic",
-        AuthVia::Unauthenticated => "unauthenticated",
     }
 }
 

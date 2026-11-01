@@ -11,9 +11,6 @@
 //! Tokens are never logged; a rejection is at most its reason code, on the
 //! `arneb::oauth` target at DEBUG.
 
-// Consumed by the Web layer (H6 Task 4); until then only the tests use it.
-#![allow(dead_code)]
-
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -696,11 +693,6 @@ pub(crate) mod test_idp {
             let mut h = Header::new(self.alg);
             h.kid = Some(self.kid.clone());
             jsonwebtoken::encode(&h, claims, &self.enc).unwrap()
-        }
-
-        /// Sign with a header of the caller's choosing.
-        pub fn sign_with(&self, header: Header, claims: &serde_json::Value) -> String {
-            jsonwebtoken::encode(&header, claims, &self.enc).unwrap()
         }
     }
 

@@ -216,6 +216,11 @@ impl StateStore {
         })
     }
 
+    /// Whether the state user `name` exists.
+    pub fn user_exists(&self, name: &str) -> bool {
+        self.snapshot().users.iter().any(|u| u.name == name)
+    }
+
     /// Every user, in name order, with their live token count.
     pub fn list_users(&self) -> Vec<UserInfo> {
         let data = self.snapshot();

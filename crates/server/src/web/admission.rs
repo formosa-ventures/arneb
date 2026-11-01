@@ -594,10 +594,19 @@ mod tests {
             state.admission_changes.try_lock().is_err(),
             "the lock is held until the append"
         );
-        assert!(audited_running(&state).is_empty());
+        // Only the intent, written before the apply.
+        assert_eq!(
+            crate::web::manage::test_hooks::outcomes(&state),
+            ["\"pending\""]
+        );
         release.send(()).unwrap();
         let _next = state.admission_changes.lock().await;
         assert_eq!(audited_running(&state).len(), 1);
+        assert_eq!(
+            crate::web::manage::test_hooks::outcomes(&state),
+            ["\"ok\""],
+            "the completion replaced the intent"
+        );
     }
 
     #[tokio::test]

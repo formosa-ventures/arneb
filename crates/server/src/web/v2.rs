@@ -388,10 +388,16 @@ pub(super) async fn issue_token_for(
     let issued = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let parameters = serde_json::json!({"name": name, "expires_ms": expires_at_ms});
+        let intent = AuditSubject {
+            // The id is not known before the token is issued.
+            target: String::new(),
+            parameters: parameters.clone(),
+        };
         audited(
             &state,
             &who,
             "token.issue",
+            intent,
             || {
                 store
                     .issue_token(&user, name, expires_at_ms)
@@ -528,10 +534,15 @@ pub(super) async fn revoke_token_for(
     }
     let (state, who) = (state.clone(), who.clone());
     tokio::task::spawn_blocking(move || {
+        let intent = AuditSubject {
+            target: id.clone(),
+            parameters: serde_json::json!({}),
+        };
         audited(
             &state,
             &who,
             "token.revoke",
+            intent,
             || store.revoke_token(&who.user, &id).map_err(state_error),
             |_| AuditSubject {
                 target: id.clone(),
@@ -1822,9 +1833,10 @@ pub(super) mod tests {
     }
 
     /// A failed append leaves the audit log unwritable: issue a token (an
-    /// audited action) while appends fail, so later calls see it closed.
+    /// audited action) while completions fail, then keep every append
+    /// failing, so later calls see it closed.
     async fn close_the_audit_log(state: &WebState) {
-        state.audit.set_fail_appends(true);
+        state.audit.set_fail_completions(true);
         let (status, _) = call(
             state,
             Method::POST,
@@ -1835,6 +1847,8 @@ pub(super) mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
         assert!(!state.audit.is_writable());
+        state.audit.set_fail_completions(false);
+        state.audit.set_fail_appends(true);
     }
 
     #[tokio::test]

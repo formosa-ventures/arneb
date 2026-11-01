@@ -1025,9 +1025,14 @@ mod tests {
             futures::poll!(uncordon.as_mut()).is_pending(),
             "the uncordon waits for the cordon"
         );
-        // While it waits, it has neither touched the store nor audited.
+        // While it waits, it has neither touched the store nor audited:
+        // the log holds only the cordon's intent.
         assert!(store.cordon(PAUSED_ID).is_some());
-        assert!(audit_actions(&state).is_empty());
+        assert_eq!(audit_actions(&state).len(), 1);
+        assert_eq!(
+            crate::web::manage::test_hooks::outcomes(&state),
+            ["\"pending\""]
+        );
 
         release_tx.send(()).unwrap();
         assert!(cordon.await.unwrap().unwrap().changed);
@@ -1064,10 +1069,15 @@ mod tests {
             state.cordon_changes.try_lock().is_err(),
             "the lock is held until the append"
         );
-        assert!(audit_actions(&state).is_empty());
+        assert_eq!(
+            crate::web::manage::test_hooks::outcomes(&state),
+            ["\"pending\""],
+            "only the intent so far"
+        );
         release.send(()).unwrap();
         let _next = state.cordon_changes.lock().await;
         assert_eq!(audit_actions(&state)[0].0, "worker.cordon");
+        assert_eq!(crate::web::manage::test_hooks::outcomes(&state), ["\"ok\""]);
     }
 
     #[tokio::test]

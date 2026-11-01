@@ -31,3 +31,11 @@
 - [x] 8.1 OpenSpec change, upgrade notes in `docs/guide/configuration.md`
 - [x] 8.2 Tier 1: `cargo fmt`, `cargo clippy --workspace --all-targets` (pinned and 1.99.0), `cargo test --workspace`
 - [x] 8.3 Tier 2: `scripts/manage-smoke.sh` against a coordinator plus 2 workers with password auth, before and after a coordinator restart (run by the controller at aaf9751: steps 1–9, 9b and `--after-restart` 10 passed)
+
+## 9. Review round 2
+
+- [x] 9.1 Kill: no `queries` rules grant only the owner or manage
+- [x] 9.2 Audit reads: managers see all entries, others only their own (`scope`)
+- [x] 9.3 Audit intent entry before apply, completion after, `interrupted` at startup
+- [x] 9.4 Audit reads never wait for an fsync or a compaction (split writer and memory locks)
+- [x] 9.5 Audit log named after the state file (`<stem>.audit.jsonl`)

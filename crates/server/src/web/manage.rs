@@ -171,10 +171,15 @@ pub(super) async fn run_manage<A: ManageAction>(
         let unchanged = action.unchanged_effect();
         #[cfg(test)]
         let lock_key = held.as_deref().map(test_hooks::key_of);
+        let intent = AuditSubject {
+            target: audit_target.clone(),
+            parameters: with_effect(parameters.clone(), None),
+        };
         let applied = audited(
             &state,
             &who,
             name,
+            intent,
             || action.apply(&state),
             |out| {
                 #[cfg(test)]
@@ -278,6 +283,20 @@ pub(super) mod test_hooks {
             .unwrap()
             .push((key(lock), inside_tx, release_rx));
         (inside_rx, release_tx)
+    }
+
+    /// Each audit entry's `outcome` as JSON text, newest first.
+    pub(in crate::web) fn outcomes(state: &crate::web::WebState) -> Vec<String> {
+        state
+            .audit
+            .query(&arneb_state::AuditQuery {
+                limit: 100,
+                ..arneb_state::AuditQuery::default()
+            })
+            .entries
+            .into_iter()
+            .map(|e| serde_json::to_string(&e.record.outcome).unwrap())
+            .collect()
     }
 
     pub(super) fn after_apply(lock_key: Option<usize>) {

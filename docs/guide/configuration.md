@@ -759,8 +759,10 @@ action (token issue and revoke, and the manage actions) as JSON lines in
 `<stem>.audit.jsonl`, in the directory of [`[state] path`](#state) and named
 after its file (`/var/lib/arneb/prod.json` →
 `/var/lib/arneb/prod.audit.jsonl`), mode `0600`.
-Each entry is written and synced to disk before the response returns. Read
-it with [`GET /api/v2/audit`](/guide/http-api#audit-log).
+An action writes an intent entry (outcome `pending`) before it is applied
+and a completion entry after; each is synced to disk, the completion before
+the response returns. Read it with
+[`GET /api/v2/audit`](/guide/http-api#audit-log).
 
 | Knob | Env | Default | Meaning |
 |---|---|---|---|
@@ -777,12 +779,17 @@ it with [`GET /api/v2/audit`](/guide/http-api#audit-log).
 - **Torn lines.** A line that does not parse (for example, cut short by a
   crash) is skipped with a WARN on `arneb::audit` naming its line number.
   Startup never fails on it, and the startup compaction drops it.
-- **A failed write.** If an entry cannot be written, the action it records
-  has already happened. The entry is logged in full at ERROR on
-  `arneb::audit`, and every later audited action is refused with
-  `503 audit_unavailable` until the file can be written again. At most one
-  entry is missing per action in flight when the log fails, and each is in
-  the ERROR log.
+- **A failed write.** If the intent cannot be written, the action is
+  refused with `503 audit_unavailable` and nothing is applied. If the
+  completion cannot be written, the action has already happened: the entry
+  is logged in full at ERROR on `arneb::audit`, its intent stays `pending`,
+  and every later audited action is refused with `503 audit_unavailable`
+  until the file can be written again.
+- **Interrupted actions.** An intent with no completion at startup (the
+  server stopped while applying it, or its completion failed) is logged at
+  WARN on `arneb::audit` and recorded once as an entry with outcome
+  `interrupted`: the action may or may not have been applied. So no applied
+  action is ever missing from the log.
 - **No `[state] path`** keeps the log in memory, with a startup WARN; it is
   lost on restart. Under `type = "none"` nothing is audited and the log stays
   empty.

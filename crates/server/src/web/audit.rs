@@ -1,14 +1,16 @@
 //! The audit log on the Web API (manage-api D6): the [`audited`] wrapper
 //! every audited action runs through, and `GET /api/v2/audit`.
 //!
-//! Order and failure: the log must be writable (or reopen) before the
-//! action runs, else `audit_unavailable`; then the action runs; then its
-//! entry is appended. A failed append cannot undo the action, so the entry
-//! goes to the ERROR log, the log is marked unwritable, and the action's
-//! real result is returned; later audited actions are refused until the
-//! log is writable again. So at most one entry is missing per action in
-//! flight when the log fails, and each is logged in full at ERROR on
-//! `arneb::audit`.
+//! Order and failure: the log must be writable (or reopen) and the
+//! action's intent entry (outcome `pending`) must be synced before the
+//! action runs, else `audit_unavailable` and nothing is applied; then the
+//! action runs; then its completion entry is appended. A failed completion
+//! cannot undo the action, so it goes to the ERROR log, the log is marked
+//! unwritable, and the action's real result is returned; later audited
+//! actions are refused until the log is writable again. So every applied
+//! action has at least its intent on disk: a crash, or a failed completion,
+//! leaves it `pending`, and the next start reports it at WARN on
+//! `arneb::audit` and records it as `interrupted`.
 
 use arneb_state::{AuditEntry, AuditOutcome, AuditQuery, AuditRecord};
 use axum::extract::rejection::QueryRejection;
@@ -43,50 +45,64 @@ fn audit_unavailable() -> ApiError {
     .with_hint("retry shortly; the server log names the audit log error")
 }
 
-/// Runs `run` as the audited `action` of `who`: refuses with
-/// `audit_unavailable` before running it when the log is unwritable and
-/// cannot be reopened; otherwise runs it and appends an entry described by
-/// `subject` (ok or error outcome). Blocking (fsync): call it from
-/// `spawn_blocking`.
+/// Runs `run` as the audited `action` of `who`: records `intent` (what is
+/// known before the action runs) as a `pending` entry first, refusing with
+/// `audit_unavailable` before running anything when the log is unwritable
+/// and cannot be reopened or the intent cannot be written; otherwise runs
+/// it and appends the completion described by `subject` (ok or error
+/// outcome). Blocking (fsync): call it from `spawn_blocking`.
 pub(super) fn audited<T>(
     state: &WebState,
     who: &Identity,
     action: &'static str,
+    intent: AuditSubject,
     run: impl FnOnce() -> Result<T, ApiError>,
     subject: impl FnOnce(Result<&T, &ApiError>) -> AuditSubject,
 ) -> Result<T, ApiError> {
-    if let Err(e) = state.audit.ensure_writable() {
-        tracing::error!(
-            target: "arneb::audit",
-            user = %who.user,
-            action,
-            error = %e,
-            "refusing an audited action: the audit log is not writable"
-        );
-        return Err(audit_unavailable());
-    }
-    let out = run();
-    let AuditSubject { target, parameters } = subject(out.as_ref());
-    let record = AuditRecord {
+    let record = |AuditSubject { target, parameters }, outcome| AuditRecord {
         user: who.user.clone(),
         via: who.via.as_str().to_owned(),
         action: action.to_owned(),
         target,
         parameters,
-        outcome: match &out {
-            Ok(_) => AuditOutcome::Ok,
-            Err(e) => AuditOutcome::Error(e.code.name()),
-        },
+        outcome,
     };
-    if let Err(arneb_state::AuditAppendError { entry, source }) = state.audit.append(record) {
+    let refuse = |error: &dyn std::fmt::Display| {
+        tracing::error!(
+            target: "arneb::audit",
+            user = %who.user,
+            action,
+            error = %error,
+            "refusing an audited action: the audit log is not writable"
+        );
+        audit_unavailable()
+    };
+    if let Err(e) = state.audit.ensure_writable() {
+        return Err(refuse(&e));
+    }
+    let begun = match state.audit.begin(record(intent, AuditOutcome::Pending)) {
+        Ok(entry) => entry,
+        Err(e) => return Err(refuse(&e.source)),
+    };
+    let out = run();
+    let outcome = match &out {
+        Ok(_) => AuditOutcome::Ok,
+        Err(e) => AuditOutcome::Error(e.code.name()),
+    };
+    let done = record(subject(out.as_ref()), outcome);
+    if let Err(arneb_state::AuditAppendError { entry, source }) =
+        state.audit.complete(begun.seq, done)
+    {
         tracing::error!(
             target: "arneb::audit",
             seq = entry.seq,
+            intent_seq = begun.seq,
             time_ms = entry.time_ms,
             entry = %serde_json::to_string(&entry).unwrap_or_default(),
             error = %source,
-            "the action was applied but its audit entry could not be written; \
-             audited actions are refused until the audit log is writable"
+            "the action was applied but its audit completion could not be written \
+             (its intent stays pending); audited actions are refused until the \
+             audit log is writable"
         );
     }
     out
@@ -387,11 +403,32 @@ mod tests {
         assert!(!body.to_string().contains("bobs"), "{body}");
     }
 
+    /// The intent is written before the action runs: an unwritable log
+    /// refuses the action before anything is applied.
+    #[tokio::test]
+    async fn failed_intent_refuses_before_applying() {
+        let state = state();
+        state.audit.set_fail_appends(true);
+        let (status, body) = issue(&state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "audit_unavailable");
+        assert_eq!(token_count(&state).await, 0, "no token was created");
+        assert!(state.audit.is_empty());
+        state.audit.set_fail_appends(false);
+        let (status, issued) = issue(&state).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued}");
+        let (_, page) = audit_log(&state, "").await;
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{page}");
+        assert_eq!(entries[0]["outcome"], "ok");
+        assert!(entries[0]["intent_seq"].is_u64(), "{page}");
+    }
+
     #[tokio::test]
     async fn failed_append_closes_manage_until_writable() {
         let state = state();
-        // 1. Appends start failing.
-        state.audit.set_fail_appends(true);
+        // 1. Completions start failing (the intent is still written).
+        state.audit.set_fail_completions(true);
         // 2. The action is applied and answered with its real result.
         let (status, issued) = issue(&state).await;
         assert_eq!(status, StatusCode::CREATED, "{issued}");
@@ -407,7 +444,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{me}");
         assert_eq!(me["user"], "alice");
         assert!(!state.audit.is_writable());
-        assert_eq!(state.audit.len(), 0, "the failed entry is not in the log");
+        assert_eq!(state.audit.len(), 1, "only the intent is in the log");
+        state.audit.set_fail_completions(false);
+        state.audit.set_fail_appends(true);
         // 3. The next audited action is refused before it runs.
         let before = token_count(&state).await;
         let (status, body) = issue(&state).await;
@@ -424,9 +463,13 @@ mod tests {
         let (_, page) = audit_log(&state, "").await;
         assert_eq!(page["writable"], true);
         let entries = page["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 1, "{page}");
+        assert_eq!(entries.len(), 2, "{page}");
         assert_eq!(entries[0]["action"], "token.issue");
         assert_eq!(entries[0]["target"], issued["id"]);
+        assert_eq!(entries[0]["outcome"], "ok");
+        // The action whose completion failed keeps its pending intent.
+        assert_eq!(entries[1]["outcome"], "pending");
+        assert_eq!(entries[1]["action"], "token.issue");
         assert_eq!(token_count(&state).await, before + 1);
     }
 }

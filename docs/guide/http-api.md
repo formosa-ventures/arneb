@@ -586,7 +586,9 @@ curl -s -H "$H" -X PUT "$B/admission?dry_run=true" \
 ### Audit log
 
 Under `[auth] type = "password"`, these actions are recorded in a durable
-audit log, each entry synced to disk before the response returns:
+audit log. Each action writes an intent entry (outcome `pending`) before it
+is applied and a completion entry after it, both synced to disk before the
+response returns:
 
 - issuing and revoking API tokens (`token.issue`, `token.revoke`), whether
   they succeed or fail;
@@ -594,10 +596,12 @@ audit log, each entry synced to disk before the response returns:
 - cancelling another user's query (`query.cancel`).
 
 A refused request (no credentials, no privilege, a malformed body or token
-id) is not recorded. If the log cannot be written, audited actions are
-refused with `audit_unavailable` until it can; at most one entry is missing
-per action in flight when the log fails, and each is logged in full at ERROR
-on `arneb::audit`. Retention is set by [`[audit]`](/guide/configuration#audit-log).
+id) is not recorded. If the intent cannot be written, the action is refused
+with `audit_unavailable` before anything is applied. If only the completion
+fails, it is logged in full at ERROR on `arneb::audit`, the intent stays
+`pending`, and audited actions are refused with `audit_unavailable` until
+the log can be written again. Retention is set by
+[`[audit]`](/guide/configuration#audit-log).
 
 ```bash
 curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
@@ -606,22 +610,27 @@ curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
 ```json
 {"entries":[
   {"seq":42,"time_ms":1767000000000,"user":"alice","via":"basic",
-   "action":"token.issue","target":"0123456789abcdef",
+   "action":"token.issue","target":"0123456789abcdef","intent_seq":41,
    "parameters":{"name":"ci","expires_ms":null},"outcome":"ok"},
   {"seq":40,"time_ms":1766990000000,"user":"bob","via":"token",
-   "action":"token.issue","target":"",
+   "action":"token.issue","target":"","intent_seq":39,
    "parameters":{"name":null,"expires_ms":null},"outcome":{"error":"invalid_argument"}}],
  "next_cursor":40,"truncated":true,"persistent":true,"writable":true,"scope":"all"}
 ```
 
-- `seq` increases with every entry, across restarts; a failed write can
-  leave a gap. After a crash, a seq that appears only in an ERROR line may be
+- `seq` increases with every entry, across restarts; a failed write, or a
+  completed intent that is no longer listed, leaves a gap. After a crash, a seq that appears only in an ERROR line may be
   reused. `time_ms` is milliseconds since the Unix epoch.
 - `via` is how the user authenticated: `token`, `session` or `basic`.
 - `target` names what the action acted on. A token is named by its 16-hex
   id only; the token itself is never recorded.
 - `outcome` is `"ok"`, or `{"error": "<code>"}` with the
-  [error code](#errors) the call returned.
+  [error code](#errors) the call returned. A completion entry carries
+  `intent_seq`, the `seq` of its intent; a completed intent is dropped from
+  the listing, so each finished action shows once. `"pending"` marks an
+  intent whose action is in progress (or whose completion could not be
+  written), and `"interrupted"` the entry written at startup for an intent
+  that never completed: the action may or may not have been applied.
 - `persistent` is `false` when the log is in memory (no `[state] path`), and
   `writable` is `false` while audited actions are refused with
   `audit_unavailable`.

@@ -75,7 +75,7 @@ A manage call SHALL answer `200` with `{dry_run, action, target, summary, change
 - **THEN** the `warning` says the change is lost on restart
 
 ### Requirement: Durable audit log
-Under password auth every non-dry manage run that passed authorization, every cancellation of another user's query and every token issue and revoke SHALL be appended to `<stem>.audit.jsonl` in the directory of `[state] path`, named after the state file (`prod.json` → `prod.audit.jsonl`, mode `0600`), and synced to disk before the response returns. An entry SHALL hold `seq`, `time_ms`, `user`, `via`, `action`, `target`, `parameters` and `outcome`, and name a token by its 16-hex id only. `seq` SHALL increase across restarts. Refused calls SHALL NOT be audited. `GET /api/v2/audit?limit=&cursor=&user=&action=` SHALL list entries newest first and need observe. A caller with manage SHALL read every entry (`scope: "all"`); any other caller SHALL read only entries whose `user` is the caller (`scope: "own"`), as SHALL the MCP `list_audit_log` tool.
+Under password auth every non-dry manage run that passed authorization, every cancellation of another user's query and every token issue and revoke SHALL be appended to `<stem>.audit.jsonl` in the directory of `[state] path`, named after the state file (`prod.json` → `prod.audit.jsonl`, mode `0600`), as an intent entry (outcome `pending`) synced before the action is applied and a completion entry (with `intent_seq`) synced before the response returns. An entry SHALL hold `seq`, `time_ms`, `user`, `via`, `action`, `target`, `parameters` and `outcome`, and name a token by its 16-hex id only. `seq` SHALL increase across restarts. Refused calls SHALL NOT be audited. `GET /api/v2/audit?limit=&cursor=&user=&action=` SHALL list entries newest first and need observe. A caller with manage SHALL read every entry (`scope: "all"`); any other caller SHALL read only entries whose `user` is the caller (`scope: "own"`), as SHALL the MCP `list_audit_log` tool.
 
 #### Scenario: Audit entries of others are hidden
 - **WHEN** alice (observe, no manage) reads the audit log after bob issued a token
@@ -94,7 +94,11 @@ Under password auth every non-dry manage run that passed authorization, every ca
 - **THEN** the next entry has `seq` 10 or more
 
 ### Requirement: Audit log retention and failure
-`[audit] max_entries` (default 10000, `1..=1000000`) and `retention_days` (default 90, `0` for no age limit) SHALL bound the log. Compaction SHALL rewrite the file atomically, keep the newest entry, and run at startup when it would drop something and whenever the file holds `max(max_entries / 10, 100)` more lines than `max_entries`. A line that cannot be parsed SHALL be skipped with a WARN naming its line number. If the log is not writable and cannot be reopened, an audited action SHALL be refused with `503 audit_unavailable` before anything is applied. If an append fails after the action was applied, the action's real result SHALL be returned, the full entry SHALL be logged at ERROR on `arneb::audit`, and later audited actions SHALL be refused until the log is writable. At most one entry per action in flight when the log fails SHALL be missing from the file, and each SHALL be in the ERROR log.
+`[audit] max_entries` (default 10000, `1..=1000000`) and `retention_days` (default 90, `0` for no age limit) SHALL bound the log. Compaction SHALL rewrite the file atomically, keep the newest entry, and run at startup when it would drop something and whenever the file holds `max(max_entries / 10, 100)` more lines than `max_entries`. A line that cannot be parsed SHALL be skipped with a WARN naming its line number. If the log is not writable and cannot be reopened, or the intent entry cannot be written, an audited action SHALL be refused with `503 audit_unavailable` before anything is applied. If the completion fails after the action was applied, the action's real result SHALL be returned, the full entry SHALL be logged at ERROR on `arneb::audit`, the intent SHALL stay `pending`, and later audited actions SHALL be refused until the log is writable. At startup, an intent with no completion SHALL be logged at WARN on `arneb::audit` and completed once with outcome `interrupted`. A completed intent SHALL NOT be listed. Reads SHALL NOT wait for an append's fsync or a compaction.
+
+#### Scenario: Crash between apply and completion
+- **WHEN** a cordon's intent is synced, the cordon is persisted, and the process dies before the completion
+- **THEN** the next start logs a WARN naming `worker.cordon`, and the log lists an `interrupted` entry for it
 
 #### Scenario: Compaction keeps the newest
 - **WHEN** every entry is older than `retention_days`
@@ -105,7 +109,7 @@ Under password auth every non-dry manage run that passed authorization, every ca
 - **THEN** startup succeeds, logs a WARN naming the line, and compaction drops it
 
 #### Scenario: Unwritable log
-- **WHEN** the log cannot be written and an admin cordons a worker
+- **WHEN** the log cannot be written (the intent fails) and an admin cordons a worker
 - **THEN** the response is `503 audit_unavailable` and the worker stays schedulable
 
 ### Requirement: Cancel any query

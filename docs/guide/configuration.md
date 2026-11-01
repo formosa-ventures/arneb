@@ -145,10 +145,9 @@ max_rows           = 10000
 
 All values must be greater than 0, `default_max_rows <= max_rows`,
 `default_page_bytes <= max_page_bytes`,
-`max_retained_bytes <= max_total_retained_bytes`, and `idle_timeout_secs` must be at
-least twice `max_wait_ms` (so a statement is never reaped around a request
-that long-polls it; a statement being waited on also never counts as idle);
-a bad combination stops startup.
+`max_retained_bytes <= max_total_retained_bytes`, and `idle_timeout_secs` must not
+be shorter than `max_wait_ms` (a statement being waited on never counts as
+idle, so a long-poll cannot outlast it); a bad combination stops startup.
 
 A catalog, schema or table listing returns `default_max_rows` names unless
 the request passes `limit`, which must be in `1..=max_rows`.

@@ -22,8 +22,8 @@ pub struct AgentLimits {
     pub max_total_retained_bytes: usize,
     /// Longest any request waits before answering "still running".
     pub max_wait: Duration,
-    /// Idle time after which a statement is reaped. At least twice
-    /// `max_wait`, so a long-poll never outlasts it.
+    /// Idle time after which a statement is reaped; at least `max_wait`.
+    /// A statement under a long-poll is never idle, whatever the values.
     pub idle_timeout: Duration,
 }
 
@@ -82,11 +82,9 @@ impl AgentLimits {
                 self.max_retained_bytes, self.max_total_retained_bytes
             ));
         }
-        // Twice the longest wait leaves a full max_wait of slack between a
-        // long-poll ending and the reaper seeing the statement as idle.
-        if self.idle_timeout < self.max_wait.saturating_mul(2) {
+        if self.idle_timeout < self.max_wait {
             return Err(format!(
-                "idle_timeout_secs ({}s) must be at least twice max_wait_ms ({}ms)",
+                "idle_timeout_secs ({}s) must not be shorter than max_wait_ms ({}ms)",
                 self.idle_timeout.as_secs(),
                 self.max_wait.as_millis()
             ));
@@ -129,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_under_twice_max_wait_is_rejected() {
+    fn idle_timeout_shorter_than_max_wait_is_rejected() {
         let l = AgentLimits {
             idle_timeout: Duration::from_secs(5),
             max_wait: Duration::from_secs(10),
@@ -140,21 +138,15 @@ mod tests {
             err.contains("idle_timeout_secs") && err.contains("max_wait_ms"),
             "{err}"
         );
-        let l = AgentLimits {
-            idle_timeout: Duration::from_secs(10),
-            max_wait: Duration::from_secs(10),
-            ..Default::default()
-        };
-        let err = l.validate().unwrap_err();
-        assert!(
-            err.contains("idle_timeout_secs") && err.contains("max_wait_ms"),
-            "equal values leave no slack: {err}"
-        );
-        let l = AgentLimits {
-            idle_timeout: Duration::from_secs(20),
-            max_wait: Duration::from_secs(10),
-            ..Default::default()
-        };
-        l.validate().unwrap();
+        // Equal values are fine: the waiter guard keeps a long-polled
+        // statement from being reaped, so no slack is needed.
+        for idle in [10, 15] {
+            let l = AgentLimits {
+                idle_timeout: Duration::from_secs(idle),
+                max_wait: Duration::from_secs(10),
+                ..Default::default()
+            };
+            l.validate().unwrap();
+        }
     }
 }

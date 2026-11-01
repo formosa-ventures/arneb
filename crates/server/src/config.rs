@@ -430,8 +430,7 @@ pub struct AgentApiConfig {
     pub max_total_retained_bytes: usize,
     /// Longest any request waits before answering "still running".
     pub max_wait_ms: u64,
-    /// Idle time before a statement is reaped; at least twice
-    /// `max_wait_ms`.
+    /// Idle time before a statement is reaped; at least `max_wait_ms`.
     pub idle_timeout_secs: u64,
 }
 
@@ -1996,7 +1995,7 @@ pgwire = "required"
             .to_string();
         assert!(err.contains("max_total_retained_bytes"), "{err}");
         let err = agent_api(
-            "[agent_api]\nmax_wait_ms = 10000\nidle_timeout_secs = 10\n",
+            "[agent_api]\nmax_wait_ms = 10000\nidle_timeout_secs = 5\n",
             &[],
         )
         .unwrap_err()
@@ -2005,6 +2004,12 @@ pgwire = "required"
             err.contains("idle_timeout_secs") && err.contains("max_wait_ms"),
             "{err}"
         );
+        // Valid before the stricter rule and valid again now.
+        agent_api(
+            "[agent_api]\nmax_wait_ms = 10000\nidle_timeout_secs = 15\n",
+            &[],
+        )
+        .unwrap();
     }
 
     #[test]

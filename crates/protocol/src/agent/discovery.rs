@@ -311,8 +311,10 @@ impl AgentQueryService {
                 wait,
             )
             .await?;
-        // The query resolves the table itself (once); when it does not exist,
-        // answer with the same not-found error (and candidates) as describe.
+        // The query resolves the table itself (once); when the sampled table
+        // does not exist, answer with the same not-found error (and
+        // candidates) as describe. A not-found raised inside it (a view over
+        // a missing table, ...) stays the query's own error.
         let not_found = status.error.as_ref().is_some_and(|e| {
             matches!(
                 e.code,
@@ -322,8 +324,15 @@ impl AgentQueryService {
             )
         });
         if not_found && !is_virtual(catalog, schema) {
-            self.forget(user, &status.id);
-            return Err(missing(&root, catalog, schema, table).await);
+            let error = match tables_of(&root, catalog, schema).await {
+                Ok(visible) if visible.iter().any(|t| t == table) => None,
+                Ok(visible) => Some(table_missing(catalog, schema, table, &visible)),
+                Err(err) => Some(err),
+            };
+            if let Some(error) = error {
+                self.forget(user, &status.id);
+                return Err(error);
+            }
         }
         Ok(status)
     }

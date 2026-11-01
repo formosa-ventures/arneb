@@ -2888,27 +2888,18 @@ pgwire = "required"
 
     #[test]
     fn oauth_requires_password_auth_and_mcp() {
-        let load = |extra: &str| {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("arneb.toml");
-            std::fs::write(
-                &path,
-                format!(
-                    "[oauth]\nissuer = \"https://idp.example\"\nresource = \"https://db.example/mcp\"\n{extra}"
-                ),
-            )
-            .unwrap();
-            AppConfig::load(Some(&path))
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        };
-        let err = load("[auth]\ntype = \"none\"\n").unwrap_err();
+        let c = oauth_ok();
+        let err = c.check_deployment(AuthType::None, true).unwrap_err();
         assert!(
             err.contains("[oauth] requires [auth] type = \"password\""),
             "{err}"
         );
-        let err = load("[mcp]\nenabled = false\n[auth]\ntype = \"password\"\n").unwrap_err();
+        let err = c.check_deployment(AuthType::Password, false).unwrap_err();
         assert!(err.contains("[oauth] requires [mcp] enabled"), "{err}");
+        assert!(c.check_deployment(AuthType::Password, true).is_ok());
+        // OAuth off: no requirements.
+        let off = OAuthConfig::default();
+        assert!(off.check_deployment(AuthType::None, false).is_ok());
     }
 
     #[test]

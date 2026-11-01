@@ -21,6 +21,12 @@ config: ""
 # config that holds [auth] users or credentials.
 existingConfigSecret: ""
 
+auth:
+  # Set to true when the config sets [auth] type = "password". It only
+  # changes the post-install notes (they show the token flow instead of an
+  # unauthenticated curl); the server reads its auth from the config.
+  password: false
+
 # Shared secret every node presents on cluster RPC (ARNEB_CLUSTER_SECRET).
 # Without existingSecret, the chart generates a random one on install and
 # keeps it on upgrade.

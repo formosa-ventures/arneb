@@ -82,6 +82,7 @@ other pod in the namespace that runs Arneb.
 | `image.repository` / `image.tag` | `ghcr.io/formosa-ventures/arneb` / chart `appVersion` | Every node must run the same release. |
 | `config` | `""` | TOML shared by every pod. |
 | `existingConfigSecret` | `""` | Use key `config.toml` of this Secret instead of `config`. |
+| `auth.password` | `false` | Set to `true` when the config sets `[auth] type = "password"`. Only switches the post-install notes to the API-token flow; the server reads its auth from the config. |
 | `clusterSecret.existingSecret` / `.key` | `""` / `secret` | Cluster secret to use instead of a generated one. |
 | `logLevel` | `info,arneb::profile=warn` | `RUST_LOG` for every pod. |
 | `extraEnv`, `envFrom` | `[]` | Extra environment, e.g. catalog passwords. |

@@ -78,6 +78,50 @@ impl CredentialSource for StateStore {
 }
 
 #[cfg(test)]
+pub(crate) mod test_log {
+    use std::io;
+    use std::sync::{Arc, Mutex, Once};
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `f` and returns what it logged.
+    pub(crate) fn capture<R>(f: impl FnOnce() -> R) -> (R, String) {
+        // A global subscriber that is interested in everything (and discards
+        // it), so a test on another thread can never cache a callsite as
+        // disabled while this thread's scoped subscriber is installed.
+        static GLOBAL: Once = Once::new();
+        GLOBAL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(io::sink)
+                    .with_max_level(tracing::Level::TRACE)
+                    .finish(),
+            );
+        });
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let r = tracing::subscriber::with_default(sub, f);
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (r, out)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use arneb_protocol::{CredentialSource, ScramVerifier};

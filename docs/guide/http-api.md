@@ -698,8 +698,10 @@ catalog as soon as the change returns.
 - Names are 1–63 characters of `a-z 0-9 _`, starting with a letter;
   `memory`, `file`, `system`, `information_schema` and `pg_catalog` are
   reserved. `type` is `hive` (needs `metastore_uri`) or `postgresql` (needs
-  `connection_url`). A `POST` of an existing name is `conflict`; a `PUT` or
-  `DELETE` of an unknown name is `not_found`.
+  `connection_url`). A field that is not a `[[catalogs]]` field, at any
+  depth (a typo such as `max_conections` or `storage.s3.secret_acess_key`),
+  is `invalid_argument` naming it. A `POST` of an existing name is
+  `conflict`; a `PUT` or `DELETE` of an unknown name is `not_found`.
 - **Probe first.** A create or update first connects to the metastore or
   database from the coordinator, for at most 10 s, also as a dry run. If that
   fails the call is `invalid_argument`, hint
@@ -712,10 +714,12 @@ catalog as soon as the change returns.
   A push can also time out while that worker is busy building catalogs from
   a pull; it then reports `synced: false` and the heartbeat repairs it.
   `failed_catalogs` lists catalogs a worker received but could not connect
-  to; it retries them (at most every 30 s).
+  to; it retries them (at most every 30 s). A `PUT` of the spec already
+  stored and served (a `GET` body sent back unchanged) answers
+  `changed: false`, with no generation bump and no push.
 - **Secrets are redacted.** `password`, `secret_access_key`,
   `service_account_path` and the password in `connection_url` (userinfo or
-  a `password` parameter) read `"<redacted>"` in every answer, MCP result and
+  a `password` parameter, also with a percent-encoded key) read `"<redacted>"` in every answer, MCP result and
   audit entry. In a `PUT`, a field left as `"<redacted>"` keeps the stored
   secret, so you can send back the body of a `GET`. If the `PUT` changes
   where that secret is sent (the `connection_url` host, port, database, user

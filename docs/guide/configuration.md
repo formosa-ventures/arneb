@@ -394,7 +394,10 @@ Under `[auth] type = "password"`, `[[catalogs]]` only seeds the catalogs:
 the first start copies them into the [state store](#state), and from then on
 they are added, changed and dropped through
 [`/api/v2/catalog-configs`](/guide/http-api#catalogs) without a restart.
-Workers ignore `[[catalogs]]` and receive the catalogs from the coordinator.
+Workers ignore `[[catalogs]]` and receive the catalogs from the coordinator,
+together with its default catalog and schema and with its global `[storage]`
+merged into each Hive catalog, so a worker needs no catalog or storage
+config of its own.
 
 ## Cluster Configuration
 
@@ -468,8 +471,10 @@ ca_path   = "/etc/arneb/ca.crt"       # CA that signed every node's certificate
 - **Catalog credentials cross this port.** Workers receive the catalog
   definitions, passwords and storage keys included, from the coordinator
   over Flight. Without a secret, any peer that reaches the coordinator's RPC
-  port can fetch them; without TLS they travel in the clear. Use both
-  whenever a catalog carries credentials.
+  port can fetch them; without TLS they travel in the clear. Without a
+  secret, any peer can also push a catalog set to a worker
+  (`sync_catalogs`); the worker replaces it with the coordinator's on its
+  next heartbeat. Use both whenever a catalog carries credentials.
 - The effective mode is logged on `arneb::config`
   (`cluster_auth="secret"|"off" cluster_tls="on"|"off"`). A short secret, a
   missing `[cluster.tls]` path, or an unreadable file stops startup.
@@ -736,14 +741,22 @@ the source of truth from the config file to the [state store](#state):
   password auth behaves like a coordinator here. Under `[auth] type =
   "none"` nothing changes: there is no state store, and the config is used
   as before.
-- **Workers ignore `[[catalogs]]`.** A worker gets its catalogs from the
-  coordinator over Flight: a push on every change, and a pull when its
-  heartbeat shows it is behind (after it starts, after a missed push, after
-  a coordinator restart). A worker config that still has `[[catalogs]]`
-  logs one INFO naming them; you can leave them, or remove them. Catalog
-  environment variables (`ARNEB_CATALOG_<NAME>_PASSWORD`) are no longer read
-  on workers. Only the alive workers get a push; a worker that joins later
-  pulls on its first heartbeat.
+- **Workers ignore `[[catalogs]]`, and `[storage]` for catalogs.** A worker
+  gets its catalogs from the coordinator over Flight: a push on every
+  change, and a pull when its heartbeat shows it is behind (after it starts,
+  after a missed push, after a coordinator restart). The set carries the
+  coordinator's default catalog and schema, which the worker uses for a
+  table named without a catalog or schema, and each Hive catalog arrives
+  with the coordinator's global `[storage]` already merged in, so the
+  worker reads object storage with the coordinator's settings and keys (a
+  worker whose own `[storage]`, for example IAM-only, differed now uses the
+  coordinator's). A worker's `[storage]` still applies to its own
+  `[[tables]]`. A worker config that still has `[[catalogs]]` logs one INFO
+  naming them; you can leave them, or remove them together with a
+  `[storage]` that only served them. Catalog environment variables
+  (`ARNEB_CATALOG_<NAME>_PASSWORD`) are no longer read on workers. Only the
+  alive workers get a push; a worker that joins later pulls on its first
+  heartbeat.
 - **Set `[cluster] secret` and `[cluster.tls]` when catalogs carry
   credentials.** The catalog definitions, passwords included, now cross the
   cluster RPC port from the coordinator to the workers. The coordinator
@@ -763,6 +776,9 @@ the source of truth from the config file to the [state store](#state):
   `connect_timeout_secs` above 10 is cut to 10 s while the catalog is built,
   and a catalog that cannot be reached is skipped with a WARN; workers retry
   it at most every 30 s.
+- **A catalog that fails to build at coordinator startup is stored but not
+  served.** It is not pushed to the workers either, until a
+  `PUT /api/v2/catalog-configs/{name}`, a re-seed or a restart builds it.
 - **Stored settings.** `PATCH /api/v2/settings` stores
   `slow_query_threshold_ms`; a stored value wins over `[observability]` and
   `ARNEB_SLOW_QUERY_THRESHOLD_MS` at every start, with a WARN.
@@ -779,7 +795,9 @@ the source of truth from the config file to the [state store](#state):
   catalogs and rules are seeded from the config file again, and users
   deleted at runtime that are still in the config come back.
 - **Kubernetes.** The chart already mounts the state volume; no chart change
-  is needed. The worker ConfigMap may keep `[[catalogs]]`.
+  is needed. The worker ConfigMap may keep `[[catalogs]]` and `[storage]`,
+  or drop both: workers take catalogs, defaults and catalog storage from
+  the coordinator.
 
 ## State
 

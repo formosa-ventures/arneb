@@ -33,22 +33,20 @@ use serde::{Deserialize, Serialize};
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    config_change_lock, run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome,
-    Preview,
+    add_warning, check_limit, config_change_lock, live_catalogs, plural, run_manage, state_store,
+    Applied, ChangeLock, DryRun, ManageAction, ManageOutcome, Preview,
 };
 use super::privilege::Layer;
 use super::v2::{bad_body, bad_query, state_error};
 use super::WebState;
 use crate::catalogs::{
-    fill_redacted, redacted_secrets, redacted_spec, same_destination, validate_spec,
+    fill_redacted, redacted_secrets, redacted_spec, same_destination, same_spec, validate_spec,
     validate_spec_fields, BuiltCatalog, LiveCatalogs, REDACTED,
 };
 use crate::config::CatalogConfig;
 
 /// Catalogs listed when the request names no `limit`.
 const DEFAULT_LIMIT: usize = 100;
-/// The largest accepted `limit` of the listing.
-const MAX_LIMIT: usize = 1000;
 /// How long a push to one worker may take.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -98,22 +96,6 @@ pub(super) struct WorkerSync {
     /// retries them on its heartbeat; Ruling R7).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     failed_catalogs: Vec<String>,
-}
-
-/// The state store behind the catalog routes (manage already passed, so
-/// the server runs password auth and has one).
-fn store(state: &WebState) -> Result<Arc<StateStore>, ApiError> {
-    state.state.clone().ok_or_else(|| {
-        tracing::error!("password auth is configured without a state store");
-        ApiError::new(ErrorCode::Internal, "the state store is unavailable")
-    })
-}
-
-fn live(state: &WebState) -> Result<Arc<LiveCatalogs>, ApiError> {
-    state.catalogs.clone().ok_or_else(|| {
-        tracing::error!("the catalog routes are served without live catalogs");
-        ApiError::new(ErrorCode::Internal, "the live catalogs are unavailable")
-    })
 }
 
 fn find_record(store: &StateStore, name: &str) -> Option<CatalogRecord> {
@@ -340,33 +322,6 @@ async fn probe(live: &LiveCatalogs, spec: &CatalogConfig) -> Result<BuiltCatalog
     })
 }
 
-fn check_limit(limit: Option<usize>) -> Result<usize, ApiError> {
-    let limit = limit.unwrap_or(DEFAULT_LIMIT);
-    if limit == 0 || limit > MAX_LIMIT {
-        return Err(ApiError::new(
-            ErrorCode::InvalidArgument,
-            format!("limit {limit} is not valid"),
-        )
-        .with_hint(format!("use a limit between 1 and {MAX_LIMIT}")));
-    }
-    Ok(limit)
-}
-
-fn plural(n: usize, one: &str) -> String {
-    if n == 1 {
-        format!("{n} {one}")
-    } else {
-        format!("{n} {one}s")
-    }
-}
-
-fn add_warning(warning: &mut Option<String>, note: String) {
-    *warning = Some(match warning.take() {
-        Some(w) => format!("{w}; {note}"),
-        None => note,
-    });
-}
-
 /// Every catalog definition, in name order, at most `limit` (default 100,
 /// at most 1000), secrets redacted. Needs manage. Shared with the MCP
 /// `list_catalog_configs` tool.
@@ -376,9 +331,9 @@ pub(super) async fn list_catalog_configs_for(
     limit: Option<usize>,
 ) -> Result<CatalogConfigList, ApiError> {
     state.authorizer.check(who, Layer::Manage)?;
-    let limit = check_limit(limit)?;
-    let default_catalog = live(state)?.default_catalog();
-    let (generation, records) = store(state)?.catalogs();
+    let limit = check_limit(limit, DEFAULT_LIMIT)?;
+    let default_catalog = live_catalogs(state)?.default_catalog();
+    let (generation, records) = state_store(state)?.catalogs();
     let truncated = records.len() > limit;
     Ok(CatalogConfigList {
         generation,
@@ -399,8 +354,8 @@ pub(super) async fn get_catalog_config_for(
     name: String,
 ) -> Result<CatalogConfigView, ApiError> {
     state.authorizer.check(who, Layer::Manage)?;
-    let default_catalog = live(state)?.default_catalog();
-    let (generation, records) = store(state)?.catalogs();
+    let default_catalog = live_catalogs(state)?.default_catalog();
+    let (generation, records) = state_store(state)?.catalogs();
     records
         .iter()
         .find(|r| r.name == name)
@@ -426,7 +381,7 @@ pub(super) async fn create_catalog_for(
         &format!("{SEND_SECRETS}: a {REDACTED:?} value is kept only by a PUT of the same catalog"),
     )?;
     validate(&spec)?;
-    let (store, live) = (store(state)?, live(state)?);
+    let (store, live) = (state_store(state)?, live_catalogs(state)?);
     check_exposure(&live, &spec)?;
     // Cheap pre-check, so a taken name never pays for a connection; the
     // action checks again under the lock.
@@ -464,7 +419,7 @@ pub(super) async fn update_catalog_for(
     spec: serde_json::Value,
 ) -> Result<ManageOutcome<CatalogChange>, ApiError> {
     let grant = state.authorizer.check(who, Layer::Manage)?;
-    let (store, live) = (store(state)?, live(state)?);
+    let (store, live) = (state_store(state)?, live_catalogs(state)?);
     let stored = existing_record(&store, &name)?;
     let mut spec = decode_spec(spec, Some(&name))?;
     match decode(&stored) {
@@ -513,7 +468,7 @@ pub(super) async fn drop_catalog_for(
     name: String,
 ) -> Result<ManageOutcome<CatalogChange>, ApiError> {
     let grant = state.authorizer.check(who, Layer::Manage)?;
-    let (store, live) = (store(state)?, live(state)?);
+    let (store, live) = (state_store(state)?, live_catalogs(state)?);
     existing_record(&store, &name)?;
     let lock = if dry_run {
         None
@@ -621,7 +576,7 @@ impl ManageAction for ChangeCatalog {
                     .live
                     .specs()
                     .iter()
-                    .any(|s| s.name == *name && same_json(s, spec));
+                    .any(|s| s.name == *name && same_spec(s, spec));
                 if !current.from_config
                     && served
                     && serde_json::to_value(spec).ok() == Some(current.spec.clone())
@@ -740,14 +695,6 @@ impl ManageAction for ChangeCatalog {
                 workers,
             },
         })
-    }
-}
-
-/// Whether `a` and `b` serialize the same (raw secrets included).
-fn same_json(a: &CatalogConfig, b: &CatalogConfig) -> bool {
-    match (serde_json::to_value(a), serde_json::to_value(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
     }
 }
 

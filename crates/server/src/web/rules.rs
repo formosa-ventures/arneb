@@ -21,8 +21,8 @@ use serde::Serialize;
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    config_change_lock, run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome,
-    Preview,
+    config_change_lock, guard_lockout, run_manage, state_store, Applied, ChangeLock, DryRun,
+    ManageAction, ManageOutcome, Preview,
 };
 use super::privilege::Layer;
 use super::v2::{bad_body, bad_query};
@@ -42,13 +42,6 @@ pub(super) struct RulesView {
 const ALLOW_ALL_WARNING: &str = "with no access rules every user may read every catalog, \
      schema and table and run any statement (allow all), and only [access_control] \
      admin_users keep the manage privilege";
-
-fn store(state: &WebState) -> Result<Arc<StateStore>, ApiError> {
-    state
-        .state
-        .clone()
-        .ok_or_else(|| ApiError::new(ErrorCode::Internal, "access rules need the state store"))
-}
 
 fn view(stored: Option<StoredRules>) -> RulesView {
     match stored {
@@ -75,27 +68,7 @@ fn hex_sha256(text: &str) -> String {
 /// `get_access_rules` tool.
 pub(super) async fn get_rules_for(state: &WebState, who: &Identity) -> Result<RulesView, ApiError> {
     state.authorizer.check(who, Layer::Manage)?;
-    Ok(view(store(state)?.access_rules()))
-}
-
-/// The lockout guard: refuses a change after which `who` would no longer
-/// hold manage. Part of validation, so a dry run is refused the same way.
-fn guard_lockout(
-    state: &WebState,
-    who: &Identity,
-    rules: Option<&AccessRules>,
-) -> Result<(), ApiError> {
-    if state.authorizer.would_manage(who, rules) {
-        return Ok(());
-    }
-    Err(ApiError::new(
-        ErrorCode::Conflict,
-        "this change would remove your own manage privilege",
-    )
-    .with_hint(
-        "keep a system_information write rule for yourself, or ask a user in \
-         [access_control] admin_users",
-    ))
+    Ok(view(state_store(state)?.access_rules()))
 }
 
 /// Replaces the access rules with `json` (a full rules file) for `who`,
@@ -114,7 +87,7 @@ pub(super) async fn set_rules_for(
              (catalogs, schemas, tables, queries, system_information)",
         )
     })?;
-    guard_lockout(state, who, Some(&rules))?;
+    guard_lockout(state, who, Some(&rules), "change")?;
     change(state, who, grant, dry_run, Some((json, Arc::new(rules)))).await
 }
 
@@ -127,7 +100,7 @@ pub(super) async fn clear_rules_for(
     dry_run: bool,
 ) -> Result<ManageOutcome<RulesView>, ApiError> {
     let grant = state.authorizer.check(who, Layer::Manage)?;
-    guard_lockout(state, who, None)?;
+    guard_lockout(state, who, None, "change")?;
     change(state, who, grant, dry_run, None).await
 }
 
@@ -138,7 +111,7 @@ async fn change(
     dry_run: bool,
     to: Option<(String, Arc<AccessRules>)>,
 ) -> Result<ManageOutcome<RulesView>, ApiError> {
-    let store = store(state)?;
+    let store = state_store(state)?;
     // runtime-config D10: held from reading `from` until the audit entry is
     // appended. The action keeps a share, so a request dropped mid-call
     // still serializes its apply.

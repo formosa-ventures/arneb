@@ -41,8 +41,8 @@ use super::auth::Identity;
 use super::catalogs::{push_to_workers, push_warnings, WorkerSync};
 use super::error::{ApiError, ErrorCode};
 use super::manage::{
-    config_change_lock, run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome,
-    Preview,
+    config_change_lock, guard_lockout, live_catalogs, run_manage, state_store, Applied, ChangeLock,
+    DryRun, ManageAction, ManageOutcome, Preview,
 };
 use super::privilege::Layer;
 use super::v2::bad_query;
@@ -157,45 +157,12 @@ fn load_seed(path: Option<&std::path::Path>) -> Result<Seed, ApiError> {
     })
 }
 
-fn store(state: &WebState) -> Result<Arc<StateStore>, ApiError> {
-    state.state.clone().ok_or_else(|| {
-        tracing::error!("password auth is configured without a state store");
-        ApiError::new(ErrorCode::Internal, "the state store is unavailable")
-    })
-}
-
-fn live(state: &WebState) -> Result<Arc<LiveCatalogs>, ApiError> {
-    state.catalogs.clone().ok_or_else(|| {
-        tracing::error!("the re-seed route is served without live catalogs");
-        ApiError::new(ErrorCode::Internal, "the live catalogs are unavailable")
-    })
-}
-
 /// The installed specs as JSON, by name.
 fn installed(live: &LiveCatalogs) -> BTreeMap<String, serde_json::Value> {
     live.specs()
         .iter()
         .filter_map(|s| Some((s.name.clone(), serde_json::to_value(s).ok()?)))
         .collect()
-}
-
-/// The lockout guard (D3): the config's rules must leave `who` manage.
-fn guard_lockout(
-    state: &WebState,
-    who: &Identity,
-    rules: Option<&AccessRules>,
-) -> Result<(), ApiError> {
-    if state.authorizer.would_manage(who, rules) {
-        return Ok(());
-    }
-    Err(ApiError::new(
-        ErrorCode::Conflict,
-        "this re-seed would remove your own manage privilege",
-    )
-    .with_hint(
-        "keep a system_information write rule for yourself, or ask a user in \
-         [access_control] admin_users",
-    ))
 }
 
 /// Re-seeds the state from the config file for `who`, who needs manage
@@ -206,7 +173,7 @@ pub(super) async fn reseed_for(
     dry_run: bool,
 ) -> Result<ManageOutcome<ReseedReport>, ApiError> {
     let grant = state.authorizer.check(who, Layer::Manage)?;
-    let (store, live) = (store(state)?, live(state)?);
+    let (store, live) = (state_store(state)?, live_catalogs(state)?);
     let path = state.config_path.clone();
     let seed = tokio::task::spawn_blocking(move || load_seed(path.as_deref()))
         .await
@@ -214,7 +181,12 @@ pub(super) async fn reseed_for(
             tracing::error!(error = %e, "config reload task failed");
             ApiError::new(ErrorCode::Internal, "the config file could not be loaded")
         })??;
-    guard_lockout(state, who, seed.rules.as_ref().map(|(_, r)| r.as_ref()))?;
+    guard_lockout(
+        state,
+        who,
+        seed.rules.as_ref().map(|(_, r)| r.as_ref()),
+        "re-seed",
+    )?;
     for (spec, _) in &seed.catalogs {
         super::catalogs::check_exposure(&live, spec)?;
     }

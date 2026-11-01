@@ -131,12 +131,83 @@ pub(super) const AUDIT_UNAVAILABLE_WARNING: &str =
 pub(super) const IN_MEMORY_WARNING: &str =
     "the state store is in memory ([state] path is not set), so this change is lost on restart";
 
-/// Appends `note` to `preview`'s warning.
-fn add_warning(preview: &mut Preview, note: &str) {
-    preview.warning = Some(match preview.warning.take() {
+/// Appends `note` to `warning`, after `; ` when there is one already.
+pub(super) fn add_warning(warning: &mut Option<String>, note: impl Into<String>) {
+    let note = note.into();
+    *warning = Some(match warning.take() {
         Some(w) => format!("{w}; {note}"),
-        None => note.to_owned(),
+        None => note,
     });
+}
+
+/// `n` and `one`, plural with an `s` unless `n` is 1 (`1 worker`, `2 workers`).
+pub(super) fn plural(n: usize, one: &str) -> String {
+    if n == 1 {
+        format!("{n} {one}")
+    } else {
+        format!("{n} {one}s")
+    }
+}
+
+/// The largest accepted `limit` of a runtime-config listing (D4).
+pub(super) const MAX_LIST_LIMIT: usize = 1000;
+
+/// A listing's `limit`: `default` when absent, else 1 to
+/// [`MAX_LIST_LIMIT`] (`invalid_argument` otherwise).
+pub(super) fn check_limit(limit: Option<usize>, default: usize) -> Result<usize, ApiError> {
+    let limit = limit.unwrap_or(default);
+    if limit == 0 || limit > MAX_LIST_LIMIT {
+        return Err(ApiError::new(
+            ErrorCode::InvalidArgument,
+            format!("limit {limit} is not valid"),
+        )
+        .with_hint(format!("use a limit between 1 and {MAX_LIST_LIMIT}")));
+    }
+    Ok(limit)
+}
+
+/// The state store behind the runtime-config routes (manage already
+/// passed, so the server runs password auth and has one).
+pub(super) fn state_store(
+    state: &WebState,
+) -> Result<std::sync::Arc<arneb_state::StateStore>, ApiError> {
+    state.state.clone().ok_or_else(|| {
+        tracing::error!("password auth is configured without a state store");
+        ApiError::new(ErrorCode::Internal, "the state store is unavailable")
+    })
+}
+
+/// The live catalogs behind the catalog and re-seed routes (served only on
+/// the node that owns the catalog definitions).
+pub(super) fn live_catalogs(
+    state: &WebState,
+) -> Result<std::sync::Arc<crate::catalogs::LiveCatalogs>, ApiError> {
+    state.catalogs.clone().ok_or_else(|| {
+        tracing::error!("the catalog routes are served without live catalogs");
+        ApiError::new(ErrorCode::Internal, "the live catalogs are unavailable")
+    })
+}
+
+/// The lockout guard (runtime-config D3): `rules` (`None`: no rules) must
+/// leave `who` manage, else this `change` (`change`, `re-seed`) is
+/// `conflict`.
+pub(super) fn guard_lockout(
+    state: &WebState,
+    who: &Identity,
+    rules: Option<&arneb_catalog::AccessRules>,
+    change: &str,
+) -> Result<(), ApiError> {
+    if state.authorizer.would_manage(who, rules) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ErrorCode::Conflict,
+        format!("this {change} would remove your own manage privilege"),
+    )
+    .with_hint(
+        "keep a system_information write rule for yourself, or ask a user in \
+         [access_control] admin_users",
+    ))
 }
 
 /// `preview` plus the in-memory warning when it changes a persisted action
@@ -144,7 +215,7 @@ fn add_warning(preview: &mut Preview, note: &str) {
 fn warn_if_in_memory(state: &WebState, persisted: bool, preview: &mut Preview) {
     let on_disk = state.state.as_ref().is_some_and(|s| s.is_persistent());
     if persisted && preview.changed && !on_disk {
-        add_warning(preview, IN_MEMORY_WARNING);
+        add_warning(&mut preview.warning, IN_MEMORY_WARNING);
     }
 }
 
@@ -244,7 +315,7 @@ pub(super) fn dry_run_outcome<T>(
 ) -> ManageOutcome<T> {
     warn_if_in_memory(state, persisted, &mut preview);
     if audited && !state.audit.is_writable() {
-        add_warning(&mut preview, AUDIT_UNAVAILABLE_WARNING);
+        add_warning(&mut preview.warning, AUDIT_UNAVAILABLE_WARNING);
     }
     tracing::debug!(
         target: "arneb::audit",

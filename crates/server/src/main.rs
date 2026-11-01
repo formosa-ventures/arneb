@@ -92,6 +92,7 @@ pub mod dynamic_filter;
 mod fragment_pruning;
 pub mod memory_probe;
 pub mod memory_profile;
+mod oauth;
 pub mod task_manager;
 mod web;
 

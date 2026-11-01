@@ -981,8 +981,6 @@ impl OAuthConfig {
     }
 
     /// The `aud` a token must carry: `audience`, else `resource`.
-    // Consumed by the OAuth token validator (a later H6 task).
-    #[allow(dead_code)]
     pub fn effective_audience(&self) -> Option<&str> {
         self.audience.as_deref().or(self.resource.as_deref())
     }

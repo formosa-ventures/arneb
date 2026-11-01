@@ -16,7 +16,7 @@ use super::session::{url_encode, ClientSession};
 use super::statements::{bind_placeholders, like_match, parse_control, ControlStatement};
 use super::types::{trino_type_of, OutputColumn, TrinoType};
 use crate::agent::explain::ScanEstimate;
-use crate::handler::{execute_query_capped, DistributedExecutor};
+use crate::handler::{execute_query_capped, BatchSink, DistributedExecutor, RowCap};
 
 /// The result of one statement, before paging.
 #[derive(Debug, Default)]
@@ -99,6 +99,25 @@ fn single_column(name: &'static str, values: Vec<String>) -> QueryOutput {
     QueryOutput::table(b)
 }
 
+/// Passes batches on to `sink`, remembering the first one's schema.
+struct FirstSchema<'a> {
+    schema: Option<arrow::datatypes::SchemaRef>,
+    sink: &'a mut dyn BatchSink,
+}
+
+impl BatchSink for FirstSchema<'_> {
+    fn push(&mut self, batch: RecordBatch) {
+        if self.schema.is_none() {
+            self.schema = Some(batch.schema());
+        }
+        self.sink.push(batch);
+    }
+
+    fn reset(&mut self) {
+        self.sink.reset();
+    }
+}
+
 impl Engine {
     /// The catalog manager this session plans against: the root, checked
     /// against the access rules for the session user. Fails when the rules
@@ -146,14 +165,24 @@ impl Engine {
 
     /// [`run_statement`](Self::run_statement) for a client that keeps at most
     /// `row_cap` rows: a query stops producing rows after `row_cap` of them,
-    /// so it reads no more than that needs.
+    /// so it reads no more than that needs, and every batch goes to `sink`
+    /// as it is produced (the returned output has no batches), so the client
+    /// can drop what it does not keep.
     pub(crate) async fn run_statement_capped(
         &self,
         session: &ClientSession,
         sql: &str,
         row_cap: usize,
+        sink: &mut dyn BatchSink,
     ) -> Result<QueryOutput, TrinoError> {
-        self.run(session, sql, 0, Some(row_cap)).await
+        let cap = RowCap {
+            rows: row_cap,
+            sink: &mut *sink,
+        };
+        let mut output = self.run(session, sql, 0, Some(cap)).await?;
+        // Control statements (`SHOW ...`) build their small result whole.
+        output.batches.drain(..).for_each(|b| sink.push(b));
+        Ok(output)
     }
 
     async fn run(
@@ -161,7 +190,7 @@ impl Engine {
         session: &ClientSession,
         sql: &str,
         depth: u8,
-        row_cap: Option<usize>,
+        row_cap: Option<RowCap<'_>>,
     ) -> Result<QueryOutput, TrinoError> {
         let sql = sql.trim().trim_end_matches(';').trim();
         if sql.is_empty() {
@@ -252,8 +281,17 @@ impl Engine {
         catalog_manager: &CatalogManager,
         registry: &ConnectorRegistry,
         distributed: Option<&dyn DistributedExecutor>,
-        row_cap: Option<usize>,
+        row_cap: Option<RowCap<'_>>,
     ) -> Result<QueryOutput, TrinoError> {
+        let mut tap = row_cap.map(|cap| {
+            (
+                cap.rows,
+                FirstSchema {
+                    schema: None,
+                    sink: cap.sink,
+                },
+            )
+        });
         let (plan, batches) = execute_query_capped(
             sql,
             catalog_manager,
@@ -261,7 +299,10 @@ impl Engine {
             distributed,
             &self.memory_pool,
             self.query_memory_limit,
-            row_cap,
+            tap.as_mut().map(|(rows, sink)| RowCap {
+                rows: *rows,
+                sink: sink as &mut dyn BatchSink,
+            }),
         )
         .await
         .map_err(|e| TrinoError::from_arneb(&e, Some(&SourceFile::new("<query>", sql))))?;
@@ -270,8 +311,9 @@ impl Engine {
         // gets encoded); fall back to the planned type for empty results.
         let physical = batches
             .first()
-            .filter(|b| b.num_columns() == infos.len())
-            .map(|b| b.schema());
+            .map(|b| b.schema())
+            .or_else(|| tap.and_then(|(_, t)| t.schema))
+            .filter(|s| s.fields().len() == infos.len());
         let columns = infos
             .iter()
             .enumerate()

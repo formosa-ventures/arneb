@@ -222,7 +222,7 @@ Only the submitting user can poll, fetch or cancel a statement.
 | `POST /api/v2/statements` | Submit a statement. `201` with a `Location` header. |
 | `GET /api/v2/statements/{id}?wait_ms=` | Poll a statement. |
 | `GET /api/v2/statements/{id}/results?cursor=&max_bytes=` | Fetch a page of rows. |
-| `DELETE /api/v2/statements/{id}` | Cancel a statement. Idempotent. |
+| `DELETE /api/v2/statements/{id}` | Cancel a queued or running statement, or release one that has ended. Returns the status. |
 
 The three listings take `?prefix=` (case-insensitive) and `?limit=`, and
 return `{"items":[{"name"}],"total","truncated"}`. Path segments are used
@@ -252,7 +252,7 @@ The reply is a status:
 {"id":"…","state":"finished","queue_position":null,"elapsed_ms":41,
  "update_type":null,
  "columns":[{"name":"l_orderkey","type":"bigint"},{"name":"l_quantity","type":"bigint"}],
- "total_rows":2,"truncated":false,"truncated_by":null,"max_rows":100,
+ "total_rows":2,"truncated":false,"truncated_by":null,"truncated_hint":null,"max_rows":100,
  "first_page":{"rows":[[1,17],[2,36]],"…":"…"},"error":null}
 ```
 
@@ -263,6 +263,15 @@ statement that finishes inside `wait_ms` carries its first page inline;
 otherwise poll with `GET /statements/{id}?wait_ms=` (long-poll) until it is
 terminal, then fetch pages with `GET /statements/{id}/results?cursor=N`,
 where `cursor` is the row offset (default 0).
+
+`DELETE /statements/{id}` cancels a statement that is still queued or
+running; it stays, so a later poll shows `cancelled` and why. On a statement
+that has ended (finished, failed or cancelled) it releases it: the reply is
+its final status (with `first_page: null`), the id answers `not_found` from
+then on, and its retained rows stop counting against the budgets, at once or,
+if a page fetch of it is in flight, once that fetch finishes.
+So a client that is done with a result should delete it rather than wait for
+the idle timeout.
 
 A statement that fails after submission is still `200`/`201`: the status has
 `state: "failed"` and an `error` object. HTTP error statuses are for the
@@ -304,23 +313,48 @@ least one, so a single wide row can make a page larger than `max_bytes`
 `max_rows + 1` of them (one extra, to tell whether there are more), so a
 `SELECT *` over a large table with `max_rows=100` reads only what it needs
 for 101 rows, and an `ORDER BY` keeps the top rows instead of sorting
-everything. The cost is that a truncated result has no exact count:
-`total_rows` is the row count when `truncated` is `false`, and `null` when it
-is `true`. To count a large result, run `SELECT count(*)`. Aggregations,
-joins and sorts still read all their input; only the rows they emit are
-capped.
+everything. The cost is that a result cut by `max_rows` has no exact count:
+`total_rows` is the number of rows the query produced when that is at most
+`max_rows` (even if a byte limit kept fewer of them), and `null` when
+execution stopped at `max_rows + 1`. To count a large result, run
+`SELECT count(*)`. Aggregations, joins and sorts still read all their
+input; only the rows they emit are capped.
 
-Retained rows are also bounded by memory: a statement keeps at most
-`max_retained_bytes` of Arrow data, and all statements together at most
-`max_total_retained_bytes`. Rows past either are dropped as they are kept;
-the statement still finishes, with `truncated: true` and `total_rows: null`.
-`truncated_by` says which limit cut the result, so an agent can react:
+Retained rows are also bounded by memory, while the query runs and after:
+a statement keeps at most `max_retained_bytes` of Arrow data, one user's
+statements together at most `max_user_retained_bytes`, and all statements
+together at most `max_total_retained_bytes`; running statements count as
+they collect. Rows are kept as the query produces them, on a standalone
+server and on a coordinator with workers alike (the final stage streams
+into the statement). Strings and binary values are cut to what a page can
+show (`max_cell_bytes`) as they are kept, and a dictionary shared by
+several batches counts once.
+
+When the user's share or the server budget is short, the server evicts
+statements that have ended and still hold rows, but only when the
+evictable ones free enough to cover the shortfall (one a page fetch is
+reading is skipped). Victims are taken in this order: for the user's share,
+the user's own; for the server budget, the user's own first, then other
+users'. Within each, fully read ones go first (the last page was fetched,
+or the first page held everything), then the least recently used. An
+evicted statement answers `not_found` with a message saying it was evicted
+and a hint to resubmit it. When eviction cannot cover the shortfall, the
+rows past the limit are dropped (still counted) and the statement finishes
+with `truncated: true`.
+
+If not even the first row fits as is, it is kept in the form a page shows
+it: each oversized cell (a long list, map or struct, say) becomes its cut
+string. That form still has to fit the limits. When it does not, the
+statement keeps no rows, and `truncated_hint` says the first row alone was
+too large. `truncated_by` says which limit cut the result, so an agent can
+react:
 
 | `truncated_by` | Cause | What to do |
 |---|---|---|
 | `max_rows` | More than `max_rows` rows. | Add `LIMIT`, a filter or an aggregate, or raise `max_rows`. |
 | `max_retained_bytes` | The kept rows reached the per-statement byte limit. | Select fewer or narrower columns. |
-| `server_budget` | Retained results across the server hit the global budget. | Retry later; results free up as statements are evicted or reaped. |
+| `user_budget` | Your statements' retained results reached your share. | `DELETE` statements you are done with, or wait for running ones to finish. |
+| `server_budget` | Retained results across the server hit the global budget. | Retry later; results free up as statements are deleted, evicted or reaped. |
 | `null` | Nothing was cut. | |
 
 A request value above its ceiling is refused with `invalid_argument` and a
@@ -339,6 +373,7 @@ query parameter is also `invalid_argument`.
 | `max_page_bytes` | `ARNEB_AGENT_MAX_PAGE_BYTES` | 4194304 |
 | `max_cell_bytes` | `ARNEB_AGENT_MAX_CELL_BYTES` | 8192 |
 | `max_retained_bytes` | `ARNEB_AGENT_MAX_RETAINED_BYTES` | 67108864 (64 MiB) |
+| `max_user_retained_bytes` | `ARNEB_AGENT_MAX_USER_RETAINED_BYTES` | 268435456 (256 MiB) |
 | `max_total_retained_bytes` | `ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES` | 1073741824 (1 GiB) |
 | `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 |
 | `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 |
@@ -346,13 +381,13 @@ query parameter is also `invalid_argument`.
 A user may hold 32 statements and the server 1024. At a cap, a new
 submission evicts the least-recently-accessed statement that has ended
 (finished, failed or cancelled; the user's own for the per-user cap), which
-from then on answers `not_found`. So an unfetched finished result can be
+from then on answers `not_found` with a message saying it was evicted. So an unfetched finished result can be
 lost once the user submits 32 newer statements. When every held statement
 is still queued or running, the submission is refused with `overloaded`.
 After `idle_timeout_secs` with no request for a statement, a finished one
 is dropped and a running one is cancelled as abandoned. A statement with a
-request long-polling it is never idle, and `idle_timeout_secs` must be at
-least twice `max_wait_ms`.
+request long-polling it is never idle, and `idle_timeout_secs` must not be
+shorter than `max_wait_ms`.
 
 ### Querying errors
 
@@ -673,9 +708,12 @@ user returns no entries.
   works on pgwire but not as Trino Basic, which treats token-shaped
   passwords as tokens. Do not choose such a password.
 - **No login lockout.** Repeated wrong passwords are not locked out.
-  Concurrent PBKDF2 checks are bounded (a burst gets `overloaded`), which
-  limits the cost, not the guessing. Use long passwords, or tokens, and
-  rate-limit at your proxy.
+  Concurrent PBKDF2 work is bounded by one process-wide limiter shared by
+  Basic checks (Web and Trino) and token issuance. Each listener and token
+  issuance has its own bounded wait queue, so a burst on one of them cannot
+  make the others answer `overloaded` (503); it can still slow their uncached
+  logins, because the CPU limiter is shared. This limits the cost, not the
+  guessing. Use long passwords, or tokens, and rate-limit at your proxy.
 - **Plaintext tokens** appear only in the issue response. The server never
   logs them.
 - **The Web port is plain HTTP.** Terminate TLS in front of it when it

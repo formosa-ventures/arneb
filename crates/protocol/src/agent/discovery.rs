@@ -304,8 +304,8 @@ impl AgentQueryService {
             if !visible.iter().any(|t| t == table) {
                 return Err(table_missing(catalog, schema, table, &visible));
             }
-        } else {
-            resolve_visible(&root, catalog, schema, table).await?;
+        } else if !names_visible(&root, catalog, schema, table) {
+            return Err(missing(&root, catalog, schema, table).await);
         }
         let sql = format!(
             "SELECT * FROM {}.{}.{} LIMIT {rows}",
@@ -314,18 +314,43 @@ impl AgentQueryService {
             quote(table)
         );
         let wait: Duration = self.limits.max_wait;
-        self.submit(
-            user,
-            SubmitRequest {
-                sql,
-                catalog: None,
-                schema: None,
-                max_rows: Some(rows),
-            },
-            wait,
-            page_bytes,
-        )
-        .await
+        let status = self
+            .submit(
+                user,
+                SubmitRequest {
+                    sql,
+                    catalog: None,
+                    schema: None,
+                    max_rows: Some(rows),
+                },
+                wait,
+                page_bytes,
+            )
+            .await?;
+        // The query resolves the table itself (once); when the sampled table
+        // does not exist, answer with the same not-found error (and
+        // candidates) as describe. A not-found raised inside it (a view over
+        // a missing table, ...) stays the query's own error.
+        let not_found = status.error.as_ref().is_some_and(|e| {
+            matches!(
+                e.code,
+                AgentErrorCode::CatalogNotFound
+                    | AgentErrorCode::SchemaNotFound
+                    | AgentErrorCode::TableNotFound
+            )
+        });
+        if not_found && !is_virtual(catalog, schema) {
+            let error = match tables_of(&root, catalog, schema).await {
+                Ok(visible) if visible.iter().any(|t| t == table) => None,
+                Ok(visible) => Some(table_missing(catalog, schema, table, &visible)),
+                Err(err) => Some(err),
+            };
+            if let Some(error) = error {
+                self.forget(user, &status.id);
+                return Err(error);
+            }
+        }
+        Ok(status)
     }
 }
 
@@ -343,10 +368,7 @@ async fn resolve_visible(
     schema: &str,
     table: &str,
 ) -> Result<Arc<dyn TableProvider>, AgentError> {
-    if root.catalog_visible(catalog)
-        && root.schema_visible(catalog, schema)
-        && root.table_visible(catalog, schema, table)
-    {
+    if names_visible(root, catalog, schema, table) {
         let reference = TableReference {
             catalog: Some(catalog.to_string()),
             schema: Some(schema.to_string()),
@@ -356,8 +378,24 @@ async fn resolve_visible(
             return Ok(provider);
         }
     }
-    let visible = tables_of(root, catalog, schema).await?;
-    Err(table_missing(catalog, schema, table, &visible))
+    Err(missing(root, catalog, schema, table).await)
+}
+
+/// Whether the access rules let the root's user see `catalog.schema.table`
+/// (it may still not exist). No metadata is loaded.
+fn names_visible(root: &CatalogManager, catalog: &str, schema: &str, table: &str) -> bool {
+    root.catalog_visible(catalog)
+        && root.schema_visible(catalog, schema)
+        && root.table_visible(catalog, schema, table)
+}
+
+/// The not-found error for a table that is missing or hidden, at the right
+/// level and with candidates, exactly as a listing would report it.
+async fn missing(root: &CatalogManager, catalog: &str, schema: &str, table: &str) -> AgentError {
+    match tables_of(root, catalog, schema).await {
+        Ok(visible) => table_missing(catalog, schema, table, &visible),
+        Err(err) => err,
+    }
 }
 
 /// Visible schemas of `catalog`, or catalog_not_found.
@@ -664,23 +702,36 @@ mod tests {
         assert_eq!(d.statistics.size_bytes, Some(1024));
     }
 
-    /// A schema `s` with table `stat` that counts its listings.
+    /// Listings and table resolutions of a [`CountingSchema`].
+    #[derive(Debug, Default)]
+    struct Counts {
+        listings: std::sync::atomic::AtomicUsize,
+        resolutions: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A schema `s` with table `stat` that counts its listings and
+    /// resolutions.
     #[derive(Debug)]
-    struct CountingSchema(Arc<std::sync::atomic::AtomicUsize>);
+    struct CountingSchema(Arc<Counts>);
 
     #[async_trait]
     impl SchemaProvider for CountingSchema {
         async fn table_names(&self) -> Vec<String> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0
+                .listings
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             vec!["stat".into()]
         }
         async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+            self.0
+                .resolutions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             StatsSchema.table(name).await
         }
     }
 
     #[derive(Debug)]
-    struct CountingCatalog(Arc<std::sync::atomic::AtomicUsize>);
+    struct CountingCatalog(Arc<Counts>);
 
     #[async_trait]
     impl CatalogProvider for CountingCatalog {
@@ -695,9 +746,9 @@ mod tests {
 
     #[tokio::test]
     async fn describe_and_sample_resolve_without_listing() {
-        let listings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counts = Arc::new(Counts::default());
         let cm = CatalogManager::new("counted", "s");
-        cm.register_catalog("counted", Arc::new(CountingCatalog(Arc::clone(&listings))));
+        cm.register_catalog("counted", Arc::new(CountingCatalog(Arc::clone(&counts))));
         let svc = AgentQueryService::new(
             Arc::new(cm),
             Arc::new(ConnectorRegistry::new()),
@@ -709,12 +760,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(d.statistics.row_count, Some(42));
-        // The sample statement itself may fail (no connector); only the
-        // existence check matters here.
+        let resolutions = || counts.resolutions.load(std::sync::atomic::Ordering::SeqCst);
+        // What the sample's own query costs, run as a plain statement. It
+        // may fail (no connector); only how often the table is resolved
+        // matters here.
+        let before = resolutions();
+        let _ = svc
+            .submit(
+                "alice",
+                SubmitRequest {
+                    sql: "SELECT * FROM \"counted\".\"s\".\"stat\" LIMIT 1".into(),
+                    catalog: None,
+                    schema: None,
+                    max_rows: Some(1),
+                },
+                Duration::from_secs(5),
+                None,
+            )
+            .await;
+        let query = resolutions() - before;
+        let before = resolutions();
         let _ = svc
             .sample("alice", "counted", "s", "stat", Some(1), None)
             .await;
-        let count = || listings.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            resolutions() - before,
+            query,
+            "the sample must not resolve the table beyond its own query"
+        );
+        let count = || counts.listings.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(count(), 0, "a hit must not list the schema");
         let err = svc
             .describe_table("alice", "counted", "s", "stta", None)

@@ -558,7 +558,8 @@ impl ArnebMcp {
         description = "Run a SQL statement. Returns its status; with `wait_ms` (at most \
                        {max_wait_ms}) a short query is already finished, with a first page of \
                        rows. At most `max_rows` (default {default_max_rows}, at most {max_rows}) \
-                       rows are kept and `truncated` says if more existed. A failed \
+                       rows are kept and `truncated` says if more existed (`truncated_by` names \
+                       the limit, `truncated_hint` what to do). A failed \
                        statement is a status with state `failed` and an error. Next: \
                        get_query_status until finished, then fetch_results starting from \
                        `first_page.next_cursor` (null means you have every row).",
@@ -638,16 +639,18 @@ impl ArnebMcp {
     /// `cancel_query`: `DELETE /api/v2/statements/{id}` or
     /// `DELETE /api/v2/queries/{id}`.
     #[tool(
-        description = "Cancel a query by id. Your own statement from submit_query returns its \
-                       status after cancelling (safe to repeat). Any other id, or a dry_run, \
-                       returns the manage envelope (dry_run, action, summary, changed, result); \
-                       cancelling another user's query needs the manage privilege or an \
-                       explicit queries rule allowing kill (with no queries rules, only the \
-                       owner or a manager may), and is audited. A query that already ended is \
-                       changed: false.",
+        description = "Cancel a query by id. Your own statement from submit_query: a queued \
+                       or running one is cancelled and kept (get_query_status still reports \
+                       it); an ended one is released with its rows, returning its final status \
+                       without a first page. Any other id (including a statement already \
+                       released), or a dry_run, returns the manage envelope (dry_run, action, \
+                       summary, changed, result); cancelling another user's query needs the \
+                       manage privilege or an explicit queries rule allowing kill (with no \
+                       queries rules, only the owner or a manager may), and is audited. A query \
+                       that already ended is changed: false.",
         annotations(
             destructive_hint = true,
-            idempotent_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -660,9 +663,10 @@ impl ArnebMcp {
         let dry_run = a.dry_run.unwrap_or(false);
         if !dry_run {
             // The caller's own agent statement keeps the H3 behavior and
-            // result; any other id is not found here and goes on.
+            // result; any other id (or one already released or evicted) is
+            // not found here and goes on to the tracker.
             if let Some(svc) = self.state.agent.as_ref() {
-                match svc.cancel(&who.user, &a.id, Some(self.page_bytes(svc))) {
+                match svc.cancel(&who.user, &a.id) {
                     Ok(status) => return ok(&status),
                     Err(e) => {
                         let e = ApiError::from(e);
@@ -1375,10 +1379,16 @@ mod tests {
         let st = tool_ok(&f, "alice", "get_query_status", json!({"id": id})).await;
         assert_eq!(st["first_page"]["rows"], first["rows"]);
         assert_eq!(st["first_page"]["next_cursor"], first["next_cursor"]);
-        // And so is cancelling a statement that already finished.
+        // Cancelling a statement that already finished releases it: its
+        // final status comes back without rows, and the id is gone after.
         let c = tool_ok(&f, "alice", "cancel_query", json!({"id": id})).await;
         assert_eq!(c["state"], "finished");
-        assert_eq!(c["first_page"], st["first_page"]);
+        assert!(c["first_page"].is_null(), "{c}");
+        // Released, the id is only the tracked query now: nothing to cancel.
+        let again = tool_ok(&f, "alice", "cancel_query", json!({"id": id})).await;
+        assert_eq!(again["changed"], false, "{again}");
+        let e = tool_err(&f, "alice", "get_query_status", json!({"id": id})).await;
+        assert_eq!(e["code"], "not_found", "{e}");
     }
 
     #[tokio::test]
@@ -1893,7 +1903,9 @@ mod tests {
             }
             if destructive {
                 assert_eq!(a["destructiveHint"], json!(true), "{name} destructive");
-                assert_eq!(a["idempotentHint"], json!(true), "{name} idempotent");
+                // A second cancel_query releases what the first cancelled.
+                let idempotent = name != "cancel_query";
+                assert_eq!(a["idempotentHint"], json!(idempotent), "{name} idempotent");
             }
         }
 

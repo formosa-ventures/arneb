@@ -374,10 +374,17 @@ async fn run() -> Result<()> {
     // Workers ignore their own [[catalogs]]: they start empty at generation
     // 0 and take the coordinator's set over Flight (D8). An unreachable
     // catalog is skipped with a WARN; the server keeps serving.
+    // Ruling R12: a worker builds the coordinator's effective specs (its
+    // global [storage] already merged in), so it merges over no storage of
+    // its own.
+    let catalog_storage = match role {
+        ServerRole::Worker => config::StorageConfig::default(),
+        _ => config.storage.clone(),
+    };
     let live_catalogs = catalogs::LiveCatalogs::new(
         catalog_manager.clone(),
         connector_registry.clone(),
-        config.storage.clone(),
+        catalog_storage,
     );
     if matches!(role, ServerRole::Worker) {
         start_worker_catalogs(&live_catalogs, &config.catalogs);
@@ -1975,6 +1982,7 @@ mod tests {
                 epoch: 0,
                 generation: 3,
                 catalogs: vec![],
+                ..Default::default()
             }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2045,6 +2053,7 @@ mod tests {
             epoch: 100,
             generation: 5,
             catalogs: vec![serde_json::to_value(&lake).unwrap()],
+            ..Default::default()
         }));
         let fetches = Arc::new(AtomicUsize::new(0));
         let addr = fake_coordinator(set.clone(), fetches.clone()).await;
@@ -2070,6 +2079,7 @@ mod tests {
             epoch: 200,
             generation: 2,
             catalogs: vec![],
+            ..Default::default()
         };
         assert!(beat().await);
         assert_eq!((live.epoch(), live.generation()), (200, 2));
@@ -2082,11 +2092,13 @@ mod tests {
             epoch: 300,
             generation: 1,
             catalogs: vec![serde_json::to_value(&lake).unwrap()],
+            ..Default::default()
         };
         live.apply_remote(arneb_rpc::CatalogSet {
             epoch: 250,
             generation: 1,
             catalogs: vec![],
+            ..Default::default()
         })
         .await;
         assert_eq!((live.epoch(), live.generation()), (250, 1));
@@ -2105,6 +2117,7 @@ mod tests {
             epoch: 7,
             generation,
             catalogs,
+            ..Default::default()
         };
         assert!(apply_pushed_catalogs(&live, push(5, vec![]))
             .await

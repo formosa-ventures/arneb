@@ -21,7 +21,7 @@ use crate::task_submission::connect;
 
 /// A catalog generation and its specs, as JSON objects (the server crate's
 /// `CatalogConfig`, raw secrets included). Encoded as JSON.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogSet {
     /// The epoch of the coordinator the set comes from, chosen at random at
     /// each start (Ruling R6). A set from another epoch than the one a
@@ -30,8 +30,18 @@ pub struct CatalogSet {
     pub epoch: u64,
     /// The catalog generation the set belongs to.
     pub generation: u64,
-    /// One spec per catalog.
+    /// One spec per catalog, each with the coordinator's global
+    /// `[storage]` already merged in (Ruling R12), so a worker builds it
+    /// without any storage config of its own.
     pub catalogs: Vec<serde_json::Value>,
+    /// The coordinator's default catalog, which a worker resolves a scan
+    /// with no catalog in (Ruling R12). `None` from an older coordinator:
+    /// the worker keeps its own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_catalog: Option<String>,
+    /// The coordinator's default schema (Ruling R12); `None` as above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_schema: Option<String>,
 }
 
 impl std::fmt::Debug for CatalogSet {
@@ -40,6 +50,8 @@ impl std::fmt::Debug for CatalogSet {
             .field("epoch", &self.epoch)
             .field("generation", &self.generation)
             .field("catalogs", &self.catalogs.len())
+            .field("default_catalog", &self.default_catalog)
+            .field("default_schema", &self.default_schema)
             .finish()
     }
 }
@@ -174,6 +186,8 @@ mod tests {
                 serde_json::json!({"name": "pg", "type": "postgresql",
                                    "connection_url": "postgresql://u@db/x"}),
             ],
+            default_catalog: Some("lake".into()),
+            default_schema: Some("tpch".into()),
         }
     }
 
@@ -192,6 +206,8 @@ mod tests {
     fn catalog_set_epoch_defaults_to_zero() {
         let set = CatalogSet::decode(br#"{"generation":3,"catalogs":[]}"#).unwrap();
         assert_eq!((set.epoch, set.generation), (0, 3));
+        // Ruling R12: a set from an older coordinator carries no defaults.
+        assert_eq!((set.default_catalog, set.default_schema), (None, None));
     }
 
     #[test]

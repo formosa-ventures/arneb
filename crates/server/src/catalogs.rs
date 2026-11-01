@@ -92,6 +92,10 @@ pub struct LiveCatalogs {
     /// with the same epoch and generation rebuilds them instead of being
     /// rejected as stale.
     failed: RwLock<std::collections::BTreeSet<String>>,
+    /// On a worker, the coordinator's default catalog and schema from the
+    /// last applied set (Ruling R12); `None` until a set that carries them
+    /// arrives, and on a coordinator.
+    pushed_defaults: RwLock<Option<(String, String)>>,
     /// Serializes [`apply_set`](Self::apply_set) calls, which build outside
     /// any other lock.
     applying: tokio::sync::Mutex<()>,
@@ -130,6 +134,7 @@ impl LiveCatalogs {
             generation: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
             failed: RwLock::new(Default::default()),
+            pushed_defaults: RwLock::new(None),
             applying: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             test_builder: None,
@@ -143,8 +148,19 @@ impl LiveCatalogs {
         connectors: Arc<ConnectorRegistry>,
         builder: TestBuilder,
     ) -> Arc<Self> {
-        let mut live = Arc::into_inner(Self::new(manager, connectors, StorageConfig::default()))
-            .expect("fresh Arc");
+        Self::with_test_builder_and_storage(manager, connectors, StorageConfig::default(), builder)
+    }
+
+    /// [`with_test_builder`](Self::with_test_builder) over `global_storage`.
+    #[cfg(test)]
+    pub(crate) fn with_test_builder_and_storage(
+        manager: Arc<CatalogManager>,
+        connectors: Arc<ConnectorRegistry>,
+        global_storage: StorageConfig,
+        builder: TestBuilder,
+    ) -> Arc<Self> {
+        let mut live =
+            Arc::into_inner(Self::new(manager, connectors, global_storage)).expect("fresh Arc");
         live.test_builder = Some(builder);
         Arc::new(live)
     }
@@ -189,21 +205,68 @@ impl LiveCatalogs {
         self.read_specs().values().cloned().collect()
     }
 
-    /// The generation and the installed specs, for a worker to apply. The
-    /// generation is read first: [`apply_set`](Self::apply_set) advances it
-    /// only after installing, so the specs are never older than it says.
+    /// The default catalog and schema a scan that names none resolves in:
+    /// on a worker the coordinator's, once a set carrying them was applied
+    /// (Ruling R12); otherwise this node's own.
+    pub fn scan_defaults(&self) -> (String, String) {
+        self.pushed_defaults
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .unwrap_or_else(|| {
+                (
+                    self.manager.default_catalog().to_owned(),
+                    self.manager.default_schema().to_owned(),
+                )
+            })
+    }
+
+    /// Whether a set carrying the coordinator's defaults was applied here.
+    pub fn has_pushed_defaults(&self) -> bool {
+        self.pushed_defaults
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    /// The storage a hive catalog of `spec` reads through: its own
+    /// `storage` merged over this node's global `[storage]`.
+    fn storage_for(&self, spec: &CatalogConfig) -> StorageConfig {
+        StorageConfig::merge(&self.global_storage, spec.storage.as_ref())
+    }
+
+    /// `spec` as a worker must build it (Ruling R12): a hive spec carries
+    /// the global `[storage]` merged in, so the worker needs none of its
+    /// own. Other types read no object storage and are unchanged.
+    fn effective_spec(&self, spec: &CatalogConfig) -> CatalogConfig {
+        let mut effective = spec.clone();
+        if spec.catalog_type == "hive" {
+            let storage = self.storage_for(spec);
+            let empty = storage.s3.is_none() && storage.gcs.is_none() && storage.azure.is_none();
+            effective.storage = (!empty).then_some(storage);
+        }
+        effective
+    }
+
+    /// The generation, the installed specs (as effective specs, Ruling
+    /// R12) and this node's default catalog and schema, for a worker to
+    /// apply. The generation is read first: [`apply_set`](Self::apply_set)
+    /// advances it only after installing, so the specs are never older than
+    /// it says.
     pub fn snapshot(&self) -> arneb_rpc::CatalogSet {
         let epoch = self.epoch();
         let generation = self.generation();
         let catalogs = self
             .specs()
             .iter()
-            .filter_map(|spec| serde_json::to_value(spec).ok())
+            .filter_map(|spec| serde_json::to_value(self.effective_spec(spec)).ok())
             .collect();
         arneb_rpc::CatalogSet {
             epoch,
             generation,
             catalogs,
+            default_catalog: Some(self.manager.default_catalog().to_owned()),
+            default_schema: Some(self.manager.default_schema().to_owned()),
         }
     }
 
@@ -238,6 +301,12 @@ impl LiveCatalogs {
         let mut report = self.apply(Some(set.epoch), set.generation, specs).await;
         if report.applied {
             report.failed.extend(undecodable);
+            if let (Some(catalog), Some(schema)) = (set.default_catalog, set.default_schema) {
+                *self
+                    .pushed_defaults
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = Some((catalog, schema));
+            }
         }
         report
     }
@@ -280,7 +349,7 @@ impl LiveCatalogs {
             CatalogBuildError::Invalid("hive catalog requires metastore_uri".into())
         })?;
         // Per-catalog storage: merge the catalog override over [storage].
-        let merged_storage = StorageConfig::merge(&self.global_storage, spec.storage.as_ref());
+        let merged_storage = self.storage_for(spec);
         let storage = Arc::new(StorageRegistry::with_config(
             merged_storage.to_cloud_config(),
         ));
@@ -475,6 +544,11 @@ impl CatalogPuller {
                 Ok(())
             })
         })
+    }
+
+    /// The live set this puller applies to.
+    pub fn live(&self) -> &Arc<LiveCatalogs> {
+        &self.inner.live
     }
 
     /// Fetches the coordinator's set and applies it. A pull already running
@@ -847,8 +921,30 @@ fn url_password_range(url: &str) -> Option<std::ops::Range<usize>> {
     Some(authority_start + colon + 1..authority_start + at)
 }
 
-/// `(parameter, value)` byte ranges of every `password=` query parameter
-/// (libpq URIs accept the password there too).
+/// Whether a query parameter key is `password` once percent-decoded:
+/// tokio-postgres decodes keys, so `pass%77ord=` sets the password too.
+fn is_password_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                decoded.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    decoded == b"password"
+}
+
+/// `(parameter, value)` byte ranges of every query parameter whose key is
+/// `password` once percent-decoded (libpq URIs accept the password there
+/// too).
 fn url_query_passwords(url: &str) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
     let Some(scheme_end) = url.find("://") else {
         return Vec::new();
@@ -860,9 +956,11 @@ fn url_query_passwords(url: &str) -> Vec<(std::ops::Range<usize>, std::ops::Rang
     let mut out = Vec::new();
     let mut start = q;
     for param in url[q..end].split('&') {
-        if let Some(value) = param.strip_prefix("password=") {
-            let value_start = start + param.len() - value.len();
-            out.push((start..start + param.len(), value_start..start + param.len()));
+        if let Some((key, value)) = param.split_once('=') {
+            if is_password_key(key) {
+                let value_start = start + param.len() - value.len();
+                out.push((start..start + param.len(), value_start..start + param.len()));
+            }
         }
         start += param.len() + 1;
     }
@@ -935,6 +1033,7 @@ mod tests {
             epoch: 0,
             generation: 4,
             catalogs: vec![serde_json::json!({"name": "bad", "type": 7})],
+            ..Default::default()
         };
         let report = live.apply_remote(set.clone()).await;
         assert!(report.applied);
@@ -944,6 +1043,74 @@ mod tests {
         assert!(!live.apply_remote(set).await.applied, "not newer");
         let snap = live.snapshot();
         assert_eq!((snap.generation, snap.catalogs.len()), (4, 0));
+    }
+
+    /// Ruling R12: the coordinator pushes each hive spec with its global
+    /// `[storage]` merged in, plus its defaults; a worker with no storage
+    /// of its own builds that spec with the coordinator's storage, and the
+    /// pushed secret stays out of `Debug`.
+    #[tokio::test]
+    async fn pushed_hive_spec_builds_with_the_coordinators_storage() {
+        let coordinator_storage: StorageConfig = toml::from_str(
+            r#"
+            [s3]
+            endpoint = "http://rustfs:9000"
+            region = "us-east-1"
+            access_key_id = "coordkey"
+            secret_access_key = "coordsecret"
+            "#,
+        )
+        .unwrap();
+        let coordinator = LiveCatalogs::with_test_builder_and_storage(
+            Arc::new(CatalogManager::new("lake", "tpch")),
+            Arc::new(ConnectorRegistry::new()),
+            coordinator_storage,
+            Box::new(|_| Ok(fake_built())),
+        );
+        coordinator.set_epoch(5);
+        coordinator.set_generation(2);
+        coordinator.install(hive("lake"), fake_built());
+        coordinator.install(
+            spec(serde_json::json!({"name": "pg", "type": "postgresql", "connection_url": "postgresql://db/x"})),
+            fake_built(),
+        );
+        let set = coordinator.snapshot();
+        assert_eq!(set.default_catalog.as_deref(), Some("lake"));
+        assert_eq!(set.default_schema.as_deref(), Some("tpch"));
+        assert!(!format!("{set:?}").contains("coordsecret"));
+        // Only the hive spec carries storage.
+        assert!(set
+            .catalogs
+            .iter()
+            .any(|c| c["name"] == "pg" && c["storage"].is_null()));
+
+        let seen: Arc<std::sync::Mutex<Vec<CatalogConfig>>> = Default::default();
+        let s = seen.clone();
+        let worker = LiveCatalogs::with_test_builder_and_storage(
+            Arc::new(CatalogManager::new("memory", "default")),
+            Arc::new(ConnectorRegistry::new()),
+            StorageConfig::default(),
+            Box::new(move |spec| {
+                s.lock().unwrap().push(spec.clone());
+                Ok(fake_built())
+            }),
+        );
+        let report = worker.apply_remote(set).await;
+        assert!(report.applied && report.failed.is_empty(), "{report:?}");
+        let lake = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.name == "lake")
+            .cloned()
+            .unwrap();
+        let s3 = worker.storage_for(&lake).s3.expect("coordinator's s3");
+        assert_eq!(s3.endpoint.as_deref(), Some("http://rustfs:9000"));
+        assert_eq!(s3.secret_access_key.as_deref(), Some("coordsecret"));
+        assert_eq!(
+            worker.scan_defaults(),
+            ("lake".to_owned(), "tpch".to_owned())
+        );
     }
 
     fn fake_built() -> BuiltCatalog {
@@ -959,6 +1126,7 @@ mod tests {
             epoch,
             generation,
             catalogs,
+            ..Default::default()
         }
     }
 
@@ -1194,6 +1362,39 @@ mod tests {
             only["connection_url"],
             "postgresql://bob@db/sales?password=<redacted>"
         );
+    }
+
+    /// tokio-postgres percent-decodes query keys, so `pass%77ord=` is a
+    /// working password: it is redacted, found as a placeholder, filled
+    /// back from the stored spec, and ignored by the destination check.
+    #[test]
+    fn percent_encoded_password_key_is_a_secret() {
+        let stored = spec(serde_json::json!({
+            "name": "p", "type": "postgresql",
+            "connection_url": "postgresql://bob@db/sales?sslmode=disable&pass%77ord=enc-secret-8&PASS%57ORD=x"
+        }));
+        let redacted = redacted_spec(&stored);
+        assert!(!redacted.to_string().contains("enc-secret-8"));
+        assert_eq!(
+            redacted["connection_url"],
+            "postgresql://bob@db/sales?sslmode=disable&pass%77ord=<redacted>&PASS%57ORD=x",
+            "keys are case-sensitive, as in tokio-postgres"
+        );
+        let mut round_trip: CatalogConfig = serde_json::from_value(redacted).unwrap();
+        assert_eq!(
+            redacted_secrets(&round_trip),
+            vec!["connection_url password"]
+        );
+        assert!(same_destination(&round_trip, &stored));
+        fill_redacted(&mut round_trip, &stored);
+        assert!(redacted_secrets(&round_trip).is_empty());
+        assert_eq!(
+            round_trip.connection_url.as_ref().unwrap().0,
+            stored.connection_url.as_ref().unwrap().0
+        );
+        assert!(is_password_key("%70%61%73%73%77%6F%72%64"));
+        assert!(!is_password_key("password%"));
+        assert!(!is_password_key("passwor"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use arneb_catalog::CatalogManager;
 use arneb_common::inflight_budget::InflightBudget;
+use arneb_common::types::TableReference;
 use arneb_common::{Domain, DynamicFilterId, QueryId, TaskId};
 use arneb_connectors::ConnectorRegistry;
 use arneb_execution::memory_pool::{MemoryPool, QueryMemoryPool};
@@ -1222,6 +1223,36 @@ struct TaskSources<'a> {
 }
 
 impl TaskSources<'_> {
+    /// `table` as this worker resolves it. With a puller (a worker), a
+    /// missing catalog or schema is filled from the coordinator's defaults
+    /// (Ruling R12), pulling the set once first when none was ever applied;
+    /// the worker's own config no longer decides. Without one, unchanged.
+    async fn qualify(&mut self, table: &TableReference) -> TableReference {
+        if table.catalog.is_some() && table.schema.is_some() {
+            return table.clone();
+        }
+        let Some((puller, _)) = self.puller else {
+            return table.clone();
+        };
+        let live = puller.live();
+        if table.catalog.is_none()
+            && !self.pulled
+            && !live.has_pushed_defaults()
+            && live.epoch() == 0
+        {
+            self.pulled = true;
+            if let Err(e) = puller.pull().await {
+                tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
+            }
+        }
+        let (catalog, schema) = live.scan_defaults();
+        TableReference {
+            catalog: Some(table.catalog.clone().unwrap_or(catalog)),
+            schema: Some(table.schema.clone().unwrap_or(schema)),
+            table: table.table.clone(),
+        }
+    }
+
     /// The connector for `catalog`, pulling the coordinator's catalogs once
     /// per task on a miss when a puller is set.
     async fn connector(
@@ -1272,17 +1303,17 @@ impl TaskSources<'_> {
                 ..
             } => {
                 let key = table.to_string();
-                let connector_name = table
+                let scan_ref = self.qualify(table).await;
+                let connector_name = scan_ref
                     .catalog
-                    .as_deref()
-                    .unwrap_or(self.catalog_manager.default_catalog())
-                    .to_owned();
+                    .clone()
+                    .unwrap_or_else(|| self.catalog_manager.default_catalog().to_owned());
 
                 if let Some(factory) = self.connector(&connector_name).await? {
                     // Surface connector errors to the coordinator instead of
                     // degrading them to a generic "data source not found".
                     let ds = factory
-                        .create_data_source(table, schema, properties)
+                        .create_data_source(&scan_ref, schema, properties)
                         .await
                         .map_err(|e| format!("failed to create data source for '{key}': {e}"))?;
                     ctx.register_data_source(key, ds);
@@ -1481,6 +1512,77 @@ mod tests {
         assert_eq!(pulls.load(Ordering::SeqCst), 1);
     }
 
+    /// Ruling R12: a worker with no `[[catalogs]]` (its own default is
+    /// `memory`) resolves an unqualified or schema-only scan in the
+    /// coordinator's pushed default catalog and schema, pulling the set
+    /// first when none was applied yet.
+    #[tokio::test]
+    async fn unqualified_scan_resolves_to_the_pushed_default() {
+        use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = Arc::new(ConnectorRegistry::new());
+        // The worker's own memory catalog has no `users` table.
+        let own = Arc::new(MemoryCatalog::new());
+        own.register_schema(
+            "default",
+            Arc::new(arneb_connectors::memory::MemorySchema::new()),
+        );
+        registry.register(
+            "memory",
+            Arc::new(MemoryConnectorFactory::new(own, "default")),
+        );
+        let live = crate::catalogs::LiveCatalogs::with_test_builder(
+            Arc::new(CatalogManager::new("memory", "default")),
+            registry.clone(),
+            Box::new(|_| Ok(users_built())),
+        );
+        let pushed = arneb_rpc::CatalogSet {
+            epoch: 4,
+            generation: 1,
+            catalogs: vec![serde_json::json!({
+                "name": "datalake", "type": "hive", "metastore_uri": "h:9083"
+            })],
+            default_catalog: Some("datalake".into()),
+            default_schema: Some("default".into()),
+        };
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let (n, l) = (pulls.clone(), live.clone());
+        let puller = crate::catalogs::CatalogPuller::new(live.clone(), move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            let (l, s) = (l.clone(), pushed.clone());
+            Box::pin(async move {
+                l.apply_remote(s).await;
+                Ok(())
+            })
+        });
+        let tm = worker_tm(registry, puller);
+        let scan = |schema: Option<&str>| LogicalPlan::TableScan {
+            table: TableReference {
+                catalog: None,
+                schema: schema.map(Into::into),
+                table: "users".into(),
+            },
+            schema: vec![],
+            alias: None,
+            properties: Default::default(),
+            dynamic_filters_consumed: vec![],
+        };
+        let mut ctx = arneb_execution::ExecutionContext::new();
+        tm.register_data_sources(&scan(None), &mut ctx)
+            .await
+            .expect("resolved in the pushed default catalog");
+        assert_eq!(pulls.load(Ordering::SeqCst), 1, "pulled once: no set yet");
+        assert_eq!(
+            live.scan_defaults(),
+            ("datalake".to_owned(), "default".to_owned())
+        );
+        // Synced now: a schema-only scan resolves without another pull.
+        tm.register_data_sources(&scan(Some("default")), &mut ctx)
+            .await
+            .expect("schema-only scan in the pushed default catalog");
+        assert_eq!(pulls.load(Ordering::SeqCst), 1);
+    }
+
     /// A memory-backed catalog holding `default.users`.
     fn users_built() -> crate::catalogs::BuiltCatalog {
         use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
@@ -1539,6 +1641,7 @@ mod tests {
             catalogs: vec![serde_json::json!({
                 "name": "cat1", "type": "hive", "metastore_uri": "h:9083"
             })],
+            ..Default::default()
         };
         assert!(live.apply_remote(held.clone()).await.applied);
         assert!(live.has_failed_builds());

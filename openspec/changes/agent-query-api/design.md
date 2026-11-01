@@ -34,7 +34,7 @@ Stage H2 of the headless agent interface, built on H1 (`headless-api-auth`): an 
 | `POST /statements` | submit |
 | `GET /statements/{id}?wait_ms=` | poll |
 | `GET /statements/{id}/results?cursor=&max_bytes=` | fetch a page |
-| `DELETE /statements/{id}` | cancel |
+| `DELETE /statements/{id}` | cancel a live statement; release an ended one (frees its retained bytes) |
 
 The listings accept `?prefix=&limit=`.
 

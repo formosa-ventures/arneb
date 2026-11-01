@@ -12,11 +12,15 @@
 - **THEN** the response is `invalid_argument` with the hint `pass "catalog" and "schema" in the request body`
 
 ### Requirement: Cancel
-`DELETE /api/v2/statements/{id}` SHALL cancel a queued or running statement and return its status; it SHALL be idempotent on a terminal statement. The query tracker SHALL record the query as cancelled.
+`DELETE /api/v2/statements/{id}` SHALL cancel a queued or running statement, keep it, and return its status; the query tracker SHALL record the query as cancelled. On a terminal statement it SHALL return the final status, remove the statement and release its retained bytes from the budget at once; the id SHALL answer `not_found` afterwards and the tracker state SHALL not change.
 
 #### Scenario: Cancel a long statement
 - **WHEN** alice submits a long query, polls until it is `running`, and cancels it
 - **THEN** the status is `cancelled`, and `/api/v2/queries/{id}` shows the query cancelled
+
+#### Scenario: Release a finished statement
+- **WHEN** alice deletes a finished statement that retains rows
+- **THEN** the reply is its `finished` status, the retained budget's used bytes drop by what it held, and a later poll answers `not_found`
 
 ### Requirement: Per-user statements
 Only the submitting user SHALL poll, fetch or cancel a statement. Any other user SHALL get `404 not_found`, exactly as for an id that does not exist. A user SHALL hold at most 32 statements and the server 1024. At a cap, a submit SHALL evict the least-recently-accessed terminal statement (the user's own for the per-user cap), and SHALL answer `overloaded` only when every counted statement is still queued or running.

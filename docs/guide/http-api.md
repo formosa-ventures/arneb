@@ -204,7 +204,7 @@ Only the submitting user can poll, fetch or cancel a statement.
 | `POST /api/v2/statements` | Submit a statement. `201` with a `Location` header. |
 | `GET /api/v2/statements/{id}?wait_ms=` | Poll a statement. |
 | `GET /api/v2/statements/{id}/results?cursor=&max_bytes=` | Fetch a page of rows. |
-| `DELETE /api/v2/statements/{id}` | Cancel a statement. Idempotent. |
+| `DELETE /api/v2/statements/{id}` | Cancel a queued or running statement, or release one that has ended. Returns the status. |
 
 The three listings take `?prefix=` (case-insensitive) and `?limit=`, and
 return `{"items":[{"name"}],"total","truncated"}`. Path segments are used
@@ -239,6 +239,14 @@ statement that finishes inside `wait_ms` carries its first page inline;
 otherwise poll with `GET /statements/{id}?wait_ms=` (long-poll) until it is
 terminal, then fetch pages with `GET /statements/{id}/results?cursor=N`,
 where `cursor` is the row offset (default 0).
+
+`DELETE /statements/{id}` cancels a statement that is still queued or
+running; it stays, so a later poll shows `cancelled` and why. On a statement
+that has ended (finished, failed or cancelled) it releases it: the reply is
+its final status, its retained rows are freed at once (they no longer count
+against the server's budget), and the id answers `not_found` from then on.
+So a client that is done with a result should delete it rather than wait for
+the idle timeout.
 
 A statement that fails after submission is still `200`/`201`: the status has
 `state: "failed"` and an `error` object. HTTP error statuses are for the

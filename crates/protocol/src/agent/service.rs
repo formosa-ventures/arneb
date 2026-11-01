@@ -244,16 +244,40 @@ impl AgentQueryService {
         statement.page(cursor, max_bytes, self.limits.max_cell_bytes)
     }
 
-    /// Cancel `user`'s statement `id`. Idempotent: a terminal statement
-    /// keeps its state and its current status is returned.
+    /// Cancel `user`'s statement `id`, or release it once it has ended.
+    /// A queued or running statement is cancelled and kept, so a later poll
+    /// learns why it stopped. A terminal one is removed with its retained
+    /// rows, which gives their bytes back to the budget; its final status is
+    /// returned and the id answers `not_found` from then on.
     pub fn cancel(&self, user: &str, id: &str) -> Result<StatementStatus, AgentError> {
         let statement = self.lookup(user, id)?;
+        if statement.is_terminal() {
+            let status = statement.status(&self.limits);
+            self.forget(user, id);
+            return Ok(status);
+        }
         self.cancel_statement(
             &statement,
             AgentError::new(AgentErrorCode::Cancelled, "Statement was cancelled"),
             "client",
         );
         Ok(statement.status(&self.limits))
+    }
+
+    /// Drops `user`'s statement `id` from the registry (a no-op for another
+    /// user's or a missing one). Its retained rows are released once no
+    /// request is still encoding a page from them.
+    pub(super) fn forget(&self, user: &str, id: &str) {
+        let removed = {
+            let mut statements = lock(&self.statements);
+            match statements.get(id) {
+                Some(s) if s.user == user => statements.remove(id),
+                _ => None,
+            }
+        };
+        if removed.is_some() {
+            tracing::debug!(statement_id = %id, "agent statement released");
+        }
     }
 
     /// Checks the caps and registers a new statement with the tracker and
@@ -1167,15 +1191,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s.state, StatementState::Finished);
-        for _ in 0..2 {
-            let c = svc.cancel("alice", &s.id).unwrap();
-            assert_eq!(c.state, StatementState::Finished);
-            assert_eq!(c.total_rows, Some(1));
-        }
+        // Deleting a finished statement returns its final status, keeps it
+        // finished in the tracker and releases it.
+        let c = svc.cancel("alice", &s.id).unwrap();
+        assert_eq!(c.state, StatementState::Finished);
+        assert_eq!(c.total_rows, Some(1));
+        let err = svc.cancel("alice", &s.id).unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::NotFound);
         let info = tracker.list_queries(None).pop().unwrap();
         assert_eq!(info.state, QueryState::Finished);
 
-        // A cancelled statement stays cancelled.
+        // A cancelled statement stays cancelled: the second delete returns
+        // the same status and releases it.
         let (svc, _) = hanging(svc);
         let s = svc
             .submit("alice", req(HANGING_SQL), Duration::ZERO)
@@ -1186,6 +1213,24 @@ mod tests {
         assert_eq!(first.state, StatementState::Cancelled);
         assert_eq!(second.state, StatementState::Cancelled);
         assert_eq!(first.elapsed_ms, second.elapsed_ms);
+        assert!(svc.status("alice", &s.id, Duration::ZERO).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_finished_statement_releases_its_bytes() {
+        let svc = service_over(vec![wide_table(10, 1000)], AgentLimits::default());
+        let a = run_to_end(&svc, "SELECT s FROM wide", None).await;
+        let one = svc.retained_budget.used();
+        assert!(one > 0);
+        let b = run_to_end(&svc, "SELECT s FROM wide", None).await;
+        assert_eq!(svc.retained_budget.used(), 2 * one);
+        svc.cancel("alice", &a.id).unwrap();
+        assert_eq!(svc.retained_budget.used(), one);
+        // Another user cannot release it.
+        assert!(svc.cancel("bob", &b.id).is_err());
+        assert_eq!(svc.retained_budget.used(), one);
+        svc.cancel("alice", &b.id).unwrap();
+        assert_eq!(svc.retained_budget.used(), 0);
     }
 
     #[tokio::test]

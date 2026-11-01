@@ -64,6 +64,7 @@ JWT_ALICE=""
 JWT_BOB=""
 JWT_CAROL=""
 JWT_OTHER=""
+JWT_ID=""
 APITOK=""
 CAROL_ARNEB_PW=""
 PROBE_PW=""
@@ -79,7 +80,7 @@ redact() {
     local s
     s=$(cat)
     for secret in "$ARNEB_ADMIN_PASSWORD" "$PW_ALICE" "$PW_BOB" "$PW_CAROL" "$JWT_ALICE" "$JWT_BOB" \
-        "$JWT_CAROL" "$JWT_OTHER" "$APITOK" "$CAROL_ARNEB_PW" "$PROBE_PW"; do
+        "$JWT_CAROL" "$JWT_OTHER" "$JWT_ID" "$APITOK" "$CAROL_ARNEB_PW" "$PROBE_PW"; do
         [ -n "$secret" ] && s="${s//"$secret"/<secret>}"
     done
     # Anything token-shaped, whatever this run knows: an Arneb API token or a JWT.
@@ -104,6 +105,7 @@ bearer_of() {
         BOB) printf '%s' "$JWT_BOB" ;;
         CAROL) printf '%s' "$JWT_CAROL" ;;
         OTHER) printf '%s' "$JWT_OTHER" ;;
+        IDTOK) printf '%s' "$JWT_ID" ;;
         APITOK) printf '%s' "$APITOK" ;;
         *) fail "unknown identity $1" ;;
     esac
@@ -191,18 +193,28 @@ mcp_query() {
     done
 }
 
-# kc_token <user> <password> <client>: an access token from the realm's
-# password grant. The form (password included) goes to curl on stdin.
+# kc_token <user> <password> <client> [field] [scope]: a token (default the
+# access_token) from the realm's password grant. The form (password
+# included) goes to curl on stdin.
 kc_token() {
-    local out
+    local out field="${4:-access_token}"
     out=$({
         printf 'data-urlencode = %s\n' "$(cfgq "grant_type=password")"
         printf 'data-urlencode = %s\n' "$(cfgq "client_id=$3")"
         printf 'data-urlencode = %s\n' "$(cfgq "username=$1")"
         printf 'data-urlencode = %s\n' "$(cfgq "password=$2")"
+        [ -z "${5:-}" ] || printf 'data-urlencode = %s\n' "$(cfgq "scope=$5")"
     } | curl -sS -K - -X POST "$ISSUER/protocol/openid-connect/token") || fail "token request for $1 on $3"
-    printf '%s' "$out" | jq -er '.access_token' 2>/dev/null \
-        || fail "no access token for $1 on $3: $(printf '%s' "$out" | jq -c '{error, error_description}' 2>/dev/null)"
+    printf '%s' "$out" | jq -er --arg f "$field" '.[$f]' 2>/dev/null \
+        || fail "no $field for $1 on $3: $(printf '%s' "$out" | jq -c '{error, error_description}' 2>/dev/null)"
+}
+
+# header_typ <jwt>: the `typ` of a JWT's header (no verification).
+header_typ() {
+    local p
+    p=$(printf '%s' "$1" | cut -d. -f1 | tr '_-' '/+')
+    while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done
+    printf '%s' "$p" | base64 -d 2>/dev/null | jq -r '.typ // "none"'
 }
 
 # claims <jwt>: the payload of a JWT as JSON (no verification; for reporting).
@@ -214,11 +226,15 @@ claims() {
 }
 
 STEP="0 metadata document and the /mcp challenge"
-for path in /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/mcp; do
+path=/.well-known/oauth-protected-resource/mcp
+req NONE GET "$BASE$path"
+expect_code 200 "GET $path"
+check ".resource == \"$BASE/mcp\" and .authorization_servers == [\"$ISSUER\"] and (.bearer_methods_supported | index(\"header\"))" \
+    "metadata at $path is wrong"
+# RFC 9728: only the path derived from the resource answers.
+for path in /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/foo; do
     req NONE GET "$BASE$path"
-    expect_code 200 "GET $path"
-    check ".resource == \"$BASE/mcp\" and .authorization_servers == [\"$ISSUER\"] and (.bearer_methods_supported | index(\"header\"))" \
-        "metadata at $path is wrong"
+    expect_code 404 "GET $path (not the resource's metadata path)"
 done
 mcp_post NONE '{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}'
 expect_code 401 "unauthenticated POST /mcp"
@@ -227,6 +243,7 @@ case "$HEADERS_VAL" in
     Bearer*resource_metadata=\"$BASE/.well-known/oauth-protected-resource*) ;;
     *) fail "WWW-Authenticate has no resource_metadata for the well-known route: $HEADERS_VAL" ;;
 esac
+case "$HEADERS_VAL" in *error=*) fail "the no-credentials challenge carries an error code: $HEADERS_VAL" ;; esac
 echo "  challenge: $HEADERS_VAL"
 req ADMIN GET "$API/whoami"
 expect_code 200 "admin whoami"
@@ -291,6 +308,20 @@ echo "  token claims: $(claims "$JWT_OTHER" | jq -c '{iss, aud, azp, preferred_u
 mcp_post OTHER '{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}'
 expect_code 401 "the no-audience token on /mcp"
 case "$(header_of www-authenticate)" in *resource_metadata=*) ;; *) fail "the 401 carries no resource_metadata challenge" ;; esac
+case "$(header_of www-authenticate)" in *'error="invalid_token"'*) ;; *) fail "the 401 for a refused JWT has no error=\"invalid_token\"" ;; esac
+pass
+
+STEP="4b an ID token (scope openid) is refused with 401 invalid_token"
+JWT_ID=$(kc_token alice "$PW_ALICE" "$CLIENT" id_token openid)
+echo "  id token: header typ $(header_typ "$JWT_ID"), claims $(claims "$JWT_ID" | jq -c '{typ, aud, azp, has_at_hash: has("at_hash"), has_nonce: has("nonce")}')"
+mcp_post IDTOK '{"jsonrpc":"2.0","id":41,"method":"tools/list","params":{}}'
+expect_code 401 "alice's ID token on /mcp"
+case "$(header_of www-authenticate)" in *'error="invalid_token"'*) ;; *) fail "the ID token's 401 has no error=\"invalid_token\"" ;; esac
+# The access token of the same grant still works (header typ JWT, payload typ Bearer).
+JWT_ALICE=$(kc_token alice "$PW_ALICE" "$CLIENT" access_token openid)
+echo "  access token: header typ $(header_typ "$JWT_ALICE"), payload typ $(claims "$JWT_ALICE" | jq -r '.typ')"
+mcp_post ALICE '{"jsonrpc":"2.0","id":42,"method":"tools/list","params":{}}'
+expect_code 200 "alice's access token (scope openid) on /mcp"
 pass
 
 STEP="5 alice's JWT is not accepted on /api/v2"
@@ -341,7 +372,7 @@ for f in "${ARNEB_COORD_LOG:-}" "${ARNEB_AUDIT_FILE:-}"; do
     if grep -E 'eyJ[A-Za-z0-9_-]{10,}|arneb_[0-9a-f]{16}_[A-Za-z0-9_-]{20,}' "$f" >/dev/null; then
         fail "$f holds a JWT or an API token"
     fi
-    for secret in "$JWT_ALICE" "$JWT_BOB" "$JWT_CAROL" "$JWT_OTHER" "$APITOK" "$PW_ALICE" "$PW_BOB" \
+    for secret in "$JWT_ALICE" "$JWT_BOB" "$JWT_CAROL" "$JWT_OTHER" "$JWT_ID" "$APITOK" "$PW_ALICE" "$PW_BOB" \
         "$PW_CAROL" "$ARNEB_ADMIN_PASSWORD" "$CAROL_ARNEB_PW" "$PROBE_PW"; do
         # An empty pattern would match every line.
         [ -n "$secret" ] || continue

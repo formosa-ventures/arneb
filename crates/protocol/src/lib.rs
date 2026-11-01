@@ -14,15 +14,15 @@ pub mod tls;
 pub mod trino;
 
 pub use auth::{
-    decoy_verifier, is_token_shaped, AuthConfigError, AuthMethod, CredentialSource, ScramVerifier,
-    UserCredentials,
+    decoy_verifier, init_decoy_secret, is_token_shaped, sha256, AuthConfigError, AuthMethod,
+    CredentialSource, ScramVerifier, UserCredentials,
 };
 pub use server::{ProtocolConfig, ProtocolServer};
 pub use tls::{PgwireTls, PgwireTlsMode, ServerTls, TlsConfigError};
-pub use trino::{BasicAuthenticator, BasicVerdict, TrinoConfig, TrinoServer};
+pub use trino::{BasicAuthenticator, BasicVerdict, SlotError, TrinoConfig, TrinoServer};
 
 // Re-export the distributed executor trait for server crate to implement
-pub use handler::DistributedExecutor;
+pub use handler::{BatchSink, DistributedExecutor};
 
 // Re-export for integration testing
 #[doc(hidden)]

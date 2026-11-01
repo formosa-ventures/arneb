@@ -138,24 +138,27 @@ max_rows           = 10000
 | `default_page_bytes` | `ARNEB_AGENT_DEFAULT_PAGE_BYTES` | 262144 | Bytes per page when the request names no limit |
 | `max_page_bytes` | `ARNEB_AGENT_MAX_PAGE_BYTES` | 4194304 | Ceiling for a requested page size |
 | `max_cell_bytes` | `ARNEB_AGENT_MAX_CELL_BYTES` | 8192 | Longest cell, in bytes of a string's UTF-8 text (other values: of their JSON); longer cells are cut and end with `…` |
-| `max_retained_bytes` | `ARNEB_AGENT_MAX_RETAINED_BYTES` | 67108864 | Arrow memory one finished statement keeps; rows past it are dropped (`truncated_by: "max_retained_bytes"`) |
-| `max_total_retained_bytes` | `ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES` | 1073741824 | Arrow memory all finished statements keep together; when exhausted a statement keeps what fits (`truncated_by: "server_budget"`), and it frees up as statements are evicted or reaped |
+| `max_retained_bytes` | `ARNEB_AGENT_MAX_RETAINED_BYTES` | 67108864 | Arrow memory one statement keeps, while collecting and after; rows past it are dropped (`truncated_by: "max_retained_bytes"`) |
+| `max_user_retained_bytes` | `ARNEB_AGENT_MAX_USER_RETAINED_BYTES` | 268435456 | Arrow memory one user's statements (running and ended) keep together, so one user cannot take the whole budget; when short, the user's own ended statements are evicted if that covers the shortfall (fully read first, then least recently used), otherwise a statement keeps what fits (`truncated_by: "user_budget"`) |
+| `max_total_retained_bytes` | `ARNEB_AGENT_MAX_TOTAL_RETAINED_BYTES` | 1073741824 | Arrow memory all statements (running and ended) keep together; when short, ended statements are evicted the same way (the user's own first) if that covers the shortfall, otherwise a statement keeps what fits (`truncated_by: "server_budget"`); it frees up as statements are deleted, evicted or reaped |
 | `max_wait_ms` | `ARNEB_AGENT_MAX_WAIT_MS` | 10000 | Longest any request waits before answering "still running" |
 | `idle_timeout_secs` | `ARNEB_AGENT_IDLE_TIMEOUT_SECS` | 600 | Idle time before a statement is reaped |
 
 All values must be greater than 0, `default_max_rows <= max_rows`,
 `default_page_bytes <= max_page_bytes`,
-`max_retained_bytes <= max_total_retained_bytes`, and `idle_timeout_secs` must be at
-least twice `max_wait_ms` (so a statement is never reaped around a request
-that long-polls it; a statement being waited on also never counts as idle);
-a bad combination stops startup.
+`max_user_retained_bytes <= max_total_retained_bytes` (a `max_user_retained_bytes`
+below `max_retained_bytes` is raised to it, with a warning, so a user can
+always retain one full statement), and `idle_timeout_secs` must not
+be shorter than `max_wait_ms` (a statement being waited on never counts as
+idle, so a long-poll cannot outlast it); a bad combination stops startup.
 
 A catalog, schema or table listing returns `default_max_rows` names unless
 the request passes `limit`, which must be in `1..=max_rows`.
 
 A query stops producing rows after `max_rows + 1` of them, so `max_rows`
-bounds what it emits as well as what it retains; a truncated result reports
-`total_rows` as `null`. A page always holds at least one row, so a single wide row can
+bounds what it emits as well as what it retains; a result cut by `max_rows`
+reports `total_rows` as `null` (one cut only by bytes still reports the
+count). A page always holds at least one row, so a single wide row can
 exceed the page byte limit; each cell is still capped at `max_cell_bytes`.
 
 ## MCP
@@ -639,7 +642,10 @@ created with mode `0600`. The path's directory must be writable.
 - **Users created through the state store are never touched** by this. If a
   config user has the same name as one of them, startup keeps the state user
   and logs a WARN. Start once with `--reseed-state` to overwrite it with the
-  config user (revoking its tokens).
+  config user (revoking its tokens). The exception is a state-created user
+  whose stored verifier is identical to the config's `password_hash`: it is
+  adopted (marked config-managed, tokens kept) with an INFO line on
+  `arneb::config`, so later config edits or removal apply to it.
 - **No `path`** keeps the state in memory. Startup logs a WARN, `no [state]
   path: API tokens are lost on restart`, and the token API says so when it
   issues a token.

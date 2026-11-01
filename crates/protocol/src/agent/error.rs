@@ -119,6 +119,24 @@ impl AgentError {
         )
     }
 
+    /// A statement of this user that the server evicted: to free memory for
+    /// newer results (`for_budget`), or at the statement-count cap.
+    pub fn statement_evicted(id: &str, for_budget: bool) -> Self {
+        let why = if for_budget {
+            "to free retained-result memory for newer statements"
+        } else {
+            "at the statement cap, to make room for a newer statement"
+        };
+        Self::new(
+            AgentErrorCode::NotFound,
+            format!("statement {id} was evicted {why}"),
+        )
+        .with_hint(
+            "resubmit the statement if you still need its rows; fetch results soon after \
+             they finish, and DELETE statements you are done with so newer ones are not cut",
+        )
+    }
+
     /// Maps a Trino-protocol error by its Trino error name, adding a hint
     /// where an agent can act on one.
     pub(crate) fn from_trino(err: &TrinoError) -> Self {

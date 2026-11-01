@@ -75,7 +75,7 @@ A manage call SHALL answer `200` with `{dry_run, action, target, summary, change
 - **THEN** the `warning` says the change is lost on restart
 
 ### Requirement: Durable audit log
-Under password auth every non-dry manage run that passed authorization, every cancellation of another user's query and every token issue and revoke SHALL be appended as one JSON line to `audit.jsonl` in the directory of `[state] path` (mode `0600`) and synced to disk before the response returns. An entry SHALL hold `seq`, `time_ms`, `user`, `via`, `action`, `target`, `parameters` and `outcome`, and name a token by its 16-hex id only. `seq` SHALL increase across restarts. Refused calls SHALL NOT be audited. `GET /api/v2/audit?limit=&cursor=&user=&action=` SHALL list entries newest first and need observe. A caller with manage SHALL read every entry (`scope: "all"`); any other caller SHALL read only entries whose `user` is the caller (`scope: "own"`), as SHALL the MCP `list_audit_log` tool.
+Under password auth every non-dry manage run that passed authorization, every cancellation of another user's query and every token issue and revoke SHALL be appended to `<stem>.audit.jsonl` in the directory of `[state] path`, named after the state file (`prod.json` → `prod.audit.jsonl`, mode `0600`), and synced to disk before the response returns. An entry SHALL hold `seq`, `time_ms`, `user`, `via`, `action`, `target`, `parameters` and `outcome`, and name a token by its 16-hex id only. `seq` SHALL increase across restarts. Refused calls SHALL NOT be audited. `GET /api/v2/audit?limit=&cursor=&user=&action=` SHALL list entries newest first and need observe. A caller with manage SHALL read every entry (`scope: "all"`); any other caller SHALL read only entries whose `user` is the caller (`scope: "own"`), as SHALL the MCP `list_audit_log` tool.
 
 #### Scenario: Audit entries of others are hidden
 - **WHEN** alice (observe, no manage) reads the audit log after bob issued a token
@@ -101,7 +101,7 @@ Under password auth every non-dry manage run that passed authorization, every ca
 - **THEN** reads hide them, and the file keeps the newest entry so `seq` continues
 
 #### Scenario: Torn line
-- **WHEN** the last line of `audit.jsonl` is cut short by a crash
+- **WHEN** the last line of the audit log is cut short by a crash
 - **THEN** startup succeeds, logs a WARN naming the line, and compaction drops it
 
 #### Scenario: Unwritable log

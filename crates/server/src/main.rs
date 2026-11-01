@@ -905,7 +905,8 @@ async fn run() -> Result<()> {
         .map(arneb_protocol::BasicAuthenticator::new)
         .transpose()
         .context("HTTP Basic authentication")?;
-    // The audit log (manage-api D6): `audit.jsonl` next to the state file,
+    // The audit log (manage-api D6): `<state stem>.audit.jsonl` next to the
+    // state file,
     // in memory without one, and an empty in-memory log under `none`
     // (nothing is audited there).
     let audit_path = state_store
@@ -914,7 +915,7 @@ async fn run() -> Result<()> {
         .map(arneb_state::AuditLog::sibling_of);
     let audit_log = Arc::new(
         arneb_state::AuditLog::open(audit_path.as_deref(), config.audit.settings())
-            .context("cannot open the audit log (audit.jsonl next to [state] path)")?,
+            .context("cannot open the audit log (<state stem>.audit.jsonl next to [state] path)")?,
     );
     if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
         tracing::info!(

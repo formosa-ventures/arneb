@@ -1,5 +1,5 @@
 //! The durable audit log (manage-api D6): one JSON line per audited action
-//! in `audit.jsonl` next to the state file, appended with `O_APPEND` and
+//! in `<state stem>.audit.jsonl` next to the state file, appended with `O_APPEND` and
 //! `sync_data` before the caller answers.
 //!
 //! The newest `max_entries` entries are also kept in memory for reads; the
@@ -21,8 +21,8 @@ use crate::tokens::now_ms;
 use crate::StateError;
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
-/// The audit log's file name, in the directory of the state file.
-const AUDIT_FILE: &str = "audit.jsonl";
+/// The audit log's file name suffix, after the state file's stem.
+const AUDIT_SUFFIX: &str = ".audit.jsonl";
 
 /// Retention of the audit log (`[audit]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,10 +181,17 @@ impl AuditLog {
         })
     }
 
-    /// The audit log path for the state file `state_path`: `audit.jsonl`
-    /// in the same directory.
+    /// The audit log path for the state file `state_path`: its stem plus
+    /// `.audit.jsonl`, in the same directory (`prod.json` →
+    /// `prod.audit.jsonl`), so state files sharing a directory never share
+    /// an audit log.
     pub fn sibling_of(state_path: &Path) -> PathBuf {
-        state_path.with_file_name(AUDIT_FILE)
+        let mut name = state_path
+            .file_stem()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_else(|| "state".into());
+        name.push(AUDIT_SUFFIX);
+        state_path.with_file_name(name)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -594,14 +601,27 @@ mod tests {
     }
 
     #[test]
-    fn sibling_is_audit_jsonl_next_to_the_state_file() {
+    fn sibling_is_named_after_the_state_file_stem() {
         assert_eq!(
             AuditLog::sibling_of(Path::new("/var/lib/arneb/state.json")),
-            PathBuf::from("/var/lib/arneb/audit.jsonl")
+            PathBuf::from("/var/lib/arneb/state.audit.jsonl")
         );
         assert_eq!(
             AuditLog::sibling_of(Path::new("state.json")),
-            PathBuf::from("audit.jsonl")
+            PathBuf::from("state.audit.jsonl")
+        );
+        // Two state files in one directory get two audit logs.
+        assert_eq!(
+            AuditLog::sibling_of(Path::new("/var/lib/arneb/prod.json")),
+            PathBuf::from("/var/lib/arneb/prod.audit.jsonl")
+        );
+        assert_eq!(
+            AuditLog::sibling_of(Path::new("/var/lib/arneb/staging.json")),
+            PathBuf::from("/var/lib/arneb/staging.audit.jsonl")
+        );
+        assert_eq!(
+            AuditLog::sibling_of(Path::new("/srv/arneb-state")),
+            PathBuf::from("/srv/arneb-state.audit.jsonl")
         );
     }
 

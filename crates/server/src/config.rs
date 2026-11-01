@@ -84,14 +84,16 @@ pub struct AppConfig {
     #[serde(default)]
     pub state: StateConfig,
 
-    /// Retention of the audit log (`audit.jsonl` next to the state file);
+    /// Retention of the audit log (`<state stem>.audit.jsonl` next to the
+    /// state file);
     /// effective values after [`AppConfig::load`].
     #[serde(default)]
     pub audit: AuditConfig,
 }
 
-/// `[audit]` section: retention of the audit log, kept as `audit.jsonl` in
-/// the directory of `[state] path` (in memory without one).
+/// `[audit]` section: retention of the audit log, kept as
+/// `<state stem>.audit.jsonl` in the directory of `[state] path` (in memory
+/// without one).
 ///
 /// ```toml
 /// [audit]

@@ -674,7 +674,8 @@ open so existing scrapers keep working.
   `settings.admission` from the state file.
 - **New state.** The state file gains `cordons` and `settings` (readable by
   older binaries, whose next write drops them), and the coordinator writes
-  [`audit.jsonl`](#audit-log) next to it. With no `[state] path` these live
+  the [audit log](#audit-log) next to it (`state.json` →
+  `state.audit.jsonl`). With no `[state] path` these live
   in memory and are lost on restart.
 - **Revoking a token with a malformed id is `400 invalid_argument`**, and
   the refusal is not audited.
@@ -718,7 +719,9 @@ path = "/var/lib/arneb/state.json"   # optional; ARNEB_STATE_PATH
 
 The coordinator (or standalone server) keeps its users and
 [API tokens](/guide/http-api#api-tokens) in one JSON state file, and the
-[audit log](#audit-log) as `audit.jsonl` in the same directory. Workers never
+[audit log](#audit-log) in the same directory, named after the state file
+(`state.json` → `state.audit.jsonl`), so two state files in one directory
+keep separate audit logs. Workers never
 open them. Every write is atomic (write, fsync, rename) and the file is
 created with mode `0600`. The path's directory must be writable.
 
@@ -752,8 +755,10 @@ retention_days = 90      # ARNEB_AUDIT_RETENTION_DAYS; 0 = no age limit
 ```
 
 Under `[auth] type = "password"`, the coordinator records every audited
-action (token issue and revoke, and the manage actions) as one JSON line in
-`audit.jsonl`, in the directory of [`[state] path`](#state), mode `0600`.
+action (token issue and revoke, and the manage actions) as JSON lines in
+`<stem>.audit.jsonl`, in the directory of [`[state] path`](#state) and named
+after its file (`/var/lib/arneb/prod.json` →
+`/var/lib/arneb/prod.audit.jsonl`), mode `0600`.
 Each entry is written and synced to disk before the response returns. Read
 it with [`GET /api/v2/audit`](/guide/http-api#audit-log).
 

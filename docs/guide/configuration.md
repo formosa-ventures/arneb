@@ -609,7 +609,10 @@ created with mode `0600`. The path's directory must be writable.
 - **Users created through the state store are never touched** by this. If a
   config user has the same name as one of them, startup keeps the state user
   and logs a WARN. Start once with `--reseed-state` to overwrite it with the
-  config user (revoking its tokens).
+  config user (revoking its tokens). The exception is a state-created user
+  whose stored verifier is identical to the config's `password_hash`: it is
+  adopted (marked config-managed, tokens kept) with an INFO line on
+  `arneb::config`, so later config edits or removal apply to it.
 - **No `path`** keeps the state in memory. Startup logs a WARN, `no [state]
   path: API tokens are lost on restart`, and the token API says so when it
   issues a token.

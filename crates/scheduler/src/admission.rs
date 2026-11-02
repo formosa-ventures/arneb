@@ -133,11 +133,17 @@ impl Shared {
     /// locked path. Checks [`CAPPED`] and counts the slot in one step, so
     /// it never takes a slot it must give back.
     fn try_admit_fast(&self) -> bool {
-        self.fast
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                (v & CAPPED == 0).then_some(v + 1)
-            })
-            .is_ok()
+        let mut v = self.fast.load(Ordering::SeqCst);
+        while v & CAPPED == 0 {
+            match self
+                .fast
+                .compare_exchange_weak(v, v + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(now) => v = now,
+            }
+        }
+        false
     }
 }
 

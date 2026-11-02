@@ -6,10 +6,13 @@
 //! installs both into the shared [`CatalogManager`] and [`ConnectorRegistry`],
 //! and remembers the installed specs plus the catalog generation they belong
 //! to. A statement pins the providers and connectors together when it
-//! starts ([`ConnectorRegistry::pinned`]; every install and remove here is
-//! one [`ConnectorRegistry::swap`]), so a change never disturbs a running
-//! statement on the coordinator. A worker resolves each task's connectors
-//! when the task starts.
+//! starts ([`ConnectorRegistry::pinned`]; each change here, with the
+//! `(epoch, generation)` tag it moves the registry to, is one
+//! [`ConnectorRegistry::swap`]), so a change never disturbs a running
+//! statement on the coordinator. Its distributed tasks carry the tag it
+//! was planned at, and a worker runs a task only against that same set
+//! (pulling once when it differs), so one query never mixes catalog
+//! versions.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -107,6 +110,14 @@ pub struct LiveCatalogs {
     /// Builds run before it is taken, so an unreachable metastore never
     /// holds up another push or pull.
     applying: tokio::sync::Mutex<()>,
+    /// On a worker, the coordinator's current epoch as last heard from it
+    /// (a heartbeat reply or a push; 0 before either). A set from any other
+    /// epoch is stale and never applies (a slow build of a set fetched
+    /// before the coordinator restarted).
+    latest_epoch: AtomicU64,
+    /// One apply per `(epoch, generation)` at a time: a push and a pull of
+    /// the same set share one build of each changed catalog.
+    apply_flights: std::sync::Mutex<BTreeMap<(Option<u64>, u64), ApplyFlight>>,
     /// Tests replace [`build`](Self::build) with this.
     #[cfg(test)]
     test_builder: Option<TestBuilder>,
@@ -114,6 +125,8 @@ pub struct LiveCatalogs {
     #[cfg(test)]
     test_build_delay: std::sync::Mutex<BTreeMap<String, Duration>>,
 }
+
+type ApplyFlight = Arc<tokio::sync::OnceCell<ApplyReport>>;
 
 #[cfg(test)]
 pub(crate) type TestBuilder =
@@ -148,6 +161,8 @@ impl LiveCatalogs {
             pushed_defaults: RwLock::new(None),
             unauthenticated_flight: std::sync::atomic::AtomicBool::new(false),
             applying: tokio::sync::Mutex::new(()),
+            latest_epoch: AtomicU64::new(0),
+            apply_flights: Default::default(),
             #[cfg(test)]
             test_builder: None,
             #[cfg(test)]
@@ -201,12 +216,41 @@ impl LiveCatalogs {
 
     /// Sets this coordinator's epoch, once at startup before it serves.
     pub fn set_epoch(&self, epoch: u64) {
-        self.epoch.store(epoch, Ordering::SeqCst);
+        self.connectors
+            .swap(|| self.store_version(Some(epoch), self.generation()));
     }
 
     /// Sets the catalog generation (after a change was persisted).
     pub fn set_generation(&self, g: u64) {
-        self.generation.store(g, Ordering::SeqCst);
+        self.connectors.swap(|| self.store_version(None, g));
+    }
+
+    /// Moves to `generation` (and `epoch`, when given) and tags the
+    /// registry with both. Only inside a [`ConnectorRegistry::swap`].
+    /// Generation before epoch: a reader seeing the new epoch also sees the
+    /// generation that goes with it.
+    fn store_version(&self, epoch: Option<u64>, generation: u64) {
+        self.generation.store(generation, Ordering::SeqCst);
+        if let Some(e) = epoch {
+            self.epoch.store(e, Ordering::SeqCst);
+        }
+        self.connectors
+            .set_version(Some((self.epoch(), self.generation())));
+    }
+
+    /// The `(epoch, generation)` a [`ConnectorRegistry::pinned`] copy of
+    /// this node's registry is tagged with when taken now.
+    pub fn version(&self) -> (u64, u64) {
+        (self.epoch(), self.generation())
+    }
+
+    /// Records the coordinator's current epoch, from a heartbeat reply or
+    /// a push (0 is ignored). From then on a set from another epoch is
+    /// refused as stale.
+    pub fn note_coordinator_epoch(&self, epoch: u64) {
+        if epoch != 0 {
+            self.latest_epoch.store(epoch, Ordering::SeqCst);
+        }
     }
 
     /// The default catalog's name (unqualified table names resolve in it).
@@ -310,8 +354,11 @@ impl LiveCatalogs {
 
     /// Applies a set from the coordinator (a push or a pull). Within the
     /// epoch held, only a newer generation applies, so a stale push loses;
-    /// a set from another epoch (a restarted coordinator) always applies
-    /// and replaces the whole set, even at a lower generation (Ruling R6).
+    /// a set from another epoch (a restarted coordinator) applies and
+    /// replaces the whole set, even at a lower generation (Ruling R6), but
+    /// only when it is the coordinator's current epoch as last heard
+    /// ([`note_coordinator_epoch`](Self::note_coordinator_epoch)), so a slow
+    /// build of a set fetched before a restart never overwrites a newer one.
     /// A spec that does not decode is skipped with a WARN and listed as
     /// failed.
     pub async fn apply_remote(&self, set: arneb_rpc::CatalogSet) -> ApplyReport {
@@ -423,12 +470,58 @@ impl LiveCatalogs {
     /// name. The connector goes in first, so a statement planned against
     /// the new provider always finds it.
     pub fn install(&self, spec: CatalogConfig, built: BuiltCatalog) {
-        let name = spec.name.clone();
         // One swap: a statement pins both halves or neither.
+        self.connectors.swap(|| self.install_unswapped(spec, built));
+    }
+
+    /// Removes the installed catalog `name`. False when no such catalog is
+    /// installed here (the startup-only catalogs are never touched).
+    pub fn remove(&self, name: &str) -> bool {
+        self.connectors.swap(|| self.remove_unswapped(name))
+    }
+
+    /// Installs `installs`, removes `removes` and moves to `generation`, all
+    /// in one [`ConnectorRegistry::swap`]: a statement pins either the whole
+    /// previous set and its tag or the whole new one. What a coordinator's
+    /// runtime change and re-seed commit with.
+    pub fn commit(
+        &self,
+        generation: u64,
+        installs: Vec<(CatalogConfig, BuiltCatalog)>,
+        removes: &[String],
+    ) {
+        self.commit_at(None, generation, installs, removes, None);
+    }
+
+    /// [`commit`](Self::commit) that also moves to `epoch` (when given) and,
+    /// when `failed` is given, records it as the catalogs of the set that
+    /// failed to build.
+    fn commit_at(
+        &self,
+        epoch: Option<u64>,
+        generation: u64,
+        installs: Vec<(CatalogConfig, BuiltCatalog)>,
+        removes: &[String],
+        failed: Option<std::collections::BTreeSet<String>>,
+    ) {
         self.connectors.swap(|| {
-            self.connectors.register(name.clone(), built.connector);
-            self.manager.register_catalog(name.clone(), built.provider);
+            for (spec, built) in installs {
+                self.install_unswapped(spec, built);
+            }
+            for name in removes {
+                self.remove_unswapped(name);
+            }
+            if let Some(failed) = failed {
+                *self.failed.write().unwrap_or_else(|p| p.into_inner()) = failed;
+            }
+            self.store_version(epoch, generation);
         });
+    }
+
+    fn install_unswapped(&self, spec: CatalogConfig, built: BuiltCatalog) {
+        let name = spec.name.clone();
+        self.connectors.register(name.clone(), built.connector);
+        self.manager.register_catalog(name.clone(), built.provider);
         self.failed
             .write()
             .unwrap_or_else(|p| p.into_inner())
@@ -436,16 +529,12 @@ impl LiveCatalogs {
         self.write_specs().insert(name, spec);
     }
 
-    /// Removes the installed catalog `name`. False when no such catalog is
-    /// installed here (the startup-only catalogs are never touched).
-    pub fn remove(&self, name: &str) -> bool {
+    fn remove_unswapped(&self, name: &str) -> bool {
         if self.write_specs().remove(name).is_none() {
             return false;
         }
-        self.connectors.swap(|| {
-            self.manager.deregister_catalog(name);
-            self.connectors.deregister(name);
-        });
+        self.manager.deregister_catalog(name);
+        self.connectors.deregister(name);
         true
     }
 
@@ -461,8 +550,10 @@ impl LiveCatalogs {
     }
 
     /// [`apply_set`](Self::apply_set), except that a set from `epoch` other
-    /// than the one held applies whatever its generation, and then records
-    /// `epoch`. `None` checks the generation only and keeps the epoch.
+    /// than the one held applies whatever its generation (when `epoch` is
+    /// the coordinator's current one, see [`applies`](Self::applies)), and
+    /// then records `epoch`. `None` checks the generation only and keeps
+    /// the epoch.
     ///
     /// The new and changed catalogs are built in parallel without any
     /// lock; `applying` is held only to re-check the generation and swap.
@@ -470,7 +561,36 @@ impl LiveCatalogs {
     /// nothing. When another apply swapped in between, a catalog this set
     /// skipped as unchanged may now differ: it is built (again outside the
     /// lock) before the swap.
+    ///
+    /// Concurrent applies of the same `(epoch, generation)` (a push and a
+    /// heartbeat-triggered pull of one change) share one run and its
+    /// report, so each changed catalog is built once.
     async fn apply(
+        &self,
+        epoch: Option<u64>,
+        generation: u64,
+        specs: Vec<CatalogConfig>,
+    ) -> ApplyReport {
+        let key = (epoch, generation);
+        let flight = self
+            .apply_flights
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(key)
+            .or_default()
+            .clone();
+        let report = flight
+            .get_or_init(|| self.apply_once(epoch, generation, specs))
+            .await
+            .clone();
+        let mut flights = self.apply_flights.lock().unwrap_or_else(|p| p.into_inner());
+        if flights.get(&key).is_some_and(|f| Arc::ptr_eq(f, &flight)) {
+            flights.remove(&key);
+        }
+        report
+    }
+
+    async fn apply_once(
         &self,
         epoch: Option<u64>,
         generation: u64,
@@ -534,26 +654,36 @@ impl LiveCatalogs {
                 installed = now;
                 continue;
             }
-            for (_, (spec, b)) in std::mem::take(&mut built) {
+            let installs: Vec<_> = std::mem::take(&mut built).into_values().collect();
+            for (spec, _) in &installs {
                 tracing::info!(
                     catalog = %spec.name,
                     catalog_type = %spec.catalog_type,
                     generation,
                     "registered catalog"
                 );
-                self.install(spec, b);
             }
-            for name in now.keys().filter(|n| !wanted.contains(*n)) {
-                self.remove(name);
+            let removes: Vec<String> = now
+                .keys()
+                .filter(|n| !wanted.contains(*n))
+                .cloned()
+                .collect();
+            for name in &removes {
                 tracing::info!(catalog = %name, generation, "removed catalog");
             }
-            *self.failed.write().unwrap_or_else(|p| p.into_inner()) =
-                failed.keys().cloned().collect();
-            // Generation before epoch: a reader seeing the new epoch also sees
-            // the generation that goes with it.
-            self.set_generation(generation);
+            self.commit_at(
+                epoch,
+                generation,
+                installs,
+                &removes,
+                Some(failed.keys().cloned().collect()),
+            );
             if let Some(e) = epoch {
-                self.set_epoch(e);
+                // The first set a worker applies names the coordinator's
+                // epoch until a heartbeat or push says otherwise.
+                let _ =
+                    self.latest_epoch
+                        .compare_exchange(0, e, Ordering::SeqCst, Ordering::SeqCst);
             }
             return ApplyReport {
                 applied: true,
@@ -563,9 +693,17 @@ impl LiveCatalogs {
     }
 
     /// Whether a set at `(epoch, generation)` applies now: a newer
-    /// generation within the epoch held, any set from another epoch, or the
-    /// set already held while some of it failed to build (Ruling R8).
+    /// generation within the epoch held, a set from another epoch when that
+    /// is the coordinator's current one ([`note_coordinator_epoch`]; any
+    /// before one is known), or the set already held while some of it
+    /// failed to build (Ruling R8).
+    ///
+    /// [`note_coordinator_epoch`]: Self::note_coordinator_epoch
     fn applies(&self, epoch: Option<u64>, generation: u64) -> bool {
+        let latest = self.latest_epoch.load(Ordering::SeqCst);
+        if epoch.is_some_and(|e| latest != 0 && e != latest) {
+            return false;
+        }
         let same_epoch = epoch.is_none_or(|e| e == self.epoch());
         let retry = same_epoch && generation == self.generation() && self.has_failed_builds();
         !same_epoch || generation > self.generation() || retry
@@ -708,6 +846,9 @@ impl CatalogPuller {
             return false;
         };
         let live = &self.inner.live;
+        if let Some(epoch) = reply.catalog_epoch {
+            live.note_coordinator_epoch(epoch);
+        }
         let (applied, applied_epoch) = (live.generation(), live.epoch());
         let epoch_differs = reply.catalog_epoch.is_some_and(|e| e != applied_epoch);
         if generation == applied && !epoch_differs {
@@ -990,7 +1131,10 @@ pub fn redacted_secrets(spec: &CatalogConfig) -> Vec<&'static str> {
         found.push("password");
     }
     if let Some(url) = &spec.connection_url {
-        let whole = url.0.split_once("://").is_some_and(|(_, rest)| rest == REDACTED);
+        let whole = url
+            .0
+            .split_once("://")
+            .is_some_and(|(_, rest)| rest == REDACTED);
         let userinfo = url_password_range(&url.0).is_some_and(|r| &url.0[r] == REDACTED);
         let query = url_query_passwords(&url.0)
             .into_iter()
@@ -1381,7 +1525,11 @@ mod tests {
         // Same epoch, older generation: ignored.
         assert!(!live.apply_remote(set(11, 3, vec![])).await.applied);
         assert_eq!(live.specs().len(), 1);
+        // A set from another epoch is stale until that epoch is the
+        // coordinator's current one (a heartbeat or a push says so).
+        assert!(!live.apply_remote(set(22, 2, vec![])).await.applied);
         // A restarted coordinator (new epoch) with a lower generation wins.
+        live.note_coordinator_epoch(22);
         let report = live.apply_remote(set(22, 2, vec![])).await;
         assert!(report.applied);
         assert_eq!((live.epoch(), live.generation()), (22, 2));
@@ -1390,6 +1538,7 @@ mod tests {
         // A no-store coordinator restarted with a changed config: new epoch,
         // generation 1 again; the changed set is applied.
         let mysql = serde_json::json!({"name": "changed", "type": "mysql"});
+        live.note_coordinator_epoch(33);
         let report = live.apply_remote(set(33, 2, vec![mysql])).await;
         assert!(report.applied);
         assert_eq!(
@@ -1642,9 +1791,18 @@ mod tests {
     fn password_with_url_delimiters_is_redacted() {
         use std::str::FromStr;
         for (url, redacted) in [
-            ("postgresql://app:pa/ss@db:5432/x", "postgresql://<redacted>"),
-            ("postgresql://app:pa?ss@db:5432/x", "postgresql://<redacted>"),
-            ("postgresql://app:pa#ss@db:5432/x", "postgresql://<redacted>"),
+            (
+                "postgresql://app:pa/ss@db:5432/x",
+                "postgresql://<redacted>",
+            ),
+            (
+                "postgresql://app:pa?ss@db:5432/x",
+                "postgresql://<redacted>",
+            ),
+            (
+                "postgresql://app:pa#ss@db:5432/x",
+                "postgresql://<redacted>",
+            ),
             (
                 "postgres://app:a/b?c#d:e@db/x?sslmode=disable",
                 "postgres://<redacted>",
@@ -2015,13 +2173,91 @@ mod tests {
         assert_eq!(names, vec!["fast"]);
     }
 
+    /// Round 3: a pull fetched epoch 1's set just before the coordinator
+    /// restarted, and its slow build finishes after the new coordinator's
+    /// (epoch 2) push installed: the stale set changes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_set_from_an_older_epoch_never_overwrites_a_newer_one() {
+        let live = slow_live(&[("slow", 10)]);
+        live.note_coordinator_epoch(1);
+        assert!(live.apply_remote(set(1, 4, vec![])).await.applied);
+        let stale = tokio::spawn({
+            let live = live.clone();
+            async move {
+                let slow = serde_json::to_value(hive("slow")).unwrap();
+                live.apply_remote(set(1, 5, vec![slow])).await
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // The restarted coordinator pushes (the push handler notes its epoch).
+        live.note_coordinator_epoch(2);
+        let fast = serde_json::to_value(hive("fast")).unwrap();
+        assert!(live.apply_remote(set(2, 1, vec![fast])).await.applied);
+        assert_eq!(stale.await.unwrap(), ApplyReport::default());
+        assert_eq!((live.epoch(), live.generation()), (2, 1));
+        let names: Vec<String> = live.specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["fast"]);
+        // And a late set from the old epoch is refused outright.
+        assert!(!live.apply_remote(set(1, 9, vec![])).await.applied);
+    }
+
+    /// Round 3: a push and a pull of the same `(epoch, generation)` that
+    /// overlap build each changed catalog once and report the same result.
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_applies_of_one_set_build_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let builds = Arc::new(AtomicUsize::new(0));
+        let n = builds.clone();
+        let live = LiveCatalogs::with_test_builder(
+            Arc::new(CatalogManager::new("memory", "default")),
+            Arc::new(ConnectorRegistry::new()),
+            Box::new(move |_| {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(fake_built())
+            }),
+        );
+        live.test_build_delay
+            .lock()
+            .unwrap()
+            .insert("a".into(), Duration::from_secs(5));
+        let changed = || set(7, 2, vec![serde_json::to_value(hive("a")).unwrap()]);
+        let (push, pull) = tokio::join!(live.apply_remote(changed()), live.apply_remote(changed()));
+        assert!(push.applied && pull.applied);
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "one build of a");
+        assert_eq!(live.generation(), 2);
+        // A later apply of the same set is stale, as before.
+        assert!(!live.apply_remote(changed()).await.applied);
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    /// Every change moves the registry's `(epoch, generation)` tag in the
+    /// same swap as the connectors, so a pinned copy names the set it holds.
+    #[tokio::test]
+    async fn the_registry_tag_follows_every_change() {
+        let (live, _, connectors) = live();
+        live.set_epoch(5);
+        assert_eq!(connectors.version(), Some((5, 0)));
+        live.commit(3, vec![(hive("a"), fake_built())], &[]);
+        assert_eq!(connectors.version(), Some((5, 3)));
+        let (pinned, _) = connectors.pinned(|| ());
+        live.commit(4, Vec::new(), &["a".to_owned()]);
+        assert_eq!(connectors.version(), Some((5, 4)));
+        assert!(connectors.get("a").is_none());
+        assert_eq!(pinned.version(), Some((5, 3)));
+        assert!(pinned.get("a").is_some());
+        assert!(live.apply_set(6, vec![hive("b")]).await.applied);
+        assert_eq!(connectors.version(), Some((5, 6)));
+        assert_eq!(live.version(), (5, 6));
+    }
+
     /// Two applies of sets that differ in one catalog: the one that swaps
     /// second rebuilds what the first changed under it.
     #[tokio::test(start_paused = true)]
     async fn an_apply_rebuilds_what_another_swapped_in_meanwhile() {
         let live = slow_live(&[("b", 30)]);
         live.install(hive("a"), fake_built());
-        // Epoch 7 later than the held 0, so both apply regardless of order.
+        live.note_coordinator_epoch(7);
+        // Generations 2 and 1 of epoch 7: both newer than the held 0.
         let mut changed_a = hive("a");
         changed_a.metastore_uri = Some("10.0.0.2:9083".into());
         let slow = tokio::spawn({
@@ -2041,16 +2277,16 @@ mod tests {
             }
         });
         tokio::time::sleep(Duration::from_secs(1)).await;
-        // An older generation of another epoch swaps in first and changes a.
+        // The older generation swaps in first and changes a.
         live.apply_remote(arneb_rpc::CatalogSet {
-            epoch: 6,
+            epoch: 7,
             generation: 1,
             catalogs: vec![serde_json::to_value(&changed_a).unwrap()],
             default_catalog: None,
             default_schema: None,
         })
         .await;
-        assert_eq!(live.epoch(), 6);
+        assert_eq!((live.epoch(), live.generation()), (7, 1));
         let report = slow.await.unwrap();
         assert!(report.applied);
         assert_eq!((live.epoch(), live.generation()), (7, 2));

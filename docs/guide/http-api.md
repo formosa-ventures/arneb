@@ -777,12 +777,16 @@ catalog as soon as the change returns.
   it a runtime catalog; the preview warns that the config file no longer
   manages it. Dropping the default catalog is allowed, with a warning that
   unqualified table names then fail.
-- A query keeps the catalog it was planned with on the coordinator: each
-  statement pins the catalogs and connectors together when it starts, and a
-  change swaps a catalog's provider and connector as one step. On workers a
-  task resolves its connectors when it starts (every scan of the task uses
-  the same one), so a task that starts after a change, for a query that
-  was already running, uses the worker's current catalogs.
+- Running queries keep the catalogs they were planned with; a distributed
+  query whose workers can't match the planned catalog version fails instead
+  of mixing. Each statement pins the catalogs and connectors together when it
+  starts, and a change swaps them, with the new catalog generation, as one
+  step. Every distributed task carries the coordinator epoch and generation
+  the query was planned at. A worker on another set pulls the coordinator's
+  set once; if it still differs (the worker is already past that set, or the
+  pull fails), the task fails with `catalog set on worker <id> is at
+  generation N, the query was planned at M; retry the query`. Retrying the
+  query plans it again at the current generation.
 
 ```bash
 curl -s -H "$H" -X POST "$B/catalog-configs?dry_run=true" \

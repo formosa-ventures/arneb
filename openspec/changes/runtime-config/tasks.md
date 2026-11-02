@@ -13,6 +13,7 @@
 ## 4. Catalog sync to workers
 
 - [x] 4.1 JSON heartbeat reply with generation and epoch, `sync_catalogs` / `get_catalogs`, partial-failure retry, pull-once on a task miss; workers ignore `[[catalogs]]`
+- [x] 4.2 Tasks carry the planned `(epoch, generation)`; a worker on another set pulls once and fails the task when it still differs; a set from an epoch other than the coordinator's current one is refused; one build per `(epoch, generation)`
 
 ## 5. Catalog API
 

@@ -81,6 +81,11 @@ pub struct ConnectorRegistry {
     /// Written across a [`swap`](Self::swap), read across a
     /// [`pinned`](Self::pinned) snapshot.
     swaps: RwLock<()>,
+    /// The `(epoch, generation)` of the catalog set these factories belong
+    /// to, as the runtime catalog manager tagged them; `None` until it
+    /// does. A [`pinned`](Self::pinned) copy keeps the tag it was taken
+    /// with.
+    version: RwLock<Option<(u64, u64)>>,
 }
 
 impl ConnectorRegistry {
@@ -115,6 +120,19 @@ impl ConnectorRegistry {
             .cloned()
     }
 
+    /// Tags the registry with the `(epoch, generation)` of the catalog set
+    /// it now holds. Call it inside the [`swap`](Self::swap) that installs
+    /// the set, so a pinned copy never pairs one set's factories with
+    /// another's tag.
+    pub fn set_version(&self, version: Option<(u64, u64)>) {
+        *self.version.write().unwrap_or_else(|p| p.into_inner()) = version;
+    }
+
+    /// The `(epoch, generation)` tag ([`set_version`](Self::set_version)).
+    pub fn version(&self) -> Option<(u64, u64)> {
+        *self.version.read().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Runs `f`, which registers or removes connectors together with their
     /// catalog providers, with every [`pinned`](Self::pinned) snapshot
     /// excluded, so none sees the change half done.
@@ -140,6 +158,7 @@ impl ConnectorRegistry {
             ConnectorRegistry {
                 factories: RwLock::new(factories),
                 swaps: RwLock::new(()),
+                version: RwLock::new(self.version()),
             },
             pinned,
         )
@@ -174,12 +193,16 @@ mod tests {
         let registry = ConnectorRegistry::new();
         let old: Arc<dyn ConnectorFactory> = Arc::new(DummyFactory);
         registry.register("c", Arc::clone(&old));
+        registry.set_version(Some((1, 4)));
         let (pinned, seen) = registry.pinned(|| 7);
         assert_eq!(seen, 7);
         registry.swap(|| {
             registry.register("c", Arc::new(DummyFactory));
             registry.register("d", Arc::new(DummyFactory));
+            registry.set_version(Some((1, 5)));
         });
+        assert_eq!(pinned.version(), Some((1, 4)));
+        assert_eq!(registry.version(), Some((1, 5)));
         assert!(Arc::ptr_eq(&pinned.get("c").unwrap(), &old));
         assert!(pinned.get("d").is_none());
         assert!(!Arc::ptr_eq(&registry.get("c").unwrap(), &old));

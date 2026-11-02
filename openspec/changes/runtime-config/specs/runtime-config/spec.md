@@ -53,11 +53,15 @@ Every change to the access rules, users, user tokens, catalogs, settings and the
 - **THEN** both uses succeed before the revoke, `/api/v2` answers `401` after it and pgwire refuses the login
 
 ### Requirement: Catalog definitions at runtime
-`/api/v2/catalog-configs` SHALL list, show, create (`POST`), update (`PUT`) and drop (`DELETE`) `hive` and `postgresql` catalogs. A created name SHALL be 1–63 characters of `[a-z0-9_]` starting with a letter, and `memory`, `file`, `system`, `information_schema` and `pg_catalog` SHALL be reserved; an update or drop SHALL accept any existing name (a config-seeded `pg-prod` stays updatable). A create or update SHALL first build the catalog on the coordinator within 10 s, also for a dry run, and a failure SHALL be `invalid_argument` with nothing changed. A real change SHALL persist the spec with the catalog generation increased by one, install it on the coordinator and push the new set to every alive worker with a 5 s timeout each, reporting each worker as `synced` or not; a failed push SHALL NOT fail the call. A spec sent through the API or MCP SHALL be refused with `invalid_argument` naming any field the spec does not have, at any depth. A `PUT` of the spec already stored and served SHALL answer `changed: false` with no generation bump and no push. A `POST` of an existing name SHALL be `conflict`, and an update or drop of an unknown name `not_found`. The `/api/v2/catalogs` discovery routes SHALL list a new catalog as soon as the change returns. A running query SHALL keep, on the coordinator, the catalog provider and connector it was planned with; a worker task SHALL use the worker's catalogs as of the task's start for all of its scans.
+`/api/v2/catalog-configs` SHALL list, show, create (`POST`), update (`PUT`) and drop (`DELETE`) `hive` and `postgresql` catalogs. A created name SHALL be 1–63 characters of `[a-z0-9_]` starting with a letter, and `memory`, `file`, `system`, `information_schema` and `pg_catalog` SHALL be reserved; an update or drop SHALL accept any existing name (a config-seeded `pg-prod` stays updatable). A create or update SHALL first build the catalog on the coordinator within 10 s, also for a dry run, and a failure SHALL be `invalid_argument` with nothing changed. A real change SHALL persist the spec with the catalog generation increased by one, install it on the coordinator and push the new set to every alive worker with a 5 s timeout each, reporting each worker as `synced` or not; a failed push SHALL NOT fail the call. A spec sent through the API or MCP SHALL be refused with `invalid_argument` naming any field the spec does not have, at any depth. A `PUT` of the spec already stored and served SHALL answer `changed: false` with no generation bump and no push. A `POST` of an existing name SHALL be `conflict`, and an update or drop of an unknown name `not_found`. The `/api/v2/catalogs` discovery routes SHALL list a new catalog as soon as the change returns. A running query SHALL keep, on the coordinator, the catalog provider and connector it was planned with. Every distributed task SHALL carry the coordinator epoch and catalog generation the query was planned at; a worker holding another set SHALL pull once and, when its set still differs, fail the task with `catalog set on worker <id> is at generation N, the query was planned at M; retry the query`, so a query never mixes catalog versions. All scans of a task SHALL use that one set.
 
 #### Scenario: Create and query across workers
 - **WHEN** a manager creates postgresql catalog `pg2` on a coordinator with two workers
 - **THEN** both workers report `synced: true`, and `SELECT count(*) FROM pg2.tpch_mixed.customer` runs distributed on both workers with the database's row count
+
+#### Scenario: Change during a distributed query
+- **WHEN** a query planned at generation 4 dispatches a task to a worker that holds generation 5
+- **THEN** the task fails with `catalog set on worker <id> is at generation 5, the query was planned at 4; retry the query` and the query fails without reading the generation-5 catalog
 
 #### Scenario: Unreachable backend
 - **WHEN** a manager creates a catalog whose database cannot be reached
@@ -94,6 +98,10 @@ A coordinator without a `[cluster] secret` SHALL refuse to start while a served 
 #### Scenario: Coordinator restarted
 - **WHEN** the coordinator restarts and its generation is the same as before
 - **THEN** each worker sees a new epoch and pulls the set again
+
+#### Scenario: Slow set from the previous epoch
+- **WHEN** a worker's pull of epoch E1's set is still building after the restarted coordinator (epoch E2) pushed its set
+- **THEN** the E1 set changes nothing when its build finishes: a worker applies a set from another epoch only when it is the coordinator's current epoch as last seen in a heartbeat reply or push, and concurrent applies of the same epoch and generation build each catalog once
 
 ### Requirement: Runtime settings
 `GET /api/v2/settings` (observe) SHALL return `{slow_query_threshold_ms, source}`. `PATCH /api/v2/settings` (manage) SHALL set `slow_query_threshold_ms` (`0` turns the slow-query log off), apply it at once and store it, and a stored value SHALL win over `[observability]` and `ARNEB_SLOW_QUERY_THRESHOLD_MS` at every start.

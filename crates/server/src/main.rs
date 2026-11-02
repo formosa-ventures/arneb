@@ -1861,6 +1861,8 @@ async fn apply_pushed_catalogs(
     set: arneb_rpc::CatalogSet,
 ) -> Result<Vec<String>, String> {
     let generation = set.generation;
+    // A push comes from the coordinator as it is now.
+    live.note_coordinator_epoch(set.epoch);
     let report = live.apply_remote(set).await;
     if !report.applied {
         tracing::debug!(
@@ -2597,6 +2599,7 @@ mod tests {
             catalogs: vec![serde_json::to_value(&lake).unwrap()],
             ..Default::default()
         };
+        live.note_coordinator_epoch(250);
         live.apply_remote(arneb_rpc::CatalogSet {
             epoch: 250,
             generation: 1,

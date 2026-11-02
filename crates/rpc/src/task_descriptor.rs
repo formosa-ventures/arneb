@@ -66,6 +66,13 @@ pub struct TaskDescriptor {
     /// coordinator via [`arneb_planner::LogicalPlan::may_stop_input_early`].
     #[serde(default)]
     pub must_drain: bool,
+    /// runtime-config: the `(epoch, generation)` of the coordinator's
+    /// catalog set the query was planned against. A worker whose own set
+    /// differs pulls once and, if it still differs, fails the task rather
+    /// than scan another version of a catalog. `None` (an older
+    /// coordinator, or an untagged set) skips the check.
+    #[serde(default)]
+    pub catalog_version: Option<(u64, u64)>,
 }
 
 fn default_scan_task_count() -> usize {

@@ -1288,6 +1288,9 @@ pub(crate) async fn execute_query_capped(
     let mut exec_ctx = ExecutionContext::new()
         .with_memory_pool(memory_pool.clone())
         .with_catalog_stats(Some(analyzer_ctx.catalog_stats.clone()))
+        // The catalog set this statement is pinned to: its distributed
+        // tasks carry it, so a worker never runs one on another set.
+        .with_catalog_version(connector_registry.version())
         // A2.x broadcast threshold (2026-05-28). Default OFF.
         //
         // A2.1+A2.2+A2.3 v1 infra ships in this commit but is dormant
@@ -2524,6 +2527,38 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(count, 3, "the planned (old) catalog's connector was used");
+    }
+
+    /// A distributed statement hands its executor the `(epoch, generation)`
+    /// tag of the registry it pinned at the start, so its tasks name the
+    /// catalog set it was planned with even if the set changes meanwhile.
+    #[tokio::test]
+    async fn a_distributed_statement_carries_its_pinned_catalog_version() {
+        struct Recording(std::sync::Mutex<Vec<Option<(u64, u64)>>>);
+        #[async_trait]
+        impl DistributedExecutor for Recording {
+            async fn execute(
+                &self,
+                _plan: LogicalPlan,
+                exec_ctx: &ExecutionContext,
+            ) -> Result<Vec<arrow::record_batch::RecordBatch>, ArnebError> {
+                self.0.lock().unwrap().push(exec_ctx.catalog_version());
+                Ok(Vec::new())
+            }
+            fn has_workers(&self) -> bool {
+                true
+            }
+        }
+        let manager = CatalogManager::new("memory", "default");
+        let registry = ConnectorRegistry::new();
+        registry.set_version(Some((3, 7)));
+        let executor = Recording(Default::default());
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        execute_query("SELECT 1", &manager, &registry, Some(&executor), &pool)
+            .await
+            .unwrap();
+        assert_eq!(*executor.0.lock().unwrap(), vec![Some((3, 7))]);
     }
 
     /// Regression: COUNT / MIN / MAX over a filter that matches nothing used

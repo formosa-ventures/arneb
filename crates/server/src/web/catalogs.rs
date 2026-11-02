@@ -486,6 +486,11 @@ pub(super) async fn drop_catalog_for(
 }
 
 /// The `warning` of an update of a config-seeded catalog (Ruling R9).
+/// What an update or drop preview says about running queries.
+const PINNING: &str = "running queries keep the catalogs they were planned with; a \
+     distributed query whose workers cannot match the planned catalog version fails instead \
+     of mixing";
+
 const DETACH_WARNING: &str = "the config file no longer manages this catalog: its \
      [[catalogs]] entry stops applying, and every start logs a WARN while the entry differs";
 
@@ -594,8 +599,7 @@ impl ManageAction for ChangeCatalog {
                 }
                 format!(
                     "replaces {} catalog {name:?} (the coordinator connected to the new spec) \
-                     and pushes it to {workers}; running queries keep the catalog they were \
-                     planned with",
+                     and pushes it to {workers}; {PINNING}",
                     spec.catalog_type
                 )
             }
@@ -620,10 +624,7 @@ impl ManageAction for ChangeCatalog {
                         ),
                     );
                 }
-                format!(
-                    "removes catalog {name:?} from the coordinator and {workers}; running \
-                     queries keep the catalog they were planned with"
-                )
+                format!("removes catalog {name:?} from the coordinator and {workers}; {PINNING}")
             }
         };
         Ok(Preview {
@@ -664,16 +665,17 @@ impl ManageAction for ChangeCatalog {
                     from_config: false,
                 };
                 let generation = self.store.put_catalog(record).map_err(catalog_error)?;
-                self.live.install(spec, built);
+                // One swap with the new generation (see `LiveCatalogs::commit`).
+                self.live.commit(generation, vec![(spec, built)], &[]);
                 generation
             }
             Kind::Drop => {
                 let generation = self.store.remove_catalog(&name).map_err(catalog_error)?;
-                self.live.remove(&name);
+                self.live
+                    .commit(generation, Vec::new(), std::slice::from_ref(&name));
                 generation
             }
         };
-        self.live.set_generation(generation);
         let workers = push_to_workers(state, &self.live.snapshot());
         for note in push_warnings(&workers) {
             add_warning(&mut preview.warning, note);

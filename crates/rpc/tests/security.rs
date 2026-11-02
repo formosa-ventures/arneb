@@ -74,6 +74,7 @@ fn descriptor() -> TaskDescriptor {
         pending_dynamic_filters: Vec::new(),
         scan_task_count: 1,
         must_drain: false,
+        catalog_version: None,
     }
 }
 

@@ -32,6 +32,11 @@ use crate::hive_type_to_arrow;
 /// Extracted metadata for a single Hive table.
 #[derive(Debug, Clone)]
 pub struct HiveTableMeta {
+    /// Database name as HMS stores it (HMS lowercases identifiers, so this
+    /// can differ from the name the table was requested by).
+    pub db_name: String,
+    /// Table name as HMS stores it.
+    pub table_name: String,
     /// Columns with their Arneb data types.
     pub columns: Vec<ColumnInfo>,
     /// HDFS / S3 / object-store location from the storage descriptor.
@@ -180,6 +185,16 @@ impl HmsClient {
             }
         };
 
+        // HMS normalizes identifiers to lowercase; fall back to that if a
+        // server leaves the names out of the response.
+        let db_name = hms_table
+            .db_name
+            .as_ref()
+            .map_or_else(|| db.to_lowercase(), |s| s.to_string());
+        let table_name = hms_table
+            .table_name
+            .as_ref()
+            .map_or_else(|| table.to_lowercase(), |s| s.to_string());
         let parameters = hms_table.parameters.clone();
         let sd = hms_table.sd.ok_or_else(|| {
             ConnectorError::ReadError(format!("table {db}.{table} has no storage descriptor"))
@@ -221,6 +236,8 @@ impl HmsClient {
         let column_stats: HashMap<String, ColumnStatistics> = HashMap::new();
 
         Ok(HiveTableMeta {
+            db_name,
+            table_name,
             columns,
             location,
             input_format,
@@ -523,6 +540,12 @@ impl SchemaProvider for HiveSchemaProvider {
         }
     }
 
+    /// HMS matches database names case-insensitively (it stores them
+    /// lowercased), so `TPCH` reads `tpch`.
+    fn canonical_name(&self) -> Option<String> {
+        Some(self.database.to_lowercase())
+    }
+
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         match self.client.get_table(&self.database, name).await {
             // Table redirection (as in Trino): Iceberg tables in HMS are
@@ -537,7 +560,9 @@ impl SchemaProvider for HiveSchemaProvider {
                 )
                 .await
                 {
-                    Ok(p) => Some(Arc::new(p)),
+                    Ok(p) => Some(Arc::new(
+                        p.with_canonical_name(meta.db_name.clone(), meta.table_name.clone()),
+                    )),
                     Err(e) => {
                         warn!("failed to load Iceberg table '{qualified}': {e}");
                         None
@@ -563,6 +588,7 @@ impl SchemaProvider for HiveSchemaProvider {
                     }
                 };
                 Some(Arc::new(HiveTableProvider {
+                    canonical_name: Some((meta.db_name, meta.table_name)),
                     transactional: is_transactional(&meta.parameters),
                     columns: meta.columns,
                     partition_columns: meta.partition_columns,
@@ -622,6 +648,8 @@ pub struct HiveTableProvider {
     pub size_bytes: Option<u64>,
     /// Per-column NDV / null-fraction stats from HMS `ANALYZE TABLE`.
     pub column_stats: HashMap<String, ColumnStatistics>,
+    /// `(database, table)` as HMS stores them, when loaded from HMS.
+    canonical_name: Option<(String, String)>,
 }
 
 impl HiveTableProvider {
@@ -649,6 +677,7 @@ impl HiveTableProvider {
             row_count,
             size_bytes,
             column_stats: HashMap::new(),
+            canonical_name: None,
         }
     }
 
@@ -694,6 +723,10 @@ impl HiveTableProvider {
 }
 
 impl TableProvider for HiveTableProvider {
+    fn canonical_name(&self) -> Option<(String, String)> {
+        self.canonical_name.clone()
+    }
+
     fn schema(&self) -> Vec<ColumnInfo> {
         let mut schema = self.columns.clone();
         schema.extend(self.partition_columns.iter().cloned());
@@ -755,6 +788,8 @@ mod tests {
     #[test]
     fn hive_table_meta_construction() {
         let meta = HiveTableMeta {
+            db_name: "db".to_string(),
+            table_name: "table".to_string(),
             columns: vec![
                 ColumnInfo {
                     name: "id".to_string(),

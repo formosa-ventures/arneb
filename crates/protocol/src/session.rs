@@ -91,14 +91,9 @@ async fn resolve(
     // pointing unqualified names at a schema that doesn't exist.
     let mut chosen = None;
     for (catalog, schema) in &candidates {
-        if !session.schema_visible(catalog, schema) {
-            continue;
-        }
-        if let Some(provider) = root.catalog(catalog) {
-            if provider.schema(schema).await.is_some() {
-                chosen = Some((catalog.clone(), schema.clone()));
-                break;
-            }
+        if session.visible_schema_exists(catalog, schema).await {
+            chosen = Some((catalog.clone(), schema.clone()));
+            break;
         }
     }
     let display = entries.join(", ");

@@ -330,6 +330,7 @@ dependencies = [
  "arneb-sql-parser",
  "arrow",
  "async-recursion",
+ "async-trait",
  "serde",
  "serde_json",
  "tokio",

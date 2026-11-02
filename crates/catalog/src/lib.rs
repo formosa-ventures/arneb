@@ -79,6 +79,15 @@ pub trait SchemaProvider: fmt::Debug + Send + Sync {
 
     /// Returns the table with the given name, or `None` if it does not exist.
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>>;
+
+    /// The schema's name as the source stores it, when the provider was
+    /// looked up by a name that may differ from it (a connector that
+    /// matches names case-insensitively). Access rules are checked on this
+    /// name as well as on the name as written. Default: `None`, meaning
+    /// the provider only answers to its stored name.
+    fn canonical_name(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A table exposes its column schema metadata.
@@ -102,6 +111,16 @@ pub trait TableProvider: fmt::Debug + Send + Sync {
     /// Connectors that cannot provide statistics return `None`. The cost-based
     /// planner falls back to conservative defaults in that case.
     fn statistics(&self) -> Option<TableStatistics> {
+        None
+    }
+
+    /// The `(schema, table)` this provider reads, as the source stores
+    /// them, when the provider was looked up by a name that may differ
+    /// from it (a connector that matches names case-insensitively, or
+    /// that redirects to another table). Access rules are checked on this
+    /// identity as well as on the name as written. Default: `None`, meaning
+    /// the provider only answers to its stored name.
+    fn canonical_name(&self) -> Option<(String, String)> {
         None
     }
 }
@@ -373,24 +392,47 @@ impl CatalogManager {
     }
 
     /// Table names of `catalog.schema` the session user may see; empty for
-    /// an unknown or hidden schema.
+    /// an unknown or hidden schema. A schema the connector resolves to a
+    /// differently-written stored name is checked under both names.
     pub async fn visible_table_names(&self, catalog: &str, schema: &str) -> Vec<String> {
-        if let Some(a) = &self.access {
-            if !a.rules.schema_visible(&a.user, catalog, schema) {
-                return Vec::new();
-            }
-        }
-        let Some(provider) = self.catalog(catalog) else {
+        if !self.schema_visible(catalog, schema) {
             return Vec::new();
-        };
-        let Some(schema_provider) = provider.schema(schema).await else {
+        }
+        let Some((schema_provider, stored)) = self.lookup_schema(catalog, schema).await else {
             return Vec::new();
         };
         let mut names = schema_provider.table_names().await;
         if let Some(a) = &self.access {
-            names.retain(|t| a.rules.table_visible(&a.user, catalog, schema, t));
+            names.retain(|t| {
+                a.rules.table_visible(&a.user, catalog, schema, t)
+                    && a.rules.table_visible(&a.user, catalog, &stored, t)
+            });
         }
         names
+    }
+
+    /// Whether `catalog.schema` exists and the session user may see it,
+    /// under the name as written and the name the connector resolved it
+    /// to. Without rules, whether it exists.
+    pub async fn visible_schema_exists(&self, catalog: &str, schema: &str) -> bool {
+        self.schema_visible(catalog, schema) && self.lookup_schema(catalog, schema).await.is_some()
+    }
+
+    /// The provider for `catalog.schema` and the schema's stored name.
+    /// `None` when the catalog or schema does not exist, or when the
+    /// connector resolved `schema` to a stored name the session user may
+    /// not see, so a hidden schema reads as a missing one whatever case
+    /// it is written in. The written name is not checked here.
+    async fn lookup_schema(
+        &self,
+        catalog: &str,
+        schema: &str,
+    ) -> Option<(Arc<dyn SchemaProvider>, String)> {
+        let provider = self.catalog(catalog)?.schema(schema).await?;
+        let stored = provider
+            .canonical_name()
+            .unwrap_or_else(|| schema.to_string());
+        (stored == schema || self.schema_visible(catalog, &stored)).then_some((provider, stored))
     }
 
     /// Returns the reference the planner should record for a scanned table.
@@ -544,22 +586,35 @@ impl CatalogManager {
             }
         }
 
-        let catalog = {
-            let catalogs = self.catalogs.read().unwrap();
-            catalogs
-                .get(catalog_name)
-                .cloned()
-                .ok_or_else(|| CatalogError::CatalogNotFound(catalog_name.to_string()))?
-        };
-
-        let schema = catalog
-            .schema(schema_name)
+        if self.catalog(catalog_name).is_none() {
+            return Err(CatalogError::CatalogNotFound(catalog_name.to_string()));
+        }
+        let (schema, stored_schema) = self
+            .lookup_schema(catalog_name, schema_name)
             .await
             .ok_or_else(|| CatalogError::SchemaNotFound(format!("{catalog_name}.{schema_name}")))?;
+        let not_found =
+            || CatalogError::SchemaNotFound(format!("{catalog_name}.{schema_name}.{table_name}"));
+        let table = schema.table(table_name).await.ok_or_else(not_found)?;
 
-        schema.table(table_name).await.ok_or_else(|| {
-            CatalogError::SchemaNotFound(format!("{catalog_name}.{schema_name}.{table_name}"))
-        })
+        // The connector may have resolved the name to a stored one that
+        // differs from it (case-insensitive matching, redirection). The
+        // rules apply to what is actually read, so check that identity
+        // too. A denial here reads as a missing table, as the name as
+        // written was allowed and the stored one must not be revealed.
+        if let Some(a) = &self.access {
+            let (stored_schema, stored_table) = table
+                .canonical_name()
+                .unwrap_or_else(|| (stored_schema, table_name.clone()));
+            if (stored_schema.as_str() != schema_name || &stored_table != table_name)
+                && !a
+                    .rules
+                    .can_select(&a.user, catalog_name, &stored_schema, &stored_table)
+            {
+                return Err(not_found());
+            }
+        }
+        Ok(table)
     }
 }
 
@@ -567,6 +622,7 @@ impl CatalogManager {
 mod tests {
     use super::*;
     use arneb_common::types::DataType;
+    use async_trait::async_trait;
 
     // -- Helper --
 
@@ -697,6 +753,254 @@ mod tests {
                 table,
             })
             .await
+    }
+
+    // -- Access on the resolved name --
+
+    /// PostgreSQL-style lookup: the exact name, else a unique
+    /// ASCII-case-insensitive match.
+    fn resolve_loosely(names: &[&str], wanted: &str) -> Option<String> {
+        if names.contains(&wanted) {
+            return Some(wanted.to_string());
+        }
+        let mut found = names.iter().filter(|n| n.eq_ignore_ascii_case(wanted));
+        let first = found.next()?;
+        found.next().is_none().then(|| first.to_string())
+    }
+
+    #[derive(Debug)]
+    struct LooseTable {
+        schema: String,
+        name: String,
+    }
+
+    impl TableProvider for LooseTable {
+        fn schema(&self) -> Vec<ColumnInfo> {
+            test_columns()
+        }
+        fn canonical_name(&self) -> Option<(String, String)> {
+            Some((self.schema.clone(), self.name.clone()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct LooseSchema {
+        name: String,
+        tables: &'static [&'static str],
+    }
+
+    #[async_trait]
+    impl SchemaProvider for LooseSchema {
+        async fn table_names(&self) -> Vec<String> {
+            self.tables.iter().map(|t| t.to_string()).collect()
+        }
+        async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+            let name = resolve_loosely(self.tables, name)?;
+            Some(Arc::new(LooseTable {
+                schema: self.name.clone(),
+                name,
+            }))
+        }
+        fn canonical_name(&self) -> Option<String> {
+            Some(self.name.clone())
+        }
+    }
+
+    /// A connector resolving names as PostgreSQL's does: `public` holds
+    /// `secret`, `open` and the mixed-case `Orders`; `hr` holds `salaries`.
+    #[derive(Debug)]
+    struct LooseCatalog;
+
+    #[async_trait]
+    impl CatalogProvider for LooseCatalog {
+        async fn schema_names(&self) -> Vec<String> {
+            vec!["hr".into(), "public".into()]
+        }
+        async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+            let name = resolve_loosely(&["hr", "public"], name)?;
+            let tables: &'static [&'static str] = if name == "hr" {
+                &["salaries"]
+            } else {
+                &["Orders", "open", "secret"]
+            };
+            Some(Arc::new(LooseSchema { name, tables }))
+        }
+    }
+
+    fn loose_view(rules: &str) -> CatalogManager {
+        let root = CatalogManager::new("pg", "public");
+        root.register_catalog("pg", Arc::new(LooseCatalog));
+        root.with_access("alice", Arc::new(AccessRules::from_json(rules).unwrap()))
+    }
+
+    /// The planner's path: fold the reference's case, then resolve it.
+    async fn fold_read(
+        manager: &CatalogManager,
+        schema: &str,
+        table: &str,
+    ) -> Result<Arc<dyn TableProvider>, CatalogError> {
+        let reference = TableReference {
+            catalog: Some("pg".into()),
+            schema: Some(schema.into()),
+            table: table.into(),
+        };
+        let folded = manager.fold_reference_case(&reference).await;
+        manager.resolve_table(&folded).await
+    }
+
+    /// The error a table that does not exist gets under the same name.
+    async fn missing_table_error(manager: &CatalogManager, schema: &str, table: &str) -> String {
+        let nope = "nope_does_not_exist";
+        let err = fold_read(manager, schema, nope).await.unwrap_err();
+        assert!(matches!(err, CatalogError::SchemaNotFound(_)), "{err}");
+        err.to_string().replace(nope, table)
+    }
+
+    /// A table rule on the stored name holds whatever case the name is
+    /// written in, and the denial reads exactly as a missing table.
+    #[tokio::test]
+    async fn table_rule_applies_to_the_name_the_connector_resolved() {
+        let alice = loose_view(
+            r#"{"tables": [
+                {"user": "alice", "schema": "public", "table": "secret", "privileges": []},
+                {"privileges": ["SELECT"]}
+            ]}"#,
+        );
+        assert!(matches!(
+            fold_read(&alice, "public", "secret").await.unwrap_err(),
+            CatalogError::AccessDenied(_)
+        ));
+        for (schema, table) in [
+            ("public", "SECRET"),
+            ("public", "Secret"),
+            ("PUBLIC", "secret"),
+            ("PUBLIC", "SECRET"),
+        ] {
+            let err = fold_read(&alice, schema, table).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                missing_table_error(&alice, schema, table).await,
+                "{schema}.{table} must read as a missing table"
+            );
+        }
+        // Allowed tables still resolve in any case.
+        for (schema, table) in [("public", "open"), ("PUBLIC", "OPEN"), ("Public", "Open")] {
+            assert!(
+                fold_read(&alice, schema, table).await.is_ok(),
+                "{schema}.{table}"
+            );
+        }
+        assert!(!alice
+            .visible_table_names("pg", "PUBLIC")
+            .await
+            .contains(&"secret".to_string()));
+    }
+
+    /// A schema rule on the stored name holds whatever case the schema is
+    /// written in, for reads and for listings.
+    #[tokio::test]
+    async fn schema_rule_applies_to_the_schema_the_connector_resolved() {
+        let alice = loose_view(
+            r#"{"tables": [
+                {"user": "alice", "schema": "hr", "privileges": []},
+                {"privileges": ["SELECT"]}
+            ]}"#,
+        );
+        assert!(fold_read(&alice, "hr", "salaries").await.is_err());
+        for (schema, table) in [("HR", "salaries"), ("Hr", "SALARIES")] {
+            let err = fold_read(&alice, schema, table).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                missing_table_error(&alice, schema, table).await,
+                "{schema}.{table} must read as a missing table"
+            );
+        }
+        assert!(alice.visible_table_names("pg", "HR").await.is_empty());
+
+        // A schema hidden under its stored name reads as a missing schema
+        // when written in another case the rules allow (here any
+        // uppercase name), and lists nothing.
+        let alice = loose_view(
+            r#"{
+                "schemas": [{"owner": false}],
+                "tables": [{"user": "alice", "schema": "public|[A-Z]+", "privileges": ["SELECT"]}]
+            }"#,
+        );
+        assert!(!alice.schema_visible("pg", "hr"));
+        let err = fold_read(&alice, "HR", "salaries").await.unwrap_err();
+        let missing = fold_read(&alice, "NOPE", "salaries").await.unwrap_err();
+        assert!(
+            matches!(missing, CatalogError::SchemaNotFound(_)),
+            "{missing}"
+        );
+        assert_eq!(err.to_string(), missing.to_string().replace("NOPE", "HR"));
+        assert!(alice.visible_table_names("pg", "HR").await.is_empty());
+        assert!(!alice.visible_schema_exists("pg", "HR").await);
+        assert!(alice.visible_schema_exists("pg", "PUBLIC").await);
+    }
+
+    /// A mixed-case stored name (`"Orders"`) still reads through a folded
+    /// or differently-cased reference when the rules allow it, and both
+    /// the written and the stored name must be allowed.
+    #[tokio::test]
+    async fn mixed_case_stored_names_need_both_names_allowed() {
+        let alice = loose_view(
+            r#"{"tables": [
+                {"user": "alice", "table": "secret", "privileges": []},
+                {"privileges": ["SELECT"]}
+            ]}"#,
+        );
+        for table in ["Orders", "orders", "ORDERS"] {
+            assert!(fold_read(&alice, "public", table).await.is_ok(), "{table}");
+        }
+
+        let alice = loose_view(
+            r#"{"tables": [
+                {"user": "alice", "table": "Orders", "privileges": []},
+                {"privileges": ["SELECT"]}
+            ]}"#,
+        );
+        assert!(fold_read(&alice, "public", "Orders").await.is_err());
+        let err = fold_read(&alice, "public", "orders").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            missing_table_error(&alice, "public", "orders").await
+        );
+
+        // Denying the written form denies it even though the stored one is
+        // allowed.
+        let alice = loose_view(
+            r#"{"tables": [
+                {"user": "alice", "table": "orders", "privileges": []},
+                {"privileges": ["SELECT"]}
+            ]}"#,
+        );
+        assert!(matches!(
+            fold_read(&alice, "public", "orders").await.unwrap_err(),
+            CatalogError::AccessDenied(_)
+        ));
+        assert!(fold_read(&alice, "public", "Orders").await.is_ok());
+    }
+
+    /// Without rules, loose resolution is unchanged.
+    #[tokio::test]
+    async fn loose_resolution_without_rules_is_unchanged() {
+        let root = CatalogManager::new("pg", "public");
+        root.register_catalog("pg", Arc::new(LooseCatalog));
+        for (schema, table) in [
+            ("PUBLIC", "SECRET"),
+            ("public", "orders"),
+            ("Hr", "Salaries"),
+        ] {
+            assert!(
+                fold_read(&root, schema, table).await.is_ok(),
+                "{schema}.{table}"
+            );
+        }
+        assert_eq!(
+            root.visible_table_names("pg", "PUBLIC").await,
+            vec!["Orders", "open", "secret"]
+        );
     }
 
     // -- MemoryTable tests --

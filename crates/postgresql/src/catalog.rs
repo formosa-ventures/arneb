@@ -168,6 +168,12 @@ impl SchemaProvider for PostgresSchema {
         }
     }
 
+    /// The schema was found by [`resolve_name`], which also accepts a
+    /// unique case-insensitive match.
+    fn canonical_name(&self) -> Option<String> {
+        Some(self.name.clone())
+    }
+
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         match load_table(&self.state, &self.name, name).await {
             Ok(Some(t)) => Some(Arc::new(t)),
@@ -190,6 +196,12 @@ pub struct PostgresTable {
 }
 
 impl TableProvider for PostgresTable {
+    /// The table was found by [`resolve_name`], which also accepts a
+    /// unique case-insensitive match.
+    fn canonical_name(&self) -> Option<(String, String)> {
+        Some((self.remote.schema.clone(), self.remote.name.clone()))
+    }
+
     fn schema(&self) -> Vec<ColumnInfo> {
         self.columns.clone()
     }

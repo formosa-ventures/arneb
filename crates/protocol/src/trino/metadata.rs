@@ -91,8 +91,7 @@ pub(crate) async fn table_names(
             _ => None,
         };
     }
-    cm.catalog(catalog)?.schema(schema).await?;
-    if !cm.catalog_visible(catalog) {
+    if !cm.catalog_visible(catalog) || !cm.visible_schema_exists(catalog, schema).await {
         return None;
     }
     let mut names = cm.visible_table_names(catalog, schema).await;

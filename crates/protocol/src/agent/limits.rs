@@ -86,6 +86,14 @@ impl AgentLimits {
                 self.default_page_bytes, self.max_page_bytes
             ));
         }
+        // Checked first: the server raises a share below the per-statement
+        // cap to it, so a cap above the total must be blamed on itself.
+        if self.max_retained_bytes > self.max_total_retained_bytes {
+            return Err(format!(
+                "max_retained_bytes ({}) must not exceed max_total_retained_bytes ({})",
+                self.max_retained_bytes, self.max_total_retained_bytes
+            ));
+        }
         if self.max_retained_bytes > self.max_user_retained_bytes {
             return Err(format!(
                 "max_retained_bytes ({}) must not exceed max_user_retained_bytes ({})",
@@ -141,6 +149,18 @@ mod tests {
         let err = l.validate().unwrap_err();
         assert!(
             err.contains("max_retained_bytes") && err.contains("max_user_retained_bytes"),
+            "{err}"
+        );
+        // A cap above the total is blamed on the cap, even with the share
+        // raised to it.
+        let l = AgentLimits {
+            max_retained_bytes: 2 << 30,
+            max_user_retained_bytes: 2 << 30,
+            ..Default::default()
+        };
+        let err = l.validate().unwrap_err();
+        assert!(
+            err.starts_with("max_retained_bytes") && err.contains("max_total_retained_bytes"),
             "{err}"
         );
         let l = AgentLimits {

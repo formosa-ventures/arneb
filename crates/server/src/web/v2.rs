@@ -1565,7 +1565,10 @@ pub(super) mod tests {
         let seen = Arc::clone(&killed_by);
         t.set_canceller(
             &id,
-            Box::new(move |by| seen.lock().unwrap().push(by.to_owned())),
+            Box::new(move |by| {
+                seen.lock().unwrap().push(by.to_owned());
+                true
+            }),
         );
         (id, killed_by)
     }
@@ -1823,6 +1826,39 @@ pub(super) mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "not_found");
         assert_eq!(audit_entries(&state).len(), 1, "refusals are not audited");
+    }
+
+    /// A kill that lands after an INSERT's work completed (before the
+    /// protocol recorded it) stops nothing: the audit says it was not
+    /// applied, and the statement finishes with its real result.
+    #[tokio::test]
+    async fn killing_a_write_whose_work_completed_is_not_applied() {
+        let state = kill_state();
+        let t = &state.query_tracker;
+        let id = t.create_query_from(
+            "INSERT INTO t SELECT 1".into(),
+            "pgwire",
+            Some("alice".into()),
+        );
+        t.advance_to(&id, arneb_scheduler::QueryState::Running)
+            .unwrap();
+        let switch = arneb_scheduler::KillSwitch::new();
+        t.set_canceller(&id, switch.canceller(|_| panic!("stopped completed work")));
+        assert_eq!(switch.guard(async { "committed" }).await, Some("committed"));
+        let (status, body) = cancel_as(&state, "root", &format!("/api/v2/queries/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], false, "{body}");
+        let summary = body["summary"].as_str().unwrap();
+        assert!(summary.contains("nothing to cancel"), "{summary}");
+        let entries = audit_entries(&state);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["parameters"]["effect"], "already_ended");
+        // The protocol then records the real outcome.
+        t.finish_query(&id, 1).unwrap();
+        assert_eq!(
+            query_state(&state, &id),
+            arneb_scheduler::QueryState::Finished
+        );
     }
 
     #[tokio::test]

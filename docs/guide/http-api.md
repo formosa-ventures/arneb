@@ -471,6 +471,12 @@ Trino, `/api/v2` statements) and stops it there: a pgwire client gets
 `USER_CANCELED` `Query was killed by <user>`, and an `/api/v2` statement
 turns `cancelled` with `Statement was cancelled by <user>`.
 
+A kill applies only when it stops the statement's work. One that arrives
+after the work completed (an `INSERT` that committed, say) but before the
+statement reported back stops nothing: the response has `changed: false`,
+the audit entry records `effect` `already_ended`, and the client gets the
+statement's real result. A committed write is never reported as cancelled.
+
 Who may cancel, in this order:
 
 1. The query's owner, in any auth mode (under `none`, the owner is the

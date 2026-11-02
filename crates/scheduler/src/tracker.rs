@@ -46,9 +46,11 @@ fn advance_machine(m: &mut QueryStateMachine, target: QueryState) -> Result<(), 
 }
 
 /// Stops a running query on the protocol that runs it. The argument is the
-/// name of the user who killed it. Called at most once, never under the
-/// tracker's lock, so it may call back into the tracker.
-pub type Canceller = Box<dyn FnOnce(&str) + Send + Sync>;
+/// name of the user who killed it. Returns `false` when the query's work had
+/// already completed, so the kill stopped nothing (see
+/// [`crate::KillSwitch`]). Called at most once, never under the tracker's
+/// lock, so it may call back into the tracker.
+pub type Canceller = Box<dyn FnOnce(&str) -> bool + Send + Sync>;
 
 /// What [`QueryTracker::kill_query`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +58,9 @@ pub enum KillOutcome {
     /// The query was stopped; `was` is its state before the kill.
     Killed { was: QueryState },
     /// The query had already ended (or ended on its own during the kill)
-    /// in this state; nothing was changed.
+    /// in this state; nothing was changed. A query whose work completed
+    /// before the kill, while its protocol had not yet recorded the
+    /// outcome, is `AlreadyEnded(Finishing)`: its result stands.
     AlreadyEnded(QueryState),
 }
 
@@ -228,12 +232,15 @@ impl QueryTracker {
             }
         };
         drop(inner);
-        canceller(&killed_by);
+        // The work cannot have completed: it starts only after registering.
+        let _ = canceller(&killed_by);
     }
 
     /// Stop query `id` on behalf of user `by`: call its canceller (outside
     /// the lock) and mark it cancelled. A query that already ended, or ends
-    /// on its own during the kill, is [`KillOutcome::AlreadyEnded`]. The
+    /// on its own during the kill, is [`KillOutcome::AlreadyEnded`], and so
+    /// is one whose canceller reports that its work had already completed
+    /// (nothing is marked; the protocol records the real outcome). The
     /// first kill claims the query under the lock; a concurrent kill of the
     /// same query is `AlreadyEnded(Cancelled)`, so only one reports a kill.
     pub fn kill_query(&self, id: &QueryId, by: &str) -> Result<KillOutcome, ExecutionError> {
@@ -255,7 +262,19 @@ impl QueryTracker {
             (was, entry.canceller.take())
         };
         if let Some(cancel) = canceller {
-            cancel(by);
+            if !cancel(by) {
+                // Too late: the work completed. Release the claim so the
+                // protocol's finish stands.
+                let mut inner = self.inner.write().unwrap();
+                let state = inner.queries.get_mut(id).map(|e| {
+                    e.killed_by = None;
+                    e.machine.state
+                });
+                return Ok(KillOutcome::AlreadyEnded(match state {
+                    Some(s) if s.is_terminal() => s,
+                    _ => QueryState::Finishing,
+                }));
+            }
         }
         if self.cancel_query(id).is_ok() {
             return Ok(KillOutcome::Killed { was });
@@ -392,6 +411,33 @@ impl From<&Entry> for QueryInfo {
 mod tests {
     use super::*;
 
+    /// A canceller that always stops the query (its work never completed).
+    fn stopping(f: impl FnOnce(&str) + Send + Sync + 'static) -> Canceller {
+        Box::new(move |by| {
+            f(by);
+            true
+        })
+    }
+
+    /// A canceller reporting that the work already completed: the kill is
+    /// not applied, the claim is released, and the protocol's finish stands.
+    #[test]
+    fn kill_after_the_work_completed_is_not_applied() {
+        let tracker = QueryTracker::with_history_limit(10);
+        let id = tracker.create_query("INSERT INTO t SELECT 1".into());
+        tracker.advance_to(&id, QueryState::Running).unwrap();
+        tracker.set_canceller(&id, Box::new(|_| false));
+        assert_eq!(
+            tracker.kill_query(&id, "root").unwrap(),
+            KillOutcome::AlreadyEnded(QueryState::Finishing)
+        );
+        assert_eq!(tracker.cancelled_by(&id), None);
+        tracker.finish_query(&id, 1).unwrap();
+        let q = tracker.get_query(&id).unwrap();
+        assert_eq!(q.state, QueryState::Finished);
+        assert_eq!(q.rows, Some(1));
+    }
+
     /// A kill that lands before the protocol registers its canceller: the
     /// query is marked cancelled, cannot then finish, and the canceller
     /// registered afterwards runs at once with the killer's name.
@@ -418,7 +464,7 @@ mod tests {
         let called = Arc::new(std::sync::Mutex::new(None));
         tracker.set_canceller(
             &id,
-            Box::new({
+            stopping({
                 let called = Arc::clone(&called);
                 move |by| *called.lock().unwrap() = Some(by.to_owned())
             }),
@@ -572,7 +618,7 @@ mod tests {
         let seen = Arc::clone(&calls);
         tracker.set_canceller(
             &id,
-            Box::new(move |by| seen.lock().unwrap().push(by.to_owned())),
+            stopping(move |by| seen.lock().unwrap().push(by.to_owned())),
         );
         assert_eq!(
             tracker.kill_query(&id, "root").unwrap(),
@@ -604,7 +650,7 @@ mod tests {
         let release_rx = std::sync::Mutex::new(release_rx);
         tracker.set_canceller(
             &id,
-            Box::new(move |_| {
+            stopping(move |_| {
                 inside_tx.send(()).unwrap();
                 release_rx.lock().unwrap().recv().unwrap();
             }),
@@ -643,7 +689,7 @@ mod tests {
         let release_rx = Mutex::new(release_rx);
         tracker.set_canceller(
             &id,
-            Box::new(move |_| {
+            stopping(move |_| {
                 inside_tx.send(()).unwrap();
                 release_rx.lock().unwrap().recv().unwrap();
             }),
@@ -657,7 +703,7 @@ mod tests {
         let seen = Arc::clone(&calls);
         tracker.set_canceller(
             &id,
-            Box::new(move |by| seen.lock().unwrap().push(by.to_owned())),
+            stopping(move |by| seen.lock().unwrap().push(by.to_owned())),
         );
         assert_eq!(*calls.lock().unwrap(), ["root"], "called during the kill");
         release_tx.send(()).unwrap();
@@ -688,7 +734,7 @@ mod tests {
         let flag = Arc::clone(&called);
         tracker.set_canceller(
             &id,
-            Box::new(move |_| {
+            stopping(move |_| {
                 let _guard = &guard;
                 flag.store(true, Ordering::SeqCst);
             }),
@@ -707,7 +753,7 @@ mod tests {
         // A canceller set on a terminal query is dropped at once.
         let late = Arc::new(AtomicBool::new(false));
         let guard = DropGuard(Arc::clone(&late));
-        tracker.set_canceller(&id, Box::new(move |_| drop(guard)));
+        tracker.set_canceller(&id, stopping(move |_| drop(guard)));
         assert!(late.load(Ordering::SeqCst));
     }
 
@@ -726,7 +772,7 @@ mod tests {
         let seen = Arc::clone(&calls);
         tracker.set_canceller(
             &id,
-            Box::new(move |by| seen.lock().unwrap().push(by.to_owned())),
+            stopping(move |by| seen.lock().unwrap().push(by.to_owned())),
         );
         assert_eq!(*calls.lock().unwrap(), ["root"], "run on registration");
         // Cancelled without a kill: the canceller still runs, by the server.
@@ -735,7 +781,7 @@ mod tests {
         let seen = Arc::clone(&calls);
         tracker.set_canceller(
             &other,
-            Box::new(move |by| seen.lock().unwrap().push(by.to_owned())),
+            stopping(move |by| seen.lock().unwrap().push(by.to_owned())),
         );
         assert_eq!(*calls.lock().unwrap(), ["root", "the server"]);
     }
@@ -746,7 +792,7 @@ mod tests {
         let id = tracker.create_query("SELECT 1".into());
         tracker.advance_to(&id, QueryState::Running).unwrap();
         let inner = tracker.clone();
-        tracker.set_canceller(&id, Box::new(move |_| inner.finish_query(&id, 1).unwrap()));
+        tracker.set_canceller(&id, stopping(move |_| inner.finish_query(&id, 1).unwrap()));
         assert_eq!(
             tracker.kill_query(&id, "root").unwrap(),
             KillOutcome::AlreadyEnded(QueryState::Finished)
@@ -762,7 +808,7 @@ mod tests {
         let inner = tracker.clone();
         tracker.set_canceller(
             &id,
-            Box::new(move |_| {
+            stopping(move |_| {
                 inner.cancel_query(&id).unwrap();
             }),
         );

@@ -43,3 +43,7 @@
 - [x] 9.7 `run_manage` takes the change lock itself (`ManageAction::change_mutex`); shared `count` / `persist_failed`
 - [x] 9.8 Lock-free admission while no cap is set
 - [x] 9.9 `DELETE /api/v2/admission` and MCP `reset_admission_limits` (26 tools)
+
+## 10. Review round 3
+
+- [x] 10.1 Kill: cancellers registered before the work starts, through a `KillSwitch`; a kill after the work completed is not applied and the statement keeps its real result

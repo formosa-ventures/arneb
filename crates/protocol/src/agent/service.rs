@@ -10,7 +10,7 @@ use futures::FutureExt;
 use arneb_catalog::CatalogManager;
 use arneb_connectors::ConnectorRegistry;
 use arneb_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
-use arneb_scheduler::{AdmissionController, AdmissionPermit, QueryState, QueryTracker};
+use arneb_scheduler::{AdmissionController, AdmissionPermit, KillSwitch, QueryState, QueryTracker};
 
 use super::error::{AgentError, AgentErrorCode};
 use super::limits::AgentLimits;
@@ -202,7 +202,8 @@ impl AgentQueryService {
         let statement = self.register(user, sql.to_string(), max_rows)?;
         let session = ClientSession::for_agent(user, req.catalog, req.schema);
         tracing::debug!(statement_id = %statement.id, user, "agent statement submitted");
-        let handle = tokio::spawn(self.clone().run(Arc::clone(&statement), session));
+        let switch = self.kill_switch(&statement);
+        let handle = tokio::spawn(self.clone().run(Arc::clone(&statement), session, switch));
         *lock(&statement.abort) = Some(handle.abort_handle());
         // Cancelled before the handle was stored: stop the task now.
         if statement.is_terminal() {
@@ -210,13 +211,22 @@ impl AgentQueryService {
                 handle.abort();
             }
         }
-        // A kill through the tracker (manage-api D7). Weak references, so the
-        // tracker never keeps the statement or itself alive.
+        self.wait_for_end(&statement, wait).await;
+        Ok(statement.status(&self.limits, page_bytes))
+    }
+
+    /// Registers the tracker canceller for a kill (manage-api D7) of
+    /// `statement`, before its task starts: the returned switch stops the
+    /// work unless it completed, in which case the kill is not applied and
+    /// the statement keeps its real outcome. Weak references, so the
+    /// tracker never keeps the statement or itself alive.
+    fn kill_switch(&self, statement: &Arc<Statement>) -> KillSwitch {
+        let switch = KillSwitch::new();
         let (weak_statement, weak_tracker) =
-            (Arc::downgrade(&statement), Arc::downgrade(&self.tracker));
+            (Arc::downgrade(statement), Arc::downgrade(&self.tracker));
         self.tracker.set_canceller(
             &statement.tracker_id,
-            Box::new(move |by| {
+            switch.canceller(move |by| {
                 if let (Some(statement), Some(tracker)) =
                     (weak_statement.upgrade(), weak_tracker.upgrade())
                 {
@@ -224,8 +234,7 @@ impl AgentQueryService {
                 }
             }),
         );
-        self.wait_for_end(&statement, wait).await;
-        Ok(statement.status(&self.limits, page_bytes))
+        switch
     }
 
     /// The status of `user`'s statement `id`, waiting up to `wait` (capped
@@ -393,25 +402,35 @@ impl AgentQueryService {
 
     /// The statement task, in the order of the Trino submit path: (already
     /// registered with the tracker) admit, run under the time limit, record
-    /// the outcome.
-    async fn run(self, statement: Arc<Statement>, session: ClientSession) {
+    /// the outcome. The work runs under `switch`, so a kill stops it unless
+    /// it completed first.
+    async fn run(self, statement: Arc<Statement>, session: ClientSession, switch: KillSwitch) {
         if statement.is_terminal() {
             return; // cancelled before the task started
         }
-        let limits = match TimeLimits::from_session(&session, self.statement_timeout) {
-            Ok(l) => l,
-            Err(err) => return self.fail(&statement, err),
+        // `None`: killed first, and the kill already ended the statement.
+        let Some(result) = switch.guard(self.execute(&statement, &session)).await else {
+            return;
         };
+        match result {
+            Ok((output, collector)) => self.complete(&statement, output, collector),
+            Err(err) => self.fail(&statement, err),
+        }
+    }
+
+    /// The statement's work: admission, then execution under its time
+    /// limits, with its rows retained in the returned collector.
+    async fn execute(
+        &self,
+        statement: &Statement,
+        session: &ClientSession,
+    ) -> Result<(QueryOutput, Collector), TrinoError> {
+        let limits = TimeLimits::from_session(session, self.statement_timeout)?;
         // The run limit counts from submission and covers the queue wait.
         let run_deadline = limits.run.and_then(|d| statement.created.checked_add(d));
-        let _permit = match with_deadline(run_deadline, self.admit(&statement, &session)).await {
-            Some(Ok(permit)) => permit,
-            Some(Err(err)) => return self.fail(&statement, err),
-            None => {
-                let err = limits.exceeded("query_max_run_time");
-                return self.fail(&statement, err);
-            }
-        };
+        let _permit = with_deadline(run_deadline, self.admit(statement, session))
+            .await
+            .ok_or_else(|| limits.exceeded("query_max_run_time"))??;
         let exec_deadline = match (
             run_deadline,
             limits
@@ -433,23 +452,20 @@ impl AgentQueryService {
         // Rows are retained (and charged to the budget) as they are
         // produced; a failed or cancelled statement drops them with the
         // collector.
-        let mut collector = self.collector(&statement);
+        let mut collector = self.collector(statement);
         let run = std::panic::AssertUnwindSafe(self.engine.run_statement_capped(
-            &session,
+            session,
             &statement.sql,
             statement.max_rows + 1,
             &mut collector,
         ))
         .catch_unwind();
-        let result = match with_deadline(exec_deadline, run).await {
+        let output = match with_deadline(exec_deadline, run).await {
             Some(outcome) => outcome
-                .unwrap_or_else(|_| Err(TrinoError::internal("statement execution panicked"))),
-            None => Err(limits.exceeded_during_execution(run_deadline, exec_deadline)),
+                .unwrap_or_else(|_| Err(TrinoError::internal("statement execution panicked")))?,
+            None => return Err(limits.exceeded_during_execution(run_deadline, exec_deadline)),
         };
-        match result {
-            Ok(output) => self.complete(&statement, output, collector),
-            Err(err) => self.fail(&statement, err),
-        }
+        Ok((output, collector))
     }
 
     /// The collector for `statement`'s rows. When a budget is short it
@@ -506,8 +522,8 @@ impl AgentQueryService {
     }
 
     /// Records a successful outcome, unless the statement was cancelled
-    /// meanwhile. A statement the tracker already marked cancelled turns
-    /// cancelled instead of keeping its rows.
+    /// meanwhile. Work that completed keeps its result: a kill never lands
+    /// after completion (the kill switch reports it as not applied).
     fn complete(&self, statement: &Statement, output: QueryOutput, collector: Collector) {
         let retained = collector.finish();
         // What the query produced, not what was kept: a truncated result
@@ -538,14 +554,8 @@ impl AgentQueryService {
         };
         let tracker = &self.tracker;
         statement.end_with(|| {
-            match tracker
-                .finish_query(&statement.tracker_id, rows)
-                .err()
-                .and_then(|_| self.killed(statement))
-            {
-                Some(cancelled) => cancelled,
-                None => Phase::Finished(finished),
-            }
+            let _ = tracker.finish_query(&statement.tracker_id, rows);
+            Phase::Finished(finished)
         });
     }
 
@@ -1695,35 +1705,76 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst), "execution was not aborted");
     }
 
-    /// A kill that lands before the canceller is registered, then the
-    /// statement finishes: it turns cancelled and keeps no rows.
-    #[tokio::test]
-    async fn a_statement_killed_before_registration_cannot_finish() {
-        let (svc, tracker) = service();
-        let statement = svc.register("alice", "SELECT 1".into(), 10).unwrap();
-        let id = statement.tracker_id;
-        assert!(matches!(
-            tracker.kill_query(&id, "root").unwrap(),
-            arneb_scheduler::KillOutcome::Killed { .. }
-        ));
+    /// One row of `n`, pushed into `statement`'s collector.
+    fn one_row(svc: &AgentQueryService, statement: &Statement) -> Collector {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "n",
             ArrowDataType::Int64,
             false,
         )]));
         let column: ArrayRef = Arc::new(Int64Array::from(vec![1]));
-        let mut collector = svc.collector(&statement);
+        let mut collector = svc.collector(statement);
         crate::handler::BatchSink::push(
             &mut collector,
             RecordBatch::try_new(schema, vec![column]).unwrap(),
         );
-        let output = QueryOutput {
+        collector
+    }
+
+    fn no_output() -> QueryOutput {
+        QueryOutput {
             columns: None,
             batches: Vec::new(),
             update_type: None,
             headers: Vec::new(),
-        };
-        svc.complete(&statement, output, collector);
+        }
+    }
+
+    /// A kill that lands after the work completed, before `complete`
+    /// recorded it: the kill is not applied and the statement keeps its
+    /// real result.
+    #[tokio::test]
+    async fn a_kill_after_the_work_completed_keeps_the_result() {
+        let (svc, tracker) = service();
+        let statement = svc.register("alice", "SELECT 1".into(), 10).unwrap();
+        let id = statement.tracker_id;
+        let switch = svc.kill_switch(&statement);
+        assert_eq!(switch.guard(async { "done" }).await, Some("done"));
+        assert_eq!(
+            tracker.kill_query(&id, "root").unwrap(),
+            arneb_scheduler::KillOutcome::AlreadyEnded(QueryState::Finishing)
+        );
+        let collector = one_row(&svc, &statement);
+        svc.complete(&statement, no_output(), collector);
+        let status = svc
+            .status("alice", &statement.id, Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(status.state, StatementState::Finished);
+        assert_eq!(status.total_rows, Some(1));
+        let info = tracker.get_query(&id).unwrap();
+        assert_eq!(info.state, QueryState::Finished);
+        assert_eq!(info.rows, Some(1));
+    }
+
+    /// A kill before the task starts (the canceller is registered before
+    /// the spawn) stops all of the work: the statement turns cancelled and
+    /// its task does nothing.
+    #[tokio::test]
+    async fn a_kill_before_the_task_starts_stops_the_work() {
+        let (svc, tracker) = service();
+        let statement = svc.register("alice", "SELECT 1".into(), 10).unwrap();
+        let id = statement.tracker_id;
+        let switch = svc.kill_switch(&statement);
+        assert!(matches!(
+            tracker.kill_query(&id, "root").unwrap(),
+            arneb_scheduler::KillOutcome::Killed { .. }
+        ));
+        assert!(switch.is_killed());
+        let session = ClientSession::for_agent("alice", None, None);
+        svc.clone()
+            .run(Arc::clone(&statement), session, switch)
+            .await;
         let status = svc
             .status("alice", &statement.id, Duration::ZERO, None)
             .await

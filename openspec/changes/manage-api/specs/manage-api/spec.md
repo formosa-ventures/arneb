@@ -113,11 +113,15 @@ Under password auth every non-dry manage run that passed authorization, every ca
 - **THEN** the response is `503 audit_unavailable` and the worker stays schedulable
 
 ### Requirement: Cancel any query
-`DELETE /api/v2/queries/{id}` SHALL cancel a query from any protocol and stop it there: pgwire answers `57014 canceling statement due to user request`, a Trino client `USER_CANCELED` `Query was killed by <user>`, and an agent statement turns `cancelled`. It SHALL answer `200` with the envelope and `result` `{query_id, owner, state_before, state}`. The owner SHALL always be allowed; otherwise the kill rule SHALL decide in this order: refused under `none`; an explicit `queries` rule that allows `kill` for the owner (no rules file or no `queries` section grants nothing); the manage privilege; otherwise `forbidden`. A caller whose rules grant `kill` but not `view` SHALL be able to cancel by id; a caller with neither SHALL get `not_found`. Cancelling a query that already ended SHALL answer `200` with `changed: false`. A kill that lands between a query's creation and its registration SHALL still stop it, and the query SHALL NOT then report success or rows: a statement that finishes after such a kill SHALL end as Trino `USER_CANCELED` or agent `cancelled`, and the tracker SHALL keep it `Cancelled`.
+`DELETE /api/v2/queries/{id}` SHALL cancel a query from any protocol and stop it there: pgwire answers `57014 canceling statement due to user request`, a Trino client `USER_CANCELED` `Query was killed by <user>`, and an agent statement turns `cancelled`. It SHALL answer `200` with the envelope and `result` `{query_id, owner, state_before, state}`. The owner SHALL always be allowed; otherwise the kill rule SHALL decide in this order: refused under `none`; an explicit `queries` rule that allows `kill` for the owner (no rules file or no `queries` section grants nothing); the manage privilege; otherwise `forbidden`. A caller whose rules grant `kill` but not `view` SHALL be able to cancel by id; a caller with neither SHALL get `not_found`. Cancelling a query that already ended SHALL answer `200` with `changed: false`. Each protocol SHALL register its canceller before the statement's work starts, so a kill that lands before the work starts SHALL stop all of it. A kill SHALL apply only when it stopped the work: one that lands after the work completed (a committed `INSERT`, CTAS or DDL included) but before the protocol recorded the outcome SHALL answer `changed: false`, its audit entry SHALL record `effect` `already_ended`, and the statement SHALL report its real result, never `57014`, `USER_CANCELED` or `cancelled`.
 
 #### Scenario: Admin kills a pgwire query
 - **WHEN** an admin cancels user2's running pgwire query
 - **THEN** the response has `changed: true`, user2's client receives `57014`, and an audit entry `query.cancel` names the admin
+
+#### Scenario: Kill after a write committed
+- **WHEN** an admin's kill lands after a pgwire `INSERT` completed but before the statement recorded its outcome
+- **THEN** the response has `changed: false`, the audit entry records `effect` `already_ended`, and the client gets the `INSERT` success
 
 #### Scenario: Ended query
 - **WHEN** an admin cancels a query that finished a moment ago

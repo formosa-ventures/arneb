@@ -70,13 +70,24 @@ Everyone can run queries and sees only their own.
   them against the names as the source stores them (lowercase in Hive;
   in PostgreSQL, lowercase unless the table was created with a quoted
   mixed-case name such as `"Orders"`).
-- Some connectors find tables case-insensitively: Hive always, PostgreSQL
-  when no name matches exactly. A read is checked on the name as written
-  **and** on the name the connector resolved it to, and is refused if
-  either is denied. So a rule on `secret` also covers `SECRET`, `Secret`
-  and `PUBLIC.secret`, and a schema rule covers the schema in any case.
-  When only the resolved name is denied, the error is the one a missing
-  table gets, so it does not reveal that the table exists.
+- Some connectors find tables by a name other than the stored one: Hive
+  always (HMS trims and lowercases names), PostgreSQL when no name matches
+  exactly (a unique case-insensitive match). A read is checked on the name
+  as written **and** on the name the connector resolved it to, and is
+  refused if either is denied. So a deny rule on `secret` also covers
+  `SECRET`, `Secret` and `PUBLIC.secret`, and a schema rule covers the
+  schema however it is written. When only the resolved name is denied,
+  the error is the one a missing table gets, so it does not reveal that
+  the table exists.
+- The same holds for **allow** rules: the name as written must match one
+  too. Arneb folds an unquoted name to lowercase only when the name as
+  written finds nothing and its lowercase form does (memory and file
+  catalogs). Hive and PostgreSQL find `NATION` as written, so it is not
+  folded, and an allow rule on `nation` refuses `SELECT * FROM NATION`.
+  Write queries with the stored (usually lowercase) names, or make allow
+  patterns case-insensitive, e.g. `"table": "(?i)nation"`.
+- A PostgreSQL view is checked by the view's own name. The tables it
+  reads are governed only by the PostgreSQL role the catalog connects as.
 - A section left out of the file allows everything it governs. With no
   `tables` section, every user has every privilege on every table; with no
   `schemas` section, every user owns every schema; and so on.

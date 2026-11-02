@@ -290,7 +290,15 @@ impl AgentQueryService {
         // statement is registered or admitted. Checked against the schema's
         // table names, which loads no table metadata (no partitions, no
         // Iceberg manifests), so the query below still resolves the table
-        // only once.
+        // only once. A virtual schema named exactly is matched exactly, as
+        // before; any other name is first folded the way the query folds
+        // it, so a name the query would find is never refused.
+        let (catalog, schema, table) = if is_virtual(catalog, schema) {
+            (catalog.to_string(), schema.to_string(), table.to_string())
+        } else {
+            fold_names(&root, catalog, schema, table).await
+        };
+        let (catalog, schema, table) = (catalog.as_str(), schema.as_str(), table.as_str());
         if !is_virtual(catalog, schema) && !names_visible(&root, catalog, schema, table) {
             return Err(missing(&root, catalog, schema, table).await);
         }
@@ -317,6 +325,52 @@ impl AgentQueryService {
         )
         .await
     }
+}
+
+/// `name`, or its lowercase form when `name` is not among `names` and the
+/// lowercase form is.
+fn fold_name(name: &str, names: &[String]) -> String {
+    let lower = name.to_lowercase();
+    if lower != name && !names.iter().any(|n| n == name) && names.iter().any(|n| *n == lower) {
+        lower
+    } else {
+        name.to_string()
+    }
+}
+
+/// `catalog.schema.table` with each part folded to lowercase where the query
+/// would fold it ([`CatalogManager::fold_reference_case`]: a part that names
+/// nothing as written but names something in lowercase), decided from name
+/// listings only (no table is loaded). The lists hold only what the user may
+/// see, so a hidden lowercase name is never folded to. An all-lowercase part
+/// needs no listing, as in the query.
+async fn fold_names(
+    root: &CatalogManager,
+    catalog: &str,
+    schema: &str,
+    table: &str,
+) -> (String, String, String) {
+    let folds = |name: &str| name.to_lowercase() != name;
+    let catalog = if folds(catalog) {
+        fold_name(catalog, &catalog_names(root))
+    } else {
+        catalog.to_string()
+    };
+    let schema = if folds(schema) {
+        let names = schema_names(root, &catalog).await.unwrap_or_default();
+        fold_name(schema, &names)
+    } else {
+        schema.to_string()
+    };
+    let table = if folds(table) {
+        let names = table_names(root, &catalog, &schema)
+            .await
+            .unwrap_or_default();
+        fold_name(table, &names)
+    } else {
+        table.to_string()
+    };
+    (catalog, schema, table)
 }
 
 /// Whether `catalog.schema` is one of the virtual metadata schemas.
@@ -763,6 +817,58 @@ mod tests {
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
         assert_eq!(err.candidates, vec!["stat".to_string()]);
         assert_eq!(count(), 2, "a miss lists once for the candidates");
+    }
+
+    #[tokio::test]
+    async fn sample_folds_names_like_the_query() {
+        let svc = service(None);
+        // The query folds a name that matches nothing as written to its
+        // lowercase form, so these sampled at 6f7e56a; they still do.
+        for (catalog, schema, table) in [
+            ("memory", "default", "LINEITEM"),
+            ("MEMORY", "DEFAULT", "LineItem"),
+        ] {
+            let s = svc
+                .sample("alice", catalog, schema, table, Some(2))
+                .await
+                .unwrap();
+            assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
+            assert_eq!(s.first_page.unwrap().rows.len(), 2);
+        }
+        let s = svc
+            .sample("alice", "memory", "INFORMATION_SCHEMA", "TABLES", Some(1))
+            .await
+            .unwrap();
+        assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
+        // The query itself resolves the name as written (what 6f7e56a ran).
+        let q = svc
+            .submit(
+                "alice",
+                SubmitRequest {
+                    sql: "SELECT * FROM \"MEMORY\".\"DEFAULT\".\"LineItem\" LIMIT 1".into(),
+                    catalog: None,
+                    schema: None,
+                    max_rows: None,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(q.state, StatementState::Finished, "{:?}", q.error);
+        // A name that folds to nothing is still refused before running.
+        let err = svc
+            .sample("alice", "memory", "default", "LINEITM", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound);
+        // A hidden lowercase table is never folded to.
+        let svc = service(Some(HIDE_ORDERS));
+        let err = svc
+            .sample("bob", "memory", "default", "ORDERS", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound);
+        assert!(!err.candidates.contains(&"orders".to_string()));
     }
 
     #[tokio::test]

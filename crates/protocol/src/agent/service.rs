@@ -546,31 +546,43 @@ impl AgentQueryService {
     /// One reaper pass over statements idle for longer than `idle_timeout`.
     fn reap(&self) {
         let idle_timeout = self.limits.idle_timeout;
-        let statements: Vec<Arc<Statement>> = lock(&self.statements).values().cloned().collect();
-        for statement in statements {
-            if statement.idle() <= idle_timeout {
-                continue;
-            }
-            if statement.is_terminal() {
-                let mut map = lock(&self.statements);
-                // Re-check under the map lock: a request may just have come in.
-                if statement.idle() > idle_timeout {
-                    map.remove(&statement.id);
-                }
-            } else {
-                let error = AgentError::new(
-                    AgentErrorCode::Cancelled,
-                    format!(
-                        "Statement was abandoned: no request within the idle timeout of {}s",
-                        idle_timeout.as_secs()
-                    ),
-                );
-                self.cancel_statement(&statement, error, "abandoned");
-                // Keep it for another idle period so a returning client
-                // learns why it was cancelled.
-                statement.touch();
-            }
+        for statement in self.reap_ended() {
+            let error = AgentError::new(
+                AgentErrorCode::Cancelled,
+                format!(
+                    "Statement was abandoned: no request within the idle timeout of {}s",
+                    idle_timeout.as_secs()
+                ),
+            );
+            self.cancel_statement(&statement, error, "abandoned");
+            // Keep it for another idle period so a returning client
+            // learns why it was cancelled.
+            statement.touch();
         }
+    }
+
+    /// Under the registry lock, removes the ended statements idle for
+    /// longer than `idle_timeout`, and returns the queued or running ones
+    /// that are (to be cancelled). Only those are cloned, so an ended
+    /// statement's sole holder stays the registry during a pass and a
+    /// concurrent eviction still sees it as a candidate.
+    fn reap_ended(&self) -> Vec<Arc<Statement>> {
+        let idle_timeout = self.limits.idle_timeout;
+        let (removed, abandoned): (Vec<_>, Vec<_>) = {
+            let mut map = lock(&self.statements);
+            let (ended, abandoned): (Vec<_>, Vec<_>) = map
+                .values()
+                .filter(|s| s.idle() > idle_timeout)
+                .partition(|s| s.is_terminal());
+            let ended: Vec<String> = ended.into_iter().map(|s| s.id.clone()).collect();
+            let abandoned: Vec<_> = abandoned.into_iter().cloned().collect();
+            let removed: Vec<_> = ended.iter().filter_map(|id| map.remove(id)).collect();
+            (removed, abandoned)
+        };
+        // Dropped outside the registry lock: their reservations give the
+        // bytes back here.
+        drop(removed);
+        abandoned
     }
 }
 
@@ -607,10 +619,10 @@ impl Evicted {
 /// `user`'s own (for the user's share), or anyone's (for the server budget,
 /// the user's own first), fully read ones first, then least recently
 /// accessed. A statement some request still holds (a poll, a page being
-/// encoded, a reaper pass) is skipped, since dropping it from the registry
-/// would free nothing yet; and should an eviction still free nothing, it
-/// stops rather than evict the next candidate for nothing. Returns whether
-/// a retry may now succeed.
+/// encoded) is skipped, since dropping it from the registry would free
+/// nothing yet; and should an eviction still free nothing (its reservation
+/// survives), it stops rather than evict the next candidate for nothing.
+/// Returns whether a retry may now succeed.
 fn evict_retained(
     statements: &Mutex<HashMap<String, Arc<Statement>>>,
     evicted: &Mutex<Evicted>,
@@ -620,7 +632,7 @@ fn evict_retained(
 ) -> bool {
     let mut needed = missing();
     while needed > 0 {
-        let (statement, bytes) = {
+        let (statement, bytes, reservation) = {
             let mut map = lock(statements);
             let candidates: Vec<_> = map
                 .values()
@@ -637,20 +649,23 @@ fn evict_retained(
                     let r = &output.retained;
                     (r.bytes > 0 && !r.pinned()).then(|| {
                         let key = (s.user != user, !inner.read_to_end, inner.last_access);
-                        (key, s.id.clone(), r.bytes)
+                        (key, s.id.clone(), r.bytes, r.reservation())
                     })
                 })
                 .collect();
             if candidates.iter().map(|c| c.2).sum::<usize>() < needed {
                 return false;
             }
-            let Some((_, id, bytes)) = candidates.into_iter().min() else {
+            let Some((_, id, bytes, reservation)) = candidates
+                .into_iter()
+                .min_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)))
+            else {
                 return false;
             };
             let Some(statement) = map.remove(&id) else {
                 return false;
             };
-            (statement, bytes)
+            (statement, bytes, reservation)
         };
         lock(evicted).record(&statement, true);
         tracing::debug!(
@@ -662,11 +677,12 @@ fn evict_retained(
         // Dropped outside the registry lock: its reservation gives the
         // bytes back here.
         drop(statement);
-        let now = missing();
-        if now >= needed {
+        // Judged by the victim's own reservation, not the budget, which a
+        // concurrent collector may have taken from meanwhile.
+        if reservation.is_some_and(|r| r.upgrade().is_some()) {
             return false; // freed nothing after all: stop here
         }
-        needed = now;
+        needed = missing();
     }
     true
 }
@@ -1164,6 +1180,8 @@ mod tests {
                 ..AgentLimits::default()
             },
         );
+        // The current-thread test runtime finishes each run task (dropping
+        // its Arc) before run_as returns, so only the registry holds a and b.
         let a = run_as(&svc, "alice", sql).await;
         let b = run_as(&svc, "alice", sql).await;
         // A request (a poll, a page) holds a, the least recently used:
@@ -1208,6 +1226,70 @@ mod tests {
         );
         assert!(retry, "the collector just retries");
         assert!(lock(&svc.statements).contains_key(&b.id), "b is kept");
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_take_does_not_stop_eviction_early() {
+        let sql = "SELECT s FROM wide";
+        let one = one_wide_result().await;
+        let svc = service_over(
+            vec![wide_table(10, 1000)],
+            AgentLimits {
+                max_retained_bytes: one,
+                max_user_retained_bytes: 3 * one,
+                ..AgentLimits::default()
+            },
+        );
+        let a = run_as(&svc, "alice", sql).await;
+        let b = run_as(&svc, "alice", sql).await;
+        // What is missing reads `one` before the first eviction and, as if
+        // another collector took the freed bytes at once, `one` again after
+        // it; then nothing.
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let missing = || match reads.fetch_add(1, Ordering::SeqCst) {
+            0 | 1 => one,
+            _ => 0,
+        };
+        let retry = evict_retained(
+            &svc.statements,
+            &svc.evicted,
+            "alice",
+            Shortfall::User,
+            &missing,
+        );
+        assert!(retry, "the first eviction did free its bytes");
+        let alive = |id: &str| lock(&svc.statements).contains_key(id);
+        assert!(!alive(&a.id) && !alive(&b.id));
+        assert_eq!(svc.retained_budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reaper_pass_leaves_ended_statements_evictable() {
+        let svc = service_over(
+            vec![wide_table(10, 1000)],
+            AgentLimits {
+                idle_timeout: Duration::from_secs(1),
+                max_wait: Duration::from_secs(1),
+                ..AgentLimits::default()
+            },
+        );
+        let done = run_to_end(&svc, "SELECT s FROM wide", None).await;
+        assert_eq!(done.state, StatementState::Finished);
+        let (svc, _dropped) = hanging(svc);
+        let live = svc
+            .submit("alice", req(HANGING_SQL), Duration::ZERO)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Both are idle; one more request keeps `done` from being reaped.
+        svc.status("alice", &done.id, Duration::ZERO).await.unwrap();
+        // Mid-pass, the reaper holds only what it is about to cancel: the
+        // ended statement's sole holder is still the registry.
+        let abandoned = svc.reap_ended();
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].id, live.id);
+        let map = lock(&svc.statements);
+        assert_eq!(Arc::strong_count(&map[&done.id]), 1);
     }
 
     /// A distributed executor that streams `batches` wide batches into the

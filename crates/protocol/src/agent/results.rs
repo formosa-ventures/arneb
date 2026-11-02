@@ -219,6 +219,12 @@ impl Retained {
         self.truncated_by.is_some()
     }
 
+    /// A handle on the budget reservation, which fails to upgrade once the
+    /// bytes are given back; `None` when nothing was reserved.
+    pub(crate) fn reservation(&self) -> Option<std::sync::Weak<Reservation>> {
+        self._reservation.as_ref().map(Arc::downgrade)
+    }
+
     /// Whether a clone (a page being encoded) still holds the reservation,
     /// so dropping this one would free nothing yet.
     pub(crate) fn pinned(&self) -> bool {

@@ -43,6 +43,19 @@ pub enum TruncatedBy {
     ServerBudget,
 }
 
+impl TruncatedBy {
+    /// The name `truncated_by` serializes as (`max_rows`, `user_budget`,
+    /// ...), for messages that must match it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxRows => "max_rows",
+            Self::MaxRetainedBytes => "max_retained_bytes",
+            Self::UserBudget => "user_budget",
+            Self::ServerBudget => "server_budget",
+        }
+    }
+}
+
 /// Which budget a reservation could not grow within.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Shortfall {
@@ -375,11 +388,14 @@ fn render_first_row(row: RecordBatch, max_cell_bytes: usize) -> RecordBatch {
     compact(with_columns(row, columns))
 }
 
-/// Frees retained bytes for a collector by evicting ended statements that
-/// together hold at least `needed` bytes in the `short` budget (only the
-/// collecting user's own for [`Shortfall::User`]); evicts nothing and
-/// returns `false` when they cannot.
-pub(crate) type Evict = Box<dyn FnMut(Shortfall, usize) -> bool + Send>;
+/// Frees retained bytes for a collector by evicting ended statements from
+/// the `short` budget (only the collecting user's own for
+/// [`Shortfall::User`]) until nothing is missing. The second argument
+/// reports the bytes still missing, read from the budget each time it is
+/// called, so a shortfall that went away meanwhile evicts nothing. Returns
+/// whether retrying may now succeed; `false` (after evicting nothing, when
+/// the candidates cannot cover the shortfall) makes the collector give up.
+pub(crate) type Evict = Box<dyn FnMut(Shortfall, &dyn Fn() -> usize) -> bool + Send>;
 
 /// Retains a statement's rows as the query produces them: at most
 /// `max_rows` rows and `max_retained_bytes` bytes (measured with
@@ -552,7 +568,8 @@ impl BatchSink for Collector {
                     self.hint = Some(format!(
                         "the first row alone needs {first_size} bytes even with long values \
                          cut to max_cell_bytes, more than this statement could retain \
-                         ({why:?}); select fewer columns, or release other results"
+                         ({}); select fewer columns, or release other results",
+                        why.as_str()
                     ));
                 }
             }
@@ -943,8 +960,22 @@ mod tests {
         let r = c.finish();
         assert_eq!((r.kept_rows(), r.bytes), (0, 0));
         assert_eq!(r.truncated_by, Some(TruncatedBy::UserBudget));
-        assert!(r.hint.is_some());
+        // The hint names the limit as truncated_by serializes it.
+        let hint = r.hint.unwrap();
+        assert!(hint.contains("(user_budget)"), "{hint}");
         assert_eq!(budget.used_by("alice"), full.bytes);
+    }
+
+    #[test]
+    fn truncated_by_names_match_their_serialized_form() {
+        for by in [
+            TruncatedBy::MaxRows,
+            TruncatedBy::MaxRetainedBytes,
+            TruncatedBy::UserBudget,
+            TruncatedBy::ServerBudget,
+        ] {
+            assert_eq!(serde_json::to_value(by).unwrap(), Value::from(by.as_str()));
+        }
     }
 
     #[test]

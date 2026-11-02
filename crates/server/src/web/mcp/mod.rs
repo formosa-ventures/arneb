@@ -58,20 +58,20 @@ Arneb is a distributed SQL engine over many data sources. Names are catalog.sche
 
 Workflow:
 1. Discover: list_catalogs, list_schemas, list_tables.
-2. Learn the table: describe_table for columns, sample_table for rows.
+2. Learn: describe_table for columns, sample_table for rows.
 3. Check it: explain_query plans without running.
-4. Run: submit_query with wait_ms (up to {max_wait_ms}) so short queries return finished.
-5. If queued or running, call get_query_status (with wait_ms) until finished, failed or cancelled.
-6. Read rows: start fetch_results from first_page.next_cursor and repeat with each next_cursor until null.
+4. Run: submit_query with wait_ms (up to {max_wait_ms}).
+5. If queued or running, poll get_query_status (with wait_ms) until it ends.
+6. Read rows: fetch_results from first_page.next_cursor, then each next_cursor until null.
 7. Done with a statement: cancel_query stops or frees it.
 
-Limits: a statement keeps at most max_rows rows (default {default_max_rows}, ceiling {max_rows}) and reports truncated when more existed. Pages hold {page_bytes} bytes of rows by default; max_bytes allows up to {max_page_bytes}. Long cells and SQL text are cut. Listings take limit.
+Limits: a statement keeps max_rows rows (default {default_max_rows}, ceiling {max_rows}); truncated says more existed. Any ended result may be evicted (read ones first) and then answers not_found: resubmit. Pages hold {page_bytes} bytes by default; max_bytes allows up to {max_page_bytes}. Long cells and SQL text are cut. Listings take limit.
 
-Errors: a failed tool call is an error result with a code and a hint. Read the hint and candidates (close matches for a misspelled name), fix the call, retry. A SQL error after submit is a status with state failed.
+Errors: a failed call returns a code and a hint. Use the hint and candidates (close matches for a misspelled name), then retry. A SQL error is a failed status.
 
-Operations: list_workers, get_worker, get_admission and list_audit_log need observe access. Manage tools (cordon_worker, drain_worker, uncordon_worker, set_admission_limits, cancel_query on another's query) need the manage privilege or a queries kill rule (see whoami.privileges); each takes dry_run, so preview first. Actions are audited.
+Operations: list_workers, get_worker, get_admission and list_audit_log need observe access. cordon_worker, drain_worker, uncordon_worker, set_admission_limits and cancel_query on another's query need the manage privilege or a queries kill rule (see whoami.privileges); each takes dry_run, so preview first. Actions are audited.
 
-Queries run as your user and you see only what your user may see.";
+Queries run as your user and see only what it may see.";
 
 /// The MCP handler: one per request (the service is stateless), cloned
 /// from the one [`mcp_service`] builds.

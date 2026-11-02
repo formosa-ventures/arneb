@@ -52,3 +52,4 @@
 - [x] 10.4 Audit: the `token.issue` intent names the token id (`TokenId`, `issue_token_as`)
 - [x] 10.5 Audit log named after the full state file name (`prod.json.audit.jsonl`); WARN on a legacy `audit.jsonl`
 - [x] 10.6 Audit reads examine at most 10,000 entries; a filtered page that runs out ends early, truncated, with a cursor
+- [x] 10.7 Lock-free admission checks the cap flag and takes its slot in one atomic step (no spurious `QueueFull`)

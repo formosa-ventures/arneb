@@ -229,8 +229,11 @@ impl LiveCatalogs {
             .swap(|| self.store_version(Some(epoch), self.generation()));
     }
 
-    /// Sets the catalog generation (after a change was persisted).
-    pub fn set_generation(&self, g: u64) {
+    /// Sets the catalog generation (and moves the registry tag). Tests only:
+    /// a real change commits its catalogs and generation together with
+    /// [`commit`](Self::commit).
+    #[cfg(test)]
+    pub(crate) fn set_generation(&self, g: u64) {
         self.connectors.swap(|| self.store_version(None, g));
     }
 
@@ -486,14 +489,20 @@ impl LiveCatalogs {
     /// Installs a built catalog under `spec.name`, replacing one of the same
     /// name. The connector goes in first, so a statement planned against
     /// the new provider always finds it.
-    pub fn install(&self, spec: CatalogConfig, built: BuiltCatalog) {
+    ///
+    /// Tests only: it leaves the registry's version tag as it was, so a
+    /// real change uses [`commit`](Self::commit).
+    #[cfg(test)]
+    pub(crate) fn install(&self, spec: CatalogConfig, built: BuiltCatalog) {
         // One swap: a statement pins both halves or neither.
         self.connectors.swap(|| self.install_unswapped(spec, built));
     }
 
     /// Removes the installed catalog `name`. False when no such catalog is
-    /// installed here (the startup-only catalogs are never touched).
-    pub fn remove(&self, name: &str) -> bool {
+    /// installed here (the startup-only catalogs are never touched). Tests
+    /// only, like [`install`](Self::install).
+    #[cfg(test)]
+    pub(crate) fn remove(&self, name: &str) -> bool {
         self.connectors.swap(|| self.remove_unswapped(name))
     }
 

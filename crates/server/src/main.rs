@@ -300,12 +300,14 @@ async fn run() -> Result<()> {
         cluster_security.tls.is_some(),
         &config.server.bind_address,
     )?;
-    if matches!(role, ServerRole::Coordinator) {
-        config
+    // Parsed once here, before the state write, and used further down.
+    let query_retry = match role {
+        ServerRole::Coordinator => config
             .cluster
             .query_retry(|k| std::env::var(k).ok())
-            .context("invalid [cluster] retry_policy")?;
-    }
+            .context("invalid [cluster] retry_policy")?,
+        _ => None,
+    };
     // Client-facing TLS ([tls] / ARNEB_TLS_*): one certificate for pgwire and
     // the Trino listener. Workers serve neither, so they skip loading it.
     let server_tls = match (&config.tls_settings, role) {
@@ -696,10 +698,7 @@ async fn run() -> Result<()> {
     // Worker: create TaskManager and register task callback
     let distributed_executor: Option<Arc<dyn arneb_protocol::DistributedExecutor>> = match role {
         ServerRole::Coordinator => {
-            let retry = config
-                .cluster
-                .query_retry(|k| std::env::var(k).ok())
-                .context("invalid [cluster] retry_policy")?;
+            let retry = query_retry;
             tracing::info!(
                 target: "arneb::config",
                 retry_policy = if retry.is_some() { "query" } else { "none" },

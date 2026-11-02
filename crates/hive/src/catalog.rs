@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hive_metastore::{
-    ColumnStatisticsData, GetTableRequest, PartitionsRequest, TableStatsRequest,
-    ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
+    ColumnStatisticsData, Database, GetDatabaseRequest, GetTableRequest, PartitionsRequest,
+    TableStatsRequest, ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
 };
 use pilota::FastStr;
 use tracing::{debug, warn};
@@ -135,6 +135,27 @@ impl HmsClient {
         }
     }
 
+    /// The name HMS stores database `name` under. HMS normalizes the
+    /// identifier it is given (trims and lowercases it, and may read a
+    /// `@catalog#db` prefix), so this can differ from `name`.
+    pub async fn get_database(&self, name: &str) -> Result<String, ConnectorError> {
+        let req = GetDatabaseRequest {
+            name: Some(FastStr::from(name.to_string())),
+            ..Default::default()
+        };
+        let result = self.client.get_database_req(req).await.map_err(|e| {
+            ConnectorError::ConnectionFailed(format!("HMS get_database_req({name}) failed: {e}"))
+        })?;
+        match result {
+            MaybeException::Ok(db) => stored_database_name(&db).ok_or_else(|| {
+                ConnectorError::ReadError(format!("HMS database {name} came back without a name"))
+            }),
+            MaybeException::Exception(ex) => Err(ConnectorError::TableNotFound(format!(
+                "HMS get_database_req({name}) exception: {ex:?}"
+            ))),
+        }
+    }
+
     /// Return all table names in the given database.
     pub async fn get_all_tables(&self, db: &str) -> Result<Vec<String>, ConnectorError> {
         let result = self
@@ -190,11 +211,11 @@ impl HmsClient {
         let db_name = hms_table
             .db_name
             .as_ref()
-            .map_or_else(|| db.to_lowercase(), |s| s.to_string());
+            .map_or_else(|| db.trim().to_lowercase(), |s| s.to_string());
         let table_name = hms_table
             .table_name
             .as_ref()
-            .map_or_else(|| table.to_lowercase(), |s| s.to_string());
+            .map_or_else(|| table.trim().to_lowercase(), |s| s.to_string());
         let parameters = hms_table.parameters.clone();
         let sd = hms_table.sd.ok_or_else(|| {
             ConnectorError::ReadError(format!("table {db}.{table} has no storage descriptor"))
@@ -496,11 +517,21 @@ impl CatalogProvider for HiveCatalogProvider {
         }
     }
 
+    /// Looks the database up in HMS and serves it under the name HMS
+    /// returns, so every later call and every access check uses the stored
+    /// identity, never the (normalized-by-HMS) name as written.
     async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        let database = match self.client.get_database(name).await {
+            Ok(database) => database,
+            Err(e) => {
+                debug!("HMS database '{name}' not found: {e}");
+                return None;
+            }
+        };
         Some(Arc::new(HiveSchemaProvider::new(
             Arc::clone(&self.client),
             Arc::clone(&self.storage),
-            name.to_string(),
+            database,
         )))
     }
 }
@@ -540,10 +571,11 @@ impl SchemaProvider for HiveSchemaProvider {
         }
     }
 
-    /// HMS matches database names case-insensitively (it stores them
-    /// lowercased), so `TPCH` reads `tpch`.
+    /// The database name as HMS returned it (see
+    /// [`HiveCatalogProvider`]'s `schema`), which `TPCH`, `"tpch "` and
+    /// similar normalize to.
     fn canonical_name(&self) -> Option<String> {
-        Some(self.database.to_lowercase())
+        Some(self.database.clone())
     }
 
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
@@ -612,6 +644,15 @@ impl SchemaProvider for HiveSchemaProvider {
 // ---------------------------------------------------------------------------
 // HiveTableProvider
 // ---------------------------------------------------------------------------
+
+/// The stored name of a database HMS returned; `None` (refused) when HMS
+/// leaves it out, rather than guessing at its normalization.
+fn stored_database_name(db: &Database) -> Option<String> {
+    db.name
+        .as_ref()
+        .map(|n| n.to_string())
+        .filter(|n| !n.is_empty())
+}
 
 /// `true` when HMS marks the table as a Hive ACID (transactional) table.
 fn is_transactional(parameters: &HashMap<String, String>) -> bool {
@@ -818,6 +859,24 @@ mod tests {
         assert_eq!(meta.columns[1].data_type, DataType::Utf8);
         assert!(meta.location.starts_with("s3://"));
         assert!(meta.input_format.contains("Parquet"));
+    }
+
+    /// However HMS normalized the requested name (`HR`, `"hr "`,
+    /// `@hive#hr`), the schema is served and checked under the name HMS
+    /// returned; a response without a name is refused.
+    #[test]
+    fn database_identity_is_the_name_hms_returned() {
+        let returned = |name: Option<&str>| Database {
+            name: name.map(|n| FastStr::from(n.to_string())),
+            ..Default::default()
+        };
+        // What HMS answers for `HR`, `"hr "` and `@hive#hr` alike.
+        assert_eq!(
+            stored_database_name(&returned(Some("hr"))).as_deref(),
+            Some("hr")
+        );
+        assert_eq!(stored_database_name(&returned(None)), None);
+        assert_eq!(stored_database_name(&returned(Some(""))), None);
     }
 
     #[test]

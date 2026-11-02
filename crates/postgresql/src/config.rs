@@ -78,11 +78,12 @@ impl PostgresConfig {
         }
         let mut config = tokio_postgres::Config::from_str(&self.connection_url)
             .map_err(|_| "invalid connection_url".to_string())?;
-        // Defense in depth: a split in the wrong place leaves a URL
-        // delimiter in the parsed user, password or host. Checked before
-        // `self.user` / `self.password` apply (those are not parsed from
-        // the URL). A password that really holds one of these characters
-        // goes in the `password` field instead.
+        // A second `@` inside the authority lands in the host, and any
+        // other split in the wrong place leaves a URL delimiter in the
+        // parsed user or host. Checked before `self.user` applies. The
+        // parsed password needs no check: with the `@` inside the authority
+        // it is exactly what the URL wrote, and a decoded `%2F` or `%3D`
+        // (base64-style passwords) is deliberate.
         let bad_host = config.get_hosts().iter().any(|h| match h {
             tokio_postgres::config::Host::Tcp(h) => h.contains(['=', '&', '?', '/', '@', '#']),
             #[cfg(unix)]
@@ -91,18 +92,8 @@ impl PostgresConfig {
         let bad_user = config
             .get_user()
             .is_some_and(|u| u.contains(['/', '?', '&', '=', '#']));
-        let bad_password = config
-            .get_password()
-            .is_some_and(|p| p.iter().any(|b| b"/?&=#".contains(b)));
         if bad_host || bad_user {
             return Err(AMBIGUOUS_AT.into());
-        }
-        if bad_password {
-            return Err(
-                "invalid connection_url: its password contains '/', '?', '&', '=' or '#'; \
-                 set it in the catalog's password field instead"
-                    .into(),
-            );
         }
         if let Some(user) = &self.user {
             config.user(user);
@@ -145,8 +136,9 @@ impl PostgresConfig {
 }
 
 /// The refusal for a URL the driver would split at the wrong `@`.
-const AMBIGUOUS_AT: &str = "invalid connection_url: an unencoded '@' splits it in the wrong \
-     place; percent-encode an '@' in a user name, password or parameter value as %40";
+const AMBIGUOUS_AT: &str = "invalid connection_url: an unencoded '@', '/', '?' or '#' splits \
+     it in the wrong place; percent-encode them in a user name, password or parameter value \
+     (%40, %2F, %3F, %23), or set the password in the catalog's password field";
 
 /// Whether the first `@` of `url` lies past its authority: after the first
 /// `/`, `?` or `#` that follows the scheme's `//`. The driver would still
@@ -260,11 +252,9 @@ mod tests {
             ("postgresql://[::1]:5432/db?password=Xy@9zK", &["Xy", "9zK"]),
             ("postgresql://[::1]/db?password=Xy@9zK", &["Xy", "9zK"]),
             ("postgresql://db:5432/sales#x@9zK", &["9zK"]),
-            // A delimiter in the userinfo password (raw or decoded).
+            // A raw delimiter in the userinfo password.
             ("postgresql://u:p/w@[::1]:5432/db", &["p/w"]),
             ("postgresql://u:p?w@db:5432/db", &["p?w"]),
-            ("postgresql://u:a%2Fb%3Dc@db:5432/db", &["a/b", "a%2Fb"]),
-            ("postgresql://db:5432/db?password=a%26b", &["a&b", "a%26b"]),
         ] {
             let c = PostgresConfig::new(url);
             let e = c.validate_url().unwrap_err();
@@ -276,12 +266,23 @@ mod tests {
                 );
             }
         }
+        let d = PostgresConfig::new("postgresql://u:Ab%2Fc%3D@db/x")
+            .driver_config()
+            .unwrap();
+        assert_eq!(d.get_password(), Some(&b"Ab/c="[..]));
         for url in [
             "postgresql://db/sales?user=admin%40srv&password=x",
             "postgresql://u:pw@[::1]:5432/db",
             "postgresql://u:p%40ss@db.internal:5432/db?sslmode=disable",
             "postgresql://db.internal:5432/sales?user=app&password=Xy%409zK",
             "postgresql://u@db/db?password=x@y",
+            // Percent-encoded delimiters (base64-style passwords) and raw
+            // sub-delims in the userinfo are what the operator meant.
+            "postgresql://u:a%2Fb%3Dc@db:5432/db",
+            "postgresql://u:Ab%2Bc%2F%3D%3D@db/x",
+            "postgresql://u:a&b=c@db/x",
+            "postgresql://db:5432/db?password=a%26b",
+            "postgresql://u:p%2Fw@[::1]:5432/db",
         ] {
             assert!(
                 PostgresConfig::new(url).validate_url().is_ok(),

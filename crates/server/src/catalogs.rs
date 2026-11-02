@@ -980,7 +980,7 @@ pub fn validate_spec_fields(spec: &CatalogConfig) -> Result<(), String> {
 
 /// The spec as JSON with every secret replaced by `"<redacted>"`: the
 /// `password`, the password inside `connection_url` (all of it after the
-/// scheme when an `@` lies past the authority), and the storage
+/// scheme when the URL fails validation), and the storage
 /// `secret_access_key`, `service_account_path` and Azure `access_key`.
 /// Every API response, MCP result and audit entry uses this form.
 pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
@@ -993,14 +993,14 @@ pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
     if spec.password.is_some() {
         spec.password = Some(RedactedString(REDACTED.to_owned()));
     }
-    if let Some(url) = spec
-        .connection_url
-        .as_mut()
-        .filter(|u| arneb_postgresql::at_outside_authority(&u.0))
-    {
-        // Where the driver ends the password of such a URL (refused by
-        // validation, but it may be stored) is no guide to what is secret:
-        // hide everything after the scheme.
+    if let Some(url) = spec.connection_url.as_mut().filter(|u| {
+        arneb_postgresql::PostgresConfig::new(u.0.clone())
+            .validate_url()
+            .is_err()
+    }) {
+        // Where the driver ends the password of a URL that validation
+        // refuses (it may be stored: config-file catalogs, older states)
+        // is no guide to what is secret: hide everything after the scheme.
         if let Some(after_scheme) = url.0.find("://").map(|i| i + 3) {
             url.0.replace_range(after_scheme.., REDACTED);
         }
@@ -1748,15 +1748,21 @@ mod tests {
     fn percent_encoded_password_key_is_a_secret() {
         let stored = spec(serde_json::json!({
             "name": "p", "type": "postgresql",
-            "connection_url": "postgresql://bob@db/sales?sslmode=disable&pass%77ord=enc-secret-8&PASS%57ORD=x"
+            "connection_url": "postgresql://bob@db/sales?sslmode=disable&pass%77ord=enc-secret-8"
         }));
         let redacted = redacted_spec(&stored);
         assert!(!redacted.to_string().contains("enc-secret-8"));
         assert_eq!(
             redacted["connection_url"],
-            "postgresql://bob@db/sales?sslmode=disable&pass%77ord=<redacted>&PASS%57ORD=x",
-            "keys are case-sensitive, as in tokio-postgres"
+            "postgresql://bob@db/sales?sslmode=disable&pass%77ord=<redacted>"
         );
+        // Keys are case-sensitive, as in tokio-postgres, which refuses the
+        // unknown `PASSWORD`: a URL it refuses is hidden whole.
+        let upper = redacted_spec(&spec(serde_json::json!({
+            "name": "p", "type": "postgresql",
+            "connection_url": "postgresql://bob@db/sales?pass%77ord=enc-secret-8&PASS%57ORD=x"
+        })));
+        assert_eq!(upper["connection_url"], "postgresql://<redacted>");
         let mut round_trip: CatalogConfig = serde_json::from_value(redacted).unwrap();
         assert_eq!(
             redacted_secrets(&round_trip),
@@ -1909,6 +1915,10 @@ mod tests {
                 &["Xy", "9zK"],
             ),
             ("postgresql://[::1]:5432/db?password=Xy@9zK", &["Xy", "9zK"]),
+            // An unencoded `@` inside the authority: the driver's host holds
+            // the password's tail (round 3, I3).
+            ("postgresql://u:p@Qz7@db/x", &["Qz7"]),
+            ("postgresql://u:p@Qz7,h2@db/x", &["Qz7"]),
         ] {
             let s = spec(serde_json::json!({
                 "name": "p", "type": "postgresql", "connection_url": url

@@ -1398,6 +1398,40 @@ mod tests {
         assert!(!stored(&state, "pg").unwrap().from_config);
     }
 
+    /// A config-seeded URL that validation refuses (an unencoded `@` in
+    /// the password) shows as `<scheme>://<redacted>` everywhere: no part
+    /// of the password after the driver's split leaks.
+    #[tokio::test]
+    async fn a_seeded_url_that_validation_refuses_is_redacted_whole() {
+        let (state, _) = node();
+        for url in ["postgresql://u:p@ss@db/x", "postgresql://u:p@ss,h2@db/x"] {
+            let spec = json!({"name": "pg", "type": "postgresql", "connection_url": url});
+            store_of(&state)
+                .seed_catalogs(&[("pg".into(), spec.clone())], true)
+                .unwrap();
+            let mut seen = vec![get(&state, BASE).await.1];
+            let (_, one) = get(&state, &format!("{BASE}/pg")).await;
+            assert_eq!(
+                one["spec"]["connection_url"], "postgresql://<redacted>",
+                "{one}"
+            );
+            seen.push(one.clone());
+            let (status, body) = update(&state, "pg", one["spec"].clone(), true).await;
+            assert_ne!(status, StatusCode::OK, "{body}");
+            seen.push(body);
+            seen.push(update(&state, "pg", spec, true).await.1);
+            seen.push(drop_catalog(&state, "pg", true).await.1);
+            seen.push(drop_catalog(&state, "pg", false).await.1);
+            seen.push(Value::Array(audit_json(&state)));
+            for body in &seen {
+                let text = body.to_string();
+                for part in ["p@ss", "@ss", "ss@db", "ss,h2"] {
+                    assert!(!text.contains(part), "{url}: {part} leaked in {text}");
+                }
+            }
+        }
+    }
+
     /// Config-seeded catalogs were never held to the `[a-z0-9_]` name rule:
     /// a `pg-prod` from the file can still be updated (to rotate its
     /// password) and dropped; only a create checks the name.

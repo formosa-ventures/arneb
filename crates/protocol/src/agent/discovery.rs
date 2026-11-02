@@ -286,25 +286,15 @@ impl AgentQueryService {
         };
         let rows = requested.min(self.limits.max_rows);
         let root = self.scoped_root(user)?;
-        // A missing (or hidden) table answers not-found before any
-        // statement is registered or admitted. Checked against the schema's
-        // table names, which loads no table metadata (no partitions, no
-        // Iceberg manifests), so the query below still resolves the table
-        // only once. A virtual schema named exactly is matched exactly, as
-        // before; any other name is first folded the way the query folds
-        // it, so a name the query would find is never refused.
-        let (catalog, schema, table) = if is_virtual(catalog, schema) {
-            (catalog.to_string(), schema.to_string(), table.to_string())
-        } else {
-            fold_names(&root, catalog, schema, table).await
-        };
-        let (catalog, schema, table) = (catalog.as_str(), schema.as_str(), table.as_str());
-        if !is_virtual(catalog, schema) && !names_visible(&root, catalog, schema, table) {
+        if is_virtual(catalog, schema) {
+            let visible = tables_of(&root, catalog, schema).await?;
+            if !visible.iter().any(|t| t == table) {
+                return Err(table_missing(catalog, schema, table, &visible));
+            }
+        } else if !names_visible(&root, catalog, schema, table) {
             return Err(missing(&root, catalog, schema, table).await);
-        }
-        let visible = tables_of(&root, catalog, schema).await?;
-        if !visible.iter().any(|t| t == table) {
-            return Err(table_missing(catalog, schema, table, &visible));
+        } else if let Some(error) = surely_missing(&root, catalog, schema, table).await {
+            return Err(error);
         }
         let sql = format!(
             "SELECT * FROM {}.{}.{} LIMIT {rows}",
@@ -313,64 +303,78 @@ impl AgentQueryService {
             quote(table)
         );
         let wait: Duration = self.limits.max_wait;
-        self.submit(
-            user,
-            SubmitRequest {
-                sql,
-                catalog: None,
-                schema: None,
-                max_rows: Some(rows),
-            },
-            wait,
-        )
-        .await
+        let status = self
+            .submit(
+                user,
+                SubmitRequest {
+                    sql,
+                    catalog: None,
+                    schema: None,
+                    max_rows: Some(rows),
+                },
+                wait,
+            )
+            .await?;
+        // The query resolves the table itself (once); when the sampled table
+        // does not exist after all (the pre-check only refuses a sure miss),
+        // answer with the same not-found error (and candidates) as describe.
+        // A not-found raised inside it (a view over a missing table, ...)
+        // stays the query's own error.
+        let not_found = status.error.as_ref().is_some_and(|e| {
+            matches!(
+                e.code,
+                AgentErrorCode::CatalogNotFound
+                    | AgentErrorCode::SchemaNotFound
+                    | AgentErrorCode::TableNotFound
+            )
+        });
+        if not_found && !is_virtual(catalog, schema) {
+            let error = match tables_of(&root, catalog, schema).await {
+                Ok(visible) if visible.iter().any(|t| t == table) => None,
+                Ok(visible) => Some(table_missing(catalog, schema, table, &visible)),
+                Err(err) => Some(err),
+            };
+            if let Some(error) = error {
+                self.forget(user, &status.id);
+                return Err(error);
+            }
+        }
+        Ok(status)
     }
 }
 
-/// `name`, or its lowercase form when `name` is not among `names` and the
-/// lowercase form is.
-fn fold_name(name: &str, names: &[String]) -> String {
-    let lower = name.to_lowercase();
-    if lower != name && !names.iter().any(|n| n == name) && names.contains(&lower) {
-        lower
-    } else {
-        name.to_string()
-    }
-}
-
-/// `catalog.schema.table` with each part folded to lowercase where the query
-/// would fold it ([`CatalogManager::fold_reference_case`]: a part that names
-/// nothing as written but names something in lowercase), decided from name
-/// listings only (no table is loaded). The lists hold only what the user may
-/// see, so a hidden lowercase name is never folded to. An all-lowercase part
-/// needs no listing, as in the query.
-async fn fold_names(
+/// The not-found error for `catalog.schema.table` when the name listings
+/// show it cannot resolve, before any statement runs; `None` (run the query
+/// and let it decide) whenever it might. A level is a sure miss only when
+/// its listing is non-empty (a failed listing reads as empty) and no
+/// visible name there matches case-insensitively, since connectors may
+/// resolve names more loosely than an exact match (the query folds case,
+/// PostgreSQL falls back to a unique case-insensitive match). Only names
+/// are listed: no table metadata is loaded, so the query still resolves the
+/// table once.
+async fn surely_missing(
     root: &CatalogManager,
     catalog: &str,
     schema: &str,
     table: &str,
-) -> (String, String, String) {
-    let folds = |name: &str| name.to_lowercase() != name;
-    let catalog = if folds(catalog) {
-        fold_name(catalog, &catalog_names(root))
-    } else {
-        catalog.to_string()
-    };
-    let schema = if folds(schema) {
-        let names = schema_names(root, &catalog).await.unwrap_or_default();
-        fold_name(schema, &names)
-    } else {
-        schema.to_string()
-    };
-    let table = if folds(table) {
-        let names = table_names(root, &catalog, &schema)
-            .await
-            .unwrap_or_default();
-        fold_name(table, &names)
-    } else {
-        table.to_string()
-    };
-    (catalog, schema, table)
+) -> Option<AgentError> {
+    fn sure_miss(name: &str, names: &[String]) -> bool {
+        let lower = name.to_lowercase();
+        !names.is_empty() && !names.iter().any(|n| n.to_lowercase() == lower)
+    }
+    let catalogs = catalog_names(root);
+    if !catalogs.iter().any(|c| c == catalog) {
+        return sure_miss(catalog, &catalogs).then(|| catalog_missing(catalog, &catalogs));
+    }
+    let schemas = schema_names(root, catalog).await?;
+    if !schemas.iter().any(|s| s == schema) {
+        return sure_miss(schema, &schemas).then(|| schema_missing(catalog, schema, &schemas));
+    }
+    let tables = table_names(root, catalog, schema).await?;
+    if !tables.iter().any(|t| t == table) {
+        return sure_miss(table, &tables).then(|| table_missing(catalog, schema, table, &tables));
+    }
+    None
 }
 
 /// Whether `catalog.schema` is one of the virtual metadata schemas.
@@ -819,49 +823,106 @@ mod tests {
         assert_eq!(count(), 2, "a miss lists once for the candidates");
     }
 
+    /// A schema `public` that lists `listed` and resolves a table as
+    /// PostgreSQL does: exactly, else by a unique case-insensitive match
+    /// against `tables`.
+    #[derive(Debug)]
+    struct LooseSchema {
+        listed: Vec<String>,
+        tables: Vec<String>,
+    }
+
+    #[async_trait]
+    impl SchemaProvider for LooseSchema {
+        async fn table_names(&self) -> Vec<String> {
+            self.listed.clone()
+        }
+        async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+            let lower = name.to_lowercase();
+            let mut ci = self.tables.iter().filter(|t| t.to_lowercase() == lower);
+            let found = self.tables.iter().any(|t| t == name)
+                || (ci.next().is_some() && ci.next().is_none());
+            found.then(|| Arc::new(StatsTable) as Arc<dyn TableProvider>)
+        }
+    }
+
+    #[derive(Debug)]
+    struct LooseCatalog(Vec<String>, Vec<String>);
+
+    #[async_trait]
+    impl CatalogProvider for LooseCatalog {
+        async fn schema_names(&self) -> Vec<String> {
+            vec!["public".into()]
+        }
+        async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+            (name == "public").then(|| {
+                Arc::new(LooseSchema {
+                    listed: self.0.clone(),
+                    tables: self.1.clone(),
+                }) as Arc<dyn SchemaProvider>
+            })
+        }
+    }
+
+    /// A service over catalog `pg` ([`LooseCatalog`]) and its tracker.
+    fn loose(listed: &[&str], tables: &[&str]) -> (AgentQueryService, Arc<QueryTracker>) {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
+        let cm = CatalogManager::new("pg", "public");
+        cm.register_catalog("pg", Arc::new(LooseCatalog(names(listed), names(tables))));
+        let tracker = Arc::new(QueryTracker::new());
+        let svc = AgentQueryService::new(
+            Arc::new(cm),
+            Arc::new(ConnectorRegistry::new()),
+            Arc::clone(&tracker),
+            AgentLimits::default(),
+        );
+        (svc, tracker)
+    }
+
     #[tokio::test]
-    async fn sample_folds_names_like_the_query() {
+    async fn sample_never_refuses_what_the_query_might_resolve() {
+        // The query folds an unmatched name to lowercase: these sampled at
+        // 6f7e56a, and still do.
         let svc = service(None);
-        // The query folds a name that matches nothing as written to its
-        // lowercase form, so these sampled at 6f7e56a; they still do.
         for (catalog, schema, table) in [
             ("memory", "default", "LINEITEM"),
             ("MEMORY", "DEFAULT", "LineItem"),
+            ("memory", "INFORMATION_SCHEMA", "TABLES"),
         ] {
             let s = svc
-                .sample("alice", catalog, schema, table, Some(2))
+                .sample("alice", catalog, schema, table, Some(1))
                 .await
                 .unwrap();
             assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
-            assert_eq!(s.first_page.unwrap().rows.len(), 2);
         }
-        let s = svc
-            .sample("alice", "memory", "INFORMATION_SCHEMA", "TABLES", Some(1))
+        // PostgreSQL resolves "Orders" for orders or ORDERS (a unique
+        // case-insensitive match): the query runs and resolves it. With no
+        // connector behind the stub it then fails, but not as not-found
+        // (that would have come back as a table_not_found error).
+        let (svc, tracker) = loose(&["Orders"], &["Orders"]);
+        for name in ["orders", "ORDERS", "Orders"] {
+            let s = svc.sample("alice", "pg", "public", name, Some(1)).await;
+            assert!(s.is_ok(), "{name}: {:?}", s.unwrap_err());
+        }
+        assert_eq!(tracker.list_queries(None).len(), 3);
+        // A failed listing reads as empty: never a sure miss, the query
+        // decides.
+        let (svc, tracker) = loose(&[], &["orders"]);
+        assert!(svc
+            .sample("alice", "pg", "public", "orders", None)
             .await
-            .unwrap();
-        assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
-        // The query itself resolves the name as written (what 6f7e56a ran).
-        let q = svc
-            .submit(
-                "alice",
-                SubmitRequest {
-                    sql: "SELECT * FROM \"MEMORY\".\"DEFAULT\".\"LineItem\" LIMIT 1".into(),
-                    catalog: None,
-                    schema: None,
-                    max_rows: None,
-                },
-                Duration::from_secs(5),
-            )
-            .await
-            .unwrap();
-        assert_eq!(q.state, StatementState::Finished, "{:?}", q.error);
-        // A name that folds to nothing is still refused before running.
+            .is_ok());
+        assert_eq!(tracker.list_queries(None).len(), 1);
+        // No case-insensitive match: refused before running.
+        let (svc, tracker) = loose(&["Orders"], &["Orders"]);
         let err = svc
-            .sample("alice", "memory", "default", "LINEITM", None)
+            .sample("alice", "pg", "public", "ordrs", None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
-        // A hidden lowercase table is never folded to.
+        assert_eq!(err.candidates, ["Orders"]);
+        assert!(tracker.list_queries(None).is_empty());
+        // A hidden table is never matched: bob cannot see orders.
         let svc = service(Some(HIDE_ORDERS));
         let err = svc
             .sample("bob", "memory", "default", "ORDERS", None)

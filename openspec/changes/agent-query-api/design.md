@@ -44,7 +44,7 @@ The listings accept `?prefix=&limit=`.
 
 **D5. Inline first page.** `submit` and `status` accept `wait_ms`, default 0, capped at `max_wait_ms`. A statement that finishes inside the wait carries its first page inline.
 
-**D6. Sample is a short statement.** It submits `SELECT * FROM "c"."s"."t" LIMIT n` with `wait_ms = max_wait_ms`. `rows` defaults to 10 and is capped at 100 (refused above), then lowered to the server's `max_rows` when that is smaller, so a small configured ceiling shortens the sample rather than failing it with an error about `max_rows`, which the caller never sent. Before submitting, each name part is folded to lowercase where the query would fold it (`fold_reference_case`'s rule, decided from name listings), and the table name is checked against the schema's table names (one listing call, no table metadata: no HMS partitions or Iceberg manifests), so a missing table answers `table_not_found` with candidates and no side effects (no statement registered, evicted for, admitted or tracked), while an existing table is still resolved only once, by the query itself.
+**D6. Sample is a short statement.** It submits `SELECT * FROM "c"."s"."t" LIMIT n` with `wait_ms = max_wait_ms`. `rows` defaults to 10 and is capped at 100 (refused above), then lowered to the server's `max_rows` when that is smaller, so a small configured ceiling shortens the sample rather than failing it with an error about `max_rows`, which the caller never sent. Before submitting, the names are checked against the visible catalog, schema and table listings (names only, no table metadata: no HMS partitions or Iceberg manifests). Only a sure miss is refused there: a non-empty listing with no name equal to the requested one ignoring case. That answers `table_not_found` (or the level above) with candidates and no side effects (no statement registered, evicted for, admitted or tracked). Anything the query or a connector might still resolve (the query folds unmatched names to lowercase; PostgreSQL falls back to a unique case-insensitive match), or an empty listing (a failed listing reads as empty), runs the query exactly as before, so an existing table is still resolved only once, by the query itself, and no name that sampled before is refused.
 
 **D7. Explain is synchronous planning only.** It is not admitted, not tracked, and does not support `ANALYZE`; an agent submits `EXPLAIN ANALYZE` as a statement.
 
@@ -94,7 +94,7 @@ The existing `forbidden`, `overloaded`, `invalid_argument`, `not_found` and `int
 
 - [A truncated result has no exact `total_rows`] -> reported as `null`, documented, and agents run `count(*)` when they need the count. In exchange a truncated `SELECT *` reads only `max_rows + 1` rows.
 - [Explain and run could disagree on catalog scoping] -> both call one `Engine::statement_scope` helper.
-- [Name matching for describe is exact-case, like `SHOW COLUMNS`; sample folds like the query it runs] -> documented; listings' `prefix` is case-insensitive.
+- [Name matching for describe is exact-case, like `SHOW COLUMNS`; sample resolves like the query it runs] -> documented; listings' `prefix` is case-insensitive.
 - [Statements live in coordinator memory] -> lost on restart; the agent resubmits.
 
 ## Migration Plan

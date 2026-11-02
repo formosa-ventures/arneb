@@ -1810,18 +1810,17 @@ impl std::fmt::Debug for PreparedState {
     }
 }
 
+/// A `[[tables]]` entry, its format and, for CSV, its columns.
+type FileTable<'a> = (
+    &'a config::TableConfig,
+    FileFormat,
+    Option<Vec<arneb_common::types::ColumnInfo>>,
+);
+
 /// Each `[[tables]]` entry with its format and, for CSV, its schema. An
 /// unsupported format, a CSV table without a schema or a bad column type
 /// refuses the start; checked before the state store is written.
-fn parse_file_tables(
-    tables: &[config::TableConfig],
-) -> Result<
-    Vec<(
-        &config::TableConfig,
-        FileFormat,
-        Option<Vec<arneb_common::types::ColumnInfo>>,
-    )>,
-> {
+fn parse_file_tables(tables: &[config::TableConfig]) -> Result<Vec<FileTable<'_>>> {
     tables
         .iter()
         .map(|table| {

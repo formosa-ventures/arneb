@@ -550,8 +550,7 @@ impl ManageAction for Reseed {
             .map(|(s, _)| s.name.as_str())
             .collect();
         let mut removes: Vec<String> = installed(&self.live)
-            .into_iter()
-            .map(|(name, _)| name)
+            .into_keys()
             .filter(|name| !wanted.contains(&name.as_str()))
             .collect();
         let mut installs = Vec::new();

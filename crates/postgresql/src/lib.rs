@@ -20,7 +20,7 @@ mod types;
 
 pub use catalog::{PostgresCatalog, PostgresSchema, PostgresTable};
 pub use config::{
-    PostgresConfig, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_SPLITS, DEFAULT_SPLIT_MIN_ROWS,
+    at_outside_authority, PostgresConfig, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_SPLITS, DEFAULT_SPLIT_MIN_ROWS,
     DEFAULT_UNCONSTRAINED_NUMERIC_SCALE,
 };
 pub use dialect::PostgresDialect;

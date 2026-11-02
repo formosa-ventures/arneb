@@ -845,7 +845,8 @@ pub fn validate_spec_fields(spec: &CatalogConfig) -> Result<(), String> {
 }
 
 /// The spec as JSON with every secret replaced by `"<redacted>"`: the
-/// `password`, the password inside `connection_url`, and the storage
+/// `password`, the password inside `connection_url` (all of it after the
+/// scheme when an `@` lies past the authority), and the storage
 /// `secret_access_key`, `service_account_path` and Azure `access_key`.
 /// Every API response, MCP result and audit entry uses this form.
 pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
@@ -858,7 +859,18 @@ pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
     if spec.password.is_some() {
         spec.password = Some(RedactedString(REDACTED.to_owned()));
     }
-    if let Some(url) = &mut spec.connection_url {
+    if let Some(url) = spec
+        .connection_url
+        .as_mut()
+        .filter(|u| arneb_postgresql::at_outside_authority(&u.0))
+    {
+        // Where the driver ends the password of such a URL (refused by
+        // validation, but it may be stored) is no guide to what is secret:
+        // hide everything after the scheme.
+        if let Some(after_scheme) = url.0.find("://").map(|i| i + 3) {
+            url.0.replace_range(after_scheme.., REDACTED);
+        }
+    } else if let Some(url) = &mut spec.connection_url {
         let mut ranges: Vec<_> = url_query_passwords(&url.0)
             .into_iter()
             .map(|(_, value)| value)
@@ -978,11 +990,12 @@ pub fn redacted_secrets(spec: &CatalogConfig) -> Vec<&'static str> {
         found.push("password");
     }
     if let Some(url) = &spec.connection_url {
+        let whole = url.0.split_once("://").is_some_and(|(_, rest)| rest == REDACTED);
         let userinfo = url_password_range(&url.0).is_some_and(|r| &url.0[r] == REDACTED);
         let query = url_query_passwords(&url.0)
             .into_iter()
             .any(|(_, value)| &url.0[value] == REDACTED);
-        if userinfo || query {
+        if whole || userinfo || query {
             found.push("connection_url password");
         }
     }
@@ -1149,22 +1162,7 @@ fn url_query_passwords(url: &str) -> Vec<(std::ops::Range<usize>, std::ops::Rang
         return Vec::new();
     };
     let host = at.map_or(start, |at| at + 1);
-    let Some(q) = url[host..].find('?').map(|i| host + i + 1) else {
-        return Vec::new();
-    };
-    let end = url.len();
-    let mut out = Vec::new();
-    let mut start = q;
-    for param in url[q..end].split('&') {
-        if let Some((key, value)) = param.split_once('=') {
-            if is_password_key(key) {
-                let value_start = start + param.len() - value.len();
-                out.push((start..start + param.len(), value_start..start + param.len()));
-            }
-        }
-        start += param.len() + 1;
-    }
-    out
+    query_passwords_from(url, host)
 }
 
 /// The value ranges of every `password` query parameter (key
@@ -1175,7 +1173,19 @@ fn url_loose_query_passwords(url: &str) -> Vec<std::ops::Range<usize>> {
     let Some(scheme_end) = url.find("://") else {
         return Vec::new();
     };
-    let Some(q) = url[scheme_end..].find('?').map(|i| scheme_end + i + 1) else {
+    query_passwords_from(url, scheme_end)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
+/// `(parameter, value)` ranges of the `password` parameters of the query
+/// that starts at the first `?` at or after byte `from`.
+fn query_passwords_from(
+    url: &str,
+    from: usize,
+) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let Some(q) = url[from..].find('?').map(|i| from + i + 1) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -1184,7 +1194,7 @@ fn url_loose_query_passwords(url: &str) -> Vec<std::ops::Range<usize>> {
         if let Some((key, value)) = param.split_once('=') {
             if is_password_key(key) {
                 let value_start = start + param.len() - value.len();
-                out.push(value_start..start + param.len());
+                out.push((start..start + param.len(), value_start..start + param.len()));
             }
         }
         start += param.len() + 1;
@@ -1624,27 +1634,20 @@ mod tests {
 
     /// tokio-postgres takes the credentials up to the first `@`, so an
     /// unencoded `/`, `?` or `#` in the password is still the password
-    /// (and a `#` in a query value is part of it). The redaction finds the
-    /// same password the driver connects with, and round-trips it.
+    /// (and a `#` in a query value is part of it). Such a userinfo puts
+    /// the `@` past the authority, so the whole URL after the scheme is
+    /// hidden (validation refuses it); a `#` in a query value is redacted
+    /// in place and round-trips.
     #[test]
     fn password_with_url_delimiters_is_redacted() {
         use std::str::FromStr;
         for (url, redacted) in [
-            (
-                "postgresql://app:pa/ss@db:5432/x",
-                "postgresql://app:<redacted>@db:5432/x",
-            ),
-            (
-                "postgresql://app:pa?ss@db:5432/x",
-                "postgresql://app:<redacted>@db:5432/x",
-            ),
-            (
-                "postgresql://app:pa#ss@db:5432/x",
-                "postgresql://app:<redacted>@db:5432/x",
-            ),
+            ("postgresql://app:pa/ss@db:5432/x", "postgresql://<redacted>"),
+            ("postgresql://app:pa?ss@db:5432/x", "postgresql://<redacted>"),
+            ("postgresql://app:pa#ss@db:5432/x", "postgresql://<redacted>"),
             (
                 "postgres://app:a/b?c#d:e@db/x?sslmode=disable",
-                "postgres://app:<redacted>@db/x?sslmode=disable",
+                "postgres://<redacted>",
             ),
             (
                 "postgresql://app@db/x?password=pa#ss&sslmode=disable",
@@ -1652,7 +1655,7 @@ mod tests {
             ),
             (
                 "postgresql://app:pa?password=no@db/x?password=q/s#t",
-                "postgresql://app:<redacted>@db/x?password=<redacted>",
+                "postgresql://<redacted>",
             ),
         ] {
             let driver = tokio_postgres::Config::from_str(url).unwrap();
@@ -1668,6 +1671,10 @@ mod tests {
             );
             let mut back: CatalogConfig = serde_json::from_value(shown).unwrap();
             assert_eq!(redacted_secrets(&back), vec!["connection_url password"]);
+            if redacted.ends_with("://<redacted>") {
+                assert!(validate_spec(&stored).is_err(), "{url}");
+                continue;
+            }
             assert!(same_destination(&back, &stored));
             fill_redacted(&mut back, &stored);
             assert_eq!(back.connection_url.as_ref().unwrap().0, url);
@@ -1737,19 +1744,99 @@ mod tests {
     /// a secret, and validation refuses the URL without echoing it.
     #[test]
     fn query_password_after_an_unencoded_at_is_redacted_and_refused() {
-        for url in [
-            "postgresql://db.internal:5432/sales?user=admin@srv&password=S3cret",
-            "postgresql://db/sales?user=admin@srv&password=S3cret",
+        for (url, parts) in [
+            (
+                "postgresql://db.internal:5432/sales?user=admin@srv&password=S3cret",
+                &["S3cret"][..],
+            ),
+            (
+                "postgresql://db/sales?user=admin@srv&password=S3cret",
+                &["S3cret"],
+            ),
+            // A port or an IPv6 host: the driver would take `9zK` as the
+            // host (round 3).
+            (
+                "postgresql://db.internal:5432/sales?user=app&password=Xy@9zK",
+                &["Xy", "9zK"],
+            ),
+            ("postgresql://[::1]:5432/db?password=Xy@9zK", &["Xy", "9zK"]),
         ] {
             let s = spec(serde_json::json!({
                 "name": "p", "type": "postgresql", "connection_url": url
             }));
-            let shown = redacted_spec(&s).to_string();
-            assert!(!shown.contains("S3cret"), "{shown}");
+            let shown = redacted_spec(&s);
+            assert_eq!(shown["connection_url"], "postgresql://<redacted>", "{url}");
             assert_eq!(secret_fields(&s), vec!["connection_url password"]);
             let e = validate_spec(&s).unwrap_err();
-            assert!(e.contains("%40") && !e.contains("S3cret"), "{e}");
+            assert!(e.contains("%40"), "{e}");
+            // A GET → PUT round trip of the redacted form is refused.
+            let back: CatalogConfig = serde_json::from_value(shown.clone()).unwrap();
+            assert_eq!(redacted_secrets(&back), vec!["connection_url password"]);
+            let pg = s.postgres_config().unwrap();
+            assert_eq!(pg.display_target(), "<invalid connection_url>");
+            // Nor does building it log or return any part of the password.
+            let live = LiveCatalogs::new(
+                Arc::new(CatalogManager::new("memory", "default")),
+                Arc::new(ConnectorRegistry::new()),
+                StorageConfig::default(),
+            );
+            let (err, logs) = capture_logs(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(live.build(&s))
+                    .unwrap_err()
+            });
+            for part in parts {
+                for shown in [
+                    &e,
+                    &shown.to_string(),
+                    &format!("{pg:?}"),
+                    &format!("{s:?}"),
+                    &err.to_string(),
+                    &logs,
+                ] {
+                    assert!(!shown.contains(part), "{url}: {part} in {shown}");
+                }
+            }
         }
+    }
+
+    /// Runs `f` and returns what it logged.
+    fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // A global subscriber interested in everything, so a callsite is
+        // never cached as disabled by a test on another thread.
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(std::io::sink)
+                    .with_max_level(tracing::Level::TRACE)
+                    .finish(),
+            );
+        });
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let r = tracing::subscriber::with_default(sub, f);
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (r, out)
     }
 
     /// M6: a URL that sets `password=` twice is refused, so a GET → PUT

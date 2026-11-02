@@ -151,10 +151,10 @@ Differences from the HTTP routes:
   another user's query is not an MCP tool.
 - **Truncation and eviction.** The statement status is the `/api/v2` one, so
   a truncated result carries `truncated_by` (which limit cut it, including
-  `user_budget` for your share of retained results) and `truncated_hint`
-  (what to do). An ended statement whose rows were evicted to make room
-  answers `not_found` with a message saying so and a hint to resubmit; see
-  [eviction](/guide/http-api#limits-and-truncation).
+  `user_budget` for your share of retained results); `truncated_hint` (what
+  to do) is set only when no row could be kept. An ended statement whose
+  rows were evicted to make room answers `not_found` with a message saying
+  so and a hint to resubmit; see [eviction](/guide/http-api#limits-and-truncation).
 - **Tokens need password auth.** `create_token`, `list_tokens` and
   `revoke_token` answer `auth_disabled` under `type = "none"`. A token that
   mints a token cannot outlive its parent: the expiry is clamped and the

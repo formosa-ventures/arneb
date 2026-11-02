@@ -54,23 +54,22 @@ impl From<&crate::config::McpConfig> for McpSettings {
 /// placeholders are filled from the configured limits (see
 /// [`tools::copy_values`]).
 const INSTRUCTIONS: &str = "\
-Arneb is a distributed SQL engine that queries many data sources through catalogs. \
-Names are catalog.schema.table.
+Arneb is a distributed SQL engine over many data sources. Names are catalog.schema.table.
 
 Workflow:
 1. Discover: list_catalogs, list_schemas, list_tables.
 2. Learn the table: describe_table for columns and types, sample_table for a few real rows.
 3. Check the query: explain_query plans it without running it.
 4. Run it: submit_query with wait_ms (up to {max_wait_ms}) so short queries return finished.
-5. If the state is queued or running, call get_query_status (with wait_ms) until it is finished, failed or cancelled.
+5. While queued or running, poll get_query_status (with wait_ms) until finished, failed or cancelled.
 6. Read rows: a finished status carries first_page; start fetch_results from first_page.next_cursor and repeat with each next_cursor until it is null.
 7. When done with a statement, cancel_query stops it or, once ended, frees its rows.
 
-Limits: a statement keeps at most max_rows rows (default {default_max_rows}, ceiling {max_rows}) and reports truncated when more existed. An unread result may be evicted when memory is short; its id then answers not_found, so resubmit. Pages hold {page_bytes} bytes of rows by default; ask for up to {max_page_bytes} with max_bytes. Long cells and SQL text are cut. Listings take limit and report truncated.
+Limits: a statement keeps at most max_rows rows (default {default_max_rows}, ceiling {max_rows}) and reports truncated when more existed. Any ended result may be evicted (read ones first); its id then answers not_found, so resubmit. Pages hold {page_bytes} bytes of rows by default; ask for up to {max_page_bytes} with max_bytes. Long cells and SQL text are cut. Listings take limit and report truncated.
 
-Errors: a failed tool call comes back as an error result with a code and a hint. Read the hint and any candidates (close matches for a misspelled table or column), fix the call, and retry. A SQL error after submit is a status with state failed, not an error result.
+Errors: a failed tool call comes back as an error result with a code and a hint. Read the hint and any candidates (close matches for a misspelled name), fix the call, and retry. A SQL error after submit is a status with state failed, not an error result.
 
-Queries run as your user and see only what your user may see.";
+Queries run as your user and see only what it may see.";
 
 /// The MCP handler: one per request (the service is stateless), cloned
 /// from the one [`mcp_service`] builds.

@@ -650,6 +650,16 @@ struct Recovered {
 /// `next_seq`), reporting it at WARN.
 fn recover(loaded: Vec<AuditEntry>, next_seq: &mut u64, path: &Path) -> Recovered {
     let completed: HashSet<u64> = loaded.iter().filter_map(|e| e.intent_seq).collect();
+    // A completion whose fsync failed may still have reached the file, and
+    // is then appended again when the log reopens: keep only the newest
+    // completion of each intent.
+    let mut newest: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for e in &loaded {
+        if let Some(intent) = e.intent_seq {
+            let seq = newest.entry(intent).or_insert(e.seq);
+            *seq = (*seq).max(e.seq);
+        }
+    }
     let mut out = Recovered {
         entries: Vec::with_capacity(loaded.len()),
         completed: 0,
@@ -664,6 +674,9 @@ fn recover(loaded: Vec<AuditEntry>, next_seq: &mut u64, path: &Path) -> Recovere
                 orphans.push(e);
             }
             continue;
+        }
+        if e.intent_seq.is_some_and(|i| newest.get(&i) != Some(&e.seq)) {
+            continue; // an earlier copy of a replayed completion
         }
         out.entries.push(e);
     }
@@ -1473,6 +1486,38 @@ mod tests {
         drop(log);
         let (_log, logged) = capture(|| AuditLog::open(Some(&p), settings(100, 0)).unwrap());
         assert!(!logged.contains("never completed"), "{logged}");
+    }
+
+    /// A completion written once before its failed fsync and again on
+    /// replay is loaded once (the newest copy), and the startup compaction
+    /// drops the other.
+    #[test]
+    fn a_replayed_completion_written_twice_loads_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let intent = AuditEntry {
+            seq: 1,
+            time_ms: now_ms(),
+            intent_seq: None,
+            record: AuditRecord {
+                outcome: AuditOutcome::Pending,
+                ..record("root", "worker.cordon")
+            },
+        };
+        let done = |seq| AuditEntry {
+            seq,
+            time_ms: now_ms(),
+            intent_seq: Some(1),
+            record: record("root", "worker.cordon"),
+        };
+        let text: String = [intent, done(2), done(3)]
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        std::fs::write(&p, text).unwrap();
+        let log = AuditLog::open(Some(&p), settings(100, 0)).unwrap();
+        assert_eq!(all(&log), vec![3]);
+        assert_eq!(lines(&p), 1, "the startup compaction dropped the copy");
     }
 
     /// An intent in flight survives the cap and compaction, however many

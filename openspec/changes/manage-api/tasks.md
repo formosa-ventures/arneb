@@ -50,3 +50,4 @@
 - [x] 10.2 Audit: a failed completion is kept and appended when the log reopens; a panicking action is completed as `internal`
 - [x] 10.3 Audit: the refused closing entry only after an attempted write
 - [x] 10.4 Audit: the `token.issue` intent names the token id (`TokenId`, `issue_token_as`)
+- [x] 10.5 Audit log named after the full state file name (`prod.json.audit.jsonl`); WARN on a legacy `audit.jsonl`

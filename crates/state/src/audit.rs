@@ -1,5 +1,5 @@
 //! The durable audit log (manage-api D6): JSON lines in
-//! `<state stem>.audit.jsonl` next to the state file, appended with
+//! `<state file name>.audit.jsonl` next to the state file, appended with
 //! `O_APPEND` and `sync_data` before the caller answers.
 //!
 //! An audited action writes two entries: an intent ([`AuditLog::begin`],
@@ -36,8 +36,11 @@ use crate::tokens::now_ms;
 use crate::StateError;
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
-/// The audit log's file name suffix, after the state file's stem.
+/// The audit log's file name suffix, after the state file's name.
 const AUDIT_SUFFIX: &str = ".audit.jsonl";
+/// The file name the audit log had before it was named after the state
+/// file; still looked for, to warn about it.
+const LEGACY_AUDIT_FILE: &str = "audit.jsonl";
 
 /// Retention of the audit log (`[audit]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,17 +248,26 @@ impl AuditLog {
         })
     }
 
-    /// The audit log path for the state file `state_path`: its stem plus
-    /// `.audit.jsonl`, in the same directory (`prod.json` →
-    /// `prod.audit.jsonl`), so state files sharing a directory never share
-    /// an audit log.
+    /// The audit log path for the state file `state_path`: its full file
+    /// name plus `.audit.jsonl`, in the same directory (`prod.json` →
+    /// `prod.json.audit.jsonl`), so state files sharing a directory never
+    /// share an audit log, even when they differ only in extension
+    /// (`prod` → `prod.audit.jsonl`).
     pub fn sibling_of(state_path: &Path) -> PathBuf {
         let mut name = state_path
-            .file_stem()
+            .file_name()
             .map(std::ffi::OsStr::to_os_string)
             .unwrap_or_else(|| "state".into());
         name.push(AUDIT_SUFFIX);
         state_path.with_file_name(name)
+    }
+
+    /// An audit log left under the earlier name, `audit.jsonl` in the
+    /// state file's directory, when one exists. It is not read or migrated;
+    /// the caller warns about it so its history is not silently dropped.
+    pub fn legacy_sibling_of(state_path: &Path) -> Option<PathBuf> {
+        let legacy = state_path.with_file_name(LEGACY_AUDIT_FILE);
+        (legacy != Self::sibling_of(state_path) && legacy.is_file()).then_some(legacy)
     }
 
     fn lock_writer(&self) -> std::sync::MutexGuard<'_, Writer> {
@@ -905,28 +917,41 @@ mod tests {
     }
 
     #[test]
-    fn sibling_is_named_after_the_state_file_stem() {
+    fn sibling_is_named_after_the_state_file_name() {
         assert_eq!(
             AuditLog::sibling_of(Path::new("/var/lib/arneb/state.json")),
-            PathBuf::from("/var/lib/arneb/state.audit.jsonl")
+            PathBuf::from("/var/lib/arneb/state.json.audit.jsonl")
         );
         assert_eq!(
             AuditLog::sibling_of(Path::new("state.json")),
-            PathBuf::from("state.audit.jsonl")
+            PathBuf::from("state.json.audit.jsonl")
         );
-        // Two state files in one directory get two audit logs.
+        // Two state files in one directory get two audit logs, also when
+        // they differ only in extension.
         assert_eq!(
             AuditLog::sibling_of(Path::new("/var/lib/arneb/prod.json")),
-            PathBuf::from("/var/lib/arneb/prod.audit.jsonl")
+            PathBuf::from("/var/lib/arneb/prod.json.audit.jsonl")
         );
         assert_eq!(
-            AuditLog::sibling_of(Path::new("/var/lib/arneb/staging.json")),
-            PathBuf::from("/var/lib/arneb/staging.audit.jsonl")
+            AuditLog::sibling_of(Path::new("/var/lib/arneb/prod")),
+            PathBuf::from("/var/lib/arneb/prod.audit.jsonl")
         );
         assert_eq!(
             AuditLog::sibling_of(Path::new("/srv/arneb-state")),
             PathBuf::from("/srv/arneb-state.audit.jsonl")
         );
+    }
+
+    #[test]
+    fn a_legacy_audit_log_is_found_but_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("prod.json");
+        assert_eq!(AuditLog::legacy_sibling_of(&state), None);
+        let legacy = tmp.path().join("audit.jsonl");
+        std::fs::write(&legacy, format!("{}\n", line(1, now_ms()))).unwrap();
+        assert_eq!(AuditLog::legacy_sibling_of(&state), Some(legacy));
+        let log = AuditLog::open(Some(&AuditLog::sibling_of(&state)), settings(100, 0)).unwrap();
+        assert!(log.is_empty(), "the legacy log is not migrated");
     }
 
     #[test]

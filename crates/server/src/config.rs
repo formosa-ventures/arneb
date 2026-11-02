@@ -2052,7 +2052,9 @@ pgwire = "required"
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("max_retained_bytes (6000) must not exceed max_total_retained_bytes (5000)"),
+            err.contains(
+                "max_retained_bytes (6000) must not exceed max_total_retained_bytes (5000)"
+            ),
             "{err}"
         );
         assert!(!err.contains("max_user_retained_bytes"), "{err}");

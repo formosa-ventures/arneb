@@ -259,7 +259,9 @@ running; it stays, so a later poll shows `cancelled` and why. On a statement
 that has ended (finished, failed or cancelled) it releases it: the reply is
 its final status (with `first_page: null`), the id answers `not_found` from
 then on, and its retained rows stop counting against the budgets, at once or,
-if a page fetch of it is in flight, once that fetch finishes.
+if a page fetch of it is in flight, once that fetch finishes. A statement
+that finishes while the DELETE is cancelling it counts as ended and is
+released the same way.
 So a client that is done with a result should delete it rather than wait for
 the idle timeout.
 
@@ -322,8 +324,10 @@ several batches counts once.
 
 When the user's share or the server budget is short, the server evicts
 statements that have ended and still hold rows, but only when the
-evictable ones free enough to cover the shortfall (one a page fetch is
-reading is skipped). Victims are taken in this order: for the user's share,
+evictable ones free enough to cover the shortfall (one a request is still
+holding, such as a page fetch or a poll, is skipped). They are evicted one
+at a time, only until the shortfall is covered, and the shortfall is
+checked again before each, so one that went away meanwhile evicts nothing. Victims are taken in this order: for the user's share,
 the user's own; for the server budget, the user's own first, then other
 users'. Within each, fully read ones go first (the last page was fetched,
 or the first page held everything), then the least recently used. An

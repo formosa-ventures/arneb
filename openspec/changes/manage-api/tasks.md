@@ -47,3 +47,6 @@
 ## 10. Review round 3
 
 - [x] 10.1 Kill: cancellers registered before the work starts, through a `KillSwitch`; a kill after the work completed is not applied and the statement keeps its real result
+- [x] 10.2 Audit: a failed completion is kept and appended when the log reopens; a panicking action is completed as `internal`
+- [x] 10.3 Audit: the refused closing entry only after an attempted write
+- [x] 10.4 Audit: the `token.issue` intent names the token id (`TokenId`, `issue_token_as`)

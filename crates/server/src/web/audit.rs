@@ -4,13 +4,15 @@
 //! Order and failure: the log must be writable (or reopen) and the
 //! action's intent entry (outcome `pending`) must be synced before the
 //! action runs, else `audit_unavailable` and nothing is applied; then the
-//! action runs; then its completion entry is appended. A failed completion
-//! cannot undo the action, so it goes to the ERROR log, the log is marked
-//! unwritable, and the action's real result is returned; later audited
-//! actions are refused until the log is writable again. So every applied
-//! action has at least its intent on disk: a crash, or a failed completion,
-//! leaves it `pending`, and the next start reports it at WARN on
-//! `arneb::audit` and records it as `interrupted`.
+//! action runs; then its completion entry is appended (a panicking action
+//! is completed as failed, `internal`). A failed completion cannot undo the
+//! action, so it goes to the ERROR log, the log is marked unwritable and
+//! keeps the completion, and the action's real result is returned; the next
+//! audited action reopens the log, which first appends the kept completion,
+//! and is refused when that fails. So every applied action has at least its
+//! intent on disk: a crash before its completion is written leaves it
+//! `pending`, and the next start reports it at WARN on `arneb::audit` and
+//! records it as `interrupted`.
 
 use arneb_state::{AuditEntry, AuditOutcome, AuditQuery, AuditRecord};
 use axum::extract::rejection::QueryRejection;
@@ -87,18 +89,39 @@ pub(super) fn audited<T>(
     let begun = match state.audit.begin(record(intent, AuditOutcome::Pending)) {
         Ok(entry) => entry,
         Err(e) => {
-            // The intent may have reached the disk (a failed fsync): close
-            // it, best effort, as refused, so a restart does not report an
-            // action that never ran as interrupted. If this fails too, the
-            // restart reports it as one that may or may not have run.
-            let refused = AuditOutcome::Error(ErrorCode::AuditUnavailable.name());
-            if state.audit.ensure_writable().is_ok() {
-                let _ = state.audit.complete(e.entry.seq, record(closing, refused));
+            // A write was attempted and may have reached the disk (a failed
+            // fsync): close the intent, best effort, as refused, so a
+            // restart does not report an action that never ran as
+            // interrupted. (If this fails too, the log keeps the closing
+            // entry and appends it when it reopens.) An intent refused
+            // without a write (the log turned unwritable meanwhile) is not
+            // in the file, so there is nothing to close.
+            if matches!(e.source, arneb_state::StateError::Io { .. }) {
+                let refused = AuditOutcome::Error(ErrorCode::AuditUnavailable.name());
+                if state.audit.ensure_writable().is_ok() {
+                    let _ = state.audit.complete(e.entry.seq, record(closing, refused));
+                }
             }
             return Err(refuse(&e.source));
         }
     };
-    let out = run();
+    // A panicking action is recorded as failed (`internal`), then the panic
+    // continues, so its intent does not stay pending.
+    let out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(out) => out,
+        Err(panic) => {
+            let failed = AuditOutcome::Error(ErrorCode::Internal.name());
+            if let Err(e) = state.audit.complete(begun.seq, record(closing, failed)) {
+                tracing::error!(
+                    target: "arneb::audit",
+                    intent_seq = begun.seq,
+                    error = %e.source,
+                    "an audited action panicked and its audit completion could not be written"
+                );
+            }
+            std::panic::resume_unwind(panic);
+        }
+    };
     let outcome = match &out {
         Ok(_) => AuditOutcome::Ok,
         Err(e) => AuditOutcome::Error(e.code.name()),
@@ -115,8 +138,8 @@ pub(super) fn audited<T>(
             entry = %serde_json::to_string(&entry).unwrap_or_default(),
             error = %source,
             "the action was applied but its audit completion could not be written \
-             (its intent stays pending); audited actions are refused until the \
-             audit log is writable"
+             (it is appended once the log reopens); audited actions are refused \
+             until the audit log is writable"
         );
     }
     out
@@ -213,6 +236,7 @@ pub(super) fn routes() -> Router<WebState> {
 
 #[cfg(test)]
 mod tests {
+    use super::{audited, ApiError, AuditSubject, Identity};
     use axum::http::{Method, StatusCode};
     use serde_json::{json, Value};
 
@@ -464,6 +488,7 @@ mod tests {
         // 2. The action is applied and answered with its real result.
         let (status, issued) = issue(&state).await;
         assert_eq!(status, StatusCode::CREATED, "{issued}");
+        let first_id = issued["id"].clone();
         let token = issued["token"].as_str().unwrap().to_owned();
         let (status, me) = call(
             &state,
@@ -499,9 +524,78 @@ mod tests {
         assert_eq!(entries[0]["action"], "token.issue");
         assert_eq!(entries[0]["target"], issued["id"]);
         assert_eq!(entries[0]["outcome"], "ok");
-        // The action whose completion failed keeps its pending intent.
-        assert_eq!(entries[1]["outcome"], "pending");
+        // The completion that failed was appended when the log reopened,
+        // so the first issue is no longer pending.
+        assert_eq!(entries[1]["outcome"], "ok");
         assert_eq!(entries[1]["action"], "token.issue");
+        assert_eq!(entries[1]["target"], first_id);
+        assert!(entries[1]["intent_seq"].is_u64(), "{page}");
         assert_eq!(token_count(&state).await, before + 1);
+    }
+
+    /// An intent refused without a write (the log turned unwritable just
+    /// before it) is not in the file: no closing entry is written for it.
+    #[tokio::test]
+    async fn an_intent_refused_without_a_write_is_not_closed() {
+        let state = state();
+        state.audit.refuse_next_append();
+        let (status, body) = issue(&state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(token_count(&state).await, 0, "nothing was applied");
+        assert!(state.audit.is_empty(), "no dangling refused entry");
+        // The next action reopens the log and is audited normally.
+        let (status, issued) = issue(&state).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued}");
+        let (_, page) = audit_log(&state, "").await;
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{page}");
+        assert_eq!(entries[0]["outcome"], "ok");
+    }
+
+    /// The `token.issue` intent names the token id, so a crash between
+    /// issuing and completing leaves an entry naming the persisted token.
+    #[tokio::test]
+    async fn the_token_issue_intent_names_the_token() {
+        let state = state();
+        state.audit.set_fail_completions(true);
+        let (status, issued) = issue(&state).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued}");
+        let (_, page) = audit_log(&state, "").await;
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{page}");
+        assert_eq!(entries[0]["outcome"], "pending");
+        assert_eq!(entries[0]["target"], issued["id"]);
+    }
+
+    /// A panicking action is completed as failed (`internal`), so its
+    /// intent does not stay pending, and the panic continues.
+    #[tokio::test]
+    async fn a_panicking_action_is_completed_as_failed() {
+        let state = state();
+        let who = Identity {
+            user: "root".into(),
+            via: crate::web::auth::AuthVia::Basic,
+        };
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            audited(
+                &state,
+                &who,
+                "worker.cordon",
+                AuditSubject {
+                    target: "w1".into(),
+                    parameters: json!({}),
+                },
+                || -> Result<(), ApiError> { panic!("boom") },
+                |_| unreachable!(),
+            )
+        }));
+        assert!(caught.is_err(), "the panic continues");
+        let (_, page) = audit_log(&state, "").await;
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{page}");
+        assert_eq!(entries[0]["action"], "worker.cordon");
+        assert_eq!(entries[0]["target"], "w1");
+        assert_eq!(entries[0]["outcome"], json!({"error": "internal"}));
+        assert!(entries[0]["intent_seq"].is_u64(), "{page}");
     }
 }

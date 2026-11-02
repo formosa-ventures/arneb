@@ -16,7 +16,7 @@ pub use audit::{
 pub use cordons::{CordonKind, CordonRecord};
 pub use file::{StateError, StateStore};
 pub use settings::AdmissionLimits;
-pub use tokens::{now_ms, IssuedToken, TokenInfo, MAX_TOKENS_PER_USER};
+pub use tokens::{now_ms, IssuedToken, TokenId, TokenInfo, MAX_TOKENS_PER_USER};
 pub use users::SeedReport;
 
 use arneb_protocol::{decoy_verifier, is_token_shaped, CredentialSource, ScramVerifier};

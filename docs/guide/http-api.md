@@ -679,8 +679,8 @@ curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
   [error code](#errors) the call returned. A completion entry carries
   `intent_seq`, the `seq` of its intent; a completed intent is dropped from
   the listing, so each finished action shows once. `"pending"` marks an
-  intent whose action is in progress (or whose completion could not be
-  written), and `"interrupted"` the entry written at startup for an intent
+  intent whose action is in progress (or whose completion is waiting for the
+  log to become writable again), and `"interrupted"` the entry written at startup for an intent
   that never completed: the action may or may not have been applied.
 - `persistent` is `false` when the log is in memory (no `[state] path`), and
   `writable` is `false` while audited actions are refused with

@@ -396,9 +396,13 @@ pub(super) async fn issue_token_for(
     let issued = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let parameters = serde_json::json!({"name": name, "expires_ms": expires_at_ms});
+        // The id is chosen before the intent, so the intent names the token
+        // that a crash between issuing and completing would leave behind.
+        // The id only: never the token itself.
+        let id = arneb_state::TokenId::generate().map_err(state_error)?;
+        let target = id.to_string();
         let intent = AuditSubject {
-            // The id is not known before the token is issued.
-            target: String::new(),
+            target: target.clone(),
             parameters: parameters.clone(),
         };
         audited(
@@ -408,14 +412,10 @@ pub(super) async fn issue_token_for(
             intent,
             || {
                 store
-                    .issue_token(&user, name, expires_at_ms)
+                    .issue_token_as(id, &user, name, expires_at_ms)
                     .map_err(state_error)
             },
-            |out| AuditSubject {
-                // The id only: never the token itself.
-                target: out.map(|t| t.info.id.clone()).unwrap_or_default(),
-                parameters,
-            },
+            |_| AuditSubject { target, parameters },
         )
     })
     .await

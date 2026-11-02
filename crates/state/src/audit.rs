@@ -145,6 +145,12 @@ struct Writer {
     file_lines: usize,
     /// Compact once `file_lines` reaches this.
     compact_at: usize,
+    /// Completions whose write failed, oldest first, as `(intent_seq,
+    /// record)`: re-appended by [`AuditLog::ensure_writable`] once the log
+    /// reopens, so a known outcome still reaches the file (and the intent
+    /// stops being `pending`). Bounded by the actions in flight when the
+    /// log failed: no new intent is written while any is stashed.
+    unwritten: Vec<(u64, AuditRecord)>,
 }
 
 /// The newest entries, oldest first, at most `max_entries`. Shared with
@@ -166,6 +172,8 @@ pub struct AuditLog {
     fail_completions: AtomicBool,
     #[cfg(any(test, feature = "test-hooks"))]
     fail_next_append: AtomicBool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    refuse_next_append: AtomicBool,
     /// `(inside, release)`: the next compaction sends on `inside` once it
     /// holds its snapshot, then waits on `release` before writing.
     #[cfg(test)]
@@ -194,6 +202,7 @@ impl AuditLog {
             next_seq: 1,
             file_lines: 0,
             compact_at: 0,
+            unwritten: Vec::new(),
         };
         let mut entries = VecDeque::new();
         if let Some(p) = path {
@@ -229,6 +238,8 @@ impl AuditLog {
             fail_completions: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             fail_next_append: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            refuse_next_append: AtomicBool::new(false),
             #[cfg(test)]
             compact_gate: Mutex::new(None),
         })
@@ -274,6 +285,16 @@ impl AuditLog {
         None
     }
 
+    /// Test hook state: whether this write is refused as if the log had
+    /// turned unwritable just before it.
+    fn refused_by_hook(&self) -> bool {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.refuse_next_append.swap(false, Ordering::SeqCst) {
+            return true;
+        }
+        false
+    }
+
     /// Appends `record` as one complete entry (no intent) and syncs it to
     /// disk. On failure the log is marked unwritable until
     /// [`Self::ensure_writable`] succeeds. Blocking.
@@ -292,8 +313,10 @@ impl AuditLog {
 
     /// Records the completion of the intent `intent_seq` (from
     /// [`Self::begin`]) and drops the intent from memory. Blocking. On
-    /// failure the intent stays `pending` (and is completed as
-    /// `interrupted` at the next start) and the log is marked unwritable.
+    /// failure the log is marked unwritable and the completion is kept:
+    /// [`Self::ensure_writable`] appends it (under a new `seq` and time)
+    /// once the log reopens. Until then the intent stays `pending`, and a
+    /// restart before then completes it as `interrupted`.
     pub fn complete(
         &self,
         intent_seq: u64,
@@ -308,6 +331,15 @@ impl AuditLog {
         intent_seq: Option<u64>,
     ) -> Result<AuditEntry, AuditAppendError> {
         let mut w = self.lock_writer();
+        self.write_entry_locked(&mut w, record, intent_seq)
+    }
+
+    fn write_entry_locked(
+        &self,
+        w: &mut Writer,
+        record: AuditRecord,
+        intent_seq: Option<u64>,
+    ) -> Result<AuditEntry, AuditAppendError> {
         let entry = AuditEntry {
             seq: w.next_seq,
             time_ms: now_ms(),
@@ -317,8 +349,8 @@ impl AuditLog {
         // The seq is used up even when the write fails: a torn write may
         // have left part of it in the file.
         w.next_seq += 1;
-        let written = if self.writable.load(Ordering::SeqCst) {
-            self.write_line(&mut w, &entry)
+        let written = if self.writable.load(Ordering::SeqCst) && !self.refused_by_hook() {
+            self.write_line(w, &entry)
         } else {
             Err(StateError::AuditUnwritable(
                 "an earlier append failed".into(),
@@ -327,6 +359,9 @@ impl AuditLog {
         if let Err(source) = written {
             self.writable.store(false, Ordering::SeqCst);
             w.file = None;
+            if let Some(intent) = intent_seq {
+                w.unwritten.push((intent, entry.record.clone()));
+            }
             return Err(AuditAppendError {
                 entry: Box::new(entry),
                 source,
@@ -346,7 +381,7 @@ impl AuditLog {
         if self.path.is_some() {
             w.file_lines += 1;
             if w.file_lines >= w.compact_at {
-                self.compact(&mut w);
+                self.compact(w);
             }
         }
         Ok(entry)
@@ -447,8 +482,9 @@ impl AuditLog {
         }
     }
 
-    /// A no-op while writable; otherwise reopens the file, and the log is
-    /// writable again when that succeeds. Blocking.
+    /// A no-op while writable; otherwise reopens the file and appends the
+    /// completions whose write failed meanwhile ([`Self::complete`]), and
+    /// the log is writable again when all of that succeeds. Blocking.
     pub fn ensure_writable(&self) -> Result<(), StateError> {
         if self.writable.load(Ordering::SeqCst) {
             return Ok(());
@@ -471,6 +507,24 @@ impl AuditLog {
             w.file = Some(file);
         }
         self.writable.store(true, Ordering::SeqCst);
+        // A failure here stashes that completion again (with the ones not
+        // yet tried) and marks the log unwritable.
+        let stashed = std::mem::take(&mut w.unwritten);
+        let count = stashed.len();
+        let mut stashed = stashed.into_iter();
+        for (intent, record) in stashed.by_ref() {
+            if let Err(e) = self.write_entry_locked(&mut w, record, Some(intent)) {
+                w.unwritten.extend(stashed);
+                return Err(e.source);
+            }
+        }
+        if count > 0 {
+            tracing::info!(
+                target: "arneb::audit",
+                completions = count,
+                "appended audit completions whose earlier write failed"
+            );
+        }
         tracing::info!(target: "arneb::audit", "the audit log is writable again");
         Ok(())
     }
@@ -514,6 +568,14 @@ impl AuditLog {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_append(&self) {
         self.fail_next_append.store(true, Ordering::SeqCst);
+    }
+
+    /// Test hook: refuse only the next write with
+    /// [`StateError::AuditUnwritable`], without attempting it, as when
+    /// another writer's failure made the log unwritable just before.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn refuse_next_append(&self) {
+        self.refuse_next_append.store(true, Ordering::SeqCst);
     }
 
     /// Test hook: stop the next compaction once it holds its snapshot;
@@ -1258,6 +1320,49 @@ mod tests {
         assert!(log.begin(record("root", "admission.set")).is_err());
         log.ensure_writable().unwrap();
         assert!(log.begin(record("root", "admission.set")).is_ok());
+    }
+
+    /// A completion whose write failed is kept and appended when the log
+    /// reopens: the intent stops being pending, the outcome reaches the
+    /// file, and a restart reports nothing as interrupted.
+    #[test]
+    fn a_failed_completion_is_appended_when_the_log_reopens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let log = AuditLog::open(Some(&p), settings(100, 0)).unwrap();
+        let intent = log.begin(record("root", "worker.cordon")).unwrap();
+        log.fail_next_append();
+        log.complete(intent.seq, record("root", "worker.cordon"))
+            .unwrap_err();
+        assert!(!log.is_writable());
+        // Still failing: the reopen fails and keeps the completion.
+        log.set_fail_appends(true);
+        assert!(log.ensure_writable().is_err());
+        log.set_fail_appends(false);
+        // A reopen whose replay fails keeps it too.
+        log.set_fail_completions(true);
+        assert!(log.ensure_writable().is_err());
+        assert!(!log.is_writable());
+        log.set_fail_completions(false);
+        assert_eq!(all(&log), vec![intent.seq], "still pending");
+        log.ensure_writable().unwrap();
+        assert!(log.is_writable());
+        let page = log.query(&AuditQuery {
+            limit: 10,
+            ..AuditQuery::default()
+        });
+        assert_eq!(page.entries.len(), 1, "{page:?}");
+        let done = &page.entries[0];
+        assert_eq!(done.intent_seq, Some(intent.seq));
+        assert_eq!(done.record.outcome, AuditOutcome::Ok);
+        let on_disk = file_entries(&p);
+        assert_eq!(on_disk.last().unwrap(), done);
+        // Appended once, not on every reopen.
+        log.ensure_writable().unwrap();
+        assert_eq!(file_entries(&p).len(), on_disk.len());
+        drop(log);
+        let (_log, logged) = capture(|| AuditLog::open(Some(&p), settings(100, 0)).unwrap());
+        assert!(!logged.contains("never completed"), "{logged}");
     }
 
     /// An intent in flight survives the cap and compaction, however many

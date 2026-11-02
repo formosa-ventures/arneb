@@ -791,16 +791,20 @@ the response returns. Read it with
   crash) is skipped with a WARN on `arneb::audit` naming its line number.
   Startup never fails on it, and the startup compaction drops it.
 - **A failed write.** If the intent cannot be written, the action is
-  refused with `503 audit_unavailable` and nothing is applied; if the log
-  reopens at once, the intent is closed with outcome
-  `{"error": "audit_unavailable"}` (best effort), so a restart does not
-  report it as interrupted. If the
-  completion cannot be written, the action has already happened: the entry
-  is logged in full at ERROR on `arneb::audit`, its intent stays `pending`,
-  and every later audited action is refused with `503 audit_unavailable`
-  until the file can be written again.
+  refused with `503 audit_unavailable` and nothing is applied. When the
+  write was attempted (it may have reached the disk) and the log reopens at
+  once, the intent is closed with outcome `{"error": "audit_unavailable"}`
+  (best effort), so a restart does not report it as interrupted; an intent
+  refused without a write gets no closing entry. If the completion cannot
+  be written, the action has already happened: the entry is logged in full
+  at ERROR on `arneb::audit`, its intent stays `pending` for now, and every
+  later audited action is refused with `503 audit_unavailable` until the
+  file can be written again. The server keeps that completion and appends
+  it first when the log reopens, so the known outcome still reaches the
+  file. An action that panics is completed with `{"error": "internal"}`.
 - **Interrupted actions.** An intent with no completion at startup (the
-  server stopped while applying it, or its completion failed) is logged at
+  server stopped while applying it, or before a failed completion could be
+  appended again) is logged at
   WARN on `arneb::audit` and recorded once as an entry with outcome
   `interrupted`: the action may or may not have been applied. So no applied
   action is ever missing from the log.

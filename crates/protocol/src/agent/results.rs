@@ -117,8 +117,8 @@ impl RetainedBudget {
     }
 
     /// How many bytes would have to be freed in the `short` budget for
-    /// `user` to take `bytes`.
-    fn missing(&self, user: &str, bytes: usize, short: Shortfall) -> usize {
+    /// `user` to take `bytes`, as of now (0 once they fit).
+    pub(crate) fn missing(&self, user: &str, bytes: usize, short: Shortfall) -> usize {
         let state = self.state();
         match short {
             Shortfall::User => {
@@ -451,11 +451,9 @@ impl Collector {
                 Ok(()) => return Ok(()),
                 Err(short) => short,
             };
-            let needed = self
-                .reservation
-                .budget
-                .missing(&self.reservation.user, size, short);
-            if !(self.evict)(short, needed) {
+            let (budget, user) = (&self.reservation.budget, &self.reservation.user);
+            let missing = || budget.missing(user, size, short);
+            if !(self.evict)(short, &missing) {
                 return Err(match short {
                     Shortfall::User => TruncatedBy::UserBudget,
                     Shortfall::Server => TruncatedBy::ServerBudget,
@@ -957,8 +955,8 @@ mod tests {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let evict: Evict = {
             let asked = Arc::clone(&asked);
-            Box::new(move |short, needed| {
-                asked.lock().unwrap().push((short, needed));
+            Box::new(move |short, missing| {
+                asked.lock().unwrap().push((short, missing()));
                 false
             })
         };

@@ -430,8 +430,8 @@ impl AgentQueryService {
         let statements = Arc::clone(&self.statements);
         let evicted = Arc::clone(&self.evicted);
         let user = statement.user.clone();
-        let evict: Evict = Box::new(move |short, needed| {
-            evict_retained(&statements, &evicted, &user, short, needed)
+        let evict: Evict = Box::new(move |short, missing| {
+            evict_retained(&statements, &evicted, &user, short, missing)
         });
         Collector::new(
             &statement.user,
@@ -577,67 +577,77 @@ impl Evicted {
     }
 }
 
-/// Frees at least `needed` bytes of the `short` budget for `user` by
-/// dropping ended statements that retain rows, or drops nothing when the
-/// candidates cannot cover it. Candidates are `user`'s own (for the user's
-/// share), or anyone's (for the server budget, the user's own first), fully
-/// read ones first, then least recently accessed; one whose rows a page
-/// request still holds is skipped, since dropping it frees nothing yet.
-/// Victims are picked in one pass over the registry.
+/// Frees room in the `short` budget for `user` by dropping ended
+/// statements that retain rows, one at a time, until `missing` (the bytes
+/// still lacking, read from the budget before each eviction) reaches 0.
+/// Drops nothing when the candidates cannot cover what is missing, and
+/// nothing at all when the shortfall has already gone (another statement
+/// was released meanwhile): the caller just retries. Candidates are
+/// `user`'s own (for the user's share), or anyone's (for the server budget,
+/// the user's own first), fully read ones first, then least recently
+/// accessed. A statement some request still holds (a poll, a page being
+/// encoded, a reaper pass) is skipped, since dropping it from the registry
+/// would free nothing yet; and should an eviction still free nothing, it
+/// stops rather than evict the next candidate for nothing. Returns whether
+/// a retry may now succeed.
 fn evict_retained(
     statements: &Mutex<HashMap<String, Arc<Statement>>>,
     evicted: &Mutex<Evicted>,
     user: &str,
     short: Shortfall,
-    needed: usize,
+    missing: &dyn Fn() -> usize,
 ) -> bool {
-    let removed: Vec<(Arc<Statement>, usize)> = {
-        let mut map = lock(statements);
-        let mut candidates: Vec<_> = map
-            .values()
-            .filter(|s| short == Shortfall::Server || s.user == user)
-            .filter_map(|s| {
-                let inner = s.lock();
-                let Phase::Finished(output) = &inner.phase else {
-                    return None;
-                };
-                let r = &output.retained;
-                (r.bytes > 0 && !r.pinned()).then(|| {
-                    let key = (s.user != user, !inner.read_to_end, inner.last_access);
-                    (key, s.id.clone(), r.bytes)
+    let mut needed = missing();
+    while needed > 0 {
+        let (statement, bytes) = {
+            let mut map = lock(statements);
+            let candidates: Vec<_> = map
+                .values()
+                .filter(|s| short == Shortfall::Server || s.user == user)
+                // Only the registry holds it (checked under the registry
+                // lock, which every new holder clones it under), so
+                // removing it drops it.
+                .filter(|s| Arc::strong_count(s) == 1)
+                .filter_map(|s| {
+                    let inner = s.lock();
+                    let Phase::Finished(output) = &inner.phase else {
+                        return None;
+                    };
+                    let r = &output.retained;
+                    (r.bytes > 0 && !r.pinned()).then(|| {
+                        let key = (s.user != user, !inner.read_to_end, inner.last_access);
+                        (key, s.id.clone(), r.bytes)
+                    })
                 })
-            })
-            .collect();
-        if candidates.iter().map(|c| c.2).sum::<usize>() < needed.max(1) {
-            return false;
-        }
-        candidates.sort_unstable();
-        let mut freed = 0;
-        let mut removed = Vec::new();
-        for (_, id, bytes) in candidates {
-            if freed >= needed.max(1) {
-                break;
+                .collect();
+            if candidates.iter().map(|c| c.2).sum::<usize>() < needed {
+                return false;
             }
-            if let Some(s) = map.remove(&id) {
-                freed += bytes;
-                removed.push((s, bytes));
-            }
-        }
-        removed
-    };
-    // Dropped outside the registry lock: their reservations give the bytes
-    // back here.
-    let mut log = lock(evicted);
-    for (statement, bytes) in &removed {
-        log.record(statement, true);
+            let Some((_, id, bytes)) = candidates.into_iter().min() else {
+                return false;
+            };
+            let Some(statement) = map.remove(&id) else {
+                return false;
+            };
+            (statement, bytes)
+        };
+        lock(evicted).record(&statement, true);
         tracing::debug!(
             statement_id = %statement.id,
             user = %statement.user,
             bytes,
             "agent statement evicted for retained-result budget"
         );
+        // Dropped outside the registry lock: its reservation gives the
+        // bytes back here.
+        drop(statement);
+        let now = missing();
+        if now >= needed {
+            return false; // freed nothing after all: stop here
+        }
+        needed = now;
     }
-    !removed.is_empty()
+    true
 }
 
 /// Id of the least-recently-accessed terminal statement among `statements`.
@@ -1119,6 +1129,64 @@ mod tests {
         let last = run_as(&svc, "alice", sql).await;
         assert_eq!(last.truncated_by, None);
         assert!(!alive(&big.id) && alive(&small.id));
+    }
+
+    #[tokio::test]
+    async fn a_held_statement_is_not_evicted_for_nothing() {
+        let sql = "SELECT s FROM wide";
+        let one = one_wide_result().await;
+        let svc = service_over(
+            vec![wide_table(10, 1000)],
+            AgentLimits {
+                max_retained_bytes: one,
+                max_user_retained_bytes: 2 * one + one / 2,
+                ..AgentLimits::default()
+            },
+        );
+        let a = run_as(&svc, "alice", sql).await;
+        let b = run_as(&svc, "alice", sql).await;
+        // A request (a poll, a page) holds a, the least recently used:
+        // dropping it from the registry would free nothing.
+        let held = lock(&svc.statements).get(&a.id).cloned().unwrap();
+        let c = run_as(&svc, "alice", sql).await;
+        assert_eq!(c.truncated_by, None);
+        let alive = |id: &str| lock(&svc.statements).contains_key(id);
+        assert!(alive(&a.id), "the held statement is skipped, not evicted");
+        assert!(!alive(&b.id) && alive(&c.id), "b alone covers it");
+        assert!(svc.retained_budget.used_by("alice") <= 2 * one + one / 2);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_shortfall_gone_by_eviction_time_evicts_nothing() {
+        let sql = "SELECT s FROM wide";
+        let one = one_wide_result().await;
+        let svc = service_over(
+            vec![wide_table(10, 1000)],
+            AgentLimits {
+                max_retained_bytes: one,
+                max_user_retained_bytes: 2 * one + one / 2,
+                ..AgentLimits::default()
+            },
+        );
+        let a = run_as(&svc, "alice", sql).await;
+        let b = run_as(&svc, "alice", sql).await;
+        let budget = Arc::clone(&svc.retained_budget);
+        let missing = || budget.missing("alice", one, Shortfall::User);
+        // A collector's try_grow of `one` fails here ...
+        assert!(missing() > 0);
+        // ... then a concurrent DELETE frees enough before it evicts.
+        svc.cancel("alice", &a.id).unwrap();
+        assert_eq!(missing(), 0);
+        let retry = evict_retained(
+            &svc.statements,
+            &svc.evicted,
+            "alice",
+            Shortfall::User,
+            &missing,
+        );
+        assert!(retry, "the collector just retries");
+        assert!(lock(&svc.statements).contains_key(&b.id), "b is kept");
     }
 
     /// A distributed executor that streams `batches` wide batches into the

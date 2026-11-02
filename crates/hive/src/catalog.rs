@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hive_metastore::{
-    ColumnStatisticsData, Database, GetDatabaseRequest, GetTableRequest, PartitionsRequest,
-    TableStatsRequest, ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
+    ColumnStatisticsData, Database, GetTableRequest, PartitionsRequest, TableStatsRequest,
+    ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
 };
 use pilota::FastStr;
 use tracing::{debug, warn};
@@ -139,19 +139,22 @@ impl HmsClient {
     /// identifier it is given (trims and lowercases it, and may read a
     /// `@catalog#db` prefix), so this can differ from `name`.
     pub async fn get_database(&self, name: &str) -> Result<String, ConnectorError> {
-        let req = GetDatabaseRequest {
-            name: Some(FastStr::from(name.to_string())),
-            ..Default::default()
-        };
-        let result = self.client.get_database_req(req).await.map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("HMS get_database_req({name}) failed: {e}"))
-        })?;
+        // The plain call, not `get_database_req`: HMS resolves the default
+        // catalog for it (and parses `@catalog#db`) exactly as it does for
+        // `get_all_tables`, which this schema then lists with.
+        let result = self
+            .client
+            .get_database(FastStr::from(name.to_string()))
+            .await
+            .map_err(|e| {
+                ConnectorError::ConnectionFailed(format!("HMS get_database({name}) failed: {e}"))
+            })?;
         match result {
             MaybeException::Ok(db) => stored_database_name(&db).ok_or_else(|| {
                 ConnectorError::ReadError(format!("HMS database {name} came back without a name"))
             }),
             MaybeException::Exception(ex) => Err(ConnectorError::TableNotFound(format!(
-                "HMS get_database_req({name}) exception: {ex:?}"
+                "HMS get_database({name}) exception: {ex:?}"
             ))),
         }
     }

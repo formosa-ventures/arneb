@@ -66,6 +66,17 @@ Everyone can run queries and sees only their own.
 - Patterns (`user`, `catalog`, `schema`, `table`, `queryOwner`) are regular
   expressions matched against the whole name, so `sales` does not match
   `sales_eu`. A pattern left out matches everything (`.*`).
+- Patterns are case-sensitive: `secret` does not match `SECRET`. Write
+  them against the names as the source stores them (lowercase in Hive;
+  in PostgreSQL, lowercase unless the table was created with a quoted
+  mixed-case name such as `"Orders"`).
+- Some connectors find tables case-insensitively: Hive always, PostgreSQL
+  when no name matches exactly. A read is checked on the name as written
+  **and** on the name the connector resolved it to, and is refused if
+  either is denied. So a rule on `secret` also covers `SECRET`, `Secret`
+  and `PUBLIC.secret`, and a schema rule covers the schema in any case.
+  When only the resolved name is denied, the error is the one a missing
+  table gets, so it does not reveal that the table exists.
 - A section left out of the file allows everything it governs. With no
   `tables` section, every user has every privilege on every table; with no
   `schemas` section, every user owns every schema; and so on.

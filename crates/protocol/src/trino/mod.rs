@@ -480,6 +480,9 @@ struct Query {
     inner: Mutex<Inner>,
     done: watch::Sender<bool>,
     abort: Mutex<Option<AbortHandle>>,
+    /// Runs the query's work; kills and client cancels go through it, so
+    /// neither relabels work that already returned.
+    switch: arneb_scheduler::KillSwitch,
     tracker_id: QueryId,
     /// Waiting for an admission slot: reported as `QUEUED`.
     queued: std::sync::atomic::AtomicBool,
@@ -557,6 +560,7 @@ async fn submit(
         }),
         done,
         abort: Mutex::new(None),
+        switch: arneb_scheduler::KillSwitch::new(),
         tracker_id,
         queued: std::sync::atomic::AtomicBool::new(false),
     });
@@ -572,7 +576,7 @@ async fn submit(
     // which case the kill is not applied and the query keeps its real
     // outcome. Weak references, so the tracker never keeps the query or
     // itself alive.
-    let switch = arneb_scheduler::KillSwitch::new();
+    let switch = query.switch.clone();
     let (weak_query, weak_tracker) = (Arc::downgrade(&query), Arc::downgrade(&state.tracker));
     state.tracker.set_canceller(
         &query.tracker_id,
@@ -1050,6 +1054,15 @@ fn json_response(
 }
 
 fn cancel_query(tracker: &QueryTracker, query: &Query, error: TrinoError, reason: &str) {
+    // Work that already returned keeps its outcome: `complete` records it.
+    // (A poll in flight, `None`, cancels as before.) Non-blocking, so client
+    // cancels and the reaper never wait for a poll.
+    if query.switch.try_kill() == Some(false)
+        && matches!(query.inner.lock().unwrap().phase, Phase::Running)
+    {
+        tracing::debug!(query_id = %query.id, reason, "trino cancel after the work returned");
+        return;
+    }
     if let Some(handle) = query.abort.lock().unwrap().take() {
         handle.abort();
     }
@@ -1273,6 +1286,50 @@ mod tests {
         );
         let phase = ended_phase(&tracker, &id, Err(TrinoError::internal("boom")));
         assert!(matches!(phase, Phase::Failed(e) if e.name == "USER_CANCELED"));
+    }
+
+    /// A client cancel (or the reaper) that lands after the work returned,
+    /// before `complete` ran, leaves the outcome to `complete`: an INSERT
+    /// that committed is not reported USER_CANCELED.
+    #[tokio::test]
+    async fn a_client_cancel_after_the_work_returned_keeps_the_result() {
+        let tracker = QueryTracker::new();
+        let tracker_id = tracker.create_query_from("INSERT INTO t".into(), "trino", None);
+        let query = Query {
+            id: "q".into(),
+            slug: "s".into(),
+            sql: "INSERT INTO t".into(),
+            user: "bob".into(),
+            source: None,
+            client_info: None,
+            family: session::HeaderFamily::Trino,
+            created: Instant::now(),
+            inner: Mutex::new(Inner {
+                phase: Phase::Running,
+                next_token: 1,
+                last: None,
+                last_access: Instant::now(),
+                ended: None,
+            }),
+            done: watch::channel(false).0,
+            abort: Mutex::new(None),
+            switch: arneb_scheduler::KillSwitch::new(),
+            tracker_id,
+            queued: std::sync::atomic::AtomicBool::new(false),
+        };
+        let result = query.switch.guard(async { Ok(rows()) }).await.unwrap();
+        cancel_query(&tracker, &query, TrinoError::canceled(), "client");
+        assert!(matches!(query.inner.lock().unwrap().phase, Phase::Running));
+        assert_eq!(
+            tracker.get_query(&tracker_id).unwrap().state,
+            TrackerState::Queued
+        );
+        let phase = ended_phase(&tracker, &tracker_id, result);
+        assert!(matches!(phase, Phase::Finished(_)));
+        assert_eq!(
+            tracker.get_query(&tracker_id).unwrap().state,
+            TrackerState::Finished
+        );
     }
 
     #[test]

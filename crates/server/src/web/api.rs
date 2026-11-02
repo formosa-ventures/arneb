@@ -355,9 +355,16 @@ async fn cancel_query(
             Ok(info) => info,
             Err(status) => return status.into_response(),
         };
-        return match state.query_tracker.kill_query(&info.query_id, &who.user) {
-            Ok(_) => StatusCode::NO_CONTENT.into_response(),
-            Err(_) => StatusCode::NOT_FOUND.into_response(),
+        // A kill may wait for one poll of the statement's work (see
+        // `QueryTracker::kill_query`): off the async workers.
+        let tracker = state.query_tracker.clone();
+        let user = who.user.clone();
+        let killed =
+            tokio::task::spawn_blocking(move || tracker.kill_query(&info.query_id, &user)).await;
+        return match killed {
+            Ok(Ok(_)) => StatusCode::NO_CONTENT.into_response(),
+            Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
     }
     match super::v2::cancel_query_for(&state, &who, &id, false).await {

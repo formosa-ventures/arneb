@@ -221,7 +221,7 @@ impl AgentQueryService {
     /// the statement keeps its real outcome. Weak references, so the
     /// tracker never keeps the statement or itself alive.
     fn kill_switch(&self, statement: &Arc<Statement>) -> KillSwitch {
-        let switch = KillSwitch::new();
+        let switch = statement.switch.clone();
         let (weak_statement, weak_tracker) =
             (Arc::downgrade(statement), Arc::downgrade(&self.tracker));
         self.tracker.set_canceller(
@@ -626,6 +626,13 @@ fn cancel_statement(
     error: AgentError,
     reason: &str,
 ) {
+    // Work that already returned keeps its outcome: `complete` / `fail`
+    // record it. (A poll in flight, `None`, cancels as before.)
+    // Non-blocking, so client cancels and the reaper never wait for a poll.
+    if statement.switch.try_kill() == Some(false) && !statement.is_terminal() {
+        tracing::debug!(statement_id = %statement.id, reason, "agent cancel after the work returned");
+        return;
+    }
     if !statement.end(Phase::Cancelled(error)) {
         return;
     }
@@ -1755,6 +1762,29 @@ mod tests {
         let info = tracker.get_query(&id).unwrap();
         assert_eq!(info.state, QueryState::Finished);
         assert_eq!(info.rows, Some(1));
+    }
+
+    /// A client cancel that lands after the work returned, before
+    /// `complete` ran, leaves the outcome to `complete`.
+    #[tokio::test]
+    async fn a_client_cancel_after_the_work_returned_keeps_the_result() {
+        let (svc, tracker) = service();
+        let statement = svc.register("alice", "SELECT 1".into(), 10).unwrap();
+        let switch = svc.kill_switch(&statement);
+        assert_eq!(switch.guard(async { "done" }).await, Some("done"));
+        svc.cancel("alice", &statement.id).unwrap();
+        assert!(!statement.is_terminal(), "the cancel relabelled the result");
+        let collector = one_row(&svc, &statement);
+        svc.complete(&statement, no_output(), collector);
+        let status = svc
+            .status("alice", &statement.id, Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(status.state, StatementState::Finished);
+        assert_eq!(
+            tracker.get_query(&statement.tracker_id).unwrap().state,
+            QueryState::Finished
+        );
     }
 
     /// A kill before the task starts (the canceller is registered before

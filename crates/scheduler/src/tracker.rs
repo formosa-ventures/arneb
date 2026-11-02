@@ -49,7 +49,10 @@ fn advance_machine(m: &mut QueryStateMachine, target: QueryState) -> Result<(), 
 /// name of the user who killed it. Returns `false` when the query's work had
 /// already completed, so the kill stopped nothing (see
 /// [`crate::KillSwitch`]). Called at most once, never under the tracker's
-/// lock, so it may call back into the tracker.
+/// lock, so it may call back into the tracker. A [`crate::KillSwitch`]
+/// canceller may block for one poll of the query's work (it waits for an
+/// in-flight poll to end), so call it off async workers (e.g. in
+/// `spawn_blocking`) and never from inside the query's own work.
 pub type Canceller = Box<dyn FnOnce(&str) -> bool + Send + Sync>;
 
 /// What [`QueryTracker::kill_query`] did.
@@ -243,6 +246,10 @@ impl QueryTracker {
     /// (nothing is marked; the protocol records the real outcome). The
     /// first kill claims the query under the lock; a concurrent kill of the
     /// same query is `AlreadyEnded(Cancelled)`, so only one reports a kill.
+    ///
+    /// Blocking: the canceller may wait for one poll of the query's work
+    /// (see [`Canceller`]). Call it from `spawn_blocking`, never from an
+    /// async worker or from inside the query's own work.
     pub fn kill_query(&self, id: &QueryId, by: &str) -> Result<KillOutcome, ExecutionError> {
         let (was, canceller) = {
             let mut inner = self.inner.write().unwrap();

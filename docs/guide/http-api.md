@@ -471,11 +471,17 @@ Trino, `/api/v2` statements) and stops it there: a pgwire client gets
 `USER_CANCELED` `Query was killed by <user>`, and an `/api/v2` statement
 turns `cancelled` with `Statement was cancelled by <user>`.
 
-A kill applies only when it stops the statement's work. One that arrives
-after the work completed (an `INSERT` that committed, say) but before the
-statement reported back stops nothing: the response has `changed: false`,
-the audit entry records `effect` `already_ended`, and the client gets the
-statement's real result. A committed write is never reported as cancelled.
+When the kill lands decides what it does:
+
+- **Before the statement's work starts:** the work never runs.
+- **After the work returned** (an `INSERT` that committed, say) but before
+  the statement reported back: the kill stops nothing. The response has
+  `changed: false`, the audit entry records `effect` `already_ended`, and
+  the client gets the statement's real result.
+- **During the work:** the work is stopped at its next step and the client
+  gets the cancellation. A write may already have taken effect in part or
+  in full (an earlier step, or a parallel task that keeps running), as
+  before this release, so check before retrying a cancelled write.
 
 Who may cancel, in this order:
 
@@ -680,7 +686,8 @@ curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
   `intent_seq`, the `seq` of its intent; a completed intent is dropped from
   the listing, so each finished action shows once. `"pending"` marks an
   intent whose action is in progress (or whose completion is waiting for the
-  log to become writable again), and `"interrupted"` the entry written at startup for an intent
+  log to become writable again; such a completion's `time_ms` is when it was
+  finally written, not when the action finished), and `"interrupted"` the entry written at startup for an intent
   that never completed: the action may or may not have been applied.
 - `persistent` is `false` when the log is in memory (no `[state] path`), and
   `writable` is `false` while audited actions are refused with
@@ -692,14 +699,14 @@ Parameters, all optional:
 |---|---|
 | `limit` | Most entries to return; default `50`, at most `500`. A larger value is `invalid_argument`. |
 | `cursor` | The previous page's `next_cursor`: continue with older entries. |
+| `user` | Only this user's entries (exact match). |
+| `action` | Only this action's entries (exact match), for example `token.revoke`. |
 
 A read examines at most 10,000 entries. A filtered page (by `user`, by
 `action`, or a non-manager's own entries) that runs out of that budget ends
 early with `truncated: true` and a `next_cursor`, possibly with fewer than
 `limit` entries or none; keep following `next_cursor` until `truncated` is
 `false`.
-| `user` | Only this user's entries (exact match). |
-| `action` | Only this action's entries (exact match), for example `token.revoke`. |
 
 Reading the log needs the observe privilege: with a `system_information`
 section in the [access rules](/guide/access-control), only users it allows

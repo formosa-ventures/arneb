@@ -575,6 +575,7 @@ mod tests {
         let who = Identity {
             user: "root".into(),
             via: crate::web::auth::AuthVia::Basic,
+            oauth_expires_ms: None,
         };
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             audited(

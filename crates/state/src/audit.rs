@@ -1,5 +1,5 @@
 //! The durable audit log (manage-api D6): JSON lines in
-//! `<state stem>.audit.jsonl` next to the state file, appended with
+//! `<state file name>.audit.jsonl` next to the state file, appended with
 //! `O_APPEND` and `sync_data` before the caller answers.
 //!
 //! An audited action writes two entries: an intent ([`AuditLog::begin`],
@@ -36,8 +36,15 @@ use crate::tokens::now_ms;
 use crate::StateError;
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
-/// The audit log's file name suffix, after the state file's stem.
+/// Most entries one [`AuditLog::query`] examines under the memory lock. A
+/// filtered read that exhausts it before filling its page ends the page
+/// early, `truncated`, with a cursor to continue from.
+pub const AUDIT_SCAN_BUDGET: usize = 10_000;
+/// The audit log's file name suffix, after the state file's name.
 const AUDIT_SUFFIX: &str = ".audit.jsonl";
+/// The file name the audit log had before it was named after the state
+/// file; still looked for, to warn about it.
+const LEGACY_AUDIT_FILE: &str = "audit.jsonl";
 
 /// Retention of the audit log (`[audit]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +138,9 @@ pub struct AuditPage {
     pub entries: Vec<AuditEntry>,
     /// The `before_seq` of the next page; `Some` exactly when `truncated`.
     pub next_cursor: Option<u64>,
-    /// More entries match beyond this page.
+    /// More entries may match beyond this page: either the page is full and
+    /// another entry matches, or the scan budget ran out (the page may then
+    /// hold fewer than `limit` entries, even none).
     pub truncated: bool,
 }
 
@@ -145,6 +154,12 @@ struct Writer {
     file_lines: usize,
     /// Compact once `file_lines` reaches this.
     compact_at: usize,
+    /// Completions whose write failed, oldest first, as `(intent_seq,
+    /// record)`: re-appended by [`AuditLog::ensure_writable`] once the log
+    /// reopens, so a known outcome still reaches the file (and the intent
+    /// stops being `pending`). Bounded by the actions in flight when the
+    /// log failed: no new intent is written while any is stashed.
+    unwritten: Vec<(u64, AuditRecord)>,
 }
 
 /// The newest entries, oldest first, at most `max_entries`. Shared with
@@ -166,6 +181,8 @@ pub struct AuditLog {
     fail_completions: AtomicBool,
     #[cfg(any(test, feature = "test-hooks"))]
     fail_next_append: AtomicBool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    refuse_next_append: AtomicBool,
     /// `(inside, release)`: the next compaction sends on `inside` once it
     /// holds its snapshot, then waits on `release` before writing.
     #[cfg(test)]
@@ -194,6 +211,7 @@ impl AuditLog {
             next_seq: 1,
             file_lines: 0,
             compact_at: 0,
+            unwritten: Vec::new(),
         };
         let mut entries = VecDeque::new();
         if let Some(p) = path {
@@ -229,22 +247,33 @@ impl AuditLog {
             fail_completions: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             fail_next_append: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            refuse_next_append: AtomicBool::new(false),
             #[cfg(test)]
             compact_gate: Mutex::new(None),
         })
     }
 
-    /// The audit log path for the state file `state_path`: its stem plus
-    /// `.audit.jsonl`, in the same directory (`prod.json` →
-    /// `prod.audit.jsonl`), so state files sharing a directory never share
-    /// an audit log.
+    /// The audit log path for the state file `state_path`: its full file
+    /// name plus `.audit.jsonl`, in the same directory (`prod.json` →
+    /// `prod.json.audit.jsonl`), so state files sharing a directory never
+    /// share an audit log, even when they differ only in extension
+    /// (`prod` → `prod.audit.jsonl`).
     pub fn sibling_of(state_path: &Path) -> PathBuf {
         let mut name = state_path
-            .file_stem()
+            .file_name()
             .map(std::ffi::OsStr::to_os_string)
             .unwrap_or_else(|| "state".into());
         name.push(AUDIT_SUFFIX);
         state_path.with_file_name(name)
+    }
+
+    /// An audit log left under the earlier name, `audit.jsonl` in the
+    /// state file's directory, when one exists. It is not read or migrated;
+    /// the caller warns about it so its history is not silently dropped.
+    pub fn legacy_sibling_of(state_path: &Path) -> Option<PathBuf> {
+        let legacy = state_path.with_file_name(LEGACY_AUDIT_FILE);
+        (legacy != Self::sibling_of(state_path) && legacy.is_file()).then_some(legacy)
     }
 
     fn lock_writer(&self) -> std::sync::MutexGuard<'_, Writer> {
@@ -274,6 +303,16 @@ impl AuditLog {
         None
     }
 
+    /// Test hook state: whether this write is refused as if the log had
+    /// turned unwritable just before it.
+    fn refused_by_hook(&self) -> bool {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.refuse_next_append.swap(false, Ordering::SeqCst) {
+            return true;
+        }
+        false
+    }
+
     /// Appends `record` as one complete entry (no intent) and syncs it to
     /// disk. On failure the log is marked unwritable until
     /// [`Self::ensure_writable`] succeeds. Blocking.
@@ -292,8 +331,10 @@ impl AuditLog {
 
     /// Records the completion of the intent `intent_seq` (from
     /// [`Self::begin`]) and drops the intent from memory. Blocking. On
-    /// failure the intent stays `pending` (and is completed as
-    /// `interrupted` at the next start) and the log is marked unwritable.
+    /// failure the log is marked unwritable and the completion is kept:
+    /// [`Self::ensure_writable`] appends it (under a new `seq` and time)
+    /// once the log reopens. Until then the intent stays `pending`, and a
+    /// restart before then completes it as `interrupted`.
     pub fn complete(
         &self,
         intent_seq: u64,
@@ -308,6 +349,15 @@ impl AuditLog {
         intent_seq: Option<u64>,
     ) -> Result<AuditEntry, AuditAppendError> {
         let mut w = self.lock_writer();
+        self.write_entry_locked(&mut w, record, intent_seq)
+    }
+
+    fn write_entry_locked(
+        &self,
+        w: &mut Writer,
+        record: AuditRecord,
+        intent_seq: Option<u64>,
+    ) -> Result<AuditEntry, AuditAppendError> {
         let entry = AuditEntry {
             seq: w.next_seq,
             time_ms: now_ms(),
@@ -317,8 +367,8 @@ impl AuditLog {
         // The seq is used up even when the write fails: a torn write may
         // have left part of it in the file.
         w.next_seq += 1;
-        let written = if self.writable.load(Ordering::SeqCst) {
-            self.write_line(&mut w, &entry)
+        let written = if self.writable.load(Ordering::SeqCst) && !self.refused_by_hook() {
+            self.write_line(w, &entry)
         } else {
             Err(StateError::AuditUnwritable(
                 "an earlier append failed".into(),
@@ -327,6 +377,9 @@ impl AuditLog {
         if let Err(source) = written {
             self.writable.store(false, Ordering::SeqCst);
             w.file = None;
+            if let Some(intent) = intent_seq {
+                w.unwritten.push((intent, entry.record.clone()));
+            }
             return Err(AuditAppendError {
                 entry: Box::new(entry),
                 source,
@@ -346,7 +399,7 @@ impl AuditLog {
         if self.path.is_some() {
             w.file_lines += 1;
             if w.file_lines >= w.compact_at {
-                self.compact(&mut w);
+                self.compact(w);
             }
         }
         Ok(entry)
@@ -420,35 +473,64 @@ impl AuditLog {
 
     /// The entries matching `q`, newest first. Entries past
     /// `retention_days` are hidden. Never waits for an append or a
-    /// compaction.
+    /// compaction, and examines at most [`AUDIT_SCAN_BUDGET`] entries, so a
+    /// selective filter over a large log ends its page early (`truncated`,
+    /// with a cursor) instead of holding the memory lock for a full scan.
     pub fn query(&self, q: &AuditQuery) -> AuditPage {
+        self.query_with_budget(q, AUDIT_SCAN_BUDGET)
+    }
+
+    fn query_with_budget(&self, q: &AuditQuery, budget: usize) -> AuditPage {
         let cutoff = cutoff_ms(self.settings, now_ms());
         let entries = self.lock_entries();
-        let mut matching = entries.iter().rev().filter(|e| {
-            e.time_ms >= cutoff
-                && q.before_seq.is_none_or(|b| e.seq < b)
+        // Entries are in `seq` order: start below the cursor directly.
+        let end = q
+            .before_seq
+            .map_or(entries.len(), |b| entries.partition_point(|e| e.seq < b));
+        let mut page: Vec<AuditEntry> = Vec::new();
+        let mut scanned = 0;
+        for e in entries.range(..end).rev() {
+            let matches = e.time_ms >= cutoff
                 && q.user.as_ref().is_none_or(|u| &e.record.user == u)
-                && q.action.as_ref().is_none_or(|a| &e.record.action == a)
-        });
-        let page: Vec<AuditEntry> = matching
-            .by_ref()
-            .take(q.limit)
-            .map(|e| AuditEntry::clone(e))
-            .collect();
-        let truncated = matching.next().is_some();
+                && q.action.as_ref().is_none_or(|a| &e.record.action == a);
+            if matches {
+                if page.len() == q.limit {
+                    // Another match beyond a full page.
+                    return AuditPage {
+                        next_cursor: page.last().map(|e| e.seq),
+                        entries: page,
+                        truncated: true,
+                    };
+                }
+                page.push(AuditEntry::clone(e));
+            }
+            scanned += 1;
+            if scanned == budget {
+                // Out of budget with entries left unexamined: continue
+                // below the last entry returned (a full page) or examined.
+                let more = end > scanned;
+                let cursor = if page.len() == q.limit {
+                    page.last().map(|e| e.seq)
+                } else {
+                    Some(e.seq)
+                };
+                return AuditPage {
+                    next_cursor: cursor.filter(|_| more),
+                    entries: page,
+                    truncated: more,
+                };
+            }
+        }
         AuditPage {
-            next_cursor: if truncated {
-                page.last().map(|e| e.seq)
-            } else {
-                None
-            },
+            next_cursor: None,
             entries: page,
-            truncated,
+            truncated: false,
         }
     }
 
-    /// A no-op while writable; otherwise reopens the file, and the log is
-    /// writable again when that succeeds. Blocking.
+    /// A no-op while writable; otherwise reopens the file and appends the
+    /// completions whose write failed meanwhile ([`Self::complete`]), and
+    /// the log is writable again when all of that succeeds. Blocking.
     pub fn ensure_writable(&self) -> Result<(), StateError> {
         if self.writable.load(Ordering::SeqCst) {
             return Ok(());
@@ -471,6 +553,24 @@ impl AuditLog {
             w.file = Some(file);
         }
         self.writable.store(true, Ordering::SeqCst);
+        // A failure here stashes that completion again (with the ones not
+        // yet tried) and marks the log unwritable.
+        let stashed = std::mem::take(&mut w.unwritten);
+        let count = stashed.len();
+        let mut stashed = stashed.into_iter();
+        for (intent, record) in stashed.by_ref() {
+            if let Err(e) = self.write_entry_locked(&mut w, record, Some(intent)) {
+                w.unwritten.extend(stashed);
+                return Err(e.source);
+            }
+        }
+        if count > 0 {
+            tracing::info!(
+                target: "arneb::audit",
+                completions = count,
+                "appended audit completions whose earlier write failed"
+            );
+        }
         tracing::info!(target: "arneb::audit", "the audit log is writable again");
         Ok(())
     }
@@ -516,6 +616,14 @@ impl AuditLog {
         self.fail_next_append.store(true, Ordering::SeqCst);
     }
 
+    /// Test hook: refuse only the next write with
+    /// [`StateError::AuditUnwritable`], without attempting it, as when
+    /// another writer's failure made the log unwritable just before.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn refuse_next_append(&self) {
+        self.refuse_next_append.store(true, Ordering::SeqCst);
+    }
+
     /// Test hook: stop the next compaction once it holds its snapshot;
     /// returns `(inside, release)`.
     #[cfg(test)]
@@ -542,6 +650,16 @@ struct Recovered {
 /// `next_seq`), reporting it at WARN.
 fn recover(loaded: Vec<AuditEntry>, next_seq: &mut u64, path: &Path) -> Recovered {
     let completed: HashSet<u64> = loaded.iter().filter_map(|e| e.intent_seq).collect();
+    // A completion whose fsync failed may still have reached the file, and
+    // is then appended again when the log reopens: keep only the newest
+    // completion of each intent.
+    let mut newest: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for e in &loaded {
+        if let Some(intent) = e.intent_seq {
+            let seq = newest.entry(intent).or_insert(e.seq);
+            *seq = (*seq).max(e.seq);
+        }
+    }
     let mut out = Recovered {
         entries: Vec::with_capacity(loaded.len()),
         completed: 0,
@@ -556,6 +674,9 @@ fn recover(loaded: Vec<AuditEntry>, next_seq: &mut u64, path: &Path) -> Recovere
                 orphans.push(e);
             }
             continue;
+        }
+        if e.intent_seq.is_some_and(|i| newest.get(&i) != Some(&e.seq)) {
+            continue; // an earlier copy of a replayed completion
         }
         out.entries.push(e);
     }
@@ -843,28 +964,41 @@ mod tests {
     }
 
     #[test]
-    fn sibling_is_named_after_the_state_file_stem() {
+    fn sibling_is_named_after_the_state_file_name() {
         assert_eq!(
             AuditLog::sibling_of(Path::new("/var/lib/arneb/state.json")),
-            PathBuf::from("/var/lib/arneb/state.audit.jsonl")
+            PathBuf::from("/var/lib/arneb/state.json.audit.jsonl")
         );
         assert_eq!(
             AuditLog::sibling_of(Path::new("state.json")),
-            PathBuf::from("state.audit.jsonl")
+            PathBuf::from("state.json.audit.jsonl")
         );
-        // Two state files in one directory get two audit logs.
+        // Two state files in one directory get two audit logs, also when
+        // they differ only in extension.
         assert_eq!(
             AuditLog::sibling_of(Path::new("/var/lib/arneb/prod.json")),
-            PathBuf::from("/var/lib/arneb/prod.audit.jsonl")
+            PathBuf::from("/var/lib/arneb/prod.json.audit.jsonl")
         );
         assert_eq!(
-            AuditLog::sibling_of(Path::new("/var/lib/arneb/staging.json")),
-            PathBuf::from("/var/lib/arneb/staging.audit.jsonl")
+            AuditLog::sibling_of(Path::new("/var/lib/arneb/prod")),
+            PathBuf::from("/var/lib/arneb/prod.audit.jsonl")
         );
         assert_eq!(
             AuditLog::sibling_of(Path::new("/srv/arneb-state")),
             PathBuf::from("/srv/arneb-state.audit.jsonl")
         );
+    }
+
+    #[test]
+    fn a_legacy_audit_log_is_found_but_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("prod.json");
+        assert_eq!(AuditLog::legacy_sibling_of(&state), None);
+        let legacy = tmp.path().join("audit.jsonl");
+        std::fs::write(&legacy, format!("{}\n", line(1, now_ms()))).unwrap();
+        assert_eq!(AuditLog::legacy_sibling_of(&state), Some(legacy));
+        let log = AuditLog::open(Some(&AuditLog::sibling_of(&state)), settings(100, 0)).unwrap();
+        assert!(log.is_empty(), "the legacy log is not migrated");
     }
 
     #[test]
@@ -1006,6 +1140,57 @@ mod tests {
             ..AuditQuery::default()
         });
         assert!(page.entries.is_empty(), "the user filter is an exact match");
+    }
+
+    /// A selective filter over a log larger than the scan budget ends its
+    /// page early, truncated, with a cursor; following the cursors finds
+    /// every match exactly once.
+    #[test]
+    fn a_filtered_read_is_bounded_by_the_scan_budget() {
+        let log = AuditLog::open(None, settings(1000, 0)).unwrap();
+        for i in 0..100 {
+            let user = if i % 40 == 0 { "bob" } else { "alice" };
+            log.append(record(user, "token.issue")).unwrap();
+        }
+        // bob's entries: seq 1, 41, 81.
+        let mut q = AuditQuery {
+            limit: 10,
+            user: Some("bob".into()),
+            ..AuditQuery::default()
+        };
+        let mut found = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = log.query_with_budget(&q, 25);
+            pages += 1;
+            assert!(page.entries.len() <= 10);
+            assert_eq!(page.truncated, page.next_cursor.is_some());
+            found.extend(page.entries.iter().map(|e| e.seq));
+            match page.next_cursor {
+                Some(c) => q.before_seq = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(found, vec![81, 41, 1]);
+        assert_eq!(pages, 4, "100 entries at 25 per scan");
+        // A full page that hits the budget continues below its last entry.
+        let q = AuditQuery {
+            limit: 2,
+            ..AuditQuery::default()
+        };
+        let page = log.query_with_budget(&q, 2);
+        assert_eq!(
+            page.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![100, 99]
+        );
+        assert_eq!(page.next_cursor, Some(99));
+        // An unfiltered page within the budget behaves as before.
+        let page = log.query(&AuditQuery {
+            limit: 5,
+            ..AuditQuery::default()
+        });
+        assert_eq!(page.entries.len(), 5);
+        assert_eq!(page.next_cursor, Some(96));
     }
 
     #[test]
@@ -1232,6 +1417,81 @@ mod tests {
         assert!(log.begin(record("root", "admission.set")).is_err());
         log.ensure_writable().unwrap();
         assert!(log.begin(record("root", "admission.set")).is_ok());
+    }
+
+    /// A completion whose write failed is kept and appended when the log
+    /// reopens: the intent stops being pending, the outcome reaches the
+    /// file, and a restart reports nothing as interrupted.
+    #[test]
+    fn a_failed_completion_is_appended_when_the_log_reopens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let log = AuditLog::open(Some(&p), settings(100, 0)).unwrap();
+        let intent = log.begin(record("root", "worker.cordon")).unwrap();
+        log.fail_next_append();
+        log.complete(intent.seq, record("root", "worker.cordon"))
+            .unwrap_err();
+        assert!(!log.is_writable());
+        // Still failing: the reopen fails and keeps the completion.
+        log.set_fail_appends(true);
+        assert!(log.ensure_writable().is_err());
+        log.set_fail_appends(false);
+        // A reopen whose replay fails keeps it too.
+        log.set_fail_completions(true);
+        assert!(log.ensure_writable().is_err());
+        assert!(!log.is_writable());
+        log.set_fail_completions(false);
+        assert_eq!(all(&log), vec![intent.seq], "still pending");
+        log.ensure_writable().unwrap();
+        assert!(log.is_writable());
+        let page = log.query(&AuditQuery {
+            limit: 10,
+            ..AuditQuery::default()
+        });
+        assert_eq!(page.entries.len(), 1, "{page:?}");
+        let done = &page.entries[0];
+        assert_eq!(done.intent_seq, Some(intent.seq));
+        assert_eq!(done.record.outcome, AuditOutcome::Ok);
+        let on_disk = file_entries(&p);
+        assert_eq!(on_disk.last().unwrap(), done);
+        // Appended once, not on every reopen.
+        log.ensure_writable().unwrap();
+        assert_eq!(file_entries(&p).len(), on_disk.len());
+        drop(log);
+        let (_log, logged) = capture(|| AuditLog::open(Some(&p), settings(100, 0)).unwrap());
+        assert!(!logged.contains("never completed"), "{logged}");
+    }
+
+    /// A completion written once before its failed fsync and again on
+    /// replay is loaded once (the newest copy), and the startup compaction
+    /// drops the other.
+    #[test]
+    fn a_replayed_completion_written_twice_loads_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("audit.jsonl");
+        let intent = AuditEntry {
+            seq: 1,
+            time_ms: now_ms(),
+            intent_seq: None,
+            record: AuditRecord {
+                outcome: AuditOutcome::Pending,
+                ..record("root", "worker.cordon")
+            },
+        };
+        let done = |seq| AuditEntry {
+            seq,
+            time_ms: now_ms(),
+            intent_seq: Some(1),
+            record: record("root", "worker.cordon"),
+        };
+        let text: String = [intent, done(2), done(3)]
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        std::fs::write(&p, text).unwrap();
+        let log = AuditLog::open(Some(&p), settings(100, 0)).unwrap();
+        assert_eq!(all(&log), vec![3]);
+        assert_eq!(lines(&p), 1, "the startup compaction dropped the copy");
     }
 
     /// An intent in flight survives the cap and compaction, however many

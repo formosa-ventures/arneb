@@ -6,10 +6,13 @@
 //! installs both into the shared [`CatalogManager`] and [`ConnectorRegistry`],
 //! and remembers the installed specs plus the catalog generation they belong
 //! to. A statement pins the providers and connectors together when it
-//! starts ([`ConnectorRegistry::pinned`]; every install and remove here is
-//! one [`ConnectorRegistry::swap`]), so a change never disturbs a running
-//! statement on the coordinator. A worker resolves each task's connectors
-//! when the task starts.
+//! starts ([`ConnectorRegistry::pinned`]; each change here, with the
+//! `(epoch, generation)` tag it moves the registry to, is one
+//! [`ConnectorRegistry::swap`]), so a change never disturbs a running
+//! statement on the coordinator. Its distributed tasks carry the tag it
+//! was planned at, and a worker runs a task only against that same set
+//! (pulling once when it differs), so one query never mixes catalog
+//! versions.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,7 +90,7 @@ pub struct LiveCatalogs {
     /// The installed specs, by name.
     specs: RwLock<BTreeMap<String, CatalogConfig>>,
     generation: AtomicU64,
-    /// On a coordinator, its own epoch (random per start); on a worker, the
+    /// On a coordinator, its own epoch (ordered by start time); on a worker, the
     /// epoch of the coordinator its set came from (0 before the first).
     /// Ruling R6.
     epoch: AtomicU64,
@@ -107,6 +110,15 @@ pub struct LiveCatalogs {
     /// Builds run before it is taken, so an unreachable metastore never
     /// holds up another push or pull.
     applying: tokio::sync::Mutex<()>,
+    /// On a worker, the coordinator's current epoch: the largest seen in a
+    /// push or pull, or the one the last heartbeat reply named (0 before
+    /// any). A set from an older epoch is stale and never applies (a slow
+    /// build of a set fetched before the coordinator restarted, a delayed
+    /// push from the old one).
+    latest_epoch: AtomicU64,
+    /// One apply per `(epoch, generation)` at a time: a push and a pull of
+    /// the same set share one build of each changed catalog.
+    apply_flights: std::sync::Mutex<BTreeMap<(Option<u64>, u64), ApplyFlight>>,
     /// Tests replace [`build`](Self::build) with this.
     #[cfg(test)]
     test_builder: Option<TestBuilder>,
@@ -114,6 +126,8 @@ pub struct LiveCatalogs {
     #[cfg(test)]
     test_build_delay: std::sync::Mutex<BTreeMap<String, Duration>>,
 }
+
+type ApplyFlight = Arc<tokio::sync::OnceCell<ApplyReport>>;
 
 #[cfg(test)]
 pub(crate) type TestBuilder =
@@ -148,6 +162,8 @@ impl LiveCatalogs {
             pushed_defaults: RwLock::new(None),
             unauthenticated_flight: std::sync::atomic::AtomicBool::new(false),
             applying: tokio::sync::Mutex::new(()),
+            latest_epoch: AtomicU64::new(0),
+            apply_flights: Default::default(),
             #[cfg(test)]
             test_builder: None,
             #[cfg(test)]
@@ -188,6 +204,14 @@ impl LiveCatalogs {
             .is_empty()
     }
 
+    /// Whether catalog `name` of the applied set failed to build here.
+    pub fn failed_to_build(&self, name: &str) -> bool {
+        self.failed
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(name)
+    }
+
     /// The catalog generation the installed set belongs to.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
@@ -201,12 +225,54 @@ impl LiveCatalogs {
 
     /// Sets this coordinator's epoch, once at startup before it serves.
     pub fn set_epoch(&self, epoch: u64) {
-        self.epoch.store(epoch, Ordering::SeqCst);
+        self.connectors
+            .swap(|| self.store_version(Some(epoch), self.generation()));
     }
 
-    /// Sets the catalog generation (after a change was persisted).
-    pub fn set_generation(&self, g: u64) {
-        self.generation.store(g, Ordering::SeqCst);
+    /// Sets the catalog generation (and moves the registry tag). Tests only:
+    /// a real change commits its catalogs and generation together with
+    /// [`commit`](Self::commit).
+    #[cfg(test)]
+    pub(crate) fn set_generation(&self, g: u64) {
+        self.connectors.swap(|| self.store_version(None, g));
+    }
+
+    /// Moves to `generation` (and `epoch`, when given) and tags the
+    /// registry with both. Only inside a [`ConnectorRegistry::swap`].
+    /// Generation before epoch: a reader seeing the new epoch also sees the
+    /// generation that goes with it.
+    fn store_version(&self, epoch: Option<u64>, generation: u64) {
+        self.generation.store(generation, Ordering::SeqCst);
+        if let Some(e) = epoch {
+            self.epoch.store(e, Ordering::SeqCst);
+        }
+        self.connectors
+            .set_version(Some((self.epoch(), self.generation())));
+    }
+
+    /// The `(epoch, generation)` a [`ConnectorRegistry::pinned`] copy of
+    /// this node's registry is tagged with when taken now.
+    pub fn version(&self) -> (u64, u64) {
+        (self.epoch(), self.generation())
+    }
+
+    /// Records an epoch a push or pull named: epochs grow with each
+    /// coordinator start, so the larger one wins (0 is ignored). From then
+    /// on a set from an older epoch is refused as stale.
+    pub fn note_coordinator_epoch(&self, epoch: u64) {
+        if epoch != 0 {
+            self.latest_epoch.fetch_max(epoch, Ordering::SeqCst);
+        }
+    }
+
+    /// Records the epoch a heartbeat reply named. Only the live coordinator
+    /// answers heartbeats, so its epoch is taken as is, even when smaller
+    /// (a coordinator host whose clock went back): a worker never refuses
+    /// the coordinator it is talking to.
+    pub fn heartbeat_epoch(&self, epoch: u64) {
+        if epoch != 0 {
+            self.latest_epoch.store(epoch, Ordering::SeqCst);
+        }
     }
 
     /// The default catalog's name (unqualified table names resolve in it).
@@ -263,13 +329,6 @@ impl LiveCatalogs {
         self.unauthenticated_flight.store(on, Ordering::SeqCst);
     }
 
-    /// The secrets the served set carries, as `catalog 'x': field` (the
-    /// effective specs: a hive spec with the global `[storage]` keys merged
-    /// in, Ruling R12).
-    pub fn served_secrets(&self) -> Vec<String> {
-        effective_secrets(&self.global_storage, &self.specs())
-    }
-
     /// Whether `spec` may be served: always with a `[cluster] secret`;
     /// without one only when its effective spec carries no secret (Flight
     /// `get_catalogs` would hand it to any peer). `Err` names the secret
@@ -286,16 +345,18 @@ impl LiveCatalogs {
         }
     }
 
-    /// The generation, the installed specs (as effective specs, Ruling
+    /// The epoch, generation, installed specs (as effective specs, Ruling
     /// R12) and this node's default catalog and schema, for a worker to
-    /// apply. The generation is read first: [`apply_set`](Self::apply_set)
-    /// advances it only after installing, so the specs are never older than
-    /// it says.
+    /// apply. The version and specs are read together outside any
+    /// [`commit`](Self::commit) (under the registry's swap lock), so a
+    /// served set is never tagged with another set's version: a worker
+    /// that installed it under that tag would pass the task pin check
+    /// with the wrong specs.
     pub fn snapshot(&self) -> arneb_rpc::CatalogSet {
-        let epoch = self.epoch();
-        let generation = self.generation();
-        let catalogs = self
-            .specs()
+        let (epoch, generation, specs) = self
+            .connectors
+            .consistent(|| (self.epoch(), self.generation(), self.specs()));
+        let catalogs = specs
             .iter()
             .filter_map(|spec| serde_json::to_value(self.effective_spec(spec)).ok())
             .collect();
@@ -310,11 +371,17 @@ impl LiveCatalogs {
 
     /// Applies a set from the coordinator (a push or a pull). Within the
     /// epoch held, only a newer generation applies, so a stale push loses;
-    /// a set from another epoch (a restarted coordinator) always applies
-    /// and replaces the whole set, even at a lower generation (Ruling R6).
+    /// a set from another epoch (a restarted coordinator) applies and
+    /// replaces the whole set, even at a lower generation (Ruling R6), but
+    /// only when it is the coordinator's current epoch: the set's epoch is
+    /// noted first ([`note_coordinator_epoch`](Self::note_coordinator_epoch)),
+    /// and one older than the latest known is refused, so neither a slow
+    /// build of a set fetched before a restart nor a delayed push from the
+    /// old coordinator overwrites a newer set.
     /// A spec that does not decode is skipped with a WARN and listed as
     /// failed.
     pub async fn apply_remote(&self, set: arneb_rpc::CatalogSet) -> ApplyReport {
+        self.note_coordinator_epoch(set.epoch);
         let mut specs = Vec::with_capacity(set.catalogs.len());
         let mut undecodable = Vec::new();
         for value in set.catalogs {
@@ -422,13 +489,65 @@ impl LiveCatalogs {
     /// Installs a built catalog under `spec.name`, replacing one of the same
     /// name. The connector goes in first, so a statement planned against
     /// the new provider always finds it.
-    pub fn install(&self, spec: CatalogConfig, built: BuiltCatalog) {
-        let name = spec.name.clone();
+    ///
+    /// Tests only: it leaves the registry's version tag as it was, so a
+    /// real change uses [`commit`](Self::commit).
+    #[cfg(test)]
+    pub(crate) fn install(&self, spec: CatalogConfig, built: BuiltCatalog) {
         // One swap: a statement pins both halves or neither.
+        self.connectors.swap(|| self.install_unswapped(spec, built));
+    }
+
+    /// Removes the installed catalog `name`. False when no such catalog is
+    /// installed here (the startup-only catalogs are never touched). Tests
+    /// only, like [`install`](Self::install).
+    #[cfg(test)]
+    pub(crate) fn remove(&self, name: &str) -> bool {
+        self.connectors.swap(|| self.remove_unswapped(name))
+    }
+
+    /// Installs `installs`, removes `removes` and moves to `generation`, all
+    /// in one [`ConnectorRegistry::swap`]: a statement pins either the whole
+    /// previous set and its tag or the whole new one. What a coordinator's
+    /// runtime change and re-seed commit with.
+    pub fn commit(
+        &self,
+        generation: u64,
+        installs: Vec<(CatalogConfig, BuiltCatalog)>,
+        removes: &[String],
+    ) {
+        self.commit_at(None, generation, installs, removes, None);
+    }
+
+    /// [`commit`](Self::commit) that also moves to `epoch` (when given) and,
+    /// when `failed` is given, records it as the catalogs of the set that
+    /// failed to build.
+    fn commit_at(
+        &self,
+        epoch: Option<u64>,
+        generation: u64,
+        installs: Vec<(CatalogConfig, BuiltCatalog)>,
+        removes: &[String],
+        failed: Option<std::collections::BTreeSet<String>>,
+    ) {
         self.connectors.swap(|| {
-            self.connectors.register(name.clone(), built.connector);
-            self.manager.register_catalog(name.clone(), built.provider);
+            for (spec, built) in installs {
+                self.install_unswapped(spec, built);
+            }
+            for name in removes {
+                self.remove_unswapped(name);
+            }
+            if let Some(failed) = failed {
+                *self.failed.write().unwrap_or_else(|p| p.into_inner()) = failed;
+            }
+            self.store_version(epoch, generation);
         });
+    }
+
+    fn install_unswapped(&self, spec: CatalogConfig, built: BuiltCatalog) {
+        let name = spec.name.clone();
+        self.connectors.register(name.clone(), built.connector);
+        self.manager.register_catalog(name.clone(), built.provider);
         self.failed
             .write()
             .unwrap_or_else(|p| p.into_inner())
@@ -436,16 +555,12 @@ impl LiveCatalogs {
         self.write_specs().insert(name, spec);
     }
 
-    /// Removes the installed catalog `name`. False when no such catalog is
-    /// installed here (the startup-only catalogs are never touched).
-    pub fn remove(&self, name: &str) -> bool {
+    fn remove_unswapped(&self, name: &str) -> bool {
         if self.write_specs().remove(name).is_none() {
             return false;
         }
-        self.connectors.swap(|| {
-            self.manager.deregister_catalog(name);
-            self.connectors.deregister(name);
-        });
+        self.manager.deregister_catalog(name);
+        self.connectors.deregister(name);
         true
     }
 
@@ -453,16 +568,20 @@ impl LiveCatalogs {
     /// generation is not newer than the one held (then nothing changes).
     /// Every new or changed catalog is built first; then they are swapped
     /// in and the catalogs not in the set are removed. A catalog that fails
-    /// to build is skipped with a WARN and listed in the report (a changed
-    /// one keeps its previous version); the rest still apply and the
-    /// generation still advances.
+    /// to build is skipped with a WARN and listed in the report; a changed
+    /// one is removed rather than left at its previous version, so nothing
+    /// tagged with the new generation serves the old spec (a task finds it
+    /// missing, retries the build once and otherwise fails). The rest
+    /// still apply and the generation still advances.
     pub async fn apply_set(&self, generation: u64, specs: Vec<CatalogConfig>) -> ApplyReport {
         self.apply(None, generation, specs).await
     }
 
     /// [`apply_set`](Self::apply_set), except that a set from `epoch` other
-    /// than the one held applies whatever its generation, and then records
-    /// `epoch`. `None` checks the generation only and keeps the epoch.
+    /// than the one held applies whatever its generation (when `epoch` is
+    /// the coordinator's current one, see [`applies`](Self::applies)), and
+    /// then records `epoch`. `None` checks the generation only and keeps
+    /// the epoch.
     ///
     /// The new and changed catalogs are built in parallel without any
     /// lock; `applying` is held only to re-check the generation and swap.
@@ -470,7 +589,36 @@ impl LiveCatalogs {
     /// nothing. When another apply swapped in between, a catalog this set
     /// skipped as unchanged may now differ: it is built (again outside the
     /// lock) before the swap.
+    ///
+    /// Concurrent applies of the same `(epoch, generation)` (a push and a
+    /// heartbeat-triggered pull of one change) share one run and its
+    /// report, so each changed catalog is built once.
     async fn apply(
+        &self,
+        epoch: Option<u64>,
+        generation: u64,
+        specs: Vec<CatalogConfig>,
+    ) -> ApplyReport {
+        let key = (epoch, generation);
+        let flight = self
+            .apply_flights
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(key)
+            .or_default()
+            .clone();
+        let report = flight
+            .get_or_init(|| self.apply_once(epoch, generation, specs))
+            .await
+            .clone();
+        let mut flights = self.apply_flights.lock().unwrap_or_else(|p| p.into_inner());
+        if flights.get(&key).is_some_and(|f| Arc::ptr_eq(f, &flight)) {
+            flights.remove(&key);
+        }
+        report
+    }
+
+    async fn apply_once(
         &self,
         epoch: Option<u64>,
         generation: u64,
@@ -534,27 +682,33 @@ impl LiveCatalogs {
                 installed = now;
                 continue;
             }
-            for (_, (spec, b)) in std::mem::take(&mut built) {
+            let installs: Vec<_> = std::mem::take(&mut built).into_values().collect();
+            for (spec, _) in &installs {
                 tracing::info!(
                     catalog = %spec.name,
                     catalog_type = %spec.catalog_type,
                     generation,
                     "registered catalog"
                 );
-                self.install(spec, b);
             }
-            for name in now.keys().filter(|n| !wanted.contains(*n)) {
-                self.remove(name);
+            // A changed catalog whose build failed goes too: the registry is
+            // about to be tagged with this generation, which must never pair
+            // with the previous spec.
+            let removes: Vec<String> = now
+                .keys()
+                .filter(|n| !wanted.contains(*n) || failed.contains_key(*n))
+                .cloned()
+                .collect();
+            for name in &removes {
                 tracing::info!(catalog = %name, generation, "removed catalog");
             }
-            *self.failed.write().unwrap_or_else(|p| p.into_inner()) =
-                failed.keys().cloned().collect();
-            // Generation before epoch: a reader seeing the new epoch also sees
-            // the generation that goes with it.
-            self.set_generation(generation);
-            if let Some(e) = epoch {
-                self.set_epoch(e);
-            }
+            self.commit_at(
+                epoch,
+                generation,
+                installs,
+                &removes,
+                Some(failed.keys().cloned().collect()),
+            );
             return ApplyReport {
                 applied: true,
                 failed: failed.into_iter().collect(),
@@ -563,9 +717,15 @@ impl LiveCatalogs {
     }
 
     /// Whether a set at `(epoch, generation)` applies now: a newer
-    /// generation within the epoch held, any set from another epoch, or the
-    /// set already held while some of it failed to build (Ruling R8).
+    /// generation within the epoch held, a set from another epoch when that
+    /// is the coordinator's current one (the largest a push or pull named,
+    /// or the last heartbeat's; any before one is known), or the set
+    /// already held while some of it failed to build (Ruling R8).
     fn applies(&self, epoch: Option<u64>, generation: u64) -> bool {
+        let latest = self.latest_epoch.load(Ordering::SeqCst);
+        if epoch.is_some_and(|e| latest != 0 && e != latest) {
+            return false;
+        }
         let same_epoch = epoch.is_none_or(|e| e == self.epoch());
         let retry = same_epoch && generation == self.generation() && self.has_failed_builds();
         !same_epoch || generation > self.generation() || retry
@@ -708,6 +868,9 @@ impl CatalogPuller {
             return false;
         };
         let live = &self.inner.live;
+        if let Some(epoch) = reply.catalog_epoch {
+            live.heartbeat_epoch(epoch);
+        }
         let (applied, applied_epoch) = (live.generation(), live.epoch());
         let epoch_differs = reply.catalog_epoch.is_some_and(|e| e != applied_epoch);
         if generation == applied && !epoch_differs {
@@ -845,7 +1008,8 @@ pub fn validate_spec_fields(spec: &CatalogConfig) -> Result<(), String> {
 }
 
 /// The spec as JSON with every secret replaced by `"<redacted>"`: the
-/// `password`, the password inside `connection_url`, and the storage
+/// `password`, the password inside `connection_url` (all of it after the
+/// scheme when the URL fails validation), and the storage
 /// `secret_access_key`, `service_account_path` and Azure `access_key`.
 /// Every API response, MCP result and audit entry uses this form.
 pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
@@ -858,7 +1022,21 @@ pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
     if spec.password.is_some() {
         spec.password = Some(RedactedString(REDACTED.to_owned()));
     }
-    if let Some(url) = &mut spec.connection_url {
+    if let Some(url) = spec.connection_url.as_mut().filter(|u| {
+        arneb_postgresql::PostgresConfig::new(u.0.clone())
+            .validate_url()
+            .is_err()
+    }) {
+        // Where the driver ends the password of a URL that validation
+        // refuses (it may be stored: config-file catalogs, older states)
+        // is no guide to what is secret: hide everything after the scheme,
+        // or the whole value when it has none (a libpq keyword string
+        // `host=db password=x`, a mistyped `postgresql:/db?password=x`).
+        match url.0.find("://").map(|i| i + 3) {
+            Some(after_scheme) => url.0.replace_range(after_scheme.., REDACTED),
+            None => url.0 = REDACTED.to_owned(),
+        }
+    } else if let Some(url) = &mut spec.connection_url {
         let mut ranges: Vec<_> = url_query_passwords(&url.0)
             .into_iter()
             .map(|(_, value)| value)
@@ -978,11 +1156,16 @@ pub fn redacted_secrets(spec: &CatalogConfig) -> Vec<&'static str> {
         found.push("password");
     }
     if let Some(url) = &spec.connection_url {
+        let whole = url.0 == REDACTED
+            || url
+                .0
+                .split_once("://")
+                .is_some_and(|(_, rest)| rest == REDACTED);
         let userinfo = url_password_range(&url.0).is_some_and(|r| &url.0[r] == REDACTED);
         let query = url_query_passwords(&url.0)
             .into_iter()
             .any(|(_, value)| &url.0[value] == REDACTED);
-        if userinfo || query {
+        if whole || userinfo || query {
             found.push("connection_url password");
         }
     }
@@ -1149,22 +1332,7 @@ fn url_query_passwords(url: &str) -> Vec<(std::ops::Range<usize>, std::ops::Rang
         return Vec::new();
     };
     let host = at.map_or(start, |at| at + 1);
-    let Some(q) = url[host..].find('?').map(|i| host + i + 1) else {
-        return Vec::new();
-    };
-    let end = url.len();
-    let mut out = Vec::new();
-    let mut start = q;
-    for param in url[q..end].split('&') {
-        if let Some((key, value)) = param.split_once('=') {
-            if is_password_key(key) {
-                let value_start = start + param.len() - value.len();
-                out.push((start..start + param.len(), value_start..start + param.len()));
-            }
-        }
-        start += param.len() + 1;
-    }
-    out
+    query_passwords_from(url, host)
 }
 
 /// The value ranges of every `password` query parameter (key
@@ -1175,7 +1343,19 @@ fn url_loose_query_passwords(url: &str) -> Vec<std::ops::Range<usize>> {
     let Some(scheme_end) = url.find("://") else {
         return Vec::new();
     };
-    let Some(q) = url[scheme_end..].find('?').map(|i| scheme_end + i + 1) else {
+    query_passwords_from(url, scheme_end)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect()
+}
+
+/// `(parameter, value)` ranges of the `password` parameters of the query
+/// that starts at the first `?` at or after byte `from`.
+fn query_passwords_from(
+    url: &str,
+    from: usize,
+) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let Some(q) = url[from..].find('?').map(|i| from + i + 1) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -1184,7 +1364,7 @@ fn url_loose_query_passwords(url: &str) -> Vec<std::ops::Range<usize>> {
         if let Some((key, value)) = param.split_once('=') {
             if is_password_key(key) {
                 let value_start = start + param.len() - value.len();
-                out.push(value_start..start + param.len());
+                out.push((start..start + param.len(), value_start..start + param.len()));
             }
         }
         start += param.len() + 1;
@@ -1375,6 +1555,8 @@ mod tests {
         let report = live.apply_remote(set(22, 2, vec![])).await;
         assert!(report.applied);
         assert_eq!((live.epoch(), live.generation()), (22, 2));
+        // The old coordinator's epoch is now older: refused (M1).
+        assert!(!live.apply_remote(set(11, 9, vec![])).await.applied);
         assert!(live.specs().is_empty());
         assert!(connectors.get("old").is_none());
         // A no-store coordinator restarted with a changed config: new epoch,
@@ -1596,15 +1778,21 @@ mod tests {
     fn percent_encoded_password_key_is_a_secret() {
         let stored = spec(serde_json::json!({
             "name": "p", "type": "postgresql",
-            "connection_url": "postgresql://bob@db/sales?sslmode=disable&pass%77ord=enc-secret-8&PASS%57ORD=x"
+            "connection_url": "postgresql://bob@db/sales?sslmode=disable&pass%77ord=enc-secret-8"
         }));
         let redacted = redacted_spec(&stored);
         assert!(!redacted.to_string().contains("enc-secret-8"));
         assert_eq!(
             redacted["connection_url"],
-            "postgresql://bob@db/sales?sslmode=disable&pass%77ord=<redacted>&PASS%57ORD=x",
-            "keys are case-sensitive, as in tokio-postgres"
+            "postgresql://bob@db/sales?sslmode=disable&pass%77ord=<redacted>"
         );
+        // Keys are case-sensitive, as in tokio-postgres, which refuses the
+        // unknown `PASSWORD`: a URL it refuses is hidden whole.
+        let upper = redacted_spec(&spec(serde_json::json!({
+            "name": "p", "type": "postgresql",
+            "connection_url": "postgresql://bob@db/sales?pass%77ord=enc-secret-8&PASS%57ORD=x"
+        })));
+        assert_eq!(upper["connection_url"], "postgresql://<redacted>");
         let mut round_trip: CatalogConfig = serde_json::from_value(redacted).unwrap();
         assert_eq!(
             redacted_secrets(&round_trip),
@@ -1624,27 +1812,29 @@ mod tests {
 
     /// tokio-postgres takes the credentials up to the first `@`, so an
     /// unencoded `/`, `?` or `#` in the password is still the password
-    /// (and a `#` in a query value is part of it). The redaction finds the
-    /// same password the driver connects with, and round-trips it.
+    /// (and a `#` in a query value is part of it). Such a userinfo puts
+    /// the `@` past the authority, so the whole URL after the scheme is
+    /// hidden (validation refuses it); a `#` in a query value is redacted
+    /// in place and round-trips.
     #[test]
     fn password_with_url_delimiters_is_redacted() {
         use std::str::FromStr;
         for (url, redacted) in [
             (
                 "postgresql://app:pa/ss@db:5432/x",
-                "postgresql://app:<redacted>@db:5432/x",
+                "postgresql://<redacted>",
             ),
             (
                 "postgresql://app:pa?ss@db:5432/x",
-                "postgresql://app:<redacted>@db:5432/x",
+                "postgresql://<redacted>",
             ),
             (
                 "postgresql://app:pa#ss@db:5432/x",
-                "postgresql://app:<redacted>@db:5432/x",
+                "postgresql://<redacted>",
             ),
             (
                 "postgres://app:a/b?c#d:e@db/x?sslmode=disable",
-                "postgres://app:<redacted>@db/x?sslmode=disable",
+                "postgres://<redacted>",
             ),
             (
                 "postgresql://app@db/x?password=pa#ss&sslmode=disable",
@@ -1652,7 +1842,7 @@ mod tests {
             ),
             (
                 "postgresql://app:pa?password=no@db/x?password=q/s#t",
-                "postgresql://app:<redacted>@db/x?password=<redacted>",
+                "postgresql://<redacted>",
             ),
         ] {
             let driver = tokio_postgres::Config::from_str(url).unwrap();
@@ -1668,6 +1858,10 @@ mod tests {
             );
             let mut back: CatalogConfig = serde_json::from_value(shown).unwrap();
             assert_eq!(redacted_secrets(&back), vec!["connection_url password"]);
+            if redacted.ends_with("://<redacted>") {
+                assert!(validate_spec(&stored).is_err(), "{url}");
+                continue;
+            }
             assert!(same_destination(&back, &stored));
             fill_redacted(&mut back, &stored);
             assert_eq!(back.connection_url.as_ref().unwrap().0, url);
@@ -1719,11 +1913,9 @@ mod tests {
         }));
         assert_eq!(live.exposure_check(&gcs_only), Ok(()));
 
-        assert!(live.served_secrets().is_empty());
-        live.install(hive("lake"), fake_built());
-        live.install(pg_pw, fake_built());
+        let (lake, pg) = (hive("lake"), pg_pw);
         assert_eq!(
-            live.served_secrets(),
+            effective_secrets(&live.global_storage, &[lake, pg]),
             vec![
                 "catalog 'lake': storage.s3.secret_access_key",
                 "catalog 'p': password"
@@ -1737,19 +1929,103 @@ mod tests {
     /// a secret, and validation refuses the URL without echoing it.
     #[test]
     fn query_password_after_an_unencoded_at_is_redacted_and_refused() {
-        for url in [
-            "postgresql://db.internal:5432/sales?user=admin@srv&password=S3cret",
-            "postgresql://db/sales?user=admin@srv&password=S3cret",
+        for (url, parts) in [
+            (
+                "postgresql://db.internal:5432/sales?user=admin@srv&password=S3cret",
+                &["S3cret"][..],
+            ),
+            (
+                "postgresql://db/sales?user=admin@srv&password=S3cret",
+                &["S3cret"],
+            ),
+            // A port or an IPv6 host: the driver would take `9zK` as the
+            // host (round 3).
+            (
+                "postgresql://db.internal:5432/sales?user=app&password=Xy@9zK",
+                &["Xy", "9zK"],
+            ),
+            ("postgresql://[::1]:5432/db?password=Xy@9zK", &["Xy", "9zK"]),
+            // An unencoded `@` inside the authority: the driver's host holds
+            // the password's tail (round 3, I3).
+            ("postgresql://u:p@Qz7@db/x", &["Qz7"]),
+            ("postgresql://u:p@Qz7,h2@db/x", &["Qz7"]),
         ] {
             let s = spec(serde_json::json!({
                 "name": "p", "type": "postgresql", "connection_url": url
             }));
-            let shown = redacted_spec(&s).to_string();
-            assert!(!shown.contains("S3cret"), "{shown}");
+            let shown = redacted_spec(&s);
+            assert_eq!(shown["connection_url"], "postgresql://<redacted>", "{url}");
             assert_eq!(secret_fields(&s), vec!["connection_url password"]);
             let e = validate_spec(&s).unwrap_err();
-            assert!(e.contains("%40") && !e.contains("S3cret"), "{e}");
+            assert!(e.contains("%40"), "{e}");
+            // A GET → PUT round trip of the redacted form is refused.
+            let back: CatalogConfig = serde_json::from_value(shown.clone()).unwrap();
+            assert_eq!(redacted_secrets(&back), vec!["connection_url password"]);
+            let pg = s.postgres_config().unwrap();
+            assert_eq!(pg.display_target(), "<invalid connection_url>");
+            // Nor does building it log or return any part of the password.
+            let live = LiveCatalogs::new(
+                Arc::new(CatalogManager::new("memory", "default")),
+                Arc::new(ConnectorRegistry::new()),
+                StorageConfig::default(),
+            );
+            let (err, logs) = capture_logs(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(live.build(&s))
+                    .unwrap_err()
+            });
+            for part in parts {
+                for shown in [
+                    &e,
+                    &shown.to_string(),
+                    &format!("{pg:?}"),
+                    &format!("{s:?}"),
+                    &err.to_string(),
+                    &logs,
+                ] {
+                    assert!(!shown.contains(part), "{url}: {part} in {shown}");
+                }
+            }
         }
+    }
+
+    /// Runs `f` and returns what it logged.
+    fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // A global subscriber interested in everything, so a callsite is
+        // never cached as disabled by a test on another thread.
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(std::io::sink)
+                    .with_max_level(tracing::Level::TRACE)
+                    .finish(),
+            );
+        });
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let r = tracing::subscriber::with_default(sub, f);
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (r, out)
     }
 
     /// M6: a URL that sets `password=` twice is refused, so a GET → PUT
@@ -1928,13 +2204,177 @@ mod tests {
         assert_eq!(names, vec!["fast"]);
     }
 
+    /// Round 3: a pull fetched epoch 1's set just before the coordinator
+    /// restarted, and its slow build finishes after the new coordinator's
+    /// (epoch 2) push installed: the stale set changes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_set_from_an_older_epoch_never_overwrites_a_newer_one() {
+        let live = slow_live(&[("slow", 10)]);
+        live.note_coordinator_epoch(1);
+        assert!(live.apply_remote(set(1, 4, vec![])).await.applied);
+        let stale = tokio::spawn({
+            let live = live.clone();
+            async move {
+                let slow = serde_json::to_value(hive("slow")).unwrap();
+                live.apply_remote(set(1, 5, vec![slow])).await
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // The restarted coordinator pushes.
+        let fast = serde_json::to_value(hive("fast")).unwrap();
+        assert!(live.apply_remote(set(2, 1, vec![fast])).await.applied);
+        assert_eq!(stale.await.unwrap(), ApplyReport::default());
+        assert_eq!((live.epoch(), live.generation()), (2, 1));
+        let names: Vec<String> = live.specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["fast"]);
+        // And a late set from the old epoch is refused outright.
+        assert!(!live.apply_remote(set(1, 9, vec![])).await.applied);
+    }
+
+    /// Round 3 (M1): a push from the old coordinator delivered after the
+    /// new one's heartbeat or push is refused and leaves the newer epoch in
+    /// place; a heartbeat names the live coordinator's epoch as is, so a
+    /// coordinator whose clock went back is still followed.
+    #[tokio::test]
+    async fn a_delayed_push_from_an_older_epoch_is_refused() {
+        let (live, _, _) = live();
+        assert!(live.apply_remote(set(200, 3, vec![])).await.applied);
+        live.heartbeat_epoch(300);
+        let fast = serde_json::to_value(hive("fast")).unwrap();
+        assert!(live.apply_remote(set(300, 1, vec![fast])).await.applied);
+        let old = serde_json::to_value(hive("old")).unwrap();
+        assert!(!live.apply_remote(set(200, 4, vec![old])).await.applied);
+        assert_eq!((live.epoch(), live.generation()), (300, 1));
+        assert_eq!(live.specs()[0].name, "fast");
+        // A later pull from the same old epoch is refused too.
+        assert!(!live.apply_remote(set(200, 5, vec![])).await.applied);
+        // The live coordinator restarted with a clock that went back.
+        live.heartbeat_epoch(250);
+        assert!(live.apply_remote(set(250, 1, vec![])).await.applied);
+        assert_eq!(live.epoch(), 250);
+    }
+
+    #[test]
+    fn epochs_grow_with_the_start_time() {
+        assert!(crate::epoch_from(1_000, u16::MAX) < crate::epoch_from(1_001, 0));
+        assert_eq!(crate::epoch_from(0, 0), 1);
+    }
+
+    /// Round 3: a push and a pull of the same `(epoch, generation)` that
+    /// overlap build each changed catalog once and report the same result.
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_applies_of_one_set_build_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let builds = Arc::new(AtomicUsize::new(0));
+        let n = builds.clone();
+        let live = LiveCatalogs::with_test_builder(
+            Arc::new(CatalogManager::new("memory", "default")),
+            Arc::new(ConnectorRegistry::new()),
+            Box::new(move |_| {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(fake_built())
+            }),
+        );
+        live.test_build_delay
+            .lock()
+            .unwrap()
+            .insert("a".into(), Duration::from_secs(5));
+        let changed = || set(7, 2, vec![serde_json::to_value(hive("a")).unwrap()]);
+        let (push, pull) = tokio::join!(live.apply_remote(changed()), live.apply_remote(changed()));
+        assert!(push.applied && pull.applied);
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "one build of a");
+        assert_eq!(live.generation(), 2);
+        // A later apply of the same set is stale, as before.
+        assert!(!live.apply_remote(changed()).await.applied);
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    /// Round 3 (R1): a stored URL that validation refuses and that has no
+    /// `://` (a libpq keyword string, a one-slash typo) is hidden whole,
+    /// and the redacted form is a placeholder a PUT cannot store.
+    #[test]
+    fn a_refused_url_without_a_scheme_separator_is_hidden_whole() {
+        for url in [
+            "host=db.internal user=app password=hunter2 dbname=sales",
+            "postgresql:/db?password=hunter2",
+            "hunter2",
+        ] {
+            let s = spec(serde_json::json!({
+                "name": "p", "type": "postgresql", "connection_url": url
+            }));
+            let shown = redacted_spec(&s);
+            assert_eq!(shown["connection_url"], REDACTED, "{url}");
+            assert!(!shown.to_string().contains("hunter2"), "{shown}");
+            assert!(!format!("{s:?}").contains("hunter2"));
+            let e = validate_spec(&s).unwrap_err();
+            assert!(!e.contains("hunter2"), "{e}");
+            let back: CatalogConfig = serde_json::from_value(shown).unwrap();
+            assert_eq!(redacted_secrets(&back), vec!["connection_url password"]);
+        }
+    }
+
+    /// Round 3 (I2): a snapshot taken while commits run never pairs one
+    /// generation's specs with another's version.
+    #[test]
+    fn a_snapshot_is_never_torn_by_a_commit() {
+        let (live, _, _) = live();
+        live.set_epoch(3);
+        let uri = |g: u64| format!("h{g}:9083");
+        let writer = std::thread::spawn({
+            let live = live.clone();
+            move || {
+                for g in 1..=3000u64 {
+                    let mut spec = hive("a");
+                    spec.metastore_uri = Some(uri(g));
+                    live.commit(g, vec![(spec, fake_built())], &[]);
+                }
+            }
+        });
+        let mut checked = 0;
+        while !writer.is_finished() {
+            let set = live.snapshot();
+            if let Some(spec) = set.catalogs.first() {
+                assert_eq!(
+                    spec["metastore_uri"],
+                    uri(set.generation),
+                    "specs of another generation"
+                );
+                assert_eq!(set.epoch, 3);
+                checked += 1;
+            }
+        }
+        writer.join().unwrap();
+        assert!(checked > 0);
+    }
+
+    /// Every change moves the registry's `(epoch, generation)` tag in the
+    /// same swap as the connectors, so a pinned copy names the set it holds.
+    #[tokio::test]
+    async fn the_registry_tag_follows_every_change() {
+        let (live, _, connectors) = live();
+        live.set_epoch(5);
+        assert_eq!(connectors.version(), Some((5, 0)));
+        live.commit(3, vec![(hive("a"), fake_built())], &[]);
+        assert_eq!(connectors.version(), Some((5, 3)));
+        let (pinned, _) = connectors.pinned(|| ());
+        live.commit(4, Vec::new(), &["a".to_owned()]);
+        assert_eq!(connectors.version(), Some((5, 4)));
+        assert!(connectors.get("a").is_none());
+        assert_eq!(pinned.version(), Some((5, 3)));
+        assert!(pinned.get("a").is_some());
+        assert!(live.apply_set(6, vec![hive("b")]).await.applied);
+        assert_eq!(connectors.version(), Some((5, 6)));
+        assert_eq!(live.version(), (5, 6));
+    }
+
     /// Two applies of sets that differ in one catalog: the one that swaps
     /// second rebuilds what the first changed under it.
     #[tokio::test(start_paused = true)]
     async fn an_apply_rebuilds_what_another_swapped_in_meanwhile() {
         let live = slow_live(&[("b", 30)]);
         live.install(hive("a"), fake_built());
-        // Epoch 7 later than the held 0, so both apply regardless of order.
+        live.note_coordinator_epoch(7);
+        // Generations 2 and 1 of epoch 7: both newer than the held 0.
         let mut changed_a = hive("a");
         changed_a.metastore_uri = Some("10.0.0.2:9083".into());
         let slow = tokio::spawn({
@@ -1954,16 +2394,16 @@ mod tests {
             }
         });
         tokio::time::sleep(Duration::from_secs(1)).await;
-        // An older generation of another epoch swaps in first and changes a.
+        // The older generation swaps in first and changes a.
         live.apply_remote(arneb_rpc::CatalogSet {
-            epoch: 6,
+            epoch: 7,
             generation: 1,
             catalogs: vec![serde_json::to_value(&changed_a).unwrap()],
             default_catalog: None,
             default_schema: None,
         })
         .await;
-        assert_eq!(live.epoch(), 6);
+        assert_eq!((live.epoch(), live.generation()), (7, 1));
         let report = slow.await.unwrap();
         assert!(report.applied);
         assert_eq!((live.epoch(), live.generation()), (7, 2));

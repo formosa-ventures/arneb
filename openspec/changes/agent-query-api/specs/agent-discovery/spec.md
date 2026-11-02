@@ -23,11 +23,15 @@ The coordinator (or standalone server) SHALL serve `GET /api/v2/catalogs`, `GET 
 - **THEN** the first 10 columns are returned and `truncated` is true, and `limit` above `max_rows` is refused with `invalid_argument`
 
 ### Requirement: Table sample
-`GET .../tables/{t}/sample?rows=n` SHALL run `SELECT * FROM "c"."s"."t" LIMIT n` as the caller's statement, waiting up to `max_wait_ms`, and return its statement status. `rows` SHALL default to 10; a value above 100 SHALL be refused with `invalid_argument`. The row count SHALL then be lowered to the server's `max_rows` when that is smaller, and the sample SHALL NOT fail because of a limit the caller did not send.
+`GET .../tables/{t}/sample?rows=n` SHALL run `SELECT * FROM "c"."s"."t" LIMIT n` as the caller's statement, waiting up to `max_wait_ms`, and return its statement status. `rows` SHALL default to 10; a value above 100 SHALL be refused with `invalid_argument`. The row count SHALL then be lowered to the server's `max_rows` when that is smaller, and the sample SHALL NOT fail because of a limit the caller did not send. Before submitting, the catalog, schema and table names SHALL be checked against the visible name listings, loading no table metadata (so the query resolves the table once). A level whose listing has a real name (besides the virtual `system` and `information_schema`) and no visible name equal to the requested one ignoring case is a sure miss, and SHALL answer the same not-found error as describe without registering, admitting or running a statement. In every other case (an exact or case-insensitive match, which the query or the connector may resolve, or a listing with no real name, which may be a failed one) the query SHALL run with the names as given. A not-found it raises SHALL be answered as describe would, at the level that is a sure miss for the names as the query resolved them (exact, else lowercase, else a unique case-insensitive match); when no level is a sure miss, the query's own error SHALL stay.
 
 #### Scenario: Sample nation
 - **WHEN** alice samples `nation` with `rows=5`
 - **THEN** the statement finishes and returns 5 rows
+
+#### Scenario: Sample a missing table
+- **WHEN** alice samples `natoin`
+- **THEN** the response is `table_not_found` with `nation` among the candidates, and no statement is registered or queued
 
 ### Requirement: Explain with estimates
 `POST /api/v2/explain` with `{"sql","catalog","schema"}` SHALL plan the statement without running it and return `{"plan","plan_truncated","scans":[{"table","row_count","size_bytes"}],"estimated_scan_bytes"}`. The `plan` text SHALL be cut at `[agent_api] default_page_bytes` on a character boundary, with `plan_truncated` true when cut. Explain SHALL NOT be admitted or tracked and SHALL NOT run `ANALYZE`.

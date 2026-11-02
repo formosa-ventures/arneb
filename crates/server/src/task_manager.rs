@@ -293,11 +293,16 @@ impl TaskManager {
         self
     }
 
-    /// Register a data source for every scan in a task's plan.
+    /// Register a data source for every scan in a task's plan. With a
+    /// puller and a `planned` catalog version (the coordinator's set the
+    /// query was planned against), the scans resolve against exactly that
+    /// set: this worker pulls once when its own differs, and the task fails
+    /// when it still does.
     async fn register_data_sources(
         &self,
         plan: &LogicalPlan,
         ctx: &mut arneb_execution::ExecutionContext,
+        planned: Option<(u64, u64)>,
     ) -> Result<(), String> {
         let mut sources = TaskSources {
             catalog_manager: &self.catalog_manager,
@@ -305,6 +310,9 @@ impl TaskManager {
             puller: self.catalog_puller.as_ref(),
             pulled: false,
             resolved: HashMap::new(),
+            planned,
+            pinned: None,
+            checked: false,
         };
         sources.register(plan, ctx).await
     }
@@ -781,7 +789,8 @@ impl TaskManager {
             // never published in distributed mode, leaving every DF dormant.
             // Gated ARNEB_DISTRIBUTED_DF (default off) until validated.
             .with_dynamic_filtering_enabled(distributed_df_enabled());
-        self.register_data_sources(&plan, &mut exec_ctx).await?;
+        self.register_data_sources(&plan, &mut exec_ctx, descriptor.catalog_version)
+            .await?;
 
         // W2 (2026-05-20): if the coord told us about upstream stages, hand
         // them to the physical planner so it can wire `ExchangeNode`
@@ -1224,9 +1233,64 @@ struct TaskSources<'a> {
     /// The connector each catalog resolved to, so every scan of one task
     /// uses the same one even if the catalog changes mid-task.
     resolved: HashMap<String, Arc<dyn arneb_connectors::ConnectorFactory>>,
+    /// The `(epoch, generation)` the query was planned at, from the task.
+    planned: Option<(u64, u64)>,
+    /// A copy of the registry at the planned version, once checked; scans
+    /// resolve through it instead of the live registry.
+    pinned: Option<ConnectorRegistry>,
+    /// Whether the planned version was checked yet (on the first scan).
+    checked: bool,
 }
 
 impl TaskSources<'_> {
+    /// On the first scan: when the task names the catalog set it was
+    /// planned at and this worker holds another, pull once (unless this
+    /// worker is already past it within the same epoch, where no pull
+    /// helps), and fail when the set still differs. From then on every scan
+    /// resolves through a copy of the registry at that set.
+    async fn check_version(&mut self) -> Result<(), String> {
+        if std::mem::replace(&mut self.checked, true) {
+            return Ok(());
+        }
+        let (Some(planned), Some((puller, worker_id))) = (self.planned, self.puller) else {
+            return Ok(());
+        };
+        let pin = |registry: &ConnectorRegistry| registry.pinned(|| ()).0;
+        let mut pinned = pin(self.connector_registry);
+        let held = pinned.version();
+        let ahead = held.is_some_and(|(e, g)| e == planned.0 && g > planned.1);
+        if held != Some(planned) && !ahead {
+            self.pulled = true;
+            tracing::info!(
+                target: "arneb::cluster",
+                held = ?held,
+                planned = ?planned,
+                "task was planned at another catalog set, pulling catalogs"
+            );
+            let registry = self.connector_registry;
+            if let Err(e) = puller
+                .pull_until(|| registry.version() == Some(planned))
+                .await
+            {
+                tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
+            }
+            pinned = pin(self.connector_registry);
+        }
+        match pinned.version() {
+            Some(v) if v == planned => {
+                self.pinned = Some(pinned);
+                Ok(())
+            }
+            held => Err(version_mismatch(worker_id, held, planned)),
+        }
+    }
+
+    /// The registry scans resolve through: the copy at the planned version
+    /// once checked, else the live one.
+    fn registry(&self) -> &ConnectorRegistry {
+        self.pinned.as_ref().unwrap_or(self.connector_registry)
+    }
+
     /// `table` as this worker resolves it. With a puller (a worker), a
     /// missing catalog or schema is filled from the coordinator's defaults
     /// (Ruling R12), pulling the set once first when none was ever applied;
@@ -1279,7 +1343,7 @@ impl TaskSources<'_> {
         &mut self,
         catalog: &str,
     ) -> Result<Option<Arc<dyn arneb_connectors::ConnectorFactory>>, String> {
-        if let Some(factory) = self.connector_registry.get(catalog) {
+        if let Some(factory) = self.registry().get(catalog) {
             return Ok(Some(factory));
         }
         let Some((puller, worker_id)) = self.puller else {
@@ -1298,9 +1362,32 @@ impl TaskSources<'_> {
             if let Err(e) = puller.pull_until(|| registry.get(catalog).is_some()).await {
                 tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
             }
-            if let Some(factory) = self.connector_registry.get(catalog) {
+            if let Some(planned) = self.planned.filter(|_| self.pinned.is_some()) {
+                // Only a rebuild of the planned set itself (Ruling R8) may
+                // serve the scan.
+                let pinned = registry.pinned(|| ()).0;
+                if pinned.version() != Some(planned) {
+                    return Err(version_mismatch(worker_id, pinned.version(), planned));
+                }
+                self.pinned = Some(pinned);
+            }
+            if let Some(factory) = self.registry().get(catalog) {
                 return Ok(Some(factory));
             }
+        }
+        // The failed set is the live one: name it only while the live set is
+        // still the one this task was planned at, else the generation in
+        // the message could be another set's.
+        let live = puller.live();
+        if let Some(planned) = self
+            .planned
+            .filter(|p| live.version() == *p && live.failed_to_build(catalog))
+        {
+            return Err(format!(
+                "catalog '{catalog}' failed to build on worker {worker_id} at generation {}; \
+                 retry the query",
+                planned.1
+            ));
         }
         Err(format!(
             "catalog '{catalog}' is not registered on worker {worker_id}"
@@ -1323,6 +1410,7 @@ impl TaskSources<'_> {
                 ..
             } => {
                 let key = table.to_string();
+                self.check_version().await?;
                 let scan_ref = self.qualify(table).await;
                 let connector_name = scan_ref
                     .catalog
@@ -1369,6 +1457,26 @@ impl TaskSources<'_> {
             _ => Ok(()),
         }
     }
+}
+
+/// The task failure for a worker whose catalog set is not the one the query
+/// was planned at (runtime-config): the query fails instead of scanning
+/// another version of a catalog.
+fn version_mismatch(worker_id: &str, held: Option<(u64, u64)>, planned: (u64, u64)) -> String {
+    let (held_epoch, held_generation) = held.unwrap_or((0, 0));
+    let epochs = if held_epoch == planned.0 {
+        String::new()
+    } else {
+        format!(
+            " (coordinator epoch {held_epoch} here, {} at planning)",
+            planned.0
+        )
+    };
+    format!(
+        "catalog set on worker {worker_id} is at generation {held_generation}, the query was \
+         planned at {}{epochs}; retry the query",
+        planned.1
+    )
 }
 
 /// exec-memory-accounting D2: drain a finished exchange spill file back through
@@ -1502,12 +1610,12 @@ mod tests {
         });
         let tm = manager(puller);
         let mut ctx = arneb_execution::ExecutionContext::new();
-        tm.register_data_sources(&cat1_scan(), &mut ctx)
+        tm.register_data_sources(&cat1_scan(), &mut ctx, None)
             .await
             .unwrap();
         assert_eq!(pulls.load(Ordering::SeqCst), 1);
         // Now registered: no further pull.
-        tm.register_data_sources(&cat1_scan(), &mut ctx)
+        tm.register_data_sources(&cat1_scan(), &mut ctx, None)
             .await
             .unwrap();
         assert_eq!(pulls.load(Ordering::SeqCst), 1);
@@ -1525,7 +1633,11 @@ mod tests {
             inputs: vec![cat1_scan(), cat1_scan()],
         };
         let err = tm
-            .register_data_sources(&two_scans, &mut arneb_execution::ExecutionContext::new())
+            .register_data_sources(
+                &two_scans,
+                &mut arneb_execution::ExecutionContext::new(),
+                None,
+            )
             .await
             .unwrap_err();
         assert_eq!(err, "catalog 'cat1' is not registered on worker w1");
@@ -1588,7 +1700,7 @@ mod tests {
             dynamic_filters_consumed: vec![],
         };
         let mut ctx = arneb_execution::ExecutionContext::new();
-        tm.register_data_sources(&scan(None), &mut ctx)
+        tm.register_data_sources(&scan(None), &mut ctx, None)
             .await
             .expect("resolved in the pushed default catalog");
         assert_eq!(pulls.load(Ordering::SeqCst), 1, "pulled once: no set yet");
@@ -1597,7 +1709,7 @@ mod tests {
             ("datalake".to_owned(), "default".to_owned())
         );
         // Synced now: a schema-only scan resolves without another pull.
-        tm.register_data_sources(&scan(Some("default")), &mut ctx)
+        tm.register_data_sources(&scan(Some("default")), &mut ctx, None)
             .await
             .expect("schema-only scan in the pushed default catalog");
         assert_eq!(pulls.load(Ordering::SeqCst), 1);
@@ -1631,6 +1743,150 @@ mod tests {
             Arc::new(UnboundedMemoryPool::new()),
         )
         .with_catalog_puller(puller, "w1".into())
+    }
+
+    /// A task carries the catalog set its query was planned at: a worker
+    /// on another set pulls once and runs it once the sets match, and fails
+    /// it (without mixing versions) when the pull does not bring that set;
+    /// a worker already past it fails without a pull.
+    #[tokio::test]
+    async fn a_task_runs_only_against_the_catalog_set_it_was_planned_at() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = Arc::new(ConnectorRegistry::new());
+        let live = crate::catalogs::LiveCatalogs::with_test_builder(
+            Arc::new(CatalogManager::new("memory", "default")),
+            registry.clone(),
+            Box::new(|_| Ok(users_built())),
+        );
+        let set = |generation, uri: &str| arneb_rpc::CatalogSet {
+            epoch: 9,
+            generation,
+            catalogs: vec![serde_json::json!({
+                "name": "cat1", "type": "hive", "metastore_uri": uri
+            })],
+            ..Default::default()
+        };
+        assert!(live.apply_remote(set(3, "h1:9083")).await.applied);
+        assert_eq!(registry.version(), Some((9, 3)));
+        let served = Arc::new(std::sync::Mutex::new(set(3, "h1:9083")));
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let (n, l, s) = (pulls.clone(), live.clone(), served.clone());
+        let puller = crate::catalogs::CatalogPuller::new(live.clone(), move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            let (l, set) = (l.clone(), s.lock().unwrap().clone());
+            Box::pin(async move {
+                l.apply_remote(set).await;
+                Ok(())
+            })
+        });
+        let tm = worker_tm(registry.clone(), puller);
+        let run = |planned| {
+            let tm = &tm;
+            async move {
+                tm.register_data_sources(
+                    &cat1_scan(),
+                    &mut arneb_execution::ExecutionContext::new(),
+                    Some(planned),
+                )
+                .await
+            }
+        };
+        run((9, 3)).await.expect("same set: runs");
+        assert_eq!(pulls.load(Ordering::SeqCst), 0);
+        // The coordinator moved to 4 and this worker missed the push.
+        *served.lock().unwrap() = set(4, "h2:9083");
+        run((9, 4)).await.expect("pulled the planned set");
+        assert_eq!(pulls.load(Ordering::SeqCst), 1);
+        assert_eq!(live.generation(), 4);
+        // Planned at a set the pull does not bring: fail, never mix.
+        assert_eq!(
+            run((9, 5)).await.unwrap_err(),
+            "catalog set on worker w1 is at generation 4, the query was planned at 5; \
+             retry the query"
+        );
+        assert_eq!(pulls.load(Ordering::SeqCst), 2);
+        // Already past the planned set: no pull can help.
+        assert_eq!(
+            run((9, 3)).await.unwrap_err(),
+            "catalog set on worker w1 is at generation 4, the query was planned at 3; \
+             retry the query"
+        );
+        assert_eq!(pulls.load(Ordering::SeqCst), 2);
+        let other_epoch = run((8, 4)).await.unwrap_err();
+        assert!(
+            other_epoch.contains("(coordinator epoch 9 here, 8 at planning)"),
+            "{other_epoch}"
+        );
+        // An untagged task (an older coordinator) is not checked.
+        tm.register_data_sources(
+            &cat1_scan(),
+            &mut arneb_execution::ExecutionContext::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Round 3 (I1): a changed catalog whose rebuild fails on this worker
+    /// is not left at its old spec under the new tag. A task planned at
+    /// that generation retries the build once and then fails; it never
+    /// scans the old connector.
+    #[tokio::test]
+    async fn a_failed_rebuild_never_serves_the_old_spec_under_the_new_tag() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = Arc::new(ConnectorRegistry::new());
+        let live = crate::catalogs::LiveCatalogs::with_test_builder(
+            Arc::new(CatalogManager::new("memory", "default")),
+            registry.clone(),
+            Box::new(|spec| match spec.metastore_uri.as_deref() {
+                Some("unreachable:9083") => Err(crate::catalogs::CatalogBuildError::Unreachable(
+                    "no route".into(),
+                )),
+                _ => Ok(users_built()),
+            }),
+        );
+        let set = |generation, uri: &str| arneb_rpc::CatalogSet {
+            epoch: 9,
+            generation,
+            catalogs: vec![serde_json::json!({
+                "name": "cat1", "type": "hive", "metastore_uri": uri
+            })],
+            ..Default::default()
+        };
+        assert!(live.apply_remote(set(4, "h1:9083")).await.applied);
+        assert!(registry.get("cat1").is_some());
+        let report = live.apply_remote(set(5, "unreachable:9083")).await;
+        assert!(report.applied && report.failed.len() == 1);
+        assert_eq!(registry.version(), Some((9, 5)));
+        assert!(
+            registry.get("cat1").is_none(),
+            "the old spec is not served under generation 5"
+        );
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let (n, l) = (pulls.clone(), live.clone());
+        let puller = crate::catalogs::CatalogPuller::new(live.clone(), move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            let l = l.clone();
+            Box::pin(async move {
+                l.apply_remote(set(5, "unreachable:9083")).await;
+                Ok(())
+            })
+        });
+        let tm = worker_tm(registry.clone(), puller);
+        let err = tm
+            .register_data_sources(
+                &cat1_scan(),
+                &mut arneb_execution::ExecutionContext::new(),
+                Some((9, 5)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "catalog 'cat1' failed to build on worker w1 at generation 5; retry the query"
+        );
+        assert_eq!(pulls.load(Ordering::SeqCst), 1, "one rebuild attempt");
+        assert!(registry.get("cat1").is_none());
     }
 
     /// Ruling R8: `cat1` failed to build at generation 5; once its backend
@@ -1680,15 +1936,23 @@ mod tests {
         let tm = worker_tm(registry, puller);
         // Still down: the task fails naming the catalog.
         let err = tm
-            .register_data_sources(&cat1_scan(), &mut arneb_execution::ExecutionContext::new())
+            .register_data_sources(
+                &cat1_scan(),
+                &mut arneb_execution::ExecutionContext::new(),
+                None,
+            )
             .await
             .unwrap_err();
         assert_eq!(err, "catalog 'cat1' is not registered on worker w1");
         // Reachable: the next task's pull rebuilds it.
         reachable.store(true, Ordering::SeqCst);
-        tm.register_data_sources(&cat1_scan(), &mut arneb_execution::ExecutionContext::new())
-            .await
-            .unwrap();
+        tm.register_data_sources(
+            &cat1_scan(),
+            &mut arneb_execution::ExecutionContext::new(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(pulls.load(Ordering::SeqCst), 2);
         assert!(!live.has_failed_builds());
         assert_eq!(live.generation(), 5);
@@ -1728,8 +1992,12 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let tm = worker_tm(registry, puller);
         let task = tokio::spawn(async move {
-            tm.register_data_sources(&cat1_scan(), &mut arneb_execution::ExecutionContext::new())
-                .await
+            tm.register_data_sources(
+                &cat1_scan(),
+                &mut arneb_execution::ExecutionContext::new(),
+                None,
+            )
+            .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(pulls.load(Ordering::SeqCst), 1, "the task joined");
@@ -1919,6 +2187,7 @@ mod tests {
             source_exchanges: Vec::new(),
             scan_task_count: 1,
             must_drain: false,
+            catalog_version: None,
         }
     }
 

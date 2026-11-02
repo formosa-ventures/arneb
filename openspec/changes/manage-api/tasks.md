@@ -43,3 +43,15 @@
 - [x] 9.7 `run_manage` takes the change lock itself (`ManageAction::change_mutex`); shared `count` / `persist_failed`
 - [x] 9.8 Lock-free admission while no cap is set
 - [x] 9.9 `DELETE /api/v2/admission` and MCP `reset_admission_limits` (26 tools)
+
+## 10. Review round 3
+
+- [x] 10.1 Kill: cancellers registered before the work starts, through a `KillSwitch`; a kill after the work completed is not applied and the statement keeps its real result
+- [x] 10.2 Audit: a failed completion is kept and appended when the log reopens; a panicking action is completed as `internal`
+- [x] 10.3 Audit: the refused closing entry only after an attempted write
+- [x] 10.4 Audit: the `token.issue` intent names the token id (`TokenId`, `issue_token_as`)
+- [x] 10.5 Audit log named after the full state file name (`prod.json.audit.jsonl`); WARN on a legacy `audit.jsonl`
+- [x] 10.6 Audit reads examine at most 10,000 entries; a filtered page that runs out ends early, truncated, with a cursor
+- [x] 10.7 Lock-free admission checks the cap flag and takes its slot in one atomic step (no spurious `QueueFull`)
+- [x] 10.8 Kill: `kill_query` documented as blocking, the v1 cancel runs it in `spawn_blocking`; Trino and agent client cancels and reapers go through `KillSwitch::try_kill`; docs state the mid-work behavior precisely
+- [x] 10.9 Audit: a completion written twice (fsync failed, then replayed) loads once

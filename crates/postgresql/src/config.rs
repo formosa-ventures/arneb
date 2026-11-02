@@ -66,31 +66,34 @@ impl PostgresConfig {
         {
             return Err("connection_url must start with postgresql://".into());
         }
+        // The driver ends the userinfo at the first `@` anywhere, so an
+        // unencoded `@` past the authority (in the path, a query value such
+        // as `?user=admin@srv` or `?password=Xy@9zK`, or a fragment) turns
+        // the rest of the URL into the "user", "password" and "host", with
+        // a port or an IPv6 host as much as without. Refuse that before the
+        // driver parses it, and never echo any part: each may hold a
+        // password.
+        if at_outside_authority(&self.connection_url) {
+            return Err(AMBIGUOUS_AT.into());
+        }
         let mut config = tokio_postgres::Config::from_str(&self.connection_url)
             .map_err(|_| "invalid connection_url".to_string())?;
-        // The driver ends the credentials at the first `@` anywhere, so an
-        // unencoded `@` in a query value (`?user=admin@srv&password=...`)
-        // turns the rest of the URL into the "host". Refuse that, without
-        // echoing the host (it may hold the password).
-        // Likewise an `@` inside a query value or a userinfo password makes
-        // the driver's user swallow the path or query, or leaves an `@` in
-        // the host. The parsed user and host are checked before `self.user`
-        // applies, and never echoed: either may hold part of a password.
+        // A second `@` inside the authority lands in the host, and any
+        // other split in the wrong place leaves a URL delimiter in the
+        // parsed user or host. Checked before `self.user` applies. The
+        // parsed password needs no check: with the `@` inside the authority
+        // it is exactly what the URL wrote, and a decoded `%2F` or `%3D`
+        // (base64-style passwords) is deliberate.
         let bad_host = config.get_hosts().iter().any(|h| match h {
-            tokio_postgres::config::Host::Tcp(h) => h.contains(['=', '&', '?', '/', '@']),
+            tokio_postgres::config::Host::Tcp(h) => h.contains(['=', '&', '?', '/', '@', '#']),
             #[cfg(unix)]
             tokio_postgres::config::Host::Unix(_) => false,
         });
         let bad_user = config
             .get_user()
-            .is_some_and(|u| u.contains(['/', '?', '&', '=']));
+            .is_some_and(|u| u.contains(['/', '?', '&', '=', '#']));
         if bad_host || bad_user {
-            return Err(
-                "invalid connection_url: an unencoded '@' splits it in the wrong \
-                        place; percent-encode an '@' in a user name, password or parameter \
-                        value as %40"
-                    .into(),
-            );
+            return Err(AMBIGUOUS_AT.into());
         }
         if let Some(user) = &self.user {
             config.user(user);
@@ -129,6 +132,26 @@ impl PostgresConfig {
             }
             Err(_) => "<invalid connection_url>".into(),
         }
+    }
+}
+
+/// The refusal for a URL the driver would split at the wrong `@`.
+const AMBIGUOUS_AT: &str = "invalid connection_url: an unencoded '@', '/', '?' or '#' splits \
+     it in the wrong place; percent-encode them in a user name, password or parameter value \
+     (%40, %2F, %3F, %23), or set the password in the catalog's password field";
+
+/// Whether the first `@` of `url` lies past its authority: after the first
+/// `/`, `?` or `#` that follows the scheme's `//`. The driver would still
+/// end the userinfo there, so where the user, password and host of such a
+/// URL end cannot be told apart.
+pub fn at_outside_authority(url: &str) -> bool {
+    let Some(start) = url.find("://").map(|i| i + 3) else {
+        return false;
+    };
+    let rest = &url[start..];
+    match (rest.find('@'), rest.find(['/', '?', '#'])) {
+        (Some(at), Some(end)) => at > end,
+        _ => false,
     }
 }
 
@@ -221,6 +244,17 @@ mod tests {
                 &["S3cret"],
             ),
             ("postgresql://u:p@ss@host/db", &["ss@"]),
+            // A port or an IPv6 host does not let the `@` through.
+            (
+                "postgresql://db.internal:5432/sales?user=app&password=Xy@9zK",
+                &["Xy", "9zK"],
+            ),
+            ("postgresql://[::1]:5432/db?password=Xy@9zK", &["Xy", "9zK"]),
+            ("postgresql://[::1]/db?password=Xy@9zK", &["Xy", "9zK"]),
+            ("postgresql://db:5432/sales#x@9zK", &["9zK"]),
+            // A raw delimiter in the userinfo password.
+            ("postgresql://u:p/w@[::1]:5432/db", &["p/w"]),
+            ("postgresql://u:p?w@db:5432/db", &["p?w"]),
         ] {
             let c = PostgresConfig::new(url);
             let e = c.validate_url().unwrap_err();
@@ -232,13 +266,28 @@ mod tests {
                 );
             }
         }
-        assert!(
-            PostgresConfig::new("postgresql://db/sales?user=admin%40srv&password=x")
-                .validate_url()
-                .is_ok()
-        );
-        assert!(PostgresConfig::new("postgresql://u:p/w@[::1]:5432/db")
-            .validate_url()
-            .is_ok());
+        let d = PostgresConfig::new("postgresql://u:Ab%2Fc%3D@db/x")
+            .driver_config()
+            .unwrap();
+        assert_eq!(d.get_password(), Some(&b"Ab/c="[..]));
+        for url in [
+            "postgresql://db/sales?user=admin%40srv&password=x",
+            "postgresql://u:pw@[::1]:5432/db",
+            "postgresql://u:p%40ss@db.internal:5432/db?sslmode=disable",
+            "postgresql://db.internal:5432/sales?user=app&password=Xy%409zK",
+            "postgresql://u@db/db?password=x@y",
+            // Percent-encoded delimiters (base64-style passwords) and raw
+            // sub-delims in the userinfo are what the operator meant.
+            "postgresql://u:a%2Fb%3Dc@db:5432/db",
+            "postgresql://u:Ab%2Bc%2F%3D%3D@db/x",
+            "postgresql://u:a&b=c@db/x",
+            "postgresql://db:5432/db?password=a%26b",
+            "postgresql://u:p%2Fw@[::1]:5432/db",
+        ] {
+            assert!(
+                PostgresConfig::new(url).validate_url().is_ok(),
+                "{url} should be accepted"
+            );
+        }
     }
 }

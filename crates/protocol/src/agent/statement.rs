@@ -151,6 +151,9 @@ pub(crate) struct Statement {
     /// Flipped to `true` once the statement is terminal.
     pub(crate) done: watch::Sender<bool>,
     pub(crate) abort: Mutex<Option<AbortHandle>>,
+    /// Runs the statement's work; kills and client cancels go through it,
+    /// so neither relabels work that already returned.
+    pub(crate) switch: arneb_scheduler::KillSwitch,
 }
 
 impl Statement {
@@ -172,6 +175,7 @@ impl Statement {
             }),
             done: watch::channel(false).0,
             abort: Mutex::new(None),
+            switch: arneb_scheduler::KillSwitch::new(),
         }
     }
 

@@ -22,6 +22,32 @@ pub struct TokenInfo {
     pub expires_ms: Option<u64>,
 }
 
+/// The id of a token about to be issued, generated before issuance so that
+/// a caller can name it first (an audit intent entry, say) and then pass it
+/// to [`StateStore::issue_token_as`]. 16 lowercase hex characters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenId(String);
+
+impl TokenId {
+    /// A fresh random id (64 bits).
+    pub fn generate() -> Result<Self, StateError> {
+        let mut id_bytes = [0u8; 8];
+        rand::fill(&mut id_bytes).map_err(|_| StateError::Random)?;
+        Ok(Self(id_bytes.iter().map(|b| format!("{b:02x}")).collect()))
+    }
+
+    /// The id as it appears in the token and in [`TokenInfo::id`].
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TokenId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Live tokens one user may hold; issuing more fails with
 /// [`StateError::TooManyTokens`].
 pub const MAX_TOKENS_PER_USER: usize = 100;
@@ -65,7 +91,19 @@ impl StateStore {
         name: Option<String>,
         expires_at_ms: Option<u64>,
     ) -> Result<IssuedToken, StateError> {
-        self.issue_token_capped(user, name, expires_at_ms, MAX_TOKENS_PER_USER, now_ms())
+        self.issue_token_as(TokenId::generate()?, user, name, expires_at_ms)
+    }
+
+    /// As [`Self::issue_token`], with the id `id` generated beforehand by
+    /// [`TokenId::generate`].
+    pub fn issue_token_as(
+        &self,
+        id: TokenId,
+        user: &str,
+        name: Option<String>,
+        expires_at_ms: Option<u64>,
+    ) -> Result<IssuedToken, StateError> {
+        self.issue_token_with_id(id, user, name, expires_at_ms, MAX_TOKENS_PER_USER, now_ms())
     }
 
     /// The cheap refusals `issue_token` would make before any PBKDF2: an
@@ -101,6 +139,7 @@ impl StateStore {
         Ok(user_scram)
     }
 
+    #[cfg(test)]
     fn issue_token_capped(
         &self,
         user: &str,
@@ -109,11 +148,21 @@ impl StateStore {
         max_tokens: usize,
         now: u64,
     ) -> Result<IssuedToken, StateError> {
-        let mut id_bytes = [0u8; 8];
+        let id = TokenId::generate()?;
+        self.issue_token_with_id(id, user, name, expires_at_ms, max_tokens, now)
+    }
+
+    fn issue_token_with_id(
+        &self,
+        TokenId(id): TokenId,
+        user: &str,
+        name: Option<String>,
+        expires_at_ms: Option<u64>,
+        max_tokens: usize,
+        now: u64,
+    ) -> Result<IssuedToken, StateError> {
         let mut secret_bytes = [0u8; 32];
-        rand::fill(&mut id_bytes).map_err(|_| StateError::Random)?;
         rand::fill(&mut secret_bytes).map_err(|_| StateError::Random)?;
-        let id: String = id_bytes.iter().map(|b| format!("{b:02x}")).collect();
         let secret = URL_SAFE_NO_PAD.encode(secret_bytes);
         let token = format!("arneb_{id}_{secret}");
         let secret_sha256 = sha256(secret.as_bytes());
@@ -290,6 +339,21 @@ mod tests {
         let v = ScramVerifier::from_password("pw", b"0123456789abcdef", 4096);
         store.seed_users(&[("alice".into(), v)], false).unwrap();
         store
+    }
+
+    /// A token issued with a pre-generated id carries exactly that id, in
+    /// its info and as the token's middle segment.
+    #[test]
+    fn issue_token_as_uses_the_given_id() {
+        let store = store_with_alice();
+        let id = TokenId::generate().unwrap();
+        assert_eq!(id.as_str().len(), 16);
+        let issued = store
+            .issue_token_as(id.clone(), "alice", None, None)
+            .unwrap();
+        assert_eq!(issued.info.id, id.as_str());
+        assert!(issued.token.starts_with(&format!("arneb_{id}_")));
+        assert_eq!(store.check_token(&issued.token).unwrap().id, id.as_str());
     }
 
     #[test]

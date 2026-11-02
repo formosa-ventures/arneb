@@ -298,7 +298,9 @@ running; it stays, so a later poll shows `cancelled` and why. On a statement
 that has ended (finished, failed or cancelled) it releases it: the reply is
 its final status (with `first_page: null`), the id answers `not_found` from
 then on, and its retained rows stop counting against the budgets, at once or,
-if a page fetch of it is in flight, once that fetch finishes.
+if a page fetch of it is in flight, once that fetch finishes. A statement
+that finishes while the DELETE is cancelling it counts as ended and is
+released the same way.
 So a client that is done with a result should delete it rather than wait for
 the idle timeout.
 
@@ -361,8 +363,10 @@ several batches counts once.
 
 When the user's share or the server budget is short, the server evicts
 statements that have ended and still hold rows, but only when the
-evictable ones free enough to cover the shortfall (one a page fetch is
-reading is skipped). Victims are taken in this order: for the user's share,
+evictable ones free enough to cover the shortfall (one a request is still
+holding, such as a page fetch or a poll, is skipped). They are evicted one
+at a time, only until the shortfall is covered, and the shortfall is
+checked again before each, so one that went away meanwhile evicts nothing. Victims are taken in this order: for the user's share,
 the user's own; for the server budget, the user's own first, then other
 users'. Within each, fully read ones go first (the last page was fetched,
 or the first page held everything), then the least recently used. An
@@ -499,6 +503,18 @@ Trino, `/api/v2` statements) and stops it there: a pgwire client gets
 `ERROR 57014 canceling statement due to user request`, a Trino client
 `USER_CANCELED` `Query was killed by <user>`, and an `/api/v2` statement
 turns `cancelled` with `Statement was cancelled by <user>`.
+
+When the kill lands decides what it does:
+
+- **Before the statement's work starts:** the work never runs.
+- **After the work returned** (an `INSERT` that committed, say) but before
+  the statement reported back: the kill stops nothing. The response has
+  `changed: false`, the audit entry records `effect` `already_ended`, and
+  the client gets the statement's real result.
+- **During the work:** the work is stopped at its next step and the client
+  gets the cancellation. A write may already have taken effect in part or
+  in full (an earlier step, or a parallel task that keeps running), as
+  before this release, so check before retrying a cancelled write.
 
 Who may cancel, in this order:
 
@@ -791,12 +807,16 @@ catalog as soon as the change returns.
   it a runtime catalog; the preview warns that the config file no longer
   manages it. Dropping the default catalog is allowed, with a warning that
   unqualified table names then fail.
-- A query keeps the catalog it was planned with on the coordinator: each
-  statement pins the catalogs and connectors together when it starts, and a
-  change swaps a catalog's provider and connector as one step. On workers a
-  task resolves its connectors when it starts (every scan of the task uses
-  the same one), so a task that starts after a change, for a query that
-  was already running, uses the worker's current catalogs.
+- Running queries keep the catalogs they were planned with; a distributed
+  query whose workers can't match the planned catalog version fails instead
+  of mixing. Each statement pins the catalogs and connectors together when it
+  starts, and a change swaps them, with the new catalog generation, as one
+  step. Every distributed task carries the coordinator epoch and generation
+  the query was planned at. A worker on another set pulls the coordinator's
+  set once; if it still differs (the worker is already past that set, or the
+  pull fails), the task fails with `catalog set on worker <id> is at
+  generation N, the query was planned at M; retry the query`. Retrying the
+  query plans it again at the current generation.
 
 ```bash
 curl -s -H "$H" -X POST "$B/catalog-configs?dry_run=true" \
@@ -900,8 +920,9 @@ curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
   [error code](#errors) the call returned. A completion entry carries
   `intent_seq`, the `seq` of its intent; a completed intent is dropped from
   the listing, so each finished action shows once. `"pending"` marks an
-  intent whose action is in progress (or whose completion could not be
-  written), and `"interrupted"` the entry written at startup for an intent
+  intent whose action is in progress (or whose completion is waiting for the
+  log to become writable again; such a completion's `time_ms` is when it was
+  finally written, not when the action finished), and `"interrupted"` the entry written at startup for an intent
   that never completed: the action may or may not have been applied.
 - `persistent` is `false` when the log is in memory (no `[state] path`), and
   `writable` is `false` while audited actions are refused with
@@ -915,6 +936,12 @@ Parameters, all optional:
 | `cursor` | The previous page's `next_cursor`: continue with older entries. |
 | `user` | Only this user's entries (exact match). |
 | `action` | Only this action's entries (exact match), for example `token.revoke`. |
+
+A read examines at most 10,000 entries. A filtered page (by `user`, by
+`action`, or a non-manager's own entries) that runs out of that budget ends
+early with `truncated: true` and a `next_cursor`, possibly with fewer than
+`limit` entries or none; keep following `next_cursor` until `truncated` is
+`false`.
 
 Reading the log needs the observe privilege: with a `system_information`
 section in the [access rules](/guide/access-control), only users it allows

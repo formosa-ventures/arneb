@@ -3,6 +3,7 @@
 mod admission;
 mod dynamic_filter;
 mod dynamic_filter_registry;
+mod kill_switch;
 mod node_registry;
 mod state;
 mod tracker;
@@ -12,6 +13,7 @@ pub use admission::{
 };
 pub use dynamic_filter::DynamicFilterService;
 pub use dynamic_filter_registry::DynamicFilterServiceRegistry;
+pub use kill_switch::{Guarded, KillSwitch};
 pub use node_registry::{
     CordonMode, InFlightGuard, LostWorker, NodeRegistry, SchedulingState, WorkerInfo,
 };

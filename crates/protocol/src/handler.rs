@@ -186,7 +186,13 @@ impl PgWireServerHandlers for HandlerFactory {
 /// One pgwire statement's entry in the query tracker: `Queued` at receipt,
 /// `Running` once admitted, then finished or failed. Dropped before either
 /// (the client went away mid-statement) it is recorded as cancelled.
-struct TrackedStatement(Option<Tracked>);
+///
+/// A kill through the tracker (manage-api D7) goes through the statement's
+/// [`arneb_scheduler::KillSwitch`], registered at receipt, before any work:
+/// it stops the work if it has not completed, and is otherwise not applied,
+/// so a statement whose work completed (a committed write included) always
+/// reports its real result.
+struct TrackedStatement(Option<Tracked>, arneb_scheduler::KillSwitch);
 
 type Tracked = (
     Arc<arneb_scheduler::QueryTracker>,
@@ -200,7 +206,16 @@ impl TrackedStatement {
         user: Option<String>,
     ) -> Self {
         let id = tracker.create_query_from(sql.to_string(), "pgwire", user);
-        Self(Some((Arc::clone(tracker), id)))
+        let switch = arneb_scheduler::KillSwitch::new();
+        // Nothing else to stop: the guard drops the work on the kill.
+        tracker.set_canceller(&id, switch.canceller(|_by| {}));
+        Self(Some((Arc::clone(tracker), id)), switch)
+    }
+
+    /// Run the statement's work under its kill switch: `None` when a kill
+    /// stopped it before it completed.
+    async fn guard<F: std::future::Future>(&self, work: F) -> Option<F::Output> {
+        self.1.guard(work).await
     }
 
     fn running(&self) {
@@ -209,15 +224,11 @@ impl TrackedStatement {
         }
     }
 
-    /// Records `rows` and marks the query finished. Returns `false` when a
-    /// kill marked it cancelled first (after the work completed, before
-    /// this ran): the statement must then answer as cancelled, not with
-    /// its rows.
-    fn finish(&mut self, rows: u64) -> bool {
-        let Some((t, id)) = self.0.take() else {
-            return true;
-        };
-        t.finish_query(&id, rows).is_ok() || t.cancelled_by(&id).is_none()
+    /// Records `rows` and marks the query finished.
+    fn finish(&mut self, rows: u64) {
+        if let Some((t, id)) = self.0.take() {
+            let _ = t.finish_query(&id, rows);
+        }
     }
 
     fn fail(&mut self, error: String) {
@@ -231,12 +242,6 @@ impl TrackedStatement {
     fn cancel(&mut self) {
         if let Some((t, id)) = self.0.take() {
             let _ = t.cancel_query(&id);
-        }
-    }
-
-    fn set_canceller(&self, canceller: arneb_scheduler::Canceller) {
-        if let Some((t, id)) = &self.0 {
-            t.set_canceller(id, canceller);
         }
     }
 }
@@ -403,10 +408,6 @@ impl ConnectionHandler {
     > {
         let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
         let mut tracked = TrackedStatement::start(&self.query_tracker, sql, user);
-        // A kill through the tracker (manage-api D7) aborts the statement
-        // future; the canceller holds only the abort handle.
-        let (abort, registration) = futures::future::AbortHandle::new_pair();
-        tracked.set_canceller(Box::new(move |_by| abort.abort()));
         let work = self.with_timeout(client, async {
             let _admission = self.admit(sql).await?;
             tracked.running();
@@ -433,16 +434,15 @@ impl ConnectionHandler {
             )
             .await)
         });
-        let Ok(result) = futures::future::Abortable::new(work, registration).await else {
+        let Some(result) = tracked.guard(work).await else {
             tracked.cancel();
             return Err(user_cancelled());
         };
+        // The work completed: a kill from here on is not applied, so the
+        // statement reports this result, rows or committed write alike.
         match &result {
             Ok(Ok((_, batches))) => {
-                if !tracked.finish(batches.iter().map(|b| b.num_rows() as u64).sum()) {
-                    // Killed after the work completed: no rows.
-                    return Err(user_cancelled());
-                }
+                tracked.finish(batches.iter().map(|b| b.num_rows() as u64).sum());
             }
             Ok(Err(e)) => tracked.fail(e.to_string()),
             // Admission refusal or statement timeout.
@@ -1288,6 +1288,9 @@ pub(crate) async fn execute_query_capped(
     let mut exec_ctx = ExecutionContext::new()
         .with_memory_pool(memory_pool.clone())
         .with_catalog_stats(Some(analyzer_ctx.catalog_stats.clone()))
+        // The catalog set this statement is pinned to: its distributed
+        // tasks carry it, so a worker never runs one on another set.
+        .with_catalog_version(connector_registry.version())
         // A2.x broadcast threshold (2026-05-28). Default OFF.
         //
         // A2.1+A2.2+A2.3 v1 infra ships in this commit but is dormant
@@ -2213,32 +2216,62 @@ async fn register_data_sources(
 
 #[cfg(test)]
 mod tests {
-    /// A kill that lands after the work completed but before `finish`:
-    /// the finish is refused, so the statement answers 57014, not rows.
-    #[test]
-    fn a_kill_after_the_work_completed_wins_over_the_rows() {
+    /// A kill that lands after an INSERT's work completed but before
+    /// `finish`: the kill is not applied and the statement reports its
+    /// real result (PostgreSQL never reports a cancel after commit).
+    #[tokio::test]
+    async fn a_kill_after_a_write_completed_is_not_applied() {
+        use arneb_scheduler::{KillOutcome, QueryState};
         let tracker = Arc::new(arneb_scheduler::QueryTracker::new());
-        let mut tracked = TrackedStatement::start(&tracker, "SELECT 1", Some("bob".into()));
+        let mut tracked =
+            TrackedStatement::start(&tracker, "INSERT INTO t SELECT 1", Some("bob".into()));
         tracked.running();
         let id = tracked.0.as_ref().unwrap().1;
-        assert!(matches!(
-            tracker.kill_query(&id, "root").unwrap(),
-            arneb_scheduler::KillOutcome::Killed { .. }
-        ));
-        assert!(
-            !tracked.finish(1),
-            "the killed statement must not return rows"
+        assert_eq!(
+            tracked.guard(async { "committed" }).await,
+            Some("committed")
         );
+        // The window between the completed work and `finish`.
+        assert_eq!(
+            tracker.kill_query(&id, "root").unwrap(),
+            KillOutcome::AlreadyEnded(QueryState::Finishing)
+        );
+        tracked.finish(1);
         let info = tracker.get_query(&id).unwrap();
-        assert_eq!(info.state, arneb_scheduler::QueryState::Cancelled);
-        assert_eq!(info.rows, None);
+        assert_eq!(info.state, QueryState::Finished);
+        assert_eq!(info.rows, Some(1));
+    }
+
+    /// A kill before the statement's work starts (the canceller is
+    /// registered at receipt) stops all of it: the work never runs.
+    #[tokio::test]
+    async fn a_kill_before_the_work_starts_stops_it() {
+        use arneb_scheduler::{KillOutcome, QueryState};
+        let tracker = Arc::new(arneb_scheduler::QueryTracker::new());
+        let mut tracked =
+            TrackedStatement::start(&tracker, "INSERT INTO t SELECT 1", Some("bob".into()));
+        let id = tracked.0.as_ref().unwrap().1;
+        assert_eq!(
+            tracker.kill_query(&id, "root").unwrap(),
+            KillOutcome::Killed {
+                was: QueryState::Queued
+            }
+        );
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let out = tracked
+            .guard(async { ran.store(true, std::sync::atomic::Ordering::SeqCst) })
+            .await;
+        assert_eq!(out, None);
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the work ran"
+        );
+        tracked.cancel();
+        assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
         match user_cancelled() {
             PgWireError::UserError(e) => assert_eq!(e.code, "57014"),
             other => panic!("{other:?}"),
         }
-        // Not killed: finishes.
-        let mut ok = TrackedStatement::start(&tracker, "SELECT 1", None);
-        assert!(ok.finish(1));
     }
 
     use super::*;
@@ -2524,6 +2557,38 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(count, 3, "the planned (old) catalog's connector was used");
+    }
+
+    /// A distributed statement hands its executor the `(epoch, generation)`
+    /// tag of the registry it pinned at the start, so its tasks name the
+    /// catalog set it was planned with even if the set changes meanwhile.
+    #[tokio::test]
+    async fn a_distributed_statement_carries_its_pinned_catalog_version() {
+        struct Recording(std::sync::Mutex<Vec<Option<(u64, u64)>>>);
+        #[async_trait]
+        impl DistributedExecutor for Recording {
+            async fn execute(
+                &self,
+                _plan: LogicalPlan,
+                exec_ctx: &ExecutionContext,
+            ) -> Result<Vec<arrow::record_batch::RecordBatch>, ArnebError> {
+                self.0.lock().unwrap().push(exec_ctx.catalog_version());
+                Ok(Vec::new())
+            }
+            fn has_workers(&self) -> bool {
+                true
+            }
+        }
+        let manager = CatalogManager::new("memory", "default");
+        let registry = ConnectorRegistry::new();
+        registry.set_version(Some((3, 7)));
+        let executor = Recording(Default::default());
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        execute_query("SELECT 1", &manager, &registry, Some(&executor), &pool)
+            .await
+            .unwrap();
+        assert_eq!(*executor.0.lock().unwrap(), vec![Some((3, 7))]);
     }
 
     /// Regression: COUNT / MIN / MAX over a filter that matches nothing used

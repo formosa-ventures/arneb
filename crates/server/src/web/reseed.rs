@@ -549,24 +549,24 @@ impl ManageAction for Reseed {
             .iter()
             .map(|(s, _)| s.name.as_str())
             .collect();
-        for (name, _) in installed(&self.live) {
-            if !wanted.contains(&name.as_str()) {
-                self.live.remove(&name);
-            }
-        }
+        let mut removes: Vec<String> = installed(&self.live)
+            .into_keys()
+            .filter(|name| !wanted.contains(&name.as_str()))
+            .collect();
+        let mut installs = Vec::new();
         let mut built = self.built;
         for (spec, _) in self.seed.catalogs {
             match built.remove(&spec.name) {
-                Some(Ok(b)) => self.live.install(spec, b),
+                Some(Ok(b)) => installs.push((spec, b)),
                 // Not served, like a startup build failure.
-                Some(Err(_)) => {
-                    self.live.remove(&spec.name);
-                }
+                Some(Err(_)) => removes.push(spec.name),
                 // Already installed with this spec (checked by the plan).
                 None => {}
             }
         }
-        self.live.set_generation(generation);
+        // One swap with the new generation: a statement pins the old set
+        // or the new one, never a mix (and its tasks carry which).
+        self.live.commit(generation, installs, &removes);
         let workers = push_to_workers(state, &self.live.snapshot());
         warnings.extend(push_warnings(&workers));
         if !warnings.is_empty() {

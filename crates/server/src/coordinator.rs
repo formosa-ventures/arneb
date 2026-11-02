@@ -294,6 +294,7 @@ impl QueryCoordinator {
                     &mut stage_results,
                     &query_id,
                     root_must_drain,
+                    exec_ctx.catalog_version(),
                 )
                 .await?;
             }
@@ -765,6 +766,8 @@ async fn execute_child_on_worker(
     // this fragment's task descriptors; computed by the caller from the
     // consumer's root via `may_stop_input_early`.
     consumer_must_drain: bool,
+    // The catalog set the query was planned against, for every task.
+    catalog_version: Option<(u64, u64)>,
 ) -> Result<(), ExecutionError> {
     // Recursively execute children first. A child's consumer is THIS fragment,
     // so its producers must_drain unless this fragment can legitimately
@@ -778,6 +781,7 @@ async fn execute_child_on_worker(
             stage_results,
             query_id,
             child_must_drain,
+            catalog_version,
         ))
         .await?;
     }
@@ -960,6 +964,7 @@ async fn execute_child_on_worker(
             // A1-fused scan SOURCE fragment, else 1. The worker strides the
             // scan by (task_id.partition_id, scan_task_count).
             scan_task_count,
+            catalog_version,
         };
 
         let flight_addr = flight_address(&worker.address);

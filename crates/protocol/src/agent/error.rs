@@ -133,7 +133,8 @@ impl AgentError {
         )
         .with_hint(
             "resubmit the statement if you still need its rows; fetch results soon after \
-             they finish, and DELETE statements you are done with so newer ones are not cut",
+             they finish, and release (DELETE / cancel_query) statements you are done with so \
+             newer ones are not cut",
         )
     }
 

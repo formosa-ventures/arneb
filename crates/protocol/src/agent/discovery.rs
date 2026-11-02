@@ -331,7 +331,7 @@ impl AgentQueryService {
 /// lowercase form is.
 fn fold_name(name: &str, names: &[String]) -> String {
     let lower = name.to_lowercase();
-    if lower != name && !names.iter().any(|n| n == name) && names.iter().any(|n| *n == lower) {
+    if lower != name && !names.iter().any(|n| n == name) && names.contains(&lower) {
         lower
     } else {
         name.to_string()

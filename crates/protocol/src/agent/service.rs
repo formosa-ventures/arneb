@@ -255,21 +255,40 @@ impl AgentQueryService {
     /// A queued or running statement is cancelled and kept, so a later poll
     /// learns why it stopped. A terminal one is removed with its retained
     /// rows, which gives their bytes back to the budget; its final status is
-    /// returned and the id answers `not_found` from then on.
+    /// returned and the id answers `not_found` from then on. A statement
+    /// that ends on its own while being cancelled counts as ended: it is
+    /// released too.
     pub fn cancel(&self, user: &str, id: &str) -> Result<StatementStatus, AgentError> {
         let statement = self.lookup(user, id)?;
         if statement.is_terminal() {
-            // No first page: the rows are being released, not read.
-            let status = statement.status_with(&self.limits, false);
-            self.forget(user, id);
-            return Ok(status);
+            return Ok(self.release(user, &statement));
         }
-        self.cancel_statement(
-            &statement,
+        Ok(self.cancel_live(user, &statement))
+    }
+
+    /// Cancels `statement`, last seen queued or running, and keeps it; or,
+    /// when it has ended meanwhile (it finished, or the reaper cancelled
+    /// it), releases it as [`cancel`](Self::cancel) does an ended one, so
+    /// its retained bytes never outlive a release-looking response.
+    fn cancel_live(&self, user: &str, statement: &Statement) -> StatementStatus {
+        let cancelled = self.cancel_statement(
+            statement,
             AgentError::new(AgentErrorCode::Cancelled, "Statement was cancelled"),
             "client",
         );
-        Ok(statement.status(&self.limits))
+        if cancelled {
+            statement.status(&self.limits)
+        } else {
+            self.release(user, statement)
+        }
+    }
+
+    /// The final status of ended `statement`, which is then forgotten.
+    fn release(&self, user: &str, statement: &Statement) -> StatementStatus {
+        // No first page: the rows are being released, not read.
+        let status = statement.status_with(&self.limits, false);
+        self.forget(user, &statement.id);
+        status
     }
 
     /// Drops `user`'s statement `id` from the registry (a no-op for another
@@ -511,15 +530,17 @@ impl AgentQueryService {
 
     /// Cancels a statement that is still queued or running: aborts its task
     /// (dropping its admission slot) and marks it cancelled in the tracker.
-    fn cancel_statement(&self, statement: &Statement, error: AgentError, reason: &str) {
+    /// Returns `false`, doing nothing, when it had already ended.
+    fn cancel_statement(&self, statement: &Statement, error: AgentError, reason: &str) -> bool {
         if !statement.end(Phase::Cancelled(error)) {
-            return;
+            return false;
         }
         if let Some(handle) = lock(&statement.abort).take() {
             handle.abort();
         }
         let _ = self.tracker.cancel_query(&statement.tracker_id);
         tracing::debug!(statement_id = %statement.id, reason, "agent statement cancelled");
+        true
     }
 
     /// One reaper pass over statements idle for longer than `idle_timeout`.
@@ -1607,6 +1628,23 @@ mod tests {
         assert_eq!(second.state, StatementState::Cancelled);
         assert_eq!(first.elapsed_ms, second.elapsed_ms);
         assert!(svc.status("alice", &s.id, Duration::ZERO).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_racing_completion_still_releases() {
+        let svc = service_over(vec![wide_table(10, 1000)], AgentLimits::default());
+        let s = run_to_end(&svc, "SELECT s FROM wide", None).await;
+        assert!(svc.retained_budget.used() > 0);
+        // DELETE saw the statement running, then it finished before the
+        // cancel: the cancel finds it ended, and releases it.
+        let statement = lock(&svc.statements).get(&s.id).cloned().unwrap();
+        let c = svc.cancel_live("alice", &statement);
+        drop(statement);
+        assert_eq!(c.state, StatementState::Finished);
+        assert!(c.first_page.is_none(), "a release does not encode rows");
+        assert_eq!(svc.retained_budget.used(), 0);
+        let err = svc.cancel("alice", &s.id).unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::NotFound);
     }
 
     #[tokio::test]

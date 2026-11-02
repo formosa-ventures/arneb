@@ -239,11 +239,6 @@ impl AccessControlConfig {
         Ok(())
     }
 
-    /// Read and parse the rules file, if one is set.
-    pub fn load_rules(&self) -> Result<Option<arneb_catalog::AccessRules>> {
-        Ok(self.load_rules_text()?.map(|(_, rules)| rules))
-    }
-
     /// Read and parse the rules file, if one is set: its text and the
     /// parsed rules.
     pub fn load_rules_text(&self) -> Result<Option<(String, arneb_catalog::AccessRules)>> {
@@ -295,20 +290,26 @@ pub fn rules_file_changed(config: &AccessControlConfig) -> anyhow::Error {
 /// rules file is stored again (INFO). Rules changed at runtime are kept
 /// over a rules file unchanged since it was last seeded (WARN); a rules
 /// file edited since then refuses the start, naming `--reseed-state`. A
-/// rules file that cannot be read or parsed is fatal.
+/// rules file that cannot be read or parsed is fatal. `loaded` is the rules
+/// file as the caller already read it (`Some`), so it is read only once;
+/// `None` reads it here.
 pub fn resolve_access_rules(
     config: &AccessControlConfig,
     store: Option<&arneb_state::StateStore>,
     reseed: bool,
+    loaded: Option<Option<(String, arneb_catalog::AccessRules)>>,
 ) -> Result<ResolvedRules> {
+    let file = match loaded {
+        Some(file) => file,
+        None => config.load_rules_text()?,
+    };
     let Some(store) = store else {
         return Ok(ResolvedRules {
-            handle: arneb_catalog::RulesHandle::new(config.load_rules()?.map(Arc::new)),
+            handle: arneb_catalog::RulesHandle::new(file.map(|(_, rules)| Arc::new(rules))),
             source: "config",
             seed: None,
         });
     };
-    let file = config.load_rules_text()?;
     let text = file.as_ref().map(|(text, _)| text.as_str());
     let seed = store
         .seed_rules(text, reseed)
@@ -3512,23 +3513,23 @@ password = "hunter2"
 
         let mut cfg: AccessControlConfig = toml::from_str("").unwrap();
         cfg.apply_env(env_from(&[])).unwrap();
-        assert!(cfg.load_rules().unwrap().is_none());
+        assert!(cfg.load_rules_text().unwrap().is_none());
 
         let mut cfg: AccessControlConfig =
             toml::from_str(&format!("rules_file = {:?}", bad.display().to_string())).unwrap();
-        let err = cfg.load_rules().unwrap_err().to_string();
+        let err = cfg.load_rules_text().unwrap_err().to_string();
         assert!(err.contains("bad.json") && err.contains("filter"), "{err}");
         cfg.apply_env(env_from(&[(
             "ARNEB_ACCESS_CONTROL_RULES_FILE",
             good.to_str().unwrap(),
         )]))
         .unwrap();
-        let rules = cfg.load_rules().unwrap().unwrap();
+        let (_, rules) = cfg.load_rules_text().unwrap().unwrap();
         assert_eq!(rules.section_sizes(), [None, None, Some(1), None, None]);
 
         cfg.rules_file = Some(dir.join("missing.json"));
         assert!(cfg
-            .load_rules()
+            .load_rules_text()
             .unwrap_err()
             .to_string()
             .contains("missing.json"));
@@ -3582,7 +3583,7 @@ password = "hunter2"
         let state_path = tmp.path().join("state.json");
         let store = arneb_state::StateStore::open(Some(&state_path)).unwrap();
         let config = rules_config(tmp.path(), Some(RULES_A));
-        let r = resolve_access_rules(&config, Some(&store), false).unwrap();
+        let r = resolve_access_rules(&config, Some(&store), false, None).unwrap();
         assert_eq!(r.source, "state");
         assert_eq!(r.seed, Some(arneb_state::RulesSeed::Seeded));
         assert!(r.handle.current().unwrap().can_execute("alice"));
@@ -3590,14 +3591,14 @@ password = "hunter2"
 
         let store = arneb_state::StateStore::open(Some(&state_path)).unwrap();
         let config = rules_config(tmp.path(), Some(RULES_B));
-        let r = resolve_access_rules(&config, Some(&store), false).unwrap();
+        let r = resolve_access_rules(&config, Some(&store), false, None).unwrap();
         assert_eq!(r.seed, Some(arneb_state::RulesSeed::FollowedFile));
         let live = r.handle.current().unwrap();
         assert!(live.can_execute("bob") && !live.can_execute("alice"));
 
         // --reseed-state copies the file again.
         let config = rules_config(tmp.path(), Some(RULES_A));
-        let r = resolve_access_rules(&config, Some(&store), true).unwrap();
+        let r = resolve_access_rules(&config, Some(&store), true, None).unwrap();
         assert_eq!(r.seed, Some(arneb_state::RulesSeed::Seeded));
         assert!(r.handle.current().unwrap().can_execute("alice"));
     }
@@ -3609,7 +3610,7 @@ password = "hunter2"
         let tmp = tempfile::tempdir().unwrap();
         let store = arneb_state::StateStore::open(None).unwrap();
         let config = rules_config(tmp.path(), Some(RULES_A));
-        resolve_access_rules(&config, Some(&store), false).unwrap();
+        resolve_access_rules(&config, Some(&store), false, None).unwrap();
         store
             .set_access_rules(Some(arneb_state::StoredRules {
                 json: RULES_B.into(),
@@ -3617,13 +3618,13 @@ password = "hunter2"
             }))
             .unwrap();
 
-        let r = resolve_access_rules(&config, Some(&store), false).unwrap();
+        let r = resolve_access_rules(&config, Some(&store), false, None).unwrap();
         assert_eq!(r.seed, Some(arneb_state::RulesSeed::Diverged));
         assert!(r.handle.current().unwrap().can_execute("bob"));
 
         const RULES_C: &str = r#"{"queries":[{"user":"carol","allow":["execute"]}]}"#;
         let edited = rules_config(tmp.path(), Some(RULES_C));
-        let e = resolve_access_rules(&edited, Some(&store), false)
+        let e = resolve_access_rules(&edited, Some(&store), false, None)
             .err()
             .unwrap()
             .to_string();
@@ -3634,7 +3635,7 @@ password = "hunter2"
             "{e}"
         );
         assert_eq!(store.access_rules().unwrap().json, RULES_B, "unchanged");
-        let r = resolve_access_rules(&edited, Some(&store), true).unwrap();
+        let r = resolve_access_rules(&edited, Some(&store), true, None).unwrap();
         assert_eq!(r.seed, Some(arneb_state::RulesSeed::Seeded));
         assert!(r.handle.current().unwrap().can_execute("carol"));
     }
@@ -3644,14 +3645,14 @@ password = "hunter2"
         let tmp = tempfile::tempdir().unwrap();
         let store = arneb_state::StateStore::open(None).unwrap();
         let bad = rules_config(tmp.path(), Some("{not json"));
-        assert!(resolve_access_rules(&bad, Some(&store), false).is_err());
+        assert!(resolve_access_rules(&bad, Some(&store), false, None).is_err());
         assert!(!store.seeded().rules, "nothing was seeded");
 
         let good = rules_config(tmp.path(), Some(RULES_A));
-        resolve_access_rules(&good, Some(&store), false).unwrap();
+        resolve_access_rules(&good, Some(&store), false, None).unwrap();
         let bad = rules_config(tmp.path(), Some("{not json"));
-        assert!(resolve_access_rules(&bad, Some(&store), false).is_err());
-        assert!(resolve_access_rules(&bad, Some(&store), true).is_err());
+        assert!(resolve_access_rules(&bad, Some(&store), false, None).is_err());
+        assert!(resolve_access_rules(&bad, Some(&store), true, None).is_err());
         assert_eq!(store.access_rules().unwrap().json, RULES_A);
     }
 
@@ -3659,12 +3660,12 @@ password = "hunter2"
     fn without_a_state_store_the_rules_file_is_used() {
         let tmp = tempfile::tempdir().unwrap();
         let config = rules_config(tmp.path(), Some(RULES_A));
-        let r = resolve_access_rules(&config, None, false).unwrap();
+        let r = resolve_access_rules(&config, None, false, None).unwrap();
         assert_eq!((r.source, r.seed), ("config", None));
         assert!(r.handle.current().unwrap().can_execute("alice"));
-        let r = resolve_access_rules(&rules_config(tmp.path(), None), None, false).unwrap();
+        let r = resolve_access_rules(&rules_config(tmp.path(), None), None, false, None).unwrap();
         assert!(r.handle.current().is_none());
         let bad = rules_config(tmp.path(), Some("{not json"));
-        assert!(resolve_access_rules(&bad, None, false).is_err());
+        assert!(resolve_access_rules(&bad, None, false, None).is_err());
     }
 }

@@ -314,67 +314,83 @@ async fn run() -> Result<()> {
         ),
         _ => None,
     };
+    let serves_clients = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
+    // Fail closed: Trino clients only send passwords over HTTPS, so password
+    // auth on a plain-HTTP listener would be unusable or a bypass.
+    let trino_enabled = config.trino.enabled && serves_clients;
+    config::check_trino_transport(
+        trino_enabled,
+        matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_)),
+        server_tls.is_some(),
+    )?;
+    let (web_host, web_reason) = config::resolve_web_bind(
+        config.auth.auth_type,
+        &config.server.bind_address,
+        config.web.bind_address.as_deref(),
+    )?;
+    let file_tables = parse_file_tables(&config.tables)?;
     // Password auth on a coordinator/standalone: users live in the state
     // store; config-seeded users follow the config file on every start
     // (a changed hash or a removed user revokes tokens). The same store
     // serves pgwire, Trino and the Web API.
-    let state_store = if matches!(role, ServerRole::Coordinator | ServerRole::Standalone)
-        && matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_))
-    {
-        let store = arneb_state::StateStore::open(config.state.path.as_deref())
-            .context("cannot open the state store ([state] path / ARNEB_STATE_PATH)")?;
-        let report = prepare_state_store(
-            &store,
-            &config,
-            &verifiers,
-            &role,
-            has_cluster_secret,
-            reseed_state,
-        )?;
-        tracing::info!(
-            target: "arneb::config",
-            state_path = %store
-                .path()
-                .map_or_else(|| "in-memory".to_owned(), |p| p.display().to_string()),
-            persistent = store.is_persistent(),
-            users = arneb_protocol::CredentialSource::user_count(&store),
-            first_start = report.first_start,
-            added = ?report.added,
-            updated = ?report.updated,
-            removed = ?report.removed,
-            adopted = ?report.adopted,
-            conflicts = ?report.conflicts,
-            revoked_tokens = report.revoked_tokens,
-            reseed = reseed_state,
-            "state store effective settings ([state] path / ARNEB_STATE_PATH / --reseed-state)"
-        );
-        if !store.is_persistent() {
-            tracing::warn!(
-                target: "arneb::config",
-                "no [state] path: API tokens, worker cordons, admission limits and the audit \
-                 log are lost on restart"
-            );
-        }
-        Some(Arc::new(store))
-    } else {
-        if reseed_state {
+    let (state_store, prepared) =
+        if matches!(role, ServerRole::Coordinator | ServerRole::Standalone)
+            && matches!(config_auth, arneb_protocol::AuthMethod::ScramSha256(_))
+        {
+            let store = arneb_state::StateStore::open(config.state.path.as_deref())
+                .context("cannot open the state store ([state] path / ARNEB_STATE_PATH)")?;
+            let (report, prepared) = prepare_state_store(
+                &store,
+                &config,
+                &verifiers,
+                &role,
+                has_cluster_secret,
+                reseed_state,
+            )?;
             tracing::info!(
                 target: "arneb::config",
-                "--reseed-state ignored: it only applies with [auth] type = \"password\" \
-                 on a coordinator or standalone server"
+                state_path = %store
+                    .path()
+                    .map_or_else(|| "in-memory".to_owned(), |p| p.display().to_string()),
+                persistent = store.is_persistent(),
+                users = arneb_protocol::CredentialSource::user_count(&store),
+                first_start = report.first_start,
+                added = ?report.added,
+                updated = ?report.updated,
+                removed = ?report.removed,
+                adopted = ?report.adopted,
+                conflicts = ?report.conflicts,
+                revoked_tokens = report.revoked_tokens,
+                reseed = reseed_state,
+                "state store effective settings ([state] path / ARNEB_STATE_PATH / --reseed-state)"
             );
-        }
-        // No state store: the config's catalogs are what is served.
-        check_catalog_exposure(
-            &role,
-            has_cluster_secret,
-            &config.storage,
-            &config.catalogs,
-            false,
-            config.cluster.rpc_port,
-        )?;
-        None
-    };
+            if !store.is_persistent() {
+                tracing::warn!(
+                    target: "arneb::config",
+                    "no [state] path: API tokens, worker cordons, admission limits and the audit \
+                     log are lost on restart"
+                );
+            }
+            (Some(Arc::new(store)), Some(prepared))
+        } else {
+            if reseed_state {
+                tracing::info!(
+                    target: "arneb::config",
+                    "--reseed-state ignored: it only applies with [auth] type = \"password\" \
+                     on a coordinator or standalone server"
+                );
+            }
+            // No state store: the config's catalogs are what is served.
+            check_catalog_exposure(
+                &role,
+                has_cluster_secret,
+                &config.storage,
+                &config.catalogs,
+                false,
+                config.cluster.rpc_port,
+            )?;
+            (None, None)
+        };
     // 5. Create catalog manager + connector registry. The default catalog
     // and schema come from the catalogs this node will serve (the state
     // store's under password auth), so they never name a catalog that is
@@ -383,7 +399,10 @@ async fn run() -> Result<()> {
         // Workers ignore [[catalogs]] and resolve with the coordinator's
         // pushed defaults (Ruling R12).
         ServerRole::Worker => Vec::new(),
-        _ => served_catalog_specs(state_store.as_deref(), &config.catalogs, false),
+        _ => match &prepared {
+            Some(p) => p.served.clone(),
+            None => config.catalogs.clone(),
+        },
     };
     let (default_catalog, default_schema) =
         default_catalog_and_schema(&config.catalogs, &served_specs, !config.tables.is_empty());
@@ -413,43 +432,7 @@ async fn run() -> Result<()> {
     if !config.tables.is_empty() {
         let file_factory = Arc::new(FileConnectorFactory::new(file_storage_registry.clone()));
 
-        for table in &config.tables {
-            let format = match table.format.as_str() {
-                "csv" => FileFormat::Csv,
-                "parquet" => FileFormat::Parquet,
-                other => bail!(
-                    "unsupported table format '{}' for table '{}'",
-                    other,
-                    table.name
-                ),
-            };
-
-            let schema = match format {
-                FileFormat::Csv => {
-                    let col_schemas = table.schema.as_ref().with_context(|| {
-                        format!("CSV table '{}' requires an explicit schema", table.name)
-                    })?;
-                    let columns: Result<Vec<_>> = col_schemas
-                        .iter()
-                        .map(|cs| {
-                            let dt = parse_data_type(&cs.r#type).with_context(|| {
-                                format!(
-                                    "invalid type '{}' for column '{}' in table '{}'",
-                                    cs.r#type, cs.name, table.name
-                                )
-                            })?;
-                            Ok(arneb_common::types::ColumnInfo {
-                                name: cs.name.clone(),
-                                data_type: dt,
-                                nullable: true,
-                            })
-                        })
-                        .collect();
-                    Some(columns?)
-                }
-                FileFormat::Parquet => None,
-            };
-
+        for (table, format, schema) in file_tables {
             if let Err(e) = file_factory
                 .register_table(&table.name, &table.path, format, schema)
                 .await
@@ -903,9 +886,13 @@ async fn run() -> Result<()> {
     let (access_rules, rules_source, rules_seed) =
         if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
             // `prepare_state_store` already applied --reseed-state.
-            let resolved =
-                config::resolve_access_rules(&config.access_control, state_store.as_deref(), false)
-                    .context("invalid [access_control] configuration")?;
+            let resolved = config::resolve_access_rules(
+                &config.access_control,
+                state_store.as_deref(),
+                false,
+                prepared.map(|p| p.rules_file),
+            )
+            .context("invalid [access_control] configuration")?;
             (resolved.handle, resolved.source, resolved.seed)
         } else {
             (arneb_catalog::RulesHandle::default(), "config", None)
@@ -975,7 +962,6 @@ async fn run() -> Result<()> {
             mode: t.pgwire,
         });
 
-    let serves_clients = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
     let password_users = match &auth_method {
         arneb_protocol::AuthMethod::ScramSha256(creds) => Some(Arc::clone(creds)),
         arneb_protocol::AuthMethod::None => None,
@@ -1211,15 +1197,7 @@ async fn run() -> Result<()> {
     // state (catalogs, connectors, memory pool, distributed executor) as
     // pgwire. Queries are registered with the tracker so they show in the
     // Web UI.
-    let trino_enabled = config.trino.enabled && serves_clients;
     let trino_addr = format!("{}:{}", config.server.bind_address, config.trino.port);
-    // Fail closed: Trino clients only send passwords over HTTPS, so password
-    // auth on a plain-HTTP listener would be unusable or a bypass.
-    config::check_trino_transport(
-        trino_enabled,
-        password_users.is_some(),
-        server_tls.is_some(),
-    )?;
     tracing::info!(
         target: "arneb::config",
         trino_enabled,
@@ -1335,11 +1313,6 @@ async fn run() -> Result<()> {
     };
     let web_router = web::build_router(web_state);
     let web_port = config.server.port + 1000; // default: pgwire port + 1000 (e.g., 5432 → 6432)
-    let (web_host, web_reason) = config::resolve_web_bind(
-        config.auth.auth_type,
-        &config.server.bind_address,
-        config.web.bind_address.as_deref(),
-    )?;
     let web_addr = format!("{web_host}:{web_port}");
     if serves_clients {
         tracing::info!(
@@ -1754,7 +1727,7 @@ fn prepare_state_store(
     role: &ServerRole,
     has_cluster_secret: bool,
     reseed: bool,
-) -> Result<arneb_state::SeedReport> {
+) -> Result<(arneb_state::SeedReport, PreparedState)> {
     let rules = config
         .access_control
         .load_rules_text()
@@ -1784,9 +1757,16 @@ fn prepare_state_store(
         config.cluster.rpc_port,
     )?;
     if !reseed {
-        return store
+        let report = store
             .seed_users(verifiers, false)
-            .context("cannot seed the state store from [auth] users");
+            .context("cannot seed the state store from [auth] users")?;
+        return Ok((
+            report,
+            PreparedState {
+                served,
+                rules_file: rules,
+            },
+        ));
     }
     let config_specs = config
         .catalogs
@@ -1803,7 +1783,85 @@ fn prepare_state_store(
         "--reseed-state: users, catalogs, access rules and settings replaced with the \
          config file's in one write"
     );
-    Ok(outcome.users)
+    Ok((
+        outcome.users,
+        PreparedState {
+            served,
+            rules_file: rules,
+        },
+    ))
+}
+
+/// What [`prepare_state_store`] read, so startup reads it only once.
+struct PreparedState {
+    /// The catalog specs this node will serve ([`served_catalog_specs`]).
+    served: Vec<config::CatalogConfig>,
+    /// The `[access_control] rules_file` text and its parsed rules.
+    rules_file: Option<(String, arneb_catalog::AccessRules)>,
+}
+
+impl std::fmt::Debug for PreparedState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let served: Vec<&str> = self.served.iter().map(|s| s.name.as_str()).collect();
+        f.debug_struct("PreparedState")
+            .field("served", &served)
+            .field("rules_file", &self.rules_file.is_some())
+            .finish()
+    }
+}
+
+/// Each `[[tables]]` entry with its format and, for CSV, its schema. An
+/// unsupported format, a CSV table without a schema or a bad column type
+/// refuses the start; checked before the state store is written.
+fn parse_file_tables(
+    tables: &[config::TableConfig],
+) -> Result<
+    Vec<(
+        &config::TableConfig,
+        FileFormat,
+        Option<Vec<arneb_common::types::ColumnInfo>>,
+    )>,
+> {
+    tables
+        .iter()
+        .map(|table| {
+            let format = match table.format.as_str() {
+                "csv" => FileFormat::Csv,
+                "parquet" => FileFormat::Parquet,
+                other => bail!(
+                    "unsupported table format '{}' for table '{}'",
+                    other,
+                    table.name
+                ),
+            };
+            let schema = match format {
+                FileFormat::Csv => {
+                    let col_schemas = table.schema.as_ref().with_context(|| {
+                        format!("CSV table '{}' requires an explicit schema", table.name)
+                    })?;
+                    let columns: Result<Vec<_>> = col_schemas
+                        .iter()
+                        .map(|cs| {
+                            let dt = parse_data_type(&cs.r#type).with_context(|| {
+                                format!(
+                                    "invalid type '{}' for column '{}' in table '{}'",
+                                    cs.r#type, cs.name, table.name
+                                )
+                            })?;
+                            Ok(arneb_common::types::ColumnInfo {
+                                name: cs.name.clone(),
+                                data_type: dt,
+                                nullable: true,
+                            })
+                        })
+                        .collect();
+                    Some(columns?)
+                }
+                FileFormat::Parquet => None,
+            };
+            Ok((table, format, schema))
+        })
+        .collect()
 }
 
 /// The external catalog specs this coordinator or standalone server will
@@ -2018,6 +2076,45 @@ fn log_filter_directives(rust_log: Option<&str>, profile: bool) -> String {
 mod tests {
     use super::*;
 
+    /// The `[[tables]]` refusals are pure and run before the state store is
+    /// written, so a first start refused by one does not mark it seeded.
+    #[test]
+    fn file_tables_are_checked_before_anything_is_written() {
+        let tables = |toml_text: &str| -> Vec<config::TableConfig> {
+            #[derive(serde::Deserialize)]
+            struct T {
+                tables: Vec<config::TableConfig>,
+            }
+            toml::from_str::<T>(toml_text).unwrap().tables
+        };
+        let ok = tables(
+            "[[tables]]\nname = \"a\"\npath = \"/a.parquet\"\nformat = \"parquet\"\n\
+             [[tables]]\nname = \"b\"\npath = \"/b.csv\"\nformat = \"csv\"\n\
+             schema = [{name = \"x\", type = \"int64\"}]",
+        );
+        let parsed = parse_file_tables(&ok).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].2.is_none() && parsed[1].2.as_ref().unwrap().len() == 1);
+        for (bad, says) in [
+            (
+                "[[tables]]\nname = \"a\"\npath = \"/a\"\nformat = \"orc\"",
+                "unsupported table format 'orc'",
+            ),
+            (
+                "[[tables]]\nname = \"b\"\npath = \"/b\"\nformat = \"csv\"",
+                "requires an explicit schema",
+            ),
+            (
+                "[[tables]]\nname = \"b\"\npath = \"/b\"\nformat = \"csv\"\n\
+                 schema = [{name = \"x\", type = \"nope\"}]",
+                "invalid type 'nope'",
+            ),
+        ] {
+            let e = format!("{:#}", parse_file_tables(&tables(bad)).unwrap_err());
+            assert!(e.contains(says), "{e}");
+        }
+    }
+
     fn empty_live() -> Arc<catalogs::LiveCatalogs> {
         catalogs::LiveCatalogs::new(
             Arc::new(CatalogManager::new("memory", "default")),
@@ -2149,7 +2246,7 @@ mod tests {
         .await
         .unwrap();
         let no_rules = config::AccessControlConfig::default();
-        config::resolve_access_rules(&no_rules, Some(&store), false).unwrap();
+        config::resolve_access_rules(&no_rules, Some(&store), false, None).unwrap();
         let names = |s: &arneb_state::StateStore| -> Vec<(String, bool)> {
             s.catalogs()
                 .1
@@ -2175,7 +2272,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let resolved = config::resolve_access_rules(&no_rules, Some(&store), false).unwrap();
+        let resolved = config::resolve_access_rules(&no_rules, Some(&store), false, None).unwrap();
         assert_eq!(names(&store), vec![("from_cfg".to_owned(), true)]);
         assert_eq!(live.generation(), store.catalogs().0);
         assert_eq!(store.access_rules(), None, "no rules file: no rules");

@@ -784,11 +784,11 @@ the source of truth from the config file to the [state store](#state):
   An unreadable or invalid rules file stops startup, as before v0.2.0.
   Every startup refusal that depends on the users, catalogs or rules (an
   invalid or edited rules file, stored rules that no longer parse, a catalog
-  secret without `[cluster] secret`), and the `[cluster]`, retry and `[tls]`
-  checks, happen before anything is written to the state file, so fixing the
-  config and restarting is enough. The write itself, a re-seed included, is
-  atomic; a later failure (a bad `[[tables]]` entry, a port in use) leaves
-  the state as the config made it. Apply
+  secret without `[cluster] secret`), and the `[cluster]`, retry, `[tls]`,
+  Trino-transport, `[web] bind_address` and `[[tables]]` checks, happen
+  before anything is written to the state file, so fixing the config and
+  restarting is enough. The write itself, a re-seed included, is atomic; a
+  later failure (a port in use) leaves the state as the config made it. Apply
   `[[catalogs]]` with a [re-seed](/guide/http-api#re-seed) or
   `--reseed-state`, which replaces catalogs, rules, settings and users in
   one atomic write of the state file. A

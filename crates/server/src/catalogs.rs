@@ -307,13 +307,6 @@ impl LiveCatalogs {
         self.unauthenticated_flight.store(on, Ordering::SeqCst);
     }
 
-    /// The secrets the served set carries, as `catalog 'x': field` (the
-    /// effective specs: a hive spec with the global `[storage]` keys merged
-    /// in, Ruling R12).
-    pub fn served_secrets(&self) -> Vec<String> {
-        effective_secrets(&self.global_storage, &self.specs())
-    }
-
     /// Whether `spec` may be served: always with a `[cluster] secret`;
     /// without one only when its effective spec carries no secret (Flight
     /// `get_catalogs` would hand it to any peer). `Err` names the secret
@@ -1884,11 +1877,9 @@ mod tests {
         }));
         assert_eq!(live.exposure_check(&gcs_only), Ok(()));
 
-        assert!(live.served_secrets().is_empty());
-        live.install(hive("lake"), fake_built());
-        live.install(pg_pw, fake_built());
+        let (lake, pg) = (hive("lake"), pg_pw);
         assert_eq!(
-            live.served_secrets(),
+            effective_secrets(&live.global_storage, &[lake, pg]),
             vec![
                 "catalog 'lake': storage.s3.secret_access_key",
                 "catalog 'p': password"

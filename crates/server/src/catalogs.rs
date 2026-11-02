@@ -90,7 +90,7 @@ pub struct LiveCatalogs {
     /// The installed specs, by name.
     specs: RwLock<BTreeMap<String, CatalogConfig>>,
     generation: AtomicU64,
-    /// On a coordinator, its own epoch (random per start); on a worker, the
+    /// On a coordinator, its own epoch (ordered by start time); on a worker, the
     /// epoch of the coordinator its set came from (0 before the first).
     /// Ruling R6.
     epoch: AtomicU64,
@@ -110,10 +110,11 @@ pub struct LiveCatalogs {
     /// Builds run before it is taken, so an unreachable metastore never
     /// holds up another push or pull.
     applying: tokio::sync::Mutex<()>,
-    /// On a worker, the coordinator's current epoch as last heard from it
-    /// (a heartbeat reply or a push; 0 before either). A set from any other
-    /// epoch is stale and never applies (a slow build of a set fetched
-    /// before the coordinator restarted).
+    /// On a worker, the coordinator's current epoch: the largest seen in a
+    /// push or pull, or the one the last heartbeat reply named (0 before
+    /// any). A set from an older epoch is stale and never applies (a slow
+    /// build of a set fetched before the coordinator restarted, a delayed
+    /// push from the old one).
     latest_epoch: AtomicU64,
     /// One apply per `(epoch, generation)` at a time: a push and a pull of
     /// the same set share one build of each changed catalog.
@@ -252,10 +253,20 @@ impl LiveCatalogs {
         (self.epoch(), self.generation())
     }
 
-    /// Records the coordinator's current epoch, from a heartbeat reply or
-    /// a push (0 is ignored). From then on a set from another epoch is
-    /// refused as stale.
+    /// Records an epoch a push or pull named: epochs grow with each
+    /// coordinator start, so the larger one wins (0 is ignored). From then
+    /// on a set from an older epoch is refused as stale.
     pub fn note_coordinator_epoch(&self, epoch: u64) {
+        if epoch != 0 {
+            self.latest_epoch.fetch_max(epoch, Ordering::SeqCst);
+        }
+    }
+
+    /// Records the epoch a heartbeat reply named. Only the live coordinator
+    /// answers heartbeats, so its epoch is taken as is, even when smaller
+    /// (a coordinator host whose clock went back): a worker never refuses
+    /// the coordinator it is talking to.
+    pub fn heartbeat_epoch(&self, epoch: u64) {
         if epoch != 0 {
             self.latest_epoch.store(epoch, Ordering::SeqCst);
         }
@@ -359,12 +370,15 @@ impl LiveCatalogs {
     /// epoch held, only a newer generation applies, so a stale push loses;
     /// a set from another epoch (a restarted coordinator) applies and
     /// replaces the whole set, even at a lower generation (Ruling R6), but
-    /// only when it is the coordinator's current epoch as last heard
-    /// ([`note_coordinator_epoch`](Self::note_coordinator_epoch)), so a slow
-    /// build of a set fetched before a restart never overwrites a newer one.
+    /// only when it is the coordinator's current epoch: the set's epoch is
+    /// noted first ([`note_coordinator_epoch`](Self::note_coordinator_epoch)),
+    /// and one older than the latest known is refused, so neither a slow
+    /// build of a set fetched before a restart nor a delayed push from the
+    /// old coordinator overwrites a newer set.
     /// A spec that does not decode is skipped with a WARN and listed as
     /// failed.
     pub async fn apply_remote(&self, set: arneb_rpc::CatalogSet) -> ApplyReport {
+        self.note_coordinator_epoch(set.epoch);
         let mut specs = Vec::with_capacity(set.catalogs.len());
         let mut undecodable = Vec::new();
         for value in set.catalogs {
@@ -686,13 +700,6 @@ impl LiveCatalogs {
                 &removes,
                 Some(failed.keys().cloned().collect()),
             );
-            if let Some(e) = epoch {
-                // The first set a worker applies names the coordinator's
-                // epoch until a heartbeat or push says otherwise.
-                let _ =
-                    self.latest_epoch
-                        .compare_exchange(0, e, Ordering::SeqCst, Ordering::SeqCst);
-            }
             return ApplyReport {
                 applied: true,
                 failed: failed.into_iter().collect(),
@@ -702,11 +709,9 @@ impl LiveCatalogs {
 
     /// Whether a set at `(epoch, generation)` applies now: a newer
     /// generation within the epoch held, a set from another epoch when that
-    /// is the coordinator's current one ([`note_coordinator_epoch`]; any
-    /// before one is known), or the set already held while some of it
-    /// failed to build (Ruling R8).
-    ///
-    /// [`note_coordinator_epoch`]: Self::note_coordinator_epoch
+    /// is the coordinator's current one (the largest a push or pull named,
+    /// or the last heartbeat's; any before one is known), or the set
+    /// already held while some of it failed to build (Ruling R8).
     fn applies(&self, epoch: Option<u64>, generation: u64) -> bool {
         let latest = self.latest_epoch.load(Ordering::SeqCst);
         if epoch.is_some_and(|e| latest != 0 && e != latest) {
@@ -855,7 +860,7 @@ impl CatalogPuller {
         };
         let live = &self.inner.live;
         if let Some(epoch) = reply.catalog_epoch {
-            live.note_coordinator_epoch(epoch);
+            live.heartbeat_epoch(epoch);
         }
         let (applied, applied_epoch) = (live.generation(), live.epoch());
         let epoch_differs = reply.catalog_epoch.is_some_and(|e| e != applied_epoch);
@@ -1533,20 +1538,17 @@ mod tests {
         // Same epoch, older generation: ignored.
         assert!(!live.apply_remote(set(11, 3, vec![])).await.applied);
         assert_eq!(live.specs().len(), 1);
-        // A set from another epoch is stale until that epoch is the
-        // coordinator's current one (a heartbeat or a push says so).
-        assert!(!live.apply_remote(set(22, 2, vec![])).await.applied);
         // A restarted coordinator (new epoch) with a lower generation wins.
-        live.note_coordinator_epoch(22);
         let report = live.apply_remote(set(22, 2, vec![])).await;
         assert!(report.applied);
         assert_eq!((live.epoch(), live.generation()), (22, 2));
+        // The old coordinator's epoch is now older: refused (M1).
+        assert!(!live.apply_remote(set(11, 9, vec![])).await.applied);
         assert!(live.specs().is_empty());
         assert!(connectors.get("old").is_none());
         // A no-store coordinator restarted with a changed config: new epoch,
         // generation 1 again; the changed set is applied.
         let mysql = serde_json::json!({"name": "changed", "type": "mysql"});
-        live.note_coordinator_epoch(33);
         let report = live.apply_remote(set(33, 2, vec![mysql])).await;
         assert!(report.applied);
         assert_eq!(
@@ -2205,8 +2207,7 @@ mod tests {
             }
         });
         tokio::time::sleep(Duration::from_secs(1)).await;
-        // The restarted coordinator pushes (the push handler notes its epoch).
-        live.note_coordinator_epoch(2);
+        // The restarted coordinator pushes.
         let fast = serde_json::to_value(hive("fast")).unwrap();
         assert!(live.apply_remote(set(2, 1, vec![fast])).await.applied);
         assert_eq!(stale.await.unwrap(), ApplyReport::default());
@@ -2215,6 +2216,35 @@ mod tests {
         assert_eq!(names, vec!["fast"]);
         // And a late set from the old epoch is refused outright.
         assert!(!live.apply_remote(set(1, 9, vec![])).await.applied);
+    }
+
+    /// Round 3 (M1): a push from the old coordinator delivered after the
+    /// new one's heartbeat or push is refused and leaves the newer epoch in
+    /// place; a heartbeat names the live coordinator's epoch as is, so a
+    /// coordinator whose clock went back is still followed.
+    #[tokio::test]
+    async fn a_delayed_push_from_an_older_epoch_is_refused() {
+        let (live, _, _) = live();
+        assert!(live.apply_remote(set(200, 3, vec![])).await.applied);
+        live.heartbeat_epoch(300);
+        let fast = serde_json::to_value(hive("fast")).unwrap();
+        assert!(live.apply_remote(set(300, 1, vec![fast])).await.applied);
+        let old = serde_json::to_value(hive("old")).unwrap();
+        assert!(!live.apply_remote(set(200, 4, vec![old])).await.applied);
+        assert_eq!((live.epoch(), live.generation()), (300, 1));
+        assert_eq!(live.specs()[0].name, "fast");
+        // A later pull from the same old epoch is refused too.
+        assert!(!live.apply_remote(set(200, 5, vec![])).await.applied);
+        // The live coordinator restarted with a clock that went back.
+        live.heartbeat_epoch(250);
+        assert!(live.apply_remote(set(250, 1, vec![])).await.applied);
+        assert_eq!(live.epoch(), 250);
+    }
+
+    #[test]
+    fn epochs_grow_with_the_start_time() {
+        assert!(crate::epoch_from(1_000, u16::MAX) < crate::epoch_from(1_001, 0));
+        assert_eq!(crate::epoch_from(0, 0), 1);
     }
 
     /// Round 3: a push and a pull of the same `(epoch, generation)` that

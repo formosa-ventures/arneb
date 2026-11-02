@@ -1636,12 +1636,24 @@ fn start_worker_catalogs(
     ignored
 }
 
-/// A random, nonzero coordinator epoch (Ruling R6), from the system RNG the
-/// Web sessions use.
+/// The coordinator epoch (Ruling R6): the start time in Unix milliseconds
+/// in the high bits and 16 random bits (the system RNG the Web sessions
+/// use) below, so a later start has a larger epoch and a worker can refuse
+/// sets from an older one. Never 0.
 fn coordinator_epoch() -> u64 {
-    let mut bytes = [0u8; 8];
-    aws_lc_rs::rand::fill(&mut bytes).expect("system random number generator failed");
-    u64::from_le_bytes(bytes).max(1)
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    epoch_from(millis, {
+        let mut bytes = [0u8; 2];
+        aws_lc_rs::rand::fill(&mut bytes).expect("system random number generator failed");
+        u16::from_le_bytes(bytes)
+    })
+}
+
+/// `(millis << 16) | random`, never 0.
+fn epoch_from(millis: u64, random: u16) -> u64 {
+    ((millis << 16) | u64::from(random)).max(1)
 }
 
 /// Cluster RPC carries the catalog definitions (runtime-config D8): a
@@ -1918,8 +1930,6 @@ async fn apply_pushed_catalogs(
     set: arneb_rpc::CatalogSet,
 ) -> Result<Vec<String>, String> {
     let generation = set.generation;
-    // A push comes from the coordinator as it is now.
-    live.note_coordinator_epoch(set.epoch);
     let report = live.apply_remote(set).await;
     if !report.applied {
         tracing::debug!(

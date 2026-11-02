@@ -17,7 +17,7 @@
 //! - FULL: leave alone.
 //!
 //! Conservative on other operators:
-//! - `Projection`: not pushed through (would need expression substitution).
+//! - `Projection`: only UNION ALL view projections with safe expressions are crossed.
 //! - `Aggregate` / `PartialAggregate` / `FinalAggregate`: not pushed
 //!   (changes GROUP BY semantics).
 //! - `Sort`: safe to push through, but skipped for v1 simplicity.
@@ -31,6 +31,7 @@ use std::collections::HashSet;
 
 use arneb_common::error::PlanError;
 use arneb_common::types::ColumnInfo;
+use arneb_common::types::ScalarValue;
 use arneb_sql_parser::ast::{BinaryOp, JoinType};
 
 use crate::analyzer::{AnalysisPass, AnalyzerContext};
@@ -511,6 +512,73 @@ fn try_push_into(
                 c,
             )),
         },
+        L::Projection {
+            input,
+            exprs,
+            schema,
+        } if matches!(input.as_ref(), L::UnionAll { .. }) => {
+            push_through_projection(*input, exprs, schema, conjunct)
+        }
+        L::UnionAll { inputs } => {
+            let schema = inputs.first().map(LogicalPlan::schema).unwrap_or_default();
+            let mut kept = Vec::new();
+            for input in inputs {
+                let branch = match input {
+                    L::Projection {
+                        input,
+                        exprs,
+                        schema,
+                    } => match push_through_projection(*input, exprs, schema, conjunct.clone()) {
+                        Ok(plan) => plan,
+                        Err((plan, predicate)) => push_or_wrap(plan, predicate),
+                    },
+                    other => push_or_wrap(other, conjunct.clone()),
+                };
+                if !branch_is_empty(&branch) {
+                    kept.push(branch);
+                }
+            }
+            let union = if kept.is_empty() {
+                L::Projection {
+                    input: Box::new(L::Limit {
+                        input: Box::new(L::OneRow),
+                        limit: Some(0),
+                        offset: None,
+                    }),
+                    exprs: schema
+                        .iter()
+                        .map(|col| PlanExpr::Cast {
+                            expr: Box::new(PlanExpr::Literal {
+                                value: ScalarValue::Null,
+                                span: None,
+                            }),
+                            data_type: col.data_type.clone(),
+                            span: None,
+                        })
+                        .collect(),
+                    schema: schema.clone(),
+                }
+            } else {
+                L::UnionAll { inputs: kept }
+            };
+            if union.schema() == schema {
+                Ok(union)
+            } else {
+                Ok(L::Projection {
+                    exprs: schema
+                        .iter()
+                        .enumerate()
+                        .map(|(index, col)| PlanExpr::Column {
+                            index,
+                            name: col.name.clone(),
+                            span: None,
+                        })
+                        .collect(),
+                    input: Box::new(union),
+                    schema,
+                })
+            }
+        }
         // SemiJoin / AntiJoin output schema = LEFT schema only, so any
         // predicate applied AFTER one can ONLY reference left cols.
         // It is therefore unconditionally safe to push the conjunct
@@ -586,10 +654,110 @@ fn try_push_into(
             }),
             None => Err((plan, conjunct)),
         },
-        // Stop at Projection / Aggregate / Sort / Limit / SemiJoin /
+        // Stop at other Projections / Aggregate / Sort / Limit / SemiJoin /
         // AntiJoin / etc. The push_or_wrap caller will wrap with a
         // Filter at this level.
         other => Err((other, conjunct)),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn push_through_projection(
+    input: LogicalPlan,
+    exprs: Vec<PlanExpr>,
+    schema: Vec<ColumnInfo>,
+    conjunct: PlanExpr,
+) -> Result<LogicalPlan, (LogicalPlan, PlanExpr)> {
+    let mut valid = true;
+    let rewritten = super::type_coercion::walk_expr(conjunct.clone(), &mut |expr| {
+        if let PlanExpr::Column { index, .. } = &expr {
+            match exprs.get(*index) {
+                Some(replacement) if safe_projection_expr(replacement) => replacement.clone(),
+                _ => {
+                    valid = false;
+                    expr
+                }
+            }
+        } else {
+            expr
+        }
+    });
+    if valid {
+        Ok(LogicalPlan::Projection {
+            input: Box::new(push_or_wrap(input, rewritten)),
+            exprs,
+            schema,
+        })
+    } else {
+        Err((
+            LogicalPlan::Projection {
+                input: Box::new(input),
+                exprs,
+                schema,
+            },
+            conjunct,
+        ))
+    }
+}
+
+fn safe_projection_expr(expr: &PlanExpr) -> bool {
+    match expr {
+        PlanExpr::Column { .. } | PlanExpr::Literal { .. } => true,
+        PlanExpr::Cast { expr: inner, .. }
+            if matches!(inner.as_ref(), PlanExpr::Literal { .. }) =>
+        {
+            crate::optimizer::fold_constants(expr.clone()).is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn branch_is_empty(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            constant_filter_truth(predicate) == Some(false) || branch_is_empty(input)
+        }
+        LogicalPlan::Projection { input, .. } => branch_is_empty(input),
+        _ => false,
+    }
+}
+
+fn constant_filter_truth(expr: &PlanExpr) -> Option<bool> {
+    use PlanExpr as E;
+    let folded = crate::optimizer::fold_constants(expr.clone()).ok()?;
+    match folded {
+        E::Literal {
+            value: ScalarValue::Boolean(value),
+            ..
+        } => Some(value),
+        E::Literal {
+            value: ScalarValue::Null,
+            ..
+        } => Some(false),
+        E::IsNull { expr, .. } => constant_nullness(&expr),
+        E::IsNotNull { expr, .. } => constant_nullness(&expr).map(|value| !value),
+        E::BinaryOp {
+            left, op, right, ..
+        } => match op {
+            BinaryOp::And => Some(constant_filter_truth(&left)? && constant_filter_truth(&right)?),
+            BinaryOp::Or => Some(constant_filter_truth(&left)? || constant_filter_truth(&right)?),
+            BinaryOp::Eq | BinaryOp::NotEq
+                if constant_nullness(&left) == Some(true)
+                    || constant_nullness(&right) == Some(true) =>
+            {
+                Some(false)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn constant_nullness(expr: &PlanExpr) -> Option<bool> {
+    match expr {
+        PlanExpr::Literal { value, .. } => Some(matches!(value, ScalarValue::Null)),
+        PlanExpr::Cast { expr, .. } if constant_nullness(expr) == Some(true) => Some(true),
+        _ => None,
     }
 }
 

@@ -679,7 +679,7 @@ impl ArnebMcp {
                        {max_wait_ms}) a short query is already finished, with a first page of \
                        rows. At most `max_rows` (default {default_max_rows}, at most {max_rows}) \
                        rows are kept and `truncated` says if more existed (`truncated_by` names \
-                       the limit, `truncated_hint` what to do). A failed \
+                       the limit; `truncated_hint` is set only when no row could be kept). A failed \
                        statement is a status with state `failed` and an error. Next: \
                        get_query_status until finished, then fetch_results starting from \
                        `first_page.next_cursor` (null means you have every row).",
@@ -1033,7 +1033,8 @@ impl ArnebMcp {
         description = "Read the audit log of manage actions (worker, admission, query cancel \
                        and token changes), newest first, at most `limit` (default \
                        {audit_limit}, at most {max_audit_limit}). Continue with `next_cursor` \
-                       as `cursor`; `truncated` says if more exist. Filter by `user` or \
+                       as `cursor`; `truncated` says if more may exist (a filtered page can end \
+                       early, even empty: keep following the cursor). Filter by `user` or \
                        `action`. Without the manage privilege you see only your own actions \
                        (`scope`: own).",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -2677,6 +2678,27 @@ mod tests {
             assert!(copy.contains(default), "{default} missing");
         }
         assert!(!copy.contains('{'), "unfilled placeholder");
+    }
+
+    /// #217 review: the 1500-character budget holds at any configured
+    /// limits, not only the defaults: every quoted number at its widest.
+    #[test]
+    fn instructions_fit_the_budget_at_maximal_limits() {
+        let limits = AgentLimits {
+            default_max_rows: usize::MAX,
+            max_rows: usize::MAX,
+            max_page_bytes: usize::MAX,
+            max_wait: Duration::from_millis(u64::MAX),
+            ..AgentLimits::default()
+        };
+        let text = super::fill(
+            super::super::INSTRUCTIONS,
+            &super::copy_values(&limits, usize::MAX),
+        );
+        assert!(!text.contains('{'), "unfilled placeholder: {text}");
+        assert!(text.contains(&usize::MAX.to_string()));
+        let n = text.chars().count();
+        assert!(n <= 1500, "{n} chars: {text}");
     }
 
     #[tokio::test]

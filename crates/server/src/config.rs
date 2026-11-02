@@ -84,7 +84,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub state: StateConfig,
 
-    /// Retention of the audit log (`<state stem>.audit.jsonl` next to the
+    /// Retention of the audit log (`<state file name>.audit.jsonl` next to the
     /// state file);
     /// effective values after [`AppConfig::load`].
     #[serde(default)]
@@ -92,7 +92,7 @@ pub struct AppConfig {
 }
 
 /// `[audit]` section: retention of the audit log, kept as
-/// `<state stem>.audit.jsonl` in the directory of `[state] path` (in memory
+/// `<state file name>.audit.jsonl` in the directory of `[state] path` (in memory
 /// without one).
 ///
 /// ```toml
@@ -2541,11 +2541,18 @@ pgwire = "required"
         )
         .unwrap();
         assert_eq!(c.max_user_retained_bytes, 536870912);
-        // ... but never past the total.
+        // ... but never past the total, and the error names the setting the
+        // operator raised, not the share raised to follow it.
         let err = agent_api(file, &[("ARNEB_AGENT_MAX_RETAINED_BYTES", "6000")])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("max_total_retained_bytes"), "{err}");
+        assert!(
+            err.contains(
+                "max_retained_bytes (6000) must not exceed max_total_retained_bytes (5000)"
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("max_user_retained_bytes"), "{err}");
         let err = agent_api(file, &[("ARNEB_AGENT_MAX_USER_RETAINED_BYTES", "6000")])
             .unwrap_err()
             .to_string();

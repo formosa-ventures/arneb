@@ -712,7 +712,7 @@ open so existing scrapers keep working.
 - **New state.** The state file gains `cordons` and `settings` (readable by
   older binaries, whose next write drops them), and the coordinator writes
   the [audit log](#audit-log) next to it (`state.json` →
-  `state.audit.jsonl`). With no `[state] path` these live
+  `state.json.audit.jsonl`). With no `[state] path` these live
   in memory and are lost on restart.
 - **Revoking a token with a malformed id is `400 invalid_argument`**, and
   the refusal is not audited.
@@ -880,7 +880,7 @@ path = "/var/lib/arneb/state.json"   # optional; ARNEB_STATE_PATH
 The coordinator (or standalone server) keeps its users and
 [API tokens](/guide/http-api#api-tokens) in one JSON state file, and the
 [audit log](#audit-log) in the same directory, named after the state file
-(`state.json` → `state.audit.jsonl`), so two state files in one directory
+(`state.json` → `state.json.audit.jsonl`), so two state files in one directory
 keep separate audit logs. Workers never
 open them. Every write is atomic (write, fsync, rename) and the file is
 created with mode `0600`. The path's directory must be writable.
@@ -931,9 +931,12 @@ retention_days = 90      # ARNEB_AUDIT_RETENTION_DAYS; 0 = no age limit
 
 Under `[auth] type = "password"`, the coordinator records every audited
 action (token issue and revoke, and the manage actions) as JSON lines in
-`<stem>.audit.jsonl`, in the directory of [`[state] path`](#state) and named
-after its file (`/var/lib/arneb/prod.json` →
-`/var/lib/arneb/prod.audit.jsonl`), mode `0600`.
+`<state file name>.audit.jsonl`, in the directory of [`[state] path`](#state)
+and named after its full file name (`/var/lib/arneb/prod.json` →
+`/var/lib/arneb/prod.json.audit.jsonl`), mode `0600`. A log under the
+earlier name `audit.jsonl` in that directory is neither read nor migrated:
+the server logs a WARN on `arneb::audit` at startup naming it, and its
+entries do not appear in `GET /api/v2/audit`. Keep or archive it.
 An action writes an intent entry (outcome `pending`) before it is applied
 and a completion entry after; each is synced to disk, the completion before
 the response returns. Read it with
@@ -957,16 +960,20 @@ the response returns. Read it with
   crash) is skipped with a WARN on `arneb::audit` naming its line number.
   Startup never fails on it, and the startup compaction drops it.
 - **A failed write.** If the intent cannot be written, the action is
-  refused with `503 audit_unavailable` and nothing is applied; if the log
-  reopens at once, the intent is closed with outcome
-  `{"error": "audit_unavailable"}` (best effort), so a restart does not
-  report it as interrupted. If the
-  completion cannot be written, the action has already happened: the entry
-  is logged in full at ERROR on `arneb::audit`, its intent stays `pending`,
-  and every later audited action is refused with `503 audit_unavailable`
-  until the file can be written again.
+  refused with `503 audit_unavailable` and nothing is applied. When the
+  write was attempted (it may have reached the disk) and the log reopens at
+  once, the intent is closed with outcome `{"error": "audit_unavailable"}`
+  (best effort), so a restart does not report it as interrupted; an intent
+  refused without a write gets no closing entry. If the completion cannot
+  be written, the action has already happened: the entry is logged in full
+  at ERROR on `arneb::audit`, its intent stays `pending` for now, and every
+  later audited action is refused with `503 audit_unavailable` until the
+  file can be written again. The server keeps that completion and appends
+  it first when the log reopens, so the known outcome still reaches the
+  file. An action that panics is completed with `{"error": "internal"}`.
 - **Interrupted actions.** An intent with no completion at startup (the
-  server stopped while applying it, or its completion failed) is logged at
+  server stopped while applying it, or before a failed completion could be
+  appended again) is logged at
   WARN on `arneb::audit` and recorded once as an entry with outcome
   `interrupted`: the action may or may not have been applied. So no applied
   action is ever missing from the log.

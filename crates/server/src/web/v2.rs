@@ -506,10 +506,13 @@ pub(super) async fn issue_token_for(
     let issued = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let parameters = serde_json::json!({"name": name, "expires_ms": expires_at_ms});
-        // The intent names the user (or nothing, for one's own token): the
-        // id is not known before the token is issued. Dropping `target`
-        // (releasing a held change lock) waits until the entry is appended.
-        let intent = target.audit_subject(None, parameters.clone());
+        // The id is chosen before the intent, so the intent names the token
+        // that a crash between issuing and completing would leave behind.
+        // The id only: never the token itself. Dropping `target` (releasing
+        // a held change lock) waits until the entry is appended.
+        let id = arneb_state::TokenId::generate().map_err(state_error)?;
+        let id_text = id.to_string();
+        let intent = target.audit_subject(Some(&id_text), parameters.clone());
         let issued = audited(
             &state,
             &who,
@@ -517,11 +520,10 @@ pub(super) async fn issue_token_for(
             intent,
             || {
                 store
-                    .issue_token(&user, name, expires_at_ms)
+                    .issue_token_as(id, &user, name, expires_at_ms)
                     .map_err(|e| target.error(e))
             },
-            // The id only: never the token itself.
-            |out| target.audit_subject(out.ok().map(|t| t.info.id.as_str()), parameters),
+            |_| target.audit_subject(Some(&id_text), parameters),
         );
         drop(target);
         issued
@@ -1681,7 +1683,10 @@ pub(super) mod tests {
         let seen = Arc::clone(&killed_by);
         t.set_canceller(
             &id,
-            Box::new(move |by| seen.lock().unwrap().push(by.to_owned())),
+            Box::new(move |by| {
+                seen.lock().unwrap().push(by.to_owned());
+                true
+            }),
         );
         (id, killed_by)
     }
@@ -1939,6 +1944,39 @@ pub(super) mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "not_found");
         assert_eq!(audit_entries(&state).len(), 1, "refusals are not audited");
+    }
+
+    /// A kill that lands after an INSERT's work completed (before the
+    /// protocol recorded it) stops nothing: the audit says it was not
+    /// applied, and the statement finishes with its real result.
+    #[tokio::test]
+    async fn killing_a_write_whose_work_completed_is_not_applied() {
+        let state = kill_state();
+        let t = &state.query_tracker;
+        let id = t.create_query_from(
+            "INSERT INTO t SELECT 1".into(),
+            "pgwire",
+            Some("alice".into()),
+        );
+        t.advance_to(&id, arneb_scheduler::QueryState::Running)
+            .unwrap();
+        let switch = arneb_scheduler::KillSwitch::new();
+        t.set_canceller(&id, switch.canceller(|_| panic!("stopped completed work")));
+        assert_eq!(switch.guard(async { "committed" }).await, Some("committed"));
+        let (status, body) = cancel_as(&state, "root", &format!("/api/v2/queries/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["changed"], false, "{body}");
+        let summary = body["summary"].as_str().unwrap();
+        assert!(summary.contains("nothing to cancel"), "{summary}");
+        let entries = audit_entries(&state);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["parameters"]["effect"], "already_ended");
+        // The protocol then records the real outcome.
+        t.finish_query(&id, 1).unwrap();
+        assert_eq!(
+            query_state(&state, &id),
+            arneb_scheduler::QueryState::Finished
+        );
     }
 
     #[tokio::test]

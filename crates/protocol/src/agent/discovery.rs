@@ -17,7 +17,7 @@ use super::service::AgentQueryService;
 use super::statement::{StatementStatus, SubmitRequest};
 use crate::trino::{
     build_virtual_catalogs, catalog_names, schema_names, table_columns, table_names, trino_type_of,
-    SYSTEM_CATALOG,
+    INFORMATION_SCHEMA, SYSTEM_CATALOG,
 };
 
 /// Rows a sample returns when `rows` is not given.
@@ -275,7 +275,9 @@ impl AgentQueryService {
     /// tracked statement and waited for up to `max_wait`. The row count is
     /// further capped at the server's `max_rows`, so a small configured
     /// ceiling shortens the sample instead of failing it. The first page
-    /// holds at most `page_bytes` (default `default_page_bytes`) of rows.
+    /// holds at most `page_bytes` (default `default_page_bytes`) of rows. A
+    /// table that does not exist (or that `user` may not see) answers
+    /// not-found without running, registering or queueing anything.
     pub async fn sample(
         &self,
         user: &str,
@@ -306,6 +308,8 @@ impl AgentQueryService {
             }
         } else if !names_visible(&root, catalog, schema, table) {
             return Err(missing(&root, catalog, schema, table).await);
+        } else if let Some(error) = listed_miss(&root, catalog, schema, table, false).await {
+            return Err(error);
         }
         let sql = format!(
             "SELECT * FROM {}.{}.{} LIMIT {rows}",
@@ -327,10 +331,11 @@ impl AgentQueryService {
                 page_bytes,
             )
             .await?;
-        // The query resolves the table itself (once); when the sampled table
-        // does not exist, answer with the same not-found error (and
-        // candidates) as describe. A not-found raised inside it (a view over
-        // a missing table, ...) stays the query's own error.
+        // The query resolves the table itself (once); when the listings now
+        // show a sure miss for the names as the query resolved them, answer
+        // with the same not-found error (and candidates) as describe, at the
+        // level that is missing. Any other not-found (a view over a missing
+        // table, a failed listing, ...) stays the query's own error.
         let not_found = status.error.as_ref().is_some_and(|e| {
             matches!(
                 e.code,
@@ -340,17 +345,89 @@ impl AgentQueryService {
             )
         });
         if not_found && !is_virtual(catalog, schema) {
-            let error = match tables_of(&root, catalog, schema).await {
-                Ok(visible) if visible.iter().any(|t| t == table) => None,
-                Ok(visible) => Some(table_missing(catalog, schema, table, &visible)),
-                Err(err) => Some(err),
-            };
-            if let Some(error) = error {
+            if let Some(error) = listed_miss(&root, catalog, schema, table, true).await {
                 self.forget(user, &status.id);
                 return Err(error);
             }
         }
         Ok(status)
+    }
+}
+
+/// The not-found error for `catalog.schema.table` when the visible name
+/// listings show it surely cannot resolve; `None` (let the query decide, or
+/// keep its own error) whenever it might. A level is a sure miss only when
+/// its listing has a real name (one besides the virtual `system` and
+/// `information_schema` the listings always add; a failed listing reads as
+/// empty) and none matches the requested name ignoring case, since the
+/// query folds case and connectors may resolve more loosely (PostgreSQL
+/// falls back to a unique case-insensitive match). Only names are listed:
+/// no table metadata is loaded.
+///
+/// Before the query (`after_query` false), a non-exact catalog or schema
+/// that matches ignoring case ends the check: the query decides. After a
+/// not-found from the query, such a level is resolved the way the query
+/// would have resolved it ([`resolve_like_query`]), so the error names the
+/// level that is really missing.
+async fn listed_miss(
+    root: &CatalogManager,
+    catalog: &str,
+    schema: &str,
+    table: &str,
+    after_query: bool,
+) -> Option<AgentError> {
+    /// The name `name` stands for in `names`: itself, else its lowercase
+    /// form, else the unique case-insensitive match; `Err(sure miss)` when
+    /// nothing matches and the listing has a real name, `Ok(None)` when it
+    /// cannot tell.
+    fn level<'a>(name: &str, names: &'a [String]) -> Result<Option<&'a str>, ()> {
+        if let Some(n) = resolve_like_query(name, names) {
+            return Ok(Some(n));
+        }
+        let lower = name.to_lowercase();
+        let real = names
+            .iter()
+            .any(|n| n != SYSTEM_CATALOG && n != INFORMATION_SCHEMA);
+        if real && !names.iter().any(|n| n.to_lowercase() == lower) {
+            Err(())
+        } else {
+            Ok(None)
+        }
+    }
+    let catalogs = catalog_names(root);
+    let catalog = match level(catalog, &catalogs) {
+        Err(()) => return Some(catalog_missing(catalog, &catalogs)),
+        Ok(Some(c)) if c == catalog || after_query => c.to_string(),
+        Ok(_) => return None,
+    };
+    let schemas = schema_names(root, &catalog).await?;
+    let schema = match level(schema, &schemas) {
+        Err(()) => return Some(schema_missing(&catalog, schema, &schemas)),
+        Ok(Some(s)) if s == schema || after_query => s.to_string(),
+        Ok(_) => return None,
+    };
+    let tables = table_names(root, &catalog, &schema).await?;
+    match level(table, &tables) {
+        Err(()) => Some(table_missing(&catalog, &schema, table, &tables)),
+        Ok(_) => None,
+    }
+}
+
+/// The name in `names` that `name` resolves to the way the query and the
+/// connectors resolve it: `name` itself, else its lowercase form (the
+/// query's fold), else the unique case-insensitive match (PostgreSQL).
+fn resolve_like_query<'a>(name: &str, names: &'a [String]) -> Option<&'a str> {
+    let lower = name.to_lowercase();
+    if let Some(n) = names.iter().find(|n| *n == name) {
+        return Some(n);
+    }
+    if let Some(n) = names.iter().find(|n| **n == lower) {
+        return Some(n);
+    }
+    let mut ci = names.iter().filter(|n| n.to_lowercase() == lower);
+    match (ci.next(), ci.next()) {
+        (Some(n), None) => Some(n),
+        _ => None,
     }
 }
 
@@ -745,7 +822,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn describe_and_sample_resolve_without_listing() {
+    async fn describe_resolves_without_listing_and_sample_resolves_once() {
         let counts = Arc::new(Counts::default());
         let cm = CatalogManager::new("counted", "s");
         cm.register_catalog("counted", Arc::new(CountingCatalog(Arc::clone(&counts))));
@@ -789,14 +866,233 @@ mod tests {
             "the sample must not resolve the table beyond its own query"
         );
         let count = || counts.listings.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(count(), 0, "a hit must not list the schema");
+        // The sample checks the name against the schema's table names
+        // (which load no table metadata) before running anything.
+        assert_eq!(count(), 1, "a sample lists the schema once");
+        let d = svc
+            .describe_table("alice", "counted", "s", "stat", None)
+            .await;
+        assert!(d.is_ok());
+        assert_eq!(count(), 1, "a describe hit must not list the schema");
         let err = svc
             .describe_table("alice", "counted", "s", "stta", None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
         assert_eq!(err.candidates, vec!["stat".to_string()]);
-        assert_eq!(count(), 1, "a miss lists once for the candidates");
+        assert_eq!(count(), 2, "a miss lists once for the candidates");
+    }
+
+    /// A schema `public` that lists `listed` and resolves a table as
+    /// PostgreSQL does: exactly, else by a unique case-insensitive match
+    /// against `tables`.
+    #[derive(Debug)]
+    struct LooseSchema {
+        listed: Vec<String>,
+        tables: Vec<String>,
+    }
+
+    #[async_trait]
+    impl SchemaProvider for LooseSchema {
+        async fn table_names(&self) -> Vec<String> {
+            self.listed.clone()
+        }
+        async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+            let lower = name.to_lowercase();
+            let mut ci = self.tables.iter().filter(|t| t.to_lowercase() == lower);
+            let found = self.tables.iter().any(|t| t == name)
+                || (ci.next().is_some() && ci.next().is_none());
+            found.then(|| Arc::new(StatsTable) as Arc<dyn TableProvider>)
+        }
+    }
+
+    /// A catalog with schema `public` (resolved case-insensitively, as
+    /// PostgreSQL does), listing `public` unless `schemas_fail`.
+    #[derive(Debug)]
+    struct LooseCatalog(Vec<String>, Vec<String>, bool);
+
+    #[async_trait]
+    impl CatalogProvider for LooseCatalog {
+        async fn schema_names(&self) -> Vec<String> {
+            if self.2 {
+                Vec::new() // a failed listing, as connectors report one
+            } else {
+                vec!["public".into()]
+            }
+        }
+        async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+            (name.to_lowercase() == "public").then(|| {
+                Arc::new(LooseSchema {
+                    listed: self.0.clone(),
+                    tables: self.1.clone(),
+                }) as Arc<dyn SchemaProvider>
+            })
+        }
+    }
+
+    /// A service over catalog `pg` ([`LooseCatalog`]) and its tracker.
+    fn loose(listed: &[&str], tables: &[&str]) -> (AgentQueryService, Arc<QueryTracker>) {
+        loose_with(false, listed, tables)
+    }
+
+    /// [`loose`], with the schema listing failing when `schemas_fail`.
+    fn loose_with(
+        schemas_fail: bool,
+        listed: &[&str],
+        tables: &[&str],
+    ) -> (AgentQueryService, Arc<QueryTracker>) {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
+        let cm = CatalogManager::new("pg", "public");
+        let catalog = LooseCatalog(names(listed), names(tables), schemas_fail);
+        cm.register_catalog("pg", Arc::new(catalog));
+        let tracker = Arc::new(QueryTracker::new());
+        let svc = AgentQueryService::new(
+            Arc::new(cm),
+            Arc::new(ConnectorRegistry::new()),
+            Arc::clone(&tracker),
+            AgentLimits::default(),
+        );
+        (svc, tracker)
+    }
+
+    #[tokio::test]
+    async fn sample_never_refuses_what_the_query_might_resolve() {
+        // The query folds an unmatched name to lowercase: these sampled at
+        // 6f7e56a, and still do.
+        let svc = service(None);
+        for (catalog, schema, table) in [
+            ("memory", "default", "LINEITEM"),
+            ("MEMORY", "DEFAULT", "LineItem"),
+            ("memory", "INFORMATION_SCHEMA", "TABLES"),
+        ] {
+            let s = svc
+                .sample("alice", catalog, schema, table, Some(1), None)
+                .await
+                .unwrap();
+            assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
+        }
+        // PostgreSQL resolves "Orders" for orders or ORDERS (a unique
+        // case-insensitive match): the query runs and resolves it. With no
+        // connector behind the stub it then fails, but not as not-found
+        // (that would have come back as a table_not_found error).
+        let (svc, tracker) = loose(&["Orders"], &["Orders"]);
+        for name in ["orders", "ORDERS", "Orders"] {
+            let s = svc
+                .sample("alice", "pg", "public", name, Some(1), None)
+                .await;
+            assert!(s.is_ok(), "{name}: {:?}", s.unwrap_err());
+        }
+        assert_eq!(tracker.list_queries(None).len(), 3);
+        // A failed listing reads as empty: never a sure miss, the query
+        // decides.
+        let (svc, tracker) = loose(&[], &["orders"]);
+        assert!(svc
+            .sample("alice", "pg", "public", "orders", None, None)
+            .await
+            .is_ok());
+        assert_eq!(tracker.list_queries(None).len(), 1);
+        // No case-insensitive match: refused before running.
+        let (svc, tracker) = loose(&["Orders"], &["Orders"]);
+        let err = svc
+            .sample("alice", "pg", "public", "ordrs", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound);
+        assert_eq!(err.candidates, ["Orders"]);
+        assert!(tracker.list_queries(None).is_empty());
+        // A failed schema listing (only the virtual information_schema
+        // left in it) is not a sure miss either.
+        let (svc, tracker) = loose_with(true, &["orders"], &["orders"]);
+        let s = svc
+            .sample("alice", "pg", "public", "orders", None, None)
+            .await;
+        assert!(s.is_ok(), "{:?}", s.unwrap_err());
+        assert_eq!(tracker.list_queries(None).len(), 1);
+        // A hidden table is never matched: bob cannot see orders.
+        let svc = service(Some(HIDE_ORDERS));
+        let err = svc
+            .sample("bob", "memory", "default", "ORDERS", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound);
+        assert!(!err.candidates.contains(&"orders".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_missing_table_under_a_case_folded_schema_is_table_not_found() {
+        // The schema matches only ignoring case, so the query runs; its
+        // not-found is reported at the table level, under the schema the
+        // query resolved, not as a missing schema.
+        let (svc, _) = loose(&["Orders"], &["Orders"]);
+        let err = svc
+            .sample("alice", "pg", "PUBLIC", "ordrs", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound, "{err:?}");
+        assert_eq!(err.candidates, ["Orders"]);
+        assert!(err.message.contains("pg.public.ordrs"), "{}", err.message);
+        let svc = service(None);
+        let err = svc
+            .sample(
+                "alice",
+                "memory",
+                "INFORMATION_SCHEMA",
+                "TABLEZ",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound, "{err:?}");
+        let err = svc
+            .sample("alice", "memory", "DEFAULT", "LINEITM", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound, "{err:?}");
+        assert_eq!(err.candidates[0], "lineitem");
+    }
+
+    #[tokio::test]
+    async fn sampling_a_missing_table_runs_nothing() {
+        let tracker = Arc::new(QueryTracker::new());
+        let cm = CatalogManager::new("memory", "default");
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("lineitem", int_table(10));
+        let memory = Arc::new(MemoryCatalog::new());
+        memory.register_schema("default", schema);
+        cm.register_catalog("memory", memory);
+        let admission = arneb_scheduler::AdmissionController::new(1, 10);
+        let svc = AgentQueryService::new(
+            Arc::new(cm),
+            Arc::new(ConnectorRegistry::new()),
+            Arc::clone(&tracker),
+            AgentLimits::default(),
+        )
+        .with_admission(Some(admission.clone()));
+        // Every slot is taken: a sample that queued would wait max_wait.
+        let _held = admission.admit("held").unwrap().wait().await;
+        let start = std::time::Instant::now();
+        let err = svc
+            .sample("alice", "memory", "default", "lineitm", Some(5), None)
+            .await
+            .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(err.code, AgentErrorCode::TableNotFound);
+        assert_eq!(err.candidates[0], "lineitem");
+        assert!(tracker.list_queries(None).is_empty(), "no statement ran");
+        let snap = admission.snapshot();
+        assert_eq!((snap.running, snap.queued), (1, 0), "no slot was asked for");
+        for (catalog, schema) in [("memry", "default"), ("memory", "defalt")] {
+            let err = svc
+                .sample("alice", catalog, schema, "lineitem", None, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err.code,
+                AgentErrorCode::CatalogNotFound | AgentErrorCode::SchemaNotFound
+            ));
+        }
+        assert!(tracker.list_queries(None).is_empty());
     }
 
     #[tokio::test]

@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_poll_fetch_cancel_over_http() {
+    async fn submit_poll_fetch_release_over_http() {
         let state = web_state(false, true);
         let me = user("alice");
         let (status, headers, body) = call(
@@ -439,7 +439,21 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(page["rows"], json!([[1]]));
 
-        // Cancel is idempotent and keeps the terminal state.
+        // Another user sees nothing (checked while the statement still
+        // exists, so the 404 is isolation, not a release).
+        let (status, _, body) = call(
+            &state,
+            Method::GET,
+            &format!("/api/v2/statements/{id}"),
+            &user("bob"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "not_found");
+
+        // DELETE on an ended statement answers its final state and
+        // releases it; a second DELETE finds nothing.
         let (status, _, body) = call(
             &state,
             Method::DELETE,
@@ -450,13 +464,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["state"], "finished");
-
-        // Another user sees nothing.
         let (status, _, body) = call(
             &state,
-            Method::GET,
+            Method::DELETE,
             &format!("/api/v2/statements/{id}"),
-            &user("bob"),
+            &me,
             None,
         )
         .await;

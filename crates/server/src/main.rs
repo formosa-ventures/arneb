@@ -975,17 +975,17 @@ async fn run() -> Result<()> {
         .map(arneb_protocol::BasicAuthenticator::new)
         .transpose()
         .context("HTTP Basic authentication")?;
-    // The audit log (manage-api D6): `<state stem>.audit.jsonl` next to the
-    // state file,
-    // in memory without one, and an empty in-memory log under `none`
+    // The audit log (manage-api D6): `<state file name>.audit.jsonl` next to
+    // the state file, in memory without one, and an empty in-memory log under `none`
     // (nothing is audited there).
     let audit_path = state_store
         .as_ref()
         .and_then(|s| s.path())
         .map(arneb_state::AuditLog::sibling_of);
     let audit_log = Arc::new(
-        arneb_state::AuditLog::open(audit_path.as_deref(), config.audit.settings())
-            .context("cannot open the audit log (<state stem>.audit.jsonl next to [state] path)")?,
+        arneb_state::AuditLog::open(audit_path.as_deref(), config.audit.settings()).context(
+            "cannot open the audit log (<state file name>.audit.jsonl next to [state] path)",
+        )?,
     );
     if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
         tracing::info!(
@@ -998,6 +998,19 @@ async fn run() -> Result<()> {
             loaded = audit_log.len(),
             "audit effective settings ([audit] / ARNEB_AUDIT_*)"
         );
+        if let Some(legacy) = state_store
+            .as_ref()
+            .and_then(|s| s.path())
+            .and_then(arneb_state::AuditLog::legacy_sibling_of)
+        {
+            tracing::warn!(
+                target: "arneb::audit",
+                legacy = %legacy.display(),
+                path = %audit_path.as_ref().map_or_else(String::new, |p| p.display().to_string()),
+                "an audit log under the earlier name exists and is not read: its entries do \
+                 not appear in GET /api/v2/audit; keep or archive it (it is not migrated)"
+            );
+        }
         if state_store.as_ref().is_some_and(|s| !s.is_persistent()) {
             tracing::warn!(
                 target: "arneb::config",

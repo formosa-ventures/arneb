@@ -20,7 +20,7 @@
 //! on the fast path count against a cap set later.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -87,13 +87,17 @@ impl State {
     }
 }
 
+/// The [`Shared::fast`] bit set while a cap is set (`max_running > 0`).
+const CAPPED: usize = 1 << (usize::BITS - 1);
+
 struct Shared {
     state: Mutex<State>,
-    /// `max_running == 0`: admit on the lock-free path. Written only under
-    /// `state`'s lock.
-    unlimited: AtomicBool,
-    /// Queries admitted on the lock-free path and still running.
-    fast_running: AtomicUsize,
+    /// The count of queries admitted on the lock-free path and still
+    /// running, plus [`CAPPED`] while a cap is set. One word, so the
+    /// lock-free admission checks the flag and takes its slot in one atomic
+    /// step: a locked admission never sees a slot that is then given back.
+    /// The flag is written only under `state`'s lock.
+    fast: AtomicUsize,
 }
 
 impl Shared {
@@ -101,8 +105,9 @@ impl Shared {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Queries admitted on the lock-free path and still running.
     fn fast(&self) -> usize {
-        self.fast_running.load(Ordering::SeqCst)
+        self.fast.load(Ordering::SeqCst) & !CAPPED
     }
 
     /// Return a freed slot and hand it to the first waiter still listening,
@@ -115,29 +120,29 @@ impl Shared {
 
     /// Return a slot taken on the lock-free path. Still unlimited: nothing
     /// can be queued, so no lock. A cap set meanwhile counted this slot
-    /// (`set_limits` flips `unlimited` before it reads `fast_running`), so
-    /// hand the slot to the queue under the lock.
+    /// (`set_limits` sets [`CAPPED`] before it reads the count), so hand
+    /// the slot to the queue under the lock.
     fn release_fast(&self) {
-        self.fast_running.fetch_sub(1, Ordering::SeqCst);
-        if !self.unlimited.load(Ordering::SeqCst) {
+        if self.fast.fetch_sub(1, Ordering::SeqCst) & CAPPED != 0 {
             let mut state = self.lock();
             state.grant_waiters(self.fast());
         }
     }
 
     /// The lock-free admission while no cap is set; `false` to take the
-    /// locked path.
+    /// locked path. Checks [`CAPPED`] and counts the slot in one step, so
+    /// it never takes a slot it must give back.
     fn try_admit_fast(&self) -> bool {
-        if !self.unlimited.load(Ordering::SeqCst) {
-            return false;
+        let mut v = self.fast.load(Ordering::SeqCst);
+        while v & CAPPED == 0 {
+            match self
+                .fast
+                .compare_exchange_weak(v, v + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(now) => v = now,
+            }
         }
-        self.fast_running.fetch_add(1, Ordering::SeqCst);
-        if self.unlimited.load(Ordering::SeqCst) {
-            return true;
-        }
-        // A cap was set in between, and may have counted this slot: give
-        // it back like a finished query.
-        self.release_fast();
         false
     }
 }
@@ -160,8 +165,7 @@ impl AdmissionController {
                     max_running,
                     max_queued,
                 }),
-                unlimited: AtomicBool::new(max_running == 0),
-                fast_running: AtomicUsize::new(0),
+                fast: AtomicUsize::new(if max_running == 0 { 0 } else { CAPPED }),
             }),
         }
     }
@@ -245,11 +249,13 @@ impl AdmissionController {
         let mut state = self.shared.lock();
         state.max_running = max_running;
         state.max_queued = max_queued;
-        // Flipped before `fast_running` is read below, so a lock-free
-        // admission either is counted or falls back to this lock.
-        self.shared
-            .unlimited
-            .store(max_running == 0, Ordering::SeqCst);
+        // Flipped before the count is read below, so a lock-free admission
+        // either is counted or falls back to this lock.
+        if max_running == 0 {
+            self.shared.fast.fetch_and(!CAPPED, Ordering::SeqCst);
+        } else {
+            self.shared.fast.fetch_or(CAPPED, Ordering::SeqCst);
+        }
         let fast = self.shared.fast();
         state.grant_waiters(fast);
         state.snapshot(self.shared.fast())
@@ -470,6 +476,37 @@ mod tests {
         drop(held);
         assert_eq!(fast, Ok(true), "admission waited for the lock");
         assert_eq!(c.snapshot().running, 0);
+    }
+
+    /// Under a cap the lock-free path changes nothing, not even for a
+    /// moment: the flag check and the slot are one atomic step, so a locked
+    /// admission never counts a slot that is then given back (a spurious
+    /// `QueueFull` right after a cap is set).
+    #[tokio::test]
+    async fn a_capped_fast_path_never_touches_the_count() {
+        let c = AdmissionController::new(0, 0);
+        c.set_limits(1, 0);
+        let word = c.shared.fast.load(Ordering::SeqCst);
+        assert_eq!(word, CAPPED);
+        assert!(!c.shared.try_admit_fast());
+        assert_eq!(c.shared.fast.load(Ordering::SeqCst), word);
+        // The one slot is free: a locked admission gets it, and the next
+        // is refused for the real reason.
+        let p = c.admit("q").unwrap();
+        assert!(matches!(p.inner, PendingInner::Admitted { fast: false }));
+        assert!(matches!(
+            c.admit("r"),
+            Err(AdmissionError::QueueFull {
+                running: 1,
+                queued: 0
+            })
+        ));
+        drop(p);
+        c.set_limits(0, 0);
+        assert!(c.shared.try_admit_fast());
+        assert_eq!(c.shared.fast.load(Ordering::SeqCst), 1);
+        c.shared.release_fast();
+        assert_eq!(c.shared.fast.load(Ordering::SeqCst), 0);
     }
 
     /// Queries admitted on the lock-free path count against a cap set

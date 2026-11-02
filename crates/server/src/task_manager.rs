@@ -1375,6 +1375,16 @@ impl TaskSources<'_> {
                 return Ok(Some(factory));
             }
         }
+        if let Some(planned) = self
+            .planned
+            .filter(|_| puller.live().failed_to_build(catalog))
+        {
+            return Err(format!(
+                "catalog '{catalog}' failed to build on worker {worker_id} at generation {}; \
+                 retry the query",
+                planned.1
+            ));
+        }
         Err(format!(
             "catalog '{catalog}' is not registered on worker {worker_id}"
         ))
@@ -1811,6 +1821,68 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Round 3 (I1): a changed catalog whose rebuild fails on this worker
+    /// is not left at its old spec under the new tag. A task planned at
+    /// that generation retries the build once and then fails; it never
+    /// scans the old connector.
+    #[tokio::test]
+    async fn a_failed_rebuild_never_serves_the_old_spec_under_the_new_tag() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = Arc::new(ConnectorRegistry::new());
+        let live = crate::catalogs::LiveCatalogs::with_test_builder(
+            Arc::new(CatalogManager::new("memory", "default")),
+            registry.clone(),
+            Box::new(|spec| match spec.metastore_uri.as_deref() {
+                Some("unreachable:9083") => Err(crate::catalogs::CatalogBuildError::Unreachable(
+                    "no route".into(),
+                )),
+                _ => Ok(users_built()),
+            }),
+        );
+        let set = |generation, uri: &str| arneb_rpc::CatalogSet {
+            epoch: 9,
+            generation,
+            catalogs: vec![serde_json::json!({
+                "name": "cat1", "type": "hive", "metastore_uri": uri
+            })],
+            ..Default::default()
+        };
+        assert!(live.apply_remote(set(4, "h1:9083")).await.applied);
+        assert!(registry.get("cat1").is_some());
+        let report = live.apply_remote(set(5, "unreachable:9083")).await;
+        assert!(report.applied && report.failed.len() == 1);
+        assert_eq!(registry.version(), Some((9, 5)));
+        assert!(
+            registry.get("cat1").is_none(),
+            "the old spec is not served under generation 5"
+        );
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let (n, l) = (pulls.clone(), live.clone());
+        let puller = crate::catalogs::CatalogPuller::new(live.clone(), move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            let l = l.clone();
+            Box::pin(async move {
+                l.apply_remote(set(5, "unreachable:9083")).await;
+                Ok(())
+            })
+        });
+        let tm = worker_tm(registry.clone(), puller);
+        let err = tm
+            .register_data_sources(
+                &cat1_scan(),
+                &mut arneb_execution::ExecutionContext::new(),
+                Some((9, 5)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "catalog 'cat1' failed to build on worker w1 at generation 5; retry the query"
+        );
+        assert_eq!(pulls.load(Ordering::SeqCst), 1, "one rebuild attempt");
+        assert!(registry.get("cat1").is_none());
     }
 
     /// Ruling R8: `cat1` failed to build at generation 5; once its backend

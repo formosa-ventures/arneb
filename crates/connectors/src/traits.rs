@@ -141,6 +141,15 @@ impl ConnectorRegistry {
         f()
     }
 
+    /// Runs `f`, which reads state that a [`swap`](Self::swap) changes
+    /// (such as the catalog specs and the version tag), never in the middle
+    /// of a swap. Like [`pinned`](Self::pinned) without copying the
+    /// factories.
+    pub fn consistent<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _swap = self.swaps.read().unwrap_or_else(|p| p.into_inner());
+        f()
+    }
+
     /// A frozen copy of the registered factories, taken together with what
     /// `f` snapshots (such as the catalog providers) and never in the
     /// middle of a [`swap`](Self::swap). A statement plans and executes

@@ -203,6 +203,14 @@ impl LiveCatalogs {
             .is_empty()
     }
 
+    /// Whether catalog `name` of the applied set failed to build here.
+    pub fn failed_to_build(&self, name: &str) -> bool {
+        self.failed
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(name)
+    }
+
     /// The catalog generation the installed set belongs to.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
@@ -323,16 +331,18 @@ impl LiveCatalogs {
         }
     }
 
-    /// The generation, the installed specs (as effective specs, Ruling
+    /// The epoch, generation, installed specs (as effective specs, Ruling
     /// R12) and this node's default catalog and schema, for a worker to
-    /// apply. The generation is read first: [`apply_set`](Self::apply_set)
-    /// advances it only after installing, so the specs are never older than
-    /// it says.
+    /// apply. The version and specs are read together outside any
+    /// [`commit`](Self::commit) (under the registry's swap lock), so a
+    /// served set is never tagged with another set's version: a worker
+    /// that installed it under that tag would pass the task pin check
+    /// with the wrong specs.
     pub fn snapshot(&self) -> arneb_rpc::CatalogSet {
-        let epoch = self.epoch();
-        let generation = self.generation();
-        let catalogs = self
-            .specs()
+        let (epoch, generation, specs) = self
+            .connectors
+            .consistent(|| (self.epoch(), self.generation(), self.specs()));
+        let catalogs = specs
             .iter()
             .filter_map(|spec| serde_json::to_value(self.effective_spec(spec)).ok())
             .collect();
@@ -535,9 +545,11 @@ impl LiveCatalogs {
     /// generation is not newer than the one held (then nothing changes).
     /// Every new or changed catalog is built first; then they are swapped
     /// in and the catalogs not in the set are removed. A catalog that fails
-    /// to build is skipped with a WARN and listed in the report (a changed
-    /// one keeps its previous version); the rest still apply and the
-    /// generation still advances.
+    /// to build is skipped with a WARN and listed in the report; a changed
+    /// one is removed rather than left at its previous version, so nothing
+    /// tagged with the new generation serves the old spec (a task finds it
+    /// missing, retries the build once and otherwise fails). The rest
+    /// still apply and the generation still advances.
     pub async fn apply_set(&self, generation: u64, specs: Vec<CatalogConfig>) -> ApplyReport {
         self.apply(None, generation, specs).await
     }
@@ -656,9 +668,12 @@ impl LiveCatalogs {
                     "registered catalog"
                 );
             }
+            // A changed catalog whose build failed goes too: the registry is
+            // about to be tagged with this generation, which must never pair
+            // with the previous spec.
             let removes: Vec<String> = now
                 .keys()
-                .filter(|n| !wanted.contains(*n))
+                .filter(|n| !wanted.contains(*n) || failed.contains_key(*n))
                 .cloned()
                 .collect();
             for name in &removes {
@@ -2229,6 +2244,40 @@ mod tests {
         // A later apply of the same set is stale, as before.
         assert!(!live.apply_remote(changed()).await.applied);
         assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    /// Round 3 (I2): a snapshot taken while commits run never pairs one
+    /// generation's specs with another's version.
+    #[test]
+    fn a_snapshot_is_never_torn_by_a_commit() {
+        let (live, _, _) = live();
+        live.set_epoch(3);
+        let uri = |g: u64| format!("h{g}:9083");
+        let writer = std::thread::spawn({
+            let live = live.clone();
+            move || {
+                for g in 1..=3000u64 {
+                    let mut spec = hive("a");
+                    spec.metastore_uri = Some(uri(g));
+                    live.commit(g, vec![(spec, fake_built())], &[]);
+                }
+            }
+        });
+        let mut checked = 0;
+        while !writer.is_finished() {
+            let set = live.snapshot();
+            if let Some(spec) = set.catalogs.first() {
+                assert_eq!(
+                    spec["metastore_uri"],
+                    uri(set.generation),
+                    "specs of another generation"
+                );
+                assert_eq!(set.epoch, 3);
+                checked += 1;
+            }
+        }
+        writer.join().unwrap();
+        assert!(checked > 0);
     }
 
     /// Every change moves the registry's `(epoch, generation)` tag in the

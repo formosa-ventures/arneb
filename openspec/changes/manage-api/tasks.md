@@ -51,3 +51,4 @@
 - [x] 10.3 Audit: the refused closing entry only after an attempted write
 - [x] 10.4 Audit: the `token.issue` intent names the token id (`TokenId`, `issue_token_as`)
 - [x] 10.5 Audit log named after the full state file name (`prod.json.audit.jsonl`); WARN on a legacy `audit.jsonl`
+- [x] 10.6 Audit reads examine at most 10,000 entries; a filtered page that runs out ends early, truncated, with a cursor

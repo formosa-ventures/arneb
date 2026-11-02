@@ -36,6 +36,10 @@ use crate::tokens::now_ms;
 use crate::StateError;
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+/// Most entries one [`AuditLog::query`] examines under the memory lock. A
+/// filtered read that exhausts it before filling its page ends the page
+/// early, `truncated`, with a cursor to continue from.
+pub const AUDIT_SCAN_BUDGET: usize = 10_000;
 /// The audit log's file name suffix, after the state file's name.
 const AUDIT_SUFFIX: &str = ".audit.jsonl";
 /// The file name the audit log had before it was named after the state
@@ -134,7 +138,9 @@ pub struct AuditPage {
     pub entries: Vec<AuditEntry>,
     /// The `before_seq` of the next page; `Some` exactly when `truncated`.
     pub next_cursor: Option<u64>,
-    /// More entries match beyond this page.
+    /// More entries may match beyond this page: either the page is full and
+    /// another entry matches, or the scan budget ran out (the page may then
+    /// hold fewer than `limit` entries, even none).
     pub truncated: bool,
 }
 
@@ -467,30 +473,58 @@ impl AuditLog {
 
     /// The entries matching `q`, newest first. Entries past
     /// `retention_days` are hidden. Never waits for an append or a
-    /// compaction.
+    /// compaction, and examines at most [`AUDIT_SCAN_BUDGET`] entries, so a
+    /// selective filter over a large log ends its page early (`truncated`,
+    /// with a cursor) instead of holding the memory lock for a full scan.
     pub fn query(&self, q: &AuditQuery) -> AuditPage {
+        self.query_with_budget(q, AUDIT_SCAN_BUDGET)
+    }
+
+    fn query_with_budget(&self, q: &AuditQuery, budget: usize) -> AuditPage {
         let cutoff = cutoff_ms(self.settings, now_ms());
         let entries = self.lock_entries();
-        let mut matching = entries.iter().rev().filter(|e| {
-            e.time_ms >= cutoff
-                && q.before_seq.is_none_or(|b| e.seq < b)
+        // Entries are in `seq` order: start below the cursor directly.
+        let end = q
+            .before_seq
+            .map_or(entries.len(), |b| entries.partition_point(|e| e.seq < b));
+        let mut page: Vec<AuditEntry> = Vec::new();
+        let mut scanned = 0;
+        for e in entries.range(..end).rev() {
+            let matches = e.time_ms >= cutoff
                 && q.user.as_ref().is_none_or(|u| &e.record.user == u)
-                && q.action.as_ref().is_none_or(|a| &e.record.action == a)
-        });
-        let page: Vec<AuditEntry> = matching
-            .by_ref()
-            .take(q.limit)
-            .map(|e| AuditEntry::clone(e))
-            .collect();
-        let truncated = matching.next().is_some();
+                && q.action.as_ref().is_none_or(|a| &e.record.action == a);
+            if matches {
+                if page.len() == q.limit {
+                    // Another match beyond a full page.
+                    return AuditPage {
+                        next_cursor: page.last().map(|e| e.seq),
+                        entries: page,
+                        truncated: true,
+                    };
+                }
+                page.push(AuditEntry::clone(e));
+            }
+            scanned += 1;
+            if scanned == budget {
+                // Out of budget with entries left unexamined: continue
+                // below the last entry returned (a full page) or examined.
+                let more = end > scanned;
+                let cursor = if page.len() == q.limit {
+                    page.last().map(|e| e.seq)
+                } else {
+                    Some(e.seq)
+                };
+                return AuditPage {
+                    next_cursor: cursor.filter(|_| more),
+                    entries: page,
+                    truncated: more,
+                };
+            }
+        }
         AuditPage {
-            next_cursor: if truncated {
-                page.last().map(|e| e.seq)
-            } else {
-                None
-            },
+            next_cursor: None,
             entries: page,
-            truncated,
+            truncated: false,
         }
     }
 
@@ -1093,6 +1127,57 @@ mod tests {
             ..AuditQuery::default()
         });
         assert!(page.entries.is_empty(), "the user filter is an exact match");
+    }
+
+    /// A selective filter over a log larger than the scan budget ends its
+    /// page early, truncated, with a cursor; following the cursors finds
+    /// every match exactly once.
+    #[test]
+    fn a_filtered_read_is_bounded_by_the_scan_budget() {
+        let log = AuditLog::open(None, settings(1000, 0)).unwrap();
+        for i in 0..100 {
+            let user = if i % 40 == 0 { "bob" } else { "alice" };
+            log.append(record(user, "token.issue")).unwrap();
+        }
+        // bob's entries: seq 1, 41, 81.
+        let mut q = AuditQuery {
+            limit: 10,
+            user: Some("bob".into()),
+            ..AuditQuery::default()
+        };
+        let mut found = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = log.query_with_budget(&q, 25);
+            pages += 1;
+            assert!(page.entries.len() <= 10);
+            assert_eq!(page.truncated, page.next_cursor.is_some());
+            found.extend(page.entries.iter().map(|e| e.seq));
+            match page.next_cursor {
+                Some(c) => q.before_seq = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(found, vec![81, 41, 1]);
+        assert_eq!(pages, 4, "100 entries at 25 per scan");
+        // A full page that hits the budget continues below its last entry.
+        let q = AuditQuery {
+            limit: 2,
+            ..AuditQuery::default()
+        };
+        let page = log.query_with_budget(&q, 2);
+        assert_eq!(
+            page.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![100, 99]
+        );
+        assert_eq!(page.next_cursor, Some(99));
+        // An unfiltered page within the budget behaves as before.
+        let page = log.query(&AuditQuery {
+            limit: 5,
+            ..AuditQuery::default()
+        });
+        assert_eq!(page.entries.len(), 5);
+        assert_eq!(page.next_cursor, Some(96));
     }
 
     #[test]

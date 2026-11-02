@@ -913,7 +913,8 @@ impl ArnebMcp {
         description = "Read the audit log of manage actions (worker, admission, query cancel \
                        and token changes), newest first, at most `limit` (default \
                        {audit_limit}, at most {max_audit_limit}). Continue with `next_cursor` \
-                       as `cursor`; `truncated` says if more exist. Filter by `user` or \
+                       as `cursor`; `truncated` says if more may exist (a filtered page can end \
+                       early, even empty: keep following the cursor). Filter by `user` or \
                        `action`. Without the manage privilege you see only your own actions \
                        (`scope`: own).",
         annotations(read_only_hint = true, open_world_hint = false)

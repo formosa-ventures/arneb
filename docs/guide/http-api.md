@@ -692,6 +692,12 @@ Parameters, all optional:
 |---|---|
 | `limit` | Most entries to return; default `50`, at most `500`. A larger value is `invalid_argument`. |
 | `cursor` | The previous page's `next_cursor`: continue with older entries. |
+
+A read examines at most 10,000 entries. A filtered page (by `user`, by
+`action`, or a non-manager's own entries) that runs out of that budget ends
+early with `truncated: true` and a `next_cursor`, possibly with fewer than
+`limit` entries or none; keep following `next_cursor` until `truncated` is
+`false`.
 | `user` | Only this user's entries (exact match). |
 | `action` | Only this action's entries (exact match), for example `token.revoke`. |
 

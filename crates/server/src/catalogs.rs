@@ -1029,9 +1029,12 @@ pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
     }) {
         // Where the driver ends the password of a URL that validation
         // refuses (it may be stored: config-file catalogs, older states)
-        // is no guide to what is secret: hide everything after the scheme.
-        if let Some(after_scheme) = url.0.find("://").map(|i| i + 3) {
-            url.0.replace_range(after_scheme.., REDACTED);
+        // is no guide to what is secret: hide everything after the scheme,
+        // or the whole value when it has none (a libpq keyword string
+        // `host=db password=x`, a mistyped `postgresql:/db?password=x`).
+        match url.0.find("://").map(|i| i + 3) {
+            Some(after_scheme) => url.0.replace_range(after_scheme.., REDACTED),
+            None => url.0 = REDACTED.to_owned(),
         }
     } else if let Some(url) = &mut spec.connection_url {
         let mut ranges: Vec<_> = url_query_passwords(&url.0)
@@ -1153,10 +1156,11 @@ pub fn redacted_secrets(spec: &CatalogConfig) -> Vec<&'static str> {
         found.push("password");
     }
     if let Some(url) = &spec.connection_url {
-        let whole = url
-            .0
-            .split_once("://")
-            .is_some_and(|(_, rest)| rest == REDACTED);
+        let whole = url.0 == REDACTED
+            || url
+                .0
+                .split_once("://")
+                .is_some_and(|(_, rest)| rest == REDACTED);
         let userinfo = url_password_range(&url.0).is_some_and(|r| &url.0[r] == REDACTED);
         let query = url_query_passwords(&url.0)
             .into_iter()
@@ -2283,6 +2287,30 @@ mod tests {
         // A later apply of the same set is stale, as before.
         assert!(!live.apply_remote(changed()).await.applied);
         assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    /// Round 3 (R1): a stored URL that validation refuses and that has no
+    /// `://` (a libpq keyword string, a one-slash typo) is hidden whole,
+    /// and the redacted form is a placeholder a PUT cannot store.
+    #[test]
+    fn a_refused_url_without_a_scheme_separator_is_hidden_whole() {
+        for url in [
+            "host=db.internal user=app password=hunter2 dbname=sales",
+            "postgresql:/db?password=hunter2",
+            "hunter2",
+        ] {
+            let s = spec(serde_json::json!({
+                "name": "p", "type": "postgresql", "connection_url": url
+            }));
+            let shown = redacted_spec(&s);
+            assert_eq!(shown["connection_url"], REDACTED, "{url}");
+            assert!(!shown.to_string().contains("hunter2"), "{shown}");
+            assert!(!format!("{s:?}").contains("hunter2"));
+            let e = validate_spec(&s).unwrap_err();
+            assert!(!e.contains("hunter2"), "{e}");
+            let back: CatalogConfig = serde_json::from_value(shown).unwrap();
+            assert_eq!(redacted_secrets(&back), vec!["connection_url password"]);
+        }
     }
 
     /// Round 3 (I2): a snapshot taken while commits run never pairs one

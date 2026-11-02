@@ -1375,9 +1375,13 @@ impl TaskSources<'_> {
                 return Ok(Some(factory));
             }
         }
+        // The failed set is the live one: name it only while the live set is
+        // still the one this task was planned at, else the generation in
+        // the message could be another set's.
+        let live = puller.live();
         if let Some(planned) = self
             .planned
-            .filter(|_| puller.live().failed_to_build(catalog))
+            .filter(|p| live.version() == *p && live.failed_to_build(catalog))
         {
             return Err(format!(
                 "catalog '{catalog}' failed to build on worker {worker_id} at generation {}; \

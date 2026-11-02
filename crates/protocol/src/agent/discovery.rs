@@ -262,7 +262,9 @@ impl AgentQueryService {
     /// Up to `rows` (default 10, at most 100) rows of a table, run as a
     /// tracked statement and waited for up to `max_wait`. The row count is
     /// further capped at the server's `max_rows`, so a small configured
-    /// ceiling shortens the sample instead of failing it.
+    /// ceiling shortens the sample instead of failing it. A table that does
+    /// not exist (or that `user` may not see) answers not-found without
+    /// running, registering or queueing anything.
     pub async fn sample(
         &self,
         user: &str,
@@ -284,13 +286,17 @@ impl AgentQueryService {
         };
         let rows = requested.min(self.limits.max_rows);
         let root = self.scoped_root(user)?;
-        if is_virtual(catalog, schema) {
-            let visible = tables_of(&root, catalog, schema).await?;
-            if !visible.iter().any(|t| t == table) {
-                return Err(table_missing(catalog, schema, table, &visible));
-            }
-        } else if !names_visible(&root, catalog, schema, table) {
+        // A missing (or hidden) table answers not-found before any
+        // statement is registered or admitted. Checked against the schema's
+        // table names, which loads no table metadata (no partitions, no
+        // Iceberg manifests), so the query below still resolves the table
+        // only once.
+        if !is_virtual(catalog, schema) && !names_visible(&root, catalog, schema, table) {
             return Err(missing(&root, catalog, schema, table).await);
+        }
+        let visible = tables_of(&root, catalog, schema).await?;
+        if !visible.iter().any(|t| t == table) {
+            return Err(table_missing(catalog, schema, table, &visible));
         }
         let sql = format!(
             "SELECT * FROM {}.{}.{} LIMIT {rows}",
@@ -299,42 +305,17 @@ impl AgentQueryService {
             quote(table)
         );
         let wait: Duration = self.limits.max_wait;
-        let status = self
-            .submit(
-                user,
-                SubmitRequest {
-                    sql,
-                    catalog: None,
-                    schema: None,
-                    max_rows: Some(rows),
-                },
-                wait,
-            )
-            .await?;
-        // The query resolves the table itself (once); when the sampled table
-        // does not exist, answer with the same not-found error (and
-        // candidates) as describe. A not-found raised inside it (a view over
-        // a missing table, ...) stays the query's own error.
-        let not_found = status.error.as_ref().is_some_and(|e| {
-            matches!(
-                e.code,
-                AgentErrorCode::CatalogNotFound
-                    | AgentErrorCode::SchemaNotFound
-                    | AgentErrorCode::TableNotFound
-            )
-        });
-        if not_found && !is_virtual(catalog, schema) {
-            let error = match tables_of(&root, catalog, schema).await {
-                Ok(visible) if visible.iter().any(|t| t == table) => None,
-                Ok(visible) => Some(table_missing(catalog, schema, table, &visible)),
-                Err(err) => Some(err),
-            };
-            if let Some(error) = error {
-                self.forget(user, &status.id);
-                return Err(error);
-            }
-        }
-        Ok(status)
+        self.submit(
+            user,
+            SubmitRequest {
+                sql,
+                catalog: None,
+                schema: None,
+                max_rows: Some(rows),
+            },
+            wait,
+        )
+        .await
     }
 }
 
@@ -728,7 +709,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn describe_and_sample_resolve_without_listing() {
+    async fn describe_resolves_without_listing_and_sample_resolves_once() {
         let counts = Arc::new(Counts::default());
         let cm = CatalogManager::new("counted", "s");
         cm.register_catalog("counted", Arc::new(CountingCatalog(Arc::clone(&counts))));
@@ -769,14 +750,62 @@ mod tests {
             "the sample must not resolve the table beyond its own query"
         );
         let count = || counts.listings.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(count(), 0, "a hit must not list the schema");
+        // The sample checks the name against the schema's table names
+        // (which load no table metadata) before running anything.
+        assert_eq!(count(), 1, "a sample lists the schema once");
+        let d = svc.describe_table("alice", "counted", "s", "stat").await;
+        assert!(d.is_ok());
+        assert_eq!(count(), 1, "a describe hit must not list the schema");
         let err = svc
             .describe_table("alice", "counted", "s", "stta")
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
         assert_eq!(err.candidates, vec!["stat".to_string()]);
-        assert_eq!(count(), 1, "a miss lists once for the candidates");
+        assert_eq!(count(), 2, "a miss lists once for the candidates");
+    }
+
+    #[tokio::test]
+    async fn sampling_a_missing_table_runs_nothing() {
+        let tracker = Arc::new(QueryTracker::new());
+        let cm = CatalogManager::new("memory", "default");
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("lineitem", int_table(10));
+        let memory = Arc::new(MemoryCatalog::new());
+        memory.register_schema("default", schema);
+        cm.register_catalog("memory", memory);
+        let admission = arneb_scheduler::AdmissionController::new(1, 10);
+        let svc = AgentQueryService::new(
+            Arc::new(cm),
+            Arc::new(ConnectorRegistry::new()),
+            Arc::clone(&tracker),
+            AgentLimits::default(),
+        )
+        .with_admission(Some(admission.clone()));
+        // Every slot is taken: a sample that queued would wait max_wait.
+        let _held = admission.admit("held").unwrap().wait().await;
+        let start = std::time::Instant::now();
+        let err = svc
+            .sample("alice", "memory", "default", "lineitm", Some(5))
+            .await
+            .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(err.code, AgentErrorCode::TableNotFound);
+        assert_eq!(err.candidates[0], "lineitem");
+        assert!(tracker.list_queries(None).is_empty(), "no statement ran");
+        let snap = admission.snapshot();
+        assert_eq!((snap.running, snap.queued), (1, 0), "no slot was asked for");
+        for (catalog, schema) in [("memry", "default"), ("memory", "defalt")] {
+            let err = svc
+                .sample("alice", catalog, schema, "lineitem", None)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err.code,
+                AgentErrorCode::CatalogNotFound | AgentErrorCode::SchemaNotFound
+            ));
+        }
+        assert!(tracker.list_queries(None).is_empty());
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@
 #![deny(unsafe_code)]
 
 pub mod access;
+pub mod conformance;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -82,9 +83,17 @@ pub trait SchemaProvider: fmt::Debug + Send + Sync {
 
     /// The schema's name as the source stores it, when the provider was
     /// looked up by a name that may differ from it (a connector that
-    /// matches names case-insensitively). Access rules are checked on this
-    /// name as well as on the name as written. Default: `None`, meaning
-    /// the provider only answers to its stored name.
+    /// matches names case-insensitively or otherwise normalizes them).
+    /// Access rules are checked on this name as well as on the name as
+    /// written.
+    ///
+    /// Default: `None`, meaning the provider only answers to its stored
+    /// name. **A connector whose [`CatalogProvider::schema`] accepts any
+    /// name other than the exact stored one MUST return `Some`**, or access
+    /// rules on the stored name can be bypassed by writing it differently.
+    /// [`conformance::check_name_resolution`] tests this. Current
+    /// implementations: PostgreSQL and Hive return `Some`; memory, file
+    /// and the virtual metadata catalogs match exactly.
     fn canonical_name(&self) -> Option<String> {
         None
     }
@@ -118,8 +127,13 @@ pub trait TableProvider: fmt::Debug + Send + Sync {
     /// them, when the provider was looked up by a name that may differ
     /// from it (a connector that matches names case-insensitively, or
     /// that redirects to another table). Access rules are checked on this
-    /// identity as well as on the name as written. Default: `None`, meaning
-    /// the provider only answers to its stored name.
+    /// identity as well as on the name as written.
+    ///
+    /// Default: `None`, meaning the provider only answers to its stored
+    /// name. **A connector whose [`SchemaProvider::table`] accepts any name
+    /// other than the exact stored one MUST return `Some`** (see
+    /// [`SchemaProvider::canonical_name`]). Current implementations:
+    /// PostgreSQL, Hive and Iceberg-via-Hive return `Some`.
     fn canonical_name(&self) -> Option<(String, String)> {
         None
     }
@@ -980,6 +994,122 @@ mod tests {
             CatalogError::AccessDenied(_)
         ));
         assert!(fold_read(&alice, "public", "Orders").await.is_ok());
+    }
+
+    /// A connector normalizing names as HMS does: trimmed, lowercased,
+    /// and a `@catalog#` prefix dropped. Databases `hr` and `sales`.
+    #[derive(Debug)]
+    struct HmsLikeCatalog;
+
+    #[async_trait]
+    impl CatalogProvider for HmsLikeCatalog {
+        async fn schema_names(&self) -> Vec<String> {
+            vec!["hr".into(), "sales".into()]
+        }
+        async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+            let name = name.trim().to_lowercase();
+            let name = name.rsplit_once('#').map_or(name.as_str(), |(_, db)| db);
+            let tables: &'static [&'static str] = match name {
+                "hr" => &["salaries"],
+                "sales" => &["orders"],
+                _ => return None,
+            };
+            Some(Arc::new(LooseSchema {
+                name: name.to_string(),
+                tables,
+            }))
+        }
+    }
+
+    /// Names HMS normalizes beyond case (`"hr "`, `@hive#hr`) are checked
+    /// under the stored name too: a denied schema lists nothing, reads as
+    /// missing, and cannot be a search-path target.
+    #[tokio::test]
+    async fn hms_normalized_schema_names_are_checked_under_the_stored_name() {
+        let root = CatalogManager::new("datalake", "sales");
+        root.register_catalog("datalake", Arc::new(HmsLikeCatalog));
+        let rules = r#"{
+            "schemas": [{"owner": false}],
+            "tables": [
+                {"user": "alice", "schema": "hr", "privileges": []},
+                {"user": "alice", "schema": "hr .*| hr|.*#hr|HR|sales", "privileges": ["SELECT"]}
+            ]
+        }"#;
+        let alice = root.with_access("alice", Arc::new(AccessRules::from_json(rules).unwrap()));
+        assert!(!alice.schema_visible("datalake", "hr"));
+        for written in ["hr ", "@hive#hr", "HR", " hr"] {
+            assert!(alice.schema_visible("datalake", written), "{written:?}");
+            assert!(
+                alice
+                    .visible_table_names("datalake", written)
+                    .await
+                    .is_empty(),
+                "{written:?} lists the denied schema"
+            );
+            assert!(!alice.visible_schema_exists("datalake", written).await);
+            let err = alice
+                .resolve_table(&TableReference {
+                    catalog: Some("datalake".into()),
+                    schema: Some(written.into()),
+                    table: "salaries".into(),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("schema not found: datalake.{written}"),
+                "{written:?} reads as a missing schema"
+            );
+        }
+        assert_eq!(
+            alice.visible_table_names("datalake", "sales").await,
+            vec!["orders"]
+        );
+    }
+
+    /// The conformance check passes exact and correctly reporting
+    /// connectors, and catches a loose one that reports nothing.
+    #[tokio::test]
+    async fn conformance_check_catches_loose_connectors_without_canonical_names() {
+        conformance::check_name_resolution(&LooseCatalog)
+            .await
+            .unwrap();
+        conformance::check_name_resolution(&HmsLikeCatalog)
+            .await
+            .unwrap();
+        let memory = MemoryCatalog::new();
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("Orders", Arc::new(MemoryTable::new(test_columns())));
+        memory.register_schema("Sales", schema);
+        conformance::check_name_resolution(&memory).await.unwrap();
+
+        #[derive(Debug)]
+        struct Forgetful;
+        #[async_trait]
+        impl SchemaProvider for Forgetful {
+            async fn table_names(&self) -> Vec<String> {
+                vec!["secret".into()]
+            }
+            async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+                name.eq_ignore_ascii_case("secret")
+                    .then(|| Arc::new(MemoryTable::new(test_columns())) as Arc<dyn TableProvider>)
+            }
+        }
+        #[derive(Debug)]
+        struct ForgetfulCatalog;
+        #[async_trait]
+        impl CatalogProvider for ForgetfulCatalog {
+            async fn schema_names(&self) -> Vec<String> {
+                vec!["public".into()]
+            }
+            async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+                (name == "public").then(|| Arc::new(Forgetful) as Arc<dyn SchemaProvider>)
+            }
+        }
+        let err = conformance::check_name_resolution(&ForgetfulCatalog)
+            .await
+            .unwrap_err();
+        assert!(err.contains("public.secret"), "{err}");
     }
 
     /// Without rules, loose resolution is unchanged.

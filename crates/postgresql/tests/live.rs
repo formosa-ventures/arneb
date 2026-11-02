@@ -606,6 +606,11 @@ async fn access_rules_apply_to_the_resolved_name() {
         .await
         .contains(&"keyed".to_string()));
 
+    // The connector reports the stored name whenever it resolves loosely.
+    arneb_catalog::conformance::check_name_resolution(&catalog(&url, |_| {}).await)
+        .await
+        .unwrap();
+
     // The mixed-case "MixedCase" still reads through `mixedcase` when
     // allowed, and reports its stored name.
     let mixed = read(&alice, "arneb_test", "mixedcase").await.unwrap();

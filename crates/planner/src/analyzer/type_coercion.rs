@@ -1207,7 +1207,7 @@ pub(super) fn walk_plan_exprs(
     }
 }
 
-fn walk_expr(expr: PlanExpr, f: &mut dyn FnMut(PlanExpr) -> PlanExpr) -> PlanExpr {
+pub(super) fn walk_expr(expr: PlanExpr, f: &mut dyn FnMut(PlanExpr) -> PlanExpr) -> PlanExpr {
     // Recurse into children first so the transform sees leaves
     // before the parent applies.
     let expr = match expr {

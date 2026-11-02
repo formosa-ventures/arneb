@@ -17,7 +17,7 @@ use super::service::AgentQueryService;
 use super::statement::{StatementStatus, SubmitRequest};
 use crate::trino::{
     build_virtual_catalogs, catalog_names, schema_names, table_columns, table_names, trino_type_of,
-    SYSTEM_CATALOG,
+    INFORMATION_SCHEMA, SYSTEM_CATALOG,
 };
 
 /// Rows a sample returns when `rows` is not given.
@@ -293,7 +293,7 @@ impl AgentQueryService {
             }
         } else if !names_visible(&root, catalog, schema, table) {
             return Err(missing(&root, catalog, schema, table).await);
-        } else if let Some(error) = surely_missing(&root, catalog, schema, table).await {
+        } else if let Some(error) = listed_miss(&root, catalog, schema, table, false).await {
             return Err(error);
         }
         let sql = format!(
@@ -315,11 +315,11 @@ impl AgentQueryService {
                 wait,
             )
             .await?;
-        // The query resolves the table itself (once); when the sampled table
-        // does not exist after all (the pre-check only refuses a sure miss),
-        // answer with the same not-found error (and candidates) as describe.
-        // A not-found raised inside it (a view over a missing table, ...)
-        // stays the query's own error.
+        // The query resolves the table itself (once); when the listings now
+        // show a sure miss for the names as the query resolved them, answer
+        // with the same not-found error (and candidates) as describe, at the
+        // level that is missing. Any other not-found (a view over a missing
+        // table, a failed listing, ...) stays the query's own error.
         let not_found = status.error.as_ref().is_some_and(|e| {
             matches!(
                 e.code,
@@ -329,12 +329,7 @@ impl AgentQueryService {
             )
         });
         if not_found && !is_virtual(catalog, schema) {
-            let error = match tables_of(&root, catalog, schema).await {
-                Ok(visible) if visible.iter().any(|t| t == table) => None,
-                Ok(visible) => Some(table_missing(catalog, schema, table, &visible)),
-                Err(err) => Some(err),
-            };
-            if let Some(error) = error {
+            if let Some(error) = listed_miss(&root, catalog, schema, table, true).await {
                 self.forget(user, &status.id);
                 return Err(error);
             }
@@ -343,38 +338,81 @@ impl AgentQueryService {
     }
 }
 
-/// The not-found error for `catalog.schema.table` when the name listings
-/// show it cannot resolve, before any statement runs; `None` (run the query
-/// and let it decide) whenever it might. A level is a sure miss only when
-/// its listing is non-empty (a failed listing reads as empty) and no
-/// visible name there matches case-insensitively, since connectors may
-/// resolve names more loosely than an exact match (the query folds case,
-/// PostgreSQL falls back to a unique case-insensitive match). Only names
-/// are listed: no table metadata is loaded, so the query still resolves the
-/// table once.
-async fn surely_missing(
+/// The not-found error for `catalog.schema.table` when the visible name
+/// listings show it surely cannot resolve; `None` (let the query decide, or
+/// keep its own error) whenever it might. A level is a sure miss only when
+/// its listing has a real name (one besides the virtual `system` and
+/// `information_schema` the listings always add; a failed listing reads as
+/// empty) and none matches the requested name ignoring case, since the
+/// query folds case and connectors may resolve more loosely (PostgreSQL
+/// falls back to a unique case-insensitive match). Only names are listed:
+/// no table metadata is loaded.
+///
+/// Before the query (`after_query` false), a non-exact catalog or schema
+/// that matches ignoring case ends the check: the query decides. After a
+/// not-found from the query, such a level is resolved the way the query
+/// would have resolved it ([`resolve_like_query`]), so the error names the
+/// level that is really missing.
+async fn listed_miss(
     root: &CatalogManager,
     catalog: &str,
     schema: &str,
     table: &str,
+    after_query: bool,
 ) -> Option<AgentError> {
-    fn sure_miss(name: &str, names: &[String]) -> bool {
+    /// The name `name` stands for in `names`: itself, else its lowercase
+    /// form, else the unique case-insensitive match; `Err(sure miss)` when
+    /// nothing matches and the listing has a real name, `Ok(None)` when it
+    /// cannot tell.
+    fn level<'a>(name: &str, names: &'a [String]) -> Result<Option<&'a str>, ()> {
+        if let Some(n) = resolve_like_query(name, names) {
+            return Ok(Some(n));
+        }
         let lower = name.to_lowercase();
-        !names.is_empty() && !names.iter().any(|n| n.to_lowercase() == lower)
+        let real = names
+            .iter()
+            .any(|n| n != SYSTEM_CATALOG && n != INFORMATION_SCHEMA);
+        if real && !names.iter().any(|n| n.to_lowercase() == lower) {
+            Err(())
+        } else {
+            Ok(None)
+        }
     }
     let catalogs = catalog_names(root);
-    if !catalogs.iter().any(|c| c == catalog) {
-        return sure_miss(catalog, &catalogs).then(|| catalog_missing(catalog, &catalogs));
+    let catalog = match level(catalog, &catalogs) {
+        Err(()) => return Some(catalog_missing(catalog, &catalogs)),
+        Ok(Some(c)) if c == catalog || after_query => c.to_string(),
+        Ok(_) => return None,
+    };
+    let schemas = schema_names(root, &catalog).await?;
+    let schema = match level(schema, &schemas) {
+        Err(()) => return Some(schema_missing(&catalog, schema, &schemas)),
+        Ok(Some(s)) if s == schema || after_query => s.to_string(),
+        Ok(_) => return None,
+    };
+    let tables = table_names(root, &catalog, &schema).await?;
+    match level(table, &tables) {
+        Err(()) => Some(table_missing(&catalog, &schema, table, &tables)),
+        Ok(_) => None,
     }
-    let schemas = schema_names(root, catalog).await?;
-    if !schemas.iter().any(|s| s == schema) {
-        return sure_miss(schema, &schemas).then(|| schema_missing(catalog, schema, &schemas));
+}
+
+/// The name in `names` that `name` resolves to the way the query and the
+/// connectors resolve it: `name` itself, else its lowercase form (the
+/// query's fold), else the unique case-insensitive match (PostgreSQL).
+fn resolve_like_query<'a>(name: &str, names: &'a [String]) -> Option<&'a str> {
+    let lower = name.to_lowercase();
+    if let Some(n) = names.iter().find(|n| *n == name) {
+        return Some(n);
     }
-    let tables = table_names(root, catalog, schema).await?;
-    if !tables.iter().any(|t| t == table) {
-        return sure_miss(table, &tables).then(|| table_missing(catalog, schema, table, &tables));
+    if let Some(n) = names.iter().find(|n| **n == lower) {
+        return Some(n);
     }
-    None
+    let mut ci = names.iter().filter(|n| n.to_lowercase() == lower);
+    match (ci.next(), ci.next()) {
+        (Some(n), None) => Some(n),
+        _ => None,
+    }
 }
 
 /// Whether `catalog.schema` is one of the virtual metadata schemas.
@@ -846,16 +884,22 @@ mod tests {
         }
     }
 
+    /// A catalog with schema `public` (resolved case-insensitively, as
+    /// PostgreSQL does), listing `public` unless `schemas_fail`.
     #[derive(Debug)]
-    struct LooseCatalog(Vec<String>, Vec<String>);
+    struct LooseCatalog(Vec<String>, Vec<String>, bool);
 
     #[async_trait]
     impl CatalogProvider for LooseCatalog {
         async fn schema_names(&self) -> Vec<String> {
-            vec!["public".into()]
+            if self.2 {
+                Vec::new() // a failed listing, as connectors report one
+            } else {
+                vec!["public".into()]
+            }
         }
         async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-            (name == "public").then(|| {
+            (name.to_lowercase() == "public").then(|| {
                 Arc::new(LooseSchema {
                     listed: self.0.clone(),
                     tables: self.1.clone(),
@@ -866,9 +910,19 @@ mod tests {
 
     /// A service over catalog `pg` ([`LooseCatalog`]) and its tracker.
     fn loose(listed: &[&str], tables: &[&str]) -> (AgentQueryService, Arc<QueryTracker>) {
+        loose_with(false, listed, tables)
+    }
+
+    /// [`loose`], with the schema listing failing when `schemas_fail`.
+    fn loose_with(
+        schemas_fail: bool,
+        listed: &[&str],
+        tables: &[&str],
+    ) -> (AgentQueryService, Arc<QueryTracker>) {
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
         let cm = CatalogManager::new("pg", "public");
-        cm.register_catalog("pg", Arc::new(LooseCatalog(names(listed), names(tables))));
+        let catalog = LooseCatalog(names(listed), names(tables), schemas_fail);
+        cm.register_catalog("pg", Arc::new(catalog));
         let tracker = Arc::new(QueryTracker::new());
         let svc = AgentQueryService::new(
             Arc::new(cm),
@@ -922,6 +976,12 @@ mod tests {
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
         assert_eq!(err.candidates, ["Orders"]);
         assert!(tracker.list_queries(None).is_empty());
+        // A failed schema listing (only the virtual information_schema
+        // left in it) is not a sure miss either.
+        let (svc, tracker) = loose_with(true, &["orders"], &["orders"]);
+        let s = svc.sample("alice", "pg", "public", "orders", None).await;
+        assert!(s.is_ok(), "{:?}", s.unwrap_err());
+        assert_eq!(tracker.list_queries(None).len(), 1);
         // A hidden table is never matched: bob cannot see orders.
         let svc = service(Some(HIDE_ORDERS));
         let err = svc
@@ -930,6 +990,33 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
         assert!(!err.candidates.contains(&"orders".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_missing_table_under_a_case_folded_schema_is_table_not_found() {
+        // The schema matches only ignoring case, so the query runs; its
+        // not-found is reported at the table level, under the schema the
+        // query resolved, not as a missing schema.
+        let (svc, _) = loose(&["Orders"], &["Orders"]);
+        let err = svc
+            .sample("alice", "pg", "PUBLIC", "ordrs", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound, "{err:?}");
+        assert_eq!(err.candidates, ["Orders"]);
+        assert!(err.message.contains("pg.public.ordrs"), "{}", err.message);
+        let svc = service(None);
+        let err = svc
+            .sample("alice", "memory", "INFORMATION_SCHEMA", "TABLEZ", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound, "{err:?}");
+        let err = svc
+            .sample("alice", "memory", "DEFAULT", "LINEITM", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::TableNotFound, "{err:?}");
+        assert_eq!(err.candidates[0], "lineitem");
     }
 
     #[tokio::test]

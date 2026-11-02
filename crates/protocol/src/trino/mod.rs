@@ -56,7 +56,8 @@ pub use auth::{BasicAuthenticator, BasicVerdict, SlotError};
 pub(crate) use engine::{Engine, QueryOutput};
 pub(crate) use error::TrinoError;
 pub(crate) use metadata::{
-    build_virtual_catalogs, catalog_names, schema_names, table_columns, table_names, SYSTEM_CATALOG,
+    build_virtual_catalogs, catalog_names, schema_names, table_columns, table_names,
+    INFORMATION_SCHEMA, SYSTEM_CATALOG,
 };
 pub(crate) use session::ClientSession;
 use session::HeaderFamily;

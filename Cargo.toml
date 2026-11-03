@@ -71,6 +71,9 @@ deadpool-postgres = { version = "0.14", default-features = false, features = ["r
 # HTTP framework
 axum = "0.8"
 tower-http = { version = "0.7", features = ["cors"] }
+# MCP server (streamable HTTP, served by the coordinator Web port at /mcp)
+rmcp = { version = "3.8.0", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
+schemars = "1"
 serde_json = "1"
 rust-embed = "8"
 mime_guess = "2"

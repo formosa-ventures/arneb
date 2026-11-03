@@ -1,4 +1,4 @@
-//! Authentication for the Web port (`/api/*` and, with `[web]
+//! Authentication for the Web port (`/api/*`, `/mcp` and, with `[web]
 //! metrics_auth`, `/metrics`).
 //!
 //! Under `[auth] type = "password"`:
@@ -61,11 +61,17 @@ pub const PUBLIC_ROUTES: &[(Option<Method>, &str)] = &[
 ];
 
 /// Whether `method path` needs credentials under password auth: every
-/// `/api/` path except [`PUBLIC_ROUTES`], and `/metrics` when
-/// `metrics_auth`. The single place that decides what is public.
-pub fn requires_auth(method: &Method, path: &str, metrics_auth: bool) -> bool {
+/// `/api/` path except [`PUBLIC_ROUTES`], all of `/mcp` when it is served
+/// (`mcp_served`), and `/metrics` when `metrics_auth`. The single place
+/// that decides what is public. An unserved `/mcp` is public so that it
+/// answers its documented `404`, not a `401` that would start a client's
+/// credential flow against an endpoint that does not exist.
+pub fn requires_auth(method: &Method, path: &str, metrics_auth: bool, mcp_served: bool) -> bool {
     if path == "/metrics" {
         return metrics_auth;
+    }
+    if path == "/mcp" || path.starts_with("/mcp/") {
+        return mcp_served;
     }
     path.starts_with("/api/")
         && !PUBLIC_ROUTES
@@ -97,7 +103,12 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
         return ApiError::new(ErrorCode::Internal, "authentication is misconfigured")
             .into_response();
     };
-    if !requires_auth(req.method(), req.uri().path(), state.metrics_auth) {
+    if !requires_auth(
+        req.method(),
+        req.uri().path(),
+        state.metrics_auth,
+        state.mcp.is_some(),
+    ) {
         return next.run(req).await;
     }
     let Some(authorization) = req
@@ -223,6 +234,7 @@ mod tests {
             metrics_auth,
             sessions: SessionStore::new(),
             agent: None,
+            mcp: None,
         }
     }
 
@@ -302,16 +314,32 @@ mod tests {
         }
 
         // `/api/v2`'s public routes are decided here.
-        assert!(!requires_auth(&Method::GET, "/api/v2/health", false));
-        assert!(!requires_auth(&Method::POST, "/api/v2/sessions", false));
-        assert!(requires_auth(&Method::GET, "/api/v2/sessions", false));
-        assert!(requires_auth(&Method::DELETE, "/api/v2/sessions", false));
-        assert!(requires_auth(&Method::GET, "/api/v2/tokens", false));
-        assert!(requires_auth(&Method::GET, "/api/v1/info/", false));
-        assert!(requires_auth(&Method::GET, "/api/v1/queries", false));
-        assert!(!requires_auth(&Method::GET, "/", false));
-        assert!(!requires_auth(&Method::GET, "/metrics", false));
-        assert!(requires_auth(&Method::GET, "/metrics", true));
+        assert!(!requires_auth(&Method::GET, "/api/v2/health", false, true));
+        assert!(!requires_auth(
+            &Method::POST,
+            "/api/v2/sessions",
+            false,
+            true
+        ));
+        assert!(requires_auth(&Method::GET, "/api/v2/sessions", false, true));
+        assert!(requires_auth(
+            &Method::DELETE,
+            "/api/v2/sessions",
+            false,
+            true
+        ));
+        assert!(requires_auth(&Method::GET, "/api/v2/tokens", false, true));
+        assert!(requires_auth(&Method::GET, "/api/v1/info/", false, true));
+        assert!(requires_auth(&Method::GET, "/api/v1/queries", false, true));
+        assert!(!requires_auth(&Method::GET, "/", false, true));
+        assert!(!requires_auth(&Method::GET, "/metrics", false, true));
+        assert!(requires_auth(&Method::GET, "/metrics", true, true));
+        // `/mcp` needs credentials exactly when it is served.
+        for path in ["/mcp", "/mcp/", "/mcp/x"] {
+            assert!(requires_auth(&Method::POST, path, false, true), "{path}");
+            assert!(!requires_auth(&Method::POST, path, false, false), "{path}");
+        }
+        assert!(requires_auth(&Method::GET, "/api/v2/tokens", false, false));
     }
 
     #[tokio::test]

@@ -21,9 +21,9 @@ use crate::trino::{
 };
 
 /// Rows a sample returns when `rows` is not given.
-const DEFAULT_SAMPLE_ROWS: usize = 10;
+pub const DEFAULT_SAMPLE_ROWS: usize = 10;
 /// Most rows a sample may ask for.
-const MAX_SAMPLE_ROWS: usize = 100;
+pub const MAX_SAMPLE_ROWS: usize = 100;
 /// Nearest names offered in a not-found error.
 const MAX_CANDIDATES: usize = 3;
 
@@ -84,8 +84,10 @@ pub struct TableDescription {
     pub schema: String,
     /// Table name.
     pub table: String,
-    /// Columns in table order.
+    /// Columns in table order, at most the request's `limit`.
     pub columns: Vec<ColumnDescription>,
+    /// Whether columns beyond `limit` were dropped.
+    pub truncated: bool,
     /// Row count and size, when known.
     pub statistics: TableStats,
 }
@@ -151,19 +153,23 @@ fn quote(ident: &str) -> String {
 }
 
 impl AgentQueryService {
+    /// A caller's `limit`: `default_max_rows` when omitted, refused outside
+    /// `1..=max_rows`.
+    fn limit(&self, limit: Option<usize>) -> Result<usize, AgentError> {
+        match limit {
+            None => Ok(self.limits.default_max_rows),
+            Some(n) if (1..=self.limits.max_rows).contains(&n) => Ok(n),
+            Some(n) => Err(AgentError::new(
+                AgentErrorCode::InvalidArgument,
+                format!("limit {n} is out of range"),
+            )
+            .with_hint(format!("limit must be in 1..={}", self.limits.max_rows))),
+        }
+    }
+
     /// Applies `req` to `names`: prefix filter, sort, limit.
     fn bound(&self, mut names: Vec<String>, req: &ListRequest) -> Result<Listing, AgentError> {
-        let limit = match req.limit {
-            None => self.limits.default_max_rows,
-            Some(n) if (1..=self.limits.max_rows).contains(&n) => n,
-            Some(n) => {
-                return Err(AgentError::new(
-                    AgentErrorCode::InvalidArgument,
-                    format!("limit {n} is out of range"),
-                )
-                .with_hint(format!("limit must be in 1..={}", self.limits.max_rows)))
-            }
-        };
+        let limit = self.limit(req.limit)?;
         if let Some(prefix) = &req.prefix {
             let prefix = prefix.to_lowercase();
             names.retain(|n| n.to_lowercase().starts_with(&prefix));
@@ -213,14 +219,17 @@ impl AgentQueryService {
         self.bound(names, req)
     }
 
-    /// The columns (in order, with Trino types) and statistics of a table.
+    /// The columns (in order, with Trino types, at most `limit`: default
+    /// `default_max_rows`, ceiling `max_rows`) and statistics of a table.
     pub async fn describe_table(
         &self,
         user: &str,
         catalog: &str,
         schema: &str,
         table: &str,
+        limit: Option<usize>,
     ) -> Result<TableDescription, AgentError> {
+        let limit = self.limit(limit)?;
         let root = self.scoped_root(user)?;
         // Virtual tables resolve against per-query metadata catalogs, as
         // SHOW COLUMNS does; they have no statistics.
@@ -240,18 +249,21 @@ impl AgentQueryService {
             let provider = resolve_visible(&root, catalog, schema, table).await?;
             (provider.schema(), provider.statistics())
         };
+        let truncated = columns.len() > limit;
         Ok(TableDescription {
             catalog: catalog.to_string(),
             schema: schema.to_string(),
             table: table.to_string(),
             columns: columns
                 .into_iter()
+                .take(limit)
                 .map(|c| ColumnDescription {
                     type_name: trino_type_of(&c.data_type).display(),
                     name: c.name,
                     nullable: c.nullable,
                 })
                 .collect(),
+            truncated,
             statistics: TableStats {
                 row_count: statistics.as_ref().and_then(|s| s.row_count),
                 size_bytes: statistics.as_ref().and_then(|s| s.size_bytes),
@@ -262,9 +274,10 @@ impl AgentQueryService {
     /// Up to `rows` (default 10, at most 100) rows of a table, run as a
     /// tracked statement and waited for up to `max_wait`. The row count is
     /// further capped at the server's `max_rows`, so a small configured
-    /// ceiling shortens the sample instead of failing it. A table that does
-    /// not exist (or that `user` may not see) answers not-found without
-    /// running, registering or queueing anything.
+    /// ceiling shortens the sample instead of failing it. The first page
+    /// holds at most `page_bytes` (default `default_page_bytes`) of rows. A
+    /// table that does not exist (or that `user` may not see) answers
+    /// not-found without running, registering or queueing anything.
     pub async fn sample(
         &self,
         user: &str,
@@ -272,7 +285,9 @@ impl AgentQueryService {
         schema: &str,
         table: &str,
         rows: Option<usize>,
+        page_bytes: Option<usize>,
     ) -> Result<StatementStatus, AgentError> {
+        self.page_budget("page_bytes", page_bytes)?;
         let requested = match rows {
             None => DEFAULT_SAMPLE_ROWS,
             Some(n) if (1..=MAX_SAMPLE_ROWS).contains(&n) => n,
@@ -313,6 +328,7 @@ impl AgentQueryService {
                     max_rows: Some(rows),
                 },
                 wait,
+                page_bytes,
             )
             .await?;
         // The query resolves the table itself (once); when the listings now
@@ -641,6 +657,7 @@ mod tests {
                     max_rows: None,
                 },
                 Duration::from_secs(30),
+                None,
             )
             .await
             .unwrap();
@@ -703,11 +720,11 @@ mod tests {
     async fn hidden_table_is_indistinguishable_from_missing() {
         let svc = service(Some(HIDE_ORDERS));
         let hidden = svc
-            .describe_table("bob", "memory", "default", "orders")
+            .describe_table("bob", "memory", "default", "orders", None)
             .await
             .unwrap_err();
         let missing = svc
-            .describe_table("bob", "memory", "default", "nosuch")
+            .describe_table("bob", "memory", "default", "nosuch", None)
             .await
             .unwrap_err();
         assert_eq!(hidden.code, AgentErrorCode::TableNotFound);
@@ -725,7 +742,7 @@ mod tests {
         assert!(!names(&l).contains(&"orders"));
         // alice is not restricted and still sees it
         assert!(svc
-            .describe_table("alice", "memory", "default", "orders")
+            .describe_table("alice", "memory", "default", "orders", None)
             .await
             .is_ok());
     }
@@ -734,7 +751,7 @@ mod tests {
     async fn describe_returns_columns_types_and_stats() {
         let svc = service(None);
         let d = svc
-            .describe_table("alice", "memory", "default", "lineitem")
+            .describe_table("alice", "memory", "default", "lineitem", None)
             .await
             .unwrap();
         let cols: Vec<_> = d
@@ -755,7 +772,7 @@ mod tests {
         assert_eq!(json["columns"][0]["type"], "bigint");
 
         let d = svc
-            .describe_table("alice", "stats", "s", "stat")
+            .describe_table("alice", "stats", "s", "stat", None)
             .await
             .unwrap();
         assert_eq!(d.statistics.row_count, Some(42));
@@ -816,7 +833,7 @@ mod tests {
             AgentLimits::default(),
         );
         let d = svc
-            .describe_table("alice", "counted", "s", "stat")
+            .describe_table("alice", "counted", "s", "stat", None)
             .await
             .unwrap();
         assert_eq!(d.statistics.row_count, Some(42));
@@ -835,11 +852,14 @@ mod tests {
                     max_rows: Some(1),
                 },
                 Duration::from_secs(5),
+                None,
             )
             .await;
         let query = resolutions() - before;
         let before = resolutions();
-        let _ = svc.sample("alice", "counted", "s", "stat", Some(1)).await;
+        let _ = svc
+            .sample("alice", "counted", "s", "stat", Some(1), None)
+            .await;
         assert_eq!(
             resolutions() - before,
             query,
@@ -849,11 +869,13 @@ mod tests {
         // The sample checks the name against the schema's table names
         // (which load no table metadata) before running anything.
         assert_eq!(count(), 1, "a sample lists the schema once");
-        let d = svc.describe_table("alice", "counted", "s", "stat").await;
+        let d = svc
+            .describe_table("alice", "counted", "s", "stat", None)
+            .await;
         assert!(d.is_ok());
         assert_eq!(count(), 1, "a describe hit must not list the schema");
         let err = svc
-            .describe_table("alice", "counted", "s", "stta")
+            .describe_table("alice", "counted", "s", "stta", None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
@@ -944,7 +966,7 @@ mod tests {
             ("memory", "INFORMATION_SCHEMA", "TABLES"),
         ] {
             let s = svc
-                .sample("alice", catalog, schema, table, Some(1))
+                .sample("alice", catalog, schema, table, Some(1), None)
                 .await
                 .unwrap();
             assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
@@ -955,7 +977,9 @@ mod tests {
         // (that would have come back as a table_not_found error).
         let (svc, tracker) = loose(&["Orders"], &["Orders"]);
         for name in ["orders", "ORDERS", "Orders"] {
-            let s = svc.sample("alice", "pg", "public", name, Some(1)).await;
+            let s = svc
+                .sample("alice", "pg", "public", name, Some(1), None)
+                .await;
             assert!(s.is_ok(), "{name}: {:?}", s.unwrap_err());
         }
         assert_eq!(tracker.list_queries(None).len(), 3);
@@ -963,14 +987,14 @@ mod tests {
         // decides.
         let (svc, tracker) = loose(&[], &["orders"]);
         assert!(svc
-            .sample("alice", "pg", "public", "orders", None)
+            .sample("alice", "pg", "public", "orders", None, None)
             .await
             .is_ok());
         assert_eq!(tracker.list_queries(None).len(), 1);
         // No case-insensitive match: refused before running.
         let (svc, tracker) = loose(&["Orders"], &["Orders"]);
         let err = svc
-            .sample("alice", "pg", "public", "ordrs", None)
+            .sample("alice", "pg", "public", "ordrs", None, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
@@ -979,13 +1003,15 @@ mod tests {
         // A failed schema listing (only the virtual information_schema
         // left in it) is not a sure miss either.
         let (svc, tracker) = loose_with(true, &["orders"], &["orders"]);
-        let s = svc.sample("alice", "pg", "public", "orders", None).await;
+        let s = svc
+            .sample("alice", "pg", "public", "orders", None, None)
+            .await;
         assert!(s.is_ok(), "{:?}", s.unwrap_err());
         assert_eq!(tracker.list_queries(None).len(), 1);
         // A hidden table is never matched: bob cannot see orders.
         let svc = service(Some(HIDE_ORDERS));
         let err = svc
-            .sample("bob", "memory", "default", "ORDERS", None)
+            .sample("bob", "memory", "default", "ORDERS", None, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
@@ -999,7 +1025,7 @@ mod tests {
         // query resolved, not as a missing schema.
         let (svc, _) = loose(&["Orders"], &["Orders"]);
         let err = svc
-            .sample("alice", "pg", "PUBLIC", "ordrs", None)
+            .sample("alice", "pg", "PUBLIC", "ordrs", None, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound, "{err:?}");
@@ -1007,12 +1033,19 @@ mod tests {
         assert!(err.message.contains("pg.public.ordrs"), "{}", err.message);
         let svc = service(None);
         let err = svc
-            .sample("alice", "memory", "INFORMATION_SCHEMA", "TABLEZ", None)
+            .sample(
+                "alice",
+                "memory",
+                "INFORMATION_SCHEMA",
+                "TABLEZ",
+                None,
+                None,
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound, "{err:?}");
         let err = svc
-            .sample("alice", "memory", "DEFAULT", "LINEITM", None)
+            .sample("alice", "memory", "DEFAULT", "LINEITM", None, None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound, "{err:?}");
@@ -1040,7 +1073,7 @@ mod tests {
         let _held = admission.admit("held").unwrap().wait().await;
         let start = std::time::Instant::now();
         let err = svc
-            .sample("alice", "memory", "default", "lineitm", Some(5))
+            .sample("alice", "memory", "default", "lineitm", Some(5), None)
             .await
             .unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(1));
@@ -1051,7 +1084,7 @@ mod tests {
         assert_eq!((snap.running, snap.queued), (1, 0), "no slot was asked for");
         for (catalog, schema) in [("memry", "default"), ("memory", "defalt")] {
             let err = svc
-                .sample("alice", catalog, schema, "lineitem", None)
+                .sample("alice", catalog, schema, "lineitem", None, None)
                 .await
                 .unwrap_err();
             assert!(matches!(
@@ -1063,10 +1096,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn describe_bounds_columns_by_limit() {
+        let infos: Vec<ColumnInfo> = (0..30)
+            .map(|i| ColumnInfo {
+                name: format!("c{i:02}"),
+                data_type: DataType::Int64,
+                nullable: true,
+            })
+            .collect();
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("wide", Arc::new(MemoryTable::new(infos, vec![])));
+        let memory = Arc::new(MemoryCatalog::new());
+        memory.register_schema("default", schema);
+        let cm = CatalogManager::new("memory", "default");
+        cm.register_catalog("memory", memory);
+        let svc = AgentQueryService::new(
+            Arc::new(cm),
+            Arc::new(ConnectorRegistry::new()),
+            Arc::new(QueryTracker::new()),
+            AgentLimits::default(),
+        );
+        let d = svc
+            .describe_table("alice", "memory", "default", "wide", Some(10))
+            .await
+            .unwrap();
+        let names: Vec<_> = d.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            (0..10).map(|i| format!("c{i:02}")).collect::<Vec<_>>()
+        );
+        assert!(d.truncated);
+        let d = svc
+            .describe_table("alice", "memory", "default", "wide", None)
+            .await
+            .unwrap();
+        assert_eq!((d.columns.len(), d.truncated), (30, false));
+        let d = svc
+            .describe_table("alice", "memory", "default", "wide", Some(30))
+            .await
+            .unwrap();
+        assert_eq!((d.columns.len(), d.truncated), (30, false));
+        for bad in [0, AgentLimits::default().max_rows + 1] {
+            let err = svc
+                .describe_table("alice", "memory", "default", "wide", Some(bad))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, AgentErrorCode::InvalidArgument, "{bad}");
+            assert_eq!(err.hint.as_deref(), Some("limit must be in 1..=10000"));
+        }
+    }
+
+    #[tokio::test]
     async fn table_not_found_suggests_visible_neighbours() {
         let svc = service(None);
         let err = svc
-            .describe_table("alice", "memory", "default", "lineitm")
+            .describe_table("alice", "memory", "default", "lineitm", None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
@@ -1076,12 +1160,12 @@ mod tests {
             .unwrap()
             .contains("/api/v2/catalogs/memory/schemas/default/tables"));
         let err = svc
-            .describe_table("alice", "memry", "default", "lineitem")
+            .describe_table("alice", "memry", "default", "lineitem", None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::CatalogNotFound);
         let err = svc
-            .describe_table("alice", "memory", "defalt", "lineitem")
+            .describe_table("alice", "memory", "defalt", "lineitem", None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::SchemaNotFound);
@@ -1091,25 +1175,25 @@ mod tests {
     async fn sample_returns_bounded_rows_inline() {
         let svc = service(None);
         let s = svc
-            .sample("alice", "memory", "default", "lineitem", Some(5))
+            .sample("alice", "memory", "default", "lineitem", Some(5), None)
             .await
             .unwrap();
         assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
         assert_eq!(s.first_page.unwrap().rows.len(), 5);
         let s = svc
-            .sample("alice", "memory", "default", "lineitem", None)
+            .sample("alice", "memory", "default", "lineitem", None, None)
             .await
             .unwrap();
         assert_eq!(s.first_page.unwrap().rows.len(), 10);
         for bad in [0, 101] {
             let err = svc
-                .sample("alice", "memory", "default", "lineitem", Some(bad))
+                .sample("alice", "memory", "default", "lineitem", Some(bad), None)
                 .await
                 .unwrap_err();
             assert_eq!(err.code, AgentErrorCode::InvalidArgument);
         }
         let err = svc
-            .sample("alice", "memory", "default", "nosuch", Some(5))
+            .sample("alice", "memory", "default", "nosuch", Some(5), None)
             .await
             .unwrap_err();
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
@@ -1126,7 +1210,7 @@ mod tests {
         let svc = service_limited(None, limits);
         for rows in [None, Some(3), Some(50)] {
             let s = svc
-                .sample("alice", "memory", "default", "lineitem", rows)
+                .sample("alice", "memory", "default", "lineitem", rows, None)
                 .await
                 .unwrap();
             assert_eq!(s.state, StatementState::Finished, "{rows:?}: {:?}", s.error);
@@ -1136,7 +1220,7 @@ mod tests {
         }
         // The caller's own ceiling still applies.
         let err = svc
-            .sample("alice", "memory", "default", "lineitem", Some(101))
+            .sample("alice", "memory", "default", "lineitem", Some(101), None)
             .await
             .unwrap_err();
         assert!(err.hint.unwrap().contains("rows must be"));
@@ -1146,14 +1230,14 @@ mod tests {
     async fn describe_information_schema_table() {
         let svc = service(None);
         let d = svc
-            .describe_table("alice", "memory", "information_schema", "tables")
+            .describe_table("alice", "memory", "information_schema", "tables", None)
             .await
             .unwrap();
         let names: Vec<_> = d.columns.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"table_name"), "{names:?}");
         assert_eq!(d.statistics.row_count, None);
         let d = svc
-            .describe_table("alice", "system", "jdbc", "tables")
+            .describe_table("alice", "system", "jdbc", "tables", None)
             .await
             .unwrap();
         assert!(!d.columns.is_empty());
@@ -1163,7 +1247,14 @@ mod tests {
     async fn sample_information_schema_table() {
         let svc = service(None);
         let s = svc
-            .sample("alice", "memory", "information_schema", "tables", Some(5))
+            .sample(
+                "alice",
+                "memory",
+                "information_schema",
+                "tables",
+                Some(5),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);
@@ -1200,7 +1291,7 @@ mod tests {
         assert!(!hidden.candidates.contains(&"stats".to_string()));
         assert!(!missing.candidates.contains(&"stats".to_string()));
         let d = svc
-            .describe_table("bob", "stats", "s", "stat")
+            .describe_table("bob", "stats", "s", "stat", None)
             .await
             .unwrap_err();
         assert_eq!(d.code, AgentErrorCode::CatalogNotFound);
@@ -1225,7 +1316,7 @@ mod tests {
         );
         assert!(!hidden.candidates.contains(&"secret".to_string()));
         let d = svc
-            .describe_table("bob", "memory", "secret", "vault")
+            .describe_table("bob", "memory", "secret", "vault", None)
             .await
             .unwrap_err();
         assert_eq!(d.code, AgentErrorCode::SchemaNotFound);
@@ -1240,7 +1331,7 @@ mod tests {
     async fn sample_quotes_identifiers() {
         let svc = service(None);
         let s = svc
-            .sample("alice", "memory", "default", "we\"ird", Some(2))
+            .sample("alice", "memory", "default", "we\"ird", Some(2), None)
             .await
             .unwrap();
         assert_eq!(s.state, StatementState::Finished, "{:?}", s.error);

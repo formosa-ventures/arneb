@@ -221,15 +221,20 @@ impl Statement {
         true
     }
 
-    /// The status document. The first page is encoded after the lock is
-    /// released, from a cheap clone of the retained rows.
-    pub(crate) fn status(&self, limits: &AgentLimits) -> StatementStatus {
-        self.status_with(limits, true)
+    /// The status document, with a first page of at most `page_bytes` of
+    /// rows once finished. The page is encoded after the lock is released,
+    /// from a cheap clone of the retained rows.
+    pub(crate) fn status(&self, limits: &AgentLimits, page_bytes: usize) -> StatementStatus {
+        self.status_with(limits, Some(page_bytes))
     }
 
-    /// [`status`](Self::status), with `first_page` left `None` unless
-    /// `first_page` is set.
-    pub(crate) fn status_with(&self, limits: &AgentLimits, first_page: bool) -> StatementStatus {
+    /// [`status`](Self::status), with `first_page` left `None` unless a
+    /// `page_bytes` budget is given.
+    pub(crate) fn status_with(
+        &self,
+        limits: &AgentLimits,
+        page_bytes: Option<usize>,
+    ) -> StatementStatus {
         let (mut status, retained) = {
             let inner = self.lock();
             let elapsed = inner
@@ -268,10 +273,10 @@ impl Statement {
                 }
                 Phase::Failed(err) | Phase::Cancelled(err) => status.error = Some(err.clone()),
             }
-            (status, retained.filter(|_| first_page))
+            (status, retained.zip(page_bytes))
         };
         status.first_page =
-            retained.map(|r| page(&r, 0, limits.default_page_bytes, limits.max_cell_bytes));
+            retained.map(|(r, page_bytes)| page(&r, 0, page_bytes, limits.max_cell_bytes));
         if status
             .first_page
             .as_ref()

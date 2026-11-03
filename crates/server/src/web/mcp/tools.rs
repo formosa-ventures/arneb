@@ -666,7 +666,7 @@ impl ArnebMcp {
             // result; any other id (or one already released or evicted) is
             // not found here and goes on to the tracker.
             if let Some(svc) = self.state.agent.as_ref() {
-                match svc.cancel(&who.user, &a.id) {
+                match svc.cancel(&who.user, &a.id).await {
                     Ok(status) => return ok(&status),
                     Err(e) => {
                         let e = ApiError::from(e);

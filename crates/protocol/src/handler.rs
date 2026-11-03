@@ -2221,8 +2221,10 @@ mod tests {
         );
         // The window between the completed work and `finish`.
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
-            KillOutcome::AlreadyEnded(QueryState::Finishing)
+            tracker.kill_query(&id, "root").await.unwrap(),
+            KillOutcome::NotApplied {
+                state: QueryState::Running
+            }
         );
         tracked.finish(1);
         let info = tracker.get_query(&id).unwrap();
@@ -2240,7 +2242,7 @@ mod tests {
             TrackedStatement::start(&tracker, "INSERT INTO t SELECT 1", Some("bob".into()));
         let id = tracked.0.as_ref().unwrap().1;
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
+            tracker.kill_query(&id, "root").await.unwrap(),
             KillOutcome::Killed {
                 was: QueryState::Queued
             }

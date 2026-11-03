@@ -230,7 +230,7 @@ impl AgentQueryService {
                 if let (Some(statement), Some(tracker)) =
                     (weak_statement.upgrade(), weak_tracker.upgrade())
                 {
-                    cancel_statement(&tracker, &statement, killed_error(by), "killed");
+                    stop_statement(&tracker, &statement, killed_error(by), "killed");
                 }
             }),
         );
@@ -296,12 +296,16 @@ impl AgentQueryService {
     /// returned and the id answers `not_found` from then on. A statement
     /// that ends on its own while being cancelled counts as ended: it is
     /// released too.
-    pub fn cancel(&self, user: &str, id: &str) -> Result<StatementStatus, AgentError> {
+    ///
+    /// A cancel that lands during a poll of the statement's work waits for
+    /// that poll to end (without blocking a thread) to learn whether it
+    /// stopped the work.
+    pub async fn cancel(&self, user: &str, id: &str) -> Result<StatementStatus, AgentError> {
         let statement = self.lookup(user, id)?;
         if statement.is_terminal() {
             return Ok(self.release(user, &statement));
         }
-        Ok(self.cancel_live(user, &statement))
+        Ok(self.cancel_live(user, &statement).await)
     }
 
     /// Cancels `statement`, last seen queued or running, and keeps it; or,
@@ -311,12 +315,14 @@ impl AgentQueryService {
     /// retained bytes never outlive a release-looking response. In the last
     /// case the outcome may not be recorded yet, so the status can still
     /// read running; the rows go with the statement either way.
-    fn cancel_live(&self, user: &str, statement: &Statement) -> StatementStatus {
-        let cancelled = self.cancel_statement(
-            statement,
-            AgentError::new(AgentErrorCode::Cancelled, "Statement was cancelled"),
-            "client",
-        );
+    async fn cancel_live(&self, user: &str, statement: &Arc<Statement>) -> StatementStatus {
+        let cancelled = self
+            .cancel_statement(
+                statement,
+                AgentError::new(AgentErrorCode::Cancelled, "Statement was cancelled"),
+                "client",
+            )
+            .await;
         if cancelled {
             // Cancelled: there is no first page to encode.
             statement.status_with(&self.limits, None)
@@ -599,8 +605,13 @@ impl AgentQueryService {
     /// (dropping its admission slot) and marks it cancelled in the tracker.
     /// Returns `false`, doing nothing, when it had already ended or its
     /// work had already returned (see [`cancel_statement`]).
-    fn cancel_statement(&self, statement: &Statement, error: AgentError, reason: &str) -> bool {
-        cancel_statement(&self.tracker, statement, error, reason)
+    async fn cancel_statement(
+        &self,
+        statement: &Arc<Statement>,
+        error: AgentError,
+        reason: &'static str,
+    ) -> bool {
+        cancel_statement(&self.tracker, statement, error, reason).await
     }
 
     /// One reaper pass over statements idle for longer than `idle_timeout`.
@@ -614,10 +625,15 @@ impl AgentQueryService {
                     idle_timeout.as_secs()
                 ),
             );
-            self.cancel_statement(&statement, error, "abandoned");
-            // Keep it for another idle period so a returning client
-            // learns why it was cancelled.
-            statement.touch();
+            // In its own task: a kill may wait for one poll of the work,
+            // which must not hold up the rest of the pass.
+            let tracker = Arc::clone(&self.tracker);
+            tokio::spawn(async move {
+                cancel_statement(&tracker, &statement, error, "abandoned").await;
+                // Keep it for another idle period so a returning client
+                // learns why it was cancelled.
+                statement.touch();
+            });
         }
     }
 
@@ -654,25 +670,41 @@ fn killed_error(by: &str) -> AgentError {
     )
 }
 
-/// [`AgentQueryService::cancel_statement`] over `tracker`, for the tracker's
-/// canceller, which holds no service.
+/// [`AgentQueryService::cancel_statement`] over `tracker`: kill the
+/// statement's work through its kill switch, then stop it.
 ///
 /// Returns whether this call cancelled it: `false` when it had already
-/// ended, or when its work had already returned (that outcome is kept, and
-/// `complete` / `fail` record it right after).
-fn cancel_statement(
+/// ended, or when its work had already returned or returned in the poll in
+/// flight (that outcome is kept, and `complete` / `fail` record it right
+/// after). Waits, without blocking a thread, for at most that one poll, in
+/// a task of its own, so a dropped request does not leave it half done.
+async fn cancel_statement(
+    tracker: &Arc<QueryTracker>,
+    statement: &Arc<Statement>,
+    error: AgentError,
+    reason: &'static str,
+) -> bool {
+    let (tracker, statement) = (Arc::clone(tracker), Arc::clone(statement));
+    tokio::spawn(async move {
+        if !statement.switch.kill().await && !statement.is_terminal() {
+            tracing::debug!(statement_id = %statement.id, reason, "agent cancel after the work returned");
+            return false;
+        }
+        stop_statement(&tracker, &statement, error, reason)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Ends a statement whose work a kill stopped: marks it cancelled with
+/// `error`, aborts its task (dropping its admission slot) and marks it
+/// cancelled in the tracker. `false` when it had already ended.
+fn stop_statement(
     tracker: &QueryTracker,
     statement: &Statement,
     error: AgentError,
     reason: &str,
 ) -> bool {
-    // Work that already returned keeps its outcome: `complete` / `fail`
-    // record it. (A poll in flight, `None`, cancels as before.)
-    // Non-blocking, so client cancels and the reaper never wait for a poll.
-    if statement.switch.try_kill() == Some(false) && !statement.is_terminal() {
-        tracing::debug!(statement_id = %statement.id, reason, "agent cancel after the work returned");
-        return false;
-    }
     if !statement.end(Phase::Cancelled(error)) {
         return false;
     }
@@ -1361,7 +1393,7 @@ mod tests {
         // A collector's try_grow of `one` fails here ...
         assert!(missing() > 0);
         // ... then a concurrent DELETE frees enough before it evicts.
-        svc.cancel("alice", &a.id).unwrap();
+        svc.cancel("alice", &a.id).await.unwrap();
         assert_eq!(missing(), 0);
         let retry = evict_retained(
             &svc.statements,
@@ -1834,7 +1866,7 @@ mod tests {
             .await
             .unwrap();
         wait_for_state(&svc, &s.id, StatementState::Running).await;
-        let c = svc.cancel("alice", &s.id).unwrap();
+        let c = svc.cancel("alice", &s.id).await.unwrap();
         assert_eq!(c.state, StatementState::Cancelled);
         assert_eq!(c.error.unwrap().code, AgentErrorCode::Cancelled);
         let info = tracker
@@ -1868,7 +1900,7 @@ mod tests {
             .unwrap()
             .query_id;
         assert!(matches!(
-            tracker.kill_query(&id, "root").unwrap(),
+            tracker.kill_query(&id, "root").await.unwrap(),
             arneb_scheduler::KillOutcome::Killed { .. }
         ));
         let status = svc
@@ -1929,8 +1961,10 @@ mod tests {
         let switch = svc.kill_switch(&statement);
         assert_eq!(switch.guard(async { "done" }).await, Some("done"));
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
-            arneb_scheduler::KillOutcome::AlreadyEnded(QueryState::Finishing)
+            tracker.kill_query(&id, "root").await.unwrap(),
+            arneb_scheduler::KillOutcome::NotApplied {
+                state: QueryState::Queued
+            }
         );
         let collector = one_row(&svc, &statement);
         svc.complete(&statement, no_output(), collector);
@@ -1955,7 +1989,7 @@ mod tests {
         let statement = svc.register("alice", "SELECT 1".into(), 10).unwrap();
         let switch = svc.kill_switch(&statement);
         assert_eq!(switch.guard(async { "done" }).await, Some("done"));
-        let c = svc.cancel("alice", &statement.id).unwrap();
+        let c = svc.cancel("alice", &statement.id).await.unwrap();
         assert_ne!(c.state, StatementState::Cancelled);
         assert!(!statement.is_terminal(), "the cancel relabelled the result");
         let err = svc
@@ -1977,6 +2011,46 @@ mod tests {
         assert_eq!(svc.retained_budget.used(), 0, "the rows went with it");
     }
 
+    /// A client cancel (or the reaper) that lands while the poll completing
+    /// the work is in flight waits for that poll and is not applied: the
+    /// statement keeps its real outcome. (The poll blocks briefly so the
+    /// cancel, on another worker, arrives inside it.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_cancel_during_the_completing_poll_keeps_the_result() {
+        let (svc, tracker) = service();
+        let statement = svc.register("alice", "INSERT INTO t".into(), 10).unwrap();
+        let switch = svc.kill_switch(&statement);
+        let (t, s) = (Arc::clone(&tracker), Arc::clone(&statement));
+        let cancel = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&cancel);
+        let out = switch
+            .guard(async move {
+                let handle = tokio::spawn(async move {
+                    let error = AgentError::new(AgentErrorCode::Cancelled, "cancelled");
+                    cancel_statement(&t, &s, error, "client").await
+                });
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(!handle.is_finished(), "the cancel waits for the poll");
+                *slot.lock().unwrap() = Some(handle);
+                "inserted"
+            })
+            .await;
+        assert_eq!(out, Some("inserted"));
+        let handle = cancel.lock().unwrap().take().unwrap();
+        assert!(!handle.await.unwrap(), "the cancel must not apply");
+        assert!(!statement.is_terminal(), "the cancel relabelled the result");
+        let collector = one_row(&svc, &statement);
+        svc.complete(&statement, no_output(), collector);
+        assert_eq!(
+            statement.status_with(&svc.limits, None).state,
+            StatementState::Finished
+        );
+        assert_eq!(
+            tracker.get_query(&statement.tracker_id).unwrap().state,
+            QueryState::Finished
+        );
+    }
+
     /// A kill before the task starts (the canceller is registered before
     /// the spawn) stops all of the work: the statement turns cancelled and
     /// its task does nothing.
@@ -1987,10 +2061,10 @@ mod tests {
         let id = statement.tracker_id;
         let switch = svc.kill_switch(&statement);
         assert!(matches!(
-            tracker.kill_query(&id, "root").unwrap(),
+            tracker.kill_query(&id, "root").await.unwrap(),
             arneb_scheduler::KillOutcome::Killed { .. }
         ));
-        assert!(switch.is_killed());
+        assert!(switch.kill().await, "already killed");
         let session = ClientSession::for_agent("alice", None, None);
         svc.clone()
             .run(Arc::clone(&statement), session, switch)
@@ -2018,11 +2092,11 @@ mod tests {
         assert_eq!(s.state, StatementState::Finished);
         // Deleting a finished statement returns its final status, keeps it
         // finished in the tracker and releases it.
-        let c = svc.cancel("alice", &s.id).unwrap();
+        let c = svc.cancel("alice", &s.id).await.unwrap();
         assert_eq!(c.state, StatementState::Finished);
         assert_eq!(c.total_rows, Some(1));
         assert!(c.first_page.is_none(), "a release does not encode rows");
-        let err = svc.cancel("alice", &s.id).unwrap_err();
+        let err = svc.cancel("alice", &s.id).await.unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
         let info = tracker.list_queries(None).pop().unwrap();
         assert_eq!(info.state, QueryState::Finished);
@@ -2034,8 +2108,8 @@ mod tests {
             .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
             .await
             .unwrap();
-        let first = svc.cancel("alice", &s.id).unwrap();
-        let second = svc.cancel("alice", &s.id).unwrap();
+        let first = svc.cancel("alice", &s.id).await.unwrap();
+        let second = svc.cancel("alice", &s.id).await.unwrap();
         assert_eq!(first.state, StatementState::Cancelled);
         assert_eq!(second.state, StatementState::Cancelled);
         assert_eq!(first.elapsed_ms, second.elapsed_ms);
@@ -2053,12 +2127,12 @@ mod tests {
         // DELETE saw the statement running, then it finished before the
         // cancel: the cancel finds it ended, and releases it.
         let statement = lock(&svc.statements).get(&s.id).cloned().unwrap();
-        let c = svc.cancel_live("alice", &statement);
+        let c = svc.cancel_live("alice", &statement).await;
         drop(statement);
         assert_eq!(c.state, StatementState::Finished);
         assert!(c.first_page.is_none(), "a release does not encode rows");
         assert_eq!(svc.retained_budget.used(), 0);
-        let err = svc.cancel("alice", &s.id).unwrap_err();
+        let err = svc.cancel("alice", &s.id).await.unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
     }
 
@@ -2070,12 +2144,12 @@ mod tests {
         assert!(one > 0);
         let b = run_to_end(&svc, "SELECT s FROM wide", None).await;
         assert_eq!(svc.retained_budget.used(), 2 * one);
-        svc.cancel("alice", &a.id).unwrap();
+        svc.cancel("alice", &a.id).await.unwrap();
         assert_eq!(svc.retained_budget.used(), one);
         // Another user cannot release it.
-        assert!(svc.cancel("bob", &b.id).is_err());
+        assert!(svc.cancel("bob", &b.id).await.is_err());
         assert_eq!(svc.retained_budget.used(), one);
-        svc.cancel("alice", &b.id).unwrap();
+        svc.cancel("alice", &b.id).await.unwrap();
         assert_eq!(svc.retained_budget.used(), 0);
     }
 
@@ -2101,8 +2175,8 @@ mod tests {
             missing.message.replace(&random, &s.id),
             "same message shape as for a random id"
         );
-        let err = svc.cancel("bob", &s.id).unwrap_err();
-        let missing = svc.cancel("bob", &random).unwrap_err();
+        let err = svc.cancel("bob", &s.id).await.unwrap_err();
+        let missing = svc.cancel("bob", &random).await.unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
         assert_eq!(err.message, missing.message.replace(&random, &s.id));
         // Alice still sees it, and bob's cancel did nothing.

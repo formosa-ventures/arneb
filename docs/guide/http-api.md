@@ -478,14 +478,26 @@ turns `cancelled` with `Statement was cancelled by <user>`.
 When the kill lands decides what it does:
 
 - **Before the statement's work starts:** the work never runs.
-- **After the work returned** (an `INSERT` that committed, say) but before
-  the statement reported back: the kill stops nothing. The response has
-  `changed: false`, the audit entry records `effect` `already_ended`, and
-  the client gets the statement's real result.
-- **During the work:** the work is stopped at its next step and the client
-  gets the cancellation. A write may already have taken effect in part or
-  in full (an earlier step, or a parallel task that keeps running), as
-  before this release, so check before retrying a cancelled write.
+- **During the step that completes the work, or after the work returned**
+  (an `INSERT` that committed, say) but before the statement reported back:
+  the kill stops nothing. A kill that arrives during a step waits for that
+  step to end to find out. The response has `changed: false` and the
+  query's real state (`state_before` and `state`, e.g. `running` until the
+  statement reports back), the audit entry records `effect`
+  `already_ended`, and the client gets the statement's real result.
+- **Between two steps of the work:** the work is stopped and the client
+  gets the cancellation. This only says that the statement did not
+  complete: anything an earlier step already did, or a parallel task that
+  keeps running, is not undone, so a cancelled write may have taken effect
+  in part (as before this release). Check before retrying it. (In this
+  release the execution engine does not run DDL or DML statements, so no
+  write can be cut short this way yet.)
+
+The same rule applies to a protocol's own cancels: a Trino client's
+`DELETE` of `nextUri`, `DELETE /v1/query/{id}`, the Trino and `/api/v2`
+idle reapers, and `DELETE /api/v2/statements/{id}`. Two kills of the same
+query at once share the first one's outcome: the second never reports a
+cancel that did not happen.
 
 Who may cancel, in this order:
 

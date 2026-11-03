@@ -233,7 +233,7 @@ async fn cancel(
     Extension(who): Extension<Identity>,
     Path(id): Path<String>,
 ) -> Result<Json<StatementStatus>, ApiError> {
-    Ok(Json(service(&state)?.cancel(&who.user, &id)?))
+    Ok(Json(service(&state)?.cancel(&who.user, &id).await?))
 }
 
 #[cfg(test)]

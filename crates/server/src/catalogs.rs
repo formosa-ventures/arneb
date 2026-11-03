@@ -1008,8 +1008,9 @@ pub fn validate_spec_fields(spec: &CatalogConfig) -> Result<(), String> {
 }
 
 /// The spec as JSON with every secret replaced by `"<redacted>"`: the
-/// `password`, the password inside `connection_url` (all of it after the
-/// scheme when the URL fails validation), and the storage
+/// `password`, the password inside `connection_url` (all of it after a
+/// leading `postgresql://` when the URL fails validation, or the whole
+/// value when it starts with no such scheme), and the storage
 /// `secret_access_key`, `service_account_path` and Azure `access_key`.
 /// Every API response, MCP result and audit entry uses this form.
 pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
@@ -1029,11 +1030,13 @@ pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
     }) {
         // Where the driver ends the password of a URL that validation
         // refuses (it may be stored: config-file catalogs, older states)
-        // is no guide to what is secret: hide everything after the scheme,
-        // or the whole value when it has none (a libpq keyword string
-        // `host=db password=x`, a mistyped `postgresql:/db?password=x`).
-        match url.0.find("://").map(|i| i + 3) {
-            Some(after_scheme) => url.0.replace_range(after_scheme.., REDACTED),
+        // is no guide to what is secret: hide everything after a leading
+        // `postgresql://` or `postgres://`, and the whole value otherwise
+        // (a libpq keyword string `host=db password=x sslrootcert=file:///…`,
+        // a mistyped `postgresql:/db?password=x`): a `://` further in may
+        // sit inside a parameter or the password itself.
+        match pg_scheme_len(&url.0) {
+            Some(scheme) => url.0.replace_range(scheme.., REDACTED),
             None => url.0 = REDACTED.to_owned(),
         }
     } else if let Some(url) = &mut spec.connection_url {
@@ -1157,10 +1160,7 @@ pub fn redacted_secrets(spec: &CatalogConfig) -> Vec<&'static str> {
     }
     if let Some(url) = &spec.connection_url {
         let whole = url.0 == REDACTED
-            || url
-                .0
-                .split_once("://")
-                .is_some_and(|(_, rest)| rest == REDACTED);
+            || pg_scheme_len(&url.0).is_some_and(|scheme| url.0[scheme..] == *REDACTED);
         let userinfo = url_password_range(&url.0).is_some_and(|r| &url.0[r] == REDACTED);
         let query = url_query_passwords(&url.0)
             .into_iter()
@@ -1277,6 +1277,18 @@ pub fn same_destination(a: &CatalogConfig, b: &CatalogConfig) -> bool {
         })
     }
     destinations(a) == destinations(b)
+}
+
+/// The length of the `postgresql://` or `postgres://` (any case) that
+/// `url` starts with: the only prefix a refused URL keeps when redacted.
+fn pg_scheme_len(url: &str) -> Option<usize> {
+    ["postgresql://", "postgres://"]
+        .into_iter()
+        .find(|scheme| {
+            url.get(..scheme.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(scheme))
+        })
+        .map(str::len)
 }
 
 /// Where the credentials of `scheme://user:password@host/...` end, found
@@ -2298,6 +2310,10 @@ mod tests {
             "host=db.internal user=app password=hunter2 dbname=sales",
             "postgresql:/db?password=hunter2",
             "hunter2",
+            // Round 4: a `://` inside a value is no scheme.
+            "host=db user=app password=hunter2 sslrootcert=file:///etc/ca.pem",
+            "password=hunter2 host=db sslrootcert=file:///etc/ca.pem",
+            "mysql://app:hunter2@db/x",
         ] {
             let s = spec(serde_json::json!({
                 "name": "p", "type": "postgresql", "connection_url": url
@@ -2308,6 +2324,32 @@ mod tests {
             assert!(!format!("{s:?}").contains("hunter2"));
             let e = validate_spec(&s).unwrap_err();
             assert!(!e.contains("hunter2"), "{e}");
+            let back: CatalogConfig = serde_json::from_value(shown).unwrap();
+            assert_eq!(redacted_secrets(&back), vec!["connection_url password"]);
+        }
+    }
+
+    /// Round 4: a refused URL keeps only a leading `postgresql://` or
+    /// `postgres://` (any case), never text before a `://` in its password.
+    #[test]
+    fn a_refused_url_keeps_only_a_leading_postgres_scheme() {
+        for (url, shown_as) in [
+            ("postgresql://u:p@hunter2@db/x", "postgresql://<redacted>"),
+            ("POSTGRES://u:hunter2@db/x", "POSTGRES://<redacted>"),
+            (
+                "postgresql://db/x?password=hunter2://y@z",
+                "postgresql://<redacted>",
+            ),
+            ("hunter2://x@db/y", REDACTED),
+            ("u:hunter2://@db", REDACTED),
+        ] {
+            let s = spec(serde_json::json!({
+                "name": "p", "type": "postgresql", "connection_url": url
+            }));
+            assert!(validate_spec(&s).is_err(), "{url}");
+            let shown = redacted_spec(&s);
+            assert_eq!(shown["connection_url"], shown_as, "{url}");
+            assert!(!shown.to_string().contains("hunter2"), "{shown}");
             let back: CatalogConfig = serde_json::from_value(shown).unwrap();
             assert_eq!(redacted_secrets(&back), vec!["connection_url password"]);
         }

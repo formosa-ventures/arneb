@@ -51,6 +51,7 @@ pub fn routes() -> Router<WebState> {
         .route("/cluster", get(cluster))
         .route("/cluster/workers", get(workers))
         .route("/info", get(info))
+        .merge(super::agent::routes())
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
 }
@@ -67,11 +68,11 @@ async fn method_not_allowed() -> Response {
     resp
 }
 
-fn bad_body(e: BytesRejection) -> ApiError {
+pub(super) fn bad_body(e: BytesRejection) -> ApiError {
     ApiError::new(ErrorCode::InvalidArgument, e.body_text())
 }
 
-fn bad_query(e: QueryRejection) -> ApiError {
+pub(super) fn bad_query(e: QueryRejection) -> ApiError {
     ApiError::new(ErrorCode::InvalidArgument, e.body_text())
         .with_hint("check the query-string parameters")
 }
@@ -559,6 +560,7 @@ mod tests {
             access_rules: None,
             metrics_auth: false,
             sessions: SessionStore::new(),
+            agent: None,
         }
     }
 

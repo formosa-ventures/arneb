@@ -44,6 +44,23 @@ pub trait DistributedExecutor: Send + Sync {
         exec_ctx: &ExecutionContext,
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, ArnebError>;
 
+    /// [`execute`](Self::execute) that hands the root stage's batches to
+    /// `sink` as they arrive instead of collecting them. An implementation
+    /// that re-runs a query (retry after a lost worker) calls
+    /// [`BatchSink::reset`] before each re-run. The default collects with
+    /// `execute` and then pushes.
+    async fn execute_into(
+        &self,
+        plan: LogicalPlan,
+        exec_ctx: &ExecutionContext,
+        sink: &mut dyn BatchSink,
+    ) -> Result<(), ArnebError> {
+        for batch in self.execute(plan, exec_ctx).await? {
+            sink.push(batch);
+        }
+        Ok(())
+    }
+
     /// Check if workers are available for distributed execution.
     fn has_workers(&self) -> bool;
 }
@@ -1057,6 +1074,101 @@ pub async fn execute_query_with_limit(
     ),
     ArnebError,
 > {
+    execute_query_capped(
+        sql,
+        catalog_manager,
+        connector_registry,
+        distributed_executor,
+        memory_pool,
+        query_memory_limit,
+        None,
+    )
+    .await
+}
+
+/// Caps the rows a query plan produces at `row_cap`: an existing root
+/// `LIMIT` keeps the smaller of the two, anything else gets a `LIMIT` on top.
+/// The cap goes below root projections (which keep the row count), so the
+/// physical planner can turn it into a Top-K over a sort or a limit hint over
+/// a bare scan.
+fn cap_plan_rows(plan: LogicalPlan, row_cap: usize) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Projection {
+            input,
+            exprs,
+            schema,
+        } => LogicalPlan::Projection {
+            input: Box::new(cap_plan_rows(*input, row_cap)),
+            exprs,
+            schema,
+        },
+        LogicalPlan::Limit {
+            input,
+            limit,
+            offset,
+        } => LogicalPlan::Limit {
+            input,
+            limit: Some(limit.map_or(row_cap, |l| l.min(row_cap))),
+            offset,
+        },
+        plan => LogicalPlan::Limit {
+            input: Box::new(plan),
+            limit: Some(row_cap),
+            offset: None,
+        },
+    }
+}
+
+/// Takes a query's batches one at a time as they are produced, so the caller
+/// keeps only what it needs instead of a fully collected result.
+pub trait BatchSink: Send {
+    /// Takes the next batch.
+    fn push(&mut self, batch: arrow::record_batch::RecordBatch);
+
+    /// Forgets every batch taken so far: the query is being re-run from
+    /// the start (retry after a lost worker), so its rows will come again.
+    fn reset(&mut self);
+}
+
+impl BatchSink for Vec<arrow::record_batch::RecordBatch> {
+    fn push(&mut self, batch: arrow::record_batch::RecordBatch) {
+        Vec::push(self, batch);
+    }
+
+    fn reset(&mut self) {
+        self.clear();
+    }
+}
+
+/// A capped query: a `SELECT` produces at most `rows` rows, and every batch
+/// goes to `sink` as it arrives.
+pub(crate) struct RowCap<'a> {
+    pub(crate) rows: usize,
+    pub(crate) sink: &'a mut dyn BatchSink,
+}
+
+/// [`execute_query_with_limit`] that, given a [`RowCap`], stops a `SELECT`
+/// after `row_cap.rows` rows (the plan's root gets a `LIMIT`, so the query
+/// reads no more than it needs to return that many) and hands every batch
+/// to `row_cap.sink` as it is produced instead of returning it (the
+/// returned batches are then empty): from the local plan's stream, or from
+/// the distributed root stage through [`DistributedExecutor::execute_into`].
+/// Other statements ignore the row limit.
+pub(crate) async fn execute_query_capped(
+    sql: &str,
+    catalog_manager: &CatalogManager,
+    connector_registry: &ConnectorRegistry,
+    distributed_executor: Option<&dyn DistributedExecutor>,
+    memory_pool: &Arc<dyn arneb_execution::memory_pool::MemoryPool>,
+    query_memory_limit: Option<usize>,
+    row_cap: Option<RowCap<'_>>,
+) -> Result<
+    (
+        Arc<dyn ExecutionPlan>,
+        Vec<arrow::record_batch::RecordBatch>,
+    ),
+    ArnebError,
+> {
     let memory_pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> = match query_memory_limit {
         Some(limit) => Arc::new(arneb_execution::memory_pool::QueryMemoryPool::new(
             Arc::clone(memory_pool),
@@ -1078,6 +1190,12 @@ pub async fn execute_query_with_limit(
     // costs only an `Arc` clone.
     let planner = QueryPlanner::new(catalog_manager);
     let (logical_plan, analyzer_ctx) = planner.plan_statement_with_context(&statement).await?;
+    let logical_plan = match (&row_cap, &statement) {
+        (Some(cap), arneb_sql_parser::ast::Statement::Query { .. }) => {
+            cap_plan_rows(logical_plan, cap.rows)
+        }
+        _ => logical_plan,
+    };
 
     // Step 2.5: Optimize logical plan
     let optimizer = LogicalOptimizer::default_rules();
@@ -1135,7 +1253,15 @@ pub async fn execute_query_with_limit(
     if let Some(executor) = distributed_executor {
         if executor.has_workers() {
             tracing::info!("routing query to distributed executor");
-            let batches = executor.execute(logical_plan, &exec_ctx).await?;
+            let batches = match row_cap {
+                Some(cap) => {
+                    executor
+                        .execute_into(logical_plan, &exec_ctx, cap.sink)
+                        .await?;
+                    Vec::new()
+                }
+                None => executor.execute(logical_plan, &exec_ctx).await?,
+            };
             // Create local physical plan just for schema (not executed)
             // Fall through to local if distributed fails
             let local_plan = exec_ctx.create_physical_plan(
@@ -1163,8 +1289,17 @@ pub async fn execute_query_with_limit(
 
     // Step 6: Execute (async). After the wrap above, top-level output
     // is always single-partition.
-    let stream = physical_plan.execute(0).await?;
-    let batches = collect_stream(stream).await?;
+    let mut stream = physical_plan.execute(0).await?;
+    let batches = match row_cap {
+        Some(cap) => {
+            use futures::StreamExt;
+            while let Some(batch) = stream.next().await {
+                cap.sink.push(batch?);
+            }
+            Vec::new()
+        }
+        None => collect_stream(stream).await?,
+    };
 
     Ok((physical_plan, batches))
 }

@@ -151,6 +151,10 @@ pub enum OAuthReject {
     /// token's `email_verified` is not true.
     #[error("email not verified")]
     UnverifiedEmail,
+    /// The user (an email address under a claim other than `email`) is not
+    /// the token's `email`, so `email_verified` does not vouch for it.
+    #[error("user claim is not the verified email")]
+    EmailMismatch,
     /// The signing keys could not be fetched, so no verdict is possible.
     #[error("identity provider unavailable")]
     Unavailable,
@@ -389,23 +393,7 @@ impl OAuthValidator {
             .filter(|s| !s.is_empty())
             .ok_or(OAuthReject::Invalid("no_user_claim"))?
             .to_owned();
-        // An unverified address can be anyone's (self-registration, social
-        // login), so it must not name an Arneb user, whichever claim
-        // carries it (`email`, `preferred_username`, `upn`, a namespaced
-        // claim, ...).
-        if settings.user_claim == "email" || user.contains('@') {
-            let verified = match claims.get("email_verified") {
-                Some(serde_json::Value::Bool(b)) => *b,
-                Some(serde_json::Value::String(s)) => s == "true",
-                Some(_) => false,
-                // The IdP does not say (Entra ID never does): only an
-                // explicit opt-in trusts it, and never for `email`.
-                None => settings.allow_missing_email_verified && settings.user_claim != "email",
-            };
-            if !verified {
-                return Err(OAuthReject::UnverifiedEmail);
-            }
-        }
+        check_email(settings, claims, &user)?;
         let mut scopes: Vec<String> = Vec::new();
         if let Some(s) = claims.get("scope").and_then(|v| v.as_str()) {
             scopes.extend(s.split_whitespace().map(str::to_owned));
@@ -711,6 +699,52 @@ struct JwksDoc {
 /// The RFC 9068 media type of a JWT access token, as a header `typ`.
 fn is_access_token_typ(typ: &str) -> bool {
     typ.eq_ignore_ascii_case("at+jwt") || typ.eq_ignore_ascii_case("application/at+jwt")
+}
+
+/// An unverified address can be anyone's (self-registration, social login),
+/// so it must not name an Arneb user, whichever claim carries it.
+///
+/// - `user_claim = "email"`: `email_verified` must be true.
+/// - `sub`: not checked. OIDC defines it as never reassigned, and Okta puts
+///   the login (an address, without `email_verified`) there.
+/// - Any other claim whose value contains `@` (`preferred_username`, `upn`,
+///   a namespaced claim): `email_verified` speaks only for the token's
+///   `email`, so that must be the same address (ASCII case-insensitive) and
+///   verified; a different `email` is refused (a user can pick a username
+///   that is someone else's address). A token without `email` or without
+///   `email_verified` passes only with `allow_missing_email_verified`; an
+///   explicit non-true `email_verified` never does.
+fn check_email(
+    settings: &OAuthSettings,
+    claims: &serde_json::Value,
+    user: &str,
+) -> Result<(), OAuthReject> {
+    let verified = || match claims.get("email_verified") {
+        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(serde_json::Value::String(s)) => Some(s == "true"),
+        Some(_) => Some(false),
+        None => None,
+    };
+    if settings.user_claim == "email" {
+        return match verified() {
+            Some(true) => Ok(()),
+            _ => Err(OAuthReject::UnverifiedEmail),
+        };
+    }
+    if settings.user_claim == "sub" || !user.contains('@') {
+        return Ok(());
+    }
+    let email = claims.get("email").and_then(|v| v.as_str());
+    if email.is_some_and(|e| !e.eq_ignore_ascii_case(user)) {
+        return Err(OAuthReject::EmailMismatch);
+    }
+    match (email, verified()) {
+        (Some(_), Some(true)) => Ok(()),
+        (_, Some(false)) => Err(OAuthReject::UnverifiedEmail),
+        // Nothing vouches for the address: only the opt-in trusts it.
+        _ if settings.allow_missing_email_verified => Ok(()),
+        _ => Err(OAuthReject::UnverifiedEmail),
+    }
 }
 
 /// Keycloak's payload `typ` of signed tokens that are not access tokens
@@ -1953,59 +1987,91 @@ mod tests {
     async fn an_email_address_under_any_claim_needs_a_verified_email() {
         let key = TestKey::ec("k1");
         let idp = TestIdp::start(&[&key]).await;
+        let addr = "alice@corp.example";
         // Keycloak "email as username", Entra `upn`, an Auth0 namespaced
-        // claim, and even `sub`: an address is checked whatever its claim.
-        for claim in [
-            "preferred_username",
-            "upn",
-            "https://corp.example/email",
-            "sub",
-        ] {
+        // claim: the address must be the token's verified `email`.
+        for claim in ["preferred_username", "upn", "https://corp.example/email"] {
             let v = validator(&idp, |s| s.user_claim = claim.into());
-            let mut c = claims(&idp.issuer(), AUD);
-            c[claim] = json!("alice@corp.example");
-            for (verified, ok) in [
-                (None, false),
-                (Some(json!(false)), false),
-                (Some(json!("false")), false),
-                (Some(json!(true)), true),
-                (Some(json!("true")), true),
-            ] {
-                match &verified {
-                    Some(b) => c["email_verified"] = b.clone(),
-                    None => {
-                        c.as_object_mut().unwrap().remove("email_verified");
-                    }
-                }
-                let got = v.validate(&key.sign(&c)).await;
-                if ok {
-                    assert_eq!(got.unwrap().user, "alice@corp.example", "{claim}");
-                } else {
-                    assert_eq!(
-                        got.unwrap_err(),
-                        OAuthReject::UnverifiedEmail,
-                        "{claim} {verified:?}"
-                    );
-                }
-            }
-            // The opt-in accepts a missing claim, never a false one.
             let lax = validator(&idp, |s| {
                 s.user_claim = claim.into();
                 s.allow_missing_email_verified = true;
             });
-            c.as_object_mut().unwrap().remove("email_verified");
+            // (email, email_verified, accepted strictly, accepted with the opt-in)
+            for (email, verified, strict, opt_in) in [
+                (Some(addr), Some(json!(true)), true, true),
+                (Some("Alice@Corp.Example"), Some(json!("true")), true, true),
+                (Some(addr), Some(json!(false)), false, false),
+                (Some(addr), Some(json!("false")), false, false),
+                (Some(addr), None, false, true),
+                (None, None, false, true),
+                // No `email` for `email_verified` to speak for.
+                (None, Some(json!(true)), false, true),
+                (None, Some(json!(false)), false, false),
+            ] {
+                let mut c = claims(&idp.issuer(), AUD);
+                c[claim] = json!(addr);
+                if let Some(e) = email {
+                    c["email"] = json!(e);
+                }
+                if let Some(b) = &verified {
+                    c["email_verified"] = b.clone();
+                }
+                let t = key.sign(&c);
+                for (v, ok) in [(&v, strict), (&lax, opt_in)] {
+                    let got = v.validate(&t).await.map(|p| p.user);
+                    let want = if ok {
+                        Ok(addr.to_owned())
+                    } else {
+                        Err(OAuthReject::UnverifiedEmail)
+                    };
+                    assert_eq!(got, want, "{claim} {email:?} {verified:?}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_username_that_is_someone_elses_address_is_refused() {
+        // Self-registration: the attacker picks the username
+        // admin@corp.example and verifies their own inbox.
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let mut c = claims(&idp.issuer(), AUD);
+        c["preferred_username"] = json!("admin@corp.example");
+        c["email"] = json!("attacker@evil.example");
+        c["email_verified"] = json!(true);
+        for lax in [false, true] {
+            let v = validator(&idp, |s| {
+                s.user_claim = "preferred_username".into();
+                s.allow_missing_email_verified = lax;
+            });
             assert_eq!(
-                lax.validate(&key.sign(&c)).await.unwrap().user,
-                "alice@corp.example",
-                "{claim}"
-            );
-            c["email_verified"] = json!(false);
-            assert_eq!(
-                lax.validate(&key.sign(&c)).await.unwrap_err(),
-                OAuthReject::UnverifiedEmail,
-                "{claim}"
+                v.validate(&key.sign(&c)).await.unwrap_err(),
+                OAuthReject::EmailMismatch,
+                "opt-in {lax}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sub_is_exempt_from_the_email_check() {
+        // Okta custom authorization servers put the login (an address) in
+        // `sub`, without `email_verified`; `sub` is never reassigned.
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let v = validator(&idp, |_| {});
+        let mut c = claims(&idp.issuer(), AUD);
+        c["sub"] = json!("alice@corp.example");
+        assert_eq!(
+            v.validate(&key.sign(&c)).await.unwrap().user,
+            "alice@corp.example"
+        );
+        c["email"] = json!("other@corp.example");
+        c["email_verified"] = json!(false);
+        assert_eq!(
+            v.validate(&key.sign(&c)).await.unwrap().user,
+            "alice@corp.example"
+        );
     }
 
     #[test]

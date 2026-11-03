@@ -285,6 +285,19 @@ async fn oauth_identity(
             )
             .into_response(),
         )),
+        Err(OAuthReject::EmailMismatch) => Err(Box::new(
+            ApiError::new(
+                ErrorCode::Forbidden,
+                format!(
+                    "the identity's '{}' claim is an email address other than its verified email",
+                    oauth.settings().user_claim
+                ),
+            )
+            .with_hint(
+                "the claim must equal the token's verified `email`; set [oauth] user_claim to `sub` or `email`",
+            )
+            .into_response(),
+        )),
         Err(OAuthReject::Unavailable) => Err(Box::new(
             ApiError::new(
                 ErrorCode::AuthProviderUnavailable,
@@ -1197,6 +1210,58 @@ mod tests {
         assert_eq!(
             reply.json()["result"]["structuredContent"]["user"],
             "alice@corp.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_username_that_is_another_address_is_a_distinct_403() {
+        let mut env = OAuthEnv::new().await;
+        let mut settings = env.state.oauth.as_ref().unwrap().settings().clone();
+        settings.user_claim = "preferred_username".into();
+        env.state.oauth = Some(Arc::new(OAuthValidator::new(settings)));
+        env.state
+            .state
+            .as_ref()
+            .unwrap()
+            .create_user(
+                "admin@corp.example",
+                arneb_protocol::ScramVerifier::generate("secret").unwrap(),
+            )
+            .unwrap();
+        // A self-registered username that is someone else's address, with
+        // the attacker's own verified inbox as `email`.
+        let mut c = claims(&env.idp.issuer(), RESOURCE);
+        c["scope"] = "arneb:query".into();
+        c["preferred_username"] = "admin@corp.example".into();
+        c["email"] = "attacker@evil.example".into();
+        c["email_verified"] = true.into();
+        let reply = mcp_call(
+            &env.state,
+            &format!("Bearer {}", env.key.sign(&c)),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        let e = &reply.json()["error"];
+        assert_eq!(e["code"], "forbidden");
+        assert_eq!(
+            e["message"],
+            "the identity's 'preferred_username' claim is an email address other than its verified email"
+        );
+        // The same address as the verified email is admin.
+        c["email"] = "admin@corp.example".into();
+        let reply = mcp_call(
+            &env.state,
+            &format!("Bearer {}", env.key.sign(&c)),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.json()["result"]["structuredContent"]["user"],
+            "admin@corp.example"
         );
     }
 

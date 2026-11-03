@@ -1391,7 +1391,8 @@ pub fn effective_secrets(global: &StorageConfig, specs: &[CatalogConfig]) -> Vec
 }
 
 /// The secrets `spec` carries, by field: `password`, a password in
-/// `connection_url` (userinfo or query parameter), `storage.s3.secret_access_key`
+/// `connection_url` (userinfo or query parameter; any URL that fails
+/// validation counts whole, as [`redacted_spec`] hides it whole), `storage.s3.secret_access_key`
 /// and `storage.azure.access_key`. A GCS `service_account_path` is a path on
 /// the node, not the key itself, so it is not listed.
 pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
@@ -1400,9 +1401,15 @@ pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
         found.push("password");
     }
     if let Some(url) = &spec.connection_url {
+        // A refused URL (a libpq keyword string, or one on a spec of
+        // another type that nothing validates) may hold a password the
+        // finders above cannot place.
         if url_password_range(&url.0).is_some()
             || !url_query_passwords(&url.0).is_empty()
             || !url_loose_query_passwords(&url.0).is_empty()
+            || arneb_postgresql::PostgresConfig::new(url.0.clone())
+                .validate_url()
+                .is_err()
         {
             found.push("connection_url password");
         }
@@ -2074,6 +2081,17 @@ mod tests {
             Err(vec!["storage.s3.secret_access_key"]),
             "the global [storage] key is served with every hive spec"
         );
+        // Round 4 follow-up: a URL that fails validation counts as a
+        // secret whole, even on a hive spec, where nothing validates it.
+        for stray in [
+            serde_json::json!({"name": "k", "type": "postgresql",
+                "connection_url": "host=db password=kw-secret"}),
+            serde_json::json!({"name": "h", "type": "hive", "metastore_uri": "h:9083",
+                "connection_url": "host=db password=kw-secret"}),
+        ] {
+            let stray = spec(stray);
+            assert_eq!(secret_fields(&stray), vec!["connection_url password"]);
+        }
         let gcs_only = spec(serde_json::json!({
             "name": "g", "type": "postgresql", "connection_url": "postgresql://u@h/db",
             "storage": {"gcs": {"service_account_path": "/keys/sa.json"}}

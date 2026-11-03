@@ -835,7 +835,15 @@ impl ManageAction for CancelQuery {
         // wait on the kill: it waits for at most one poll of the work.
         let outcome = tokio::runtime::Handle::current()
             .block_on(tracker.kill_query(&self.id, &self.by))
-            .map_err(|_| Self::gone())?;
+            .map_err(|e| {
+                // Still tracked: the kill itself failed (interrupted).
+                if tracker.get_query(&self.id).is_some() {
+                    ApiError::new(ErrorCode::Internal, e.to_string())
+                        .with_hint("retry the cancel; the server log has the cause")
+                } else {
+                    Self::gone()
+                }
+            })?;
         let (before, preview) = match outcome {
             KillOutcome::Killed { was } => (
                 was,

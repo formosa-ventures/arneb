@@ -20,7 +20,7 @@ use super::types::{trino_type_of, TrinoType};
 
 /// Name of the virtual catalog that hosts `system.jdbc` / `system.metadata`.
 pub(crate) const SYSTEM_CATALOG: &str = "system";
-const INFORMATION_SCHEMA: &str = "information_schema";
+pub(crate) const INFORMATION_SCHEMA: &str = "information_schema";
 const INFO_SCHEMA_TABLES: [&str; 4] = ["columns", "schemata", "tables", "views"];
 
 const NULL_STR: Cell = Cell::Str(None);

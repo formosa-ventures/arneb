@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod auth;
 mod encoding;
 mod error;
@@ -21,7 +22,7 @@ pub use tls::{PgwireTls, PgwireTlsMode, ServerTls, TlsConfigError};
 pub use trino::{BasicAuthenticator, BasicVerdict, SlotError, TrinoConfig, TrinoServer};
 
 // Re-export the distributed executor trait for server crate to implement
-pub use handler::DistributedExecutor;
+pub use handler::{BatchSink, DistributedExecutor};
 
 // Re-export for integration testing
 #[doc(hidden)]

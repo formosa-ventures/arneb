@@ -223,6 +223,18 @@ impl Pending {
         }
     }
 
+    /// A handle that reads this query's live queue position while
+    /// [`Self::wait`] is pending, or `None` when it was admitted at once.
+    pub fn ticket(&self) -> Option<QueueTicket> {
+        match &self.inner {
+            PendingInner::Queued { id, .. } => Some(QueueTicket {
+                shared: Arc::clone(&self.shared),
+                id: *id,
+            }),
+            _ => None,
+        }
+    }
+
     /// Wait for a slot. Cancel-safe: dropping this future leaves the queue
     /// (and passes on a slot granted in the meantime).
     pub async fn wait(mut self) -> AdmissionPermit {
@@ -265,6 +277,36 @@ impl Drop for Pending {
     }
 }
 
+/// A queued query's place in the queue, readable from outside the task
+/// that awaits [`Pending::wait`] (e.g. by a status request).
+#[derive(Clone)]
+pub struct QueueTicket {
+    shared: Arc<Shared>,
+    id: u64,
+}
+
+impl std::fmt::Debug for QueueTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueTicket")
+            .field("position", &self.position())
+            .finish()
+    }
+}
+
+impl QueueTicket {
+    /// Current queue position (1 = next), or `None` once the query has left
+    /// the queue (admitted, or its wait was dropped). One scan of the
+    /// bounded queue under the controller lock.
+    pub fn position(&self) -> Option<usize> {
+        self.shared
+            .lock()
+            .queue
+            .iter()
+            .position(|w| w.id == self.id)
+            .map(|i| i + 1)
+    }
+}
+
 /// A running query's slot; dropping it admits the next queued query.
 pub struct AdmissionPermit {
     shared: Arc<Shared>,
@@ -302,6 +344,24 @@ mod tests {
         let unlimited = AdmissionController::new(0, 0);
         let _a = unlimited.admit_with(label).unwrap();
         assert_eq!(built.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn ticket_tracks_the_live_position() {
+        let c = AdmissionController::new(1, 10);
+        let first = admitted(&c).await;
+        let q1 = c.admit("q1").unwrap();
+        let q2 = c.admit("q2").unwrap();
+        let (t1, t2) = (q1.ticket().unwrap(), q2.ticket().unwrap());
+        assert_eq!((t1.position(), t2.position()), (Some(1), Some(2)));
+        drop(first); // the slot goes to q1
+        let p1 = q1.wait().await;
+        assert_eq!((t1.position(), t2.position()), (None, Some(1)));
+        drop(q2); // gave up waiting
+        assert_eq!(t2.position(), None);
+        drop(p1);
+        let unlimited = AdmissionController::new(0, 0);
+        assert!(unlimited.admit("x").unwrap().ticket().is_none());
     }
 
     #[tokio::test]

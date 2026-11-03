@@ -8,7 +8,7 @@ mod state;
 mod tracker;
 
 pub use admission::{
-    AdmissionController, AdmissionError, AdmissionPermit, AdmissionSnapshot, Pending,
+    AdmissionController, AdmissionError, AdmissionPermit, AdmissionSnapshot, Pending, QueueTicket,
 };
 pub use dynamic_filter::DynamicFilterService;
 pub use dynamic_filter_registry::DynamicFilterServiceRegistry;

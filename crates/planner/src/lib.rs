@@ -20,7 +20,7 @@ pub use cost::{
     DEFAULT_TABLE_SIZE,
 };
 pub use dynamic_filter::DynamicFilterIdAllocator;
-pub use explain::format_plan_with_estimates;
+pub use explain::{format_plan_with_estimates, plan_children};
 pub use fragment::{
     Distribution, FragmentType, PartitioningScheme, PlanFragment, PlanFragmenter, QueryStage,
     DEFAULT_HASH_PARTITION_TARGET_ROWS, DEFAULT_MAX_HASH_PARTITIONS,

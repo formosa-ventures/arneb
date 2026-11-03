@@ -154,6 +154,22 @@ impl ClientSession {
         }
     }
 
+    /// A session for one agent-API statement: the user plus the request's
+    /// catalog and schema, with no session properties and no prepared
+    /// statements (the agent API is stateless per statement).
+    pub(crate) fn for_agent(user: &str, catalog: Option<String>, schema: Option<String>) -> Self {
+        Self {
+            family: HeaderFamily::Trino,
+            user: user.to_string(),
+            source: None,
+            catalog,
+            schema,
+            client_info: None,
+            properties: Vec::new(),
+            prepared: Vec::new(),
+        }
+    }
+
     pub(crate) fn prepared_statement(&self, name: &str) -> Option<&str> {
         self.prepared
             .iter()

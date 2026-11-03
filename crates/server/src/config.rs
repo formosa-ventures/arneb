@@ -958,8 +958,8 @@ pub struct OAuthConfig {
     /// Public URL of the MCP endpoint (the protected resource); must end in
     /// `/mcp`. Required with `issuer`.
     pub resource: Option<String>,
-    /// Required `aud` value; defaults to `resource`. A different value
-    /// (client-id mode) needs `required_scopes`.
+    /// Required `aud` value; defaults to `resource`. A value that is not a
+    /// URL (client-id mode) needs `required_scopes`.
     pub audience: Option<String>,
     /// Claim mapped to the Arneb user name. `sub` is the only claim OIDC
     /// guarantees stable and unique; others (`preferred_username`, `email`)
@@ -1164,14 +1164,17 @@ impl OAuthConfig {
         }
         // An OIDC ID token for a client carries `aud` = that client id and
         // no scope, so in client-id mode only a required scope tells an
-        // access token from an ID token whose shape gives nothing away.
-        if self.effective_audience() != Some(resource.as_str()) && self.required_scopes.is_empty() {
-            return Err(format!(
-                "[oauth] audience '{}' differs from resource, so ID tokens issued to that client \
-                 would carry the same aud: set required_scopes to a scope only access tokens \
-                 for Arneb carry",
-                self.effective_audience().unwrap_or_default()
-            ));
+        // access token from an ID token whose shape gives nothing away. A
+        // URL or URI audience (the resource, Entra `api://...`, an Auth0
+        // API identifier) is not a client id.
+        if let Some(audience) = self.audience.as_deref() {
+            if audience_is_client_id(audience) && self.required_scopes.is_empty() {
+                return Err(format!(
+                    "[oauth] audience '{audience}' looks like a client id (it is not a URL), \
+                     and OIDC ID tokens issued to that client carry it as their aud: set \
+                     required_scopes to a scope only access tokens for Arneb carry"
+                ));
+            }
         }
         Ok(())
     }
@@ -1194,6 +1197,12 @@ impl OAuthConfig {
         }
         Ok(())
     }
+}
+
+/// An `[oauth] audience` that is not an absolute URL or URI (`https://...`,
+/// `api://...`, `urn:...`): the shape of an OAuth client id.
+fn audience_is_client_id(audience: &str) -> bool {
+    url::Url::parse(audience).is_err()
 }
 
 /// A boolean env value: `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`,
@@ -3115,7 +3124,30 @@ pgwire = "required"
                 },
                 None,
             ),
+            // A GUID (Entra application id) is a client id too.
+            (
+                OAuthConfig {
+                    audience: Some("6f1c2a3b-0000-4000-8000-123456789abc".into()),
+                    ..oauth_ok()
+                },
+                Some("looks like a client id"),
+            ),
         ];
+        // URL and URI audiences are never client ids: the resource with a
+        // trailing slash, an Entra application id URI, an Auth0 API
+        // identifier, a URN.
+        for audience in [
+            "https://db.example/mcp/",
+            "api://6f1c2a3b-0000-4000-8000-123456789abc",
+            "https://api.corp.example",
+            "urn:arneb:mcp",
+        ] {
+            let c = OAuthConfig {
+                audience: Some(audience.into()),
+                ..oauth_ok()
+            };
+            assert_eq!(c.validate(), Ok(()), "{audience}");
+        }
         for (cfg, expect) in cases {
             match (cfg.validate(), expect) {
                 (Ok(()), None) => {}

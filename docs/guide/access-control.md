@@ -85,12 +85,46 @@ Everyone can run queries and sees only their own.
   catalogs). Hive and PostgreSQL find `NATION` as written, so it is not
   folded, and an allow rule on `nation` refuses `SELECT * FROM NATION`.
   Write queries with the stored (usually lowercase) names, or make allow
-  patterns case-insensitive, e.g. `"table": "(?i)nation"`.
+  patterns case-insensitive, e.g. `"table": "(?i)nation"`. See
+  [Upgrading from v0.1.8](#upgrading-from-v0-1-8) if your allow rules use
+  another case than the stored names.
+- When a connector cannot be reached (HMS or the PostgreSQL server is
+  down), a lookup fails with an error. It never reads as a missing schema,
+  so `SET search_path` fails instead of falling back to another schema.
 - A PostgreSQL view is checked by the view's own name. The tables it
   reads are governed only by the PostgreSQL role the catalog connects as.
 - A section left out of the file allows everything it governs. With no
   `tables` section, every user has every privilege on every table; with no
   `schemas` section, every user owns every schema; and so on.
+
+## Upgrading from v0.1.8
+
+Before v0.1.9, rules were checked only on the names as written in the
+query. From v0.1.9 they are also checked on the stored names the Hive or
+PostgreSQL connector resolved, so **an allow rule must match the stored
+name as well**. An allow rule written in another case than the stored
+name now refuses the read, and the error is the one a missing table gets,
+not `Access Denied`, so it can look as if the data went away.
+
+For example, with a Hive catalog whose database is stored as `tpch`:
+
+```json
+{
+  "tables": [
+    {"user": "alice", "schema": "TPCH", "privileges": ["SELECT"]},
+    {"privileges": []}
+  ]
+}
+```
+
+`SELECT * FROM TPCH.nation` worked on v0.1.8. On v0.1.9 it is refused,
+because the stored schema `tpch` does not match `TPCH`. Fix the rule by
+writing the stored name, `"schema": "tpch"`, or by making the pattern
+case-insensitive, `"schema": "(?i)tpch"`. Check every `catalog`, `schema`
+and `table` pattern in an allow rule against `SHOW SCHEMAS` / `SHOW TABLES`
+(which list the stored names) before upgrading. Deny rules need no change:
+they now also cover every other spelling of the stored name. Memory and
+file catalogs are not affected.
 
 ## Supported rules
 

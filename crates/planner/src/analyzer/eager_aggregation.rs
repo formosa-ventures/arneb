@@ -139,6 +139,17 @@ fn rewrite(plan: LogicalPlan, stats: &CatalogStats) -> LogicalPlan {
                 schema,
             })
         }
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => L::RollupAggregate {
+            input: Box::new(rewrite(*input, stats)),
+            group_by,
+            aggr_exprs,
+            schema,
+        },
         L::Filter { input, predicate } => L::Filter {
             input: Box::new(rewrite(*input, stats)),
             predicate,

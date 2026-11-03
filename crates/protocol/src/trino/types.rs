@@ -48,6 +48,7 @@ pub(crate) enum TrinoType {
     Double,
     Decimal(u8, i8),
     Varchar,
+    Char(u32),
     Varbinary,
     Date,
     Time(u8),
@@ -127,6 +128,7 @@ impl TrinoType {
             Self::Double => "double",
             Self::Decimal(..) => "decimal",
             Self::Varchar => "varchar",
+            Self::Char(_) => "char",
             Self::Varbinary => "varbinary",
             Self::Date => "date",
             Self::Time(_) => "time",
@@ -142,6 +144,7 @@ impl TrinoType {
     pub(crate) fn display(&self) -> String {
         match self {
             Self::Decimal(p, s) => format!("decimal({p},{s})"),
+            Self::Char(length) => format!("char({length})"),
             Self::Time(p) => format!("time({p})"),
             Self::Timestamp(p) => format!("timestamp({p})"),
             Self::TimestampTz(p) => format!("timestamp({p}) with time zone"),
@@ -164,6 +167,7 @@ impl TrinoType {
         let ty = |t: &TrinoType| json!({"kind": "TYPE", "value": t.signature()});
         let arguments: Vec<Value> = match self {
             Self::Varchar => vec![long(UNBOUNDED_VARCHAR)],
+            Self::Char(length) => vec![long(*length as i64)],
             Self::Decimal(p, s) => vec![long(*p as i64), long(*s as i64)],
             Self::Time(p) | Self::Timestamp(p) | Self::TimestampTz(p) => vec![long(*p as i64)],
             Self::Array(t) => vec![ty(t)],
@@ -195,6 +199,7 @@ impl TrinoType {
             Self::Double => 8,
             Self::Decimal(..) => 3,
             Self::Varchar => 12,
+            Self::Char(_) => 1,
             Self::Varbinary => -3,
             Self::Date => 91,
             Self::Time(_) => 92,
@@ -208,7 +213,10 @@ impl TrinoType {
 
 /// Maps an Arneb logical type to the Trino type a client should see.
 pub(crate) fn trino_type_of(dt: &arneb_common::types::DataType) -> TrinoType {
-    TrinoType::from_arrow(&ArrowType::from(dt.clone()))
+    match dt {
+        arneb_common::types::DataType::Char(length) => TrinoType::Char(*length),
+        other => TrinoType::from_arrow(&ArrowType::from(other.clone())),
+    }
 }
 
 /// Builds the JSON `columns` entry for one output column.
@@ -481,6 +489,13 @@ mod tests {
     use super::*;
     use arrow::array::{Decimal128Array, StringArray};
     use std::sync::Arc;
+
+    #[test]
+    fn char_columns_are_reported_as_char_n() {
+        let ty = trino_type_of(&arneb_common::types::DataType::Char(50));
+        assert_eq!(ty.display(), "char(50)");
+        assert_eq!(ty.jdbc_type_code(), 1);
+    }
 
     #[test]
     fn type_strings_and_signatures() {

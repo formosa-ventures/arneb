@@ -315,6 +315,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_quoted_function_name_drops_the_quotes() {
+        // Trino writes "sum"("x"); the quotes are identifier quoting, not
+        // part of the name, so the planner must see the same name as sum(x).
+        let stmt = parse(r#"SELECT "sum"("x"), "substr"("y", 1, 5), "Count"(*) FROM t"#).unwrap();
+        let Statement::Query { query, .. } = stmt else {
+            panic!("expected Query");
+        };
+        let names: Vec<&str> = select_body(&query)
+            .projection
+            .iter()
+            .map(|item| match item {
+                SelectItem::UnnamedExpr(Expr::Function { name, .. }) => name.as_str(),
+                other => panic!("expected function, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["sum", "substr", "Count"]);
+    }
+
+    #[test]
+    fn parse_quoted_window_function_name_drops_the_quotes() {
+        let stmt = parse(r#"SELECT "rank"() OVER (ORDER BY x) FROM t"#).unwrap();
+        let Statement::Query { query, .. } = stmt else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(Expr::WindowFunction { name, .. }) => assert_eq!(name, "rank"),
+            other => panic!("expected window function, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_function_distinct() {
         let stmt = parse("SELECT COUNT(DISTINCT x) FROM t").unwrap();
         let Statement::Query { query, .. } = stmt else {
@@ -789,6 +820,27 @@ mod tests {
             match &select_body(&query).projection[0] {
                 SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => {
                     assert_eq!(*data_type, DataType::Utf8, "failed for {sql_type}");
+                }
+                other => panic!("expected cast for {sql_type}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_cast_char_types() {
+        for (sql_type, expected) in [
+            ("CHAR(5)", DataType::Char(5)),
+            ("CHARACTER(16)", DataType::Char(16)),
+            ("CHAR", DataType::Char(1)),
+            ("CHARACTER VARYING(10)", DataType::Utf8),
+        ] {
+            let stmt = parse(&format!("SELECT CAST(x AS {sql_type}) FROM t")).unwrap();
+            let Statement::Query { query, .. } = stmt else {
+                panic!("expected Query for {sql_type}");
+            };
+            match &select_body(&query).projection[0] {
+                SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => {
+                    assert_eq!(*data_type, expected, "failed for {sql_type}");
                 }
                 other => panic!("expected cast for {sql_type}, got {other:?}"),
             }
@@ -1402,6 +1454,54 @@ mod tests {
         // the CAST construct.
         assert_eq!(span.start.line, 1);
         assert!(span.start.column >= 8);
+    }
+
+    #[test]
+    fn decimal_typed_literal_takes_its_type_from_the_text() {
+        // Trino: DECIMAL '1.3' is decimal(2,1); the digits decide p and s.
+        for (sql, value, precision, scale) in [
+            ("SELECT DECIMAL '1.3'", 13, 2, 1),
+            ("SELECT DECIMAL '-0.05'", -5, 2, 2),
+            ("SELECT DECIMAL '12'", 12, 2, 0),
+            ("SELECT DECIMAL '0012.50'", 1250, 4, 2),
+            ("SELECT DECIMAL '.5'", 5, 1, 1),
+        ] {
+            let Statement::Query { query, .. } = parse(sql).unwrap() else {
+                panic!("expected Query for {sql}");
+            };
+            match &select_body(&query).projection[0] {
+                SelectItem::UnnamedExpr(Expr::Literal {
+                    value:
+                        ScalarValue::Decimal128 {
+                            value: v,
+                            precision: p,
+                            scale: s,
+                        },
+                    ..
+                }) => assert_eq!((*v, *p, *s), (value, precision, scale), "{sql}"),
+                other => panic!("{sql}: expected a decimal literal, got {other:?}"),
+            }
+        }
+        assert!(parse("SELECT DECIMAL 'abc'").is_err());
+    }
+
+    #[test]
+    fn cast_to_bare_decimal_keeps_scale_zero() {
+        // Unlike the typed literal, CAST('1.3' AS DECIMAL) is decimal(38,0)
+        // in Trino (it yields 1).
+        let Statement::Query { query, .. } = parse("SELECT CAST('1.3' AS DECIMAL)").unwrap() else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(Expr::Cast { data_type, .. }) => assert_eq!(
+                *data_type,
+                DataType::Decimal128 {
+                    precision: 38,
+                    scale: 0
+                }
+            ),
+            other => panic!("expected cast, got {other:?}"),
+        }
     }
 
     #[test]

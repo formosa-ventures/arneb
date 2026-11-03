@@ -8,7 +8,7 @@ pub mod datasource;
 mod orc;
 mod types;
 
-pub use types::hive_type_to_arrow;
+pub use types::{hive_type_to_arrow, hive_type_to_data_type};
 
 #[cfg(test)]
 mod scan_tests;

@@ -51,6 +51,32 @@ impl fmt::Display for TimeUnit {
     }
 }
 
+/// Largest `n` a CHAR(n) type may declare (Trino's limit).
+pub const CHAR_MAX_LENGTH: u32 = 65_536;
+
+/// The stored form of `value` as a CHAR(`length`) value: truncated to
+/// `length` characters, without trailing blanks.
+pub fn char_storage_value(value: &str, length: u32) -> &str {
+    let end = value
+        .char_indices()
+        .nth(length as usize)
+        .map_or(value.len(), |(i, _)| i);
+    value[..end].trim_end_matches(' ')
+}
+
+/// `value` blank-padded to `length` characters: how a CHAR(`length`)
+/// value is presented to clients.
+pub fn char_padded_value(value: &str, length: u32) -> std::borrow::Cow<'_, str> {
+    let chars = value.chars().count();
+    if chars >= length as usize {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut padded = String::with_capacity(value.len() + (length as usize - chars));
+    padded.push_str(value);
+    padded.extend(std::iter::repeat_n(' ', length as usize - chars));
+    std::borrow::Cow::Owned(padded)
+}
+
 /// SQL data type system. Maintains SQL semantics (precision, scale, etc.)
 /// while providing conversion to/from Arrow types.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -88,6 +114,10 @@ pub enum DataType {
     },
     /// SQL VARCHAR / TEXT.
     Utf8,
+    /// SQL CHAR(n): a fixed-length string of `n` characters. Stored in
+    /// Arrow as Utf8 holding the value without trailing blanks; the
+    /// blank padding to `n` is applied only when results leave the engine.
+    Char(u32),
     /// SQL VARCHAR for large strings.
     LargeUtf8,
     /// SQL VARBINARY.
@@ -127,6 +157,7 @@ impl fmt::Display for DataType {
                 write!(f, "Decimal64({precision}, {scale})")
             }
             DataType::Utf8 => write!(f, "Utf8"),
+            DataType::Char(length) => write!(f, "Char({length})"),
             DataType::LargeUtf8 => write!(f, "LargeUtf8"),
             DataType::Binary => write!(f, "Binary"),
             DataType::Date32 => write!(f, "Date32"),
@@ -167,7 +198,7 @@ impl From<DataType> for arrow::datatypes::DataType {
             DataType::Decimal64 { precision, scale } => {
                 arrow::datatypes::DataType::Decimal64(precision, scale)
             }
-            DataType::Utf8 => arrow::datatypes::DataType::Utf8,
+            DataType::Utf8 | DataType::Char(_) => arrow::datatypes::DataType::Utf8,
             DataType::LargeUtf8 => arrow::datatypes::DataType::LargeUtf8,
             DataType::Binary => arrow::datatypes::DataType::Binary,
             DataType::Date32 => arrow::datatypes::DataType::Date32,
@@ -487,6 +518,19 @@ impl fmt::Display for ScalarValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- CHAR(n) --
+
+    #[test]
+    fn char_type_is_utf8_in_arrow_and_displays_its_length() {
+        assert_eq!(
+            arrow::datatypes::DataType::from(DataType::Char(50)),
+            arrow::datatypes::DataType::Utf8
+        );
+        assert_eq!(DataType::Char(50).to_string(), "Char(50)");
+        assert_ne!(DataType::Char(50), DataType::Utf8);
+        assert_ne!(DataType::Char(50), DataType::Char(16));
+    }
 
     // -- TimeUnit tests --
 

@@ -80,6 +80,9 @@ fn summarize_node(plan: &LogicalPlan) -> String {
             group_by.len(),
             aggr_exprs.len()
         ),
+        L::RollupAggregate { group_by, .. } => {
+            format!("RollupAggregate (levels={})", group_by.len() + 1)
+        }
         L::PartialAggregate {
             group_by,
             aggr_exprs,
@@ -140,6 +143,7 @@ fn children(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
         | L::Explain { input, .. }
         | L::Distinct { input }
         | L::Aggregate { input, .. }
+        | L::RollupAggregate { input, .. }
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Window { input, .. }

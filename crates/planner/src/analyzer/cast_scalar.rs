@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use arneb_common::error::PlanError;
-use arneb_common::types::{DataType, ScalarValue, TimeUnit};
+use arneb_common::types::{char_storage_value, DataType, ScalarValue, TimeUnit};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int32Array, Int64Array, NullArray, StringArray, TimestampMicrosecondArray,
@@ -34,6 +34,14 @@ use arrow::datatypes::DataType as ArrowDataType;
 pub fn cast_scalar(value: &ScalarValue, target: &DataType) -> Result<ScalarValue, PlanError> {
     if &value.data_type() == target {
         return Ok(value.clone());
+    }
+    // A CHAR(n) literal is held in its stored form, without trailing
+    // blanks (see `char_storage_value`).
+    if let DataType::Char(length) = target {
+        return Ok(match cast_scalar(value, &DataType::Utf8)? {
+            ScalarValue::Utf8(s) => ScalarValue::Utf8(char_storage_value(&s, *length).to_string()),
+            other => other,
+        });
     }
     let source_array =
         scalar_to_single_element_array(value).map_err(|e| PlanError::InvalidLiteral {

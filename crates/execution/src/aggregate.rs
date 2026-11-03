@@ -476,6 +476,174 @@ fn div_round_half_up(n: i128, d: i128) -> i128 {
 }
 
 // ---------------------------------------------------------------------------
+// Variance and standard deviation
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Clone, Copy)]
+struct VarianceState {
+    count: u64,
+    mean: f64,
+    m2: f64,
+}
+
+impl VarianceState {
+    fn add(&mut self, value: f64) {
+        self.count += 1;
+        let delta = value - self.mean;
+        self.mean += delta / self.count as f64;
+        self.m2 += delta * (value - self.mean);
+    }
+
+    fn merge(&mut self, other: Self) {
+        if other.count == 0 {
+            return;
+        }
+        if self.count == 0 {
+            *self = other;
+            return;
+        }
+        let total = self.count + other.count;
+        let delta = other.mean - self.mean;
+        self.m2 += other.m2 + delta * delta * self.count as f64 * other.count as f64 / total as f64;
+        self.mean += delta * other.count as f64 / total as f64;
+        self.count = total;
+    }
+
+    fn evaluate(&self, sample: bool, stddev: bool) -> ScalarValue {
+        if self.count == 0 || (sample && self.count < 2) {
+            return ScalarValue::Null;
+        }
+        let variance = (self.m2 / (self.count - u64::from(sample)) as f64).max(0.0);
+        ScalarValue::Float64(if stddev { variance.sqrt() } else { variance })
+    }
+}
+
+fn variance_input(values: &ArrayRef, index: usize) -> Result<Option<f64>, ExecutionError> {
+    use arrow::datatypes::DataType::*;
+    if values.is_null(index) {
+        return Ok(None);
+    }
+    let value = match values.data_type() {
+        Int8 => values.as_primitive::<datatypes::Int8Type>().value(index) as f64,
+        Int16 => values.as_primitive::<datatypes::Int16Type>().value(index) as f64,
+        Int32 => values.as_primitive::<datatypes::Int32Type>().value(index) as f64,
+        Int64 => values.as_primitive::<datatypes::Int64Type>().value(index) as f64,
+        Float32 => values.as_primitive::<datatypes::Float32Type>().value(index) as f64,
+        Float64 => values.as_primitive::<datatypes::Float64Type>().value(index),
+        Decimal128(_, scale) => {
+            values
+                .as_primitive::<datatypes::Decimal128Type>()
+                .value(index) as f64
+                / 10_f64.powi(i32::from(*scale))
+        }
+        dt => {
+            return Err(ExecutionError::InvalidOperation(format!(
+                "variance not supported for type {dt:?}"
+            )))
+        }
+    };
+    Ok(Some(value))
+}
+
+#[derive(Debug)]
+struct VarianceAccumulator {
+    state: VarianceState,
+    sample: bool,
+    stddev: bool,
+}
+
+impl Accumulator for VarianceAccumulator {
+    fn update_batch(&mut self, values: &ArrayRef) -> Result<(), ExecutionError> {
+        for i in 0..values.len() {
+            if let Some(value) = variance_input(values, i)? {
+                self.state.add(value);
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate(&self) -> Result<ScalarValue, ExecutionError> {
+        Ok(self.state.evaluate(self.sample, self.stddev))
+    }
+
+    fn reset(&mut self) {
+        self.state = VarianceState::default();
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn merge(&mut self, other: &dyn Accumulator) -> Result<(), ExecutionError> {
+        let other = other.as_any().downcast_ref::<Self>().ok_or_else(|| {
+            ExecutionError::InvalidOperation("variance accumulator type mismatch".to_string())
+        })?;
+        self.state.merge(other.state);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct GroupedVarianceAccumulator {
+    states: Vec<VarianceState>,
+    sample: bool,
+    stddev: bool,
+}
+
+impl GroupedAccumulator for GroupedVarianceAccumulator {
+    fn ensure_capacity(&mut self, n: usize) {
+        self.states.resize(n, VarianceState::default());
+    }
+
+    fn add_input(&mut self, group_ids: &[u32], values: &ArrayRef) -> Result<(), ExecutionError> {
+        for (i, &group) in group_ids.iter().enumerate() {
+            if let Some(value) = variance_input(values, i)? {
+                self.states[group as usize].add(value);
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate(&self, group_id: u32) -> Result<ScalarValue, ExecutionError> {
+        Ok(self.states[group_id as usize].evaluate(self.sample, self.stddev))
+    }
+
+    fn num_groups(&self) -> usize {
+        self.states.len()
+    }
+
+    fn merge_from(
+        &mut self,
+        other: &dyn GroupedAccumulator,
+        group_remap: &[u32],
+    ) -> Result<(), ExecutionError> {
+        let other = other.as_any().downcast_ref::<Self>().ok_or_else(|| {
+            ExecutionError::InvalidOperation(
+                "grouped variance accumulator type mismatch".to_string(),
+            )
+        })?;
+        for (i, &group) in group_remap.iter().enumerate().take(other.states.len()) {
+            self.states[group as usize].merge(other.states[i]);
+        }
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn variance_mode(name: &str) -> Option<(bool, bool)> {
+    match name {
+        "STDDEV_SAMP" | "STDDEV" => Some((true, true)),
+        "STDDEV_POP" => Some((false, true)),
+        "VAR_SAMP" | "VARIANCE" => Some((true, false)),
+        "VAR_POP" => Some((false, false)),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MIN
 // ---------------------------------------------------------------------------
 
@@ -745,6 +913,11 @@ pub(crate) fn create_accumulator(
     distinct: bool,
 ) -> Result<Box<dyn Accumulator>, ExecutionError> {
     let upper = func_name.to_uppercase();
+    if distinct && variance_mode(&upper).is_some() {
+        return Err(ExecutionError::InvalidOperation(format!(
+            "{upper}(DISTINCT) is not supported"
+        )));
+    }
     let inner: Box<dyn Accumulator> = match upper.as_str() {
         "COUNT" => {
             if is_count_star {
@@ -758,6 +931,14 @@ pub(crate) fn create_accumulator(
         "MIN" => Box::new(MinAccumulator::new()),
         "MAX" => Box::new(MaxAccumulator::new()),
         "BOOL_OR" => Box::new(BoolOrAccumulator::new()),
+        name if variance_mode(name).is_some() => {
+            let (sample, stddev) = variance_mode(name).unwrap();
+            Box::new(VarianceAccumulator {
+                state: VarianceState::default(),
+                sample,
+                stddev,
+            })
+        }
         other => {
             return Err(ExecutionError::InvalidOperation(format!(
                 "unknown aggregate function: {other}"
@@ -1629,6 +1810,14 @@ pub(crate) fn create_grouped_accumulator(
         "MIN" => Box::new(GroupedMinAccumulator::new()),
         "MAX" => Box::new(GroupedMaxAccumulator::new()),
         "BOOL_OR" => Box::new(GroupedBoolOrAccumulator::new()),
+        name if variance_mode(name).is_some() => {
+            let (sample, stddev) = variance_mode(name).unwrap();
+            Box::new(GroupedVarianceAccumulator {
+                states: Vec::new(),
+                sample,
+                stddev,
+            })
+        }
         other => {
             return Err(ExecutionError::InvalidOperation(format!(
                 "unknown aggregate function: {other}"

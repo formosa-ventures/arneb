@@ -12,10 +12,12 @@
 //! - LEFT:  push to LEFT side only (right-side filters would discard
 //!   NULL-padded rows, changing semantics).
 //! - RIGHT: push to RIGHT side only (mirror of LEFT).
-//! - FULL/CROSS: leave alone.
+//! - CROSS: like INNER for single-side conjuncts; a conjunct spanning
+//!   both sides becomes the ON condition and the join becomes INNER.
+//! - FULL: leave alone.
 //!
 //! Conservative on other operators:
-//! - `Projection`: not pushed through (would need expression substitution).
+//! - `Projection`: only UNION ALL view projections with safe expressions are crossed.
 //! - `Aggregate` / `PartialAggregate` / `FinalAggregate`: not pushed
 //!   (changes GROUP BY semantics).
 //! - `Sort`: safe to push through, but skipped for v1 simplicity.
@@ -29,10 +31,11 @@ use std::collections::HashSet;
 
 use arneb_common::error::PlanError;
 use arneb_common::types::ColumnInfo;
+use arneb_common::types::ScalarValue;
 use arneb_sql_parser::ast::{BinaryOp, JoinType};
 
 use crate::analyzer::{AnalysisPass, AnalyzerContext};
-use crate::plan::{LogicalPlan, PlanExpr};
+use crate::plan::{JoinCondition, LogicalPlan, PlanExpr};
 
 /// Splits AND conjuncts and pushes each to the deepest node whose
 /// schema covers all its column references.
@@ -55,8 +58,18 @@ impl AnalysisPass for PredicatePushdown {
         plan: LogicalPlan,
         _ctx: &mut AnalyzerContext,
     ) -> Result<LogicalPlan, PlanError> {
-        Ok(push_down(plan))
+        Ok(push_down_expr_subqueries(push_down(plan)))
     }
+}
+
+fn push_down_expr_subqueries(plan: LogicalPlan) -> LogicalPlan {
+    super::type_coercion::walk_plan_exprs(plan, &mut |expr| match expr {
+        PlanExpr::ScalarSubquery { subplan, span } => PlanExpr::ScalarSubquery {
+            subplan: Box::new(push_down_expr_subqueries(push_down(*subplan))),
+            span,
+        },
+        other => other,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -74,9 +87,41 @@ fn push_down(plan: LogicalPlan) -> LogicalPlan {
             let conjuncts = split_and(predicate);
             let mut current = new_input;
             let mut remaining: Vec<PlanExpr> = Vec::new();
+            // Set once a spanning conjunct turned a CROSS join into an
+            // INNER one in this loop; later spanning conjuncts then AND
+            // into that ON.
+            let mut converted = false;
             for c in conjuncts {
-                match try_push_into(current, c) {
-                    Ok(p) => current = p,
+                let was_cross = matches!(
+                    &current,
+                    L::Join {
+                        join_type: JoinType::Cross,
+                        ..
+                    }
+                );
+                let current_try = if converted {
+                    match extend_converted_on(current, c) {
+                        Ok(p) => {
+                            current = p;
+                            continue;
+                        }
+                        Err((p, c)) => (p, c),
+                    }
+                } else {
+                    (current, c)
+                };
+                match try_push_into(current_try.0, current_try.1) {
+                    Ok(p) => {
+                        converted |= was_cross
+                            && matches!(
+                                &p,
+                                L::Join {
+                                    join_type: JoinType::Inner,
+                                    ..
+                                }
+                            );
+                        current = p;
+                    }
                     Err((p, c)) => {
                         current = p;
                         remaining.push(c);
@@ -120,6 +165,17 @@ fn push_down(plan: LogicalPlan) -> LogicalPlan {
             aggr_exprs,
             schema,
         } => L::Aggregate {
+            input: Box::new(push_down(*input)),
+            group_by,
+            aggr_exprs,
+            schema,
+        },
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => L::RollupAggregate {
             input: Box::new(push_down(*input)),
             group_by,
             aggr_exprs,
@@ -207,8 +263,94 @@ fn push_down(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(push_down(*input)),
             id_column,
         },
-        // Leaves and non-recursive variants pass through unchanged.
-        other => other,
+        // The operators below only get their children rewritten: no
+        // predicate is pushed through them, but a Filter beneath one
+        // (e.g. a comma join under a Window or a UNION ALL branch) must
+        // still be pushed down within its own subtree.
+        L::Window { input, functions } => L::Window {
+            input: Box::new(push_down(*input)),
+            functions,
+        },
+        L::Distinct { input } => L::Distinct {
+            input: Box::new(push_down(*input)),
+        },
+        L::ScalarSubquery { subplan } => L::ScalarSubquery {
+            subplan: Box::new(push_down(*subplan)),
+        },
+        L::UnionAll { inputs } => L::UnionAll {
+            inputs: inputs.into_iter().map(push_down).collect(),
+        },
+        L::Intersect { left, right } => L::Intersect {
+            left: Box::new(push_down(*left)),
+            right: Box::new(push_down(*right)),
+        },
+        L::Except { left, right } => L::Except {
+            left: Box::new(push_down(*left)),
+            right: Box::new(push_down(*right)),
+        },
+        L::CreateTableAsSelect { name, source } => L::CreateTableAsSelect {
+            name,
+            source: Box::new(push_down(*source)),
+        },
+        L::InsertInto { table, source } => L::InsertInto {
+            table,
+            source: Box::new(push_down(*source)),
+        },
+        L::CreateView { name, sql, plan } => L::CreateView {
+            name,
+            sql,
+            plan: Box::new(push_down(*plan)),
+        },
+        // Leaves pass through unchanged.
+        leaf @ (L::TableScan { .. }
+        | L::ExchangeNode { .. }
+        | L::CreateTable { .. }
+        | L::DropTable { .. }
+        | L::DeleteFrom { .. }
+        | L::DropView { .. }
+        | L::OneRow) => leaf,
+    }
+}
+
+/// AND a conjunct spanning both sides of an Inner join into its ON.
+/// Used only for joins converted from CROSS in the current filter loop.
+#[allow(clippy::result_large_err)]
+fn extend_converted_on(
+    plan: LogicalPlan,
+    conjunct: PlanExpr,
+) -> Result<LogicalPlan, (LogicalPlan, PlanExpr)> {
+    match plan {
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type: JoinType::Inner,
+            condition: JoinCondition::On(existing),
+            ..
+        } => {
+            let l_len = left.schema().len();
+            let idx = collect_column_indices(&conjunct);
+            if idx.iter().any(|&i| i < l_len) && idx.iter().any(|&i| i >= l_len) {
+                Ok(LogicalPlan::Join {
+                    left,
+                    right,
+                    join_type: JoinType::Inner,
+                    condition: JoinCondition::On(combine_and(vec![existing, conjunct])),
+                    dynamic_filter_ids: Vec::new(),
+                })
+            } else {
+                Err((
+                    LogicalPlan::Join {
+                        left,
+                        right,
+                        join_type: JoinType::Inner,
+                        condition: JoinCondition::On(existing),
+                        dynamic_filter_ids: Vec::new(),
+                    },
+                    conjunct,
+                ))
+            }
+        }
+        other => Err((other, conjunct)),
     }
 }
 
@@ -263,8 +405,9 @@ fn try_push_into(
             let ambiguous = in_left && in_right;
 
             match (join_type, in_left, in_right, ambiguous) {
-                (JoinType::Inner, true, _, false) | (JoinType::Left, true, _, false) => {
-                    match rewrite_against(&conjunct, &l_schema) {
+                (JoinType::Inner | JoinType::Cross, true, _, false)
+                | (JoinType::Left, true, _, false) => {
+                    match rewrite_join_child(&conjunct, &l_schema, 0) {
                         Some(resolved) => {
                             let new_left = push_or_wrap(*left, resolved);
                             Ok(L::Join {
@@ -287,8 +430,9 @@ fn try_push_into(
                         )),
                     }
                 }
-                (JoinType::Inner, false, true, false) | (JoinType::Right, _, true, false) => {
-                    match rewrite_against(&conjunct, &r_schema) {
+                (JoinType::Inner | JoinType::Cross, false, true, false)
+                | (JoinType::Right, _, true, false) => {
+                    match rewrite_join_child(&conjunct, &r_schema, l_len) {
                         Some(resolved) => {
                             let new_right = push_or_wrap(*right, resolved);
                             Ok(L::Join {
@@ -304,6 +448,38 @@ fn try_push_into(
                                 left,
                                 right,
                                 join_type,
+                                condition,
+                                dynamic_filter_ids: Vec::new(),
+                            },
+                            conjunct,
+                        )),
+                    }
+                }
+                // A conjunct spanning both sides of a CROSS join becomes
+                // the join condition: CROSS + Filter(c) is INNER ON c.
+                (JoinType::Cross, false, false, false) if !col_indices.is_empty() => Ok(L::Join {
+                    left,
+                    right,
+                    join_type: JoinType::Inner,
+                    condition: JoinCondition::On(conjunct),
+                    dynamic_filter_ids: Vec::new(),
+                }),
+                (JoinType::Inner, false, false, false)
+                    if is_spanning_equality(&conjunct, l_len) =>
+                {
+                    match condition {
+                        JoinCondition::On(existing) => Ok(L::Join {
+                            left,
+                            right,
+                            join_type: JoinType::Inner,
+                            condition: JoinCondition::On(combine_and(vec![existing, conjunct])),
+                            dynamic_filter_ids: Vec::new(),
+                        }),
+                        condition => Err((
+                            L::Join {
+                                left,
+                                right,
+                                join_type: JoinType::Inner,
                                 condition,
                                 dynamic_filter_ids: Vec::new(),
                             },
@@ -336,6 +512,73 @@ fn try_push_into(
                 c,
             )),
         },
+        L::Projection {
+            input,
+            exprs,
+            schema,
+        } if matches!(input.as_ref(), L::UnionAll { .. }) => {
+            push_through_projection(*input, exprs, schema, conjunct)
+        }
+        L::UnionAll { inputs } => {
+            let schema = inputs.first().map(LogicalPlan::schema).unwrap_or_default();
+            let mut kept = Vec::new();
+            for input in inputs {
+                let branch = match input {
+                    L::Projection {
+                        input,
+                        exprs,
+                        schema,
+                    } => match push_through_projection(*input, exprs, schema, conjunct.clone()) {
+                        Ok(plan) => plan,
+                        Err((plan, predicate)) => push_or_wrap(plan, predicate),
+                    },
+                    other => push_or_wrap(other, conjunct.clone()),
+                };
+                if !branch_is_empty(&branch) {
+                    kept.push(branch);
+                }
+            }
+            let union = if kept.is_empty() {
+                L::Projection {
+                    input: Box::new(L::Limit {
+                        input: Box::new(L::OneRow),
+                        limit: Some(0),
+                        offset: None,
+                    }),
+                    exprs: schema
+                        .iter()
+                        .map(|col| PlanExpr::Cast {
+                            expr: Box::new(PlanExpr::Literal {
+                                value: ScalarValue::Null,
+                                span: None,
+                            }),
+                            data_type: col.data_type.clone(),
+                            span: None,
+                        })
+                        .collect(),
+                    schema: schema.clone(),
+                }
+            } else {
+                L::UnionAll { inputs: kept }
+            };
+            if union.schema() == schema {
+                Ok(union)
+            } else {
+                Ok(L::Projection {
+                    exprs: schema
+                        .iter()
+                        .enumerate()
+                        .map(|(index, col)| PlanExpr::Column {
+                            index,
+                            name: col.name.clone(),
+                            span: None,
+                        })
+                        .collect(),
+                    input: Box::new(union),
+                    schema,
+                })
+            }
+        }
         // SemiJoin / AntiJoin output schema = LEFT schema only, so any
         // predicate applied AFTER one can ONLY reference left cols.
         // It is therefore unconditionally safe to push the conjunct
@@ -411,10 +654,110 @@ fn try_push_into(
             }),
             None => Err((plan, conjunct)),
         },
-        // Stop at Projection / Aggregate / Sort / Limit / SemiJoin /
+        // Stop at other Projections / Aggregate / Sort / Limit / SemiJoin /
         // AntiJoin / etc. The push_or_wrap caller will wrap with a
         // Filter at this level.
         other => Err((other, conjunct)),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn push_through_projection(
+    input: LogicalPlan,
+    exprs: Vec<PlanExpr>,
+    schema: Vec<ColumnInfo>,
+    conjunct: PlanExpr,
+) -> Result<LogicalPlan, (LogicalPlan, PlanExpr)> {
+    let mut valid = true;
+    let rewritten = super::type_coercion::walk_expr(conjunct.clone(), &mut |expr| {
+        if let PlanExpr::Column { index, .. } = &expr {
+            match exprs.get(*index) {
+                Some(replacement) if safe_projection_expr(replacement) => replacement.clone(),
+                _ => {
+                    valid = false;
+                    expr
+                }
+            }
+        } else {
+            expr
+        }
+    });
+    if valid {
+        Ok(LogicalPlan::Projection {
+            input: Box::new(push_or_wrap(input, rewritten)),
+            exprs,
+            schema,
+        })
+    } else {
+        Err((
+            LogicalPlan::Projection {
+                input: Box::new(input),
+                exprs,
+                schema,
+            },
+            conjunct,
+        ))
+    }
+}
+
+fn safe_projection_expr(expr: &PlanExpr) -> bool {
+    match expr {
+        PlanExpr::Column { .. } | PlanExpr::Literal { .. } => true,
+        PlanExpr::Cast { expr: inner, .. }
+            if matches!(inner.as_ref(), PlanExpr::Literal { .. }) =>
+        {
+            crate::optimizer::fold_constants(expr.clone()).is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn branch_is_empty(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            constant_filter_truth(predicate) == Some(false) || branch_is_empty(input)
+        }
+        LogicalPlan::Projection { input, .. } => branch_is_empty(input),
+        _ => false,
+    }
+}
+
+fn constant_filter_truth(expr: &PlanExpr) -> Option<bool> {
+    use PlanExpr as E;
+    let folded = crate::optimizer::fold_constants(expr.clone()).ok()?;
+    match folded {
+        E::Literal {
+            value: ScalarValue::Boolean(value),
+            ..
+        } => Some(value),
+        E::Literal {
+            value: ScalarValue::Null,
+            ..
+        } => Some(false),
+        E::IsNull { expr, .. } => constant_nullness(&expr),
+        E::IsNotNull { expr, .. } => constant_nullness(&expr).map(|value| !value),
+        E::BinaryOp {
+            left, op, right, ..
+        } => match op {
+            BinaryOp::And => Some(constant_filter_truth(&left)? && constant_filter_truth(&right)?),
+            BinaryOp::Or => Some(constant_filter_truth(&left)? || constant_filter_truth(&right)?),
+            BinaryOp::Eq | BinaryOp::NotEq
+                if constant_nullness(&left) == Some(true)
+                    || constant_nullness(&right) == Some(true) =>
+            {
+                Some(false)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn constant_nullness(expr: &PlanExpr) -> Option<bool> {
+    match expr {
+        PlanExpr::Literal { value, .. } => Some(matches!(value, ScalarValue::Null)),
+        PlanExpr::Cast { expr, .. } if constant_nullness(expr) == Some(true) => Some(true),
+        _ => None,
     }
 }
 
@@ -933,6 +1276,25 @@ fn collect_column_indices(expr: &PlanExpr) -> Vec<usize> {
     out
 }
 
+fn is_spanning_equality(expr: &PlanExpr, left_len: usize) -> bool {
+    let PlanExpr::BinaryOp {
+        left,
+        op: BinaryOp::Eq,
+        right,
+        ..
+    } = expr
+    else {
+        return false;
+    };
+    let left_cols = collect_column_indices(left);
+    let right_cols = collect_column_indices(right);
+    !left_cols.is_empty()
+        && !right_cols.is_empty()
+        && ((left_cols.iter().all(|&i| i < left_len) && right_cols.iter().all(|&i| i >= left_len))
+            || (left_cols.iter().all(|&i| i >= left_len)
+                && right_cols.iter().all(|&i| i < left_len)))
+}
+
 fn visit_column_names<F: FnMut(&str)>(expr: &PlanExpr, callback: &mut F) {
     use PlanExpr as E;
     match expr {
@@ -995,6 +1357,16 @@ fn rewrite_against(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<PlanExpr> {
         }
     }
     rewrite_expr(expr, schema)
+}
+
+fn rewrite_join_child(expr: &PlanExpr, schema: &[ColumnInfo], offset: usize) -> Option<PlanExpr> {
+    crate::analyzer::join_reorder::rewrite_expr(expr, &mut |name, index| {
+        let child_index = index.checked_sub(offset)?;
+        if schema.get(child_index)?.name != name {
+            return None;
+        }
+        Some(child_index)
+    })
 }
 
 fn rewrite_expr(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<PlanExpr> {
@@ -1446,5 +1818,150 @@ mod tests {
         };
         let out = push_down(filter);
         assert!(matches!(out, LogicalPlan::Filter { .. }));
+    }
+    // -- comma joins: `FROM a, b WHERE a.k = b.k` plans as Cross + Filter --
+
+    fn cross(left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Cross,
+            condition: crate::plan::JoinCondition::None,
+            dynamic_filter_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cross_join_spanning_equi_conjunct_becomes_inner_on() {
+        // SELECT * FROM left, right WHERE left.k = right.k
+        let filter = LogicalPlan::Filter {
+            input: Box::new(cross(scan("left", &["k", "a"]), scan("right", &["k", "b"]))),
+            predicate: eq(col("k", 0), col("k", 2)),
+        };
+        let out = push_down(filter);
+        match &out {
+            LogicalPlan::Join {
+                join_type,
+                condition,
+                left,
+                right,
+                ..
+            } => {
+                assert_eq!(*join_type, JoinType::Inner);
+                match condition {
+                    crate::plan::JoinCondition::On(e) => {
+                        assert_eq!(collect_column_indices(e), vec![0, 2]);
+                    }
+                    other => panic!("expected On(k = k), got {other:?}"),
+                }
+                assert!(matches!(left.as_ref(), LogicalPlan::TableScan { .. }));
+                assert!(matches!(right.as_ref(), LogicalPlan::TableScan { .. }));
+            }
+            other => panic!("expected an Inner join at the top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_join_one_sided_conjunct_pushes_to_that_side() {
+        // SELECT * FROM left, right WHERE right.b = 1  (no join key: stays Cross)
+        let filter = LogicalPlan::Filter {
+            input: Box::new(cross(scan("left", &["k", "a"]), scan("right", &["k", "b"]))),
+            predicate: eq(col("b", 3), lit_i32(1)),
+        };
+        let out = push_down(filter);
+        match &out {
+            LogicalPlan::Join {
+                join_type,
+                condition,
+                right,
+                ..
+            } => {
+                assert_eq!(*join_type, JoinType::Cross);
+                assert!(matches!(condition, crate::plan::JoinCondition::None));
+                match right.as_ref() {
+                    LogicalPlan::Filter { predicate, input } => {
+                        // re-resolved against right's schema [k, b]: b -> 1
+                        assert_eq!(collect_column_indices(predicate), vec![1]);
+                        assert!(matches!(input.as_ref(), LogicalPlan::TableScan { .. }));
+                    }
+                    other => panic!("expected Filter under Join.right, got {other:?}"),
+                }
+            }
+            other => panic!("expected Join at the top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_join_two_spanning_conjuncts_both_join_the_condition() {
+        // WHERE left.k = right.k AND left.a = right.b
+        let filter = LogicalPlan::Filter {
+            input: Box::new(cross(scan("left", &["k", "a"]), scan("right", &["k", "b"]))),
+            predicate: and(eq(col("k", 0), col("k", 2)), eq(col("a", 1), col("b", 3))),
+        };
+        let out = push_down(filter);
+        match &out {
+            LogicalPlan::Join {
+                join_type,
+                condition,
+                ..
+            } => {
+                assert_eq!(*join_type, JoinType::Inner);
+                match condition {
+                    crate::plan::JoinCondition::On(e) => {
+                        let parts = split_and(e.clone());
+                        assert_eq!(parts.len(), 2, "both conjuncts in the ON: {e:?}");
+                    }
+                    other => panic!("expected On(...), got {other:?}"),
+                }
+            }
+            other => panic!("expected an Inner join at the top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_join_conjuncts_in_reverse_order_give_the_same_plan() {
+        // WHERE right.b = 1 AND left.k = right.k — the one-sided conjunct
+        // arrives first, the join key second.
+        let filter = LogicalPlan::Filter {
+            input: Box::new(cross(scan("left", &["k", "a"]), scan("right", &["k", "b"]))),
+            predicate: and(eq(col("b", 3), lit_i32(1)), eq(col("k", 0), col("k", 2))),
+        };
+        let out = push_down(filter);
+        match &out {
+            LogicalPlan::Join {
+                join_type,
+                condition,
+                right,
+                ..
+            } => {
+                assert_eq!(*join_type, JoinType::Inner);
+                assert!(matches!(condition, crate::plan::JoinCondition::On(_)));
+                assert!(
+                    matches!(right.as_ref(), LogicalPlan::Filter { .. }),
+                    "right.b = 1 pushed under the join: {right:?}"
+                );
+            }
+            other => panic!("expected an Inner join at the top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_join_constant_conjunct_stays_above() {
+        // WHERE 1 = 2 references no column: nothing to route, the Filter stays.
+        let filter = LogicalPlan::Filter {
+            input: Box::new(cross(scan("left", &["k", "a"]), scan("right", &["k", "b"]))),
+            predicate: eq(lit_i32(1), lit_i32(2)),
+        };
+        let out = push_down(filter);
+        match &out {
+            LogicalPlan::Filter { input, .. } => assert!(matches!(
+                input.as_ref(),
+                LogicalPlan::Join {
+                    join_type: JoinType::Cross,
+                    ..
+                }
+            )),
+            other => panic!("expected the Filter to stay above the Cross join, got {other:?}"),
+        }
     }
 }

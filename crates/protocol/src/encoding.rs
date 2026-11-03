@@ -20,6 +20,7 @@ pub fn datatype_to_pg_type(dt: &DataType) -> Type {
         DataType::Float64 => Type::FLOAT8,
         DataType::Decimal128 { .. } => Type::NUMERIC,
         DataType::Utf8 | DataType::LargeUtf8 => Type::VARCHAR,
+        DataType::Char(_) => Type::BPCHAR,
         DataType::Binary => Type::BYTEA,
         DataType::Date32 => Type::DATE,
         DataType::Timestamp { .. } => Type::TIMESTAMP,
@@ -252,6 +253,11 @@ mod tests {
     #[test]
     fn test_datatype_to_pg_type_utf8() {
         assert_eq!(datatype_to_pg_type(&DataType::Utf8), Type::VARCHAR);
+    }
+
+    #[test]
+    fn test_datatype_to_pg_type_char() {
+        assert_eq!(datatype_to_pg_type(&DataType::Char(50)), Type::BPCHAR);
     }
 
     #[test]

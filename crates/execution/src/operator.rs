@@ -15,9 +15,7 @@ use std::time::Instant;
 
 use arneb_common::error::ExecutionError;
 use arneb_common::memory_profile::LiveBytesGuard;
-use arneb_common::stream::{
-    collect_stream, stream_from_batches, RecordBatchStream, SendableRecordBatchStream,
-};
+use arneb_common::stream::{stream_from_batches, RecordBatchStream, SendableRecordBatchStream};
 use arneb_common::types::{ColumnInfo, ScalarValue};
 use arneb_planner::{LogicalPlan, PlanExpr, SortExpr};
 use arneb_sql_parser::ast;
@@ -1307,6 +1305,31 @@ pub(crate) struct NestedLoopJoinExec {
     pub(crate) right: Arc<dyn ExecutionPlan>,
     pub(crate) join_type: ast::JoinType,
     pub(crate) condition: arneb_planner::JoinCondition,
+    /// Pool charged for the collected inputs, the match-index vectors and
+    /// the output batches; exhaustion fails the query with
+    /// `ResourceExhausted` instead of growing without bound.
+    pub(crate) memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
+}
+
+/// Output stream that owns the join's reservation: the bytes stay charged
+/// while the output batches are held and are returned when it is dropped.
+struct ReservedStream {
+    inner: SendableRecordBatchStream,
+    _reservation: crate::memory_pool::MemoryReservation,
+}
+
+impl Stream for ReservedStream {
+    type Item = Result<RecordBatch, arneb_common::error::ArnebError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl RecordBatchStream for ReservedStream {
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.inner.schema()
+    }
 }
 
 #[async_trait]
@@ -1323,42 +1346,14 @@ impl ExecutionPlan for NestedLoopJoinExec {
         &self,
         _partition: usize,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
-        let left_batches = self.collect_input(&self.left).await?;
-        let right_batches = self.collect_input(&self.right).await?;
-
-        let left_batch = match left_batches {
-            Some(b) => b,
-            None => {
-                let schema = crate::datasource::column_info_to_arrow_schema(&self.schema());
-                return Ok(stream_from_batches(schema, vec![]));
-            }
-        };
-        let right_batch = match right_batches {
-            Some(b) => b,
-            None => {
-                return match self.join_type {
-                    ast::JoinType::Left | ast::JoinType::Full => {
-                        let result =
-                            self.left_unmatched_output(&left_batch, self.right.schema().len())?;
-                        let schema = result.first().map(|b| b.schema()).unwrap_or_else(|| {
-                            crate::datasource::column_info_to_arrow_schema(&self.schema())
-                        });
-                        Ok(stream_from_batches(schema, result))
-                    }
-                    _ => {
-                        let schema = crate::datasource::column_info_to_arrow_schema(&self.schema());
-                        Ok(stream_from_batches(schema, vec![]))
-                    }
-                };
-            }
-        };
-
-        let result = self.execute_join(&left_batch, &right_batch)?;
-        let schema = result
-            .first()
-            .map(|b| b.schema())
-            .unwrap_or_else(|| crate::datasource::column_info_to_arrow_schema(&self.schema()));
-        Ok(stream_from_batches(schema, result))
+        let mut reservation = crate::memory_pool::MemoryConsumer::new("NestedLoopJoinExec")
+            .with_can_spill(false)
+            .register(Arc::clone(&self.memory_pool));
+        let (schema, batches) = self.join_batches(&mut reservation).await?;
+        Ok(Box::pin(ReservedStream {
+            inner: stream_from_batches(schema, batches),
+            _reservation: reservation,
+        }))
     }
 
     fn display_name(&self) -> &str {
@@ -1367,24 +1362,90 @@ impl ExecutionPlan for NestedLoopJoinExec {
 }
 
 impl NestedLoopJoinExec {
-    /// Collect all input batches into a single concatenated batch.
-    /// Nested-loop join materializes both sides; v1 always reads
-    /// partition 0 of each child. (Parallel nested-loop is out of scope.)
+    /// Collects both inputs and runs the join, charging `reservation` for
+    /// everything it holds. Returns the output schema and batches.
+    async fn join_batches(
+        &self,
+        reservation: &mut crate::memory_pool::MemoryReservation,
+    ) -> Result<(arrow::datatypes::SchemaRef, Vec<RecordBatch>), ExecutionError> {
+        let left_batches = self.collect_input(&self.left, reservation).await?;
+        let right_batches = self.collect_input(&self.right, reservation).await?;
+
+        let left_batch = match left_batches {
+            Some(b) => b,
+            None => {
+                let schema = crate::datasource::column_info_to_arrow_schema(&self.schema());
+                return Ok((schema, vec![]));
+            }
+        };
+        let right_batch = match right_batches {
+            Some(b) => b,
+            None => {
+                return match self.join_type {
+                    ast::JoinType::Left | ast::JoinType::Full => {
+                        // The output re-uses the left columns and adds nulls;
+                        // charge it at the left side's size before building.
+                        reservation.try_grow(record_batch_bytes(&left_batch))?;
+                        let result =
+                            self.left_unmatched_output(&left_batch, self.right.schema().len())?;
+                        let schema = result.first().map(|b| b.schema()).unwrap_or_else(|| {
+                            crate::datasource::column_info_to_arrow_schema(&self.schema())
+                        });
+                        Ok((schema, result))
+                    }
+                    _ => {
+                        let schema = crate::datasource::column_info_to_arrow_schema(&self.schema());
+                        Ok((schema, vec![]))
+                    }
+                };
+            }
+        };
+
+        let result = self.execute_join(&left_batch, &right_batch, reservation)?;
+        let schema = result
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| crate::datasource::column_info_to_arrow_schema(&self.schema()));
+        Ok((schema, result))
+    }
+
+    /// Collect all input batches into a single concatenated batch,
+    /// charging `reservation` for every batch pulled and for the
+    /// concatenated copy. Nested-loop join materializes both sides; v1
+    /// always reads partition 0 of each child. (Parallel nested-loop is
+    /// out of scope.)
     async fn collect_input(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
+        reservation: &mut crate::memory_pool::MemoryReservation,
     ) -> Result<Option<RecordBatch>, ExecutionError> {
-        let stream = plan.execute(0).await?;
-        let batches = collect_stream(stream)
-            .await
-            .map_err(|e| ExecutionError::upstream("failed to collect input", e))?;
+        let mut stream = plan.execute(0).await?;
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut collected_bytes = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch =
+                batch.map_err(|e| ExecutionError::upstream("failed to collect input", e))?;
+            let bytes = record_batch_bytes(&batch);
+            reservation.try_grow(bytes)?;
+            collected_bytes += bytes;
+            batches.push(batch);
+        }
         if batches.is_empty() {
             return Ok(None);
         }
         let batch = if batches.len() == 1 {
             batches.into_iter().next().unwrap()
         } else {
-            arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?
+            let merged_bytes = batches
+                .iter()
+                .map(|b| b.get_array_memory_size())
+                .sum::<usize>();
+            reservation.try_grow(merged_bytes)?;
+            let merged = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+            drop(batches);
+            reservation.shrink(collected_bytes + merged_bytes);
+            reservation.try_grow(record_batch_bytes(&merged))?;
+            merged
         };
         if batch.num_rows() == 0 {
             Ok(None)
@@ -1397,17 +1458,28 @@ impl NestedLoopJoinExec {
         &self,
         left_batch: &RecordBatch,
         right_batch: &RecordBatch,
+        reservation: &mut crate::memory_pool::MemoryReservation,
     ) -> Result<Vec<RecordBatch>, ExecutionError> {
         let left_rows = left_batch.num_rows();
         let right_rows = right_batch.num_rows();
         let output_schema = self.build_output_schema(left_batch, right_batch);
+        // Average bytes per output row (left + right columns).
+        let row_bytes = record_batch_bytes(left_batch) / left_rows.max(1)
+            + record_batch_bytes(right_batch) / right_rows.max(1);
 
+        // The matched flags (1 byte per row).
+        reservation.try_grow(left_rows + right_rows)?;
         let mut left_matched = vec![false; left_rows];
         let mut right_matched = vec![false; right_rows];
         let mut left_indices = Vec::new();
         let mut right_indices = Vec::new();
 
+        // Two u32 indices per matching pair, charged per left row so a
+        // cartesian product fails before the vectors grow.
+        const PAIR_BYTES: usize = 2 * std::mem::size_of::<u32>();
+        let mut index_bytes = 0usize;
         for (l, l_matched) in left_matched.iter_mut().enumerate() {
+            let pairs_before = left_indices.len();
             for (r, r_matched) in right_matched.iter_mut().enumerate() {
                 let pass = self.eval_join_condition(l, r, left_batch, right_batch)?;
                 if pass {
@@ -1417,11 +1489,21 @@ impl NestedLoopJoinExec {
                     *r_matched = true;
                 }
             }
+            let added = (left_indices.len() - pairs_before) * PAIR_BYTES;
+            if added > 0 {
+                reservation.try_grow(added)?;
+                index_bytes += added;
+            }
         }
 
+        let has_pairs = !left_indices.is_empty();
+        // Charge the output before `take` allocates it, then true it up
+        // to the real batch size.
+        let est_output = left_indices.len() * row_bytes;
+        reservation.try_grow(est_output)?;
         let mut result_columns = Vec::new();
-        let left_idx_arr = UInt32Array::from(left_indices.clone());
-        let right_idx_arr = UInt32Array::from(right_indices.clone());
+        let left_idx_arr = UInt32Array::from(left_indices);
+        let right_idx_arr = UInt32Array::from(right_indices);
 
         for col_i in 0..left_batch.num_columns() {
             let col = compute::take(left_batch.column(col_i), &left_idx_arr, None)?;
@@ -1434,8 +1516,15 @@ impl NestedLoopJoinExec {
 
         let mut all_batches = Vec::new();
 
-        if !result_columns.is_empty() && !left_indices.is_empty() {
-            all_batches.push(RecordBatch::try_new(output_schema.clone(), result_columns)?);
+        drop((left_idx_arr, right_idx_arr));
+        reservation.shrink(index_bytes);
+        let mut output_charged = est_output;
+        if !result_columns.is_empty() && has_pairs {
+            let batch = RecordBatch::try_new(output_schema.clone(), result_columns)?;
+            self.settle_output(reservation, &mut output_charged, record_batch_bytes(&batch))?;
+            all_batches.push(batch);
+        } else {
+            reservation.shrink(output_charged);
         }
 
         // Handle unmatched rows for outer joins.
@@ -1448,6 +1537,8 @@ impl NestedLoopJoinExec {
                     .map(|(i, _)| i as u32)
                     .collect();
                 if !unmatched.is_empty() {
+                    let est = unmatched.len() * (row_bytes + std::mem::size_of::<u32>());
+                    reservation.try_grow(est)?;
                     let idx = UInt32Array::from(unmatched);
                     let mut cols: Vec<ArrayRef> = Vec::new();
                     for col_i in 0..left_batch.num_columns() {
@@ -1460,7 +1551,11 @@ impl NestedLoopJoinExec {
                             null_len,
                         ));
                     }
-                    all_batches.push(RecordBatch::try_new(output_schema.clone(), cols)?);
+                    let batch = RecordBatch::try_new(output_schema.clone(), cols)?;
+                    let mut charged = est;
+                    drop(idx);
+                    self.settle_output(reservation, &mut charged, record_batch_bytes(&batch))?;
+                    all_batches.push(batch);
                 }
             }
             _ => {}
@@ -1475,6 +1570,8 @@ impl NestedLoopJoinExec {
                     .map(|(i, _)| i as u32)
                     .collect();
                 if !unmatched.is_empty() {
+                    let est = unmatched.len() * (row_bytes + std::mem::size_of::<u32>());
+                    reservation.try_grow(est)?;
                     let idx = UInt32Array::from(unmatched);
                     let null_len = idx.len();
                     let mut cols: Vec<ArrayRef> = Vec::new();
@@ -1487,13 +1584,34 @@ impl NestedLoopJoinExec {
                     for col_i in 0..right_batch.num_columns() {
                         cols.push(compute::take(right_batch.column(col_i), &idx, None)?);
                     }
-                    all_batches.push(RecordBatch::try_new(output_schema.clone(), cols)?);
+                    let batch = RecordBatch::try_new(output_schema.clone(), cols)?;
+                    let mut charged = est;
+                    drop(idx);
+                    self.settle_output(reservation, &mut charged, record_batch_bytes(&batch))?;
+                    all_batches.push(batch);
                 }
             }
             _ => {}
         }
 
         Ok(all_batches)
+    }
+
+    /// Moves the reservation from the pre-allocation estimate `charged`
+    /// (index scratch included) to the output batch's real size `actual`.
+    fn settle_output(
+        &self,
+        reservation: &mut crate::memory_pool::MemoryReservation,
+        charged: &mut usize,
+        actual: usize,
+    ) -> Result<(), ExecutionError> {
+        if actual > *charged {
+            reservation.try_grow(actual - *charged)?;
+        } else {
+            reservation.shrink(*charged - actual);
+        }
+        *charged = actual;
+        Ok(())
     }
 
     fn build_output_schema(&self, left: &RecordBatch, right: &RecordBatch) -> Arc<Schema> {
@@ -1615,6 +1733,132 @@ pub(crate) struct HashAggregateExec {
     /// tracking); the distributed worker installs the cgroup-derived pool via
     /// the physical planner's `ExecutionContext`.
     pub(crate) memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
+}
+
+/// Runs every ROLLUP level over the same input stream. The channels hold at
+/// most one batch per level, so only aggregate group state grows with input.
+#[derive(Debug)]
+pub(crate) struct RollupAggregateExec {
+    pub(crate) input: Arc<dyn ExecutionPlan>,
+    pub(crate) group_by: Vec<PlanExpr>,
+    pub(crate) aggr_exprs: Vec<PlanExpr>,
+    pub(crate) output_schema: Vec<ColumnInfo>,
+    pub(crate) memory_pool: Arc<dyn crate::memory_pool::MemoryPool>,
+}
+
+#[async_trait]
+impl ExecutionPlan for RollupAggregateExec {
+    fn schema(&self) -> Vec<ColumnInfo> {
+        self.output_schema.clone()
+    }
+
+    async fn execute(
+        &self,
+        _partition: usize,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
+        let key_count = self.group_by.len();
+        let input_schema = self.input.schema();
+        let mut senders = Vec::with_capacity(key_count + 1);
+        let mut levels = Vec::with_capacity(key_count + 1);
+        for keep in (0..=key_count).rev() {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            senders.push(sender);
+            let mut level_schema = self.output_schema[..keep].to_vec();
+            level_schema.extend_from_slice(
+                &self.output_schema[key_count..key_count + self.aggr_exprs.len()],
+            );
+            let aggregate = HashAggregateExec {
+                input: self.input.clone(),
+                group_by: self.group_by[..keep].to_vec(),
+                aggr_exprs: self.aggr_exprs.clone(),
+                output_schema: level_schema,
+                output_order: None,
+                estimated_groups: None,
+                memory_pool: self.memory_pool.clone(),
+            };
+            let stream: SendableRecordBatchStream = Box::pin(RollupInputStream {
+                schema: crate::datasource::column_info_to_arrow_schema(&input_schema),
+                receiver,
+            });
+            levels.push(async move {
+                let batches = if aggregate.has_distinct() {
+                    aggregate.execute_streaming(stream).await
+                } else {
+                    aggregate.execute_streaming_batch_aware(stream).await
+                }?;
+                Ok::<_, ExecutionError>((keep, batches))
+            });
+        }
+
+        let mut input = self.input.execute(0).await?;
+        let producer = async move {
+            while let Some(batch) = input.next().await {
+                let batch = batch.map_err(|e| ExecutionError::upstream("rollup input", e))?;
+                for sender in &senders {
+                    sender.send(batch.clone()).await.map_err(|_| {
+                        ExecutionError::InvalidOperation("rollup level stopped early".to_string())
+                    })?;
+                }
+            }
+            Ok::<_, ExecutionError>(())
+        };
+        let (produced, results) =
+            futures::future::join(producer, futures::future::join_all(levels)).await;
+        produced?;
+        let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
+        let mut output = Vec::new();
+        for result in results {
+            let (keep, batches) = result?;
+            for batch in batches {
+                let row_count = batch.num_rows();
+                let mut cols = Vec::with_capacity(self.output_schema.len());
+                for index in 0..key_count {
+                    if index < keep {
+                        cols.push(batch.column(index).clone());
+                    } else {
+                        cols.push(arrow::array::new_null_array(
+                            arrow_schema.field(index).data_type(),
+                            row_count,
+                        ));
+                    }
+                }
+                for index in keep..batch.num_columns() {
+                    cols.push(batch.column(index).clone());
+                }
+                for index in 0..key_count {
+                    cols.push(
+                        Arc::new(Int64Array::from_value(i64::from(index >= keep), row_count))
+                            as ArrayRef,
+                    );
+                }
+                output.push(RecordBatch::try_new(arrow_schema.clone(), cols)?);
+            }
+        }
+        Ok(stream_from_batches(arrow_schema, output))
+    }
+
+    fn display_name(&self) -> &str {
+        "RollupAggregateExec"
+    }
+}
+
+struct RollupInputStream {
+    schema: arrow::datatypes::SchemaRef,
+    receiver: tokio::sync::mpsc::Receiver<RecordBatch>,
+}
+
+impl Stream for RollupInputStream {
+    type Item = Result<RecordBatch, arneb_common::error::ArnebError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx).map(|item| item.map(Ok))
+    }
+}
+
+impl RecordBatchStream for RollupInputStream {
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.schema.clone()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5754,12 +5998,142 @@ mod tests {
             right,
             join_type: ast::JoinType::Cross,
             condition: arneb_planner::JoinCondition::None,
+            memory_pool: Arc::new(crate::memory_pool::UnboundedMemoryPool::new()),
         };
 
         let stream = join.execute(0).await.unwrap();
         let batches = collect_stream(stream).await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 6);
+    }
+
+    /// A single-column Int32 scan over `values`.
+    fn nlj_int_scan(name: &str, values: Vec<i32>) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            name,
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))]).unwrap();
+        let source =
+            Arc::new(InMemoryDataSource::from_batch(batch).unwrap()) as Arc<dyn DataSource>;
+        Arc::new(ScanExec {
+            source,
+            _table_name: name.to_string(),
+            scan_context: ScanContext::default(),
+            dynamic_filters: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
+            dynamic_filter_collector: None,
+            dynamic_filtering_enabled: false,
+            dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+            scan_task_index: 0,
+            scan_task_count: 1,
+        })
+    }
+
+    /// Runs the join to completion; the error, if any, may surface from
+    /// `execute` or from the stream.
+    async fn run_nlj(join: NestedLoopJoinExec) -> Result<usize, ExecutionError> {
+        let stream = join.execute(0).await?;
+        let batches = collect_stream(stream)
+            .await
+            .map_err(|e| ExecutionError::upstream("nested loop join output", e))?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum())
+    }
+
+    #[tokio::test]
+    async fn nested_loop_join_fails_fast_when_output_exceeds_the_pool() {
+        // 1000 x 1000 cross product: two ~4 KB inputs, ~8 MB of output.
+        // A 256 KB pool holds the inputs but not the product.
+        let pool: Arc<dyn crate::memory_pool::MemoryPool> =
+            Arc::new(crate::memory_pool::GreedyMemoryPool::new(256 * 1024));
+        let join = NestedLoopJoinExec {
+            left: nlj_int_scan("a", (0..1000).collect()),
+            right: nlj_int_scan("b", (0..1000).collect()),
+            join_type: ast::JoinType::Cross,
+            condition: arneb_planner::JoinCondition::None,
+            memory_pool: Arc::clone(&pool),
+        };
+        match run_nlj(join).await {
+            Err(ExecutionError::ResourceExhausted(_)) => {}
+            Err(other) => panic!("expected ResourceExhausted, got {other:?}"),
+            Ok(rows) => panic!("expected ResourceExhausted, got {rows} rows (no accounting)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_loop_join_fails_fast_when_an_input_exceeds_the_pool() {
+        // The right input alone (100k Int32 ≈ 400 KB) is over a 16 KB pool.
+        let pool: Arc<dyn crate::memory_pool::MemoryPool> =
+            Arc::new(crate::memory_pool::GreedyMemoryPool::new(16 * 1024));
+        let join = NestedLoopJoinExec {
+            left: nlj_int_scan("a", vec![1, 2]),
+            right: nlj_int_scan("b", (0..100_000).collect()),
+            join_type: ast::JoinType::Cross,
+            condition: arneb_planner::JoinCondition::None,
+            memory_pool: Arc::clone(&pool),
+        };
+        match run_nlj(join).await {
+            Err(ExecutionError::ResourceExhausted(_)) => {}
+            Err(other) => panic!("expected ResourceExhausted, got {other:?}"),
+            Ok(rows) => panic!("expected ResourceExhausted, got {rows} rows (no accounting)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_loop_join_accounts_and_releases_its_memory() {
+        let pool: Arc<dyn crate::memory_pool::MemoryPool> =
+            Arc::new(crate::memory_pool::GreedyMemoryPool::new(64 * 1024 * 1024));
+        let join = NestedLoopJoinExec {
+            left: nlj_int_scan("a", vec![1, 2]),
+            right: nlj_int_scan("b", vec![10, 20, 30]),
+            join_type: ast::JoinType::Cross,
+            condition: arneb_planner::JoinCondition::None,
+            memory_pool: Arc::clone(&pool),
+        };
+        assert_eq!(run_nlj(join).await.unwrap(), 6);
+        assert!(pool.reserved_peak() > 0, "the join reserved nothing");
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "the join's reservation outlived its output"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_loop_join_under_the_limit_matches_the_unbounded_result() {
+        // Same rows with and without a (generous) limit; a filtered join
+        // (a < b) so the condition path is exercised too.
+        let cond = arneb_planner::JoinCondition::On(PlanExpr::BinaryOp {
+            left: Box::new(PlanExpr::Column {
+                index: 0,
+                name: "a".to_string(),
+                span: None,
+            }),
+            op: ast::BinaryOp::Lt,
+            right: Box::new(PlanExpr::Column {
+                index: 1,
+                name: "b".to_string(),
+                span: None,
+            }),
+            span: None,
+        });
+        let mut counts = Vec::new();
+        for pool in [
+            Arc::new(crate::memory_pool::UnboundedMemoryPool::new())
+                as Arc<dyn crate::memory_pool::MemoryPool>,
+            Arc::new(crate::memory_pool::GreedyMemoryPool::new(64 * 1024 * 1024)),
+        ] {
+            let join = NestedLoopJoinExec {
+                left: nlj_int_scan("a", (0..50).collect()),
+                right: nlj_int_scan("b", (0..50).collect()),
+                join_type: ast::JoinType::Inner,
+                condition: cond.clone(),
+                memory_pool: pool,
+            };
+            counts.push(run_nlj(join).await.unwrap());
+        }
+        assert_eq!(counts, vec![50 * 49 / 2, 50 * 49 / 2]);
     }
 
     #[tokio::test]

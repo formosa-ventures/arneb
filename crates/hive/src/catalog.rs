@@ -19,11 +19,11 @@ use volo_thrift::MaybeException;
 
 use arneb_catalog::{CatalogProvider, ColumnStatistics, SchemaProvider, TableProvider};
 use arneb_common::error::ConnectorError;
-use arneb_common::types::{ColumnInfo, DataType};
+use arneb_common::types::ColumnInfo;
 use arneb_connectors::storage::StorageRegistry;
 
 use crate::datasource::HivePartition;
-use crate::hive_type_to_arrow;
+use crate::hive_type_to_data_type;
 
 // ---------------------------------------------------------------------------
 // HiveTableMeta
@@ -207,18 +207,13 @@ impl HmsClient {
             })
             .unwrap_or_default();
 
-        // NOTE: HMS column NDV stats are intentionally NOT fetched in
-        // production yet. The infrastructure exists
-        // (`get_table_column_stats`) but a 2026-05-15 bench showed that
-        // adding NDV without retuning the cost function regresses
-        // multi-join queries by 8-24% (Q03/Q07/Q08). With accurate
-        // NDV, intermediate cardinality estimates shrink, and the
-        // partition-aware Selinger DP loses its "lineitem wins"
-        // heuristic that worked under inflated default NDVs. Re-enable
-        // alongside a cost-function redesign that accounts for executor
-        // parallelism differently — see
-        // `memory/project_joinreorder_disabled.md`.
-        let column_stats: HashMap<String, ColumnStatistics> = HashMap::new();
+        let column_stats = self
+            .get_table_column_stats(db, table, &columns)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("HMS column statistics unavailable for {db}.{table}: {e}");
+                HashMap::new()
+            });
 
         Ok(HiveTableMeta {
             columns,
@@ -290,10 +285,6 @@ impl HmsClient {
     /// is normal for freshly-created tables that haven't been
     /// `ANALYZE`d. Errors are converted to empty so a stats fetch
     /// failure doesn't break catalog resolution.
-    /// Currently unused — wired but not called from `get_table` (see
-    /// note in `get_table`). Kept as the integration point for a
-    /// future cost-model retune that re-enables HMS column stats.
-    #[allow(dead_code)]
     async fn get_table_column_stats(
         &self,
         db: &str,
@@ -421,11 +412,8 @@ fn convert_field_schemas(
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        match hive_type_to_arrow(&hive_type) {
-            Ok(arrow_dt) => {
-                let data_type = DataType::try_from(arrow_dt).map_err(|e| {
-                    ConnectorError::UnsupportedOperation(format!("column {db}.{table}.{name}: {e}"))
-                })?;
+        match hive_type_to_data_type(&hive_type) {
+            Ok(data_type) => {
                 columns.push(ColumnInfo {
                     name,
                     data_type,

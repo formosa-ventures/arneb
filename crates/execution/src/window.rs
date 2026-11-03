@@ -166,13 +166,13 @@ fn compute_window_function(
                     .find(|&i| partition_ids[i] != partition_ids[start])
                     .unwrap_or(num_rows);
                 acc.reset();
-                // Without ORDER BY the whole partition is one peer group.
-                // With it, the default frame is RANGE UNBOUNDED PRECEDING ..
-                // CURRENT ROW: peers (equal ORDER BY values) share the
-                // running value after their whole peer group.
+                // ROWS advances one physical row at a time. The default and
+                // explicit RANGE frames include all peers at once.
                 let mut peer = start;
                 while peer < end {
-                    let peer_end = if has_order {
+                    let peer_end = if func.rows_frame {
+                        peer + 1
+                    } else if has_order {
                         (peer + 1..end)
                             .find(|&i| !same_order_values(&order_vals, i, peer))
                             .unwrap_or(end)

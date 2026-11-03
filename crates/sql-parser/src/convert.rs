@@ -10,7 +10,7 @@
 //! degrades error quality, even if the compiler does not catch it.
 
 use arneb_common::error::ParseError;
-use arneb_common::types::{DataType, ScalarValue, TableReference, TimeUnit};
+use arneb_common::types::{DataType, ScalarValue, TableReference, TimeUnit, CHAR_MAX_LENGTH};
 use sqlparser::ast as sp;
 use sqlparser::ast::Spanned;
 use sqlparser::tokenizer::Span;
@@ -44,7 +44,12 @@ pub(crate) fn convert_statement(stmt: sp::Statement) -> Result<ast::Statement, P
                 .columns
                 .into_iter()
                 .map(|col| {
-                    let dt = convert_data_type(col.data_type)?;
+                    // CHAR semantics apply to catalog-provided columns
+                    // only; a CHAR column in DDL is stored as varchar.
+                    let dt = match convert_data_type(col.data_type)? {
+                        DataType::Char(_) => DataType::Utf8,
+                        dt => dt,
+                    };
                     Ok(ast::ColumnDef {
                         name: col.name.value,
                         data_type: dt,
@@ -269,6 +274,7 @@ fn convert_set_expr(expr: sp::SetExpr) -> Result<ast::QueryBody, ParseError> {
             let body = convert_select(*select)?;
             Ok(ast::QueryBody::Select(body))
         }
+        sp::SetExpr::Query(query) => Ok(ast::QueryBody::Query(Box::new(convert_query(*query)?))),
         sp::SetExpr::SetOperation {
             op,
             set_quantifier,
@@ -655,30 +661,51 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             })
         }
         // Typed string literals (`DATE '...'`, `TIMESTAMP '...'`, `TIME '...'`)
-        // parse as Expr::TypedString in sqlparser-rs. Lower them to
-        // `CAST('...' AS <type>)` so the rest of the pipeline treats them
-        // identically to the explicit CAST form. This matches Trino/Postgres
-        // semantics for ANSI typed-string literals.
+        // parse as Expr::TypedString in sqlparser-rs. Lower them to casts,
+        // except bare DECIMAL literals, whose precision and scale come from
+        // their text rather than the default DECIMAL(38,0) cast type.
         sp::Expr::TypedString(ts) => {
             if ts.uses_odbc_syntax {
                 return Err(ParseError::UnsupportedFeature(
                     "ODBC-style typed-string literal ({d '...'})".to_string(),
                 ));
             }
-            let literal = match sp::Value::from(ts.value) {
-                sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => {
-                    ScalarValue::Utf8(s)
-                }
+            let text = match sp::Value::from(ts.value) {
+                sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => s,
                 other => {
                     return Err(ParseError::InvalidSyntax(format!(
                         "typed-string literal expects a string value, got: {other}"
                     )))
                 }
             };
+            if matches!(
+                ts.data_type,
+                sp::DataType::Decimal(sp::ExactNumberInfo::None)
+            ) {
+                let (negative, unsigned) = match text.strip_prefix('-') {
+                    Some(unsigned) => (true, unsigned),
+                    None => (false, text.as_str()),
+                };
+                let (int_part, frac_part) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+                if !unsigned.bytes().any(|b| b.is_ascii_digit()) {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "invalid decimal literal: {text}"
+                    )));
+                }
+                let mut value = decimal_literal(unsigned, int_part, frac_part)?;
+                if negative {
+                    match &mut value {
+                        ScalarValue::Decimal128 { value, .. } => *value = -*value,
+                        ScalarValue::Float64(value) => *value = -*value,
+                        _ => unreachable!(),
+                    }
+                }
+                return Ok(ast::Expr::Literal { value, span });
+            }
             let dt = convert_data_type(ts.data_type)?;
             Ok(ast::Expr::Cast {
                 expr: Box::new(ast::Expr::Literal {
-                    value: literal,
+                    value: ScalarValue::Utf8(text),
                     span,
                 }),
                 data_type: dt,
@@ -700,6 +727,25 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             })
         }
         sp::Expr::Function(func) => convert_function(func, span),
+        sp::Expr::Rollup(sets) => {
+            let mut args = Vec::with_capacity(sets.len());
+            for set in sets {
+                if set.len() != 1 {
+                    return Err(ParseError::UnsupportedFeature(
+                        "ROLLUP with composite grouping elements".to_string(),
+                    ));
+                }
+                args.push(ast::FunctionArg::Unnamed(convert_expr(
+                    set.into_iter().next().unwrap(),
+                )?));
+            }
+            Ok(ast::Expr::Function {
+                name: "ROLLUP".to_string(),
+                args,
+                distinct: false,
+                span,
+            })
+        }
         sp::Expr::InSubquery {
             expr,
             subquery,
@@ -1223,14 +1269,31 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
     if let Some(over) = func.over {
         match over {
             sp::WindowType::WindowSpec(spec) => {
-                // The window operator only implements the SQL default frame
-                // (whole partition, or RANGE UNBOUNDED PRECEDING .. CURRENT
-                // ROW with ORDER BY); reject what it would silently ignore.
-                if spec.window_frame.is_some() {
-                    return Err(ParseError::UnsupportedFeature(
-                        "window frame clause (ROWS/RANGE/GROUPS ...)".to_string(),
-                    ));
-                }
+                let rows_frame = match spec.window_frame {
+                    None => false,
+                    Some(frame)
+                        if matches!(frame.start_bound, sp::WindowFrameBound::Preceding(None))
+                            && matches!(
+                                frame.end_bound,
+                                None | Some(sp::WindowFrameBound::CurrentRow)
+                            ) =>
+                    {
+                        match frame.units {
+                            sp::WindowFrameUnits::Rows => true,
+                            sp::WindowFrameUnits::Range => false,
+                            sp::WindowFrameUnits::Groups => {
+                                return Err(ParseError::UnsupportedFeature(
+                                    "window frame clause (ROWS/RANGE/GROUPS ...)".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        return Err(ParseError::UnsupportedFeature(
+                            "window frame clause (ROWS/RANGE/GROUPS ...)".to_string(),
+                        ));
+                    }
+                };
                 if spec.window_name.is_some() {
                     return Err(ParseError::UnsupportedFeature(
                         "named window references".to_string(),
@@ -1263,6 +1326,7 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
                     args: plain_args,
                     partition_by,
                     order_by,
+                    rows_frame,
                     span,
                 });
             }
@@ -1629,7 +1693,18 @@ pub(crate) fn convert_data_type(dt: sp::DataType) -> Result<DataType, ParseError
         sp::DataType::Varchar(_) | sp::DataType::Text | sp::DataType::String(_) => {
             Ok(DataType::Utf8)
         }
-        sp::DataType::Char(_) | sp::DataType::CharacterVarying(_) => Ok(DataType::Utf8),
+        sp::DataType::CharacterVarying(_) => Ok(DataType::Utf8),
+        sp::DataType::Char(length) | sp::DataType::Character(length) => match length {
+            None => Ok(DataType::Char(1)),
+            Some(sp::CharacterLength::IntegerLength { length, .. })
+                if (1..=u64::from(CHAR_MAX_LENGTH)).contains(&length) =>
+            {
+                Ok(DataType::Char(length as u32))
+            }
+            Some(other) => Err(ParseError::UnsupportedFeature(format!(
+                "CHAR length: {other}"
+            ))),
+        },
         sp::DataType::Decimal(info) | sp::DataType::Dec(info) | sp::DataType::Numeric(info) => {
             match info {
                 sp::ExactNumberInfo::PrecisionAndScale(p, s) => Ok(DataType::Decimal128 {

@@ -226,6 +226,12 @@ fn collect_join_key_blocks(
             aggr_exprs,
             ..
         }
+        | LogicalPlan::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            ..
+        }
         | LogicalPlan::PartialAggregate {
             input,
             group_by,
@@ -413,6 +419,7 @@ fn collect_join_key_sources(
         LogicalPlan::Projection { input, .. }
         | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::RollupAggregate { input, .. }
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. }
         | LogicalPlan::Sort { input, .. }
@@ -543,6 +550,12 @@ fn collect_inner_join_equivalence_classes(
             collect_inner_join_equivalence_expr_classes(predicate, classes);
         }
         LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            ..
+        }
+        | LogicalPlan::RollupAggregate {
             input,
             group_by,
             aggr_exprs,
@@ -764,6 +777,12 @@ fn block_plan_sources(plan: &LogicalPlan, blocked: &mut HashSet<ColumnSource>) {
             }
         }
         LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            ..
+        }
+        | LogicalPlan::RollupAggregate {
             input,
             group_by,
             aggr_exprs,
@@ -1855,6 +1874,7 @@ mod tests {
             }
             LogicalPlan::Projection { input, .. }
             | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::RollupAggregate { input, .. }
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Sort { input, .. }
@@ -1938,6 +1958,7 @@ mod tests {
             LogicalPlan::Projection { input, .. }
             | LogicalPlan::Filter { input, .. }
             | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::RollupAggregate { input, .. }
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Sort { input, .. }
@@ -2284,6 +2305,15 @@ mod tests {
                 schema,
             } => {
                 assert_eq!(schema.len(), group_by.len() + aggr_exprs.len());
+                assert_schema_lengths_consistent(input);
+            }
+            LogicalPlan::RollupAggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                schema,
+            } => {
+                assert_eq!(schema.len(), group_by.len() * 2 + aggr_exprs.len());
                 assert_schema_lengths_consistent(input);
             }
             LogicalPlan::Sort { input, order_by } => {

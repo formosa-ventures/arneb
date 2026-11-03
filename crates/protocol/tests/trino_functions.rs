@@ -190,6 +190,38 @@ async fn string_functions_in_select() {
 }
 
 #[tokio::test]
+async fn substr_matches_substring() {
+    let rows = query(
+        // Quoted, as Trino writes it, `"substr"` is a plain function call
+        // rather than the parser's SUBSTR syntax.
+        "SELECT id, substr(name, 2, 3), \"substr\"(name, 3), substring(name, 2, 3) FROM t ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            row(&["1", "-b-", "b-c", "-b-"]),
+            row(&["2", "ob", "b", "ob"]),
+            row(&["3", "NULL", "NULL", "NULL"]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn decimal_typed_literals_keep_their_fraction() {
+    // TPC-DS q32/q92 compare against `DECIMAL '1.3' * avg(...)`.
+    let rows = query(
+        "SELECT DECIMAL '1.3' * 10, DECIMAL '-0.05', DECIMAL '0012.50', DECIMAL '.5', \
+         CAST('1.3' AS DECIMAL), price * DECIMAL '1.3' FROM t WHERE id = 2",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![row(&["13.0", "-0.05", "12.50", "0.5", "1", "4.225"])]
+    );
+}
+
+#[tokio::test]
 async fn functions_in_where_clause() {
     let rows = query("SELECT id FROM t WHERE regexp_like(name, '^a') ORDER BY id").await;
     assert_eq!(rows, vec![row(&["1"])]);

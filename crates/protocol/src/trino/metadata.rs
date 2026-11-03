@@ -188,6 +188,7 @@ fn jdbc_sizes(ty: &TrinoType) -> (Option<i64>, Option<i64>) {
         TrinoType::Double => (Some(53), None),
         TrinoType::Decimal(p, s) => (Some(*p as i64), Some(*s as i64)),
         TrinoType::Varchar | TrinoType::Varbinary => (Some(2_147_483_647), None),
+        TrinoType::Char(length) => (Some(*length as i64), None),
         TrinoType::Date => (Some(10), None),
         TrinoType::Timestamp(p) | TrinoType::TimestampTz(p) => (Some(19 + *p as i64), None),
         _ => (None, None),
@@ -444,11 +445,16 @@ async fn jdbc_schema(root: &CatalogManager, tables: &[TableMeta]) -> MemorySchem
                 NULL_STR,
                 NULL_INT,
                 NULL_INT,
-                Cell::Int(if matches!(ty, TrinoType::Varchar | TrinoType::Varbinary) {
-                    size
-                } else {
-                    None
-                }),
+                Cell::Int(
+                    if matches!(
+                        ty,
+                        TrinoType::Varchar | TrinoType::Char(_) | TrinoType::Varbinary
+                    ) {
+                        size
+                    } else {
+                        None
+                    },
+                ),
                 Cell::Int(Some(i as i64 + 1)),
                 s(yes_no(col.nullable)),
                 NULL_STR,

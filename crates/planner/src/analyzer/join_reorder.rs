@@ -351,6 +351,26 @@ fn recurse_remap(
             )
         }
 
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => {
+            let (input, t) = tr(*input);
+            let group_by = remap_exprs(group_by, &t);
+            let aggr_exprs = remap_exprs(aggr_exprs, &t);
+            (
+                L::RollupAggregate {
+                    input: Box::new(input),
+                    group_by,
+                    aggr_exprs,
+                    schema,
+                },
+                None,
+            )
+        }
+
         L::PartialAggregate {
             input,
             group_by,
@@ -654,6 +674,17 @@ where
             aggr_exprs,
             schema,
         },
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => L::RollupAggregate {
+            input: Box::new(f(*input)),
+            group_by,
+            aggr_exprs,
+            schema,
+        },
         L::PartialAggregate {
             input,
             group_by,
@@ -799,7 +830,7 @@ fn try_reorder_chain(
 
     let mut leaves: Vec<LogicalPlan> = Vec::new();
     let mut edges: Vec<PlanExpr> = Vec::new();
-    if !flatten_inner_chain(plan, &mut leaves, &mut edges) {
+    if !flatten_inner_chain(plan, 0, &mut leaves, &mut edges) {
         return None;
     }
 
@@ -815,14 +846,27 @@ fn try_reorder_chain(
     // the permutation is threaded to the consuming operator via the returned
     // `RemapTable` (see `transform_remap`).
 
-    // Reorder each leaf in case it contains its own nested inner-join
-    // chain that survived the boundary detection (e.g., inner inside
-    // outer-join's right side). This is conservative — calling
-    // `transform` again on each leaf is a no-op when there's no chain.
-    let leaves: Vec<LogicalPlan> = leaves
+    // A leaf can contain a join chain beneath a Filter. Preserve its
+    // column permutation when remapping the outer chain's edges and output.
+    let (leaves, leaf_remaps): (Vec<LogicalPlan>, Vec<Option<RemapTable>>) = leaves
         .into_iter()
-        .map(|leaf| transform(leaf, stats, config))
-        .collect();
+        .map(|leaf| transform_remap(leaf, stats, config))
+        .unzip();
+    let widths = leaf_widths(&leaves);
+    let orig_off = cumulative_offsets(&widths);
+    let edges: Vec<PlanExpr> = edges
+        .into_iter()
+        .map(|edge| {
+            rewrite_expr(&edge, &mut |_name, idx| {
+                let (leaf, pos) = leaf_of_orig_index(idx, &orig_off, &widths)?;
+                let mapped = leaf_remaps[leaf]
+                    .as_ref()
+                    .map(|table| table[pos])
+                    .unwrap_or(pos);
+                Some(orig_off[leaf] + mapped)
+            })
+        })
+        .collect::<Option<_>>()?;
 
     let original_cost = estimated_cardinality(plan, stats);
 
@@ -905,15 +949,17 @@ fn try_reorder_chain(
     // combined index `oi` → `new_offsets[leaf] + pos`. The consuming operator
     // remaps its refs through this (`transform_remap`). Identity when the
     // chosen order equals the original.
-    let widths = leaf_widths(&leaves);
-    let orig_off = cumulative_offsets(&widths);
     let new_off = new_offsets(&order, &widths);
     let total: usize = widths.iter().sum();
     let table: RemapTable = (0..total)
         .map(|oi| {
             let (leaf, pos) =
                 leaf_of_orig_index(oi, &orig_off, &widths).expect("orig index within chain width");
-            new_off[leaf] + pos
+            new_off[leaf]
+                + leaf_remaps[leaf]
+                    .as_ref()
+                    .map(|remap| remap[pos])
+                    .unwrap_or(pos)
         })
         .collect();
 
@@ -931,6 +977,7 @@ fn leaf_table_label(plan: &LogicalPlan) -> String {
         | L::Sort { input, .. }
         | L::Limit { input, .. }
         | L::Aggregate { input, .. }
+        | L::RollupAggregate { input, .. }
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Distinct { input }
@@ -1148,11 +1195,15 @@ fn connected_to_prefix(edge_refs: &[Vec<usize>], prefix: &[usize], candidate: us
 
 /// Flattens a contiguous inner-join chain rooted at `plan` into `leaves`
 /// (one per non-Join leaf) and `edges` (one per AND-atom in each Join's
-/// `On(expr)` condition). Returns `false` if a non-inner Join or a
-/// non-equi join condition (`JoinCondition::None`) is encountered,
-/// signalling to caller that no rewrite should be attempted.
+/// `On(expr)` condition). A CROSS join (a comma join whose first tables
+/// share no predicate) is an inner join with no edge, so it is flattened
+/// too: the chain's other edges may connect its leaves, and
+/// `emit_left_deep` refuses any order that would leave a step without
+/// one. Returns `false` if an Inner join without a condition is
+/// encountered, signalling to caller that no rewrite should be attempted.
 fn flatten_inner_chain(
     plan: &LogicalPlan,
+    offset: usize,
     leaves: &mut Vec<LogicalPlan>,
     edges: &mut Vec<PlanExpr>,
 ) -> bool {
@@ -1165,22 +1216,53 @@ fn flatten_inner_chain(
             ..
         } => {
             match condition {
-                JoinCondition::On(expr) => split_and_atoms(expr, edges),
+                JoinCondition::On(expr) => {
+                    let shifted = remap_join_atom(expr, offset);
+                    split_and_atoms(&shifted, edges);
+                }
                 JoinCondition::None => return false,
             }
-            if !flatten_inner_chain(left, leaves, edges) {
+            if !flatten_inner_chain(left, offset, leaves, edges) {
                 return false;
             }
-            if !flatten_inner_chain(right, leaves, edges) {
+            if !flatten_inner_chain(right, offset + left.schema().len(), leaves, edges) {
                 return false;
             }
             true
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type: JoinType::Cross,
+            condition: JoinCondition::None,
+            ..
+        } => {
+            flatten_inner_chain(left, offset, leaves, edges)
+                && flatten_inner_chain(right, offset + left.schema().len(), leaves, edges)
+        }
+        LogicalPlan::Filter { input, predicate }
+            if matches!(
+                **input,
+                LogicalPlan::Join {
+                    join_type: JoinType::Inner,
+                    ..
+                }
+            ) =>
+        {
+            let shifted = remap_join_atom(predicate, offset);
+            split_and_atoms(&shifted, edges);
+            flatten_inner_chain(input, offset, leaves, edges)
         }
         _ => {
             leaves.push(plan.clone());
             true
         }
     }
+}
+
+fn remap_join_atom(expr: &PlanExpr, offset: usize) -> PlanExpr {
+    rewrite_expr(expr, &mut |_name, index| Some(index + offset))
+        .expect("join atom offset always resolves")
 }
 
 fn split_and_atoms(expr: &PlanExpr, sink: &mut Vec<PlanExpr>) {
@@ -1644,7 +1726,7 @@ fn rebuild_column_indices(
 /// cloned/recursed unchanged. `remap` returning `None` aborts the rewrite.
 /// Both the name-based and the leaf-origin (index-based) resolvers share
 /// this walk — only the `remap` closure differs.
-fn rewrite_expr<F>(expr: &PlanExpr, remap: &mut F) -> Option<PlanExpr>
+pub(super) fn rewrite_expr<F>(expr: &PlanExpr, remap: &mut F) -> Option<PlanExpr>
 where
     F: FnMut(&str, usize) -> Option<usize>,
 {
@@ -1832,6 +1914,12 @@ fn indices_consistent(plan: &LogicalPlan) -> bool {
         | L::AssignUniqueId { input, .. } => indices_consistent(input),
 
         L::Aggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            ..
+        }
+        | L::RollupAggregate {
             input,
             group_by,
             aggr_exprs,
@@ -2658,5 +2746,316 @@ mod tests {
         } else {
             panic!("expected Join");
         }
+    }
+
+    // -- Chains cut by a Filter over an inner join (TPC-DS q72) -----------
+    //
+    // A pushed-down cross-table predicate (q72's `inv_quantity_on_hand <
+    // cs_quantity`) leaves `Filter(fact_a ⋈ fact_b)` inside the chain. The
+    // reorderer must still be able to join a selective dimension to fact_a
+    // before the many-to-many fact_a ⋈ fact_b, and must keep every
+    // predicate exactly once.
+
+    fn gt(left: PlanExpr, right: PlanExpr) -> PlanExpr {
+        PlanExpr::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOp::Gt,
+            right: Box::new(right),
+            span: None,
+        }
+    }
+
+    fn inner(left: LogicalPlan, right: LogicalPlan, on: PlanExpr) -> LogicalPlan {
+        LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            condition: JoinCondition::On(on),
+            dynamic_filter_ids: Vec::new(),
+        }
+    }
+
+    fn filter(input: LogicalPlan, predicate: PlanExpr) -> LogicalPlan {
+        LogicalPlan::Filter {
+            input: Box::new(input),
+            predicate,
+        }
+    }
+
+    /// fa (1.44 M rows) and fb (11.7 M rows) share only an 18 K-value key, so
+    /// fa ⋈ fb is ~1 B rows; dim `d` filtered to one year keeps 1/200 of fa.
+    fn q72_stats() -> AnalyzerContext {
+        let mut catalog_stats = CatalogStats::new();
+        catalog_stats.insert(
+            TableReference::table("fa"),
+            stats_for("fa", 1_441_548, &[("a_item", 18_000), ("a_date", 1_800)]),
+        );
+        catalog_stats.insert(
+            TableReference::table("fb"),
+            stats_for("fb", 11_745_000, &[("b_item", 18_000)]),
+        );
+        catalog_stats.insert(
+            TableReference::table("d"),
+            stats_for("d", 73_049, &[("d_sk", 73_049), ("d_year", 200)]),
+        );
+        catalog_stats.insert(
+            TableReference::table("e"),
+            stats_for("e", 7_200, &[("e_sk", 7_200), ("e_flag", 6)]),
+        );
+        AnalyzerContext::with_stats(std::sync::Arc::new(catalog_stats))
+    }
+
+    // fa = [a_item, a_date, a_qty, a_e], fb = [b_item, b_qty], d = [d_sk, d_year]
+    fn fa() -> LogicalPlan {
+        scan("fa", &["a_item", "a_date", "a_qty", "a_e"])
+    }
+    fn fb() -> LogicalPlan {
+        scan("fb", &["b_item", "b_qty"])
+    }
+    /// `Filter(d, d_year = 1999)`; the predicate indexes d's own columns.
+    fn d_1999() -> LogicalPlan {
+        filter(
+            scan("d", &["d_sk", "d_year"]),
+            eq(col_expr(1, "d_year"), lit(1999)),
+        )
+    }
+
+    /// `Filter(fa ⋈ fb ON item, a_qty > b_qty)` in the fa||fb column space.
+    fn facts_with_cross_filter() -> LogicalPlan {
+        filter(
+            inner(fa(), fb(), eq(col_expr(0, "a_item"), col_expr(4, "b_item"))),
+            gt(col_expr(2, "a_qty"), col_expr(5, "b_qty")),
+        )
+    }
+
+    fn tables_under(plan: &LogicalPlan, sink: &mut Vec<String>) {
+        match plan {
+            LogicalPlan::TableScan { table, .. } => sink.push(table.table.clone()),
+            LogicalPlan::Join { left, right, .. } => {
+                tables_under(left, sink);
+                tables_under(right, sink);
+            }
+            LogicalPlan::Filter { input, .. } | LogicalPlan::Projection { input, .. } => {
+                tables_under(input, sink)
+            }
+            _ => {}
+        }
+    }
+
+    /// Tables under the deepest join on the left spine (the first join run).
+    fn first_join_tables(plan: &LogicalPlan) -> Vec<String> {
+        fn deepest(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Join { left, .. } => deepest(left).or(Some(plan)),
+                LogicalPlan::Filter { input, .. } | LogicalPlan::Projection { input, .. } => {
+                    deepest(input)
+                }
+                _ => None,
+            }
+        }
+        let mut tables = Vec::new();
+        if let Some(join) = deepest(plan) {
+            tables_under(join, &mut tables);
+        }
+        tables.sort();
+        tables
+    }
+
+    /// Counts predicate atoms with operator `op` across Filters and ON clauses.
+    fn count_atoms(plan: &LogicalPlan, op: BinaryOp) -> usize {
+        fn in_expr(e: &PlanExpr, op: BinaryOp) -> usize {
+            match e {
+                PlanExpr::BinaryOp {
+                    left, op: o, right, ..
+                } => usize::from(*o == op) + in_expr(left, op) + in_expr(right, op),
+                _ => 0,
+            }
+        }
+        match plan {
+            LogicalPlan::Filter { input, predicate } => {
+                in_expr(predicate, op) + count_atoms(input, op)
+            }
+            LogicalPlan::Join {
+                left,
+                right,
+                condition,
+                ..
+            } => {
+                let here = match condition {
+                    JoinCondition::On(e) => in_expr(e, op),
+                    JoinCondition::None => 0,
+                };
+                here + count_atoms(left, op) + count_atoms(right, op)
+            }
+            LogicalPlan::Projection { input, .. } => count_atoms(input, op),
+            _ => 0,
+        }
+    }
+
+    /// Wraps `plan` in a Projection of all its columns, as the planner's
+    /// SELECT list would; a reordered chain remaps through it.
+    fn project_all(plan: LogicalPlan) -> LogicalPlan {
+        let schema = plan.schema();
+        let exprs = schema
+            .iter()
+            .enumerate()
+            .map(|(i, c)| col_expr(i, &c.name))
+            .collect();
+        LogicalPlan::Projection {
+            input: Box::new(plan),
+            exprs,
+            schema,
+        }
+    }
+
+    /// Every column the top Projection reads must still point at a column of
+    /// the same name in its (possibly reordered) input.
+    fn assert_projection_resolves(plan: &LogicalPlan) {
+        let LogicalPlan::Projection { input, exprs, .. } = plan else {
+            panic!("expected the Projection to stay on top:\n{plan}");
+        };
+        let input_schema = input.schema();
+        for e in exprs {
+            let PlanExpr::Column { index, name, .. } = e else {
+                panic!("projection is not a plain column: {e:?}");
+            };
+            assert_eq!(&input_schema[*index].name, name, "{plan}");
+        }
+    }
+
+    #[test]
+    fn selective_dim_joins_before_a_many_to_many_fact_join_under_a_filter() {
+        // ((Filter(fa ⋈ fb) ⋈ d[1999]) ON a_date = d_sk)
+        let plan = inner(
+            facts_with_cross_filter(),
+            d_1999(),
+            eq(col_expr(1, "a_date"), col_expr(6, "d_sk")),
+        );
+        let mut ctx = q72_stats();
+        let after = JoinReorder::new()
+            .analyze(project_all(plan), &mut ctx)
+            .unwrap();
+        assert_eq!(
+            first_join_tables(&after),
+            vec!["d".to_string(), "fa".to_string()],
+            "fa must meet the selective dimension before fb:\n{after}"
+        );
+        assert_eq!(
+            count_atoms(&after, BinaryOp::Gt),
+            1,
+            "a_qty > b_qty kept once:\n{after}"
+        );
+        assert_projection_resolves(&after);
+    }
+
+    #[test]
+    fn filtered_join_on_the_right_side_keeps_every_predicate_once() {
+        // d[1999] ⋈ Filter(fa ⋈ fb): the filtered pair is the RIGHT child.
+        let plan = inner(
+            filter(
+                scan("d", &["d_sk", "d_year"]),
+                eq(col_expr(1, "d_year"), lit(1999)),
+            ),
+            filter(
+                inner(fa(), fb(), eq(col_expr(0, "a_item"), col_expr(4, "b_item"))),
+                gt(col_expr(2, "a_qty"), col_expr(5, "b_qty")),
+            ),
+            eq(col_expr(0, "d_sk"), col_expr(3, "a_date")),
+        );
+        let mut ctx = q72_stats();
+        let after = JoinReorder::new()
+            .analyze(project_all(plan), &mut ctx)
+            .unwrap();
+        assert_eq!(count_atoms(&after, BinaryOp::Gt), 1, "{after}");
+        assert_eq!(count_atoms(&after, BinaryOp::Eq), 3, "{after}");
+        assert_projection_resolves(&after);
+    }
+
+    #[test]
+    fn two_filters_at_different_depths_are_each_kept_once() {
+        // Filter((Filter(fa ⋈ fb) ⋈ d[1999]) ⋈ e, a_qty > 7) with e = [e_sk, e_flag]
+        let lower = inner(
+            facts_with_cross_filter(),
+            d_1999(),
+            eq(col_expr(1, "a_date"), col_expr(6, "d_sk")),
+        );
+        let upper = filter(
+            inner(
+                lower,
+                scan("e", &["e_sk", "e_flag"]),
+                eq(col_expr(3, "a_e"), col_expr(8, "e_sk")),
+            ),
+            gt(col_expr(2, "a_qty"), lit(7)),
+        );
+        let plan = inner(
+            upper,
+            scan("d", &["d_sk", "d_year"]),
+            eq(col_expr(1, "a_date"), col_expr(10, "d_sk")),
+        );
+        let mut ctx = q72_stats();
+        let after = JoinReorder::new()
+            .analyze(project_all(plan), &mut ctx)
+            .unwrap();
+        assert_eq!(count_atoms(&after, BinaryOp::Gt), 2, "{after}");
+        assert_projection_resolves(&after);
+    }
+
+    #[test]
+    fn single_table_filter_over_an_inner_join_is_kept() {
+        let plan = inner(
+            filter(
+                inner(fa(), fb(), eq(col_expr(0, "a_item"), col_expr(4, "b_item"))),
+                gt(col_expr(2, "a_qty"), lit(5)),
+            ),
+            d_1999(),
+            eq(col_expr(1, "a_date"), col_expr(6, "d_sk")),
+        );
+        let mut ctx = q72_stats();
+        let after = JoinReorder::new()
+            .analyze(project_all(plan), &mut ctx)
+            .unwrap();
+        assert_eq!(count_atoms(&after, BinaryOp::Gt), 1, "{after}");
+        assert_projection_resolves(&after);
+    }
+
+    #[test]
+    fn filter_over_an_outer_join_is_not_flattened() {
+        let left_join = LogicalPlan::Join {
+            left: Box::new(fa()),
+            right: Box::new(fb()),
+            join_type: JoinType::Left,
+            condition: JoinCondition::On(eq(col_expr(0, "a_item"), col_expr(4, "b_item"))),
+            dynamic_filter_ids: Vec::new(),
+        };
+        let plan = inner(
+            filter(left_join, gt(col_expr(2, "a_qty"), col_expr(5, "b_qty"))),
+            d_1999(),
+            eq(col_expr(1, "a_date"), col_expr(6, "d_sk")),
+        );
+        let mut ctx = q72_stats();
+        let after = JoinReorder::new().analyze(plan, &mut ctx).unwrap();
+        fn filter_over_left_join(plan: &LogicalPlan) -> bool {
+            match plan {
+                LogicalPlan::Filter { input, .. }
+                    if matches!(
+                        **input,
+                        LogicalPlan::Join {
+                            join_type: JoinType::Left,
+                            ..
+                        }
+                    ) =>
+                {
+                    true
+                }
+                LogicalPlan::Join { left, right, .. } => {
+                    filter_over_left_join(left) || filter_over_left_join(right)
+                }
+                LogicalPlan::Filter { input, .. } | LogicalPlan::Projection { input, .. } => {
+                    filter_over_left_join(input)
+                }
+                _ => false,
+            }
+        }
+        assert!(filter_over_left_join(&after), "{after}");
     }
 }

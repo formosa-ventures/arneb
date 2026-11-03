@@ -120,6 +120,7 @@ fn pg_type_name(dt: &DataType) -> &'static str {
         DataType::Float64 => "float8",
         DataType::Decimal128 { .. } => "numeric",
         DataType::Utf8 | DataType::LargeUtf8 => "varchar",
+        DataType::Char(_) => "bpchar",
         DataType::Binary => "bytea",
         DataType::Date32 => "date",
         DataType::Timestamp { .. } => "timestamp",

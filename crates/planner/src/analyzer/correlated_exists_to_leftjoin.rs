@@ -195,6 +195,17 @@ where
             aggr_exprs,
             schema,
         },
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => L::RollupAggregate {
+            input: Box::new(f(*input)),
+            group_by,
+            aggr_exprs,
+            schema,
+        },
         L::PartialAggregate {
             input,
             group_by,

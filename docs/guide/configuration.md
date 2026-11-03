@@ -832,8 +832,9 @@ the source of truth from the config file to the [state store](#state):
   password and storage key, or replace a worker's catalogs. So a
   coordinator without `[cluster] secret` (`ARNEB_CLUSTER_SECRET`) now
   **refuses to start** while a served catalog carries a secret: a
-  `password`, a password in `connection_url`, an S3 `secret_access_key` or
-  an Azure `access_key`, including the global `[storage]` keys merged into
+  `password`, a password in `connection_url` (a `connection_url` that fails
+  validation, such as a libpq `host=... password=...` string, counts whole),
+  an S3 `secret_access_key` or an Azure `access_key`, including the global `[storage]` keys merged into
   every Hive catalog. The error names each catalog and field (never the
   value). The check runs before anything is stored, on every catalog that
   would be served (built or not): on a first start, removing the secret

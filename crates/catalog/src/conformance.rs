@@ -45,17 +45,35 @@ fn candidates<'a>(listed: &'a [String], variant: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// `try_schema`, failing the check when the source can't be asked: an
+/// outage must not pass for "nothing to check".
+async fn lookup(
+    catalog: &dyn CatalogProvider,
+    name: &str,
+) -> Result<Option<std::sync::Arc<dyn crate::SchemaProvider>>, String> {
+    catalog
+        .try_schema(name)
+        .await
+        .map_err(|e| format!("looking up schema {name:?}: {e}"))
+}
+
 /// Looks every schema and table of `catalog` up under other spellings
 /// (case variants, surrounding spaces) and fails if one is found without
 /// reporting a stored name, or reports a stored name the variant could not
 /// stand for (`variant` itself when listed, else a listed name equal to it
 /// up to case and spaces, in the schema it was found in). Exact-match
-/// connectors pass trivially (every unlisted variant is `None`).
+/// connectors pass trivially (every unlisted variant is `None`). Fails when
+/// the source can't be asked, including when it lists no schemas.
 pub async fn check_name_resolution(catalog: &dyn CatalogProvider) -> Result<(), String> {
     let schemas = catalog.schema_names().await;
+    // Listings swallow errors, so an empty one may be an outage: there is
+    // nothing to check either way, which must not pass.
+    if schemas.is_empty() {
+        return Err("catalog lists no schemas (empty, or the source is unreachable)".into());
+    }
     for schema in &schemas {
         for variant in variants(schema) {
-            if let Some(found) = catalog.schema(&variant).await {
+            if let Some(found) = lookup(catalog, &variant).await? {
                 let expected = candidates(&schemas, &variant);
                 match found.canonical_name() {
                     Some(stored) if expected.contains(&stored.as_str()) => {}
@@ -68,9 +86,10 @@ pub async fn check_name_resolution(catalog: &dyn CatalogProvider) -> Result<(), 
                 }
             }
         }
-        let Some(provider) = catalog.schema(schema).await else {
-            // Dropped since it was listed (a live source changing under
-            // the check) is fine; still listed but not found is not.
+        let Some(provider) = lookup(catalog, schema).await? else {
+            // Dropped since it was listed (the source answered "no such
+            // schema" while changing under the check) is fine; still
+            // listed but not found is not. An outage fails the check.
             if catalog.schema_names().await.contains(schema) {
                 return Err(format!("listed schema {schema:?} does not resolve"));
             }
@@ -88,7 +107,11 @@ pub async fn check_name_resolution(catalog: &dyn CatalogProvider) -> Result<(), 
         let tables = provider.table_names().await;
         for table in &tables {
             for variant in variants(table) {
-                if let Some(found) = provider.table(&variant).await {
+                let found = provider
+                    .table_if_allowed(&variant, &|_, _| true)
+                    .await
+                    .map_err(|e| format!("looking up table {schema}.{variant:?}: {e}"))?;
+                if let Some(found) = found {
                     let expected = candidates(&tables, &variant);
                     match found.canonical_name() {
                         Some((s, t)) if &s == schema && expected.contains(&t.as_str()) => {}

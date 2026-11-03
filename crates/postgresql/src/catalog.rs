@@ -199,30 +199,39 @@ impl SchemaProvider for PostgresSchema {
     }
 
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
-        self.load(name, &|_, _| true).await
-    }
-
-    /// Asks `allowed` once the name is resolved, before the columns and
-    /// splits are loaded.
-    async fn table_if_allowed(
-        &self,
-        name: &str,
-        allowed: TableGate<'_>,
-    ) -> Option<Arc<dyn TableProvider>> {
-        self.load(name, allowed).await
-    }
-}
-
-impl PostgresSchema {
-    async fn load(&self, name: &str, allowed: TableGate<'_>) -> Option<Arc<dyn TableProvider>> {
-        match load_table(&self.state, &self.name, name, allowed).await {
-            Ok(Some(t)) => Some(Arc::new(t)),
-            Ok(None) => None,
+        match self.load(name, &|_, _| true).await {
+            Ok(table) => table,
             Err(e) => {
                 tracing::warn!(catalog = %self.state.name, schema = %self.name, table = name, error = %e, "failed to load table");
                 None
             }
         }
+    }
+
+    /// Asks `allowed` once the name is resolved, before the columns and
+    /// splits are loaded. A failed metadata query is `Unavailable`, not a
+    /// missing table.
+    async fn table_if_allowed(
+        &self,
+        name: &str,
+        allowed: TableGate<'_>,
+    ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+        self.load(name, allowed).await
+    }
+}
+
+impl PostgresSchema {
+    async fn load(
+        &self,
+        name: &str,
+        allowed: TableGate<'_>,
+    ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+        let table = load_table(&self.state, &self.name, name, allowed)
+            .await
+            .map_err(|e| {
+                CatalogError::Unavailable(format!("{}.{}.{name}: {e}", self.state.name, self.name))
+            })?;
+        Ok(table.map(|t| Arc::new(t) as Arc<dyn TableProvider>))
     }
 }
 

@@ -97,23 +97,27 @@ pub trait SchemaProvider: fmt::Debug + Send + Sync {
     /// Returns the table with the given name, or `None` if it does not exist.
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>>;
 
-    /// Like [`table`](Self::table), but returns `None` when `allowed`
-    /// refuses the table's stored `(schema, table)`. A connector whose
-    /// lookup is expensive (partitions, table-format metadata) overrides
-    /// it to ask `allowed` as soon as it knows the stored name, so a table
-    /// the user may not read costs no more to refuse than a missing one.
-    /// The caller checks the identity again afterwards. Default: `table`,
-    /// then `allowed` on its [`TableProvider::canonical_name`].
+    /// Like [`table`](Self::table), but returns `Ok(None)` when `allowed`
+    /// refuses the table's stored `(schema, table)`, and `Err` (rather
+    /// than `None`) when the source could not be asked, as
+    /// [`CatalogProvider::try_schema`] does. A connector whose lookup is
+    /// expensive (partitions, table-format metadata) overrides it to ask
+    /// `allowed` as soon as it knows the stored name, so a table the user
+    /// may not read costs no more to refuse than a missing one. The caller
+    /// checks the identity again afterwards. Default: `table`, then
+    /// `allowed` on its [`TableProvider::canonical_name`]; never fails.
     async fn table_if_allowed(
         &self,
         name: &str,
         allowed: TableGate<'_>,
-    ) -> Option<Arc<dyn TableProvider>> {
-        let table = self.table(name).await?;
-        match table.canonical_name() {
+    ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+        let Some(table) = self.table(name).await else {
+            return Ok(None);
+        };
+        Ok(match table.canonical_name() {
             Some((schema, stored)) if !allowed(&schema, &stored) => None,
             _ => Some(table),
-        }
+        })
     }
 
     /// The schema's name as the source stores it. Access rules are checked
@@ -423,6 +427,14 @@ impl CatalogManager {
             .is_none_or(|a| a.rules.table_visible(&a.user, catalog, schema, table))
     }
 
+    /// Whether the session user may read `catalog.schema.table` (true
+    /// without rules, whether or not it exists).
+    fn can_select(&self, catalog: &str, schema: &str, table: &str) -> bool {
+        self.access
+            .as_ref()
+            .is_none_or(|a| a.rules.can_select(&a.user, catalog, schema, table))
+    }
+
     /// Catalog names the session user may see (all of them without rules).
     pub fn visible_catalog_names(&self) -> Vec<String> {
         let mut names = self.catalog_names();
@@ -453,8 +465,13 @@ impl CatalogManager {
         if !self.schema_visible(catalog, schema) {
             return Vec::new();
         }
-        let Ok(Some((schema_provider, stored))) = self.lookup_schema(catalog, schema).await else {
-            return Vec::new();
+        let (schema_provider, stored) = match self.lookup_schema(catalog, schema).await {
+            Ok(Some(found)) => found,
+            Ok(None) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!("listing tables of {catalog}.{schema}: {e}");
+                return Vec::new();
+            }
         };
         let mut names = schema_provider.table_names().await;
         if let Some(a) = &self.access {
@@ -626,11 +643,21 @@ impl CatalogManager {
         let Some(schema) = catalog.schema(&schema_name).await else {
             return folded;
         };
+        // Probed through the rules gate, so a table the user may not read
+        // under its stored name is never loaded here (it reads as missing
+        // either way); a source that can't be asked folds nothing.
         let lower = reference.table.to_lowercase();
+        let readable = |s: &str, t: &str| self.can_select(&catalog_name, s, t);
         if lower != reference.table
             && self.table_visible(&catalog_name, &schema_name, &lower)
-            && schema.table(&reference.table).await.is_none()
-            && schema.table(&lower).await.is_some()
+            && matches!(
+                schema.table_if_allowed(&reference.table, &readable).await,
+                Ok(None)
+            )
+            && matches!(
+                schema.table_if_allowed(&lower, &readable).await,
+                Ok(Some(_))
+            )
         {
             folded.table = lower;
         }
@@ -676,7 +703,10 @@ impl CatalogManager {
         let not_found =
             || CatalogError::SchemaNotFound(format!("{catalog_name}.{schema_name}.{table_name}"));
         let Some(a) = &self.access else {
-            return schema.table(table_name).await.ok_or_else(not_found);
+            return schema
+                .table_if_allowed(table_name, &|_, _| true)
+                .await?
+                .ok_or_else(not_found);
         };
 
         // The connector may have resolved the name to a stored one that
@@ -688,7 +718,7 @@ impl CatalogManager {
         let allowed = |s: &str, t: &str| a.rules.can_select(&a.user, catalog_name, s, t);
         let table = schema
             .table_if_allowed(table_name, &allowed)
-            .await
+            .await?
             .ok_or_else(not_found)?;
         let (stored_schema, stored_table) = match table.canonical_name() {
             Some(identity) => identity,
@@ -1330,6 +1360,65 @@ mod tests {
                 .await
                 .is_empty());
         }
+        assert!(conformance::check_name_resolution(&Down).await.is_err());
+    }
+
+    /// A table lookup that fails to reach the source is `Unavailable`,
+    /// not a missing table, with or without rules; the conformance check
+    /// fails rather than passing on it.
+    #[tokio::test]
+    async fn an_unreachable_source_during_table_load_is_not_a_missing_table() {
+        #[derive(Debug)]
+        struct Flaky;
+        #[async_trait]
+        impl SchemaProvider for Flaky {
+            async fn table_names(&self) -> Vec<String> {
+                vec!["orders".into()]
+            }
+            async fn table(&self, _name: &str) -> Option<Arc<dyn TableProvider>> {
+                None
+            }
+            async fn table_if_allowed(
+                &self,
+                _name: &str,
+                _allowed: TableGate<'_>,
+            ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+                Err(CatalogError::Unavailable("metastore down".into()))
+            }
+            fn canonical_name(&self) -> Option<String> {
+                Some("sales".into())
+            }
+        }
+        #[derive(Debug)]
+        struct FlakyCatalog;
+        #[async_trait]
+        impl CatalogProvider for FlakyCatalog {
+            async fn schema_names(&self) -> Vec<String> {
+                vec!["sales".into()]
+            }
+            async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+                (name == "sales").then(|| Arc::new(Flaky) as Arc<dyn SchemaProvider>)
+            }
+        }
+        let root = CatalogManager::new("lake", "sales");
+        root.register_catalog("lake", Arc::new(FlakyCatalog));
+        let rules = r#"{"tables": [{"privileges": ["SELECT"]}]}"#;
+        let alice = root.with_access("alice", Arc::new(AccessRules::from_json(rules).unwrap()));
+        for manager in [&root, &alice] {
+            let err = manager
+                .resolve_table(&TableReference {
+                    catalog: Some("lake".into()),
+                    schema: Some("sales".into()),
+                    table: "ORDERS".into(),
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CatalogError::Unavailable(_)), "{err}");
+        }
+        let err = conformance::check_name_resolution(&FlakyCatalog)
+            .await
+            .unwrap_err();
+        assert!(err.contains("metastore down"), "{err}");
     }
 
     /// The connector is asked, before it loads a table, whether the
@@ -1347,22 +1436,27 @@ mod tests {
                 vec!["open".into(), "secret".into()]
             }
             async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
-                self.table_if_allowed(name, &|_, _| true).await
+                self.table_if_allowed(name, &|_, _| true)
+                    .await
+                    .ok()
+                    .flatten()
             }
             async fn table_if_allowed(
                 &self,
                 name: &str,
                 allowed: TableGate<'_>,
-            ) -> Option<Arc<dyn TableProvider>> {
-                let stored = resolve_loosely(&["open", "secret"], name)?;
+            ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+                let Some(stored) = resolve_loosely(&["open", "secret"], name) else {
+                    return Ok(None);
+                };
                 if !allowed("public", &stored) {
-                    return None;
+                    return Ok(None);
                 }
                 LOADS.fetch_add(1, Ordering::SeqCst);
-                Some(Arc::new(LooseTable {
+                Ok(Some(Arc::new(LooseTable {
                     schema: "public".into(),
                     name: stored,
-                }))
+                })))
             }
             fn canonical_name(&self) -> Option<String> {
                 Some("public".into())

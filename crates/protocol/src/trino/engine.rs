@@ -258,6 +258,7 @@ impl Engine {
                 };
                 let names = metadata::table_names(root, &catalog, &schema)
                     .await
+                    .map_err(|e| TrinoError::internal(e.to_string()))?
                     .ok_or_else(|| schema_not_found(&catalog, &schema))?;
                 Ok(single_column("Table", filter_like(names, &like)))
             }

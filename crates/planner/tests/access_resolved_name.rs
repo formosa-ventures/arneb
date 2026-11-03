@@ -133,3 +133,82 @@ async fn every_read_checks_the_name_the_connector_resolved() {
         }
     }
 }
+
+/// Counts full table loads; a connector shaped like Hive's (it learns the
+/// stored name cheaply, then loads), so a denied table must never be
+/// loaded, including by the planner's case-folding probe.
+static LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[derive(Debug)]
+struct CountingSchema(String);
+
+#[async_trait]
+impl SchemaProvider for CountingSchema {
+    async fn table_names(&self) -> Vec<String> {
+        vec!["open".into(), "secret".into()]
+    }
+    async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+        self.table_if_allowed(name, &|_, _| true)
+            .await
+            .ok()
+            .flatten()
+    }
+    async fn table_if_allowed(
+        &self,
+        name: &str,
+        allowed: arneb_catalog::TableGate<'_>,
+    ) -> Result<Option<Arc<dyn TableProvider>>, arneb_common::error::CatalogError> {
+        let Some(name) = resolve_loosely(&["open", "secret"], name) else {
+            return Ok(None);
+        };
+        if !allowed(&self.0, &name) {
+            return Ok(None);
+        }
+        LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(Arc::new(LooseTable {
+            schema: self.0.clone(),
+            name,
+        })))
+    }
+    fn canonical_name(&self) -> Option<String> {
+        Some(self.0.clone())
+    }
+}
+
+#[derive(Debug)]
+struct CountingCatalog;
+
+#[async_trait]
+impl CatalogProvider for CountingCatalog {
+    async fn schema_names(&self) -> Vec<String> {
+        vec!["public".into()]
+    }
+    async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        let name = resolve_loosely(&["public"], name)?;
+        Some(Arc::new(CountingSchema(name)))
+    }
+}
+
+/// `pg.PUBLIC.SECRET` passes the written-name checks (the rule names
+/// `public`), so the planner's case-folding probe runs; it must go
+/// through the rules gate and never load the denied `public.secret`.
+#[tokio::test]
+async fn a_denied_table_is_never_loaded_while_planning() {
+    use std::sync::atomic::Ordering;
+    let root = CatalogManager::new("pg", "public");
+    root.register_catalog("pg", Arc::new(CountingCatalog));
+    let rules = AccessRules::from_json(
+        r#"{"tables": [
+            {"user": "alice", "schema": "public", "table": "secret", "privileges": []},
+            {"privileges": ["SELECT"]}
+        ]}"#,
+    )
+    .unwrap();
+    let alice = root.with_access("alice", Arc::new(rules));
+    for t in ["pg.PUBLIC.SECRET", "pg.PUBLIC.Secret", "pg.public.SECRET"] {
+        assert!(plan(&alice, &format!("SELECT * FROM {t}")).await.is_err());
+    }
+    assert_eq!(LOADS.load(Ordering::SeqCst), 0, "a denied table was loaded");
+    plan(&alice, "SELECT * FROM pg.PUBLIC.OPEN").await.unwrap();
+    assert!(LOADS.load(Ordering::SeqCst) > 0);
+}

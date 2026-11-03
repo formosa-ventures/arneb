@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use arneb_catalog::CatalogManager;
+use arneb_common::error::CatalogError;
 use arneb_common::types::{ColumnInfo, TableReference};
 use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
 use arneb_connectors::ConnectorRegistry;
@@ -63,17 +64,21 @@ pub(crate) async fn schema_names(cm: &CatalogManager, catalog: &str) -> Option<V
     Some(names)
 }
 
-/// Tables of `catalog.schema` (virtual tables for the virtual schemas).
+/// Tables of `catalog.schema` (virtual tables for the virtual schemas);
+/// `Ok(None)` for a missing or hidden schema, `Err` when the source could
+/// not be asked whether it exists.
 pub(crate) async fn table_names(
     cm: &CatalogManager,
     catalog: &str,
     schema: &str,
-) -> Option<Vec<String>> {
+) -> Result<Option<Vec<String>>, CatalogError> {
     if schema == INFORMATION_SCHEMA {
-        return Some(INFO_SCHEMA_TABLES.iter().map(|t| t.to_string()).collect());
+        return Ok(Some(
+            INFO_SCHEMA_TABLES.iter().map(|t| t.to_string()).collect(),
+        ));
     }
     if catalog == SYSTEM_CATALOG && cm.catalog(catalog).is_none() {
-        return match schema {
+        return Ok(match schema {
             "jdbc" => Some(
                 [
                     "catalogs",
@@ -89,18 +94,14 @@ pub(crate) async fn table_names(
             ),
             "metadata" => Some(vec!["table_comments".to_string()]),
             _ => None,
-        };
+        });
     }
-    // An unreachable source reads as a missing schema here (the lookup
-    // logs it); only `SET search_path` must fail on it.
-    if !cm.catalog_visible(catalog)
-        || !matches!(cm.visible_schema_exists(catalog, schema).await, Ok(true))
-    {
-        return None;
+    if !cm.catalog_visible(catalog) || !cm.visible_schema_exists(catalog, schema).await? {
+        return Ok(None);
     }
     let mut names = cm.visible_table_names(catalog, schema).await;
     names.sort();
-    Some(names)
+    Ok(Some(names))
 }
 
 /// Columns of a real table.
@@ -613,8 +614,39 @@ mod tests {
             build_virtual_catalogs(&root, "lake", "SELECT * FROM system.jdbc.tables").await;
         assert!(cm.catalog("system").is_some());
         assert!(registry.get("system").is_some());
-        let names = table_names(&root, "system", "jdbc").await.unwrap();
+        let names = table_names(&root, "system", "jdbc").await.unwrap().unwrap();
         assert!(names.contains(&"columns".to_string()));
+    }
+
+    /// `SHOW TABLES` on a source that can't be asked is an error, not a
+    /// missing schema.
+    #[tokio::test]
+    async fn table_names_report_an_unreachable_source() {
+        use arneb_catalog::{CatalogProvider, SchemaProvider};
+        #[derive(Debug)]
+        struct Down;
+        #[async_trait::async_trait]
+        impl CatalogProvider for Down {
+            async fn schema_names(&self) -> Vec<String> {
+                Vec::new()
+            }
+            async fn schema(&self, _name: &str) -> Option<Arc<dyn SchemaProvider>> {
+                None
+            }
+            async fn try_schema(
+                &self,
+                _name: &str,
+            ) -> Result<Option<Arc<dyn SchemaProvider>>, CatalogError> {
+                Err(CatalogError::Unavailable("metastore down".into()))
+            }
+        }
+        let root = root();
+        root.register_catalog("down", Arc::new(Down));
+        assert!(matches!(
+            table_names(&root, "down", "sales").await,
+            Err(CatalogError::Unavailable(_))
+        ));
+        assert!(table_names(&root, "lake", "nope").await.unwrap().is_none());
     }
 
     #[tokio::test]

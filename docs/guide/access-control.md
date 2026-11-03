@@ -89,8 +89,13 @@ Everyone can run queries and sees only their own.
   [Upgrading from v0.1.8](#upgrading-from-v0-1-8) if your allow rules use
   another case than the stored names.
 - When a connector cannot be reached (HMS or the PostgreSQL server is
-  down), a lookup fails with an error. It never reads as a missing schema,
-  so `SET search_path` fails instead of falling back to another schema.
+  down), reads and `SET search_path` fail with an error instead of
+  reporting a missing schema or table, so `SET search_path` never falls
+  back to another schema. Trino `SHOW TABLES` fails too when it cannot
+  look the schema up. Listings (`SHOW TABLES` once the schema is known,
+  `information_schema`, `pg_catalog`, `system.jdbc`) show nothing for what
+  they cannot reach, and the server logs a warning. Iceberg tables whose
+  metadata files cannot be read still read as missing (logged).
 - A PostgreSQL view is checked by the view's own name. The tables it
   reads are governed only by the PostgreSQL role the catalog connects as.
 - A section left out of the file allows everything it governs. With no

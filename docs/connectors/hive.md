@@ -39,7 +39,8 @@ and lowercased), so `datalake.DEMO.cities` reads `demo.cities`. Arneb reads
 from the metastore's default catalog: an HMS catalog-qualified database
 name (`"@spark#demo"`) is served only when it names the default catalog's
 own database, and reads as missing otherwise. If HMS cannot be reached,
-the lookup fails with an error instead of reading as a missing schema.
+a query fails with an error instead of reporting a missing schema or
+table.
 
 ## Storage Formats
 

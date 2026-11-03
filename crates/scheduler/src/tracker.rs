@@ -76,7 +76,51 @@ pub enum KillOutcome {
 
 /// The first kill's outcome, shared with kills of the same query that
 /// arrive while it is being settled.
-type KillWatch = tokio::sync::watch::Receiver<Option<KillOutcome>>;
+type KillWatch = tokio::sync::watch::Receiver<Option<Settled>>;
+
+/// How the first kill of a query settled.
+#[derive(Debug, Clone, Copy)]
+enum Settled {
+    Outcome(KillOutcome),
+    /// The query left the history meanwhile: its state is unknown.
+    Gone,
+}
+
+/// The first kill's claim on a query while its task settles it. Dropped
+/// without publishing (the canceller panicked, or the runtime shut down
+/// mid-kill), it releases the claim, so a later kill can try again instead
+/// of waiting on a kill that will never settle; waiting kills then fail.
+struct Claim {
+    tracker: QueryTracker,
+    id: QueryId,
+    tx: Option<tokio::sync::watch::Sender<Option<Settled>>>,
+}
+
+impl Claim {
+    fn publish(mut self, settled: Settled) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Some(settled));
+        }
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if self.tx.is_none() {
+            return;
+        }
+        tracing::warn!(query_id = %self.id, "a kill ended without an outcome; releasing its claim");
+        let mut inner = self
+            .tracker
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(e) = inner.queries.get_mut(&self.id) {
+            e.killed_by = None;
+            e.kill = None;
+        }
+    }
+}
 
 struct Entry {
     machine: QueryStateMachine,
@@ -275,6 +319,11 @@ impl QueryTracker {
     /// while the protocol has not yet recorded a completed outcome, so it
     /// never reports a cancel that did not happen.
     ///
+    /// A query that leaves the history while the kill settles is not found.
+    /// A kill whose task ended without an outcome (its canceller panicked)
+    /// fails with "interrupted" and releases its claim, so a later kill can
+    /// try again.
+    ///
     /// The kill is settled in a task of its own, so dropping this future
     /// does not leave it half done. It waits for at most one poll of the
     /// query's work and never blocks a thread.
@@ -297,38 +346,50 @@ impl QueryTracker {
                     let (tx, rx) = tokio::sync::watch::channel(None);
                     entry.kill = Some(rx.clone());
                     let canceller = entry.canceller.take();
+                    let claim = Claim {
+                        tracker: self.clone(),
+                        id: *id,
+                        tx: Some(tx),
+                    };
                     tokio::spawn(
                         self.clone()
-                            .settle_kill(*id, by.to_owned(), was, canceller, tx),
+                            .settle_kill(claim, by.to_owned(), was, canceller),
                     );
                     (true, rx)
                 }
             }
         };
-        let outcome = wait_for_kill(watch).await.ok_or_else(|| {
-            ExecutionError::InvalidOperation(format!("the kill of query {id} was interrupted"))
-        })?;
+        let not_found = || ExecutionError::InvalidOperation(format!("query {id} not found"));
+        let outcome = match wait_for_kill(watch).await {
+            Some(Settled::Outcome(outcome)) => outcome,
+            Some(Settled::Gone) => return Err(not_found()),
+            None => {
+                return Err(ExecutionError::InvalidOperation(format!(
+                    "the kill of query {id} was interrupted"
+                )))
+            }
+        };
         if first {
             return Ok(outcome);
         }
         // What the query is now, after the first kill settled.
-        Ok(match self.get_query(id).map(|q| q.state) {
-            Some(state) if state.is_terminal() => KillOutcome::AlreadyEnded(state),
-            Some(state) => KillOutcome::NotApplied { state },
-            None => KillOutcome::AlreadyEnded(QueryState::Finished),
-        })
+        match self.get_query(id).map(|q| q.state) {
+            Some(state) if state.is_terminal() => Ok(KillOutcome::AlreadyEnded(state)),
+            Some(state) => Ok(KillOutcome::NotApplied { state }),
+            None => Err(not_found()),
+        }
     }
 
     /// The claimed kill of `id`: call the canceller, then record and
     /// publish the outcome.
     async fn settle_kill(
         self,
-        id: QueryId,
+        claim: Claim,
         by: String,
         was: QueryState,
         canceller: Option<Canceller>,
-        tx: tokio::sync::watch::Sender<Option<KillOutcome>>,
     ) {
+        let id = claim.id;
         let applied = match canceller {
             Some(cancel) => cancel(&by).await,
             None => true,
@@ -344,7 +405,10 @@ impl QueryTracker {
             match state {
                 Some(state) if !state.is_terminal() => KillOutcome::NotApplied { state },
                 Some(state) => KillOutcome::AlreadyEnded(state),
-                None => KillOutcome::AlreadyEnded(QueryState::Finished),
+                None => {
+                    drop(inner);
+                    return claim.publish(Settled::Gone);
+                }
             }
         } else if self.cancel_query(&id).is_ok() {
             KillOutcome::Killed { was }
@@ -356,7 +420,7 @@ impl QueryTracker {
                 _ => KillOutcome::Killed { was },
             }
         };
-        let _ = tx.send(Some(outcome));
+        claim.publish(Settled::Outcome(outcome));
     }
 
     pub fn active_count(&self) -> usize {
@@ -417,7 +481,7 @@ impl QueryTracker {
 
 /// The outcome published on `watch`; `None` when its kill task ended
 /// without one (a panicking canceller, or the runtime shutting down).
-async fn wait_for_kill(mut watch: KillWatch) -> Option<KillOutcome> {
+async fn wait_for_kill(mut watch: KillWatch) -> Option<Settled> {
     let outcome = watch.wait_for(Option::is_some).await.ok()?;
     *outcome
 }
@@ -839,6 +903,28 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the dropped kill was never settled");
+    }
+
+    /// A kill whose canceller panics fails as interrupted and releases its
+    /// claim: the next kill is not stuck behind it.
+    #[tokio::test]
+    async fn a_kill_whose_canceller_panics_releases_its_claim() {
+        let tracker = QueryTracker::with_history_limit(10);
+        let id = tracker.create_query("SELECT 1".into());
+        tracker.advance_to(&id, QueryState::Running).unwrap();
+        tracker.set_canceller(
+            &id,
+            Box::new(|_| Box::pin(async { panic!("canceller panicked") })),
+        );
+        let err = tracker.kill_query(&id, "root").await.unwrap_err();
+        assert!(err.to_string().contains("interrupted"), "{err}");
+        assert_eq!(tracker.cancelled_by(&id), None);
+        assert_eq!(
+            tracker.kill_query(&id, "ops").await.unwrap(),
+            KillOutcome::Killed {
+                was: QueryState::Running
+            }
+        );
     }
 
     /// A canceller registered while a kill is in progress (claimed, not yet

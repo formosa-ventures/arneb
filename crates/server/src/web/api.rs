@@ -363,6 +363,10 @@ async fn cancel_query(
             .await
         {
             Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            // Still tracked: the kill itself failed (interrupted).
+            Err(_) if state.query_tracker.get_query(&info.query_id).is_some() => {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
             Err(_) => StatusCode::NOT_FOUND.into_response(),
         };
     }

@@ -526,9 +526,13 @@ curl -s -H "$H" -X DELETE "$B/queries/0b9f…?dry_run=true"
 
 A query that already ended, or ends during the call, answers `200` with
 `changed: false` and a summary such as `query 0b9f… owned by bob already
-finished; nothing to cancel`.
+finished; nothing to cancel`. A query that leaves the query history while
+the kill settles answers `not_found`. In the rare case that a kill ends
+without an outcome (a server fault), it answers `internal` (`500`), and the
+query can be cancelled again.
 
-`DELETE /api/v1/queries/{id}` answers `204` / `403` / `404` and has no dry
+`DELETE /api/v1/queries/{id}` answers `204` / `403` / `404` (or `500` for
+a kill that ended without an outcome) and has no dry
 run. Under password auth it uses the rule above, audited the same way, so it
 can also answer `503 audit_unavailable` (with an error body and
 `Retry-After: 5`) while the audit log is unwritable. Under

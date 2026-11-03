@@ -1170,10 +1170,21 @@ fn challenge(settings: &OAuthSettings) -> String {
 /// `WWW-Authenticate` value for a presented token that is not valid. The
 /// description is fixed: the reason stays in the DEBUG log (D10).
 fn invalid_token_challenge(settings: &OAuthSettings) -> String {
-    format!(
-        r#"Bearer realm="arneb", error="invalid_token", error_description="the access token is not valid", resource_metadata="{}""#,
+    let mut v = String::from(
+        r#"Bearer realm="arneb", error="invalid_token", error_description="the access token is not valid""#,
+    );
+    // The scope to re-authorize with, as in the no-credentials challenge.
+    if !settings.required_scopes.is_empty() {
+        v.push_str(&format!(
+            r#", scope="{}""#,
+            settings.required_scopes.join(" ")
+        ));
+    }
+    v.push_str(&format!(
+        r#", resource_metadata="{}""#,
         metadata_url(&settings.resource)
-    )
+    ));
+    v
 }
 
 /// `WWW-Authenticate` value for a valid token that lacks a required scope.
@@ -1277,6 +1288,13 @@ mod tests {
         s.required_scopes = vec!["a".into(), "b".into()];
         let v = OAuthValidator::new(s);
         assert!(v.challenge().ends_with(r#"", scope="a b""#));
+        // A refused token is told which scope to re-authorize with, too.
+        assert_eq!(
+            v.invalid_token_challenge(),
+            format!(
+                r#"Bearer realm="arneb", error="invalid_token", error_description="the access token is not valid", scope="a b", resource_metadata="{meta}""#
+            )
+        );
         assert_eq!(
             v.insufficient_scope_challenge(),
             format!(

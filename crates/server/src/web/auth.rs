@@ -154,7 +154,8 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
     };
     let (scheme, value) = authorization.split_once(' ').unwrap_or((authorization, ""));
     let value = value.trim();
-    let identity = if scheme.eq_ignore_ascii_case("bearer") {
+    let bearer = scheme.eq_ignore_ascii_case("bearer");
+    let identity = if bearer {
         if value.starts_with(SESSION_PREFIX) {
             state.sessions.resolve(value).map(|user| Identity {
                 user,
@@ -204,6 +205,12 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
         Some(identity) => {
             req.extensions_mut().insert(identity);
             next.run(req).await
+        }
+        // A refused bearer on `/mcp` under `[oauth]` (an opaque IdP token,
+        // an expired or revoked Arneb token) is an `invalid_token` too, so
+        // the client refreshes or re-authorizes instead of resending it.
+        None if bearer && challenge.is_some() => {
+            unauthenticated(state.oauth.as_ref().map(|o| o.invalid_token_challenge()))
         }
         None => unauthenticated(challenge),
     }
@@ -830,15 +837,31 @@ mod tests {
             api.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
             Some(r#"Bearer realm="arneb""#)
         );
-        // A bad non-JWT credential on /mcp gets the same challenge.
-        let bad = send(
+        // A refused non-JWT bearer on /mcp (an opaque IdP token, an
+        // unknown or revoked Arneb token) is an `invalid_token`, with the
+        // same body; bad Basic credentials keep the discovery challenge.
+        let invalid = on.oauth.as_ref().unwrap().invalid_token_challenge();
+        for bearer in ["Bearer nope", "Bearer arneb_x_redacted", "Bearer a.b"] {
+            let bad = send(&on, Method::POST, "/mcp", &[("authorization", bearer)]).await;
+            assert_eq!(bad.status, StatusCode::UNAUTHORIZED, "{bearer}");
+            assert_eq!(bad.body, mcp.body, "{bearer}");
+            assert_eq!(
+                bad.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
+                Some(invalid),
+                "{bearer}"
+            );
+        }
+        let bad_basic = send(
             &on,
             Method::POST,
             "/mcp",
-            &[("authorization", "Bearer nope")],
+            &[("authorization", &basic("alice", "wrong"))],
         )
         .await;
-        assert_eq!(bad.www_authenticate, mcp.www_authenticate);
+        assert_eq!(bad_basic.www_authenticate, mcp.www_authenticate);
+        // Off /mcp a refused bearer keeps the plain challenge.
+        let api_bad = get(&on, "/api/v1/queries", Some("Bearer nope")).await;
+        assert_eq!(api_bad.www_authenticate, api.www_authenticate);
 
         let off = oauth_state(false);
         let mcp = send(&off, Method::POST, "/mcp", &[]).await;

@@ -30,39 +30,73 @@ fn variants(name: &str) -> Vec<String> {
     out
 }
 
+/// The listed names a lookup of `variant` may resolve to: `variant`
+/// itself when it is listed (an exact match wins), else every listed name
+/// equal to it up to case and surrounding spaces.
+fn candidates<'a>(listed: &'a [String], variant: &str) -> Vec<&'a str> {
+    if let Some(exact) = listed.iter().find(|n| *n == variant) {
+        return vec![exact];
+    }
+    let key = variant.trim().to_lowercase();
+    listed
+        .iter()
+        .filter(|n| n.trim().to_lowercase() == key)
+        .map(String::as_str)
+        .collect()
+}
+
 /// Looks every schema and table of `catalog` up under other spellings
 /// (case variants, surrounding spaces) and fails if one is found without
-/// reporting a stored name, or reports a name the catalog does not list.
-/// Exact-match connectors pass trivially (every variant is `None`).
+/// reporting a stored name, or reports a stored name the variant could not
+/// stand for (`variant` itself when listed, else a listed name equal to it
+/// up to case and spaces, in the schema it was found in). Exact-match
+/// connectors pass trivially (every unlisted variant is `None`).
 pub async fn check_name_resolution(catalog: &dyn CatalogProvider) -> Result<(), String> {
     let schemas = catalog.schema_names().await;
     for schema in &schemas {
         for variant in variants(schema) {
             if let Some(found) = catalog.schema(&variant).await {
+                let expected = candidates(&schemas, &variant);
                 match found.canonical_name() {
-                    Some(stored) if schemas.contains(&stored) => {}
+                    Some(stored) if expected.contains(&stored.as_str()) => {}
                     other => {
                         return Err(format!(
                             "schema {schema:?} found as {variant:?} but reports \
-                             canonical_name {other:?}"
+                             canonical_name {other:?}, expected one of {expected:?}"
                         ))
                     }
                 }
             }
         }
         let Some(provider) = catalog.schema(schema).await else {
-            return Err(format!("listed schema {schema:?} does not resolve"));
+            // Dropped since it was listed (a live source changing under
+            // the check) is fine; still listed but not found is not.
+            if catalog.schema_names().await.contains(schema) {
+                return Err(format!("listed schema {schema:?} does not resolve"));
+            }
+            continue;
         };
+        if provider
+            .canonical_name()
+            .is_some_and(|stored| &stored != schema)
+        {
+            return Err(format!(
+                "listed schema {schema:?} reports canonical_name {:?}",
+                provider.canonical_name()
+            ));
+        }
         let tables = provider.table_names().await;
         for table in &tables {
             for variant in variants(table) {
                 if let Some(found) = provider.table(&variant).await {
+                    let expected = candidates(&tables, &variant);
                     match found.canonical_name() {
-                        Some((s, t)) if &s == schema && tables.contains(&t) => {}
+                        Some((s, t)) if &s == schema && expected.contains(&t.as_str()) => {}
                         other => {
                             return Err(format!(
                                 "table {schema}.{table} found as {variant:?} but reports \
-                                 canonical_name {other:?}"
+                                 canonical_name {other:?}, expected {schema:?} and one of \
+                                 {expected:?}"
                             ))
                         }
                     }

@@ -58,6 +58,11 @@ impl TableProvider for MemoryTable {
     fn schema(&self) -> Vec<ColumnInfo> {
         self.schema.clone()
     }
+
+    /// Found by its exact registered name only.
+    fn canonical_name(&self) -> Option<(String, String)> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +120,11 @@ impl SchemaProvider for MemorySchema {
             .unwrap()
             .get(name)
             .map(|t| Arc::clone(t) as Arc<dyn TableProvider>)
+    }
+
+    /// Found by its exact registered name only.
+    fn canonical_name(&self) -> Option<String> {
+        None
     }
 }
 

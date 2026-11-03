@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arneb_catalog::{CatalogProvider, SchemaProvider, TableProvider, TableStatistics};
-use arneb_common::error::ConnectorError;
+use arneb_catalog::{CatalogProvider, SchemaProvider, TableGate, TableProvider, TableStatistics};
+use arneb_common::error::{CatalogError, ConnectorError};
 use arneb_common::types::ColumnInfo;
 use arneb_rdbms::{plan_splits, RemoteColumn, RemoteTable, SplitPlan};
 use async_trait::async_trait;
@@ -115,14 +115,20 @@ pub(crate) fn pool_error(e: &deadpool_postgres::PoolError) -> String {
     }
 }
 
-#[async_trait]
-impl CatalogProvider for PostgresCatalog {
-    async fn schema_names(&self) -> Vec<String> {
+impl PostgresCatalog {
+    async fn list_schemas(&self) -> Result<Vec<String>, String> {
         let sql = "SELECT nspname FROM pg_namespace \
                    WHERE nspname NOT IN ('pg_catalog', 'information_schema') \
                    AND nspname NOT LIKE 'pg\\_toast%' AND nspname NOT LIKE 'pg\\_temp\\_%' \
                    ORDER BY 1";
-        match query_strings(&self.state, sql, &[]).await {
+        query_strings(&self.state, sql, &[]).await
+    }
+}
+
+#[async_trait]
+impl CatalogProvider for PostgresCatalog {
+    async fn schema_names(&self) -> Vec<String> {
+        match self.list_schemas().await {
             Ok(names) => names,
             Err(e) => {
                 tracing::warn!(catalog = %self.state.name, error = %e, "failed to list schemas");
@@ -132,11 +138,29 @@ impl CatalogProvider for PostgresCatalog {
     }
 
     async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        let names = self.schema_names().await;
-        let resolved = resolve_name(&names, name)?;
-        Some(Arc::new(PostgresSchema {
-            state: self.state.clone(),
-            name: resolved,
+        match self.try_schema(name).await {
+            Ok(schema) => schema,
+            Err(e) => {
+                tracing::warn!(catalog = %self.state.name, schema = name, error = %e, "failed to look up schema");
+                None
+            }
+        }
+    }
+
+    /// A server that cannot be reached is an error, not a missing schema.
+    async fn try_schema(
+        &self,
+        name: &str,
+    ) -> Result<Option<Arc<dyn SchemaProvider>>, CatalogError> {
+        let names = self
+            .list_schemas()
+            .await
+            .map_err(|e| CatalogError::Unavailable(format!("{}: {e}", self.state.name)))?;
+        Ok(resolve_name(&names, name).map(|resolved| {
+            Arc::new(PostgresSchema {
+                state: self.state.clone(),
+                name: resolved,
+            }) as Arc<dyn SchemaProvider>
         }))
     }
 }
@@ -175,7 +199,23 @@ impl SchemaProvider for PostgresSchema {
     }
 
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
-        match load_table(&self.state, &self.name, name).await {
+        self.load(name, &|_, _| true).await
+    }
+
+    /// Asks `allowed` once the name is resolved, before the columns and
+    /// splits are loaded.
+    async fn table_if_allowed(
+        &self,
+        name: &str,
+        allowed: TableGate<'_>,
+    ) -> Option<Arc<dyn TableProvider>> {
+        self.load(name, allowed).await
+    }
+}
+
+impl PostgresSchema {
+    async fn load(&self, name: &str, allowed: TableGate<'_>) -> Option<Arc<dyn TableProvider>> {
+        match load_table(&self.state, &self.name, name, allowed).await {
             Ok(Some(t)) => Some(Arc::new(t)),
             Ok(None) => None,
             Err(e) => {
@@ -246,6 +286,7 @@ async fn load_table(
     state: &CatalogState,
     schema: &str,
     name: &str,
+    allowed: TableGate<'_>,
 ) -> Result<Option<PostgresTable>, String> {
     let client = state.pool.get().await.map_err(|e| pool_error(&e))?;
     let rel_sql = format!(
@@ -261,6 +302,9 @@ async fn load_table(
     let Some(resolved) = resolve_name(&names, name) else {
         return Ok(None);
     };
+    if !allowed(schema, &resolved) {
+        return Ok(None);
+    }
     let rel = rels
         .iter()
         .find(|r| r.get::<_, String>(1) == resolved)

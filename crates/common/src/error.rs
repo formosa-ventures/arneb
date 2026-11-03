@@ -271,6 +271,12 @@ pub enum CatalogError {
     /// message is the denial, e.g. `Cannot select from table c.s.t`.
     #[error("Access Denied: {0}")]
     AccessDenied(String),
+
+    /// The source could not be asked whether the object exists (e.g. its
+    /// metastore is unreachable). Distinct from a not-found answer, so a
+    /// caller does not mistake an outage for a missing object.
+    #[error("catalog unavailable: {0}")]
+    Unavailable(String),
 }
 
 /// Errors from configuration loading.

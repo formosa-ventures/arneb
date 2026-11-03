@@ -91,7 +91,11 @@ pub(crate) async fn table_names(
             _ => None,
         };
     }
-    if !cm.catalog_visible(catalog) || !cm.visible_schema_exists(catalog, schema).await {
+    // An unreachable source reads as a missing schema here (the lookup
+    // logs it); only `SET search_path` must fail on it.
+    if !cm.catalog_visible(catalog)
+        || !matches!(cm.visible_schema_exists(catalog, schema).await, Ok(true))
+    {
         return None;
     }
     let mut names = cm.visible_table_names(catalog, schema).await;

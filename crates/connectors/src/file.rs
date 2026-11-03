@@ -392,6 +392,11 @@ impl TableProvider for FileTable {
             columns: Default::default(),
         })
     }
+
+    /// Found by its exact configured name only.
+    fn canonical_name(&self) -> Option<(String, String)> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +675,11 @@ impl SchemaProvider for FileSchema {
                 e.size_bytes,
             )) as Arc<dyn TableProvider>
         })
+    }
+
+    /// Found by its exact configured name only.
+    fn canonical_name(&self) -> Option<String> {
+        None
     }
 }
 

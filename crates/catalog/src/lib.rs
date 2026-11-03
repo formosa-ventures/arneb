@@ -70,7 +70,23 @@ pub trait CatalogProvider: fmt::Debug + Send + Sync {
 
     /// Returns the schema with the given name, or `None` if it does not exist.
     async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>>;
+
+    /// Like [`schema`](Self::schema), but tells "does not exist"
+    /// (`Ok(None)`) apart from "could not ask the source" (`Err`, e.g. an
+    /// unreachable metastore), so a caller choosing between schemas (such
+    /// as `SET search_path`) fails instead of silently picking another.
+    /// Default: `schema`, which never fails.
+    async fn try_schema(
+        &self,
+        name: &str,
+    ) -> Result<Option<Arc<dyn SchemaProvider>>, CatalogError> {
+        Ok(self.schema(name).await)
+    }
 }
+
+/// Asked by [`SchemaProvider::table_if_allowed`] whether the session user
+/// may read a table, given its stored `(schema, table)`.
+pub type TableGate<'a> = &'a (dyn Fn(&str, &str) -> bool + Send + Sync);
 
 /// A schema is a namespace within a catalog containing tables.
 #[async_trait]
@@ -81,22 +97,38 @@ pub trait SchemaProvider: fmt::Debug + Send + Sync {
     /// Returns the table with the given name, or `None` if it does not exist.
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>>;
 
-    /// The schema's name as the source stores it, when the provider was
-    /// looked up by a name that may differ from it (a connector that
-    /// matches names case-insensitively or otherwise normalizes them).
-    /// Access rules are checked on this name as well as on the name as
-    /// written.
-    ///
-    /// Default: `None`, meaning the provider only answers to its stored
-    /// name. **A connector whose [`CatalogProvider::schema`] accepts any
-    /// name other than the exact stored one MUST return `Some`**, or access
-    /// rules on the stored name can be bypassed by writing it differently.
-    /// [`conformance::check_name_resolution`] tests this. Current
-    /// implementations: PostgreSQL and Hive return `Some`; memory, file
-    /// and the virtual metadata catalogs match exactly.
-    fn canonical_name(&self) -> Option<String> {
-        None
+    /// Like [`table`](Self::table), but returns `None` when `allowed`
+    /// refuses the table's stored `(schema, table)`. A connector whose
+    /// lookup is expensive (partitions, table-format metadata) overrides
+    /// it to ask `allowed` as soon as it knows the stored name, so a table
+    /// the user may not read costs no more to refuse than a missing one.
+    /// The caller checks the identity again afterwards. Default: `table`,
+    /// then `allowed` on its [`TableProvider::canonical_name`].
+    async fn table_if_allowed(
+        &self,
+        name: &str,
+        allowed: TableGate<'_>,
+    ) -> Option<Arc<dyn TableProvider>> {
+        let table = self.table(name).await?;
+        match table.canonical_name() {
+            Some((schema, stored)) if !allowed(&schema, &stored) => None,
+            _ => Some(table),
+        }
     }
+
+    /// The schema's name as the source stores it. Access rules are checked
+    /// on this name as well as on the name as written.
+    ///
+    /// **A connector whose [`CatalogProvider::schema`] accepts any name
+    /// other than the exact stored one (case-insensitive matching, or any
+    /// other normalization) MUST return `Some`**, or access rules on the
+    /// stored name could be bypassed by writing it differently. `None`
+    /// claims the provider answers only to its exact stored name; the
+    /// catalog manager holds it to that by finding the name as written in
+    /// [`CatalogProvider::schema_names`], and treats the schema as missing
+    /// otherwise. Required, so no connector gets `None` by omission.
+    /// [`conformance::check_name_resolution`] tests this.
+    fn canonical_name(&self) -> Option<String>;
 }
 
 /// A table exposes its column schema metadata.
@@ -124,19 +156,18 @@ pub trait TableProvider: fmt::Debug + Send + Sync {
     }
 
     /// The `(schema, table)` this provider reads, as the source stores
-    /// them, when the provider was looked up by a name that may differ
-    /// from it (a connector that matches names case-insensitively, or
-    /// that redirects to another table). Access rules are checked on this
-    /// identity as well as on the name as written.
+    /// them (after any case-insensitive matching or redirection). Access
+    /// rules are checked on this identity as well as on the name as
+    /// written.
     ///
-    /// Default: `None`, meaning the provider only answers to its stored
-    /// name. **A connector whose [`SchemaProvider::table`] accepts any name
+    /// **A connector whose [`SchemaProvider::table`] accepts any name
     /// other than the exact stored one MUST return `Some`** (see
-    /// [`SchemaProvider::canonical_name`]). Current implementations:
-    /// PostgreSQL, Hive and Iceberg-via-Hive return `Some`.
-    fn canonical_name(&self) -> Option<(String, String)> {
-        None
-    }
+    /// [`SchemaProvider::canonical_name`]). `None` claims the table was
+    /// found by its exact stored name; the catalog manager holds it to
+    /// that by finding the name in [`SchemaProvider::table_names`], and
+    /// treats the table as missing otherwise. Required, so no connector
+    /// gets `None` by omission.
+    fn canonical_name(&self) -> Option<(String, String)>;
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +190,11 @@ impl MemoryTable {
 impl TableProvider for MemoryTable {
     fn schema(&self) -> Vec<ColumnInfo> {
         self.columns.clone()
+    }
+
+    /// Found by its exact registered name only.
+    fn canonical_name(&self) -> Option<(String, String)> {
+        None
     }
 }
 
@@ -204,6 +240,10 @@ impl SchemaProvider for MemorySchema {
 
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         self.tables.read().unwrap().get(name).cloned()
+    }
+    /// Found by its exact registered name only.
+    fn canonical_name(&self) -> Option<String> {
+        None
     }
 }
 
@@ -406,13 +446,14 @@ impl CatalogManager {
     }
 
     /// Table names of `catalog.schema` the session user may see; empty for
-    /// an unknown or hidden schema. A schema the connector resolves to a
-    /// differently-written stored name is checked under both names.
+    /// an unknown or hidden schema, or when the source cannot be reached.
+    /// A schema the connector resolves to a differently-written stored name
+    /// is checked under both names.
     pub async fn visible_table_names(&self, catalog: &str, schema: &str) -> Vec<String> {
         if !self.schema_visible(catalog, schema) {
             return Vec::new();
         }
-        let Some((schema_provider, stored)) = self.lookup_schema(catalog, schema).await else {
+        let Ok(Some((schema_provider, stored))) = self.lookup_schema(catalog, schema).await else {
             return Vec::new();
         };
         let mut names = schema_provider.table_names().await;
@@ -427,26 +468,51 @@ impl CatalogManager {
 
     /// Whether `catalog.schema` exists and the session user may see it,
     /// under the name as written and the name the connector resolved it
-    /// to. Without rules, whether it exists.
-    pub async fn visible_schema_exists(&self, catalog: &str, schema: &str) -> bool {
-        self.schema_visible(catalog, schema) && self.lookup_schema(catalog, schema).await.is_some()
+    /// to. Without rules, whether it exists. `Err` when the source could
+    /// not be asked (see [`CatalogProvider::try_schema`]).
+    pub async fn visible_schema_exists(
+        &self,
+        catalog: &str,
+        schema: &str,
+    ) -> Result<bool, CatalogError> {
+        if !self.schema_visible(catalog, schema) {
+            return Ok(false);
+        }
+        Ok(self.lookup_schema(catalog, schema).await?.is_some())
     }
 
     /// The provider for `catalog.schema` and the schema's stored name.
     /// `None` when the catalog or schema does not exist, or when the
     /// connector resolved `schema` to a stored name the session user may
     /// not see, so a hidden schema reads as a missing one whatever case
-    /// it is written in. The written name is not checked here.
+    /// it is written in. The written name is not checked here. `Err` only
+    /// when the source could not be asked.
     async fn lookup_schema(
         &self,
         catalog: &str,
         schema: &str,
-    ) -> Option<(Arc<dyn SchemaProvider>, String)> {
-        let provider = self.catalog(catalog)?.schema(schema).await?;
-        let stored = provider
-            .canonical_name()
-            .unwrap_or_else(|| schema.to_string());
-        (stored == schema || self.schema_visible(catalog, &stored)).then_some((provider, stored))
+    ) -> Result<Option<(Arc<dyn SchemaProvider>, String)>, CatalogError> {
+        let Some(provider) = self.catalog(catalog) else {
+            return Ok(None);
+        };
+        let Some(found) = provider.try_schema(schema).await? else {
+            return Ok(None);
+        };
+        let Some(a) = &self.access else {
+            let stored = found.canonical_name().unwrap_or_else(|| schema.to_string());
+            return Ok(Some((found, stored)));
+        };
+        let stored = match found.canonical_name() {
+            Some(stored) => stored,
+            // The provider claims it answers only to its stored name: hold
+            // it to that, so a loose connector that reports no stored name
+            // fails closed.
+            None if provider.schema_names().await.iter().any(|s| s == schema) => schema.to_string(),
+            None => return Ok(None),
+        };
+        Ok(a.rules
+            .schema_visible(&a.user, catalog, &stored)
+            .then_some((found, stored)))
     }
 
     /// Returns the reference the planner should record for a scanned table.
@@ -605,28 +671,35 @@ impl CatalogManager {
         }
         let (schema, stored_schema) = self
             .lookup_schema(catalog_name, schema_name)
-            .await
+            .await?
             .ok_or_else(|| CatalogError::SchemaNotFound(format!("{catalog_name}.{schema_name}")))?;
         let not_found =
             || CatalogError::SchemaNotFound(format!("{catalog_name}.{schema_name}.{table_name}"));
-        let table = schema.table(table_name).await.ok_or_else(not_found)?;
+        let Some(a) = &self.access else {
+            return schema.table(table_name).await.ok_or_else(not_found);
+        };
 
         // The connector may have resolved the name to a stored one that
         // differs from it (case-insensitive matching, redirection). The
         // rules apply to what is actually read, so check that identity
-        // too. A denial here reads as a missing table, as the name as
-        // written was allowed and the stored one must not be revealed.
-        if let Some(a) = &self.access {
-            let (stored_schema, stored_table) = table
-                .canonical_name()
-                .unwrap_or_else(|| (stored_schema, table_name.clone()));
-            if (stored_schema.as_str() != schema_name || &stored_table != table_name)
-                && !a
-                    .rules
-                    .can_select(&a.user, catalog_name, &stored_schema, &stored_table)
-            {
-                return Err(not_found());
+        // too, before the connector loads the table where it can and once
+        // more here. A denial reads as a missing table: the name as
+        // written was allowed, and the stored one must not be revealed.
+        let allowed = |s: &str, t: &str| a.rules.can_select(&a.user, catalog_name, s, t);
+        let table = schema
+            .table_if_allowed(table_name, &allowed)
+            .await
+            .ok_or_else(not_found)?;
+        let (stored_schema, stored_table) = match table.canonical_name() {
+            Some(identity) => identity,
+            // Found by its exact name, the provider claims: hold it to that.
+            None if schema.table_names().await.iter().any(|t| t == table_name) => {
+                (stored_schema, table_name.clone())
             }
+            None => return Err(not_found()),
+        };
+        if !allowed(&stored_schema, &stored_table) {
+            return Err(not_found());
         }
         Ok(table)
     }
@@ -949,8 +1022,8 @@ mod tests {
         );
         assert_eq!(err.to_string(), missing.to_string().replace("NOPE", "HR"));
         assert!(alice.visible_table_names("pg", "HR").await.is_empty());
-        assert!(!alice.visible_schema_exists("pg", "HR").await);
-        assert!(alice.visible_schema_exists("pg", "PUBLIC").await);
+        assert!(!alice.visible_schema_exists("pg", "HR").await.unwrap());
+        assert!(alice.visible_schema_exists("pg", "PUBLIC").await.unwrap());
     }
 
     /// A mixed-case stored name (`"Orders"`) still reads through a folded
@@ -1046,7 +1119,10 @@ mod tests {
                     .is_empty(),
                 "{written:?} lists the denied schema"
             );
-            assert!(!alice.visible_schema_exists("datalake", written).await);
+            assert!(!alice
+                .visible_schema_exists("datalake", written)
+                .await
+                .unwrap());
             let err = alice
                 .resolve_table(&TableReference {
                     catalog: Some("datalake".into()),
@@ -1094,6 +1170,9 @@ mod tests {
                 name.eq_ignore_ascii_case("secret")
                     .then(|| Arc::new(MemoryTable::new(test_columns())) as Arc<dyn TableProvider>)
             }
+            fn canonical_name(&self) -> Option<String> {
+                None
+            }
         }
         #[derive(Debug)]
         struct ForgetfulCatalog;
@@ -1110,6 +1189,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("public.secret"), "{err}");
+
+        // A connector reporting a listed, but wrong, stored schema fails.
+        #[derive(Debug)]
+        struct Misreporting;
+        #[async_trait]
+        impl CatalogProvider for Misreporting {
+            async fn schema_names(&self) -> Vec<String> {
+                vec!["hr".into(), "public".into()]
+            }
+            async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+                resolve_loosely(&["hr", "public"], name)?;
+                Some(Arc::new(LooseSchema {
+                    name: "hr".into(),
+                    tables: &[],
+                }))
+            }
+        }
+        let err = conformance::check_name_resolution(&Misreporting)
+            .await
+            .unwrap_err();
+        assert!(err.contains("\"public\""), "{err}");
     }
 
     /// Without rules, loose resolution is unchanged.
@@ -1131,6 +1231,202 @@ mod tests {
             root.visible_table_names("pg", "PUBLIC").await,
             vec!["Orders", "open", "secret"]
         );
+    }
+
+    /// A loose connector that reports no stored name (`None`) fails
+    /// closed under rules: only names it lists exactly resolve, so a deny
+    /// rule on the stored name cannot be bypassed by writing it in
+    /// another case. Without rules its loose matching is unchanged.
+    #[tokio::test]
+    async fn a_loose_connector_reporting_no_stored_name_fails_closed() {
+        #[derive(Debug)]
+        struct Silent;
+        #[async_trait]
+        impl SchemaProvider for Silent {
+            async fn table_names(&self) -> Vec<String> {
+                vec!["open".into(), "secret".into()]
+            }
+            async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+                resolve_loosely(&["open", "secret"], name)
+                    .map(|_| Arc::new(MemoryTable::new(test_columns())) as Arc<dyn TableProvider>)
+            }
+            fn canonical_name(&self) -> Option<String> {
+                None
+            }
+        }
+        #[derive(Debug)]
+        struct SilentCatalog;
+        #[async_trait]
+        impl CatalogProvider for SilentCatalog {
+            async fn schema_names(&self) -> Vec<String> {
+                vec!["public".into()]
+            }
+            async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+                resolve_loosely(&["public"], name)
+                    .map(|_| Arc::new(Silent) as Arc<dyn SchemaProvider>)
+            }
+        }
+        let root = CatalogManager::new("pg", "public");
+        root.register_catalog("pg", Arc::new(SilentCatalog));
+        let rules = r#"{"tables": [
+            {"user": "alice", "table": "secret", "privileges": []},
+            {"privileges": ["SELECT"]}
+        ]}"#;
+        let alice = root.with_access("alice", Arc::new(AccessRules::from_json(rules).unwrap()));
+        assert!(fold_read(&alice, "public", "open").await.is_ok());
+        for (schema, table) in [("public", "SECRET"), ("public", "OPEN"), ("PUBLIC", "open")] {
+            let err = fold_read(&alice, schema, table).await.unwrap_err();
+            assert!(
+                matches!(err, CatalogError::SchemaNotFound(_)),
+                "{schema}.{table}: {err}"
+            );
+        }
+        assert!(!alice.visible_schema_exists("pg", "PUBLIC").await.unwrap());
+        assert!(fold_read(&root, "PUBLIC", "SECRET").await.is_ok());
+    }
+
+    /// An unreachable source is an error, not a missing schema: reads
+    /// and `visible_schema_exists` report it, so `SET search_path` can
+    /// fail instead of falling back to another schema.
+    #[tokio::test]
+    async fn an_unreachable_source_is_not_a_missing_schema() {
+        #[derive(Debug)]
+        struct Down;
+        #[async_trait]
+        impl CatalogProvider for Down {
+            async fn schema_names(&self) -> Vec<String> {
+                Vec::new()
+            }
+            async fn schema(&self, _name: &str) -> Option<Arc<dyn SchemaProvider>> {
+                None
+            }
+            async fn try_schema(
+                &self,
+                _name: &str,
+            ) -> Result<Option<Arc<dyn SchemaProvider>>, CatalogError> {
+                Err(CatalogError::Unavailable("metastore down".into()))
+            }
+        }
+        let root = CatalogManager::new("lake", "sales");
+        root.register_catalog("lake", Arc::new(Down));
+        let rules = r#"{"tables": [{"privileges": ["SELECT"]}]}"#;
+        let alice = root.with_access("alice", Arc::new(AccessRules::from_json(rules).unwrap()));
+        for manager in [&root, &alice] {
+            assert!(matches!(
+                manager.visible_schema_exists("lake", "sales").await,
+                Err(CatalogError::Unavailable(_))
+            ));
+            let err = manager
+                .resolve_table(&TableReference {
+                    catalog: Some("lake".into()),
+                    schema: Some("sales".into()),
+                    table: "orders".into(),
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, CatalogError::Unavailable(_)), "{err}");
+            assert!(manager
+                .visible_table_names("lake", "sales")
+                .await
+                .is_empty());
+        }
+    }
+
+    /// The connector is asked, before it loads a table, whether the
+    /// stored name may be read, so a denied table costs no more than a
+    /// missing one.
+    #[tokio::test]
+    async fn a_denied_table_is_refused_before_it_is_loaded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static LOADS: AtomicUsize = AtomicUsize::new(0);
+        #[derive(Debug)]
+        struct Gated;
+        #[async_trait]
+        impl SchemaProvider for Gated {
+            async fn table_names(&self) -> Vec<String> {
+                vec!["open".into(), "secret".into()]
+            }
+            async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+                self.table_if_allowed(name, &|_, _| true).await
+            }
+            async fn table_if_allowed(
+                &self,
+                name: &str,
+                allowed: TableGate<'_>,
+            ) -> Option<Arc<dyn TableProvider>> {
+                let stored = resolve_loosely(&["open", "secret"], name)?;
+                if !allowed("public", &stored) {
+                    return None;
+                }
+                LOADS.fetch_add(1, Ordering::SeqCst);
+                Some(Arc::new(LooseTable {
+                    schema: "public".into(),
+                    name: stored,
+                }))
+            }
+            fn canonical_name(&self) -> Option<String> {
+                Some("public".into())
+            }
+        }
+        #[derive(Debug)]
+        struct GatedCatalog;
+        #[async_trait]
+        impl CatalogProvider for GatedCatalog {
+            async fn schema_names(&self) -> Vec<String> {
+                vec!["public".into()]
+            }
+            async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+                (name == "public").then(|| Arc::new(Gated) as Arc<dyn SchemaProvider>)
+            }
+        }
+        let root = CatalogManager::new("pg", "public");
+        root.register_catalog("pg", Arc::new(GatedCatalog));
+        let rules = r#"{"tables": [
+            {"user": "alice", "table": "secret", "privileges": []},
+            {"privileges": ["SELECT"]}
+        ]}"#;
+        let alice = root.with_access("alice", Arc::new(AccessRules::from_json(rules).unwrap()));
+        let read = |table: &str| TableReference {
+            catalog: Some("pg".into()),
+            schema: Some("public".into()),
+            table: table.into(),
+        };
+        assert!(alice.resolve_table(&read("SECRET")).await.is_err());
+        assert_eq!(LOADS.load(Ordering::SeqCst), 0, "denied table was loaded");
+        assert!(alice.resolve_table(&read("OPEN")).await.is_ok());
+        assert_eq!(LOADS.load(Ordering::SeqCst), 1);
+    }
+
+    /// The upgrade note's example: an allow rule written in another case
+    /// than the stored schema name no longer grants the read.
+    #[tokio::test]
+    async fn an_allow_rule_must_match_the_stored_name() {
+        let root = CatalogManager::new("datalake", "sales");
+        root.register_catalog("datalake", Arc::new(HmsLikeCatalog));
+        let read = |rule: &str| {
+            let rules = format!(
+                r#"{{"tables": [
+                    {{"user": "alice", "schema": "{rule}", "privileges": ["SELECT"]}},
+                    {{"privileges": []}}
+                ]}}"#
+            );
+            let alice =
+                root.with_access("alice", Arc::new(AccessRules::from_json(&rules).unwrap()));
+            async move {
+                alice
+                    .resolve_table(&TableReference {
+                        catalog: Some("datalake".into()),
+                        schema: Some("SALES".into()),
+                        table: "orders".into(),
+                    })
+                    .await
+            }
+        };
+        assert!(matches!(
+            read("SALES").await.unwrap_err(),
+            CatalogError::SchemaNotFound(_)
+        ));
+        assert!(read("(?i)sales").await.is_ok());
     }
 
     // -- MemoryTable tests --

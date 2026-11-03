@@ -209,7 +209,9 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
         // A refused bearer on `/mcp` under `[oauth]` (an opaque IdP token,
         // an expired or revoked Arneb token) is an `invalid_token` too, so
         // the client refreshes or re-authorizes instead of resending it.
-        None if bearer && challenge.is_some() => {
+        // An empty bearer carries no authentication information, so it
+        // gets no error code (RFC 6750 section 3.1).
+        None if bearer && !value.is_empty() && challenge.is_some() => {
             unauthenticated(state.oauth.as_ref().map(|o| o.invalid_token_challenge()))
         }
         None => unauthenticated(challenge),
@@ -866,6 +868,12 @@ mod tests {
                 Some(invalid),
                 "{bearer}"
             );
+        }
+        // An empty bearer is no credential: the bare discovery challenge.
+        for empty in ["Bearer", "Bearer ", "Bearer   "] {
+            let reply = send(&on, Method::POST, "/mcp", &[("authorization", empty)]).await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{empty:?}");
+            assert_eq!(reply.www_authenticate, mcp.www_authenticate, "{empty:?}");
         }
         let bad_basic = send(
             &on,

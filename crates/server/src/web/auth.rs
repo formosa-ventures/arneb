@@ -774,8 +774,13 @@ mod tests {
     #[tokio::test]
     async fn metadata_document_is_public_and_exact() {
         let state = oauth_state(true);
-        {
-            let path = "/.well-known/oauth-protected-resource/mcp";
+        // The path derived from `resource` (RFC 9728 section 3.1), and the
+        // bare root, which clients that only probe the root fetch: `/mcp`
+        // is the one protected resource.
+        for path in [
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+        ] {
             let req = axum::http::Request::builder()
                 .uri(path)
                 .body(Body::empty())
@@ -799,10 +804,8 @@ mod tests {
                 })
             );
         }
-        // RFC 9728 section 3.3: only the path derived from `resource` (here
-        // `/mcp`); the bare root and any other suffix are a plain 404.
+        // Any other suffix is a plain 404.
         for path in [
-            "/.well-known/oauth-protected-resource",
             "/.well-known/oauth-protected-resource/",
             "/.well-known/oauth-protected-resource/foo",
             "/.well-known/oauth-protected-resource/mcp/extra",

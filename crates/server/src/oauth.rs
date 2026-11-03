@@ -236,7 +236,8 @@ pub struct OAuthValidator {
     challenge: String,
     invalid_token_challenge: String,
     insufficient_scope_challenge: String,
-    /// The one path the metadata document is served at.
+    /// The path derived from `resource` that the metadata document is
+    /// served at (besides the bare well-known path).
     metadata_path: String,
 }
 

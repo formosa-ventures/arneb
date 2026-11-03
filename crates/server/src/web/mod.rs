@@ -136,9 +136,9 @@ pub fn build_router(state: WebState) -> Router {
             .route("/mcp", axum::routing::any(mcp::not_served))
             .route("/mcp/{*rest}", axum::routing::any(mcp::not_served))
     };
-    // Discovery for OAuth clients. The handler answers only at the path
-    // derived from `resource`; everything under the well-known prefix is
-    // otherwise a plain 404 (not the SPA), also when OAuth is off.
+    // Discovery for OAuth clients. The handler answers at the path derived
+    // from `resource` and at the bare prefix; everything else under the
+    // well-known prefix is a plain 404 (not the SPA), also when OAuth is off.
     let metadata_paths = [
         crate::oauth::METADATA_PATH.to_owned(),
         format!("{}/", crate::oauth::METADATA_PATH),

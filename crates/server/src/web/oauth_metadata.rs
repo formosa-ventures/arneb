@@ -9,14 +9,16 @@ use axum::Json;
 use super::WebState;
 
 /// `GET /.well-known/oauth-protected-resource[/…]`. Mounted only when
-/// `[oauth]` is enabled; public (outside `/api/`). Answers only at the path
-/// derived from `resource` (RFC 9728 section 3.3: the document's `resource`
-/// must match the URL it was fetched for); any other path is a plain `404`.
+/// `[oauth]` is enabled; public (outside `/api/`). Answers at the path
+/// derived from `resource` (RFC 9728 section 3.1) and at the bare
+/// well-known path, which clients that only probe the root fetch: `/mcp` is
+/// the server's one protected resource, so the root cannot be ambiguous.
+/// Any other path is a plain `404`.
 pub(super) async fn metadata(State(state): State<WebState>, uri: Uri) -> Response {
     let Some(oauth) = state
         .oauth
         .as_ref()
-        .filter(|o| uri.path() == o.metadata_path())
+        .filter(|o| uri.path() == o.metadata_path() || uri.path() == crate::oauth::METADATA_PATH)
     else {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     };

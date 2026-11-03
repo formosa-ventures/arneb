@@ -794,15 +794,20 @@ catalog as soon as the change returns.
   manages it. Dropping the default catalog is allowed, with a warning that
   unqualified table names then fail.
 - Running queries keep the catalogs they were planned with; a distributed
-  query whose workers can't match the planned catalog version fails instead
-  of mixing. Each statement pins the catalogs and connectors together when it
-  starts, and a change swaps them, with the new catalog generation, as one
-  step. Every distributed task carries the coordinator epoch and generation
-  the query was planned at. A worker on another set pulls the coordinator's
-  set once; if it still differs (the worker is already past that set, or the
-  pull fails), the task fails with `catalog set on worker <id> is at
-  generation N, the query was planned at M; retry the query`. Retrying the
-  query plans it again at the current generation.
+  query that scans a catalog its workers can't match at the planned version
+  fails instead of mixing. Each statement pins the catalogs and connectors
+  together when it starts, and a change swaps them, with the new catalog
+  generation, as one step. Every distributed task carries the version it was
+  planned at: the coordinator epoch and generation, a fingerprint of each
+  catalog's spec, and the default catalog and schema (unqualified table names
+  resolve in those, not in the worker's current defaults). A task checks only
+  the catalogs it scans, so a change to another catalog never fails it. A
+  worker whose copy of a scanned catalog has another fingerprint pulls the
+  coordinator's set once; if it still differs (the worker is already past
+  that version, or the pull fails), the task fails with `catalog '<name>' on
+  worker <id> is not the version the query was planned with (worker at
+  generation N, query planned at M); retry the query`. Retrying the query
+  plans it again at the current version.
 
 ```bash
 curl -s -H "$H" -X POST "$B/catalog-configs?dry_run=true" \

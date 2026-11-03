@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 
 use arneb_common::error::ConnectorError;
 use arneb_common::types::{ColumnInfo, TableReference};
+use arneb_common::CatalogVersion;
 use arneb_execution::DataSource;
 use async_trait::async_trait;
 
@@ -81,11 +82,12 @@ pub struct ConnectorRegistry {
     /// Written across a [`swap`](Self::swap), read across a
     /// [`pinned`](Self::pinned) snapshot.
     swaps: RwLock<()>,
-    /// The `(epoch, generation)` of the catalog set these factories belong
-    /// to, as the runtime catalog manager tagged them; `None` until it
-    /// does. A [`pinned`](Self::pinned) copy keeps the tag it was taken
-    /// with.
-    version: RwLock<Option<(u64, u64)>>,
+    /// The version of the catalog set these factories belong to (its
+    /// `(epoch, generation)`, each catalog's fingerprint and the default
+    /// catalog and schema), as the runtime catalog manager tagged them;
+    /// `None` until it does. A [`pinned`](Self::pinned) copy keeps the tag
+    /// it was taken with.
+    version: RwLock<Option<Arc<CatalogVersion>>>,
 }
 
 impl ConnectorRegistry {
@@ -120,17 +122,20 @@ impl ConnectorRegistry {
             .cloned()
     }
 
-    /// Tags the registry with the `(epoch, generation)` of the catalog set
-    /// it now holds. Call it inside the [`swap`](Self::swap) that installs
-    /// the set, so a pinned copy never pairs one set's factories with
-    /// another's tag.
-    pub fn set_version(&self, version: Option<(u64, u64)>) {
-        *self.version.write().unwrap_or_else(|p| p.into_inner()) = version;
+    /// Tags the registry with the version of the catalog set it now
+    /// holds. Call it inside the [`swap`](Self::swap) that installs the
+    /// set, so a pinned copy never pairs one set's factories with another's
+    /// tag.
+    pub fn set_version(&self, version: Option<CatalogVersion>) {
+        *self.version.write().unwrap_or_else(|p| p.into_inner()) = version.map(Arc::new);
     }
 
-    /// The `(epoch, generation)` tag ([`set_version`](Self::set_version)).
-    pub fn version(&self) -> Option<(u64, u64)> {
-        *self.version.read().unwrap_or_else(|p| p.into_inner())
+    /// The version tag ([`set_version`](Self::set_version)).
+    pub fn version(&self) -> Option<Arc<CatalogVersion>> {
+        self.version
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Runs `f`, which registers or removes connectors together with their
@@ -202,16 +207,21 @@ mod tests {
         let registry = ConnectorRegistry::new();
         let old: Arc<dyn ConnectorFactory> = Arc::new(DummyFactory);
         registry.register("c", Arc::clone(&old));
-        registry.set_version(Some((1, 4)));
+        let version = |generation| CatalogVersion {
+            epoch: 1,
+            generation,
+            ..Default::default()
+        };
+        registry.set_version(Some(version(4)));
         let (pinned, seen) = registry.pinned(|| 7);
         assert_eq!(seen, 7);
         registry.swap(|| {
             registry.register("c", Arc::new(DummyFactory));
             registry.register("d", Arc::new(DummyFactory));
-            registry.set_version(Some((1, 5)));
+            registry.set_version(Some(version(5)));
         });
-        assert_eq!(pinned.version(), Some((1, 4)));
-        assert_eq!(registry.version(), Some((1, 5)));
+        assert_eq!(pinned.version().unwrap().generation, 4);
+        assert_eq!(registry.version().unwrap().generation, 5);
         assert!(Arc::ptr_eq(&pinned.get("c").unwrap(), &old));
         assert!(pinned.get("d").is_none());
         assert!(!Arc::ptr_eq(&registry.get("c").unwrap(), &old));

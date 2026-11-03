@@ -87,6 +87,23 @@ pub struct ApplyReport {
     pub failed: Vec<(String, String)>,
 }
 
+/// What an applied set commits besides its installs and removes.
+struct SetCommit {
+    /// The set's catalogs that failed to build (Ruling R8).
+    failed: std::collections::BTreeSet<String>,
+    /// The fingerprint of each of the set's catalogs, as its sender serves
+    /// it; recorded for the installed ones, changed or not.
+    fingerprints: BTreeMap<String, u64>,
+    /// The coordinator's default catalog and schema, when the set carries
+    /// them (Ruling R12).
+    defaults: Option<(String, String)>,
+}
+
+/// The fingerprint of a served spec's JSON.
+fn value_fingerprint(value: &serde_json::Value) -> u64 {
+    arneb_common::spec_fingerprint(&value.to_string())
+}
+
 impl ApplyReport {
     fn stale() -> Self {
         Self {
@@ -103,6 +120,12 @@ pub struct LiveCatalogs {
     global_storage: StorageConfig,
     /// The installed specs, by name.
     specs: RwLock<BTreeMap<String, CatalogConfig>>,
+    /// The fingerprint of each installed spec as the coordinator serves it
+    /// ([`arneb_common::spec_fingerprint`] of its effective spec's JSON):
+    /// on a worker the coordinator's own, so both sides agree. Part of the
+    /// registry's version tag; a task scans a catalog only at the
+    /// fingerprint its query was planned with.
+    fingerprints: RwLock<BTreeMap<String, u64>>,
     generation: AtomicU64,
     /// On a coordinator, its own epoch (ordered by start time); on a worker, the
     /// epoch of the coordinator its set came from (0 before the first).
@@ -173,6 +196,7 @@ impl LiveCatalogs {
             connectors,
             global_storage,
             specs: RwLock::new(BTreeMap::new()),
+            fingerprints: RwLock::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
             failed: RwLock::new(Default::default()),
@@ -256,16 +280,40 @@ impl LiveCatalogs {
     }
 
     /// Moves to `generation` (and `epoch`, when given) and tags the
-    /// registry with both. Only inside a [`ConnectorRegistry::swap`].
-    /// Generation before epoch: a reader seeing the new epoch also sees the
-    /// generation that goes with it.
+    /// registry with both, each catalog's fingerprint and the scan
+    /// defaults. Only inside a [`ConnectorRegistry::swap`], after the
+    /// catalogs, fingerprints and defaults changed. Generation before
+    /// epoch: a reader seeing the new epoch also sees the generation that
+    /// goes with it.
     fn store_version(&self, epoch: Option<u64>, generation: u64) {
         self.generation.store(generation, Ordering::SeqCst);
         if let Some(e) = epoch {
             self.epoch.store(e, Ordering::SeqCst);
         }
+        let (default_catalog, default_schema) = self.scan_defaults();
         self.connectors
-            .set_version(Some((self.epoch(), self.generation())));
+            .set_version(Some(arneb_common::CatalogVersion {
+                epoch: self.epoch(),
+                generation: self.generation(),
+                catalogs: self
+                    .fingerprints
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone(),
+                default_catalog,
+                default_schema,
+            }));
+    }
+
+    /// `spec` as served to workers ([`snapshot`](Self::snapshot)): its
+    /// effective spec as JSON.
+    fn served_value(&self, spec: &CatalogConfig) -> Option<serde_json::Value> {
+        serde_json::to_value(self.effective_spec(spec)).ok()
+    }
+
+    /// The fingerprint of `spec` as this node serves it.
+    fn fingerprint(&self, spec: &CatalogConfig) -> u64 {
+        value_fingerprint(&self.served_value(spec).unwrap_or_default())
     }
 
     /// The `(epoch, generation)` a [`ConnectorRegistry::pinned`] copy of
@@ -388,7 +436,7 @@ impl LiveCatalogs {
             .consistent(|| (self.epoch(), self.generation(), self.specs()));
         let catalogs = specs
             .iter()
-            .filter_map(|spec| serde_json::to_value(self.effective_spec(spec)).ok())
+            .filter_map(|spec| self.served_value(spec))
             .collect();
         arneb_rpc::CatalogSet {
             epoch,
@@ -420,8 +468,11 @@ impl LiveCatalogs {
                 .and_then(|n| n.as_str())
                 .unwrap_or("<unnamed>")
                 .to_owned();
+            // The coordinator's fingerprint: of the JSON it served, which
+            // is what it tagged its own registry with.
+            let fingerprint = value_fingerprint(&value);
             match serde_json::from_value::<CatalogConfig>(value) {
-                Ok(spec) => specs.push(spec),
+                Ok(spec) => specs.push((spec, fingerprint)),
                 Err(e) => {
                     // Only the error's category: its text may quote a value.
                     tracing::warn!(
@@ -433,15 +484,13 @@ impl LiveCatalogs {
                 }
             }
         }
-        let mut report = self.apply(Some(set.epoch), set.generation, specs).await;
+        // The defaults go in with the catalogs, under the same tag.
+        let defaults = set.default_catalog.zip(set.default_schema);
+        let mut report = self
+            .apply(Some(set.epoch), set.generation, specs, defaults)
+            .await;
         if report.applied {
             report.failed.extend(undecodable);
-            if let (Some(catalog), Some(schema)) = (set.default_catalog, set.default_schema) {
-                *self
-                    .pushed_defaults
-                    .write()
-                    .unwrap_or_else(|p| p.into_inner()) = Some((catalog, schema));
-            }
         }
         report
     }
@@ -549,16 +598,15 @@ impl LiveCatalogs {
         self.commit_at(None, generation, installs, removes, None);
     }
 
-    /// [`commit`](Self::commit) that also moves to `epoch` (when given) and,
-    /// when `failed` is given, records it as the catalogs of the set that
-    /// failed to build.
+    /// [`commit`](Self::commit) that also moves to `epoch` (when given) and
+    /// commits what `set` adds when given (an applied set).
     fn commit_at(
         &self,
         epoch: Option<u64>,
         generation: u64,
         installs: Vec<(CatalogConfig, BuiltCatalog)>,
         removes: &[String],
-        failed: Option<std::collections::BTreeSet<String>>,
+        set: Option<SetCommit>,
     ) {
         self.connectors.swap(|| {
             for (spec, built) in installs {
@@ -567,8 +615,22 @@ impl LiveCatalogs {
             for name in removes {
                 self.remove_unswapped(name);
             }
-            if let Some(failed) = failed {
-                *self.failed.write().unwrap_or_else(|p| p.into_inner()) = failed;
+            if let Some(set) = set {
+                *self.failed.write().unwrap_or_else(|p| p.into_inner()) = set.failed;
+                let installed = self.read_specs();
+                let mut fingerprints = self.fingerprints.write().unwrap_or_else(|p| p.into_inner());
+                for (name, fingerprint) in set.fingerprints {
+                    if installed.contains_key(&name) {
+                        fingerprints.insert(name, fingerprint);
+                    }
+                }
+                drop((installed, fingerprints));
+                if let Some(defaults) = set.defaults {
+                    *self
+                        .pushed_defaults
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(defaults);
+                }
             }
             self.store_version(epoch, generation);
         });
@@ -582,6 +644,11 @@ impl LiveCatalogs {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&name);
+        let fingerprint = self.fingerprint(&spec);
+        self.fingerprints
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(name.clone(), fingerprint);
         self.write_specs().insert(name, spec);
     }
 
@@ -589,6 +656,10 @@ impl LiveCatalogs {
         if self.write_specs().remove(name).is_none() {
             return false;
         }
+        self.fingerprints
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(name);
         self.manager.deregister_catalog(name);
         self.connectors.deregister(name);
         true
@@ -604,7 +675,14 @@ impl LiveCatalogs {
     /// missing, retries the build once and otherwise fails). The rest
     /// still apply and the generation still advances.
     pub async fn apply_set(&self, generation: u64, specs: Vec<CatalogConfig>) -> ApplyReport {
-        self.apply(None, generation, specs).await
+        let specs = specs
+            .into_iter()
+            .map(|spec| {
+                let fingerprint = self.fingerprint(&spec);
+                (spec, fingerprint)
+            })
+            .collect();
+        self.apply(None, generation, specs, None).await
     }
 
     /// [`apply_set`](Self::apply_set), except that a set from `epoch` other
@@ -623,11 +701,16 @@ impl LiveCatalogs {
     /// Concurrent applies of the same `(epoch, generation)` (a push and a
     /// heartbeat-triggered pull of one change) share one run and its
     /// report, so each changed catalog is built once.
+    ///
+    /// Each spec comes with its fingerprint as the coordinator serves it,
+    /// and `defaults` (the coordinator's default catalog and schema) are
+    /// committed with the catalogs when given.
     async fn apply(
         &self,
         epoch: Option<u64>,
         generation: u64,
-        specs: Vec<CatalogConfig>,
+        specs: Vec<(CatalogConfig, u64)>,
+        defaults: Option<(String, String)>,
     ) -> ApplyReport {
         let key = (epoch, generation);
         let flight = self
@@ -638,7 +721,7 @@ impl LiveCatalogs {
             .or_default()
             .clone();
         let report = flight
-            .get_or_init(|| self.apply_once(epoch, generation, specs))
+            .get_or_init(|| self.apply_once(epoch, generation, specs, defaults))
             .await
             .clone();
         let mut flights = self.apply_flights.lock().unwrap_or_else(|p| p.into_inner());
@@ -652,8 +735,14 @@ impl LiveCatalogs {
         &self,
         epoch: Option<u64>,
         generation: u64,
-        specs: Vec<CatalogConfig>,
+        specs: Vec<(CatalogConfig, u64)>,
+        defaults: Option<(String, String)>,
     ) -> ApplyReport {
+        let fingerprints: BTreeMap<String, u64> = specs
+            .iter()
+            .map(|(spec, fingerprint)| (spec.name.clone(), *fingerprint))
+            .collect();
+        let specs: Vec<CatalogConfig> = specs.into_iter().map(|(spec, _)| spec).collect();
         if self.stale_epoch(epoch) {
             return ApplyReport::stale();
         }
@@ -744,7 +833,11 @@ impl LiveCatalogs {
                 generation,
                 installs,
                 &removes,
-                Some(failed.keys().cloned().collect()),
+                Some(SetCommit {
+                    failed: failed.keys().cloned().collect(),
+                    fingerprints,
+                    defaults,
+                }),
             );
             return ApplyReport {
                 applied: true,
@@ -1413,6 +1506,11 @@ fn query_passwords_from(
 mod tests {
     use super::*;
     use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory};
+
+    /// A registry tag's `(epoch, generation)`.
+    pub(crate) fn eg(tag: Option<Arc<arneb_common::CatalogVersion>>) -> Option<(u64, u64)> {
+        tag.map(|t| (t.epoch, t.generation))
+    }
 
     fn spec(json: serde_json::Value) -> CatalogConfig {
         serde_json::from_value(json).unwrap()
@@ -2469,23 +2567,78 @@ mod tests {
         assert!(checked > 0);
     }
 
+    /// Round 4: a worker's tag carries the coordinator's fingerprint of
+    /// each catalog after the set crossed the wire, even when the
+    /// coordinator merged its global `[storage]` in and the worker has a
+    /// `[storage]` of its own; an unchanged catalog keeps its fingerprint
+    /// across generations, a changed one gets a new one.
+    #[tokio::test]
+    async fn worker_and_coordinator_agree_on_each_catalog_fingerprint() {
+        let storage = |region: &str| -> StorageConfig {
+            serde_json::from_value(serde_json::json!({"s3": {"region": region}})).unwrap()
+        };
+        let coordinator_registry = Arc::new(ConnectorRegistry::new());
+        let coordinator = LiveCatalogs::with_test_builder_and_storage(
+            Arc::new(CatalogManager::new("lake", "tpch")),
+            coordinator_registry.clone(),
+            storage("us-east-1"),
+            Box::new(|_| Ok(fake_built())),
+        );
+        coordinator.set_epoch(4);
+        let pg = spec(serde_json::json!({
+            "name": "pg", "type": "postgresql", "connection_url": "postgresql://u@h/db"
+        }));
+        coordinator.commit(
+            1,
+            vec![(hive("lake"), fake_built()), (pg, fake_built())],
+            &[],
+        );
+        let worker_registry = Arc::new(ConnectorRegistry::new());
+        let worker = LiveCatalogs::with_test_builder_and_storage(
+            Arc::new(CatalogManager::new("memory", "default")),
+            worker_registry.clone(),
+            storage("eu-west-1"),
+            Box::new(|_| Ok(fake_built())),
+        );
+        let wire = arneb_rpc::CatalogSet::decode(&coordinator.snapshot().encode()).unwrap();
+        assert!(worker.apply_remote(wire).await.applied);
+        let (planned, held) = (
+            coordinator_registry.version().unwrap(),
+            worker_registry.version().unwrap(),
+        );
+        assert_eq!(planned.catalogs.len(), 2);
+        assert_eq!(
+            held, planned,
+            "same fingerprints, epoch, generation and defaults"
+        );
+        assert_eq!(held.default_catalog, "lake");
+        // A change to `pg` alone leaves `lake`'s fingerprint as it was.
+        let pg2 = spec(serde_json::json!({
+            "name": "pg", "type": "postgresql", "connection_url": "postgresql://u@h2/db"
+        }));
+        coordinator.commit(2, vec![(pg2, fake_built())], &[]);
+        let after = coordinator_registry.version().unwrap();
+        assert_eq!(after.catalog("lake"), planned.catalog("lake"));
+        assert_ne!(after.catalog("pg"), planned.catalog("pg"));
+    }
+
     /// Every change moves the registry's `(epoch, generation)` tag in the
     /// same swap as the connectors, so a pinned copy names the set it holds.
     #[tokio::test]
     async fn the_registry_tag_follows_every_change() {
         let (live, _, connectors) = live();
         live.set_epoch(5);
-        assert_eq!(connectors.version(), Some((5, 0)));
+        assert_eq!(eg(connectors.version()), Some((5, 0)));
         live.commit(3, vec![(hive("a"), fake_built())], &[]);
-        assert_eq!(connectors.version(), Some((5, 3)));
+        assert_eq!(eg(connectors.version()), Some((5, 3)));
         let (pinned, _) = connectors.pinned(|| ());
         live.commit(4, Vec::new(), &["a".to_owned()]);
-        assert_eq!(connectors.version(), Some((5, 4)));
+        assert_eq!(eg(connectors.version()), Some((5, 4)));
         assert!(connectors.get("a").is_none());
-        assert_eq!(pinned.version(), Some((5, 3)));
+        assert_eq!(eg(pinned.version()), Some((5, 3)));
         assert!(pinned.get("a").is_some());
         assert!(live.apply_set(6, vec![hive("b")]).await.applied);
-        assert_eq!(connectors.version(), Some((5, 6)));
+        assert_eq!(eg(connectors.version()), Some((5, 6)));
         assert_eq!(live.version(), (5, 6));
     }
 

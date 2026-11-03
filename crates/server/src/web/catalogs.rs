@@ -485,12 +485,12 @@ pub(super) async fn drop_catalog_for(
     run_manage(state, who, grant, dry_run, action).await
 }
 
-/// The `warning` of an update of a config-seeded catalog (Ruling R9).
 /// What an update or drop preview says about running queries.
 const PINNING: &str = "running queries keep the catalogs they were planned with; a \
-     distributed query whose workers cannot match the planned catalog version fails instead \
-     of mixing";
+     distributed query that scans this catalog fails instead of mixing versions when its \
+     workers cannot match the planned one, and queries that do not scan it are not affected";
 
+/// The `warning` of an update of a config-seeded catalog (Ruling R9).
 const DETACH_WARNING: &str = "the config file no longer manages this catalog: its \
      [[catalogs]] entry stops applying, and every start logs a WARN while the entry differs";
 

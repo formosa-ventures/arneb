@@ -948,6 +948,7 @@ impl McpConfig {
 /// jwks_min_refresh_secs  = 30                                  # ARNEB_OAUTH_JWKS_MIN_REFRESH_SECS
 /// jwks_max_stale_secs    = 86400                               # ARNEB_OAUTH_JWKS_MAX_STALE_SECS (>= jwks_cache_secs)
 /// require_access_token_typ = false                             # ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP
+/// allow_missing_email_verified = false                         # ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -979,6 +980,11 @@ pub struct OAuthConfig {
     pub jwks_max_stale_secs: u64,
     /// Accept only tokens whose header `typ` is `at+jwt` (RFC 9068).
     pub require_access_token_typ: bool,
+    /// Accept a user name that is an email address from a token without
+    /// `email_verified` (an IdP such as Entra ID that never sends it). Not
+    /// for `user_claim = "email"`; `email_verified: false` is always
+    /// refused.
+    pub allow_missing_email_verified: bool,
 }
 
 impl Default for OAuthConfig {
@@ -995,6 +1001,7 @@ impl Default for OAuthConfig {
             jwks_min_refresh_secs: 30,
             jwks_max_stale_secs: 86400,
             require_access_token_typ: false,
+            allow_missing_email_verified: false,
         }
     }
 }
@@ -1091,6 +1098,10 @@ impl OAuthConfig {
         if let Some(v) = get("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP") {
             self.require_access_token_typ =
                 parse_env_bool("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP", &v)?;
+        }
+        if let Some(v) = get("ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED") {
+            self.allow_missing_email_verified =
+                parse_env_bool("ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED", &v)?;
         }
         Ok(())
     }
@@ -2893,6 +2904,7 @@ pgwire = "required"
             (60, 3600, 30, 86400)
         );
         assert!(!c.require_access_token_typ);
+        assert!(!c.allow_missing_email_verified);
         assert_eq!(oauth("port = 5432", &[]).unwrap(), c);
     }
 
@@ -2933,6 +2945,15 @@ pgwire = "required"
             err.contains("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP"),
             "{err}"
         );
+        let c = oauth(file, &[("ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED", "on")]).unwrap();
+        assert!(c.allow_missing_email_verified);
+        let c = oauth(
+            "[oauth]\nissuer = \"https://a\"\nresource = \"https://a/mcp\"\n\
+             allow_missing_email_verified = true\n",
+            &[("ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED", "false")],
+        )
+        .unwrap();
+        assert!(!c.allow_missing_email_verified);
     }
 
     #[test]

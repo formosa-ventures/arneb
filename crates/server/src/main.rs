@@ -1179,8 +1179,17 @@ async fn run() -> Result<()> {
                 jwks_min_refresh_secs = o.jwks_min_refresh.as_secs(),
                 jwks_max_stale_secs = o.jwks_max_stale.as_secs(),
                 require_access_token_typ = o.require_access_token_typ,
+                allow_missing_email_verified = o.allow_missing_email_verified,
                 "oauth effective settings ([oauth] / ARNEB_OAUTH_*)"
             );
+            if o.allow_missing_email_verified {
+                tracing::warn!(
+                    target: "arneb::config",
+                    "[oauth] allow_missing_email_verified is on: an email-address user name from \
+                     a token without email_verified is trusted, so the identity provider must \
+                     never issue an address its owner has not proven"
+                );
+            }
             if o.user_claim != "sub" {
                 tracing::warn!(
                     target: "arneb::config",

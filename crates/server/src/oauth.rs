@@ -3,8 +3,8 @@
 //!
 //! [`OAuthValidator`] holds a cache of the IdP's signing keys (by `kid`) and
 //! checks signature, algorithm, `iss`, `aud`, `exp`, `nbf`, that the token
-//! is an access token (not an OIDC ID token), the user claim and the
-//! required scopes. Only asymmetric algorithms are accepted (RS256/384/512,
+//! is an access token (not an OIDC ID token), the user claim (with
+//! `email_verified` for an email address) and the required scopes. Only asymmetric algorithms are accepted (RS256/384/512,
 //! PS256, ES256/384); `none` and HS* are always refused.
 //!
 //! Key refreshes run in a detached task (single-flight, at most one start
@@ -72,6 +72,10 @@ pub struct OAuthSettings {
     /// Require the `at+jwt` header `typ` (RFC 9068); off by default because
     /// many IdPs send `typ: JWT` on access tokens.
     pub require_access_token_typ: bool,
+    /// Accept an email-shaped user (other than from `user_claim = "email"`)
+    /// from a token without `email_verified`; an explicit non-`true` value
+    /// is refused regardless.
+    pub allow_missing_email_verified: bool,
 }
 
 /// Why an [`OAuthConfig`] cannot become [`OAuthSettings`].
@@ -110,6 +114,7 @@ impl TryFrom<&OAuthConfig> for OAuthSettings {
             jwks_min_refresh: Duration::from_secs(c.jwks_min_refresh_secs),
             jwks_max_stale: Duration::from_secs(c.jwks_max_stale_secs),
             require_access_token_typ: c.require_access_token_typ,
+            allow_missing_email_verified: c.allow_missing_email_verified,
         })
     }
 }
@@ -142,7 +147,8 @@ pub enum OAuthReject {
     /// A valid token that lacks a required scope.
     #[error("insufficient scope")]
     InsufficientScope,
-    /// `user_claim = "email"` and the token's `email_verified` is not true.
+    /// The user is an email address (or `user_claim = "email"`) and the
+    /// token's `email_verified` is not true.
     #[error("email not verified")]
     UnverifiedEmail,
     /// The signing keys could not be fetched, so no verdict is possible.
@@ -383,12 +389,17 @@ impl OAuthValidator {
             .ok_or(OAuthReject::Invalid("no_user_claim"))?
             .to_owned();
         // An unverified address can be anyone's (self-registration, social
-        // login), so it must not name an Arneb user.
-        if settings.user_claim == "email" {
+        // login), so it must not name an Arneb user, whichever claim
+        // carries it (`email`, `preferred_username`, `upn`, a namespaced
+        // claim, ...).
+        if settings.user_claim == "email" || user.contains('@') {
             let verified = match claims.get("email_verified") {
                 Some(serde_json::Value::Bool(b)) => *b,
                 Some(serde_json::Value::String(s)) => s == "true",
-                _ => false,
+                Some(_) => false,
+                // The IdP does not say (Entra ID never does): only an
+                // explicit opt-in trusts it, and never for `email`.
+                None => settings.allow_missing_email_verified && settings.user_claim != "email",
             };
             if !verified {
                 return Err(OAuthReject::UnverifiedEmail);
@@ -1198,6 +1209,7 @@ mod tests {
             jwks_min_refresh: Duration::from_secs(30),
             jwks_max_stale: Duration::from_secs(86400),
             require_access_token_typ: false,
+            allow_missing_email_verified: false,
         }
     }
 
@@ -1902,10 +1914,79 @@ mod tests {
                 "alice@corp.example"
             );
         }
-        // Other claims do not look at email_verified.
+        // The opt-in for a missing email_verified never covers `email`.
+        let v = validator(&idp, |s| {
+            s.user_claim = "email".into();
+            s.allow_missing_email_verified = true;
+        });
+        c.as_object_mut().unwrap().remove("email_verified");
+        assert_eq!(
+            v.validate(&key.sign(&c)).await.unwrap_err(),
+            OAuthReject::UnverifiedEmail
+        );
+        // A user name that is not an address does not look at it.
         let v = validator(&idp, |s| s.user_claim = "preferred_username".into());
         c["email_verified"] = json!(false);
         assert_eq!(v.validate(&key.sign(&c)).await.unwrap().user, "alice");
+    }
+
+    #[tokio::test]
+    async fn an_email_address_under_any_claim_needs_a_verified_email() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        // Keycloak "email as username", Entra `upn`, an Auth0 namespaced
+        // claim, and even `sub`: an address is checked whatever its claim.
+        for claim in [
+            "preferred_username",
+            "upn",
+            "https://corp.example/email",
+            "sub",
+        ] {
+            let v = validator(&idp, |s| s.user_claim = claim.into());
+            let mut c = claims(&idp.issuer(), AUD);
+            c[claim] = json!("alice@corp.example");
+            for (verified, ok) in [
+                (None, false),
+                (Some(json!(false)), false),
+                (Some(json!("false")), false),
+                (Some(json!(true)), true),
+                (Some(json!("true")), true),
+            ] {
+                match &verified {
+                    Some(b) => c["email_verified"] = b.clone(),
+                    None => {
+                        c.as_object_mut().unwrap().remove("email_verified");
+                    }
+                }
+                let got = v.validate(&key.sign(&c)).await;
+                if ok {
+                    assert_eq!(got.unwrap().user, "alice@corp.example", "{claim}");
+                } else {
+                    assert_eq!(
+                        got.unwrap_err(),
+                        OAuthReject::UnverifiedEmail,
+                        "{claim} {verified:?}"
+                    );
+                }
+            }
+            // The opt-in accepts a missing claim, never a false one.
+            let lax = validator(&idp, |s| {
+                s.user_claim = claim.into();
+                s.allow_missing_email_verified = true;
+            });
+            c.as_object_mut().unwrap().remove("email_verified");
+            assert_eq!(
+                lax.validate(&key.sign(&c)).await.unwrap().user,
+                "alice@corp.example",
+                "{claim}"
+            );
+            c["email_verified"] = json!(false);
+            assert_eq!(
+                lax.validate(&key.sign(&c)).await.unwrap_err(),
+                OAuthReject::UnverifiedEmail,
+                "{claim}"
+            );
+        }
     }
 
     #[test]

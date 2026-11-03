@@ -757,6 +757,7 @@ mod tests {
                     jwks_min_refresh: std::time::Duration::from_secs(30),
                     jwks_max_stale: std::time::Duration::from_secs(86400),
                     require_access_token_typ: false,
+                    allow_missing_email_verified: false,
                 },
             )));
         }
@@ -890,6 +891,7 @@ mod tests {
                 jwks_min_refresh: std::time::Duration::from_secs(30),
                 jwks_max_stale: std::time::Duration::from_secs(86400),
                 require_access_token_typ: false,
+                allow_missing_email_verified: false,
             })));
             Self { state, idp, key }
         }

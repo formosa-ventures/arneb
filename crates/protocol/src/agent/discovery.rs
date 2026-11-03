@@ -406,7 +406,8 @@ async fn listed_miss(
         Ok(Some(s)) if s == schema || after_query => s.to_string(),
         Ok(_) => return None,
     };
-    let tables = table_names(root, &catalog, &schema).await?;
+    // An unreachable source is not a sure miss: the query decides.
+    let tables = table_names(root, &catalog, &schema).await.ok()??;
     match level(table, &tables) {
         Err(()) => Some(table_missing(&catalog, &schema, table, &tables)),
         Ok(_) => None,
@@ -491,7 +492,12 @@ async fn tables_of(
 ) -> Result<Vec<String>, AgentError> {
     let schemas = schemas_of(root, catalog).await?;
     match table_names(root, catalog, schema).await {
-        Some(names) if schemas.iter().any(|s| s == schema) => Ok(names),
+        Ok(Some(names)) if schemas.iter().any(|s| s == schema) => Ok(names),
+        Err(e) => Err(AgentError::new(
+            AgentErrorCode::QueryFailed,
+            format!("cannot list the tables of {catalog}.{schema}: {e}"),
+        )
+        .with_hint("the source is unreachable; retry later")),
         _ => Err(schema_missing(catalog, schema, &schemas)),
     }
 }
@@ -555,6 +561,9 @@ mod tests {
                 nullable: false,
             }]
         }
+        fn canonical_name(&self) -> Option<(String, String)> {
+            None
+        }
         fn statistics(&self) -> Option<TableStatistics> {
             Some(TableStatistics {
                 row_count: Some(42),
@@ -574,6 +583,9 @@ mod tests {
         }
         async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
             (name == "stat").then(|| Arc::new(StatsTable) as Arc<dyn TableProvider>)
+        }
+        fn canonical_name(&self) -> Option<String> {
+            None
         }
     }
 
@@ -805,6 +817,9 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             StatsSchema.table(name).await
         }
+        fn canonical_name(&self) -> Option<String> {
+            None
+        }
     }
 
     #[derive(Debug)]
@@ -899,10 +914,29 @@ mod tests {
         }
         async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
             let lower = name.to_lowercase();
+            let exact = self.tables.iter().find(|t| *t == name);
             let mut ci = self.tables.iter().filter(|t| t.to_lowercase() == lower);
-            let found = self.tables.iter().any(|t| t == name)
-                || (ci.next().is_some() && ci.next().is_none());
-            found.then(|| Arc::new(StatsTable) as Arc<dyn TableProvider>)
+            let stored = match (exact, ci.next(), ci.next()) {
+                (Some(t), _, _) | (None, Some(t), None) => t.clone(),
+                _ => return None,
+            };
+            Some(Arc::new(StoredTable(stored)) as Arc<dyn TableProvider>)
+        }
+        fn canonical_name(&self) -> Option<String> {
+            Some("public".into())
+        }
+    }
+
+    /// A [`StatsTable`] that reports the stored name it was resolved to.
+    #[derive(Debug)]
+    struct StoredTable(String);
+
+    impl TableProvider for StoredTable {
+        fn schema(&self) -> Vec<ColumnInfo> {
+            StatsTable.schema()
+        }
+        fn canonical_name(&self) -> Option<(String, String)> {
+            Some(("public".into(), self.0.clone()))
         }
     }
 

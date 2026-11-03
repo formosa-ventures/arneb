@@ -151,6 +151,9 @@ mod tests {
         fn schema(&self) -> Vec<ColumnInfo> {
             columns()
         }
+        fn canonical_name(&self) -> Option<(String, String)> {
+            None
+        }
         fn statistics(&self) -> Option<TableStatistics> {
             Some(TableStatistics {
                 row_count: Some(self.0 / 10),
@@ -174,6 +177,9 @@ mod tests {
                 "b" => Some(Arc::new(SizedTable(240))),
                 _ => None,
             }
+        }
+        fn canonical_name(&self) -> Option<String> {
+            None
         }
     }
 

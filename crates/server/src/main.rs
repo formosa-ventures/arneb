@@ -1364,6 +1364,7 @@ async fn run() -> Result<()> {
         result = server.start(), if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "pgwire server error");
+                web::flush_audit(Arc::clone(&audit_for_shutdown)).await;
                 bail!("server error: {e}");
             }
         }
@@ -1371,6 +1372,7 @@ async fn run() -> Result<()> {
         result = arneb_rpc::start_flight_server(&rpc_addr_clone, flight_state_clone) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "flight server error");
+                web::flush_audit(Arc::clone(&audit_for_shutdown)).await;
                 bail!("flight server error: {e}");
             }
         }
@@ -1425,7 +1427,8 @@ async fn run() -> Result<()> {
             drain_timeout_secs,
         ) => {}
     }
-    // Completions whose write failed get one last try before exiting.
+    // Completions whose write failed get one last try before exiting (the
+    // fatal server errors above flush too).
     web::flush_audit(audit_for_shutdown).await;
 
     Ok(())

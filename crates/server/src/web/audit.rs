@@ -8,8 +8,10 @@
 //! is completed as `interrupted`: it may or may not have been applied). A failed completion cannot undo the
 //! action, so it goes to the ERROR log, the log is marked unwritable and
 //! keeps the completion, and the action's real result is returned; the next
-//! audited action reopens the log, which first appends the kept completion,
-//! and is refused when that fails. So every applied action has at least its
+//! audited action, the background retry ([`spawn_audit_retry`], every 5 s)
+//! or the shutdown flush ([`flush_audit`]) reopens the log, which first
+//! appends the kept completion; an audited action is refused while that
+//! fails. So every applied action has at least its
 //! intent on disk: a crash before its completion is written leaves it
 //! `pending`, and the next start reports it at WARN on `arneb::audit` and
 //! records it as `interrupted`.
@@ -71,16 +73,18 @@ pub(crate) async fn flush_audit(audit: std::sync::Arc<arneb_state::AuditLog>) {
         return;
     }
     let log = std::sync::Arc::clone(&audit);
-    let flushed = tokio::task::spawn_blocking(move || log.ensure_writable()).await;
-    if let Ok(Err(e)) = flushed {
-        tracing::error!(
-            target: "arneb::audit",
-            error = %e,
-            completions = audit.unwritten_completions(),
-            "shutting down with audit completions that could not be written; \
-             the next start records their actions as interrupted"
-        );
-    }
+    let error = match tokio::task::spawn_blocking(move || log.ensure_writable()).await {
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => format!("the flush task failed: {e}"),
+    };
+    tracing::error!(
+        target: "arneb::audit",
+        error = %error,
+        completions = audit.unwritten_completions(),
+        "shutting down with audit completions that could not be written; \
+         the next start records their actions as interrupted"
+    );
 }
 
 /// Entries returned when the request names no `limit`.

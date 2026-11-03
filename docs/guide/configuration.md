@@ -986,9 +986,11 @@ the response returns. Read it with
   file can be written again. The server keeps that completion and appends
   it first when the log reopens, so the known outcome still reaches the
   file. It tries to reopen the log every 5 seconds in the background (no
-  audited action is needed), and once more at a graceful shutdown; a
+  audited action is needed), and once more when the server exits (a
+  graceful shutdown, or a fatal pgwire or Flight listener error); a
   completion still unwritten then is logged at ERROR and its action is
-  recorded as `interrupted` at the next start. An action that panics is completed as `interrupted`, since the
+  recorded as `interrupted` at the next start. A manage action still running
+  when the server exits is not waited for. An action that panics is completed as `interrupted`, since the
   panic may come after the action took effect. A `token.issue` that failed
   has an empty `target`: its token id never became a token.
 - **Interrupted actions.** An intent with no completion at startup (the

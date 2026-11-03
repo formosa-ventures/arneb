@@ -76,22 +76,31 @@ impl PostgresConfig {
         if at_outside_authority(&self.connection_url) {
             return Err(AMBIGUOUS_AT.into());
         }
+        // The driver ends a query value at the next `&`, so in
+        // `?password=Xy&host=9zK` the tail of a password with a raw `&`
+        // becomes a real parameter (here a host). Where such a password
+        // ends cannot be told: the password must be the last parameter.
+        if query_password_not_last(&self.connection_url) {
+            return Err(QUERY_PASSWORD_NOT_LAST.into());
+        }
         let mut config = tokio_postgres::Config::from_str(&self.connection_url)
             .map_err(|_| "invalid connection_url".to_string())?;
         // A second `@` inside the authority lands in the host, and any
         // other split in the wrong place leaves a URL delimiter in the
-        // parsed user or host. Checked before `self.user` applies. The
-        // parsed password needs no check: with the `@` inside the authority
-        // it is exactly what the URL wrote, and a decoded `%2F` or `%3D`
-        // (base64-style passwords) is deliberate.
+        // parsed host or the user as written. The user is checked as
+        // written, before decoding, so a percent-encoded `%2F` or `%3D`
+        // is accepted (what the refusal advises); the parsed password
+        // needs no check: with the `@` inside the authority it is exactly
+        // what the URL wrote, and a decoded `%2F` or `%3D` (base64-style
+        // passwords) is deliberate.
         let bad_host = config.get_hosts().iter().any(|h| match h {
             tokio_postgres::config::Host::Tcp(h) => h.contains(['=', '&', '?', '/', '@', '#']),
             #[cfg(unix)]
             tokio_postgres::config::Host::Unix(_) => false,
         });
-        let bad_user = config
-            .get_user()
-            .is_some_and(|u| u.contains(['/', '?', '&', '=', '#']));
+        let bad_user = raw_users(&self.connection_url)
+            .iter()
+            .any(|u| u.contains(['/', '?', '&', '=', '#']));
         if bad_host || bad_user {
             return Err(AMBIGUOUS_AT.into());
         }
@@ -139,6 +148,74 @@ impl PostgresConfig {
 const AMBIGUOUS_AT: &str = "invalid connection_url: an unencoded '@', '/', '?' or '#' splits \
      it in the wrong place; percent-encode them in a user name, password or parameter value \
      (%40, %2F, %3F, %23), or set the password in the catalog's password field";
+
+/// The refusal for a `password` query parameter followed by another one.
+const QUERY_PASSWORD_NOT_LAST: &str = "invalid connection_url: a password parameter must be \
+     the last one, with any '&' in it percent-encoded (%26); or set the password in the \
+     catalog's password field";
+
+/// The query parameters of `url` (after its first `?` past the scheme),
+/// as written.
+fn query_params(url: &str) -> Vec<&str> {
+    let Some(start) = url.find("://").map(|i| i + 3) else {
+        return Vec::new();
+    };
+    match url[start..].find('?') {
+        Some(q) => url[start + q + 1..].split('&').collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Whether a parameter key is `password` once percent-decoded, as the
+/// driver decodes keys (`pass%77ord=` sets the password too).
+pub fn is_password_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                decoded.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    decoded == b"password"
+}
+
+/// Whether a `password` query parameter of `url` is followed by another
+/// parameter: a raw `&` in the password would make its tail one.
+fn query_password_not_last(url: &str) -> bool {
+    let params = query_params(url);
+    params
+        .iter()
+        .rev()
+        .skip(1)
+        .any(|p| is_password_key(p.split_once('=').map_or(*p, |(key, _)| key)))
+}
+
+/// The user names `url` sets, as written (not percent-decoded): the
+/// userinfo's, up to its first `:`, and every `user` query value.
+fn raw_users(url: &str) -> Vec<&str> {
+    let mut users = Vec::new();
+    if let Some(start) = url.find("://").map(|i| i + 3) {
+        if let Some(at) = url[start..].find('@') {
+            let userinfo = &url[start..start + at];
+            users.push(userinfo.split_once(':').map_or(userinfo, |(user, _)| user));
+        }
+    }
+    users.extend(
+        query_params(url)
+            .into_iter()
+            .filter_map(|p| p.strip_prefix("user="))
+            .filter(|u| !u.is_empty()),
+    );
+    users
+}
 
 /// Whether the first `@` of `url` lies past its authority: after the first
 /// `/`, `?` or `#` that follows the scheme's `//`. The driver would still
@@ -255,6 +332,15 @@ mod tests {
             // A raw delimiter in the userinfo password.
             ("postgresql://u:p/w@[::1]:5432/db", &["p/w"]),
             ("postgresql://u:p?w@db:5432/db", &["p?w"]),
+            // A raw `&` in a query password (round 4): its tail would be a
+            // real parameter.
+            ("postgresql://db/x?password=Xy&host=9zK", &["Xy", "9zK"]),
+            (
+                "postgresql://db/x?sslmode=disable&password=Xy&dbname=9zK",
+                &["Xy", "9zK"],
+            ),
+            ("postgresql://db/x?pass%77ord=Xy&user=9zK", &["Xy", "9zK"]),
+            ("postgresql://db/x?password=Xy&9zK", &["Xy", "9zK"]),
         ] {
             let c = PostgresConfig::new(url);
             let e = c.validate_url().unwrap_err();
@@ -283,6 +369,11 @@ mod tests {
             "postgresql://u:a&b=c@db/x",
             "postgresql://db:5432/db?password=a%26b",
             "postgresql://u:p%2Fw@[::1]:5432/db",
+            // The password as the last parameter, `&` encoded (round 4).
+            "postgresql://db/x?sslmode=disable&password=Xy%26host%3D9zK",
+            // A user percent-encoded as the refusal advises (round 4).
+            "postgresql://dom%2Fsvc:pw@db/x",
+            "postgresql://db/x?user=dom%2Fsvc%3Dx&password=pw",
         ] {
             assert!(
                 PostgresConfig::new(url).validate_url().is_ok(),

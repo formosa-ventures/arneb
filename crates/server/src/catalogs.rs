@@ -985,18 +985,11 @@ pub fn validate_spec_fields(spec: &CatalogConfig) -> Result<(), String> {
         }
         "postgresql" => {
             let pg = spec.postgres_config().map_err(|e| e.to_string())?;
+            // Also refuses a `password` parameter set twice (only the last
+            // parameter may be one), which a GET → PUT round trip could not
+            // tell apart once redacted.
             pg.validate_url()
                 .map_err(|e| format!("catalog '{name}': {e}"))?;
-            if let Some(url) = &spec.connection_url {
-                // The driver takes the last; a GET → PUT round trip could not
-                // tell the redacted copies apart.
-                if url_query_passwords(&url.0).len() > 1 {
-                    return Err(format!(
-                        "catalog '{name}': connection_url sets the password parameter more \
-                         than once"
-                    ));
-                }
-            }
         }
         other => {
             return Err(format!(
@@ -1312,27 +1305,6 @@ fn url_password_range(url: &str) -> Option<std::ops::Range<usize>> {
     Some(start + colon + 1..at)
 }
 
-/// Whether a query parameter key is `password` once percent-decoded:
-/// tokio-postgres decodes keys, so `pass%77ord=` sets the password too.
-fn is_password_key(key: &str) -> bool {
-    let bytes = key.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let hex = |b: u8| (b as char).to_digit(16);
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                decoded.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        decoded.push(bytes[i]);
-        i += 1;
-    }
-    decoded == b"password"
-}
-
 /// `(parameter, value)` byte ranges of every query parameter whose key is
 /// `password` once percent-decoded (libpq URIs accept the password there
 /// too).
@@ -1374,7 +1346,7 @@ fn query_passwords_from(
     let mut start = q;
     for param in url[q..].split('&') {
         if let Some((key, value)) = param.split_once('=') {
-            if is_password_key(key) {
+            if arneb_postgresql::is_password_key(key) {
                 let value_start = start + param.len() - value.len();
                 out.push((start..start + param.len(), value_start..start + param.len()));
             }
@@ -1765,13 +1737,13 @@ mod tests {
         let query = redacted_spec(&spec(serde_json::json!({
             "name": "p", "type": "postgresql",
             "connection_url":
-                "postgresql://bob:ui-secret-7@db/sales?sslmode=disable&password=q-secret-6&application_name=x"
+                "postgresql://bob:ui-secret-7@db/sales?sslmode=disable&application_name=x&password=q-secret-6"
         })));
         let text = query.to_string();
         assert!(!text.contains("q-secret-6") && !text.contains("ui-secret-7"));
         assert_eq!(
             query["connection_url"],
-            "postgresql://bob:<redacted>@db/sales?sslmode=disable&password=<redacted>&application_name=x"
+            "postgresql://bob:<redacted>@db/sales?sslmode=disable&application_name=x&password=<redacted>"
         );
         let only = redacted_spec(&spec(serde_json::json!({
             "name": "p", "type": "postgresql",
@@ -1817,9 +1789,11 @@ mod tests {
             round_trip.connection_url.as_ref().unwrap().0,
             stored.connection_url.as_ref().unwrap().0
         );
-        assert!(is_password_key("%70%61%73%73%77%6F%72%64"));
-        assert!(!is_password_key("password%"));
-        assert!(!is_password_key("passwor"));
+        assert!(arneb_postgresql::is_password_key(
+            "%70%61%73%73%77%6F%72%64"
+        ));
+        assert!(!arneb_postgresql::is_password_key("password%"));
+        assert!(!arneb_postgresql::is_password_key("passwor"));
     }
 
     /// tokio-postgres takes the credentials up to the first `@`, so an
@@ -1849,8 +1823,8 @@ mod tests {
                 "postgres://<redacted>",
             ),
             (
-                "postgresql://app@db/x?password=pa#ss&sslmode=disable",
-                "postgresql://app@db/x?password=<redacted>&sslmode=disable",
+                "postgresql://app@db/x?sslmode=disable&password=pa#ss",
+                "postgresql://app@db/x?sslmode=disable&password=<redacted>",
             ),
             (
                 "postgresql://app:pa?password=no@db/x?password=q/s#t",
@@ -2041,19 +2015,48 @@ mod tests {
     }
 
     /// M6: a URL that sets `password=` twice is refused, so a GET → PUT
-    /// round trip cannot change which one the driver uses.
+    /// round trip cannot change which one the driver uses. Since round 4
+    /// the password must be the last parameter, which covers it, and the
+    /// refused URL is hidden whole.
     #[test]
     fn duplicate_query_passwords_are_refused() {
         let s = spec(serde_json::json!({
             "name": "p", "type": "postgresql",
-            "connection_url": "postgresql://u@db/x?password=a&sslmode=disable&pass%77ord=b"
+            "connection_url": "postgresql://u@db/x?password=a1&sslmode=disable&pass%77ord=b2"
         }));
         let e = validate_spec(&s).unwrap_err();
-        assert!(e.contains("more than once") && !e.contains("=a"), "{e}");
+        assert!(e.contains("last one") && !e.contains("a1"), "{e}");
         let shown = redacted_spec(&s);
+        assert_eq!(shown["connection_url"], "postgresql://<redacted>");
+    }
+
+    /// Round 4: a raw `&` in a query password would turn its tail into a
+    /// real driver parameter (a host sent to DNS). Such a URL is refused,
+    /// and shown with nothing after the scheme.
+    #[test]
+    fn a_query_password_with_a_raw_ampersand_is_refused_and_hidden() {
+        for url in [
+            "postgresql://db/x?password=Xy&host=9zK",
+            "postgresql://db/x?sslmode=disable&password=Xy&dbname=9zK",
+            "postgresql://u@db/x?pass%77ord=Xy&options=9zK",
+        ] {
+            let s = spec(serde_json::json!({
+                "name": "p", "type": "postgresql", "connection_url": url
+            }));
+            let e = validate_spec(&s).unwrap_err();
+            assert!(!e.contains("Xy") && !e.contains("9zK"), "{e}");
+            let shown = redacted_spec(&s);
+            assert_eq!(shown["connection_url"], "postgresql://<redacted>", "{url}");
+            assert!(!shown.to_string().contains("9zK"), "{shown}");
+        }
+        let encoded = spec(serde_json::json!({
+            "name": "p", "type": "postgresql",
+            "connection_url": "postgresql://db/x?sslmode=disable&password=Xy%26host%3D9zK"
+        }));
+        validate_spec(&encoded).unwrap();
         assert_eq!(
-            shown["connection_url"],
-            "postgresql://u@db/x?password=<redacted>&sslmode=disable&pass%77ord=<redacted>"
+            redacted_spec(&encoded)["connection_url"],
+            "postgresql://db/x?sslmode=disable&password=<redacted>"
         );
     }
 

@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use hive_metastore::{
     ColumnStatisticsData, Database, GetTableRequest, PartitionsRequest, TableStatsRequest,
     ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
-    ThriftHiveMetastoreGetDatabaseException,
+    ThriftHiveMetastoreGetDatabaseException, ThriftHiveMetastoreGetTableReqException,
 };
 use pilota::FastStr;
 use tracing::{debug, warn};
@@ -157,6 +157,9 @@ impl HmsClient {
         match result {
             MaybeException::Ok(db) => Ok(Some(db)),
             MaybeException::Exception(ThriftHiveMetastoreGetDatabaseException::O1(_)) => Ok(None),
+            // HMS parses a leading `@` as `@catalog#db` and answers a
+            // malformed one with `MetaException`: that name names nothing.
+            MaybeException::Exception(_) if name.starts_with('@') => Ok(None),
             MaybeException::Exception(ex) => Err(ConnectorError::ConnectionFailed(format!(
                 "HMS get_database({name}) exception: {ex:?}"
             ))),
@@ -206,8 +209,15 @@ impl HmsClient {
 
         let hms_table = match result {
             MaybeException::Ok(resp) => resp.table,
-            MaybeException::Exception(ex) => {
+            MaybeException::Exception(ThriftHiveMetastoreGetTableReqException::O2(ex)) => {
                 return Err(ConnectorError::TableNotFound(format!(
+                    "HMS get_table_req({db}.{table}): {ex:?}"
+                )));
+            }
+            // `MetaException`: HMS failed to answer, which is not a
+            // missing table.
+            MaybeException::Exception(ex) => {
+                return Err(ConnectorError::ConnectionFailed(format!(
                     "HMS get_table_req({db}.{table}) exception: {ex:?}"
                 )));
             }
@@ -663,82 +673,111 @@ impl SchemaProvider for HiveSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
-        self.load(name, &|_, _| true).await
-    }
-
-    /// Asks `allowed` as soon as HMS returns the table's stored name,
-    /// before partitions or Iceberg metadata are read.
-    async fn table_if_allowed(
-        &self,
-        name: &str,
-        allowed: TableGate<'_>,
-    ) -> Option<Arc<dyn TableProvider>> {
-        self.load(name, allowed).await
-    }
-}
-
-impl HiveSchemaProvider {
-    async fn load(&self, name: &str, allowed: TableGate<'_>) -> Option<Arc<dyn TableProvider>> {
-        match self.client.get_table(&self.database, name).await {
-            Ok(meta) if !allowed(&meta.db_name, &meta.table_name) => None,
-            // Table redirection (as in Trino): Iceberg tables in HMS are
-            // served by the Iceberg reader. Listing their location as a
-            // plain Hive table would read deleted and orphaned files.
-            Ok(meta) if arneb_iceberg::is_iceberg_table(&meta.parameters) => {
-                let qualified = format!("{}.{}", self.database, name);
-                match arneb_iceberg::IcebergTableProvider::resolve(
-                    &self.storage,
-                    &qualified,
-                    &meta.parameters,
-                )
-                .await
-                {
-                    Ok(p) => Some(Arc::new(
-                        p.with_canonical_name(meta.db_name.clone(), meta.table_name.clone()),
-                    )),
-                    Err(e) => {
-                        warn!("failed to load Iceberg table '{qualified}': {e}");
-                        None
-                    }
-                }
-            }
-            Ok(meta) => {
-                // A partitioned table reads exactly the partitions registered
-                // in HMS, each at its own location (as Trino and Hive do), not
-                // whatever `key=value` directories sit under the table root.
-                let partitions = if meta.partition_columns.is_empty() {
-                    None
-                } else {
-                    match self.client.get_partitions(&self.database, name).await {
-                        Ok(p) => Some(p),
-                        Err(e) => {
-                            warn!(
-                                "failed to get HMS partitions of '{}.{}': {e}",
-                                self.database, name
-                            );
-                            return None;
-                        }
-                    }
-                };
-                Some(Arc::new(HiveTableProvider {
-                    canonical_name: Some((meta.db_name, meta.table_name)),
-                    transactional: is_transactional(&meta.parameters),
-                    columns: meta.columns,
-                    partition_columns: meta.partition_columns,
-                    partitions,
-                    location: meta.location,
-                    input_format: meta.input_format,
-                    serde_lib: meta.serde_lib,
-                    row_count: meta.row_count,
-                    size_bytes: meta.size_bytes,
-                    column_stats: meta.column_stats,
-                }))
-            }
+        match self.load(name, &|_, _| true).await {
+            Ok(table) => table,
             Err(e) => {
                 warn!("failed to get HMS table '{}.{}': {e}", self.database, name);
                 None
             }
         }
+    }
+
+    /// Asks `allowed` as soon as HMS returns the table's stored name,
+    /// before partitions or Iceberg metadata are read. An unreachable HMS
+    /// is `Unavailable`, not a missing table.
+    async fn table_if_allowed(
+        &self,
+        name: &str,
+        allowed: TableGate<'_>,
+    ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+        self.load(name, allowed).await
+    }
+}
+
+/// `Err(Unavailable)` for an HMS call that failed to get an answer;
+/// `Ok(None)` (logged) for any other failure, which reads as missing as
+/// it always has (no such table, unsupported metadata).
+fn not_found_unless_unreachable<T>(
+    e: ConnectorError,
+    what: &str,
+) -> Result<Option<T>, CatalogError> {
+    match e {
+        ConnectorError::ConnectionFailed(_) => Err(CatalogError::Unavailable(e.to_string())),
+        ConnectorError::TableNotFound(_) => {
+            debug!("{what}: {e}");
+            Ok(None)
+        }
+        _ => {
+            warn!("{what}: {e}");
+            Ok(None)
+        }
+    }
+}
+
+impl HiveSchemaProvider {
+    async fn load(
+        &self,
+        name: &str,
+        allowed: TableGate<'_>,
+    ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+        let qualified = format!("{}.{}", self.database, name);
+        let meta = match self.client.get_table(&self.database, name).await {
+            Ok(meta) => meta,
+            Err(e) => return not_found_unless_unreachable(e, &qualified),
+        };
+        if !allowed(&meta.db_name, &meta.table_name) {
+            return Ok(None);
+        }
+        // Table redirection (as in Trino): Iceberg tables in HMS are
+        // served by the Iceberg reader. Listing their location as a plain
+        // Hive table would read deleted and orphaned files.
+        if arneb_iceberg::is_iceberg_table(&meta.parameters) {
+            return match arneb_iceberg::IcebergTableProvider::resolve(
+                &self.storage,
+                &qualified,
+                &meta.parameters,
+            )
+            .await
+            {
+                Ok(p) => Ok(Some(Arc::new(p.with_canonical_name(
+                    meta.db_name.clone(),
+                    meta.table_name.clone(),
+                )))),
+                Err(e) => {
+                    warn!("failed to load Iceberg table '{qualified}': {e}");
+                    Ok(None)
+                }
+            };
+        }
+        // A partitioned table reads exactly the partitions registered in
+        // HMS, each at its own location (as Trino and Hive do), not
+        // whatever `key=value` directories sit under the table root.
+        let partitions = if meta.partition_columns.is_empty() {
+            None
+        } else {
+            match self.client.get_partitions(&self.database, name).await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    return not_found_unless_unreachable(
+                        e,
+                        &format!("HMS partitions of '{qualified}'"),
+                    )
+                }
+            }
+        };
+        Ok(Some(Arc::new(HiveTableProvider {
+            canonical_name: Some((meta.db_name, meta.table_name)),
+            transactional: is_transactional(&meta.parameters),
+            columns: meta.columns,
+            partition_columns: meta.partition_columns,
+            partitions,
+            location: meta.location,
+            input_format: meta.input_format,
+            serde_lib: meta.serde_lib,
+            row_count: meta.row_count,
+            size_bytes: meta.size_bytes,
+            column_stats: meta.column_stats,
+        })))
     }
 }
 
@@ -1229,6 +1268,21 @@ mod tests {
         let err = provider.try_schema("sales").await.unwrap_err();
         assert!(matches!(err, CatalogError::Unavailable(_)), "{err}");
         assert!(provider.schema("sales").await.is_none());
+    }
+
+    /// An HMS outage while loading a table is `Unavailable`, not a missing
+    /// table; `table()` still reads it as missing (and logs it).
+    #[tokio::test]
+    async fn an_unreachable_metastore_is_not_a_missing_table() {
+        let provider = unreachable_provider();
+        provider.remember("sales", "sales");
+        let schema = provider.try_schema("sales").await.unwrap().unwrap();
+        let err = schema
+            .table_if_allowed("orders", &|_, _| true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::Unavailable(_)), "{err}");
+        assert!(schema.table("orders").await.is_none());
     }
 
     /// A resolution is reused within its TTL (no HMS call: the metastore

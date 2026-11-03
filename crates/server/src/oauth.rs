@@ -17,7 +17,7 @@
 //! Tokens are never logged; a rejection is at most its reason code, on the
 //! `arneb::oauth` target at DEBUG.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures::future::{BoxFuture, FutureExt as _, Shared};
@@ -210,8 +210,9 @@ struct Inner {
     panic_next_fetch: std::sync::atomic::AtomicBool,
 }
 
-/// Armed for the life of a fetch task; dropped without being disarmed
-/// (`mem::forget`) only when the task unwinds or is cancelled.
+/// Armed for the life of a fetch task; still armed when dropped only when
+/// the task unwinds or is cancelled (a finished task disarms it with
+/// `take`).
 struct FetchGuard(Option<Arc<Inner>>);
 
 impl Drop for FetchGuard {
@@ -296,7 +297,7 @@ impl OAuthValidator {
     /// Fetch the signing keys once, so the first request does not pay for
     /// it. Logs a WARN on failure; never errors.
     pub async fn warm(&self) {
-        let seen = self.inner.cache.lock().unwrap().generation;
+        let seen = self.inner.lock().generation;
         if matches!(self.refresh(seen).await, Refresh::Failed) {
             tracing::warn!(
                 target: "arneb::oauth",
@@ -428,7 +429,7 @@ impl OAuthValidator {
         let mut refreshed = false;
         loop {
             let (found, usable, generation, last_ok) = {
-                let mut c = self.inner.cache.lock().unwrap();
+                let mut c = self.inner.lock();
                 let age = c.fetched_at.map(|t| t.elapsed());
                 let usable = age.is_some_and(|a| a < settings.jwks_max_stale);
                 if usable && age.is_some_and(|a| a >= settings.refresh_ahead()) {
@@ -478,7 +479,7 @@ impl OAuthValidator {
     /// the caller observed) or the previous attempt was too recent.
     async fn refresh(&self, seen: u64) -> Refresh {
         let flight = {
-            let mut c = self.inner.cache.lock().unwrap();
+            let mut c = self.inner.lock();
             if c.generation != seen {
                 // Someone else refreshed meanwhile: share the outcome.
                 return if c.last_ok {
@@ -501,6 +502,13 @@ impl OAuthValidator {
 }
 
 impl Inner {
+    /// The key cache, also after a panic while it was held: every update
+    /// leaves it consistent (at worst an attempt recorded twice), so a
+    /// poisoned lock must not turn every later request into a panic.
+    fn lock(&self) -> MutexGuard<'_, KeyCache> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The fetch in flight, else a new one in a detached task; `None` when
     /// the previous attempt started less than `jwks_min_refresh` ago. Called
     /// with the cache locked.
@@ -520,9 +528,10 @@ impl Inner {
             // Records a failed attempt if the task ends without recording
             // one (a panic, or the runtime shutting down), so the flight is
             // never left listed and refreshes resume.
-            let guard = FetchGuard(Some(Arc::clone(&inner)));
+            let mut guard = FetchGuard(Some(Arc::clone(&inner)));
             let ok = inner.run_fetch(known_uri).await;
-            std::mem::forget(guard);
+            // Disarm: the outcome is recorded (and the Arc released).
+            guard.0.take();
             ok
         });
         let flight = task.map(|r| r.unwrap_or(false)).boxed().shared();
@@ -532,7 +541,7 @@ impl Inner {
 
     /// Record an attempt that ended without an outcome as failed.
     fn record_lost_fetch(&self) {
-        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = self.lock();
         c.generation += 1;
         c.inflight = None;
         c.last_ok = false;
@@ -545,7 +554,7 @@ impl Inner {
     /// One fetch attempt, recorded in the cache; `true` on success.
     async fn run_fetch(&self, known_uri: Option<String>) -> bool {
         let outcome = self.fetch(known_uri).await;
-        let mut c = self.cache.lock().unwrap();
+        let mut c = self.lock();
         c.generation += 1;
         c.inflight = None;
         match outcome {
@@ -1517,7 +1526,7 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(v.validate(&t).await.unwrap_err(), OAuthReject::Unavailable);
         {
-            let c = v.inner.cache.lock().unwrap();
+            let c = v.inner.lock();
             assert!(c.inflight.is_none(), "the dead flight is not left listed");
             assert!(!c.last_ok);
             assert_eq!(c.generation, 1);
@@ -1548,7 +1557,7 @@ mod tests {
         v.validate(&t).await.unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         {
-            let c = v.inner.cache.lock().unwrap();
+            let c = v.inner.lock();
             assert!(c.inflight.is_none(), "the dead flight is not left listed");
             assert!(!c.last_ok);
         }
@@ -1556,7 +1565,7 @@ mod tests {
         v.validate(&t).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(idp.jwks_hits(), 2);
-        assert!(v.inner.cache.lock().unwrap().last_ok);
+        assert!(v.inner.lock().last_ok);
     }
 
     #[tokio::test]
@@ -1613,7 +1622,7 @@ mod tests {
         let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(1));
         let t = key.sign(&claims(&idp.issuer(), AUD));
         v.validate(&t).await.unwrap();
-        assert!(v.inner.cache.lock().unwrap().jwks_uri.is_some());
+        assert!(v.inner.lock().jwks_uri.is_some());
         // The cached URL starts failing: it is forgotten, so the next
         // attempt goes back through discovery.
         idp.set_mode(Mode::Fail500);
@@ -1623,7 +1632,7 @@ mod tests {
             v.validate(&unknown).await.unwrap_err(),
             OAuthReject::Unavailable
         );
-        assert!(v.inner.cache.lock().unwrap().jwks_uri.is_none());
+        assert!(v.inner.lock().jwks_uri.is_none());
         idp.set_mode(Mode::Ok);
         let rotated = TestKey::ec("k2");
         idp.set_keys(&[&key, &rotated]);
@@ -1631,7 +1640,7 @@ mod tests {
         v.validate(&rotated.sign(&claims(&idp.issuer(), AUD)))
             .await
             .unwrap();
-        assert!(v.inner.cache.lock().unwrap().jwks_uri.is_some());
+        assert!(v.inner.lock().jwks_uri.is_some());
     }
 
     #[tokio::test]
@@ -1861,6 +1870,47 @@ mod tests {
             v.validate(&second.sign(&expired)).await.unwrap_err(),
             OAuthReject::Invalid("expired")
         );
+    }
+
+    #[tokio::test]
+    async fn a_finished_fetch_releases_its_reference() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(10));
+        let t = key.sign(&claims(&idp.issuer(), AUD));
+        for _ in 0..3 {
+            v.validate(&t).await.unwrap();
+            v.warm().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(idp.jwks_hits() >= 2);
+        // Only the validator holds `Inner`: no fetch task leaked its Arc.
+        assert_eq!(Arc::strong_count(&v.inner), 1);
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_key_cache_keeps_serving() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let v = validator(&idp, |s| s.jwks_min_refresh = Duration::from_millis(10));
+        let t = key.sign(&claims(&idp.issuer(), AUD));
+        v.validate(&t).await.unwrap();
+        // A panic while the cache is locked poisons the mutex...
+        let inner = Arc::clone(&v.inner);
+        std::thread::spawn(move || {
+            let _held = inner.cache.lock().unwrap();
+            panic!("test: panic while holding the key cache");
+        })
+        .join()
+        .unwrap_err();
+        assert!(v.inner.cache.is_poisoned());
+        // ...and requests, refreshes and a lost fetch still work.
+        v.validate(&t).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        v.warm().await;
+        v.inner.record_lost_fetch();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        v.validate(&t).await.unwrap();
     }
 
     #[test]

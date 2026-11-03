@@ -61,3 +61,5 @@
 - [x] 11.1 Kill: a kill during a poll is pending and settled by the guard when the poll ends; `KillSwitch::kill`, `Canceller` and `kill_query` are async (no lock held across a poll, no `spawn_blocking` for the v1 cancel); every protocol cancel goes through it with no abort fallback; a not-applied kill reports `NotApplied` with the real state and concurrent kills share the first kill's outcome; docs narrow the between-polls claim
 - [x] 11.2 Audit: a panicking action is completed as `interrupted`, not `internal`; a failed `token.issue` completion has no target
 - [x] 11.3 Audit: a background tick retries an unwritable log (and its kept completions) every 5 s; graceful shutdown flushes once more
+- [x] 11.4 Kill (fix review): Trino decides a paging cancel before the kill, so a cancel resuming after `complete` keeps the result; a kill that ends without an outcome releases its claim (`internal` / `500`); a query that leaves the history mid-kill is `not_found`; the agent reaper touches before spawning a cancel
+- [x] 11.5 Audit (fix review): the exit flush also runs on fatal listener errors and logs a failed flush task

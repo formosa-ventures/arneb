@@ -65,20 +65,25 @@ it needs a restart, and a bad value stops startup with a message naming it.
 - The protected-resource metadata document
   ([RFC 9728](https://www.rfc-editor.org/rfc/rfc9728)) answers without
   credentials with the `resource`, the `authorization_servers` (the issuer)
-  and the supported scopes. It is served only at the path derived from
+  and the supported scopes. It is served at the path derived from
   `resource`, `/.well-known/oauth-protected-resource` followed by the
   resource's path (`/.well-known/oauth-protected-resource/mcp` for
-  `https://db.example/mcp`); the bare well-known path and any other suffix
-  answer a plain `404`.
+  `https://db.example/mcp`), and also at the bare
+  `/.well-known/oauth-protected-resource`, because some MCP clients and
+  proxies only probe the root (`/mcp` is the server's one protected
+  resource, so the root is unambiguous). Any other suffix answers a plain
+  `404`.
 - A `/mcp` request without credentials gets `401` with
   `WWW-Authenticate: Bearer realm="arneb", resource_metadata="…"`, which is
-  where an OAuth client starts. A JWT that is presented but refused
-  (expired, wrong audience, bad signature, an ID token, ...) gets the same
-  `401` body with `error="invalid_token"` added to the challenge
-  ([RFC 6750](https://www.rfc-editor.org/rfc/rfc6750#section-3.1)), so a
-  client can refresh its token instead of starting over; the reason itself
-  is only logged at DEBUG on `arneb::oauth`. The `401` body is the same as
-  everywhere else.
+  where an OAuth client starts. A bearer that is presented but refused (a
+  JWT that is expired, for the wrong audience, badly signed or an ID token;
+  an opaque token; an expired or revoked Arneb token) gets the same `401`
+  body with `error="invalid_token"` added to the challenge
+  ([RFC 6750](https://www.rfc-editor.org/rfc/rfc6750#section-3.1)), plus
+  `scope="…"` when `required_scopes` is set, so a client can refresh its
+  token or re-authorize with the right scope instead of starting over; the
+  reason itself is only logged at DEBUG on `arneb::oauth`. The `401` body is
+  the same as everywhere else.
 - A bearer that looks like a JWT (three dot-separated parts, not starting
   with `arneb_`) is validated: the signature against the issuer's JWKS,
   `iss`, `aud`, `exp` / `nbf`, that it is an access token, and
@@ -86,12 +91,25 @@ it needs a restart, and a bad value stops startup with a message naming it.
   its algorithm is tried, so an algorithm migration (say RS256 and PS256
   under one `kid`) keeps working. Only asymmetric algorithms are accepted
   (RS256/384/512, PS256, ES256/384); `none` and `HS*` are always refused.
-- **Access tokens only.** A header `typ` of `at+jwt` (RFC 9068) is an access
-  token. Many IdPs (Keycloak, Entra ID, Okta) send `typ: JWT` instead, so
-  that is accepted too, but such a token is refused when it carries a claim
-  only OIDC ID tokens have (`nonce`, `at_hash`), or a Keycloak payload
-  `typ` other than an access token's (`ID`, `Refresh`, `Offline`, `Logout`).
-  Set `require_access_token_typ = true` when your IdP sends `at+jwt`, to
+- **Access tokens only.** The IdP signs OIDC ID tokens with the same keys,
+  so a token is classified, first rule that applies:
+  1. A header `typ` of `at+jwt` (RFC 9068) is an access token.
+  2. A payload `typ` of `Bearer` (any case; Keycloak's access tokens) is an
+     access token, even with a `nonce`: Keycloak before 24, and later
+     versions with the "nonce backwards compatible" mapper, copy the
+     request's `nonce` into access tokens.
+  3. A payload `typ` of `ID`, `Refresh`, `Offline` or `Logout` (Keycloak's
+     other tokens) is refused.
+  4. Any other token (Entra ID, Okta and most IdPs send header `typ: JWT`
+     and no payload `typ`) may be an ID token when it has a `nonce` or
+     `at_hash`, or no `scope` / `scp` claim at all (an ID token from a
+     refresh grant carries neither `nonce` nor scope). Such a token is
+     refused when `required_scopes` is empty, and otherwise accepted only
+     with every required scope, which an ID token never carries.
+
+  So an IdP whose access tokens have neither a `typ` marker nor a scope
+  claim needs `required_scopes` (and its tokens must then carry them). Set
+  `require_access_token_typ = true` when your IdP sends `at+jwt`, to
   accept nothing else.
 - **Key cache.** The JWKS comes from the discovery document (a remote
   issuer's discovered `jwks_uri` must be `https`) and is cached for
@@ -122,18 +140,27 @@ Design decisions you should know about:
   user could take over another Arneb user. The server logs a WARN at startup
   when the claim is not `sub`. With `sub` the Arneb user names are the IdP's
   subject ids.
-- **`user_claim = "email"` needs a verified address.** The token's
-  `email_verified` must be `true` (or the string `"true"`); otherwise the
-  answer is `403 forbidden`, "the identity's email address is not verified".
-  An IdP that does not send `email_verified` (Entra ID, for one) cannot be
-  used with `email`.
+- **An email address needs a verified address.** When `user_claim =
+  "email"`, or the mapped value contains `@` whatever the claim
+  (`preferred_username` with Keycloak's "email as username", Entra's `upn`,
+  an Auth0 namespaced claim such as `https://corp.example/email`), the
+  token's `email_verified` must be `true` (or the string `"true"`);
+  otherwise the answer is `403 forbidden`, "the identity's email address is
+  not verified", even if that user exists. An IdP that never sends
+  `email_verified` (Entra ID, for one) cannot be used with `email`; for an
+  address under another claim, `allow_missing_email_verified = true`
+  accepts a token without the claim (startup logs a WARN). Only turn it on
+  when the IdP never issues an address its owner has not proven; an
+  explicit `email_verified: false` is refused regardless. A value without
+  `@` is not checked.
 - **The audience is the resource URL.** Tokens must be issued for this
   resource (RFC 8707): `aud` has to contain `audience`, which defaults to
-  `resource`. Set `audience` only for an IdP that can emit nothing but a
-  client id. In that client-id mode an OIDC ID token for the same client
-  carries the same `aud`, so startup refuses an `audience` other than
-  `resource` unless `required_scopes` is set too (ID tokens carry no
-  scope).
+  `resource`. Set `audience` for an IdP that names the API differently (an
+  Entra `api://…` application id URI, an Auth0 API identifier) or that can
+  emit nothing but a client id. In that client-id mode an OIDC ID token for
+  the same client carries the same `aud`, so startup refuses an `audience`
+  that is not a URL or URI (which a client id is not) unless
+  `required_scopes` is set too (ID tokens carry no scope).
 - **If the IdP is unreachable** and no cached key can decide, `/mcp` answers
   `503 auth_provider_unavailable` with `Retry-After: 5`, not `401`. API
   tokens, sessions and Basic keep working.
@@ -172,7 +199,9 @@ Design decisions you should know about:
 
 `docker/keycloak/arneb-realm.json` is a dev realm that does this (users
 `alice`, `bob`, `carol` with public, dev-only passwords; client
-`arneb-smoke` with the audience mapper, client `arneb-other` without). Start
+`arneb-smoke` with the audience mapper, client `arneb-other` without; the
+mapper also puts the resource in the ID token's `aud`, so the smoke test
+shows that an ID token is refused for what it is, not for its audience). Start
 it with `docker compose --profile oauth up -d keycloak` and point `[oauth]`
 at `http://127.0.0.1:8180/realms/arneb`; `scripts/mcp-oauth-smoke.sh` runs
 the whole scenario against it.

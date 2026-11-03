@@ -25,3 +25,12 @@
 - [x] 6.2 Refuse ID tokens (`nonce` / `at_hash` / payload `typ` `ID`/`Refresh`/`Offline`/`Logout` without `at+jwt`), opt-in `require_access_token_typ`, client-id audience needs `required_scopes`
 - [x] 6.3 `email_verified` for `user_claim = "email"`; https for a discovered `jwks_uri` of a remote issuer; every key under a `kid` tried
 - [x] 6.4 `error="invalid_token"` on refused JWTs, metadata only at the derived path, challenges computed once
+
+## 7. Review round 4
+
+- [x] 7.1 Token kind by marker: header `at+jwt`, then payload `typ` `Bearer` (access, even with `nonce`) or `ID`/`Refresh`/`Offline`/`Logout` (refused); an unmarked token with `nonce`/`at_hash`/no scope needs `required_scopes`
+- [x] 7.2 `email_verified` for any email-address user name, opt-in `allow_missing_email_verified`
+- [x] 7.3 Client-id guard only for an `audience` that is not a URL or URI
+- [x] 7.4 Fetch guard disarmed with `take` (no leaked `Arc`); key-cache lock recovers from poisoning everywhere
+- [x] 7.5 `invalid_token` challenge carries `scope`, and is sent for every refused bearer on `/mcp`
+- [x] 7.6 Metadata also at the bare well-known path

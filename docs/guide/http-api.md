@@ -50,7 +50,7 @@ route below is public and exists only then (otherwise `404`):
 
 | Route | Answers |
 |---|---|
-| `GET /.well-known/oauth-protected-resource/mcp` (the well-known path plus the path of `[oauth] resource`; any other path under it is `404`) | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) metadata: `resource`, `authorization_servers`, `bearer_methods_supported`, `scopes_supported` when `required_scopes` is set. `Cache-Control: max-age=300`, CORS open. |
+| `GET /.well-known/oauth-protected-resource/mcp` (the well-known path plus the path of `[oauth] resource`, and the bare well-known path; any other path under it is `404`) | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) metadata: `resource`, `authorization_servers`, `bearer_methods_supported`, `scopes_supported` when `required_scopes` is set. `Cache-Control: max-age=300`, CORS open. |
 
 A JWT on any `/api` route is an invalid bearer (`401`), and a token that
 fails validation gets the same `401` body as any other bad credential. A valid token

@@ -4,6 +4,7 @@
 
 //! Shared types, error handling, and configuration for arneb.
 
+pub mod catalog_version;
 pub mod config;
 pub mod diagnostic;
 pub mod domain;
@@ -20,6 +21,7 @@ pub mod stream;
 pub mod suggest;
 pub mod types;
 
+pub use catalog_version::{spec_fingerprint, CatalogVersion};
 pub use config::ServerConfig;
 pub use domain::{bloom_dynamic_filter_enabled, BloomFilter, Domain, DEFAULT_MAX_DISTINCT_VALUES};
 pub use dynamic_filter::DynamicFilterId;

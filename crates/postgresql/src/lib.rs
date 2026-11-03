@@ -20,8 +20,8 @@ mod types;
 
 pub use catalog::{PostgresCatalog, PostgresSchema, PostgresTable};
 pub use config::{
-    at_outside_authority, PostgresConfig, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_SPLITS,
-    DEFAULT_SPLIT_MIN_ROWS, DEFAULT_UNCONSTRAINED_NUMERIC_SCALE,
+    at_outside_authority, is_password_key, PostgresConfig, DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_MAX_SPLITS, DEFAULT_SPLIT_MIN_ROWS, DEFAULT_UNCONSTRAINED_NUMERIC_SCALE,
 };
 pub use dialect::PostgresDialect;
 pub use source::{PostgresConnectorFactory, PostgresDataSource};

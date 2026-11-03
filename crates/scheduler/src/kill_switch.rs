@@ -10,9 +10,12 @@ use crate::tracker::Canceller;
 
 #[derive(Default)]
 enum Progress {
-    /// Not started, or still running.
+    /// Not started, or waiting between two polls.
     #[default]
-    Running,
+    Idle,
+    /// A poll of the work is in flight: a kill is recorded as pending and
+    /// settled by the guard when that poll ends.
+    Polling,
     /// The guarded work completed (successfully or not): a kill is too
     /// late and stops nothing.
     Done,
@@ -23,29 +26,36 @@ enum Progress {
 #[derive(Default)]
 struct Shared {
     progress: Progress,
+    /// A kill arrived during the poll in flight.
+    kill_pending: bool,
+    /// The guard's waker, while it waits between polls.
     waker: Option<Waker>,
+    /// Kills waiting for the poll in flight to settle them.
+    killers: Vec<Waker>,
 }
 
 /// Stops a statement's work on a kill, or reports that the kill came too
 /// late. A protocol creates one per statement, registers
-/// [`Self::canceller`] with the tracker *before* the work starts, and runs
-/// the work through [`Self::guard`].
+/// [`Self::canceller`] with the tracker *before* the work starts, runs the
+/// work through [`Self::guard`], and routes its own cancels (a client
+/// cancel, a reaper) through [`Self::kill`].
 ///
-/// The guard polls the work under the switch's lock, and the canceller
-/// takes the same lock, so a kill never lands in the middle of a poll:
+/// A kill never lands in the middle of a poll of the work. A kill during a
+/// poll is recorded as pending and settled by the guard when that poll
+/// ends; the kill waits (asynchronously, holding no lock) for that outcome:
 ///
 /// - a kill before the work starts prevents it: the work is never polled;
-/// - a kill after the work returned is not applied (the canceller returns
-///   `false`), so the statement reports its real result;
-/// - a kill during the work drops it at its next poll. A write may already
-///   have taken effect in an earlier poll, or in a spawned task the root
-///   future does not own, and is then reported as cancelled although part
-///   or all of it happened, as with an abort handle.
-///
-/// Blocking: a kill waits for an in-flight poll of the work to end, so call
-/// the canceller off async workers. The lock is not reentrant: the work
-/// must never kill its own statement from inside its poll (it would
-/// deadlock); no such path exists.
+/// - a kill that lands while the poll that completes the work is in
+///   flight, or after the work returned, is not applied, so the statement
+///   reports its real result;
+/// - otherwise the work is dropped between two polls and the kill is
+///   applied. This decides only whether the *root* future completed: work
+///   already done in an earlier poll, or in a spawned task the root future
+///   does not own, is not undone, and is reported as cancelled, as with an
+///   abort handle. A statement whose effect happens partway through its
+///   future would need its own "write started" point to report such a
+///   kill as not applied; none exists today, since the execution engine
+///   does not run DDL or DML plans.
 #[derive(Clone, Default)]
 pub struct KillSwitch(Arc<Mutex<Shared>>);
 
@@ -59,68 +69,56 @@ impl KillSwitch {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A tracker canceller for this switch. When the work has not completed
-    /// it marks the switch killed, wakes the guard (which drops the work),
-    /// then calls `on_kill` with the killer's name outside the lock, and
-    /// returns `true`. Once the work completed it does nothing and returns
-    /// `false`.
+    /// A tracker canceller for this switch: [`Self::kill`], then, when the
+    /// kill was applied, `on_kill` with the killer's name. Its future
+    /// resolves to whether the kill was applied. The kill is requested when
+    /// the canceller is called, before its future is first polled.
     pub fn canceller(&self, on_kill: impl FnOnce(&str) + Send + Sync + 'static) -> Canceller {
         let switch = self.clone();
         Box::new(move |by| {
-            if !switch.kill() {
-                return false;
-            }
-            on_kill(by);
-            true
+            let by = by.to_owned();
+            let kill = switch.kill();
+            Box::pin(async move {
+                let applied = kill.await;
+                if applied {
+                    on_kill(&by);
+                }
+                applied
+            })
         })
     }
 
-    /// Mark the switch killed; `false` when the work already completed.
-    fn kill(&self) -> bool {
+    /// Kill the work. The kill is requested at once; the returned future
+    /// resolves to `true` when it stopped the work (or the work was already
+    /// killed), and to `false` when the work completed first, so the
+    /// statement keeps its real outcome. During a poll it resolves when
+    /// that poll ends. It never blocks a thread, and dropping it does not
+    /// withdraw the kill.
+    pub fn kill(&self) -> Kill {
         let waker = {
             let mut shared = self.lock();
             match shared.progress {
-                Progress::Done => return false,
-                Progress::Killed => return true,
-                Progress::Running => {}
+                Progress::Idle => {
+                    shared.progress = Progress::Killed;
+                    shared.waker.take()
+                }
+                Progress::Polling => {
+                    shared.kill_pending = true;
+                    None
+                }
+                Progress::Done | Progress::Killed => None,
             }
-            shared.progress = Progress::Killed;
-            shared.waker.take()
         };
         if let Some(waker) = waker {
             waker.wake();
         }
-        true
+        Kill {
+            switch: self.clone(),
+        }
     }
 
-    /// A non-blocking kill for a protocol's own cancel (a client cancel, a
-    /// reaper), which runs on async workers. `Some(false)` when the work
-    /// already returned (leave the outcome to the protocol), `Some(true)`
-    /// when it is now killed, and `None` when a poll is in flight, so the
-    /// outcome is not known without waiting (cancel as before: abort the
-    /// task).
-    pub fn try_kill(&self) -> Option<bool> {
-        let mut shared = match self.0.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-        };
-        match shared.progress {
-            Progress::Done => return Some(false),
-            Progress::Killed => return Some(true),
-            Progress::Running => {}
-        }
-        shared.progress = Progress::Killed;
-        let waker = shared.waker.take();
-        drop(shared);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        Some(true)
-    }
-
-    /// Whether a kill stopped the work.
-    pub fn is_killed(&self) -> bool {
+    #[cfg(test)]
+    fn is_killed(&self) -> bool {
         matches!(self.lock().progress, Progress::Killed)
     }
 
@@ -133,12 +131,91 @@ impl KillSwitch {
             work: Some(Box::pin(work)),
         }
     }
+
+    /// End the poll in flight: `Done` when the work completed, otherwise
+    /// `Killed` when a kill arrived during the poll, else `Idle`. Returns
+    /// whether the work is now killed. Wakes the waiting kills.
+    fn settle(&self, completed: bool, waker: Option<&Waker>) -> bool {
+        let (killers, killed) = {
+            let mut shared = self.lock();
+            let pending = std::mem::take(&mut shared.kill_pending);
+            shared.progress = if completed {
+                Progress::Done
+            } else if pending {
+                Progress::Killed
+            } else {
+                Progress::Idle
+            };
+            match waker {
+                // Skip the clone when the stored waker would wake this task.
+                Some(w) if !completed && !pending => {
+                    if !shared.waker.as_ref().is_some_and(|old| old.will_wake(w)) {
+                        shared.waker = Some(w.clone());
+                    }
+                }
+                _ => shared.waker = None,
+            }
+            (std::mem::take(&mut shared.killers), pending && !completed)
+        };
+        for killer in killers {
+            killer.wake();
+        }
+        killed
+    }
+}
+
+/// The future returned by [`KillSwitch::kill`]: whether the kill was
+/// applied.
+pub struct Kill {
+    switch: KillSwitch,
+}
+
+impl Future for Kill {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+        let mut shared = self.switch.lock();
+        match shared.progress {
+            Progress::Done => Poll::Ready(false),
+            Progress::Killed => Poll::Ready(true),
+            Progress::Polling => {
+                // Settled by the guard when the poll ends.
+                shared.kill_pending = true;
+                if !shared.killers.iter().any(|w| w.will_wake(cx.waker())) {
+                    shared.killers.push(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+            Progress::Idle => {
+                // Between polls (e.g. the kill was requested before a poll
+                // whose work panicked): kill now.
+                shared.progress = Progress::Killed;
+                let waker = shared.waker.take();
+                drop(shared);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+                Poll::Ready(true)
+            }
+        }
+    }
 }
 
 /// The future returned by [`KillSwitch::guard`].
 pub struct Guarded<F> {
     switch: KillSwitch,
     work: Option<Pin<Box<F>>>,
+}
+
+/// Settles a poll that unwinds (the work panicked): a pending kill is
+/// applied, since the work did not complete; otherwise the switch is left
+/// idle, so a later kill applies too.
+struct SettleOnUnwind<'a>(&'a KillSwitch);
+
+impl Drop for SettleOnUnwind<'_> {
+    fn drop(&mut self) {
+        self.0.settle(false, None);
+    }
 }
 
 impl<F: Future> Future for Guarded<F> {
@@ -149,31 +226,36 @@ impl<F: Future> Future for Guarded<F> {
         let Some(work) = this.work.as_mut() else {
             return Poll::Ready(None);
         };
-        let mut shared = this.switch.lock();
-        match shared.progress {
-            Progress::Killed => {
-                drop(shared);
-                this.work = None;
-                return Poll::Ready(None);
-            }
-            Progress::Done => {
+        {
+            let mut shared = this.switch.lock();
+            match shared.progress {
+                Progress::Killed => {
+                    drop(shared);
+                    this.work = None;
+                    return Poll::Ready(None);
+                }
                 // Polled again after completing: nothing left to run.
-                drop(shared);
-                return Poll::Ready(None);
+                Progress::Done => return Poll::Ready(None),
+                Progress::Idle | Progress::Polling => shared.progress = Progress::Polling,
             }
-            Progress::Running => {}
         }
-        // Polled under the lock: a kill waits for this poll to end.
-        match work.as_mut().poll(cx) {
+        // Polled without the lock: a kill meanwhile is recorded as pending
+        // and settled right below.
+        let unwind = SettleOnUnwind(&this.switch);
+        let polled = work.as_mut().poll(cx);
+        std::mem::forget(unwind);
+        match polled {
             Poll::Ready(output) => {
-                shared.progress = Progress::Done;
-                shared.waker = None;
-                drop(shared);
+                this.switch.settle(true, None);
                 this.work = None;
                 Poll::Ready(Some(output))
             }
             Poll::Pending => {
-                shared.waker = Some(cx.waker().clone());
+                if this.switch.settle(false, Some(cx.waker())) {
+                    // Killed during this poll, which did not complete it.
+                    this.work = None;
+                    return Poll::Ready(None);
+                }
                 Poll::Pending
             }
         }
@@ -186,6 +268,25 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    /// Polls `fut` once with a no-op waker.
+    fn poll_once<F: Future + Unpin>(fut: &mut F) -> Poll<F::Output> {
+        Pin::new(fut).poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// Yields once: `Pending` on the first poll, then `Ready`.
+    async fn yield_once() {
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                return Poll::Ready(());
+            }
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await
+    }
+
     /// A kill before the work starts: the work is never polled, and the
     /// canceller reports the kill as applied.
     #[tokio::test]
@@ -197,7 +298,7 @@ mod tests {
             assert_eq!(by, "root");
             seen.store(true, Ordering::SeqCst);
         });
-        assert!(cancel("root"));
+        assert!(cancel("root").await);
         assert!(called.load(Ordering::SeqCst));
         let ran = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&ran);
@@ -219,13 +320,15 @@ mod tests {
         let switch = KillSwitch::new();
         let cancel = switch.canceller(|_| panic!("on_kill after completion"));
         assert_eq!(switch.guard(async { 7 }).await, Some(7));
-        assert!(!cancel("root"));
+        assert!(!cancel("root").await);
+        assert!(!switch.kill().await);
         assert!(!switch.is_killed());
     }
 
-    /// A kill while the work waits wakes the guard, which drops the work.
+    /// A kill while the work waits between polls wakes the guard, which
+    /// drops the work.
     #[tokio::test]
-    async fn a_kill_while_running_drops_the_work() {
+    async fn a_kill_between_polls_drops_the_work() {
         struct Dropped(Arc<AtomicBool>);
         impl Drop for Dropped {
             fn drop(&mut self) {
@@ -240,7 +343,7 @@ mod tests {
             std::future::pending::<()>().await;
         }));
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(switch.canceller(|_| {})("root"));
+        assert!(switch.canceller(|_| {})("root").await);
         let out = tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .expect("the guard returned after the kill")
@@ -249,58 +352,77 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
     }
 
-    /// A kill that arrives during the poll that completes the work waits
-    /// for that poll (proven: it has not returned while the poll still
-    /// runs), then finds the work done: not applied. A non-blocking
-    /// `try_kill` during the poll reports `None`.
+    /// A kill that arrives during the poll that completes the work is
+    /// pending until that poll ends (it blocks no thread meanwhile), then
+    /// settled as not applied; so is a second kill waiting with it.
     #[tokio::test]
-    async fn a_kill_during_the_completing_poll_waits_and_is_not_applied() {
-        use std::sync::mpsc;
+    async fn a_kill_during_the_completing_poll_is_not_applied() {
         let switch = KillSwitch::new();
         let cancel = switch.canceller(|_| panic!("on_kill after completion"));
         let probe = switch.clone();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let killer = Arc::new(Mutex::new(None));
-        let slot = Arc::clone(&killer);
+        let kills = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&kills);
         let out = switch
             .guard(async move {
-                // Inside the poll: the switch is locked.
-                assert_eq!(probe.try_kill(), None, "a poll is in flight");
-                let handle = std::thread::spawn(move || {
-                    started_tx.send(()).unwrap();
-                    let applied = cancel("root");
-                    done_tx.send(()).unwrap();
-                    applied
-                });
-                started_rx.recv().unwrap();
-                // The killer started, yet cannot return while we poll.
-                assert!(
-                    done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-                    "the kill returned during the poll"
-                );
-                *slot.lock().unwrap() = Some((handle, done_rx));
+                // Inside the poll: both kills are pending, not blocked.
+                let mut first = cancel("root");
+                let mut second = probe.kill();
+                assert!(poll_once(&mut first).is_pending(), "a poll is in flight");
+                assert!(poll_once(&mut second).is_pending());
+                *slot.lock().unwrap() = Some((first, second));
                 "inserted"
             })
             .await;
         assert_eq!(out, Some("inserted"));
-        let (handle, done_rx) = killer.lock().unwrap().take().unwrap();
-        assert!(!handle.join().unwrap(), "the kill must not apply");
-        assert!(done_rx.try_recv().is_ok());
-        assert_eq!(switch.try_kill(), Some(false), "done: nothing to kill");
+        let (first, second) = kills.lock().unwrap().take().unwrap();
+        assert!(!first.await, "the kill must not apply");
+        assert!(!second.await, "a concurrent kill shares the outcome");
+        assert!(!switch.is_killed());
     }
 
-    /// `try_kill` between polls kills without blocking and wakes the guard.
+    /// A kill during a poll that does not complete the work is applied when
+    /// that poll ends: the work is dropped and never polled again.
     #[tokio::test]
-    async fn try_kill_between_polls_kills() {
+    async fn a_kill_during_a_poll_that_does_not_complete_is_applied() {
         let switch = KillSwitch::new();
-        let task = tokio::spawn(switch.guard(std::future::pending::<()>()));
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(switch.try_kill(), Some(true));
-        let out = tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .unwrap()
-            .unwrap();
+        let probe = switch.clone();
+        let kill = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&kill);
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&polls);
+        let out = switch
+            .guard(async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                *slot.lock().unwrap() = Some(probe.kill());
+                yield_once().await;
+                count.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
         assert_eq!(out, None);
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "polled again after the kill"
+        );
+        let kill = kill.lock().unwrap().take().unwrap();
+        assert!(kill.await);
+        assert!(switch.is_killed());
+    }
+
+    /// A kill pending when the work panics is applied: the work did not
+    /// complete.
+    #[tokio::test]
+    async fn a_kill_pending_when_the_work_panics_is_applied() {
+        let switch = KillSwitch::new();
+        let probe = switch.clone();
+        let kill = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&kill);
+        let task = tokio::spawn(switch.guard(async move {
+            *slot.lock().unwrap() = Some(probe.kill());
+            panic!("work panicked");
+        }));
+        assert!(task.await.unwrap_err().is_panic());
+        let kill = kill.lock().unwrap().take().unwrap();
+        assert!(kill.await);
     }
 }

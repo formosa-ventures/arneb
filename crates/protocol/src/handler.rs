@@ -2233,8 +2233,10 @@ mod tests {
         );
         // The window between the completed work and `finish`.
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
-            KillOutcome::AlreadyEnded(QueryState::Finishing)
+            tracker.kill_query(&id, "root").await.unwrap(),
+            KillOutcome::NotApplied {
+                state: QueryState::Running
+            }
         );
         tracked.finish(1);
         let info = tracker.get_query(&id).unwrap();
@@ -2252,7 +2254,7 @@ mod tests {
             TrackedStatement::start(&tracker, "INSERT INTO t SELECT 1", Some("bob".into()));
         let id = tracked.0.as_ref().unwrap().1;
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
+            tracker.kill_query(&id, "root").await.unwrap(),
             KillOutcome::Killed {
                 was: QueryState::Queued
             }
@@ -2559,9 +2561,9 @@ mod tests {
         assert_eq!(count, 3, "the planned (old) catalog's connector was used");
     }
 
-    /// A distributed statement hands its executor the `(epoch, generation)`
-    /// tag of the registry it pinned at the start, so its tasks name the
-    /// catalog set it was planned with even if the set changes meanwhile.
+    /// A distributed statement hands its executor the version tag of the
+    /// registry it pinned at the start, so its tasks name the catalog set
+    /// it was planned with even if the set changes meanwhile.
     #[tokio::test]
     async fn a_distributed_statement_carries_its_pinned_catalog_version() {
         struct Recording(std::sync::Mutex<Vec<Option<(u64, u64)>>>);
@@ -2572,7 +2574,10 @@ mod tests {
                 _plan: LogicalPlan,
                 exec_ctx: &ExecutionContext,
             ) -> Result<Vec<arrow::record_batch::RecordBatch>, ArnebError> {
-                self.0.lock().unwrap().push(exec_ctx.catalog_version());
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(exec_ctx.catalog_version().map(|v| (v.epoch, v.generation)));
                 Ok(Vec::new())
             }
             fn has_workers(&self) -> bool {
@@ -2581,7 +2586,11 @@ mod tests {
         }
         let manager = CatalogManager::new("memory", "default");
         let registry = ConnectorRegistry::new();
-        registry.set_version(Some((3, 7)));
+        registry.set_version(Some(arneb_common::CatalogVersion {
+            epoch: 3,
+            generation: 7,
+            ..Default::default()
+        }));
         let executor = Recording(Default::default());
         let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
             Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());

@@ -767,7 +767,7 @@ async fn execute_child_on_worker(
     // consumer's root via `may_stop_input_early`.
     consumer_must_drain: bool,
     // The catalog set the query was planned against, for every task.
-    catalog_version: Option<(u64, u64)>,
+    catalog_version: Option<Arc<arneb_common::CatalogVersion>>,
 ) -> Result<(), ExecutionError> {
     // Recursively execute children first. A child's consumer is THIS fragment,
     // so its producers must_drain unless this fragment can legitimately
@@ -781,7 +781,7 @@ async fn execute_child_on_worker(
             stage_results,
             query_id,
             child_must_drain,
-            catalog_version,
+            catalog_version.clone(),
         ))
         .await?;
     }
@@ -964,7 +964,7 @@ async fn execute_child_on_worker(
             // A1-fused scan SOURCE fragment, else 1. The worker strides the
             // scan by (task_id.partition_id, scan_task_count).
             scan_task_count,
-            catalog_version,
+            catalog_version: catalog_version.as_deref().cloned(),
         };
 
         let flight_addr = flight_address(&worker.address);

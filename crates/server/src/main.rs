@@ -988,7 +988,12 @@ async fn run() -> Result<()> {
             "cannot open the audit log (<state file name>.audit.jsonl next to [state] path)",
         )?,
     );
+    // Kept for the shutdown flush; the web state takes `audit_log`.
+    let audit_for_shutdown = Arc::clone(&audit_log);
     if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
+        // Retries an unwritable log in the background, so a completion whose
+        // write failed reaches the file once the disk recovers.
+        web::spawn_audit_retry(Arc::clone(&audit_log), web::AUDIT_RETRY_INTERVAL);
         tracing::info!(
             target: "arneb::config",
             path = %audit_path
@@ -1476,6 +1481,8 @@ async fn run() -> Result<()> {
             drain_timeout_secs,
         ) => {}
     }
+    // Completions whose write failed get one last try before exiting.
+    web::flush_audit(audit_for_shutdown).await;
 
     Ok(())
 }
@@ -1997,8 +2004,13 @@ async fn apply_pushed_catalogs(
     live: &catalogs::LiveCatalogs,
     set: arneb_rpc::CatalogSet,
 ) -> Result<Vec<String>, String> {
-    let generation = set.generation;
+    let (epoch, generation) = (set.epoch, set.generation);
     let report = live.apply_remote(set).await;
+    if report.stale_epoch {
+        // Not synced: the sender is not the coordinator this worker's
+        // heartbeat follows (an old one's delayed push).
+        return Err(catalogs::stale_epoch_error(epoch, live.current_epoch()));
+    }
     if !report.applied {
         tracing::debug!(
             target: "arneb::cluster",
@@ -2773,7 +2785,7 @@ mod tests {
             catalogs: vec![serde_json::to_value(&lake).unwrap()],
             ..Default::default()
         };
-        live.note_coordinator_epoch(250);
+        live.heartbeat_epoch(250);
         live.apply_remote(arneb_rpc::CatalogSet {
             epoch: 250,
             generation: 1,
@@ -2814,6 +2826,23 @@ mod tests {
             .unwrap();
         assert_eq!(failed, vec!["bad".to_string()]);
         assert_eq!(live.generation(), 6);
+    }
+
+    /// Round 4: a push from another epoch than the one the last heartbeat
+    /// named is refused with an error, so the coordinator that sent it
+    /// never counts this worker as synced.
+    #[tokio::test]
+    async fn a_push_from_another_epoch_than_the_heartbeat_is_an_error() {
+        let live = empty_live();
+        live.heartbeat_epoch(400);
+        let push = arneb_rpc::CatalogSet {
+            epoch: 500,
+            generation: 9,
+            ..Default::default()
+        };
+        let e = apply_pushed_catalogs(&live, push).await.unwrap_err();
+        assert!(e.contains("epoch 500") && e.contains("epoch 400"), "{e}");
+        assert_eq!(live.generation(), 0);
     }
 
     /// Which `tracing` target an [`enabled`] probe checks.

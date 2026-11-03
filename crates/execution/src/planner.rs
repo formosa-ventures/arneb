@@ -105,11 +105,11 @@ pub struct ExecutionContext {
     /// on workers (only coord-side fragmenter consults it) and in
     /// unit tests.
     catalog_stats: Option<Arc<CatalogStats>>,
-    /// The `(epoch, generation)` of the runtime catalog set the statement
-    /// was planned against (its pinned connector registry's tag). The
-    /// coordinator ships it with every distributed task, and a worker runs
-    /// a task only against that same set. `None` when untagged.
-    catalog_version: Option<(u64, u64)>,
+    /// The runtime catalog set the statement was planned against (its
+    /// pinned connector registry's tag). The coordinator ships it with
+    /// every distributed task, and a worker scans each catalog only at the
+    /// version planned. `None` when untagged.
+    catalog_version: Option<Arc<arneb_common::CatalogVersion>>,
     /// Multi-worker scan parallelism `M`: the number of parallel tasks the
     /// coordinator scheduled for this scan SOURCE fragment. Each ScanExec
     /// built from this context reads only the strided 1/M of its
@@ -195,7 +195,7 @@ impl ExecutionContext {
             dynamic_filter_publisher: self.dynamic_filter_publisher.clone(),
             broadcast_max_build_bytes: self.broadcast_max_build_bytes,
             catalog_stats: self.catalog_stats.clone(),
-            catalog_version: self.catalog_version,
+            catalog_version: self.catalog_version.clone(),
             scan_task_count: self.scan_task_count,
         }
     }
@@ -218,7 +218,7 @@ impl ExecutionContext {
             dynamic_filter_publisher: self.dynamic_filter_publisher.clone(),
             broadcast_max_build_bytes: self.broadcast_max_build_bytes,
             catalog_stats: self.catalog_stats.clone(),
-            catalog_version: self.catalog_version,
+            catalog_version: self.catalog_version.clone(),
             scan_task_count: self.scan_task_count,
         }
     }
@@ -242,7 +242,7 @@ impl ExecutionContext {
             dynamic_filter_publisher: self.dynamic_filter_publisher.clone(),
             broadcast_max_build_bytes: self.broadcast_max_build_bytes,
             catalog_stats: self.catalog_stats.clone(),
-            catalog_version: self.catalog_version,
+            catalog_version: self.catalog_version.clone(),
             scan_task_count,
         }
     }
@@ -265,7 +265,7 @@ impl ExecutionContext {
             dynamic_filter_publisher: self.dynamic_filter_publisher.clone(),
             broadcast_max_build_bytes: self.broadcast_max_build_bytes,
             catalog_stats: self.catalog_stats.clone(),
-            catalog_version: self.catalog_version,
+            catalog_version: self.catalog_version.clone(),
             scan_task_count: self.scan_task_count,
         }
     }
@@ -286,7 +286,7 @@ impl ExecutionContext {
             dynamic_filter_publisher: self.dynamic_filter_publisher.clone(),
             broadcast_max_build_bytes: self.broadcast_max_build_bytes,
             catalog_stats: self.catalog_stats.clone(),
-            catalog_version: self.catalog_version,
+            catalog_version: self.catalog_version.clone(),
             scan_task_count: self.scan_task_count,
         }
     }
@@ -313,7 +313,7 @@ impl ExecutionContext {
             dynamic_filter_publisher: self.dynamic_filter_publisher.clone(),
             broadcast_max_build_bytes: self.broadcast_max_build_bytes,
             catalog_stats: self.catalog_stats.clone(),
-            catalog_version: self.catalog_version,
+            catalog_version: self.catalog_version.clone(),
             scan_task_count: self.scan_task_count,
         }
     }
@@ -336,7 +336,7 @@ impl ExecutionContext {
             dynamic_filter_publisher: self.dynamic_filter_publisher.clone(),
             broadcast_max_build_bytes: self.broadcast_max_build_bytes,
             catalog_stats: self.catalog_stats.clone(),
-            catalog_version: self.catalog_version,
+            catalog_version: self.catalog_version.clone(),
             scan_task_count: self.scan_task_count,
         }
     }
@@ -359,7 +359,7 @@ impl ExecutionContext {
             dynamic_filter_publisher: self.dynamic_filter_publisher.clone(),
             broadcast_max_build_bytes: self.broadcast_max_build_bytes,
             catalog_stats: self.catalog_stats.clone(),
-            catalog_version: self.catalog_version,
+            catalog_version: self.catalog_version.clone(),
             scan_task_count: self.scan_task_count,
         }
     }
@@ -386,7 +386,7 @@ impl ExecutionContext {
             dynamic_filter_publisher: publisher,
             broadcast_max_build_bytes: self.broadcast_max_build_bytes,
             catalog_stats: self.catalog_stats.clone(),
-            catalog_version: self.catalog_version,
+            catalog_version: self.catalog_version.clone(),
             scan_task_count: self.scan_task_count,
         }
     }
@@ -409,7 +409,7 @@ impl ExecutionContext {
             dynamic_filter_publisher: self.dynamic_filter_publisher.clone(),
             broadcast_max_build_bytes: bytes,
             catalog_stats: self.catalog_stats.clone(),
-            catalog_version: self.catalog_version,
+            catalog_version: self.catalog_version.clone(),
             scan_task_count: self.scan_task_count,
         }
     }
@@ -431,7 +431,7 @@ impl ExecutionContext {
             dynamic_filter_publisher: self.dynamic_filter_publisher.clone(),
             broadcast_max_build_bytes: self.broadcast_max_build_bytes,
             catalog_stats: stats,
-            catalog_version: self.catalog_version,
+            catalog_version: self.catalog_version.clone(),
             scan_task_count: self.scan_task_count,
         }
     }
@@ -446,16 +446,19 @@ impl ExecutionContext {
         self.catalog_stats.as_ref()
     }
 
-    /// Sets the `(epoch, generation)` of the catalog set the statement was
-    /// planned against.
-    pub fn with_catalog_version(mut self, version: Option<(u64, u64)>) -> Self {
+    /// Sets the version of the catalog set the statement was planned
+    /// against.
+    pub fn with_catalog_version(
+        mut self,
+        version: Option<Arc<arneb_common::CatalogVersion>>,
+    ) -> Self {
         self.catalog_version = version;
         self
     }
 
-    /// The `(epoch, generation)` the statement was planned against.
-    pub fn catalog_version(&self) -> Option<(u64, u64)> {
-        self.catalog_version
+    /// The version of the catalog set the statement was planned against.
+    pub fn catalog_version(&self) -> Option<Arc<arneb_common::CatalogVersion>> {
+        self.catalog_version.clone()
     }
 
     /// Access the per-task dynamic-filter collector, if installed.

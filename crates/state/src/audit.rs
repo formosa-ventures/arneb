@@ -575,6 +575,13 @@ impl AuditLog {
         Ok(())
     }
 
+    /// Completions whose write failed and that wait for the log to reopen
+    /// ([`Self::ensure_writable`]); lost if the process exits first (the
+    /// next start then records their intents as interrupted).
+    pub fn unwritten_completions(&self) -> usize {
+        self.lock_writer().unwritten.len()
+    }
+
     /// Whether the next append is expected to succeed. Lock-free.
     pub fn is_writable(&self) -> bool {
         self.writable.load(Ordering::SeqCst)

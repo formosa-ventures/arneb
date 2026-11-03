@@ -77,9 +77,68 @@ pub struct ApplyReport {
     /// False when the set's generation was not newer than the one held, so
     /// nothing changed.
     pub applied: bool,
+    /// True when the set was refused because it came from another epoch
+    /// than the coordinator's current one ([`LiveCatalogs::current_epoch`]):
+    /// an old coordinator's delayed push or pull. Nothing changed, and the
+    /// worker is not in sync with the sender.
+    pub stale_epoch: bool,
     /// `(catalog, error)` for each new or changed catalog that failed to
     /// build and was skipped.
     pub failed: Vec<(String, String)>,
+}
+
+/// What an applied set commits besides its installs and removes.
+struct SetCommit {
+    /// The set's catalogs that failed to build (Ruling R8).
+    failed: std::collections::BTreeSet<String>,
+    /// The fingerprint of each of the set's catalogs, as its sender serves
+    /// it; recorded for the installed ones, changed or not.
+    fingerprints: BTreeMap<String, u64>,
+    /// The coordinator's default catalog and schema, when the set carries
+    /// them (Ruling R12).
+    defaults: Option<(String, String)>,
+}
+
+/// One caller's hold on an apply flight. Dropped (the apply finished, or
+/// its caller was cancelled), it removes the flight from the map once no
+/// other caller holds it, so a cancelled apply never leaves its entry.
+struct FlightGuard<'a> {
+    flights: &'a std::sync::Mutex<BTreeMap<(Option<u64>, u64), ApplyFlight>>,
+    key: (Option<u64>, u64),
+    flight: Option<ApplyFlight>,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(flight) = self.flight.take() {
+            // Two holders left: the map and this caller. Dropped under the
+            // lock, so concurrent callers count each other right.
+            let last = Arc::strong_count(&flight) == 2;
+            if last
+                && flights
+                    .get(&self.key)
+                    .is_some_and(|f| Arc::ptr_eq(f, &flight))
+            {
+                flights.remove(&self.key);
+            }
+            drop(flight);
+        }
+    }
+}
+
+/// The fingerprint of a served spec's JSON.
+fn value_fingerprint(value: &serde_json::Value) -> u64 {
+    arneb_common::spec_fingerprint(&value.to_string())
+}
+
+impl ApplyReport {
+    fn stale() -> Self {
+        Self {
+            stale_epoch: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// The node's live external catalogs. Share as `Arc<LiveCatalogs>`.
@@ -89,6 +148,12 @@ pub struct LiveCatalogs {
     global_storage: StorageConfig,
     /// The installed specs, by name.
     specs: RwLock<BTreeMap<String, CatalogConfig>>,
+    /// The fingerprint of each installed spec as the coordinator serves it
+    /// ([`arneb_common::spec_fingerprint`] of its effective spec's JSON):
+    /// on a worker the coordinator's own, so both sides agree. Part of the
+    /// registry's version tag; a task scans a catalog only at the
+    /// fingerprint its query was planned with.
+    fingerprints: RwLock<BTreeMap<String, u64>>,
     generation: AtomicU64,
     /// On a coordinator, its own epoch (ordered by start time); on a worker, the
     /// epoch of the coordinator its set came from (0 before the first).
@@ -110,12 +175,15 @@ pub struct LiveCatalogs {
     /// Builds run before it is taken, so an unreachable metastore never
     /// holds up another push or pull.
     applying: tokio::sync::Mutex<()>,
-    /// On a worker, the coordinator's current epoch: the largest seen in a
-    /// push or pull, or the one the last heartbeat reply named (0 before
-    /// any). A set from an older epoch is stale and never applies (a slow
-    /// build of a set fetched before the coordinator restarted, a delayed
-    /// push from the old one).
-    latest_epoch: AtomicU64,
+    /// On a worker, the epoch the last heartbeat reply named (0 before
+    /// any): the live coordinator's, so once known only a heartbeat moves
+    /// it, down as well as up. A set from any other epoch is stale and
+    /// never applies (a slow build of a set fetched before the coordinator
+    /// restarted, a delayed push from the old one).
+    heartbeat_epoch: AtomicU64,
+    /// On a worker, the largest epoch a push or pull named; the current
+    /// epoch only until a heartbeat names one.
+    seen_epoch: AtomicU64,
     /// One apply per `(epoch, generation)` at a time: a push and a pull of
     /// the same set share one build of each changed catalog.
     apply_flights: std::sync::Mutex<BTreeMap<(Option<u64>, u64), ApplyFlight>>,
@@ -156,13 +224,15 @@ impl LiveCatalogs {
             connectors,
             global_storage,
             specs: RwLock::new(BTreeMap::new()),
+            fingerprints: RwLock::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
             failed: RwLock::new(Default::default()),
             pushed_defaults: RwLock::new(None),
             unauthenticated_flight: std::sync::atomic::AtomicBool::new(false),
             applying: tokio::sync::Mutex::new(()),
-            latest_epoch: AtomicU64::new(0),
+            heartbeat_epoch: AtomicU64::new(0),
+            seen_epoch: AtomicU64::new(0),
             apply_flights: Default::default(),
             #[cfg(test)]
             test_builder: None,
@@ -238,16 +308,40 @@ impl LiveCatalogs {
     }
 
     /// Moves to `generation` (and `epoch`, when given) and tags the
-    /// registry with both. Only inside a [`ConnectorRegistry::swap`].
-    /// Generation before epoch: a reader seeing the new epoch also sees the
-    /// generation that goes with it.
+    /// registry with both, each catalog's fingerprint and the scan
+    /// defaults. Only inside a [`ConnectorRegistry::swap`], after the
+    /// catalogs, fingerprints and defaults changed. Generation before
+    /// epoch: a reader seeing the new epoch also sees the generation that
+    /// goes with it.
     fn store_version(&self, epoch: Option<u64>, generation: u64) {
         self.generation.store(generation, Ordering::SeqCst);
         if let Some(e) = epoch {
             self.epoch.store(e, Ordering::SeqCst);
         }
+        let (default_catalog, default_schema) = self.scan_defaults();
         self.connectors
-            .set_version(Some((self.epoch(), self.generation())));
+            .set_version(Some(arneb_common::CatalogVersion {
+                epoch: self.epoch(),
+                generation: self.generation(),
+                catalogs: self
+                    .fingerprints
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone(),
+                default_catalog,
+                default_schema,
+            }));
+    }
+
+    /// `spec` as served to workers ([`snapshot`](Self::snapshot)): its
+    /// effective spec as JSON.
+    fn served_value(&self, spec: &CatalogConfig) -> Option<serde_json::Value> {
+        serde_json::to_value(self.effective_spec(spec)).ok()
+    }
+
+    /// The fingerprint of `spec` as this node serves it.
+    fn fingerprint(&self, spec: &CatalogConfig) -> u64 {
+        value_fingerprint(&self.served_value(spec).unwrap_or_default())
     }
 
     /// The `(epoch, generation)` a [`ConnectorRegistry::pinned`] copy of
@@ -256,12 +350,14 @@ impl LiveCatalogs {
         (self.epoch(), self.generation())
     }
 
-    /// Records an epoch a push or pull named: epochs grow with each
-    /// coordinator start, so the larger one wins (0 is ignored). From then
-    /// on a set from an older epoch is refused as stale.
+    /// Records an epoch a push or pull named. Until a heartbeat names the
+    /// coordinator's epoch, the largest seen is taken as current (epochs
+    /// grow with each coordinator start; 0 is ignored); after that a push
+    /// or pull never moves it, so an old coordinator's delayed push cannot
+    /// lock out the live one.
     pub fn note_coordinator_epoch(&self, epoch: u64) {
         if epoch != 0 {
-            self.latest_epoch.fetch_max(epoch, Ordering::SeqCst);
+            self.seen_epoch.fetch_max(epoch, Ordering::SeqCst);
         }
     }
 
@@ -271,7 +367,17 @@ impl LiveCatalogs {
     /// the coordinator it is talking to.
     pub fn heartbeat_epoch(&self, epoch: u64) {
         if epoch != 0 {
-            self.latest_epoch.store(epoch, Ordering::SeqCst);
+            self.heartbeat_epoch.store(epoch, Ordering::SeqCst);
+        }
+    }
+
+    /// The epoch of the coordinator this worker follows: the last
+    /// heartbeat's, else the largest a push or pull named (0 before any).
+    /// A set from another epoch is refused.
+    pub fn current_epoch(&self) -> u64 {
+        match self.heartbeat_epoch.load(Ordering::SeqCst) {
+            0 => self.seen_epoch.load(Ordering::SeqCst),
+            e => e,
         }
     }
 
@@ -358,7 +464,7 @@ impl LiveCatalogs {
             .consistent(|| (self.epoch(), self.generation(), self.specs()));
         let catalogs = specs
             .iter()
-            .filter_map(|spec| serde_json::to_value(self.effective_spec(spec)).ok())
+            .filter_map(|spec| self.served_value(spec))
             .collect();
         arneb_rpc::CatalogSet {
             epoch,
@@ -390,8 +496,11 @@ impl LiveCatalogs {
                 .and_then(|n| n.as_str())
                 .unwrap_or("<unnamed>")
                 .to_owned();
+            // The coordinator's fingerprint: of the JSON it served, which
+            // is what it tagged its own registry with.
+            let fingerprint = value_fingerprint(&value);
             match serde_json::from_value::<CatalogConfig>(value) {
-                Ok(spec) => specs.push(spec),
+                Ok(spec) => specs.push((spec, fingerprint)),
                 Err(e) => {
                     // Only the error's category: its text may quote a value.
                     tracing::warn!(
@@ -403,15 +512,13 @@ impl LiveCatalogs {
                 }
             }
         }
-        let mut report = self.apply(Some(set.epoch), set.generation, specs).await;
+        // The defaults go in with the catalogs, under the same tag.
+        let defaults = set.default_catalog.zip(set.default_schema);
+        let mut report = self
+            .apply(Some(set.epoch), set.generation, specs, defaults)
+            .await;
         if report.applied {
             report.failed.extend(undecodable);
-            if let (Some(catalog), Some(schema)) = (set.default_catalog, set.default_schema) {
-                *self
-                    .pushed_defaults
-                    .write()
-                    .unwrap_or_else(|p| p.into_inner()) = Some((catalog, schema));
-            }
         }
         report
     }
@@ -519,16 +626,15 @@ impl LiveCatalogs {
         self.commit_at(None, generation, installs, removes, None);
     }
 
-    /// [`commit`](Self::commit) that also moves to `epoch` (when given) and,
-    /// when `failed` is given, records it as the catalogs of the set that
-    /// failed to build.
+    /// [`commit`](Self::commit) that also moves to `epoch` (when given) and
+    /// commits what `set` adds when given (an applied set).
     fn commit_at(
         &self,
         epoch: Option<u64>,
         generation: u64,
         installs: Vec<(CatalogConfig, BuiltCatalog)>,
         removes: &[String],
-        failed: Option<std::collections::BTreeSet<String>>,
+        set: Option<SetCommit>,
     ) {
         self.connectors.swap(|| {
             for (spec, built) in installs {
@@ -537,8 +643,22 @@ impl LiveCatalogs {
             for name in removes {
                 self.remove_unswapped(name);
             }
-            if let Some(failed) = failed {
-                *self.failed.write().unwrap_or_else(|p| p.into_inner()) = failed;
+            if let Some(set) = set {
+                *self.failed.write().unwrap_or_else(|p| p.into_inner()) = set.failed;
+                let installed = self.read_specs();
+                let mut fingerprints = self.fingerprints.write().unwrap_or_else(|p| p.into_inner());
+                for (name, fingerprint) in set.fingerprints {
+                    if installed.contains_key(&name) {
+                        fingerprints.insert(name, fingerprint);
+                    }
+                }
+                drop((installed, fingerprints));
+                if let Some(defaults) = set.defaults {
+                    *self
+                        .pushed_defaults
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(defaults);
+                }
             }
             self.store_version(epoch, generation);
         });
@@ -552,6 +672,11 @@ impl LiveCatalogs {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&name);
+        let fingerprint = self.fingerprint(&spec);
+        self.fingerprints
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(name.clone(), fingerprint);
         self.write_specs().insert(name, spec);
     }
 
@@ -559,6 +684,10 @@ impl LiveCatalogs {
         if self.write_specs().remove(name).is_none() {
             return false;
         }
+        self.fingerprints
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(name);
         self.manager.deregister_catalog(name);
         self.connectors.deregister(name);
         true
@@ -574,7 +703,14 @@ impl LiveCatalogs {
     /// missing, retries the build once and otherwise fails). The rest
     /// still apply and the generation still advances.
     pub async fn apply_set(&self, generation: u64, specs: Vec<CatalogConfig>) -> ApplyReport {
-        self.apply(None, generation, specs).await
+        let specs = specs
+            .into_iter()
+            .map(|spec| {
+                let fingerprint = self.fingerprint(&spec);
+                (spec, fingerprint)
+            })
+            .collect();
+        self.apply(None, generation, specs, None).await
     }
 
     /// [`apply_set`](Self::apply_set), except that a set from `epoch` other
@@ -593,11 +729,16 @@ impl LiveCatalogs {
     /// Concurrent applies of the same `(epoch, generation)` (a push and a
     /// heartbeat-triggered pull of one change) share one run and its
     /// report, so each changed catalog is built once.
+    ///
+    /// Each spec comes with its fingerprint as the coordinator serves it,
+    /// and `defaults` (the coordinator's default catalog and schema) are
+    /// committed with the catalogs when given.
     async fn apply(
         &self,
         epoch: Option<u64>,
         generation: u64,
-        specs: Vec<CatalogConfig>,
+        specs: Vec<(CatalogConfig, u64)>,
+        defaults: Option<(String, String)>,
     ) -> ApplyReport {
         let key = (epoch, generation);
         let flight = self
@@ -607,23 +748,34 @@ impl LiveCatalogs {
             .entry(key)
             .or_default()
             .clone();
-        let report = flight
-            .get_or_init(|| self.apply_once(epoch, generation, specs))
+        // Leaves the map when its last caller does, finished or cancelled.
+        let guard = FlightGuard {
+            flights: &self.apply_flights,
+            key,
+            flight: Some(flight),
+        };
+        let flight = guard.flight.as_ref().expect("set above");
+        flight
+            .get_or_init(|| self.apply_once(epoch, generation, specs, defaults))
             .await
-            .clone();
-        let mut flights = self.apply_flights.lock().unwrap_or_else(|p| p.into_inner());
-        if flights.get(&key).is_some_and(|f| Arc::ptr_eq(f, &flight)) {
-            flights.remove(&key);
-        }
-        report
+            .clone()
     }
 
     async fn apply_once(
         &self,
         epoch: Option<u64>,
         generation: u64,
-        specs: Vec<CatalogConfig>,
+        specs: Vec<(CatalogConfig, u64)>,
+        defaults: Option<(String, String)>,
     ) -> ApplyReport {
+        let fingerprints: BTreeMap<String, u64> = specs
+            .iter()
+            .map(|(spec, fingerprint)| (spec.name.clone(), *fingerprint))
+            .collect();
+        let specs: Vec<CatalogConfig> = specs.into_iter().map(|(spec, _)| spec).collect();
+        if self.stale_epoch(epoch) {
+            return ApplyReport::stale();
+        }
         if !self.applies(epoch, generation) {
             return ApplyReport::default();
         }
@@ -665,7 +817,11 @@ impl LiveCatalogs {
                 }
             }
             let _applying = self.applying.lock().await;
-            // A newer set may have been applied while this one was building.
+            // A newer set may have been applied, or a heartbeat named
+            // another epoch, while this one was building.
+            if self.stale_epoch(epoch) {
+                return ApplyReport::stale();
+            }
             if !self.applies(epoch, generation) {
                 return ApplyReport::default();
             }
@@ -707,29 +863,46 @@ impl LiveCatalogs {
                 generation,
                 installs,
                 &removes,
-                Some(failed.keys().cloned().collect()),
+                Some(SetCommit {
+                    failed: failed.keys().cloned().collect(),
+                    fingerprints,
+                    defaults,
+                }),
             );
             return ApplyReport {
                 applied: true,
                 failed: failed.into_iter().collect(),
+                stale_epoch: false,
             };
         }
     }
 
-    /// Whether a set at `(epoch, generation)` applies now: a newer
-    /// generation within the epoch held, a set from another epoch when that
-    /// is the coordinator's current one (the largest a push or pull named,
-    /// or the last heartbeat's; any before one is known), or the set
-    /// already held while some of it failed to build (Ruling R8).
+    /// Whether a set from `epoch` comes from another coordinator than the
+    /// current one ([`current_epoch`](Self::current_epoch)); any is
+    /// current before one is known.
+    fn stale_epoch(&self, epoch: Option<u64>) -> bool {
+        let current = self.current_epoch();
+        epoch.is_some_and(|e| current != 0 && e != current)
+    }
+
+    /// Whether a set at `(epoch, generation)` that is not
+    /// [stale](Self::stale_epoch) applies now: a newer generation within
+    /// the epoch held, a set from another epoch, or the set already held
+    /// while some of it failed to build (Ruling R8).
     fn applies(&self, epoch: Option<u64>, generation: u64) -> bool {
-        let latest = self.latest_epoch.load(Ordering::SeqCst);
-        if epoch.is_some_and(|e| latest != 0 && e != latest) {
-            return false;
-        }
         let same_epoch = epoch.is_none_or(|e| e == self.epoch());
         let retry = same_epoch && generation == self.generation() && self.has_failed_builds();
         !same_epoch || generation > self.generation() || retry
     }
+}
+
+/// Why a set from coordinator `epoch` was refused by a worker following
+/// `current`.
+pub fn stale_epoch_error(epoch: u64, current: u64) -> String {
+    format!(
+        "catalog set from coordinator epoch {epoch} refused: this worker follows epoch \
+         {current} (its last heartbeat's coordinator)"
+    )
 }
 
 /// How a worker pulls its catalogs from the coordinator (runtime-config
@@ -784,8 +957,11 @@ impl CatalogPuller {
             Box::pin(async move {
                 let set =
                     arneb_rpc::fetch_catalogs(&coordinator, arneb_rpc::cluster_security()).await?;
-                let generation = set.generation;
+                let (epoch, generation) = (set.epoch, set.generation);
                 let report = live.apply_remote(set).await;
+                if report.stale_epoch {
+                    return Err(stale_epoch_error(epoch, live.current_epoch()));
+                }
                 if report.applied {
                     tracing::info!(
                         target: "arneb::cluster",
@@ -985,18 +1161,11 @@ pub fn validate_spec_fields(spec: &CatalogConfig) -> Result<(), String> {
         }
         "postgresql" => {
             let pg = spec.postgres_config().map_err(|e| e.to_string())?;
+            // Also refuses a `password` parameter set twice (only the last
+            // parameter may be one), which a GET → PUT round trip could not
+            // tell apart once redacted.
             pg.validate_url()
                 .map_err(|e| format!("catalog '{name}': {e}"))?;
-            if let Some(url) = &spec.connection_url {
-                // The driver takes the last; a GET → PUT round trip could not
-                // tell the redacted copies apart.
-                if url_query_passwords(&url.0).len() > 1 {
-                    return Err(format!(
-                        "catalog '{name}': connection_url sets the password parameter more \
-                         than once"
-                    ));
-                }
-            }
         }
         other => {
             return Err(format!(
@@ -1008,8 +1177,9 @@ pub fn validate_spec_fields(spec: &CatalogConfig) -> Result<(), String> {
 }
 
 /// The spec as JSON with every secret replaced by `"<redacted>"`: the
-/// `password`, the password inside `connection_url` (all of it after the
-/// scheme when the URL fails validation), and the storage
+/// `password`, the password inside `connection_url` (all of it after a
+/// leading `postgresql://` when the URL fails validation, or the whole
+/// value when it starts with no such scheme), and the storage
 /// `secret_access_key`, `service_account_path` and Azure `access_key`.
 /// Every API response, MCP result and audit entry uses this form.
 pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
@@ -1029,11 +1199,13 @@ pub fn redacted_spec(spec: &CatalogConfig) -> serde_json::Value {
     }) {
         // Where the driver ends the password of a URL that validation
         // refuses (it may be stored: config-file catalogs, older states)
-        // is no guide to what is secret: hide everything after the scheme,
-        // or the whole value when it has none (a libpq keyword string
-        // `host=db password=x`, a mistyped `postgresql:/db?password=x`).
-        match url.0.find("://").map(|i| i + 3) {
-            Some(after_scheme) => url.0.replace_range(after_scheme.., REDACTED),
+        // is no guide to what is secret: hide everything after a leading
+        // `postgresql://` or `postgres://`, and the whole value otherwise
+        // (a libpq keyword string `host=db password=x sslrootcert=file:///…`,
+        // a mistyped `postgresql:/db?password=x`): a `://` further in may
+        // sit inside a parameter or the password itself.
+        match pg_scheme_len(&url.0) {
+            Some(scheme) => url.0.replace_range(scheme.., REDACTED),
             None => url.0 = REDACTED.to_owned(),
         }
     } else if let Some(url) = &mut spec.connection_url {
@@ -1157,10 +1329,7 @@ pub fn redacted_secrets(spec: &CatalogConfig) -> Vec<&'static str> {
     }
     if let Some(url) = &spec.connection_url {
         let whole = url.0 == REDACTED
-            || url
-                .0
-                .split_once("://")
-                .is_some_and(|(_, rest)| rest == REDACTED);
+            || pg_scheme_len(&url.0).is_some_and(|scheme| url.0[scheme..] == *REDACTED);
         let userinfo = url_password_range(&url.0).is_some_and(|r| &url.0[r] == REDACTED);
         let query = url_query_passwords(&url.0)
             .into_iter()
@@ -1279,6 +1448,18 @@ pub fn same_destination(a: &CatalogConfig, b: &CatalogConfig) -> bool {
     destinations(a) == destinations(b)
 }
 
+/// The length of the `postgresql://` or `postgres://` (any case) that
+/// `url` starts with: the only prefix a refused URL keeps when redacted.
+fn pg_scheme_len(url: &str) -> Option<usize> {
+    ["postgresql://", "postgres://"]
+        .into_iter()
+        .find(|scheme| {
+            url.get(..scheme.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(scheme))
+        })
+        .map(str::len)
+}
+
 /// Where the credentials of `scheme://user:password@host/...` end, found
 /// the way tokio-postgres finds them: everything after the scheme up to
 /// the first `@` anywhere is the userinfo, so an unencoded `/`, `?` or `#`
@@ -1298,27 +1479,6 @@ fn url_password_range(url: &str) -> Option<std::ops::Range<usize>> {
     let at = at?;
     let colon = url[start..at].find(':')?;
     Some(start + colon + 1..at)
-}
-
-/// Whether a query parameter key is `password` once percent-decoded:
-/// tokio-postgres decodes keys, so `pass%77ord=` sets the password too.
-fn is_password_key(key: &str) -> bool {
-    let bytes = key.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let hex = |b: u8| (b as char).to_digit(16);
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                decoded.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        decoded.push(bytes[i]);
-        i += 1;
-    }
-    decoded == b"password"
 }
 
 /// `(parameter, value)` byte ranges of every query parameter whose key is
@@ -1362,7 +1522,7 @@ fn query_passwords_from(
     let mut start = q;
     for param in url[q..].split('&') {
         if let Some((key, value)) = param.split_once('=') {
-            if is_password_key(key) {
+            if arneb_postgresql::is_password_key(key) {
                 let value_start = start + param.len() - value.len();
                 out.push((start..start + param.len(), value_start..start + param.len()));
             }
@@ -1376,6 +1536,11 @@ fn query_passwords_from(
 mod tests {
     use super::*;
     use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory};
+
+    /// A registry tag's `(epoch, generation)`.
+    pub(crate) fn eg(tag: Option<Arc<arneb_common::CatalogVersion>>) -> Option<(u64, u64)> {
+        tag.map(|t| (t.epoch, t.generation))
+    }
 
     fn spec(json: serde_json::Value) -> CatalogConfig {
         serde_json::from_value(json).unwrap()
@@ -1753,13 +1918,13 @@ mod tests {
         let query = redacted_spec(&spec(serde_json::json!({
             "name": "p", "type": "postgresql",
             "connection_url":
-                "postgresql://bob:ui-secret-7@db/sales?sslmode=disable&password=q-secret-6&application_name=x"
+                "postgresql://bob:ui-secret-7@db/sales?sslmode=disable&application_name=x&password=q-secret-6"
         })));
         let text = query.to_string();
         assert!(!text.contains("q-secret-6") && !text.contains("ui-secret-7"));
         assert_eq!(
             query["connection_url"],
-            "postgresql://bob:<redacted>@db/sales?sslmode=disable&password=<redacted>&application_name=x"
+            "postgresql://bob:<redacted>@db/sales?sslmode=disable&application_name=x&password=<redacted>"
         );
         let only = redacted_spec(&spec(serde_json::json!({
             "name": "p", "type": "postgresql",
@@ -1805,9 +1970,11 @@ mod tests {
             round_trip.connection_url.as_ref().unwrap().0,
             stored.connection_url.as_ref().unwrap().0
         );
-        assert!(is_password_key("%70%61%73%73%77%6F%72%64"));
-        assert!(!is_password_key("password%"));
-        assert!(!is_password_key("passwor"));
+        assert!(arneb_postgresql::is_password_key(
+            "%70%61%73%73%77%6F%72%64"
+        ));
+        assert!(!arneb_postgresql::is_password_key("password%"));
+        assert!(!arneb_postgresql::is_password_key("passwor"));
     }
 
     /// tokio-postgres takes the credentials up to the first `@`, so an
@@ -1837,8 +2004,8 @@ mod tests {
                 "postgres://<redacted>",
             ),
             (
-                "postgresql://app@db/x?password=pa#ss&sslmode=disable",
-                "postgresql://app@db/x?password=<redacted>&sslmode=disable",
+                "postgresql://app@db/x?sslmode=disable&password=pa#ss",
+                "postgresql://app@db/x?sslmode=disable&password=<redacted>",
             ),
             (
                 "postgresql://app:pa?password=no@db/x?password=q/s#t",
@@ -2029,19 +2196,48 @@ mod tests {
     }
 
     /// M6: a URL that sets `password=` twice is refused, so a GET → PUT
-    /// round trip cannot change which one the driver uses.
+    /// round trip cannot change which one the driver uses. Since round 4
+    /// the password must be the last parameter, which covers it, and the
+    /// refused URL is hidden whole.
     #[test]
     fn duplicate_query_passwords_are_refused() {
         let s = spec(serde_json::json!({
             "name": "p", "type": "postgresql",
-            "connection_url": "postgresql://u@db/x?password=a&sslmode=disable&pass%77ord=b"
+            "connection_url": "postgresql://u@db/x?password=a1&sslmode=disable&pass%77ord=b2"
         }));
         let e = validate_spec(&s).unwrap_err();
-        assert!(e.contains("more than once") && !e.contains("=a"), "{e}");
+        assert!(e.contains("last one") && !e.contains("a1"), "{e}");
         let shown = redacted_spec(&s);
+        assert_eq!(shown["connection_url"], "postgresql://<redacted>");
+    }
+
+    /// Round 4: a raw `&` in a query password would turn its tail into a
+    /// real driver parameter (a host sent to DNS). Such a URL is refused,
+    /// and shown with nothing after the scheme.
+    #[test]
+    fn a_query_password_with_a_raw_ampersand_is_refused_and_hidden() {
+        for url in [
+            "postgresql://db/x?password=Xy&host=9zK",
+            "postgresql://db/x?sslmode=disable&password=Xy&dbname=9zK",
+            "postgresql://u@db/x?pass%77ord=Xy&options=9zK",
+        ] {
+            let s = spec(serde_json::json!({
+                "name": "p", "type": "postgresql", "connection_url": url
+            }));
+            let e = validate_spec(&s).unwrap_err();
+            assert!(!e.contains("Xy") && !e.contains("9zK"), "{e}");
+            let shown = redacted_spec(&s);
+            assert_eq!(shown["connection_url"], "postgresql://<redacted>", "{url}");
+            assert!(!shown.to_string().contains("9zK"), "{shown}");
+        }
+        let encoded = spec(serde_json::json!({
+            "name": "p", "type": "postgresql",
+            "connection_url": "postgresql://db/x?sslmode=disable&password=Xy%26host%3D9zK"
+        }));
+        validate_spec(&encoded).unwrap();
         assert_eq!(
-            shown["connection_url"],
-            "postgresql://u@db/x?password=<redacted>&sslmode=disable&pass%77ord=<redacted>"
+            redacted_spec(&encoded)["connection_url"],
+            "postgresql://db/x?sslmode=disable&password=<redacted>"
         );
     }
 
@@ -2223,7 +2419,7 @@ mod tests {
         // The restarted coordinator pushes.
         let fast = serde_json::to_value(hive("fast")).unwrap();
         assert!(live.apply_remote(set(2, 1, vec![fast])).await.applied);
-        assert_eq!(stale.await.unwrap(), ApplyReport::default());
+        assert_eq!(stale.await.unwrap(), ApplyReport::stale());
         assert_eq!((live.epoch(), live.generation()), (2, 1));
         let names: Vec<String> = live.specs().into_iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["fast"]);
@@ -2243,21 +2439,68 @@ mod tests {
         let fast = serde_json::to_value(hive("fast")).unwrap();
         assert!(live.apply_remote(set(300, 1, vec![fast])).await.applied);
         let old = serde_json::to_value(hive("old")).unwrap();
-        assert!(!live.apply_remote(set(200, 4, vec![old])).await.applied);
+        let report = live.apply_remote(set(200, 4, vec![old])).await;
+        assert!(!report.applied && report.stale_epoch);
         assert_eq!((live.epoch(), live.generation()), (300, 1));
         assert_eq!(live.specs()[0].name, "fast");
         // A later pull from the same old epoch is refused too.
-        assert!(!live.apply_remote(set(200, 5, vec![])).await.applied);
+        assert!(live.apply_remote(set(200, 5, vec![])).await.stale_epoch);
         // The live coordinator restarted with a clock that went back.
         live.heartbeat_epoch(250);
         assert!(live.apply_remote(set(250, 1, vec![])).await.applied);
         assert_eq!(live.epoch(), 250);
     }
 
+    /// Round 4: once a heartbeat lowered the epoch (the coordinator moved to
+    /// a host whose clock is behind), a delayed push from the old, larger
+    /// epoch neither applies nor raises the epoch back, so pulls from the
+    /// live coordinator keep applying.
+    #[tokio::test]
+    async fn a_push_from_a_larger_old_epoch_cannot_undo_a_heartbeat() {
+        let (live, _, _) = live();
+        live.heartbeat_epoch(500);
+        assert!(live.apply_remote(set(500, 7, vec![])).await.applied);
+        // The coordinator moved; its clock is behind.
+        live.heartbeat_epoch(400);
+        assert!(live.apply_remote(set(400, 1, vec![])).await.applied);
+        let zombie = serde_json::to_value(hive("zombie")).unwrap();
+        let report = live.apply_remote(set(500, 8, vec![zombie])).await;
+        assert!(report.stale_epoch && !report.applied);
+        assert_eq!(live.current_epoch(), 400);
+        assert_eq!((live.epoch(), live.generation()), (400, 1));
+        assert!(live.specs().is_empty());
+        // The live coordinator's next change still applies.
+        assert!(live.apply_remote(set(400, 2, vec![])).await.applied);
+        assert_eq!(live.version(), (400, 2));
+    }
+
     #[test]
     fn epochs_grow_with_the_start_time() {
         assert!(crate::epoch_from(1_000, u16::MAX) < crate::epoch_from(1_001, 0));
         assert_eq!(crate::epoch_from(0, 0), 1);
+    }
+
+    /// Round 4: an apply whose caller is cancelled mid-build leaves no
+    /// entry in the single-flight map, and a later apply of the same set
+    /// runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_apply_leaves_no_flight_behind() {
+        let live = slow_live(&[("slow", 10)]);
+        let task = tokio::spawn({
+            let live = live.clone();
+            async move {
+                let slow = serde_json::to_value(hive("slow")).unwrap();
+                live.apply_remote(set(1, 1, vec![slow])).await
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(live.apply_flights.lock().unwrap().len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(live.apply_flights.lock().unwrap().is_empty());
+        let slow = serde_json::to_value(hive("slow")).unwrap();
+        assert!(live.apply_remote(set(1, 1, vec![slow])).await.applied);
+        assert!(live.apply_flights.lock().unwrap().is_empty());
     }
 
     /// Round 3: a push and a pull of the same `(epoch, generation)` that
@@ -2298,6 +2541,10 @@ mod tests {
             "host=db.internal user=app password=hunter2 dbname=sales",
             "postgresql:/db?password=hunter2",
             "hunter2",
+            // Round 4: a `://` inside a value is no scheme.
+            "host=db user=app password=hunter2 sslrootcert=file:///etc/ca.pem",
+            "password=hunter2 host=db sslrootcert=file:///etc/ca.pem",
+            "mysql://app:hunter2@db/x",
         ] {
             let s = spec(serde_json::json!({
                 "name": "p", "type": "postgresql", "connection_url": url
@@ -2308,6 +2555,32 @@ mod tests {
             assert!(!format!("{s:?}").contains("hunter2"));
             let e = validate_spec(&s).unwrap_err();
             assert!(!e.contains("hunter2"), "{e}");
+            let back: CatalogConfig = serde_json::from_value(shown).unwrap();
+            assert_eq!(redacted_secrets(&back), vec!["connection_url password"]);
+        }
+    }
+
+    /// Round 4: a refused URL keeps only a leading `postgresql://` or
+    /// `postgres://` (any case), never text before a `://` in its password.
+    #[test]
+    fn a_refused_url_keeps_only_a_leading_postgres_scheme() {
+        for (url, shown_as) in [
+            ("postgresql://u:p@hunter2@db/x", "postgresql://<redacted>"),
+            ("POSTGRES://u:hunter2@db/x", "POSTGRES://<redacted>"),
+            (
+                "postgresql://db/x?password=hunter2://y@z",
+                "postgresql://<redacted>",
+            ),
+            ("hunter2://x@db/y", REDACTED),
+            ("u:hunter2://@db", REDACTED),
+        ] {
+            let s = spec(serde_json::json!({
+                "name": "p", "type": "postgresql", "connection_url": url
+            }));
+            assert!(validate_spec(&s).is_err(), "{url}");
+            let shown = redacted_spec(&s);
+            assert_eq!(shown["connection_url"], shown_as, "{url}");
+            assert!(!shown.to_string().contains("hunter2"), "{shown}");
             let back: CatalogConfig = serde_json::from_value(shown).unwrap();
             assert_eq!(redacted_secrets(&back), vec!["connection_url password"]);
         }
@@ -2347,23 +2620,78 @@ mod tests {
         assert!(checked > 0);
     }
 
+    /// Round 4: a worker's tag carries the coordinator's fingerprint of
+    /// each catalog after the set crossed the wire, even when the
+    /// coordinator merged its global `[storage]` in and the worker has a
+    /// `[storage]` of its own; an unchanged catalog keeps its fingerprint
+    /// across generations, a changed one gets a new one.
+    #[tokio::test]
+    async fn worker_and_coordinator_agree_on_each_catalog_fingerprint() {
+        let storage = |region: &str| -> StorageConfig {
+            serde_json::from_value(serde_json::json!({"s3": {"region": region}})).unwrap()
+        };
+        let coordinator_registry = Arc::new(ConnectorRegistry::new());
+        let coordinator = LiveCatalogs::with_test_builder_and_storage(
+            Arc::new(CatalogManager::new("lake", "tpch")),
+            coordinator_registry.clone(),
+            storage("us-east-1"),
+            Box::new(|_| Ok(fake_built())),
+        );
+        coordinator.set_epoch(4);
+        let pg = spec(serde_json::json!({
+            "name": "pg", "type": "postgresql", "connection_url": "postgresql://u@h/db"
+        }));
+        coordinator.commit(
+            1,
+            vec![(hive("lake"), fake_built()), (pg, fake_built())],
+            &[],
+        );
+        let worker_registry = Arc::new(ConnectorRegistry::new());
+        let worker = LiveCatalogs::with_test_builder_and_storage(
+            Arc::new(CatalogManager::new("memory", "default")),
+            worker_registry.clone(),
+            storage("eu-west-1"),
+            Box::new(|_| Ok(fake_built())),
+        );
+        let wire = arneb_rpc::CatalogSet::decode(&coordinator.snapshot().encode()).unwrap();
+        assert!(worker.apply_remote(wire).await.applied);
+        let (planned, held) = (
+            coordinator_registry.version().unwrap(),
+            worker_registry.version().unwrap(),
+        );
+        assert_eq!(planned.catalogs.len(), 2);
+        assert_eq!(
+            held, planned,
+            "same fingerprints, epoch, generation and defaults"
+        );
+        assert_eq!(held.default_catalog, "lake");
+        // A change to `pg` alone leaves `lake`'s fingerprint as it was.
+        let pg2 = spec(serde_json::json!({
+            "name": "pg", "type": "postgresql", "connection_url": "postgresql://u@h2/db"
+        }));
+        coordinator.commit(2, vec![(pg2, fake_built())], &[]);
+        let after = coordinator_registry.version().unwrap();
+        assert_eq!(after.catalog("lake"), planned.catalog("lake"));
+        assert_ne!(after.catalog("pg"), planned.catalog("pg"));
+    }
+
     /// Every change moves the registry's `(epoch, generation)` tag in the
     /// same swap as the connectors, so a pinned copy names the set it holds.
     #[tokio::test]
     async fn the_registry_tag_follows_every_change() {
         let (live, _, connectors) = live();
         live.set_epoch(5);
-        assert_eq!(connectors.version(), Some((5, 0)));
+        assert_eq!(eg(connectors.version()), Some((5, 0)));
         live.commit(3, vec![(hive("a"), fake_built())], &[]);
-        assert_eq!(connectors.version(), Some((5, 3)));
+        assert_eq!(eg(connectors.version()), Some((5, 3)));
         let (pinned, _) = connectors.pinned(|| ());
         live.commit(4, Vec::new(), &["a".to_owned()]);
-        assert_eq!(connectors.version(), Some((5, 4)));
+        assert_eq!(eg(connectors.version()), Some((5, 4)));
         assert!(connectors.get("a").is_none());
-        assert_eq!(pinned.version(), Some((5, 3)));
+        assert_eq!(eg(pinned.version()), Some((5, 3)));
         assert!(pinned.get("a").is_some());
         assert!(live.apply_set(6, vec![hive("b")]).await.applied);
-        assert_eq!(connectors.version(), Some((5, 6)));
+        assert_eq!(eg(connectors.version()), Some((5, 6)));
         assert_eq!(live.version(), (5, 6));
     }
 
@@ -2462,7 +2790,7 @@ mod tests {
             report,
             ApplyReport {
                 applied: true,
-                failed: vec![]
+                ..Default::default()
             }
         );
         assert!(manager.catalog("lake").is_some());

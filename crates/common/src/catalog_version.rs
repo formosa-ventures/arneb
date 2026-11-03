@@ -9,7 +9,14 @@ use serde::{Deserialize, Serialize};
 /// spec, and the default catalog and schema an unqualified scan resolves
 /// in. A worker runs a scan of catalog `c` only on a copy of `c` whose
 /// fingerprint matches, so a change to another catalog never fails it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The fingerprints are derived from secret-bearing JSON (each spec's raw
+/// password included) with an unkeyed fast hash, so anyone who can see a
+/// redacted spec could test password guesses against one offline. They
+/// must never be logged or shown to a client: the value only travels
+/// between nodes (inside a `TaskDescriptor`, under the cluster security),
+/// and `Debug` prints the catalog names without their fingerprints.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogVersion {
     /// The epoch of the coordinator the set comes from.
     pub epoch: u64,
@@ -25,6 +32,18 @@ pub struct CatalogVersion {
     pub default_schema: String,
 }
 
+impl std::fmt::Debug for CatalogVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogVersion")
+            .field("epoch", &self.epoch)
+            .field("generation", &self.generation)
+            .field("catalogs", &self.catalogs.keys().collect::<Vec<_>>())
+            .field("default_catalog", &self.default_catalog)
+            .field("default_schema", &self.default_schema)
+            .finish()
+    }
+}
+
 impl CatalogVersion {
     /// The fingerprint of catalog `name`, if it is a runtime catalog of the
     /// set.
@@ -35,7 +54,9 @@ impl CatalogVersion {
 
 /// A fingerprint of a catalog spec's JSON text: 64-bit FNV-1a, which is
 /// the same on every node, platform and build (unlike `std`'s hasher), so
-/// a coordinator and a worker agree on it.
+/// a coordinator and a worker agree on it. The input holds raw secrets and
+/// the hash is unkeyed: never log or expose the result (see
+/// [`CatalogVersion`]).
 pub fn spec_fingerprint(json: &str) -> u64 {
     json.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
@@ -45,6 +66,26 @@ pub fn spec_fingerprint(json: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_never_prints_a_fingerprint() {
+        let v = CatalogVersion {
+            epoch: 3,
+            generation: 7,
+            catalogs: [("pg".to_owned(), 0x1234_5678_9abc_def0)].into(),
+            default_catalog: "pg".into(),
+            default_schema: "public".into(),
+        };
+        let shown = format!("{v:?}");
+        assert!(
+            shown.contains("\"pg\"") && shown.contains("generation: 7"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains(&0x1234_5678_9abc_def0_u64.to_string()) && !shown.contains("9abc"),
+            "{shown}"
+        );
+    }
 
     #[test]
     fn fingerprint_is_fnv1a() {

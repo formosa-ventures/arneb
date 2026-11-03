@@ -497,7 +497,7 @@ async fn tracker_kill_stops_a_pgwire_statement() {
     });
     let id = running_query(&tracker).await;
     assert_eq!(
-        tracker.kill_query(&id, "root").unwrap(),
+        tracker.kill_query(&id, "root").await.unwrap(),
         KillOutcome::Killed {
             was: QueryState::Running
         }
@@ -541,7 +541,7 @@ async fn tracker_kill_stops_a_trino_query() {
     let next = doc["nextUri"].as_str().unwrap().to_owned();
     let id = running_query(&tracker).await;
     assert!(matches!(
-        tracker.kill_query(&id, "root").unwrap(),
+        tracker.kill_query(&id, "root").await.unwrap(),
         KillOutcome::Killed { .. }
     ));
     let polled: Value = http.get(&next).send().await.unwrap().json().await.unwrap();

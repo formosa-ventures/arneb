@@ -523,7 +523,11 @@ pub(super) async fn issue_token_for(
                     .issue_token_as(id, &user, name, expires_at_ms)
                     .map_err(|e| target.error(e))
             },
-            |_| target.audit_subject(Some(&id_text), parameters),
+            // A failed issue names no token: the id never became one.
+            |issued| {
+                let id = issued.is_ok().then_some(id_text.as_str());
+                target.audit_subject(id, parameters)
+            },
         );
         drop(target);
         issued
@@ -820,8 +824,10 @@ impl ManageAction for CancelQuery {
 
     fn apply(self, state: &WebState) -> Result<Applied<KillResult>, ApiError> {
         let tracker = &state.query_tracker;
-        let outcome = tracker
-            .kill_query(&self.id, &self.by)
+        // `apply` runs in `spawn_blocking` (the audit fsyncs), which may
+        // wait on the kill: it waits for at most one poll of the work.
+        let outcome = tokio::runtime::Handle::current()
+            .block_on(tracker.kill_query(&self.id, &self.by))
             .map_err(|_| Self::gone())?;
         let (before, preview) = match outcome {
             KillOutcome::Killed { was } => (
@@ -838,6 +844,20 @@ impl ManageAction for CancelQuery {
                 },
             ),
             KillOutcome::AlreadyEnded(now) => (now, self.ended(now)),
+            KillOutcome::NotApplied { state: now } => (
+                now,
+                Preview {
+                    summary: format!(
+                        "query {} {} had already completed its work (it is {}); \
+                         nothing to cancel, its result stands",
+                        self.id,
+                        self.owned_by(),
+                        api::state_name(now)
+                    ),
+                    changed: false,
+                    warning: None,
+                },
+            ),
         };
         let after = tracker
             .get_query(&self.id)
@@ -1685,7 +1705,7 @@ pub(super) mod tests {
             &id,
             Box::new(move |by| {
                 seen.lock().unwrap().push(by.to_owned());
-                true
+                Box::pin(async { true })
             }),
         );
         (id, killed_by)
@@ -1968,6 +1988,9 @@ pub(super) mod tests {
         assert_eq!(body["changed"], false, "{body}");
         let summary = body["summary"].as_str().unwrap();
         assert!(summary.contains("nothing to cancel"), "{summary}");
+        // The real state: the protocol has not recorded the outcome yet.
+        assert_eq!(body["result"]["state_before"], "running", "{body}");
+        assert_eq!(body["result"]["state"], "running", "{body}");
         let entries = audit_entries(&state);
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["parameters"]["effect"], "already_ended");

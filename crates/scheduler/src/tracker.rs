@@ -2,6 +2,8 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -45,15 +47,18 @@ fn advance_machine(m: &mut QueryStateMachine, target: QueryState) -> Result<(), 
     Ok(())
 }
 
+/// Whether a [`Canceller`] stopped its query: `false` when the query's work
+/// had already completed, so the kill stopped nothing (see
+/// [`crate::KillSwitch`]). A [`crate::KillSwitch`] canceller resolves it
+/// once a poll of the work in flight ends; it never blocks a thread.
+pub type CancelFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
+
 /// Stops a running query on the protocol that runs it. The argument is the
-/// name of the user who killed it. Returns `false` when the query's work had
-/// already completed, so the kill stopped nothing (see
-/// [`crate::KillSwitch`]). Called at most once, never under the tracker's
-/// lock, so it may call back into the tracker. A [`crate::KillSwitch`]
-/// canceller may block for one poll of the query's work (it waits for an
-/// in-flight poll to end), so call it off async workers (e.g. in
-/// `spawn_blocking`) and never from inside the query's own work.
-pub type Canceller = Box<dyn FnOnce(&str) -> bool + Send + Sync>;
+/// name of the user who killed it; the kill is requested when it is called,
+/// and the returned [`CancelFuture`] says whether it was applied. Called at
+/// most once, never under the tracker's lock, so it may call back into the
+/// tracker.
+pub type Canceller = Box<dyn FnOnce(&str) -> CancelFuture + Send + Sync>;
 
 /// What [`QueryTracker::kill_query`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,11 +66,17 @@ pub enum KillOutcome {
     /// The query was stopped; `was` is its state before the kill.
     Killed { was: QueryState },
     /// The query had already ended (or ended on its own during the kill)
-    /// in this state; nothing was changed. A query whose work completed
-    /// before the kill, while its protocol had not yet recorded the
-    /// outcome, is `AlreadyEnded(Finishing)`: its result stands.
+    /// in this state; nothing was changed.
     AlreadyEnded(QueryState),
+    /// The query's work had already completed when the kill landed, but its
+    /// protocol had not yet recorded the outcome: nothing was stopped and
+    /// its result stands. `state` is its (still non-terminal) state then.
+    NotApplied { state: QueryState },
 }
+
+/// The first kill's outcome, shared with kills of the same query that
+/// arrive while it is being settled.
+type KillWatch = tokio::sync::watch::Receiver<Option<KillOutcome>>;
 
 struct Entry {
     machine: QueryStateMachine,
@@ -76,6 +87,9 @@ struct Entry {
     canceller: Option<Canceller>,
     /// Who killed it through [`QueryTracker::kill_query`].
     killed_by: Option<String>,
+    /// The first kill's outcome, once a kill claimed the query; kept after a
+    /// kill that was not applied, so a later kill reports the same.
+    kill: Option<KillWatch>,
 }
 
 struct Inner {
@@ -131,6 +145,7 @@ impl QueryTracker {
                 rows: None,
                 canceller: None,
                 killed_by: None,
+                kill: None,
             },
         );
         id
@@ -235,23 +250,36 @@ impl QueryTracker {
             }
         };
         drop(inner);
-        // The work cannot have completed: it starts only after registering.
-        let _ = canceller(&killed_by);
+        // The work cannot have completed: it starts only after registering,
+        // so a kill switch canceller resolves at its first poll.
+        let mut cancel = canceller(&killed_by);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if cancel.as_mut().poll(&mut cx).is_pending() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(cancel);
+            }
+        }
     }
 
     /// Stop query `id` on behalf of user `by`: call its canceller (outside
-    /// the lock) and mark it cancelled. A query that already ended, or ends
-    /// on its own during the kill, is [`KillOutcome::AlreadyEnded`], and so
-    /// is one whose canceller reports that its work had already completed
-    /// (nothing is marked; the protocol records the real outcome). The
-    /// first kill claims the query under the lock; a concurrent kill of the
-    /// same query is `AlreadyEnded(Cancelled)`, so only one reports a kill.
+    /// the lock), wait for whether that stopped the work, and mark it
+    /// cancelled. A query that already ended, or ends on its own during the
+    /// kill, is [`KillOutcome::AlreadyEnded`]; one whose canceller reports
+    /// that its work had already completed is [`KillOutcome::NotApplied`]
+    /// with its real state (nothing is marked; the protocol records the
+    /// outcome).
     ///
-    /// Blocking: the canceller may wait for one poll of the query's work
-    /// (see [`Canceller`]). Call it from `spawn_blocking`, never from an
-    /// async worker or from inside the query's own work.
-    pub fn kill_query(&self, id: &QueryId, by: &str) -> Result<KillOutcome, ExecutionError> {
-        let (was, canceller) = {
+    /// The first kill claims the query under the lock. A kill of the same
+    /// query while that one is settled waits for it, then reports what the
+    /// query is: `AlreadyEnded` with its terminal state, or `NotApplied`
+    /// while the protocol has not yet recorded a completed outcome, so it
+    /// never reports a cancel that did not happen.
+    ///
+    /// The kill is settled in a task of its own, so dropping this future
+    /// does not leave it half done. It waits for at most one poll of the
+    /// query's work and never blocks a thread.
+    pub async fn kill_query(&self, id: &QueryId, by: &str) -> Result<KillOutcome, ExecutionError> {
+        let (first, watch) = {
             let mut inner = self.inner.write().unwrap();
             let entry = inner
                 .queries
@@ -261,37 +289,74 @@ impl QueryTracker {
             if was.is_terminal() {
                 return Ok(KillOutcome::AlreadyEnded(was));
             }
-            if entry.killed_by.is_some() {
-                // Another kill claimed it and is stopping it now.
-                return Ok(KillOutcome::AlreadyEnded(QueryState::Cancelled));
+            match &entry.kill {
+                // Another kill claimed it: share its outcome.
+                Some(watch) => (false, watch.clone()),
+                None => {
+                    entry.killed_by = Some(by.to_owned());
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    entry.kill = Some(rx.clone());
+                    let canceller = entry.canceller.take();
+                    tokio::spawn(
+                        self.clone()
+                            .settle_kill(*id, by.to_owned(), was, canceller, tx),
+                    );
+                    (true, rx)
+                }
             }
-            entry.killed_by = Some(by.to_owned());
-            (was, entry.canceller.take())
         };
-        if let Some(cancel) = canceller {
-            if !cancel(by) {
-                // Too late: the work completed. Release the claim so the
-                // protocol's finish stands.
-                let mut inner = self.inner.write().unwrap();
-                let state = inner.queries.get_mut(id).map(|e| {
-                    e.killed_by = None;
-                    e.machine.state
-                });
-                return Ok(KillOutcome::AlreadyEnded(match state {
-                    Some(s) if s.is_terminal() => s,
-                    _ => QueryState::Finishing,
-                }));
-            }
+        let outcome = wait_for_kill(watch).await.ok_or_else(|| {
+            ExecutionError::InvalidOperation(format!("the kill of query {id} was interrupted"))
+        })?;
+        if first {
+            return Ok(outcome);
         }
-        if self.cancel_query(id).is_ok() {
-            return Ok(KillOutcome::Killed { was });
-        }
-        // Already terminal: cancelled by the canceller itself (or by the
-        // server), or it ended on its own meanwhile.
+        // What the query is now, after the first kill settled.
         Ok(match self.get_query(id).map(|q| q.state) {
-            Some(state) if state != QueryState::Cancelled => KillOutcome::AlreadyEnded(state),
-            _ => KillOutcome::Killed { was },
+            Some(state) if state.is_terminal() => KillOutcome::AlreadyEnded(state),
+            Some(state) => KillOutcome::NotApplied { state },
+            None => KillOutcome::AlreadyEnded(QueryState::Finished),
         })
+    }
+
+    /// The claimed kill of `id`: call the canceller, then record and
+    /// publish the outcome.
+    async fn settle_kill(
+        self,
+        id: QueryId,
+        by: String,
+        was: QueryState,
+        canceller: Option<Canceller>,
+        tx: tokio::sync::watch::Sender<Option<KillOutcome>>,
+    ) {
+        let applied = match canceller {
+            Some(cancel) => cancel(&by).await,
+            None => true,
+        };
+        let outcome = if !applied {
+            // Too late: the work completed. Release the claim so the
+            // protocol's finish stands; keep the outcome for later kills.
+            let mut inner = self.inner.write().unwrap();
+            let state = inner.queries.get_mut(&id).map(|e| {
+                e.killed_by = None;
+                e.machine.state
+            });
+            match state {
+                Some(state) if !state.is_terminal() => KillOutcome::NotApplied { state },
+                Some(state) => KillOutcome::AlreadyEnded(state),
+                None => KillOutcome::AlreadyEnded(QueryState::Finished),
+            }
+        } else if self.cancel_query(&id).is_ok() {
+            KillOutcome::Killed { was }
+        } else {
+            // Already terminal: cancelled by the canceller itself (or by
+            // the server), or it ended on its own meanwhile.
+            match self.get_query(&id).map(|q| q.state) {
+                Some(state) if state != QueryState::Cancelled => KillOutcome::AlreadyEnded(state),
+                _ => KillOutcome::Killed { was },
+            }
+        };
+        let _ = tx.send(Some(outcome));
     }
 
     pub fn active_count(&self) -> usize {
@@ -348,6 +413,13 @@ impl QueryTracker {
         drop(dropped_canceller);
         Ok(())
     }
+}
+
+/// The outcome published on `watch`; `None` when its kill task ended
+/// without one (a panicking canceller, or the runtime shutting down).
+async fn wait_for_kill(mut watch: KillWatch) -> Option<KillOutcome> {
+    let outcome = watch.wait_for(Option::is_some).await.ok()?;
+    *outcome
 }
 
 fn report_end(entry: &Entry) {
@@ -418,25 +490,37 @@ impl From<&Entry> for QueryInfo {
 mod tests {
     use super::*;
 
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
     /// A canceller that always stops the query (its work never completed).
     fn stopping(f: impl FnOnce(&str) + Send + Sync + 'static) -> Canceller {
         Box::new(move |by| {
             f(by);
-            true
+            Box::pin(async { true })
         })
     }
 
     /// A canceller reporting that the work already completed: the kill is
     /// not applied, the claim is released, and the protocol's finish stands.
-    #[test]
-    fn kill_after_the_work_completed_is_not_applied() {
+    #[tokio::test]
+    async fn kill_after_the_work_completed_is_not_applied() {
         let tracker = QueryTracker::with_history_limit(10);
         let id = tracker.create_query("INSERT INTO t SELECT 1".into());
         tracker.advance_to(&id, QueryState::Running).unwrap();
-        tracker.set_canceller(&id, Box::new(|_| false));
+        tracker.set_canceller(&id, Box::new(|_| Box::pin(async { false })));
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
-            KillOutcome::AlreadyEnded(QueryState::Finishing)
+            tracker.kill_query(&id, "root").await.unwrap(),
+            KillOutcome::NotApplied {
+                state: QueryState::Running
+            }
+        );
+        // A later kill reports the same, not a cancel.
+        assert_eq!(
+            tracker.kill_query(&id, "ops").await.unwrap(),
+            KillOutcome::NotApplied {
+                state: QueryState::Running
+            }
         );
         assert_eq!(tracker.cancelled_by(&id), None);
         tracker.finish_query(&id, 1).unwrap();
@@ -448,15 +532,15 @@ mod tests {
     /// A kill that lands before the protocol registers its canceller: the
     /// query is marked cancelled, cannot then finish, and the canceller
     /// registered afterwards runs at once with the killer's name.
-    #[test]
-    fn kill_before_registration_cannot_finish_and_cancels_on_register() {
+    #[tokio::test]
+    async fn kill_before_registration_cannot_finish_and_cancels_on_register() {
         let tracker = QueryTracker::new();
         let id = tracker.create_query_from("SELECT 1".into(), "trino", Some("bob".into()));
         tracker.advance_to(&id, QueryState::Running).unwrap();
         assert_eq!(tracker.cancelled_by(&id), None);
         // 1. The kill: nothing registered, nothing stopped yet.
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
+            tracker.kill_query(&id, "root").await.unwrap(),
             KillOutcome::Killed {
                 was: QueryState::Running
             }
@@ -615,8 +699,8 @@ mod tests {
         assert_eq!(ids, vec![second, first]);
     }
 
-    #[test]
-    fn kill_calls_the_canceller_once_and_marks_cancelled() {
+    #[tokio::test]
+    async fn kill_calls_the_canceller_once_and_marks_cancelled() {
         use std::sync::Mutex;
         let tracker = QueryTracker::with_history_limit(10);
         let id = tracker.create_query("SELECT 1".into());
@@ -628,7 +712,7 @@ mod tests {
             stopping(move |by| seen.lock().unwrap().push(by.to_owned())),
         );
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
+            tracker.kill_query(&id, "root").await.unwrap(),
             KillOutcome::Killed {
                 was: QueryState::Running
             }
@@ -636,76 +720,142 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), ["root"]);
         assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
+            tracker.kill_query(&id, "root").await.unwrap(),
             KillOutcome::AlreadyEnded(QueryState::Cancelled)
         );
         assert_eq!(calls.lock().unwrap().len(), 1, "called once");
         let missing = QueryId::new();
-        assert!(tracker.kill_query(&missing, "root").is_err());
+        assert!(tracker.kill_query(&missing, "root").await.is_err());
+    }
+
+    /// A canceller that signals `inside` when called, then waits for
+    /// `release` and resolves to `applied`.
+    fn gated(applied: bool) -> (Canceller, oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (inside_tx, inside_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let canceller: Canceller = Box::new(move |_| {
+            let _ = inside_tx.send(());
+            Box::pin(async move {
+                let _ = release_rx.await;
+                applied
+            })
+        });
+        (canceller, inside_rx, release_tx)
     }
 
     /// Two kills of one query at once: the one that claims it reports the
-    /// kill; the other, landing while the canceller runs, already ended.
-    #[test]
-    fn concurrent_kills_report_one_kill() {
-        use std::sync::mpsc;
-        let tracker = Arc::new(QueryTracker::with_history_limit(10));
+    /// kill; the other waits for it, then reports the query cancelled.
+    #[tokio::test]
+    async fn concurrent_kills_report_one_kill() {
+        let tracker = QueryTracker::with_history_limit(10);
         let id = tracker.create_query("SELECT 1".into());
         tracker.advance_to(&id, QueryState::Running).unwrap();
-        let (inside_tx, inside_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let release_rx = std::sync::Mutex::new(release_rx);
-        tracker.set_canceller(
-            &id,
-            stopping(move |_| {
-                inside_tx.send(()).unwrap();
-                release_rx.lock().unwrap().recv().unwrap();
-            }),
-        );
-        let first = std::thread::spawn({
-            let tracker = Arc::clone(&tracker);
-            move || tracker.kill_query(&id, "root").unwrap()
+        let (canceller, inside, release) = gated(true);
+        tracker.set_canceller(&id, canceller);
+        let first = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.kill_query(&id, "root").await.unwrap() }
         });
-        inside_rx.recv().unwrap();
+        inside.await.unwrap();
         assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Running);
-        assert_eq!(
-            tracker.kill_query(&id, "ops").unwrap(),
-            KillOutcome::AlreadyEnded(QueryState::Cancelled)
+        let mut second = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.kill_query(&id, "ops").await.unwrap() }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "the second kill waits for the first"
         );
-        release_tx.send(()).unwrap();
+        release.send(()).unwrap();
         assert_eq!(
-            first.join().unwrap(),
+            first.await.unwrap(),
             KillOutcome::Killed {
                 was: QueryState::Running
             }
         );
+        assert_eq!(
+            second.await.unwrap(),
+            KillOutcome::AlreadyEnded(QueryState::Cancelled)
+        );
         assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
+    }
+
+    /// A kill concurrent with one that is not applied (the work completed)
+    /// does not report a cancel: it shares that outcome with the query's
+    /// real state, which then finishes normally.
+    #[tokio::test]
+    async fn a_kill_concurrent_with_one_not_applied_is_not_applied() {
+        let tracker = QueryTracker::with_history_limit(10);
+        let id = tracker.create_query("INSERT INTO t SELECT 1".into());
+        tracker.advance_to(&id, QueryState::Running).unwrap();
+        let (canceller, inside, release) = gated(false);
+        tracker.set_canceller(&id, canceller);
+        let first = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.kill_query(&id, "root").await.unwrap() }
+        });
+        inside.await.unwrap();
+        let second = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.kill_query(&id, "ops").await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release.send(()).unwrap();
+        let running = KillOutcome::NotApplied {
+            state: QueryState::Running,
+        };
+        assert_eq!(first.await.unwrap(), running);
+        assert_eq!(second.await.unwrap(), running);
+        assert_eq!(tracker.cancelled_by(&id), None);
+        tracker.finish_query(&id, 1).unwrap();
+        assert_eq!(
+            tracker.kill_query(&id, "ops").await.unwrap(),
+            KillOutcome::AlreadyEnded(QueryState::Finished)
+        );
+    }
+
+    /// Dropping a kill's future does not leave the query claimed: the kill
+    /// is settled in its own task.
+    #[tokio::test]
+    async fn a_dropped_kill_is_still_settled() {
+        let tracker = QueryTracker::with_history_limit(10);
+        let id = tracker.create_query("SELECT 1".into());
+        tracker.advance_to(&id, QueryState::Running).unwrap();
+        let (canceller, inside, release) = gated(true);
+        tracker.set_canceller(&id, canceller);
+        let kill = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.kill_query(&id, "root").await }
+        });
+        inside.await.unwrap();
+        kill.abort();
+        release.send(()).unwrap();
+        for _ in 0..100 {
+            if tracker.get_query(&id).unwrap().state == QueryState::Cancelled {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the dropped kill was never settled");
     }
 
     /// A canceller registered while a kill is in progress (claimed, not yet
     /// cancelled) is called at once, not stored and then dropped uncalled.
-    #[test]
-    fn canceller_registered_during_a_kill_is_called() {
-        use std::sync::mpsc;
+    #[tokio::test]
+    async fn canceller_registered_during_a_kill_is_called() {
         use std::sync::Mutex;
-        let tracker = Arc::new(QueryTracker::with_history_limit(10));
+        let tracker = QueryTracker::with_history_limit(10);
         let id = tracker.create_query("SELECT 1".into());
         tracker.advance_to(&id, QueryState::Running).unwrap();
-        let (inside_tx, inside_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let release_rx = Mutex::new(release_rx);
-        tracker.set_canceller(
-            &id,
-            stopping(move |_| {
-                inside_tx.send(()).unwrap();
-                release_rx.lock().unwrap().recv().unwrap();
-            }),
-        );
-        let kill = std::thread::spawn({
-            let tracker = Arc::clone(&tracker);
-            move || tracker.kill_query(&id, "root").unwrap()
+        let (canceller, inside, release) = gated(true);
+        tracker.set_canceller(&id, canceller);
+        let kill = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.kill_query(&id, "root").await.unwrap() }
         });
-        inside_rx.recv().unwrap();
+        inside.await.unwrap();
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen = Arc::clone(&calls);
         tracker.set_canceller(
@@ -713,17 +863,17 @@ mod tests {
             stopping(move |by| seen.lock().unwrap().push(by.to_owned())),
         );
         assert_eq!(*calls.lock().unwrap(), ["root"], "called during the kill");
-        release_tx.send(()).unwrap();
+        release.send(()).unwrap();
         assert_eq!(
-            kill.join().unwrap(),
+            kill.await.unwrap(),
             KillOutcome::Killed {
                 was: QueryState::Running
             }
         );
     }
 
-    #[test]
-    fn terminal_query_drops_its_canceller() {
+    #[tokio::test]
+    async fn terminal_query_drops_its_canceller() {
         use std::sync::atomic::{AtomicBool, Ordering};
         struct DropGuard(Arc<AtomicBool>);
         impl Drop for DropGuard {
@@ -753,7 +903,7 @@ mod tests {
             "dropped at the terminal turn"
         );
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
+            tracker.kill_query(&id, "root").await.unwrap(),
             KillOutcome::AlreadyEnded(QueryState::Finished)
         );
         assert!(!called.load(Ordering::SeqCst), "never called");
@@ -764,13 +914,13 @@ mod tests {
         assert!(late.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn kill_before_registration_runs_the_canceller_on_registration() {
+    #[tokio::test]
+    async fn kill_before_registration_runs_the_canceller_on_registration() {
         use std::sync::Mutex;
         let tracker = QueryTracker::with_history_limit(10);
         let id = tracker.create_query("SELECT 1".into());
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
+            tracker.kill_query(&id, "root").await.unwrap(),
             KillOutcome::Killed {
                 was: QueryState::Queued
             }
@@ -793,22 +943,22 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), ["root", "the server"]);
     }
 
-    #[test]
-    fn query_ending_on_its_own_during_the_kill_already_ended() {
+    #[tokio::test]
+    async fn query_ending_on_its_own_during_the_kill_already_ended() {
         let tracker = QueryTracker::with_history_limit(10);
         let id = tracker.create_query("SELECT 1".into());
         tracker.advance_to(&id, QueryState::Running).unwrap();
         let inner = tracker.clone();
         tracker.set_canceller(&id, stopping(move |_| inner.finish_query(&id, 1).unwrap()));
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
+            tracker.kill_query(&id, "root").await.unwrap(),
             KillOutcome::AlreadyEnded(QueryState::Finished)
         );
         assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Finished);
     }
 
-    #[test]
-    fn canceller_may_reenter_the_tracker() {
+    #[tokio::test]
+    async fn canceller_may_reenter_the_tracker() {
         let tracker = QueryTracker::with_history_limit(10);
         let id = tracker.create_query("SELECT 1".into());
         tracker.advance_to(&id, QueryState::Running).unwrap();
@@ -820,7 +970,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            tracker.kill_query(&id, "root").unwrap(),
+            tracker.kill_query(&id, "root").await.unwrap(),
             KillOutcome::Killed {
                 was: QueryState::Running
             }

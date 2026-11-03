@@ -970,10 +970,15 @@ the response returns. Read it with
   later audited action is refused with `503 audit_unavailable` until the
   file can be written again. The server keeps that completion and appends
   it first when the log reopens, so the known outcome still reaches the
-  file. An action that panics is completed with `{"error": "internal"}`.
+  file. It tries to reopen the log every 5 seconds in the background (no
+  audited action is needed), and once more at a graceful shutdown; a
+  completion still unwritten then is logged at ERROR and its action is
+  recorded as `interrupted` at the next start. An action that panics is completed as `interrupted`, since the
+  panic may come after the action took effect. A `token.issue` that failed
+  has an empty `target`: its token id never became a token.
 - **Interrupted actions.** An intent with no completion at startup (the
   server stopped while applying it, or before a failed completion could be
-  appended again) is logged at
+  appended again, or the action panicked) is logged at
   WARN on `arneb::audit` and recorded once as an entry with outcome
   `interrupted`: the action may or may not have been applied. So no applied
   action is ever missing from the log.

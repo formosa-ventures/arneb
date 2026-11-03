@@ -22,6 +22,7 @@ mod workers;
 
 pub use workers::restore_worker_cordons;
 
+pub(crate) use audit::{flush_audit, spawn_audit_retry, AUDIT_RETRY_INTERVAL};
 pub use session::SessionStore;
 
 use std::sync::Arc;

@@ -1097,10 +1097,12 @@ mod tests {
         expired["scope"] = "arneb:query".into();
         let mut bad_aud = claims(&env.idp.issuer(), "http://elsewhere.test/mcp");
         bad_aud["scope"] = "arneb:query".into();
-        // An OIDC ID token of the same issuer (header `typ: JWT`, `nonce`).
+        // A Keycloak ID token of the same issuer (header `typ: JWT`,
+        // payload `typ: ID`, `nonce`), even with the scope.
         let mut id_token = claims(&env.idp.issuer(), RESOURCE);
         id_token["scope"] = "arneb:query".into();
         id_token["nonce"] = "n-0S6".into();
+        id_token["typ"] = "ID".into();
         let bad_sig =
             crate::oauth::test_idp::TestKey::ec("k1").sign(&claims(&env.idp.issuer(), RESOURCE));
         let mut tokens: Vec<String> = [expired, bad_aud, id_token]

@@ -327,8 +327,9 @@ impl OAuthValidator {
         if !ALLOWED_ALGS.contains(&alg) {
             return Err(OAuthReject::Invalid("bad_algorithm"));
         }
-        let typed_access_token = header.typ.as_deref().is_some_and(is_access_token_typ);
-        if settings.require_access_token_typ && !typed_access_token {
+        if settings.require_access_token_typ
+            && !header.typ.as_deref().is_some_and(is_access_token_typ)
+        {
             return Err(OAuthReject::Invalid("not_at_jwt"));
         }
         let keys = self.keys_for(header.kid.as_deref(), alg).await?;
@@ -356,11 +357,19 @@ impl OAuthValidator {
             }
         }
         let claims = claims.ok_or(OAuthReject::Invalid("bad_signature"))?;
-        // An `at+jwt` header is an access token by definition (RFC 9068);
-        // otherwise refuse what can only be an OIDC ID token, which the IdP
-        // also signs, for the same issuer and possibly the same audience.
-        if !typed_access_token && looks_like_id_token(&claims) {
-            return Err(OAuthReject::Invalid("id_token"));
+        // The IdP also signs OIDC ID tokens, for the same issuer and
+        // possibly the same audience: refuse what may be one.
+        match token_kind(header.typ.as_deref(), &claims) {
+            TokenKind::Access => {}
+            TokenKind::NotAccess => return Err(OAuthReject::Invalid("id_token")),
+            // Unmarked and ID-token-like: only a required scope, which an
+            // ID token never carries, can vouch for it (checked below).
+            TokenKind::Unmarked if may_be_id_token(&claims) => {
+                if settings.required_scopes.is_empty() {
+                    return Err(OAuthReject::Invalid("id_token"));
+                }
+            }
+            TokenKind::Unmarked => {}
         }
         self.principal(&claims)
     }
@@ -696,17 +705,45 @@ fn is_access_token_typ(typ: &str) -> bool {
 /// (its access tokens say `Bearer`).
 const NON_ACCESS_TOKEN_TYPS: [&str; 4] = ["ID", "Refresh", "Offline", "Logout"];
 
-/// Claims only a non-access token carries: `nonce` and `at_hash` (OIDC Core
-/// 2 and 3.1.3.6), or a Keycloak payload `typ` of `ID`, `Refresh`,
-/// `Offline` or `Logout`.
-fn looks_like_id_token(claims: &serde_json::Value) -> bool {
+/// What a token's type markers say it is.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenKind {
+    /// Header `typ` `at+jwt` (RFC 9068), or payload `typ` `Bearer`
+    /// (Keycloak, whose access tokens may carry `nonce`).
+    Access,
+    /// Payload `typ` `ID`, `Refresh`, `Offline` or `Logout` (Keycloak).
+    NotAccess,
+    /// No marker (Entra ID, Okta and most others send header `typ: JWT`).
+    Unmarked,
+}
+
+/// The token's kind by its markers, strongest first: the header's `at+jwt`,
+/// then the payload `typ` (case-insensitive).
+fn token_kind(header_typ: Option<&str>, claims: &serde_json::Value) -> TokenKind {
+    if header_typ.is_some_and(is_access_token_typ) {
+        return TokenKind::Access;
+    }
+    match claims.get("typ").and_then(|v| v.as_str()) {
+        Some(t) if t.eq_ignore_ascii_case("Bearer") => TokenKind::Access,
+        Some(t)
+            if NON_ACCESS_TOKEN_TYPS
+                .iter()
+                .any(|n| t.eq_ignore_ascii_case(n)) =>
+        {
+            TokenKind::NotAccess
+        }
+        _ => TokenKind::Unmarked,
+    }
+}
+
+/// An unmarked token that may be an OIDC ID token: it has `nonce` or
+/// `at_hash` (OIDC Core 2 and 3.1.3.6), or no `scope` / `scp` at all. ID
+/// tokens carry no scope, and one from a refresh grant has no `nonce`
+/// either, so a missing scope is the only sign it gives.
+fn may_be_id_token(claims: &serde_json::Value) -> bool {
     claims.get("nonce").is_some()
         || claims.get("at_hash").is_some()
-        || claims.get("typ").and_then(|v| v.as_str()).is_some_and(|t| {
-            NON_ACCESS_TOKEN_TYPS
-                .iter()
-                .any(|n| t.eq_ignore_ascii_case(n))
-        })
+        || (claims.get("scope").is_none() && claims.get("scp").is_none())
 }
 
 enum Lookup {
@@ -1066,12 +1103,13 @@ pub(crate) mod test_idp {
             .as_secs()
     }
 
-    /// Claims of a valid token for `issuer`/`aud`: `sub = "alice"`,
-    /// `preferred_username = "alice"`, `exp` in five minutes.
+    /// Claims of a valid access token for `issuer`/`aud`: `sub = "alice"`,
+    /// `preferred_username = "alice"`, `scope = "openid"`, `exp` in five
+    /// minutes.
     pub(crate) fn claims(issuer: &str, aud: &str) -> serde_json::Value {
         serde_json::json!({
             "iss": issuer, "aud": aud, "sub": "alice",
-            "preferred_username": "alice",
+            "preferred_username": "alice", "scope": "openid",
             "iat": now(), "exp": now() + 300,
         })
     }
@@ -1248,6 +1286,7 @@ mod tests {
             assert_eq!(p.scopes, ["openid", "arneb"]);
 
             let mut c = claims(&idp.issuer(), AUD);
+            c.as_object_mut().unwrap().remove("scope");
             c["scp"] = json!(["a", "b"]);
             let p = v.validate(&key.sign(&c)).await.unwrap();
             assert_eq!(p.scopes, ["a", "b"]);
@@ -1733,12 +1772,12 @@ mod tests {
         let v = validator(&idp, |_| {});
         let iss = idp.issuer();
         let id_token = OAuthReject::Invalid("id_token");
-        // `typ: JWT` (Keycloak, Entra, Okta) with OIDC-only claims.
+        // Unmarked (`typ: JWT` or none: Entra, Okta) with OIDC-only claims,
+        // or a Keycloak payload `typ` of a non-access token.
         for (claim, value) in [
             ("nonce", json!("n-0S6")),
             ("at_hash", json!("77QmUPtjPfzWtF2AnpK9RQ")),
             ("typ", json!("ID")),
-            // Keycloak's other signed non-access tokens.
             ("typ", json!("Refresh")),
             ("typ", json!("Offline")),
             ("typ", json!("Logout")),
@@ -1757,15 +1796,65 @@ mod tests {
                 "{claim} without typ"
             );
         }
-        // Keycloak's access tokens: `typ: JWT` header, payload `typ: Bearer`.
-        let mut c = claims(&iss, AUD);
-        c["typ"] = json!("Bearer");
-        v.validate(&key.sign(&c)).await.unwrap();
-        v.validate(&key.sign_typ(&c, None)).await.unwrap();
-        // An `at+jwt` header is an access token by definition (RFC 9068).
+        // An ID token from a refresh grant: no nonce, no at_hash, no scope.
+        let mut refreshed = claims(&iss, AUD);
+        refreshed.as_object_mut().unwrap().remove("scope");
+        assert_eq!(
+            v.validate(&key.sign(&refreshed)).await.unwrap_err(),
+            id_token
+        );
+        // Keycloak's access tokens: `typ: JWT` header, payload `typ: Bearer`
+        // (any case), with a `nonce` before Keycloak 24 or with its
+        // "nonce backwards compatible" mapper, even without a scope.
+        for typ in ["Bearer", "bearer"] {
+            let mut c = claims(&iss, AUD);
+            c["typ"] = json!(typ);
+            v.validate(&key.sign(&c)).await.unwrap();
+            v.validate(&key.sign_typ(&c, None)).await.unwrap();
+            c["nonce"] = json!("n-0S6");
+            c["at_hash"] = json!("77QmUPtjPfzWtF2AnpK9RQ");
+            v.validate(&key.sign(&c)).await.unwrap();
+            c.as_object_mut().unwrap().remove("scope");
+            v.validate(&key.sign(&c)).await.unwrap();
+        }
+        // An `at+jwt` header is an access token by definition (RFC 9068),
+        // and outranks a payload `typ`.
         let mut c = claims(&iss, AUD);
         c["nonce"] = json!("n");
+        c["typ"] = json!("ID");
         v.validate(&key.sign_typ(&c, Some("at+jwt"))).await.unwrap();
+        // Unmarked with a scope and neither nonce nor at_hash: an access token.
+        v.validate(&key.sign(&claims(&iss, AUD))).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_scopes_vouch_for_unmarked_id_token_like_tokens() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let v = validator(&idp, |s| s.required_scopes = vec!["arneb".into()]);
+        let iss = idp.issuer();
+        // An ID token (no scope), with or without nonce: never accepted.
+        let mut refreshed = claims(&iss, AUD);
+        refreshed.as_object_mut().unwrap().remove("scope");
+        let mut code_flow = refreshed.clone();
+        code_flow["nonce"] = json!("n-0S6");
+        for c in [&refreshed, &code_flow] {
+            assert_eq!(
+                v.validate(&key.sign(c)).await.unwrap_err(),
+                OAuthReject::InsufficientScope
+            );
+        }
+        // An unmarked access token carrying a nonce passes once it carries
+        // the required scope, which no ID token does.
+        let mut c = code_flow.clone();
+        c["scope"] = json!("openid arneb");
+        assert_eq!(v.validate(&key.sign(&c)).await.unwrap().user, "alice");
+        // Keycloak's payload `typ: ID` stays refused, scope or not.
+        c["typ"] = json!("ID");
+        assert_eq!(
+            v.validate(&key.sign(&c)).await.unwrap_err(),
+            OAuthReject::Invalid("id_token")
+        );
     }
 
     #[tokio::test]

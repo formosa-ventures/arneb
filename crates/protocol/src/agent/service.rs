@@ -626,7 +626,10 @@ impl AgentQueryService {
                 ),
             );
             // In its own task: a kill may wait for one poll of the work,
-            // which must not hold up the rest of the pass.
+            // which must not hold up the rest of the pass. Touched first, so
+            // the next pass does not start another cancel while this one
+            // waits.
+            statement.touch();
             let tracker = Arc::clone(&self.tracker);
             tokio::spawn(async move {
                 cancel_statement(&tracker, &statement, error, "abandoned").await;
@@ -1470,6 +1473,33 @@ mod tests {
         assert_eq!(abandoned[0].id, live.id);
         let map = lock(&svc.statements);
         assert_eq!(Arc::strong_count(&map[&done.id]), 1);
+    }
+
+    /// A reaper pass touches an abandoned statement before its cancel task
+    /// runs, so the next pass does not spawn a second cancel while the
+    /// first may still wait for a poll.
+    #[tokio::test]
+    async fn a_reaper_pass_does_not_repeat_a_pending_cancel() {
+        let svc = service_over(
+            vec![wide_table(10, 1000)],
+            AgentLimits {
+                idle_timeout: Duration::from_secs(1),
+                max_wait: Duration::from_secs(1),
+                ..AgentLimits::default()
+            },
+        );
+        let (svc, _dropped) = hanging(svc);
+        let live = svc
+            .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Single-threaded: the spawned cancel has not run yet.
+        svc.reap();
+        let statement = lock(&svc.statements).get(&live.id).cloned().unwrap();
+        assert!(!statement.is_terminal(), "the cancel ran inline");
+        drop(statement);
+        assert!(svc.reap_ended().is_empty(), "picked up again");
     }
 
     /// A distributed executor that streams `batches` wide batches into the

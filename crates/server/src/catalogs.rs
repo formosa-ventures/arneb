@@ -99,6 +99,34 @@ struct SetCommit {
     defaults: Option<(String, String)>,
 }
 
+/// One caller's hold on an apply flight. Dropped (the apply finished, or
+/// its caller was cancelled), it removes the flight from the map once no
+/// other caller holds it, so a cancelled apply never leaves its entry.
+struct FlightGuard<'a> {
+    flights: &'a std::sync::Mutex<BTreeMap<(Option<u64>, u64), ApplyFlight>>,
+    key: (Option<u64>, u64),
+    flight: Option<ApplyFlight>,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(flight) = self.flight.take() {
+            // Two holders left: the map and this caller. Dropped under the
+            // lock, so concurrent callers count each other right.
+            let last = Arc::strong_count(&flight) == 2;
+            if last
+                && flights
+                    .get(&self.key)
+                    .is_some_and(|f| Arc::ptr_eq(f, &flight))
+            {
+                flights.remove(&self.key);
+            }
+            drop(flight);
+        }
+    }
+}
+
 /// The fingerprint of a served spec's JSON.
 fn value_fingerprint(value: &serde_json::Value) -> u64 {
     arneb_common::spec_fingerprint(&value.to_string())
@@ -720,15 +748,17 @@ impl LiveCatalogs {
             .entry(key)
             .or_default()
             .clone();
-        let report = flight
+        // Leaves the map when its last caller does, finished or cancelled.
+        let guard = FlightGuard {
+            flights: &self.apply_flights,
+            key,
+            flight: Some(flight),
+        };
+        let flight = guard.flight.as_ref().expect("set above");
+        flight
             .get_or_init(|| self.apply_once(epoch, generation, specs, defaults))
             .await
-            .clone();
-        let mut flights = self.apply_flights.lock().unwrap_or_else(|p| p.into_inner());
-        if flights.get(&key).is_some_and(|f| Arc::ptr_eq(f, &flight)) {
-            flights.remove(&key);
-        }
-        report
+            .clone()
     }
 
     async fn apply_once(
@@ -2448,6 +2478,29 @@ mod tests {
     fn epochs_grow_with_the_start_time() {
         assert!(crate::epoch_from(1_000, u16::MAX) < crate::epoch_from(1_001, 0));
         assert_eq!(crate::epoch_from(0, 0), 1);
+    }
+
+    /// Round 4: an apply whose caller is cancelled mid-build leaves no
+    /// entry in the single-flight map, and a later apply of the same set
+    /// runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_apply_leaves_no_flight_behind() {
+        let live = slow_live(&[("slow", 10)]);
+        let task = tokio::spawn({
+            let live = live.clone();
+            async move {
+                let slow = serde_json::to_value(hive("slow")).unwrap();
+                live.apply_remote(set(1, 1, vec![slow])).await
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(live.apply_flights.lock().unwrap().len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(live.apply_flights.lock().unwrap().is_empty());
+        let slow = serde_json::to_value(hive("slow")).unwrap();
+        assert!(live.apply_remote(set(1, 1, vec![slow])).await.applied);
+        assert!(live.apply_flights.lock().unwrap().is_empty());
     }
 
     /// Round 3: a push and a pull of the same `(epoch, generation)` that

@@ -1,7 +1,7 @@
 //! Against a real HMS: a database requested under any spelling HMS
-//! normalizes (`TPCH`, `"tpch "`, `@hive#tpch`) is served under the name
-//! HMS returns, so access rules are checked on that name; an unknown one
-//! is missing. Read-only.
+//! normalizes (`TPCH`, `"tpch "`, `@hive#tpch` for the default catalog) is
+//! served under the name HMS returns, so access rules are checked on that
+//! name; an unknown one, or another catalog's, is missing. Read-only.
 //!
 //! Requires `docker compose up -d` and the TPC-H seed (HMS on :9083):
 //! `cargo test -p arneb-hive --test hms_name_resolution -- --ignored`
@@ -28,7 +28,17 @@ async fn schemas_are_served_under_the_name_hms_returns() {
             "{written:?}"
         );
     }
-    assert!(catalog.schema("no_such_database_xyz").await.is_none());
+    assert!(catalog
+        .try_schema("no_such_database_xyz")
+        .await
+        .unwrap()
+        .is_none());
+    // Another HMS catalog's database is not served from the default one.
+    assert!(catalog
+        .try_schema("@no_such_catalog#tpch")
+        .await
+        .unwrap()
+        .is_none());
     arneb_catalog::conformance::check_name_resolution(&catalog)
         .await
         .unwrap();

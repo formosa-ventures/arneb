@@ -6,19 +6,21 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hive_metastore::{
     ColumnStatisticsData, Database, GetTableRequest, PartitionsRequest, TableStatsRequest,
     ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
+    ThriftHiveMetastoreGetDatabaseException,
 };
 use pilota::FastStr;
 use tracing::{debug, warn};
 use volo_thrift::MaybeException;
 
-use arneb_catalog::{CatalogProvider, ColumnStatistics, SchemaProvider, TableProvider};
-use arneb_common::error::ConnectorError;
+use arneb_catalog::{CatalogProvider, ColumnStatistics, SchemaProvider, TableGate, TableProvider};
+use arneb_common::error::{CatalogError, ConnectorError};
 use arneb_common::types::{ColumnInfo, DataType};
 use arneb_connectors::storage::StorageRegistry;
 
@@ -135,13 +137,16 @@ impl HmsClient {
         }
     }
 
-    /// The name HMS stores database `name` under. HMS normalizes the
-    /// identifier it is given (trims and lowercases it, and may read a
-    /// `@catalog#db` prefix), so this can differ from `name`.
-    pub async fn get_database(&self, name: &str) -> Result<String, ConnectorError> {
+    /// Database `name` as HMS returns it, or `None` when HMS answers
+    /// that it does not exist. HMS normalizes the identifier it is given
+    /// (trims and lowercases it, and reads a leading `@catalog#db` as a
+    /// catalog-qualified name), so the returned name can differ from
+    /// `name`. Any other failure (transport, timeout, `MetaException`) is
+    /// an error, never "missing".
+    pub async fn get_database(&self, name: &str) -> Result<Option<Database>, ConnectorError> {
         // The plain call, not `get_database_req`: HMS resolves the default
-        // catalog for it (and parses `@catalog#db`) exactly as it does for
-        // `get_all_tables`, which this schema then lists with.
+        // catalog for it exactly as it does for `get_all_tables`, which
+        // this schema then lists with.
         let result = self
             .client
             .get_database(FastStr::from(name.to_string()))
@@ -150,10 +155,9 @@ impl HmsClient {
                 ConnectorError::ConnectionFailed(format!("HMS get_database({name}) failed: {e}"))
             })?;
         match result {
-            MaybeException::Ok(db) => stored_database_name(&db).ok_or_else(|| {
-                ConnectorError::ReadError(format!("HMS database {name} came back without a name"))
-            }),
-            MaybeException::Exception(ex) => Err(ConnectorError::TableNotFound(format!(
+            MaybeException::Ok(db) => Ok(Some(db)),
+            MaybeException::Exception(ThriftHiveMetastoreGetDatabaseException::O1(_)) => Ok(None),
+            MaybeException::Exception(ex) => Err(ConnectorError::ConnectionFailed(format!(
                 "HMS get_database({name}) exception: {ex:?}"
             ))),
         }
@@ -209,16 +213,20 @@ impl HmsClient {
             }
         };
 
-        // HMS normalizes identifiers to lowercase; fall back to that if a
-        // server leaves the names out of the response.
-        let db_name = hms_table
-            .db_name
-            .as_ref()
-            .map_or_else(|| db.trim().to_lowercase(), |s| s.to_string());
-        let table_name = hms_table
-            .table_name
-            .as_ref()
-            .map_or_else(|| table.trim().to_lowercase(), |s| s.to_string());
+        // The stored names are the identity access rules are checked on:
+        // refuse a response without them rather than guess at how HMS
+        // normalized the requested ones.
+        let stored = |name: Option<&FastStr>, what: &str| {
+            name.map(|n| n.to_string())
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| {
+                    ConnectorError::ReadError(format!(
+                        "HMS table {db}.{table} came back without a {what}"
+                    ))
+                })
+        };
+        let db_name = stored(hms_table.db_name.as_ref(), "db_name")?;
+        let table_name = stored(hms_table.table_name.as_ref(), "tbl_name")?;
         let parameters = hms_table.parameters.clone();
         let sd = hms_table.sd.ok_or_else(|| {
             ConnectorError::ReadError(format!("table {db}.{table} has no storage descriptor"))
@@ -488,6 +496,15 @@ fn convert_field_schemas(
 // HiveCatalogProvider
 // ---------------------------------------------------------------------------
 
+/// How long a database name resolution is reused. Planning one query
+/// looks the same schema up several times (case folding, resolution,
+/// statistics) and metadata listings twice per schema; this keeps that to
+/// one HMS call. Only found databases are cached, so a new one shows up
+/// at once; a dropped one fails at its next table call.
+const RESOLVED_TTL: Duration = Duration::from_secs(10);
+/// Bound on cached resolutions (the cache is cleared when it is reached).
+const RESOLVED_MAX: usize = 1024;
+
 /// Catalog provider backed by a Hive Metastore.
 ///
 /// Each HMS database maps to a schema. Tables within a database are
@@ -498,13 +515,55 @@ fn convert_field_schemas(
 pub struct HiveCatalogProvider {
     client: Arc<HmsClient>,
     storage: Arc<StorageRegistry>,
+    /// Recently resolved database names: name as requested → stored name.
+    resolved: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl HiveCatalogProvider {
     /// Create a new provider from an existing [`HmsClient`] and the
     /// catalog's storage registry.
     pub fn new(client: Arc<HmsClient>, storage: Arc<StorageRegistry>) -> Self {
-        Self { client, storage }
+        Self {
+            client,
+            storage,
+            resolved: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn cached(&self, name: &str) -> Option<String> {
+        let resolved = self.resolved.lock().unwrap();
+        let (stored, at) = resolved.get(name)?;
+        (at.elapsed() < RESOLVED_TTL).then(|| stored.clone())
+    }
+
+    fn remember(&self, name: &str, stored: &str) {
+        let mut resolved = self.resolved.lock().unwrap();
+        if resolved.len() >= RESOLVED_MAX {
+            resolved.clear();
+        }
+        resolved.insert(name.to_string(), (stored.to_string(), Instant::now()));
+    }
+
+    /// The stored name of the default-catalog database `name` resolves
+    /// to; `None` when there is none.
+    async fn resolve_database(&self, name: &str) -> Result<Option<String>, ConnectorError> {
+        let Some(db) = self.client.get_database(name).await? else {
+            return Ok(None);
+        };
+        let stored = stored_database_name(&db).ok_or_else(|| {
+            ConnectorError::ReadError(format!("HMS database {name} came back without a name"))
+        })?;
+        // HMS read a catalog out of an `@catalog#db` name, but this schema
+        // lists and reads its tables from the default catalog. Serve such a
+        // name only when it names the default catalog's own database;
+        // another catalog's reads as missing.
+        if name.contains('@') {
+            let plain = self.client.get_database(&stored).await?;
+            if !same_catalog(&db, plain.as_ref()) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(stored))
     }
 }
 
@@ -520,22 +579,44 @@ impl CatalogProvider for HiveCatalogProvider {
         }
     }
 
+    async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        match self.try_schema(name).await {
+            Ok(schema) => schema,
+            Err(e) => {
+                warn!("failed to look up HMS database '{name}': {e}");
+                None
+            }
+        }
+    }
+
     /// Looks the database up in HMS and serves it under the name HMS
     /// returns, so every later call and every access check uses the stored
-    /// identity, never the (normalized-by-HMS) name as written.
-    async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        let database = match self.client.get_database(name).await {
-            Ok(database) => database,
-            Err(e) => {
-                debug!("HMS database '{name}' not found: {e}");
-                return None;
+    /// identity, never the (normalized-by-HMS) name as written. `Ok(None)`
+    /// only when HMS answers that the database does not exist.
+    async fn try_schema(
+        &self,
+        name: &str,
+    ) -> Result<Option<Arc<dyn SchemaProvider>>, CatalogError> {
+        let database = match self.cached(name) {
+            Some(stored) => stored,
+            None => {
+                let resolved = self
+                    .resolve_database(name)
+                    .await
+                    .map_err(|e| CatalogError::Unavailable(e.to_string()))?;
+                let Some(stored) = resolved else {
+                    debug!("HMS database '{name}' not found");
+                    return Ok(None);
+                };
+                self.remember(name, &stored);
+                stored
             }
         };
-        Some(Arc::new(HiveSchemaProvider::new(
+        Ok(Some(Arc::new(HiveSchemaProvider::new(
             Arc::clone(&self.client),
             Arc::clone(&self.storage),
             database,
-        )))
+        ))))
     }
 }
 
@@ -582,7 +663,24 @@ impl SchemaProvider for HiveSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+        self.load(name, &|_, _| true).await
+    }
+
+    /// Asks `allowed` as soon as HMS returns the table's stored name,
+    /// before partitions or Iceberg metadata are read.
+    async fn table_if_allowed(
+        &self,
+        name: &str,
+        allowed: TableGate<'_>,
+    ) -> Option<Arc<dyn TableProvider>> {
+        self.load(name, allowed).await
+    }
+}
+
+impl HiveSchemaProvider {
+    async fn load(&self, name: &str, allowed: TableGate<'_>) -> Option<Arc<dyn TableProvider>> {
         match self.client.get_table(&self.database, name).await {
+            Ok(meta) if !allowed(&meta.db_name, &meta.table_name) => None,
             // Table redirection (as in Trino): Iceberg tables in HMS are
             // served by the Iceberg reader. Listing their location as a
             // plain Hive table would read deleted and orphaned files.
@@ -655,6 +753,19 @@ fn stored_database_name(db: &Database) -> Option<String> {
         .as_ref()
         .map(|n| n.to_string())
         .filter(|n| !n.is_empty())
+}
+
+/// Whether `requested` (looked up as `@catalog#db`) is the database the
+/// default catalog serves under the same name (`plain`). Refused when
+/// either leaves its catalog out.
+fn same_catalog(requested: &Database, plain: Option<&Database>) -> bool {
+    match (
+        requested.catalog_name.as_ref(),
+        plain.and_then(|p| p.catalog_name.as_ref()),
+    ) {
+        (Some(requested), Some(default)) => requested == default,
+        _ => false,
+    }
 }
 
 /// `true` when HMS marks the table as a Hive ACID (transactional) table.
@@ -1097,6 +1208,68 @@ mod tests {
         assert!(columns.is_empty());
     }
 
+    /// A provider whose metastore refuses connections (nothing listens on
+    /// port 1), standing in for an HMS outage.
+    fn unreachable_provider() -> HiveCatalogProvider {
+        HiveCatalogProvider::new(
+            Arc::new(HmsClient {
+                client: ThriftHiveMetastoreClientBuilder::new("test")
+                    .address("127.0.0.1:1".parse::<SocketAddr>().unwrap())
+                    .build(),
+            }),
+            Arc::new(StorageRegistry::new()),
+        )
+    }
+
+    /// An HMS outage is an error from `try_schema`, never a missing
+    /// database, so callers such as `SET search_path` can fail on it.
+    #[tokio::test]
+    async fn an_unreachable_metastore_is_not_a_missing_database() {
+        let provider = unreachable_provider();
+        let err = provider.try_schema("sales").await.unwrap_err();
+        assert!(matches!(err, CatalogError::Unavailable(_)), "{err}");
+        assert!(provider.schema("sales").await.is_none());
+    }
+
+    /// A resolution is reused within its TTL (no HMS call: the metastore
+    /// here is unreachable) and asked again after it.
+    #[tokio::test]
+    async fn resolved_database_names_are_reused_briefly() {
+        let provider = unreachable_provider();
+        provider.remember("TPCH", "tpch");
+        let schema = provider.try_schema("TPCH").await.unwrap().unwrap();
+        assert_eq!(schema.canonical_name().as_deref(), Some("tpch"));
+
+        let stale = Instant::now()
+            .checked_sub(RESOLVED_TTL + Duration::from_secs(1))
+            .unwrap();
+        provider
+            .resolved
+            .lock()
+            .unwrap()
+            .insert("TPCH".into(), ("tpch".into(), stale));
+        assert!(provider.try_schema("TPCH").await.is_err());
+    }
+
+    /// `@catalog#db` is served only when HMS puts it in the same catalog as
+    /// the plain name `db` (the default catalog the tables are read from).
+    #[test]
+    fn catalog_qualified_names_must_name_the_default_catalog() {
+        let db = |catalog: Option<&str>| Database {
+            name: Some(FastStr::from("hr")),
+            catalog_name: catalog.map(|c| FastStr::from(c.to_string())),
+            ..Default::default()
+        };
+        assert!(same_catalog(&db(Some("hive")), Some(&db(Some("hive")))));
+        // `@spark#hr` while the default catalog's `hr` is in `hive`.
+        assert!(!same_catalog(&db(Some("spark")), Some(&db(Some("hive")))));
+        // The default catalog has no `hr`.
+        assert!(!same_catalog(&db(Some("spark")), None));
+        // A server that leaves the catalog out is refused.
+        assert!(!same_catalog(&db(None), Some(&db(None))));
+        assert!(!same_catalog(&db(Some("hive")), Some(&db(None))));
+    }
+
     #[tokio::test]
     async fn hive_catalog_provider_debug() {
         // Verify Debug is implemented (required by CatalogProvider trait)
@@ -1107,6 +1280,7 @@ mod tests {
                     .build(),
             }),
             storage: Arc::new(StorageRegistry::new()),
+            resolved: Mutex::new(HashMap::new()),
         };
         let debug_str = format!("{provider:?}");
         assert!(debug_str.contains("HiveCatalogProvider"));

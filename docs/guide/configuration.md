@@ -804,7 +804,9 @@ the response returns. Read it with
   later audited action is refused with `503 audit_unavailable` until the
   file can be written again. The server keeps that completion and appends
   it first when the log reopens, so the known outcome still reaches the
-  file. An action that panics is completed with `{"error": "internal"}`.
+  file. An action that panics is completed as `interrupted`, since the
+  panic may come after the action took effect. A `token.issue` that failed
+  has an empty `target`: its token id never became a token.
 - **Interrupted actions.** An intent with no completion at startup (the
   server stopped while applying it, or before a failed completion could be
   appended again) is logged at

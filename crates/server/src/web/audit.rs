@@ -5,7 +5,7 @@
 //! action's intent entry (outcome `pending`) must be synced before the
 //! action runs, else `audit_unavailable` and nothing is applied; then the
 //! action runs; then its completion entry is appended (a panicking action
-//! is completed as failed, `internal`). A failed completion cannot undo the
+//! is completed as `interrupted`: it may or may not have been applied). A failed completion cannot undo the
 //! action, so it goes to the ERROR log, the log is marked unwritable and
 //! keeps the completion, and the action's real result is returned; the next
 //! audited action reopens the log, which first appends the kept completion,
@@ -105,12 +105,13 @@ pub(super) fn audited<T>(
             return Err(refuse(&e.source));
         }
     };
-    // A panicking action is recorded as failed (`internal`), then the panic
-    // continues, so its intent does not stay pending.
+    // A panicking action is recorded as `interrupted` (it may or may not
+    // have been applied: the panic may follow the side effect), then the
+    // panic continues, so its intent does not stay pending.
     let out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
         Ok(out) => out,
         Err(panic) => {
-            let failed = AuditOutcome::Error(ErrorCode::Internal.name());
+            let failed = AuditOutcome::Interrupted;
             if let Err(e) = state.audit.complete(begun.seq, record(closing, failed)) {
                 tracing::error!(
                     target: "arneb::audit",
@@ -567,10 +568,11 @@ mod tests {
         assert_eq!(entries[0]["target"], issued["id"]);
     }
 
-    /// A panicking action is completed as failed (`internal`), so its
-    /// intent does not stay pending, and the panic continues.
+    /// A panicking action is completed as `interrupted` (the panic may come
+    /// after the side effect), so its intent does not stay pending, and the
+    /// panic continues.
     #[tokio::test]
-    async fn a_panicking_action_is_completed_as_failed() {
+    async fn a_panicking_action_is_completed_as_interrupted() {
         let state = state();
         let who = Identity {
             user: "root".into(),
@@ -595,7 +597,33 @@ mod tests {
         assert_eq!(entries.len(), 1, "{page}");
         assert_eq!(entries[0]["action"], "worker.cordon");
         assert_eq!(entries[0]["target"], "w1");
-        assert_eq!(entries[0]["outcome"], json!({"error": "internal"}));
+        assert_eq!(entries[0]["outcome"], "interrupted");
         assert!(entries[0]["intent_seq"].is_u64(), "{page}");
+    }
+
+    /// A failed `token.issue` completion names no token: the pre-generated
+    /// id never became one. (The state file's directory turns read-only
+    /// after the checks, so the issue itself fails.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_token_issue_names_no_token() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        let state = with_authz(web_state(true, Some(&path)), None, &["root"]);
+        let mode = |m| std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(m));
+        mode(0o500).unwrap();
+        let (status, body) = issue(&state).await;
+        mode(0o700).unwrap();
+        if status == StatusCode::CREATED {
+            return; // running as root: permissions do not stop the write
+        }
+        assert_eq!(body["error"]["code"], "internal", "{body}");
+        let (_, page) = audit_log(&state, "").await;
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{page}");
+        assert_eq!(entries[0]["action"], "token.issue");
+        assert!(entries[0]["outcome"]["error"].is_string(), "{page}");
+        assert_eq!(entries[0]["target"], "", "{page}");
     }
 }

@@ -415,7 +415,15 @@ pub(super) async fn issue_token_for(
                     .issue_token_as(id, &user, name, expires_at_ms)
                     .map_err(state_error)
             },
-            |_| AuditSubject { target, parameters },
+            // A failed issue names no token: the id never became one.
+            |issued| AuditSubject {
+                target: if issued.is_ok() {
+                    target
+                } else {
+                    String::new()
+                },
+                parameters,
+            },
         )
     })
     .await

@@ -34,3 +34,4 @@
 - [x] 7.4 Fetch guard disarmed with `take` (no leaked `Arc`); key-cache lock recovers from poisoning everywhere
 - [x] 7.5 `invalid_token` challenge carries `scope`, and is sent for every refused bearer on `/mcp`
 - [x] 7.6 Metadata also at the bare well-known path
+- [x] 7.7 An email-address user under a claim other than `email`/`sub` must equal the token's verified `email`; `sub` exempt; an empty bearer gets no error code; app-only tokens documented

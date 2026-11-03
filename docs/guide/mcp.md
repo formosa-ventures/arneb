@@ -75,7 +75,8 @@ it needs a restart, and a bad value stops startup with a message naming it.
   `404`.
 - A `/mcp` request without credentials gets `401` with
   `WWW-Authenticate: Bearer realm="arneb", resource_metadata="…"`, which is
-  where an OAuth client starts. A bearer that is presented but refused (a
+  where an OAuth client starts (an empty `Bearer` counts as no
+  credentials). A bearer that is presented but refused (a
   JWT that is expired, for the wrong audience, badly signed or an ID token;
   an opaque token; an expired or revoked Arneb token) gets the same `401`
   body with `error="invalid_token"` added to the challenge
@@ -140,19 +141,32 @@ Design decisions you should know about:
   user could take over another Arneb user. The server logs a WARN at startup
   when the claim is not `sub`. With `sub` the Arneb user names are the IdP's
   subject ids.
-- **An email address needs a verified address.** When `user_claim =
-  "email"`, or the mapped value contains `@` whatever the claim
-  (`preferred_username` with Keycloak's "email as username", Entra's `upn`,
-  an Auth0 namespaced claim such as `https://corp.example/email`), the
-  token's `email_verified` must be `true` (or the string `"true"`);
-  otherwise the answer is `403 forbidden`, "the identity's email address is
-  not verified", even if that user exists. An IdP that never sends
-  `email_verified` (Entra ID, for one) cannot be used with `email`; for an
-  address under another claim, `allow_missing_email_verified = true`
-  accepts a token without the claim (startup logs a WARN). Only turn it on
-  when the IdP never issues an address its owner has not proven; an
-  explicit `email_verified: false` is refused regardless. A value without
-  `@` is not checked.
+- **An email address must be a verified address.** An unverified address
+  can be anyone's (self-registration, social login), so:
+  - With `user_claim = "email"`, the token's `email_verified` must be
+    `true` (or the string `"true"`).
+  - With another claim whose value contains `@` (`preferred_username`
+    with Keycloak's "email as username", Entra's `upn`, an Auth0
+    namespaced claim such as `https://corp.example/email`),
+    `email_verified` speaks only for the token's `email`, so `email` must
+    be the same address (ASCII case-insensitive) and `email_verified` must
+    be `true`. A different `email` is refused with "the identity's '…'
+    claim is an email address other than its verified email": a user who
+    can pick their username could otherwise choose someone else's address
+    and verify their own inbox.
+  - `sub` is exempt: OIDC defines it as never reassigned, and Okta's
+    custom authorization servers put the login (usually an address) there
+    without `email_verified`.
+  - A value without `@` is not checked.
+
+  A refused address answers `403 forbidden` ("the identity's email
+  address is not verified" when not verified), even if that user exists.
+  An IdP that never sends `email_verified` (Entra ID, for one) cannot be
+  used with `email`. For an address under another claim,
+  `allow_missing_email_verified = true` accepts a token with no `email` or
+  no `email_verified` (startup logs a WARN); only turn it on when the IdP
+  never issues an address its owner has not proven. An explicit
+  `email_verified: false` and a different `email` are refused regardless.
 - **The audience is the resource URL.** Tokens must be issued for this
   resource (RFC 8707): `aud` has to contain `audience`, which defaults to
   `resource`. Set `audience` for an IdP that names the API differently (an
@@ -196,6 +210,13 @@ Design decisions you should know about:
    IdP and the client.
 6. Optionally set `required_scopes` to a scope the IdP grants only to
    permitted clients.
+7. Use a grant that puts a scope in the token. App-only and
+   machine-to-machine tokens (Entra client credentials, which carry
+   `roles` but no `scp`; Auth0 M2M tokens without granted permissions)
+   have no type marker and no scope, so Arneb takes them for possible ID
+   tokens and refuses them. Give such clients a scope the token carries
+   (and list it in `required_scopes`), have the IdP send `typ: at+jwt`, or
+   use an Arneb API token for them instead.
 
 `docker/keycloak/arneb-realm.json` is a dev realm that does this (users
 `alice`, `bob`, `carol` with public, dev-only passwords; client

@@ -213,7 +213,7 @@ user_claim = "sub"
 | `issuer` | `ARNEB_OAUTH_ISSUER` | unset | Issuer URL of the IdP; the required `iss`, and the base of the discovery document. Setting it enables OAuth. `https`, or `http` for a loopback host. |
 | `resource` | `ARNEB_OAUTH_RESOURCE` | unset | Public URL of `/mcp`; required with `issuer`, must end in `/mcp`, no query or fragment. Published in the metadata document. |
 | `audience` | `ARNEB_OAUTH_AUDIENCE` | `resource` | Value `aud` must contain. A value that is not a URL or URI (a client id; `api://…` and `https://…` identifiers are fine) needs `required_scopes`, or startup fails: an ID token for that client would carry the same `aud`. |
-| `user_claim` | `ARNEB_OAUTH_USER_CLAIM` | `sub` | Claim holding the Arneb user name: 1 to 64 characters of `A-Z a-z 0-9 _ . @ -`. A value outside that set (e.g. Auth0's `auth0\|...` subjects) answers `403`; use a claim that holds a valid name. With `email`, or whenever the value contains `@`, the token's `email_verified` must be `true`, or the answer is `403` (see `allow_missing_email_verified`). |
+| `user_claim` | `ARNEB_OAUTH_USER_CLAIM` | `sub` | Claim holding the Arneb user name: 1 to 64 characters of `A-Z a-z 0-9 _ . @ -`. A value outside that set (e.g. Auth0's `auth0\|...` subjects) answers `403`; use a claim that holds a valid name. With `email`, the token's `email_verified` must be `true`. With another claim whose value contains `@` (not `sub`, which is exempt), the token's `email` must equal it and be verified. Otherwise the answer is `403` (see `allow_missing_email_verified`). |
 | `jwks_uri` | `ARNEB_OAUTH_JWKS_URI` | from discovery | The IdP's JWKS URL, when its discovery document cannot be used. |
 | `required_scopes` | `ARNEB_OAUTH_REQUIRED_SCOPES` (comma-separated) | none | Scopes a token must carry (`scope` string or `scp` array). A valid token without one gets `403` with `error="insufficient_scope"`. |
 | `leeway_secs` | `ARNEB_OAUTH_LEEWAY_SECS` | 60 | Clock-skew allowance for `exp` / `nbf`, `0` to `300`. |
@@ -221,7 +221,7 @@ user_claim = "sub"
 | `jwks_min_refresh_secs` | `ARNEB_OAUTH_JWKS_MIN_REFRESH_SECS` | 30 | Minimum gap between JWKS fetches (a token with an unknown `kid` triggers one), `1` to `jwks_cache_secs`. |
 | `jwks_max_stale_secs` | `ARNEB_OAUTH_JWKS_MAX_STALE_SECS` | 86400 | While refetches fail (IdP down), how long after the last successful fetch its keys keep deciding; at least `jwks_cache_secs`. After that, `/mcp` answers `503` for JWTs. |
 | `require_access_token_typ` | `ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP` | `false` | Accept only tokens whose header `typ` is `at+jwt` (RFC 9068). Off by default because many IdPs send `typ: JWT` on access tokens; ID tokens are refused either way. |
-| `allow_missing_email_verified` | `ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED` | `false` | Accept an email-address user name (from a claim other than `email`) when the token has no `email_verified` claim at all, for an IdP such as Entra ID that never sends it. `email_verified: false` is refused regardless. Logged, with a WARN when on. |
+| `allow_missing_email_verified` | `ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED` | `false` | Accept an email-address user name (from a claim other than `email` or `sub`) when the token has no `email` or no `email_verified` claim, for an IdP such as Entra ID that never sends it. `email_verified: false` and an `email` other than the user name are refused regardless. Logged, with a WARN when on. |
 
 An empty env var counts as unset; env vars override the file. The server
 reaches the IdP over the network (5 s timeout per request), so its pod needs
@@ -920,15 +920,19 @@ single-page app. With `[oauth]`:
   `403`; there is no auto-provisioning.
 - **Check `user_claim`.** The default is `sub`, so Arneb user names are
   subject ids. `preferred_username` and `email` work but must not be
-  editable by users at your IdP; `email`, and any user name that is an
-  email address, also needs `email_verified = true` in the token (or
-  `allow_missing_email_verified` for an IdP that never sends it).
+  editable by users at your IdP; `email` also needs `email_verified =
+  true` in the token, and an email-address user name under another claim
+  (other than `sub`) needs the token's `email` to be that same address,
+  verified (or `allow_missing_email_verified` for an IdP that never sends
+  them).
 - **Client-id audiences need a scope.** An `audience` that is not a URL or
   URI refuses to start without `required_scopes`.
 - **Unmarked tokens without a scope are refused.** A token with neither an
   `at+jwt` header nor a Keycloak payload `typ` is taken for a possible ID
   token when it has a `nonce`, an `at_hash` or no scope claim; set
-  `required_scopes` for an IdP that issues such access tokens.
+  `required_scopes` for an IdP that issues such access tokens. App-only
+  tokens without a scope (Entra client credentials, Auth0 M2M) are refused;
+  give those clients a scope or an Arneb API token.
 - **Two metadata paths answer.** The metadata document is at
   `/.well-known/oauth-protected-resource` plus the path of `resource`
   (normally `…/mcp`) and at the bare well-known path.

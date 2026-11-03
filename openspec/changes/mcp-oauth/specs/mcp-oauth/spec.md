@@ -66,7 +66,7 @@ A bearer on `/mcp` that has three dot-separated non-empty parts and does not sta
 - **THEN** `/mcp` answers `401`
 
 ### Requirement: Identity mapping
-The value of `user_claim` SHALL be the Arneb user, who must exist in the state store. With `user_claim = "email"`, or whenever the mapped value contains `@` (whatever the claim), a token whose `email_verified` is not `true` (or `"true"`) SHALL answer `403 forbidden`; only with `allow_missing_email_verified` and a claim other than `email` SHALL a token without any `email_verified` be accepted. The request SHALL run with that user's access rules and privileges, `whoami` SHALL report `via: "oauth"`, and audit entries SHALL record `via: "oauth"`. A valid token whose user does not exist, or whose `user_claim` value is not a valid Arneb user name, SHALL answer `403 forbidden` (with distinct messages). API tokens minted by an OAuth identity SHALL expire no later than the access token's `exp`. Deleting the user SHALL make their still-valid tokens answer `403` from the next request. A JWT on any route other than `/mcp` SHALL be an invalid bearer (`401`). API tokens, sessions and Basic credentials SHALL keep working on `/mcp`.
+The value of `user_claim` SHALL be the Arneb user, who must exist in the state store. With `user_claim = "email"`, a token whose `email_verified` is not `true` (or `"true"`) SHALL answer `403 forbidden`. With any other claim except `sub` whose value contains `@`, the token's `email` SHALL equal the value (ASCII case-insensitive) and `email_verified` SHALL be `true`; a different `email` or a non-true `email_verified` SHALL answer `403 forbidden`, and a token without `email` or `email_verified` SHALL be accepted only with `allow_missing_email_verified`. `sub` SHALL NOT be checked. The request SHALL run with that user's access rules and privileges, `whoami` SHALL report `via: "oauth"`, and audit entries SHALL record `via: "oauth"`. A valid token whose user does not exist, or whose `user_claim` value is not a valid Arneb user name, SHALL answer `403 forbidden` (with distinct messages). API tokens minted by an OAuth identity SHALL expire no later than the access token's `exp`. Deleting the user SHALL make their still-valid tokens answer `403` from the next request. A JWT on any route other than `/mcp` SHALL be an invalid bearer (`401`). API tokens, sessions and Basic credentials SHALL keep working on `/mcp`.
 
 #### Scenario: Unknown user
 - **WHEN** a valid token names `bob`, who has no Arneb user
@@ -79,6 +79,10 @@ The value of `user_claim` SHALL be the Arneb user, who must exist in the state s
 #### Scenario: Unverified address under another claim
 - **WHEN** `user_claim = "preferred_username"` and a valid token carries `alice@corp.example` without `email_verified: true`
 - **THEN** `/mcp` answers `403 forbidden`
+
+#### Scenario: A username that is someone else's address
+- **WHEN** `user_claim = "preferred_username"` and a valid token carries `preferred_username: admin@corp.example`, `email: attacker@evil.example`, `email_verified: true`
+- **THEN** `/mcp` answers `403 forbidden`, even if the Arneb user `admin@corp.example` exists
 
 #### Scenario: JWT outside MCP
 - **WHEN** a valid token is sent to `GET /api/v2/whoami`

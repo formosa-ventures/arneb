@@ -9,7 +9,10 @@
 #   [oauth] issuer = "http://127.0.0.1:8180/realms/arneb"
 #           resource = "http://127.0.0.1:<web port>/mcp"
 #           user_claim = "preferred_username"
-# and the realm's audience mapper must name that same resource URL. The Arneb
+# and the realm's audience mapper must name that same resource URL (in the
+# access token, and in the ID token so that step 4b reaches the ID-token
+# check rather than the audience check; re-import the realm after an
+# upgrade). The Arneb
 # user alice exists (config or API); carol is created here through the API;
 # bob has no Arneb user.
 #
@@ -231,11 +234,16 @@ req NONE GET "$BASE$path"
 expect_code 200 "GET $path"
 check ".resource == \"$BASE/mcp\" and .authorization_servers == [\"$ISSUER\"] and (.bearer_methods_supported | index(\"header\"))" \
     "metadata at $path is wrong"
-# RFC 9728: only the path derived from the resource answers.
-for path in /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/foo; do
-    req NONE GET "$BASE$path"
-    expect_code 404 "GET $path (not the resource's metadata path)"
-done
+# The bare root answers the same document (clients that only probe the root);
+# any other suffix is 404.
+path=/.well-known/oauth-protected-resource
+req NONE GET "$BASE$path"
+expect_code 200 "GET $path (the bare root)"
+check ".resource == \"$BASE/mcp\"" "metadata at $path is not the /mcp document"
+path=/.well-known/oauth-protected-resource/foo
+req NONE GET "$BASE$path"
+expect_code 404 "GET $path (not the resource's metadata path)"
+
 mcp_post NONE '{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}'
 expect_code 401 "unauthenticated POST /mcp"
 HEADERS_VAL=$(header_of www-authenticate)
@@ -314,6 +322,10 @@ pass
 STEP="4b an ID token (scope openid) is refused with 401 invalid_token"
 JWT_ID=$(kc_token alice "$PW_ALICE" "$CLIENT" id_token openid)
 echo "  id token: header typ $(header_typ "$JWT_ID"), claims $(claims "$JWT_ID" | jq -c '{typ, aud, azp, has_at_hash: has("at_hash"), has_nonce: has("nonce")}')"
+# Its aud must hold the resource, or it is refused as bad_audience before
+# the ID-token check runs and this step proves nothing.
+claims "$JWT_ID" | jq -e --arg r "$BASE/mcp" '.aud | (if type == "array" then . else [.] end) | index($r) != null' >/dev/null \
+    || fail "the ID token's aud lacks $BASE/mcp: set id.token.claim on the $CLIENT audience mapper (re-import docker/keycloak/arneb-realm.json)"
 mcp_post IDTOK '{"jsonrpc":"2.0","id":41,"method":"tools/list","params":{}}'
 expect_code 401 "alice's ID token on /mcp"
 case "$(header_of www-authenticate)" in *'error="invalid_token"'*) ;; *) fail "the ID token's 401 has no error=\"invalid_token\"" ;; esac

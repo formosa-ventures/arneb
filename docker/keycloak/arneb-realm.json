@@ -76,7 +76,7 @@
           "consentRequired": false,
           "config": {
             "included.custom.audience": "http://127.0.0.1:7432/mcp",
-            "id.token.claim": "false",
+            "id.token.claim": "true",
             "access.token.claim": "true"
           }
         }

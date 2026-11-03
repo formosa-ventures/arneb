@@ -105,7 +105,11 @@ A coordinator without a `[cluster] secret` SHALL refuse to start while a served 
 
 #### Scenario: Slow set from the previous epoch
 - **WHEN** a worker's pull of epoch E1's set is still building after the restarted coordinator (epoch E2) pushed its set
-- **THEN** the E1 set changes nothing when its build finishes, and a later push from E1 is refused: epochs grow with each coordinator start, a worker refuses a set from an epoch older than the newest it has seen in a push, pull or heartbeat reply, and concurrent applies of the same epoch and generation build each catalog once
+- **THEN** the E1 set changes nothing when its build finishes, and a later push from E1 is refused with an error, so E1's coordinator never counts the worker as synced: a worker follows the epoch its last heartbeat reply named (before the first, the largest a push or pull named), refuses a set from any other epoch, and concurrent applies of the same epoch and generation build each catalog once
+
+#### Scenario: Coordinator moved to a host whose clock is behind
+- **WHEN** a heartbeat names epoch E2 smaller than the applied E1, and a delayed push from E1's coordinator arrives afterwards
+- **THEN** the push is refused with an error and does not move the epoch back to E1, and the live coordinator's pulls and pushes at E2 keep applying
 
 ### Requirement: Runtime settings
 `GET /api/v2/settings` (observe) SHALL return `{slow_query_threshold_ms, source}`. `PATCH /api/v2/settings` (manage) SHALL set `slow_query_threshold_ms` (`0` turns the slow-query log off), apply it at once and store it, and a stored value SHALL win over `[observability]` and `ARNEB_SLOW_QUERY_THRESHOLD_MS` at every start.

@@ -926,7 +926,12 @@ async fn run() -> Result<()> {
             "cannot open the audit log (<state file name>.audit.jsonl next to [state] path)",
         )?,
     );
+    // Kept for the shutdown flush; the web state takes `audit_log`.
+    let audit_for_shutdown = Arc::clone(&audit_log);
     if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
+        // Retries an unwritable log in the background, so a completion whose
+        // write failed reaches the file once the disk recovers.
+        web::spawn_audit_retry(Arc::clone(&audit_log), web::AUDIT_RETRY_INTERVAL);
         tracing::info!(
             target: "arneb::config",
             path = %audit_path
@@ -1352,6 +1357,8 @@ async fn run() -> Result<()> {
             drain_timeout_secs,
         ) => {}
     }
+    // Completions whose write failed get one last try before exiting.
+    web::flush_audit(audit_for_shutdown).await;
 
     Ok(())
 }

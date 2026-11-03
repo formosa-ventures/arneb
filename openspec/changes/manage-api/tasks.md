@@ -50,10 +50,14 @@
 - [x] 10.2 Audit: a failed completion is kept and appended when the log reopens; a panicking action is completed as `internal`
 - [x] 10.3 Audit: the refused closing entry only after an attempted write
 - [x] 10.4 Audit: the `token.issue` intent names the token id (`TokenId`, `issue_token_as`)
-- [x] 10.10 Audit (review round 4): a panicking action is completed as `interrupted`, not `internal`; a failed `token.issue` completion has no target
 - [x] 10.5 Audit log named after the full state file name (`prod.json.audit.jsonl`); WARN on a legacy `audit.jsonl`
 - [x] 10.6 Audit reads examine at most 10,000 entries; a filtered page that runs out ends early, truncated, with a cursor
 - [x] 10.7 Lock-free admission checks the cap flag and takes its slot in one atomic step (no spurious `QueueFull`)
 - [x] 10.8 Kill: `kill_query` documented as blocking, the v1 cancel runs it in `spawn_blocking`; Trino and agent client cancels and reapers go through `KillSwitch::try_kill`; docs state the mid-work behavior precisely
-- [x] 10.9 Kill (review round 4): a kill during a poll is pending and settled by the guard when the poll ends; `KillSwitch::kill`, `Canceller` and `kill_query` are async (no lock held across a poll, no `spawn_blocking` for the v1 cancel); every protocol cancel goes through it with no abort fallback; a not-applied kill reports `NotApplied` with the real state and concurrent kills share the first kill's outcome; docs narrow the between-polls claim
 - [x] 10.9 Audit: a completion written twice (fsync failed, then replayed) loads once
+
+## 11. Review round 4
+
+- [x] 11.1 Kill: a kill during a poll is pending and settled by the guard when the poll ends; `KillSwitch::kill`, `Canceller` and `kill_query` are async (no lock held across a poll, no `spawn_blocking` for the v1 cancel); every protocol cancel goes through it with no abort fallback; a not-applied kill reports `NotApplied` with the real state and concurrent kills share the first kill's outcome; docs narrow the between-polls claim
+- [x] 11.2 Audit: a panicking action is completed as `interrupted`, not `internal`; a failed `token.issue` completion has no target
+- [x] 11.3 Audit: a background tick retries an unwritable log (and its kept completions) every 5 s; graceful shutdown flushes once more

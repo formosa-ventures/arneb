@@ -28,6 +28,61 @@ use super::privilege::Layer;
 use super::v2::bad_query;
 use super::WebState;
 
+/// How often [`spawn_audit_retry`] tries to reopen an unwritable log.
+pub(crate) const AUDIT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Tries to make an unwritable audit log writable again every `every`,
+/// appending the completions whose write failed
+/// ([`arneb_state::AuditLog::ensure_writable`]), so a known outcome reaches
+/// the file (and `writable` turns true again) once the disk recovers, even
+/// when no audited action comes in. A no-op tick while writable.
+pub(crate) fn spawn_audit_retry(
+    audit: std::sync::Arc<arneb_state::AuditLog>,
+    every: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if audit.is_writable() {
+                continue;
+            }
+            let log = std::sync::Arc::clone(&audit);
+            // Blocking (reopen + fsync); failures were already logged at
+            // ERROR when the log turned unwritable.
+            if let Ok(Err(e)) = tokio::task::spawn_blocking(move || log.ensure_writable()).await {
+                tracing::debug!(
+                    target: "arneb::audit",
+                    error = %e,
+                    "the audit log is still not writable"
+                );
+            }
+        }
+    })
+}
+
+/// At graceful shutdown: one last attempt to append the completions whose
+/// write failed, so their known outcomes are not lost (a restart would
+/// record their intents as `interrupted`). Logs at ERROR how many are lost
+/// when that fails.
+pub(crate) async fn flush_audit(audit: std::sync::Arc<arneb_state::AuditLog>) {
+    if audit.is_writable() {
+        return;
+    }
+    let log = std::sync::Arc::clone(&audit);
+    let flushed = tokio::task::spawn_blocking(move || log.ensure_writable()).await;
+    if let Ok(Err(e)) = flushed {
+        tracing::error!(
+            target: "arneb::audit",
+            error = %e,
+            completions = audit.unwritten_completions(),
+            "shutting down with audit completions that could not be written; \
+             the next start records their actions as interrupted"
+        );
+    }
+}
+
 /// Entries returned when the request names no `limit`.
 pub(super) const DEFAULT_AUDIT_LIMIT: usize = 50;
 /// The largest accepted `limit`.
@@ -237,7 +292,10 @@ pub(super) fn routes() -> Router<WebState> {
 
 #[cfg(test)]
 mod tests {
-    use super::{audited, ApiError, AuditSubject, Identity};
+    use super::{
+        audited, flush_audit, spawn_audit_retry, ApiError, AuditOutcome, AuditQuery, AuditRecord,
+        AuditSubject, Identity,
+    };
     use axum::http::{Method, StatusCode};
     use serde_json::{json, Value};
 
@@ -599,6 +657,79 @@ mod tests {
         assert_eq!(entries[0]["target"], "w1");
         assert_eq!(entries[0]["outcome"], "interrupted");
         assert!(entries[0]["intent_seq"].is_u64(), "{page}");
+    }
+
+    /// A completion whose write failed reaches the log from the background
+    /// retry once the disk recovers, with no further audited action, and
+    /// the log turns writable again.
+    #[tokio::test]
+    async fn a_failed_completion_is_retried_in_the_background() {
+        let state = state();
+        state.audit.set_fail_completions(true);
+        let (status, issued) = issue(&state).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued}");
+        assert!(!state.audit.is_writable());
+        assert_eq!(state.audit.unwritten_completions(), 1);
+        state.audit.set_fail_completions(false);
+        let retry = spawn_audit_retry(
+            std::sync::Arc::clone(&state.audit),
+            std::time::Duration::from_millis(10),
+        );
+        for _ in 0..200 {
+            if state.audit.is_writable() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        retry.abort();
+        assert!(
+            state.audit.is_writable(),
+            "the retry never reopened the log"
+        );
+        assert_eq!(state.audit.unwritten_completions(), 0);
+        let (_, page) = audit_log(&state, "").await;
+        assert_eq!(page["writable"], true, "{page}");
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{page}");
+        assert_eq!(entries[0]["outcome"], "ok");
+        assert_eq!(entries[0]["target"], issued["id"]);
+    }
+
+    /// The shutdown flush appends a kept completion, so the next start
+    /// loads its real outcome instead of recording it as interrupted.
+    #[tokio::test]
+    async fn the_shutdown_flush_appends_a_kept_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("audit.jsonl");
+        let settings = arneb_state::AuditSettings {
+            max_entries: 100,
+            retention_days: 0,
+        };
+        let audit = std::sync::Arc::new(arneb_state::AuditLog::open(Some(&log), settings).unwrap());
+        let record = |outcome| AuditRecord {
+            user: "root".into(),
+            via: "basic".into(),
+            action: "worker.cordon".into(),
+            target: "w1".into(),
+            parameters: json!({}),
+            outcome,
+        };
+        let intent = audit.begin(record(AuditOutcome::Pending)).unwrap();
+        audit.set_fail_completions(true);
+        assert!(audit
+            .complete(intent.seq, record(AuditOutcome::Ok))
+            .is_err());
+        audit.set_fail_completions(false);
+        flush_audit(std::sync::Arc::clone(&audit)).await;
+        assert!(audit.is_writable());
+        drop(audit);
+        let reopened = arneb_state::AuditLog::open(Some(&log), settings).unwrap();
+        let page = reopened.query(&AuditQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(page.entries.len(), 1, "{:?}", page.entries);
+        assert_eq!(page.entries[0].record.outcome, AuditOutcome::Ok);
     }
 
     /// A failed `token.issue` completion names no token: the pre-generated

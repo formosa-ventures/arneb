@@ -795,6 +795,20 @@ the source of truth from the config file to the [state store](#state):
   standalone server under password auth behaves like a coordinator here.
   Under `[auth] type = "none"` nothing changes: there is no state store, and
   the config is used as before.
+- **A PostgreSQL `connection_url` password must be the last query
+  parameter.** In `?password=pw&sslmode=require` the driver used to read the
+  password `pw`, but a password that really is `pw&sslmode=require` would
+  have been split the same way, with its tail sent as a driver parameter.
+  Such a URL is now refused (with or without runtime config): the catalog
+  fails to build with a WARN at startup and queries on it fail with "not
+  registered", and the API shows its URL as `postgresql://<redacted>`.
+  Before: `connection_url = "postgresql://app@db/sales?password=pw&sslmode=require"`.
+  After: `connection_url = "postgresql://app@db/sales?sslmode=require&password=pw"`,
+  or `connection_url = "postgresql://app@db/sales?sslmode=require"` with
+  `password = "pw"`. Percent-encode an `&` inside the password as `%26`. A
+  catalog already in the state store is fixed with a `PUT` (send the full
+  `connection_url`, password included), or from `[[catalogs]]` with a
+  re-seed.
 - **Workers ignore `[[catalogs]]`, and `[storage]` for catalogs.** A worker
   gets its catalogs from the coordinator over Flight: a push on every
   change, and a pull when its heartbeat shows it is behind (after it starts,

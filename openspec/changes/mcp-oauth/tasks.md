@@ -35,3 +35,13 @@
 - [x] 7.5 `invalid_token` challenge carries `scope`, and is sent for every refused bearer on `/mcp`
 - [x] 7.6 Metadata also at the bare well-known path
 - [x] 7.7 An email-address user under a claim other than `email`/`sub` must equal the token's verified `email`; `sub` exempt; an empty bearer gets no error code; app-only tokens documented
+
+## 8. Review round 5
+
+- [x] 8.1 Refuse sender-constrained tokens (`cnf`, payload or header `typ` DPoP) with `401 invalid_token`
+- [x] 8.2 `sub` no longer exempt from the email check
+- [x] 8.3 With `allow_missing_email_verified`, an unverified `email` that differs is ignored; mismatch only for a verified `email`
+- [x] 8.4 Client-id guard: only the `resource` URL itself is exempt from `required_scopes`
+- [x] 8.5 An unmarked ID-token-like token without every required scope is `401 invalid_token` (before scope and email `403`s); one parsed scope list; scope checked before email
+- [x] 8.6 Bare well-known path only when the resource path is exactly `/mcp`; shared-ingress risk documented
+- [x] 8.7 Entra app-only remedies corrected (Arneb API token; no `scp`, no `at+jwt`)

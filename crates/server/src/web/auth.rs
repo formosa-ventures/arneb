@@ -283,7 +283,7 @@ async fn oauth_identity(
                 "the identity's email address is not verified",
             )
             .with_hint(
-                "verify the address at the identity provider (email_verified must be true), or set [oauth] user_claim to `sub`",
+                "verify the address at the identity provider (email_verified must be true), or set [oauth] user_claim to a claim that is not an email address",
             )
             .into_response(),
         )),

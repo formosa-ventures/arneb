@@ -712,10 +712,9 @@ fn is_access_token_typ(typ: &str) -> bool {
 /// so it must not name an Arneb user, whichever claim carries it.
 ///
 /// - `user_claim = "email"`: `email_verified` must be true.
-/// - `sub`: not checked. OIDC defines it as never reassigned, and Okta puts
-///   the login (an address, without `email_verified`) there.
-/// - Any other claim whose value contains `@` (`preferred_username`, `upn`,
-///   a namespaced claim): `email_verified` speaks only for the token's
+/// - Any other claim whose value contains `@` (`sub` included: Okta puts
+///   the login there, which a self-registering user picks; also
+///   `preferred_username`, `upn`, a namespaced claim): `email_verified` speaks only for the token's
 ///   `email`, so that must be the same address (ASCII case-insensitive) and
 ///   verified; a different `email` is refused (a user can pick a username
 ///   that is someone else's address). A token without `email` or without
@@ -738,7 +737,7 @@ fn check_email(
             _ => Err(OAuthReject::UnverifiedEmail),
         };
     }
-    if settings.user_claim == "sub" || !user.contains('@') {
+    if !user.contains('@') {
         return Ok(());
     }
     let email = claims.get("email").and_then(|v| v.as_str());
@@ -2125,23 +2124,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sub_is_exempt_from_the_email_check() {
-        // Okta custom authorization servers put the login (an address) in
-        // `sub`, without `email_verified`; `sub` is never reassigned.
+    async fn an_email_shaped_sub_is_checked_like_any_claim() {
+        // Okta custom authorization server, `sub` = the login, self-service
+        // registration without email verification: the attacker registers
+        // the login admin@corp.example (an Arneb user with no Okta account
+        // yet) and gets a token with that `sub` and no `email_verified`.
         let key = TestKey::ec("k1");
         let idp = TestIdp::start(&[&key]).await;
-        let v = validator(&idp, |_| {});
+        let strict = validator(&idp, |_| {});
         let mut c = claims(&idp.issuer(), AUD);
-        c["sub"] = json!("alice@corp.example");
+        c["sub"] = json!("admin@corp.example");
         assert_eq!(
-            v.validate(&key.sign(&c)).await.unwrap().user,
-            "alice@corp.example"
+            strict.validate(&key.sign(&c)).await.unwrap_err(),
+            OAuthReject::UnverifiedEmail
         );
-        c["email"] = json!("other@corp.example");
-        c["email_verified"] = json!(false);
+        // Only the explicit opt-in trusts it.
+        let lax = validator(&idp, |s| s.allow_missing_email_verified = true);
         assert_eq!(
-            v.validate(&key.sign(&c)).await.unwrap().user,
-            "alice@corp.example"
+            lax.validate(&key.sign(&c)).await.unwrap().user,
+            "admin@corp.example"
+        );
+        // A verified `email` that is the same address vouches for it.
+        c["email"] = json!("Admin@corp.example");
+        c["email_verified"] = json!(true);
+        assert_eq!(
+            strict.validate(&key.sign(&c)).await.unwrap().user,
+            "admin@corp.example"
+        );
+        // A verified other address, or `email_verified: false`, never does.
+        c["email"] = json!("attacker@evil.example");
+        for v in [&strict, &lax] {
+            assert_eq!(
+                v.validate(&key.sign(&c)).await.unwrap_err(),
+                OAuthReject::EmailMismatch
+            );
+        }
+        c["email"] = json!("admin@corp.example");
+        c["email_verified"] = json!(false);
+        for v in [&strict, &lax] {
+            assert_eq!(
+                v.validate(&key.sign(&c)).await.unwrap_err(),
+                OAuthReject::UnverifiedEmail
+            );
+        }
+        // An opaque `sub` is not an address and is not checked.
+        c["sub"] = json!("00u1a2b3c4");
+        assert_eq!(
+            strict.validate(&key.sign(&c)).await.unwrap().user,
+            "00u1a2b3c4"
         );
     }
 

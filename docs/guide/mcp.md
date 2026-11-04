@@ -158,24 +158,28 @@ Design decisions you should know about:
   can be anyone's (self-registration, social login), so:
   - With `user_claim = "email"`, the token's `email_verified` must be
     `true` (or the string `"true"`).
-  - With another claim whose value contains `@` (`preferred_username`
-    with Keycloak's "email as username", Entra's `upn`, an Auth0
-    namespaced claim such as `https://corp.example/email`),
+  - With another claim whose value contains `@` (`sub` included, such as
+    an Okta login; `preferred_username` with Keycloak's "email as
+    username", Entra's `upn`, an Auth0 namespaced claim such as
+    `https://corp.example/email`),
     `email_verified` speaks only for the token's `email`, so `email` must
     be the same address (ASCII case-insensitive) and `email_verified` must
     be `true`. A different `email` is refused with "the identity's '…'
     claim is an email address other than its verified email": a user who
     can pick their username could otherwise choose someone else's address
     and verify their own inbox.
-  - `sub` is exempt: OIDC defines it as never reassigned, and Okta's
-    custom authorization servers put the login (usually an address) there
-    without `email_verified`.
+  - `sub` is not exempt: "never reassigned" does not mean "not chosen by
+    the registrant". Okta's custom authorization servers put the login
+    there, which a self-registering user picks, without `email_verified`;
+    so an address-shaped `sub` needs a verified matching `email`, or
+    `allow_missing_email_verified` when no one can register an address
+    they do not own.
   - A value without `@` is not checked.
 
   A refused address answers `403 forbidden` ("the identity's email
   address is not verified" when not verified), even if that user exists.
   An IdP that never sends `email_verified` (Entra ID, for one) cannot be
-  used with `email`. For an address under another claim,
+  used with `email`. For an address under another claim (`sub` included),
   `allow_missing_email_verified = true` accepts a token with no `email` or
   no `email_verified` (startup logs a WARN); only turn it on when the IdP
   never issues an address its owner has not proven. An explicit

@@ -452,7 +452,7 @@ impl QueryTracker {
             Some(Settled::Outcome(outcome)) => outcome,
             Some(Settled::Gone) => return Err(not_found()),
             None => {
-                return Err(ExecutionError::InvalidOperation(format!(
+                return Err(ExecutionError::Interrupted(format!(
                     "the kill of query {id} was interrupted"
                 )))
             }
@@ -996,7 +996,7 @@ mod tests {
             Box::new(|_| Box::pin(async { panic!("canceller panicked") })),
         );
         let err = tracker.kill_query(&id, "root").await.unwrap_err();
-        assert!(err.to_string().contains("interrupted"), "{err}");
+        assert!(err.is_interrupted(), "{err}");
         assert_eq!(tracker.cancelled_by(&id), None);
         assert_eq!(
             tracker.kill_query(&id, "ops").await.unwrap(),
@@ -1177,12 +1177,12 @@ mod tests {
         let t = tracker.clone();
         std::thread::spawn(move || {
             let out = handle.block_on(t.kill_query(&id, "root"));
-            let _ = tx.send(out.map_err(|e| e.to_string()));
+            let _ = tx.send(out.map_err(|e| e.is_interrupted()));
         });
         let out = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the kill deadlocked (or panicked) on a closing runtime");
-        assert!(out.unwrap_err().contains("interrupted"));
+        assert!(out.unwrap_err(), "the kill fails as interrupted");
         assert!(!called.load(Ordering::SeqCst));
         assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Running);
         assert_eq!(

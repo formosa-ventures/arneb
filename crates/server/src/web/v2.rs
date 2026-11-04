@@ -724,23 +724,7 @@ impl ManageAction for CancelQuery {
         // wait on the kill: it waits for at most one poll of the work.
         let outcome = tokio::runtime::Handle::current()
             .block_on(tracker.kill_query(&self.id, &self.by))
-            .map_err(|e| {
-                // The kill ended without an outcome (the query is still
-                // tracked, or the error says so). It may already have
-                // stopped the work, so it is audited as `interrupted`, not
-                // as a failure that applied nothing.
-                let interrupted = e.to_string().contains("interrupted");
-                if interrupted || tracker.get_query(&self.id).is_some() {
-                    ApiError::new(ErrorCode::Internal, e.to_string())
-                        .with_hint(
-                            "the cancel may or may not have been applied; check the \
-                             query's state, and retry the cancel if it is still running",
-                        )
-                        .interrupted()
-                } else {
-                    Self::gone()
-                }
-            })?;
+            .map_err(|e| kill_error(&e, tracker.get_query(&self.id).is_some()))?;
         let (before, preview) = match outcome {
             KillOutcome::Killed { was } => (
                 was,
@@ -781,6 +765,27 @@ impl ManageAction for CancelQuery {
                 state: api::state_name(after).to_owned(),
             },
         })
+    }
+}
+
+/// The API error for a failed kill of a query (`tracked`: still in the
+/// history). A kill that ended without an outcome ([`ExecutionError::Interrupted`],
+/// decided by the variant, never the message; or any failure of a query
+/// still tracked) may already have stopped the work, so it is marked
+/// interrupted and audited as such, not as a failure that applied nothing.
+/// Otherwise the query left the history: `not_found`.
+///
+/// [`ExecutionError::Interrupted`]: arneb_common::error::ExecutionError::Interrupted
+fn kill_error(e: &arneb_common::error::ExecutionError, tracked: bool) -> ApiError {
+    if e.is_interrupted() || tracked {
+        ApiError::new(ErrorCode::Internal, e.to_string())
+            .with_hint(
+                "the cancel may or may not have been applied; check the \
+                 query's state, and retry the cancel if it is still running",
+            )
+            .interrupted()
+    } else {
+        CancelQuery::gone()
     }
 }
 
@@ -1939,6 +1944,24 @@ pub(super) mod tests {
         let entries = audit_entries(&state);
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["outcome"], "interrupted", "{entries:?}");
+    }
+
+    /// A kill's interruption is recognized by its error variant, whatever
+    /// the message says, also when the query already left the history;
+    /// any other failure of an untracked query is `not_found`.
+    #[test]
+    fn an_interrupted_kill_is_recognized_by_its_variant() {
+        use super::{kill_error, ErrorCode};
+        use arneb_common::error::ExecutionError;
+        let lost = ExecutionError::Interrupted("the kill lost its task".into());
+        let e = kill_error(&lost, false);
+        assert!(e.interrupted, "classified by the message, not the variant");
+        assert_eq!(e.code, ErrorCode::Internal);
+        let gone = ExecutionError::InvalidOperation("was interrupted".into());
+        let e = kill_error(&gone, false);
+        assert!(!e.interrupted);
+        assert_eq!(e.code, ErrorCode::NotFound);
+        assert!(kill_error(&gone, true).interrupted, "still tracked");
     }
 
     /// The state reported after a kill when the query already left the

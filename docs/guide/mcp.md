@@ -239,12 +239,18 @@ Design decisions you should know about:
 6. Optionally set `required_scopes` to a scope the IdP grants only to
    permitted clients.
 7. Use a grant that puts a scope in the token. App-only and
-   machine-to-machine tokens (Entra client credentials, which carry
-   `roles` but no `scp`; Auth0 M2M tokens without granted permissions)
-   have no type marker and no scope, so Arneb takes them for possible ID
-   tokens and refuses them. Give such clients a scope the token carries
-   (and list it in `required_scopes`), have the IdP send `typ: at+jwt`, or
-   use an Arneb API token for them instead.
+   machine-to-machine tokens without a scope have no type marker either,
+   so Arneb takes them for possible ID tokens and refuses them:
+   - Entra ID client-credentials (app-only) tokens carry application
+     permissions in `roles` and never `scp`, and Entra cannot be made to
+     send `typ: at+jwt`. Arneb does not read `roles`, so these tokens
+     cannot be used; give such clients an Arneb API token. Delegated
+     (signed-in user) Entra tokens carry `scp` and work.
+   - Auth0 M2M tokens carry `scope` once the client is granted a
+     permission on the API; grant one (and list it in `required_scopes`).
+   - Any IdP that can send `typ: at+jwt` (RFC 9068) on access tokens:
+     turn it on.
+   An Arneb API token always works for a machine client.
 
 `docker/keycloak/arneb-realm.json` is a dev realm that does this (users
 `alice`, `bob`, `carol` with public, dev-only passwords; client

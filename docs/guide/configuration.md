@@ -946,8 +946,10 @@ single-page app. With `[oauth]`:
   `at+jwt` header nor a Keycloak payload `typ` is taken for a possible ID
   token when it has a `nonce`, an `at_hash` or no scope claim; set
   `required_scopes` for an IdP that issues such access tokens. App-only
-  tokens without a scope (Entra client credentials, Auth0 M2M) are refused;
-  give those clients a scope or an Arneb API token.
+  tokens without a scope are refused: Entra client-credentials tokens
+  (only `roles`, never `scp` or `at+jwt`) cannot be used, so give those
+  clients an Arneb API token; Auth0 M2M tokens work once granted a
+  permission, which puts it in `scope`.
 - **Metadata paths.** The metadata document is at
   `/.well-known/oauth-protected-resource` plus the path of `resource`
   (normally `…/mcp`), and at the bare well-known path only when that path is

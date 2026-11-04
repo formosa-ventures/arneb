@@ -1211,17 +1211,15 @@ mod tests {
         let work = switch.guard(async move {
             // Inside the poll that completes the work: the first kill
             // calls the canceller, and its kill is pending on this poll.
-            let kill = first.block_on(async move {
+            first.block_on(async move {
                 let kill = tokio::spawn(async move { t.kill_query(&id, "root").await });
                 for _ in 0..10 {
                     tokio::task::yield_now().await;
                 }
                 assert!(!kill.is_finished(), "the kill waits for the poll");
-                kill
             });
             // The runtime shuts down: the settle task is dropped mid-kill.
             drop(first);
-            drop(kill);
             "inserted"
         });
         let mut work = std::pin::pin!(work);

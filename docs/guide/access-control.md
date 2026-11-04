@@ -102,12 +102,13 @@ Everyone can run queries and sees only their own.
   missing (logged).
 - When an HMS authorization plugin (Apache Ranger, storage-based or
   SQL-standard authorization) refuses Arneb's request for a database or
-  table, the object reads as missing, as it did before v0.1.9; any other
-  HMS error is treated as an outage. HMS reports both the same way, so
-  Arneb recognizes a refusal by the plugins' messages (`Permission
-  denied: user ...`, `Permission denied: Principal ...`, or an
-  `AccessControlException` / `AuthorizationException`). A refusal worded
-  otherwise is reported as an outage.
+  table, the object reads as missing, and a refused listing as empty, as
+  before v0.1.9; any other HMS error is treated as an outage. HMS reports
+  both the same way, so Arneb recognizes a refusal by the plugins'
+  explicit phrases (`Permission denied: user ...` or `Permission denied:
+  Principal ...`). An authentication failure, such as an expired Kerberos
+  ticket or delegation token, is an outage, never a refusal. A refusal
+  worded otherwise is reported as an outage.
 - A PostgreSQL view is checked by the view's own name. The tables it
   reads are governed only by the PostgreSQL role the catalog connects as.
 - A section left out of the file allows everything it governs. With no

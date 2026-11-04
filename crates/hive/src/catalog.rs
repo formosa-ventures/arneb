@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use hive_metastore::{
     ColumnStatisticsData, Database, GetTableRequest, MetaException, PartitionsRequest,
     TableStatsRequest, ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
-    ThriftHiveMetastoreGetAllTablesException, ThriftHiveMetastoreGetDatabaseException,
-    ThriftHiveMetastoreGetPartitionsReqException, ThriftHiveMetastoreGetTableReqException,
+    ThriftHiveMetastoreGetAllDatabasesException, ThriftHiveMetastoreGetAllTablesException,
+    ThriftHiveMetastoreGetDatabaseException, ThriftHiveMetastoreGetPartitionsReqException,
+    ThriftHiveMetastoreGetTableReqException,
 };
 use pilota::FastStr;
 use tracing::{debug, warn};
@@ -134,6 +135,14 @@ impl HmsClient {
 
         match result {
             MaybeException::Ok(dbs) => Ok(dbs.into_iter().map(|s| s.to_string()).collect()),
+            // Refused by an authorization plugin: nothing this user may
+            // see, as for `get_database` and `get_all_tables`.
+            MaybeException::Exception(ThriftHiveMetastoreGetAllDatabasesException::O1(ex))
+                if is_authorization_denial(&ex) =>
+            {
+                debug!("HMS refused get_all_databases: {ex:?}");
+                Ok(Vec::new())
+            }
             MaybeException::Exception(ex) => Err(ConnectorError::ConnectionFailed(format!(
                 "HMS get_all_databases exception: {ex:?}"
             ))),
@@ -841,34 +850,48 @@ impl HiveSchemaProvider {
 /// Whether a `MetaException` is an HMS authorization plugin refusing the
 /// request (Apache Ranger, storage-based or SQL-standard authorization)
 /// rather than HMS failing to answer. Such an object reads as missing to
-/// this user, as it did before outages were told apart from missing
-/// objects; any other `MetaException` (a backing-database failure, ...)
-/// is an outage.
+/// this user (a refused listing as empty), as it did before outages were
+/// told apart from missing objects; any other `MetaException` (a
+/// backing-database failure, an expired Kerberos ticket or token, ...) is
+/// an outage.
 ///
 /// HMS has no typed exception for a refusal, so it is recognized by the
-/// plugins' message prefixes, kept narrow on purpose: a refusal worded
-/// otherwise reads as an outage (the statement fails loudly, nothing is
-/// read), and only an outage whose message carries one of these prefixes
-/// would read as missing.
+/// explicit refusal phrases the plugins put in the message (a
+/// case-insensitive substring match, since the phrase may follow a
+/// wrapping exception's class name). Kept narrow on purpose: a bare
+/// `AccessControlException` is not enough, because Hadoop raises it for
+/// credential failures too (`Client cannot authenticate via:[TOKEN,
+/// KERBEROS]`), and those are cluster-wide outages, not per-object
+/// refusals. A refusal worded otherwise reads as an outage (the statement
+/// fails loudly, nothing is read).
 fn is_authorization_denial(ex: &MetaException) -> bool {
     let Some(message) = &ex.message else {
         return false;
     };
     let message = message.to_ascii_lowercase();
+    // Authentication failures, never a refusal, whatever else they say.
+    let authentication = [
+        "cannot authenticate",
+        "gssexception",
+        "token is expired",
+        "token has expired",
+        "invalidtoken",
+    ];
+    if authentication.iter().any(|m| message.contains(m)) {
+        return false;
+    }
     [
         // Ranger: `Permission denied: user [alice] does not have [SELECT]
         // privilege on [db]`; HDFS/storage-based: `Permission denied:
         // user=alice, access=READ, ...`.
         "permission denied: user",
-        // SQL-standard authorization: `Permission denied: Principal
-        // [name=alice, type=USER] does not have following privileges ...`.
+        // SQL-standard authorization (`HiveAccessControlException`):
+        // `Permission denied: Principal [name=alice, type=USER] does not
+        // have following privileges ...`.
         "permission denied: principal",
-        // The exception class names, when a plugin's message carries them.
-        "accesscontrolexception",
-        "authorizationexception",
     ]
     .iter()
-    .any(|prefix| message.contains(prefix))
+    .any(|phrase| message.contains(phrase))
 }
 
 /// Whether an `@`-prefixed database name is one HMS reads as
@@ -1429,7 +1452,8 @@ mod tests {
             "Permission denied: Principal [name=alice, type=USER] does not have following \
              privileges for operation QUERY",
             "java.security.AccessControlException: Permission denied: user=alice, access=READ",
-            "org.apache.hadoop.hive.ql.security.authorization.plugin.HiveAccessControlException",
+            "org.apache.hadoop.hive.ql.security.authorization.plugin.HiveAccessControlException: \
+             Permission denied: Principal [name=alice, type=USER] does not have privileges",
         ] {
             assert!(is_authorization_denial(&meta(refused)), "{refused}");
         }
@@ -1437,6 +1461,14 @@ mod tests {
             "Unable to fetch database: org.postgresql.util.PSQLException: Connection refused",
             "javax.jdo.JDOFatalDataStoreException: Communications link failure",
             "ERROR: permission denied for table DBS",
+            // Credential failures: cluster-wide outages, not refusals.
+            "org.apache.hadoop.security.AccessControlException: Client cannot authenticate \
+             via:[TOKEN, KERBEROS]",
+            "java.io.IOException: org.apache.hadoop.security.AccessControlException: \
+             Permission denied: user=hive, Client cannot authenticate via:[TOKEN, KERBEROS]",
+            "org.apache.hadoop.security.token.SecretManager$InvalidToken: token is expired",
+            "javax.security.sasl.SaslException: GSS initiate failed [Caused by GSSException]",
+            "org.apache.hadoop.hive.ql.security.authorization.plugin.HiveAuthzPluginException",
             "",
         ] {
             assert!(!is_authorization_denial(&meta(outage)), "{outage}");

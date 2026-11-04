@@ -725,10 +725,12 @@ impl ManageAction for CancelQuery {
         let outcome = tokio::runtime::Handle::current()
             .block_on(tracker.kill_query(&self.id, &self.by))
             .map_err(|e| {
-                // Still tracked: the kill ended without an outcome. It may
-                // already have stopped the work, so it is audited as
-                // `interrupted`, not as a failure that applied nothing.
-                if tracker.get_query(&self.id).is_some() {
+                // The kill ended without an outcome (the query is still
+                // tracked, or the error says so). It may already have
+                // stopped the work, so it is audited as `interrupted`, not
+                // as a failure that applied nothing.
+                let interrupted = e.to_string().contains("interrupted");
+                if interrupted || tracker.get_query(&self.id).is_some() {
                     ApiError::new(ErrorCode::Internal, e.to_string())
                         .with_hint(
                             "the cancel may or may not have been applied; check the \

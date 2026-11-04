@@ -512,7 +512,18 @@ The same rule applies to a protocol's own cancels: a Trino client's
 `DELETE` of `nextUri`, `DELETE /v1/query/{id}`, the Trino and `/api/v2`
 idle reapers, and `DELETE /api/v2/statements/{id}`. Two kills of the same
 query at once share the first one's outcome: the second never reports a
-cancel that did not happen.
+cancel that did not happen. A Trino query that finished is stopped by a
+cancel only while it pages out the rows of a read (a query or a plain
+`EXPLAIN`); a finished write keeps its result even before the client
+fetched its update count.
+
+A kill that ends without an outcome (the server shut down mid-kill, say)
+answers `500 internal`, and its audit entry says `interrupted`: it may or
+may not have stopped the work. Check the query's state before retrying; a
+retried cancel asks the same statement whether its work completed, so it
+never reports a finished write cancelled. When the query already left the
+history, `state` is the last state the cancel knew (`cancelled` only when
+it cancelled the query).
 
 Who may cancel, in this order:
 
@@ -929,8 +940,10 @@ curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
   the listing, so each finished action shows once. `"pending"` marks an
   intent whose action is in progress (or whose completion is waiting for the
   log to become writable again; such a completion's `time_ms` is when it was
-  finally written, not when the action finished), and `"interrupted"` the entry written at startup for an intent
-  that never completed: the action may or may not have been applied.
+  finally written, not when the action finished), and `"interrupted"` an
+  action that may or may not have been applied: one that panicked, a cancel
+  whose kill ended without an outcome, or (the entry written at startup) an
+  intent that never completed.
 - `persistent` is `false` when the log is in memory (no `[state] path`), and
   `writable` is `false` while audited actions are refused with
   `audit_unavailable`.

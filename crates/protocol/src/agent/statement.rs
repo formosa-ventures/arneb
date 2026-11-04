@@ -154,6 +154,9 @@ pub(crate) struct Statement {
     /// Runs the statement's work; kills and client cancels go through it,
     /// so neither relabels work that already returned.
     pub(crate) switch: arneb_scheduler::KillSwitch,
+    /// A reaper cancel is in flight, so later reaper passes do not start
+    /// another one while it waits on a poll of the work.
+    pub(crate) reaping: std::sync::atomic::AtomicBool,
 }
 
 impl Statement {
@@ -176,6 +179,7 @@ impl Statement {
             done: watch::channel(false).0,
             abort: Mutex::new(None),
             switch: arneb_scheduler::KillSwitch::new(),
+            reaping: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

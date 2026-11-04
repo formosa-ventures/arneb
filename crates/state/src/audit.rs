@@ -26,7 +26,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -175,6 +175,8 @@ pub struct AuditLog {
     writer: Mutex<Writer>,
     entries: Mutex<Entries>,
     writable: AtomicBool,
+    /// Audited actions running now ([`Self::track_action`]).
+    in_flight: AtomicUsize,
     #[cfg(any(test, feature = "test-hooks"))]
     fail_appends: AtomicBool,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -241,6 +243,7 @@ impl AuditLog {
             writer: Mutex::new(writer),
             entries: Mutex::new(entries),
             writable: AtomicBool::new(true),
+            in_flight: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
             fail_appends: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -582,6 +585,19 @@ impl AuditLog {
         self.lock_writer().unwritten.len()
     }
 
+    /// Counts an audited action as running until the returned guard drops,
+    /// so a graceful shutdown can wait for it ([`Self::actions_in_flight`])
+    /// before its last attempt to append failed completions.
+    pub fn track_action(&self) -> ActionInFlight<'_> {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        ActionInFlight(&self.in_flight)
+    }
+
+    /// Audited actions running now ([`Self::track_action`]). Lock-free.
+    pub fn actions_in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
     /// Whether the next append is expected to succeed. Lock-free.
     pub fn is_writable(&self) -> bool {
         self.writable.load(Ordering::SeqCst)
@@ -727,6 +743,17 @@ fn retain_young(entries: &mut Entries, settings: AuditSettings, now: u64) {
         return;
     };
     entries.retain(|e| e.time_ms >= cutoff || e.seq == last || is_open_intent(e));
+}
+
+/// An audited action counted as running by [`AuditLog::track_action`],
+/// until dropped (a panicking action included).
+#[must_use = "the action counts as running only while this is held"]
+pub struct ActionInFlight<'a>(&'a AtomicUsize);
+
+impl Drop for ActionInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A `pending` intent whose completion has not been written: an action in

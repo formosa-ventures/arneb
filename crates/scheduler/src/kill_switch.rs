@@ -187,8 +187,13 @@ impl Future for Kill {
                 Poll::Pending
             }
             Progress::Idle => {
-                // Between polls (e.g. the kill was requested before a poll
-                // whose work panicked): kill now.
+                // Not reached today: `kill` turns an idle switch `Killed`,
+                // and it or a waiting `Kill` marks a kill pending during a
+                // poll, which that poll's settle (or its unwind) turns
+                // `Killed` or `Done`, never `Idle`. Should a later change
+                // reach it, the work is between polls, so kill now, as
+                // `kill` does.
+                debug_assert!(false, "a requested kill found its switch idle");
                 shared.progress = Progress::Killed;
                 let waker = shared.waker.take();
                 drop(shared);

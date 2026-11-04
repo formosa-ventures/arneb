@@ -13,8 +13,8 @@ mod tokens;
 mod users;
 
 pub use audit::{
-    AuditAppendError, AuditEntry, AuditLog, AuditOutcome, AuditPage, AuditQuery, AuditRecord,
-    AuditSettings,
+    ActionInFlight, AuditAppendError, AuditEntry, AuditLog, AuditOutcome, AuditPage, AuditQuery,
+    AuditRecord, AuditSettings,
 };
 pub use catalogs::{CatalogRecord, CatalogSeedReport};
 pub use cordons::{CordonKind, CordonRecord};

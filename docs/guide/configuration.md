@@ -948,9 +948,10 @@ single-page app. With `[oauth]`:
   `required_scopes` for an IdP that issues such access tokens. App-only
   tokens without a scope (Entra client credentials, Auth0 M2M) are refused;
   give those clients a scope or an Arneb API token.
-- **Two metadata paths answer.** The metadata document is at
+- **Metadata paths.** The metadata document is at
   `/.well-known/oauth-protected-resource` plus the path of `resource`
-  (normally `…/mcp`) and at the bare well-known path.
+  (normally `…/mcp`), and at the bare well-known path only when that path is
+  exactly `/mcp` (behind a path prefix the bare path is `404`).
 - **`[oauth]` is startup-only** and refuses to start without `[auth] type =
   "password"` and `[mcp] enabled = true`. A plain-`http` issuer or resource
   is refused unless the host is loopback.

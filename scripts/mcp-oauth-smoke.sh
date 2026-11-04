@@ -234,8 +234,8 @@ req NONE GET "$BASE$path"
 expect_code 200 "GET $path"
 check ".resource == \"$BASE/mcp\" and .authorization_servers == [\"$ISSUER\"] and (.bearer_methods_supported | index(\"header\"))" \
     "metadata at $path is wrong"
-# The bare root answers the same document (clients that only probe the root);
-# any other suffix is 404.
+# The bare root answers the same document (clients that only probe the root;
+# served because the resource path is exactly /mcp); any other suffix is 404.
 path=/.well-known/oauth-protected-resource
 req NONE GET "$BASE$path"
 expect_code 200 "GET $path (the bare root)"

@@ -20,7 +20,7 @@ An `[oauth]` section SHALL enable OAuth on `/mcp` when `issuer` is set, with `re
 - **THEN** every response, `WWW-Authenticate` included, is unchanged, except that `/.well-known/oauth-protected-resource[/...]` answers `404` instead of the single-page app
 
 ### Requirement: Protected-resource metadata
-With `[oauth]` enabled, `GET` of the well-known path `/.well-known/oauth-protected-resource` followed by the path of `resource` (for example `/.well-known/oauth-protected-resource/mcp`) SHALL answer without credentials with a JSON document holding `resource`, `authorization_servers` (the issuer), `bearer_methods_supported` (`["header"]`) and, when `required_scopes` is set, `scopes_supported`. The bare `/.well-known/oauth-protected-resource` SHALL answer the same document (`/mcp` is the one protected resource). Any other path under `/.well-known/oauth-protected-resource`, and every such path without `[oauth]`, SHALL answer a plain `404`. A `401` from `/mcp` SHALL carry `WWW-Authenticate: Bearer realm="arneb", resource_metadata="<url>"` naming that document, adding `error="invalid_token"` (and `scope="<required_scopes>"` when set) when a bearer credential was presented and refused, and its body SHALL be the same `unauthenticated` envelope as every other `401`.
+With `[oauth]` enabled, `GET` of the well-known path `/.well-known/oauth-protected-resource` followed by the path of `resource` (for example `/.well-known/oauth-protected-resource/mcp`) SHALL answer without credentials with a JSON document holding `resource`, `authorization_servers` (the issuer), `bearer_methods_supported` (`["header"]`) and, when `required_scopes` is set, `scopes_supported`. When the path of `resource` is exactly `/mcp`, the bare `/.well-known/oauth-protected-resource` SHALL answer the same document; otherwise (a path prefix, a shared host) it SHALL answer `404`. Any other path under `/.well-known/oauth-protected-resource`, and every such path without `[oauth]`, SHALL answer a plain `404`. A `401` from `/mcp` SHALL carry `WWW-Authenticate: Bearer realm="arneb", resource_metadata="<url>"` naming that document, adding `error="invalid_token"` (and `scope="<required_scopes>"` when set) when a bearer credential was presented and refused, and its body SHALL be the same `unauthenticated` envelope as every other `401`.
 
 #### Scenario: A client discovers the IdP
 - **WHEN** an unauthenticated client posts to `/mcp`
@@ -31,8 +31,12 @@ With `[oauth]` enabled, `GET` of the well-known path `/.well-known/oauth-protect
 - **THEN** the answer is `404`
 
 #### Scenario: A client probes the root
-- **WHEN** a client fetches the bare `/.well-known/oauth-protected-resource`
+- **WHEN** `resource` is `https://db.example/mcp` and a client fetches the bare `/.well-known/oauth-protected-resource`
 - **THEN** it gets the same document as at the derived path
+
+#### Scenario: A prefixed resource does not claim the root
+- **WHEN** `resource` is `https://h/arneb/mcp` and a client fetches the bare `/.well-known/oauth-protected-resource`
+- **THEN** the answer is `404`
 
 #### Scenario: An opaque or revoked bearer
 - **WHEN** a bearer that is not a JWT (an opaque IdP token, an expired or revoked Arneb token) is refused on `/mcp`

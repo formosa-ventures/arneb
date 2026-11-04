@@ -139,9 +139,12 @@ config like any other section, or in `ARNEB_OAUTH_*` through `extraEnv`.
   `https://h/.well-known/oauth-protected-resource/arneb/mcp`, so a proxy that
   forwards only `/arneb/*` must route that path too, unchanged. Arneb
   answers the document at that exact path (RFC 9728), so the proxy must not
-  strip `/arneb` from it, and also at the bare
-  `/.well-known/oauth-protected-resource` for clients that only probe the
-  root; every other path under it is `404`.
+  strip `/arneb` from it. Only when `resource`'s path is exactly `/mcp`
+  does Arneb also answer the bare `/.well-known/oauth-protected-resource`
+  (for clients that only probe the root); behind a prefix the bare path is
+  `404`, and an ingress shared with other protected resources must not
+  route the host-wide bare path to Arneb, or Arneb would answer discovery
+  for them. Every other path under it is `404`.
   `resource` is the public URL of that ingress plus `/mcp`; the IdP must put
   the same URL in the token's `aud`. Arneb refuses a plain-`http` `issuer` or
   `resource` unless the host is loopback.

@@ -10,16 +10,14 @@ use super::WebState;
 
 /// `GET /.well-known/oauth-protected-resource[/…]`. Mounted only when
 /// `[oauth]` is enabled; public (outside `/api/`). Answers at the path
-/// derived from `resource` (RFC 9728 section 3.1) and at the bare
-/// well-known path, which clients that only probe the root fetch: `/mcp` is
-/// the server's one protected resource, so the root cannot be ambiguous.
-/// Any other path is a plain `404`.
+/// derived from `resource` (RFC 9728 section 3.1), and at the bare
+/// well-known path only when that path is exactly `/mcp` (see
+/// [`serves_bare_path`]). Any other path is a plain `404`.
 pub(super) async fn metadata(State(state): State<WebState>, uri: Uri) -> Response {
-    let Some(oauth) = state
-        .oauth
-        .as_ref()
-        .filter(|o| uri.path() == o.metadata_path() || uri.path() == crate::oauth::METADATA_PATH)
-    else {
+    let Some(oauth) = state.oauth.as_ref().filter(|o| {
+        uri.path() == o.metadata_path()
+            || (uri.path() == crate::oauth::METADATA_PATH && serves_bare_path(o.metadata_path()))
+    }) else {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     };
     let s = oauth.settings();
@@ -43,4 +41,16 @@ pub(super) async fn metadata(State(state): State<WebState>, uri: Uri) -> Respons
         HeaderValue::from_static("*"),
     );
     resp
+}
+
+/// Whether the bare well-known path is answered too: only for a resource at
+/// exactly `/mcp` on its origin, as a fallback for clients that probe only
+/// the root. Its `resource` is not the root URL, so a strict RFC 9728
+/// (section 3.3) client discards it and uses the derived path. Behind a
+/// path prefix the host is shared, and answering the host-wide path would
+/// claim discovery for every other resource on it.
+fn serves_bare_path(metadata_path: &str) -> bool {
+    metadata_path
+        .strip_prefix(crate::oauth::METADATA_PATH)
+        .is_some_and(|rest| rest == "/mcp")
 }

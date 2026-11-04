@@ -68,11 +68,16 @@ it needs a restart, and a bad value stops startup with a message naming it.
   and the supported scopes. It is served at the path derived from
   `resource`, `/.well-known/oauth-protected-resource` followed by the
   resource's path (`/.well-known/oauth-protected-resource/mcp` for
-  `https://db.example/mcp`), and also at the bare
-  `/.well-known/oauth-protected-resource`, because some MCP clients and
-  proxies only probe the root (`/mcp` is the server's one protected
-  resource, so the root is unambiguous). Any other suffix answers a plain
-  `404`.
+  `https://db.example/mcp`). When `resource`'s path is exactly `/mcp`, it
+  is also served at the bare `/.well-known/oauth-protected-resource`, as a
+  fallback for MCP clients and proxies that only probe the root; a strict
+  RFC 9728 client discards that copy (its `resource` is not the root URL,
+  section 3.3) and uses the derived path. Behind a path prefix
+  (`https://h/arneb/mcp`) the bare path is `404`: the host is shared, and
+  answering it would claim discovery for every other resource there. Even
+  with `/mcp` at the root, do not route the host-wide bare path to Arneb
+  from an ingress that also fronts other protected resources. Any other
+  suffix answers a plain `404`.
 - A `/mcp` request without credentials gets `401` with
   `WWW-Authenticate: Bearer realm="arneb", resource_metadata="…"`, which is
   where an OAuth client starts (an empty `Bearer` counts as no

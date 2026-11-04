@@ -790,8 +790,8 @@ mod tests {
     async fn metadata_document_is_public_and_exact() {
         let state = oauth_state(true);
         // The path derived from `resource` (RFC 9728 section 3.1), and the
-        // bare root, which clients that only probe the root fetch: `/mcp`
-        // is the one protected resource.
+        // bare root, which clients that only probe the root fetch: the
+        // resource is exactly `/mcp` on its origin.
         for path in [
             "/.well-known/oauth-protected-resource/mcp",
             "/.well-known/oauth-protected-resource",
@@ -836,6 +836,33 @@ mod tests {
             "/.well-known/oauth-protected-resource/mcp",
         ] {
             assert_eq!(get(&off, path, None).await.status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prefixed_resource_does_not_answer_the_bare_path() {
+        // Behind a path prefix the host is shared: answering the host-wide
+        // bare path would claim discovery for every resource on it (and its
+        // `resource` would not match that URL, RFC 9728 section 3.3).
+        let mut state = oauth_state(true);
+        let mut settings = state.oauth.as_ref().unwrap().settings().clone();
+        settings.resource = "https://arneb.test/arneb/mcp".into();
+        settings.audience = settings.resource.clone();
+        state.oauth = Some(Arc::new(crate::oauth::OAuthValidator::new(settings)));
+        let reply = get(
+            &state,
+            "/.well-known/oauth-protected-resource/arneb/mcp",
+            None,
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            let reply = get(&state, path, None).await;
+            assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
+            assert!(reply.body.is_empty(), "{path}");
         }
     }
 

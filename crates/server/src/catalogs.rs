@@ -924,6 +924,35 @@ struct PullerInner {
     last_pull: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
+/// One caller's hold on the shared fetch of [`CatalogPuller::pull_joined`]:
+/// `waiting` is the clone it polls, `handle` an unpolled one to compare
+/// with the slot (a `Shared` polled to completion compares unequal). On
+/// drop, finished or cancelled, it clears the slot when the fetch is done
+/// or nobody else holds it, as [`FlightGuard`] does for applies.
+struct PullGuard<'a> {
+    slot: &'a std::sync::Mutex<Option<PullFuture>>,
+    waiting: Option<PullFuture>,
+    handle: Option<PullFuture>,
+}
+
+impl Drop for PullGuard<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        // Both clones are dropped under the lock, so concurrent callers
+        // count each other right.
+        drop(self.waiting.take());
+        if let Some(handle) = self.handle.take() {
+            let done = handle.peek().is_some();
+            // Two holders left: the slot and this handle.
+            let last = handle.strong_count().is_some_and(|n| n <= 2);
+            if (done || last) && slot.as_ref().is_some_and(|f| f.ptr_eq(&handle)) {
+                *slot = None;
+            }
+            drop(handle);
+        }
+    }
+}
+
 /// The least time between two heartbeat-triggered retries of catalogs that
 /// failed to build (Ruling R8).
 pub const FAILED_BUILD_RETRY: Duration = Duration::from_secs(30);
@@ -999,7 +1028,11 @@ impl CatalogPuller {
         result
     }
 
-    /// The pull's result, and whether it joined one already running.
+    /// The pull's result, and whether it joined one already running. The
+    /// shared fetch leaves `in_flight` once it finished or its last caller
+    /// is gone, cancelled or not, so a later pull never joins a fetch
+    /// nobody awaits any more (it would return a set fetched before the
+    /// change that triggered the pull).
     async fn pull_joined(&self) -> (Result<(), String>, bool) {
         use futures::FutureExt;
         let (fut, joined) = {
@@ -1022,15 +1055,12 @@ impl CatalogPuller {
                 }
             }
         };
-        let result = fut.clone().await;
-        let mut slot = self
-            .inner
-            .in_flight
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if slot.as_ref().is_some_and(|f| f.ptr_eq(&fut)) {
-            *slot = None;
-        }
+        let mut guard = PullGuard {
+            slot: &self.inner.in_flight,
+            waiting: Some(fut.clone()),
+            handle: Some(fut),
+        };
+        let result = guard.waiting.as_mut().expect("set above").await;
         (result, joined)
     }
 
@@ -2575,6 +2605,44 @@ mod tests {
         let slow = serde_json::to_value(hive("slow")).unwrap();
         assert!(live.apply_remote(set(1, 1, vec![slow])).await.applied);
         assert!(live.apply_flights.lock().unwrap().is_empty());
+    }
+
+    /// Round 5: a pull whose callers are all cancelled leaves no shared
+    /// fetch behind, so a later pull fetches afresh instead of joining the
+    /// old fetch; a caller cancelled while another still waits keeps it.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_pull_leaves_no_fetch_behind() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (live, _, _) = live();
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let n = fetches.clone();
+        let puller = CatalogPuller::new(live, move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok(())
+            })
+        });
+        let spawn = || {
+            let p = puller.clone();
+            tokio::spawn(async move { p.pull().await })
+        };
+        let task = spawn();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(puller.inner.in_flight.lock().unwrap().is_some());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(puller.inner.in_flight.lock().unwrap().is_none());
+        // Two callers share a fetch; cancelling one keeps it for the other.
+        let (first, second) = (spawn(), spawn());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(fetches.load(Ordering::SeqCst), 2, "a fresh fetch");
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(puller.inner.in_flight.lock().unwrap().is_some());
+        assert_eq!(second.await.unwrap(), Ok(()));
+        assert!(puller.inner.in_flight.lock().unwrap().is_none());
+        assert_eq!(fetches.load(Ordering::SeqCst), 2, "joined, not refetched");
     }
 
     /// Round 3: a push and a pull of the same `(epoch, generation)` that

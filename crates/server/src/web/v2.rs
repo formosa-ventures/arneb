@@ -725,10 +725,16 @@ impl ManageAction for CancelQuery {
         let outcome = tokio::runtime::Handle::current()
             .block_on(tracker.kill_query(&self.id, &self.by))
             .map_err(|e| {
-                // Still tracked: the kill itself failed (interrupted).
+                // Still tracked: the kill ended without an outcome. It may
+                // already have stopped the work, so it is audited as
+                // `interrupted`, not as a failure that applied nothing.
                 if tracker.get_query(&self.id).is_some() {
                     ApiError::new(ErrorCode::Internal, e.to_string())
-                        .with_hint("retry the cancel; the server log has the cause")
+                        .with_hint(
+                            "the cancel may or may not have been applied; check the \
+                             query's state, and retry the cancel if it is still running",
+                        )
+                        .interrupted()
                 } else {
                     Self::gone()
                 }
@@ -763,9 +769,7 @@ impl ManageAction for CancelQuery {
                 },
             ),
         };
-        let after = tracker
-            .get_query(&self.id)
-            .map_or(arneb_scheduler::QueryState::Cancelled, |q| q.state);
+        let after = state_after(outcome, tracker.get_query(&self.id).map(|q| q.state));
         Ok(Applied {
             preview,
             result: KillResult {
@@ -776,6 +780,20 @@ impl ManageAction for CancelQuery {
             },
         })
     }
+}
+
+/// The query's state after a kill with `outcome`, given its state `now`
+/// (`None` once it left the history): a query that left reports the last
+/// state the kill knew, never one it did not have (`cancelled` only when
+/// this kill cancelled it).
+fn state_after(
+    outcome: KillOutcome,
+    now: Option<arneb_scheduler::QueryState>,
+) -> arneb_scheduler::QueryState {
+    now.unwrap_or(match outcome {
+        KillOutcome::Killed { .. } => arneb_scheduler::QueryState::Cancelled,
+        KillOutcome::AlreadyEnded(state) | KillOutcome::NotApplied { state } => state,
+    })
 }
 
 async fn cluster(
@@ -1893,6 +1911,51 @@ pub(super) mod tests {
         assert_eq!(
             query_state(&state, &id),
             arneb_scheduler::QueryState::Finished
+        );
+    }
+
+    /// A kill that ends without an outcome (its canceller panicked, here
+    /// after the kill may have stopped the work) fails, and its audit
+    /// entry says `interrupted` (it may or may not have been applied), not
+    /// an error that applied nothing.
+    #[tokio::test]
+    async fn a_kill_without_an_outcome_is_audited_as_interrupted() {
+        let state = kill_state();
+        let t = &state.query_tracker;
+        let id = t.create_query_from("SELECT 1".into(), "pgwire", Some("alice".into()));
+        t.advance_to(&id, arneb_scheduler::QueryState::Running)
+            .unwrap();
+        t.set_canceller(
+            &id,
+            Box::new(|_| Box::pin(async { panic!("on_kill panicked") })),
+        );
+        let (status, body) = cancel_as(&state, "root", &format!("/api/v2/queries/{id}")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["error"]["code"], "internal", "{body}");
+        let hint = body["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains("may or may not have been applied"), "{hint}");
+        let entries = audit_entries(&state);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["outcome"], "interrupted", "{entries:?}");
+    }
+
+    /// The state reported after a kill when the query already left the
+    /// history: the last one the kill knew, `cancelled` only when this kill
+    /// cancelled it.
+    #[test]
+    fn the_state_after_a_kill_is_never_invented() {
+        use super::state_after;
+        use arneb_scheduler::{KillOutcome, QueryState as S};
+        let running = KillOutcome::NotApplied { state: S::Running };
+        assert_eq!(state_after(running, None), S::Running);
+        assert_eq!(state_after(running, Some(S::Finished)), S::Finished);
+        assert_eq!(
+            state_after(KillOutcome::AlreadyEnded(S::Failed), None),
+            S::Failed
+        );
+        assert_eq!(
+            state_after(KillOutcome::Killed { was: S::Running }, None),
+            S::Cancelled
         );
     }
 

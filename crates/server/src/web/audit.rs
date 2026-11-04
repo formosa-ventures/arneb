@@ -182,8 +182,11 @@ pub(super) fn audited<T>(
             std::panic::resume_unwind(panic);
         }
     };
+    // An action that ended without an outcome (e.g. a kill interrupted
+    // after it may have stopped the work) is `interrupted`, like a panic.
     let outcome = match &out {
         Ok(_) => AuditOutcome::Ok,
+        Err(e) if e.interrupted => AuditOutcome::Interrupted,
         Err(e) => AuditOutcome::Error(e.code.name()),
     };
     let done = record(subject(out.as_ref()), outcome);

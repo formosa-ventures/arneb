@@ -221,7 +221,7 @@ user_claim = "sub"
 | `jwks_min_refresh_secs` | `ARNEB_OAUTH_JWKS_MIN_REFRESH_SECS` | 30 | Minimum gap between JWKS fetches (a token with an unknown `kid` triggers one), `1` to `jwks_cache_secs`. |
 | `jwks_max_stale_secs` | `ARNEB_OAUTH_JWKS_MAX_STALE_SECS` | 86400 | While refetches fail (IdP down), how long after the last successful fetch its keys keep deciding; at least `jwks_cache_secs`. After that, `/mcp` answers `503` for JWTs. |
 | `require_access_token_typ` | `ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP` | `false` | Accept only tokens whose header `typ` is `at+jwt` (RFC 9068). Off by default because many IdPs send `typ: JWT` on access tokens; ID tokens are refused either way. |
-| `allow_missing_email_verified` | `ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED` | `false` | Accept an email-address user name (from a claim other than `email`, `sub` included) when the token has no `email` or no `email_verified` claim, for an IdP such as Entra ID that never sends it. `email_verified: false` and an `email` other than the user name are refused regardless. Logged, with a WARN when on. |
+| `allow_missing_email_verified` | `ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED` | `false` | Accept an email-address user name (from a claim other than `email`, `sub` included) when the token has no `email` or no `email_verified` claim, for an IdP such as Entra ID that never sends it. `email_verified: false`, and a verified `email` other than the user name, are refused regardless; an unverified `email` that differs (Entra's `upn` beside its `email`) is ignored. Logged, with a WARN when on. |
 
 An empty env var counts as unset; env vars override the file. The server
 reaches the IdP over the network (5 s timeout per request), so its pod needs

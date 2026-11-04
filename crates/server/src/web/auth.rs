@@ -296,7 +296,7 @@ async fn oauth_identity(
                 ),
             )
             .with_hint(
-                "the claim must equal the token's verified `email`; set [oauth] user_claim to `sub` or `email`",
+                "the claim must equal the token's verified `email`; set [oauth] user_claim to `sub` when the identity provider's subject ids are not email addresses",
             )
             .into_response(),
         )),

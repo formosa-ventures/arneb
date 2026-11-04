@@ -714,12 +714,15 @@ fn is_access_token_typ(typ: &str) -> bool {
 /// - `user_claim = "email"`: `email_verified` must be true.
 /// - Any other claim whose value contains `@` (`sub` included: Okta puts
 ///   the login there, which a self-registering user picks; also
-///   `preferred_username`, `upn`, a namespaced claim): `email_verified` speaks only for the token's
-///   `email`, so that must be the same address (ASCII case-insensitive) and
-///   verified; a different `email` is refused (a user can pick a username
-///   that is someone else's address). A token without `email` or without
-///   `email_verified` passes only with `allow_missing_email_verified`; an
-///   explicit non-true `email_verified` never does.
+///   `preferred_username`, `upn`, a namespaced claim): `email_verified`
+///   speaks only for the token's `email`, so that must be the same address
+///   (ASCII case-insensitive) and verified; a different verified `email` is
+///   refused (a user can pick a username that is someone else's address).
+///   An explicit non-true `email_verified` is always refused. Otherwise
+///   nothing vouches for the address (no `email_verified`, or no `email`
+///   for it to speak for): only `allow_missing_email_verified` trusts it,
+///   and then an unverified `email` vouches for nothing either way, so a
+///   different one is ignored (Entra's `upn` beside its `email`).
 fn check_email(
     settings: &OAuthSettings,
     claims: &serde_json::Value,
@@ -741,12 +744,10 @@ fn check_email(
         return Ok(());
     }
     let email = claims.get("email").and_then(|v| v.as_str());
-    if email.is_some_and(|e| !e.eq_ignore_ascii_case(user)) {
-        return Err(OAuthReject::EmailMismatch);
-    }
     match (email, verified()) {
-        (Some(_), Some(true)) => Ok(()),
         (_, Some(false)) => Err(OAuthReject::UnverifiedEmail),
+        (Some(e), Some(true)) if e.eq_ignore_ascii_case(user) => Ok(()),
+        (Some(_), Some(true)) => Err(OAuthReject::EmailMismatch),
         // Nothing vouches for the address: only the opt-in trusts it.
         _ if settings.allow_missing_email_verified => Ok(()),
         _ => Err(OAuthReject::UnverifiedEmail),
@@ -2119,6 +2120,34 @@ mod tests {
                 v.validate(&key.sign(&c)).await.unwrap_err(),
                 OAuthReject::EmailMismatch,
                 "opt-in {lax}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_opt_in_ignores_an_unverified_other_email() {
+        // Entra: `upn` (or a guest `#EXT#` UPN) beside an `email` that is a
+        // different address, and never an `email_verified`.
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        for upn in [
+            "alice@corp.onmicrosoft.com",
+            "alice_corp.com#EXT#@tenant.onmicrosoft.com",
+        ] {
+            let mut c = claims(&idp.issuer(), AUD);
+            c["upn"] = json!(upn);
+            c["email"] = json!("alice@corp.com");
+            let t = key.sign(&c);
+            let lax = validator(&idp, |s| {
+                s.user_claim = "upn".into();
+                s.allow_missing_email_verified = true;
+            });
+            assert_eq!(lax.validate(&t).await.unwrap().user, upn);
+            // Without the opt-in the address is simply unverified.
+            let strict = validator(&idp, |s| s.user_claim = "upn".into());
+            assert_eq!(
+                strict.validate(&t).await.unwrap_err(),
+                OAuthReject::UnverifiedEmail
             );
         }
     }

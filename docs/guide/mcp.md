@@ -164,8 +164,9 @@ Design decisions you should know about:
     `https://corp.example/email`),
     `email_verified` speaks only for the token's `email`, so `email` must
     be the same address (ASCII case-insensitive) and `email_verified` must
-    be `true`. A different `email` is refused with "the identity's '…'
-    claim is an email address other than its verified email": a user who
+    be `true`. A different verified `email` is refused with "the
+    identity's '…' claim is an email address other than its verified
+    email": a user who
     can pick their username could otherwise choose someone else's address
     and verify their own inbox.
   - `sub` is not exempt: "never reassigned" does not mean "not chosen by
@@ -182,8 +183,11 @@ Design decisions you should know about:
   used with `email`. For an address under another claim (`sub` included),
   `allow_missing_email_verified = true` accepts a token with no `email` or
   no `email_verified` (startup logs a WARN); only turn it on when the IdP
-  never issues an address its owner has not proven. An explicit
-  `email_verified: false` and a different `email` are refused regardless.
+  never issues an address its owner has not proven. With it on, an
+  unverified `email` vouches for nothing, so one that differs from the
+  user name is ignored (Entra's `upn` beside its `email`). An explicit
+  `email_verified: false`, and a different `email` with
+  `email_verified: true`, are refused regardless.
 - **The audience is the resource URL.** Tokens must be issued for this
   resource (RFC 8707): `aud` has to contain `audience`, which defaults to
   `resource`. Set `audience` for an IdP that names the API differently (an

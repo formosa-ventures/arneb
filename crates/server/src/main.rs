@@ -1359,8 +1359,9 @@ async fn run() -> Result<()> {
             drain_timeout_secs,
         ) => {}
     }
-    // Completions whose write failed get one last try before exiting (the
-    // fatal server errors above flush too).
+    // Audited actions still running (in `spawn_blocking`) get a bounded
+    // wait, then completions whose write failed get one last try before
+    // exiting (the fatal server errors above flush too).
     web::flush_audit(audit_for_shutdown).await;
 
     Ok(())

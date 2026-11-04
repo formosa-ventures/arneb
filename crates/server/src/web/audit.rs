@@ -64,11 +64,37 @@ pub(crate) fn spawn_audit_retry(
     })
 }
 
-/// At graceful shutdown: one last attempt to append the completions whose
-/// write failed, so their known outcomes are not lost (a restart would
-/// record their intents as `interrupted`). Logs at ERROR how many are lost
-/// when that fails.
+/// How long the shutdown flush waits for audited actions still running
+/// (e.g. a cancel waiting on its kill, a PBKDF2 token issue).
+pub(crate) const SHUTDOWN_ACTION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// At graceful shutdown: waits (at most [`SHUTDOWN_ACTION_WAIT`]) for the
+/// audited actions still running in `spawn_blocking` to complete, then
+/// makes one last attempt to append the completions whose write failed, so
+/// their known outcomes are not lost (a restart would record their intents
+/// as `interrupted`). Logs at ERROR how many actions are still running, or
+/// how many completions are lost, when that fails.
 pub(crate) async fn flush_audit(audit: std::sync::Arc<arneb_state::AuditLog>) {
+    flush_audit_within(audit, SHUTDOWN_ACTION_WAIT).await;
+}
+
+async fn flush_audit_within(
+    audit: std::sync::Arc<arneb_state::AuditLog>,
+    wait: std::time::Duration,
+) {
+    let deadline = tokio::time::Instant::now() + wait;
+    while audit.actions_in_flight() > 0 {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::error!(
+                target: "arneb::audit",
+                running = audit.actions_in_flight(),
+                "shutting down with audited actions still running; \
+                 the next start records them as interrupted"
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     if audit.is_writable() {
         return;
     }
@@ -138,6 +164,9 @@ pub(super) fn audited<T>(
         );
         audit_unavailable()
     };
+    // Counted until its completion is appended (or kept), so the shutdown
+    // flush waits for it ([`flush_audit`]).
+    let _running = state.audit.track_action();
     if let Err(e) = state.audit.ensure_writable() {
         return Err(refuse(&e));
     }
@@ -300,8 +329,8 @@ pub(super) fn routes() -> Router<WebState> {
 #[cfg(test)]
 mod tests {
     use super::{
-        audited, flush_audit, spawn_audit_retry, ApiError, AuditOutcome, AuditQuery, AuditRecord,
-        AuditSubject, Identity,
+        audited, flush_audit, flush_audit_within, spawn_audit_retry, ApiError, AuditOutcome,
+        AuditQuery, AuditRecord, AuditSubject, Identity,
     };
     use axum::http::{Method, StatusCode};
     use serde_json::{json, Value};
@@ -737,6 +766,80 @@ mod tests {
         });
         assert_eq!(page.entries.len(), 1, "{:?}", page.entries);
         assert_eq!(page.entries[0].record.outcome, AuditOutcome::Ok);
+    }
+
+    /// The shutdown flush waits for an audited action still running in
+    /// `spawn_blocking` (a cancel waiting on its kill): when that action's
+    /// completion then fails, the flush still appends it, instead of
+    /// having returned before it finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shutdown_flush_waits_for_running_audited_actions() {
+        let state = state();
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let action = tokio::task::spawn_blocking({
+            let state = state.clone();
+            move || {
+                let who = Identity {
+                    user: "root".into(),
+                    via: crate::web::auth::AuthVia::Basic,
+                };
+                audited(
+                    &state,
+                    &who,
+                    "query.cancel",
+                    AuditSubject {
+                        target: "q1".into(),
+                        parameters: json!({}),
+                    },
+                    || -> Result<(), ApiError> {
+                        inside_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    },
+                    |_| AuditSubject {
+                        target: "q1".into(),
+                        parameters: json!({}),
+                    },
+                )
+            }
+        });
+        tokio::task::spawn_blocking(move || inside_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(state.audit.actions_in_flight(), 1);
+        // Its completion will fail once; the log is writable until then.
+        state.audit.fail_next_append();
+        let flush = tokio::spawn(flush_audit(std::sync::Arc::clone(&state.audit)));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !flush.is_finished(),
+            "the flush ran before the action ended"
+        );
+        release_tx.send(()).unwrap();
+        action.await.unwrap().unwrap();
+        flush.await.unwrap();
+        assert_eq!(state.audit.actions_in_flight(), 0);
+        assert!(state.audit.is_writable());
+        assert_eq!(state.audit.unwritten_completions(), 0);
+        let (_, page) = audit_log(&state, "").await;
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{page}");
+        assert_eq!(entries[0]["outcome"], "ok");
+    }
+
+    /// The flush waits for running actions only up to its bound.
+    #[tokio::test]
+    async fn the_shutdown_flush_wait_is_bounded() {
+        let state = state();
+        let _running = state.audit.track_action();
+        let flush = flush_audit_within(
+            std::sync::Arc::clone(&state.audit),
+            std::time::Duration::from_millis(50),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), flush)
+            .await
+            .expect("the flush waited past its bound");
     }
 
     /// A failed `token.issue` completion names no token: the pre-generated

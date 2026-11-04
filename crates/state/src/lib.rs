@@ -10,8 +10,8 @@ mod tokens;
 mod users;
 
 pub use audit::{
-    AuditAppendError, AuditEntry, AuditLog, AuditOutcome, AuditPage, AuditQuery, AuditRecord,
-    AuditSettings,
+    ActionInFlight, AuditAppendError, AuditEntry, AuditLog, AuditOutcome, AuditPage, AuditQuery,
+    AuditRecord, AuditSettings,
 };
 pub use cordons::{CordonKind, CordonRecord};
 pub use file::{StateError, StateStore};

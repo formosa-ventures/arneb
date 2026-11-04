@@ -110,7 +110,8 @@ pub async fn check_name_resolution(catalog: &dyn CatalogProvider) -> Result<(), 
                 let found = provider
                     .table_if_allowed(&variant, &|_, _| true)
                     .await
-                    .map_err(|e| format!("looking up table {schema}.{variant:?}: {e}"))?;
+                    .map_err(|e| format!("looking up table {schema}.{variant:?}: {e}"))?
+                    .found();
                 if let Some(found) = found {
                     let expected = candidates(&tables, &variant);
                     match found.canonical_name() {

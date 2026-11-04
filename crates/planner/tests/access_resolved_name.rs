@@ -3,9 +3,12 @@
 //! case-insensitively (PostgreSQL, Hive) must not let `SECRET` read a
 //! denied `secret`. Covers every statement that plans a table read.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use arneb_catalog::{AccessRules, CatalogManager, CatalogProvider, SchemaProvider, TableProvider};
+use arneb_catalog::{
+    AccessRules, CatalogManager, CatalogProvider, SchemaProvider, TableLookup, TableProvider,
+};
 use arneb_common::types::{ColumnInfo, DataType};
 use arneb_planner::QueryPlanner;
 use async_trait::async_trait;
@@ -134,13 +137,17 @@ async fn every_read_checks_the_name_the_connector_resolved() {
     }
 }
 
-/// Counts full table loads; a connector shaped like Hive's (it learns the
-/// stored name cheaply, then loads), so a denied table must never be
-/// loaded, including by the planner's case-folding probe.
-static LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Counts lookups and full table loads; a connector shaped like Hive's (it
+/// learns the stored name cheaply, then loads), so a denied table must
+/// never be loaded, including by the planner's case-folding probe.
+#[derive(Debug, Default)]
+struct Counts {
+    probes: AtomicUsize,
+    loads: AtomicUsize,
+}
 
 #[derive(Debug)]
-struct CountingSchema(String);
+struct CountingSchema(String, Arc<Counts>);
 
 #[async_trait]
 impl SchemaProvider for CountingSchema {
@@ -150,22 +157,23 @@ impl SchemaProvider for CountingSchema {
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         self.table_if_allowed(name, &|_, _| true)
             .await
-            .ok()
-            .flatten()
+            .ok()?
+            .found()
     }
     async fn table_if_allowed(
         &self,
         name: &str,
         allowed: arneb_catalog::TableGate<'_>,
-    ) -> Result<Option<Arc<dyn TableProvider>>, arneb_common::error::CatalogError> {
+    ) -> Result<TableLookup, arneb_common::error::CatalogError> {
+        self.1.probes.fetch_add(1, Ordering::SeqCst);
         let Some(name) = resolve_loosely(&["open", "secret"], name) else {
-            return Ok(None);
+            return Ok(TableLookup::Missing);
         };
         if !allowed(&self.0, &name) {
-            return Ok(None);
+            return Ok(TableLookup::Denied);
         }
-        LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(Some(Arc::new(LooseTable {
+        self.1.loads.fetch_add(1, Ordering::SeqCst);
+        Ok(TableLookup::Found(Arc::new(LooseTable {
             schema: self.0.clone(),
             name,
         })))
@@ -176,7 +184,7 @@ impl SchemaProvider for CountingSchema {
 }
 
 #[derive(Debug)]
-struct CountingCatalog;
+struct CountingCatalog(Arc<Counts>);
 
 #[async_trait]
 impl CatalogProvider for CountingCatalog {
@@ -185,8 +193,17 @@ impl CatalogProvider for CountingCatalog {
     }
     async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
         let name = resolve_loosely(&["public"], name)?;
-        Some(Arc::new(CountingSchema(name)))
+        Some(Arc::new(CountingSchema(name, Arc::clone(&self.0))))
     }
+}
+
+/// `alice` over a [`CountingCatalog`], with the counts it records.
+fn counted(rules: &str) -> (CatalogManager, Arc<Counts>) {
+    let counts = Arc::new(Counts::default());
+    let root = CatalogManager::new("pg", "public");
+    root.register_catalog("pg", Arc::new(CountingCatalog(Arc::clone(&counts))));
+    let rules = AccessRules::from_json(rules).unwrap();
+    (root.with_access("alice", Arc::new(rules)), counts)
 }
 
 /// `pg.PUBLIC.SECRET` passes the written-name checks (the rule names
@@ -194,21 +211,49 @@ impl CatalogProvider for CountingCatalog {
 /// through the rules gate and never load the denied `public.secret`.
 #[tokio::test]
 async fn a_denied_table_is_never_loaded_while_planning() {
-    use std::sync::atomic::Ordering;
-    let root = CatalogManager::new("pg", "public");
-    root.register_catalog("pg", Arc::new(CountingCatalog));
-    let rules = AccessRules::from_json(
+    let (alice, counts) = counted(
         r#"{"tables": [
             {"user": "alice", "schema": "public", "table": "secret", "privileges": []},
             {"privileges": ["SELECT"]}
         ]}"#,
-    )
-    .unwrap();
-    let alice = root.with_access("alice", Arc::new(rules));
+    );
     for t in ["pg.PUBLIC.SECRET", "pg.PUBLIC.Secret", "pg.public.SECRET"] {
         assert!(plan(&alice, &format!("SELECT * FROM {t}")).await.is_err());
     }
-    assert_eq!(LOADS.load(Ordering::SeqCst), 0, "a denied table was loaded");
+    assert_eq!(
+        counts.loads.load(Ordering::SeqCst),
+        0,
+        "a denied table was loaded"
+    );
     plan(&alice, "SELECT * FROM pg.PUBLIC.OPEN").await.unwrap();
-    assert!(LOADS.load(Ordering::SeqCst) > 0);
+    assert!(counts.loads.load(Ordering::SeqCst) > 0);
+}
+
+/// A name denied as written is refused before the connector is asked
+/// anything about it, so the refusal takes the same time whether or not
+/// the table exists, and costs no table load. The upgrade note's own
+/// pattern: allow `open`, deny everything else; `OPEN` is the stored
+/// `open` written in a case the rule does not allow.
+#[tokio::test]
+async fn a_name_denied_as_written_is_never_probed() {
+    let (alice, counts) = counted(
+        r#"{"tables": [
+            {"user": "alice", "schema": "public", "table": "open", "privileges": ["SELECT"]},
+            {"privileges": []}
+        ]}"#,
+    );
+    for t in ["pg.public.OPEN", "pg.public.SECRET", "pg.public.NOPE"] {
+        let err = plan(&alice, &format!("SELECT * FROM {t}"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Access Denied"), "{t}: {err}");
+    }
+    assert_eq!(
+        counts.probes.load(Ordering::SeqCst),
+        0,
+        "a denied name was probed"
+    );
+    assert_eq!(counts.loads.load(Ordering::SeqCst), 0);
+    plan(&alice, "SELECT * FROM pg.public.open").await.unwrap();
+    assert!(counts.loads.load(Ordering::SeqCst) > 0);
 }

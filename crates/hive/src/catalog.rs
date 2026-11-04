@@ -19,7 +19,9 @@ use pilota::FastStr;
 use tracing::{debug, warn};
 use volo_thrift::MaybeException;
 
-use arneb_catalog::{CatalogProvider, ColumnStatistics, SchemaProvider, TableGate, TableProvider};
+use arneb_catalog::{
+    CatalogProvider, ColumnStatistics, SchemaProvider, TableGate, TableLookup, TableProvider,
+};
 use arneb_common::error::{CatalogError, ConnectorError};
 use arneb_common::types::{ColumnInfo, DataType};
 use arneb_connectors::storage::StorageRegistry;
@@ -674,7 +676,7 @@ impl SchemaProvider for HiveSchemaProvider {
 
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         match self.load(name, &|_, _| true).await {
-            Ok(table) => table,
+            Ok(table) => table.found(),
             Err(e) => {
                 warn!("failed to get HMS table '{}.{}': {e}", self.database, name);
                 None
@@ -689,44 +691,40 @@ impl SchemaProvider for HiveSchemaProvider {
         &self,
         name: &str,
         allowed: TableGate<'_>,
-    ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+    ) -> Result<TableLookup, CatalogError> {
         self.load(name, allowed).await
     }
 }
 
 /// `Err(Unavailable)` for an HMS call that failed to get an answer;
-/// `Ok(None)` (logged) for any other failure, which reads as missing as
+/// `Missing` (logged) for any other failure, which reads as missing as
 /// it always has (no such table, unsupported metadata).
-fn not_found_unless_unreachable<T>(
+fn not_found_unless_unreachable(
     e: ConnectorError,
     what: &str,
-) -> Result<Option<T>, CatalogError> {
+) -> Result<TableLookup, CatalogError> {
     match e {
         ConnectorError::ConnectionFailed(_) => Err(CatalogError::Unavailable(e.to_string())),
         ConnectorError::TableNotFound(_) => {
             debug!("{what}: {e}");
-            Ok(None)
+            Ok(TableLookup::Missing)
         }
         _ => {
             warn!("{what}: {e}");
-            Ok(None)
+            Ok(TableLookup::Missing)
         }
     }
 }
 
 impl HiveSchemaProvider {
-    async fn load(
-        &self,
-        name: &str,
-        allowed: TableGate<'_>,
-    ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+    async fn load(&self, name: &str, allowed: TableGate<'_>) -> Result<TableLookup, CatalogError> {
         let qualified = format!("{}.{}", self.database, name);
         let meta = match self.client.get_table(&self.database, name).await {
             Ok(meta) => meta,
             Err(e) => return not_found_unless_unreachable(e, &qualified),
         };
         if !allowed(&meta.db_name, &meta.table_name) {
-            return Ok(None);
+            return Ok(TableLookup::Denied);
         }
         // Table redirection (as in Trino): Iceberg tables in HMS are
         // served by the Iceberg reader. Listing their location as a plain
@@ -739,13 +737,13 @@ impl HiveSchemaProvider {
             )
             .await
             {
-                Ok(p) => Ok(Some(Arc::new(p.with_canonical_name(
+                Ok(p) => Ok(TableLookup::Found(Arc::new(p.with_canonical_name(
                     meta.db_name.clone(),
                     meta.table_name.clone(),
                 )))),
                 Err(e) => {
                     warn!("failed to load Iceberg table '{qualified}': {e}");
-                    Ok(None)
+                    Ok(TableLookup::Missing)
                 }
             };
         }
@@ -765,7 +763,7 @@ impl HiveSchemaProvider {
                 }
             }
         };
-        Ok(Some(Arc::new(HiveTableProvider {
+        Ok(TableLookup::Found(Arc::new(HiveTableProvider {
             canonical_name: Some((meta.db_name, meta.table_name)),
             transactional: is_transactional(&meta.parameters),
             columns: meta.columns,

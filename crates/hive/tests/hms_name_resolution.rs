@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use arneb_catalog::CatalogProvider;
+use arneb_catalog::{CatalogProvider, TableLookup};
 use arneb_connectors::storage::StorageRegistry;
 use arneb_hive::catalog::{HiveCatalogProvider, HmsClient};
 
@@ -48,22 +48,23 @@ async fn schemas_are_served_under_the_name_hms_returns() {
     }
     // A table HMS knows, and one it doesn't, under the stored schema.
     let tpch = catalog.try_schema("tpch").await.unwrap().unwrap();
-    assert!(tpch
-        .table_if_allowed("NATION", &|_, _| true)
-        .await
-        .unwrap()
-        .is_some());
-    assert!(tpch
-        .table_if_allowed("no_such_table_xyz", &|_, _| true)
-        .await
-        .unwrap()
-        .is_none());
-    // Refused by the gate: not loaded, reads as missing.
-    assert!(tpch
-        .table_if_allowed("nation", &|_, _| false)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(matches!(
+        tpch.table_if_allowed("NATION", &|_, _| true).await.unwrap(),
+        TableLookup::Found(_)
+    ));
+    assert!(matches!(
+        tpch.table_if_allowed("no_such_table_xyz", &|_, _| true)
+            .await
+            .unwrap(),
+        TableLookup::Missing
+    ));
+    // Refused by the gate: not loaded, and denied rather than missing.
+    assert!(matches!(
+        tpch.table_if_allowed("nation", &|_, _| false)
+            .await
+            .unwrap(),
+        TableLookup::Denied
+    ));
     arneb_catalog::conformance::check_name_resolution(&catalog)
         .await
         .unwrap();

@@ -84,6 +84,30 @@ pub trait CatalogProvider: fmt::Debug + Send + Sync {
     }
 }
 
+/// What [`SchemaProvider::table_if_allowed`] found under a name.
+#[derive(Debug, Clone)]
+pub enum TableLookup {
+    /// The table, whose stored name the gate allowed.
+    Found(Arc<dyn TableProvider>),
+    /// A table answers to the name, but the gate refused its stored
+    /// `(schema, table)`. It was not loaded. Not the same as
+    /// [`Missing`](Self::Missing): a caller choosing between names (the
+    /// planner's case fold) must not move past a denied one.
+    Denied,
+    /// No table answers to the name.
+    Missing,
+}
+
+impl TableLookup {
+    /// The table when found; `None` when denied or missing.
+    pub fn found(self) -> Option<Arc<dyn TableProvider>> {
+        match self {
+            TableLookup::Found(table) => Some(table),
+            TableLookup::Denied | TableLookup::Missing => None,
+        }
+    }
+}
+
 /// Asked by [`SchemaProvider::table_if_allowed`] whether the session user
 /// may read a table, given its stored `(schema, table)`.
 pub type TableGate<'a> = &'a (dyn Fn(&str, &str) -> bool + Send + Sync);
@@ -97,26 +121,27 @@ pub trait SchemaProvider: fmt::Debug + Send + Sync {
     /// Returns the table with the given name, or `None` if it does not exist.
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>>;
 
-    /// Like [`table`](Self::table), but returns `Ok(None)` when `allowed`
-    /// refuses the table's stored `(schema, table)`, and `Err` (rather
-    /// than `None`) when the source could not be asked, as
-    /// [`CatalogProvider::try_schema`] does. A connector whose lookup is
-    /// expensive (partitions, table-format metadata) overrides it to ask
-    /// `allowed` as soon as it knows the stored name, so a table the user
-    /// may not read costs no more to refuse than a missing one. The caller
-    /// checks the identity again afterwards. Default: `table`, then
-    /// `allowed` on its [`TableProvider::canonical_name`]; never fails.
+    /// Like [`table`](Self::table), but tells a table `allowed` refuses
+    /// under its stored `(schema, table)` ([`TableLookup::Denied`]) apart
+    /// from a missing one, and returns `Err` (rather than "missing") when
+    /// the source could not be asked, as [`CatalogProvider::try_schema`]
+    /// does. A connector whose lookup is expensive (partitions,
+    /// table-format metadata) overrides it to ask `allowed` as soon as it
+    /// knows the stored name, so a table the user may not read costs no
+    /// more to refuse than a missing one. The caller checks the identity
+    /// again afterwards. Default: `table`, then `allowed` on its
+    /// [`TableProvider::canonical_name`]; never fails.
     async fn table_if_allowed(
         &self,
         name: &str,
         allowed: TableGate<'_>,
-    ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+    ) -> Result<TableLookup, CatalogError> {
         let Some(table) = self.table(name).await else {
-            return Ok(None);
+            return Ok(TableLookup::Missing);
         };
         Ok(match table.canonical_name() {
-            Some((schema, stored)) if !allowed(&schema, &stored) => None,
-            _ => Some(table),
+            Some((schema, stored)) if !allowed(&schema, &stored) => TableLookup::Denied,
+            _ => TableLookup::Found(table),
         })
     }
 
@@ -643,20 +668,28 @@ impl CatalogManager {
         let Some(schema) = catalog.schema(&schema_name).await else {
             return folded;
         };
-        // Probed through the rules gate, so a table the user may not read
-        // under its stored name is never loaded here (it reads as missing
-        // either way); a source that can't be asked folds nothing.
+        // Access rules must never choose which table is read: fold only
+        // when the name as written is readable and the source answers
+        // that no table goes by it. A name the user may not read as
+        // written is not probed at all (`resolve_table` refuses it before
+        // any lookup, so its denial costs the same whether or not the
+        // table exists); one whose stored name is denied stops the fold
+        // (`Denied`, not `Missing`), so the reference is refused as
+        // written instead of reading the lowercase table. Probes go through the rules gate,
+        // so a denied table is never loaded; a source that can't be asked
+        // folds nothing.
         let lower = reference.table.to_lowercase();
         let readable = |s: &str, t: &str| self.can_select(&catalog_name, s, t);
         if lower != reference.table
+            && self.can_select(&catalog_name, &schema_name, &reference.table)
             && self.table_visible(&catalog_name, &schema_name, &lower)
             && matches!(
                 schema.table_if_allowed(&reference.table, &readable).await,
-                Ok(None)
+                Ok(TableLookup::Missing)
             )
             && matches!(
                 schema.table_if_allowed(&lower, &readable).await,
-                Ok(Some(_))
+                Ok(TableLookup::Found(_))
             )
         {
             folded.table = lower;
@@ -706,6 +739,7 @@ impl CatalogManager {
             return schema
                 .table_if_allowed(table_name, &|_, _| true)
                 .await?
+                .found()
                 .ok_or_else(not_found);
         };
 
@@ -719,6 +753,7 @@ impl CatalogManager {
         let table = schema
             .table_if_allowed(table_name, &allowed)
             .await?
+            .found()
             .ok_or_else(not_found)?;
         let (stored_schema, stored_table) = match table.canonical_name() {
             Some(identity) => identity,
@@ -924,21 +959,22 @@ mod tests {
     }
 
     /// A connector resolving names as PostgreSQL's does: `public` holds
-    /// `secret`, `open` and the mixed-case `Orders`; `hr` holds `salaries`.
+    /// `secret`, `open` and the mixed-case `Orders`; `hr` holds `salaries`;
+    /// `shop` holds both `"Orders"` and `orders`.
     #[derive(Debug)]
     struct LooseCatalog;
 
     #[async_trait]
     impl CatalogProvider for LooseCatalog {
         async fn schema_names(&self) -> Vec<String> {
-            vec!["hr".into(), "public".into()]
+            vec!["hr".into(), "public".into(), "shop".into()]
         }
         async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-            let name = resolve_loosely(&["hr", "public"], name)?;
-            let tables: &'static [&'static str] = if name == "hr" {
-                &["salaries"]
-            } else {
-                &["Orders", "open", "secret"]
+            let name = resolve_loosely(&["hr", "public", "shop"], name)?;
+            let tables: &'static [&'static str] = match name.as_str() {
+                "hr" => &["salaries"],
+                "shop" => &["Orders", "orders"],
+                _ => &["Orders", "open", "secret"],
             };
             Some(Arc::new(LooseSchema { name, tables }))
         }
@@ -1097,6 +1133,50 @@ mod tests {
             CatalogError::AccessDenied(_)
         ));
         assert!(fold_read(&alice, "public", "Orders").await.is_ok());
+    }
+
+    /// Access rules never choose which table a name reads. `shop` holds
+    /// both `"Orders"` and `orders`: a rule denying alice `"Orders"`
+    /// refuses `shop.Orders` instead of folding it onto `orders`, the
+    /// table an unrestricted user reading the same name never gets.
+    #[tokio::test]
+    async fn a_denied_name_is_never_folded_onto_another_table() {
+        let root = CatalogManager::new("pg", "public");
+        root.register_catalog("pg", Arc::new(LooseCatalog));
+        let stored = |t: Arc<dyn TableProvider>| t.canonical_name().unwrap();
+        assert_eq!(
+            stored(fold_read(&root, "shop", "Orders").await.unwrap()),
+            ("shop".to_string(), "Orders".to_string())
+        );
+
+        // Denied as written: refused before any lookup.
+        let alice = loose_view(
+            r#"{"tables": [
+                {"user": "alice", "table": "Orders", "privileges": []},
+                {"privileges": ["SELECT"]}
+            ]}"#,
+        );
+        let err = fold_read(&alice, "shop", "Orders").await.unwrap_err();
+        assert!(matches!(err, CatalogError::AccessDenied(_)), "{err}");
+
+        // Denied only under its stored name (the schema is written in a
+        // case the rule does not name): refused as a missing table, never
+        // read as `orders`.
+        let alice = loose_view(
+            r#"{"tables": [
+                {"user": "alice", "schema": "shop", "table": "Orders", "privileges": []},
+                {"privileges": ["SELECT"]}
+            ]}"#,
+        );
+        let err = fold_read(&alice, "SHOP", "Orders").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            missing_table_error(&alice, "SHOP", "Orders").await
+        );
+        assert_eq!(
+            stored(fold_read(&alice, "SHOP", "orders").await.unwrap()),
+            ("shop".to_string(), "orders".to_string())
+        );
     }
 
     /// A connector normalizing names as HMS does: trimmed, lowercased,
@@ -1382,7 +1462,7 @@ mod tests {
                 &self,
                 _name: &str,
                 _allowed: TableGate<'_>,
-            ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+            ) -> Result<TableLookup, CatalogError> {
                 Err(CatalogError::Unavailable("metastore down".into()))
             }
             fn canonical_name(&self) -> Option<String> {
@@ -1438,22 +1518,22 @@ mod tests {
             async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
                 self.table_if_allowed(name, &|_, _| true)
                     .await
-                    .ok()
-                    .flatten()
+                    .ok()?
+                    .found()
             }
             async fn table_if_allowed(
                 &self,
                 name: &str,
                 allowed: TableGate<'_>,
-            ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+            ) -> Result<TableLookup, CatalogError> {
                 let Some(stored) = resolve_loosely(&["open", "secret"], name) else {
-                    return Ok(None);
+                    return Ok(TableLookup::Missing);
                 };
                 if !allowed("public", &stored) {
-                    return Ok(None);
+                    return Ok(TableLookup::Denied);
                 }
                 LOADS.fetch_add(1, Ordering::SeqCst);
-                Ok(Some(Arc::new(LooseTable {
+                Ok(TableLookup::Found(Arc::new(LooseTable {
                     schema: "public".into(),
                     name: stored,
                 })))

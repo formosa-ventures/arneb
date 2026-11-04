@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arneb_catalog::{CatalogProvider, SchemaProvider, TableGate, TableProvider, TableStatistics};
+use arneb_catalog::{
+    CatalogProvider, SchemaProvider, TableGate, TableLookup, TableProvider, TableStatistics,
+};
 use arneb_common::error::{CatalogError, ConnectorError};
 use arneb_common::types::ColumnInfo;
 use arneb_rdbms::{plan_splits, RemoteColumn, RemoteTable, SplitPlan};
@@ -200,7 +202,7 @@ impl SchemaProvider for PostgresSchema {
 
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         match self.load(name, &|_, _| true).await {
-            Ok(table) => table,
+            Ok(table) => table.found(),
             Err(e) => {
                 tracing::warn!(catalog = %self.state.name, schema = %self.name, table = name, error = %e, "failed to load table");
                 None
@@ -215,23 +217,18 @@ impl SchemaProvider for PostgresSchema {
         &self,
         name: &str,
         allowed: TableGate<'_>,
-    ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
+    ) -> Result<TableLookup, CatalogError> {
         self.load(name, allowed).await
     }
 }
 
 impl PostgresSchema {
-    async fn load(
-        &self,
-        name: &str,
-        allowed: TableGate<'_>,
-    ) -> Result<Option<Arc<dyn TableProvider>>, CatalogError> {
-        let table = load_table(&self.state, &self.name, name, allowed)
+    async fn load(&self, name: &str, allowed: TableGate<'_>) -> Result<TableLookup, CatalogError> {
+        load_table(&self.state, &self.name, name, allowed)
             .await
             .map_err(|e| {
                 CatalogError::Unavailable(format!("{}.{}.{name}: {e}", self.state.name, self.name))
-            })?;
-        Ok(table.map(|t| Arc::new(t) as Arc<dyn TableProvider>))
+            })
     }
 }
 
@@ -296,7 +293,7 @@ async fn load_table(
     schema: &str,
     name: &str,
     allowed: TableGate<'_>,
-) -> Result<Option<PostgresTable>, String> {
+) -> Result<TableLookup, String> {
     let client = state.pool.get().await.map_err(|e| pool_error(&e))?;
     let rel_sql = format!(
         "SELECT c.oid, c.relname, c.reltuples::float8 FROM pg_class c \
@@ -309,10 +306,10 @@ async fn load_table(
         .map_err(|e| pg_error(&e))?;
     let names: Vec<String> = rels.iter().map(|r| r.get(1)).collect();
     let Some(resolved) = resolve_name(&names, name) else {
-        return Ok(None);
+        return Ok(TableLookup::Missing);
     };
     if !allowed(schema, &resolved) {
-        return Ok(None);
+        return Ok(TableLookup::Denied);
     }
     let rel = rels
         .iter()
@@ -384,12 +381,12 @@ async fn load_table(
         partitions = split.partition_count(),
         "resolved postgresql table"
     );
-    Ok(Some(PostgresTable {
+    Ok(TableLookup::Found(Arc::new(PostgresTable {
         columns,
         remote,
         split,
         row_count,
-    }))
+    })))
 }
 
 /// Primary-key range splits for large tables with a single integer key.

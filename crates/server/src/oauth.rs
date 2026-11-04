@@ -3,7 +3,8 @@
 //!
 //! [`OAuthValidator`] holds a cache of the IdP's signing keys (by `kid`) and
 //! checks signature, algorithm, `iss`, `aud`, `exp`, `nbf`, that the token
-//! is an access token (not an OIDC ID token), the user claim (with
+//! is a plain bearer (no DPoP or mTLS binding) and an access token (not an
+//! OIDC ID token), the user claim (with
 //! `email_verified` for an email address) and the required scopes. Only asymmetric algorithms are accepted (RS256/384/512,
 //! PS256, ES256/384); `none` and HS* are always refused.
 //!
@@ -368,6 +369,12 @@ impl OAuthValidator {
             }
         }
         let claims = claims.ok_or(OAuthReject::Invalid("bad_signature"))?;
+        // A sender-constrained token (DPoP, mTLS) is only valid with a proof
+        // of possession, which Arneb does not verify: accepting it as a
+        // plain bearer would let a stolen one be replayed.
+        if is_sender_constrained(header.typ.as_deref(), &claims) {
+            return Err(OAuthReject::Invalid("sender_constrained"));
+        }
         // The IdP also signs OIDC ID tokens, for the same issuer and
         // possibly the same audience: refuse what may be one.
         match token_kind(header.typ.as_deref(), &claims) {
@@ -745,6 +752,16 @@ fn check_email(
         _ if settings.allow_missing_email_verified => Ok(()),
         _ => Err(OAuthReject::UnverifiedEmail),
     }
+}
+
+/// A token bound to a key: a `cnf` claim of any shape (RFC 7800; DPoP's
+/// `jkt`, mTLS's `x5t#S256`), or a `DPoP` type in the payload `typ`
+/// (Keycloak's DPoP-bound access tokens) or the header `typ`.
+fn is_sender_constrained(header_typ: Option<&str>, claims: &serde_json::Value) -> bool {
+    let dpop = |t: &str| t.eq_ignore_ascii_case("DPoP") || t.eq_ignore_ascii_case("dpop+jwt");
+    claims.get("cnf").is_some()
+        || header_typ.is_some_and(dpop)
+        || claims.get("typ").and_then(|v| v.as_str()).is_some_and(dpop)
 }
 
 /// Keycloak's payload `typ` of signed tokens that are not access tokens
@@ -1890,6 +1907,60 @@ mod tests {
         v.validate(&key.sign_typ(&c, Some("at+jwt"))).await.unwrap();
         // Unmarked with a scope and neither nonce nor at_hash: an access token.
         v.validate(&key.sign(&claims(&iss, AUD))).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sender_constrained_tokens_are_refused() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let iss = idp.issuer();
+        let bound = OAuthReject::Invalid("sender_constrained");
+        let cnf = json!({"jkt": "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"});
+        // Keycloak 23: payload `typ: DPoP`, the request's nonce, a scope.
+        let mut kc23 = claims(&iss, AUD);
+        kc23["typ"] = json!("DPoP");
+        kc23["nonce"] = json!("n-0S6");
+        kc23["scope"] = json!("openid arneb");
+        kc23["cnf"] = cnf.clone();
+        // Keycloak 24+: no nonce. Without the refusal it would be accepted
+        // as a plain bearer, `cnf.jkt` ignored.
+        let mut kc24 = kc23.clone();
+        kc24.as_object_mut().unwrap().remove("nonce");
+        // A `cnf` alone (mTLS-bound, or a marked access token), and the
+        // DPoP type alone.
+        let mut mtls = claims(&iss, AUD);
+        mtls["cnf"] = json!({"x5t#S256": "bwcK0esc3ACC3DB2Y5_lESsXE8o9ltc05O89jdN-dg2"});
+        let mut bearer_bound = claims(&iss, AUD);
+        bearer_bound["typ"] = json!("Bearer");
+        bearer_bound["cnf"] = cnf;
+        let mut typ_only = claims(&iss, AUD);
+        typ_only["typ"] = json!("dpop");
+        for (what, c) in [
+            ("kc23", &kc23),
+            ("kc24", &kc24),
+            ("mtls", &mtls),
+            ("bearer_bound", &bearer_bound),
+            ("typ_only", &typ_only),
+        ] {
+            for required in [vec![], vec!["arneb".to_owned()]] {
+                let v = validator(&idp, |s| s.required_scopes = required.clone());
+                assert_eq!(
+                    v.validate(&key.sign(c)).await.unwrap_err(),
+                    bound,
+                    "{what} {required:?}"
+                );
+                let at = key.sign_typ(c, Some("at+jwt"));
+                assert_eq!(v.validate(&at).await.unwrap_err(), bound, "{what} at+jwt");
+            }
+        }
+        // A `DPoP` header type too.
+        let v = validator(&idp, |_| {});
+        assert_eq!(
+            v.validate(&key.sign_typ(&claims(&iss, AUD), Some("dpop+jwt")))
+                .await
+                .unwrap_err(),
+            bound
+        );
     }
 
     #[tokio::test]

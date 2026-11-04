@@ -108,6 +108,14 @@ it needs a restart, and a bad value stops startup with a message naming it.
      refused when `required_scopes` is empty, and otherwise accepted only
      with every required scope, which an ID token never carries.
 
+  Before that, a sender-constrained token is refused whatever its type:
+  one with a `cnf` claim (RFC 7800: a DPoP key thumbprint `jkt`, an mTLS
+  certificate thumbprint) or a DPoP type (Keycloak's payload `typ: DPoP`, or
+  a header `typ` of `dpop+jwt`). Such a token is only valid with a proof of
+  possession, which Arneb does not verify, so accepting it as a plain bearer
+  would let a stolen one be replayed. Turn DPoP binding off for the client
+  your MCP client uses.
+
   So an IdP whose access tokens have neither a `typ` marker nor a scope
   claim needs `required_scopes` (and its tokens must then carry them). Set
   `require_access_token_typ = true` when your IdP sends `at+jwt`, to

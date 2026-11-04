@@ -808,9 +808,13 @@ the response returns. Read it with
   audited action is needed), and once more when the server exits (a
   graceful shutdown, or a fatal pgwire or Flight listener error); a
   completion still unwritten then is logged at ERROR and its action is
-  recorded as `interrupted` at the next start. A manage action still running
-  when the server exits is not waited for. An action that panics is completed as `interrupted`, since the
-  panic may come after the action took effect. A `token.issue` that failed
+  recorded as `interrupted` at the next start. Before that last attempt, the
+  server waits up to 10 seconds for audited actions still running (a cancel
+  waiting on its kill, a token issue), so their completions get the same
+  retry; one still running after that is logged at ERROR and recorded as
+  `interrupted` at the next start. An action that panics, or a cancel whose
+  kill ended without an outcome, is completed as `interrupted`, since it may
+  have taken effect. A `token.issue` that failed
   has an empty `target`: its token id never became a token.
 - **Interrupted actions.** An intent with no completion at startup (the
   server stopped while applying it, or before a failed completion could be

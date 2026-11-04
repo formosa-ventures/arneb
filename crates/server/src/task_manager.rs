@@ -1299,10 +1299,12 @@ impl TaskSources<'_> {
     /// with. Only the scanned catalog is checked: a change to any other
     /// catalog of the set never fails the task. On a miss (not registered,
     /// or another fingerprint) a worker pulls the coordinator's set once
-    /// and looks again, unless it is already past the planned set within
-    /// its epoch and holds another version of the catalog, where no pull
-    /// brings the planned one back. A catalog that failed to build is
-    /// rebuilt by that pull (Ruling R8).
+    /// and looks again, even when it is already past the planned set (the
+    /// coordinator may have changed the catalog back since). Behind, it
+    /// starts a fresh pull when the one it joined fetched before the
+    /// change; past the planned set, it joins whatever pull runs, so the
+    /// tasks of a query planned before a change share one fetch. A catalog
+    /// that failed to build is rebuilt by that pull (Ruling R8).
     async fn lookup(
         &mut self,
         catalog: &str,
@@ -1335,22 +1337,26 @@ impl TaskSources<'_> {
             }
             _ => false,
         };
-        if !ahead {
-            tracing::info!(
-                target: "arneb::cluster",
-                catalog = %catalog,
-                registered = now.0.is_some(),
-                "task names a catalog not registered here at the planned version, pulling \
-                 catalogs"
-            );
+        tracing::info!(
+            target: "arneb::cluster",
+            catalog = %catalog,
+            registered = now.0.is_some(),
+            ahead,
+            "task names a catalog not registered here at the planned version, pulling \
+             catalogs"
+        );
+        let pulled = if ahead {
+            puller.pull().await
+        } else {
             // A fresh pull when the one joined fetched before the change.
-            if let Err(e) = puller.pull_until(|| fits(&held())).await {
-                tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
-            }
-            now = held();
-            if fits(&now) {
-                return Ok(now.0);
-            }
+            puller.pull_until(|| fits(&held())).await
+        };
+        if let Err(e) = pulled {
+            tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
+        }
+        now = held();
+        if fits(&now) {
+            return Ok(now.0);
         }
         if let (Some(planned), Some(_)) = (planned, &now.0) {
             return Err(version_mismatch(
@@ -1746,7 +1752,8 @@ mod tests {
     /// A task scans each catalog only at the version its query was planned
     /// with: a worker holding another version pulls once and runs once it
     /// matches, and fails (without mixing versions) when the pull does not
-    /// bring it; a worker already past it fails without a pull. Round 4: a
+    /// bring it, also when already past it (round 5: the catalog may have
+    /// been changed back). Round 4: a
     /// change to a catalog the task does not scan never fails it.
     #[tokio::test]
     async fn a_task_scans_each_catalog_only_at_its_planned_version() {
@@ -1829,13 +1836,23 @@ mod tests {
              (worker at generation 5, query planned at 6); retry the query"
         );
         assert_eq!(pulls.load(Ordering::SeqCst), 2);
-        // Already past the planned set, with another cat1: no pull can help.
+        // Already past the planned set, with another cat1: one pull, which
+        // does not bring it back here, so the task fails.
         assert_eq!(
             run(&at3).await.unwrap_err(),
             "catalog 'cat1' on worker w1 is not the version the query was planned with \
              (worker at generation 5, query planned at 3); retry the query"
         );
-        assert_eq!(pulls.load(Ordering::SeqCst), 2);
+        assert_eq!(pulls.load(Ordering::SeqCst), 3);
+        // Round 5: the coordinator changed cat1 back to the planned spec
+        // (gen 7) and this worker missed it: the pull brings it, and the
+        // task planned at 3 runs.
+        *served.lock().unwrap() = set(9, 7, "h1:9083", &["x"]);
+        run(&at3)
+            .await
+            .expect("cat1 reverted to the planned version: runs");
+        assert_eq!(pulls.load(Ordering::SeqCst), 4);
+        assert_eq!(live.generation(), 7);
         let other_epoch = run(&tag_of(set(8, 4, "h3:9083", &[])).await)
             .await
             .unwrap_err();

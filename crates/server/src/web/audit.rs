@@ -784,6 +784,7 @@ mod tests {
                 let who = Identity {
                     user: "root".into(),
                     via: crate::web::auth::AuthVia::Basic,
+                    oauth_expires_ms: None,
                 };
                 audited(
                     &state,

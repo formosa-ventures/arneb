@@ -1391,10 +1391,12 @@ pub fn effective_secrets(global: &StorageConfig, specs: &[CatalogConfig]) -> Vec
 }
 
 /// The secrets `spec` carries, by field: `password`, a password in
-/// `connection_url` (userinfo or query parameter; any URL that fails
-/// validation counts whole, as [`redacted_spec`] hides it whole), `storage.s3.secret_access_key`
-/// and `storage.azure.access_key`. A GCS `service_account_path` is a path on
-/// the node, not the key itself, so it is not listed.
+/// `connection_url` (userinfo or query parameter; for a URL that fails
+/// validation, anything that may be one, see [`refused_url_may_hold_password`]),
+/// `storage.s3.secret_access_key` and `storage.azure.access_key`. A GCS
+/// `service_account_path` is a path on the node, not the key itself, so it
+/// is not listed. A refused URL with no password is not a secret: its
+/// validation error is reported where the spec is checked or built.
 pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
     let mut found = Vec::new();
     if spec.password.is_some() {
@@ -1407,9 +1409,10 @@ pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
         if url_password_range(&url.0).is_some()
             || !url_query_passwords(&url.0).is_empty()
             || !url_loose_query_passwords(&url.0).is_empty()
-            || arneb_postgresql::PostgresConfig::new(url.0.clone())
+            || (arneb_postgresql::PostgresConfig::new(url.0.clone())
                 .validate_url()
                 .is_err()
+                && refused_url_may_hold_password(&url.0))
         {
             found.push("connection_url password");
         }
@@ -1431,6 +1434,26 @@ pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
         }
     }
     found
+}
+
+/// Whether a `connection_url` that fails validation may hold a password,
+/// read loosely since where its parts end is unknown: an `@` with a `:`
+/// anywhere before it (a userinfo password, as the driver would split
+/// it), or `password` anywhere once percent-decoded, in any case (a query
+/// parameter, a libpq keyword string `host=db password=x`). A typo such
+/// as `postgresql://db/x?sslmod=require` or an uppercase scheme holds
+/// none.
+fn refused_url_may_hold_password(url: &str) -> bool {
+    let before_at = url.find('@').map(|at| &url[..at]);
+    let userinfo_password = before_at.is_some_and(|head| {
+        // The scheme's own `:` is not a password separator.
+        let head = head.find("://").map_or(head, |i| &head[i + 3..]);
+        head.contains(':')
+    });
+    userinfo_password
+        || String::from_utf8_lossy(&arneb_postgresql::percent_decode(url))
+            .to_ascii_lowercase()
+            .contains("password")
 }
 
 /// Whether `a` and `b` send their secrets to the same places (Ruling R10):
@@ -1517,26 +1540,17 @@ fn url_loose_query_passwords(url: &str) -> Vec<std::ops::Range<usize>> {
 }
 
 /// `(parameter, value)` ranges of the `password` parameters of the query
-/// that starts at the first `?` at or after byte `from`.
+/// that starts at the first `?` at or after byte `from`, read with the
+/// connector's own query scanner (the one validation uses).
 fn query_passwords_from(
     url: &str,
     from: usize,
 ) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
-    let Some(q) = url[from..].find('?').map(|i| from + i + 1) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut start = q;
-    for param in url[q..].split('&') {
-        if let Some((key, value)) = param.split_once('=') {
-            if arneb_postgresql::is_password_key(key) {
-                let value_start = start + param.len() - value.len();
-                out.push((start..start + param.len(), value_start..start + param.len()));
-            }
-        }
-        start += param.len() + 1;
-    }
-    out
+    arneb_postgresql::query_params_from(url, from)
+        .into_iter()
+        .filter(|p| arneb_postgresql::is_password_key(&url[p.key.clone()]))
+        .map(|p| (p.segment, p.value))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2107,6 +2121,48 @@ mod tests {
             ]
         );
         assert_eq!(secret_fields(&secret_spec()).len(), 4);
+    }
+
+    /// Round 5: a URL that fails validation counts as a secret only when
+    /// it may hold a password; a typo, an uppercase scheme or a stray `&`
+    /// with no password is a validation failure, not a secret. Either way
+    /// the refused URL is still redacted whole.
+    #[test]
+    fn a_refused_url_is_a_secret_only_when_it_may_hold_a_password() {
+        let pg = |url: &str| {
+            spec(serde_json::json!({"name": "p", "type": "postgresql", "connection_url": url}))
+        };
+        for url in [
+            "postgresql://db/x?sslmod=require",
+            "POSTGRESQL://db/x",
+            "postgresql://db/x?sslmode=require&&",
+            "postgresql://u@db/x?sslmod=require",
+        ] {
+            let s = pg(url);
+            assert!(validate_spec(&s).is_err(), "{url}");
+            assert!(secret_fields(&s).is_empty(), "{url}");
+            let shown = redacted_spec(&s)["connection_url"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                shown.eq_ignore_ascii_case("postgresql://<redacted>"),
+                "{shown}"
+            );
+        }
+        for url in [
+            "host=db password=kw-secret",
+            "host=db PASSWORD=kw-secret",
+            "postgresql://db/x?sslmod=require&pass%77ord=Qz7",
+            "postgresql://db/x?sslmod=require&password=Qz7",
+            "postgresql://u:Qz7@db/x?sslmod=require",
+            "postgresql://u:p@Qz7@db/x",
+            "postgresql:/u:Qz7@db/x",
+        ] {
+            let s = pg(url);
+            assert!(validate_spec(&s).is_err(), "{url}");
+            assert_eq!(secret_fields(&s), vec!["connection_url password"], "{url}");
+        }
     }
 
     /// M2: an unencoded `@` in a query value makes the driver read the

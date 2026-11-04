@@ -2510,6 +2510,41 @@ mod tests {
         );
         check_catalog_exposure(&ServerRole::Coordinator, false, &none, &[hive], false, 9090)
             .unwrap();
+        // Round 5: a URL that fails validation but holds no password does
+        // not stop the start (the failed build is a WARN); one that may
+        // hold a password still does.
+        let pg = |url: &str| -> config::CatalogConfig {
+            serde_json::from_value(serde_json::json!({
+                "name": "pg", "type": "postgresql", "connection_url": url
+            }))
+            .unwrap()
+        };
+        for url in [
+            "postgresql://db/x?sslmod=require",
+            "POSTGRESQL://db/x",
+            "postgresql://db/x?sslmode=require&&",
+        ] {
+            check_catalog_exposure(
+                &ServerRole::Coordinator,
+                false,
+                &none,
+                &[pg(url)],
+                false,
+                9090,
+            )
+            .unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+        let e = check_catalog_exposure(
+            &ServerRole::Coordinator,
+            false,
+            &none,
+            &[pg("postgresql://db/x?sslmod=require&password=Qz7")],
+            false,
+            9090,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("catalog 'pg': connection_url password"), "{e}");
     }
 
     /// The default catalog follows the served catalogs: the first config

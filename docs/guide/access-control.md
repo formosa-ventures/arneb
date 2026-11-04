@@ -91,11 +91,23 @@ Everyone can run queries and sees only their own.
 - When a connector cannot be reached (HMS or the PostgreSQL server is
   down), reads and `SET search_path` fail with an error instead of
   reporting a missing schema or table, so `SET search_path` never falls
-  back to another schema. Trino `SHOW TABLES` fails too when it cannot
-  look the schema up. Listings (`SHOW TABLES` once the schema is known,
-  `information_schema`, `pg_catalog`, `system.jdbc`) show nothing for what
-  they cannot reach, and the server logs a warning. Iceberg tables whose
-  metadata files cannot be read still read as missing (logged).
+  back to another schema. So do Trino `SHOW SCHEMAS`, `SHOW TABLES`,
+  `SHOW COLUMNS`, `DESCRIBE` and `USE`, instead of returning an empty
+  list or a not-found error. A failed read is reported as an external
+  error: SQLSTATE `58030` over pgwire, and `CONNECTOR_ERROR` with
+  `errorType` `EXTERNAL` over the Trino protocol, so clients can retry it.
+  The `information_schema`, `pg_catalog` and `system.jdbc` listings show
+  nothing for what they cannot reach, and the server logs a warning.
+  Iceberg tables whose metadata files cannot be read still read as
+  missing (logged).
+- When an HMS authorization plugin (Apache Ranger, storage-based or
+  SQL-standard authorization) refuses Arneb's request for a database or
+  table, the object reads as missing, as it did before v0.1.9; any other
+  HMS error is treated as an outage. HMS reports both the same way, so
+  Arneb recognizes a refusal by the plugins' messages (`Permission
+  denied: user ...`, `Permission denied: Principal ...`, or an
+  `AccessControlException` / `AuthorizationException`). A refusal worded
+  otherwise is reported as an outage.
 - A PostgreSQL view is checked by the view's own name. The tables it
   reads are governed only by the PostgreSQL role the catalog connects as.
 - A section left out of the file allows everything it governs. With no

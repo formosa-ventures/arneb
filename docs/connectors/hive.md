@@ -40,7 +40,9 @@ from the metastore's default catalog: an HMS catalog-qualified database
 name (`"@spark#demo"`) is served only when it names the default catalog's
 own database, and reads as missing otherwise. If HMS cannot be reached,
 a query fails with an error instead of reporting a missing schema or
-table.
+table. A database or table an HMS authorization plugin (such as Ranger)
+refuses reads as missing (see
+[Access Control](/guide/access-control)).
 
 ## Storage Formats
 

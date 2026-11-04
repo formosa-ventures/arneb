@@ -63,3 +63,11 @@
 - [x] 11.3 Audit: a background tick retries an unwritable log (and its kept completions) every 5 s; graceful shutdown flushes once more
 - [x] 11.4 Kill (fix review): Trino decides a paging cancel before the kill, so a cancel resuming after `complete` keeps the result; a kill that ends without an outcome releases its claim (`internal` / `500`); a query that leaves the history mid-kill is `not_found`; the agent reaper touches before spawning a cancel
 - [x] 11.5 Audit (fix review): the exit flush also runs on fatal listener errors and logs a failed flush task
+
+## 12. Review round 5
+
+- [x] 12.1 Kill: the settle task is spawned after the tracker lock is released (a runtime shutting down drops it inline, and the claim's drop takes the lock); an interrupted kill hands its canceller, or its pending call, back to the entry, so a retry asks the same kill switch instead of assuming the kill applied
+- [x] 12.2 Trino: only a read with remaining pages is paging; a finished write is never relabelled; paging is read when the cancel arrives; the reaper spawns one task per cancel
+- [x] 12.3 Audit: a kill without an outcome is audited `interrupted`; a query that left the history reports the last state the kill knew, never an invented `cancelled`
+- [x] 12.4 Audit: the shutdown flush waits (at most 10 s) for audited actions still running
+- [x] 12.5 Agent: one reaper cancel in flight per statement; a cancel whose task failed keeps the statement instead of releasing it

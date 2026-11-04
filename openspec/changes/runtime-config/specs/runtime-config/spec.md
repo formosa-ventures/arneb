@@ -89,11 +89,15 @@ Every catalog answer, MCP result and audit entry SHALL replace `password`, `secr
 ### Requirement: Workers receive catalogs from the coordinator
 Workers SHALL ignore `[[catalogs]]` in their own config, logging one INFO on `arneb::config` that names them, and SHALL take their catalogs from the coordinator over Flight under the cluster security. Each set SHALL carry the coordinator's default catalog and schema, which a worker SHALL use for a scan with no catalog or schema, and each hive spec SHALL carry the coordinator's global `[storage]` merged in, so a worker needs no catalog or storage config of its own. Every heartbeat reply SHALL carry the coordinator's catalog generation and an epoch chosen at random at each coordinator start; a worker whose applied `(epoch, generation)` differs SHALL pull the set. A pushed or pulled set from the same epoch SHALL apply only when its generation is newer, and a set from another epoch SHALL always apply. Applying a set SHALL build new or changed catalogs, swap them in and remove catalogs not in the set; a catalog that fails to build SHALL be skipped with a WARN, the applied generation SHALL still advance, and the worker SHALL retry the failed catalogs at most once per 30 s. A task that names a catalog the worker does not have SHALL pull once and retry before failing with `catalog '<name>' is not registered on worker <id>`.
 
-A coordinator without a `[cluster] secret` SHALL refuse to start while a served catalog's effective spec carries a secret (`password`, a `connection_url` password (a `connection_url` that fails URL validation counts whole), an S3 `secret_access_key` or an Azure `access_key`), naming each catalog and field but never a value, and SHALL refuse a catalog create, update or re-seed that would serve one with `invalid_argument` and a hint to set `[cluster] secret`. Without such secrets it SHALL start and log a WARN on `arneb::config` that cluster RPC is unauthenticated; a worker without a secret SHALL log a WARN that `sync_catalogs` is unauthenticated.
+A coordinator without a `[cluster] secret` SHALL refuse to start while a served catalog's effective spec carries a secret (`password`, a `connection_url` password (a `connection_url` that fails URL validation counts when it may hold one: an `@` with a `:` before it within the authority after `scheme://` (or a `:` that is not a port before an `@` past the authority), or a query parameter whose key is `password` once percent-decoded; without a `scheme://`, an `@` with a `:` before it or `password` anywhere once percent-decoded, in any case; one with neither, such as a mistyped parameter, is a validation failure reported when the catalog is checked or built, not a secret), an S3 `secret_access_key` or an Azure `access_key`), naming each catalog and field but never a value, and SHALL refuse a catalog create, update or re-seed that would serve one with `invalid_argument` and a hint to set `[cluster] secret`. Without such secrets it SHALL start and log a WARN on `arneb::config` that cluster RPC is unauthenticated; a worker without a secret SHALL log a WARN that `sync_catalogs` is unauthenticated.
 
 #### Scenario: Catalog secret without a cluster secret
 - **WHEN** a coordinator with no `[cluster] secret` starts with a postgresql catalog that has a `password`
 - **THEN** startup fails with an error naming `[cluster] secret` and `catalog 'pg': password`
+
+#### Scenario: Invalid URL with no password without a cluster secret
+- **WHEN** a coordinator with no `[cluster] secret` starts with a postgresql catalog whose `connection_url` is `postgresql://db/x?sslmod=require` (a typo, no password)
+- **THEN** it starts, and the catalog fails to build with a WARN
 
 #### Scenario: Worker restarted
 - **WHEN** a worker restarts after catalog `pg2` was created
@@ -109,7 +113,11 @@ A coordinator without a `[cluster] secret` SHALL refuse to start while a served 
 
 #### Scenario: Slow set from the previous epoch
 - **WHEN** a worker's pull of epoch E1's set is still building after the restarted coordinator (epoch E2) pushed its set
-- **THEN** the E1 set changes nothing when its build finishes, and a later push from E1 is refused with an error, so E1's coordinator never counts the worker as synced: a worker follows the epoch its last heartbeat reply named (before the first, the largest a push or pull named), refuses a set from any other epoch, and concurrent applies of the same epoch and generation build each catalog once
+- **THEN** the E1 set changes nothing when its build finishes, and a later push from E1 is refused with an error, so E1's coordinator never counts the worker as synced: a worker follows the epoch named by the answer to its latest-sent heartbeat or pull (before any, the largest a push named), refuses a set from any other epoch (a push from another epoch is checked with one pull and accepted when that pull reaches its sender, a restarted coordinator), and concurrent applies of the same epoch and generation build each catalog once
+
+#### Scenario: Restarted coordinator reached before its heartbeat
+- **WHEN** the coordinator restarts at the same address with epoch E2 and dispatches a task or pushes a change before the worker processed a heartbeat reply naming E2
+- **THEN** the task's pull, or the one pull the push triggers, reaches E2's coordinator, the worker follows E2 and applies its set, and the task runs or the push is acknowledged
 
 #### Scenario: Coordinator moved to a host whose clock is behind
 - **WHEN** a heartbeat names epoch E2 smaller than the applied E1, and a delayed push from E1's coordinator arrives afterwards

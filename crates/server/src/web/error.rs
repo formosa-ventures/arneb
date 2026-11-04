@@ -113,6 +113,11 @@ pub struct ApiError {
     /// Nearest existing names (column typos).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub candidates: Vec<String>,
+    /// The action ended without an outcome: it may or may not have been
+    /// applied. An audited action failing this way is completed as
+    /// `interrupted`, not as this error. Not serialized.
+    #[serde(skip)]
+    pub interrupted: bool,
 }
 
 impl ApiError {
@@ -124,7 +129,15 @@ impl ApiError {
             hint: None,
             location: None,
             candidates: Vec::new(),
+            interrupted: false,
         }
+    }
+
+    /// Mark the error as an action that ended without an outcome: it may
+    /// or may not have been applied.
+    pub fn interrupted(mut self) -> Self {
+        self.interrupted = true;
+        self
     }
 
     /// Attach a hint telling the caller what to do.
@@ -162,6 +175,7 @@ impl From<AgentError> for ApiError {
             hint: e.hint,
             location: e.location,
             candidates: e.candidates,
+            interrupted: false,
         }
     }
 }

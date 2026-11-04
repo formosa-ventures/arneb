@@ -544,6 +544,21 @@ async fn run() -> Result<()> {
     // FlightState `df_report_callback` (routes worker reports in).
     let df_registry = arneb_scheduler::DynamicFilterServiceRegistry::new();
 
+    // Where and as whom a worker heartbeats; built here so the task
+    // manager's catalog puller shares the worker id and coordinator.
+    let heartbeat_target = match role {
+        ServerRole::Worker => HeartbeatTarget::from_config(&config, &rpc_addr),
+        _ => None,
+    };
+    // runtime-config D8: the heartbeat loop, the task manager and the
+    // push handler pull the coordinator's catalogs through one
+    // single-flight puller. None off workers (standalone has no workers).
+    let catalog_puller = heartbeat_target.as_ref().map(|target| {
+        catalogs::CatalogPuller::from_coordinator(
+            target.coordinator_address.clone(),
+            live_catalogs.clone(),
+        )
+    });
     let mut flight_state = match role {
         ServerRole::Coordinator | ServerRole::Standalone => {
             // Coordinator receives heartbeats from workers. The reply names
@@ -630,9 +645,10 @@ async fn run() -> Result<()> {
             let mut state = arneb_rpc::FlightState::new();
             // runtime-config D8: apply a catalog set the coordinator pushes.
             let live = live_catalogs.clone();
+            let puller = catalog_puller.clone();
             state.set_catalog_sync_callback(Arc::new(move |set: arneb_rpc::CatalogSet| {
-                let live = live.clone();
-                Box::pin(async move { apply_pushed_catalogs(&live, set).await })
+                let (live, puller) = (live.clone(), puller.clone());
+                Box::pin(async move { apply_pushed_catalogs(&live, puller.as_ref(), set).await })
             }));
             state
         }
@@ -714,21 +730,6 @@ async fn run() -> Result<()> {
         _ => None,
     };
 
-    // Where and as whom a worker heartbeats; built here so the task
-    // manager's catalog puller shares the worker id and coordinator.
-    let heartbeat_target = match role {
-        ServerRole::Worker => HeartbeatTarget::from_config(&config, &rpc_addr),
-        _ => None,
-    };
-    // runtime-config D8: the heartbeat loop and the task manager pull the
-    // coordinator's catalogs through one single-flight puller. None off
-    // workers (standalone has no workers).
-    let catalog_puller = heartbeat_target.as_ref().map(|target| {
-        catalogs::CatalogPuller::from_coordinator(
-            target.coordinator_address.clone(),
-            live_catalogs.clone(),
-        )
-    });
     let mut worker_tasks: Option<task_manager::TaskManager> = None;
     if matches!(role, ServerRole::Worker) {
         // Phase A (2026-05-23): the count-based `[memory]
@@ -1483,8 +1484,9 @@ async fn run() -> Result<()> {
             drain_timeout_secs,
         ) => {}
     }
-    // Completions whose write failed get one last try before exiting (the
-    // fatal server errors above flush too).
+    // Audited actions still running (in `spawn_blocking`) get a bounded
+    // wait, then completions whose write failed get one last try before
+    // exiting (the fatal server errors above flush too).
     web::flush_audit(audit_for_shutdown).await;
 
     Ok(())
@@ -1610,9 +1612,10 @@ async fn worker_heartbeat_loop(
     );
     loop {
         let current = *state.borrow_and_update();
+        let sent_at = tokio::time::Instant::now();
         if let (Some(reply), Some(puller)) = (target.send(current).await, catalogs) {
             let puller = puller.clone();
-            tokio::spawn(async move { puller.after_heartbeat(&reply).await });
+            tokio::spawn(async move { puller.after_heartbeat_sent(&reply, sent_at).await });
         }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
@@ -2003,15 +2006,43 @@ fn default_catalog_and_schema(
 /// stale set (same epoch, not newer) is acknowledged unchanged. An applied
 /// set is Ok even when some catalogs failed to build; their names are
 /// returned (Ruling R7).
+///
+/// A push from another epoch than the one this worker follows is checked
+/// against the coordinator's address with one pull (`puller`): a restarted
+/// coordinator can push before this worker has heard from it, and the pull
+/// then reaches it, applies its set and follows its epoch, so the push is
+/// Ok once the worker holds that epoch at the pushed generation or later.
+/// An old coordinator's delayed push stays refused: the pull reaches the
+/// live one.
 async fn apply_pushed_catalogs(
     live: &catalogs::LiveCatalogs,
+    puller: Option<&catalogs::CatalogPuller>,
     set: arneb_rpc::CatalogSet,
 ) -> Result<Vec<String>, String> {
     let (epoch, generation) = (set.epoch, set.generation);
     let report = live.apply_remote(set).await;
     if report.stale_epoch {
-        // Not synced: the sender is not the coordinator this worker's
-        // heartbeat follows (an old one's delayed push).
+        let caught_up = || {
+            let (e, g) = live.version();
+            e == epoch && g >= generation
+        };
+        if let Some(puller) = puller {
+            // A fresh pull when the one joined left before the restart.
+            if let Err(e) = puller.pull_until(caught_up).await {
+                tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
+            }
+            if caught_up() {
+                tracing::info!(
+                    target: "arneb::cluster",
+                    epoch,
+                    generation,
+                    "catalog push from a newly reached coordinator applied through a pull"
+                );
+                return Ok(live.failed_builds());
+            }
+        }
+        // Not synced: the sender is not the coordinator at this worker's
+        // coordinator address (an old one's delayed push).
         return Err(catalogs::stale_epoch_error(epoch, live.current_epoch()));
     }
     if !report.applied {
@@ -2566,6 +2597,42 @@ mod tests {
         );
         check_catalog_exposure(&ServerRole::Coordinator, false, &none, &[hive], false, 9090)
             .unwrap();
+        // Round 5: a URL that fails validation but holds no password does
+        // not stop the start (the failed build is a WARN); one that may
+        // hold a password still does.
+        let pg = |url: &str| -> config::CatalogConfig {
+            serde_json::from_value(serde_json::json!({
+                "name": "pg", "type": "postgresql", "connection_url": url
+            }))
+            .unwrap()
+        };
+        for url in [
+            "postgresql://db/x?sslmod=require",
+            "POSTGRESQL://db/x",
+            "postgresql://db/x?sslmode=require&&",
+            "postgresql://db:5432/x?user=a@b",
+        ] {
+            check_catalog_exposure(
+                &ServerRole::Coordinator,
+                false,
+                &none,
+                &[pg(url)],
+                false,
+                9090,
+            )
+            .unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+        let e = check_catalog_exposure(
+            &ServerRole::Coordinator,
+            false,
+            &none,
+            &[pg("postgresql://db/x?sslmod=require&password=Qz7")],
+            false,
+            9090,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("catalog 'pg': connection_url password"), "{e}");
     }
 
     /// The default catalog follows the served catalogs: the first config
@@ -2814,17 +2881,17 @@ mod tests {
             catalogs,
             ..Default::default()
         };
-        assert!(apply_pushed_catalogs(&live, push(5, vec![]))
+        assert!(apply_pushed_catalogs(&live, None, push(5, vec![]))
             .await
             .unwrap()
             .is_empty());
         let bad = serde_json::json!({"name": "bad", "type": "mysql", "password": "s3cret"});
-        let failed = apply_pushed_catalogs(&live, push(3, vec![bad.clone()]))
+        let failed = apply_pushed_catalogs(&live, None, push(3, vec![bad.clone()]))
             .await
             .unwrap();
         assert!(failed.is_empty(), "stale: not applied, nothing built");
         assert_eq!(live.generation(), 5);
-        let failed = apply_pushed_catalogs(&live, push(6, vec![bad]))
+        let failed = apply_pushed_catalogs(&live, None, push(6, vec![bad]))
             .await
             .unwrap();
         assert_eq!(failed, vec!["bad".to_string()]);
@@ -2843,9 +2910,63 @@ mod tests {
             generation: 9,
             ..Default::default()
         };
-        let e = apply_pushed_catalogs(&live, push).await.unwrap_err();
+        let e = apply_pushed_catalogs(&live, None, push).await.unwrap_err();
         assert!(e.contains("epoch 500") && e.contains("epoch 400"), "{e}");
         assert_eq!(live.generation(), 0);
+    }
+
+    /// Round 5: a coordinator restarted at the same address (new epoch)
+    /// that pushes before this worker processed its heartbeat is accepted:
+    /// one pull reaches it and follows its epoch. A push from an old
+    /// coordinator stays refused, since the pull reaches the live one.
+    #[tokio::test]
+    async fn a_push_from_a_restarted_coordinator_is_checked_with_a_pull() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let live = empty_live();
+        live.heartbeat_epoch(400);
+        let lake = serde_json::json!({"name": "lake", "type": "mysql"});
+        // What the coordinator's address serves: the restarted one.
+        let served = arneb_rpc::CatalogSet {
+            epoch: 500,
+            generation: 2,
+            catalogs: vec![lake.clone()],
+            ..Default::default()
+        };
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let (n, target, set) = (fetches.clone(), live.clone(), served.clone());
+        let puller = catalogs::CatalogPuller::new(live.clone(), move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            let (live, set) = (target.clone(), set.clone());
+            Box::pin(async move {
+                live.observe_epoch(set.epoch, tokio::time::Instant::now());
+                live.apply_remote(set).await;
+                Ok(())
+            })
+        });
+        let push = arneb_rpc::CatalogSet {
+            epoch: 500,
+            generation: 2,
+            catalogs: vec![lake],
+            ..Default::default()
+        };
+        let failed = apply_pushed_catalogs(&live, Some(&puller), push)
+            .await
+            .unwrap();
+        assert_eq!(failed, vec!["lake".to_string()], "mysql does not build");
+        assert_eq!(live.version(), (500, 2));
+        assert_eq!(live.current_epoch(), 500);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        // The old coordinator's delayed push: the pull reaches the live one.
+        let zombie = arneb_rpc::CatalogSet {
+            epoch: 400,
+            generation: 9,
+            ..Default::default()
+        };
+        let e = apply_pushed_catalogs(&live, Some(&puller), zombie)
+            .await
+            .unwrap_err();
+        assert!(e.contains("epoch 400") && e.contains("epoch 500"), "{e}");
+        assert_eq!(live.version(), (500, 2));
     }
 
     /// Which `tracing` target an [`enabled`] probe checks.

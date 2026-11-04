@@ -108,10 +108,13 @@ it needs a restart, and a bad value stops startup with a message naming it.
      other tokens) is refused.
   4. Any other token (Entra ID, Okta and most IdPs send header `typ: JWT`
      and no payload `typ`) may be an ID token when it has a `nonce` or
-     `at_hash`, or no `scope` / `scp` claim at all (an ID token from a
+     `at_hash`, or no scope at all (no `scope` / `scp`, or one that is
+     empty, `null` or not a string or string array; an ID token from a
      refresh grant carries neither `nonce` nor scope). Such a token is
-     refused when `required_scopes` is empty, and otherwise accepted only
-     with every required scope, which an ID token never carries.
+     accepted only with every required scope, which an ID token never
+     carries; otherwise (and always when `required_scopes` is empty) it is
+     refused as an ID token, with `401` `invalid_token`, never a `403`,
+     so the client discards it instead of asking for more scope.
 
   Before that, a sender-constrained token is refused whatever its type:
   one with a `cnf` claim (RFC 7800: a DPoP key thumbprint `jkt`, an mTLS
@@ -179,6 +182,8 @@ Design decisions you should know about:
 
   A refused address answers `403 forbidden` ("the identity's email
   address is not verified" when not verified), even if that user exists.
+  The required scopes are checked first, so a token lacking one gets the
+  `insufficient_scope` `403` rather than an email message.
   An IdP that never sends `email_verified` (Entra ID, for one) cannot be
   used with `email`. For an address under another claim (`sub` included),
   `allow_missing_email_verified = true` accepts a token with no `email` or

@@ -375,24 +375,35 @@ impl OAuthValidator {
         if is_sender_constrained(header.typ.as_deref(), &claims) {
             return Err(OAuthReject::Invalid("sender_constrained"));
         }
+        // One parsed scope list decides both what the token is and what it
+        // may do.
+        let scopes = token_scopes(&claims);
         // The IdP also signs OIDC ID tokens, for the same issuer and
-        // possibly the same audience: refuse what may be one.
+        // possibly the same audience: refuse what may be one. This comes
+        // before every 403 (scope, email), so an ID token is always a 401
+        // `invalid_token` that the client discards, never a step-up.
         match token_kind(header.typ.as_deref(), &claims) {
             TokenKind::Access => {}
             TokenKind::NotAccess => return Err(OAuthReject::Invalid("id_token")),
-            // Unmarked and ID-token-like: only a required scope, which an
-            // ID token never carries, can vouch for it (checked below).
-            TokenKind::Unmarked if may_be_id_token(&claims) => {
-                if settings.required_scopes.is_empty() {
+            // Unmarked and ID-token-like: only every required scope, which
+            // an ID token never carries, vouches for it.
+            TokenKind::Unmarked if may_be_id_token(&claims, &scopes) => {
+                if settings.required_scopes.is_empty()
+                    || !has_scopes(&scopes, &settings.required_scopes)
+                {
                     return Err(OAuthReject::Invalid("id_token"));
                 }
             }
             TokenKind::Unmarked => {}
         }
-        self.principal(&claims)
+        self.principal(&claims, scopes)
     }
 
-    fn principal(&self, claims: &serde_json::Value) -> Result<OAuthPrincipal, OAuthReject> {
+    fn principal(
+        &self,
+        claims: &serde_json::Value,
+        scopes: Vec<String>,
+    ) -> Result<OAuthPrincipal, OAuthReject> {
         let settings = &self.inner.settings;
         let user = claims
             .get(&settings.user_claim)
@@ -400,27 +411,12 @@ impl OAuthValidator {
             .filter(|s| !s.is_empty())
             .ok_or(OAuthReject::Invalid("no_user_claim"))?
             .to_owned();
-        check_email(settings, claims, &user)?;
-        let mut scopes: Vec<String> = Vec::new();
-        if let Some(s) = claims.get("scope").and_then(|v| v.as_str()) {
-            scopes.extend(s.split_whitespace().map(str::to_owned));
-        }
-        match claims.get("scp") {
-            Some(serde_json::Value::Array(a)) => {
-                scopes.extend(a.iter().filter_map(|v| v.as_str()).map(str::to_owned));
-            }
-            Some(serde_json::Value::String(s)) => {
-                scopes.extend(s.split_whitespace().map(str::to_owned));
-            }
-            _ => {}
-        }
-        if !settings
-            .required_scopes
-            .iter()
-            .all(|r| scopes.iter().any(|s| s == r))
-        {
+        // The scope first: an email refusal is about the identity, and
+        // should not mask a token the client can fix by stepping up.
+        if !has_scopes(&scopes, &settings.required_scopes) {
             return Err(OAuthReject::InsufficientScope);
         }
+        check_email(settings, claims, &user)?;
         let expires_at_ms = claims
             .get("exp")
             .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
@@ -800,13 +796,37 @@ fn token_kind(header_typ: Option<&str>, claims: &serde_json::Value) -> TokenKind
 }
 
 /// An unmarked token that may be an OIDC ID token: it has `nonce` or
-/// `at_hash` (OIDC Core 2 and 3.1.3.6), or no `scope` / `scp` at all. ID
-/// tokens carry no scope, and one from a refresh grant has no `nonce`
-/// either, so a missing scope is the only sign it gives.
-fn may_be_id_token(claims: &serde_json::Value) -> bool {
-    claims.get("nonce").is_some()
-        || claims.get("at_hash").is_some()
-        || (claims.get("scope").is_none() && claims.get("scp").is_none())
+/// `at_hash` (OIDC Core 2 and 3.1.3.6), or no scope at all (`scopes` as
+/// [`token_scopes`] parses them, so a `null`, empty or non-string scope
+/// counts as none). ID tokens carry no scope, and one from a refresh grant
+/// has no `nonce` either, so a missing scope is the only sign it gives.
+fn may_be_id_token(claims: &serde_json::Value, scopes: &[String]) -> bool {
+    claims.get("nonce").is_some() || claims.get("at_hash").is_some() || scopes.is_empty()
+}
+
+/// The token's scopes: `scope` (a space-separated string) and `scp` (an
+/// array of strings, or a space-separated string). Anything else is no
+/// scope.
+fn token_scopes(claims: &serde_json::Value) -> Vec<String> {
+    let mut scopes: Vec<String> = Vec::new();
+    if let Some(s) = claims.get("scope").and_then(|v| v.as_str()) {
+        scopes.extend(s.split_whitespace().map(str::to_owned));
+    }
+    match claims.get("scp") {
+        Some(serde_json::Value::Array(a)) => {
+            scopes.extend(a.iter().filter_map(|v| v.as_str()).map(str::to_owned));
+        }
+        Some(serde_json::Value::String(s)) => {
+            scopes.extend(s.split_whitespace().map(str::to_owned));
+        }
+        _ => {}
+    }
+    scopes
+}
+
+/// `scopes` holds every one of `required`.
+fn has_scopes(scopes: &[String], required: &[String]) -> bool {
+    required.iter().all(|r| scopes.iter().any(|s| s == r))
 }
 
 enum Lookup {
@@ -1468,6 +1488,14 @@ mod tests {
         );
         c["scope"] = json!("openid arneb");
         v.validate(&key.sign(&c)).await.unwrap();
+        // The scope is checked before the address: an unverified one does
+        // not mask the missing scope the client can fix.
+        c["scope"] = json!("openid");
+        c["sub"] = json!("alice@corp.example");
+        assert_eq!(
+            v.validate(&key.sign(&c)).await.unwrap_err(),
+            OAuthReject::InsufficientScope
+        );
     }
 
     #[tokio::test]
@@ -1969,15 +1997,41 @@ mod tests {
         let idp = TestIdp::start(&[&key]).await;
         let v = validator(&idp, |s| s.required_scopes = vec!["arneb".into()]);
         let iss = idp.issuer();
-        // An ID token (no scope), with or without nonce: never accepted.
+        // An ID token (no scope), with or without nonce: never accepted,
+        // and a 401 `invalid_token` (not a 403 step-up), even when its
+        // address is unverified or another `email` (checks that would be
+        // a 403).
         let mut refreshed = claims(&iss, AUD);
         refreshed.as_object_mut().unwrap().remove("scope");
         let mut code_flow = refreshed.clone();
         code_flow["nonce"] = json!("n-0S6");
-        for c in [&refreshed, &code_flow] {
+        let mut unverified = code_flow.clone();
+        unverified["sub"] = json!("alice@corp.example");
+        unverified["email"] = json!("other@corp.example");
+        unverified["email_verified"] = json!(true);
+        // A scope that does not parse is no scope; a nonce-bearing token
+        // with only other scopes is no better.
+        let mut null_scope = refreshed.clone();
+        null_scope["scope"] = json!(null);
+        let mut array_scope = refreshed.clone();
+        array_scope["scope"] = json!(["arneb"]);
+        let mut empty_scope = refreshed.clone();
+        empty_scope["scope"] = json!("");
+        let mut other_scope = code_flow.clone();
+        other_scope["scope"] = json!("openid profile");
+        for (what, c) in [
+            ("refreshed", &refreshed),
+            ("code_flow", &code_flow),
+            ("unverified", &unverified),
+            ("null_scope", &null_scope),
+            ("array_scope", &array_scope),
+            ("empty_scope", &empty_scope),
+            ("other_scope", &other_scope),
+        ] {
             assert_eq!(
                 v.validate(&key.sign(c)).await.unwrap_err(),
-                OAuthReject::InsufficientScope
+                OAuthReject::Invalid("id_token"),
+                "{what}"
             );
         }
         // An unmarked access token carrying a nonce passes once it carries

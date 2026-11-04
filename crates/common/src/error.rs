@@ -176,6 +176,12 @@ pub enum PlanError {
         location: Option<Location>,
     },
 
+    /// A source the query reads could not be asked about a table (e.g. its
+    /// metastore is unreachable). Not a missing table and not an engine
+    /// bug: clients see it as an external failure to retry.
+    #[error("source unavailable: {0}")]
+    SourceUnavailable(String),
+
     /// An internal planner invariant was violated. These errors carry no
     /// location because they point at engine-internal state rather than
     /// user SQL.
@@ -199,6 +205,7 @@ impl PlanError {
             | PlanError::ParameterTypeConflict { location, .. } => *location,
             PlanError::TableNotFound(_)
             | PlanError::AccessDenied(_)
+            | PlanError::SourceUnavailable(_)
             | PlanError::InternalError(_) => None,
         }
     }

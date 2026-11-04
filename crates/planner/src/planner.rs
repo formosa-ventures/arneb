@@ -1614,10 +1614,9 @@ impl<'a> QueryPlanner<'a> {
                         .await
                         .map_err(|e| match e {
                             CatalogError::AccessDenied(denial) => PlanError::AccessDenied(denial),
-                            // An outage is not a missing table.
-                            e @ CatalogError::Unavailable(_) => {
-                                PlanError::InternalError(e.to_string())
-                            }
+                            // An outage is neither a missing table nor an
+                            // engine bug.
+                            CatalogError::Unavailable(why) => PlanError::SourceUnavailable(why),
                             _ => PlanError::TableNotFound(name.to_string()),
                         })?;
                 let schema = table_provider.schema();

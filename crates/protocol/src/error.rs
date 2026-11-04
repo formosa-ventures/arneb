@@ -42,6 +42,10 @@ pub fn arneb_error_to_pg_error_with_source(
                     "42601"
                 }
                 PlanError::InternalError(_) => "XX000",
+                // io_error, class 58 ("system error", external to the
+                // server): retryable, and not 08xxx, which drivers read as
+                // the client connection itself having failed.
+                PlanError::SourceUnavailable(_) => "58030",
                 _ => "42P01",
             };
             let message = match source {
@@ -57,6 +61,9 @@ pub fn arneb_error_to_pg_error_with_source(
         ArnebError::Connector(e) => ("58030".to_string(), e.to_string()),
         ArnebError::Catalog(e @ arneb_common::error::CatalogError::AccessDenied(_)) => {
             ("42501".to_string(), e.to_string())
+        }
+        ArnebError::Catalog(e @ arneb_common::error::CatalogError::Unavailable(_)) => {
+            ("58030".to_string(), e.to_string())
         }
         ArnebError::Catalog(e) => ("3D000".to_string(), e.to_string()),
         ArnebError::Config(e) => ("F0000".to_string(), e.to_string()),
@@ -160,6 +167,25 @@ mod tests {
                 assert!(info.message.contains("mycat"));
             }
             _ => panic!("expected UserError"),
+        }
+    }
+
+    /// An unreachable source is SQLSTATE 58030 (io_error), from the
+    /// planner or straight from the catalog: not XX000 (an engine bug) nor
+    /// 3D000 (no such catalog).
+    #[test]
+    fn an_unreachable_source_maps_to_58030() {
+        for err in [
+            ArnebError::Plan(PlanError::SourceUnavailable("metastore down".into())),
+            ArnebError::Catalog(CatalogError::Unavailable("metastore down".into())),
+        ] {
+            match arneb_error_to_pg_error(&err) {
+                PgWireError::UserError(info) => {
+                    assert_eq!(info.code, "58030", "{err}");
+                    assert!(info.message.contains("metastore down"));
+                }
+                _ => panic!("expected UserError"),
+            }
         }
     }
 }

@@ -254,3 +254,26 @@ async fn a_name_denied_as_written_is_never_loaded() {
     plan(&alice, "SELECT * FROM pg.public.open").await.unwrap();
     assert!(counts.loads.load(Ordering::SeqCst) > 0);
 }
+
+/// A source that can't be asked fails planning as `SourceUnavailable`,
+/// which clients see as an external error, not a missing table or a
+/// planner bug.
+#[tokio::test]
+async fn an_unreachable_source_is_not_a_planner_error() {
+    let root = CatalogManager::new("lake", "sales");
+    root.register_catalog(
+        "lake",
+        Arc::new(arneb_catalog::conformance::Unreachable {
+            cached: vec!["sales".into()],
+        }),
+    );
+    let stmt = arneb_sql_parser::parse("SELECT * FROM lake.sales.orders").unwrap();
+    let err = QueryPlanner::new(&root)
+        .plan_statement(&stmt)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, arneb_common::error::PlanError::SourceUnavailable(_)),
+        "{err}"
+    );
+}

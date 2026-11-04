@@ -23,6 +23,11 @@ const USER_ERROR: &str = "USER_ERROR";
 const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
 const INSUFFICIENT_RESOURCES: &str = "INSUFFICIENT_RESOURCES";
 const EXTERNAL: &str = "EXTERNAL";
+/// A source (metastore, remote database) that could not be asked: the
+/// connector error class Trino reports for metastore failures, so
+/// clients retry it as `EXTERNAL` rather than treat it as an engine bug
+/// or a missing object.
+const SOURCE_UNAVAILABLE: (i64, &str, &str) = (16777216, "CONNECTOR_ERROR", EXTERNAL);
 
 impl TrinoError {
     pub(crate) fn user(code: i64, name: &'static str, message: impl Into<String>) -> Self {
@@ -118,6 +123,7 @@ impl TrinoError {
                 PlanError::TypeMismatch { .. } => (58, "TYPE_MISMATCH", USER_ERROR),
                 PlanError::UnsupportedExpression { .. } => (13, "NOT_SUPPORTED", USER_ERROR),
                 PlanError::InternalError(_) => (65536, "GENERIC_INTERNAL_ERROR", INTERNAL_ERROR),
+                PlanError::SourceUnavailable(_) => SOURCE_UNAVAILABLE,
                 _ => (0, "GENERIC_USER_ERROR", USER_ERROR),
             },
             ArnebError::Catalog(e) => match e {
@@ -125,6 +131,7 @@ impl TrinoError {
                 CatalogError::SchemaNotFound(_) => (45, "SCHEMA_NOT_FOUND", USER_ERROR),
                 CatalogError::TableAlreadyExists(_) => (50, "TABLE_ALREADY_EXISTS", USER_ERROR),
                 CatalogError::AccessDenied(_) => (4, "PERMISSION_DENIED", USER_ERROR),
+                CatalogError::Unavailable(_) => SOURCE_UNAVAILABLE,
                 #[allow(unreachable_patterns)]
                 _ => (0, "GENERIC_USER_ERROR", USER_ERROR),
             },
@@ -135,7 +142,7 @@ impl TrinoError {
                 (13, "NOT_SUPPORTED", USER_ERROR)
             }
             // Trino reserves 0x0100_0000+ for connector-specific codes.
-            ArnebError::Connector(_) => (16777216, "CONNECTOR_ERROR", EXTERNAL),
+            ArnebError::Connector(_) => SOURCE_UNAVAILABLE,
             _ => (65536, "GENERIC_INTERNAL_ERROR", INTERNAL_ERROR),
         };
         let (location, candidates) = match err {
@@ -218,6 +225,23 @@ mod tests {
         );
         assert_eq!(e.name, "EXCEEDED_LOCAL_MEMORY_LIMIT");
         assert_eq!(e.message, "resource exhausted: query memory limit exceeded");
+    }
+
+    /// An unreachable source is `EXTERNAL`, from the planner or straight
+    /// from the catalog, never an internal error or a missing object.
+    #[test]
+    fn an_unreachable_source_is_external() {
+        for err in [
+            ArnebError::Plan(PlanError::SourceUnavailable("metastore down".into())),
+            ArnebError::Catalog(CatalogError::Unavailable("metastore down".into())),
+        ] {
+            let e = TrinoError::from_arneb(&err, None);
+            assert_eq!(
+                (e.code, e.name, e.kind),
+                (16777216, "CONNECTOR_ERROR", "EXTERNAL"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

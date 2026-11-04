@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hive_metastore::{
-    ColumnStatisticsData, Database, GetTableRequest, PartitionsRequest, TableStatsRequest,
-    ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
-    ThriftHiveMetastoreGetDatabaseException, ThriftHiveMetastoreGetTableReqException,
+    ColumnStatisticsData, Database, GetTableRequest, MetaException, PartitionsRequest,
+    TableStatsRequest, ThriftHiveMetastoreClient, ThriftHiveMetastoreClientBuilder,
+    ThriftHiveMetastoreGetAllTablesException, ThriftHiveMetastoreGetDatabaseException,
+    ThriftHiveMetastoreGetPartitionsReqException, ThriftHiveMetastoreGetTableReqException,
 };
 use pilota::FastStr;
 use tracing::{debug, warn};
@@ -143,9 +144,14 @@ impl HmsClient {
     /// that it does not exist. HMS normalizes the identifier it is given
     /// (trims and lowercases it, and reads a leading `@catalog#db` as a
     /// catalog-qualified name), so the returned name can differ from
-    /// `name`. Any other failure (transport, timeout, `MetaException`) is
-    /// an error, never "missing".
+    /// `name`. A malformed `@` name, and an authorization plugin's refusal
+    /// (see [`is_authorization_denial`]), also read as `None`. Any other
+    /// failure (transport, timeout, other `MetaException`) is an error,
+    /// never "missing", for `@catalog#db` names too.
     pub async fn get_database(&self, name: &str) -> Result<Option<Database>, ConnectorError> {
+        if name.starts_with('@') && !well_formed_catalog_qualified(name) {
+            return Ok(None);
+        }
         // The plain call, not `get_database_req`: HMS resolves the default
         // catalog for it exactly as it does for `get_all_tables`, which
         // this schema then lists with.
@@ -159,9 +165,12 @@ impl HmsClient {
         match result {
             MaybeException::Ok(db) => Ok(Some(db)),
             MaybeException::Exception(ThriftHiveMetastoreGetDatabaseException::O1(_)) => Ok(None),
-            // HMS parses a leading `@` as `@catalog#db` and answers a
-            // malformed one with `MetaException`: that name names nothing.
-            MaybeException::Exception(_) if name.starts_with('@') => Ok(None),
+            MaybeException::Exception(ThriftHiveMetastoreGetDatabaseException::O2(ex))
+                if is_authorization_denial(&ex) =>
+            {
+                debug!("HMS refused get_database({name}): {ex:?}");
+                Ok(None)
+            }
             MaybeException::Exception(ex) => Err(ConnectorError::ConnectionFailed(format!(
                 "HMS get_database({name}) exception: {ex:?}"
             ))),
@@ -180,6 +189,13 @@ impl HmsClient {
 
         match result {
             MaybeException::Ok(tables) => Ok(tables.into_iter().map(|s| s.to_string()).collect()),
+            // Refused by an authorization plugin: nothing this user may see.
+            MaybeException::Exception(ThriftHiveMetastoreGetAllTablesException::O1(ex))
+                if is_authorization_denial(&ex) =>
+            {
+                debug!("HMS refused get_all_tables({db}): {ex:?}");
+                Ok(Vec::new())
+            }
             MaybeException::Exception(ex) => Err(ConnectorError::ConnectionFailed(format!(
                 "HMS get_all_tables({db}) exception: {ex:?}"
             ))),
@@ -216,8 +232,15 @@ impl HmsClient {
                     "HMS get_table_req({db}.{table}): {ex:?}"
                 )));
             }
-            // `MetaException`: HMS failed to answer, which is not a
-            // missing table.
+            MaybeException::Exception(ThriftHiveMetastoreGetTableReqException::O1(ex))
+                if is_authorization_denial(&ex) =>
+            {
+                return Err(ConnectorError::TableNotFound(format!(
+                    "HMS refused get_table_req({db}.{table}): {ex:?}"
+                )));
+            }
+            // Any other `MetaException`: HMS failed to answer, which is
+            // not a missing table.
             MaybeException::Exception(ex) => {
                 return Err(ConnectorError::ConnectionFailed(format!(
                     "HMS get_table_req({db}.{table}) exception: {ex:?}"
@@ -320,10 +343,25 @@ impl HmsClient {
                 "HMS get_partitions_req({db}.{table}) failed: {e}"
             ))
         })?;
+        // Classified as `get_table` is: the table dropped since (or a
+        // refusal) reads as missing, any other failure is an outage, never
+        // a missing table.
         let partitions = match result {
             MaybeException::Ok(resp) => resp.partitions,
+            MaybeException::Exception(ThriftHiveMetastoreGetPartitionsReqException::O1(ex)) => {
+                return Err(ConnectorError::TableNotFound(format!(
+                    "HMS get_partitions_req({db}.{table}): {ex:?}"
+                )));
+            }
+            MaybeException::Exception(ThriftHiveMetastoreGetPartitionsReqException::O2(ex))
+                if is_authorization_denial(&ex) =>
+            {
+                return Err(ConnectorError::TableNotFound(format!(
+                    "HMS refused get_partitions_req({db}.{table}): {ex:?}"
+                )));
+            }
             MaybeException::Exception(ex) => {
-                return Err(ConnectorError::ReadError(format!(
+                return Err(ConnectorError::ConnectionFailed(format!(
                     "HMS get_partitions_req({db}.{table}) exception: {ex:?}"
                 )));
             }
@@ -799,6 +837,52 @@ impl HiveSchemaProvider {
 // ---------------------------------------------------------------------------
 // HiveTableProvider
 // ---------------------------------------------------------------------------
+
+/// Whether a `MetaException` is an HMS authorization plugin refusing the
+/// request (Apache Ranger, storage-based or SQL-standard authorization)
+/// rather than HMS failing to answer. Such an object reads as missing to
+/// this user, as it did before outages were told apart from missing
+/// objects; any other `MetaException` (a backing-database failure, ...)
+/// is an outage.
+///
+/// HMS has no typed exception for a refusal, so it is recognized by the
+/// plugins' message prefixes, kept narrow on purpose: a refusal worded
+/// otherwise reads as an outage (the statement fails loudly, nothing is
+/// read), and only an outage whose message carries one of these prefixes
+/// would read as missing.
+fn is_authorization_denial(ex: &MetaException) -> bool {
+    let Some(message) = &ex.message else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    [
+        // Ranger: `Permission denied: user [alice] does not have [SELECT]
+        // privilege on [db]`; HDFS/storage-based: `Permission denied:
+        // user=alice, access=READ, ...`.
+        "permission denied: user",
+        // SQL-standard authorization: `Permission denied: Principal
+        // [name=alice, type=USER] does not have following privileges ...`.
+        "permission denied: principal",
+        // The exception class names, when a plugin's message carries them.
+        "accesscontrolexception",
+        "authorizationexception",
+    ]
+    .iter()
+    .any(|prefix| message.contains(prefix))
+}
+
+/// Whether an `@`-prefixed database name is one HMS reads as
+/// `@catalog#db` with both parts present. HMS rejects any other `@` name
+/// with a `MetaException` (no `#`), or reads a trailing `#` / `!` as a
+/// null / empty database: such a name names nothing, so it is answered
+/// locally and every exception HMS raises for a well-formed one keeps its
+/// meaning (missing, refused, or an outage).
+fn well_formed_catalog_qualified(name: &str) -> bool {
+    let Some((catalog, db)) = name.strip_prefix('@').and_then(|n| n.split_once('#')) else {
+        return false;
+    };
+    !catalog.is_empty() && !db.is_empty() && !name.ends_with('!')
+}
 
 /// The stored name of a database HMS returned; `None` (refused) when HMS
 /// leaves it out, rather than guessing at its normalization.
@@ -1331,6 +1415,53 @@ mod tests {
             .unwrap()
             .insert("TPCH".into(), ("tpch".into(), stale));
         assert!(provider.try_schema("TPCH").await.is_err());
+    }
+
+    /// Only an authorization plugin's refusal reads as missing; any other
+    /// `MetaException` is an outage.
+    #[test]
+    fn only_authorization_refusals_read_as_missing() {
+        let meta = |m: &str| MetaException {
+            message: Some(FastStr::from(m.to_string())),
+        };
+        for refused in [
+            "Permission denied: user [alice] does not have [SELECT] privilege on [restricted]",
+            "Permission denied: Principal [name=alice, type=USER] does not have following \
+             privileges for operation QUERY",
+            "java.security.AccessControlException: Permission denied: user=alice, access=READ",
+            "org.apache.hadoop.hive.ql.security.authorization.plugin.HiveAccessControlException",
+        ] {
+            assert!(is_authorization_denial(&meta(refused)), "{refused}");
+        }
+        for outage in [
+            "Unable to fetch database: org.postgresql.util.PSQLException: Connection refused",
+            "javax.jdo.JDOFatalDataStoreException: Communications link failure",
+            "ERROR: permission denied for table DBS",
+            "",
+        ] {
+            assert!(!is_authorization_denial(&meta(outage)), "{outage}");
+        }
+        assert!(!is_authorization_denial(&MetaException { message: None }));
+    }
+
+    /// A malformed `@` name is missing without asking HMS (the metastore
+    /// here is unreachable); a well-formed one is asked, so an outage on
+    /// it is an error, not a missing database.
+    #[tokio::test]
+    async fn catalog_qualified_names_are_missing_only_when_malformed() {
+        for malformed in ["@", "@x", "@#", "@#db", "@hive#", "@hive#!"] {
+            assert!(!well_formed_catalog_qualified(malformed), "{malformed:?}");
+        }
+        assert!(well_formed_catalog_qualified("@hive#sales"));
+        let provider = unreachable_provider();
+        for malformed in ["@", "@x", "@hive#"] {
+            assert!(
+                provider.try_schema(malformed).await.unwrap().is_none(),
+                "{malformed:?}"
+            );
+        }
+        let err = provider.try_schema("@hive#sales").await.unwrap_err();
+        assert!(matches!(err, CatalogError::Unavailable(_)), "{err}");
     }
 
     /// `@catalog#db` is served only when HMS puts it in the same catalog as

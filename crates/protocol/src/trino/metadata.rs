@@ -46,22 +46,38 @@ pub(crate) fn catalog_names(cm: &CatalogManager) -> Vec<String> {
     names
 }
 
-/// Schemas of a catalog, including the virtual `information_schema`.
-pub(crate) async fn schema_names(cm: &CatalogManager, catalog: &str) -> Option<Vec<String>> {
+/// Schemas of a catalog, including the virtual `information_schema`;
+/// `Ok(None)` for a missing or hidden catalog, `Err` when the source could
+/// not be asked for its schemas.
+pub(crate) async fn schema_names(
+    cm: &CatalogManager,
+    catalog: &str,
+) -> Result<Option<Vec<String>>, CatalogError> {
     let mut names = if catalog == SYSTEM_CATALOG && cm.catalog(catalog).is_none() {
         vec!["jdbc".to_string(), "metadata".to_string()]
     } else {
-        cm.catalog(catalog)?;
-        if !cm.catalog_visible(catalog) {
-            return None;
+        if cm.catalog(catalog).is_none() || !cm.catalog_visible(catalog) {
+            return Ok(None);
         }
-        cm.visible_schema_names(catalog).await
+        cm.try_visible_schema_names(catalog).await?
     };
     if !names.iter().any(|n| n == INFORMATION_SCHEMA) {
         names.push(INFORMATION_SCHEMA.to_string());
     }
     names.sort();
-    Some(names)
+    Ok(Some(names))
+}
+
+/// [`schema_names`] for the virtual metadata tables, which list what they
+/// can: a catalog whose source can't be asked lists no schemas (logged).
+async fn listed_schema_names(cm: &CatalogManager, catalog: &str) -> Vec<String> {
+    match schema_names(cm, catalog).await {
+        Ok(names) => names.unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("listing schemas of {catalog}: {e}");
+            Vec::new()
+        }
+    }
 }
 
 /// Tables of `catalog.schema` (virtual tables for the virtual schemas);
@@ -99,27 +115,31 @@ pub(crate) async fn table_names(
     if !cm.catalog_visible(catalog) || !cm.visible_schema_exists(catalog, schema).await? {
         return Ok(None);
     }
-    let mut names = cm.visible_table_names(catalog, schema).await;
+    let mut names = cm.try_visible_table_names(catalog, schema).await?;
     names.sort();
     Ok(Some(names))
 }
 
-/// Columns of a real table.
+/// Columns of a real table; `Ok(None)` when it is missing or may not be
+/// read, `Err` when the source could not be asked.
 pub(crate) async fn table_columns(
     cm: &CatalogManager,
     catalog: &str,
     schema: &str,
     table: &str,
-) -> Option<Vec<ColumnInfo>> {
-    let provider = cm
+) -> Result<Option<Vec<ColumnInfo>>, CatalogError> {
+    let resolved = cm
         .resolve_table(&TableReference {
             catalog: Some(catalog.to_string()),
             schema: Some(schema.to_string()),
             table: table.to_string(),
         })
-        .await
-        .ok()?;
-    Some(provider.schema())
+        .await;
+    match resolved {
+        Ok(provider) => Ok(Some(provider.schema())),
+        Err(e @ CatalogError::Unavailable(_)) => Err(e),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Does `sql` reference one of the virtual metadata schemas?
@@ -255,7 +275,7 @@ pub(crate) async fn build_virtual_catalogs(
         let in_catalog: Vec<&TableMeta> = tables.iter().filter(|t| &t.catalog == catalog).collect();
 
         let mut schemata = TableBuilder::new(&["catalog_name", "schema_name"]);
-        for schema in schema_names(root, catalog).await.unwrap_or_default() {
+        for schema in listed_schema_names(root, catalog).await {
             schemata.push(vec![s(catalog.clone()), s(schema)]);
         }
         info.register_table("schemata", schemata.into_memory_table());
@@ -354,7 +374,7 @@ async fn jdbc_schema(root: &CatalogManager, tables: &[TableMeta]) -> MemorySchem
 
     let mut schemas = TableBuilder::new(&["table_schem", "table_catalog"]);
     for c in catalog_names(root) {
-        for sc in schema_names(root, &c).await.unwrap_or_default() {
+        for sc in listed_schema_names(root, &c).await {
             schemas.push(vec![s(sc), s(c.clone())]);
         }
     }
@@ -618,41 +638,55 @@ mod tests {
         assert!(names.contains(&"columns".to_string()));
     }
 
-    /// `SHOW TABLES` on a source that can't be asked is an error, not a
-    /// missing schema.
+    /// `SHOW TABLES`, `SHOW SCHEMAS`/`USE`, and `SHOW COLUMNS`/`DESCRIBE`
+    /// on a source that can't be asked are errors, never a missing or
+    /// empty object, including for a schema still served from a name
+    /// cache (Hive keeps resolutions for 10 s).
     #[tokio::test]
-    async fn table_names_report_an_unreachable_source() {
-        use arneb_catalog::{CatalogProvider, SchemaProvider};
-        #[derive(Debug)]
-        struct Down;
-        #[async_trait::async_trait]
-        impl CatalogProvider for Down {
-            async fn schema_names(&self) -> Vec<String> {
-                Vec::new()
-            }
-            async fn schema(&self, _name: &str) -> Option<Arc<dyn SchemaProvider>> {
-                None
-            }
-            async fn try_schema(
-                &self,
-                _name: &str,
-            ) -> Result<Option<Arc<dyn SchemaProvider>>, CatalogError> {
-                Err(CatalogError::Unavailable("metastore down".into()))
-            }
-        }
+    async fn listings_report_an_unreachable_source() {
+        use arneb_catalog::conformance::Unreachable;
         let root = root();
-        root.register_catalog("down", Arc::new(Down));
-        assert!(matches!(
-            table_names(&root, "down", "sales").await,
-            Err(CatalogError::Unavailable(_))
-        ));
+        root.register_catalog("down", Arc::new(Unreachable::default()));
+        root.register_catalog(
+            "cached",
+            Arc::new(Unreachable {
+                cached: vec!["sales".into()],
+            }),
+        );
+        for catalog in ["down", "cached"] {
+            assert!(
+                matches!(
+                    table_names(&root, catalog, "sales").await,
+                    Err(CatalogError::Unavailable(_))
+                ),
+                "{catalog}"
+            );
+            assert!(
+                matches!(
+                    schema_names(&root, catalog).await,
+                    Err(CatalogError::Unavailable(_))
+                ),
+                "{catalog}"
+            );
+            assert!(
+                matches!(
+                    table_columns(&root, catalog, "sales", "orders").await,
+                    Err(CatalogError::Unavailable(_))
+                ),
+                "{catalog}"
+            );
+        }
         assert!(table_names(&root, "lake", "nope").await.unwrap().is_none());
+        assert!(table_columns(&root, "lake", "nope", "t")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
     async fn lists_schemas_with_information_schema() {
         let root = root();
-        let schemas = schema_names(&root, "lake").await.unwrap();
+        let schemas = schema_names(&root, "lake").await.unwrap().unwrap();
         assert_eq!(schemas, vec!["information_schema", "sales"]);
         assert_eq!(catalog_names(&root), vec!["lake", "system"]);
     }

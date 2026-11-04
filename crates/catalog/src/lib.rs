@@ -82,6 +82,13 @@ pub trait CatalogProvider: fmt::Debug + Send + Sync {
     ) -> Result<Option<Arc<dyn SchemaProvider>>, CatalogError> {
         Ok(self.schema(name).await)
     }
+
+    /// Like [`schema_names`](Self::schema_names), but `Err` when the source
+    /// could not be asked, so a listing that failed is not mistaken for an
+    /// empty catalog. Default: `schema_names`, which never fails.
+    async fn try_schema_names(&self) -> Result<Vec<String>, CatalogError> {
+        Ok(self.schema_names().await)
+    }
 }
 
 /// What [`SchemaProvider::table_if_allowed`] found under a name.
@@ -117,6 +124,13 @@ pub type TableGate<'a> = &'a (dyn Fn(&str, &str) -> bool + Send + Sync);
 pub trait SchemaProvider: fmt::Debug + Send + Sync {
     /// Returns the names of all tables in this schema.
     async fn table_names(&self) -> Vec<String>;
+
+    /// Like [`table_names`](Self::table_names), but `Err` when the source
+    /// could not be asked, so a listing that failed is not mistaken for an
+    /// empty schema. Default: `table_names`, which never fails.
+    async fn try_table_names(&self) -> Result<Vec<String>, CatalogError> {
+        Ok(self.table_names().await)
+    }
 
     /// Returns the table with the given name, or `None` if it does not exist.
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>>;
@@ -470,42 +484,70 @@ impl CatalogManager {
     }
 
     /// Schema names of `catalog` the session user may see; empty for an
-    /// unknown or hidden catalog.
+    /// unknown or hidden catalog, or (logged) when the source cannot be
+    /// reached. See [`try_visible_schema_names`](Self::try_visible_schema_names).
     pub async fn visible_schema_names(&self, catalog: &str) -> Vec<String> {
+        self.try_visible_schema_names(catalog)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("listing schemas of {catalog}: {e}");
+                Vec::new()
+            })
+    }
+
+    /// Like [`visible_schema_names`](Self::visible_schema_names), but `Err`
+    /// when the source could not be asked, so an outage is not mistaken
+    /// for an empty catalog.
+    pub async fn try_visible_schema_names(
+        &self,
+        catalog: &str,
+    ) -> Result<Vec<String>, CatalogError> {
         let Some(provider) = self.catalog(catalog) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let mut names = provider.schema_names().await;
+        let mut names = provider.try_schema_names().await?;
         if let Some(a) = &self.access {
             names.retain(|s| a.rules.schema_visible(&a.user, catalog, s));
         }
-        names
+        Ok(names)
     }
 
     /// Table names of `catalog.schema` the session user may see; empty for
-    /// an unknown or hidden schema, or when the source cannot be reached.
-    /// A schema the connector resolves to a differently-written stored name
-    /// is checked under both names.
+    /// an unknown or hidden schema, or (logged) when the source cannot be
+    /// reached. See [`try_visible_table_names`](Self::try_visible_table_names).
     pub async fn visible_table_names(&self, catalog: &str, schema: &str) -> Vec<String> {
-        if !self.schema_visible(catalog, schema) {
-            return Vec::new();
-        }
-        let (schema_provider, stored) = match self.lookup_schema(catalog, schema).await {
-            Ok(Some(found)) => found,
-            Ok(None) => return Vec::new(),
-            Err(e) => {
+        self.try_visible_table_names(catalog, schema)
+            .await
+            .unwrap_or_else(|e| {
                 tracing::warn!("listing tables of {catalog}.{schema}: {e}");
-                return Vec::new();
-            }
+                Vec::new()
+            })
+    }
+
+    /// Like [`visible_table_names`](Self::visible_table_names), but `Err`
+    /// when the source could not be asked, either for the schema or for
+    /// its tables, so an outage is not mistaken for an empty schema. A
+    /// schema the connector resolves to a differently-written stored name
+    /// is checked under both names.
+    pub async fn try_visible_table_names(
+        &self,
+        catalog: &str,
+        schema: &str,
+    ) -> Result<Vec<String>, CatalogError> {
+        if !self.schema_visible(catalog, schema) {
+            return Ok(Vec::new());
+        }
+        let Some((schema_provider, stored)) = self.lookup_schema(catalog, schema).await? else {
+            return Ok(Vec::new());
         };
-        let mut names = schema_provider.table_names().await;
+        let mut names = schema_provider.try_table_names().await?;
         if let Some(a) = &self.access {
             names.retain(|t| {
                 a.rules.table_visible(&a.user, catalog, schema, t)
                     && a.rules.table_visible(&a.user, catalog, &stored, t)
             });
         }
-        names
+        Ok(names)
     }
 
     /// Whether `catalog.schema` exists and the session user may see it,
@@ -549,7 +591,14 @@ impl CatalogManager {
             // The provider claims it answers only to its stored name: hold
             // it to that, so a loose connector that reports no stored name
             // fails closed.
-            None if provider.schema_names().await.iter().any(|s| s == schema) => schema.to_string(),
+            None if provider
+                .try_schema_names()
+                .await?
+                .iter()
+                .any(|s| s == schema) =>
+            {
+                schema.to_string()
+            }
             None => return Ok(None),
         };
         Ok(a.rules
@@ -758,7 +807,12 @@ impl CatalogManager {
         let (stored_schema, stored_table) = match table.canonical_name() {
             Some(identity) => identity,
             // Found by its exact name, the provider claims: hold it to that.
-            None if schema.table_names().await.iter().any(|t| t == table_name) => {
+            None if schema
+                .try_table_names()
+                .await?
+                .iter()
+                .any(|t| t == table_name) =>
+            {
                 (stored_schema, table_name.clone())
             }
             None => return Err(not_found()),
@@ -1400,25 +1454,8 @@ mod tests {
     /// fail instead of falling back to another schema.
     #[tokio::test]
     async fn an_unreachable_source_is_not_a_missing_schema() {
-        #[derive(Debug)]
-        struct Down;
-        #[async_trait]
-        impl CatalogProvider for Down {
-            async fn schema_names(&self) -> Vec<String> {
-                Vec::new()
-            }
-            async fn schema(&self, _name: &str) -> Option<Arc<dyn SchemaProvider>> {
-                None
-            }
-            async fn try_schema(
-                &self,
-                _name: &str,
-            ) -> Result<Option<Arc<dyn SchemaProvider>>, CatalogError> {
-                Err(CatalogError::Unavailable("metastore down".into()))
-            }
-        }
         let root = CatalogManager::new("lake", "sales");
-        root.register_catalog("lake", Arc::new(Down));
+        root.register_catalog("lake", Arc::new(conformance::Unreachable::default()));
         let rules = r#"{"tables": [{"privileges": ["SELECT"]}]}"#;
         let alice = root.with_access("alice", Arc::new(AccessRules::from_json(rules).unwrap()));
         for manager in [&root, &alice] {
@@ -1435,56 +1472,53 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, CatalogError::Unavailable(_)), "{err}");
+            assert!(matches!(
+                manager.try_visible_table_names("lake", "sales").await,
+                Err(CatalogError::Unavailable(_))
+            ));
+            assert!(matches!(
+                manager.try_visible_schema_names("lake").await,
+                Err(CatalogError::Unavailable(_))
+            ));
+            // The lenient listings show nothing (and log it).
             assert!(manager
                 .visible_table_names("lake", "sales")
                 .await
                 .is_empty());
         }
-        assert!(conformance::check_name_resolution(&Down).await.is_err());
+        let err = conformance::check_name_resolution(&conformance::Unreachable::default())
+            .await
+            .unwrap_err();
+        assert!(err.contains("metastore down"), "{err}");
     }
 
-    /// A table lookup that fails to reach the source is `Unavailable`,
-    /// not a missing table, with or without rules; the conformance check
-    /// fails rather than passing on it.
+    /// A schema that still resolves during an outage (as Hive's name cache
+    /// serves it) reports the outage when its tables are listed or loaded,
+    /// never an empty schema or a missing table, with or without rules;
+    /// the conformance check fails rather than passing on it.
     #[tokio::test]
-    async fn an_unreachable_source_during_table_load_is_not_a_missing_table() {
-        #[derive(Debug)]
-        struct Flaky;
-        #[async_trait]
-        impl SchemaProvider for Flaky {
-            async fn table_names(&self) -> Vec<String> {
-                vec!["orders".into()]
-            }
-            async fn table(&self, _name: &str) -> Option<Arc<dyn TableProvider>> {
-                None
-            }
-            async fn table_if_allowed(
-                &self,
-                _name: &str,
-                _allowed: TableGate<'_>,
-            ) -> Result<TableLookup, CatalogError> {
-                Err(CatalogError::Unavailable("metastore down".into()))
-            }
-            fn canonical_name(&self) -> Option<String> {
-                Some("sales".into())
-            }
-        }
-        #[derive(Debug)]
-        struct FlakyCatalog;
-        #[async_trait]
-        impl CatalogProvider for FlakyCatalog {
-            async fn schema_names(&self) -> Vec<String> {
-                vec!["sales".into()]
-            }
-            async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-                (name == "sales").then(|| Arc::new(Flaky) as Arc<dyn SchemaProvider>)
-            }
-        }
+    async fn an_unreachable_source_behind_a_cached_schema_is_not_empty_or_missing() {
+        let lake = conformance::Unreachable {
+            cached: vec!["sales".into()],
+        };
         let root = CatalogManager::new("lake", "sales");
-        root.register_catalog("lake", Arc::new(FlakyCatalog));
+        root.register_catalog(
+            "lake",
+            Arc::new(conformance::Unreachable {
+                cached: vec!["sales".into()],
+            }),
+        );
         let rules = r#"{"tables": [{"privileges": ["SELECT"]}]}"#;
         let alice = root.with_access("alice", Arc::new(AccessRules::from_json(rules).unwrap()));
         for manager in [&root, &alice] {
+            assert!(manager
+                .visible_schema_exists("lake", "sales")
+                .await
+                .unwrap());
+            assert!(matches!(
+                manager.try_visible_table_names("lake", "sales").await,
+                Err(CatalogError::Unavailable(_))
+            ));
             let err = manager
                 .resolve_table(&TableReference {
                     catalog: Some("lake".into()),
@@ -1495,10 +1529,17 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, CatalogError::Unavailable(_)), "{err}");
         }
-        let err = conformance::check_name_resolution(&FlakyCatalog)
-            .await
-            .unwrap_err();
+        let err = conformance::check_name_resolution(&lake).await.unwrap_err();
         assert!(err.contains("metastore down"), "{err}");
+    }
+
+    /// A catalog that is legitimately empty passes the conformance check;
+    /// only one that can't be asked fails it.
+    #[tokio::test]
+    async fn the_conformance_check_passes_an_empty_catalog() {
+        conformance::check_name_resolution(&MemoryCatalog::new())
+            .await
+            .unwrap();
     }
 
     /// The connector is asked, before it loads a table, whether the

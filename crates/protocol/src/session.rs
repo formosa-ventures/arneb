@@ -227,27 +227,11 @@ mod tests {
     /// and falling back to the default schema.
     #[tokio::test]
     async fn set_fails_when_a_schema_lookup_fails() {
-        use arneb_catalog::{CatalogProvider, SchemaProvider};
-
-        #[derive(Debug)]
-        struct Down;
-        #[async_trait::async_trait]
-        impl CatalogProvider for Down {
-            async fn schema_names(&self) -> Vec<String> {
-                Vec::new()
-            }
-            async fn schema(&self, _name: &str) -> Option<Arc<dyn SchemaProvider>> {
-                None
-            }
-            async fn try_schema(
-                &self,
-                _name: &str,
-            ) -> Result<Option<Arc<dyn SchemaProvider>>, CatalogError> {
-                Err(CatalogError::Unavailable("metastore down".into()))
-            }
-        }
         let root = Arc::new(CatalogManager::new("lake", "default"));
-        root.register_catalog("lake", Arc::new(Down));
+        root.register_catalog(
+            "lake",
+            Arc::new(arneb_catalog::conformance::Unreachable::default()),
+        );
         let (result, path) = handle_search_path("SET search_path = sales", &root, &root, None)
             .await
             .unwrap();

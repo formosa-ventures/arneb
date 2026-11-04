@@ -130,13 +130,20 @@ impl PostgresCatalog {
 #[async_trait]
 impl CatalogProvider for PostgresCatalog {
     async fn schema_names(&self) -> Vec<String> {
-        match self.list_schemas().await {
+        match self.try_schema_names().await {
             Ok(names) => names,
             Err(e) => {
                 tracing::warn!(catalog = %self.state.name, error = %e, "failed to list schemas");
                 Vec::new()
             }
         }
+    }
+
+    /// A server that cannot be reached is an error, not an empty catalog.
+    async fn try_schema_names(&self) -> Result<Vec<String>, CatalogError> {
+        self.list_schemas()
+            .await
+            .map_err(|e| CatalogError::Unavailable(format!("{}: {e}", self.state.name)))
     }
 
     async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
@@ -181,17 +188,26 @@ const RELKINDS: &str = "('r', 'v', 'm', 'f', 'p')";
 #[async_trait]
 impl SchemaProvider for PostgresSchema {
     async fn table_names(&self) -> Vec<String> {
-        let sql = format!(
-            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = $1 AND c.relkind IN {RELKINDS} ORDER BY 1"
-        );
-        match query_strings(&self.state, &sql, &[&self.name]).await {
+        match self.try_table_names().await {
             Ok(names) => names,
             Err(e) => {
                 tracing::warn!(catalog = %self.state.name, schema = %self.name, error = %e, "failed to list tables");
                 Vec::new()
             }
         }
+    }
+
+    /// A server that cannot be reached is an error, not an empty schema.
+    async fn try_table_names(&self) -> Result<Vec<String>, CatalogError> {
+        let sql = format!(
+            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relkind IN {RELKINDS} ORDER BY 1"
+        );
+        query_strings(&self.state, &sql, &[&self.name])
+            .await
+            .map_err(|e| {
+                CatalogError::Unavailable(format!("{}.{}: {e}", self.state.name, self.name))
+            })
     }
 
     /// The schema was found by [`resolve_name`], which also accepts a

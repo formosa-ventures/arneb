@@ -9,6 +9,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use arneb_catalog::{CatalogManager, TableProvider};
+use arneb_common::error::CatalogError;
 use arneb_common::suggest::nearest;
 use arneb_common::TableReference;
 
@@ -243,6 +244,7 @@ impl AgentQueryService {
             let (cm, _) = build_virtual_catalogs(&root, catalog, &probe).await;
             let columns = table_columns(&cm, catalog, schema, table)
                 .await
+                .map_err(|e| unreachable(&format!("{catalog}.{schema}.{table}"), &e))?
                 .ok_or_else(missing)?;
             (columns, None)
         } else {
@@ -400,7 +402,8 @@ async fn listed_miss(
         Ok(Some(c)) if c == catalog || after_query => c.to_string(),
         Ok(_) => return None,
     };
-    let schemas = schema_names(root, &catalog).await?;
+    // An unreachable source is not a sure miss: the query decides.
+    let schemas = schema_names(root, &catalog).await.ok()??;
     let schema = match level(schema, &schemas) {
         Err(()) => return Some(schema_missing(&catalog, schema, &schemas)),
         Ok(Some(s)) if s == schema || after_query => s.to_string(),
@@ -452,8 +455,12 @@ async fn resolve_visible(
             schema: Some(schema.to_string()),
             table: table.to_string(),
         };
-        if let Ok(provider) = root.resolve_table(&reference).await {
-            return Ok(provider);
+        match root.resolve_table(&reference).await {
+            Ok(provider) => return Ok(provider),
+            Err(e @ CatalogError::Unavailable(_)) => {
+                return Err(unreachable(&format!("{catalog}.{schema}.{table}"), &e))
+            }
+            Err(_) => {}
         }
     }
     Err(missing(root, catalog, schema, table).await)
@@ -479,9 +486,20 @@ async fn missing(root: &CatalogManager, catalog: &str, schema: &str, table: &str
 /// Visible schemas of `catalog`, or catalog_not_found.
 async fn schemas_of(root: &CatalogManager, catalog: &str) -> Result<Vec<String>, AgentError> {
     match schema_names(root, catalog).await {
-        Some(names) => Ok(names),
-        None => Err(catalog_missing(catalog, &catalog_names(root))),
+        Ok(Some(names)) => Ok(names),
+        Ok(None) => Err(catalog_missing(catalog, &catalog_names(root))),
+        Err(e) => Err(unreachable(catalog, &e)),
     }
+}
+
+/// A listing or lookup of `what` that could not reach its source: an
+/// error to retry, never "not found".
+fn unreachable(what: &str, e: &CatalogError) -> AgentError {
+    AgentError::new(
+        AgentErrorCode::QueryFailed,
+        format!("cannot look up {what}: {e}"),
+    )
+    .with_hint("the source is unreachable; retry later")
 }
 
 /// Visible tables of `catalog.schema`, or the not-found error one level up.
@@ -493,11 +511,7 @@ async fn tables_of(
     let schemas = schemas_of(root, catalog).await?;
     match table_names(root, catalog, schema).await {
         Ok(Some(names)) if schemas.iter().any(|s| s == schema) => Ok(names),
-        Err(e) => Err(AgentError::new(
-            AgentErrorCode::QueryFailed,
-            format!("cannot list the tables of {catalog}.{schema}: {e}"),
-        )
-        .with_hint("the source is unreachable; retry later")),
+        Err(e) => Err(unreachable(&format!("{catalog}.{schema}"), &e)),
         _ => Err(schema_missing(catalog, schema, &schemas)),
     }
 }

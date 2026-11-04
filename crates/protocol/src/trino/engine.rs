@@ -350,6 +350,7 @@ impl Engine {
                 let catalog = catalog.unwrap_or(session_catalog);
                 let names = metadata::schema_names(root, &catalog)
                     .await
+                    .map_err(catalog_error)?
                     .ok_or_else(|| catalog_not_found(&catalog))?;
                 Ok(single_column("Schema", filter_like(names, &like)))
             }
@@ -368,7 +369,7 @@ impl Engine {
                 };
                 let names = metadata::table_names(root, &catalog, &schema)
                     .await
-                    .map_err(|e| TrinoError::internal(e.to_string()))?
+                    .map_err(catalog_error)?
                     .ok_or_else(|| schema_not_found(&catalog, &schema))?;
                 Ok(single_column("Table", filter_like(names, &like)))
             }
@@ -394,7 +395,7 @@ impl Engine {
                 } else {
                     metadata::table_columns(root, &catalog, &schema, &table).await
                 };
-                let columns = columns.ok_or_else(|| {
+                let columns = columns.map_err(catalog_error)?.ok_or_else(|| {
                     TrinoError::user(
                         46,
                         "TABLE_NOT_FOUND",
@@ -432,6 +433,7 @@ impl Engine {
                 let target_catalog = catalog.clone().unwrap_or(session_catalog);
                 let schemas = metadata::schema_names(root, &target_catalog)
                     .await
+                    .map_err(catalog_error)?
                     .ok_or_else(|| catalog_not_found(&target_catalog))?;
                 if !schemas.contains(&schema) {
                     return Err(schema_not_found(&target_catalog, &schema));
@@ -485,6 +487,12 @@ impl Engine {
             .map_err(|m| TrinoError::user(0, "GENERIC_USER_ERROR", m))?;
         Box::pin(self.run(session, &bound, depth + 1, None)).await
     }
+}
+
+/// A catalog lookup that failed, classified as the query path would
+/// classify it (an unreachable source is `EXTERNAL`, not "not found").
+fn catalog_error(e: arneb_common::error::CatalogError) -> TrinoError {
+    TrinoError::from_arneb(&arneb_common::error::ArnebError::Catalog(e), None)
 }
 
 fn catalog_not_found(catalog: &str) -> TrinoError {

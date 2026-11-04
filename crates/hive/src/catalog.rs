@@ -582,13 +582,21 @@ impl HiveCatalogProvider {
 #[async_trait]
 impl CatalogProvider for HiveCatalogProvider {
     async fn schema_names(&self) -> Vec<String> {
-        match self.client.get_all_databases().await {
+        match self.try_schema_names().await {
             Ok(names) => names,
             Err(e) => {
                 warn!("failed to list HMS databases: {e}");
                 vec![]
             }
         }
+    }
+
+    /// An HMS that cannot be asked is an error, not an empty catalog.
+    async fn try_schema_names(&self) -> Result<Vec<String>, CatalogError> {
+        self.client
+            .get_all_databases()
+            .await
+            .map_err(|e| CatalogError::Unavailable(e.to_string()))
     }
 
     async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
@@ -658,13 +666,22 @@ impl HiveSchemaProvider {
 #[async_trait]
 impl SchemaProvider for HiveSchemaProvider {
     async fn table_names(&self) -> Vec<String> {
-        match self.client.get_all_tables(&self.database).await {
+        match self.try_table_names().await {
             Ok(names) => names,
             Err(e) => {
                 warn!("failed to list HMS tables in '{}': {e}", self.database);
                 vec![]
             }
         }
+    }
+
+    /// An HMS that cannot be asked is an error, not an empty schema, even
+    /// when the schema itself came from the name cache.
+    async fn try_table_names(&self) -> Result<Vec<String>, CatalogError> {
+        self.client
+            .get_all_tables(&self.database)
+            .await
+            .map_err(|e| CatalogError::Unavailable(e.to_string()))
     }
 
     /// The database name as HMS returned it (see
@@ -1281,6 +1298,19 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, CatalogError::Unavailable(_)), "{err}");
         assert!(schema.table("orders").await.is_none());
+    }
+
+    /// A schema served from the name cache during an outage still reports
+    /// the outage when its tables are listed, rather than an empty schema.
+    #[tokio::test]
+    async fn a_cached_schema_lists_an_outage_as_an_error() {
+        let provider = unreachable_provider();
+        provider.remember("sales", "sales");
+        let schema = provider.try_schema("sales").await.unwrap().unwrap();
+        let err = schema.try_table_names().await.unwrap_err();
+        assert!(matches!(err, CatalogError::Unavailable(_)), "{err}");
+        let err = provider.try_schema_names().await.unwrap_err();
+        assert!(matches!(err, CatalogError::Unavailable(_)), "{err}");
     }
 
     /// A resolution is reused within its TTL (no HMS call: the metastore

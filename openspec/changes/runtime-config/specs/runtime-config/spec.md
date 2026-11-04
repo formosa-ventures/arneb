@@ -113,7 +113,11 @@ A coordinator without a `[cluster] secret` SHALL refuse to start while a served 
 
 #### Scenario: Slow set from the previous epoch
 - **WHEN** a worker's pull of epoch E1's set is still building after the restarted coordinator (epoch E2) pushed its set
-- **THEN** the E1 set changes nothing when its build finishes, and a later push from E1 is refused with an error, so E1's coordinator never counts the worker as synced: a worker follows the epoch its last heartbeat reply named (before the first, the largest a push or pull named), refuses a set from any other epoch, and concurrent applies of the same epoch and generation build each catalog once
+- **THEN** the E1 set changes nothing when its build finishes, and a later push from E1 is refused with an error, so E1's coordinator never counts the worker as synced: a worker follows the epoch named by the answer to its latest-sent heartbeat or pull (before any, the largest a push named), refuses a set from any other epoch (a push from another epoch is checked with one pull and accepted when that pull reaches its sender, a restarted coordinator), and concurrent applies of the same epoch and generation build each catalog once
+
+#### Scenario: Restarted coordinator reached before its heartbeat
+- **WHEN** the coordinator restarts at the same address with epoch E2 and dispatches a task or pushes a change before the worker processed a heartbeat reply naming E2
+- **THEN** the task's pull, or the one pull the push triggers, reaches E2's coordinator, the worker follows E2 and applies its set, and the task runs or the push is acknowledged
 
 #### Scenario: Coordinator moved to a host whose clock is behind
 - **WHEN** a heartbeat names epoch E2 smaller than the applied E1, and a delayed push from E1's coordinator arrives afterwards

@@ -175,12 +175,15 @@ pub struct LiveCatalogs {
     /// Builds run before it is taken, so an unreachable metastore never
     /// holds up another push or pull.
     applying: tokio::sync::Mutex<()>,
-    /// On a worker, the epoch the last heartbeat reply named (0 before
-    /// any): the live coordinator's, so once known only a heartbeat moves
-    /// it, down as well as up. A set from any other epoch is stale and
-    /// never applies (a slow build of a set fetched before the coordinator
-    /// restarted, a delayed push from the old one).
-    heartbeat_epoch: AtomicU64,
+    /// On a worker, the epoch named by the answer to the latest-sent
+    /// request to the coordinator's address (a heartbeat or a pull), with
+    /// when that request was sent; `None` before any. Whoever answers there
+    /// is the live coordinator, so it moves down as well as up, but an
+    /// answer to a request sent before the one recorded never moves it. A
+    /// set from any other epoch is stale and never applies (a slow build of
+    /// a set fetched before the coordinator restarted, a delayed push from
+    /// the old one).
+    observed_epoch: std::sync::Mutex<Option<(tokio::time::Instant, u64)>>,
     /// On a worker, the largest epoch a push or pull named; the current
     /// epoch only until a heartbeat names one.
     seen_epoch: AtomicU64,
@@ -231,7 +234,7 @@ impl LiveCatalogs {
             pushed_defaults: RwLock::new(None),
             unauthenticated_flight: std::sync::atomic::AtomicBool::new(false),
             applying: tokio::sync::Mutex::new(()),
-            heartbeat_epoch: AtomicU64::new(0),
+            observed_epoch: std::sync::Mutex::new(None),
             seen_epoch: AtomicU64::new(0),
             apply_flights: Default::default(),
             #[cfg(test)]
@@ -272,6 +275,16 @@ impl LiveCatalogs {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .is_empty()
+    }
+
+    /// The catalogs of the applied set that failed to build here, by name.
+    pub fn failed_builds(&self) -> Vec<String> {
+        self.failed
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Whether catalog `name` of the applied set failed to build here.
@@ -350,34 +363,57 @@ impl LiveCatalogs {
         (self.epoch(), self.generation())
     }
 
-    /// Records an epoch a push or pull named. Until a heartbeat names the
-    /// coordinator's epoch, the largest seen is taken as current (epochs
-    /// grow with each coordinator start; 0 is ignored); after that a push
-    /// or pull never moves it, so an old coordinator's delayed push cannot
-    /// lock out the live one.
+    /// Records an epoch a push or pull named. Until a heartbeat or pull
+    /// answer names the coordinator's epoch
+    /// ([`observe_epoch`](Self::observe_epoch)), the largest seen is taken
+    /// as current (epochs grow with each coordinator start; 0 is ignored);
+    /// after that a push never moves it, so an old coordinator's delayed
+    /// push cannot lock out the live one.
     pub fn note_coordinator_epoch(&self, epoch: u64) {
         if epoch != 0 {
             self.seen_epoch.fetch_max(epoch, Ordering::SeqCst);
         }
     }
 
-    /// Records the epoch a heartbeat reply named. Only the live coordinator
-    /// answers heartbeats, so its epoch is taken as is, even when smaller
-    /// (a coordinator host whose clock went back): a worker never refuses
-    /// the coordinator it is talking to.
+    /// Records the epoch a heartbeat reply named, as answered now; see
+    /// [`observe_epoch`](Self::observe_epoch).
     pub fn heartbeat_epoch(&self, epoch: u64) {
-        if epoch != 0 {
-            self.heartbeat_epoch.store(epoch, Ordering::SeqCst);
+        self.observe_epoch(epoch, tokio::time::Instant::now());
+    }
+
+    /// Records the epoch named by the answer to a request this worker sent
+    /// to the coordinator's address at `sent_at` (a heartbeat or a pull).
+    /// Only the live coordinator answers there, so its epoch is taken as
+    /// is, even when smaller (a coordinator host whose clock went back): a
+    /// worker never refuses the coordinator it is talking to. A restarted
+    /// coordinator is followed from the first answer of its own, a pull
+    /// as much as a heartbeat. An answer to a request sent before the one
+    /// recorded is ignored, so a fetch that left before a restart cannot
+    /// bring the old epoch back. 0 is ignored.
+    pub fn observe_epoch(&self, epoch: u64, sent_at: tokio::time::Instant) {
+        if epoch == 0 {
+            return;
+        }
+        let mut observed = self
+            .observed_epoch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if observed.is_none_or(|(at, _)| sent_at >= at) {
+            *observed = Some((sent_at, epoch));
         }
     }
 
-    /// The epoch of the coordinator this worker follows: the last
-    /// heartbeat's, else the largest a push or pull named (0 before any).
-    /// A set from another epoch is refused.
+    /// The epoch of the coordinator this worker follows: the one named by
+    /// the answer to its latest-sent heartbeat or pull, else the largest a
+    /// push named (0 before any). A set from another epoch is refused.
     pub fn current_epoch(&self) -> u64 {
-        match self.heartbeat_epoch.load(Ordering::SeqCst) {
-            0 => self.seen_epoch.load(Ordering::SeqCst),
-            e => e,
+        match *self
+            .observed_epoch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+        {
+            Some((_, e)) => e,
+            None => self.seen_epoch.load(Ordering::SeqCst),
         }
     }
 
@@ -901,7 +937,7 @@ impl LiveCatalogs {
 pub fn stale_epoch_error(epoch: u64, current: u64) -> String {
     format!(
         "catalog set from coordinator epoch {epoch} refused: this worker follows epoch \
-         {current} (its last heartbeat's coordinator)"
+         {current} (the coordinator its latest heartbeat or pull reached)"
     )
 }
 
@@ -984,9 +1020,13 @@ impl CatalogPuller {
         Self::new(live, move || {
             let (coordinator, live) = (coordinator.clone(), target.clone());
             Box::pin(async move {
+                let sent_at = tokio::time::Instant::now();
                 let set =
                     arneb_rpc::fetch_catalogs(&coordinator, arneb_rpc::cluster_security()).await?;
                 let (epoch, generation) = (set.epoch, set.generation);
+                // The coordinator's address answered: its epoch is the live
+                // one, as a heartbeat's would be.
+                live.observe_epoch(epoch, sent_at);
                 let report = live.apply_remote(set).await;
                 if report.stale_epoch {
                     return Err(stale_epoch_error(epoch, live.current_epoch()));
@@ -1070,12 +1110,23 @@ impl CatalogPuller {
     /// per [`FAILED_BUILD_RETRY`] since the last fetch (Ruling R8). True
     /// when it pulled.
     pub async fn after_heartbeat(&self, reply: &arneb_rpc::HeartbeatReply) -> bool {
+        self.after_heartbeat_sent(reply, tokio::time::Instant::now())
+            .await
+    }
+
+    /// [`after_heartbeat`](Self::after_heartbeat) for a heartbeat sent at
+    /// `sent_at` (see [`LiveCatalogs::observe_epoch`]).
+    pub async fn after_heartbeat_sent(
+        &self,
+        reply: &arneb_rpc::HeartbeatReply,
+        sent_at: tokio::time::Instant,
+    ) -> bool {
         let Some(generation) = reply.catalog_generation else {
             return false;
         };
         let live = &self.inner.live;
         if let Some(epoch) = reply.catalog_epoch {
-            live.heartbeat_epoch(epoch);
+            live.observe_epoch(epoch, sent_at);
         }
         let (applied, applied_epoch) = (live.generation(), live.epoch());
         let epoch_differs = reply.catalog_epoch.is_some_and(|e| e != applied_epoch);
@@ -2553,6 +2604,31 @@ mod tests {
         live.heartbeat_epoch(250);
         assert!(live.apply_remote(set(250, 1, vec![])).await.applied);
         assert_eq!(live.epoch(), 250);
+    }
+
+    /// Round 5: the answer to a pull is followed like a heartbeat's, so a
+    /// restarted coordinator's set applies before its heartbeat was
+    /// processed; an answer to a request sent before the latest one
+    /// recorded (a fetch that left before the restart) never brings the
+    /// old epoch back.
+    #[tokio::test(start_paused = true)]
+    async fn a_pull_answer_is_followed_unless_sent_before_the_latest() {
+        let (live, _, _) = live();
+        let before_restart = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        live.heartbeat_epoch(100);
+        assert!(live.apply_remote(set(100, 4, vec![])).await.applied);
+        // Restarted at the same address; a task's pull reaches it first.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        live.observe_epoch(200, tokio::time::Instant::now());
+        assert!(live.apply_remote(set(200, 1, vec![])).await.applied);
+        assert_eq!(live.version(), (200, 1));
+        // The answer to a fetch sent before the restart arrives late.
+        live.observe_epoch(100, before_restart);
+        assert_eq!(live.current_epoch(), 200);
+        let report = live.apply_remote(set(100, 5, vec![])).await;
+        assert!(report.stale_epoch && !report.applied);
+        assert_eq!(live.version(), (200, 1));
     }
 
     /// Round 4: once a heartbeat lowered the epoch (the coordinator moved to

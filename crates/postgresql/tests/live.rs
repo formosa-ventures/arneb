@@ -562,7 +562,10 @@ async fn read(
         schema: Some(schema.into()),
         table: table.into(),
     };
-    let folded = cm.fold_reference_case(&reference).await;
+    let folded = cm
+        .fold_reference_case(&reference)
+        .await
+        .map_err(|e| e.to_string())?;
     cm.resolve_table(&folded).await.map_err(|e| e.to_string())
 }
 

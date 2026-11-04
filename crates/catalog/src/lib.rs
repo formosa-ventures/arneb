@@ -674,14 +674,21 @@ impl CatalogManager {
     /// something as written is kept, so mixed-case names still resolve.
     /// A lowercase form the session user may not see is never probed, so
     /// the folded name does not reveal whether a hidden object exists.
-    pub async fn fold_reference_case(&self, reference: &TableReference) -> TableReference {
+    ///
+    /// A part is folded only when the source answers that nothing goes by
+    /// it as written, so neither access rules nor an outage choose which
+    /// object is read: `Err` when the source could not be asked.
+    pub async fn fold_reference_case(
+        &self,
+        reference: &TableReference,
+    ) -> Result<TableReference, CatalogError> {
         // All-lowercase references (the common case) need no lookups.
         let folds = |name: &str| name.to_lowercase() != name;
         if !reference.catalog.as_deref().is_some_and(folds)
             && !reference.schema.as_deref().is_some_and(folds)
             && !folds(&reference.table)
         {
-            return reference.clone();
+            return Ok(reference.clone());
         }
         let mut folded = reference.clone();
         let catalog_name = match &reference.catalog {
@@ -699,14 +706,17 @@ impl CatalogManager {
             None => self.default_catalog.clone(),
         };
         let Some(catalog) = self.catalog(&catalog_name) else {
-            return folded;
+            return Ok(folded);
         };
         let schema_name = match &reference.schema {
             Some(name) => {
                 let lower = name.to_lowercase();
-                if self.schema_visible(&catalog_name, &lower)
-                    && catalog.schema(name).await.is_none()
-                    && catalog.schema(&lower).await.is_some()
+                // `try_schema`, not `schema`: a transient failure looking
+                // up `"Shop"` must not fold the reference onto `shop`.
+                if lower != *name
+                    && self.schema_visible(&catalog_name, &lower)
+                    && catalog.try_schema(name).await?.is_none()
+                    && catalog.try_schema(&lower).await?.is_some()
                 {
                     folded.schema = Some(lower);
                 }
@@ -714,39 +724,48 @@ impl CatalogManager {
             }
             None => self.default_schema.clone(),
         };
-        let Some(schema) = catalog.schema(&schema_name).await else {
-            return folded;
+        let Some(schema) = catalog.try_schema(&schema_name).await? else {
+            return Ok(folded);
         };
         // Access rules must never choose which table is read: fold only
         // when the source answers that no table goes by the name as
-        // written (`Missing`). A table found under it that the user may
-        // not read, as written or under its stored name, stops the fold
-        // (`Denied`), so the reference is refused as written instead of
-        // reading the lowercase table. The probes go through that gate, so
-        // a denied table is never loaded here: refusing it costs the
-        // connector's name lookup only, as for a missing table. The name
-        // as written is checked inside the gate, not before probing, so an
-        // exact-name catalog (memory, file) still folds `OPEN_T` onto an
-        // allowed `open_t`. A source that can't be asked folds nothing.
+        // written (`Missing`); one that exists, readable or not, stops the
+        // fold, and `resolve_table` then reads or refuses it as written.
+        // Neither probe loads a table: the gate refuses every stored name,
+        // so a connector stops at its name lookup (`Denied` meaning "it
+        // exists"), and the second probe only records whether the user may
+        // read the lowercase table. So a denied table is never loaded here,
+        // and an allowed one is loaded once, by `resolve_table`.
         let lower = reference.table.to_lowercase();
-        let written_readable = self.can_select(&catalog_name, &schema_name, &reference.table);
-        let as_written =
-            |s: &str, t: &str| written_readable && self.can_select(&catalog_name, s, t);
-        let readable = |s: &str, t: &str| self.can_select(&catalog_name, s, t);
         if lower != reference.table
             && self.table_visible(&catalog_name, &schema_name, &lower)
             && matches!(
-                schema.table_if_allowed(&reference.table, &as_written).await,
-                Ok(TableLookup::Missing)
-            )
-            && matches!(
-                schema.table_if_allowed(&lower, &readable).await,
-                Ok(TableLookup::Found(_))
+                schema
+                    .table_if_allowed(&reference.table, &|_, _| false)
+                    .await?,
+                TableLookup::Missing
             )
         {
-            folded.table = lower;
+            let readable = std::sync::atomic::AtomicBool::new(false);
+            let record = |s: &str, t: &str| {
+                readable.store(
+                    self.can_select(&catalog_name, s, t),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                false
+            };
+            let fold = match schema.table_if_allowed(&lower, &record).await? {
+                // A connector that reports no stored name (memory, file)
+                // finds by the exact name only, and its lookup is cheap.
+                TableLookup::Found(_) => true,
+                TableLookup::Denied => readable.load(std::sync::atomic::Ordering::Relaxed),
+                TableLookup::Missing => false,
+            };
+            if fold {
+                folded.table = lower;
+            }
         }
-        folded
+        Ok(folded)
     }
 
     /// Resolves a [`TableReference`] to a [`TableProvider`].
@@ -1054,7 +1073,7 @@ mod tests {
             schema: Some(schema.into()),
             table: table.into(),
         };
-        let folded = manager.fold_reference_case(&reference).await;
+        let folded = manager.fold_reference_case(&reference).await?;
         manager.resolve_table(&folded).await
     }
 
@@ -1233,6 +1252,59 @@ mod tests {
         assert_eq!(
             stored(fold_read(&alice, "SHOP", "orders").await.unwrap()),
             ("shop".to_string(), "orders".to_string())
+        );
+    }
+
+    /// An outage looking up the schema as written is reported, never
+    /// taken for "missing": a transient failure on `"Shop"` must not fold
+    /// the reference onto a different schema `shop`.
+    #[tokio::test]
+    async fn an_outage_never_folds_onto_another_schema() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        /// Schemas `Shop` and `shop`; the first lookup of `Shop` fails.
+        #[derive(Debug, Default)]
+        struct Blip(AtomicBool);
+        #[async_trait]
+        impl CatalogProvider for Blip {
+            async fn schema_names(&self) -> Vec<String> {
+                vec!["Shop".into(), "shop".into()]
+            }
+            async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+                self.try_schema(name).await.ok().flatten()
+            }
+            async fn try_schema(
+                &self,
+                name: &str,
+            ) -> Result<Option<Arc<dyn SchemaProvider>>, CatalogError> {
+                if name == "Shop" && !self.0.swap(true, Ordering::SeqCst) {
+                    return Err(CatalogError::Unavailable("connection reset".into()));
+                }
+                Ok(["Shop", "shop"].contains(&name).then(|| {
+                    Arc::new(LooseSchema {
+                        name: name.to_string(),
+                        tables: &["orders"],
+                    }) as Arc<dyn SchemaProvider>
+                }))
+            }
+        }
+        let root = CatalogManager::new("pg", "public");
+        root.register_catalog("pg", Arc::new(Blip::default()));
+        let reference = TableReference {
+            catalog: Some("pg".into()),
+            schema: Some("Shop".into()),
+            table: "orders".into(),
+        };
+        assert!(matches!(
+            root.fold_reference_case(&reference).await,
+            Err(CatalogError::Unavailable(_))
+        ));
+        // Once the source answers, `Shop` is kept as written.
+        assert_eq!(
+            root.fold_reference_case(&reference)
+                .await
+                .unwrap()
+                .to_string(),
+            "pg.Shop.orders"
         );
     }
 
@@ -1692,7 +1764,12 @@ mod tests {
                 table: table.to_string(),
             };
             let cm = &cm;
-            async move { cm.fold_reference_case(&reference).await.to_string() }
+            async move {
+                cm.fold_reference_case(&reference)
+                    .await
+                    .unwrap()
+                    .to_string()
+            }
         };
         assert_eq!(fold(None, None, "NATION").await, "nation");
         assert_eq!(

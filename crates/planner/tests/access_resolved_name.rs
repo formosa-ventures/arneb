@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arneb_catalog::{
     AccessRules, CatalogManager, CatalogProvider, SchemaProvider, TableLookup, TableProvider,
 };
-use arneb_common::types::{ColumnInfo, DataType};
+use arneb_common::types::{ColumnInfo, DataType, TableReference};
 use arneb_planner::QueryPlanner;
 use async_trait::async_trait;
 
@@ -253,6 +253,32 @@ async fn a_name_denied_as_written_is_never_loaded() {
     );
     plan(&alice, "SELECT * FROM pg.public.open").await.unwrap();
     assert!(counts.loads.load(Ordering::SeqCst) > 0);
+}
+
+/// The case fold only asks whether a name exists: it never loads a table
+/// (HMS partitions, PostgreSQL columns and splits), so a mixed-case
+/// reference is loaded once, by `resolve_table`, not again by the fold.
+#[tokio::test]
+async fn the_case_fold_never_loads_a_table() {
+    let (alice, counts) = counted(r#"{"tables": [{"privileges": ["SELECT"]}]}"#);
+    for (schema, table, folded) in [
+        ("PUBLIC", "OPEN", "pg.PUBLIC.OPEN"),
+        ("public", "Secret", "pg.public.Secret"),
+        ("public", "NOPE", "pg.public.NOPE"),
+    ] {
+        let reference = TableReference {
+            catalog: Some("pg".into()),
+            schema: Some(schema.into()),
+            table: table.into(),
+        };
+        let got = alice.fold_reference_case(&reference).await.unwrap();
+        assert_eq!(got.to_string(), folded);
+    }
+    assert_eq!(
+        counts.loads.load(Ordering::SeqCst),
+        0,
+        "the fold loaded a table"
+    );
 }
 
 /// A source that can't be asked fails planning as `SourceUnavailable`,

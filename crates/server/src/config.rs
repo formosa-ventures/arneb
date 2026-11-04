@@ -958,8 +958,8 @@ pub struct OAuthConfig {
     /// Public URL of the MCP endpoint (the protected resource); must end in
     /// `/mcp`. Required with `issuer`.
     pub resource: Option<String>,
-    /// Required `aud` value; defaults to `resource`. A value that is not a
-    /// URL (client-id mode) needs `required_scopes`.
+    /// Required `aud` value; defaults to `resource`. Any value other than
+    /// the resource URL may be a client id and needs `required_scopes`.
     pub audience: Option<String>,
     /// Claim mapped to the Arneb user name. `sub` is the only claim OIDC
     /// guarantees stable and unique; others (`preferred_username`, `email`)
@@ -1163,15 +1163,16 @@ impl OAuthConfig {
             ));
         }
         // An OIDC ID token for a client carries `aud` = that client id and
-        // no scope, so in client-id mode only a required scope tells an
-        // access token from an ID token whose shape gives nothing away. A
-        // URL or URI audience (the resource, Entra `api://...`, an Auth0
-        // API identifier) is not a client id.
+        // no scope, so unless the audience is the resource URL only a
+        // required scope tells an access token from an ID token whose shape
+        // gives nothing away. Any other value can be a client id: a plain
+        // name, a colon-bearing one (`arneb:mcp`, `localhost:8080`), or a
+        // URL (an MCP client-metadata-document id, a Keycloak URL client).
         if let Some(audience) = self.audience.as_deref() {
-            if audience_is_client_id(audience) && self.required_scopes.is_empty() {
+            if !audience_is_resource(audience, resource) && self.required_scopes.is_empty() {
                 return Err(format!(
-                    "[oauth] audience '{audience}' looks like a client id (it is not a URL), \
-                     and OIDC ID tokens issued to that client carry it as their aud: set \
+                    "[oauth] audience '{audience}' is not the resource URL, so it may be a client \
+                     id, and OIDC ID tokens issued to that client carry it as their aud: set \
                      required_scopes to a scope only access tokens for Arneb carry"
                 ));
             }
@@ -1199,10 +1200,17 @@ impl OAuthConfig {
     }
 }
 
-/// An `[oauth] audience` that is not an absolute URL or URI (`https://...`,
-/// `api://...`, `urn:...`): the shape of an OAuth client id.
-fn audience_is_client_id(audience: &str) -> bool {
-    url::Url::parse(audience).is_err()
+/// An `[oauth] audience` that is the resource URL itself: a hierarchical URL
+/// with a host, equal to `resource` up to URL normalization (scheme and host
+/// case, default port) and a trailing slash. No client id is that URL.
+fn audience_is_resource(audience: &str, resource: &str) -> bool {
+    let (Ok(a), Ok(r)) = (url::Url::parse(audience), url::Url::parse(resource)) else {
+        return false;
+    };
+    if a.cannot_be_a_base() || a.host().is_none() {
+        return false;
+    }
+    a.as_str().trim_end_matches('/') == r.as_str().trim_end_matches('/')
 }
 
 /// A boolean env value: `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`,
@@ -3130,23 +3138,45 @@ pgwire = "required"
                     audience: Some("6f1c2a3b-0000-4000-8000-123456789abc".into()),
                     ..oauth_ok()
                 },
-                Some("looks like a client id"),
+                Some("may be a client id"),
             ),
         ];
-        // URL and URI audiences are never client ids: the resource with a
-        // trailing slash, an Entra application id URI, an Auth0 API
-        // identifier, a URN.
+        // Only the resource URL itself (up to normalization and a trailing
+        // slash) is exempt.
         for audience in [
+            "https://db.example/mcp",
             "https://db.example/mcp/",
-            "api://6f1c2a3b-0000-4000-8000-123456789abc",
-            "https://api.corp.example",
-            "urn:arneb:mcp",
+            "HTTPS://DB.example:443/mcp",
         ] {
             let c = OAuthConfig {
                 audience: Some(audience.into()),
                 ..oauth_ok()
             };
             assert_eq!(c.validate(), Ok(()), "{audience}");
+        }
+        // Everything else can be a client id: colon-bearing ids that parse
+        // as URLs, URL client ids (an MCP client-metadata document, a
+        // Keycloak URL client), another URL on the resource's host, an
+        // Entra application id URI, an Auth0 API identifier, a URN.
+        for audience in [
+            "arneb:mcp",
+            "mcp-client:prod",
+            "localhost:8080",
+            "https://app.example/client.json",
+            "https://db.example/other",
+            "https://db.example",
+            "api://6f1c2a3b-0000-4000-8000-123456789abc",
+            "https://api.corp.example",
+            "urn:arneb:mcp",
+        ] {
+            let mut c = OAuthConfig {
+                audience: Some(audience.into()),
+                ..oauth_ok()
+            };
+            let err = c.validate().unwrap_err();
+            assert!(err.contains("required_scopes"), "{audience}: {err}");
+            c.required_scopes = vec!["arneb".into()];
+            assert_eq!(c.validate(), Ok(()), "{audience} with a scope");
         }
         for (cfg, expect) in cases {
             match (cfg.validate(), expect) {

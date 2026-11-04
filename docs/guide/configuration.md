@@ -212,7 +212,7 @@ user_claim = "sub"
 |---|---|---|---|
 | `issuer` | `ARNEB_OAUTH_ISSUER` | unset | Issuer URL of the IdP; the required `iss`, and the base of the discovery document. Setting it enables OAuth. `https`, or `http` for a loopback host. |
 | `resource` | `ARNEB_OAUTH_RESOURCE` | unset | Public URL of `/mcp`; required with `issuer`, must end in `/mcp`, no query or fragment. Published in the metadata document. |
-| `audience` | `ARNEB_OAUTH_AUDIENCE` | `resource` | Value `aud` must contain. A value that is not a URL or URI (a client id; `api://…` and `https://…` identifiers are fine) needs `required_scopes`, or startup fails: an ID token for that client would carry the same `aud`. |
+| `audience` | `ARNEB_OAUTH_AUDIENCE` | `resource` | Value `aud` must contain. Any value other than the `resource` URL (a client id, including colon-bearing ones such as `arneb:mcp` and URL client ids, but also `api://…`, `urn:…` and other `https://…` identifiers) needs `required_scopes`, or startup fails: an ID token for a client with that id would carry the same `aud`. |
 | `user_claim` | `ARNEB_OAUTH_USER_CLAIM` | `sub` | Claim holding the Arneb user name: 1 to 64 characters of `A-Z a-z 0-9 _ . @ -`. A value outside that set (e.g. Auth0's `auth0\|...` subjects) answers `403`; use a claim that holds a valid name. With `email`, the token's `email_verified` must be `true`. With another claim whose value contains `@` (not `sub`, which is exempt), the token's `email` must equal it and be verified. Otherwise the answer is `403` (see `allow_missing_email_verified`). |
 | `jwks_uri` | `ARNEB_OAUTH_JWKS_URI` | from discovery | The IdP's JWKS URL, when its discovery document cannot be used. |
 | `required_scopes` | `ARNEB_OAUTH_REQUIRED_SCOPES` (comma-separated) | none | Scopes a token must carry (`scope` string or `scp` array). A valid token without one gets `403` with `error="insufficient_scope"`. |
@@ -940,8 +940,8 @@ single-page app. With `[oauth]`:
   (other than `sub`) needs the token's `email` to be that same address,
   verified (or `allow_missing_email_verified` for an IdP that never sends
   them).
-- **Client-id audiences need a scope.** An `audience` that is not a URL or
-  URI refuses to start without `required_scopes`.
+- **Client-id audiences need a scope.** An `audience` other than the
+  `resource` URL refuses to start without `required_scopes`.
 - **Unmarked tokens without a scope are refused.** A token with neither an
   `at+jwt` header nor a Keycloak payload `typ` is taken for a possible ID
   token when it has a `nonce`, an `at_hash` or no scope claim; set

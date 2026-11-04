@@ -179,10 +179,12 @@ Design decisions you should know about:
   resource (RFC 8707): `aud` has to contain `audience`, which defaults to
   `resource`. Set `audience` for an IdP that names the API differently (an
   Entra `api://…` application id URI, an Auth0 API identifier) or that can
-  emit nothing but a client id. In that client-id mode an OIDC ID token for
-  the same client carries the same `aud`, so startup refuses an `audience`
-  that is not a URL or URI (which a client id is not) unless
-  `required_scopes` is set too (ID tokens carry no scope).
+  emit nothing but a client id. An OIDC ID token for a client carries that
+  client's id as its `aud`, and a client id can be any string, a URL
+  included (`arneb:mcp`, `localhost:8080`, an MCP client-metadata-document
+  URL, a Keycloak URL client), so startup refuses an `audience` other than
+  the `resource` URL itself unless `required_scopes` is set too (ID tokens
+  carry no scope).
 - **If the IdP is unreachable** and no cached key can decide, `/mcp` answers
   `503 auth_provider_unavailable` with `Retry-After: 5`, not `401`. API
   tokens, sessions and Basic keep working.

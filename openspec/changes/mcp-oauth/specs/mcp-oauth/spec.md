@@ -1,14 +1,14 @@
 ## ADDED Requirements
 
 ### Requirement: Configuration
-An `[oauth]` section SHALL enable OAuth on `/mcp` when `issuer` is set, with `resource` (the public URL of `/mcp`, ending in `/mcp`) required, `audience` defaulting to `resource`, `user_claim` defaulting to `sub`, and optional `jwks_uri`, `required_scopes` (RFC 6749 scope tokens), `leeway_secs` (0 to 300, default 60), `jwks_cache_secs` (at least 60, default 3600), `jwks_min_refresh_secs` (1 to `jwks_cache_secs`, default 30), `jwks_max_stale_secs` (at least `jwks_cache_secs`, default 86400) and `require_access_token_typ` (default false). Each key SHALL have an `ARNEB_OAUTH_*` override that wins over the file, and the effective values SHALL be logged on `arneb::config`. `issuer`, `resource` and `jwks_uri` SHALL be `https`, or `http` only for a loopback host. Startup SHALL fail with a message naming the setting when a value is invalid, when `audience` differs from `resource` while `required_scopes` is empty, or when `[oauth]` is used without `[auth] type = "password"` or with `[mcp] enabled = false`. A `user_claim` other than `sub` SHALL log a WARN at startup. Without `issuer` the server SHALL behave exactly as before.
+An `[oauth]` section SHALL enable OAuth on `/mcp` when `issuer` is set, with `resource` (the public URL of `/mcp`, ending in `/mcp`) required, `audience` defaulting to `resource`, `user_claim` defaulting to `sub`, and optional `jwks_uri`, `required_scopes` (RFC 6749 scope tokens), `leeway_secs` (0 to 300, default 60), `jwks_cache_secs` (at least 60, default 3600), `jwks_min_refresh_secs` (1 to `jwks_cache_secs`, default 30), `jwks_max_stale_secs` (at least `jwks_cache_secs`, default 86400) and `require_access_token_typ` (default false). Each key SHALL have an `ARNEB_OAUTH_*` override that wins over the file, and the effective values SHALL be logged on `arneb::config`. `issuer`, `resource` and `jwks_uri` SHALL be `https`, or `http` only for a loopback host. Startup SHALL fail with a message naming the setting when a value is invalid, when `audience` is not the `resource` URL (a hierarchical URL with a host, equal to `resource` up to URL normalization and a trailing slash) while `required_scopes` is empty, or when `[oauth]` is used without `[auth] type = "password"` or with `[mcp] enabled = false`. A `user_claim` other than `sub` SHALL log a WARN at startup. Without `issuer` the server SHALL behave exactly as before.
 
 #### Scenario: Missing resource
 - **WHEN** the config sets `issuer` and no `resource`
 - **THEN** startup fails naming `[oauth] resource`
 
 #### Scenario: Client-id audience without a scope
-- **WHEN** the config sets `audience` to a client id and no `required_scopes`
+- **WHEN** the config sets `audience` to a client id (`arneb-client`, `arneb:mcp`, `localhost:8080`, or a URL such as `https://app.example/client.json`) and no `required_scopes`
 - **THEN** startup fails naming `required_scopes`
 
 #### Scenario: Password auth required

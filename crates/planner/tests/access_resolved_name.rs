@@ -137,12 +137,11 @@ async fn every_read_checks_the_name_the_connector_resolved() {
     }
 }
 
-/// Counts lookups and full table loads; a connector shaped like Hive's (it
+/// Counts full table loads; a connector shaped like Hive's (it
 /// learns the stored name cheaply, then loads), so a denied table must
 /// never be loaded, including by the planner's case-folding probe.
 #[derive(Debug, Default)]
 struct Counts {
-    probes: AtomicUsize,
     loads: AtomicUsize,
 }
 
@@ -165,7 +164,6 @@ impl SchemaProvider for CountingSchema {
         name: &str,
         allowed: arneb_catalog::TableGate<'_>,
     ) -> Result<TableLookup, arneb_common::error::CatalogError> {
-        self.1.probes.fetch_add(1, Ordering::SeqCst);
         let Some(name) = resolve_loosely(&["open", "secret"], name) else {
             return Ok(TableLookup::Missing);
         };
@@ -229,13 +227,13 @@ async fn a_denied_table_is_never_loaded_while_planning() {
     assert!(counts.loads.load(Ordering::SeqCst) > 0);
 }
 
-/// A name denied as written is refused before the connector is asked
-/// anything about it, so the refusal takes the same time whether or not
-/// the table exists, and costs no table load. The upgrade note's own
-/// pattern: allow `open`, deny everything else; `OPEN` is the stored
+/// A name denied as written is never loaded: the planner's case-folding
+/// probe checks it with the stored name, so refusing it costs only the
+/// connector's name lookup, as a missing table does. The upgrade note's
+/// own pattern: allow `open`, deny everything else; `OPEN` is the stored
 /// `open` written in a case the rule does not allow.
 #[tokio::test]
-async fn a_name_denied_as_written_is_never_probed() {
+async fn a_name_denied_as_written_is_never_loaded() {
     let (alice, counts) = counted(
         r#"{"tables": [
             {"user": "alice", "schema": "public", "table": "open", "privileges": ["SELECT"]},
@@ -249,11 +247,10 @@ async fn a_name_denied_as_written_is_never_probed() {
         assert!(err.contains("Access Denied"), "{t}: {err}");
     }
     assert_eq!(
-        counts.probes.load(Ordering::SeqCst),
+        counts.loads.load(Ordering::SeqCst),
         0,
-        "a denied name was probed"
+        "a denied table was loaded"
     );
-    assert_eq!(counts.loads.load(Ordering::SeqCst), 0);
     plan(&alice, "SELECT * FROM pg.public.open").await.unwrap();
     assert!(counts.loads.load(Ordering::SeqCst) > 0);
 }

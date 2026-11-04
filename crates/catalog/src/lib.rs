@@ -718,22 +718,25 @@ impl CatalogManager {
             return folded;
         };
         // Access rules must never choose which table is read: fold only
-        // when the name as written is readable and the source answers
-        // that no table goes by it. A name the user may not read as
-        // written is not probed at all (`resolve_table` refuses it before
-        // any lookup, so its denial costs the same whether or not the
-        // table exists); one whose stored name is denied stops the fold
-        // (`Denied`, not `Missing`), so the reference is refused as
-        // written instead of reading the lowercase table. Probes go through the rules gate,
-        // so a denied table is never loaded; a source that can't be asked
-        // folds nothing.
+        // when the source answers that no table goes by the name as
+        // written (`Missing`). A table found under it that the user may
+        // not read, as written or under its stored name, stops the fold
+        // (`Denied`), so the reference is refused as written instead of
+        // reading the lowercase table. The probes go through that gate, so
+        // a denied table is never loaded here: refusing it costs the
+        // connector's name lookup only, as for a missing table. The name
+        // as written is checked inside the gate, not before probing, so an
+        // exact-name catalog (memory, file) still folds `OPEN_T` onto an
+        // allowed `open_t`. A source that can't be asked folds nothing.
         let lower = reference.table.to_lowercase();
+        let written_readable = self.can_select(&catalog_name, &schema_name, &reference.table);
+        let as_written =
+            |s: &str, t: &str| written_readable && self.can_select(&catalog_name, s, t);
         let readable = |s: &str, t: &str| self.can_select(&catalog_name, s, t);
         if lower != reference.table
-            && self.can_select(&catalog_name, &schema_name, &reference.table)
             && self.table_visible(&catalog_name, &schema_name, &lower)
             && matches!(
-                schema.table_if_allowed(&reference.table, &readable).await,
+                schema.table_if_allowed(&reference.table, &as_written).await,
                 Ok(TableLookup::Missing)
             )
             && matches!(
@@ -1203,7 +1206,7 @@ mod tests {
             ("shop".to_string(), "Orders".to_string())
         );
 
-        // Denied as written: refused before any lookup.
+        // Denied as written: refused (Access Denied), never folded.
         let alice = loose_view(
             r#"{"tables": [
                 {"user": "alice", "table": "Orders", "privileges": []},

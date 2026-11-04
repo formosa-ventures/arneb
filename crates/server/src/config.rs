@@ -981,9 +981,13 @@ pub struct OAuthConfig {
     /// Accept only tokens whose header `typ` is `at+jwt` (RFC 9068).
     pub require_access_token_typ: bool,
     /// Accept a user name that is an email address from a token without
-    /// `email_verified` (an IdP such as Entra ID that never sends it). Not
-    /// for `user_claim = "email"`; `email_verified: false` is always
-    /// refused.
+    /// `email_verified` (an IdP such as Entra ID that never sends it), and
+    /// then ignore an unverified `email` that differs. Not for
+    /// `user_claim = "email"`; `email_verified: false` is always refused.
+    /// Nothing then checks the address, so turn it on only when the
+    /// `user_claim` is admin-assigned (Entra `upn`, an IdP-assigned `sub`):
+    /// a user-chosen claim (a self-service `preferred_username`) could name
+    /// someone else's address.
     pub allow_missing_email_verified: bool,
 }
 

@@ -193,6 +193,14 @@ Design decisions you should know about:
   user name is ignored (Entra's `upn` beside its `email`). An explicit
   `email_verified: false`, and a different `email` with
   `email_verified: true`, are refused regardless.
+
+  **Risk of the opt-in:** with it on, nothing checks the address in the
+  `user_claim` at all. If users can choose that claim's value (a
+  self-service `preferred_username`, a self-registered Okta login in
+  `sub`), anyone can claim another user's address and act as that Arneb
+  user. Turn the opt-in on only when the IdP assigns the claim and users
+  cannot change it (Entra's `upn`, or a `sub` the IdP generates or an
+  administrator sets).
 - **The audience is the resource URL.** Tokens must be issued for this
   resource (RFC 8707): `aud` has to contain `audience`, which defaults to
   `resource`. Set `audience` for an IdP that names the API differently (an

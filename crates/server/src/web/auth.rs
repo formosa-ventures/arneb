@@ -283,7 +283,7 @@ async fn oauth_identity(
                 "the identity's email address is not verified",
             )
             .with_hint(
-                "verify the address at the identity provider (email_verified must be true), or set [oauth] user_claim to a claim that is not an email address",
+                "verify the address at the identity provider (email_verified must be true), set [oauth] user_claim to a claim that is not an email address, or, for an IdP that never sends email_verified and only for an admin-assigned claim, set [oauth] allow_missing_email_verified = true (ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED)",
             )
             .into_response(),
         )),
@@ -1232,6 +1232,10 @@ mod tests {
         assert_eq!(e["code"], "forbidden");
         assert_eq!(e["message"], "the identity's email address is not verified");
         assert!(e["hint"].as_str().unwrap().contains("email_verified"));
+        assert!(e["hint"]
+            .as_str()
+            .unwrap()
+            .contains("ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED"));
 
         c["email_verified"] = true.into();
         let reply = mcp_call(

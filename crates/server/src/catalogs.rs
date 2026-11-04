@@ -1484,17 +1484,23 @@ pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
         found.push("password");
     }
     if let Some(url) = &spec.connection_url {
-        // A refused URL (a libpq keyword string, or one on a spec of
-        // another type that nothing validates) may hold a password the
-        // finders above cannot place.
-        if url_password_range(&url.0).is_some()
-            || !url_query_passwords(&url.0).is_empty()
-            || !url_loose_query_passwords(&url.0).is_empty()
-            || (arneb_postgresql::PostgresConfig::new(url.0.clone())
-                .validate_url()
-                .is_err()
-                && refused_url_may_hold_password(&url.0))
-        {
+        // A URL validation accepts splits as the driver splits it; a
+        // refused one (a libpq keyword string, a mis-split URL, or one on
+        // a spec of another type that nothing validates) is read with the
+        // stricter rules of `refused_url_may_hold_password`, since the
+        // driver-faithful finders misplace its parts (`?user=a@b` makes
+        // `db:5432/x?user=a` the userinfo).
+        let valid = arneb_postgresql::PostgresConfig::new(url.0.clone())
+            .validate_url()
+            .is_ok();
+        let holds = if valid {
+            url_password_range(&url.0).is_some()
+                || !url_query_passwords(&url.0).is_empty()
+                || !url_loose_query_passwords(&url.0).is_empty()
+        } else {
+            refused_url_may_hold_password(&url.0)
+        };
+        if holds {
             found.push("connection_url password");
         }
     }
@@ -1517,24 +1523,52 @@ pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
     found
 }
 
-/// Whether a `connection_url` that fails validation may hold a password,
-/// read loosely since where its parts end is unknown: an `@` with a `:`
-/// anywhere before it (a userinfo password, as the driver would split
-/// it), or `password` anywhere once percent-decoded, in any case (a query
-/// parameter, a libpq keyword string `host=db password=x`). A typo such
-/// as `postgresql://db/x?sslmod=require` or an uppercase scheme holds
-/// none.
+/// Whether a `connection_url` that fails validation may hold a password.
+/// With a `scheme://`:
+/// - its authority (up to the first `/`, `?` or `#`) holds an `@` with a
+///   `:` before it (`u:p@db`, `u:p@ss@db`);
+/// - or the driver would end the userinfo at an `@` past the authority
+///   and the authority has a `:` that is not a port (`u:p/w@db`, a raw `/`
+///   in the password); `db:5432/x?user=a@b` (a port) and a `:` past the
+///   authority (`?application_name=a:b@c`) are not passwords;
+/// - or a query parameter's key is `password` once percent-decoded, found
+///   by the shared scanner (not a substring anywhere).
+///
+/// Without a `scheme://` (a libpq keyword string `host=db password=x`, a
+/// mistyped `postgresql:/u:p@db`) where its parts end is unknown, so it
+/// stays fail-closed: an `@` with a `:` before it, or `password` anywhere
+/// once percent-decoded, in any case. A typo such as
+/// `postgresql://db/x?sslmod=require` or an uppercase scheme holds none.
 fn refused_url_may_hold_password(url: &str) -> bool {
-    let before_at = url.find('@').map(|at| &url[..at]);
-    let userinfo_password = before_at.is_some_and(|head| {
-        // The scheme's own `:` is not a password separator.
-        let head = head.find("://").map_or(head, |i| &head[i + 3..]);
-        head.contains(':')
-    });
-    userinfo_password
-        || String::from_utf8_lossy(&arneb_postgresql::percent_decode(url))
-            .to_ascii_lowercase()
-            .contains("password")
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        let userinfo = url.find('@').is_some_and(|at| url[..at].contains(':'));
+        return userinfo
+            || String::from_utf8_lossy(&arneb_postgresql::percent_decode(url))
+                .to_ascii_lowercase()
+                .contains("password");
+    };
+    let rest = &url[scheme_end..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let in_authority = authority
+        .find('@')
+        .is_some_and(|at| authority[..at].contains(':'));
+    let past_authority = !authority.contains('@') && rest.contains('@') && {
+        // A bracketed IPv6 host's colons are not separators.
+        let host_start = if authority.starts_with('[') {
+            authority.find(']').map_or(authority.len(), |i| i + 1)
+        } else {
+            0
+        };
+        authority[host_start..].find(':').is_some_and(|c| {
+            let after = &authority[host_start + c + 1..];
+            after.is_empty() || !after.bytes().all(|b| b.is_ascii_digit())
+        })
+    };
+    let query = arneb_postgresql::query_params_from(url, scheme_end)
+        .iter()
+        .any(|p| arneb_postgresql::is_password_key(&url[p.key.clone()]));
+    in_authority || past_authority || query
 }
 
 /// Whether `a` and `b` send their secrets to the same places (Ruling R10):
@@ -2218,6 +2252,12 @@ mod tests {
             "POSTGRESQL://db/x",
             "postgresql://db/x?sslmode=require&&",
             "postgresql://u@db/x?sslmod=require",
+            // Round 5 follow-up: an `@` in a query value is no userinfo,
+            // whether a port or another `:` comes before it.
+            "postgresql://db:5432/x?user=a@b",
+            "postgresql://db/x?sslmod=require&application_name=a:b@c",
+            "postgresql://[::1]:5432/x?user=a@b",
+            "postgresql://db/x?sslmod=require&note=password",
         ] {
             let s = pg(url);
             assert!(validate_spec(&s).is_err(), "{url}");
@@ -2239,6 +2279,10 @@ mod tests {
             "postgresql://u:Qz7@db/x?sslmod=require",
             "postgresql://u:p@Qz7@db/x",
             "postgresql:/u:Qz7@db/x",
+            "postgresql://u:p@db/x?sslmod=bad",
+            "postgresql://db/x?sslmod=bad&password=x",
+            "postgresql://u:p/w@db/x",
+            "user:pass@host/db",
         ] {
             let s = pg(url);
             assert!(validate_spec(&s).is_err(), "{url}");

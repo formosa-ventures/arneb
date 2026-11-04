@@ -2553,6 +2553,7 @@ mod tests {
             "postgresql://db/x?sslmod=require",
             "POSTGRESQL://db/x",
             "postgresql://db/x?sslmode=require&&",
+            "postgresql://db:5432/x?user=a@b",
         ] {
             check_catalog_exposure(
                 &ServerRole::Coordinator,

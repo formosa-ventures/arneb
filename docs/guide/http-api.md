@@ -483,7 +483,9 @@ When the kill lands decides what it does:
   the kill stops nothing. A kill that arrives during a step waits for that
   step to end to find out. The response has `changed: false` and the
   query's real state (`state_before` and `state`, e.g. `running` until the
-  statement reports back), the audit entry records `effect`
+  statement reports back; `state` is `ended` when the query has meanwhile
+  ended and left the history, so its final state is unknown), the audit
+  entry records `effect`
   `already_ended`, and the client gets the statement's real result.
 - **Between two steps of the work:** the work is stopped and the client
   gets the cancellation. This only says that the statement did not

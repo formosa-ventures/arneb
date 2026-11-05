@@ -75,3 +75,4 @@
 ## 13. Review round 6
 
 - [x] 13.1 Shutdown: the Web API stops gracefully (bounded) before the audit flush; once the flush starts, new audited actions (one queued on the blocking pool included) are refused before their intent is written
+- [x] 13.2 Kill: a not-applied kill of a query that then left the history reports `state` `ended`, not the stale `running`

@@ -762,7 +762,7 @@ impl ManageAction for CancelQuery {
                 query_id: self.id.to_string(),
                 owner: self.owner,
                 state_before: api::state_name(before).to_owned(),
-                state: api::state_name(after).to_owned(),
+                state: after.to_owned(),
             },
         })
     }
@@ -789,18 +789,29 @@ fn kill_error(e: &arneb_common::error::ExecutionError, tracked: bool) -> ApiErro
     }
 }
 
-/// The query's state after a kill with `outcome`, given its state `now`
-/// (`None` once it left the history): a query that left reports the last
-/// state the kill knew, never one it did not have (`cancelled` only when
-/// this kill cancelled it).
-fn state_after(
-    outcome: KillOutcome,
-    now: Option<arneb_scheduler::QueryState>,
-) -> arneb_scheduler::QueryState {
-    now.unwrap_or(match outcome {
-        KillOutcome::Killed { .. } => arneb_scheduler::QueryState::Cancelled,
-        KillOutcome::AlreadyEnded(state) | KillOutcome::NotApplied { state } => state,
-    })
+/// The reported `state` of a query that left the history after a kill
+/// that did not end it, before its final state could be read: it has
+/// ended (only terminal queries leave), but how is not known.
+const ENDED: &str = "ended";
+
+/// The query's state name after a kill with `outcome`, given its state
+/// `now` (`None` once it left the history). A query that left reports the
+/// last state the kill knew when that was terminal (`cancelled` only when
+/// this kill cancelled it), otherwise [`ENDED`]: never a state it did not
+/// have, such as `running` for a query that has already ended.
+fn state_after(outcome: KillOutcome, now: Option<arneb_scheduler::QueryState>) -> &'static str {
+    match (now, outcome) {
+        (Some(now), _) => api::state_name(now),
+        (None, KillOutcome::Killed { .. }) => {
+            api::state_name(arneb_scheduler::QueryState::Cancelled)
+        }
+        (None, KillOutcome::AlreadyEnded(last) | KillOutcome::NotApplied { state: last })
+            if last.is_terminal() =>
+        {
+            api::state_name(last)
+        }
+        (None, _) => ENDED,
+    }
 }
 
 async fn cluster(
@@ -1972,15 +1983,18 @@ pub(super) mod tests {
         use super::state_after;
         use arneb_scheduler::{KillOutcome, QueryState as S};
         let running = KillOutcome::NotApplied { state: S::Running };
-        assert_eq!(state_after(running, None), S::Running);
-        assert_eq!(state_after(running, Some(S::Finished)), S::Finished);
+        // Not applied while running, then left the history: it has ended
+        // (only terminal queries leave), so never `running`.
+        assert_eq!(state_after(running, None), "ended");
+        assert_eq!(state_after(running, Some(S::Finished)), "finished");
+        assert_eq!(state_after(running, Some(S::Running)), "running");
         assert_eq!(
             state_after(KillOutcome::AlreadyEnded(S::Failed), None),
-            S::Failed
+            "failed"
         );
         assert_eq!(
             state_after(KillOutcome::Killed { was: S::Running }, None),
-            S::Cancelled
+            "cancelled"
         );
     }
 

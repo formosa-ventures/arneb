@@ -132,7 +132,8 @@ impl OAuthSettings {
 pub struct OAuthPrincipal {
     /// Value of the configured user claim.
     pub user: String,
-    /// Scopes from `scope` (space separated) and/or `scp` (array).
+    /// Scopes from `scope` and/or `scp` (each a space-separated string or
+    /// an array of strings; see `token_scopes`).
     pub scopes: Vec<String>,
     /// The token's `exp` in epoch milliseconds.
     pub expires_at_ms: u64,
@@ -797,31 +798,44 @@ fn token_kind(header_typ: Option<&str>, claims: &serde_json::Value) -> TokenKind
 
 /// An unmarked token that may be an OIDC ID token: it has `nonce` or
 /// `at_hash` (OIDC Core 2 and 3.1.3.6), or no scope at all (`scopes` as
-/// [`token_scopes`] parses them, so a `null`, empty or non-string scope
+/// [`token_scopes`] parses them, so an empty or malformed scope claim
 /// counts as none). ID tokens carry no scope, and one from a refresh grant
 /// has no `nonce` either, so a missing scope is the only sign it gives.
 fn may_be_id_token(claims: &serde_json::Value, scopes: &[String]) -> bool {
     claims.get("nonce").is_some() || claims.get("at_hash").is_some() || scopes.is_empty()
 }
 
-/// The token's scopes: `scope` (a space-separated string) and `scp` (an
-/// array of strings, or a space-separated string). Anything else is no
-/// scope.
+/// The token's scopes: `scope` and `scp`, each either a space-separated
+/// string or an array of strings (each element split the same way, so an
+/// empty element adds nothing). A claim of any other shape (`null`, a
+/// number, a boolean, an object, or an array with a non-string element)
+/// is malformed and adds no scope at all, not even its string elements:
+/// it grants nothing and, alone, leaves the token looking like an ID
+/// token.
 fn token_scopes(claims: &serde_json::Value) -> Vec<String> {
     let mut scopes: Vec<String> = Vec::new();
-    if let Some(s) = claims.get("scope").and_then(|v| v.as_str()) {
-        scopes.extend(s.split_whitespace().map(str::to_owned));
-    }
-    match claims.get("scp") {
-        Some(serde_json::Value::Array(a)) => {
-            scopes.extend(a.iter().filter_map(|v| v.as_str()).map(str::to_owned));
+    for name in ["scope", "scp"] {
+        if let Some(v) = claims.get(name) {
+            scopes.extend(claim_scopes(v));
         }
-        Some(serde_json::Value::String(s)) => {
-            scopes.extend(s.split_whitespace().map(str::to_owned));
-        }
-        _ => {}
     }
     scopes
+}
+
+/// One scope claim's scopes, or none when it is malformed (see
+/// [`token_scopes`]).
+fn claim_scopes(v: &serde_json::Value) -> Vec<String> {
+    let split = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+    match v {
+        serde_json::Value::String(s) => split(s),
+        serde_json::Value::Array(a) => a
+            .iter()
+            .map(|e| e.as_str().map(split))
+            .collect::<Option<Vec<_>>>()
+            .map(|parts| parts.concat())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 /// `scopes` holds every one of `required`.
@@ -1991,6 +2005,95 @@ mod tests {
         );
     }
 
+    /// Scope claims that are empty or malformed: each counts as no scope.
+    fn malformed_scopes() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("null", json!(null)),
+            ("empty", json!("")),
+            ("blank", json!("  ")),
+            ("number", json!(1)),
+            ("bool", json!(true)),
+            ("object", json!({"arneb": true})),
+            ("empty_array", json!([])),
+            ("empty_element", json!([""])),
+            ("mixed_array", json!(["arneb", 1])),
+            ("null_element", json!(["arneb", null])),
+            ("nested_array", json!([["arneb"]])),
+        ]
+    }
+
+    #[tokio::test]
+    async fn an_array_scope_counts_like_a_string() {
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let iss = idp.issuer();
+        let open = validator(&idp, |_| {});
+        let required = validator(&idp, |s| {
+            s.required_scopes = vec!["mcp".into(), "read".into()]
+        });
+        // `"scope": ["mcp", "read"]` and no `at+jwt` header: an access
+        // token with those scopes, not an ID token.
+        let mut c = claims(&iss, AUD);
+        c["scope"] = json!(["mcp", "read"]);
+        for v in [&open, &required] {
+            let p = v.validate(&key.sign(&c)).await.unwrap();
+            assert_eq!(p.user, "alice");
+            assert_eq!(p.scopes, ["mcp", "read"]);
+            v.validate(&key.sign_typ(&c, None)).await.unwrap();
+        }
+        // Elements are split like the string form; empty ones add nothing.
+        c["scope"] = json!(["mcp read", ""]);
+        assert_eq!(
+            required.validate(&key.sign(&c)).await.unwrap().scopes,
+            ["mcp", "read"]
+        );
+        // An array short of a required scope is a 403, as a string is.
+        c["scope"] = json!(["mcp"]);
+        assert_eq!(
+            required.validate(&key.sign(&c)).await.unwrap_err(),
+            OAuthReject::InsufficientScope
+        );
+        // A malformed `scope` grants nothing, and with no other scope the
+        // token is ID-token-like: a 401 even with `required_scopes` empty.
+        for (what, bad) in malformed_scopes() {
+            let mut c = claims(&iss, AUD);
+            c["scope"] = bad;
+            for v in [&open, &required] {
+                assert_eq!(
+                    v.validate(&key.sign(&c)).await.unwrap_err(),
+                    OAuthReject::Invalid("id_token"),
+                    "{what}"
+                );
+            }
+            // Beside a well-formed `scp`, it still adds nothing.
+            c["scp"] = json!(["mcp"]);
+            assert_eq!(open.validate(&key.sign(&c)).await.unwrap().scopes, ["mcp"]);
+            assert_eq!(
+                required.validate(&key.sign(&c)).await.unwrap_err(),
+                OAuthReject::InsufficientScope,
+                "{what} beside scp"
+            );
+        }
+        // A marked access token with a malformed scope is accepted only
+        // without `required_scopes`, and carries no scope.
+        let mut c = claims(&iss, AUD);
+        c["scope"] = json!(["mcp", 1]);
+        let at = key.sign_typ(&c, Some("at+jwt"));
+        assert!(open.validate(&at).await.unwrap().scopes.is_empty());
+        assert_eq!(
+            required.validate(&at).await.unwrap_err(),
+            OAuthReject::InsufficientScope
+        );
+        // An array scope does not lift the DPoP / `cnf` refusal.
+        let mut c = claims(&iss, AUD);
+        c["scope"] = json!(["mcp", "read"]);
+        c["cnf"] = json!({"jkt": "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"});
+        assert_eq!(
+            required.validate(&key.sign(&c)).await.unwrap_err(),
+            OAuthReject::Invalid("sender_constrained")
+        );
+    }
+
     #[tokio::test]
     async fn required_scopes_vouch_for_unmarked_id_token_like_tokens() {
         let key = TestKey::ec("k1");
@@ -2009,25 +2112,25 @@ mod tests {
         unverified["sub"] = json!("alice@corp.example");
         unverified["email"] = json!("other@corp.example");
         unverified["email_verified"] = json!(true);
-        // A scope that does not parse is no scope; a nonce-bearing token
-        // with only other scopes is no better.
-        let mut null_scope = refreshed.clone();
-        null_scope["scope"] = json!(null);
-        let mut array_scope = refreshed.clone();
-        array_scope["scope"] = json!(["arneb"]);
-        let mut empty_scope = refreshed.clone();
-        empty_scope["scope"] = json!("");
+        // A scope that does not parse is no scope, even when it holds the
+        // required one beside a non-string; a nonce-bearing token with only
+        // other scopes is no better.
+        let mut cases = vec![
+            ("refreshed", refreshed.clone()),
+            ("code_flow", code_flow.clone()),
+            ("unverified", unverified),
+        ];
+        for (what, bad) in malformed_scopes() {
+            for name in ["scope", "scp"] {
+                let mut c = refreshed.clone();
+                c[name] = bad.clone();
+                cases.push((what, c));
+            }
+        }
         let mut other_scope = code_flow.clone();
         other_scope["scope"] = json!("openid profile");
-        for (what, c) in [
-            ("refreshed", &refreshed),
-            ("code_flow", &code_flow),
-            ("unverified", &unverified),
-            ("null_scope", &null_scope),
-            ("array_scope", &array_scope),
-            ("empty_scope", &empty_scope),
-            ("other_scope", &other_scope),
-        ] {
+        cases.push(("other_scope", other_scope));
+        for (what, c) in &cases {
             assert_eq!(
                 v.validate(&key.sign(c)).await.unwrap_err(),
                 OAuthReject::Invalid("id_token"),

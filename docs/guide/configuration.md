@@ -215,7 +215,7 @@ user_claim = "sub"
 | `audience` | `ARNEB_OAUTH_AUDIENCE` | `resource` | Value `aud` must contain. Any value other than the `resource` URL (a client id, including colon-bearing ones such as `arneb:mcp` and URL client ids, but also `api://…`, `urn:…` and other `https://…` identifiers) needs `required_scopes`, or startup fails: an ID token for a client with that id would carry the same `aud`. |
 | `user_claim` | `ARNEB_OAUTH_USER_CLAIM` | `sub` | Claim holding the Arneb user name: 1 to 64 characters of `A-Z a-z 0-9 _ . @ -`. A value outside that set (e.g. Auth0's `auth0\|...` subjects) answers `403`; use a claim that holds a valid name. With `email`, the token's `email_verified` must be `true`. With another claim whose value contains `@` (`sub` included), the token's `email` must equal it and be verified. Otherwise the answer is `403` (see `allow_missing_email_verified`). |
 | `jwks_uri` | `ARNEB_OAUTH_JWKS_URI` | from discovery | The IdP's JWKS URL, when its discovery document cannot be used. |
-| `required_scopes` | `ARNEB_OAUTH_REQUIRED_SCOPES` (comma-separated) | none | Scopes a token must carry (`scope` string or `scp` array). A valid token without one gets `403` with `error="insufficient_scope"`. |
+| `required_scopes` | `ARNEB_OAUTH_REQUIRED_SCOPES` (comma-separated) | none | Scopes a token must carry, in `scope` or `scp` (each a space-separated string or an array of strings; a claim of any other shape, such as `null`, a number or `["mcp", 1]`, grants nothing). A valid token without one gets `403` with `error="insufficient_scope"`. |
 | `leeway_secs` | `ARNEB_OAUTH_LEEWAY_SECS` | 60 | Clock-skew allowance for `exp` / `nbf`, `0` to `300`. |
 | `jwks_cache_secs` | `ARNEB_OAUTH_JWKS_CACHE_SECS` | 3600 | How long fetched signing keys are fresh, at least `60`. From 80% of it they are refetched in the background. |
 | `jwks_min_refresh_secs` | `ARNEB_OAUTH_JWKS_MIN_REFRESH_SECS` | 30 | Minimum gap between JWKS fetches (a token with an unknown `kid` triggers one), `1` to `jwks_cache_secs`. |
@@ -950,7 +950,9 @@ single-page app. With `[oauth]`:
   `resource` URL refuses to start without `required_scopes`.
 - **Unmarked tokens without a scope are refused.** A token with neither an
   `at+jwt` header nor a Keycloak payload `typ` is taken for a possible ID
-  token when it has a `nonce`, an `at_hash` or no scope claim; set
+  token when it has a `nonce`, an `at_hash` or no scope (no `scope` /
+  `scp`, or only empty or malformed ones; string and string-array forms of
+  either claim both count); set
   `required_scopes` for an IdP that issues such access tokens. App-only
   tokens without a scope are refused: Entra client-credentials tokens
   (only `roles`, never `scp` or `at+jwt`) cannot be used, so give those

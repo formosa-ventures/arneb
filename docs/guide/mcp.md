@@ -108,9 +108,8 @@ it needs a restart, and a bad value stops startup with a message naming it.
      other tokens) is refused.
   4. Any other token (Entra ID, Okta and most IdPs send header `typ: JWT`
      and no payload `typ`) may be an ID token when it has a `nonce` or
-     `at_hash`, or no scope at all (no `scope` / `scp`, or one that is
-     empty, `null` or not a string or string array; an ID token from a
-     refresh grant carries neither `nonce` nor scope). Such a token is
+     `at_hash`, or no scope at all (an ID token from a refresh grant
+     carries neither `nonce` nor scope). Such a token is
      accepted only with every required scope, which an ID token never
      carries; otherwise (and always when `required_scopes` is empty) it is
      refused as an ID token, with `401` `invalid_token`, never a `403`,
@@ -123,6 +122,16 @@ it needs a restart, and a bad value stops startup with a message naming it.
   possession, which Arneb does not verify, so accepting it as a plain bearer
   would let a stolen one be replayed. Turn DPoP binding off for the client
   your MCP client uses.
+
+  `scope` and `scp` are each read the same way: a space-separated string,
+  or an array of strings (each element split on spaces too), so
+  `"scope": ["mcp", "read"]` grants `mcp` and `read`. A claim of any other
+  shape is malformed and grants nothing, not even the strings in it:
+  `null`, a number, a boolean, an object, or an array holding anything but
+  strings (`["mcp", 1]`). Empty strings and elements add nothing. A token
+  whose only scope claims are empty or malformed has no scope, so rule 4
+  refuses it unless it has a type marker, and with one it still fails any
+  `required_scopes`.
 
   So an IdP whose access tokens have neither a `typ` marker nor a scope
   claim needs `required_scopes` (and its tokens must then carry them). Set

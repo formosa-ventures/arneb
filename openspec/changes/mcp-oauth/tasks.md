@@ -45,3 +45,7 @@
 - [x] 8.5 An unmarked ID-token-like token without every required scope is `401 invalid_token` (before scope and email `403`s); one parsed scope list; scope checked before email
 - [x] 8.6 Bare well-known path only when the resource path is exactly `/mcp`; shared-ingress risk documented
 - [x] 8.7 Entra app-only remedies corrected (Arneb API token; no `scp`, no `at+jwt`)
+
+## 9. Review round 6
+
+- [x] 9.1 `scope` parsed like `scp` (string or string array); a malformed claim (`null`, number, boolean, object, array with a non-string element) grants nothing and counts as no scope

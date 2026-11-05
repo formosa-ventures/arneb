@@ -868,13 +868,14 @@ the source of truth from the config file to the [state store](#state):
   coordinator without `[cluster] secret` (`ARNEB_CLUSTER_SECRET`) now
   **refuses to start** while a served catalog carries a secret: a
   `password`, a password in `connection_url` (a `connection_url` that fails
-  validation counts when it may hold one: an `@` with a `:` before it in
-  the part after `scheme://` up to the first `/`, `?` or `#` (or a raw
-  `/`, `?` or `#` in a userinfo password), a query parameter whose key is
-  `password` once percent-decoded, or, with no `scheme://` (a libpq
-  `host=... password=...` string), any `password` or `user:pass@` shape; a
-  mistyped URL with no password, such as `?sslmod=require`, does not
-  stop the start, its catalog fails to build with a WARN),
+  validation counts when it may hold one: a `:` before its first `@`
+  after `scheme://` (outside an IPv6 host), unless that `@` plainly sits
+  in a query value such as `db:5432/x?user=a@b`; a query parameter whose
+  key, split on every `&` and percent-decoded, contains `password` in any
+  case (`?sslmode&password=`, `?PASSWORD=`); or, with no `scheme://` (a
+  libpq `host=... password=...` string), any `password` or `user:pass@`
+  shape; a mistyped URL with no password, such as `?sslmod=require`,
+  does not stop the start, its catalog fails to build with a WARN),
   an S3 `secret_access_key` or an Azure `access_key`, including the global `[storage]` keys merged into
   every Hive catalog. The error names each catalog and field (never the
   value). The check runs before anything is stored, on every catalog that
@@ -1077,10 +1078,14 @@ the response returns. Read it with
   graceful shutdown, or a fatal pgwire or Flight listener error); a
   completion still unwritten then is logged at ERROR and its action is
   recorded as `interrupted` at the next start. Before that last attempt, the
-  server waits up to 10 seconds for audited actions still running (a cancel
-  waiting on its kill, a token issue), so their completions get the same
-  retry; one still running after that is logged at ERROR and recorded as
-  `interrupted` at the next start. An action that panics, or a cancel whose
+  Web API stops gracefully: it accepts no new connections, closes idle ones,
+  and gives requests in progress up to 5 seconds to finish. Then new audited
+  actions are refused with `503 audit_unavailable` ("the server is shutting
+  down"; nothing is applied or written, including one still queued on the
+  blocking pool), and the server waits up to 10 seconds for audited actions
+  already running (a cancel waiting on its kill, a token issue), so their
+  completions get the same retry; one still running after that is logged at
+  ERROR and recorded as `interrupted` at the next start. An action that panics, or a cancel whose
   kill ended without an outcome, is completed as `interrupted`, since it may
   have taken effect. A `token.issue` that failed
   has an empty `target`: its token id never became a token.

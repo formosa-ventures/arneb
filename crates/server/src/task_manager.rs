@@ -1300,11 +1300,11 @@ impl TaskSources<'_> {
     /// catalog of the set never fails the task. On a miss (not registered,
     /// or another fingerprint) a worker pulls the coordinator's set once
     /// and looks again, even when it is already past the planned set (the
-    /// coordinator may have changed the catalog back since). Behind, it
-    /// starts a fresh pull when the one it joined fetched before the
-    /// change; past the planned set, it joins whatever pull runs, so the
-    /// tasks of a query planned before a change share one fetch. A catalog
-    /// that failed to build is rebuilt by that pull (Ruling R8).
+    /// coordinator may have changed the catalog back since). When the pull
+    /// it joined was already running (its fetch may predate the change) and
+    /// the catalog still does not match, it starts one fresh pull; tasks
+    /// arriving together still share those fetches. A catalog that failed
+    /// to build is rebuilt by that pull (Ruling R8).
     async fn lookup(
         &mut self,
         catalog: &str,
@@ -1345,12 +1345,9 @@ impl TaskSources<'_> {
             "task names a catalog not registered here at the planned version, pulling \
              catalogs"
         );
-        let pulled = if ahead {
-            puller.pull().await
-        } else {
-            // A fresh pull when the one joined fetched before the change.
-            puller.pull_until(|| fits(&held())).await
-        };
+        // A fresh pull when the one joined fetched before the change (or,
+        // ahead, before the coordinator changed the catalog back).
+        let pulled = puller.pull_until(|| fits(&held())).await;
         if let Err(e) = pulled {
             tracing::warn!(target: "arneb::cluster", error = %e, "catalog pull failed");
         }
@@ -1868,6 +1865,71 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Round 6: past the planned set, a task that joins a pull already
+    /// running (fetched before the coordinator changed the catalog back)
+    /// starts one fresh pull rather than failing on the stale answer.
+    #[tokio::test]
+    async fn an_ahead_task_does_not_trust_a_pull_older_than_itself() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = Arc::new(ConnectorRegistry::new());
+        let live = crate::catalogs::LiveCatalogs::with_test_builder(
+            Arc::new(CatalogManager::new("memory", "default")),
+            registry.clone(),
+            Box::new(|_| Ok(users_built())),
+        );
+        let set = |generation, cat1: &str| arneb_rpc::CatalogSet {
+            epoch: 9,
+            generation,
+            catalogs: vec![serde_json::json!({
+                "name": "cat1", "type": "hive", "metastore_uri": cat1
+            })],
+            ..Default::default()
+        };
+        let at3 = tag_of(set(3, "h1:9083")).await;
+        assert!(live.apply_remote(set(5, "h2:9083")).await.applied);
+        let served = Arc::new(std::sync::Mutex::new(set(5, "h2:9083")));
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (n, l, s, g) = (pulls.clone(), live.clone(), served.clone(), gate.clone());
+        let puller = crate::catalogs::CatalogPuller::new(live.clone(), move || {
+            // The set is read when the fetch starts; the first one waits.
+            let first = n.fetch_add(1, Ordering::SeqCst) == 0;
+            let (l, set, g) = (l.clone(), s.lock().unwrap().clone(), g.clone());
+            Box::pin(async move {
+                if first {
+                    g.notified().await;
+                }
+                l.apply_remote(set).await;
+                Ok(())
+            })
+        });
+        // A heartbeat's pull is under way, with the gen-5 set.
+        let running = tokio::spawn({
+            let p = puller.clone();
+            async move { p.pull().await }
+        });
+        while pulls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // The coordinator then changed cat1 back to the planned spec.
+        *served.lock().unwrap() = set(7, "h1:9083");
+        let tm = worker_tm(registry.clone(), puller);
+        let (scan, mut ctx) = (cat1_scan(), arneb_execution::ExecutionContext::new());
+        let (ran, ()) = tokio::join!(
+            tm.register_data_sources(&scan, &mut ctx, Some(at3)),
+            async {
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                gate.notify_one();
+            }
+        );
+        ran.expect("a fresh pull brings the reverted catalog");
+        running.await.unwrap().unwrap();
+        assert_eq!(pulls.load(Ordering::SeqCst), 2);
+        assert_eq!(live.generation(), 7);
     }
 
     /// Round 4: an unqualified scan of a task resolves in the default

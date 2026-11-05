@@ -177,6 +177,8 @@ pub struct AuditLog {
     writable: AtomicBool,
     /// Audited actions running now ([`Self::track_action`]).
     in_flight: AtomicUsize,
+    /// Set by [`Self::stop_actions`]: new audited actions are refused.
+    stopped: AtomicBool,
     #[cfg(any(test, feature = "test-hooks"))]
     fail_appends: AtomicBool,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -244,6 +246,7 @@ impl AuditLog {
             entries: Mutex::new(entries),
             writable: AtomicBool::new(true),
             in_flight: AtomicUsize::new(0),
+            stopped: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             fail_appends: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -587,10 +590,28 @@ impl AuditLog {
 
     /// Counts an audited action as running until the returned guard drops,
     /// so a graceful shutdown can wait for it ([`Self::actions_in_flight`])
-    /// before its last attempt to append failed completions.
-    pub fn track_action(&self) -> ActionInFlight<'_> {
+    /// before its last attempt to append failed completions. `None` once
+    /// [`Self::stop_actions`] was called: the action must then be refused
+    /// before it writes anything.
+    ///
+    /// The count is raised before the stop flag is read, and
+    /// [`Self::stop_actions`] sets the flag before the shutdown reads the
+    /// count (both `SeqCst`), so an action either sees the stop and is
+    /// refused, or is counted and waited for; none slips between the two.
+    pub fn track_action(&self) -> Option<ActionInFlight<'_>> {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        ActionInFlight(&self.in_flight)
+        let running = ActionInFlight(&self.in_flight);
+        if self.stopped.load(Ordering::SeqCst) {
+            return None; // `running` drops: no longer counted
+        }
+        Some(running)
+    }
+
+    /// Refuses new audited actions from now on ([`Self::track_action`]
+    /// returns `None`); the ones already counted keep running. Called once
+    /// at shutdown, before waiting for [`Self::actions_in_flight`] to drain.
+    pub fn stop_actions(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
     }
 
     /// Audited actions running now ([`Self::track_action`]). Lock-free.

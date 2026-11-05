@@ -71,3 +71,9 @@
 - [x] 12.3 Audit: a kill without an outcome is audited `interrupted`; a query that left the history reports the last state the kill knew, never an invented `cancelled`
 - [x] 12.4 Audit: the shutdown flush waits (at most 10 s) for audited actions still running
 - [x] 12.5 Agent: one reaper cancel in flight per statement; a cancel whose task failed keeps the statement instead of releasing it
+
+## 13. Review round 6
+
+- [x] 13.1 Shutdown: the Web API stops gracefully (bounded) before the audit flush; once the flush starts, new audited actions (one queued on the blocking pool included) are refused before their intent is written
+- [x] 13.2 Kill: a not-applied kill of a query that then left the history reports `state` `ended`, not the stale `running`
+- [x] 13.3 Trino: `EXPLAIN ANALYZE` of a read and an `EXECUTE` of a prepared read with `?` parameters (classified on the bound SQL) count as reads; `EXPLAIN ANALYZE` of a write stays a write

@@ -1524,51 +1524,131 @@ pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
 }
 
 /// Whether a `connection_url` that fails validation may hold a password.
-/// With a `scheme://`:
-/// - its authority (up to the first `/`, `?` or `#`) holds an `@` with a
-///   `:` before it (`u:p@db`, `u:p@ss@db`);
-/// - or the driver would end the userinfo at an `@` past the authority
-///   and the authority has a `:` that is not a port (`u:p/w@db`, a raw `/`
-///   in the password); `db:5432/x?user=a@b` (a port) and a `:` past the
-///   authority (`?application_name=a:b@c`) are not passwords;
-/// - or a query parameter's key is `password` once percent-decoded, found
-///   by the shared scanner (not a substring anywhere).
+/// It fails closed: a missed password would be served to peers, while a
+/// false positive only refuses the spec (or startup without a cluster
+/// secret) with a clear message. With a `scheme://`:
+/// - the text before its first `@` (the userinfo, as the driver ends it)
+///   has a `:` outside a bracketed IPv6 host (`u:p@db`, `u:p/w@db`,
+///   `app:1234/56@db`), unless that `@` plainly sits in a query value, see
+///   [`at_in_query_value`] (`db:5432/x?user=a@b`,
+///   `?application_name=a:b@c`);
+/// - or a query parameter's key, split loosely (on every `&`, key to the
+///   first `=`) and percent-decoded, contains `password` in any case
+///   (`?sslmode&password=x`, `?PASSWORD=x`, `?sslpassword=x`).
 ///
-/// Without a `scheme://` (a libpq keyword string `host=db password=x`, a
-/// mistyped `postgresql:/u:p@db`) where its parts end is unknown, so it
-/// stays fail-closed: an `@` with a `:` before it, or `password` anywhere
-/// once percent-decoded, in any case. A typo such as
-/// `postgresql://db/x?sslmod=require` or an uppercase scheme holds none.
+/// Without a leading `scheme://` (a libpq keyword string `host=db
+/// password=x`, even one with a `file:///` parameter, a mistyped
+/// `postgresql:/u:p@db`) where its parts end is unknown: an `@`
+/// with a `:` before it, or `password` anywhere once percent-decoded, in
+/// any case. A typo such as `postgresql://db/x?sslmod=require` or an
+/// uppercase scheme holds none.
 fn refused_url_may_hold_password(url: &str) -> bool {
-    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+    let has_password = |text: &str| {
+        String::from_utf8_lossy(&arneb_postgresql::percent_decode(text))
+            .to_ascii_lowercase()
+            .contains("password")
+    };
+    // Only a leading scheme name counts: a `://` further in may sit in a
+    // keyword string's parameter (`sslrootcert=file:///ca.crt`).
+    let scheme_end = url.find("://").filter(|&i| {
+        i > 0
+            && url[..i]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    });
+    let Some(scheme_end) = scheme_end.map(|i| i + 3) else {
         let userinfo = url.find('@').is_some_and(|at| url[..at].contains(':'));
-        return userinfo
-            || String::from_utf8_lossy(&arneb_postgresql::percent_decode(url))
-                .to_ascii_lowercase()
-                .contains("password");
+        return userinfo || has_password(url);
     };
     let rest = &url[scheme_end..];
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let in_authority = authority
-        .find('@')
-        .is_some_and(|at| authority[..at].contains(':'));
-    let past_authority = !authority.contains('@') && rest.contains('@') && {
-        // A bracketed IPv6 host's colons are not separators.
-        let host_start = if authority.starts_with('[') {
-            authority.find(']').map_or(authority.len(), |i| i + 1)
-        } else {
-            0
-        };
-        authority[host_start..].find(':').is_some_and(|c| {
-            let after = &authority[host_start + c + 1..];
-            after.is_empty() || !after.bytes().all(|b| b.is_ascii_digit())
+    let userinfo = rest.find('@').is_some_and(|at| {
+        let host_start = ipv6_host_len(rest);
+        rest[host_start..at].contains(':') && !at_in_query_value(rest, at)
+    });
+    let query = rest.find('?').is_some_and(|q| {
+        rest[q + 1..]
+            .split('&')
+            .any(|segment| has_password(segment.split('=').next().unwrap_or_default()))
+    });
+    userinfo || query
+}
+
+/// The length of the bracketed IPv6 host `rest` starts with (`[::1]`), or
+/// 0: only hex digits, `:` and `.` inside, and no `@` right after, count
+/// as one, so a `[` in a userinfo (`[u:p@db`, `[ab:cd]@db`) leaves its
+/// `:` counted.
+fn ipv6_host_len(rest: &str) -> usize {
+    rest.strip_prefix('[')
+        .and_then(|r| r.find(']'))
+        .filter(|&end| {
+            rest[1..1 + end]
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+                && !rest[end + 2..].starts_with('@')
         })
+        .map_or(0, |end| end + 2)
+}
+
+/// Whether the `@` at byte `at` of `rest` (a URL after its `scheme://`)
+/// plainly sits in a query value rather than ending a userinfo: before it
+/// come a `host[:port]` (an all-digit port), a path with no `:` and a `?`,
+/// and its own parameter has a key the driver knows (`user=a@b`); after it
+/// no `/`, `:` or `?` comes before the next `&` (so `app:12?user=x@db/x`,
+/// which the driver would read as user `app` with a password, still
+/// counts). `u:<digits>/x?user=v@h` is the shape no rule can tell from
+/// `db:5432/x?user=a@b`; it is read as the latter.
+fn at_in_query_value(rest: &str, at: usize) -> bool {
+    const KNOWN_KEYS: &[&str] = &[
+        "user",
+        "dbname",
+        "options",
+        "application_name",
+        "sslmode",
+        "sslnegotiation",
+        "sslcert",
+        "sslkey",
+        "sslrootcert",
+        "host",
+        "hostaddr",
+        "port",
+        "connect_timeout",
+        "tcp_user_timeout",
+        "keepalives",
+        "keepalives_idle",
+        "keepalives_interval",
+        "keepalives_retries",
+        "target_session_attrs",
+        "channel_binding",
+        "load_balance_hosts",
+    ];
+    let before = &rest[..at];
+    let Some(q) = before.find('?') else {
+        return false;
     };
-    let query = arneb_postgresql::query_params_from(url, scheme_end)
-        .iter()
-        .any(|p| arneb_postgresql::is_password_key(&url[p.key.clone()]));
-    in_authority || past_authority || query
+    let (pre, query) = (&before[..q], &before[q + 1..]);
+    let authority_end = pre.find('/').unwrap_or(pre.len());
+    let (authority, path) = pre.split_at(authority_end);
+    let host_start = ipv6_host_len(authority);
+    let port_ok = match authority[host_start..].split_once(':') {
+        None => true,
+        Some((_, port)) => !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
+    };
+    let known_key = query
+        .rsplit('&')
+        .next()
+        .and_then(|segment| segment.split_once('='))
+        .is_some_and(|(key, _)| {
+            let key = String::from_utf8_lossy(&arneb_postgresql::percent_decode(key))
+                .to_ascii_lowercase();
+            KNOWN_KEYS.contains(&key.as_str())
+        });
+    let after = &rest[at + 1..];
+    let tail = &after[..after.find('&').unwrap_or(after.len())];
+    port_ok
+        && !pre.contains('#')
+        && !path.contains(':')
+        && known_key
+        && !tail.contains(['/', ':', '?'])
 }
 
 /// Whether `a` and `b` send their secrets to the same places (Ruling R10):
@@ -2274,6 +2354,7 @@ mod tests {
         for url in [
             "host=db password=kw-secret",
             "host=db PASSWORD=kw-secret",
+            "host=db sslrootcert=file:///ca.crt password=kw-secret",
             "postgresql://db/x?sslmod=require&pass%77ord=Qz7",
             "postgresql://db/x?sslmod=require&password=Qz7",
             "postgresql://u:Qz7@db/x?sslmod=require",
@@ -2283,10 +2364,27 @@ mod tests {
             "postgresql://db/x?sslmod=bad&password=x",
             "postgresql://u:p/w@db/x",
             "user:pass@host/db",
+            // Round 6: a valueless parameter before the password, an
+            // all-digit password with a raw `/`, an uppercase key.
+            "postgresql://db/x?sslmode&password=hunter2",
+            "postgresql://app:1234/56@db/x",
+            "postgresql://db/x?PASSWORD=hunter2",
+            "postgresql://db/x?sslmode=require&sslpassword=hunter2",
+            "postgresql://app:1234?56@db/x",
+            "postgresql://app:12?user=x@db/x",
+            "postgresql://app:12/x?y=z@db",
+            "postgresql://[ab:cd]@db/x?sslmod=bad",
         ] {
             let s = pg(url);
             assert!(validate_spec(&s).is_err(), "{url}");
             assert_eq!(secret_fields(&s), vec!["connection_url password"], "{url}");
+            // Logged or served, the refused URL keeps only its scheme.
+            let shown = if url.starts_with("postgresql://") {
+                "postgresql://<redacted>"
+            } else {
+                REDACTED
+            };
+            assert_eq!(redacted_spec(&s)["connection_url"], shown, "{url}");
         }
     }
 

@@ -1536,8 +1536,9 @@ pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
 ///   first `=`) and percent-decoded, contains `password` in any case
 ///   (`?sslmode&password=x`, `?PASSWORD=x`, `?sslpassword=x`).
 ///
-/// Without a `scheme://` (a libpq keyword string `host=db password=x`, a
-/// mistyped `postgresql:/u:p@db`) where its parts end is unknown: an `@`
+/// Without a leading `scheme://` (a libpq keyword string `host=db
+/// password=x`, even one with a `file:///` parameter, a mistyped
+/// `postgresql:/u:p@db`) where its parts end is unknown: an `@`
 /// with a `:` before it, or `password` anywhere once percent-decoded, in
 /// any case. A typo such as `postgresql://db/x?sslmod=require` or an
 /// uppercase scheme holds none.
@@ -1547,7 +1548,15 @@ fn refused_url_may_hold_password(url: &str) -> bool {
             .to_ascii_lowercase()
             .contains("password")
     };
-    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+    // Only a leading scheme name counts: a `://` further in may sit in a
+    // keyword string's parameter (`sslrootcert=file:///ca.crt`).
+    let scheme_end = url.find("://").filter(|&i| {
+        i > 0
+            && url[..i]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    });
+    let Some(scheme_end) = scheme_end.map(|i| i + 3) else {
         let userinfo = url.find('@').is_some_and(|at| url[..at].contains(':'));
         return userinfo || has_password(url);
     };
@@ -1565,8 +1574,9 @@ fn refused_url_may_hold_password(url: &str) -> bool {
 }
 
 /// The length of the bracketed IPv6 host `rest` starts with (`[::1]`), or
-/// 0: only hex digits, `:` and `.` count as one, so a `[` before a
-/// userinfo password (`[u:p@db`) leaves its `:` counted.
+/// 0: only hex digits, `:` and `.` inside, and no `@` right after, count
+/// as one, so a `[` in a userinfo (`[u:p@db`, `[ab:cd]@db`) leaves its
+/// `:` counted.
 fn ipv6_host_len(rest: &str) -> usize {
     rest.strip_prefix('[')
         .and_then(|r| r.find(']'))
@@ -1574,6 +1584,7 @@ fn ipv6_host_len(rest: &str) -> usize {
             rest[1..1 + end]
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+                && !rest[end + 2..].starts_with('@')
         })
         .map_or(0, |end| end + 2)
 }
@@ -2343,6 +2354,7 @@ mod tests {
         for url in [
             "host=db password=kw-secret",
             "host=db PASSWORD=kw-secret",
+            "host=db sslrootcert=file:///ca.crt password=kw-secret",
             "postgresql://db/x?sslmod=require&pass%77ord=Qz7",
             "postgresql://db/x?sslmod=require&password=Qz7",
             "postgresql://u:Qz7@db/x?sslmod=require",
@@ -2361,18 +2373,18 @@ mod tests {
             "postgresql://app:1234?56@db/x",
             "postgresql://app:12?user=x@db/x",
             "postgresql://app:12/x?y=z@db",
+            "postgresql://[ab:cd]@db/x?sslmod=bad",
         ] {
             let s = pg(url);
             assert!(validate_spec(&s).is_err(), "{url}");
             assert_eq!(secret_fields(&s), vec!["connection_url password"], "{url}");
             // Logged or served, the refused URL keeps only its scheme.
-            if url.contains("://") {
-                assert_eq!(
-                    redacted_spec(&s)["connection_url"],
-                    "postgresql://<redacted>",
-                    "{url}"
-                );
-            }
+            let shown = if url.starts_with("postgresql://") {
+                "postgresql://<redacted>"
+            } else {
+                REDACTED
+            };
+            assert_eq!(redacted_spec(&s)["connection_url"], shown, "{url}");
         }
     }
 

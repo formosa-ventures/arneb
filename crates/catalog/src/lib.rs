@@ -677,7 +677,10 @@ impl CatalogManager {
     ///
     /// A part is folded only when the source answers that nothing goes by
     /// it as written, so neither access rules nor an outage choose which
-    /// object is read: `Err` when the source could not be asked.
+    /// object is read: `Err` when the source could not be asked. Both
+    /// spellings are looked up before the fold is decided, so how many
+    /// lookups a reference costs never depends on whether a name the user
+    /// may not read exists.
     pub async fn fold_reference_case(
         &self,
         reference: &TableReference,
@@ -708,44 +711,62 @@ impl CatalogManager {
         let Some(catalog) = self.catalog(&catalog_name) else {
             return Ok(folded);
         };
-        let schema_name = match &reference.schema {
-            Some(name) => {
+        // Both spellings are always asked about, and only then is the fold
+        // decided, so the number of source lookups never depends on whether
+        // an object exists (one the user may not see included). `try_schema`,
+        // not `schema`: a transient failure looking up `"Shop"` must not
+        // fold the reference onto `shop`.
+        let schema = match &reference.schema {
+            Some(name)
+                if name.to_lowercase() != *name
+                    && self.schema_visible(&catalog_name, &name.to_lowercase()) =>
+            {
                 let lower = name.to_lowercase();
-                // `try_schema`, not `schema`: a transient failure looking
-                // up `"Shop"` must not fold the reference onto `shop`.
-                if lower != *name
-                    && self.schema_visible(&catalog_name, &lower)
-                    && catalog.try_schema(name).await?.is_none()
-                    && catalog.try_schema(&lower).await?.is_some()
-                {
-                    folded.schema = Some(lower);
+                let as_written = catalog.try_schema(name).await?;
+                let lowered = catalog.try_schema(&lower).await?;
+                match (as_written, lowered) {
+                    (None, Some(lowered)) => {
+                        folded.schema = Some(lower);
+                        Some(lowered)
+                    }
+                    (as_written, _) => as_written,
                 }
-                folded.schema.clone().unwrap_or_default()
             }
-            None => self.default_schema.clone(),
+            Some(name) => catalog.try_schema(name).await?,
+            None => catalog.try_schema(&self.default_schema).await?,
         };
-        let Some(schema) = catalog.try_schema(&schema_name).await? else {
+        let schema_name = folded
+            .schema
+            .clone()
+            .unwrap_or_else(|| self.default_schema.clone());
+        let Some(schema) = schema else {
             return Ok(folded);
         };
+        // A schema hidden under its stored name reads as missing in
+        // `resolve_table`, so probing its tables would only reveal, by the
+        // lookups it costs, that it exists.
+        let stored_schema = schema
+            .canonical_name()
+            .unwrap_or_else(|| schema_name.clone());
+        if !self.schema_visible(&catalog_name, &stored_schema) {
+            return Ok(folded);
+        }
         // Access rules must never choose which table is read: fold only
         // when the source answers that no table goes by the name as
         // written (`Missing`); one that exists, readable or not, stops the
         // fold, and `resolve_table` then reads or refuses it as written.
+        // Both names are always probed before deciding, so a denied name
+        // costs the source the same lookups whether or not it exists.
         // Neither probe loads a table: the gate refuses every stored name,
         // so a connector stops at its name lookup (`Denied` meaning "it
         // exists"), and the second probe only records whether the user may
         // read the lowercase table. So a denied table is never loaded here,
         // and an allowed one is loaded once, by `resolve_table`.
         let lower = reference.table.to_lowercase();
-        if lower != reference.table
-            && self.table_visible(&catalog_name, &schema_name, &lower)
-            && matches!(
-                schema
-                    .table_if_allowed(&reference.table, &|_, _| false)
-                    .await?,
-                TableLookup::Missing
-            )
-        {
+        if lower != reference.table && self.table_visible(&catalog_name, &schema_name, &lower) {
+            let as_written = schema
+                .table_if_allowed(&reference.table, &|_, _| false)
+                .await?;
             let readable = std::sync::atomic::AtomicBool::new(false);
             let record = |s: &str, t: &str| {
                 readable.store(
@@ -754,13 +775,16 @@ impl CatalogManager {
                 );
                 false
             };
-            let fold = match schema.table_if_allowed(&lower, &record).await? {
-                // A connector that reports no stored name (memory, file)
-                // finds by the exact name only, and its lookup is cheap.
-                TableLookup::Found(_) => true,
-                TableLookup::Denied => readable.load(std::sync::atomic::Ordering::Relaxed),
-                TableLookup::Missing => false,
-            };
+            let lowered = schema.table_if_allowed(&lower, &record).await?;
+            let fold = matches!(as_written, TableLookup::Missing)
+                && match lowered {
+                    // A connector that reports no stored name (memory,
+                    // file) finds by the exact name only, and its lookup is
+                    // cheap.
+                    TableLookup::Found(_) => true,
+                    TableLookup::Denied => readable.load(std::sync::atomic::Ordering::Relaxed),
+                    TableLookup::Missing => false,
+                };
             if fold {
                 folded.table = lower;
             }
@@ -1306,6 +1330,142 @@ mod tests {
                 .to_string(),
             "pg.Shop.orders"
         );
+    }
+
+    /// A PostgreSQL-like connector over a fixed layout that counts every
+    /// question it is asked (lookups and listings), to show how many round
+    /// trips a statement costs.
+    #[derive(Debug)]
+    struct Counted {
+        layout: &'static [(&'static str, &'static [&'static str])],
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Counted {
+        fn ask(&self) {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountedSchema {
+        inner: LooseSchema,
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SchemaProvider for CountedSchema {
+        async fn table_names(&self) -> Vec<String> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.table_names().await
+        }
+        async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.table(name).await
+        }
+        fn canonical_name(&self) -> Option<String> {
+            self.inner.canonical_name()
+        }
+    }
+
+    #[async_trait]
+    impl CatalogProvider for Counted {
+        async fn schema_names(&self) -> Vec<String> {
+            self.ask();
+            self.layout.iter().map(|(s, _)| s.to_string()).collect()
+        }
+        async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+            self.ask();
+            let names: Vec<&str> = self.layout.iter().map(|(s, _)| *s).collect();
+            let name = resolve_loosely(&names, name)?;
+            let tables = self.layout.iter().find(|(s, _)| *s == name)?.1;
+            Some(Arc::new(CountedSchema {
+                inner: LooseSchema { name, tables },
+                asked: self.asked.clone(),
+            }))
+        }
+    }
+
+    /// Source questions and the outcome of reading `schema.table` as alice
+    /// under `rules`, from `layout`.
+    async fn counted_read(
+        layout: &'static [(&'static str, &'static [&'static str])],
+        rules: &str,
+        schema: &str,
+        table: &str,
+    ) -> (usize, String) {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let root = CatalogManager::new("pg", "public");
+        root.register_catalog(
+            "pg",
+            Arc::new(Counted {
+                layout,
+                asked: asked.clone(),
+            }),
+        );
+        let alice = root.with_access("alice", Arc::new(AccessRules::from_json(rules).unwrap()));
+        let err = fold_read(&alice, schema, table).await.unwrap_err();
+        (
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            err.to_string(),
+        )
+    }
+
+    /// A denied name costs the source the same number of questions whether
+    /// or not the table exists, so latency does not tell alice which. The
+    /// case fold asks about both spellings before deciding, instead of
+    /// stopping as soon as the name as written turns out to exist.
+    #[tokio::test]
+    async fn a_denied_name_costs_the_same_whether_or_not_it_exists() {
+        // Denied as written, every other name readable.
+        let rules = r#"{"tables": [
+            {"user": "alice", "table": "Payroll", "privileges": []},
+            {"privileges": ["SELECT"]}
+        ]}"#;
+        let present = counted_read(&[("public", &["Payroll", "t"])], rules, "public", "Payroll");
+        let absent = counted_read(&[("public", &["t"])], rules, "public", "Payroll");
+        let (present, absent) = (present.await, absent.await);
+        assert!(present.1.contains("Access Denied"), "{}", present.1);
+        assert_eq!(present, absent);
+
+        // Denied only under its stored name (`shop`.`Orders`, written
+        // `SHOP.Orders`): refused as missing either way, at the same cost.
+        let rules = r#"{"tables": [
+            {"user": "alice", "schema": "shop", "table": "Orders", "privileges": []},
+            {"privileges": ["SELECT"]}
+        ]}"#;
+        let present = counted_read(&[("shop", &["Orders", "t"])], rules, "SHOP", "Orders");
+        let absent = counted_read(&[("shop", &["t"])], rules, "SHOP", "Orders");
+        let (present, absent) = (present.await, absent.await);
+        assert!(present.1.contains("schema not found"), "{}", present.1);
+        assert_eq!(present, absent);
+
+        // A schema the user may not see costs the same too.
+        let rules = r#"{"tables": [
+            {"user": "alice", "schema": "Hidden", "privileges": []},
+            {"privileges": ["SELECT"]}
+        ]}"#;
+        let present = counted_read(
+            &[("HIDDEN", &["t"]), ("Hidden", &["t"])],
+            rules,
+            "Hidden",
+            "t",
+        );
+        let absent = counted_read(&[("other", &["t"])], rules, "Hidden", "t");
+        let (present, absent) = (present.await, absent.await);
+        assert_eq!(present, absent);
+
+        // So does a mixed-case table in a schema hidden under its stored
+        // name (`hr`, written `HR`): its tables are not probed.
+        let rules = r#"{
+            "schemas": [{"owner": false}],
+            "tables": [{"user": "alice", "schema": "public|[A-Z]+", "privileges": ["SELECT"]}]
+        }"#;
+        let present = counted_read(&[("hr", &["salaries"])], rules, "HR", "Salaries");
+        let absent = counted_read(&[("other", &["t"])], rules, "HR", "Salaries");
+        let (present, absent) = (present.await, absent.await);
+        assert!(present.1.contains("schema not found"), "{}", present.1);
+        assert_eq!(present, absent);
     }
 
     /// A connector normalizing names as HMS does: trimmed, lowercased,

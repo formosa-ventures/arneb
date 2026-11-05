@@ -1778,7 +1778,7 @@ mod tests {
     async fn the_web_shutdown_wait_is_bounded() {
         let router = axum::Router::new().route(
             "/hang",
-            axum::routing::get(|| futures::future::pending::<&str>()),
+            axum::routing::get(futures::future::pending::<&str>),
         );
         let (addr, web) = spawn_test_web(router).await;
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();

@@ -244,7 +244,7 @@ impl AgentQueryService {
             let (cm, _) = build_virtual_catalogs(&root, catalog, &probe).await;
             let columns = table_columns(&cm, catalog, schema, table)
                 .await
-                .map_err(|e| unreachable(&format!("{catalog}.{schema}.{table}"), &e))?
+                .map_err(|e| lookup_failed(&format!("{catalog}.{schema}.{table}"), &e))?
                 .ok_or_else(missing)?;
             (columns, None)
         } else {
@@ -458,7 +458,7 @@ async fn resolve_visible(
         match root.resolve_table(&reference).await {
             Ok(provider) => return Ok(provider),
             Err(e @ CatalogError::Unavailable(_)) => {
-                return Err(unreachable(&format!("{catalog}.{schema}.{table}"), &e))
+                return Err(lookup_failed(&format!("{catalog}.{schema}.{table}"), &e))
             }
             Err(_) => {}
         }
@@ -488,18 +488,23 @@ async fn schemas_of(root: &CatalogManager, catalog: &str) -> Result<Vec<String>,
     match schema_names(root, catalog).await {
         Ok(Some(names)) => Ok(names),
         Ok(None) => Err(catalog_missing(catalog, &catalog_names(root))),
-        Err(e) => Err(unreachable(catalog, &e)),
+        Err(e) => Err(lookup_failed(catalog, &e)),
     }
 }
 
-/// A listing or lookup of `what` that could not reach its source: an
-/// error to retry, never "not found".
-fn unreachable(what: &str, e: &CatalogError) -> AgentError {
+/// A listing or lookup of `what` that failed, never reported as "not
+/// found". Only an unreachable source ([`CatalogError::Unavailable`]) is
+/// worth retrying as is, so only it gets the retry hint.
+fn lookup_failed(what: &str, e: &CatalogError) -> AgentError {
+    let hint = match e {
+        CatalogError::Unavailable(_) => "the source is unreachable; retry later",
+        _ => "the source refused the lookup; see the message",
+    };
     AgentError::new(
         AgentErrorCode::QueryFailed,
         format!("cannot look up {what}: {e}"),
     )
-    .with_hint("the source is unreachable; retry later")
+    .with_hint(hint)
 }
 
 /// Visible tables of `catalog.schema`, or the not-found error one level up.
@@ -511,7 +516,7 @@ async fn tables_of(
     let schemas = schemas_of(root, catalog).await?;
     match table_names(root, catalog, schema).await {
         Ok(Some(names)) if schemas.iter().any(|s| s == schema) => Ok(names),
-        Err(e) => Err(unreachable(&format!("{catalog}.{schema}"), &e)),
+        Err(e) => Err(lookup_failed(&format!("{catalog}.{schema}"), &e)),
         _ => Err(schema_missing(catalog, schema, &schemas)),
     }
 }
@@ -735,6 +740,59 @@ mod tests {
             .hint
             .unwrap()
             .contains("/api/v2/catalogs/memory/schemas"));
+    }
+
+    /// Every discovery call on a catalog whose source is down (`down`,
+    /// with schema `cached` still served from Hive's name cache) reports
+    /// a failed lookup to retry, never a missing or empty object.
+    #[tokio::test]
+    async fn an_unreachable_source_is_a_retryable_failure_not_a_miss() {
+        let cm = CatalogManager::new("down", "cached");
+        cm.register_catalog(
+            "down",
+            Arc::new(arneb_catalog::conformance::Unreachable {
+                cached: vec!["cached".into()],
+            }),
+        );
+        let svc = AgentQueryService::new(
+            Arc::new(cm),
+            Arc::new(ConnectorRegistry::new()),
+            Arc::new(QueryTracker::new()),
+            AgentLimits::default(),
+        );
+        let retryable = |err: AgentError| {
+            assert_eq!(err.code, AgentErrorCode::QueryFailed, "{}", err.message);
+            assert!(err.message.contains("metastore down"), "{}", err.message);
+            assert_eq!(
+                err.hint.as_deref(),
+                Some("the source is unreachable; retry later")
+            );
+        };
+        retryable(svc.list_schemas("alice", "down", &all()).await.unwrap_err());
+        for schema in ["cached", "other"] {
+            retryable(
+                svc.list_tables("alice", "down", schema, &all())
+                    .await
+                    .unwrap_err(),
+            );
+            retryable(
+                svc.describe_table("alice", "down", schema, "t", None)
+                    .await
+                    .unwrap_err(),
+            );
+        }
+    }
+
+    /// Only an outage is worth retrying as is; any other failed lookup
+    /// gets a hint that says so.
+    #[test]
+    fn only_an_outage_gets_the_retry_hint() {
+        let other = lookup_failed(
+            "c.s",
+            &CatalogError::AccessDenied("Cannot list schema c.s".into()),
+        );
+        assert_eq!(other.code, AgentErrorCode::QueryFailed);
+        assert!(!other.hint.unwrap().contains("retry"));
     }
 
     const HIDE_ORDERS: &str = r#"{"tables": [

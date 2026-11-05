@@ -68,8 +68,10 @@ pub(crate) fn spawn_audit_retry(
 /// (e.g. a cancel waiting on its kill, a PBKDF2 token issue).
 pub(crate) const SHUTDOWN_ACTION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// At graceful shutdown: waits (at most [`SHUTDOWN_ACTION_WAIT`]) for the
-/// audited actions still running in `spawn_blocking` to complete, then
+/// At shutdown: refuses new audited actions (one queued on the blocking
+/// pool but not started yet is refused without writing its intent), waits
+/// (at most [`SHUTDOWN_ACTION_WAIT`]) for the audited actions already
+/// running in `spawn_blocking` to complete, then
 /// makes one last attempt to append the completions whose write failed, so
 /// their known outcomes are not lost (a restart would record their intents
 /// as `interrupted`). Logs at ERROR how many actions are still running, or
@@ -82,6 +84,7 @@ async fn flush_audit_within(
     audit: std::sync::Arc<arneb_state::AuditLog>,
     wait: std::time::Duration,
 ) {
+    audit.stop_actions();
     let deadline = tokio::time::Instant::now() + wait;
     while audit.actions_in_flight() > 0 {
         if tokio::time::Instant::now() >= deadline {
@@ -132,6 +135,14 @@ fn audit_unavailable() -> ApiError {
     .with_hint("retry shortly; the server log names the audit log error")
 }
 
+fn shutting_down() -> ApiError {
+    ApiError::new(
+        ErrorCode::AuditUnavailable,
+        "the server is shutting down, so audited actions are refused",
+    )
+    .with_hint("nothing was applied; retry against a running server")
+}
+
 /// Runs `run` as the audited `action` of `who`: records `intent` (what is
 /// known before the action runs) as a `pending` entry first, refusing with
 /// `audit_unavailable` before running anything when the log is unwritable
@@ -165,8 +176,12 @@ pub(super) fn audited<T>(
         audit_unavailable()
     };
     // Counted until its completion is appended (or kept), so the shutdown
-    // flush waits for it ([`flush_audit`]).
-    let _running = state.audit.track_action();
+    // flush waits for it ([`flush_audit`]); once the shutdown has begun, an
+    // action that had not started yet (e.g. still queued on the blocking
+    // pool) is refused before anything is written.
+    let Some(_running) = state.audit.track_action() else {
+        return Err(shutting_down());
+    };
     if let Err(e) = state.audit.ensure_writable() {
         return Err(refuse(&e));
     }
@@ -828,11 +843,85 @@ mod tests {
         assert_eq!(entries[0]["outcome"], "ok");
     }
 
+    /// An audited action still queued on the blocking pool when the
+    /// shutdown begins (the pool is busy, so it has not started) is refused
+    /// once it runs, before writing its intent: the flush does not return
+    /// with a `begin` record about to be written behind it.
+    #[test]
+    fn an_action_queued_when_the_shutdown_begins_is_refused_unwritten() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = state();
+            // Occupy the only blocking thread.
+            let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+            let (free_tx, free_rx) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).unwrap();
+                free_rx.recv().unwrap();
+            });
+            while busy_rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+            let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let queued = tokio::task::spawn_blocking({
+                let state = state.clone();
+                let ran = std::sync::Arc::clone(&ran);
+                move || {
+                    let who = Identity {
+                        user: "root".into(),
+                        via: crate::web::auth::AuthVia::Basic,
+                    };
+                    let subject = || AuditSubject {
+                        target: "q1".into(),
+                        parameters: json!({}),
+                    };
+                    audited(
+                        &state,
+                        &who,
+                        "query.cancel",
+                        subject(),
+                        || -> Result<(), ApiError> {
+                            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Ok(())
+                        },
+                        |_| subject(),
+                    )
+                }
+            });
+            // Queued, not started: nothing counted, so the flush returns.
+            assert_eq!(state.audit.actions_in_flight(), 0);
+            flush_audit_within(
+                std::sync::Arc::clone(&state.audit),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            free_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            let err = queued.await.unwrap().unwrap_err();
+            assert_eq!(err.code, super::ErrorCode::AuditUnavailable);
+            assert!(err.message.contains("shutting down"), "{}", err.message);
+            assert!(
+                !ran.load(std::sync::atomic::Ordering::SeqCst),
+                "the action ran"
+            );
+            let page = state.audit.query(&AuditQuery {
+                limit: 10,
+                ..Default::default()
+            });
+            assert!(page.entries.is_empty(), "{:?}", page.entries);
+        });
+    }
+
     /// The flush waits for running actions only up to its bound.
     #[tokio::test]
     async fn the_shutdown_flush_wait_is_bounded() {
         let state = state();
-        let _running = state.audit.track_action();
+        let _running = state.audit.track_action().unwrap();
         let flush = flush_audit_within(
             std::sync::Arc::clone(&state.audit),
             std::time::Duration::from_millis(50),

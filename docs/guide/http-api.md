@@ -145,7 +145,7 @@ password auth without `[tls]` is a startup error; disable the listener with
 | `auth_disabled` | 409 | The route needs `[auth] type = "password"`. |
 | `conflict` | 409 | The change clashes with the current state: the name exists, the object changed while the call was being prepared (retry), or the change would remove your own manage privilege. |
 | `overloaded` | 503 | Too many pending password checks or sessions; retry (`Retry-After: 1`). |
-| `audit_unavailable` | 503 | The [audit log](#audit-log) cannot be written, so audited actions are refused; retry (`Retry-After: 5`). |
+| `audit_unavailable` | 503 | The [audit log](#audit-log) cannot be written, or the server is shutting down, so audited actions are refused before anything is applied; retry (`Retry-After: 5`). |
 | `internal` | 500 | An unexpected failure; the server log has the detail. |
 
 The [querying](#querying) routes add the codes in
@@ -498,7 +498,9 @@ When the kill lands decides what it does:
   the kill stops nothing. A kill that arrives during a step waits for that
   step to end to find out. The response has `changed: false` and the
   query's real state (`state_before` and `state`, e.g. `running` until the
-  statement reports back), the audit entry records `effect`
+  statement reports back; `state` is `ended` when the query has meanwhile
+  ended and left the history, so its final state is unknown), the audit
+  entry records `effect`
   `already_ended`, and the client gets the statement's real result.
 - **Between two steps of the work:** the work is stopped and the client
   gets the cancellation. This only says that the statement did not

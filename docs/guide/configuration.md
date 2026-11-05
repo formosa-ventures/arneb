@@ -997,10 +997,14 @@ the response returns. Read it with
   graceful shutdown, or a fatal pgwire or Flight listener error); a
   completion still unwritten then is logged at ERROR and its action is
   recorded as `interrupted` at the next start. Before that last attempt, the
-  server waits up to 10 seconds for audited actions still running (a cancel
-  waiting on its kill, a token issue), so their completions get the same
-  retry; one still running after that is logged at ERROR and recorded as
-  `interrupted` at the next start. An action that panics, or a cancel whose
+  Web API stops gracefully: it accepts no new connections, closes idle ones,
+  and gives requests in progress up to 5 seconds to finish. Then new audited
+  actions are refused with `503 audit_unavailable` ("the server is shutting
+  down"; nothing is applied or written, including one still queued on the
+  blocking pool), and the server waits up to 10 seconds for audited actions
+  already running (a cancel waiting on its kill, a token issue), so their
+  completions get the same retry; one still running after that is logged at
+  ERROR and recorded as `interrupted` at the next start. An action that panics, or a cancel whose
   kill ended without an outcome, is completed as `interrupted`, since it may
   have taken effect. A `token.issue` that failed
   has an empty `target`: its token id never became a token.

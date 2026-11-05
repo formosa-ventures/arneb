@@ -76,3 +76,4 @@
 
 - [x] 13.1 Shutdown: the Web API stops gracefully (bounded) before the audit flush; once the flush starts, new audited actions (one queued on the blocking pool included) are refused before their intent is written
 - [x] 13.2 Kill: a not-applied kill of a query that then left the history reports `state` `ended`, not the stale `running`
+- [x] 13.3 Trino: `EXPLAIN ANALYZE` of a read and an `EXECUTE` of a prepared read with `?` parameters (classified on the bound SQL) count as reads; `EXPLAIN ANALYZE` of a write stays a write

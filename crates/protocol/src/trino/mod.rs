@@ -776,27 +776,37 @@ async fn admit(
     Ok(Some(permit))
 }
 
-/// Whether `sql` only reads: a query, or an `EXPLAIN` without `ANALYZE`,
-/// directly or through `EXECUTE` / `EXECUTE IMMEDIATE`. Other control
-/// statements (`SHOW`, `USE`, `SET SESSION`, `PREPARE`, …) write no data.
-/// SQL that does not parse counts as a write (fail closed: a cancel then
+/// Whether `sql` only reads: a query, an `EXPLAIN` without `ANALYZE` (of
+/// anything: it runs nothing), or an `EXPLAIN ANALYZE` of a read (it runs
+/// the statement), directly or through `EXECUTE` / `EXECUTE IMMEDIATE`,
+/// classified on the SQL with its `?` placeholders bound, as the engine
+/// runs it. Other control statements (`SHOW`, `USE`, `SET SESSION`,
+/// `PREPARE`, …) write no data. SQL that does not parse, or whose
+/// parameters do not bind, counts as a write (fail closed: a cancel then
 /// never relabels the statement once it finished).
 fn only_reads(session: &ClientSession, sql: &str) -> bool {
     use arneb_sql_parser::ast::Statement;
+    fn reads(statement: &Statement) -> bool {
+        match statement {
+            Statement::Query { .. } | Statement::Explain { analyze: false, .. } => true,
+            Statement::Explain { stmt, .. } => reads(stmt),
+            _ => false,
+        }
+    }
     let sql = sql.trim().trim_end_matches(';').trim();
-    let target = match parse_control(sql) {
-        None => sql.to_owned(),
-        Some(ControlStatement::Execute { name, .. }) => match session.prepared_statement(&name) {
-            Some(prepared) => prepared.to_owned(),
-            None => return false,
-        },
-        Some(ControlStatement::ExecuteImmediate { sql, .. }) => sql,
+    let (target, params) = match parse_control(sql) {
+        None => return arneb_sql_parser::parse(sql).is_ok_and(|s| reads(&s)),
+        Some(ControlStatement::Execute { name, params }) => {
+            match session.prepared_statement(&name) {
+                Some(prepared) => (prepared.to_owned(), params),
+                None => return false,
+            }
+        }
+        Some(ControlStatement::ExecuteImmediate { sql, params }) => (sql, params),
         Some(_) => return true,
     };
-    matches!(
-        arneb_sql_parser::parse(&target),
-        Ok(Statement::Query { .. } | Statement::Explain { analyze: false, .. })
-    )
+    statements::bind_placeholders(&target, &params)
+        .is_ok_and(|bound| arneb_sql_parser::parse(&bound).is_ok_and(|s| reads(&s)))
 }
 
 /// Whether `sql` takes an admission slot, deciding `EXECUTE` /
@@ -1374,6 +1384,35 @@ mod tests {
         );
         let phase = ended_phase(&tracker, &id, Err(TrinoError::internal("boom")));
         assert!(matches!(phase, Phase::Failed(e) if e.name == "USER_CANCELED"));
+    }
+
+    /// `EXPLAIN ANALYZE` of a read and an `EXECUTE` of a prepared read with
+    /// `?` placeholders are reads (a cancel can stop them while paging);
+    /// `EXPLAIN ANALYZE` of a write, a prepared write, an `EXECUTE` whose
+    /// parameters do not bind and unparsable SQL stay writes.
+    #[test]
+    fn only_reads_classifies_explain_analyze_and_bound_executes() {
+        let mut session = ClientSession::from_headers(&HeaderMap::new(), None);
+        session.prepared = vec![
+            ("r".into(), "SELECT * FROM t WHERE a = ?".into()),
+            ("w".into(), "INSERT INTO t VALUES (?)".into()),
+        ];
+        let reads = |sql: &str| only_reads(&session, sql);
+        assert!(reads("SELECT 1"));
+        assert!(reads("EXPLAIN SELECT 1"));
+        assert!(reads("EXPLAIN INSERT INTO t VALUES (1)"), "runs nothing");
+        assert!(reads("EXPLAIN ANALYZE SELECT 1"));
+        assert!(!reads("EXPLAIN ANALYZE INSERT INTO t VALUES (1)"));
+        assert!(!reads("INSERT INTO t VALUES (1)"));
+        assert!(reads("EXECUTE r USING 1"));
+        assert!(reads(
+            "EXECUTE IMMEDIATE 'SELECT * FROM t WHERE a = ?' USING 1"
+        ));
+        assert!(!reads("EXECUTE w USING 1"));
+        assert!(!reads("EXECUTE r"), "a parameter is missing");
+        assert!(!reads("EXECUTE missing USING 1"));
+        assert!(!reads("SELEC nonsense"));
+        assert!(reads("SHOW CATALOGS"));
     }
 
     /// The Trino side of tracked query `tracker_id`, running its SQL.

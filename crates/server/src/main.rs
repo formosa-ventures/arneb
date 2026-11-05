@@ -1292,39 +1292,44 @@ async fn run() -> Result<()> {
     let flight_state_clone = flight_state.clone();
     let rpc_addr_clone = rpc_addr.clone();
 
-    tokio::select! {
-        // pgwire server (coordinator + standalone only)
-        result = server.start(), if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "pgwire server error");
-                web::flush_audit(Arc::clone(&audit_for_shutdown)).await;
-                bail!("server error: {e}");
-            }
-        }
-        // Flight RPC server (all roles)
-        result = arneb_rpc::start_flight_server(&rpc_addr_clone, flight_state_clone) => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "flight server error");
-                web::flush_audit(Arc::clone(&audit_for_shutdown)).await;
-                bail!("flight server error: {e}");
-            }
-        }
-        // Web UI HTTP server (coordinator + standalone only). Like the Trino
-        // listener, a bind failure is logged but not fatal.
-        _ = non_fatal_listener(
-            async {
+    // Web UI HTTP server (coordinator + standalone only), in its own task so
+    // the shutdown can stop it gracefully ([`stop_web_then_flush_audit`]).
+    // Like the Trino listener, a bind failure is logged but not fatal.
+    let web_server = serves_clients.then(|| {
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let web_addr = web_addr.clone();
+        let task = tokio::spawn(async move {
+            let served = async {
                 let listener = tokio::net::TcpListener::bind(&web_addr).await?;
                 tracing::info!(web_address = %web_addr, "web UI listening");
-                axum::serve(listener, web_router).await
-            },
-            |e| {
+                serve_until_stopped(listener, web_router, stopping).await
+            };
+            if let Err(e) = served.await {
                 tracing::error!(
                     error = %e,
                     address = %web_addr,
                     "web UI listener failed; continuing without it"
-                )
-            },
-        ), if serves_clients => {}
+                );
+            }
+        });
+        (stop, task)
+    });
+
+    let fatal = tokio::select! {
+        // pgwire server (coordinator + standalone only)
+        result = server.start(), if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) => {
+            result.err().map(|e| {
+                tracing::error!(error = %e, "pgwire server error");
+                anyhow::anyhow!("server error: {e}")
+            })
+        }
+        // Flight RPC server (all roles)
+        result = arneb_rpc::start_flight_server(&rpc_addr_clone, flight_state_clone) => {
+            result.err().map(|e| {
+                tracing::error!(error = %e, "flight server error");
+                anyhow::anyhow!("flight server error: {e}")
+            })
+        }
         // Trino client protocol. A bind failure (e.g. a local Trino already
         // on 8080) is logged but not fatal: pgwire keeps serving.
         _ = non_fatal_listener(
@@ -1342,7 +1347,7 @@ async fn run() -> Result<()> {
                      (set [trino] port / ARNEB_TRINO_PORT / --trino-port, or --no-trino)"
                 )
             },
-        ) => {}
+        ) => None,
 
         // Worker heartbeat loop
         _ = worker_heartbeat_loop(
@@ -1350,21 +1355,81 @@ async fn run() -> Result<()> {
             role,
             worker_state_rx,
             heartbeat.interval_secs,
-        ) => {}
+        ) => None,
         // SIGTERM / Ctrl-C; a worker drains first (worker-graceful-drain).
         _ = run_until_shutdown(
             heartbeat_target.as_ref().zip(worker_tasks.as_ref()),
             &worker_state,
             heartbeat.interval_secs,
             drain_timeout_secs,
-        ) => {}
+        ) => None,
+    };
+    // On a signal and on a fatal server error alike: the Web API finishes
+    // its requests (bounded), then audited actions still running get a
+    // bounded wait and completions whose write failed one last try.
+    stop_web_then_flush_audit(web_server, audit_for_shutdown).await;
+    match fatal {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-    // Audited actions still running (in `spawn_blocking`) get a bounded
-    // wait, then completions whose write failed get one last try before
-    // exiting (the fatal server errors above flush too).
-    web::flush_audit(audit_for_shutdown).await;
+}
 
-    Ok(())
+/// How long the shutdown lets the Web API finish the requests it has
+/// accepted (an audited action among them) before closing its connections.
+const WEB_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Stops the Web API gracefully: no new connections, idle keep-alive
+/// connections closed, requests in progress finished, for at most
+/// [`WEB_SHUTDOWN_WAIT`] (then the server task is aborted, logged at WARN;
+/// an audited action it had already handed to the blocking pool still runs
+/// to completion or is refused unwritten). Then flushes the audit log
+/// ([`web::flush_audit`], itself bounded and logging at ERROR what it
+/// could not finish). Holds no lock.
+async fn stop_web_then_flush_audit(
+    web_server: Option<(
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    )>,
+    audit: Arc<arneb_state::AuditLog>,
+) {
+    stop_web(web_server, WEB_SHUTDOWN_WAIT).await;
+    web::flush_audit(audit).await;
+}
+
+/// Serves `router` on `listener` until `stopping` turns true, then stops
+/// accepting, closes idle connections and returns once the requests in
+/// progress have finished.
+async fn serve_until_stopped(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            // A dropped sender also stops the server.
+            let _ = stopping.wait_for(|stop| *stop).await;
+        })
+        .await
+}
+
+/// Signals the web server to stop and waits for it at most `wait`.
+async fn stop_web(
+    web_server: Option<(
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    )>,
+    wait: std::time::Duration,
+) {
+    if let Some((stop, mut task)) = web_server {
+        stop.send_replace(true);
+        if tokio::time::timeout(wait, &mut task).await.is_err() {
+            tracing::warn!(
+                wait_ms = wait.as_millis() as u64,
+                "the web UI did not finish its requests in time; closing its connections"
+            );
+            task.abort();
+        }
+    }
 }
 
 /// Run an auxiliary listener (Web UI, Trino) whose failure must not stop
@@ -1638,6 +1703,100 @@ fn log_filter_directives(rust_log: Option<&str>, profile: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sends one HTTP/1.1 request on `stream` and reads the status line.
+    async fn request(stream: &mut tokio::net::TcpStream, path: &str) -> String {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let req = format!("GET {path} HTTP/1.1\r\nhost: x\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        line
+    }
+
+    /// A web server spawned like `run` does, on an ephemeral port.
+    async fn spawn_test_web(
+        router: axum::Router,
+    ) -> (
+        std::net::SocketAddr,
+        (
+            tokio::sync::watch::Sender<bool>,
+            tokio::task::JoinHandle<()>,
+        ),
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            serve_until_stopped(listener, router, stopping)
+                .await
+                .unwrap();
+        });
+        (addr, (stop, task))
+    }
+
+    /// The shutdown lets a request in progress (an audited action, say)
+    /// finish before the audit flush, instead of dropping the listener
+    /// with the connection still serving.
+    #[tokio::test]
+    async fn the_web_shutdown_finishes_requests_in_progress() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered = std::sync::Mutex::new(Some(entered_tx));
+        let entered = std::sync::Arc::new(entered);
+        let router = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(move || {
+                let entered = std::sync::Arc::clone(&entered);
+                async move {
+                    if let Some(tx) = entered.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    "done"
+                }
+            }),
+        );
+        let (addr, web) = spawn_test_web(router).await;
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            request(&mut stream, "/slow").await
+        });
+        entered_rx.await.unwrap();
+        let started = std::time::Instant::now();
+        stop_web(Some(web), std::time::Duration::from_secs(5)).await;
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+        let status = client.await.unwrap();
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    }
+
+    /// A request that never finishes does not hold up the exit.
+    #[tokio::test]
+    async fn the_web_shutdown_wait_is_bounded() {
+        let router = axum::Router::new().route(
+            "/hang",
+            axum::routing::get(|| futures::future::pending::<&str>()),
+        );
+        let (addr, web) = spawn_test_web(router).await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        {
+            use tokio::io::AsyncWriteExt as _;
+            stream
+                .write_all(b"GET /hang HTTP/1.1\r\nhost: x\r\n\r\n")
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stop_web(Some(web), std::time::Duration::from_millis(100)),
+        )
+        .await
+        .expect("the web shutdown waited past its bound");
+    }
 
     /// Which `tracing` target an [`enabled`] probe checks.
     #[derive(Clone, Copy)]

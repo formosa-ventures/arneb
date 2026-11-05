@@ -144,7 +144,7 @@ password auth without `[tls]` is a startup error; disable the listener with
 | `invalid_argument` | 400 (405 for a wrong method) | A malformed request. |
 | `auth_disabled` | 409 | The route needs `[auth] type = "password"`. |
 | `overloaded` | 503 | Too many pending password checks or sessions; retry (`Retry-After: 1`). |
-| `audit_unavailable` | 503 | The [audit log](#audit-log) cannot be written, so audited actions are refused; retry (`Retry-After: 5`). |
+| `audit_unavailable` | 503 | The [audit log](#audit-log) cannot be written, or the server is shutting down, so audited actions are refused before anything is applied; retry (`Retry-After: 5`). |
 | `internal` | 500 | An unexpected failure; the server log has the detail. |
 
 The [querying](#querying) routes add the codes in

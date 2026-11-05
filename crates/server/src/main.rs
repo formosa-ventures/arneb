@@ -2566,17 +2566,29 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("{url}: {e}"));
         }
-        let e = check_catalog_exposure(
-            &ServerRole::Coordinator,
-            false,
-            &none,
-            &[pg("postgresql://db/x?sslmod=require&password=Qz7")],
-            false,
-            9090,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(e.contains("catalog 'pg': connection_url password"), "{e}");
+        for url in [
+            "postgresql://db/x?sslmod=require&password=Qz7",
+            // Round 6: refused URLs whose password the earlier rule missed.
+            "postgresql://db/x?sslmode&password=hunter2",
+            "postgresql://app:1234/56@db/x",
+            "postgresql://db/x?PASSWORD=hunter2",
+        ] {
+            let e = check_catalog_exposure(
+                &ServerRole::Coordinator,
+                false,
+                &none,
+                &[pg(url)],
+                false,
+                9090,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                e.contains("catalog 'pg': connection_url password"),
+                "{url}: {e}"
+            );
+            assert!(!e.contains("hunter2") && !e.contains("1234/56"), "{e}");
+        }
     }
 
     /// The default catalog follows the served catalogs: the first config

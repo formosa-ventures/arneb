@@ -507,6 +507,9 @@ ORDER BY s_name";
         fn statistics(&self) -> Option<TableStatistics> {
             Some(self.stats.clone())
         }
+        fn canonical_name(&self) -> Option<(String, String)> {
+            None
+        }
     }
 
     fn ci(name: &str, data_type: DataType) -> ColumnInfo {

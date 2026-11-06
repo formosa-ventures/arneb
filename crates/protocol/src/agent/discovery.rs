@@ -9,6 +9,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use arneb_catalog::{CatalogManager, TableProvider};
+use arneb_common::error::CatalogError;
 use arneb_common::suggest::nearest;
 use arneb_common::TableReference;
 
@@ -243,6 +244,7 @@ impl AgentQueryService {
             let (cm, _) = build_virtual_catalogs(&root, catalog, &probe).await;
             let columns = table_columns(&cm, catalog, schema, table)
                 .await
+                .map_err(|e| lookup_failed(&format!("{catalog}.{schema}.{table}"), &e))?
                 .ok_or_else(missing)?;
             (columns, None)
         } else {
@@ -400,13 +402,15 @@ async fn listed_miss(
         Ok(Some(c)) if c == catalog || after_query => c.to_string(),
         Ok(_) => return None,
     };
-    let schemas = schema_names(root, &catalog).await?;
+    // An unreachable source is not a sure miss: the query decides.
+    let schemas = schema_names(root, &catalog).await.ok()??;
     let schema = match level(schema, &schemas) {
         Err(()) => return Some(schema_missing(&catalog, schema, &schemas)),
         Ok(Some(s)) if s == schema || after_query => s.to_string(),
         Ok(_) => return None,
     };
-    let tables = table_names(root, &catalog, &schema).await?;
+    // An unreachable source is not a sure miss: the query decides.
+    let tables = table_names(root, &catalog, &schema).await.ok()??;
     match level(table, &tables) {
         Err(()) => Some(table_missing(&catalog, &schema, table, &tables)),
         Ok(_) => None,
@@ -451,8 +455,12 @@ async fn resolve_visible(
             schema: Some(schema.to_string()),
             table: table.to_string(),
         };
-        if let Ok(provider) = root.resolve_table(&reference).await {
-            return Ok(provider);
+        match root.resolve_table(&reference).await {
+            Ok(provider) => return Ok(provider),
+            Err(e @ CatalogError::Unavailable(_)) => {
+                return Err(lookup_failed(&format!("{catalog}.{schema}.{table}"), &e))
+            }
+            Err(_) => {}
         }
     }
     Err(missing(root, catalog, schema, table).await)
@@ -478,9 +486,25 @@ async fn missing(root: &CatalogManager, catalog: &str, schema: &str, table: &str
 /// Visible schemas of `catalog`, or catalog_not_found.
 async fn schemas_of(root: &CatalogManager, catalog: &str) -> Result<Vec<String>, AgentError> {
     match schema_names(root, catalog).await {
-        Some(names) => Ok(names),
-        None => Err(catalog_missing(catalog, &catalog_names(root))),
+        Ok(Some(names)) => Ok(names),
+        Ok(None) => Err(catalog_missing(catalog, &catalog_names(root))),
+        Err(e) => Err(lookup_failed(catalog, &e)),
     }
+}
+
+/// A listing or lookup of `what` that failed, never reported as "not
+/// found". Only an unreachable source ([`CatalogError::Unavailable`]) is
+/// worth retrying as is, so only it gets the retry hint.
+fn lookup_failed(what: &str, e: &CatalogError) -> AgentError {
+    let hint = match e {
+        CatalogError::Unavailable(_) => "the source is unreachable; retry later",
+        _ => "the source refused the lookup; see the message",
+    };
+    AgentError::new(
+        AgentErrorCode::QueryFailed,
+        format!("cannot look up {what}: {e}"),
+    )
+    .with_hint(hint)
 }
 
 /// Visible tables of `catalog.schema`, or the not-found error one level up.
@@ -491,7 +515,8 @@ async fn tables_of(
 ) -> Result<Vec<String>, AgentError> {
     let schemas = schemas_of(root, catalog).await?;
     match table_names(root, catalog, schema).await {
-        Some(names) if schemas.iter().any(|s| s == schema) => Ok(names),
+        Ok(Some(names)) if schemas.iter().any(|s| s == schema) => Ok(names),
+        Err(e) => Err(lookup_failed(&format!("{catalog}.{schema}"), &e)),
         _ => Err(schema_missing(catalog, schema, &schemas)),
     }
 }
@@ -555,6 +580,9 @@ mod tests {
                 nullable: false,
             }]
         }
+        fn canonical_name(&self) -> Option<(String, String)> {
+            None
+        }
         fn statistics(&self) -> Option<TableStatistics> {
             Some(TableStatistics {
                 row_count: Some(42),
@@ -574,6 +602,9 @@ mod tests {
         }
         async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
             (name == "stat").then(|| Arc::new(StatsTable) as Arc<dyn TableProvider>)
+        }
+        fn canonical_name(&self) -> Option<String> {
+            None
         }
     }
 
@@ -711,6 +742,59 @@ mod tests {
             .contains("/api/v2/catalogs/memory/schemas"));
     }
 
+    /// Every discovery call on a catalog whose source is down (`down`,
+    /// with schema `cached` still served from Hive's name cache) reports
+    /// a failed lookup to retry, never a missing or empty object.
+    #[tokio::test]
+    async fn an_unreachable_source_is_a_retryable_failure_not_a_miss() {
+        let cm = CatalogManager::new("down", "cached");
+        cm.register_catalog(
+            "down",
+            Arc::new(arneb_catalog::conformance::Unreachable {
+                cached: vec!["cached".into()],
+            }),
+        );
+        let svc = AgentQueryService::new(
+            Arc::new(cm),
+            Arc::new(ConnectorRegistry::new()),
+            Arc::new(QueryTracker::new()),
+            AgentLimits::default(),
+        );
+        let retryable = |err: AgentError| {
+            assert_eq!(err.code, AgentErrorCode::QueryFailed, "{}", err.message);
+            assert!(err.message.contains("metastore down"), "{}", err.message);
+            assert_eq!(
+                err.hint.as_deref(),
+                Some("the source is unreachable; retry later")
+            );
+        };
+        retryable(svc.list_schemas("alice", "down", &all()).await.unwrap_err());
+        for schema in ["cached", "other"] {
+            retryable(
+                svc.list_tables("alice", "down", schema, &all())
+                    .await
+                    .unwrap_err(),
+            );
+            retryable(
+                svc.describe_table("alice", "down", schema, "t", None)
+                    .await
+                    .unwrap_err(),
+            );
+        }
+    }
+
+    /// Only an outage is worth retrying as is; any other failed lookup
+    /// gets a hint that says so.
+    #[test]
+    fn only_an_outage_gets_the_retry_hint() {
+        let other = lookup_failed(
+            "c.s",
+            &CatalogError::AccessDenied("Cannot list schema c.s".into()),
+        );
+        assert_eq!(other.code, AgentErrorCode::QueryFailed);
+        assert!(!other.hint.unwrap().contains("retry"));
+    }
+
     const HIDE_ORDERS: &str = r#"{"tables": [
         {"user": "bob", "table": "orders", "privileges": []},
         {"privileges": ["SELECT"]}
@@ -804,6 +888,9 @@ mod tests {
                 .resolutions
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             StatsSchema.table(name).await
+        }
+        fn canonical_name(&self) -> Option<String> {
+            None
         }
     }
 
@@ -899,10 +986,29 @@ mod tests {
         }
         async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
             let lower = name.to_lowercase();
+            let exact = self.tables.iter().find(|t| *t == name);
             let mut ci = self.tables.iter().filter(|t| t.to_lowercase() == lower);
-            let found = self.tables.iter().any(|t| t == name)
-                || (ci.next().is_some() && ci.next().is_none());
-            found.then(|| Arc::new(StatsTable) as Arc<dyn TableProvider>)
+            let stored = match (exact, ci.next(), ci.next()) {
+                (Some(t), _, _) | (None, Some(t), None) => t.clone(),
+                _ => return None,
+            };
+            Some(Arc::new(StoredTable(stored)) as Arc<dyn TableProvider>)
+        }
+        fn canonical_name(&self) -> Option<String> {
+            Some("public".into())
+        }
+    }
+
+    /// A [`StatsTable`] that reports the stored name it was resolved to.
+    #[derive(Debug)]
+    struct StoredTable(String);
+
+    impl TableProvider for StoredTable {
+        fn schema(&self) -> Vec<ColumnInfo> {
+            StatsTable.schema()
+        }
+        fn canonical_name(&self) -> Option<(String, String)> {
+            Some(("public".into(), self.0.clone()))
         }
     }
 

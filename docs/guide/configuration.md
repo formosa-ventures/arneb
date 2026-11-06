@@ -571,6 +571,14 @@ admin_users = ["root"]
 
 See [Access Control](/guide/access-control) for the rule format.
 
+**Upgrading to v0.1.9.** With a `hive` or `postgresql` catalog, rules are
+now also checked on the stored names the connector resolved, so an allow
+rule must match the stored name (for example `tpch`, not `TPCH`). An allow
+rule written in another case now refuses the read as if the table were
+missing. See
+[Upgrading from v0.1.8](/guide/access-control#upgrading-from-v0-1-8) for
+the fix.
+
 ## TLS
 
 `[tls]` turns on TLS for both client-facing listeners with one

@@ -1607,15 +1607,24 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
 
-                let name = &self.catalog.fold_reference_case(name).await;
-                let table_provider =
-                    self.catalog
-                        .resolve_table(name)
-                        .await
-                        .map_err(|e| match e {
-                            CatalogError::AccessDenied(denial) => PlanError::AccessDenied(denial),
-                            _ => PlanError::TableNotFound(name.to_string()),
-                        })?;
+                let to_plan_error =
+                    |e: CatalogError, name: &arneb_common::types::TableReference| match e {
+                        CatalogError::AccessDenied(denial) => PlanError::AccessDenied(denial),
+                        // An outage is neither a missing table nor an
+                        // engine bug.
+                        CatalogError::Unavailable(why) => PlanError::SourceUnavailable(why),
+                        _ => PlanError::TableNotFound(name.to_string()),
+                    };
+                let name = &self
+                    .catalog
+                    .fold_reference_case(name)
+                    .await
+                    .map_err(|e| to_plan_error(e, name))?;
+                let table_provider = self
+                    .catalog
+                    .resolve_table(name)
+                    .await
+                    .map_err(|e| to_plan_error(e, name))?;
                 let schema = table_provider.schema();
                 let qualifier = alias.as_deref().unwrap_or(&name.table);
 

@@ -550,3 +550,82 @@ async fn dynamic_in_list_is_exact_under_the_threshold_and_a_range_over_it() {
     assert_eq!(ranged, (5..=90_000).collect());
     assert!(exact.is_subset(&ranged));
 }
+
+/// The planner's path: fold the reference's case, then resolve it.
+async fn read(
+    cm: &arneb_catalog::CatalogManager,
+    schema: &str,
+    table: &str,
+) -> Result<Arc<dyn TableProvider>, String> {
+    let reference = TableReference {
+        catalog: Some("pg".into()),
+        schema: Some(schema.into()),
+        table: table.into(),
+    };
+    let folded = cm
+        .fold_reference_case(&reference)
+        .await
+        .map_err(|e| e.to_string())?;
+    cm.resolve_table(&folded).await.map_err(|e| e.to_string())
+}
+
+/// Access rules are checked on the table PostgreSQL resolved, not only on
+/// the name as written: `KEYED` or `ARNEB_TEST.keyed` must not read a
+/// denied `arneb_test.keyed`, and the denial reads as a missing table.
+#[tokio::test]
+async fn access_rules_apply_to_the_resolved_name() {
+    use arneb_catalog::{AccessRules, CatalogManager};
+    let url = require_postgres!();
+    let root = CatalogManager::new("pg", "arneb_test");
+    root.register_catalog("pg", Arc::new(catalog(&url, |_| {}).await));
+    let view =
+        |rules: &str| root.with_access("alice", Arc::new(AccessRules::from_json(rules).unwrap()));
+
+    let alice = view(
+        r#"{"tables": [
+            {"user": "alice", "schema": "arneb_test", "table": "keyed", "privileges": []},
+            {"privileges": ["SELECT"]}
+        ]}"#,
+    );
+    assert!(read(&alice, "arneb_test", "keyed")
+        .await
+        .unwrap_err()
+        .contains("Access Denied"));
+    for (schema, table) in [
+        ("arneb_test", "KEYED"),
+        ("ARNEB_TEST", "keyed"),
+        ("Arneb_Test", "Keyed"),
+    ] {
+        let err = read(&alice, schema, table).await.unwrap_err();
+        let missing = read(&alice, schema, "no_such_table").await.unwrap_err();
+        assert_eq!(
+            err,
+            missing.replace("no_such_table", table),
+            "{schema}.{table}"
+        );
+    }
+    assert!(!alice
+        .visible_table_names("pg", "ARNEB_TEST")
+        .await
+        .contains(&"keyed".to_string()));
+
+    // The connector reports the stored name whenever it resolves loosely.
+    arneb_catalog::conformance::check_name_resolution(&catalog(&url, |_| {}).await)
+        .await
+        .unwrap();
+
+    // The mixed-case "MixedCase" still reads through `mixedcase` when
+    // allowed, and reports its stored name.
+    let mixed = read(&alice, "arneb_test", "mixedcase").await.unwrap();
+    assert_eq!(
+        mixed.canonical_name(),
+        Some(("arneb_test".to_string(), "MixedCase".to_string()))
+    );
+    let alice = view(
+        r#"{"tables": [
+            {"user": "alice", "table": "MixedCase", "privileges": []},
+            {"privileges": ["SELECT"]}
+        ]}"#,
+    );
+    assert!(read(&alice, "arneb_test", "mixedcase").await.is_err());
+}

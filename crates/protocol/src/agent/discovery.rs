@@ -366,11 +366,13 @@ impl AgentQueryService {
 /// falls back to a unique case-insensitive match). Only names are listed:
 /// no table metadata is loaded.
 ///
-/// Before the query (`after_query` false), a non-exact catalog or schema
-/// that matches ignoring case ends the check: the query decides. After a
-/// not-found from the query, such a level is resolved the way the query
-/// would have resolved it ([`resolve_like_query`]), so the error names the
-/// level that is really missing.
+/// Before the query (`after_query` false), a catalog or schema is followed
+/// to its lowercase form, as the query's fold would follow it, so a
+/// missing table under `MEMORY.DEFAULT` runs nothing either; one that
+/// matches only ignoring case otherwise ends the check: the query decides.
+/// After a not-found from the query, such a level is resolved the way the
+/// query would have resolved it ([`resolve_like_query`]), so the error
+/// names the level that is really missing.
 async fn listed_miss(
     root: &CatalogManager,
     catalog: &str,
@@ -396,17 +398,21 @@ async fn listed_miss(
             Ok(None)
         }
     }
+    // Before the query, follow a level only as the query's own fold does:
+    // the name itself or its lowercase form. A match found only ignoring
+    // case (a connector's looser lookup) is left to the query.
+    let folds_to = |found: &str, name: &str| found == name || found == name.to_lowercase();
     let catalogs = catalog_names(root);
     let catalog = match level(catalog, &catalogs) {
         Err(()) => return Some(catalog_missing(catalog, &catalogs)),
-        Ok(Some(c)) if c == catalog || after_query => c.to_string(),
+        Ok(Some(c)) if after_query || folds_to(c, catalog) => c.to_string(),
         Ok(_) => return None,
     };
     // An unreachable source is not a sure miss: the query decides.
     let schemas = schema_names(root, &catalog).await.ok()??;
     let schema = match level(schema, &schemas) {
         Err(()) => return Some(schema_missing(&catalog, schema, &schemas)),
-        Ok(Some(s)) if s == schema || after_query => s.to_string(),
+        Ok(Some(s)) if after_query || folds_to(s, schema) => s.to_string(),
         Ok(_) => return None,
     };
     // An unreachable source is not a sure miss: the query decides.
@@ -1185,6 +1191,30 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(err.code, AgentErrorCode::TableNotFound);
         assert_eq!(err.candidates[0], "lineitem");
+        assert!(tracker.list_queries(None).is_empty(), "no statement ran");
+        let snap = admission.snapshot();
+        assert_eq!((snap.running, snap.queued), (1, 0), "no slot was asked for");
+        // Round 4: a catalog or schema that the query's fold resolves (its
+        // lowercase form) is resolved before the query as well, so a
+        // missing table under it runs nothing either.
+        for (catalog, schema) in [("MEMORY", "default"), ("memory", "DEFAULT")] {
+            let start = std::time::Instant::now();
+            let err = svc
+                .sample("alice", catalog, schema, "lineitm", None, None)
+                .await
+                .unwrap_err();
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "{catalog}.{schema}"
+            );
+            assert_eq!(err.code, AgentErrorCode::TableNotFound, "{err:?}");
+            assert_eq!(err.candidates[0], "lineitem");
+            assert!(
+                err.message.contains("memory.default.lineitm"),
+                "{}",
+                err.message
+            );
+        }
         assert!(tracker.list_queries(None).is_empty(), "no statement ran");
         let snap = admission.snapshot();
         assert_eq!((snap.running, snap.queued), (1, 0), "no slot was asked for");

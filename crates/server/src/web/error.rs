@@ -51,14 +51,27 @@ pub enum ErrorCode {
     ExceededTime,
     /// The statement was cancelled (409).
     Cancelled,
+    /// A manage action under `[auth] type = "none"` (403).
+    ManageRequiresAuth,
+    /// The audit log cannot be written, so audited actions are refused
+    /// (503, `Retry-After: 5`).
+    AuditUnavailable,
 }
 
 impl ErrorCode {
+    /// The snake_case name, as serialized.
+    pub fn name(self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default()
+    }
+
     /// The HTTP status this code is sent with.
     pub fn status(self) -> StatusCode {
         match self {
             Self::Unauthenticated => StatusCode::UNAUTHORIZED,
-            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::Forbidden | Self::ManageRequiresAuth => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::InvalidArgument
             | Self::SyntaxError
@@ -74,7 +87,7 @@ impl ErrorCode {
             }
             Self::Cancelled => StatusCode::CONFLICT,
             Self::AuthDisabled => StatusCode::CONFLICT,
-            Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Overloaded | Self::AuditUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -92,6 +105,11 @@ pub struct ApiError {
     /// Nearest existing names (column typos).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub candidates: Vec<String>,
+    /// The action ended without an outcome: it may or may not have been
+    /// applied. An audited action failing this way is completed as
+    /// `interrupted`, not as this error. Not serialized.
+    #[serde(skip)]
+    pub interrupted: bool,
 }
 
 impl ApiError {
@@ -103,7 +121,15 @@ impl ApiError {
             hint: None,
             location: None,
             candidates: Vec::new(),
+            interrupted: false,
         }
+    }
+
+    /// Mark the error as an action that ended without an outcome: it may
+    /// or may not have been applied.
+    pub fn interrupted(mut self) -> Self {
+        self.interrupted = true;
+        self
     }
 
     /// Attach a hint telling the caller what to do.
@@ -141,6 +167,7 @@ impl From<AgentError> for ApiError {
             hint: e.hint,
             location: e.location,
             candidates: e.candidates,
+            interrupted: false,
         }
     }
 }
@@ -164,6 +191,9 @@ impl IntoResponse for ApiError {
             }
             ErrorCode::Overloaded => {
                 headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            }
+            ErrorCode::AuditUnavailable => {
+                headers.insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
             }
             _ => {}
         }
@@ -197,6 +227,8 @@ mod tests {
             (ErrorCode::ExceededMemory, 400, "exceeded_memory"),
             (ErrorCode::ExceededTime, 400, "exceeded_time"),
             (ErrorCode::Cancelled, 409, "cancelled"),
+            (ErrorCode::ManageRequiresAuth, 403, "manage_requires_auth"),
+            (ErrorCode::AuditUnavailable, 503, "audit_unavailable"),
         ] {
             let resp = ApiError::new(code, "m").with_hint("h").into_response();
             assert_eq!(resp.status().as_u16(), status);
@@ -216,6 +248,8 @@ mod tests {
         );
         let resp = ApiError::new(ErrorCode::Overloaded, "m").into_response();
         assert_eq!(resp.headers()[header::RETRY_AFTER], "1");
+        let resp = ApiError::new(ErrorCode::AuditUnavailable, "m").into_response();
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "5");
     }
 
     #[test]

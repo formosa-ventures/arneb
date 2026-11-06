@@ -2,6 +2,7 @@
 //! through the Trino-protocol engine, with an idle-timeout reaper.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use futures::FutureExt;
 use arneb_catalog::CatalogManager;
 use arneb_connectors::ConnectorRegistry;
 use arneb_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
-use arneb_scheduler::{AdmissionController, AdmissionPermit, QueryState, QueryTracker};
+use arneb_scheduler::{AdmissionController, AdmissionPermit, KillSwitch, QueryState, QueryTracker};
 
 use super::error::{AgentError, AgentErrorCode};
 use super::limits::AgentLimits;
@@ -202,7 +203,8 @@ impl AgentQueryService {
         let statement = self.register(user, sql.to_string(), max_rows)?;
         let session = ClientSession::for_agent(user, req.catalog, req.schema);
         tracing::debug!(statement_id = %statement.id, user, "agent statement submitted");
-        let handle = tokio::spawn(self.clone().run(Arc::clone(&statement), session));
+        let switch = self.kill_switch(&statement);
+        let handle = tokio::spawn(self.clone().run(Arc::clone(&statement), session, switch));
         *lock(&statement.abort) = Some(handle.abort_handle());
         // Cancelled before the handle was stored: stop the task now.
         if statement.is_terminal() {
@@ -212,6 +214,28 @@ impl AgentQueryService {
         }
         self.wait_for_end(&statement, wait).await;
         Ok(statement.status(&self.limits, page_bytes))
+    }
+
+    /// Registers the tracker canceller for a kill (manage-api D7) of
+    /// `statement`, before its task starts: the returned switch stops the
+    /// work unless it completed, in which case the kill is not applied and
+    /// the statement keeps its real outcome. Weak references, so the
+    /// tracker never keeps the statement or itself alive.
+    fn kill_switch(&self, statement: &Arc<Statement>) -> KillSwitch {
+        let switch = statement.switch.clone();
+        let (weak_statement, weak_tracker) =
+            (Arc::downgrade(statement), Arc::downgrade(&self.tracker));
+        self.tracker.set_canceller(
+            &statement.tracker_id,
+            switch.canceller(move |by| {
+                if let (Some(statement), Some(tracker)) =
+                    (weak_statement.upgrade(), weak_tracker.upgrade())
+                {
+                    stop_statement(&tracker, &statement, killed_error(by), "killed");
+                }
+            }),
+        );
+        switch
     }
 
     /// The status of `user`'s statement `id`, waiting up to `wait` (capped
@@ -273,29 +297,39 @@ impl AgentQueryService {
     /// returned and the id answers `not_found` from then on. A statement
     /// that ends on its own while being cancelled counts as ended: it is
     /// released too.
-    pub fn cancel(&self, user: &str, id: &str) -> Result<StatementStatus, AgentError> {
+    ///
+    /// A cancel that lands during a poll of the statement's work waits for
+    /// that poll to end (without blocking a thread) to learn whether it
+    /// stopped the work.
+    pub async fn cancel(&self, user: &str, id: &str) -> Result<StatementStatus, AgentError> {
         let statement = self.lookup(user, id)?;
         if statement.is_terminal() {
             return Ok(self.release(user, &statement));
         }
-        Ok(self.cancel_live(user, &statement))
+        Ok(self.cancel_live(user, &statement).await)
     }
 
     /// Cancels `statement`, last seen queued or running, and keeps it; or,
-    /// when it has ended meanwhile (it finished, or the reaper cancelled
-    /// it), releases it as [`cancel`](Self::cancel) does an ended one, so
-    /// its retained bytes never outlive a release-looking response.
-    fn cancel_live(&self, user: &str, statement: &Statement) -> StatementStatus {
-        let cancelled = self.cancel_statement(
-            statement,
-            AgentError::new(AgentErrorCode::Cancelled, "Statement was cancelled"),
-            "client",
-        );
-        if cancelled {
-            // Cancelled: there is no first page to encode.
-            statement.status_with(&self.limits, None)
-        } else {
-            self.release(user, statement)
+    /// when the cancel came too late (it finished, the reaper cancelled
+    /// it, or its work returned first, whose outcome the kill switch keeps),
+    /// releases it as [`cancel`](Self::cancel) does an ended one, so its
+    /// retained bytes never outlive a release-looking response. In the last
+    /// case the outcome may not be recorded yet, so the status can still
+    /// read running; the rows go with the statement either way. A cancel
+    /// whose task failed (it panicked, or the runtime is shutting down) has
+    /// no outcome: the statement may still run, so it is kept, not released.
+    async fn cancel_live(&self, user: &str, statement: &Arc<Statement>) -> StatementStatus {
+        let cancelled = self
+            .cancel_statement(
+                statement,
+                AgentError::new(AgentErrorCode::Cancelled, "Statement was cancelled"),
+                "client",
+            )
+            .await;
+        match cancelled {
+            Some(false) => self.release(user, statement),
+            // Cancelled (there is no first page to encode), or unknown.
+            Some(true) | None => statement.status_with(&self.limits, None),
         }
     }
 
@@ -398,25 +432,35 @@ impl AgentQueryService {
 
     /// The statement task, in the order of the Trino submit path: (already
     /// registered with the tracker) admit, run under the time limit, record
-    /// the outcome.
-    async fn run(self, statement: Arc<Statement>, session: ClientSession) {
+    /// the outcome. The work runs under `switch`, so a kill stops it unless
+    /// it completed first.
+    async fn run(self, statement: Arc<Statement>, session: ClientSession, switch: KillSwitch) {
         if statement.is_terminal() {
             return; // cancelled before the task started
         }
-        let limits = match TimeLimits::from_session(&session, self.statement_timeout) {
-            Ok(l) => l,
-            Err(err) => return self.fail(&statement, err),
+        // `None`: killed first, and the kill already ended the statement.
+        let Some(result) = switch.guard(self.execute(&statement, &session)).await else {
+            return;
         };
+        match result {
+            Ok((output, collector)) => self.complete(&statement, output, collector),
+            Err(err) => self.fail(&statement, err),
+        }
+    }
+
+    /// The statement's work: admission, then execution under its time
+    /// limits, with its rows retained in the returned collector.
+    async fn execute(
+        &self,
+        statement: &Statement,
+        session: &ClientSession,
+    ) -> Result<(QueryOutput, Collector), TrinoError> {
+        let limits = TimeLimits::from_session(session, self.statement_timeout)?;
         // The run limit counts from submission and covers the queue wait.
         let run_deadline = limits.run.and_then(|d| statement.created.checked_add(d));
-        let _permit = match with_deadline(run_deadline, self.admit(&statement, &session)).await {
-            Some(Ok(permit)) => permit,
-            Some(Err(err)) => return self.fail(&statement, err),
-            None => {
-                let err = limits.exceeded("query_max_run_time");
-                return self.fail(&statement, err);
-            }
-        };
+        let _permit = with_deadline(run_deadline, self.admit(statement, session))
+            .await
+            .ok_or_else(|| limits.exceeded("query_max_run_time"))??;
         let exec_deadline = match (
             run_deadline,
             limits
@@ -438,23 +482,20 @@ impl AgentQueryService {
         // Rows are retained (and charged to the budget) as they are
         // produced; a failed or cancelled statement drops them with the
         // collector.
-        let mut collector = self.collector(&statement);
+        let mut collector = self.collector(statement);
         let run = std::panic::AssertUnwindSafe(self.engine.run_statement_capped(
-            &session,
+            session,
             &statement.sql,
             statement.max_rows + 1,
             &mut collector,
         ))
         .catch_unwind();
-        let result = match with_deadline(exec_deadline, run).await {
+        let output = match with_deadline(exec_deadline, run).await {
             Some(outcome) => outcome
-                .unwrap_or_else(|_| Err(TrinoError::internal("statement execution panicked"))),
-            None => Err(limits.exceeded_during_execution(run_deadline, exec_deadline)),
+                .unwrap_or_else(|_| Err(TrinoError::internal("statement execution panicked")))?,
+            None => return Err(limits.exceeded_during_execution(run_deadline, exec_deadline)),
         };
-        match result {
-            Ok(output) => self.complete(&statement, output, collector),
-            Err(err) => self.fail(&statement, err),
-        }
+        Ok((output, collector))
     }
 
     /// The collector for `statement`'s rows. When a budget is short it
@@ -502,8 +543,17 @@ impl AgentQueryService {
         Ok(Some(pending.wait().await))
     }
 
+    /// The phase for a statement the tracker already marked cancelled (a
+    /// kill that landed before its canceller was registered), if it was.
+    fn killed(&self, statement: &Statement) -> Option<Phase> {
+        self.tracker
+            .cancelled_by(&statement.tracker_id)
+            .map(|by| Phase::Cancelled(killed_error(&by)))
+    }
+
     /// Records a successful outcome, unless the statement was cancelled
-    /// meanwhile.
+    /// meanwhile. Work that completed keeps its result: a kill never lands
+    /// after completion (the kill switch reports it as not applied).
     fn complete(&self, statement: &Statement, output: QueryOutput, collector: Collector) {
         let retained = collector.finish();
         // What the query produced, not what was kept: a truncated result
@@ -532,31 +582,39 @@ impl AgentQueryService {
             update_type: output.update_type,
             retained,
         };
-        if statement.end(Phase::Finished(finished)) {
-            let _ = self.tracker.finish_query(&statement.tracker_id, rows);
-        }
+        let tracker = &self.tracker;
+        statement.end_with(|| {
+            let _ = tracker.finish_query(&statement.tracker_id, rows);
+            Phase::Finished(finished)
+        });
     }
 
-    /// Records a failure, unless the statement was cancelled meanwhile.
+    /// Records a failure, unless the statement was cancelled meanwhile (a
+    /// statement the tracker already marked cancelled turns cancelled).
     fn fail(&self, statement: &Statement, err: TrinoError) {
-        if statement.end(Phase::Failed(AgentError::from_trino(&err))) {
-            let _ = self.tracker.fail_query(&statement.tracker_id, err.message);
-        }
+        statement.end_with(|| {
+            let failed = self
+                .tracker
+                .fail_query(&statement.tracker_id, err.message.clone());
+            failed
+                .err()
+                .and_then(|_| self.killed(statement))
+                .unwrap_or_else(|| Phase::Failed(AgentError::from_trino(&err)))
+        });
     }
 
     /// Cancels a statement that is still queued or running: aborts its task
     /// (dropping its admission slot) and marks it cancelled in the tracker.
-    /// Returns `false`, doing nothing, when it had already ended.
-    fn cancel_statement(&self, statement: &Statement, error: AgentError, reason: &str) -> bool {
-        if !statement.end(Phase::Cancelled(error)) {
-            return false;
-        }
-        if let Some(handle) = lock(&statement.abort).take() {
-            handle.abort();
-        }
-        let _ = self.tracker.cancel_query(&statement.tracker_id);
-        tracing::debug!(statement_id = %statement.id, reason, "agent statement cancelled");
-        true
+    /// Returns `Some(false)`, doing nothing, when it had already ended or
+    /// its work had already returned, and `None` when the cancel's task
+    /// failed (see [`cancel_statement`]).
+    async fn cancel_statement(
+        &self,
+        statement: &Arc<Statement>,
+        error: AgentError,
+        reason: &'static str,
+    ) -> Option<bool> {
+        cancel_statement(&self.tracker, statement, error, reason).await
     }
 
     /// One reaper pass over statements idle for longer than `idle_timeout`.
@@ -570,10 +628,24 @@ impl AgentQueryService {
                     idle_timeout.as_secs()
                 ),
             );
-            self.cancel_statement(&statement, error, "abandoned");
-            // Keep it for another idle period so a returning client
-            // learns why it was cancelled.
+            // One reaper cancel at a time per statement: a kill may wait for
+            // a poll of the work for longer than the idle timeout. (Touched
+            // too, so the next passes skip it until then.)
             statement.touch();
+            if statement.reaping.swap(true, Ordering::SeqCst) {
+                continue;
+            }
+            // In its own task (one): a kill may wait for one poll of the
+            // work, which must not hold up the rest of the pass.
+            let tracker = Arc::clone(&self.tracker);
+            tokio::spawn(async move {
+                let reaping = Reaping(&statement);
+                cancel_now(&tracker, &statement, error, "abandoned").await;
+                drop(reaping);
+                // Keep it for another idle period so a returning client
+                // learns why it was cancelled.
+                statement.touch();
+            });
         }
     }
 
@@ -600,6 +672,83 @@ impl AgentQueryService {
         drop(removed);
         abandoned
     }
+}
+
+/// The error of a statement killed through the tracker by `by`.
+fn killed_error(by: &str) -> AgentError {
+    AgentError::new(
+        AgentErrorCode::Cancelled,
+        format!("Statement was cancelled by {by}"),
+    )
+}
+
+/// Marks a reaper cancel of a statement as in flight until dropped (the
+/// cancel ended, or its task was dropped).
+struct Reaping<'a>(&'a Statement);
+
+impl Drop for Reaping<'_> {
+    fn drop(&mut self) {
+        self.0.reaping.store(false, Ordering::SeqCst);
+    }
+}
+
+/// [`AgentQueryService::cancel_statement`] over `tracker`: [`cancel_now`]
+/// in a task of its own, so a dropped request does not leave it half done.
+///
+/// `None` when that task failed (it panicked, or the runtime is shutting
+/// down): whether the statement was cancelled is unknown, and it may still
+/// be running, so the caller must not treat it as ended.
+async fn cancel_statement(
+    tracker: &Arc<QueryTracker>,
+    statement: &Arc<Statement>,
+    error: AgentError,
+    reason: &'static str,
+) -> Option<bool> {
+    let (tracker, statement) = (Arc::clone(tracker), Arc::clone(statement));
+    let id = statement.id.clone();
+    tokio::spawn(async move { cancel_now(&tracker, &statement, error, reason).await })
+        .await
+        .inspect_err(|e| tracing::warn!(statement_id = %id, error = %e, "agent cancel failed"))
+        .ok()
+}
+
+/// Kill the statement's work through its kill switch, then stop it.
+///
+/// Returns whether this call cancelled it: `false` when it had already
+/// ended, or when its work had already returned or returned in the poll in
+/// flight (that outcome is kept, and `complete` / `fail` record it right
+/// after). Waits, without blocking a thread, for at most that one poll.
+async fn cancel_now(
+    tracker: &QueryTracker,
+    statement: &Statement,
+    error: AgentError,
+    reason: &'static str,
+) -> bool {
+    if !statement.switch.kill().await && !statement.is_terminal() {
+        tracing::debug!(statement_id = %statement.id, reason, "agent cancel after the work returned");
+        return false;
+    }
+    stop_statement(tracker, statement, error, reason)
+}
+
+/// Ends a statement whose work a kill stopped: marks it cancelled with
+/// `error`, aborts its task (dropping its admission slot) and marks it
+/// cancelled in the tracker. `false` when it had already ended.
+fn stop_statement(
+    tracker: &QueryTracker,
+    statement: &Statement,
+    error: AgentError,
+    reason: &str,
+) -> bool {
+    if !statement.end(Phase::Cancelled(error)) {
+        return false;
+    }
+    if let Some(handle) = lock(&statement.abort).take() {
+        handle.abort();
+    }
+    let _ = tracker.cancel_query(&statement.tracker_id);
+    tracing::debug!(statement_id = %statement.id, reason, "agent statement cancelled");
+    true
 }
 
 /// Ids of recently evicted statements (at most [`MAX_STATEMENTS_TOTAL`]),
@@ -1279,7 +1428,7 @@ mod tests {
         // A collector's try_grow of `one` fails here ...
         assert!(missing() > 0);
         // ... then a concurrent DELETE frees enough before it evicts.
-        svc.cancel("alice", &a.id).unwrap();
+        svc.cancel("alice", &a.id).await.unwrap();
         assert_eq!(missing(), 0);
         let retry = evict_retained(
             &svc.statements,
@@ -1356,6 +1505,106 @@ mod tests {
         assert_eq!(abandoned[0].id, live.id);
         let map = lock(&svc.statements);
         assert_eq!(Arc::strong_count(&map[&done.id]), 1);
+    }
+
+    /// A reaper pass touches an abandoned statement before its cancel task
+    /// runs, so the next pass does not spawn a second cancel while the
+    /// first may still wait for a poll.
+    #[tokio::test]
+    async fn a_reaper_pass_does_not_repeat_a_pending_cancel() {
+        let svc = service_over(
+            vec![wide_table(10, 1000)],
+            AgentLimits {
+                idle_timeout: Duration::from_secs(1),
+                max_wait: Duration::from_secs(1),
+                ..AgentLimits::default()
+            },
+        );
+        let (svc, _dropped) = hanging(svc);
+        let live = svc
+            .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Single-threaded: the spawned cancel has not run yet.
+        svc.reap();
+        let statement = lock(&svc.statements).get(&live.id).cloned().unwrap();
+        assert!(!statement.is_terminal(), "the cancel ran inline");
+        drop(statement);
+        assert!(svc.reap_ended().is_empty(), "picked up again");
+    }
+
+    /// A client cancel whose task fails (here the runtime is shutting
+    /// down, so the task is dropped as it is spawned) has no outcome: the
+    /// statement may still be running, so it is kept, not released as if
+    /// it had ended.
+    #[test]
+    fn a_failed_cancel_task_does_not_release_the_statement() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (svc, tracker) = runtime.block_on(async { service() });
+        let statement = svc.register("alice", "SELECT 1".into(), 10).unwrap();
+        let _switch = svc.kill_switch(&statement);
+        let handle = runtime.handle().clone();
+        drop(runtime);
+        let status = handle.block_on(svc.cancel("alice", &statement.id)).unwrap();
+        assert_ne!(status.state, StatementState::Cancelled);
+        assert!(
+            lock(&svc.statements).contains_key(&statement.id),
+            "released as if it had ended"
+        );
+        assert!(!tracker
+            .get_query(&statement.tracker_id)
+            .unwrap()
+            .state
+            .is_terminal());
+    }
+
+    /// A reaper cancel still waiting (here: not yet run) is not repeated by
+    /// a later pass that finds the statement idle again: one cancel task
+    /// per abandoned statement, however long its kill waits.
+    #[tokio::test]
+    async fn a_reaper_cancel_in_flight_is_not_started_again() {
+        let svc = service_over(
+            vec![wide_table(10, 1000)],
+            AgentLimits {
+                idle_timeout: Duration::from_secs(1),
+                max_wait: Duration::from_secs(1),
+                ..AgentLimits::default()
+            },
+        );
+        let (svc, _dropped) = hanging(svc);
+        let live = svc
+            .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
+            .await
+            .unwrap();
+        let statement = lock(&svc.statements).get(&live.id).cloned().unwrap();
+        let idle =
+            || statement.lock().last_access = tokio::time::Instant::now() - Duration::from_secs(2);
+        let tasks = || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+        };
+        idle();
+        let before = tasks();
+        // Single-threaded: the spawned cancel has not run yet.
+        svc.reap();
+        assert_eq!(tasks(), before + 1, "one cancel task");
+        idle();
+        svc.reap();
+        assert_eq!(tasks(), before + 1, "a second cancel task was spawned");
+        // Once it ran, the statement is cancelled.
+        for _ in 0..100 {
+            if statement.is_terminal() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(statement.is_terminal());
+        assert!(!statement.reaping.load(Ordering::SeqCst));
     }
 
     /// A distributed executor that streams `batches` wide batches into the
@@ -1501,6 +1750,22 @@ mod tests {
         let s = run_to_end(&svc, "CREATE TABLE memory.default.t AS SELECT 1 AS x", None).await;
         assert_eq!(s.state, StatementState::Failed);
         assert!(s.error.is_some() && s.first_page.is_none());
+    }
+
+    /// A user without OWNERSHIP on the target is refused with `forbidden`.
+    #[tokio::test]
+    async fn write_without_privilege_fails_forbidden() {
+        let (svc, _) = service();
+        let rules = arneb_catalog::AccessRules::from_json(
+            r#"{"tables": [{"user": "alice", "privileges": ["SELECT"]}]}"#,
+        )
+        .unwrap();
+        let svc = svc.with_access_rules(Some(Arc::new(rules)));
+        let s = run_to_end(&svc, "CREATE TABLE memory.default.t AS SELECT 1 AS x", None).await;
+        assert_eq!(s.state, StatementState::Failed);
+        let error = s.error.expect("an error body");
+        assert_eq!(error.code, AgentErrorCode::Forbidden, "{error:?}");
+        assert!(error.message.contains("requires OWNERSHIP"), "{error:?}");
     }
 
     /// A finished statement without a result set reports its update type and
@@ -1736,7 +2001,7 @@ mod tests {
             .await
             .unwrap();
         wait_for_state(&svc, &s.id, StatementState::Running).await;
-        let c = svc.cancel("alice", &s.id).unwrap();
+        let c = svc.cancel("alice", &s.id).await.unwrap();
         assert_eq!(c.state, StatementState::Cancelled);
         assert_eq!(c.error.unwrap().code, AgentErrorCode::Cancelled);
         let info = tracker
@@ -1755,6 +2020,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracker_kill_cancels_an_agent_statement() {
+        let (svc, tracker) = service();
+        let (svc, dropped) = hanging(svc);
+        let s = svc
+            .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
+            .await
+            .unwrap();
+        wait_for_state(&svc, &s.id, StatementState::Running).await;
+        let id = tracker
+            .list_queries(None)
+            .into_iter()
+            .find(|q| q.query_id.to_string() == s.id)
+            .unwrap()
+            .query_id;
+        assert!(matches!(
+            tracker.kill_query(&id, "root").await.unwrap(),
+            arneb_scheduler::KillOutcome::Killed { .. }
+        ));
+        let status = svc
+            .status("alice", &s.id, Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(status.state, StatementState::Cancelled);
+        let error = status.error.unwrap();
+        assert_eq!(error.code, AgentErrorCode::Cancelled);
+        assert!(
+            error.message.contains("cancelled by root"),
+            "{}",
+            error.message
+        );
+        assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(dropped.load(Ordering::SeqCst), "execution was not aborted");
+    }
+
+    /// One row of `n`, pushed into `statement`'s collector.
+    fn one_row(svc: &AgentQueryService, statement: &Statement) -> Collector {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "n",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let mut collector = svc.collector(statement);
+        crate::handler::BatchSink::push(
+            &mut collector,
+            RecordBatch::try_new(schema, vec![column]).unwrap(),
+        );
+        collector
+    }
+
+    fn no_output() -> QueryOutput {
+        QueryOutput {
+            columns: None,
+            batches: Vec::new(),
+            update_type: None,
+            headers: Vec::new(),
+        }
+    }
+
+    /// A kill that lands after the work completed, before `complete`
+    /// recorded it: the kill is not applied and the statement keeps its
+    /// real result.
+    #[tokio::test]
+    async fn a_kill_after_the_work_completed_keeps_the_result() {
+        let (svc, tracker) = service();
+        let statement = svc.register("alice", "SELECT 1".into(), 10).unwrap();
+        let id = statement.tracker_id;
+        let switch = svc.kill_switch(&statement);
+        assert_eq!(switch.guard(async { "done" }).await, Some("done"));
+        assert_eq!(
+            tracker.kill_query(&id, "root").await.unwrap(),
+            arneb_scheduler::KillOutcome::NotApplied {
+                state: QueryState::Queued
+            }
+        );
+        let collector = one_row(&svc, &statement);
+        svc.complete(&statement, no_output(), collector);
+        let status = svc
+            .status("alice", &statement.id, Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(status.state, StatementState::Finished);
+        assert_eq!(status.total_rows, Some(1));
+        let info = tracker.get_query(&id).unwrap();
+        assert_eq!(info.state, QueryState::Finished);
+        assert_eq!(info.rows, Some(1));
+    }
+
+    /// A client cancel that lands after the work returned, before
+    /// `complete` ran, leaves the outcome to `complete` (the kill switch
+    /// keeps it) and still releases the statement, as a DELETE racing
+    /// completion does: its id answers not_found, and its rows go with it.
+    #[tokio::test]
+    async fn a_client_cancel_after_the_work_returned_keeps_the_result() {
+        let (svc, tracker) = service();
+        let statement = svc.register("alice", "SELECT 1".into(), 10).unwrap();
+        let switch = svc.kill_switch(&statement);
+        assert_eq!(switch.guard(async { "done" }).await, Some("done"));
+        let c = svc.cancel("alice", &statement.id).await.unwrap();
+        assert_ne!(c.state, StatementState::Cancelled);
+        assert!(!statement.is_terminal(), "the cancel relabelled the result");
+        let err = svc
+            .status("alice", &statement.id, Duration::ZERO, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, AgentErrorCode::NotFound, "the cancel released it");
+        let collector = one_row(&svc, &statement);
+        svc.complete(&statement, no_output(), collector);
+        assert_eq!(
+            statement.status_with(&svc.limits, None).state,
+            StatementState::Finished
+        );
+        assert_eq!(
+            tracker.get_query(&statement.tracker_id).unwrap().state,
+            QueryState::Finished
+        );
+        drop(statement);
+        assert_eq!(svc.retained_budget.used(), 0, "the rows went with it");
+    }
+
+    /// A client cancel (or the reaper) that lands while the poll completing
+    /// the work is in flight waits for that poll and is not applied: the
+    /// statement keeps its real outcome. (The poll blocks briefly so the
+    /// cancel, on another worker, arrives inside it.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_cancel_during_the_completing_poll_keeps_the_result() {
+        let (svc, tracker) = service();
+        let statement = svc.register("alice", "INSERT INTO t".into(), 10).unwrap();
+        let switch = svc.kill_switch(&statement);
+        let (t, s) = (Arc::clone(&tracker), Arc::clone(&statement));
+        let cancel = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&cancel);
+        let out = switch
+            .guard(async move {
+                let handle = tokio::spawn(async move {
+                    let error = AgentError::new(AgentErrorCode::Cancelled, "cancelled");
+                    cancel_statement(&t, &s, error, "client").await
+                });
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(!handle.is_finished(), "the cancel waits for the poll");
+                *slot.lock().unwrap() = Some(handle);
+                "inserted"
+            })
+            .await;
+        assert_eq!(out, Some("inserted"));
+        let handle = cancel.lock().unwrap().take().unwrap();
+        assert_eq!(
+            handle.await.unwrap(),
+            Some(false),
+            "the cancel must not apply"
+        );
+        assert!(!statement.is_terminal(), "the cancel relabelled the result");
+        let collector = one_row(&svc, &statement);
+        svc.complete(&statement, no_output(), collector);
+        assert_eq!(
+            statement.status_with(&svc.limits, None).state,
+            StatementState::Finished
+        );
+        assert_eq!(
+            tracker.get_query(&statement.tracker_id).unwrap().state,
+            QueryState::Finished
+        );
+    }
+
+    /// A kill before the task starts (the canceller is registered before
+    /// the spawn) stops all of the work: the statement turns cancelled and
+    /// its task does nothing.
+    #[tokio::test]
+    async fn a_kill_before_the_task_starts_stops_the_work() {
+        let (svc, tracker) = service();
+        let statement = svc.register("alice", "SELECT 1".into(), 10).unwrap();
+        let id = statement.tracker_id;
+        let switch = svc.kill_switch(&statement);
+        assert!(matches!(
+            tracker.kill_query(&id, "root").await.unwrap(),
+            arneb_scheduler::KillOutcome::Killed { .. }
+        ));
+        assert!(switch.kill().await, "already killed");
+        let session = ClientSession::for_agent("alice", None, None);
+        svc.clone()
+            .run(Arc::clone(&statement), session, switch)
+            .await;
+        let status = svc
+            .status("alice", &statement.id, Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(status.state, StatementState::Cancelled);
+        let error = status.error.unwrap();
+        assert_eq!(error.code, AgentErrorCode::Cancelled);
+        assert_eq!(error.message, "Statement was cancelled by root");
+        let info = tracker.get_query(&id).unwrap();
+        assert_eq!(info.state, QueryState::Cancelled);
+        assert_eq!(info.rows, None);
+    }
+
+    #[tokio::test]
     async fn delete_releases_a_terminal_statement() {
         let (svc, tracker) = service();
         let s = svc
@@ -1764,11 +2231,11 @@ mod tests {
         assert_eq!(s.state, StatementState::Finished);
         // Deleting a finished statement returns its final status, keeps it
         // finished in the tracker and releases it.
-        let c = svc.cancel("alice", &s.id).unwrap();
+        let c = svc.cancel("alice", &s.id).await.unwrap();
         assert_eq!(c.state, StatementState::Finished);
         assert_eq!(c.total_rows, Some(1));
         assert!(c.first_page.is_none(), "a release does not encode rows");
-        let err = svc.cancel("alice", &s.id).unwrap_err();
+        let err = svc.cancel("alice", &s.id).await.unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
         let info = tracker.list_queries(None).pop().unwrap();
         assert_eq!(info.state, QueryState::Finished);
@@ -1780,8 +2247,8 @@ mod tests {
             .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
             .await
             .unwrap();
-        let first = svc.cancel("alice", &s.id).unwrap();
-        let second = svc.cancel("alice", &s.id).unwrap();
+        let first = svc.cancel("alice", &s.id).await.unwrap();
+        let second = svc.cancel("alice", &s.id).await.unwrap();
         assert_eq!(first.state, StatementState::Cancelled);
         assert_eq!(second.state, StatementState::Cancelled);
         assert_eq!(first.elapsed_ms, second.elapsed_ms);
@@ -1799,12 +2266,12 @@ mod tests {
         // DELETE saw the statement running, then it finished before the
         // cancel: the cancel finds it ended, and releases it.
         let statement = lock(&svc.statements).get(&s.id).cloned().unwrap();
-        let c = svc.cancel_live("alice", &statement);
+        let c = svc.cancel_live("alice", &statement).await;
         drop(statement);
         assert_eq!(c.state, StatementState::Finished);
         assert!(c.first_page.is_none(), "a release does not encode rows");
         assert_eq!(svc.retained_budget.used(), 0);
-        let err = svc.cancel("alice", &s.id).unwrap_err();
+        let err = svc.cancel("alice", &s.id).await.unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
     }
 
@@ -1816,12 +2283,12 @@ mod tests {
         assert!(one > 0);
         let b = run_to_end(&svc, "SELECT s FROM wide", None).await;
         assert_eq!(svc.retained_budget.used(), 2 * one);
-        svc.cancel("alice", &a.id).unwrap();
+        svc.cancel("alice", &a.id).await.unwrap();
         assert_eq!(svc.retained_budget.used(), one);
         // Another user cannot release it.
-        assert!(svc.cancel("bob", &b.id).is_err());
+        assert!(svc.cancel("bob", &b.id).await.is_err());
         assert_eq!(svc.retained_budget.used(), one);
-        svc.cancel("alice", &b.id).unwrap();
+        svc.cancel("alice", &b.id).await.unwrap();
         assert_eq!(svc.retained_budget.used(), 0);
     }
 
@@ -1847,8 +2314,8 @@ mod tests {
             missing.message.replace(&random, &s.id),
             "same message shape as for a random id"
         );
-        let err = svc.cancel("bob", &s.id).unwrap_err();
-        let missing = svc.cancel("bob", &random).unwrap_err();
+        let err = svc.cancel("bob", &s.id).await.unwrap_err();
+        let missing = svc.cancel("bob", &random).await.unwrap_err();
         assert_eq!(err.code, AgentErrorCode::NotFound);
         assert_eq!(err.message, missing.message.replace(&random, &s.id));
         // Alice still sees it, and bob's cancel did nothing.

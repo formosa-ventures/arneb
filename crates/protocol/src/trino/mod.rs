@@ -481,12 +481,34 @@ struct Query {
     inner: Mutex<Inner>,
     done: watch::Sender<bool>,
     abort: Mutex<Option<AbortHandle>>,
+    /// Runs the query's work; kills and client cancels go through it, so
+    /// neither relabels work that already returned.
+    switch: arneb_scheduler::KillSwitch,
     tracker_id: QueryId,
     /// Waiting for an admission slot: reported as `QUEUED`.
     queued: std::sync::atomic::AtomicBool,
+    /// The statement only reads ([`only_reads`]): only then can a cancel
+    /// stop it while it pages out its results.
+    reads: bool,
 }
 
 impl Query {
+    /// Paging out the results of a statement that only reads: it finished,
+    /// and pages remain. A finished write never is, even before the client
+    /// fetched its update count, so no cancel relabels it.
+    fn paging(&self, inner: &Inner) -> bool {
+        self.reads && matches!(&inner.phase, Phase::Finished(r) if r.batch < r.output.batches.len())
+    }
+
+    fn is_paging(&self) -> bool {
+        self.paging(&self.inner.lock().unwrap())
+    }
+
+    /// Still running, or paging: a cancel (or the reaper) stops it.
+    fn active(&self, inner: &Inner) -> bool {
+        matches!(inner.phase, Phase::Running) || self.paging(inner)
+    }
+
     fn state_name(&self, inner: &Inner) -> &'static str {
         match &inner.phase {
             Phase::Running if self.queued.load(Ordering::Relaxed) => "QUEUED",
@@ -540,6 +562,7 @@ async fn submit(
             .tracker
             .create_query_from(sql.clone(), "trino", Some(session.user.clone()));
     let (done, _) = watch::channel(false);
+    let reads = only_reads(&session, &sql);
     let query = Arc::new(Query {
         id: id.clone(),
         slug,
@@ -558,8 +581,10 @@ async fn submit(
         }),
         done,
         abort: Mutex::new(None),
+        switch: arneb_scheduler::KillSwitch::new(),
         tracker_id,
         queued: std::sync::atomic::AtomicBool::new(false),
+        reads,
     });
     state
         .queries
@@ -568,66 +593,30 @@ async fn submit(
         .insert(id.clone(), Arc::clone(&query));
     tracing::debug!(query_id = %id, user = %session.user, "trino query submitted");
 
+    // A kill through the tracker (manage-api D7), registered before the
+    // task starts: the kill switch stops the work unless it completed, in
+    // which case the kill is not applied and the query keeps its real
+    // outcome. Weak references, so the tracker never keeps the query or
+    // itself alive.
+    let switch = query.switch.clone();
+    let (weak_query, weak_tracker) = (Arc::downgrade(&query), Arc::downgrade(&state.tracker));
+    state.tracker.set_canceller(
+        &query.tracker_id,
+        switch.canceller(move |by| {
+            if let (Some(query), Some(tracker)) = (weak_query.upgrade(), weak_tracker.upgrade()) {
+                stop_query(&tracker, &query, TrinoError::killed_by(by), "killed");
+            }
+        }),
+    );
+
     let task_state = state.clone();
     let task_query = Arc::clone(&query);
     let handle = tokio::spawn(async move {
-        // admission-control D5: wait for a slot before planning; the permit
-        // is held until the statement task completes (paging out the
-        // materialized results does not hold it).
-        // admission-control D7: `query_max_run_time` (or the server
-        // default) runs from submission and covers the queue wait;
-        // `query_max_execution_time` runs from admission. On expiry the
-        // statement future is dropped, which cancels it on the workers.
-        let limits = match TimeLimits::from_session(&session, task_state.statement_timeout) {
-            Ok(l) => l,
-            Err(err) => {
-                complete(&task_state, &task_query, Err(err));
-                return;
-            }
-        };
-        // A limit past the clock's range (`checked_add` overflow) never fires.
-        let run_deadline = limits
-            .run
-            .and_then(|d| tokio::time::Instant::from_std(task_query.created).checked_add(d));
-        let _admission =
-            match with_deadline(run_deadline, admit(&task_state, &task_query, &session)).await {
-                Some(Ok(permit)) => permit,
-                Some(Err(err)) => {
-                    complete(&task_state, &task_query, Err(err));
-                    return;
-                }
-                None => {
-                    complete(
-                        &task_state,
-                        &task_query,
-                        Err(limits.exceeded("query_max_run_time")),
-                    );
-                    return;
-                }
-            };
-        let exec_deadline = match (
-            run_deadline,
-            limits
-                .execution
-                .and_then(|d| tokio::time::Instant::now().checked_add(d)),
-        ) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        let _ = task_state
-            .tracker
-            .advance_to(&task_query.tracker_id, TrackerState::Running);
-        let run = std::panic::AssertUnwindSafe(
-            task_state.engine.run_statement(&session, &task_query.sql),
-        )
-        .catch_unwind();
-        let result = match with_deadline(exec_deadline, run).await {
-            Some(outcome) => {
-                outcome.unwrap_or_else(|_| Err(TrinoError::internal("query execution panicked")))
-            }
-            None => Err(limits.exceeded_during_execution(run_deadline, exec_deadline)),
-        };
-        complete(&task_state, &task_query, result);
+        let work = run_query(&task_state, &task_query, session);
+        // `None`: killed first, and the kill already ended the query.
+        if let Some(result) = switch.guard(work).await {
+            complete(&task_state, &task_query, result);
+        }
     });
     *query.abort.lock().unwrap() = Some(handle.abort_handle());
 
@@ -642,6 +631,50 @@ async fn submit(
         doc
     };
     json_response(StatusCode::OK, body, &[], query.family)
+}
+
+/// A submitted query's work: admission, then execution under its time
+/// limits. The outcome is recorded by [`complete`].
+async fn run_query(
+    state: &AppState,
+    query: &Query,
+    session: ClientSession,
+) -> Result<QueryOutput, TrinoError> {
+    // admission-control D5: wait for a slot before planning; the permit
+    // is held until the statement task completes (paging out the
+    // materialized results does not hold it).
+    // admission-control D7: `query_max_run_time` (or the server
+    // default) runs from submission and covers the queue wait;
+    // `query_max_execution_time` runs from admission. On expiry the
+    // statement future is dropped, which cancels it on the workers.
+    let limits = TimeLimits::from_session(&session, state.statement_timeout)?;
+    // A limit past the clock's range (`checked_add` overflow) never fires.
+    let run_deadline = limits
+        .run
+        .and_then(|d| tokio::time::Instant::from_std(query.created).checked_add(d));
+    let _admission = with_deadline(run_deadline, admit(state, query, &session))
+        .await
+        .ok_or_else(|| limits.exceeded("query_max_run_time"))??;
+    let exec_deadline = match (
+        run_deadline,
+        limits
+            .execution
+            .and_then(|d| tokio::time::Instant::now().checked_add(d)),
+    ) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let _ = state
+        .tracker
+        .advance_to(&query.tracker_id, TrackerState::Running);
+    let run = std::panic::AssertUnwindSafe(state.engine.run_statement(&session, &query.sql))
+        .catch_unwind();
+    match with_deadline(exec_deadline, run).await {
+        Some(outcome) => {
+            outcome.unwrap_or_else(|_| Err(TrinoError::internal("query execution panicked")))
+        }
+        None => Err(limits.exceeded_during_execution(run_deadline, exec_deadline)),
+    }
 }
 
 /// A query's time limits from its session (admission-control D7).
@@ -743,6 +776,39 @@ async fn admit(
     Ok(Some(permit))
 }
 
+/// Whether `sql` only reads: a query, an `EXPLAIN` without `ANALYZE` (of
+/// anything: it runs nothing), or an `EXPLAIN ANALYZE` of a read (it runs
+/// the statement), directly or through `EXECUTE` / `EXECUTE IMMEDIATE`,
+/// classified on the SQL with its `?` placeholders bound, as the engine
+/// runs it. Other control statements (`SHOW`, `USE`, `SET SESSION`,
+/// `PREPARE`, …) write no data. SQL that does not parse, or whose
+/// parameters do not bind, counts as a write (fail closed: a cancel then
+/// never relabels the statement once it finished).
+fn only_reads(session: &ClientSession, sql: &str) -> bool {
+    use arneb_sql_parser::ast::Statement;
+    fn reads(statement: &Statement) -> bool {
+        match statement {
+            Statement::Query { .. } | Statement::Explain { analyze: false, .. } => true,
+            Statement::Explain { stmt, .. } => reads(stmt),
+            _ => false,
+        }
+    }
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let (target, params) = match parse_control(sql) {
+        None => return arneb_sql_parser::parse(sql).is_ok_and(|s| reads(&s)),
+        Some(ControlStatement::Execute { name, params }) => {
+            match session.prepared_statement(&name) {
+                Some(prepared) => (prepared.to_owned(), params),
+                None => return false,
+            }
+        }
+        Some(ControlStatement::ExecuteImmediate { sql, params }) => (sql, params),
+        Some(_) => return true,
+    };
+    statements::bind_placeholders(&target, &params)
+        .is_ok_and(|bound| arneb_sql_parser::parse(&bound).is_ok_and(|s| reads(&s)))
+}
+
 /// Whether `sql` takes an admission slot, deciding `EXECUTE` /
 /// `EXECUTE IMMEDIATE` on the statement they run. Other control statements
 /// (`SHOW`, `USE`, `SET SESSION`, `PREPARE`, …) never queue; an `EXECUTE`
@@ -762,6 +828,10 @@ pub(crate) fn needs_admission(session: &ClientSession, sql: &str) -> bool {
     crate::handler::needs_admission(&target)
 }
 
+/// Records the statement's outcome, unless it was cancelled meanwhile. A
+/// kill that lands after the work completed, or during the poll that
+/// completed it, is not applied (see [`cancel_now`]), so a completed query
+/// keeps its real result.
 fn complete(state: &AppState, query: &Query, result: Result<QueryOutput, TrinoError>) {
     {
         let mut inner = query.inner.lock().unwrap();
@@ -769,26 +839,41 @@ fn complete(state: &AppState, query: &Query, result: Result<QueryOutput, TrinoEr
             return;
         }
         inner.ended = Some(Instant::now());
-        inner.phase = match result {
-            Ok(output) => {
-                let rows = output.batches.iter().map(|b| b.num_rows() as u64).sum();
-                let _ = state.tracker.finish_query(&query.tracker_id, rows);
-                Phase::Finished(Results {
-                    output,
-                    batch: 0,
-                    row: 0,
-                    rows_returned: 0,
-                })
-            }
-            Err(err) => {
-                let _ = state
-                    .tracker
-                    .fail_query(&query.tracker_id, err.message.clone());
-                Phase::Failed(err)
-            }
-        };
+        inner.phase = ended_phase(&state.tracker, &query.tracker_id, result);
     }
     let _ = query.done.send(true);
+}
+
+/// Records `result` in the tracker and returns the query's terminal phase.
+/// Work that completed keeps its result, even if the tracker already marked
+/// the query cancelled: its effects (a committed write) happened. A failure
+/// of a query the tracker marked cancelled reports the cancellation.
+fn ended_phase(
+    tracker: &QueryTracker,
+    id: &QueryId,
+    result: Result<QueryOutput, TrinoError>,
+) -> Phase {
+    let killed = || {
+        tracker
+            .cancelled_by(id)
+            .map(|by| TrinoError::killed_by(&by))
+    };
+    match result {
+        Ok(output) => {
+            let rows = output.batches.iter().map(|b| b.num_rows() as u64).sum();
+            let _ = tracker.finish_query(id, rows);
+            Phase::Finished(Results {
+                output,
+                batch: 0,
+                row: 0,
+                rows_returned: 0,
+            })
+        }
+        Err(err) => {
+            let failed = tracker.fail_query(id, err.message.clone());
+            Phase::Failed(failed.err().and_then(|_| killed()).unwrap_or(err))
+        }
+    }
 }
 
 /// Under password auth, a query is only visible to the user who submitted it.
@@ -1024,19 +1109,62 @@ fn json_response(
     response
 }
 
-fn cancel_query(state: &AppState, query: &Query, error: TrinoError, reason: &str) {
+/// A client cancel or the reaper: kill the query's work through its kill
+/// switch, then stop the query. Work that already returned (or returns in
+/// the poll in flight) keeps its outcome, which `complete` records; the
+/// returned task waits, without blocking a thread, for at most that one
+/// poll. It runs on its own, so a dropped request does not leave it half
+/// done; awaiting it is optional.
+///
+/// Whether the query is paging ([`Query::paging`]) is read here, when the
+/// cancel arrives, not in the task: see [`cancel_now`].
+fn cancel_query(
+    tracker: &Arc<QueryTracker>,
+    query: &Arc<Query>,
+    error: TrinoError,
+    reason: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    let paging = query.is_paging();
+    let (tracker, query) = (Arc::clone(tracker), Arc::clone(query));
+    tokio::spawn(async move { cancel_now(&tracker, &query, error, reason, paging).await })
+}
+
+/// The body of [`cancel_query`]; `paging` is whether the query was paging
+/// out a read's results when the cancel arrived.
+///
+/// That is decided before the kill: the statement task records the result
+/// (`complete`) in the same poll that completes the work, so by the time a
+/// kill pending on that poll resumes, the phase already reads `Finished`.
+/// A kill that was not applied therefore stops the query only when it was
+/// already paging when the cancel arrived; a write that finished never is.
+async fn cancel_now(
+    tracker: &QueryTracker,
+    query: &Query,
+    error: TrinoError,
+    reason: &str,
+    paging: bool,
+) {
+    if !query.switch.kill().await && !paging {
+        tracing::debug!(query_id = %query.id, reason, "trino cancel after the work returned");
+        return;
+    }
+    stop_query(tracker, query, error, reason);
+}
+
+/// Ends a query whose work a kill stopped (or that is paging out results):
+/// aborts its task, marks it failed with `error` and cancelled in the
+/// tracker.
+fn stop_query(tracker: &QueryTracker, query: &Query, error: TrinoError, reason: &str) {
     if let Some(handle) = query.abort.lock().unwrap().take() {
         handle.abort();
     }
     {
         let mut inner = query.inner.lock().unwrap();
-        let active = matches!(inner.phase, Phase::Running)
-            || matches!(&inner.phase, Phase::Finished(r) if r.batch < r.output.batches.len());
-        if active {
+        if query.active(&inner) {
             inner.phase = Phase::Failed(error);
             inner.ended = Some(Instant::now());
             inner.last = None;
-            let _ = state.tracker.cancel_query(&query.tracker_id);
+            let _ = tracker.cancel_query(&query.tracker_id);
         }
     }
     let _ = query.done.send(true);
@@ -1054,7 +1182,13 @@ async fn cancel(
     if not_owner(&user, &query) {
         return auth::forbidden("Query belongs to another user");
     }
-    cancel_query(&state, &query, TrinoError::canceled(), "client DELETE");
+    let _ = cancel_query(
+        &state.tracker,
+        &query,
+        TrinoError::canceled(),
+        "client DELETE",
+    )
+    .await;
     state.queries.lock().unwrap().remove(&id);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1068,7 +1202,7 @@ async fn kill(
     match query {
         Some(q) if not_owner(&user, &q) => auth::forbidden("Query belongs to another user"),
         Some(q) => {
-            cancel_query(&state, &q, TrinoError::canceled(), "kill");
+            let _ = cancel_query(&state.tracker, &q, TrinoError::canceled(), "kill").await;
             StatusCode::NO_CONTENT.into_response()
         }
         None => StatusCode::NOT_FOUND.into_response(),
@@ -1164,16 +1298,406 @@ async fn reaper(state: AppState) {
         for query in queries {
             let (idle, active) = {
                 let inner = query.inner.lock().unwrap();
-                let active = matches!(inner.phase, Phase::Running)
-                    || matches!(&inner.phase, Phase::Finished(r) if r.batch < r.output.batches.len());
-                (inner.last_access.elapsed(), active)
+                (inner.last_access.elapsed(), query.active(&inner))
             };
             if active && idle > state.config.client_timeout {
-                cancel_query(&state, &query, TrinoError::abandoned(), "abandoned");
+                // Not awaited: a kill may wait for one poll of the work,
+                // which must not hold up the rest of the pass.
+                drop(cancel_query(
+                    &state.tracker,
+                    &query,
+                    TrinoError::abandoned(),
+                    "abandoned",
+                ));
                 state.queries.lock().unwrap().remove(&query.id);
             } else if !active && idle > state.config.retention {
                 state.queries.lock().unwrap().remove(&query.id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arneb_scheduler::KillOutcome;
+
+    fn rows() -> QueryOutput {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let column: arrow::array::ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![1, 2]));
+        QueryOutput {
+            columns: None,
+            batches: vec![arrow::record_batch::RecordBatch::try_new(schema, vec![column]).unwrap()],
+            update_type: None,
+            headers: Vec::new(),
+        }
+    }
+
+    /// A kill that lands after the work completed, before `complete`
+    /// recorded it (an INSERT that committed): the kill is not applied and
+    /// the query keeps its real result.
+    #[tokio::test]
+    async fn a_kill_after_the_work_completed_keeps_the_result() {
+        let tracker = QueryTracker::new();
+        let id = tracker.create_query_from("INSERT INTO t".into(), "trino", Some("bob".into()));
+        tracker.advance_to(&id, TrackerState::Running).unwrap();
+        let switch = arneb_scheduler::KillSwitch::new();
+        tracker.set_canceller(&id, switch.canceller(|_| panic!("stopped completed work")));
+        let result = switch.guard(async { Ok(rows()) }).await.unwrap();
+        assert_eq!(
+            tracker.kill_query(&id, "root").await.unwrap(),
+            KillOutcome::NotApplied {
+                state: TrackerState::Running
+            }
+        );
+        assert!(matches!(
+            ended_phase(&tracker, &id, result),
+            Phase::Finished(_)
+        ));
+        let info = tracker.get_query(&id).unwrap();
+        assert_eq!(info.state, TrackerState::Finished);
+        assert_eq!(info.rows, Some(2));
+    }
+
+    /// A kill before the task starts (the canceller is registered before
+    /// the spawn) stops all of the work; a failure of a query the tracker
+    /// marked cancelled reports the cancellation.
+    #[tokio::test]
+    async fn a_kill_before_the_task_starts_stops_the_work() {
+        let tracker = QueryTracker::new();
+        let id = tracker.create_query_from("INSERT INTO t".into(), "trino", Some("bob".into()));
+        let switch = arneb_scheduler::KillSwitch::new();
+        tracker.set_canceller(&id, switch.canceller(|_| {}));
+        assert!(matches!(
+            tracker.kill_query(&id, "root").await.unwrap(),
+            KillOutcome::Killed { .. }
+        ));
+        let out = switch
+            .guard(async { panic!("the killed work ran") as Result<QueryOutput, TrinoError> })
+            .await;
+        assert!(out.is_none());
+        assert_eq!(
+            tracker.get_query(&id).unwrap().state,
+            TrackerState::Cancelled
+        );
+        let phase = ended_phase(&tracker, &id, Err(TrinoError::internal("boom")));
+        assert!(matches!(phase, Phase::Failed(e) if e.name == "USER_CANCELED"));
+    }
+
+    /// `EXPLAIN ANALYZE` of a read and an `EXECUTE` of a prepared read with
+    /// `?` placeholders are reads (a cancel can stop them while paging);
+    /// `EXPLAIN ANALYZE` of a write, a prepared write, an `EXECUTE` whose
+    /// parameters do not bind and unparsable SQL stay writes.
+    #[test]
+    fn only_reads_classifies_explain_analyze_and_bound_executes() {
+        let mut session = ClientSession::from_headers(&HeaderMap::new(), None);
+        session.prepared = vec![
+            ("r".into(), "SELECT * FROM t WHERE a = ?".into()),
+            ("w".into(), "INSERT INTO t VALUES (?)".into()),
+        ];
+        let reads = |sql: &str| only_reads(&session, sql);
+        assert!(reads("SELECT 1"));
+        assert!(reads("EXPLAIN SELECT 1"));
+        assert!(reads("EXPLAIN INSERT INTO t VALUES (1)"), "runs nothing");
+        assert!(reads("EXPLAIN ANALYZE SELECT 1"));
+        assert!(!reads("EXPLAIN ANALYZE INSERT INTO t VALUES (1)"));
+        assert!(!reads("INSERT INTO t VALUES (1)"));
+        assert!(reads("EXECUTE r USING 1"));
+        assert!(reads(
+            "EXECUTE IMMEDIATE 'SELECT * FROM t WHERE a = ?' USING 1"
+        ));
+        assert!(!reads("EXECUTE w USING 1"));
+        assert!(!reads("EXECUTE r"), "a parameter is missing");
+        assert!(!reads("EXECUTE missing USING 1"));
+        assert!(!reads("SELEC nonsense"));
+        assert!(reads("SHOW CATALOGS"));
+    }
+
+    /// The Trino side of tracked query `tracker_id`, running its SQL.
+    fn test_query(tracker: &QueryTracker, tracker_id: QueryId) -> Arc<Query> {
+        let sql = tracker.get_query(&tracker_id).unwrap().sql;
+        let session = ClientSession::from_headers(&HeaderMap::new(), None);
+        Arc::new(Query {
+            id: "q".into(),
+            slug: "s".into(),
+            reads: only_reads(&session, &sql),
+            sql,
+            user: "bob".into(),
+            source: None,
+            client_info: None,
+            family: session::HeaderFamily::Trino,
+            created: Instant::now(),
+            inner: Mutex::new(Inner {
+                phase: Phase::Running,
+                next_token: 1,
+                last: None,
+                last_access: Instant::now(),
+                ended: None,
+            }),
+            done: watch::channel(false).0,
+            abort: Mutex::new(None),
+            switch: arneb_scheduler::KillSwitch::new(),
+            tracker_id,
+            queued: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// A client cancel (or the reaper) that lands after the work returned,
+    /// before `complete` ran, leaves the outcome to `complete`: an INSERT
+    /// that committed is not reported USER_CANCELED.
+    #[tokio::test]
+    async fn a_client_cancel_after_the_work_returned_keeps_the_result() {
+        let tracker = Arc::new(QueryTracker::new());
+        let tracker_id = tracker.create_query_from("INSERT INTO t".into(), "trino", None);
+        let query = test_query(&tracker, tracker_id);
+        let result = query.switch.guard(async { Ok(rows()) }).await.unwrap();
+        cancel_query(&tracker, &query, TrinoError::canceled(), "client")
+            .await
+            .unwrap();
+        assert!(matches!(query.inner.lock().unwrap().phase, Phase::Running));
+        assert_eq!(
+            tracker.get_query(&tracker_id).unwrap().state,
+            TrackerState::Queued
+        );
+        let phase = ended_phase(&tracker, &tracker_id, result);
+        assert!(matches!(phase, Phase::Finished(_)));
+        assert_eq!(
+            tracker.get_query(&tracker_id).unwrap().state,
+            TrackerState::Finished
+        );
+    }
+
+    /// A client cancel (nextUri DELETE, `/v1/query` kill, the reaper) that
+    /// lands while the poll completing an INSERT is in flight waits for that
+    /// poll and is not applied: the committed write is reported FINISHED,
+    /// never USER_CANCELED. (The poll blocks briefly so the cancel, on
+    /// another worker, arrives inside it.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_cancel_during_the_completing_poll_keeps_the_result() {
+        let tracker = Arc::new(QueryTracker::new());
+        let tracker_id = tracker.create_query_from("INSERT INTO t".into(), "trino", None);
+        let query = test_query(&tracker, tracker_id);
+        let (t, q) = (Arc::clone(&tracker), Arc::clone(&query));
+        let cancel = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&cancel);
+        let result = query
+            .switch
+            .guard(async move {
+                let handle = tokio::spawn(async move {
+                    cancel_query(&t, &q, TrinoError::canceled(), "client DELETE")
+                        .await
+                        .unwrap();
+                });
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(!handle.is_finished(), "the cancel waits for the poll");
+                *slot.lock().unwrap() = Some(handle);
+                Ok(rows())
+            })
+            .await
+            .unwrap();
+        let handle = cancel.lock().unwrap().take().unwrap();
+        handle.await.unwrap();
+        // What `complete` does: the phase is still running, so it records
+        // the real result.
+        let mut inner = query.inner.lock().unwrap();
+        assert!(matches!(inner.phase, Phase::Running), "relabelled");
+        inner.phase = ended_phase(&tracker, &tracker_id, result);
+        assert!(matches!(inner.phase, Phase::Finished(_)));
+        drop(inner);
+        assert_eq!(
+            tracker.get_query(&tracker_id).unwrap().state,
+            TrackerState::Finished
+        );
+    }
+
+    /// A client cancel that lands during the poll completing the work, in
+    /// the order production runs it: the statement task records the result
+    /// (`complete`) in that same poll, before the woken cancel resumes. The
+    /// cancel must not relabel the completed query. Deterministic: the
+    /// cancel is polled once inside the work's poll, so its kill is pending
+    /// there, and resumed only after `complete`.
+    #[tokio::test]
+    async fn a_cancel_resuming_after_complete_keeps_the_result() {
+        let tracker = Arc::new(QueryTracker::new());
+        let tracker_id = tracker.create_query_from("SELECT n".into(), "trino", None);
+        let query = test_query(&tracker, tracker_id);
+        let (t, q) = (Arc::clone(&tracker), Arc::clone(&query));
+        let cancel = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&cancel);
+        let task = {
+            let (tracker, query) = (Arc::clone(&tracker), Arc::clone(&query));
+            async move {
+                let work = async move {
+                    let mut c: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                        Box::pin(async move {
+                            let paging = q.is_paging();
+                            cancel_now(&t, &q, TrinoError::canceled(), "client DELETE", paging)
+                                .await
+                        });
+                    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(c.as_mut().poll(&mut cx).is_pending(), "the kill is pending");
+                    *slot.lock().unwrap() = Some(c);
+                    Ok(rows())
+                };
+                // The statement task: guard, then `complete`, in one poll.
+                if let Some(result) = query.switch.guard(work).await {
+                    let mut inner = query.inner.lock().unwrap();
+                    if matches!(inner.phase, Phase::Running) {
+                        inner.phase = ended_phase(&tracker, &query.tracker_id, result);
+                    }
+                }
+            }
+        };
+        task.await;
+        assert!(matches!(
+            query.inner.lock().unwrap().phase,
+            Phase::Finished(_)
+        ));
+        let c = cancel.lock().unwrap().take().unwrap();
+        c.await;
+        assert!(
+            matches!(query.inner.lock().unwrap().phase, Phase::Finished(_)),
+            "the cancel relabelled a completed query"
+        );
+        assert_eq!(
+            tracker.get_query(&tracker_id).unwrap().state,
+            TrackerState::Finished
+        );
+    }
+
+    /// A cancel of a query paging out its results (it completed before the
+    /// cancel) still stops it: USER_CANCELED.
+    #[tokio::test]
+    async fn a_cancel_while_paging_stops_the_query() {
+        let tracker = Arc::new(QueryTracker::new());
+        let tracker_id = tracker.create_query_from("SELECT n".into(), "trino", None);
+        let query = test_query(&tracker, tracker_id);
+        let result = query.switch.guard(async { Ok(rows()) }).await.unwrap();
+        {
+            let mut inner = query.inner.lock().unwrap();
+            inner.phase = ended_phase(&tracker, &tracker_id, result);
+        }
+        cancel_query(&tracker, &query, TrinoError::canceled(), "client DELETE")
+            .await
+            .unwrap();
+        assert!(matches!(
+            &query.inner.lock().unwrap().phase,
+            Phase::Failed(e) if e.name == "USER_CANCELED"
+        ));
+    }
+
+    /// A write that finished keeps its result when a cancel (client
+    /// `DELETE`, `/v1/query` kill, the reaper) lands before the client
+    /// fetched its update count: only a read pages, so the cancel is not
+    /// applied and the reaper does not count the query as active.
+    #[tokio::test]
+    async fn a_cancel_of_a_finished_write_keeps_its_result() {
+        let tracker = Arc::new(QueryTracker::new());
+        let tracker_id =
+            tracker.create_query_from("INSERT INTO t VALUES (1)".into(), "trino", None);
+        let query = test_query(&tracker, tracker_id);
+        let result = query.switch.guard(async { Ok(rows()) }).await.unwrap();
+        {
+            let mut inner = query.inner.lock().unwrap();
+            inner.phase = ended_phase(&tracker, &tracker_id, result);
+            assert!(!query.active(&inner), "a finished write is not paging");
+        }
+        cancel_query(&tracker, &query, TrinoError::canceled(), "client DELETE")
+            .await
+            .unwrap();
+        assert!(
+            matches!(query.inner.lock().unwrap().phase, Phase::Finished(_)),
+            "the cancel relabelled a committed write"
+        );
+        assert_eq!(
+            tracker.get_query(&tracker_id).unwrap().state,
+            TrackerState::Finished
+        );
+    }
+
+    /// Whether a cancel stops a paging query is decided when the cancel
+    /// arrives: one that arrives while a SELECT runs, whose kill is pending
+    /// on the poll that completes it, does not stop it once it reads as
+    /// paging (its task runs only after `complete`).
+    #[tokio::test]
+    async fn a_cancel_decides_paging_when_it_arrives() {
+        let tracker = Arc::new(QueryTracker::new());
+        let tracker_id = tracker.create_query_from("SELECT n".into(), "trino", None);
+        let query = test_query(&tracker, tracker_id);
+        let (t, q) = (Arc::clone(&tracker), Arc::clone(&query));
+        let cancel = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&cancel);
+        let work = async move {
+            // Arrives inside the completing poll; its task runs later.
+            *slot.lock().unwrap() = Some(cancel_query(
+                &t,
+                &q,
+                TrinoError::canceled(),
+                "client DELETE",
+            ));
+            Ok(rows())
+        };
+        if let Some(result) = query.switch.guard(work).await {
+            let mut inner = query.inner.lock().unwrap();
+            inner.phase = ended_phase(&tracker, &tracker_id, result);
+            assert!(query.paging(&inner));
+        }
+        let handle = cancel.lock().unwrap().take().unwrap();
+        handle.await.unwrap();
+        assert!(
+            matches!(query.inner.lock().unwrap().phase, Phase::Finished(_)),
+            "the cancel relabelled a completed query"
+        );
+    }
+
+    /// A client cancel during a poll that does not complete the work stops
+    /// it once that poll ends: USER_CANCELED, and the work is never polled
+    /// again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_cancel_during_a_poll_stops_the_work() {
+        let tracker = Arc::new(QueryTracker::new());
+        let tracker_id = tracker.create_query_from("SELECT 1".into(), "trino", None);
+        let query = test_query(&tracker, tracker_id);
+        let (t, q) = (Arc::clone(&tracker), Arc::clone(&query));
+        let out = query
+            .switch
+            .guard(async move {
+                tokio::spawn(async move {
+                    cancel_query(&t, &q, TrinoError::canceled(), "client DELETE")
+                        .await
+                        .unwrap();
+                });
+                std::thread::sleep(Duration::from_millis(200));
+                std::future::pending::<Result<QueryOutput, TrinoError>>().await
+            })
+            .await;
+        assert!(out.is_none());
+        for _ in 0..200 {
+            if matches!(&query.inner.lock().unwrap().phase, Phase::Failed(e) if e.name == "USER_CANCELED")
+            {
+                assert_eq!(
+                    tracker.get_query(&tracker_id).unwrap().state,
+                    TrackerState::Cancelled
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the cancel never stopped the query");
+    }
+
+    #[test]
+    fn an_unkilled_query_finishes_with_its_rows() {
+        let tracker = QueryTracker::new();
+        let id = tracker.create_query_from("SELECT n".into(), "trino", None);
+        assert!(matches!(
+            ended_phase(&tracker, &id, Ok(rows())),
+            Phase::Finished(_)
+        ));
+        let info = tracker.get_query(&id).unwrap();
+        assert_eq!(info.state, TrackerState::Finished);
+        assert_eq!(info.rows, Some(2));
     }
 }

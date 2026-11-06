@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use arneb_catalog::CatalogManager;
+use arneb_catalog::{CatalogManager, TablePrivilege};
 use arneb_common::error::{ArnebError, ExecutionError};
 use arneb_common::stream::collect_stream;
 use arneb_common::types::ScalarValue;
@@ -185,7 +185,13 @@ impl PgWireServerHandlers for HandlerFactory {
 /// One pgwire statement's entry in the query tracker: `Queued` at receipt,
 /// `Running` once admitted, then finished or failed. Dropped before either
 /// (the client went away mid-statement) it is recorded as cancelled.
-struct TrackedStatement(Option<Tracked>);
+///
+/// A kill through the tracker (manage-api D7) goes through the statement's
+/// [`arneb_scheduler::KillSwitch`], registered at receipt, before any work:
+/// it stops the work if it has not completed, and is otherwise not applied,
+/// so a statement whose work completed (a committed write included) always
+/// reports its real result.
+struct TrackedStatement(Option<Tracked>, arneb_scheduler::KillSwitch);
 
 type Tracked = (
     Arc<arneb_scheduler::QueryTracker>,
@@ -199,7 +205,16 @@ impl TrackedStatement {
         user: Option<String>,
     ) -> Self {
         let id = tracker.create_query_from(sql.to_string(), "pgwire", user);
-        Self(Some((Arc::clone(tracker), id)))
+        let switch = arneb_scheduler::KillSwitch::new();
+        // Nothing else to stop: the guard drops the work on the kill.
+        tracker.set_canceller(&id, switch.canceller(|_by| {}));
+        Self(Some((Arc::clone(tracker), id)), switch)
+    }
+
+    /// Run the statement's work under its kill switch: `None` when a kill
+    /// stopped it before it completed.
+    async fn guard<F: std::future::Future>(&self, work: F) -> Option<F::Output> {
+        self.1.guard(work).await
     }
 
     fn running(&self) {
@@ -208,6 +223,7 @@ impl TrackedStatement {
         }
     }
 
+    /// Records `rows` and marks the query finished.
     fn finish(&mut self, rows: u64) {
         if let Some((t, id)) = self.0.take() {
             let _ = t.finish_query(&id, rows);
@@ -219,6 +235,14 @@ impl TrackedStatement {
             let _ = t.fail_query(&id, error);
         }
     }
+
+    /// Killed through the tracker: record it as cancelled (a no-op when the
+    /// kill already did).
+    fn cancel(&mut self) {
+        if let Some((t, id)) = self.0.take() {
+            let _ = t.cancel_query(&id);
+        }
+    }
 }
 
 impl Drop for TrackedStatement {
@@ -227,6 +251,15 @@ impl Drop for TrackedStatement {
             let _ = t.cancel_query(&id);
         }
     }
+}
+
+/// SQLSTATE `57014`, as PostgreSQL answers a cancelled statement.
+fn user_cancelled() -> PgWireError {
+    PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+        "ERROR".to_owned(),
+        "57014".to_owned(),
+        "canceling statement due to user request".to_owned(),
+    )))
 }
 
 /// Per-connection handler that processes queries through the full pipeline.
@@ -374,37 +407,41 @@ impl ConnectionHandler {
     > {
         let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
         let mut tracked = TrackedStatement::start(&self.query_tracker, sql, user);
-        let result = self
-            .with_timeout(client, async {
-                let _admission = self.admit(sql).await?;
-                tracked.running();
-                // Snapshot after admission, so the reading statement shows
-                // itself as RUNNING.
-                let runtime = crate::runtime_queries::references_runtime_queries(sql).then(|| {
-                    crate::runtime_queries::runtime_catalog(&self.query_tracker, catalog_manager)
-                });
-                let (cm, registry, executor) = match &runtime {
-                    Some((cm, registry)) => (cm, registry, None),
-                    None => (
-                        catalog_manager.as_ref(),
-                        self.connector_registry.as_ref(),
-                        self.distributed_executor.as_deref(),
-                    ),
-                };
-                Ok(execute_query_with_limit(
-                    sql,
-                    cm,
-                    registry,
-                    executor,
-                    &self.memory_pool,
-                    self.query_memory_limit,
-                )
-                .await)
-            })
-            .await;
+        let work = self.with_timeout(client, async {
+            let _admission = self.admit(sql).await?;
+            tracked.running();
+            // Snapshot after admission, so the reading statement shows
+            // itself as RUNNING.
+            let runtime = crate::runtime_queries::references_runtime_queries(sql).then(|| {
+                crate::runtime_queries::runtime_catalog(&self.query_tracker, catalog_manager)
+            });
+            let (cm, registry, executor) = match &runtime {
+                Some((cm, registry)) => (cm, registry, None),
+                None => (
+                    catalog_manager.as_ref(),
+                    self.connector_registry.as_ref(),
+                    self.distributed_executor.as_deref(),
+                ),
+            };
+            Ok(execute_query_with_limit(
+                sql,
+                cm,
+                registry,
+                executor,
+                &self.memory_pool,
+                self.query_memory_limit,
+            )
+            .await)
+        });
+        let Some(result) = tracked.guard(work).await else {
+            tracked.cancel();
+            return Err(user_cancelled());
+        };
+        // The work completed: a kill from here on is not applied, so the
+        // statement reports this result, rows or committed write alike.
         match &result {
             Ok(Ok((_, batches))) => {
-                tracked.finish(batches.iter().map(|b| b.num_rows() as u64).sum())
+                tracked.finish(batches.iter().map(|b| b.num_rows() as u64).sum());
             }
             Ok(Err(e)) => tracked.fail(e.to_string()),
             // Admission refusal or statement timeout.
@@ -1119,6 +1156,31 @@ fn cap_plan_rows(plan: LogicalPlan, row_cap: usize) -> LogicalPlan {
     }
 }
 
+/// Checks the write privilege a DDL/DML plan needs on its target table
+/// (`INSERT`, `DELETE`, or `OWNERSHIP` for create/drop), recursing through
+/// `EXPLAIN` because analysis is where access is checked. Reads need
+/// nothing here: planning already checked every `SELECT` source.
+pub(crate) fn check_write_privileges(
+    plan: &LogicalPlan,
+    catalogs: &CatalogManager,
+) -> Result<(), ArnebError> {
+    use TablePrivilege::{Delete, Insert, Ownership};
+    let (name, privilege, verb) = match plan {
+        LogicalPlan::Explain { input, .. } => return check_write_privileges(input, catalogs),
+        LogicalPlan::InsertInto { table, .. } => (table, Insert, "insert into table"),
+        LogicalPlan::DeleteFrom { table, .. } => (table, Delete, "delete from table"),
+        LogicalPlan::CreateTable { name, .. } | LogicalPlan::CreateTableAsSelect { name, .. } => {
+            (name, Ownership, "create table")
+        }
+        LogicalPlan::DropTable { name, .. } => (name, Ownership, "drop table"),
+        LogicalPlan::CreateView { name, .. } => (name, Ownership, "create view"),
+        LogicalPlan::DropView { name, .. } => (name, Ownership, "drop view"),
+        _ => return Ok(()),
+    };
+    catalogs.check_table_privilege(name, privilege, verb)?;
+    Ok(())
+}
+
 /// Takes a query's batches one at a time as they are produced, so the caller
 /// keeps only what it needs instead of a fully collected result.
 pub trait BatchSink: Send {
@@ -1196,6 +1258,8 @@ pub(crate) async fn execute_query_capped(
         }
         _ => logical_plan,
     };
+
+    check_write_privileges(&logical_plan, catalog_manager)?;
 
     // Step 2.5: Optimize logical plan
     let optimizer = LogicalOptimizer::default_rules();
@@ -2140,6 +2204,66 @@ async fn register_data_sources(
 
 #[cfg(test)]
 mod tests {
+    /// A kill that lands after an INSERT's work completed but before
+    /// `finish`: the kill is not applied and the statement reports its
+    /// real result (PostgreSQL never reports a cancel after commit).
+    #[tokio::test]
+    async fn a_kill_after_a_write_completed_is_not_applied() {
+        use arneb_scheduler::{KillOutcome, QueryState};
+        let tracker = Arc::new(arneb_scheduler::QueryTracker::new());
+        let mut tracked =
+            TrackedStatement::start(&tracker, "INSERT INTO t SELECT 1", Some("bob".into()));
+        tracked.running();
+        let id = tracked.0.as_ref().unwrap().1;
+        assert_eq!(
+            tracked.guard(async { "committed" }).await,
+            Some("committed")
+        );
+        // The window between the completed work and `finish`.
+        assert_eq!(
+            tracker.kill_query(&id, "root").await.unwrap(),
+            KillOutcome::NotApplied {
+                state: QueryState::Running
+            }
+        );
+        tracked.finish(1);
+        let info = tracker.get_query(&id).unwrap();
+        assert_eq!(info.state, QueryState::Finished);
+        assert_eq!(info.rows, Some(1));
+    }
+
+    /// A kill before the statement's work starts (the canceller is
+    /// registered at receipt) stops all of it: the work never runs.
+    #[tokio::test]
+    async fn a_kill_before_the_work_starts_stops_it() {
+        use arneb_scheduler::{KillOutcome, QueryState};
+        let tracker = Arc::new(arneb_scheduler::QueryTracker::new());
+        let mut tracked =
+            TrackedStatement::start(&tracker, "INSERT INTO t SELECT 1", Some("bob".into()));
+        let id = tracked.0.as_ref().unwrap().1;
+        assert_eq!(
+            tracker.kill_query(&id, "root").await.unwrap(),
+            KillOutcome::Killed {
+                was: QueryState::Queued
+            }
+        );
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let out = tracked
+            .guard(async { ran.store(true, std::sync::atomic::Ordering::SeqCst) })
+            .await;
+        assert_eq!(out, None);
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the work ran"
+        );
+        tracked.cancel();
+        assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
+        match user_cancelled() {
+            PgWireError::UserError(e) => assert_eq!(e.code, "57014"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     use super::*;
     use arneb_common::types::{ColumnInfo, DataType};
     use arneb_sql_parser::ast;

@@ -799,7 +799,8 @@ async fn run() -> Result<()> {
         if !store.is_persistent() {
             tracing::warn!(
                 target: "arneb::config",
-                "no [state] path: API tokens are lost on restart"
+                "no [state] path: API tokens, worker cordons, admission limits and the audit \
+                 log are lost on restart"
             );
         }
         Some(Arc::new(store))
@@ -813,6 +814,12 @@ async fn run() -> Result<()> {
         }
         None
     };
+    // manage-api D8: stored cordons apply before the Flight server below
+    // accepts heartbeats, so a cordoned worker never gets a query on rejoin.
+    if let Some(store) = &state_store {
+        let count = web::restore_worker_cordons(store, &node_registry);
+        tracing::info!(target: "arneb::config", count, "restored worker cordons");
+    }
     let auth_method = match &state_store {
         Some(store) => arneb_protocol::AuthMethod::ScramSha256(store.clone()),
         None => config_auth,
@@ -827,7 +834,7 @@ async fn run() -> Result<()> {
         None
     };
     if let (Some(rules), Some(path)) = (&access_rules, &config.access_control.rules_file) {
-        let [catalogs, schemas, tables, queries] = rules
+        let [catalogs, schemas, tables, queries, system_information] = rules
             .section_sizes()
             .map(|n| n.map_or_else(|| "absent (allow all)".to_owned(), |n| n.to_string()));
         tracing::info!(
@@ -837,6 +844,7 @@ async fn run() -> Result<()> {
             schemas = %schemas,
             tables = %tables,
             queries = %queries,
+            system_information = %system_information,
             "access control rules loaded"
         );
         if matches!(auth_method, arneb_protocol::AuthMethod::None) {
@@ -906,32 +914,136 @@ async fn run() -> Result<()> {
         .map(arneb_protocol::BasicAuthenticator::new)
         .transpose()
         .context("HTTP Basic authentication")?;
+    // The audit log (manage-api D6): `<state file name>.audit.jsonl` next to
+    // the state file, in memory without one, and an empty in-memory log under `none`
+    // (nothing is audited there).
+    let audit_path = state_store
+        .as_ref()
+        .and_then(|s| s.path())
+        .map(arneb_state::AuditLog::sibling_of);
+    let audit_log = Arc::new(
+        arneb_state::AuditLog::open(audit_path.as_deref(), config.audit.settings()).context(
+            "cannot open the audit log (<state file name>.audit.jsonl next to [state] path)",
+        )?,
+    );
+    // Kept for the shutdown flush; the web state takes `audit_log`.
+    let audit_for_shutdown = Arc::clone(&audit_log);
+    if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) {
+        // Retries an unwritable log in the background, so a completion whose
+        // write failed reaches the file once the disk recovers.
+        web::spawn_audit_retry(Arc::clone(&audit_log), web::AUDIT_RETRY_INTERVAL);
+        tracing::info!(
+            target: "arneb::config",
+            path = %audit_path
+                .as_ref()
+                .map_or_else(|| "in-memory".to_owned(), |p| p.display().to_string()),
+            max_entries = config.audit.max_entries,
+            retention_days = config.audit.retention_days,
+            loaded = audit_log.len(),
+            "audit effective settings ([audit] / ARNEB_AUDIT_*)"
+        );
+        if let Some(legacy) = state_store
+            .as_ref()
+            .and_then(|s| s.path())
+            .and_then(arneb_state::AuditLog::legacy_sibling_of)
+        {
+            tracing::warn!(
+                target: "arneb::audit",
+                legacy = %legacy.display(),
+                path = %audit_path.as_ref().map_or_else(String::new, |p| p.display().to_string()),
+                "an audit log under the earlier name exists and is not read: its entries do \
+                 not appear in GET /api/v2/audit; keep or archive it (it is not migrated)"
+            );
+        }
+        if state_store.as_ref().is_some_and(|s| !s.is_persistent()) {
+            tracing::warn!(
+                target: "arneb::config",
+                "the audit log is kept in memory (no [state] path): its entries are lost on \
+                 restart"
+            );
+        }
+    }
     let state_for_web = state_store.clone();
     let credentials_for_web: Option<Arc<dyn arneb_protocol::CredentialSource>> =
         state_store.clone().map(|s| s as _);
 
+    // Privilege layers (manage-api D1). Admin users are only meaningful
+    // under password auth; say so rather than silently ignoring them.
+    if !matches!(role, ServerRole::Worker) {
+        let admins = &config.access_control.admin_users;
+        tracing::info!(
+            target: "arneb::config",
+            admin_users = %if admins.is_empty() { "none".to_owned() } else { admins.join(",") },
+            auth = if password_users.is_some() { "password" } else { "none" },
+            "manage privileges effective settings ([access_control] admin_users / ARNEB_ADMIN_USERS)"
+        );
+        match &credentials_for_web {
+            None if !admins.is_empty() => tracing::warn!(
+                target: "arneb::config",
+                "[access_control] admin_users is set but [auth] type = \"none\": manage \
+                 actions need an authenticated user, so it has no effect"
+            ),
+            Some(creds) => {
+                let unknown: Vec<&str> = admins
+                    .iter()
+                    .filter(|u| creds.scram_verifiers(u).is_empty())
+                    .map(String::as_str)
+                    .collect();
+                if !unknown.is_empty() {
+                    tracing::warn!(
+                        target: "arneb::config",
+                        "[access_control] admin_users names users that are not in the state \
+                         store: {}",
+                        unknown.join(", ")
+                    );
+                }
+            }
+            None => {}
+        }
+    }
+    let authorizer = web::privilege::Authorizer::new(
+        access_rules.clone(),
+        config.access_control.admin_users.clone(),
+        password_users.is_some(),
+    );
+
     // admission-control D5/D8: one controller for the process, shared by
-    // pgwire, the Trino listener and the Web UI. Workers have none; their
-    // admission stays the RSS probe, and this cap bounds what reaches them.
-    // `max_running_queries = 0` admits every query at once, so no queue can
-    // form whatever `max_queued_queries` says: build no controller, and
-    // statements skip admission (and its lock) entirely.
+    // pgwire, the Trino listener, the agent API and the Web UI. Workers have
+    // none; their admission stays the RSS probe, and this cap bounds what
+    // reaches them. manage-api D9: the controller is built whenever SQL is
+    // served, also for `max_running_queries = 0` (unlimited), so the limits
+    // can change at runtime; a value stored in the state store wins over
+    // the config seed.
     let serves_sql = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
     let admission_config = &config.admission;
-    let admission = (serves_sql && admission_config.max_running_queries > 0).then(|| {
+    let resolved_admission = config::resolve_admission_limits(
+        admission_config,
+        state_store.as_ref().and_then(|s| s.admission_limits()),
+    );
+    let admission = serves_sql.then(|| {
         arneb_scheduler::AdmissionController::new(
-            admission_config.max_running_queries,
-            admission_config.max_queued_queries,
+            resolved_admission.limits.max_running_queries,
+            resolved_admission.limits.max_queued_queries,
         )
     });
     if let Some(controller) = &admission {
         controller.spawn_snapshot_logger(std::time::Duration::from_secs(10));
     }
     if serves_sql {
+        for (knob, from_config, from_state) in &resolved_admission.diverging {
+            tracing::warn!(
+                target: "arneb::config",
+                "[admission] {knob} / ARNEB_{} = {from_config} is overridden by the runtime \
+                 value {from_state} in the state store (DELETE /api/v2/admission returns to \
+                 the config)",
+                knob.to_ascii_uppercase()
+            );
+        }
         tracing::info!(
             target: "arneb::config",
-            max_running_queries = admission_config.max_running_queries,
-            max_queued_queries = admission_config.max_queued_queries,
+            max_running_queries = resolved_admission.limits.max_running_queries,
+            max_queued_queries = resolved_admission.limits.max_queued_queries,
+            admission_source = resolved_admission.source,
             statement_timeout = %arneb_common::duration::format_pg_time_limit(
                 admission_config.statement_timeout
             ),
@@ -1118,6 +1230,9 @@ async fn run() -> Result<()> {
         start_time: std::time::Instant::now(),
         role: config.cluster.role.clone(),
         admission: admission.clone(),
+        admission_changes: Default::default(),
+        cordon_changes: Default::default(),
+        max_running_queries: config.admission.max_running_queries,
         max_queued_queries: config.admission.max_queued_queries,
         memory_pool: memory_pool.clone(),
         memory_limit_bytes: budget.map(|b| b as u64),
@@ -1128,7 +1243,9 @@ async fn run() -> Result<()> {
             .and(basic_auth.as_ref().map(|a| a.sibling())),
         credentials: credentials_for_web,
         state: state_for_web,
+        audit: audit_log,
         access_rules: access_rules.clone(),
+        authorizer,
         metrics_auth: config.web.metrics_auth,
         sessions: web::SessionStore::new(),
         mcp: (serves_clients && agent_service.is_some() && config.mcp.enabled)
@@ -1175,37 +1292,44 @@ async fn run() -> Result<()> {
     let flight_state_clone = flight_state.clone();
     let rpc_addr_clone = rpc_addr.clone();
 
-    tokio::select! {
-        // pgwire server (coordinator + standalone only)
-        result = server.start(), if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "pgwire server error");
-                bail!("server error: {e}");
-            }
-        }
-        // Flight RPC server (all roles)
-        result = arneb_rpc::start_flight_server(&rpc_addr_clone, flight_state_clone) => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "flight server error");
-                bail!("flight server error: {e}");
-            }
-        }
-        // Web UI HTTP server (coordinator + standalone only). Like the Trino
-        // listener, a bind failure is logged but not fatal.
-        _ = non_fatal_listener(
-            async {
+    // Web UI HTTP server (coordinator + standalone only), in its own task so
+    // the shutdown can stop it gracefully ([`stop_web_then_flush_audit`]).
+    // Like the Trino listener, a bind failure is logged but not fatal.
+    let web_server = serves_clients.then(|| {
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let web_addr = web_addr.clone();
+        let task = tokio::spawn(async move {
+            let served = async {
                 let listener = tokio::net::TcpListener::bind(&web_addr).await?;
                 tracing::info!(web_address = %web_addr, "web UI listening");
-                axum::serve(listener, web_router).await
-            },
-            |e| {
+                serve_until_stopped(listener, web_router, stopping).await
+            };
+            if let Err(e) = served.await {
                 tracing::error!(
                     error = %e,
                     address = %web_addr,
                     "web UI listener failed; continuing without it"
-                )
-            },
-        ), if serves_clients => {}
+                );
+            }
+        });
+        (stop, task)
+    });
+
+    let fatal = tokio::select! {
+        // pgwire server (coordinator + standalone only)
+        result = server.start(), if matches!(role, ServerRole::Coordinator | ServerRole::Standalone) => {
+            result.err().map(|e| {
+                tracing::error!(error = %e, "pgwire server error");
+                anyhow::anyhow!("server error: {e}")
+            })
+        }
+        // Flight RPC server (all roles)
+        result = arneb_rpc::start_flight_server(&rpc_addr_clone, flight_state_clone) => {
+            result.err().map(|e| {
+                tracing::error!(error = %e, "flight server error");
+                anyhow::anyhow!("flight server error: {e}")
+            })
+        }
         // Trino client protocol. A bind failure (e.g. a local Trino already
         // on 8080) is logged but not fatal: pgwire keeps serving.
         _ = non_fatal_listener(
@@ -1223,7 +1347,7 @@ async fn run() -> Result<()> {
                      (set [trino] port / ARNEB_TRINO_PORT / --trino-port, or --no-trino)"
                 )
             },
-        ) => {}
+        ) => None,
 
         // Worker heartbeat loop
         _ = worker_heartbeat_loop(
@@ -1231,17 +1355,81 @@ async fn run() -> Result<()> {
             role,
             worker_state_rx,
             heartbeat.interval_secs,
-        ) => {}
+        ) => None,
         // SIGTERM / Ctrl-C; a worker drains first (worker-graceful-drain).
         _ = run_until_shutdown(
             heartbeat_target.as_ref().zip(worker_tasks.as_ref()),
             &worker_state,
             heartbeat.interval_secs,
             drain_timeout_secs,
-        ) => {}
+        ) => None,
+    };
+    // On a signal and on a fatal server error alike: the Web API finishes
+    // its requests (bounded), then audited actions still running get a
+    // bounded wait and completions whose write failed one last try.
+    stop_web_then_flush_audit(web_server, audit_for_shutdown).await;
+    match fatal {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
+}
 
-    Ok(())
+/// How long the shutdown lets the Web API finish the requests it has
+/// accepted (an audited action among them) before closing its connections.
+const WEB_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Stops the Web API gracefully: no new connections, idle keep-alive
+/// connections closed, requests in progress finished, for at most
+/// [`WEB_SHUTDOWN_WAIT`] (then the server task is aborted, logged at WARN;
+/// an audited action it had already handed to the blocking pool still runs
+/// to completion or is refused unwritten). Then flushes the audit log
+/// ([`web::flush_audit`], itself bounded and logging at ERROR what it
+/// could not finish). Holds no lock.
+async fn stop_web_then_flush_audit(
+    web_server: Option<(
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    )>,
+    audit: Arc<arneb_state::AuditLog>,
+) {
+    stop_web(web_server, WEB_SHUTDOWN_WAIT).await;
+    web::flush_audit(audit).await;
+}
+
+/// Serves `router` on `listener` until `stopping` turns true, then stops
+/// accepting, closes idle connections and returns once the requests in
+/// progress have finished.
+async fn serve_until_stopped(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            // A dropped sender also stops the server.
+            let _ = stopping.wait_for(|stop| *stop).await;
+        })
+        .await
+}
+
+/// Signals the web server to stop and waits for it at most `wait`.
+async fn stop_web(
+    web_server: Option<(
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    )>,
+    wait: std::time::Duration,
+) {
+    if let Some((stop, mut task)) = web_server {
+        stop.send_replace(true);
+        if tokio::time::timeout(wait, &mut task).await.is_err() {
+            tracing::warn!(
+                wait_ms = wait.as_millis() as u64,
+                "the web UI did not finish its requests in time; closing its connections"
+            );
+            task.abort();
+        }
+    }
 }
 
 /// Run an auxiliary listener (Web UI, Trino) whose failure must not stop
@@ -1515,6 +1703,100 @@ fn log_filter_directives(rust_log: Option<&str>, profile: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sends one HTTP/1.1 request on `stream` and reads the status line.
+    async fn request(stream: &mut tokio::net::TcpStream, path: &str) -> String {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let req = format!("GET {path} HTTP/1.1\r\nhost: x\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        line
+    }
+
+    /// A web server spawned like `run` does, on an ephemeral port.
+    async fn spawn_test_web(
+        router: axum::Router,
+    ) -> (
+        std::net::SocketAddr,
+        (
+            tokio::sync::watch::Sender<bool>,
+            tokio::task::JoinHandle<()>,
+        ),
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            serve_until_stopped(listener, router, stopping)
+                .await
+                .unwrap();
+        });
+        (addr, (stop, task))
+    }
+
+    /// The shutdown lets a request in progress (an audited action, say)
+    /// finish before the audit flush, instead of dropping the listener
+    /// with the connection still serving.
+    #[tokio::test]
+    async fn the_web_shutdown_finishes_requests_in_progress() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered = std::sync::Mutex::new(Some(entered_tx));
+        let entered = std::sync::Arc::new(entered);
+        let router = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(move || {
+                let entered = std::sync::Arc::clone(&entered);
+                async move {
+                    if let Some(tx) = entered.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    "done"
+                }
+            }),
+        );
+        let (addr, web) = spawn_test_web(router).await;
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            request(&mut stream, "/slow").await
+        });
+        entered_rx.await.unwrap();
+        let started = std::time::Instant::now();
+        stop_web(Some(web), std::time::Duration::from_secs(5)).await;
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+        let status = client.await.unwrap();
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    }
+
+    /// A request that never finishes does not hold up the exit.
+    #[tokio::test]
+    async fn the_web_shutdown_wait_is_bounded() {
+        let router = axum::Router::new().route(
+            "/hang",
+            axum::routing::get(futures::future::pending::<&str>),
+        );
+        let (addr, web) = spawn_test_web(router).await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        {
+            use tokio::io::AsyncWriteExt as _;
+            stream
+                .write_all(b"GET /hang HTTP/1.1\r\nhost: x\r\n\r\n")
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stop_web(Some(web), std::time::Duration::from_millis(100)),
+        )
+        .await
+        .expect("the web shutdown waited past its bound");
+    }
 
     /// Which `tracing` target an [`enabled`] probe checks.
     #[derive(Clone, Copy)]

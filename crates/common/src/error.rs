@@ -245,6 +245,11 @@ pub enum ExecutionError {
     /// A resource limit (memory, threads, etc.) has been exceeded.
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
+
+    /// An operation ended without an outcome: it may or may not have taken
+    /// effect (e.g. a query kill whose task was dropped mid-kill).
+    #[error("interrupted: {0}")]
+    Interrupted(String),
 }
 
 /// Errors from data source connectors.
@@ -324,6 +329,12 @@ pub enum ConfigError {
 pub type Result<T> = std::result::Result<T, ArnebError>;
 
 impl ExecutionError {
+    /// Whether this is [`ExecutionError::Interrupted`]: decided by the
+    /// variant, never by the message.
+    pub fn is_interrupted(&self) -> bool {
+        matches!(self, ExecutionError::Interrupted(_))
+    }
+
     /// An upstream failure (an input stream, a child operator, a remote
     /// task) re-raised by an operator under `context`. A memory-limit
     /// failure keeps its variant and its message, so it reaches the client

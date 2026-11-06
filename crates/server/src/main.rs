@@ -969,8 +969,8 @@ async fn run() -> Result<()> {
     };
     // Only the coordinator's Trino and Web listeners check Basic credentials
     // (workers serve neither). They share one PBKDF2 limiter and success
-    // cache, but each gets its own wait queue (`sibling`), so a flood on one
-    // port cannot 503 the other.
+    // cache, but each has its own wait queue (Web this handle, Trino its
+    // `sibling`), so a flood on one port cannot 503 the other.
     let basic_auth = password_users
         .clone()
         .filter(|_| serves_clients)
@@ -1364,9 +1364,9 @@ async fn run() -> Result<()> {
         memory_limit_bytes: budget.map(|b| b as u64),
         // Same source as `credentials_for_web` (the state store) whenever
         // that is set: password auth makes the state store the auth method.
-        basic: credentials_for_web
-            .as_ref()
-            .and(basic_auth.as_ref().map(|a| a.sibling())),
+        // The root handle (the Trino listener has its `sibling`), so no
+        // handle sits unused with a wait queue of its own.
+        basic: credentials_for_web.as_ref().and(basic_auth),
         credentials: credentials_for_web,
         state: state_for_web,
         audit: audit_log,

@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arneb_catalog::{CatalogProvider, SchemaProvider, TableProvider, TableStatistics};
-use arneb_common::error::ConnectorError;
+use arneb_catalog::{
+    CatalogProvider, SchemaProvider, TableGate, TableLookup, TableProvider, TableStatistics,
+};
+use arneb_common::error::{CatalogError, ConnectorError};
 use arneb_common::types::ColumnInfo;
 use arneb_rdbms::{plan_splits, RemoteColumn, RemoteTable, SplitPlan};
 use async_trait::async_trait;
@@ -115,14 +117,20 @@ pub(crate) fn pool_error(e: &deadpool_postgres::PoolError) -> String {
     }
 }
 
-#[async_trait]
-impl CatalogProvider for PostgresCatalog {
-    async fn schema_names(&self) -> Vec<String> {
+impl PostgresCatalog {
+    async fn list_schemas(&self) -> Result<Vec<String>, String> {
         let sql = "SELECT nspname FROM pg_namespace \
                    WHERE nspname NOT IN ('pg_catalog', 'information_schema') \
                    AND nspname NOT LIKE 'pg\\_toast%' AND nspname NOT LIKE 'pg\\_temp\\_%' \
                    ORDER BY 1";
-        match query_strings(&self.state, sql, &[]).await {
+        query_strings(&self.state, sql, &[]).await
+    }
+}
+
+#[async_trait]
+impl CatalogProvider for PostgresCatalog {
+    async fn schema_names(&self) -> Vec<String> {
+        match self.try_schema_names().await {
             Ok(names) => names,
             Err(e) => {
                 tracing::warn!(catalog = %self.state.name, error = %e, "failed to list schemas");
@@ -131,12 +139,37 @@ impl CatalogProvider for PostgresCatalog {
         }
     }
 
+    /// A server that cannot be reached is an error, not an empty catalog.
+    async fn try_schema_names(&self) -> Result<Vec<String>, CatalogError> {
+        self.list_schemas()
+            .await
+            .map_err(|e| CatalogError::Unavailable(format!("{}: {e}", self.state.name)))
+    }
+
     async fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        let names = self.schema_names().await;
-        let resolved = resolve_name(&names, name)?;
-        Some(Arc::new(PostgresSchema {
-            state: self.state.clone(),
-            name: resolved,
+        match self.try_schema(name).await {
+            Ok(schema) => schema,
+            Err(e) => {
+                tracing::warn!(catalog = %self.state.name, schema = name, error = %e, "failed to look up schema");
+                None
+            }
+        }
+    }
+
+    /// A server that cannot be reached is an error, not a missing schema.
+    async fn try_schema(
+        &self,
+        name: &str,
+    ) -> Result<Option<Arc<dyn SchemaProvider>>, CatalogError> {
+        let names = self
+            .list_schemas()
+            .await
+            .map_err(|e| CatalogError::Unavailable(format!("{}: {e}", self.state.name)))?;
+        Ok(resolve_name(&names, name).map(|resolved| {
+            Arc::new(PostgresSchema {
+                state: self.state.clone(),
+                name: resolved,
+            }) as Arc<dyn SchemaProvider>
         }))
     }
 }
@@ -155,11 +188,7 @@ const RELKINDS: &str = "('r', 'v', 'm', 'f', 'p')";
 #[async_trait]
 impl SchemaProvider for PostgresSchema {
     async fn table_names(&self) -> Vec<String> {
-        let sql = format!(
-            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = $1 AND c.relkind IN {RELKINDS} ORDER BY 1"
-        );
-        match query_strings(&self.state, &sql, &[&self.name]).await {
+        match self.try_table_names().await {
             Ok(names) => names,
             Err(e) => {
                 tracing::warn!(catalog = %self.state.name, schema = %self.name, error = %e, "failed to list tables");
@@ -168,15 +197,54 @@ impl SchemaProvider for PostgresSchema {
         }
     }
 
+    /// A server that cannot be reached is an error, not an empty schema.
+    async fn try_table_names(&self) -> Result<Vec<String>, CatalogError> {
+        let sql = format!(
+            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relkind IN {RELKINDS} ORDER BY 1"
+        );
+        query_strings(&self.state, &sql, &[&self.name])
+            .await
+            .map_err(|e| {
+                CatalogError::Unavailable(format!("{}.{}: {e}", self.state.name, self.name))
+            })
+    }
+
+    /// The schema was found by [`resolve_name`], which also accepts a
+    /// unique case-insensitive match.
+    fn canonical_name(&self) -> Option<String> {
+        Some(self.name.clone())
+    }
+
     async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
-        match load_table(&self.state, &self.name, name).await {
-            Ok(Some(t)) => Some(Arc::new(t)),
-            Ok(None) => None,
+        match self.load(name, &|_, _| true).await {
+            Ok(table) => table.found(),
             Err(e) => {
                 tracing::warn!(catalog = %self.state.name, schema = %self.name, table = name, error = %e, "failed to load table");
                 None
             }
         }
+    }
+
+    /// Asks `allowed` once the name is resolved, before the columns and
+    /// splits are loaded. A failed metadata query is `Unavailable`, not a
+    /// missing table.
+    async fn table_if_allowed(
+        &self,
+        name: &str,
+        allowed: TableGate<'_>,
+    ) -> Result<TableLookup, CatalogError> {
+        self.load(name, allowed).await
+    }
+}
+
+impl PostgresSchema {
+    async fn load(&self, name: &str, allowed: TableGate<'_>) -> Result<TableLookup, CatalogError> {
+        load_table(&self.state, &self.name, name, allowed)
+            .await
+            .map_err(|e| {
+                CatalogError::Unavailable(format!("{}.{}.{name}: {e}", self.state.name, self.name))
+            })
     }
 }
 
@@ -190,6 +258,12 @@ pub struct PostgresTable {
 }
 
 impl TableProvider for PostgresTable {
+    /// The table was found by [`resolve_name`], which also accepts a
+    /// unique case-insensitive match.
+    fn canonical_name(&self) -> Option<(String, String)> {
+        Some((self.remote.schema.clone(), self.remote.name.clone()))
+    }
+
     fn schema(&self) -> Vec<ColumnInfo> {
         self.columns.clone()
     }
@@ -234,7 +308,8 @@ async fn load_table(
     state: &CatalogState,
     schema: &str,
     name: &str,
-) -> Result<Option<PostgresTable>, String> {
+    allowed: TableGate<'_>,
+) -> Result<TableLookup, String> {
     let client = state.pool.get().await.map_err(|e| pool_error(&e))?;
     let rel_sql = format!(
         "SELECT c.oid, c.relname, c.reltuples::float8 FROM pg_class c \
@@ -247,8 +322,11 @@ async fn load_table(
         .map_err(|e| pg_error(&e))?;
     let names: Vec<String> = rels.iter().map(|r| r.get(1)).collect();
     let Some(resolved) = resolve_name(&names, name) else {
-        return Ok(None);
+        return Ok(TableLookup::Missing);
     };
+    if !allowed(schema, &resolved) {
+        return Ok(TableLookup::Denied);
+    }
     let rel = rels
         .iter()
         .find(|r| r.get::<_, String>(1) == resolved)
@@ -319,12 +397,12 @@ async fn load_table(
         partitions = split.partition_count(),
         "resolved postgresql table"
     );
-    Ok(Some(PostgresTable {
+    Ok(TableLookup::Found(Arc::new(PostgresTable {
         columns,
         remote,
         split,
         row_count,
-    }))
+    })))
 }
 
 /// Primary-key range splits for large tables with a single integer key.

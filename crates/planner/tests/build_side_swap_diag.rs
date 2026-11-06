@@ -41,6 +41,9 @@ impl TableProvider for StatsTable {
     fn statistics(&self) -> Option<TableStatistics> {
         Some(self.stats.clone())
     }
+    fn canonical_name(&self) -> Option<(String, String)> {
+        None
+    }
 }
 
 #[tokio::test]

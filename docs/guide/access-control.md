@@ -117,9 +117,83 @@ Everyone can run queries and sees only their own.
 - Patterns (`user`, `catalog`, `schema`, `table`, `queryOwner`) are regular
   expressions matched against the whole name, so `sales` does not match
   `sales_eu`. A pattern left out matches everything (`.*`).
+- Patterns are case-sensitive: `secret` does not match `SECRET`. Write
+  them against the names as the source stores them (lowercase in Hive;
+  in PostgreSQL, lowercase unless the table was created with a quoted
+  mixed-case name such as `"Orders"`).
+- Some connectors find tables by a name other than the stored one: Hive
+  always (HMS trims and lowercases names), PostgreSQL when no name matches
+  exactly (a unique case-insensitive match). A read is checked on the name
+  as written **and** on the name the connector resolved it to, and is
+  refused if either is denied. So a deny rule on `secret` also covers
+  `SECRET`, `Secret` and `PUBLIC.secret`, and a schema rule covers the
+  schema however it is written. When only the resolved name is denied,
+  the error is the one a missing table gets, so it does not reveal that
+  the table exists.
+- The same holds for **allow** rules: the name as written must match one
+  too. Arneb folds an unquoted name to lowercase only when the name as
+  written finds nothing and its lowercase form does (memory and file
+  catalogs). Hive and PostgreSQL find `NATION` as written, so it is not
+  folded, and an allow rule on `nation` refuses `SELECT * FROM NATION`.
+  Write queries with the stored (usually lowercase) names, or make allow
+  patterns case-insensitive, e.g. `"table": "(?i)nation"`. See
+  [Upgrading from v0.1.8](#upgrading-from-v0-1-8) if your allow rules use
+  another case than the stored names.
+- When a connector cannot be reached (HMS or the PostgreSQL server is
+  down), reads and `SET search_path` fail with an error instead of
+  reporting a missing schema or table, so `SET search_path` never falls
+  back to another schema. So do Trino `SHOW SCHEMAS`, `SHOW TABLES`,
+  `SHOW COLUMNS`, `DESCRIBE` and `USE`, instead of returning an empty
+  list or a not-found error. A failed read is reported as an external
+  error: SQLSTATE `58030` over pgwire, and `CONNECTOR_ERROR` with
+  `errorType` `EXTERNAL` over the Trino protocol, so clients can retry it.
+  The `information_schema`, `pg_catalog` and `system.jdbc` listings show
+  nothing for what they cannot reach, and the server logs a warning.
+  Iceberg tables whose metadata files cannot be read still read as
+  missing (logged).
+- When an HMS authorization plugin (Apache Ranger, storage-based or
+  SQL-standard authorization) refuses Arneb's request for a database or
+  table, the object reads as missing, and a refused listing as empty, as
+  before v0.1.9; any other HMS error is treated as an outage. HMS reports
+  both the same way, so Arneb recognizes a refusal by the plugins'
+  explicit phrases (`Permission denied: user ...` or `Permission denied:
+  Principal ...`). An authentication failure, such as an expired Kerberos
+  ticket or delegation token, is an outage, never a refusal. A refusal
+  worded otherwise is reported as an outage.
+- A PostgreSQL view is checked by the view's own name. The tables it
+  reads are governed only by the PostgreSQL role the catalog connects as.
 - A section left out of the file allows everything it governs. With no
   `tables` section, every user has every privilege on every table; with no
   `schemas` section, every user owns every schema; and so on.
+
+## Upgrading from v0.1.8
+
+Before v0.1.9, rules were checked only on the names as written in the
+query. From v0.1.9 they are also checked on the stored names the Hive or
+PostgreSQL connector resolved, so **an allow rule must match the stored
+name as well**. An allow rule written in another case than the stored
+name now refuses the read, and the error is the one a missing table gets,
+not `Access Denied`, so it can look as if the data went away.
+
+For example, with a Hive catalog whose database is stored as `tpch`:
+
+```json
+{
+  "tables": [
+    {"user": "alice", "schema": "TPCH", "privileges": ["SELECT"]},
+    {"privileges": []}
+  ]
+}
+```
+
+`SELECT * FROM TPCH.nation` worked on v0.1.8. On v0.1.9 it is refused,
+because the stored schema `tpch` does not match `TPCH`. Fix the rule by
+writing the stored name, `"schema": "tpch"`, or by making the pattern
+case-insensitive, `"schema": "(?i)tpch"`. Check every `catalog`, `schema`
+and `table` pattern in an allow rule against `SHOW SCHEMAS` / `SHOW TABLES`
+(which list the stored names) before upgrading. Deny rules need no change:
+they now also cover every other spelling of the stored name. Memory and
+file catalogs are not affected.
 
 ## Supported rules
 

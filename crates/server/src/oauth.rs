@@ -149,6 +149,10 @@ pub enum OAuthReject {
     /// A valid token that lacks a required scope.
     #[error("insufficient scope")]
     InsufficientScope,
+    /// The user claim is not a valid Arneb user name, so no user can match
+    /// it whatever else the token proves.
+    #[error("user claim is not a valid user name")]
+    InvalidUserName,
     /// The user is an email address (or `user_claim = "email"`) and the
     /// token's `email_verified` is not true.
     #[error("email not verified")]
@@ -416,6 +420,11 @@ impl OAuthValidator {
         // should not mask a token the client can fix by stepping up.
         if !has_scopes(&scopes, &settings.required_scopes) {
             return Err(OAuthReject::InsufficientScope);
+        }
+        // Then the name: a claim no user can have is refused as such, not
+        // with an email-specific 403 that suggests verifying an address.
+        if !crate::web::is_valid_user_name(&user) {
+            return Err(OAuthReject::InvalidUserName);
         }
         check_email(settings, claims, &user)?;
         let expires_at_ms = claims
@@ -2291,22 +2300,60 @@ mod tests {
             "alice@corp.onmicrosoft.com",
             "alice_corp.com#EXT#@tenant.onmicrosoft.com",
         ] {
-            let mut c = claims(&idp.issuer(), AUD);
-            c["upn"] = json!(upn);
-            c["email"] = json!("alice@corp.com");
-            let t = key.sign(&c);
             let lax = validator(&idp, |s| {
                 s.user_claim = "upn".into();
                 s.allow_missing_email_verified = true;
             });
+            let strict = validator(&idp, |s| s.user_claim = "upn".into());
+            let mut c = claims(&idp.issuer(), AUD);
+            if upn.contains('#') {
+                // A guest UPN is no valid user name (`#`): refused as such
+                // before any email check, with or without the opt-in (the
+                // Web layer refused it with that same 403 before).
+                c["upn"] = json!(upn);
+                c["email"] = json!("alice@corp.com");
+                let t = key.sign(&c);
+                for v in [&lax, &strict] {
+                    assert_eq!(
+                        v.validate(&t).await.unwrap_err(),
+                        OAuthReject::InvalidUserName
+                    );
+                }
+                continue;
+            }
+            c["upn"] = json!(upn);
+            c["email"] = json!("alice@corp.com");
+            let t = key.sign(&c);
             assert_eq!(lax.validate(&t).await.unwrap().user, upn);
             // Without the opt-in the address is simply unverified.
-            let strict = validator(&idp, |s| s.user_claim = "upn".into());
             assert_eq!(
                 strict.validate(&t).await.unwrap_err(),
                 OAuthReject::UnverifiedEmail
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_user_name_is_refused_before_the_email_check() {
+        // #220 follow-up: a claim that can never be an Arneb user name gets
+        // that refusal, not an email-specific 403 that suggests verifying
+        // an address.
+        let key = TestKey::ec("k1");
+        let idp = TestIdp::start(&[&key]).await;
+        let strict = validator(&idp, |_| {});
+        let mut c = claims(&idp.issuer(), AUD);
+        c["sub"] = json!("not a name@corp.example");
+        assert_eq!(
+            strict.validate(&key.sign(&c)).await.unwrap_err(),
+            OAuthReject::InvalidUserName
+        );
+        // A missing scope still comes first: the client can step up.
+        let scoped = validator(&idp, |s| s.required_scopes = vec!["mcp".into()]);
+        c["scope"] = json!("other");
+        assert_eq!(
+            scoped.validate(&key.sign(&c)).await.unwrap_err(),
+            OAuthReject::InsufficientScope
+        );
     }
 
     #[tokio::test]

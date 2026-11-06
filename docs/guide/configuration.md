@@ -878,9 +878,10 @@ the source of truth from the config file to the [state store](#state):
   `password`, a password in `connection_url` (a `connection_url` that fails
   validation counts when it may hold one: a `:` before its first `@`
   after `scheme://` (outside an IPv6 host), unless that `@` plainly sits
-  in a query value such as `db:5432/x?user=a@b`; a query parameter whose
-  key, split on every `&` and percent-decoded, contains `password` in any
-  case (`?sslmode&password=`, `?PASSWORD=`); or, with no `scheme://` (a
+  in a query value such as `db:5432/x?user=a@b`; `password` in any case
+  anywhere after the first `?` or `#` once percent-decoded, in a key, a
+  value or the fragment (`?sslmode&password=`, `?PASSWORD=`,
+  `?sslmode=require password=`, `#password=`); or, with no `scheme://` (a
   libpq `host=... password=...` string), any `password` or `user:pass@`
   shape; a mistyped URL with no password, such as `?sslmod=require`,
   does not stop the start, its catalog fails to build with a WARN),

@@ -20,8 +20,14 @@ rules_file = "/etc/arneb/rules.json"   # or ARNEB_ACCESS_CONTROL_RULES_FILE
 
 The coordinator (or standalone server) reads the file at startup. A file
 that cannot be read or parsed stops startup with an error naming the file
-and the problem. Changing the rules needs a restart. Without a rules file,
-every user reads every table, as before.
+and the problem. Without a rules file, every user reads every table, as
+before.
+
+Under `[auth] type = "password"` the file only seeds the rules: the first
+start copies it into the [state store](/guide/configuration#state), and from
+then on the stored rules are in force and can be
+[changed at runtime](#changing-rules-at-runtime). Under `none` there is no
+state store, the file is the rules, and changing them needs a restart.
 
 At startup the coordinator logs the file and the number of rules in each
 section on `arneb::config`:
@@ -29,6 +35,51 @@ section on `arneb::config`:
 ```
 INFO arneb::config: access control rules loaded rules_file=/etc/arneb/rules.json catalogs=1 schemas=1 tables=2 queries=2
 ```
+
+The line also says where the rules came from (`source="state"` or
+`"config"`). When the file's text differs from the rules currently stored in
+the state, every start logs a WARN that the state store's rules are used,
+ending `Preview a re-seed with POST /api/v2/state/reseed?dry_run=true`. That
+includes rules changed at runtime: after a `PUT` or `DELETE` the WARN fires
+at every start until a re-seed copies the file again (or the file is edited
+to match).
+
+## Changing rules at runtime
+
+Under password auth a user with the [manage](#privilege-layers) privilege
+reads, replaces and clears the rules through `GET`, `PUT` and `DELETE
+/api/v2/access-rules` (or the MCP tools `get_access_rules`,
+`set_access_rules` and `clear_access_rules`). See the
+[HTTP API](/guide/http-api#access-rules).
+
+- `PUT` takes the whole rules file as its JSON body, checked exactly like
+  the file at startup; an unsupported section or field is
+  `invalid_argument`. `DELETE` removes every rule, which allows everything.
+- The change is stored before the response and applies to every statement
+  planned after it, on pgwire, Trino, the agent API and MCP, including
+  connections already open. A statement already running keeps the rules it
+  was checked with.
+- It survives a restart: rules changed at runtime win over an unchanged
+  `rules_file` (with a WARN at every start) until a
+  [re-seed](/guide/http-api#re-seed) copies the file again. If the rules
+  file is also edited after a runtime change, startup refuses until you
+  restart with `--reseed-state` or restore the file to its last seeded
+  version. Rules never changed at runtime follow the file: an edited
+  `rules_file` applies at the next start. Runtime rules copied into the file
+  (compared as JSON) count as the file's again and follow its later edits.
+- Every change is audited (`access_rules.set`, `access_rules.clear`), with a
+  SHA-256 of the rules instead of their text.
+- `GET` reports `from_config: true` while the rules are the seeded copy of
+  `rules_file`, and `false` after a runtime change or when there are no
+  rules.
+
+**Lockout guard.** A rules change, or a re-seed, after which you would no
+longer hold manage is refused with `409 conflict`, hint `keep a
+system_information write rule for yourself, or ask a user in
+[access_control] admin_users`. A dry run is refused the same way. Users in
+`[access_control] admin_users` always hold manage, so the guard never fires
+for them, and `admin_users` itself is startup-only: keep at least one
+operator there so a bad rules change can always be undone.
 
 ## Example
 
@@ -265,8 +316,15 @@ every user cancel every query.
   [manage envelope](/guide/http-api#dry-runs-and-the-response-envelope)
   instead of `204`, and stops the query on its protocol.
 
-The full list, with the state-file and admission changes, is in
-[Upgrading to v0.2.0 (manage API)](/guide/configuration#upgrading-to-v020-manage-api).
+- Under password auth the rules are kept in the state store and can change
+  at runtime (see [Changing rules at runtime](#changing-rules-at-runtime)).
+  While they are not changed at runtime they follow the rules file at every
+  start; after a runtime change they win over an unchanged file, and an
+  edited file then stops startup until `--reseed-state`.
+
+The full lists are in
+[Upgrading to v0.2.0 (manage API)](/guide/configuration#upgrading-to-v020-manage-api)
+and [Upgrading to v0.2.0 (runtime config)](/guide/configuration#upgrading-to-v020-runtime-config).
 
 ## Limits
 

@@ -28,7 +28,9 @@ use super::api::{
 use super::audit::{audited, AuditSubject};
 use super::auth::{decode_basic, AuthVia, Identity};
 use super::error::{ApiError, ErrorCode};
-use super::manage::{run_manage, Applied, DryRun, ManageAction, ManageOutcome, Preview};
+use super::manage::{
+    run_manage, Applied, ChangeLock, DryRun, ManageAction, ManageOutcome, Preview,
+};
 use super::privilege::{Authorizer, Layer};
 use super::session::{SESSION_PREFIX, SESSION_TTL};
 use super::WebState;
@@ -40,6 +42,26 @@ const EXPIRES_IN_DAYS: std::ops::RangeInclusive<i64> = 1..=3650;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// [`SESSION_TTL`] in milliseconds (8 hours: no truncation).
 const SESSION_TTL_MS: u64 = SESSION_TTL.as_secs() * 1000;
+
+/// A slot of the shared PBKDF2 limiter for a token issuance or a runtime
+/// password hash; `overloaded` while the wait queue is full. Shared with
+/// the user routes.
+pub(super) async fn pbkdf2_slot(
+    state: &WebState,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    state
+        .basic
+        .as_ref()
+        .ok_or_else(|| ApiError::new(ErrorCode::Internal, "token issuance is unavailable"))?
+        .acquire_pbkdf2_slot()
+        .await
+        .map_err(|e| match e {
+            arneb_protocol::SlotError::Overloaded => overloaded(),
+            arneb_protocol::SlotError::Closed => {
+                ApiError::new(ErrorCode::Internal, "token issuance is unavailable")
+            }
+        })
+}
 
 /// The `/api/v2` routes, nested at `/api/v2` by [`super::build_router`].
 pub fn routes() -> Router<WebState> {
@@ -59,6 +81,11 @@ pub fn routes() -> Router<WebState> {
         .merge(super::audit::routes())
         .merge(super::workers::routes())
         .merge(super::admission::routes())
+        .merge(super::rules::routes())
+        .merge(super::users::routes())
+        .merge(super::catalogs::routes())
+        .merge(super::settings::routes())
+        .merge(super::reseed::routes())
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
 }
@@ -258,7 +285,7 @@ fn token_store(state: &WebState) -> Result<Arc<StateStore>, ApiError> {
     })
 }
 
-fn state_error(e: StateError) -> ApiError {
+pub(super) fn state_error(e: StateError) -> ApiError {
     match e {
         StateError::TokenNotFound(_) => ApiError::new(ErrorCode::NotFound, "no such token"),
         StateError::UnknownUser(_) => {
@@ -276,18 +303,128 @@ fn state_error(e: StateError) -> ApiError {
     }
 }
 
-fn blocking_failed(e: tokio::task::JoinError) -> ApiError {
+pub(super) fn blocking_failed(e: tokio::task::JoinError) -> ApiError {
     tracing::error!(error = %e, "blocking state store task failed");
     ApiError::new(ErrorCode::Internal, "the state store operation failed")
 }
 
+/// Whose API tokens a token function acts on.
+pub(super) enum TokenTarget {
+    /// The caller's own (`/api/v2/tokens*`). Audited with the token id as
+    /// the `target`.
+    Own,
+    /// `name`'s, for a manager (`/api/v2/users/{name}/tokens*`, already
+    /// authorized). Audited with the user as the `target` and the token id
+    /// in `parameters`; `_lock` (a share of `WebState::config_changes`) is
+    /// held until the audit entry is appended.
+    User { name: String, _lock: ChangeLock },
+}
+
+impl TokenTarget {
+    fn user<'a>(&'a self, who: &'a Identity) -> &'a str {
+        match self {
+            TokenTarget::Own => &who.user,
+            TokenTarget::User { name, .. } => name,
+        }
+    }
+
+    /// The audit `target` and `parameters` for token `id`.
+    fn audit_subject(&self, id: Option<&str>, mut parameters: serde_json::Value) -> AuditSubject {
+        match self {
+            TokenTarget::Own => AuditSubject {
+                target: id.unwrap_or_default().to_owned(),
+                parameters,
+            },
+            TokenTarget::User { name, .. } => {
+                if let (Some(map), Some(id)) = (parameters.as_object_mut(), id) {
+                    map.insert("id".into(), id.into());
+                }
+                AuditSubject {
+                    target: name.clone(),
+                    parameters,
+                }
+            }
+        }
+    }
+
+    /// [`state_error`], worded for a manager acting on another user.
+    fn error(&self, e: StateError) -> ApiError {
+        match (self, e) {
+            (TokenTarget::Own, e) => state_error(e),
+            (TokenTarget::User { name, .. }, StateError::UnknownUser(_)) => no_such_user(name),
+            (TokenTarget::User { name, .. }, StateError::TooManyTokens { limit, .. }) => {
+                ApiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("user {name:?} already has {limit} live tokens"),
+                )
+                .with_hint(format!(
+                    "revoke unused tokens with DELETE /api/v2/users/{name}/tokens/{{id}}"
+                ))
+            }
+            (TokenTarget::User { .. }, e) => state_error(e),
+        }
+    }
+}
+
+/// `not_found` for a user name.
+pub(super) fn no_such_user(name: &str) -> ApiError {
+    ApiError::new(ErrorCode::NotFound, format!("no user {name:?}"))
+        .with_hint("GET /api/v2/users lists the users")
+}
+
 /// A token issuing request: the `POST /api/v2/tokens` body, or the
 /// `create_token` tool's arguments.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub(super) struct IssueTokenRequest {
     pub(super) name: Option<String>,
     /// Kept untyped so a non-integer gets the range hint too.
     pub(super) expires_in_days: Option<serde_json::Value>,
+}
+
+/// A validated [`IssueTokenRequest`].
+pub(super) struct TokenSpec {
+    pub(super) name: Option<String>,
+    pub(super) expires_at_ms: Option<u64>,
+}
+
+impl IssueTokenRequest {
+    /// Validates the name and `expires_in_days`.
+    pub(super) fn validate(self) -> Result<TokenSpec, ApiError> {
+        let name = self
+            .name
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty());
+        if name
+            .as_ref()
+            .is_some_and(|n| n.chars().count() > MAX_TOKEN_NAME_CHARS)
+        {
+            return Err(
+                ApiError::new(ErrorCode::InvalidArgument, "name is too long")
+                    .with_hint(format!("use at most {MAX_TOKEN_NAME_CHARS} characters")),
+            );
+        }
+        let expires_at_ms = match self.expires_in_days {
+            None => None,
+            Some(days) => match days.as_i64().filter(|d| EXPIRES_IN_DAYS.contains(d)) {
+                Some(days) => Some(now_ms().saturating_add(days.unsigned_abs() * DAY_MS)),
+                None => {
+                    return Err(ApiError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("expires_in_days {days} is not valid"),
+                    )
+                    .with_hint(format!(
+                        "expires_in_days must be an integer between {} and {}",
+                        EXPIRES_IN_DAYS.start(),
+                        EXPIRES_IN_DAYS.end()
+                    )));
+                }
+            },
+        };
+        Ok(TokenSpec {
+            name,
+            expires_at_ms,
+        })
+    }
 }
 
 /// A freshly issued token; the plaintext is shown once.
@@ -306,6 +443,13 @@ pub(super) struct IssuedTokenResponse {
     hint: Option<String>,
 }
 
+impl IssuedTokenResponse {
+    /// The token's 16-hex id.
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 async fn issue_token(
     State(state): State<WebState>,
     Extension(who): Extension<Identity>,
@@ -314,51 +458,28 @@ async fn issue_token(
 ) -> Result<(StatusCode, Json<IssuedTokenResponse>), ApiError> {
     token_store(&state)?;
     let req: IssueTokenRequest = parse_body(&body.map_err(bad_body)?, true)?;
-    let issued = issue_token_for(&state, &who, &headers, req).await?;
+    let issued = issue_token_for(&state, &who, TokenTarget::Own, &headers, req).await?;
     Ok((StatusCode::CREATED, Json(issued)))
 }
 
-/// Issues a token for `who`. `headers` are the request's, to find the
-/// credential that authenticated it (a token cannot mint a longer-lived
-/// child). Shared with the MCP `create_token` tool.
+/// Issues a token for `target`'s user (the caller, or another user for a
+/// manager). `headers` are the request's, to find the credential that
+/// authenticated it: a token cannot mint a token that outlives it, for
+/// itself or anyone else. Shared with the MCP `create_token` tool and the
+/// per-user routes.
 pub(super) async fn issue_token_for(
     state: &WebState,
     who: &Identity,
+    target: TokenTarget,
     headers: &HeaderMap,
     req: IssueTokenRequest,
 ) -> Result<IssuedTokenResponse, ApiError> {
     let store = token_store(state)?;
-    let user = who.user.clone();
-    let name = req
-        .name
-        .map(|n| n.trim().to_owned())
-        .filter(|n| !n.is_empty());
-    if name
-        .as_ref()
-        .is_some_and(|n| n.chars().count() > MAX_TOKEN_NAME_CHARS)
-    {
-        return Err(
-            ApiError::new(ErrorCode::InvalidArgument, "name is too long")
-                .with_hint(format!("use at most {MAX_TOKEN_NAME_CHARS} characters")),
-        );
-    }
-    let expires_at_ms = match req.expires_in_days {
-        None => None,
-        Some(days) => match days.as_i64().filter(|d| EXPIRES_IN_DAYS.contains(d)) {
-            Some(days) => Some(now_ms().saturating_add(days.unsigned_abs() * DAY_MS)),
-            None => {
-                return Err(ApiError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("expires_in_days {days} is not valid"),
-                )
-                .with_hint(format!(
-                    "expires_in_days must be an integer between {} and {}",
-                    EXPIRES_IN_DAYS.start(),
-                    EXPIRES_IN_DAYS.end()
-                )));
-            }
-        },
-    };
+    let user = target.user(who).to_owned();
+    let TokenSpec {
+        name,
+        expires_at_ms,
+    } = req.validate()?;
     // A token cannot mint a child that outlives it.
     let mut hints = Vec::new();
     let mut expires_at_ms = expires_at_ms;
@@ -378,18 +499,7 @@ pub(super) async fn issue_token_for(
     store.check_can_issue(&who.user).map_err(state_error)?;
     // The slot comes from the Basic authenticator's limiter: one CPU bound
     // for every PBKDF2 derivation the HTTP listeners start.
-    let permit = state
-        .basic
-        .as_ref()
-        .ok_or_else(|| ApiError::new(ErrorCode::Internal, "token issuance is unavailable"))?
-        .acquire_pbkdf2_slot()
-        .await
-        .map_err(|e| match e {
-            arneb_protocol::SlotError::Overloaded => overloaded(),
-            arneb_protocol::SlotError::Closed => {
-                ApiError::new(ErrorCode::Internal, "token issuance is unavailable")
-            }
-        })?;
+    let permit = pbkdf2_slot(state).await?;
     // The permit moves into the blocking task, so it is held for as long as
     // PBKDF2 runs even if the client disconnects and this future is dropped.
     let (state, who) = (state.clone(), who.clone());
@@ -398,14 +508,12 @@ pub(super) async fn issue_token_for(
         let parameters = serde_json::json!({"name": name, "expires_ms": expires_at_ms});
         // The id is chosen before the intent, so the intent names the token
         // that a crash between issuing and completing would leave behind.
-        // The id only: never the token itself.
+        // The id only: never the token itself. Dropping `target` (releasing
+        // a held change lock) waits until the entry is appended.
         let id = arneb_state::TokenId::generate().map_err(state_error)?;
-        let target = id.to_string();
-        let intent = AuditSubject {
-            target: target.clone(),
-            parameters: parameters.clone(),
-        };
-        audited(
+        let id_text = id.to_string();
+        let intent = target.audit_subject(Some(&id_text), parameters.clone());
+        let issued = audited(
             &state,
             &who,
             "token.issue",
@@ -413,18 +521,16 @@ pub(super) async fn issue_token_for(
             || {
                 store
                     .issue_token_as(id, &user, name, expires_at_ms)
-                    .map_err(state_error)
+                    .map_err(|e| target.error(e))
             },
             // A failed issue names no token: the id never became one.
-            |issued| AuditSubject {
-                target: if issued.is_ok() {
-                    target
-                } else {
-                    String::new()
-                },
-                parameters,
+            |issued| {
+                let id = issued.is_ok().then_some(id_text.as_str());
+                target.audit_subject(id, parameters)
             },
-        )
+        );
+        drop(target);
+        issued
     })
     .await
     .map_err(blocking_failed)??;
@@ -493,24 +599,23 @@ pub(super) struct TokenView {
 /// The caller's live tokens.
 #[derive(Serialize)]
 pub(super) struct TokensResponse {
-    tokens: Vec<TokenView>,
+    pub(super) tokens: Vec<TokenView>,
 }
 
 async fn list_tokens(
     State(state): State<WebState>,
     Extension(who): Extension<Identity>,
 ) -> Result<Json<TokensResponse>, ApiError> {
-    Ok(Json(list_tokens_for(&state, &who)?))
+    Ok(Json(list_tokens_for(&state, &who.user)?))
 }
 
-/// `who`'s live tokens. Shared with the MCP `list_tokens` tool.
-pub(super) fn list_tokens_for(
-    state: &WebState,
-    who: &Identity,
-) -> Result<TokensResponse, ApiError> {
+/// `user`'s tokens (the caller's own, or, for an authorized manager,
+/// another user's). Shared with the MCP `list_tokens` tool and the
+/// per-user route.
+pub(super) fn list_tokens_for(state: &WebState, user: &str) -> Result<TokensResponse, ApiError> {
     let store = token_store(state)?;
     let tokens = store
-        .list_tokens(&who.user)
+        .list_tokens(user)
         .into_iter()
         .map(|t| TokenView {
             id: t.id,
@@ -527,15 +632,17 @@ async fn revoke_token(
     Extension(who): Extension<Identity>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    revoke_token_for(&state, &who, id).await?;
+    revoke_token_for(&state, &who, TokenTarget::Own, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Revokes `who`'s token `id`; another user's id is `not_found`. Shared
-/// with the MCP `revoke_token` tool.
+/// Revokes token `id` of `target`'s user; a token of anyone else is
+/// `not_found`. Shared with the MCP `revoke_token` tool and the per-user
+/// route.
 pub(super) async fn revoke_token_for(
     state: &WebState,
     who: &Identity,
+    target: TokenTarget,
     id: String,
 ) -> Result<(), ApiError> {
     let store = token_store(state)?;
@@ -550,21 +657,18 @@ pub(super) async fn revoke_token_for(
     }
     let (state, who) = (state.clone(), who.clone());
     tokio::task::spawn_blocking(move || {
-        let intent = AuditSubject {
-            target: id.clone(),
-            parameters: serde_json::json!({}),
-        };
-        audited(
+        let user = target.user(&who).to_owned();
+        let intent = target.audit_subject(Some(&id), serde_json::json!({}));
+        let revoked = audited(
             &state,
             &who,
             "token.revoke",
             intent,
-            || store.revoke_token(&who.user, &id).map_err(state_error),
-            |_| AuditSubject {
-                target: id.clone(),
-                parameters: serde_json::json!({}),
-            },
-        )
+            || store.revoke_token(&user, &id).map_err(|e| target.error(e)),
+            |_| target.audit_subject(Some(&id), serde_json::json!({})),
+        );
+        drop(target);
+        revoked
     })
     .await
     .map_err(blocking_failed)?
@@ -858,6 +962,7 @@ pub(super) mod tests {
             ("bob", "hunter2"),
             ("root", "rootpw"),
             ("ops", "opspw"),
+            ("carol", "carolpw"),
         ]
         .into_iter()
         .map(|(user, pw)| {
@@ -886,8 +991,15 @@ pub(super) mod tests {
             credentials,
             state: password.then_some(store),
             audit: crate::web::test_audit_log(),
-            access_rules: None,
-            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), password),
+            rules: Default::default(),
+            config_changes: Default::default(),
+            config_path: None,
+            catalogs: None,
+            authorizer: crate::web::privilege::Authorizer::new(
+                Default::default(),
+                Vec::new(),
+                password,
+            ),
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent: None,
@@ -901,8 +1013,10 @@ pub(super) mod tests {
         rules: Option<&str>,
         admins: &[&str],
     ) -> WebState {
-        let rules = rules.map(|r| Arc::new(arneb_catalog::AccessRules::from_json(r).unwrap()));
-        state.access_rules = rules.clone();
+        let rules = arneb_catalog::RulesHandle::new(
+            rules.map(|r| Arc::new(arneb_catalog::AccessRules::from_json(r).unwrap())),
+        );
+        state.rules = rules.clone();
         state.authorizer = crate::web::privilege::Authorizer::new(
             rules,
             admins.iter().map(|a| a.to_string()).collect(),

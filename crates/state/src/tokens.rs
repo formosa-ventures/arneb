@@ -292,7 +292,7 @@ impl StateStore {
 const DUMMY_SECRET_SHA256: [u8; 32] = [0u8; 32];
 
 /// Live (unexpired at `now`) tokens held by `user`.
-fn live_token_count(data: &crate::file::StateData, user: &str, now: u64) -> usize {
+pub(crate) fn live_token_count(data: &crate::file::StateData, user: &str, now: u64) -> usize {
     data.tokens
         .iter()
         .filter(|t| t.user == user && is_live(t, now))

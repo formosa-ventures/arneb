@@ -1,10 +1,13 @@
-//! Durable coordinator state (users, API tokens, worker cordons, runtime
-//! settings) kept in one atomic, versioned JSON file, and the audit log next
-//! to it. Only the coordinator / standalone server opens them.
+//! Durable coordinator state (users, API tokens, worker cordons, access
+//! rules, catalog definitions, runtime settings) kept in one atomic, versioned JSON file, and the
+//! audit log next to it. Only the coordinator / standalone server opens them.
 
 mod audit;
+mod catalogs;
 mod cordons;
 mod file;
+mod reseed;
+mod rules;
 mod settings;
 mod tokens;
 mod users;
@@ -13,11 +16,14 @@ pub use audit::{
     ActionInFlight, AuditAppendError, AuditEntry, AuditLog, AuditOutcome, AuditPage, AuditQuery,
     AuditRecord, AuditSettings,
 };
+pub use catalogs::{CatalogRecord, CatalogSeedReport};
 pub use cordons::{CordonKind, CordonRecord};
 pub use file::{StateError, StateStore};
+pub use reseed::ReseedOutcome;
+pub use rules::{rules_fingerprint, RulesSeed, Seeded, StoredRules};
 pub use settings::AdmissionLimits;
 pub use tokens::{now_ms, IssuedToken, TokenId, TokenInfo, MAX_TOKENS_PER_USER};
-pub use users::SeedReport;
+pub use users::{PasswordChange, SeedReport, UserDeletion, UserInfo};
 
 use arneb_protocol::{decoy_verifier, is_token_shaped, CredentialSource, ScramVerifier};
 

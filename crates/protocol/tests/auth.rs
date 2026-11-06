@@ -57,7 +57,7 @@ fn users_table_state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
     let factory = MemoryConnectorFactory::new(mem_catalog.clone(), "default");
     let catalog_manager = Arc::new(CatalogManager::new("memory", "default"));
     catalog_manager.register_catalog("memory", mem_catalog);
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register("memory", Arc::new(factory));
     (catalog_manager, Arc::new(registry))
 }

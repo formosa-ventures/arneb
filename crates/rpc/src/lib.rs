@@ -5,7 +5,9 @@
 //! - [`ExchangeClient`]: Async client for fetching data from remote workers
 //! - [`FlightState`] + [`start_flight_server`]: Arrow Flight server for streaming RecordBatches
 //! - [`HeartbeatMessage`] + [`send_heartbeat`]: Worker → coordinator heartbeat
+//! - [`CatalogSet`] + [`push_catalogs`] / [`fetch_catalogs`]: catalog sync
 
+mod catalog_sync;
 mod dynamic_filter;
 mod exchange_client;
 mod flight_service;
@@ -24,6 +26,10 @@ mod task_submission;
 /// exchange (`do_get`) is streamed per-batch and unaffected.
 pub const MAX_FLIGHT_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+pub use catalog_sync::{
+    fetch_catalogs, push_catalogs, CatalogSet, CatalogSourceCallback, CatalogSyncCallback,
+    FETCH_CATALOGS_TIMEOUT,
+};
 pub use dynamic_filter::{NotifyDynamicFilterRequest, ReportDynamicFilterRequest};
 pub use exchange_client::ExchangeClient;
 pub use flight_service::{
@@ -32,8 +38,8 @@ pub use flight_service::{
     TaskStatusCallback, TaskStatusResponse,
 };
 pub use heartbeat::{
-    send_heartbeat, send_heartbeat_with, HeartbeatError, HeartbeatMessage, WorkerState,
-    LEGACY_VERSION, VERSION,
+    send_heartbeat, send_heartbeat_with, HeartbeatError, HeartbeatMessage, HeartbeatReply,
+    WorkerState, LEGACY_VERSION, VERSION,
 };
 pub use output_buffer::{
     BroadcastOutputBuffer, BroadcastStream, OutputBuffer, TrackedReceiver, TrackedSendOutcome,

@@ -143,6 +143,7 @@ password auth without `[tls]` is a startup error; disable the listener with
 | `not_found` | 404 | No such route, query or token, or one you may not see. |
 | `invalid_argument` | 400 (405 for a wrong method) | A malformed request. |
 | `auth_disabled` | 409 | The route needs `[auth] type = "password"`. |
+| `conflict` | 409 | The change clashes with the current state: the name exists, the object changed while the call was being prepared (retry), or the change would remove your own manage privilege. |
 | `overloaded` | 503 | Too many pending password checks or sessions; retry (`Retry-After: 1`). |
 | `audit_unavailable` | 503 | The [audit log](#audit-log) cannot be written, or the server is shutting down, so audited actions are refused before anything is applied; retry (`Retry-After: 5`). |
 | `internal` | 500 | An unexpected failure; the server log has the detail. |
@@ -179,6 +180,20 @@ All `/api/v2` routes need credentials, except `health` and `POST /sessions`.
 | `DELETE /api/v2/admission[?dry_run=]` | [Clear the stored limits](#admission-limits) and return to the config values. |
 | `GET /api/v2/info` | Server version and role. |
 | `GET /api/v2/audit` | The [audit log](#audit-log), newest first. |
+| `GET /api/v2/access-rules` | The [access rules](#access-rules) in force. |
+| `PUT\|DELETE /api/v2/access-rules[?dry_run=]` | Replace or clear the access rules. |
+| `GET /api/v2/users[?limit=]` | The [users](#users), with their live token counts. |
+| `POST /api/v2/users[?dry_run=]` | Create a user. |
+| `PATCH\|DELETE /api/v2/users/{name}[?dry_run=]` | Change a user's password, or delete the user. |
+| `GET /api/v2/users/{name}/tokens[?limit=]` | [Another user's tokens](#tokens-for-another-user). |
+| `POST /api/v2/users/{name}/tokens[?dry_run=]` | Issue a token for that user. |
+| `DELETE /api/v2/users/{name}/tokens/{id}[?dry_run=]` | Revoke one of that user's tokens. |
+| `GET /api/v2/catalog-configs[?limit=]` | The [catalog definitions](#catalogs), secrets redacted. |
+| `GET /api/v2/catalog-configs/{name}` | One catalog definition. |
+| `POST /api/v2/catalog-configs[?dry_run=]` | Add a `hive` or `postgresql` catalog. |
+| `PUT\|DELETE /api/v2/catalog-configs/{name}[?dry_run=]` | Change or drop a catalog. |
+| `GET\|PATCH /api/v2/settings[?dry_run=]` | The [runtime settings](#settings) (the slow-query threshold). |
+| `POST /api/v2/state/reseed[?dry_run=]` | [Re-seed](#re-seed) the state from the config file. |
 
 The [querying](#querying) routes (`catalogs`, `explain`, `statements`) are
 listed in their own section.
@@ -670,6 +685,213 @@ curl -s -H "$H" -X PUT "$B/admission?dry_run=true" \
 #  "summary":"sets max_running_queries 8 → 2 (5 queries running, 0 queued): running queries finish; new queries queue until fewer than 2 run",
 #  "changed":true,"warning":null}
 ```
+
+### Runtime configuration
+
+Under `[auth] type = "password"` the state store holds the access rules,
+the users, the catalogs and the slow-query threshold, and the routes below
+change them while the server runs. Each change is a manage action: it takes
+`?dry_run=`, answers with the [envelope](#dry-runs-and-the-response-envelope),
+is [audited](#audit-log), is written to the state store before the response
+and survives a restart. Changes are serialized: one runs at a time. The
+config file only seeds the state; see
+[Upgrading to v0.2.0 (runtime config)](/guide/configuration#upgrading-to-v020-runtime-config)
+for what wins at the next start.
+
+Not runtime-editable: `[[tables]]` (the `file` catalog), the `memory`
+catalog, the default catalog and schema, `admin_users`, `[audit]` retention,
+ports, bind addresses and TLS.
+
+#### Access rules
+
+| Method and path | Privilege | Description |
+|---|---|---|
+| `GET /api/v2/access-rules` | manage | `{"rules": <rules JSON or null>, "from_config": bool}`. |
+| `PUT /api/v2/access-rules` | manage | Action `access_rules.set`; the body is the whole [rules file](/guide/access-control) as JSON. |
+| `DELETE /api/v2/access-rules` | manage | Action `access_rules.clear`; removes every rule, which allows everything. |
+
+- `from_config` is `true` while the rules are the copy seeded from
+  `rules_file`, and `false` after a runtime change or when there are no
+  rules.
+- A body that is not a valid rules file is `invalid_argument` with the
+  parser's message.
+- A change applies to every statement planned after the response, on every
+  protocol, including connections already open. A statement already running
+  keeps the rules it was checked with.
+- **Lockout guard.** A change after which you would no longer hold manage is
+  refused with `conflict`, also as a dry run. A user in
+  `[access_control] admin_users` always keeps manage. See
+  [access control](/guide/access-control#changing-rules-at-runtime).
+- The audit entry names the rules by SHA-256, not their text.
+
+```bash
+curl -s -H "$H" "$B/access-rules" | jq '.rules' > rules.json
+# edit rules.json, then preview and apply
+curl -s -H "$H" -X PUT "$B/access-rules?dry_run=true" \
+  -H 'Content-Type: application/json' --data-binary @rules.json
+curl -s -H "$H" -X PUT "$B/access-rules" \
+  -H 'Content-Type: application/json' --data-binary @rules.json
+```
+
+#### Users
+
+| Method and path | Privilege | Description |
+|---|---|---|
+| `GET /api/v2/users` | manage | `{users: [{name, from_config, tokens}], truncated}` in name order; `limit` default 100, at most 1000. |
+| `POST /api/v2/users` | manage | Action `user.create`; body `{"name", "password"}`. |
+| `PATCH /api/v2/users/{name}` | manage | Action `user.set_password`; body `{"password"}`. |
+| `DELETE /api/v2/users/{name}` | manage | Action `user.delete`. |
+
+- Names are 1–64 characters of `A-Z a-z 0-9 _ . @ -`; passwords 8–1024
+  characters. An existing name is `conflict`. The server stores a SCRAM
+  verifier only; a password is never logged, audited or returned.
+- A password change revokes all of the user's tokens (the preview says how
+  many). A delete removes the user and their tokens.
+- After either, the user's cached Trino/Basic logins are dropped and their
+  Web sessions end at once. **pgwire connections already open stay open**
+  until they disconnect, as in Trino and PostgreSQL.
+- A config user (`from_config: true`) that gets a new password is detached:
+  the config file no longer manages it, and every start logs a WARN while
+  the name is still in `[[auth.users]]`. Deleting a user that came from the
+  config records a tombstone, so the next start does not add it back (it
+  logs a WARN instead). A [re-seed](#re-seed) clears the tombstones.
+- You may delete yourself; the preview warns you.
+
+#### Tokens for another user
+
+| Method and path | Privilege | Description |
+|---|---|---|
+| `GET /api/v2/users/{name}/tokens` | manage | `{user, tokens: [{id, name, created_ms, expires_ms}], truncated}`. |
+| `POST /api/v2/users/{name}/tokens` | manage | Action `token.issue`; body as for [`POST /tokens`](#api-tokens). |
+| `DELETE /api/v2/users/{name}/tokens/{id}` | manage | Action `token.revoke`. |
+
+The issued token is in `result.token`, shown once, to you. The audit
+`target` is the user, and the token is named by its 16-hex id only. Your own
+tokens stay at `/api/v2/tokens`.
+
+#### Catalogs
+
+`/api/v2/catalog-configs` holds the definitions of the external catalogs
+(`hive` and `postgresql`), with the `[[catalogs]]` fields. The
+[`/api/v2/catalogs`](#querying) discovery routes are unchanged and show a new
+catalog as soon as the change returns.
+
+| Method and path | Privilege | Description |
+|---|---|---|
+| `GET /api/v2/catalog-configs` | manage | `{generation, catalogs: [{name, from_config, default, generation, spec}], truncated}`; `limit` default 100, at most 1000. |
+| `GET /api/v2/catalog-configs/{name}` | manage | One definition. |
+| `POST /api/v2/catalog-configs` | manage | Action `catalog.create`; the body is the spec, e.g. `{"name", "type", "connection_url", ...}`. |
+| `PUT /api/v2/catalog-configs/{name}` | manage | Action `catalog.update`; the body is the whole new spec. |
+| `DELETE /api/v2/catalog-configs/{name}` | manage | Action `catalog.drop`. |
+
+- A new name (`POST`) is 1–63 characters of `a-z 0-9 _`, starting with a
+  letter; `memory`, `file`, `system`, `information_schema` and `pg_catalog`
+  are reserved. A `PUT` or `DELETE` accepts any existing name, so a
+  config-seeded catalog such as `pg-prod` can still be updated (for example
+  to rotate its password) and dropped. `type` is `hive` (needs `metastore_uri`) or `postgresql` (needs
+  `connection_url`). A field that is not a `[[catalogs]]` field, at any
+  depth (a typo such as `max_conections` or `storage.s3.secret_acess_key`),
+  is `invalid_argument` naming it. A `POST` of an existing name is
+  `conflict`; a `PUT` or `DELETE` of an unknown name is `not_found`.
+- **Probe first.** A create or update first connects to the metastore or
+  database from the coordinator, for at most 10 s, also as a dry run. If that
+  fails the call is `invalid_argument`, hint
+  `the coordinator could not connect: <error>`, and nothing changes.
+- **Then apply.** The spec is stored (the catalog `generation` goes up by
+  one), installed on the coordinator, and pushed to every live worker,
+  5 s each. `result` is `{name, generation, workers: [{worker_id, synced,
+  error?, failed_catalogs?}]}`. A failed push is not an error: the worker
+  pulls the set on its next heartbeat, and the envelope `warning` names it.
+  A push can also time out while that worker is busy building catalogs from
+  a pull; it then reports `synced: false` and the heartbeat repairs it.
+  `failed_catalogs` lists catalogs a worker received but could not connect
+  to; it retries them (at most every 30 s). A `PUT` of the spec already
+  stored and served (a `GET` body sent back unchanged) answers
+  `changed: false`, with no generation bump and no push.
+- **Secrets are redacted.** `password`, `secret_access_key`,
+  `service_account_path` and the password in `connection_url` (userinfo or
+  a `password` parameter, also with a percent-encoded key) read `"<redacted>"` in every answer, MCP result and
+  audit entry. In a `PUT`, a field left as `"<redacted>"` keeps the stored
+  secret, so you can send back the body of a `GET`. If the `PUT` changes
+  where that secret is sent (the `connection_url` host, port, database, user
+  or parameters, the `metastore_uri`, a storage endpoint, region or bucket),
+  send the secret again: a field left as `"<redacted>"` is then
+  `invalid_argument`, hint `send the secret again when you change where it is
+  sent`. A literal `"<redacted>"` is never stored as a secret.
+- Updating a catalog that came from the config (`from_config: true`) makes
+  it a runtime catalog; the preview warns that the config file no longer
+  manages it. Dropping the default catalog is allowed, with a warning that
+  unqualified table names then fail.
+- Running queries keep the catalogs they were planned with; a distributed
+  query that scans a catalog its workers can't match at the planned version
+  fails instead of mixing. Each statement pins the catalogs and connectors
+  together when it starts, and a change swaps them, with the new catalog
+  generation, as one step. Every distributed task carries the version it was
+  planned at: the coordinator epoch and generation, a fingerprint of each
+  catalog's spec, and the default catalog and schema (unqualified table names
+  resolve in those, not in the worker's current defaults). A task checks only
+  the catalogs it scans, so a change to another catalog never fails it. A
+  worker whose copy of a scanned catalog has another fingerprint pulls the
+  coordinator's set once; if it still differs (the worker is already past
+  that version, or the pull fails), the task fails with `catalog '<name>' on
+  worker <id> is not the version the query was planned with (worker at
+  generation N, query planned at M); retry the query`. Retrying the query
+  plans it again at the current version.
+
+```bash
+curl -s -H "$H" -X POST "$B/catalog-configs?dry_run=true" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"pg2","type":"postgresql",
+       "connection_url":"postgresql://arneb:…@db.internal:5432/arneb",
+       "default_schema":"public"}'
+# {"dry_run":true,"action":"catalog.create","target":"pg2",
+#  "summary":"adds postgresql catalog \"pg2\" (the coordinator connected to it) and pushes it to 2 live workers; queries can use it as soon as this call returns",
+#  "changed":true,"warning":null}
+```
+
+Catalog definitions carry credentials to the workers over the cluster RPC
+port. Set [`[cluster] secret` and `[cluster.tls]`](/guide/configuration#cluster-security)
+when they do.
+
+#### Settings
+
+| Method and path | Privilege | Description |
+|---|---|---|
+| `GET /api/v2/settings` | observe | `{slow_query_threshold_ms, source}`; `source` is `config` or `state`. |
+| `PATCH /api/v2/settings` | manage | Action `settings.update`; body `{"slow_query_threshold_ms"}`, `0` turns the slow-query log off. |
+
+A stored value wins over `[observability]` and
+`ARNEB_SLOW_QUERY_THRESHOLD_MS` at the next start, with a WARN. The
+admission limits stay at [`/api/v2/admission`](#admission-limits).
+
+#### Re-seed
+
+`POST /api/v2/state/reseed` (manage, action `state.reseed`, target `state`)
+makes the state what a first start of the config file would make it. It
+reloads the config file the server was started with (`--config`, or
+`./arneb.toml` when present), with `ARNEB_*` overrides, and replaces:
+
+- the catalogs (runtime-created catalogs are removed);
+- the access rules (no `rules_file` means no rules);
+- the stored settings, which are cleared, so the config's admission limits
+  and slow-query threshold apply;
+- the config users, as `--reseed-state` does; the tombstones are cleared.
+
+Runtime-created users, tokens (except those user seeding revokes), worker
+cordons and the audit log are kept. Preview it first: the dry run lists the
+catalogs it adds, changes and removes, whether the rules change and the
+settings it resets. A config file that fails to load is `invalid_argument`
+with the loader's first line. A re-seed that would remove your own manage
+privilege, or delete your own user, is `conflict`. The config's `[auth]
+type` must still be `"password"`.
+
+The catalogs, rules, settings and users are replaced in one atomic write
+of the state file: a failed write is `internal` and changes nothing, and a
+crash leaves either the old state or the new one. Like every manage
+action, its `state.reseed` intent (names only) is synced to the audit log
+with outcome `pending` before the write, and the completion replaces it; a
+re-seed interrupted by a crash is reported at the next start and recorded
+as `interrupted`: check the state with the dry run.
 
 ### Audit log
 

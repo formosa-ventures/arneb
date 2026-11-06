@@ -208,7 +208,7 @@ mod tests {
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", memory.clone());
         cm.register_catalog("sized", Arc::new(SizedCatalog));
-        let mut registry = ConnectorRegistry::new();
+        let registry = ConnectorRegistry::new();
         registry.register(
             "memory",
             Arc::new(MemoryConnectorFactory::new(memory, "default")),

@@ -27,6 +27,9 @@ pub enum StateError {
     /// No user with this name exists.
     #[error("unknown user {0:?}")]
     UnknownUser(String),
+    /// A user with this name already exists.
+    #[error("user {0:?} already exists")]
+    UserExists(String),
     /// No token with this id exists.
     #[error("token {0:?} not found")]
     TokenNotFound(String),
@@ -39,6 +42,9 @@ pub enum StateError {
     /// The audit log failed a write and has not been reopened since.
     #[error("the audit log is not writable: {0}")]
     AuditUnwritable(String),
+    /// No catalog with this name exists.
+    #[error("catalog {0:?} not found")]
+    CatalogNotFound(String),
 }
 
 /// A stored user with a SCRAM-SHA-256 verifier (never a plaintext password).
@@ -48,6 +54,12 @@ pub(crate) struct UserRecord {
     pub scram: String,
     /// True when the user was seeded from the config file.
     pub from_config: bool,
+    /// True when the user was ever seeded from the config file, including
+    /// after a runtime password change detached them (`from_config`
+    /// false). Deleting such a user records a tombstone. Absent (false) in
+    /// files written before runtime config existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub config_seeded: bool,
 }
 
 /// A stored API token. Holds only a hash of the secret and a SCRAM verifier
@@ -80,6 +92,32 @@ pub(crate) struct StateData {
     /// Runtime settings; absent in files written before they existed.
     #[serde(default)]
     pub settings: crate::settings::Settings,
+    /// The stored access rules; `None` allows everything. Absent in files
+    /// written before runtime config existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<crate::StoredRules>,
+    /// Where the stored rules came from: the fingerprint of the rules file
+    /// last seeded, and whether they were changed at runtime since. Absent
+    /// in files written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_origin: Option<crate::rules::RulesOrigin>,
+    /// Which config objects were seeded; absent (nothing seeded) in files
+    /// written before runtime config existed.
+    #[serde(default)]
+    pub seeded: crate::Seeded,
+    /// Config-seeded users deleted at runtime (tombstones): seeding does
+    /// not re-add them until a reseed clears the list. Absent in files
+    /// written before runtime config existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_config_users: Vec<String>,
+    /// The catalog definitions, in name order. Absent in files written
+    /// before runtime config existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub catalogs: Vec<crate::CatalogRecord>,
+    /// Bumped by every catalog change; workers pull the set when theirs
+    /// differs. Absent (0) in files written before runtime config existed.
+    #[serde(default)]
+    pub catalog_generation: u64,
 }
 
 impl Default for StateData {
@@ -90,6 +128,12 @@ impl Default for StateData {
             tokens: Vec::new(),
             cordons: Vec::new(),
             settings: Default::default(),
+            rules: None,
+            rules_origin: None,
+            seeded: Default::default(),
+            deleted_config_users: Vec::new(),
+            catalogs: Vec::new(),
+            catalog_generation: 0,
         }
     }
 }
@@ -104,6 +148,8 @@ pub struct StateStore {
     data: RwLock<Arc<StateData>>,
     /// Serializes writers; held across apply + persist + swap.
     writer: Mutex<()>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_writes: std::sync::atomic::AtomicBool,
 }
 
 /// Shows only counts: the state holds verifiers and token hashes, which must
@@ -116,6 +162,8 @@ impl std::fmt::Debug for StateStore {
             .field("users", &data.users.len())
             .field("tokens", &data.tokens.len())
             .field("cordons", &data.cordons.len())
+            .field("rules", &data.rules.is_some())
+            .field("catalogs", &data.catalogs.len())
             .finish_non_exhaustive()
     }
 }
@@ -139,6 +187,8 @@ impl StateStore {
             path: path.map(Path::to_path_buf),
             data: RwLock::new(Arc::new(data)),
             writer: Mutex::new(()),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -201,11 +251,26 @@ impl StateStore {
         let _writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         let mut next = StateData::clone(&self.snapshot());
         let out = f(&mut next)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StateError::Io {
+                path: self.path.clone().unwrap_or_default(),
+                source: std::io::Error::other("injected state write failure"),
+            });
+        }
         if let Some(path) = &self.path {
             Self::persist(path, &next)?;
         }
         *self.data.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(next);
         Ok(out)
+    }
+
+    /// Test hook: make every write fail (nothing is persisted or swapped
+    /// in) while `fail` is set.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn sync_dir(dir: &Path) -> std::io::Result<()> {
@@ -290,6 +355,7 @@ mod tests {
             name: "alice".into(),
             scram: "SCRAM-SHA-256$4096:salt$stored:server".into(),
             from_config: false,
+            config_seeded: false,
         }
     }
 

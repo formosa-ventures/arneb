@@ -12,7 +12,7 @@ arrow = { workspace = true }
 arrow-flight = "60"
 tonic = { version = "0.14", features = ["tls-aws-lc"] }
 prost = "0.14"
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 futures.workspace = true
 async-trait.workspace = true
 tracing.workspace = true

@@ -47,7 +47,7 @@ fn state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
     let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
     let cm = Arc::new(CatalogManager::new("memory", "default"));
     cm.register_catalog("memory", catalog);
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register("memory", Arc::new(factory));
     (cm, Arc::new(registry))
 }

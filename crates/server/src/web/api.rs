@@ -259,8 +259,8 @@ pub fn api_routes() -> Router<WebState> {
 fn may_view(state: &WebState, who: &Identity, owner: Option<&str>) -> bool {
     who.via == AuthVia::Unauthenticated
         || state
-            .access_rules
-            .as_ref()
+            .rules
+            .current()
             .is_none_or(|r| r.can_view_query(&who.user, owner.unwrap_or_default()))
 }
 

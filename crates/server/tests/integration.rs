@@ -33,7 +33,7 @@ async fn start_test_server(
         admission: None,
         statement_timeout: None,
         query_tracker: Default::default(),
-        access_rules: None,
+        access_rules: Default::default(),
     });
 
     tokio::spawn(async move {
@@ -118,7 +118,7 @@ fn create_server_with_memory_connector() -> (Arc<CatalogManager>, Arc<ConnectorR
     let catalog_manager = Arc::new(CatalogManager::new("memory", "default"));
     catalog_manager.register_catalog("memory", mem_catalog);
 
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register("memory", Arc::new(factory));
 
     (catalog_manager, Arc::new(registry))
@@ -190,7 +190,7 @@ async fn test_query_parquet_table() {
     let catalog_manager = Arc::new(CatalogManager::new("file", "default"));
     catalog_manager.register_catalog("file", file_catalog);
 
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register("file", file_factory);
     let registry = Arc::new(registry);
 
@@ -275,7 +275,7 @@ async fn test_parquet_pushdown_with_decimal_literals() {
             Arc::new(FileSchema::new(file_factory.clone())),
         )),
     );
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register("file", file_factory);
     let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
         Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
@@ -366,7 +366,7 @@ async fn test_query_parquet_via_object_store() {
     let catalog_manager = Arc::new(CatalogManager::new("file", "default"));
     catalog_manager.register_catalog("file", file_catalog);
 
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register("file", file_factory);
     let registry = Arc::new(registry);
 
@@ -516,7 +516,7 @@ fn create_server_with_two_tables() -> (Arc<CatalogManager>, Arc<ConnectorRegistr
     let catalog_manager = Arc::new(CatalogManager::new("memory", "default"));
     catalog_manager.register_catalog("memory", mem_catalog);
 
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register("memory", Arc::new(factory));
 
     (catalog_manager, Arc::new(registry))
@@ -774,7 +774,7 @@ async fn test_hive_connector_query_via_object_store() {
     let catalog_manager = Arc::new(CatalogManager::new("hive_lake", "default"));
     catalog_manager.register_catalog("hive_lake", hive_catalog);
 
-    let mut connector_registry = ConnectorRegistry::new();
+    let connector_registry = ConnectorRegistry::new();
     connector_registry.register("hive_lake", Arc::new(hive_factory));
     let connector_registry = Arc::new(connector_registry);
 
@@ -906,7 +906,7 @@ async fn test_s3_read_via_local_s3() {
     let catalog_manager = Arc::new(CatalogManager::new("file", "default"));
     catalog_manager.register_catalog("file", file_catalog);
 
-    let mut connector_registry = ConnectorRegistry::new();
+    let connector_registry = ConnectorRegistry::new();
     connector_registry.register("file", file_factory);
     let connector_registry = Arc::new(connector_registry);
 
@@ -1134,7 +1134,7 @@ async fn test_hive_e2e_hms_s3_parquet() {
     let catalog_manager = Arc::new(CatalogManager::new("hive_test", db_name));
     catalog_manager.register_catalog("hive_test", hive_catalog);
 
-    let mut connector_registry = ConnectorRegistry::new();
+    let connector_registry = ConnectorRegistry::new();
     connector_registry.register("hive_test", Arc::new(hive_factory));
     let connector_registry = Arc::new(connector_registry);
 

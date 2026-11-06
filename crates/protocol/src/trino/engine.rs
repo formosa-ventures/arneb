@@ -79,9 +79,9 @@ pub(crate) struct Engine {
     pub(crate) query_memory_limit: Option<usize>,
     /// Backs `system.runtime.queries`.
     pub(crate) query_tracker: Arc<arneb_scheduler::QueryTracker>,
-    /// Access rules checked for the session user; `None` allows all
-    /// (file-based-access-control).
-    pub(crate) access_rules: Option<Arc<arneb_catalog::AccessRules>>,
+    /// Access rules checked for the session user; empty allows all
+    /// (file-based-access-control). Live (runtime-config D3).
+    pub(crate) access_rules: arneb_catalog::RulesHandle,
 }
 
 fn filter_like(names: Vec<String>, like: &Option<String>) -> Vec<String> {
@@ -126,12 +126,13 @@ impl Engine {
         &self,
         session: &ClientSession,
     ) -> Result<Arc<CatalogManager>, TrinoError> {
-        let Some(rules) = &self.access_rules else {
+        // One snapshot per statement (runtime-config D3).
+        let Some(rules) = self.access_rules.current() else {
             return Ok(Arc::clone(&self.catalog_manager));
         };
         let view = self
             .catalog_manager
-            .with_access(session.user.clone(), Arc::clone(rules));
+            .with_access(session.user.clone(), rules);
         view.check_execute()
             .map_err(|e| TrinoError::from_arneb(&e.into(), None))?;
         Ok(Arc::new(view))

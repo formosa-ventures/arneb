@@ -145,6 +145,18 @@ password_hash = "SCRAM-SHA-256$…"   # arneb hash-password
   settings; nodes switch to `https://` automatically.
 - Cluster TLS does not authenticate peers; the secret does. A node with
   `[cluster.tls]` but no secret refuses to start on a non-loopback bind.
+- **Catalog definitions cross the RPC port.** The coordinator serves its
+  catalogs to the workers (`get_catalogs`), passwords and storage keys
+  included, and pushes changes to them (`sync_catalogs`). Without a secret
+  any peer that reaches the port could read them, or replace a worker's
+  catalogs. So a coordinator **without a secret refuses to start** while a
+  served catalog carries a secret (a `password`, a password in
+  `connection_url`, an S3 `secret_access_key` or an Azure `access_key`,
+  including the global `[storage]` keys a Hive catalog is served with), and
+  refuses a catalog create, update or re-seed that would add one. Without
+  secrets it starts with a WARN that cluster RPC is unauthenticated; a
+  worker without a secret WARNs that its catalogs can be replaced by any
+  peer.
 - Every node must use the same mode: a plaintext node cannot talk to a TLS
   node, and the failure shows up as heartbeat errors on the worker.
 - With password auth, the coordinator's Web UI binds to `127.0.0.1` unless

@@ -166,6 +166,15 @@ impl SessionStore {
     pub fn revoke(&self, token: &str) {
         self.lock().remove(&token_digest(token));
     }
+
+    /// End every session of `user` (after their password changed or they
+    /// were deleted); returns how many were live or expired-but-kept.
+    pub fn end_user(&self, user: &str) -> usize {
+        let mut sessions = self.lock();
+        let before = sessions.len();
+        sessions.retain(|_, s| s.user != user);
+        before - sessions.len()
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +291,17 @@ mod tests {
         assert_eq!(store.create("carol"), Err(SessionLimit));
         store.revoke(&a);
         assert!(store.create("carol").is_ok());
+    }
+    #[test]
+    fn end_user_ends_only_that_users_sessions() {
+        let store = SessionStore::new();
+        let a1 = store.create("alice").unwrap();
+        let a2 = store.create("alice").unwrap();
+        let b = store.create("bob").unwrap();
+        assert_eq!(store.end_user("alice"), 2);
+        assert_eq!(store.resolve(&a1), None);
+        assert_eq!(store.resolve(&a2), None);
+        assert_eq!(store.resolve(&b).as_deref(), Some("bob"));
+        assert_eq!(store.end_user("alice"), 0);
     }
 }

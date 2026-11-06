@@ -79,7 +79,7 @@ fn state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
     let cm = CatalogManager::new("memory", "default");
     cm.register_catalog("memory", memory.clone());
     cm.register_catalog("lake", lake.clone());
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register(
         "memory",
         Arc::new(MemoryConnectorFactory::new(memory, "default")),
@@ -550,4 +550,50 @@ async fn tracker_kill_stops_a_trino_query() {
     let message = polled["error"]["message"].as_str().unwrap();
     assert!(message.contains("killed by root"), "{message}");
     assert_eq!(tracker.get_query(&id).unwrap().state, QueryState::Cancelled);
+}
+
+/// runtime-config D3: a rules change applies to the next statement of a
+/// connection that is already open, through both the simple and the
+/// extended query path.
+#[tokio::test]
+async fn rules_change_applies_to_an_open_pgwire_session() {
+    let allow_bob = r#"{"tables": [{"user": "bob", "privileges": ["SELECT"]}]}"#;
+    let deny_bob = r#"{"tables": [{"user": "alice", "privileges": ["SELECT"]}]}"#;
+    let handle =
+        arneb_catalog::RulesHandle::new(Some(Arc::new(AccessRules::from_json(allow_bob).unwrap())));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (cm, cr) = state();
+    let server = ProtocolServer::new(
+        ProtocolConfig {
+            bind_address: format!("127.0.0.1:{port}"),
+        },
+        cm,
+        cr,
+    )
+    .with_access_rules(handle.clone());
+    tokio::spawn(async move {
+        let _ = server.serve(listener).await;
+    });
+
+    let bob = pg(port, "bob").await;
+    let sql = "SELECT n FROM memory.default.open_t ORDER BY n";
+    let rows = pg_rows(&bob.simple_query(sql).await.unwrap());
+    assert_eq!(rows, vec![vec!["1"], vec!["2"], vec!["3"]]);
+    assert_eq!(bob.query(sql, &[]).await.unwrap().len(), 3);
+
+    handle.replace(Some(Arc::new(AccessRules::from_json(deny_bob).unwrap())));
+    let (code, _) = pg_error(&bob, sql).await;
+    assert_eq!(code, "42501", "simple query on the open session");
+    let err = bob.query(sql, &[]).await.unwrap_err();
+    let db = err.as_db_error().expect("a server error");
+    assert_eq!(
+        db.code().code(),
+        "42501",
+        "extended query on the open session"
+    );
+
+    // Back to allowing: the same session reads again.
+    handle.replace(Some(Arc::new(AccessRules::from_json(allow_bob).unwrap())));
+    assert_eq!(pg_rows(&bob.simple_query(sql).await.unwrap()).len(), 3);
 }

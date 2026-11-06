@@ -76,7 +76,7 @@ async fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
     catalog.register_schema("default", schema);
     let catalog_manager = Arc::new(CatalogManager::new("lake", "default"));
     catalog_manager.register_catalog("lake", catalog);
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register("lake", Arc::new(HiveConnectorFactory::new(storage)));
     (catalog_manager, Arc::new(registry))
 }

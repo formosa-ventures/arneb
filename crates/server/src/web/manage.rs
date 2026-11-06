@@ -96,7 +96,26 @@ pub(super) trait ManageAction: Send + 'static {
     fn change_mutex(&self) -> Option<&Arc<tokio::sync::Mutex<()>>> {
         None
     }
+
+    /// A share of `WebState::config_changes` the action took (with
+    /// [`config_change_lock`]) before it was built, for the runtime-config
+    /// changes (D10), which re-check manage once the lock is held.
+    /// [`run_manage`] keeps it until the completion entry is appended, like
+    /// a [`change_mutex`](Self::change_mutex).
+    fn change_lock(&self) -> Option<ChangeLock> {
+        None
+    }
+
+    /// A second lock guard the action holds (taken after the
+    /// [`change_lock`](Self::change_lock)'s), handed over so that
+    /// [`run_manage`] keeps it, too, until the audit entry is appended.
+    fn take_secondary_lock(&mut self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        None
+    }
 }
+
+/// A share of a change lock's guard (`WebState::config_changes`).
+pub(super) type ChangeLock = std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>;
 
 /// `n` with the singular or plural noun.
 pub(super) fn count(n: usize, one: &str, many: &str) -> String {
@@ -117,6 +136,23 @@ pub(super) fn persist_failed(
     }
 }
 
+/// A share of `WebState::config_changes` (runtime-config D10) for `who`,
+/// held until the audit entry is appended. Manage is checked again once
+/// the lock is held, so a change queued behind a rules change that removed
+/// `who`'s manage privilege is refused with `forbidden`.
+pub(super) async fn config_change_lock(
+    state: &WebState,
+    who: &Identity,
+) -> Result<ChangeLock, ApiError> {
+    let guard = std::sync::Arc::clone(&state.config_changes)
+        .lock_owned()
+        .await;
+    state
+        .authorizer
+        .check(who, super::privilege::Layer::Manage)?;
+    Ok(std::sync::Arc::new(guard))
+}
+
 /// The dry-run `warning` of an audited action while the audit log is not
 /// writable.
 pub(super) const AUDIT_UNAVAILABLE_WARNING: &str =
@@ -127,12 +163,83 @@ pub(super) const AUDIT_UNAVAILABLE_WARNING: &str =
 pub(super) const IN_MEMORY_WARNING: &str =
     "the state store is in memory ([state] path is not set), so this change is lost on restart";
 
-/// Appends `note` to `preview`'s warning.
-fn add_warning(preview: &mut Preview, note: &str) {
-    preview.warning = Some(match preview.warning.take() {
+/// Appends `note` to `warning`, after `; ` when there is one already.
+pub(super) fn add_warning(warning: &mut Option<String>, note: impl Into<String>) {
+    let note = note.into();
+    *warning = Some(match warning.take() {
         Some(w) => format!("{w}; {note}"),
-        None => note.to_owned(),
+        None => note,
     });
+}
+
+/// `n` and `one`, plural with an `s` unless `n` is 1 (`1 worker`, `2 workers`).
+pub(super) fn plural(n: usize, one: &str) -> String {
+    if n == 1 {
+        format!("{n} {one}")
+    } else {
+        format!("{n} {one}s")
+    }
+}
+
+/// The largest accepted `limit` of a runtime-config listing (D4).
+pub(super) const MAX_LIST_LIMIT: usize = 1000;
+
+/// A listing's `limit`: `default` when absent, else 1 to
+/// [`MAX_LIST_LIMIT`] (`invalid_argument` otherwise).
+pub(super) fn check_limit(limit: Option<usize>, default: usize) -> Result<usize, ApiError> {
+    let limit = limit.unwrap_or(default);
+    if limit == 0 || limit > MAX_LIST_LIMIT {
+        return Err(ApiError::new(
+            ErrorCode::InvalidArgument,
+            format!("limit {limit} is not valid"),
+        )
+        .with_hint(format!("use a limit between 1 and {MAX_LIST_LIMIT}")));
+    }
+    Ok(limit)
+}
+
+/// The state store behind the runtime-config routes (manage already
+/// passed, so the server runs password auth and has one).
+pub(super) fn state_store(
+    state: &WebState,
+) -> Result<std::sync::Arc<arneb_state::StateStore>, ApiError> {
+    state.state.clone().ok_or_else(|| {
+        tracing::error!("password auth is configured without a state store");
+        ApiError::new(ErrorCode::Internal, "the state store is unavailable")
+    })
+}
+
+/// The live catalogs behind the catalog and re-seed routes (served only on
+/// the node that owns the catalog definitions).
+pub(super) fn live_catalogs(
+    state: &WebState,
+) -> Result<std::sync::Arc<crate::catalogs::LiveCatalogs>, ApiError> {
+    state.catalogs.clone().ok_or_else(|| {
+        tracing::error!("the catalog routes are served without live catalogs");
+        ApiError::new(ErrorCode::Internal, "the live catalogs are unavailable")
+    })
+}
+
+/// The lockout guard (runtime-config D3): `rules` (`None`: no rules) must
+/// leave `who` manage, else this `change` (`change`, `re-seed`) is
+/// `conflict`.
+pub(super) fn guard_lockout(
+    state: &WebState,
+    who: &Identity,
+    rules: Option<&arneb_catalog::AccessRules>,
+    change: &str,
+) -> Result<(), ApiError> {
+    if state.authorizer.would_manage(who, rules) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ErrorCode::Conflict,
+        format!("this {change} would remove your own manage privilege"),
+    )
+    .with_hint(
+        "keep a system_information write rule for yourself, or ask a user in \
+         [access_control] admin_users",
+    ))
 }
 
 /// `preview` plus the in-memory warning when it changes a persisted action
@@ -140,7 +247,7 @@ fn add_warning(preview: &mut Preview, note: &str) {
 fn warn_if_in_memory(state: &WebState, persisted: bool, preview: &mut Preview) {
     let on_disk = state.state.as_ref().is_some_and(|s| s.is_persistent());
     if persisted && preview.changed && !on_disk {
-        add_warning(preview, IN_MEMORY_WARNING);
+        add_warning(&mut preview.warning, IN_MEMORY_WARNING);
     }
 }
 
@@ -156,7 +263,7 @@ pub(super) async fn run_manage<A: ManageAction>(
     who: &Identity,
     grant: Grant,
     dry_run: bool,
-    action: A,
+    mut action: A,
 ) -> Result<ManageOutcome<A::Output>, ApiError> {
     let _ = grant; // the proof only: authorization already passed
     let name = action.action();
@@ -169,33 +276,39 @@ pub(super) async fn run_manage<A: ManageAction>(
         None => None,
     };
     if dry_run {
-        let mut preview = action.preview(state)?;
-        warn_if_in_memory(state, persisted, &mut preview);
-        if action.audited() && !state.audit.is_writable() {
-            add_warning(&mut preview, AUDIT_UNAVAILABLE_WARNING);
-        }
-        tracing::debug!(
-            target: "arneb::audit",
-            user = %who.user,
-            action = name,
-            target = %target,
-            summary = %preview.summary,
-            "manage dry run"
-        );
-        return Ok(outcome(true, name, target, preview, None));
+        let preview = action.preview(state)?;
+        return Ok(dry_run_outcome(
+            state,
+            who,
+            name,
+            target,
+            preview,
+            persisted,
+            action.audited(),
+        ));
     }
     let (blocking_state, who, audit_target) = (state.clone(), who.clone(), target.clone());
-    let mut applied = tokio::task::spawn_blocking(move || {
+    // runtime-config D10: a share of `config_changes` the action already
+    // holds (taken, with manage re-checked, before it was built), and the
+    // re-seed's admission lock; both kept until the completion entry.
+    let pre_held = action.change_lock();
+    let secondary = action.take_secondary_lock();
+    let applied = tokio::task::spawn_blocking(move || {
         let state = blocking_state;
         if !action.audited() {
             let applied = action.apply(&state);
+            drop(secondary);
+            drop(pre_held);
             drop(held);
             return applied;
         }
         let parameters = action.parameters();
         let unchanged = action.unchanged_effect();
         #[cfg(test)]
-        let lock_key = held.as_ref().map(test_hooks::key_of);
+        let lock_key = held
+            .as_ref()
+            .or(pre_held.as_deref())
+            .map(test_hooks::key_of);
         let intent = AuditSubject {
             target: audit_target.clone(),
             parameters: with_effect(parameters.clone(), None),
@@ -224,7 +337,9 @@ pub(super) async fn run_manage<A: ManageAction>(
                 }
             },
         );
-        // Released only once the entry is appended.
+        // Released only once the entry is appended, in reverse order.
+        drop(secondary);
+        drop(pre_held);
         drop(held);
         applied
     })
@@ -233,14 +348,48 @@ pub(super) async fn run_manage<A: ManageAction>(
         tracing::error!(error = %e, action = name, "manage action task failed");
         ApiError::new(ErrorCode::Internal, "the manage action failed")
     })??;
+    Ok(applied_outcome(state, name, target, applied, persisted))
+}
+
+/// The envelope of a dry run of `name` on `target` (for an action that
+/// does not fit [`ManageAction`]): `preview`, plus the in-memory warning
+/// for a `persisted` change and the audit-unavailable warning for an
+/// `audited` one; logged at DEBUG on `arneb::audit`.
+pub(super) fn dry_run_outcome<T>(
+    state: &WebState,
+    who: &Identity,
+    name: &'static str,
+    target: String,
+    mut preview: Preview,
+    persisted: bool,
+    audited: bool,
+) -> ManageOutcome<T> {
+    warn_if_in_memory(state, persisted, &mut preview);
+    if audited && !state.audit.is_writable() {
+        add_warning(&mut preview.warning, AUDIT_UNAVAILABLE_WARNING);
+    }
+    tracing::debug!(
+        target: "arneb::audit",
+        user = %who.user,
+        action = name,
+        target = %target,
+        summary = %preview.summary,
+        "manage dry run"
+    );
+    outcome(true, name, target, preview, None)
+}
+
+/// The envelope of a real run of `name` on `target` that `applied`, plus
+/// the in-memory warning for a `persisted` change.
+pub(super) fn applied_outcome<T>(
+    state: &WebState,
+    name: &'static str,
+    target: String,
+    mut applied: Applied<T>,
+    persisted: bool,
+) -> ManageOutcome<T> {
     warn_if_in_memory(state, persisted, &mut applied.preview);
-    Ok(outcome(
-        false,
-        name,
-        target,
-        applied.preview,
-        Some(applied.result),
-    ))
+    outcome(false, name, target, applied.preview, Some(applied.result))
 }
 
 fn outcome<T>(

@@ -35,7 +35,7 @@ password = "..."            # or ARNEB_CATALOG_PG_PASSWORD
 
 | Field | Default | Description |
 |---|---|---|
-| `connection_url` | required | `postgresql://host:port/database`. It may carry the user and password, but the separate fields are preferred. |
+| `connection_url` | required | `postgresql://host:port/database`. It may carry the user and password, but the separate fields are preferred. Percent-encode an `@` anywhere past the host (`user=admin%40srv`, `password=Xy%409zK`): the driver ends the credentials at the first `@`, so a URL whose first `@` comes after the first `/`, `?` or `#` is refused (with or without a port, IPv6 hosts included). Likewise percent-encode a `/`, `?` or `#` in the user or password (`%2F`, `%3F`, `%23`); encoded passwords such as base64 ones work. A refused URL is never echoed, and the catalog API, MCP and the audit log show any stored URL the driver config refuses (for example one seeded from the config file) as `postgresql://<redacted>` when it starts with `postgresql://` or `postgres://`, and as `<redacted>` otherwise (a libpq `host=... password=...` string, even one with a `file:///` parameter). A `password` query parameter must be the last parameter (so it appears once at most), with any `&` in it percent-encoded (`%26`): in `?password=Xy&host=9zK` the driver would read `host=9zK` as a separate parameter, so that URL is refused (a single trailing `&` is ignored, as the driver ignores it). **Upgrade note:** a URL such as `?password=pw&sslmode=require`, accepted before v0.2.0, is now refused (the catalog fails to build with a WARN at startup); write `?sslmode=require&password=pw` or set `password` separately (see [Upgrading to v0.2.0 (runtime config)](/guide/configuration#upgrading-to-v020-runtime-config)). A user name is checked as written, so a percent-encoded one (`dom%2Fsvc`) is accepted; a `user` parameter is found with its key percent-decoded (`us%65r=` sets the user too), as the driver decodes it. |
 | `user`, `password` | from the URL | Credentials. The password is never logged. |
 | `default_schema` | `public` | The schema used for unqualified names when this is the default (first) catalog. |
 | `max_connections` | `8` | Connection pool size, per catalog **per node**. |
@@ -51,9 +51,16 @@ name in upper case, with every non-alphanumeric character replaced by `_`. For
 example, the catalog `pg-prod` reads `ARNEB_CATALOG_PG_PROD_PASSWORD`.
 
 The catalog is registered on the coordinator **and on every worker**, so every
-node needs the same `[[catalogs]]` entry and network access to the database. If
-the database cannot be reached at startup, Arneb logs a warning, skips the
-catalog and keeps serving the rest. An unreachable Hive Metastore is handled the
+node needs network access to the database. Only the coordinator's
+`[[catalogs]]` counts: workers receive the catalog definitions from the
+coordinator (and ignore their own `[[catalogs]]`), and under password auth a
+catalog can also be added, changed or dropped at runtime through
+[`/api/v2/catalog-configs`](/guide/http-api#catalogs). The password then
+crosses the cluster RPC port; set
+[`[cluster] secret` and `[cluster.tls]`](/guide/configuration#cluster-security).
+`ARNEB_CATALOG_<NAME>_PASSWORD` is read on the coordinator only. If the
+database cannot be reached when a node builds the catalog, it logs a warning,
+skips the catalog and keeps serving the rest. An unreachable Hive Metastore is handled the
 same way. Each mounted catalog logs its effective settings, without the
 password, at startup.
 

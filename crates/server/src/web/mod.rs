@@ -5,13 +5,18 @@ mod agent;
 mod api;
 mod audit;
 pub mod auth;
+mod catalogs;
 pub mod error;
 mod frontend;
 mod manage;
 pub mod mcp;
 mod metrics;
 pub mod privilege;
+mod reseed;
+mod rules;
 pub mod session;
+mod settings;
+mod users;
 mod v2;
 mod workers;
 
@@ -64,8 +69,21 @@ pub struct WebState {
     /// The audit log: next to the state file, or in memory (always empty
     /// under `[auth] type = "none"`, where nothing is audited).
     pub audit: Arc<arneb_state::AuditLog>,
-    /// Access rules shared with pgwire and Trino.
-    pub access_rules: Option<Arc<arneb_catalog::AccessRules>>,
+    /// The live access rules, shared with pgwire, Trino, the agent API and
+    /// [`WebState::authorizer`]; changed through `/api/v2/access-rules`.
+    pub rules: arneb_catalog::RulesHandle,
+    /// Serializes every runtime-config change (rules, users, user tokens,
+    /// catalogs, settings, re-seed; runtime-config D10): held across the
+    /// whole change, through the audit append.
+    pub config_changes: Arc<tokio::sync::Mutex<()>>,
+    /// The `--config` path the process started with (`None`: the default
+    /// `./arneb.toml` when present, else the defaults); a re-seed reloads
+    /// it with `AppConfig::load` (runtime-config D2, Ruling R3).
+    pub config_path: Option<std::path::PathBuf>,
+    /// The live external catalogs, changed through
+    /// `/api/v2/catalog-configs` (runtime-config D7); `Some` on a
+    /// coordinator or standalone server.
+    pub catalogs: Option<Arc<crate::catalogs::LiveCatalogs>>,
     /// The observe and manage privilege layers and the kill rule.
     pub authorizer: privilege::Authorizer,
     /// `[web] metrics_auth`: require credentials for `/metrics`.

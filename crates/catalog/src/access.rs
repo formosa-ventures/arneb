@@ -556,9 +556,62 @@ impl SystemRule {
     }
 }
 
+/// The live access rules, shared by every protocol and the Web API
+/// (runtime-config D3). Clones share one slot: a [`RulesHandle::replace`]
+/// is seen by the next [`RulesHandle::current`] on every clone. A
+/// statement takes one snapshot and keeps it until it is done, so a change
+/// never applies halfway through a statement. `None` allows everything.
+#[derive(Debug, Clone, Default)]
+pub struct RulesHandle {
+    slot: std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<AccessRules>>>>,
+}
+
+impl RulesHandle {
+    /// A handle holding `rules`.
+    pub fn new(rules: Option<std::sync::Arc<AccessRules>>) -> Self {
+        Self {
+            slot: std::sync::Arc::new(std::sync::RwLock::new(rules)),
+        }
+    }
+
+    /// The rules now in force. The read lock is held only to clone the
+    /// `Arc`.
+    pub fn current(&self) -> Option<std::sync::Arc<AccessRules>> {
+        self.slot.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Replaces the rules for every clone of this handle.
+    pub fn replace(&self, rules: Option<std::sync::Arc<AccessRules>>) {
+        *self.slot.write().unwrap_or_else(|p| p.into_inner()) = rules;
+    }
+}
+
+impl From<Option<std::sync::Arc<AccessRules>>> for RulesHandle {
+    fn from(rules: Option<std::sync::Arc<AccessRules>>) -> Self {
+        Self::new(rules)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rules_handle_replace_is_seen_by_clones() {
+        let h = RulesHandle::default();
+        assert!(h.current().is_none());
+        let clone = h.clone();
+        h.replace(Some(std::sync::Arc::new(rules(
+            r#"{"queries":[{"user":"ops","allow":["execute"]}]}"#,
+        ))));
+        let seen = clone.current().expect("the clone sees the replacement");
+        assert!(seen.can_execute("ops"));
+        assert!(!seen.can_execute("bob"));
+        clone.replace(None);
+        assert!(h.current().is_none());
+        // A snapshot taken before a replace keeps the rules it was taken with.
+        assert!(seen.can_execute("ops"));
+    }
 
     fn rules(json: &str) -> AccessRules {
         AccessRules::from_json(json).unwrap()

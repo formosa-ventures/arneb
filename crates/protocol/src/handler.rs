@@ -134,9 +134,10 @@ pub struct HandlerFactory {
     pub tls_required: bool,
     /// Records each statement (Web UI, `system.runtime.queries`, `/metrics`).
     pub query_tracker: Arc<arneb_scheduler::QueryTracker>,
-    /// Access rules checked for the connection's user; `None` allows all
-    /// (file-based-access-control).
-    pub access_rules: Option<Arc<arneb_catalog::AccessRules>>,
+    /// Access rules checked for the connection's user; empty allows all
+    /// (file-based-access-control). Live: each statement checks against the
+    /// rules current when it is planned (runtime-config D3).
+    pub access_rules: arneb_catalog::RulesHandle,
 }
 
 impl PgWireServerHandlers for HandlerFactory {
@@ -281,7 +282,7 @@ pub struct ConnectionHandler {
     /// See [`HandlerFactory::query_tracker`].
     pub query_tracker: Arc<arneb_scheduler::QueryTracker>,
     /// See [`HandlerFactory::access_rules`].
-    pub access_rules: Option<Arc<arneb_catalog::AccessRules>>,
+    pub access_rules: arneb_catalog::RulesHandle,
 }
 
 impl ConnectionHandler {
@@ -459,7 +460,9 @@ impl ConnectionHandler {
             || Arc::clone(&self.catalog_manager),
             |p| Arc::clone(&p.catalog_manager),
         );
-        let Some(rules) = &self.access_rules else {
+        // One snapshot per statement: planning and the privilege checks
+        // all see the rules current when the statement started.
+        let Some(rules) = self.access_rules.current() else {
             return Ok(base);
         };
         let user = client
@@ -467,7 +470,7 @@ impl ConnectionHandler {
             .get(pgwire::api::METADATA_USER)
             .cloned()
             .unwrap_or_default();
-        let view = base.with_access(user, Arc::clone(rules));
+        let view = base.with_access(user, rules);
         view.check_execute()
             .map_err(|e| arneb_error_to_pg_error(&e.into()))?;
         Ok(Arc::new(view))
@@ -1239,6 +1242,12 @@ pub(crate) async fn execute_query_capped(
         None => Arc::clone(memory_pool),
     };
     let memory_pool = &memory_pool;
+    // Pin the catalogs and connectors now (never half-swapped), so a
+    // runtime catalog change while this statement plans or runs does not
+    // give it another connector than the provider it was planned with.
+    let (pinned_connectors, pinned_catalogs) =
+        connector_registry.pinned(|| catalog_manager.pinned());
+    let (catalog_manager, connector_registry) = (&pinned_catalogs, &pinned_connectors);
     // Step 1: Parse SQL
     let statement = arneb_sql_parser::parse(sql)?;
 
@@ -1279,6 +1288,9 @@ pub(crate) async fn execute_query_capped(
     let mut exec_ctx = ExecutionContext::new()
         .with_memory_pool(memory_pool.clone())
         .with_catalog_stats(Some(analyzer_ctx.catalog_stats.clone()))
+        // The catalog set this statement is pinned to: its distributed
+        // tasks carry it, so a worker never runs one on another set.
+        .with_catalog_version(connector_registry.version())
         // A2.x broadcast threshold (2026-05-28). Default OFF.
         //
         // A2.1+A2.2+A2.3 v1 infra ships in this commit but is dormant
@@ -2436,6 +2448,158 @@ mod tests {
         assert!(matches!(resolved, PlanExpr::ScalarSubquery { .. }));
     }
 
+    /// A statement executes with the connector that matches the provider it
+    /// was planned with: a catalog swapped while it plans (here, while the
+    /// planner awaits the catalog's schema lookup) does not hand it the new
+    /// connector.
+    #[tokio::test]
+    async fn a_catalog_swapped_while_planning_keeps_the_planned_connector() {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+
+        /// `inner`, whose first schema lookup reports `entered` and then
+        /// waits for `release`.
+        #[derive(Debug)]
+        struct Gated {
+            inner: Arc<MemoryCatalog>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            gated: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait::async_trait]
+        impl arneb_catalog::CatalogProvider for Gated {
+            async fn schema_names(&self) -> Vec<String> {
+                self.inner.schema_names().await
+            }
+            async fn schema(&self, name: &str) -> Option<Arc<dyn arneb_catalog::SchemaProvider>> {
+                if !self.gated.swap(true, Ordering::SeqCst) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                self.inner.schema(name).await
+            }
+        }
+
+        let catalog_of = |rows: Vec<i64>| {
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "k",
+                    ArrowDataType::Int64,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(rows))],
+            )
+            .unwrap();
+            let schema = Arc::new(MemorySchema::new());
+            schema.register_table(
+                "t",
+                Arc::new(MemoryTable::new(
+                    vec![col("k", DataType::Int64)],
+                    vec![batch],
+                )),
+            );
+            let catalog = Arc::new(MemoryCatalog::new());
+            catalog.register_schema("default", schema);
+            catalog
+        };
+        let old = catalog_of(vec![1, 2, 3]);
+        let (entered, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let manager = Arc::new(CatalogManager::new("memory", "default"));
+        manager.register_catalog(
+            "c",
+            Arc::new(Gated {
+                inner: Arc::clone(&old),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                gated: std::sync::atomic::AtomicBool::new(false),
+            }),
+        );
+        let registry = Arc::new(ConnectorRegistry::new());
+        registry.register("c", Arc::new(MemoryConnectorFactory::new(old, "default")));
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+
+        let running = tokio::spawn({
+            let (manager, registry) = (Arc::clone(&manager), Arc::clone(&registry));
+            async move {
+                execute_query(
+                    "SELECT count(*) FROM c.default.t",
+                    &manager,
+                    &registry,
+                    None,
+                    &pool,
+                )
+                .await
+                .map(|(_, batches)| batches)
+            }
+        });
+        entered.notified().await;
+        // The runtime change: a new provider and connector, swapped together.
+        let new = catalog_of((1..=10).collect());
+        registry.swap(|| {
+            registry.register(
+                "c",
+                Arc::new(MemoryConnectorFactory::new(Arc::clone(&new), "default")),
+            );
+            manager.register_catalog("c", new);
+        });
+        release.notify_one();
+        let batches = running.await.unwrap().unwrap();
+        let count = batches
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(count, 3, "the planned (old) catalog's connector was used");
+    }
+
+    /// A distributed statement hands its executor the version tag of the
+    /// registry it pinned at the start, so its tasks name the catalog set
+    /// it was planned with even if the set changes meanwhile.
+    #[tokio::test]
+    async fn a_distributed_statement_carries_its_pinned_catalog_version() {
+        struct Recording(std::sync::Mutex<Vec<Option<(u64, u64)>>>);
+        #[async_trait]
+        impl DistributedExecutor for Recording {
+            async fn execute(
+                &self,
+                _plan: LogicalPlan,
+                exec_ctx: &ExecutionContext,
+            ) -> Result<Vec<arrow::record_batch::RecordBatch>, ArnebError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(exec_ctx.catalog_version().map(|v| (v.epoch, v.generation)));
+                Ok(Vec::new())
+            }
+            fn has_workers(&self) -> bool {
+                true
+            }
+        }
+        let manager = CatalogManager::new("memory", "default");
+        let registry = ConnectorRegistry::new();
+        registry.set_version(Some(arneb_common::CatalogVersion {
+            epoch: 3,
+            generation: 7,
+            ..Default::default()
+        }));
+        let executor = Recording(Default::default());
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        execute_query("SELECT 1", &manager, &registry, Some(&executor), &pool)
+            .await
+            .unwrap();
+        assert_eq!(*executor.0.lock().unwrap(), vec![Some((3, 7))]);
+    }
+
     /// Regression: COUNT / MIN / MAX over a filter that matches nothing used
     /// to fail with "expected Int64 but found Null".
     #[tokio::test]
@@ -2460,7 +2624,7 @@ mod tests {
         catalog.register_schema("default", schema);
         let catalog_manager = CatalogManager::new("memory", "default");
         catalog_manager.register_catalog("memory", catalog.clone());
-        let mut registry = ConnectorRegistry::new();
+        let registry = ConnectorRegistry::new();
         registry.register(
             "memory",
             Arc::new(MemoryConnectorFactory::new(catalog, "default")),
@@ -2536,7 +2700,7 @@ mod tests {
         let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", catalog);
-        let mut reg = ConnectorRegistry::new();
+        let reg = ConnectorRegistry::new();
         reg.register("memory", Arc::new(factory));
 
         let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
@@ -2636,7 +2800,7 @@ mod tests {
         let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
         let catalog_manager = CatalogManager::new("memory", "default");
         catalog_manager.register_catalog("memory", catalog);
-        let mut registry = ConnectorRegistry::new();
+        let registry = ConnectorRegistry::new();
         registry.register("memory", Arc::new(factory));
         (catalog_manager, registry)
     }
@@ -2798,7 +2962,7 @@ mod tests {
         let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", catalog);
-        let mut reg = ConnectorRegistry::new();
+        let reg = ConnectorRegistry::new();
         reg.register("memory", Arc::new(factory));
         (cm, reg)
     }
@@ -2922,7 +3086,7 @@ mod tests {
         let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", catalog);
-        let mut reg = ConnectorRegistry::new();
+        let reg = ConnectorRegistry::new();
         reg.register("memory", Arc::new(factory));
         (cm, reg)
     }
@@ -3178,7 +3342,7 @@ mod tests {
         catalog.register_schema("default", schema);
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", catalog.clone());
-        let mut reg = ConnectorRegistry::new();
+        let reg = ConnectorRegistry::new();
         reg.register(
             "memory",
             Arc::new(MemoryConnectorFactory::new(catalog, "default")),
@@ -3477,7 +3641,7 @@ mod tests {
         let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", catalog);
-        let mut reg = ConnectorRegistry::new();
+        let reg = ConnectorRegistry::new();
         reg.register("memory", Arc::new(factory));
         (cm, reg)
     }

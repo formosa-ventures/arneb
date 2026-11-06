@@ -286,7 +286,7 @@ mod tests {
         memory.register_schema("default", default_schema);
         let cm = CatalogManager::new("memory", "default");
         cm.register_catalog("memory", memory.clone());
-        let mut registry = ConnectorRegistry::new();
+        let registry = ConnectorRegistry::new();
         registry.register(
             "memory",
             Arc::new(MemoryConnectorFactory::new(memory, "default")),
@@ -322,8 +322,15 @@ mod tests {
             credentials,
             state: password.then_some(store),
             audit: crate::web::test_audit_log(),
-            access_rules: None,
-            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), password),
+            rules: Default::default(),
+            config_changes: Default::default(),
+            config_path: None,
+            catalogs: None,
+            authorizer: crate::web::privilege::Authorizer::new(
+                Default::default(),
+                Vec::new(),
+                password,
+            ),
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent,

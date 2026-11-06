@@ -74,7 +74,7 @@ async fn flight_server_heartbeat_roundtrip() {
 
     let state = FlightState::with_heartbeat_callback(Arc::new(move |msg| {
         received_clone.lock().unwrap().push(msg);
-        Ok(())
+        Ok(Default::default())
     }));
 
     let addr = start_test_flight_server(state).await;

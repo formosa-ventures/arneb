@@ -2,10 +2,11 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use arneb_common::error::ConnectorError;
 use arneb_common::types::{ColumnInfo, TableReference};
+use arneb_common::CatalogVersion;
 use arneb_execution::DataSource;
 use async_trait::async_trait;
 
@@ -66,10 +67,27 @@ pub trait ConnectorFactory: Send + Sync + Debug {
     }
 }
 
-/// Registry mapping connector names to their factories.
+/// Registry mapping connector names to their factories. Shared as
+/// `Arc<ConnectorRegistry>`; factories can be registered and removed at
+/// runtime through a shared reference. The lock is held only to clone or
+/// swap an `Arc`, so lookups stay cheap.
+///
+/// A catalog swap changes a connector and the matching catalog provider
+/// (held elsewhere, in a `CatalogManager`) together; [`swap`](Self::swap)
+/// and [`pinned`](Self::pinned) exclude each other, so a statement that
+/// pins both never sees one half-swapped.
 #[derive(Debug, Default)]
 pub struct ConnectorRegistry {
-    factories: HashMap<String, Arc<dyn ConnectorFactory>>,
+    factories: RwLock<HashMap<String, Arc<dyn ConnectorFactory>>>,
+    /// Written across a [`swap`](Self::swap), read across a
+    /// [`pinned`](Self::pinned) snapshot.
+    swaps: RwLock<()>,
+    /// The version of the catalog set these factories belong to (its
+    /// `(epoch, generation)`, each catalog's fingerprint and the default
+    /// catalog and schema), as the runtime catalog manager tagged them;
+    /// `None` until it does. A [`pinned`](Self::pinned) copy keeps the tag
+    /// it was taken with.
+    version: RwLock<Option<Arc<CatalogVersion>>>,
 }
 
 impl ConnectorRegistry {
@@ -78,14 +96,86 @@ impl ConnectorRegistry {
         Self::default()
     }
 
-    /// Registers a connector factory under the given name.
-    pub fn register(&mut self, name: impl Into<String>, factory: Arc<dyn ConnectorFactory>) {
-        self.factories.insert(name.into(), factory);
+    /// Registers a connector factory under the given name, replacing any
+    /// factory already registered under it.
+    pub fn register(&self, name: impl Into<String>, factory: Arc<dyn ConnectorFactory>) {
+        self.factories
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(name.into(), factory);
+    }
+
+    /// Removes the factory registered under `name`, returning it.
+    pub fn deregister(&self, name: &str) -> Option<Arc<dyn ConnectorFactory>> {
+        self.factories
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(name)
     }
 
     /// Returns the factory for the given connector name, if registered.
     pub fn get(&self, name: &str) -> Option<Arc<dyn ConnectorFactory>> {
-        self.factories.get(name).cloned()
+        self.factories
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(name)
+            .cloned()
+    }
+
+    /// Tags the registry with the version of the catalog set it now
+    /// holds. Call it inside the [`swap`](Self::swap) that installs the
+    /// set, so a pinned copy never pairs one set's factories with another's
+    /// tag.
+    pub fn set_version(&self, version: Option<CatalogVersion>) {
+        *self.version.write().unwrap_or_else(|p| p.into_inner()) = version.map(Arc::new);
+    }
+
+    /// The version tag ([`set_version`](Self::set_version)).
+    pub fn version(&self) -> Option<Arc<CatalogVersion>> {
+        self.version
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Runs `f`, which registers or removes connectors together with their
+    /// catalog providers, with every [`pinned`](Self::pinned) snapshot
+    /// excluded, so none sees the change half done.
+    pub fn swap<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _swap = self.swaps.write().unwrap_or_else(|p| p.into_inner());
+        f()
+    }
+
+    /// Runs `f`, which reads state that a [`swap`](Self::swap) changes
+    /// (such as the catalog specs and the version tag), never in the middle
+    /// of a swap. Like [`pinned`](Self::pinned) without copying the
+    /// factories.
+    pub fn consistent<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _swap = self.swaps.read().unwrap_or_else(|p| p.into_inner());
+        f()
+    }
+
+    /// A frozen copy of the registered factories, taken together with what
+    /// `f` snapshots (such as the catalog providers) and never in the
+    /// middle of a [`swap`](Self::swap). A statement plans and executes
+    /// against the pair, so a catalog change while it runs does not give
+    /// it another connector than the provider it was planned with.
+    pub fn pinned<R>(&self, f: impl FnOnce() -> R) -> (ConnectorRegistry, R) {
+        let _swap = self.swaps.read().unwrap_or_else(|p| p.into_inner());
+        let pinned = f();
+        let factories = self
+            .factories
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        (
+            ConnectorRegistry {
+                factories: RwLock::new(factories),
+                swaps: RwLock::new(()),
+                version: RwLock::new(self.version()),
+            },
+            pinned,
+        )
     }
 }
 
@@ -113,13 +203,50 @@ mod tests {
     }
 
     #[test]
+    fn pinned_copy_keeps_the_factories_it_was_taken_with() {
+        let registry = ConnectorRegistry::new();
+        let old: Arc<dyn ConnectorFactory> = Arc::new(DummyFactory);
+        registry.register("c", Arc::clone(&old));
+        let version = |generation| CatalogVersion {
+            epoch: 1,
+            generation,
+            ..Default::default()
+        };
+        registry.set_version(Some(version(4)));
+        let (pinned, seen) = registry.pinned(|| 7);
+        assert_eq!(seen, 7);
+        registry.swap(|| {
+            registry.register("c", Arc::new(DummyFactory));
+            registry.register("d", Arc::new(DummyFactory));
+            registry.set_version(Some(version(5)));
+        });
+        assert_eq!(pinned.version().unwrap().generation, 4);
+        assert_eq!(registry.version().unwrap().generation, 5);
+        assert!(Arc::ptr_eq(&pinned.get("c").unwrap(), &old));
+        assert!(pinned.get("d").is_none());
+        assert!(!Arc::ptr_eq(&registry.get("c").unwrap(), &old));
+    }
+
+    #[test]
     fn registry_register_and_get() {
-        let mut registry = ConnectorRegistry::new();
+        let registry = ConnectorRegistry::new();
         let factory: Arc<dyn ConnectorFactory> = Arc::new(DummyFactory);
         registry.register("dummy", factory);
         let retrieved = registry.get("dummy");
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().name(), "dummy");
+    }
+
+    #[test]
+    fn registry_register_and_deregister_through_shared_ref() {
+        let registry = Arc::new(ConnectorRegistry::new());
+        let shared = Arc::clone(&registry);
+        shared.register("dummy", Arc::new(DummyFactory));
+        assert_eq!(registry.get("dummy").unwrap().name(), "dummy");
+        let removed = shared.deregister("dummy");
+        assert_eq!(removed.unwrap().name(), "dummy");
+        assert!(registry.get("dummy").is_none());
+        assert!(shared.deregister("dummy").is_none());
     }
 
     #[test]

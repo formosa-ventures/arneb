@@ -39,7 +39,7 @@ Under `[auth] type = "none"` there is nothing to prove: the caller is the
 
 ## Tools
 
-Twenty-six tools. The server also sends `instructions` on connect, which tell
+Forty-four tools. The server also sends `instructions` on connect, which tell
 the agent the intended order: discover, describe or sample, explain, submit,
 poll, fetch, cancel.
 
@@ -71,6 +71,24 @@ poll, fetch, cancel.
 | `list_tokens` | none | your live tokens, never the secret | `GET /tokens` |
 | `create_token` | `name?`, `expires_in_days?` | the new token, shown once | `POST /tokens` |
 | `revoke_token` | `id` | `{revoked: id}` | `DELETE /tokens/{id}` |
+| `get_access_rules` | none | `{rules, from_config}` | `GET /access-rules` |
+| `set_access_rules` | `rules`, `dry_run?` | manage envelope | `PUT /access-rules` |
+| `clear_access_rules` | `dry_run?` | manage envelope | `DELETE /access-rules` |
+| `list_users` | `limit?` | `{users, truncated}` (default 100, at most 1000) | `GET /users` |
+| `create_user` | `name`, `password`, `dry_run?` | manage envelope | `POST /users` |
+| `set_user_password` | `name`, `password`, `dry_run?` | manage envelope | `PATCH /users/{name}` |
+| `delete_user` | `name`, `dry_run?` | manage envelope | `DELETE /users/{name}` |
+| `list_user_tokens` | `name`, `limit?` | `{user, tokens, truncated}` | `GET /users/{name}/tokens` |
+| `issue_user_token` | `name`, `token_name?`, `expires_in_days?`, `dry_run?` | manage envelope; the token is shown once | `POST /users/{name}/tokens` |
+| `revoke_user_token` | `name`, `id`, `dry_run?` | manage envelope | `DELETE /users/{name}/tokens/{id}` |
+| `list_catalog_configs` | `limit?` | `{generation, catalogs, truncated}`, secrets redacted | `GET /catalog-configs` |
+| `get_catalog_config` | `name` | one definition, secrets redacted | `GET /catalog-configs/{name}` |
+| `create_catalog` | `spec`, `dry_run?` | manage envelope | `POST /catalog-configs` |
+| `update_catalog` | `name`, `spec`, `dry_run?` | manage envelope | `PUT /catalog-configs/{name}` |
+| `drop_catalog` | `name`, `dry_run?` | manage envelope | `DELETE /catalog-configs/{name}` |
+| `get_settings` | none | `{slow_query_threshold_ms, source}` | `GET /settings` |
+| `update_settings` | `slow_query_threshold_ms`, `dry_run?` | manage envelope | `PATCH /settings` |
+| `reseed_state` | `dry_run?` | manage envelope | `POST /state/reseed` |
 
 The result of a tool is its `structuredContent`: the same JSON body as the
 matching route (an array is wrapped in an object). Every argument has a
@@ -80,12 +98,15 @@ Annotations tell a client which calls are safe to auto-approve. All tools set
 `openWorldHint = false`. `whoami`, the `list_*` and `get_*` tools,
 `describe_table`, `sample_table`, `explain_query` and `fetch_results` are
 read-only. `revoke_token`, `cordon_worker`, `drain_worker`,
-`set_admission_limits` and `reset_admission_limits` are destructive and
-idempotent; `uncordon_worker` is idempotent and not destructive.
-`cancel_query` is destructive but not idempotent: the first call cancels a
-running statement of yours and keeps it, a call on an ended one releases it
-with its rows, and a call after that only finds the tracked query that
-already ended (`changed: false`).
+`set_admission_limits`, `reset_admission_limits`, `set_access_rules`,
+`clear_access_rules`, `set_user_password`, `delete_user`,
+`revoke_user_token`, `update_catalog`, `drop_catalog`, `update_settings` and
+`reseed_state` are destructive and idempotent; `uncordon_worker` is
+idempotent and not destructive; `create_user`, `issue_user_token` and
+`create_catalog` are neither. `cancel_query` is destructive but not
+idempotent: the first call cancels a running statement of yours and keeps
+it, a call on an ended one releases it with its rows, and a call after that
+only finds the tracked query that already ended (`changed: false`).
 `submit_query` and `create_token` carry no read-only hint.
 
 ### Typical session
@@ -130,6 +151,29 @@ integers; the server refuses a negative value or an empty call with
 `invalid_argument`, as `PUT /api/v2/admission` does. An argument of the wrong
 type (`1.5`, a string, a number above the 64-bit range) comes back as a text
 error naming the value and the expected type, not the `{code}` envelope.
+
+### Runtime configuration
+
+The access rules, users, user tokens, catalogs, settings and re-seed tools
+change the [runtime configuration](/guide/http-api#runtime-configuration)
+exactly as their routes do, with the same checks, dry runs and audit
+entries. All of them need manage, except `get_settings` (observe).
+
+- `set_access_rules` takes the whole rules file as `rules` (a JSON object). A
+  change that would remove your own manage privilege is refused with
+  `conflict`, also as a dry run.
+- `create_user` and `set_user_password` take a password. It is not logged or
+  audited; the tool descriptions tell the agent not to repeat it back to the
+  user. `issue_user_token` shows the new token once.
+- `create_catalog` and `update_catalog` take the spec as `spec` (the
+  `[[catalogs]]` fields). The coordinator connects to the backend first (at
+  most 10 s); every result carries the spec with its secrets as
+  `"<redacted>"`. To change a catalog, read it with `get_catalog_config`,
+  edit the fields and send it back: a field left as `"<redacted>"` keeps the
+  stored secret, unless the change moves where it is sent, which needs the
+  secret again.
+- `reseed_state` replaces catalogs, rules, settings and config users with
+  the config file's. Preview it with `dry_run: true` first.
 
 ## Limits
 

@@ -66,6 +66,7 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # Config
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror.workspace = true
 toml = { workspace = true }
 
 # Web UI
@@ -98,3 +99,5 @@ arneb-catalog = { path = "../catalog" }
 arneb-hive = { path = "../hive" }
 arneb-connectors = { path = "../connectors" }
 orc-rust = { workspace = true }
+# Cross-checks the connection_url redaction against the driver's parser.
+tokio-postgres.workspace = true

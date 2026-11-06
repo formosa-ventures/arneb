@@ -74,6 +74,7 @@ fn descriptor() -> TaskDescriptor {
         pending_dynamic_filters: Vec::new(),
         scan_task_count: 1,
         must_drain: false,
+        catalog_version: None,
     }
 }
 
@@ -85,7 +86,7 @@ async fn recording_state() -> (FlightState, Arc<Mutex<usize>>, Arc<Mutex<usize>>
     let b = beats.clone();
     let mut state = FlightState::with_heartbeat_callback(Arc::new(move |_| {
         *b.lock().unwrap() += 1;
-        Ok(())
+        Ok(Default::default())
     }));
     let t = tasks.clone();
     state.set_task_callback(Arc::new(move |_| {

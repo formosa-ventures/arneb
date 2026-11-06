@@ -68,6 +68,7 @@ async fn submit_task_carries_pending_dynamic_filters() {
         ],
         scan_task_count: 1,
         must_drain: false,
+        catalog_version: None,
     };
 
     tokio::time::timeout(

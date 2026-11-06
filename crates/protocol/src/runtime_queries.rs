@@ -151,7 +151,7 @@ pub fn runtime_catalog(
     catalog.register_schema(SCHEMA, schema);
     let cm = CatalogManager::new(CATALOG, SCHEMA);
     cm.register_catalog(CATALOG, catalog.clone());
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register(
         CATALOG,
         Arc::new(MemoryConnectorFactory::new(catalog, SCHEMA)),

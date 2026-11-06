@@ -48,7 +48,7 @@ async fn start_server() -> u16 {
     catalog.register_schema("alt", schema_with_marker("alt"));
     let cm = Arc::new(CatalogManager::new("memory", "default"));
     cm.register_catalog("memory", catalog.clone());
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register(
         "memory",
         Arc::new(MemoryConnectorFactory::new(catalog, "default")),

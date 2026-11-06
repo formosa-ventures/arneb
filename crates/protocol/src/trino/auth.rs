@@ -20,7 +20,9 @@
 //!   retry 503), so a flood of bad credentials cannot build an unbounded
 //!   queue in front of a legitimate client whose cache entry expired. The
 //!   TTL is deliberately not refreshed on a hit, so a revoked or changed
-//!   password still stops working within [`CACHE_TTL`].
+//!   password still stops working within [`CACHE_TTL`]; a password changed
+//!   or a user deleted through the server calls
+//!   [`BasicAuthenticator::forget_user`], which stops it at once.
 //! - A [token-shaped](crate::auth::is_token_shaped) password is an API
 //!   token: it is checked with a SHA-256 compare on every request, bypassing
 //!   the cache, the limiter and the queue, so a revoked token is refused at
@@ -99,6 +101,10 @@ pub struct BasicAuthenticator {
     limiter: Arc<Semaphore>,
     /// Single-flight map; its size bounds the verification queue.
     in_flight: Arc<Mutex<InFlight>>,
+    /// Bumped (under the cache lock) by [`BasicAuthenticator::forget_user`];
+    /// a verification that saw another value when it started does not
+    /// cache its result, since it may have checked replaced credentials.
+    epoch: Arc<AtomicU64>,
     /// Issuances waiting for a slot via [`Self::acquire_pbkdf2_slot`].
     slot_waiters: Arc<AtomicUsize>,
 }
@@ -209,8 +215,27 @@ impl BasicAuthenticator {
             verifications,
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_VERIFICATIONS)),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            epoch: Arc::new(AtomicU64::new(0)),
             slot_waiters: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Drop every cached verification of `user`, and detach their
+    /// verifications in flight from new requests, so the next request with
+    /// their old password is checked against the credential source again.
+    /// Call it after the user's password changed or they were deleted.
+    /// Other users' entries are kept. API tokens are never cached, so they
+    /// need nothing here.
+    pub fn forget_user(&self, user: &str) {
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+            cache.retain(|(u, _), _| u != user);
+        }
+        // Requests already waiting on a flight keep its result; a request
+        // arriving from now on starts a new one.
+        let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|(u, _), _| u != user);
     }
 
     fn is_cached(&self, key: &CredKey, now: Instant) -> bool {
@@ -278,6 +303,7 @@ impl BasicAuthenticator {
     /// Run (or, if a slot frees up after another flight cached the same
     /// credentials, skip) the PBKDF2 verification and cache a success.
     async fn verify_uncached(&self, key: &CredKey, user: &str, password: &str) -> bool {
+        let epoch = self.epoch.load(Ordering::SeqCst);
         let Ok(permit) = Arc::clone(&self.limiter).acquire_owned().await else {
             return false;
         };
@@ -300,6 +326,11 @@ impl BasicAuthenticator {
         }
         let now = Instant::now();
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if self.epoch.load(Ordering::SeqCst) != epoch {
+            // A user was forgotten while this ran: do not cache a check
+            // that may predate their new credentials.
+            return true;
+        }
         if cache.len() >= CACHE_CAPACITY {
             cache.retain(|_, at| now.duration_since(*at) < CACHE_TTL);
             if cache.len() >= CACHE_CAPACITY {
@@ -606,6 +637,63 @@ mod tests {
         assert_eq!(
             resp.headers().get("Retry-After").unwrap(),
             OVERLOADED_RETRY_AFTER_SECS
+        );
+    }
+    fn two_user_authenticator() -> (BasicAuthenticator, Arc<AtomicU64>) {
+        let creds = UserCredentials::new(vec![
+            (
+                "alice".to_owned(),
+                ScramVerifier::generate("alice-pw").unwrap(),
+            ),
+            ("bob".to_owned(), ScramVerifier::generate("bob-pw").unwrap()),
+        ])
+        .unwrap();
+        let counter = Arc::new(AtomicU64::new(0));
+        let auth = BasicAuthenticator::with_counter(Arc::new(creds), Arc::clone(&counter)).unwrap();
+        (auth, counter)
+    }
+
+    #[tokio::test]
+    async fn forget_user_drops_only_that_users_entries() {
+        let (auth, counter) = two_user_authenticator();
+        assert_eq!(auth.check("alice", "alice-pw").await, BasicVerdict::Valid);
+        assert_eq!(auth.check("bob", "bob-pw").await, BasicVerdict::Valid);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        auth.forget_user("alice");
+        // alice verifies again (PBKDF2); bob is still a cache hit.
+        assert_eq!(auth.check("bob", "bob-pw").await, BasicVerdict::Valid);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        assert_eq!(auth.check("alice", "alice-pw").await, BasicVerdict::Valid);
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+        assert_eq!(auth.check("alice", "alice-pw").await, BasicVerdict::Valid);
+        assert_eq!(counter.load(Ordering::Relaxed), 3, "cached again");
+        auth.forget_user("nobody");
+        assert_eq!(auth.check("alice", "alice-pw").await, BasicVerdict::Valid);
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+    }
+
+    /// A verification still running when the user is forgotten checked the
+    /// old credentials, so its success is not cached.
+    #[tokio::test]
+    async fn a_flight_running_across_forget_user_is_not_cached() {
+        let (auth, counter) = two_user_authenticator();
+        let held = hold_all_slots(&auth);
+        let task = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.check("alice", "alice-pw").await }
+        });
+        settle().await;
+        assert_eq!(in_flight_len(&auth), 1);
+        auth.forget_user("alice");
+        assert_eq!(in_flight_len(&auth), 0, "a new request starts a new flight");
+        drop(held);
+        assert_eq!(task.await.unwrap(), BasicVerdict::Valid);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(auth.check("alice", "alice-pw").await, BasicVerdict::Valid);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "not served from the cache"
         );
     }
 }

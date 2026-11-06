@@ -395,6 +395,26 @@ user = "arneb"
 password = "arneb"
 ```
 
+Under `[auth] type = "password"`, `[[catalogs]]` only seeds the catalogs:
+the first start copies them into the [state store](#state), and from then on
+they are added, changed and dropped through
+[`/api/v2/catalog-configs`](/guide/http-api#catalogs) without a restart.
+Workers ignore `[[catalogs]]` and receive the catalogs from the coordinator,
+together with its default catalog and schema and with its global `[storage]`
+merged into each Hive catalog, so a worker needs no catalog or storage
+config of its own.
+
+**Default catalog.** Unqualified table names resolve in the default catalog
+and its `default_schema` (`public` for PostgreSQL, `default` otherwise). It
+is picked at startup from the catalogs the node serves (under password auth,
+the state store's): the first `[[catalogs]]` entry when it is served, else
+the first served catalog by name, else `file` when `[[tables]]` are set,
+else `memory`. So it never names a catalog that is not defined, and a
+config edit that the state store does not follow does not move it. The
+effective value is logged on `arneb::config` at startup, and workers
+receive the same one. It changes only at a restart: dropping the default
+catalog at runtime leaves unqualified names failing until then.
+
 ## Cluster Configuration
 
 For distributed mode (worker nodes):
@@ -464,6 +484,17 @@ ca_path   = "/etc/arneb/ca.crt"       # CA that signed every node's certificate
 - **Without TLS, the secret crosses the network in the clear.** Startup logs
   a WARN when a secret is set without `[cluster.tls]` and `bind_address` is
   not loopback.
+- **Catalog credentials cross this port.** Workers receive the catalog
+  definitions, passwords and storage keys included, from the coordinator
+  over Flight. Without a secret, any peer that reaches the coordinator's RPC
+  port can fetch them; without TLS they travel in the clear. Without a
+  secret, any peer can also push a catalog set to a worker
+  (`sync_catalogs`); the worker replaces it with the coordinator's on its
+  next heartbeat. So a coordinator without a secret refuses to start while
+  a catalog it serves carries a secret, refuses API changes that add one,
+  and otherwise starts with a WARN; a worker without a secret WARNs too
+  (see [Upgrading to v0.2.0 (runtime config)](#upgrading-to-v020-runtime-config)).
+  Use TLS as well whenever a catalog carries credentials.
 - The effective mode is logged on `arneb::config`
   (`cluster_auth="secret"|"off" cluster_tls="on"|"off"`). A short secret, a
   missing `[cluster.tls]` path, or an unreadable file stops startup.
@@ -724,6 +755,151 @@ open so existing scrapers keep working.
   [`metrics_auth = true`](#web-ui) (and keep the port private) if they must
   not be public.
 
+### Upgrading to v0.2.0 (runtime config)
+
+Under `[auth] type = "password"` the access rules, users, catalogs and the
+slow-query threshold can now change while the server runs (see
+[Runtime configuration](/guide/http-api#runtime-configuration)). That moves
+the source of truth from the config file to the [state store](#state):
+
+- **The state wins for catalogs; rules from the file follow the file.**
+  The first start on this version copies `[[catalogs]]` and the
+  `rules_file` into the state (an older state file has no seeded copy, so
+  this happens once on upgrade). From then on the stored catalogs are used.
+  Editing `[[catalogs]]` no longer takes effect at a restart: each config
+  catalog that is new, changed or gone relative to its seeded copy logs one
+  WARN on `arneb::config` at every start, ending `Preview a re-seed with
+  POST /api/v2/state/reseed?dry_run=true`. The access rules depend on
+  whether they were changed at runtime:
+  - **Never changed at runtime** (they are the seeded copy of the file):
+    the file wins. A changed `rules_file` is stored again at the next start,
+    with an INFO line, so tightening the file revokes access on restart as
+    before.
+  - **Changed at runtime** (`PUT` or `DELETE /api/v2/access-rules`) and the
+    rules file is unchanged since it was last seeded: the runtime rules are
+    kept, with a WARN at every start until a re-seed.
+  - **Changed at runtime, then copied into the rules file:** once the file
+    holds the same rules as the state (compared as JSON, so formatting and
+    key order do not count), the rules count as the file's again and follow
+    later edits of it.
+  - **Changed at runtime, and the rules file was also edited since it was
+    last seeded:** startup refuses, since neither copy can be assumed to be
+    the one you want. Restart with `--reseed-state` to take the config file
+    (users, catalogs, rules and settings), or restore the rules file to its
+    last seeded version to keep the runtime rules (copy them into it
+    afterwards to make them the file's).
+
+  An unreadable or invalid rules file stops startup, as before v0.2.0.
+  Every startup refusal that depends on the users, catalogs or rules (an
+  invalid or edited rules file, stored rules that no longer parse, a catalog
+  secret without `[cluster] secret`), and the `[cluster]`, retry, `[tls]`,
+  Trino-transport, `[web] bind_address` and `[[tables]]` checks, happen
+  before anything is written to the state file, so fixing the config and
+  restarting is enough. The write itself, a re-seed included, is atomic; a
+  later failure (a port in use) leaves the state as the config made it. Apply
+  `[[catalogs]]` with a [re-seed](/guide/http-api#re-seed) or
+  `--reseed-state`, which replaces catalogs, rules, settings and users in
+  one atomic write of the state file. A
+  standalone server under password auth behaves like a coordinator here.
+  Under `[auth] type = "none"` nothing changes: there is no state store, and
+  the config is used as before.
+- **A PostgreSQL `connection_url` password must be the last query
+  parameter.** In `?password=pw&sslmode=require` the driver used to read the
+  password `pw`, but a password that really is `pw&sslmode=require` would
+  have been split the same way, with its tail sent as a driver parameter.
+  Such a URL is now refused (with or without runtime config): the catalog
+  fails to build with a WARN at startup and queries on it fail with "not
+  registered", and the API shows its URL as `postgresql://<redacted>`.
+  Before: `connection_url = "postgresql://app@db/sales?password=pw&sslmode=require"`.
+  After: `connection_url = "postgresql://app@db/sales?sslmode=require&password=pw"`,
+  or `connection_url = "postgresql://app@db/sales?sslmode=require"` with
+  `password = "pw"`. Percent-encode an `&` inside the password as `%26`. A
+  catalog already in the state store is fixed with a `PUT` (send the full
+  `connection_url`, password included), or from `[[catalogs]]` with a
+  re-seed.
+- **Workers ignore `[[catalogs]]`, and `[storage]` for catalogs.** A worker
+  gets its catalogs from the coordinator over Flight: a push on every
+  change, and a pull when its heartbeat shows it is behind (after it starts,
+  after a missed push, after a coordinator restart). The set carries the
+  coordinator's default catalog and schema, which the worker uses for a
+  table named without a catalog or schema, and each Hive catalog arrives
+  with the coordinator's global `[storage]` already merged in, so the
+  worker reads object storage with the coordinator's settings and keys (a
+  worker whose own `[storage]`, for example IAM-only, differed now uses the
+  coordinator's). A worker's `[storage]` still applies to its own
+  `[[tables]]`. A worker config that still has `[[catalogs]]` logs one INFO
+  naming them; you can leave them, or remove them together with a
+  `[storage]` that only served them. Catalog environment variables
+  (`ARNEB_CATALOG_<NAME>_PASSWORD`) are no longer read on workers. Only the
+  alive workers get a push; a worker that joins later pulls on its first
+  heartbeat.
+- **A coordinator with catalog secrets needs `[cluster] secret`.** The
+  catalog definitions, passwords included, now cross the cluster RPC port
+  from the coordinator to the workers (`get_catalogs`, `sync_catalogs`).
+  Without a secret anyone who reaches the port could read every catalog
+  password and storage key, or replace a worker's catalogs. So a
+  coordinator without `[cluster] secret` (`ARNEB_CLUSTER_SECRET`) now
+  **refuses to start** while a served catalog carries a secret: a
+  `password`, a password in `connection_url` (a `connection_url` that fails
+  validation counts when it may hold one: a `:` before its first `@`
+  after `scheme://` (outside an IPv6 host), unless that `@` plainly sits
+  in a query value such as `db:5432/x?user=a@b`; a query parameter whose
+  key, split on every `&` and percent-decoded, contains `password` in any
+  case (`?sslmode&password=`, `?PASSWORD=`); or, with no `scheme://` (a
+  libpq `host=... password=...` string), any `password` or `user:pass@`
+  shape; a mistyped URL with no password, such as `?sslmod=require`,
+  does not stop the start, its catalog fails to build with a WARN),
+  an S3 `secret_access_key` or an Azure `access_key`, including the global `[storage]` keys merged into
+  every Hive catalog. The error names each catalog and field (never the
+  value). The check runs before anything is stored, on every catalog that
+  would be served (built or not): on a first start, removing the secret
+  from `[[catalogs]]` and restarting is enough; a secret already in the
+  state store has to be removed with a `PUT` on a server with a cluster
+  secret, or from `[[catalogs]]` followed by one start with
+  `--reseed-state`. A catalog create, update or re-seed that would add such a secret
+  is refused the same way (`invalid_argument`, hint `set [cluster] secret
+  ...`). Without secrets the coordinator starts with a WARN that cluster RPC
+  is unauthenticated, and a worker without a secret WARNs that any peer can
+  replace its catalogs. Set the same secret on every node (the Helm chart
+  already does) and add `[cluster.tls]`, or the secret and the catalog
+  passwords cross the network in the clear. A standalone server serves no
+  catalogs over RPC and is not affected.
+- **A resolved `ARNEB_CATALOG_<NAME>_PASSWORD` is stored in the state
+  file.** The coordinator resolves it when it loads the config, so the
+  seeded catalog keeps the password in `state.json` (mode `0600`). Rotating
+  the variable alone no longer changes it: update the catalog through
+  `PUT /api/v2/catalog-configs/{name}` or re-seed.
+- **Open pgwire sessions survive a user delete.** Deleting a user, or
+  changing their password, revokes their tokens, drops their cached Trino
+  logins and ends their Web sessions at once, but pgwire connections already
+  open stay open until they disconnect (as in Trino and PostgreSQL).
+- **A catalog build has a 10 s limit**, at startup too. A PostgreSQL
+  `connect_timeout_secs` above 10 is cut to 10 s while the catalog is built,
+  and a catalog that cannot be reached is skipped with a WARN; workers retry
+  it at most every 30 s.
+- **A catalog that fails to build at coordinator startup is stored but not
+  served.** It is not pushed to the workers either, until a
+  `PUT /api/v2/catalog-configs/{name}`, a re-seed or a restart builds it.
+- **Stored settings.** `PATCH /api/v2/settings` stores
+  `slow_query_threshold_ms`; a stored value wins over `[observability]` and
+  `ARNEB_SLOW_QUERY_THRESHOLD_MS` at every start, with a WARN.
+- **`GET /api/v2/access-rules` reports `from_config: false` when there are
+  no rules**, not only after a runtime change.
+- **Changing where a catalog sends its secret needs the secret again.** A
+  `PUT /api/v2/catalog-configs/{name}` that changes the host, port,
+  database, user or parameters of `connection_url`, the `metastore_uri`, or
+  a storage endpoint, region or bucket, must send the password or key
+  again instead of `"<redacted>"`.
+- **Downgrading.** An older binary reads the new state file, but its next
+  write drops `catalogs`, `rules`, `rules_origin`, `seeded`, `deleted_config_users` and
+  `slow_query_threshold_ms`. After a downgrade (and a later upgrade) the
+  catalogs and rules are seeded from the config file again, and users
+  deleted at runtime that are still in the config come back.
+- **Kubernetes.** The chart already mounts the state volume; no chart change
+  is needed. The worker ConfigMap may keep `[[catalogs]]` and `[storage]`,
+  or drop both: workers take catalogs, defaults and catalog storage from
+  the coordinator.
+
 ## State
 
 ```toml
@@ -745,6 +921,16 @@ created with mode `0600`. The path's directory must be writable.
   user's API tokens, so the old password and its tokens stop working. A user
   removed from the config is deleted together with their tokens. Each change
   logs a line on `arneb::config` naming the user.
+- **Catalogs and access rules are seeded once.** The first start whose state
+  has no seeded copy copies `[[catalogs]]` and the `rules_file` into it; from
+  then on the stored catalogs are used, they change through the
+  [runtime configuration](/guide/http-api#runtime-configuration) API, and a
+  config entry that differs logs a WARN at every start. Rules never changed
+  at runtime follow the rules file at every start; rules changed at runtime
+  are kept while the file is unchanged, and a file edited since then stops
+  startup until `--reseed-state`. See
+  [Upgrading to v0.2.0 (runtime config)](#upgrading-to-v020-runtime-config).
+  The state file then holds catalog passwords too.
 - **Users created through the state store are never touched** by this. If a
   config user has the same name as one of them, startup keeps the state user
   and logs a WARN. Start once with `--reseed-state` to overwrite it with the
@@ -752,6 +938,8 @@ created with mode `0600`. The path's directory must be writable.
   whose stored verifier is identical to the config's `password_hash`: it is
   adopted (marked config-managed, tokens kept) with an INFO line on
   `arneb::config`, so later config edits or removal apply to it.
+  `--reseed-state` re-seeds the catalogs, the access rules and the stored
+  settings too, like [`POST /api/v2/state/reseed`](/guide/http-api#re-seed).
 - **No `path`** keeps the state, and the audit log, in memory. Startup logs a
   WARN, `no [state] path: API tokens, worker cordons, admission limits and
   the audit log are lost on restart`, and the token API says so when it
@@ -867,8 +1055,10 @@ Options:
   --config <PATH>    Path to configuration file
   --port <PORT>      Override the pgwire port
   --role <ROLE>      Server role: standalone, coordinator, or worker
-  --reseed-state     Let [[auth.users]] overwrite state-created users of
-                     the same name (config users follow the config anyway)
+  --reseed-state     Re-seed the state from the config file, like
+                     POST /api/v2/state/reseed: catalogs, access rules and
+                     settings, and let [[auth.users]] overwrite
+                     state-created users of the same name
 ```
 
 ## Example: Standalone with Local Files

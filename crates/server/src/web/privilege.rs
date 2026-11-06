@@ -9,9 +9,7 @@
 //!   user in `[access_control] admin_users` or a `system_information` rule
 //!   allowing `write`. Nothing grants it by default.
 
-use std::sync::Arc;
-
-use arneb_catalog::AccessRules;
+use arneb_catalog::{AccessRules, RulesHandle};
 
 use super::auth::Identity;
 use super::error::{ApiError, ErrorCode};
@@ -54,22 +52,19 @@ impl KillGrant {
     }
 }
 
-/// Decides the observe and manage layers and the kill rule.
+/// Decides the observe and manage layers and the kill rule, against the
+/// live access rules: every decision reads [`RulesHandle::current`] once.
 #[derive(Clone)]
 pub struct Authorizer {
-    rules: Option<Arc<AccessRules>>,
+    rules: RulesHandle,
     admin_users: Vec<String>,
     password_auth: bool,
 }
 
 impl Authorizer {
-    /// An authorizer over the loaded `rules`, the `[access_control]
+    /// An authorizer over the live `rules`, the `[access_control]
     /// admin_users` and whether `[auth] type = "password"` is on.
-    pub fn new(
-        rules: Option<Arc<AccessRules>>,
-        admin_users: Vec<String>,
-        password_auth: bool,
-    ) -> Self {
+    pub fn new(rules: RulesHandle, admin_users: Vec<String>, password_auth: bool) -> Self {
         Self {
             rules,
             admin_users,
@@ -77,29 +72,27 @@ impl Authorizer {
         }
     }
 
-    fn manages(&self, who: &Identity) -> bool {
+    /// Whether `who` would hold manage under `rules` (`None`: no rules) —
+    /// the lockout check for a candidate rule set (runtime-config D3). A
+    /// user in `admin_users` always would; nobody does under `none` auth.
+    pub fn would_manage(&self, who: &Identity, rules: Option<&AccessRules>) -> bool {
         self.password_auth
             && (self.admin_users.contains(&who.user)
-                || self
-                    .rules
-                    .as_ref()
-                    .is_some_and(|r| r.system_information_write(&who.user)))
+                || rules.is_some_and(|r| r.system_information_write(&who.user)))
     }
 
-    fn observes(&self, who: &Identity) -> bool {
+    fn observes(&self, who: &Identity, rules: Option<&AccessRules>) -> bool {
         !self.password_auth
-            || self.manages(who)
-            || self
-                .rules
-                .as_ref()
-                .is_none_or(|r| r.system_information_read(&who.user))
+            || self.would_manage(who, rules)
+            || rules.is_none_or(|r| r.system_information_read(&who.user))
     }
 
-    /// Whether `who` holds `layer`.
+    /// Whether `who` holds `layer` under the current rules.
     pub fn allows(&self, who: &Identity, layer: Layer) -> bool {
+        let rules = self.rules.current();
         match layer {
-            Layer::Observe => self.observes(who),
-            Layer::Manage => self.manages(who),
+            Layer::Observe => self.observes(who, rules.as_deref()),
+            Layer::Manage => self.would_manage(who, rules.as_deref()),
         }
     }
 
@@ -147,14 +140,14 @@ impl Authorizer {
         if !self.password_auth {
             return Err(manage_requires_auth());
         }
-        if self
-            .rules
-            .as_ref()
+        let rules = self.rules.current();
+        if rules
+            .as_deref()
             .is_some_and(|r| r.has_query_rules() && r.can_kill_query(&who.user, owner))
         {
             return Ok(KillGrant::Rule);
         }
-        if self.manages(who) {
+        if self.would_manage(who, rules.as_deref()) {
             return Ok(KillGrant::Manage);
         }
         Err(ApiError::new(
@@ -192,8 +185,10 @@ mod tests {
         }
     }
 
-    fn rules(json: &str) -> Option<Arc<AccessRules>> {
-        Some(Arc::new(AccessRules::from_json(json).unwrap()))
+    fn rules(json: &str) -> RulesHandle {
+        RulesHandle::new(Some(std::sync::Arc::new(
+            AccessRules::from_json(json).unwrap(),
+        )))
     }
 
     fn code(r: Result<impl std::fmt::Debug, ApiError>) -> (ErrorCode, String) {
@@ -204,7 +199,7 @@ mod tests {
     #[test]
     fn observe_defaults_open_and_follows_the_section() {
         let alice = who("alice", true);
-        assert!(Authorizer::new(None, vec![], true)
+        assert!(Authorizer::new(RulesHandle::default(), vec![], true)
             .check(&alice, Layer::Observe)
             .is_ok());
         let sect = rules(r#"{"system_information":[{"user":"ops","allow":["read"]}]}"#);
@@ -233,14 +228,16 @@ mod tests {
     #[test]
     fn manage_is_denied_unless_granted() {
         let alice = who("alice", true);
-        let (c, hint) = code(Authorizer::new(None, vec![], true).check(&alice, Layer::Manage));
+        let (c, hint) = code(
+            Authorizer::new(RulesHandle::default(), vec![], true).check(&alice, Layer::Manage),
+        );
         assert_eq!(c, ErrorCode::Forbidden);
         assert_eq!(
             hint,
             "needs a system_information rule that allows write for user alice, \
              or alice in [access_control] admin_users"
         );
-        let a = Authorizer::new(None, vec!["root".into()], true);
+        let a = Authorizer::new(RulesHandle::default(), vec!["root".into()], true);
         assert!(a.check(&who("root", true), Layer::Manage).is_ok());
         assert!(a.check(&alice, Layer::Manage).is_err());
         let a = Authorizer::new(
@@ -250,7 +247,7 @@ mod tests {
         );
         assert!(a.check(&who("ops", true), Layer::Manage).is_ok());
         // Under none, even an admin_users name is refused.
-        let a = Authorizer::new(None, vec!["root".into()], false);
+        let a = Authorizer::new(RulesHandle::default(), vec!["root".into()], false);
         let e = a.check(&who("root", false), Layer::Manage).unwrap_err();
         assert_eq!(e.code, ErrorCode::ManageRequiresAuth);
         assert_eq!(
@@ -268,7 +265,7 @@ mod tests {
     #[test]
     fn kill_rule_order() {
         // 1. The owner, in any auth mode.
-        let none = Authorizer::new(None, vec![], false);
+        let none = Authorizer::new(RulesHandle::default(), vec![], false);
         let k = none.check_kill(&who("bob", false), Some("bob")).unwrap();
         assert!(k.is_owner());
         // A query with no user is owned by "".
@@ -282,7 +279,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::ManageRequiresAuth);
         // 3. No rules, or no queries section: only the owner or manage.
-        let open = Authorizer::new(None, vec!["root".into()], true);
+        let open = Authorizer::new(RulesHandle::default(), vec!["root".into()], true);
         let (c, _) = code(open.check_kill(&who("alice", true), Some("bob")));
         assert_eq!(c, ErrorCode::Forbidden, "alice cannot kill bob's query");
         assert!(open

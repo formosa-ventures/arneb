@@ -50,7 +50,7 @@ impl From<&crate::config::McpConfig> for McpSettings {
 }
 
 /// What the agent reads on `initialize`: the intended workflow (at most
-/// 1500 characters once filled; a test enforces it). The `{…}`
+/// 1900 characters once filled; a test enforces it). The `{…}`
 /// placeholders are filled from the configured limits (see
 /// [`tools::copy_values`]).
 const INSTRUCTIONS: &str = "\
@@ -69,7 +69,7 @@ Limits: a statement keeps max_rows rows (default {default_max_rows}, ceiling {ma
 
 Errors: a failed call returns a code and a hint. Use the hint and candidates (close matches for a misspelled name), then retry. A SQL error is a failed status.
 
-Operations: list_workers, get_worker, get_admission and list_audit_log need observe access. cordon_worker, drain_worker, uncordon_worker, set_admission_limits and cancel_query on another's query need the manage privilege or a queries kill rule (see whoami.privileges); each takes dry_run, so preview first. Actions are audited.
+Operations: list_workers, get_worker, get_admission and list_audit_log need observe access. cordon_/drain_/uncordon_worker, set_admission_limits and config tools (create_*, update_*, set_*, drop_*, reseed_state) need manage; cancel_query on another's query needs manage or a queries kill rule (see whoami.privileges). Changes take dry_run and are audited.
 
 Queries run as your user and see only what it may see.";
 
@@ -251,8 +251,15 @@ mod tests {
             credentials,
             state: password.then_some(store),
             audit: crate::web::test_audit_log(),
-            access_rules: None,
-            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), password),
+            rules: Default::default(),
+            config_changes: Default::default(),
+            config_path: None,
+            catalogs: None,
+            authorizer: crate::web::privilege::Authorizer::new(
+                Default::default(),
+                Vec::new(),
+                password,
+            ),
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent: None,
@@ -369,7 +376,8 @@ mod tests {
                     r#"{"system_information":[{"user":"bob","allow":["read"]}]}"#,
                 )
                 .unwrap(),
-            )),
+            ))
+            .into(),
             vec!["alice".into()],
             true,
         );
@@ -707,9 +715,9 @@ mod tests {
     }
 
     fn with_rules(mut state: WebState, json: &str) -> WebState {
-        state.access_rules = Some(Arc::new(
+        state.rules = arneb_catalog::RulesHandle::new(Some(Arc::new(
             arneb_catalog::AccessRules::from_json(json).unwrap(),
-        ));
+        )));
         state
     }
 

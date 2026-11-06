@@ -294,6 +294,7 @@ impl QueryCoordinator {
                     &mut stage_results,
                     &query_id,
                     root_must_drain,
+                    exec_ctx.catalog_version(),
                 )
                 .await?;
             }
@@ -658,6 +659,70 @@ fn attribute_worker_failure(
     ))
 }
 
+/// `version` with only the catalogs `plan` (a serialized fragment) scans:
+/// every `TableScan`'s catalog, or the default catalog for one that names
+/// none, as the worker qualifies it. A scan inside a subquery expression
+/// counts too, since the whole tree is searched.
+fn scanned_catalog_version(
+    version: &arneb_common::CatalogVersion,
+    plan: &serde_json::Value,
+) -> arneb_common::CatalogVersion {
+    fn scanned(value: &serde_json::Value, default: &str, out: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    if key == "TableScan" {
+                        let catalog = child
+                            .get("table")
+                            .and_then(|t| t.get("catalog"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or(default);
+                        out.insert(catalog.to_owned());
+                    }
+                    scanned(child, default, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    scanned(item, default, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    use std::collections::BTreeSet;
+    let mut names = BTreeSet::new();
+    scanned(plan, &version.default_catalog, &mut names);
+    let mut filtered = version.clone();
+    filtered.catalogs.retain(|name, _| names.contains(name));
+    filtered
+}
+
+/// A fragment's plan as the JSON its tasks carry, with `version` cut down
+/// to the catalogs the fragment scans: the worker checks no others, and
+/// the rest (secret-derived) need not go to every task. The plan goes
+/// through `to_string`, which writes any `i128` (a large `Decimal128`
+/// literal); `to_value` refuses one outside the i64/u64 range. The scans
+/// are then read from that string parsed back (an out-of-range number
+/// parses as a float there, which the scan search never looks at).
+fn serialize_fragment_plan(
+    root: &LogicalPlan,
+    version: Option<&arneb_common::CatalogVersion>,
+) -> Result<(String, Option<arneb_common::CatalogVersion>), ExecutionError> {
+    let failed = |e: serde_json::Error| {
+        ExecutionError::InvalidOperation(format!("plan serialization failed: {e}"))
+    };
+    let plan_json = serde_json::to_string(root).map_err(failed)?;
+    let version = match version {
+        Some(v) => {
+            let plan: serde_json::Value = serde_json::from_str(&plan_json).map_err(failed)?;
+            Some(scanned_catalog_version(v, &plan))
+        }
+        None => None,
+    };
+    Ok((plan_json, version))
+}
+
 /// A worker's Flight address with its scheme.
 pub(crate) fn flight_address(address: &str) -> String {
     if address.starts_with("http") {
@@ -765,6 +830,8 @@ async fn execute_child_on_worker(
     // this fragment's task descriptors; computed by the caller from the
     // consumer's root via `may_stop_input_early`.
     consumer_must_drain: bool,
+    // The catalog set the query was planned against, for every task.
+    catalog_version: Option<Arc<arneb_common::CatalogVersion>>,
 ) -> Result<(), ExecutionError> {
     // Recursively execute children first. A child's consumer is THIS fragment,
     // so its producers must_drain unless this fragment can legitimately
@@ -778,14 +845,15 @@ async fn execute_child_on_worker(
             stage_results,
             query_id,
             child_must_drain,
+            catalog_version.clone(),
         ))
         .await?;
     }
 
     let stage_id = fragment.id;
 
-    let plan_json = serde_json::to_string(&fragment.root)
-        .map_err(|e| ExecutionError::InvalidOperation(format!("plan serialization failed: {e}")))?;
+    let (plan_json, catalog_version) =
+        serialize_fragment_plan(&fragment.root, catalog_version.as_deref())?;
 
     // W3-Hash.6 (2026-05-20): distinguish β producer from α consumer.
     // Trino uses α: N parallel tasks each emitting 1 output partition.
@@ -960,6 +1028,7 @@ async fn execute_child_on_worker(
             // A1-fused scan SOURCE fragment, else 1. The worker strides the
             // scan by (task_id.partition_id, scan_task_count).
             scan_task_count,
+            catalog_version: catalog_version.clone(),
         };
 
         let flight_addr = flight_address(&worker.address);
@@ -1541,6 +1610,131 @@ mod tests {
             version: env!("CARGO_PKG_VERSION").to_string(),
             draining: false,
         }
+    }
+
+    /// Round 5: a task carries only the fingerprints of the catalogs its
+    /// fragment scans (an unqualified scan's default catalog included),
+    /// with the epoch, generation and defaults unchanged.
+    #[test]
+    fn a_task_carries_only_its_scanned_catalogs() {
+        let version = arneb_common::CatalogVersion {
+            epoch: 9,
+            generation: 4,
+            catalogs: [("lake", 1), ("pg", 2), ("other", 3)]
+                .into_iter()
+                .map(|(n, f)| (n.to_owned(), f))
+                .collect(),
+            default_catalog: "lake".into(),
+            default_schema: "default".into(),
+        };
+        let scan = |catalog: Option<&str>| {
+            serde_json::json!({"TableScan": {
+                "table": {"catalog": catalog, "schema": "s", "table": "t"},
+                "schema": [], "alias": null
+            }})
+        };
+        let plan = serde_json::json!({"Join": {
+            "left": scan(Some("pg")),
+            "right": {"Filter": {"input": scan(None)}}
+        }});
+        let filtered = scanned_catalog_version(&version, &plan);
+        assert_eq!(filtered.catalogs.keys().collect::<Vec<_>>(), ["lake", "pg"]);
+        assert_eq!(
+            (
+                filtered.epoch,
+                filtered.generation,
+                filtered.default_catalog.as_str()
+            ),
+            (9, 4, "lake")
+        );
+        // A real fragment plan serializes its scan the same way.
+        let real = arneb_planner::LogicalPlan::TableScan {
+            table: arneb_common::types::TableReference {
+                catalog: Some("other".into()),
+                schema: Some("s".into()),
+                table: "t".into(),
+            },
+            schema: vec![],
+            alias: None,
+            properties: Default::default(),
+            dynamic_filters_consumed: Default::default(),
+        };
+        let filtered = scanned_catalog_version(&version, &serde_json::to_value(&real).unwrap());
+        assert_eq!(filtered.catalogs.keys().collect::<Vec<_>>(), ["other"]);
+    }
+
+    /// Round 6: a fragment holding a `Decimal128` literal outside the
+    /// i64/u64 range still serializes (`to_value` refused it), and its
+    /// scanned catalogs are still found.
+    #[tokio::test]
+    async fn a_fragment_with_a_large_decimal_literal_serializes() {
+        use arneb_catalog::CatalogManager;
+        use arneb_connectors::memory::{MemoryCatalog, MemorySchema, MemoryTable};
+
+        let table = Arc::new(MemoryTable::new(
+            vec![arneb_common::types::ColumnInfo {
+                name: "id".into(),
+                data_type: arneb_common::types::DataType::Int32,
+                nullable: false,
+            }],
+            vec![],
+        ));
+        let mem_schema = Arc::new(MemorySchema::new());
+        mem_schema.register_table("t", table);
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", mem_schema);
+        let cm = CatalogManager::new("memory", "default");
+        cm.register_catalog("memory", catalog);
+        let statement = arneb_sql_parser::parse(
+            "SELECT id, CAST('123456789012345678901' AS DECIMAL(38,0)) FROM t",
+        )
+        .unwrap();
+        let plan = arneb_planner::QueryPlanner::new(&cm)
+            .plan_statement(&statement)
+            .await
+            .unwrap();
+        // As the protocol layer runs it: the optimizer folds the cast into
+        // a `Decimal128` literal.
+        let plan = arneb_planner::LogicalOptimizer::default_rules()
+            .optimize(plan)
+            .unwrap();
+        let root = arneb_planner::PlanFragmenter::new().fragment(plan);
+        let version = arneb_common::CatalogVersion {
+            epoch: 1,
+            generation: 2,
+            catalogs: [("memory", 1), ("other", 2)]
+                .into_iter()
+                .map(|(n, f)| (n.to_owned(), f))
+                .collect(),
+            default_catalog: "memory".into(),
+            default_schema: "default".into(),
+        };
+        let mut fragments = vec![&root];
+        let mut scanned = Vec::new();
+        while let Some(fragment) = fragments.pop() {
+            fragments.extend(&fragment.source_fragments);
+            let (json, filtered) = serialize_fragment_plan(&fragment.root, Some(&version))
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert!(serde_json::from_str::<LogicalPlan>(&json).is_ok(), "{json}");
+            scanned.extend(filtered.unwrap().catalogs.into_keys());
+        }
+        assert!(
+            scanned.iter().any(|c| c == "memory") && !scanned.iter().any(|c| c == "other"),
+            "{scanned:?}"
+        );
+        // The literal itself survives the round trip.
+        let json = serde_json::to_string(&root.root).unwrap();
+        let all = std::iter::once(json)
+            .chain(
+                root.source_fragments
+                    .iter()
+                    .map(|f| serde_json::to_string(&f.root).unwrap()),
+            )
+            .collect::<String>();
+        assert!(
+            all.contains(r#""Decimal128":{"value":123456789012345678901"#),
+            "{all}"
+        );
     }
 
     #[tokio::test]

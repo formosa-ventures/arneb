@@ -6,7 +6,7 @@ use arneb_common::types::DataType;
 use arneb_common::ServerConfig;
 use arneb_connectors::{CloudStorageConfig, S3StorageConfig};
 use arneb_protocol::{AuthMethod, PgwireTlsMode, ScramVerifier, UserCredentials};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
@@ -239,18 +239,125 @@ impl AccessControlConfig {
         Ok(())
     }
 
-    /// Read and parse the rules file, if one is set.
-    pub fn load_rules(&self) -> Result<Option<arneb_catalog::AccessRules>> {
+    /// Read and parse the rules file, if one is set: its text and the
+    /// parsed rules.
+    pub fn load_rules_text(&self) -> Result<Option<(String, arneb_catalog::AccessRules)>> {
         let Some(path) = &self.rules_file else {
             return Ok(None);
         };
         let text = std::fs::read_to_string(path).map_err(|e| {
             anyhow::anyhow!("cannot read access rules file {}: {e}", path.display())
         })?;
-        arneb_catalog::AccessRules::from_json(&text)
-            .map(Some)
-            .map_err(|e| anyhow::anyhow!("access rules file {}: {e}", path.display()))
+        let rules = arneb_catalog::AccessRules::from_json(&text)
+            .map_err(|e| anyhow::anyhow!("access rules file {}: {e}", path.display()))?;
+        Ok(Some((text, rules)))
     }
+}
+
+/// The startup access rules ([`resolve_access_rules`]).
+pub struct ResolvedRules {
+    /// The live rules every protocol and the Web API share.
+    pub handle: arneb_catalog::RulesHandle,
+    /// `"config"` (the rules file, no state store) or `"state"` (the copy in
+    /// the state store, which wins under password auth).
+    pub source: &'static str,
+    /// What seeding did; `None` without a state store.
+    pub seed: Option<arneb_state::RulesSeed>,
+}
+
+/// The startup refusal for a rules file edited since it was seeded while
+/// the stored rules were changed at runtime (Ruling R14).
+pub fn rules_file_changed(config: &AccessControlConfig) -> anyhow::Error {
+    let rules_file = config
+        .rules_file
+        .as_ref()
+        .map_or_else(|| "(unset)".to_owned(), |p| p.display().to_string());
+    anyhow::anyhow!(
+        "[access_control] rules_file {rules_file} changed since it was seeded, but the access \
+         rules in the state store were changed at runtime since then: refusing to pick one. \
+         Restart with --reseed-state to replace the stored state with the config file (the \
+         users, catalogs, rules and settings become the config's; re-seeded users' tokens \
+         are revoked), or restore the rules file to its last seeded version to keep the \
+         runtime rules (copying GET /api/v2/access-rules into the file then makes them the \
+         file's)"
+    )
+}
+
+/// Pick the startup access rules (runtime-config D1). Without a state store
+/// (`[auth] type = "none"`) they are the rules file's, as before. With one,
+/// the rules file seeds the state on its first start (or with `reseed`).
+/// On a later start, rules that came from the file follow it: a changed
+/// rules file is stored again (INFO). Rules changed at runtime are kept
+/// over a rules file unchanged since it was last seeded (WARN); a rules
+/// file edited since then refuses the start, naming `--reseed-state`. A
+/// rules file that cannot be read or parsed is fatal. `loaded` is the rules
+/// file as the caller already read it (`Some`), so it is read only once;
+/// `None` reads it here.
+pub fn resolve_access_rules(
+    config: &AccessControlConfig,
+    store: Option<&arneb_state::StateStore>,
+    reseed: bool,
+    loaded: Option<Option<(String, arneb_catalog::AccessRules)>>,
+) -> Result<ResolvedRules> {
+    let file = match loaded {
+        Some(file) => file,
+        None => config.load_rules_text()?,
+    };
+    let Some(store) = store else {
+        return Ok(ResolvedRules {
+            handle: arneb_catalog::RulesHandle::new(file.map(|(_, rules)| Arc::new(rules))),
+            source: "config",
+            seed: None,
+        });
+    };
+    let text = file.as_ref().map(|(text, _)| text.as_str());
+    let seed = store
+        .seed_rules(text, reseed)
+        .map_err(|e| anyhow::anyhow!("cannot seed the access rules: {e}"))?;
+    let rules_file = || {
+        config
+            .rules_file
+            .as_ref()
+            .map_or_else(|| "(unset)".to_owned(), |p| p.display().to_string())
+    };
+    match seed {
+        arneb_state::RulesSeed::FollowedFile => tracing::info!(
+            target: "arneb::config",
+            rules_file = %rules_file(),
+            "[access_control] rules_file changed since it was seeded and the stored rules \
+             were never changed at runtime; the state store now holds the file's rules"
+        ),
+        arneb_state::RulesSeed::Diverged => {
+            let what = config.rules_file.as_ref().map_or_else(
+                || "rules_file is not set, but the state store holds access rules".to_owned(),
+                |p| {
+                    format!(
+                        "rules_file {} differs from the access rules in the state store",
+                        p.display()
+                    )
+                },
+            );
+            tracing::warn!(
+                target: "arneb::config",
+                "[access_control] {what} (they were changed at runtime); the state store's \
+                 rules are used. Preview a re-seed with POST /api/v2/state/reseed?dry_run=true"
+            );
+        }
+        arneb_state::RulesSeed::FileChanged => return Err(rules_file_changed(config)),
+        arneb_state::RulesSeed::Seeded | arneb_state::RulesSeed::Unchanged => {}
+    }
+    let rules = match store.access_rules() {
+        Some(stored) => Some(Arc::new(
+            arneb_catalog::AccessRules::from_json(&stored.json)
+                .map_err(|e| anyhow::anyhow!("the access rules in the state store: {e}"))?,
+        )),
+        None => None,
+    };
+    Ok(ResolvedRules {
+        handle: arneb_catalog::RulesHandle::new(rules),
+        source: "state",
+        seed: Some(seed),
+    })
 }
 
 /// `[web]` section.
@@ -889,11 +996,41 @@ impl ObservabilityConfig {
         );
         Ok(())
     }
+}
 
-    /// The slow-query threshold; `None` when the log is off.
-    pub fn slow_query_threshold(&self) -> Option<std::time::Duration> {
-        (self.slow_query_threshold_ms > 0)
-            .then(|| std::time::Duration::from_millis(self.slow_query_threshold_ms))
+/// A slow-query threshold in ms as a duration; `None` (log off) for `0`.
+pub fn slow_query_threshold_from_ms(ms: u64) -> Option<std::time::Duration> {
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// The slow-query threshold a coordinator starts with (runtime-config D1,
+/// D9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSlowQuery {
+    /// The threshold in ms to apply (`0` = log off).
+    pub ms: u64,
+    /// `"config"` (`[observability]`) or `"state"` (a runtime value stored
+    /// in the state store).
+    pub source: &'static str,
+    /// `(config value, stored value)` when a stored value overrides a
+    /// different config value.
+    pub diverging: Option<(u64, u64)>,
+}
+
+/// Pick the startup slow-query threshold: a value stored at runtime wins
+/// over the config, and a different config value is reported as diverging.
+pub fn resolve_slow_query_threshold(config_ms: u64, stored: Option<u64>) -> ResolvedSlowQuery {
+    match stored {
+        None => ResolvedSlowQuery {
+            ms: config_ms,
+            source: "config",
+            diverging: None,
+        },
+        Some(ms) => ResolvedSlowQuery {
+            ms,
+            source: "state",
+            diverging: (ms != config_ms).then_some((config_ms, ms)),
+        },
     }
 }
 
@@ -1272,8 +1409,10 @@ impl MemoryConfig {
     }
 }
 
-/// External catalog configuration.
-#[derive(Debug, Clone, Deserialize)]
+/// External catalog configuration. `Serialize` writes the raw secrets
+/// (for the state file and the cluster RPC); responses and logs use
+/// `catalogs::redacted_spec`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct CatalogConfig {
     /// Catalog name (used in SQL: `SELECT * FROM <name>.schema.table`).
@@ -1431,7 +1570,7 @@ fn check_password_env_vars(catalogs: &[CatalogConfig]) -> Result<()> {
 }
 
 /// Global storage backend configuration.
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct StorageConfig {
     /// AWS S3 configuration.
@@ -1445,7 +1584,7 @@ pub struct StorageConfig {
 /// AWS S3 storage configuration.
 ///
 /// Credential resolution: config > env var (`AWS_ACCESS_KEY_ID`) > IAM role.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct S3Config {
     /// AWS region (e.g., "us-east-1").
@@ -1462,7 +1601,7 @@ pub struct S3Config {
 }
 
 /// Google Cloud Storage configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct GcsConfig {
     /// Path to service account JSON key file.
@@ -1470,13 +1609,54 @@ pub struct GcsConfig {
 }
 
 /// Azure Blob Storage configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct AzureConfig {
     /// Azure storage account name.
     pub storage_account: Option<String>,
     /// Azure storage access key.
     pub access_key: Option<String>,
+}
+
+/// Shows whether the secret key is set, never its value.
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("allow_http", &self.allow_http)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Shows whether the key path is set, never its value.
+impl std::fmt::Debug for GcsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcsConfig")
+            .field(
+                "service_account_path",
+                &self.service_account_path.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Shows whether the access key is set, never its value.
+impl std::fmt::Debug for AzureConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureConfig")
+            .field("storage_account", &self.storage_account)
+            .field(
+                "access_key",
+                &self.access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl StorageConfig {
@@ -1602,8 +1782,9 @@ pub struct HeartbeatSettings {
     pub timeout_secs: u64,
 }
 
-/// A string that never appears in `Debug` output.
-#[derive(Clone, Deserialize, PartialEq, Eq)]
+/// A string that never appears in `Debug` output. `Serialize` writes the
+/// raw value (state file, cluster RPC); redact before returning it.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct RedactedString(pub String);
 
@@ -2638,13 +2819,16 @@ pgwire = "required"
         };
         let none = load("port = 5432", &[]).unwrap();
         assert_eq!(
-            none.slow_query_threshold(),
+            slow_query_threshold_from_ms(none.slow_query_threshold_ms),
             Some(std::time::Duration::from_secs(10))
         );
         let file = "[observability]\nslow_query_threshold_ms = 2500\n";
         assert_eq!(load(file, &[]).unwrap().slow_query_threshold_ms, 2500);
         let off = load(file, &[("ARNEB_SLOW_QUERY_THRESHOLD_MS", "0")]).unwrap();
-        assert_eq!(off.slow_query_threshold(), None);
+        assert_eq!(
+            slow_query_threshold_from_ms(off.slow_query_threshold_ms),
+            None
+        );
         let err = load(file, &[("ARNEB_SLOW_QUERY_THRESHOLD_MS", "soon")]).unwrap_err();
         assert!(
             err.to_string().contains("ARNEB_SLOW_QUERY_THRESHOLD_MS"),
@@ -3336,23 +3520,23 @@ password = "hunter2"
 
         let mut cfg: AccessControlConfig = toml::from_str("").unwrap();
         cfg.apply_env(env_from(&[])).unwrap();
-        assert!(cfg.load_rules().unwrap().is_none());
+        assert!(cfg.load_rules_text().unwrap().is_none());
 
         let mut cfg: AccessControlConfig =
             toml::from_str(&format!("rules_file = {:?}", bad.display().to_string())).unwrap();
-        let err = cfg.load_rules().unwrap_err().to_string();
+        let err = cfg.load_rules_text().unwrap_err().to_string();
         assert!(err.contains("bad.json") && err.contains("filter"), "{err}");
         cfg.apply_env(env_from(&[(
             "ARNEB_ACCESS_CONTROL_RULES_FILE",
             good.to_str().unwrap(),
         )]))
         .unwrap();
-        let rules = cfg.load_rules().unwrap().unwrap();
+        let (_, rules) = cfg.load_rules_text().unwrap().unwrap();
         assert_eq!(rules.section_sizes(), [None, None, Some(1), None, None]);
 
         cfg.rules_file = Some(dir.join("missing.json"));
         assert!(cfg
-            .load_rules()
+            .load_rules_text()
             .unwrap_err()
             .to_string()
             .contains("missing.json"));
@@ -3381,5 +3565,114 @@ password = "hunter2"
             .unwrap();
         assert_eq!(cfg.admin_users, ["a", "b"]);
         assert!(toml::from_str::<AccessControlConfig>("admin_user = []").is_err());
+    }
+
+    fn rules_config(dir: &Path, text: Option<&str>) -> AccessControlConfig {
+        let rules_file = text.map(|t| {
+            let p = dir.join("rules.json");
+            std::fs::write(&p, t).unwrap();
+            p
+        });
+        AccessControlConfig {
+            rules_file,
+            admin_users: Vec::new(),
+        }
+    }
+
+    const RULES_A: &str = r#"{"queries":[{"user":"alice","allow":["execute"]}]}"#;
+    const RULES_B: &str = r#"{"queries":[{"user":"bob","allow":["execute"]}]}"#;
+
+    /// Rules from the file follow it: a tightened file applies on the next
+    /// start (the revoked user loses access).
+    #[test]
+    fn file_seeded_rules_follow_the_rules_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_path = tmp.path().join("state.json");
+        let store = arneb_state::StateStore::open(Some(&state_path)).unwrap();
+        let config = rules_config(tmp.path(), Some(RULES_A));
+        let r = resolve_access_rules(&config, Some(&store), false, None).unwrap();
+        assert_eq!(r.source, "state");
+        assert_eq!(r.seed, Some(arneb_state::RulesSeed::Seeded));
+        assert!(r.handle.current().unwrap().can_execute("alice"));
+        drop(store);
+
+        let store = arneb_state::StateStore::open(Some(&state_path)).unwrap();
+        let config = rules_config(tmp.path(), Some(RULES_B));
+        let r = resolve_access_rules(&config, Some(&store), false, None).unwrap();
+        assert_eq!(r.seed, Some(arneb_state::RulesSeed::FollowedFile));
+        let live = r.handle.current().unwrap();
+        assert!(live.can_execute("bob") && !live.can_execute("alice"));
+
+        // --reseed-state copies the file again.
+        let config = rules_config(tmp.path(), Some(RULES_A));
+        let r = resolve_access_rules(&config, Some(&store), true, None).unwrap();
+        assert_eq!(r.seed, Some(arneb_state::RulesSeed::Seeded));
+        assert!(r.handle.current().unwrap().can_execute("alice"));
+    }
+
+    /// Rules changed at runtime: kept over an unchanged file (WARN), and a
+    /// file edited since the seed refuses the start until a re-seed.
+    #[test]
+    fn runtime_rules_and_an_edited_rules_file_refuse_the_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = arneb_state::StateStore::open(None).unwrap();
+        let config = rules_config(tmp.path(), Some(RULES_A));
+        resolve_access_rules(&config, Some(&store), false, None).unwrap();
+        store
+            .set_access_rules(Some(arneb_state::StoredRules {
+                json: RULES_B.into(),
+                from_config: false,
+            }))
+            .unwrap();
+
+        let r = resolve_access_rules(&config, Some(&store), false, None).unwrap();
+        assert_eq!(r.seed, Some(arneb_state::RulesSeed::Diverged));
+        assert!(r.handle.current().unwrap().can_execute("bob"));
+
+        const RULES_C: &str = r#"{"queries":[{"user":"carol","allow":["execute"]}]}"#;
+        let edited = rules_config(tmp.path(), Some(RULES_C));
+        let e = resolve_access_rules(&edited, Some(&store), false, None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("--reseed-state")
+                && e.contains("users")
+                && e.contains("restore the rules file"),
+            "{e}"
+        );
+        assert_eq!(store.access_rules().unwrap().json, RULES_B, "unchanged");
+        let r = resolve_access_rules(&edited, Some(&store), true, None).unwrap();
+        assert_eq!(r.seed, Some(arneb_state::RulesSeed::Seeded));
+        assert!(r.handle.current().unwrap().can_execute("carol"));
+    }
+
+    #[test]
+    fn a_bad_rules_file_is_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = arneb_state::StateStore::open(None).unwrap();
+        let bad = rules_config(tmp.path(), Some("{not json"));
+        assert!(resolve_access_rules(&bad, Some(&store), false, None).is_err());
+        assert!(!store.seeded().rules, "nothing was seeded");
+
+        let good = rules_config(tmp.path(), Some(RULES_A));
+        resolve_access_rules(&good, Some(&store), false, None).unwrap();
+        let bad = rules_config(tmp.path(), Some("{not json"));
+        assert!(resolve_access_rules(&bad, Some(&store), false, None).is_err());
+        assert!(resolve_access_rules(&bad, Some(&store), true, None).is_err());
+        assert_eq!(store.access_rules().unwrap().json, RULES_A);
+    }
+
+    #[test]
+    fn without_a_state_store_the_rules_file_is_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = rules_config(tmp.path(), Some(RULES_A));
+        let r = resolve_access_rules(&config, None, false, None).unwrap();
+        assert_eq!((r.source, r.seed), ("config", None));
+        assert!(r.handle.current().unwrap().can_execute("alice"));
+        let r = resolve_access_rules(&rules_config(tmp.path(), None), None, false, None).unwrap();
+        assert!(r.handle.current().is_none());
+        let bad = rules_config(tmp.path(), Some("{not json"));
+        assert!(resolve_access_rules(&bad, None, false, None).is_err());
     }
 }

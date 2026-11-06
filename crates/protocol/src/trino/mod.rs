@@ -121,7 +121,7 @@ pub struct TrinoServer {
     query_memory_limit: Option<usize>,
     admission: Option<arneb_scheduler::AdmissionController>,
     statement_timeout: Option<Duration>,
-    access_rules: Option<Arc<arneb_catalog::AccessRules>>,
+    access_rules: arneb_catalog::RulesHandle,
 }
 
 impl TrinoServer {
@@ -144,7 +144,7 @@ impl TrinoServer {
             query_memory_limit: None,
             admission: None,
             statement_timeout: None,
-            access_rules: None,
+            access_rules: Default::default(),
         }
     }
 
@@ -220,9 +220,11 @@ impl TrinoServer {
     }
 
     /// Check every statement against `rules` for the session user
-    /// (file-based-access-control). Default: none, every user reads all.
-    pub fn with_access_rules(mut self, rules: Option<Arc<arneb_catalog::AccessRules>>) -> Self {
-        self.access_rules = rules;
+    /// (file-based-access-control). Pass a [`arneb_catalog::RulesHandle`]
+    /// to share live rules: each statement uses the rules current when it
+    /// starts. Default: none, every user reads all.
+    pub fn with_access_rules(mut self, rules: impl Into<arneb_catalog::RulesHandle>) -> Self {
+        self.access_rules = rules.into();
         self
     }
 

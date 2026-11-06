@@ -7,7 +7,10 @@
 # `tables` section grants user2 SELECT only, `admin_users = [<admin>]` and a
 # persistent `[state] path`. Uses curl and jq for the API and psql for the
 # pgwire checks. Prints `PASS <step>` per check and exits non-zero at the
-# first `FAIL <step>`. Passwords are never printed.
+# first `FAIL <step>`. Passwords are never printed, but they are passed on
+# the curl command line (`curl -u user:password`), where `ps` on the same
+# host can see them: run it only on a host you trust, with throwaway
+# passwords. scripts/runtime-config-smoke.sh keeps them off the command line.
 #
 # Environment:
 #   ARNEB_URL             Web port base URL, e.g. http://127.0.0.1:6432 (required)
@@ -366,7 +369,7 @@ out=$(curl -sS -u "$ADMIN:$ARNEB_ADMIN_PASSWORD" -X POST "$MCP" \
     -H 'MCP-Protocol-Version: 2025-06-18' \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}') || fail "curl tools/list"
 LAST="$out"
-check '.result.tools | length == 26' "tools/list does not have exactly 26 tools"
+check '.result.tools | length == 44' "tools/list does not have exactly 44 tools"
 mcp_tool ADMIN get_worker "$(jq -nc --arg id "$W1" '{id:$id}')"
 check '.isError == false' "get_worker as admin returned isError"
 check '.structuredContent.scheduling == "schedulable"' "get_worker does not report $W1 schedulable"

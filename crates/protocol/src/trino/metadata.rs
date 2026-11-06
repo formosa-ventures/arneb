@@ -258,9 +258,9 @@ pub(crate) async fn build_virtual_catalogs(
     let tables = collect_tables(root, &scan_catalogs, with_columns).await;
 
     let meta_cm = CatalogManager::new(session_catalog, INFORMATION_SCHEMA);
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
 
-    let mut register = |name: &str, catalog: Arc<MemoryCatalog>| {
+    let register = |name: &str, catalog: Arc<MemoryCatalog>| {
         meta_cm.register_catalog(name, catalog.clone());
         registry.register(
             name,

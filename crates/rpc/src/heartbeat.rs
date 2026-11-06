@@ -93,6 +93,37 @@ impl HeartbeatMessage {
     }
 }
 
+/// The coordinator's answer to a heartbeat, encoded as JSON
+/// (runtime-config D8).
+///
+/// Fields must be `#[serde(default)]`: a body that is not JSON (the `"ok"`
+/// of earlier releases) decodes as the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeartbeatReply {
+    /// The generation of the coordinator's live catalog set; a worker that
+    /// applied another one pulls the set with `get_catalogs`. `None` when
+    /// the coordinator does not serve catalogs.
+    #[serde(default)]
+    pub catalog_generation: Option<u64>,
+    /// The coordinator's epoch, chosen at random at each start (Ruling R6).
+    /// A worker holding a set from another epoch pulls, whatever the
+    /// generations.
+    #[serde(default)]
+    pub catalog_epoch: Option<u64>,
+}
+
+impl HeartbeatReply {
+    /// Serialize to JSON.
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("HeartbeatReply serialization should not fail")
+    }
+
+    /// Deserialize from JSON; any other body decodes as the default.
+    pub fn decode(data: &[u8]) -> Self {
+        serde_json::from_slice(data).unwrap_or_default()
+    }
+}
+
 /// Send a heartbeat to the coordinator's Flight server.
 ///
 /// Uses the Flight `do_action` RPC with action type "heartbeat".
@@ -100,7 +131,8 @@ pub async fn send_heartbeat(
     coordinator_address: &str,
     message: &HeartbeatMessage,
 ) -> Result<(), ExecutionError> {
-    Ok(send_heartbeat_with(coordinator_address, message, cluster_security()).await?)
+    send_heartbeat_with(coordinator_address, message, cluster_security()).await?;
+    Ok(())
 }
 
 /// Why a heartbeat failed.
@@ -127,12 +159,12 @@ impl From<HeartbeatError> for ExecutionError {
 }
 
 /// [`send_heartbeat`] with explicit cluster security, keeping the
-/// rejected-secret case distinct.
+/// rejected-secret case distinct. Returns the coordinator's reply.
 pub async fn send_heartbeat_with(
     coordinator_address: &str,
     message: &HeartbeatMessage,
     security: &ClusterSecurity,
-) -> Result<(), HeartbeatError> {
+) -> Result<HeartbeatReply, HeartbeatError> {
     let mut client = crate::security::connect(coordinator_address, security)
         .await
         .map_err(|e| HeartbeatError::Other(format!("coordinator at {coordinator_address}: {e}")))?;
@@ -142,7 +174,7 @@ pub async fn send_heartbeat_with(
         body: message.encode().into(),
     };
 
-    let _response = client.do_action(action).await.map_err(|status| {
+    let response = client.do_action(action).await.map_err(|status| {
         if status.code() == tonic::Code::Unauthenticated {
             HeartbeatError::Unauthenticated(coordinator_address.to_owned())
         } else if status.code() == tonic::Code::FailedPrecondition {
@@ -155,7 +187,15 @@ pub async fn send_heartbeat_with(
         }
     })?;
 
-    Ok(())
+    use futures::StreamExt;
+    let mut stream = response.into_inner();
+    match stream.next().await {
+        Some(Ok(result)) => Ok(HeartbeatReply::decode(&result.body)),
+        Some(Err(status)) => Err(HeartbeatError::Other(format!(
+            "heartbeat response error: {status}"
+        ))),
+        None => Ok(HeartbeatReply::default()),
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +230,22 @@ mod tests {
         assert_eq!(msg.flight_address, "http://localhost:9090");
         assert_eq!(msg.max_splits, 256);
         assert_eq!(msg.version, LEGACY_VERSION);
+    }
+
+    #[test]
+    fn heartbeat_reply_ok_body_decodes_as_none() {
+        assert_eq!(HeartbeatReply::decode(b"ok").catalog_generation, None);
+        assert_eq!(HeartbeatReply::decode(b"").catalog_generation, None);
+        let reply = HeartbeatReply {
+            catalog_generation: Some(3),
+            catalog_epoch: Some(9),
+        };
+        assert_eq!(HeartbeatReply::decode(&reply.encode()), reply);
+        assert_eq!(
+            HeartbeatReply::decode(b"{}").catalog_generation,
+            None,
+            "a JSON body without the field"
+        );
     }
 
     #[test]

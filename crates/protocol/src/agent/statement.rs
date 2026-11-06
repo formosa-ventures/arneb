@@ -214,6 +214,23 @@ impl Statement {
         self.lock().last_access = Instant::now();
     }
 
+    /// [`Self::touch`], returning the access time it replaced and the one
+    /// it set, for [`Self::untouch`].
+    pub(crate) fn touch_from(&self) -> (Instant, Instant) {
+        let mut inner = self.lock();
+        let now = Instant::now();
+        (std::mem::replace(&mut inner.last_access, now), now)
+    }
+
+    /// Puts back the access time `before` that a [`Self::touch_from`]
+    /// replaced with `touched`, unless the statement was accessed since.
+    pub(crate) fn untouch(&self, before: Instant, touched: Instant) {
+        let mut inner = self.lock();
+        if inner.last_access == touched {
+            inner.last_access = before;
+        }
+    }
+
     /// Moves a statement that is still executing to `phase` (terminal).
     /// Returns `false` when it had already ended.
     pub(crate) fn end(&self, phase: Phase) -> bool {

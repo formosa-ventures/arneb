@@ -634,7 +634,7 @@ impl AgentQueryService {
             // One reaper cancel at a time per statement: a kill may wait for
             // a poll of the work for longer than the idle timeout. (Touched
             // too, so the next passes skip it until then.)
-            statement.touch();
+            let (before, touched) = statement.touch_from();
             if statement.reaping.swap(true, Ordering::SeqCst) {
                 continue;
             }
@@ -643,11 +643,18 @@ impl AgentQueryService {
             let tracker = Arc::clone(&self.tracker);
             tokio::spawn(async move {
                 let reaping = Reaping(&statement);
-                cancel_now(&tracker, &statement, error, "abandoned").await;
+                if cancel_now(&tracker, &statement, error, "abandoned").await {
+                    // Keep it for another idle period so a returning client
+                    // learns why it was cancelled.
+                    statement.touch();
+                } else {
+                    // It ended on its own first: undo this pass's touch
+                    // (unless a client came back meanwhile), so the next
+                    // pass releases it like any ended, idle statement, as
+                    // a DELETE racing completion releases it.
+                    statement.untouch(before, touched);
+                }
                 drop(reaping);
-                // Keep it for another idle period so a returning client
-                // learns why it was cancelled.
-                statement.touch();
             });
         }
     }
@@ -1608,6 +1615,47 @@ mod tests {
         }
         assert!(statement.is_terminal());
         assert!(!statement.reaping.load(Ordering::SeqCst));
+    }
+
+    /// A statement that ends on its own while the reaper's cancel is on its
+    /// way is not kept for another idle period: the next pass releases it
+    /// like any ended, idle statement (as a DELETE racing completion does).
+    #[tokio::test]
+    async fn a_statement_that_ends_during_a_reaper_cancel_is_not_kept() {
+        let svc = service_over(
+            vec![wide_table(10, 1000)],
+            AgentLimits {
+                idle_timeout: Duration::from_secs(1),
+                max_wait: Duration::from_secs(1),
+                ..AgentLimits::default()
+            },
+        );
+        let (svc, _dropped) = hanging(svc);
+        let live = svc
+            .submit("alice", req(HANGING_SQL), Duration::ZERO, None)
+            .await
+            .unwrap();
+        let statement = lock(&svc.statements).get(&live.id).cloned().unwrap();
+        statement.lock().last_access = tokio::time::Instant::now() - Duration::from_secs(2);
+        // Single-threaded: the spawned cancel has not run yet, so the
+        // statement ends first.
+        svc.reap();
+        let ended = AgentError::new(AgentErrorCode::Cancelled, "ended meanwhile");
+        assert!(stop_statement(&svc.tracker, &statement, ended, "test"));
+        for _ in 0..100 {
+            if !statement.reaping.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!statement.reaping.load(Ordering::SeqCst));
+        assert!(
+            statement.idle() > Duration::from_secs(1),
+            "a cancel that applied nothing must not reset the idle clock"
+        );
+        drop(statement);
+        svc.reap();
+        assert!(!lock(&svc.statements).contains_key(&live.id));
     }
 
     /// A distributed executor that streams `batches` wide batches into the

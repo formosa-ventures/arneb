@@ -1499,15 +1499,18 @@ async fn run() -> Result<()> {
     }
 }
 
-/// How long the shutdown lets the Web API finish the requests it has
-/// accepted (an audited action among them) before closing its connections.
+/// How long the shutdown waits for the Web API to finish the requests it
+/// has accepted (an audited action among them) before it stops waiting.
 const WEB_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Stops the Web API gracefully: no new connections, idle keep-alive
 /// connections closed, requests in progress finished, for at most
-/// [`WEB_SHUTDOWN_WAIT`] (then the server task is aborted, logged at WARN;
-/// an audited action it had already handed to the blocking pool still runs
-/// to completion or is refused unwritten). Then flushes the audit log
+/// [`WEB_SHUTDOWN_WAIT`]. Past that it stops waiting (logged at WARN) and
+/// aborts the server task, which closes nothing: axum serves each
+/// connection in its own task, so a connection still in a request keeps
+/// running until the process exits. Any audited action on it is refused
+/// unwritten once the flush starts, and one it had already handed to the
+/// blocking pool still runs to completion. Then flushes the audit log
 /// ([`web::flush_audit`], itself bounded and logging at ERROR what it
 /// could not finish). Holds no lock.
 async fn stop_web_then_flush_audit(
@@ -1550,7 +1553,8 @@ async fn stop_web(
         if tokio::time::timeout(wait, &mut task).await.is_err() {
             tracing::warn!(
                 wait_ms = wait.as_millis() as u64,
-                "the web UI did not finish its requests in time; closing its connections"
+                "the web UI did not finish its requests in time; no longer waiting \
+                 (connections still in a request run until the process exits)"
             );
             task.abort();
         }

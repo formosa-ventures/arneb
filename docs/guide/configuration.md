@@ -1088,7 +1088,9 @@ the response returns. Read it with
   completion still unwritten then is logged at ERROR and its action is
   recorded as `interrupted` at the next start. Before that last attempt, the
   Web API stops gracefully: it accepts no new connections, closes idle ones,
-  and gives requests in progress up to 5 seconds to finish. Then new audited
+  and gives requests in progress up to 5 seconds to finish (one still
+  running after that is not cut off; its connection lives until the
+  process exits). Then new audited
   actions are refused with `503 audit_unavailable` ("the server is shutting
   down"; nothing is applied or written, including one still queued on the
   blocking pool), and the server waits up to 10 seconds for audited actions

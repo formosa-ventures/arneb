@@ -252,6 +252,24 @@ services:
       timeout: 5s
       retries: 12
 
+  # Keycloak for the MCP OAuth Tier 2 test (scripts/mcp-oauth-smoke.sh). Opt-in:
+  # `docker compose --profile oauth up -d keycloak`. DEV ONLY: the admin login
+  # and the realm users' passwords are public, and the realm allows plain http.
+  # Issuer: http://127.0.0.1:8180/realms/arneb
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.7
+    command: ["start-dev", "--import-realm", "--http-port", "8180"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin-dev-only
+      KC_HOSTNAME_STRICT: "false"
+    ports:
+      - "127.0.0.1:8180:8180"
+    volumes:
+      - ./docker/keycloak/arneb-realm.json:/opt/keycloak/data/import/arneb-realm.json:ro
+    profiles:
+      - oauth
+
 volumes:
   s3-data:
   hms-db:

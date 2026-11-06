@@ -124,7 +124,7 @@ fn existing_user(store: &StateStore, name: &str) -> Result<UserInfo, ApiError> {
     find_user(store, name).ok_or_else(|| no_such_user(name))
 }
 
-fn validate_name(name: &str) -> Result<(), ApiError> {
+pub(super) fn validate_name(name: &str) -> Result<(), ApiError> {
     let ok_chars = name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '@' | '-'));

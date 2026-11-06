@@ -23,7 +23,6 @@ use crate::web::admission::{self, AdmissionUpdate};
 use crate::web::agent::{service, wait};
 use crate::web::api::{self, BoundedParams, BoundedQuery};
 use crate::web::audit::{self, AuditParams};
-use crate::web::auth::AuthVia;
 use crate::web::error::{ApiError, ErrorCode};
 use crate::web::privilege::Layer;
 use crate::web::v2;
@@ -495,7 +494,7 @@ impl ArnebMcp {
     /// `whoami`: the caller, how it authenticated, and the server.
     #[tool(
         description = "Who the server thinks you are: the user, how the request authenticated \
-                       (token, session, basic or unauthenticated), the auth mode, and the \
+                       (token, session, basic, oauth or unauthenticated), the auth mode, and the \
                        server version and role, and your `privileges` (`observe`, `manage`).",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
@@ -503,7 +502,7 @@ impl ArnebMcp {
         let who = identity(&ctx)?;
         ok(&serde_json::json!({
             "user": who.user,
-            "via": via_name(who.via),
+            "via": who.via.as_str(),
             "version": env!("CARGO_PKG_VERSION"),
             "role": self.state.role,
             "auth": if self.state.credentials.is_some() { "password" } else { "none" },
@@ -1538,15 +1537,6 @@ impl ArnebMcp {
     }
 }
 
-fn via_name(via: AuthVia) -> &'static str {
-    match via {
-        AuthVia::Token => "token",
-        AuthVia::Session => "session",
-        AuthVia::Basic => "basic",
-        AuthVia::Unauthenticated => "unauthenticated",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1793,6 +1783,7 @@ mod tests {
             ),
             metrics_auth: false,
             sessions: SessionStore::new(),
+            oauth: None,
             agent: Some(agent),
             mcp: Some(McpSettings {
                 allowed_hosts: None,

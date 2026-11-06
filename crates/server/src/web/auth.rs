@@ -5,6 +5,9 @@
 //! - `Authorization: Bearer <token>` is checked first: a session token
 //!   (`arneb_s_…`) against the [`SessionStore`](super::session::SessionStore),
 //!   anything else as an API token against the credential source.
+//! - On `/mcp` only, with `[oauth]` configured, a JWT-shaped bearer is an
+//!   OAuth access token ([`OAuthValidator`](crate::oauth::OAuthValidator)):
+//!   it maps to the Arneb user of that name, which must already exist.
 //! - Otherwise `Authorization: Basic` goes through the shared
 //!   [`BasicAuthenticator`](arneb_protocol::BasicAuthenticator), so PBKDF2
 //!   never runs on an async worker.
@@ -40,17 +43,20 @@ pub enum AuthVia {
     Session,
     /// `Authorization: Basic` (a password or an API token as the password).
     Basic,
+    /// `Authorization: Bearer` with an OAuth access token (`/mcp` only).
+    OAuth,
     /// `[auth] type = "none"`: the user is only claimed.
     Unauthenticated,
 }
 
 impl AuthVia {
-    /// `token`, `session`, `basic` or `unauthenticated`.
+    /// `token`, `session`, `basic`, `oauth` or `unauthenticated`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Token => "token",
             Self::Session => "session",
             Self::Basic => "basic",
+            Self::OAuth => "oauth",
             Self::Unauthenticated => "unauthenticated",
         }
     }
@@ -61,6 +67,9 @@ impl AuthVia {
 pub struct Identity {
     pub user: String,
     pub via: AuthVia,
+    /// For [`AuthVia::OAuth`]: the access token's `exp` in epoch ms, which
+    /// bounds any API token this request mints. `None` otherwise.
+    pub oauth_expires_ms: Option<u64>,
 }
 
 /// Routes under `/api/` reachable without credentials: `(method, path)`,
@@ -91,11 +100,17 @@ pub fn requires_auth(method: &Method, path: &str, metrics_auth: bool, mcp_served
             .any(|(m, p)| *p == path && m.as_ref().is_none_or(|m| m == method))
 }
 
-/// The one rejection for every missing or bad credential.
-fn unauthenticated() -> Response {
-    ApiError::new(ErrorCode::Unauthenticated, "authentication required")
+/// The one rejection for every missing or bad credential. `challenge`
+/// replaces the default `WWW-Authenticate` (OAuth discovery on `/mcp`); the
+/// body is the same either way.
+fn unauthenticated(challenge: Option<&str>) -> Response {
+    let mut resp = ApiError::new(ErrorCode::Unauthenticated, "authentication required")
         .with_hint("send `Authorization: Bearer <token>` or `Authorization: Basic`")
-        .into_response()
+        .into_response();
+    if let Some(value) = challenge.and_then(|c| header::HeaderValue::from_str(c).ok()) {
+        resp.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+    }
+    resp
 }
 
 /// Middleware: authenticate the request (see the module docs).
@@ -105,6 +120,7 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
         req.extensions_mut().insert(Identity {
             user,
             via: AuthVia::Unauthenticated,
+            oauth_expires_ms: None,
         });
         return next.run(req).await;
     };
@@ -123,35 +139,54 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
     ) {
         return next.run(req).await;
     }
+    let path = req.uri().path();
+    let on_mcp = path == "/mcp" || path.starts_with("/mcp/");
+    let challenge = on_mcp
+        .then_some(state.oauth.as_ref())
+        .flatten()
+        .map(|o| o.challenge());
     let Some(authorization) = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     else {
-        return unauthenticated();
+        return unauthenticated(challenge);
     };
     let (scheme, value) = authorization.split_once(' ').unwrap_or((authorization, ""));
     let value = value.trim();
-    let identity = if scheme.eq_ignore_ascii_case("bearer") {
+    let bearer = scheme.eq_ignore_ascii_case("bearer");
+    let identity = if bearer {
         if value.starts_with(SESSION_PREFIX) {
             state.sessions.resolve(value).map(|user| Identity {
                 user,
                 via: AuthVia::Session,
+                oauth_expires_ms: None,
             })
+        } else if let Some(oauth) = state
+            .oauth
+            .as_ref()
+            .filter(|_| on_mcp && crate::oauth::looks_like_jwt(value))
+        {
+            match oauth_identity(&state, oauth, value).await {
+                Ok(identity) => Some(identity),
+                Err(resp) => return *resp,
+            }
         } else {
             creds.verify_token(value).map(|user| Identity {
                 user,
                 via: AuthVia::Token,
+                oauth_expires_ms: None,
             })
         }
     } else if scheme.eq_ignore_ascii_case("basic") {
         let Some((user, password)) = decode_basic(value) else {
-            return unauthenticated();
+            return unauthenticated(challenge);
         };
         match basic.check(&user, &password).await {
             BasicVerdict::Valid => Some(Identity {
                 user,
                 via: AuthVia::Basic,
+                oauth_expires_ms: None,
             }),
             BasicVerdict::Invalid => None,
             BasicVerdict::Overloaded => {
@@ -171,7 +206,112 @@ pub async fn authenticate(State(state): State<WebState>, mut req: Request, next:
             req.extensions_mut().insert(identity);
             next.run(req).await
         }
-        None => unauthenticated(),
+        // A refused bearer on `/mcp` under `[oauth]` (an opaque IdP token,
+        // an expired or revoked Arneb token) is an `invalid_token` too, so
+        // the client refreshes or re-authorizes instead of resending it.
+        // An empty bearer carries no authentication information, so it
+        // gets no error code (RFC 6750 section 3.1).
+        None if bearer && !value.is_empty() && challenge.is_some() => {
+            unauthenticated(state.oauth.as_ref().map(|o| o.invalid_token_challenge()))
+        }
+        None => unauthenticated(challenge),
+    }
+}
+
+/// Validate an OAuth access token and map it to an existing Arneb user.
+/// `Err` is the response to send: the standard `401` body with an
+/// `error="invalid_token"` challenge (reason only in the DEBUG log), `403`
+/// for an unknown user, an unverified email or a missing scope, `503` while
+/// the issuer's keys cannot be fetched.
+async fn oauth_identity(
+    state: &WebState,
+    oauth: &crate::oauth::OAuthValidator,
+    token: &str,
+) -> Result<Identity, Box<Response>> {
+    use crate::oauth::OAuthReject;
+
+    match oauth.validate(token).await {
+        Ok(principal) => {
+            if let Err(e) = super::users::validate_name(&principal.user) {
+                tracing::debug!(target: "arneb::oauth", error = ?e, "mapped user name is not valid");
+                return Err(Box::new(
+                    ApiError::new(
+                        ErrorCode::Forbidden,
+                        format!(
+                            "the identity's '{}' claim is not a valid Arneb user name",
+                            oauth.settings().user_claim
+                        ),
+                    )
+                    .with_hint(
+                        "set [oauth] user_claim to a claim that holds a valid user name, or seed the user in [[auth.users]]",
+                    )
+                    .into_response(),
+                ));
+            }
+            if state
+                .state
+                .as_ref()
+                .is_some_and(|s| s.user_exists(&principal.user))
+            {
+                Ok(Identity {
+                    user: principal.user,
+                    via: AuthVia::OAuth,
+                    oauth_expires_ms: Some(principal.expires_at_ms),
+                })
+            } else {
+                Err(Box::new(
+                    ApiError::new(
+                        ErrorCode::Forbidden,
+                        format!("no Arneb user '{}' for this identity", principal.user),
+                    )
+                    .with_hint("ask a manager to create the user (create_user), then reconnect")
+                    .into_response(),
+                ))
+            }
+        }
+        Err(OAuthReject::InsufficientScope) => {
+            let mut resp = ApiError::new(ErrorCode::Forbidden, "the token lacks a required scope")
+                .into_response();
+            if let Ok(v) = header::HeaderValue::from_str(oauth.insufficient_scope_challenge()) {
+                resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+            }
+            Err(Box::new(resp))
+        }
+        Err(OAuthReject::UnverifiedEmail) => Err(Box::new(
+            ApiError::new(
+                ErrorCode::Forbidden,
+                "the identity's email address is not verified",
+            )
+            .with_hint(
+                "verify the address at the identity provider (email_verified must be true), set [oauth] user_claim to a claim that is not an email address, or, for an IdP that never sends email_verified and only for an admin-assigned claim, set [oauth] allow_missing_email_verified = true (ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED)",
+            )
+            .into_response(),
+        )),
+        Err(OAuthReject::EmailMismatch) => Err(Box::new(
+            ApiError::new(
+                ErrorCode::Forbidden,
+                format!(
+                    "the identity's '{}' claim is an email address other than its verified email",
+                    oauth.settings().user_claim
+                ),
+            )
+            .with_hint(
+                "the claim must equal the token's verified `email`; set [oauth] user_claim to `sub` when the identity provider's subject ids are not email addresses",
+            )
+            .into_response(),
+        )),
+        Err(OAuthReject::Unavailable) => Err(Box::new(
+            ApiError::new(
+                ErrorCode::AuthProviderUnavailable,
+                "the identity provider is unavailable",
+            )
+            .with_hint("the identity provider is unreachable; retry, or use an Arneb API token")
+            .into_response(),
+        )),
+        // `validate` already logged the reason at DEBUG.
+        Err(OAuthReject::Invalid(_)) => Err(Box::new(unauthenticated(Some(
+            oauth.invalid_token_challenge(),
+        )))),
     }
 }
 
@@ -255,6 +395,7 @@ mod tests {
             catalogs: None,
             metrics_auth,
             sessions: SessionStore::new(),
+            oauth: None,
             agent: None,
             mcp: None,
         }
@@ -615,5 +756,659 @@ mod tests {
                 .unwrap();
             assert_eq!(&body[..], expect.as_bytes());
         }
+    }
+
+    fn oauth_state(enabled: bool) -> WebState {
+        let mut state = web_state(true, None, false);
+        state.mcp = Some(crate::web::mcp::McpSettings {
+            allowed_hosts: None,
+            allowed_origins: None,
+            default_page_bytes: 32768,
+        });
+        if enabled {
+            state.oauth = Some(Arc::new(crate::oauth::OAuthValidator::new(
+                crate::oauth::OAuthSettings {
+                    issuer: "https://idp.invalid".into(),
+                    resource: "https://arneb.test/mcp".into(),
+                    audience: "https://arneb.test/mcp".into(),
+                    user_claim: "sub".into(),
+                    jwks_uri: None,
+                    required_scopes: vec!["arneb:query".into()],
+                    leeway: std::time::Duration::from_secs(0),
+                    jwks_cache: std::time::Duration::from_secs(3600),
+                    jwks_min_refresh: std::time::Duration::from_secs(30),
+                    jwks_max_stale: std::time::Duration::from_secs(86400),
+                    require_access_token_typ: false,
+                    allow_missing_email_verified: false,
+                },
+            )));
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn metadata_document_is_public_and_exact() {
+        let state = oauth_state(true);
+        // The path derived from `resource` (RFC 9728 section 3.1), and the
+        // bare root, which clients that only probe the root fetch: the
+        // resource is exactly `/mcp` on its origin.
+        for path in [
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+        ] {
+            let req = axum::http::Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let resp = build_router(state.clone()).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            assert_eq!(resp.headers()["access-control-allow-origin"], "*");
+            assert_eq!(resp.headers()[header::CACHE_CONTROL], "max-age=300");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "resource": "https://arneb.test/mcp",
+                    "authorization_servers": ["https://idp.invalid"],
+                    "bearer_methods_supported": ["header"],
+                    "scopes_supported": ["arneb:query"],
+                    "resource_name": "Arneb",
+                })
+            );
+        }
+        // Any other suffix is a plain 404.
+        for path in [
+            "/.well-known/oauth-protected-resource/",
+            "/.well-known/oauth-protected-resource/foo",
+            "/.well-known/oauth-protected-resource/mcp/extra",
+            "/.well-known/oauth-protected-resource/arneb/mcp",
+        ] {
+            let reply = get(&state, path, None).await;
+            assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
+            assert!(reply.body.is_empty(), "{path}");
+        }
+        let off = oauth_state(false);
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            assert_eq!(get(&off, path, None).await.status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prefixed_resource_does_not_answer_the_bare_path() {
+        // Behind a path prefix the host is shared: answering the host-wide
+        // bare path would claim discovery for every resource on it (and its
+        // `resource` would not match that URL, RFC 9728 section 3.3).
+        let mut state = oauth_state(true);
+        let mut settings = state.oauth.as_ref().unwrap().settings().clone();
+        settings.resource = "https://arneb.test/arneb/mcp".into();
+        settings.audience = settings.resource.clone();
+        state.oauth = Some(Arc::new(crate::oauth::OAuthValidator::new(settings)));
+        let reply = get(
+            &state,
+            "/.well-known/oauth-protected-resource/arneb/mcp",
+            None,
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            let reply = get(&state, path, None).await;
+            assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
+            assert!(reply.body.is_empty(), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_401_advertises_resource_metadata() {
+        let on = oauth_state(true);
+        let challenge = on.oauth.as_ref().unwrap().challenge().to_owned();
+        let mcp = send(&on, Method::POST, "/mcp", &[]).await;
+        let api = get(&on, "/api/v1/queries", None).await;
+        assert_eq!(mcp.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            mcp.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
+            Some(challenge.as_str())
+        );
+        assert_eq!(mcp.body, api.body);
+        assert_eq!(
+            api.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
+            Some(r#"Bearer realm="arneb""#)
+        );
+        // A refused non-JWT bearer on /mcp (an opaque IdP token, an
+        // unknown or revoked Arneb token) is an `invalid_token`, with the
+        // same body; bad Basic credentials keep the discovery challenge.
+        let invalid = on.oauth.as_ref().unwrap().invalid_token_challenge();
+        for bearer in ["Bearer nope", "Bearer arneb_x_redacted", "Bearer a.b"] {
+            let bad = send(&on, Method::POST, "/mcp", &[("authorization", bearer)]).await;
+            assert_eq!(bad.status, StatusCode::UNAUTHORIZED, "{bearer}");
+            assert_eq!(bad.body, mcp.body, "{bearer}");
+            assert_eq!(
+                bad.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
+                Some(invalid),
+                "{bearer}"
+            );
+        }
+        // An empty bearer is no credential: the bare discovery challenge.
+        for empty in ["Bearer", "Bearer ", "Bearer   "] {
+            let reply = send(&on, Method::POST, "/mcp", &[("authorization", empty)]).await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{empty:?}");
+            assert_eq!(reply.www_authenticate, mcp.www_authenticate, "{empty:?}");
+        }
+        let bad_basic = send(
+            &on,
+            Method::POST,
+            "/mcp",
+            &[("authorization", &basic("alice", "wrong"))],
+        )
+        .await;
+        assert_eq!(bad_basic.www_authenticate, mcp.www_authenticate);
+        // Off /mcp a refused bearer keeps the plain challenge.
+        let api_bad = get(&on, "/api/v1/queries", Some("Bearer nope")).await;
+        assert_eq!(api_bad.www_authenticate, api.www_authenticate);
+
+        let off = oauth_state(false);
+        let mcp = send(&off, Method::POST, "/mcp", &[]).await;
+        assert_eq!(mcp.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            mcp.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
+            Some(r#"Bearer realm="arneb""#)
+        );
+    }
+
+    // ----- OAuth access tokens on /mcp -----
+
+    use crate::oauth::test_idp::{claims, Mode, TestIdp, TestKey};
+    use crate::oauth::{OAuthSettings, OAuthValidator};
+
+    const RESOURCE: &str = "http://127.0.0.1/mcp";
+
+    struct OAuthEnv {
+        state: WebState,
+        idp: TestIdp,
+        key: TestKey,
+    }
+
+    impl OAuthEnv {
+        /// Password auth with a state store (alice, bob, root, ...), alice a
+        /// manager, `/mcp` served and OAuth requiring the `arneb:query`
+        /// scope.
+        async fn new() -> Self {
+            let key = TestKey::ec("k1");
+            let idp = TestIdp::start(&[&key]).await;
+            let mut state = crate::web::v2::tests::with_authz(
+                crate::web::v2::tests::web_state(true, None),
+                None,
+                &["alice"],
+            );
+            state.mcp = Some(crate::web::mcp::McpSettings {
+                allowed_hosts: None,
+                allowed_origins: None,
+                default_page_bytes: 32768,
+            });
+            state.oauth = Some(Arc::new(OAuthValidator::new(OAuthSettings {
+                issuer: idp.issuer(),
+                resource: RESOURCE.into(),
+                audience: RESOURCE.into(),
+                user_claim: "sub".into(),
+                jwks_uri: None,
+                required_scopes: vec!["arneb:query".into()],
+                leeway: std::time::Duration::from_secs(0),
+                jwks_cache: std::time::Duration::from_secs(3600),
+                jwks_min_refresh: std::time::Duration::from_secs(30),
+                jwks_max_stale: std::time::Duration::from_secs(86400),
+                require_access_token_typ: false,
+                allow_missing_email_verified: false,
+            })));
+            Self { state, idp, key }
+        }
+
+        /// A valid token for `sub` carrying `scope`.
+        fn token(&self, sub: &str, scope: &str) -> String {
+            let mut c = claims(&self.idp.issuer(), RESOURCE);
+            c["sub"] = sub.into();
+            c["scope"] = scope.into();
+            self.key.sign(&c)
+        }
+
+        fn bearer(&self, sub: &str) -> String {
+            format!("Bearer {}", self.token(sub, "arneb:query"))
+        }
+    }
+
+    /// `POST /mcp` with a `tools/call`; the status, headers' challenge and
+    /// the JSON body.
+    async fn mcp_call(state: &WebState, auth: &str, tool: &str, args: serde_json::Value) -> Reply {
+        let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":tool,"arguments":args}});
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::HOST, "127.0.0.1:6432")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .header(header::AUTHORIZATION, auth)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = build_router(state.clone()).oneshot(req).await.unwrap();
+        Reply {
+            status: resp.status(),
+            www_authenticate: resp.headers().get(header::WWW_AUTHENTICATE).cloned(),
+            body: axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_token_authenticates_mcp_as_the_mapped_user() {
+        let env = OAuthEnv::new().await;
+        let oauth = mcp_call(
+            &env.state,
+            &env.bearer("alice"),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(oauth.status, StatusCode::OK);
+        let oauth = oauth.json()["result"]["structuredContent"].clone();
+        assert_eq!(
+            (oauth["via"].as_str(), oauth["user"].as_str()),
+            (Some("oauth"), Some("alice"))
+        );
+
+        // Exactly the rights alice has over Basic.
+        let basic_alice = mcp_call(
+            &env.state,
+            &basic("alice", "secret"),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        let basic_alice = basic_alice.json()["result"]["structuredContent"].clone();
+        assert_eq!(basic_alice["via"], "basic");
+        assert_eq!(oauth["privileges"], basic_alice["privileges"]);
+        assert_eq!(oauth["privileges"]["manage"], true);
+    }
+
+    #[tokio::test]
+    async fn oauth_token_is_not_accepted_outside_mcp() {
+        let env = OAuthEnv::new().await;
+        let auth = env.bearer("alice");
+        let baseline = get(&env.state, "/api/v2/whoami", None).await;
+        assert_eq!(baseline.status, StatusCode::UNAUTHORIZED);
+        for path in ["/api/v2/whoami", "/api/v1/queries"] {
+            let reply = get(&env.state, path, Some(&auth)).await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(reply.body, baseline.body, "{path}");
+            assert_eq!(reply.www_authenticate, baseline.www_authenticate, "{path}");
+        }
+        // The IdP was never asked: a JWT is just an invalid bearer there.
+        assert_eq!(env.idp.jwks_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_user_is_403_not_401() {
+        let env = OAuthEnv::new().await;
+        let reply = mcp_call(
+            &env.state,
+            &env.bearer("mallory"),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        let e = &reply.json()["error"];
+        assert_eq!(e["code"], "forbidden");
+        assert_eq!(e["message"], "no Arneb user 'mallory' for this identity");
+        assert_eq!(
+            e["hint"],
+            "ask a manager to create the user (create_user), then reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_user_is_refused_on_the_next_request() {
+        let env = OAuthEnv::new().await;
+        let auth = env.bearer("alice");
+        let first = mcp_call(&env.state, &auth, "whoami", serde_json::json!({})).await;
+        assert_eq!(first.status, StatusCode::OK);
+        env.state
+            .state
+            .as_ref()
+            .unwrap()
+            .delete_user("alice")
+            .unwrap();
+        let again = mcp_call(&env.state, &auth, "whoami", serde_json::json!({})).await;
+        assert_eq!(again.status, StatusCode::FORBIDDEN);
+        assert_eq!(again.json()["error"]["code"], "forbidden");
+    }
+
+    #[tokio::test]
+    async fn idp_down_is_503_and_api_tokens_still_work() {
+        let env = OAuthEnv::new().await;
+        env.idp.set_mode(Mode::Fail500);
+        let reply = mcp_call(
+            &env.state,
+            &env.bearer("alice"),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        let e = &reply.json()["error"];
+        assert_eq!(e["code"], "auth_provider_unavailable");
+        assert_eq!(
+            e["hint"],
+            "the identity provider is unreachable; retry, or use an Arneb API token"
+        );
+
+        let api_token = env
+            .state
+            .state
+            .as_ref()
+            .unwrap()
+            .issue_token("alice", None, None)
+            .unwrap()
+            .token;
+        let session = env.state.sessions.create("alice").unwrap();
+        for (auth, via) in [
+            (format!("Bearer {api_token}"), "token"),
+            (format!("Bearer {session}"), "session"),
+            (basic("alice", "secret"), "basic"),
+        ] {
+            let reply = mcp_call(&env.state, &auth, "whoami", serde_json::json!({})).await;
+            assert_eq!(reply.status, StatusCode::OK, "{via}");
+            assert_eq!(reply.json()["result"]["structuredContent"]["via"], via);
+        }
+    }
+
+    #[tokio::test]
+    async fn insufficient_scope_is_403_with_challenge() {
+        let env = OAuthEnv::new().await;
+        let auth = format!("Bearer {}", env.token("alice", "openid"));
+        let reply = mcp_call(&env.state, &auth, "whoami", serde_json::json!({})).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        assert_eq!(reply.json()["error"]["code"], "forbidden");
+        let expected = env
+            .state
+            .oauth
+            .as_ref()
+            .unwrap()
+            .insufficient_scope_challenge();
+        assert_eq!(
+            reply.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
+            Some(expected)
+        );
+        assert!(expected.contains(r#"error="insufficient_scope""#));
+    }
+
+    #[tokio::test]
+    async fn invalid_oauth_tokens_get_the_401_body_and_an_invalid_token_challenge() {
+        let env = OAuthEnv::new().await;
+        let oauth = env.state.oauth.as_ref().unwrap();
+        let missing = send(&env.state, Method::POST, "/mcp", &[]).await;
+        assert_eq!(missing.status, StatusCode::UNAUTHORIZED);
+        // No credentials: the bare discovery challenge, no error code.
+        assert_eq!(
+            missing
+                .www_authenticate
+                .as_ref()
+                .map(|v| v.to_str().unwrap()),
+            Some(oauth.challenge())
+        );
+        assert!(!oauth.challenge().contains("error="));
+
+        let mut expired = claims(&env.idp.issuer(), RESOURCE);
+        expired["exp"] = (crate::oauth::test_idp::now() - 3600).into();
+        expired["scope"] = "arneb:query".into();
+        let mut bad_aud = claims(&env.idp.issuer(), "http://elsewhere.test/mcp");
+        bad_aud["scope"] = "arneb:query".into();
+        // A Keycloak ID token of the same issuer (header `typ: JWT`,
+        // payload `typ: ID`, `nonce`), even with the scope.
+        let mut id_token = claims(&env.idp.issuer(), RESOURCE);
+        id_token["scope"] = "arneb:query".into();
+        id_token["nonce"] = "n-0S6".into();
+        id_token["typ"] = "ID".into();
+        let bad_sig =
+            crate::oauth::test_idp::TestKey::ec("k1").sign(&claims(&env.idp.issuer(), RESOURCE));
+        let mut tokens: Vec<String> = [expired, bad_aud, id_token]
+            .iter()
+            .map(|c| env.key.sign(c))
+            .collect();
+        tokens.push(bad_sig);
+        for token in tokens {
+            let auth = format!("Bearer {token}");
+            let reply = mcp_call(&env.state, &auth, "whoami", serde_json::json!({})).await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(reply.body, missing.body);
+            let header = reply.www_authenticate.as_ref().map(|v| v.to_str().unwrap());
+            assert_eq!(header, Some(oauth.invalid_token_challenge()));
+            let header = header.unwrap();
+            assert!(header.contains(r#"error="invalid_token""#), "{header}");
+            assert!(header.contains("resource_metadata="), "{header}");
+            // Nothing of the token is echoed.
+            assert!(!header.contains("eyJ"), "{header}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unverified_email_is_a_distinct_403() {
+        let mut env = OAuthEnv::new().await;
+        let mut settings = env.state.oauth.as_ref().unwrap().settings().clone();
+        settings.user_claim = "email".into();
+        env.state.oauth = Some(Arc::new(OAuthValidator::new(settings)));
+        env.state
+            .state
+            .as_ref()
+            .unwrap()
+            .create_user(
+                "alice@corp.example",
+                arneb_protocol::ScramVerifier::generate("secret").unwrap(),
+            )
+            .unwrap();
+        let mut c = claims(&env.idp.issuer(), RESOURCE);
+        c["scope"] = "arneb:query".into();
+        c["email"] = "alice@corp.example".into();
+        c["email_verified"] = false.into();
+        let reply = mcp_call(
+            &env.state,
+            &format!("Bearer {}", env.key.sign(&c)),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        let e = &reply.json()["error"];
+        assert_eq!(e["code"], "forbidden");
+        assert_eq!(e["message"], "the identity's email address is not verified");
+        assert!(e["hint"].as_str().unwrap().contains("email_verified"));
+        assert!(e["hint"]
+            .as_str()
+            .unwrap()
+            .contains("ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED"));
+
+        c["email_verified"] = true.into();
+        let reply = mcp_call(
+            &env.state,
+            &format!("Bearer {}", env.key.sign(&c)),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.json()["result"]["structuredContent"]["user"],
+            "alice@corp.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_username_that_is_another_address_is_a_distinct_403() {
+        let mut env = OAuthEnv::new().await;
+        let mut settings = env.state.oauth.as_ref().unwrap().settings().clone();
+        settings.user_claim = "preferred_username".into();
+        env.state.oauth = Some(Arc::new(OAuthValidator::new(settings)));
+        env.state
+            .state
+            .as_ref()
+            .unwrap()
+            .create_user(
+                "admin@corp.example",
+                arneb_protocol::ScramVerifier::generate("secret").unwrap(),
+            )
+            .unwrap();
+        // A self-registered username that is someone else's address, with
+        // the attacker's own verified inbox as `email`.
+        let mut c = claims(&env.idp.issuer(), RESOURCE);
+        c["scope"] = "arneb:query".into();
+        c["preferred_username"] = "admin@corp.example".into();
+        c["email"] = "attacker@evil.example".into();
+        c["email_verified"] = true.into();
+        let reply = mcp_call(
+            &env.state,
+            &format!("Bearer {}", env.key.sign(&c)),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        let e = &reply.json()["error"];
+        assert_eq!(e["code"], "forbidden");
+        assert_eq!(
+            e["message"],
+            "the identity's 'preferred_username' claim is an email address other than its verified email"
+        );
+        // The same address as the verified email is admin.
+        c["email"] = "admin@corp.example".into();
+        let reply = mcp_call(
+            &env.state,
+            &format!("Bearer {}", env.key.sign(&c)),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.json()["result"]["structuredContent"]["user"],
+            "admin@corp.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_action_audits_via_oauth() {
+        let _g = crate::web::settings::THRESHOLD_TEST_LOCK.lock().await;
+        let env = OAuthEnv::new().await;
+        let reply = mcp_call(
+            &env.state,
+            &env.bearer("alice"),
+            "update_settings",
+            serde_json::json!({"slow_query_threshold_ms": 4321}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_ne!(reply.json()["result"]["isError"], serde_json::json!(true));
+        let entries = env
+            .state
+            .audit
+            .query(&arneb_state::AuditQuery {
+                limit: 10,
+                before_seq: None,
+                user: None,
+                action: None,
+            })
+            .entries;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].record.user, "alice");
+        assert_eq!(entries[0].record.via, "oauth");
+        assert_eq!(entries[0].record.action, "settings.update");
+    }
+
+    #[tokio::test]
+    async fn oauth_minted_tokens_end_with_the_access_token() {
+        let env = OAuthEnv::new().await;
+        let mut c = claims(&env.idp.issuer(), RESOURCE);
+        let exp = c["exp"].as_u64().unwrap();
+        c["scope"] = "arneb:query".into();
+        let auth = format!("Bearer {}", env.key.sign(&c));
+        // No explicit expiry: the child ends with the JWT.
+        let reply = mcp_call(
+            &env.state,
+            &auth,
+            "create_token",
+            serde_json::json!({"name": "from-oauth"}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let out = reply.json()["result"]["structuredContent"].clone();
+        assert_eq!(out["expires_ms"].as_u64(), Some(exp * 1000), "{out}");
+        assert!(out["hint"].as_str().unwrap().contains("OAuth access token"));
+        // A later explicit expiry is clamped the same way.
+        let reply = mcp_call(
+            &env.state,
+            &auth,
+            "create_token",
+            serde_json::json!({"name": "later", "expires_in_days": 365}),
+        )
+        .await;
+        let out = reply.json()["result"]["structuredContent"].clone();
+        assert_eq!(out["expires_ms"].as_u64(), Some(exp * 1000), "{out}");
+        // Any expiry past the JWT's is clamped (a day is far beyond five minutes).
+        let reply = mcp_call(
+            &env.state,
+            &auth,
+            "create_token",
+            serde_json::json!({"name": "sooner", "expires_in_days": 1}),
+        )
+        .await;
+        let out = reply.json()["result"]["structuredContent"].clone();
+        assert_eq!(out["expires_ms"].as_u64(), Some(exp * 1000), "{out}");
+    }
+
+    #[tokio::test]
+    async fn invalid_mapped_user_name_is_a_distinct_403() {
+        let env = OAuthEnv::new().await;
+        let reply = mcp_call(
+            &env.state,
+            &env.bearer("auth0|x"),
+            "whoami",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        let e = &reply.json()["error"];
+        assert_eq!(e["code"], "forbidden");
+        assert_eq!(
+            e["message"],
+            "the identity's 'sub' claim is not a valid Arneb user name"
+        );
+        assert!(e["hint"].as_str().unwrap().contains("user_claim"));
+    }
+
+    #[tokio::test]
+    async fn no_oauth_section_is_unchanged() {
+        let mut env = OAuthEnv::new().await;
+        env.state.oauth = None;
+        let jwt = env.bearer("alice");
+        let reply = mcp_call(&env.state, &jwt, "whoami", serde_json::json!({})).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            reply.www_authenticate.as_ref().map(|v| v.to_str().unwrap()),
+            Some(r#"Bearer realm="arneb""#)
+        );
+        assert_eq!(
+            reply.body,
+            get(&env.state, "/api/v1/queries", None).await.body
+        );
+        assert_eq!(env.idp.jwks_hits(), 0);
     }
 }

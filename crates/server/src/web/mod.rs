@@ -11,6 +11,7 @@ mod frontend;
 mod manage;
 pub mod mcp;
 mod metrics;
+mod oauth_metadata;
 pub mod privilege;
 mod reseed;
 mod rules;
@@ -101,6 +102,9 @@ pub struct WebState {
     /// Resolved `[mcp]` settings; `Some` exactly when `/mcp` is served
     /// (enabled, on a coordinator or standalone node).
     pub mcp: Option<mcp::McpSettings>,
+    /// OAuth access-token validator for `/mcp`; `Some` exactly when
+    /// `[oauth]` is enabled on a coordinator or standalone node.
+    pub oauth: Option<Arc<crate::oauth::OAuthValidator>>,
 }
 
 /// An empty in-memory audit log, for `WebState`s built in tests.
@@ -133,6 +137,21 @@ pub fn build_router(state: WebState) -> Router {
             .route("/mcp", axum::routing::any(mcp::not_served))
             .route("/mcp/{*rest}", axum::routing::any(mcp::not_served))
     };
+    // Discovery for OAuth clients. The handler answers at the path derived
+    // from `resource` and at the bare prefix; everything else under the
+    // well-known prefix is a plain 404 (not the SPA), also when OAuth is off.
+    let metadata_paths = [
+        crate::oauth::METADATA_PATH.to_owned(),
+        format!("{}/", crate::oauth::METADATA_PATH),
+        format!("{}/{{*rest}}", crate::oauth::METADATA_PATH),
+    ];
+    let router = metadata_paths.iter().fold(router, |router, path| {
+        if state.oauth.is_some() {
+            router.route(path, axum::routing::get(oauth_metadata::metadata))
+        } else {
+            router.route(path, axum::routing::any(mcp::not_served))
+        }
+    });
     router
         .fallback(frontend::static_handler)
         .layer(axum::middleware::from_fn_with_state(

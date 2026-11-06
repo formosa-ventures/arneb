@@ -29,13 +29,263 @@ are accepted too.
 - **The Web port is plain HTTP.** The bearer token crosses the network in
   the clear. For anything beyond the same machine, put a TLS-terminating
   proxy in front of the Web port and connect to its `https://` address.
-- **OAuth-only clients are not supported yet.** Clients that insist on an
-  OAuth flow, such as claude.ai custom connectors, have to wait for H6 of
-  the headless agent interface. Use a client that accepts a bearer header.
+- **OAuth-only clients** (claude.ai custom connectors, for example) need
+  `[oauth]` configured; see [OAuth](#oauth).
 
 Under `[auth] type = "none"` there is nothing to prove: the caller is the
 `X-Arneb-User` header or `anonymous`, and `/mcp` accepts only loopback
 `Host` values by default (see [Host allow-list](#host-allow-list)).
+
+## OAuth
+
+Clients that insist on an OAuth flow cannot send an API token. With an
+`[oauth]` section, `/mcp` also accepts OAuth 2.0 access tokens (JWTs) from an
+external OpenID Connect identity provider (IdP) such as Keycloak, Auth0,
+Okta or Entra ID. Arneb is only the resource server: it never issues tokens,
+serves a login page or registers clients. The client discovers the IdP from
+Arneb, signs the user in there, and sends the resulting token.
+
+```toml
+[auth]
+type = "password"          # required
+
+[oauth]
+issuer     = "https://idp.example/realms/arneb"
+resource   = "https://db.example/mcp"     # the public URL of /mcp
+user_claim = "sub"                        # default; see below
+```
+
+Every key, its env var and its default is in
+[Configuration](/guide/configuration#oauth). Setting `issuer` turns OAuth
+on; without it nothing changes. `[oauth]` is read at startup only; changing
+it needs a restart, and a bad value stops startup with a message naming it.
+
+### What the server does
+
+- The protected-resource metadata document
+  ([RFC 9728](https://www.rfc-editor.org/rfc/rfc9728)) answers without
+  credentials with the `resource`, the `authorization_servers` (the issuer)
+  and the supported scopes. It is served at the path derived from
+  `resource`, `/.well-known/oauth-protected-resource` followed by the
+  resource's path (`/.well-known/oauth-protected-resource/mcp` for
+  `https://db.example/mcp`). When `resource`'s path is exactly `/mcp`, it
+  is also served at the bare `/.well-known/oauth-protected-resource`, as a
+  fallback for MCP clients and proxies that only probe the root; a strict
+  RFC 9728 client discards that copy (its `resource` is not the root URL,
+  section 3.3) and uses the derived path. Behind a path prefix
+  (`https://h/arneb/mcp`) the bare path is `404`: the host is shared, and
+  answering it would claim discovery for every other resource there. Even
+  with `/mcp` at the root, do not route the host-wide bare path to Arneb
+  from an ingress that also fronts other protected resources. Any other
+  suffix answers a plain `404`.
+- A `/mcp` request without credentials gets `401` with
+  `WWW-Authenticate: Bearer realm="arneb", resource_metadata="…"`, which is
+  where an OAuth client starts (an empty `Bearer` counts as no
+  credentials). A bearer that is presented but refused (a
+  JWT that is expired, for the wrong audience, badly signed or an ID token;
+  an opaque token; an expired or revoked Arneb token) gets the same `401`
+  body with `error="invalid_token"` added to the challenge
+  ([RFC 6750](https://www.rfc-editor.org/rfc/rfc6750#section-3.1)), plus
+  `scope="…"` when `required_scopes` is set, so a client can refresh its
+  token or re-authorize with the right scope instead of starting over; the
+  reason itself is only logged at DEBUG on `arneb::oauth`. The `401` body is
+  the same as everywhere else.
+- A bearer that looks like a JWT (three dot-separated parts, not starting
+  with `arneb_`) is validated: the signature against the issuer's JWKS,
+  `iss`, `aud`, `exp` / `nbf`, that it is an access token, and
+  `required_scopes`. Every key published under the token's `kid` that fits
+  its algorithm is tried, so an algorithm migration (say RS256 and PS256
+  under one `kid`) keeps working. Only asymmetric algorithms are accepted
+  (RS256/384/512, PS256, ES256/384); `none` and `HS*` are always refused.
+- **Access tokens only.** The IdP signs OIDC ID tokens with the same keys,
+  so a token is classified, first rule that applies:
+  1. A header `typ` of `at+jwt` (RFC 9068) is an access token.
+  2. A payload `typ` of `Bearer` (any case; Keycloak's access tokens) is an
+     access token, even with a `nonce`: Keycloak before 24, and later
+     versions with the "nonce backwards compatible" mapper, copy the
+     request's `nonce` into access tokens.
+  3. A payload `typ` of `ID`, `Refresh`, `Offline` or `Logout` (Keycloak's
+     other tokens) is refused.
+  4. Any other token (Entra ID, Okta and most IdPs send header `typ: JWT`
+     and no payload `typ`) may be an ID token when it has a `nonce` or
+     `at_hash`, or no scope at all (an ID token from a refresh grant
+     carries neither `nonce` nor scope). Such a token is
+     accepted only with every required scope, which an ID token never
+     carries; otherwise (and always when `required_scopes` is empty) it is
+     refused as an ID token, with `401` `invalid_token`, never a `403`,
+     so the client discards it instead of asking for more scope.
+
+  Before that, a sender-constrained token is refused whatever its type:
+  one with a `cnf` claim (RFC 7800: a DPoP key thumbprint `jkt`, an mTLS
+  certificate thumbprint) or a DPoP type (Keycloak's payload `typ: DPoP`, or
+  a header `typ` of `dpop+jwt`). Such a token is only valid with a proof of
+  possession, which Arneb does not verify, so accepting it as a plain bearer
+  would let a stolen one be replayed. Turn DPoP binding off for the client
+  your MCP client uses.
+
+  `scope` and `scp` are each read the same way: a space-separated string,
+  or an array of strings (each element split on spaces too), so
+  `"scope": ["mcp", "read"]` grants `mcp` and `read`. A claim of any other
+  shape is malformed and grants nothing, not even the strings in it:
+  `null`, a number, a boolean, an object, or an array holding anything but
+  strings (`["mcp", 1]`). Empty strings and elements add nothing. A token
+  whose only scope claims are empty or malformed has no scope, so rule 4
+  refuses it unless it has a type marker, and with one it still fails any
+  `required_scopes`.
+
+  So an IdP whose access tokens have neither a `typ` marker nor a scope
+  claim needs `required_scopes` (and its tokens must then carry them). Set
+  `require_access_token_typ = true` when your IdP sends `at+jwt`, to
+  accept nothing else.
+- **Key cache.** The JWKS comes from the discovery document (a remote
+  issuer's discovered `jwks_uri` must be `https`) and is cached for
+  `jwks_cache_secs`. From 80% of that age it is refetched in the
+  background, so requests never wait for a routine refresh. If the IdP is
+  down then, the last good keys keep deciding until they are
+  `jwks_max_stale_secs` old (default 24 h). A token with an unknown `kid`
+  waits for a refetch, at most one per `jwks_min_refresh_secs`. A fetch
+  runs on its own: a client that disconnects never cancels it.
+- The token's `user_claim` is the Arneb user. That user runs the tools with
+  their own access rules, and `whoami` reports `via: "oauth"`. Audit entries
+  of manage actions carry `via: "oauth"`.
+- API tokens, sessions and Basic credentials keep working on `/mcp` as before.
+
+Design decisions you should know about:
+
+- **`/mcp` only.** A JWT on `/api/*`, `/metrics` or the Web UI is just an
+  invalid bearer (`401`).
+- **The user must already exist.** Arneb does not create users from tokens. A
+  valid token for a name with no Arneb user is `403 forbidden` (not `401`,
+  which would send the client round its login flow again). Create the user
+  once with `POST /api/v2/users` or `[[auth.users]]`; the password is only
+  for pgwire and Basic, an OAuth-only user never uses it. Deleting the user
+  ends their OAuth access on the next request.
+- **`sub` is the default `user_claim`** because it is the only claim OIDC
+  guarantees stable and unique. `preferred_username` and `email` can be
+  edited by users at some IdPs; only use them when the IdP forbids that, or a
+  user could take over another Arneb user. The server logs a WARN at startup
+  when the claim is not `sub`. With `sub` the Arneb user names are the IdP's
+  subject ids.
+- **An email address must be a verified address.** An unverified address
+  can be anyone's (self-registration, social login), so:
+  - With `user_claim = "email"`, the token's `email_verified` must be
+    `true` (or the string `"true"`).
+  - With another claim whose value contains `@` (`sub` included, such as
+    an Okta login; `preferred_username` with Keycloak's "email as
+    username", Entra's `upn`, an Auth0 namespaced claim such as
+    `https://corp.example/email`),
+    `email_verified` speaks only for the token's `email`, so `email` must
+    be the same address (ASCII case-insensitive) and `email_verified` must
+    be `true`. A different verified `email` is refused with "the
+    identity's '…' claim is an email address other than its verified
+    email": a user who
+    can pick their username could otherwise choose someone else's address
+    and verify their own inbox.
+  - `sub` is not exempt: "never reassigned" does not mean "not chosen by
+    the registrant". Okta's custom authorization servers put the login
+    there, which a self-registering user picks, without `email_verified`;
+    so an address-shaped `sub` needs a verified matching `email`, or
+    `allow_missing_email_verified` when no one can register an address
+    they do not own.
+  - A value without `@` is not checked.
+
+  A refused address answers `403 forbidden` ("the identity's email
+  address is not verified" when not verified), even if that user exists.
+  The required scopes are checked first, so a token lacking one gets the
+  `insufficient_scope` `403` rather than an email message.
+  An IdP that never sends `email_verified` (Entra ID, for one) cannot be
+  used with `email`. For an address under another claim (`sub` included),
+  `allow_missing_email_verified = true` accepts a token with no `email` or
+  no `email_verified` (startup logs a WARN); only turn it on when the IdP
+  never issues an address its owner has not proven. With it on, an
+  unverified `email` vouches for nothing, so one that differs from the
+  user name is ignored (Entra's `upn` beside its `email`). An explicit
+  `email_verified: false`, and a different `email` with
+  `email_verified: true`, are refused regardless.
+
+  **Risk of the opt-in:** with it on, nothing checks the address in the
+  `user_claim` at all. If users can choose that claim's value (a
+  self-service `preferred_username`, a self-registered Okta login in
+  `sub`), anyone can claim another user's address and act as that Arneb
+  user. Turn the opt-in on only when the IdP assigns the claim and users
+  cannot change it (Entra's `upn`, or a `sub` the IdP generates or an
+  administrator sets).
+- **The audience is the resource URL.** Tokens must be issued for this
+  resource (RFC 8707): `aud` has to contain `audience`, which defaults to
+  `resource`. Set `audience` for an IdP that names the API differently (an
+  Entra `api://…` application id URI, an Auth0 API identifier) or that can
+  emit nothing but a client id. An OIDC ID token for a client carries that
+  client's id as its `aud`, and a client id can be any string, a URL
+  included (`arneb:mcp`, `localhost:8080`, an MCP client-metadata-document
+  URL, a Keycloak URL client), so startup refuses an `audience` other than
+  the `resource` URL itself unless `required_scopes` is set too (ID tokens
+  carry no scope).
+- **If the IdP is unreachable** and no cached key can decide, `/mcp` answers
+  `503 auth_provider_unavailable` with `Retry-After: 5`, not `401`. API
+  tokens, sessions and Basic keep working.
+- **An OAuth identity has the same rights as the user**, including
+  `create_token`. A token minted this way never outlives the access token
+  that minted it: its expiry is clamped to the JWT's `exp` and the result's
+  `hint` says so. Revoking the user at the IdP does not revoke Arneb API
+  tokens they minted earlier (until that expiry); revoke those through the
+  API, or delete the Arneb user.
+- **Plain `http`** is accepted for `issuer` and `resource` only on a
+  loopback host (local testing). Anything else must be `https`, and
+  `resource` must end in `/mcp`.
+
+### Identity provider checklist
+
+1. Create an OIDC realm / tenant whose access tokens are signed JWTs with an
+   asymmetric key (not opaque tokens, not HS256).
+2. Make the access token's `aud` contain exactly the `resource` URL. In
+   Keycloak that is an Audience mapper on the client with *Included Custom
+   Audience* set to the URL; in other IdPs an API / resource identifier.
+3. Make sure the claim named by `user_claim` is in the access token (not
+   only in the ID token), and that it equals an Arneb user name. A user
+   name is 1 to 64 characters of `A-Z a-z 0-9 _ . @ -`; a value outside that
+   set (Auth0 subjects such as `auth0|64f...` contain `|`) answers `403`
+   with "the identity's 'sub' claim is not a valid Arneb user name". With
+   Auth0, point `user_claim` at a custom claim (added by an Action) holding a
+   valid name, or seed the user in `[[auth.users]]` under a valid name that
+   the claim carries.
+4. Create the matching Arneb users.
+5. Allow the MCP client's redirect URI. MCP clients are public clients
+   using the authorization-code flow with PKCE; what a given client needs
+   (a registered client id, or dynamic client registration) is up to the
+   IdP and the client.
+6. Optionally set `required_scopes` to a scope the IdP grants only to
+   permitted clients.
+7. Use a grant that puts a scope in the token. App-only and
+   machine-to-machine tokens without a scope have no type marker either,
+   so Arneb takes them for possible ID tokens and refuses them:
+   - Entra ID client-credentials (app-only) tokens carry application
+     permissions in `roles` and never `scp`, and Entra cannot be made to
+     send `typ: at+jwt`. Arneb does not read `roles`, so these tokens
+     cannot be used; give such clients an Arneb API token. Delegated
+     (signed-in user) Entra tokens carry `scp` and work.
+   - Auth0 M2M tokens carry `scope` once the client is granted a
+     permission on the API; grant one (and list it in `required_scopes`).
+   - Any IdP that can send `typ: at+jwt` (RFC 9068) on access tokens:
+     turn it on.
+   An Arneb API token always works for a machine client.
+
+`docker/keycloak/arneb-realm.json` is a dev realm that does this (users
+`alice`, `bob`, `carol` with public, dev-only passwords; client
+`arneb-smoke` with the audience mapper, client `arneb-other` without; the
+mapper also puts the resource in the ID token's `aud`, so the smoke test
+shows that an ID token is refused for what it is, not for its audience). Start
+it with `docker compose --profile oauth up -d keycloak` and point `[oauth]`
+at `http://127.0.0.1:8180/realms/arneb`; `scripts/mcp-oauth-smoke.sh` runs
+the whole scenario against it.
+
+### Connecting claude.ai
+
+Custom connectors need a public `https` URL, so put a TLS-terminating proxy
+in front of the Web port (see [Kubernetes](/guide/kubernetes#oauth-for-mcp))
+and set `resource` to its address plus `/mcp`. In claude.ai, add a custom
+connector with that URL. claude.ai reads the metadata document, sends the
+user to the IdP to sign in, and calls `/mcp` with the token. The signed-in
+user must exist in Arneb, or every call is `403`.
 
 ## Tools
 

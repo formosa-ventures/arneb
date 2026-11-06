@@ -92,6 +92,7 @@ pub mod dynamic_filter;
 mod fragment_pruning;
 pub mod memory_probe;
 pub mod memory_profile;
+mod oauth;
 pub mod task_manager;
 mod web;
 
@@ -1077,6 +1078,15 @@ async fn run() -> Result<()> {
     // can change at runtime; a value stored in the state store wins over
     // the config seed.
     let serves_sql = matches!(role, ServerRole::Coordinator | ServerRole::Standalone);
+    // `[oauth]` resolved once; workers ignore it.
+    let oauth_settings = if serves_sql && config.oauth.enabled() {
+        Some(
+            oauth::OAuthSettings::try_from(&config.oauth)
+                .context("invalid [oauth] configuration")?,
+        )
+    } else {
+        None
+    };
     let admission_config = &config.admission;
     let resolved_admission = config::resolve_admission_limits(
         admission_config,
@@ -1157,8 +1167,44 @@ async fn run() -> Result<()> {
                 if origins.is_empty() { "none".to_owned() } else { origins.join(",") }
             },
             default_page_bytes = config.mcp.default_page_bytes,
+            oauth = if config.oauth.enabled() { "enabled" } else { "disabled" },
             "mcp effective settings ([mcp] / ARNEB_MCP_*)"
         );
+        if let Some(o) = &oauth_settings {
+            tracing::info!(
+                target: "arneb::config",
+                oauth = "enabled",
+                issuer = %o.issuer,
+                resource = %o.resource,
+                audience = %o.audience,
+                user_claim = %o.user_claim,
+                jwks = %o.jwks_uri.as_deref().unwrap_or("discovered"),
+                required_scopes = %o.required_scopes.join(" "),
+                leeway_secs = o.leeway.as_secs(),
+                jwks_cache_secs = o.jwks_cache.as_secs(),
+                jwks_min_refresh_secs = o.jwks_min_refresh.as_secs(),
+                jwks_max_stale_secs = o.jwks_max_stale.as_secs(),
+                require_access_token_typ = o.require_access_token_typ,
+                allow_missing_email_verified = o.allow_missing_email_verified,
+                "oauth effective settings ([oauth] / ARNEB_OAUTH_*)"
+            );
+            if o.allow_missing_email_verified {
+                tracing::warn!(
+                    target: "arneb::config",
+                    "[oauth] allow_missing_email_verified is on: an email-address user name from \
+                     a token without email_verified is trusted, so the identity provider must \
+                     never issue an address its owner has not proven"
+                );
+            }
+            if o.user_claim != "sub" {
+                tracing::warn!(
+                    target: "arneb::config",
+                    user_claim = %o.user_claim,
+                    "[oauth] user_claim is not `sub`: the claim must not be editable by users \
+                     at the identity provider, or a user could take over another Arneb user"
+                );
+            }
+        }
         // runtime-config D1/D9: a threshold stored at runtime wins.
         let slow_query = config::resolve_slow_query_threshold(
             config.observability.slow_query_threshold_ms,
@@ -1295,6 +1341,15 @@ async fn run() -> Result<()> {
     }
 
     // 10. Set up Web UI (coordinator + standalone only)
+    // OAuth for `/mcp`: coordinator/standalone only (workers ignore
+    // `[oauth]`); keys are fetched in the background so startup never
+    // waits on the IdP.
+    let oauth_validator = oauth_settings.map(|settings| {
+        let validator = Arc::new(oauth::OAuthValidator::new(settings));
+        let warm = validator.clone();
+        tokio::spawn(async move { warm.warm().await });
+        validator
+    });
     let web_state = web::WebState {
         query_tracker: query_tracker.clone(),
         node_registry: node_registry.clone(),
@@ -1325,6 +1380,7 @@ async fn run() -> Result<()> {
         authorizer,
         metrics_auth: config.web.metrics_auth,
         sessions: web::SessionStore::new(),
+        oauth: oauth_validator,
         mcp: (serves_clients && agent_service.is_some() && config.mcp.enabled)
             .then(|| web::mcp::McpSettings::from(&config.mcp)),
         agent: agent_service,

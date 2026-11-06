@@ -192,6 +192,41 @@ override the file. `default_page_bytes` must be in `1..=` `[agent_api]`
 `max_page_bytes`, so a bad value stops startup. Row, wait and cell limits of
 the tools are the `[agent_api]` ones above.
 
+## OAuth
+
+`[oauth]` lets `/mcp` accept OAuth 2.0 access tokens from an external OpenID
+Connect provider; see [MCP Server: OAuth](/guide/mcp#oauth) for how it works
+and for the identity provider checklist. It is startup-only (a restart
+applies a change) and needs `[auth] type = "password"` and `[mcp] enabled =
+true`; otherwise startup fails naming the setting. Setting `issuer` turns it
+on. The effective values are logged once on `arneb::config`.
+
+```toml
+[oauth]
+issuer     = "https://idp.example/realms/arneb"
+resource   = "https://db.example/mcp"
+user_claim = "sub"
+```
+
+| `[oauth]` field | Env var | Default | Meaning |
+|---|---|---|---|
+| `issuer` | `ARNEB_OAUTH_ISSUER` | unset | Issuer URL of the IdP; the required `iss`, and the base of the discovery document. Setting it enables OAuth. `https`, or `http` for a loopback host. |
+| `resource` | `ARNEB_OAUTH_RESOURCE` | unset | Public URL of `/mcp`; required with `issuer`, must end in `/mcp`, no query or fragment. Published in the metadata document. |
+| `audience` | `ARNEB_OAUTH_AUDIENCE` | `resource` | Value `aud` must contain. Any value other than the `resource` URL (a client id, including colon-bearing ones such as `arneb:mcp` and URL client ids, but also `api://…`, `urn:…` and other `https://…` identifiers) needs `required_scopes`, or startup fails: an ID token for a client with that id would carry the same `aud`. |
+| `user_claim` | `ARNEB_OAUTH_USER_CLAIM` | `sub` | Claim holding the Arneb user name: 1 to 64 characters of `A-Z a-z 0-9 _ . @ -`. A value outside that set (e.g. Auth0's `auth0\|...` subjects) answers `403`; use a claim that holds a valid name. With `email`, the token's `email_verified` must be `true`. With another claim whose value contains `@` (`sub` included), the token's `email` must equal it and be verified. Otherwise the answer is `403` (see `allow_missing_email_verified`). |
+| `jwks_uri` | `ARNEB_OAUTH_JWKS_URI` | from discovery | The IdP's JWKS URL, when its discovery document cannot be used. |
+| `required_scopes` | `ARNEB_OAUTH_REQUIRED_SCOPES` (comma-separated) | none | Scopes a token must carry, in `scope` or `scp` (each a space-separated string or an array of strings; a claim of any other shape, such as `null`, a number or `["mcp", 1]`, grants nothing). A valid token without one gets `403` with `error="insufficient_scope"`. |
+| `leeway_secs` | `ARNEB_OAUTH_LEEWAY_SECS` | 60 | Clock-skew allowance for `exp` / `nbf`, `0` to `300`. |
+| `jwks_cache_secs` | `ARNEB_OAUTH_JWKS_CACHE_SECS` | 3600 | How long fetched signing keys are fresh, at least `60`. From 80% of it they are refetched in the background. |
+| `jwks_min_refresh_secs` | `ARNEB_OAUTH_JWKS_MIN_REFRESH_SECS` | 30 | Minimum gap between JWKS fetches (a token with an unknown `kid` triggers one), `1` to `jwks_cache_secs`. |
+| `jwks_max_stale_secs` | `ARNEB_OAUTH_JWKS_MAX_STALE_SECS` | 86400 | While refetches fail (IdP down), how long after the last successful fetch its keys keep deciding; at least `jwks_cache_secs`. After that, `/mcp` answers `503` for JWTs. |
+| `require_access_token_typ` | `ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP` | `false` | Accept only tokens whose header `typ` is `at+jwt` (RFC 9068). Off by default because many IdPs send `typ: JWT` on access tokens; ID tokens are refused either way. |
+| `allow_missing_email_verified` | `ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED` | `false` | Accept an email-address user name (from a claim other than `email`, `sub` included) when the token has no `email` or no `email_verified` claim, for an IdP such as Entra ID that never sends it. `email_verified: false`, and a verified `email` other than the user name, are refused regardless; an unverified `email` that differs (Entra's `upn` beside its `email`) is ignored. Risk: nothing then checks the address in `user_claim`, so if users can choose that claim (a self-service `preferred_username`, a self-registered login in `sub`) they can claim another user's address; turn it on only when the claim is admin-assigned (Entra's `upn`, or an IdP-assigned `sub`). Logged, with a WARN when on. |
+
+An empty env var counts as unset; env vars override the file. The server
+reaches the IdP over the network (5 s timeout per request), so its pod needs
+a route to the issuer.
+
 ## Admission Control
 
 The coordinator (or standalone node) caps how many queries run at once,
@@ -899,6 +934,52 @@ the source of truth from the config file to the [state store](#state):
   is needed. The worker ConfigMap may keep `[[catalogs]]` and `[storage]`,
   or drop both: workers take catalogs, defaults and catalog storage from
   the coordinator.
+
+### Upgrading to v0.2.0 (MCP OAuth)
+
+Nothing changes unless you add an `[oauth]` section: without it `/mcp`,
+every other route, and every response header are byte-identical to the
+previous release, and the `WWW-Authenticate` challenge stays
+`Bearer realm="arneb"`. The one difference is that
+`/.well-known/oauth-protected-resource[/...]` answers `404` instead of the
+single-page app. With `[oauth]`:
+
+- **Only `/mcp` accepts JWTs.** `/api/*` and `/metrics` treat one as an
+  invalid bearer.
+- **Create the users first.** A valid token for a name with no Arneb user is
+  `403`; there is no auto-provisioning.
+- **Check `user_claim`.** The default is `sub`, so Arneb user names are
+  subject ids. `preferred_username` and `email` work but must not be
+  editable by users at your IdP; `email` also needs `email_verified =
+  true` in the token, and an email-address user name under another claim
+  (`sub` included) needs the token's `email` to be that same address,
+  verified (or `allow_missing_email_verified` for an IdP that never sends
+  them).
+- **Client-id audiences need a scope.** An `audience` other than the
+  `resource` URL refuses to start without `required_scopes`.
+- **Unmarked tokens without a scope are refused.** A token with neither an
+  `at+jwt` header nor a Keycloak payload `typ` is taken for a possible ID
+  token when it has a `nonce`, an `at_hash` or no scope (no `scope` /
+  `scp`, or only empty or malformed ones; string and string-array forms of
+  either claim both count); set
+  `required_scopes` for an IdP that issues such access tokens. App-only
+  tokens without a scope are refused: Entra client-credentials tokens
+  (only `roles`, never `scp` or `at+jwt`) cannot be used, so give those
+  clients an Arneb API token; Auth0 M2M tokens work once granted a
+  permission, which puts it in `scope`.
+- **Metadata paths.** The metadata document is at
+  `/.well-known/oauth-protected-resource` plus the path of `resource`
+  (normally `…/mcp`), and at the bare well-known path only when that path is
+  exactly `/mcp` (behind a path prefix the bare path is `404`).
+- **`[oauth]` is startup-only** and refuses to start without `[auth] type =
+  "password"` and `[mcp] enabled = true`. A plain-`http` issuer or resource
+  is refused unless the host is loopback.
+- **The Web port needs TLS in front** for any non-loopback `resource`; see
+  [Kubernetes](/guide/kubernetes#oauth-for-mcp).
+- **Revoking at the IdP is not enough for minted API tokens.** An OAuth
+  identity can create API tokens like any user; they outlive the IdP
+  session until revoked or until the Arneb user is deleted, but never the
+  access token that minted them: the expiry is clamped to the JWT's `exp`.
 
 ## State
 

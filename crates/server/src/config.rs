@@ -69,6 +69,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub mcp: McpConfig,
 
+    /// OAuth resource-server settings for `/mcp` (startup-only); effective
+    /// values after [`AppConfig::load`].
+    #[serde(default)]
+    pub oauth: OAuthConfig,
+
     /// Query metrics and the slow-query log (coordinator/standalone only);
     /// effective values after [`AppConfig::load`].
     #[serde(default)]
@@ -923,6 +928,293 @@ impl McpConfig {
         }
         Ok(())
     }
+}
+
+/// `[oauth]` section: accept OAuth access tokens from an external OIDC IdP
+/// on `/mcp` (resource-server role). Startup-only; setting `issuer` turns it
+/// on. After [`AppConfig::load`] the fields hold the effective values (env
+/// applied, validated).
+///
+/// ```toml
+/// [oauth]
+/// issuer                 = "https://idp.example/realms/arneb"  # ARNEB_OAUTH_ISSUER
+/// resource               = "https://db.example/mcp"            # ARNEB_OAUTH_RESOURCE (must end in /mcp)
+/// audience               = "https://db.example/mcp"            # ARNEB_OAUTH_AUDIENCE (default: resource)
+/// user_claim             = "sub"                               # ARNEB_OAUTH_USER_CLAIM
+/// jwks_uri               = "https://idp.example/certs"         # ARNEB_OAUTH_JWKS_URI (default: from discovery)
+/// required_scopes        = ["arneb"]                           # ARNEB_OAUTH_REQUIRED_SCOPES (comma-separated)
+/// leeway_secs            = 60                                  # ARNEB_OAUTH_LEEWAY_SECS (0..=300)
+/// jwks_cache_secs        = 3600                                # ARNEB_OAUTH_JWKS_CACHE_SECS (>= 60)
+/// jwks_min_refresh_secs  = 30                                  # ARNEB_OAUTH_JWKS_MIN_REFRESH_SECS
+/// jwks_max_stale_secs    = 86400                               # ARNEB_OAUTH_JWKS_MAX_STALE_SECS (>= jwks_cache_secs)
+/// require_access_token_typ = false                             # ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP
+/// allow_missing_email_verified = false                         # ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OAuthConfig {
+    /// Issuer URL of the IdP; `Some` enables OAuth on `/mcp`.
+    pub issuer: Option<String>,
+    /// Public URL of the MCP endpoint (the protected resource); must end in
+    /// `/mcp`. Required with `issuer`.
+    pub resource: Option<String>,
+    /// Required `aud` value; defaults to `resource`. Any value other than
+    /// the resource URL may be a client id and needs `required_scopes`.
+    pub audience: Option<String>,
+    /// Claim mapped to the Arneb user name. `sub` is the only claim OIDC
+    /// guarantees stable and unique; others (`preferred_username`, `email`)
+    /// can be mutable at some IdPs.
+    pub user_claim: String,
+    /// JWKS URL; `None` = taken from the issuer's discovery document.
+    pub jwks_uri: Option<String>,
+    /// Scopes a token must carry.
+    pub required_scopes: Vec<String>,
+    /// Clock-skew allowance for `exp` / `nbf`, in seconds (max 300).
+    pub leeway_secs: u64,
+    /// How long fetched signing keys are cached, in seconds (min 60).
+    pub jwks_cache_secs: u64,
+    /// Minimum gap between JWKS refetches (unknown `kid`), in seconds.
+    pub jwks_min_refresh_secs: u64,
+    /// How long after a successful fetch the keys keep deciding while
+    /// refetches fail, in seconds (at least `jwks_cache_secs`).
+    pub jwks_max_stale_secs: u64,
+    /// Accept only tokens whose header `typ` is `at+jwt` (RFC 9068).
+    pub require_access_token_typ: bool,
+    /// Accept a user name that is an email address from a token without
+    /// `email_verified` (an IdP such as Entra ID that never sends it), and
+    /// then ignore an unverified `email` that differs. Not for
+    /// `user_claim = "email"`; `email_verified: false` is always refused.
+    /// Nothing then checks the address, so turn it on only when the
+    /// `user_claim` is admin-assigned (Entra `upn`, an IdP-assigned `sub`):
+    /// a user-chosen claim (a self-service `preferred_username`) could name
+    /// someone else's address.
+    pub allow_missing_email_verified: bool,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            issuer: None,
+            resource: None,
+            audience: None,
+            user_claim: "sub".into(),
+            jwks_uri: None,
+            required_scopes: Vec::new(),
+            leeway_secs: 60,
+            jwks_cache_secs: 3600,
+            jwks_min_refresh_secs: 30,
+            jwks_max_stale_secs: 86400,
+            require_access_token_typ: false,
+            allow_missing_email_verified: false,
+        }
+    }
+}
+
+/// `https`, or `http` for a loopback host (local testing); no query or
+/// fragment when `plain` is false.
+pub(crate) fn check_oauth_url(
+    what: &str,
+    value: &str,
+    plain: bool,
+) -> std::result::Result<(), String> {
+    let url =
+        url::Url::parse(value).map_err(|e| format!("{what} '{value}' is not a valid URL: {e}"))?;
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback_url(&url) => {}
+        _ => {
+            return Err(format!(
+                "{what} '{value}' must use https (http is allowed only for localhost or a \
+                 loopback address)"
+            ))
+        }
+    }
+    if url.host().is_none() {
+        return Err(format!("{what} '{value}' has no host"));
+    }
+    if !plain && (url.query().is_some() || url.fragment().is_some()) {
+        return Err(format!(
+            "{what} '{value}' must not have a query or fragment"
+        ));
+    }
+    Ok(())
+}
+
+/// The URL's host is `localhost` or a loopback address.
+pub(crate) fn is_loopback_url(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+impl OAuthConfig {
+    /// OAuth is on when an issuer is configured.
+    pub fn enabled(&self) -> bool {
+        self.issuer.is_some()
+    }
+
+    /// The `aud` a token must carry: `audience`, else `resource`.
+    pub fn effective_audience(&self) -> Option<&str> {
+        self.audience.as_deref().or(self.resource.as_deref())
+    }
+
+    /// Apply the `ARNEB_OAUTH_*` variables (looked up through `env`) over
+    /// the file values (env > file > defaults). An empty value counts as
+    /// unset.
+    pub fn apply_env(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+        let get = |name: &str| env(name).filter(|v| !v.trim().is_empty());
+        let text = |name: &str, slot: &mut Option<String>| {
+            if let Some(v) = get(name) {
+                *slot = Some(v.trim().to_owned());
+            }
+        };
+        text("ARNEB_OAUTH_ISSUER", &mut self.issuer);
+        text("ARNEB_OAUTH_RESOURCE", &mut self.resource);
+        text("ARNEB_OAUTH_AUDIENCE", &mut self.audience);
+        text("ARNEB_OAUTH_JWKS_URI", &mut self.jwks_uri);
+        if let Some(v) = get("ARNEB_OAUTH_USER_CLAIM") {
+            self.user_claim = v.trim().to_owned();
+        }
+        if let Some(v) = get("ARNEB_OAUTH_REQUIRED_SCOPES") {
+            self.required_scopes = non_blank(v.split(','));
+        }
+        for (name, slot) in [
+            ("ARNEB_OAUTH_LEEWAY_SECS", &mut self.leeway_secs),
+            ("ARNEB_OAUTH_JWKS_CACHE_SECS", &mut self.jwks_cache_secs),
+            (
+                "ARNEB_OAUTH_JWKS_MIN_REFRESH_SECS",
+                &mut self.jwks_min_refresh_secs,
+            ),
+            (
+                "ARNEB_OAUTH_JWKS_MAX_STALE_SECS",
+                &mut self.jwks_max_stale_secs,
+            ),
+        ] {
+            if let Some(v) = get(name) {
+                *slot = v.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("invalid {name} value '{v}' (expected a non-negative integer)")
+                })?;
+            }
+        }
+        if let Some(v) = get("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP") {
+            self.require_access_token_typ =
+                parse_env_bool("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP", &v)?;
+        }
+        if let Some(v) = get("ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED") {
+            self.allow_missing_email_verified =
+                parse_env_bool("ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED", &v)?;
+        }
+        Ok(())
+    }
+
+    /// Check the settings. Nothing is checked while `issuer` is unset
+    /// (OAuth off).
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let Some(issuer) = &self.issuer else {
+            return Ok(());
+        };
+        check_oauth_url("[oauth] issuer", issuer, true)?;
+        let Some(resource) = &self.resource else {
+            return Err("[oauth] resource is required with issuer (the public URL of /mcp)".into());
+        };
+        check_oauth_url("[oauth] resource", resource, false)?;
+        if !resource.ends_with("/mcp") {
+            return Err(format!("[oauth] resource '{resource}' must end in /mcp"));
+        }
+        if let Some(uri) = &self.jwks_uri {
+            check_oauth_url("[oauth] jwks_uri", uri, true)?;
+        }
+        if self.user_claim.trim().is_empty() {
+            return Err("[oauth] user_claim must not be empty".into());
+        }
+        // RFC 6749 section 3.3: scope-token = 1*( %x21 / %x23-5B / %x5D-7E ).
+        if let Some(bad) = self.required_scopes.iter().find(|s| {
+            s.is_empty()
+                || !s
+                    .bytes()
+                    .all(|b| matches!(b, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
+        }) {
+            return Err(format!(
+                "[oauth] required_scopes entry '{bad}' is not a valid scope token (RFC 6749: \
+                 printable ASCII without space, '\"' or '\\')"
+            ));
+        }
+        if self.leeway_secs > 300 {
+            return Err(format!(
+                "[oauth] leeway_secs ({}) must be at most 300",
+                self.leeway_secs
+            ));
+        }
+        if self.jwks_cache_secs < 60 {
+            return Err(format!(
+                "[oauth] jwks_cache_secs ({}) must be at least 60",
+                self.jwks_cache_secs
+            ));
+        }
+        if self.jwks_min_refresh_secs == 0 || self.jwks_min_refresh_secs > self.jwks_cache_secs {
+            return Err(format!(
+                "[oauth] jwks_min_refresh_secs ({}) must be in 1..=jwks_cache_secs ({})",
+                self.jwks_min_refresh_secs, self.jwks_cache_secs
+            ));
+        }
+        if self.jwks_max_stale_secs < self.jwks_cache_secs {
+            return Err(format!(
+                "[oauth] jwks_max_stale_secs ({}) must be at least jwks_cache_secs ({})",
+                self.jwks_max_stale_secs, self.jwks_cache_secs
+            ));
+        }
+        // An OIDC ID token for a client carries `aud` = that client id and
+        // no scope, so unless the audience is the resource URL only a
+        // required scope tells an access token from an ID token whose shape
+        // gives nothing away. Any other value can be a client id: a plain
+        // name, a colon-bearing one (`arneb:mcp`, `localhost:8080`), or a
+        // URL (an MCP client-metadata-document id, a Keycloak URL client).
+        if let Some(audience) = self.audience.as_deref() {
+            if !audience_is_resource(audience, resource) && self.required_scopes.is_empty() {
+                return Err(format!(
+                    "[oauth] audience '{audience}' is not the resource URL, so it may be a client \
+                     id, and OIDC ID tokens issued to that client carry it as their aud: set \
+                     required_scopes to a scope only access tokens for Arneb carry"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Cross-checks against the rest of the config: OAuth needs password
+    /// auth (users to map to) and an enabled `/mcp`.
+    pub fn check_deployment(
+        &self,
+        auth: AuthType,
+        mcp_enabled: bool,
+    ) -> std::result::Result<(), String> {
+        if !self.enabled() {
+            return Ok(());
+        }
+        if auth != AuthType::Password {
+            return Err("[oauth] requires [auth] type = \"password\"".into());
+        }
+        if !mcp_enabled {
+            return Err("[oauth] requires [mcp] enabled = true".into());
+        }
+        Ok(())
+    }
+}
+
+/// An `[oauth] audience` that is the resource URL itself: a hierarchical URL
+/// with a host, equal to `resource` up to URL normalization (scheme and host
+/// case, default port) and a trailing slash. No client id is that URL.
+fn audience_is_resource(audience: &str, resource: &str) -> bool {
+    let (Ok(a), Ok(r)) = (url::Url::parse(audience), url::Url::parse(resource)) else {
+        return false;
+    };
+    if a.cannot_be_a_base() || a.host().is_none() {
+        return false;
+    }
+    a.as_str().trim_end_matches('/') == r.as_str().trim_end_matches('/')
 }
 
 /// A boolean env value: `true`/`1`/`yes`/`on` or `false`/`0`/`no`/`off`,
@@ -2089,6 +2381,7 @@ impl AppConfig {
                         admission: AdmissionConfig::default(),
                         agent_api: AgentApiConfig::default(),
                         mcp: McpConfig::default(),
+                        oauth: OAuthConfig::default(),
                         observability: ObservabilityConfig::default(),
                         access_control: AccessControlConfig::default(),
                         state: StateConfig::default(),
@@ -2114,6 +2407,14 @@ impl AppConfig {
         mcp.apply_env(|k| std::env::var(k).ok())?;
         mcp.validate(agent_api.max_page_bytes)
             .map_err(|e| anyhow::anyhow!("invalid [mcp] settings: {e}"))?;
+        let mut oauth = config.oauth;
+        oauth.apply_env(|k| std::env::var(k).ok())?;
+        oauth
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid [oauth] settings: {e}"))?;
+        oauth
+            .check_deployment(config.auth.auth_type, mcp.enabled)
+            .map_err(|e| anyhow::anyhow!("invalid [oauth] settings: {e}"))?;
         let mut observability = config.observability;
         observability.apply_env(|k| std::env::var(k).ok())?;
         let mut cluster = config.cluster;
@@ -2146,6 +2447,7 @@ impl AppConfig {
             admission,
             agent_api,
             mcp,
+            oauth,
             observability,
             access_control,
             state,
@@ -2591,6 +2893,327 @@ pgwire = "required"
         c.validate(config.agent_api.max_page_bytes)
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(c)
+    }
+
+    fn oauth(toml_text: &str, env: &[(&str, &str)]) -> Result<OAuthConfig> {
+        let mut c = toml::from_str::<AppConfig>(toml_text)?.oauth;
+        c.apply_env(env_from(env))?;
+        c.validate().map_err(|e| anyhow::anyhow!(e))?;
+        Ok(c)
+    }
+
+    fn oauth_ok() -> OAuthConfig {
+        OAuthConfig {
+            issuer: Some("https://idp.example/realms/arneb".into()),
+            resource: Some("https://db.example/mcp".into()),
+            ..OAuthConfig::default()
+        }
+    }
+
+    #[test]
+    fn oauth_defaults_are_off() {
+        let c = OAuthConfig::default();
+        assert!(!c.enabled());
+        assert_eq!(c.user_claim, "sub");
+        assert_eq!(
+            (
+                c.leeway_secs,
+                c.jwks_cache_secs,
+                c.jwks_min_refresh_secs,
+                c.jwks_max_stale_secs
+            ),
+            (60, 3600, 30, 86400)
+        );
+        assert!(!c.require_access_token_typ);
+        assert!(!c.allow_missing_email_verified);
+        assert_eq!(oauth("port = 5432", &[]).unwrap(), c);
+    }
+
+    #[test]
+    fn oauth_env_overrides_file() {
+        let file = "[oauth]\nissuer = \"https://a\"\nresource = \"https://a/mcp\"\n";
+        let c = oauth(
+            file,
+            &[
+                ("ARNEB_OAUTH_ISSUER", "https://b"),
+                ("ARNEB_OAUTH_REQUIRED_SCOPES", " arneb , ,mcp"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.issuer.as_deref(), Some("https://b"));
+        assert_eq!(c.required_scopes, ["arneb", "mcp"]);
+        let err = oauth(file, &[("ARNEB_OAUTH_LEEWAY_SECS", "x")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ARNEB_OAUTH_LEEWAY_SECS"), "{err}");
+        // An empty value counts as unset.
+        let c = oauth(file, &[("ARNEB_OAUTH_ISSUER", "")]).unwrap();
+        assert_eq!(c.issuer.as_deref(), Some("https://a"));
+        let c = oauth(
+            file,
+            &[
+                ("ARNEB_OAUTH_JWKS_MAX_STALE_SECS", "7200"),
+                ("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP", "true"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.jwks_max_stale_secs, 7200);
+        assert!(c.require_access_token_typ);
+        let err = oauth(file, &[("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP", "maybe")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ARNEB_OAUTH_REQUIRE_ACCESS_TOKEN_TYP"),
+            "{err}"
+        );
+        let c = oauth(file, &[("ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED", "on")]).unwrap();
+        assert!(c.allow_missing_email_verified);
+        let c = oauth(
+            "[oauth]\nissuer = \"https://a\"\nresource = \"https://a/mcp\"\n\
+             allow_missing_email_verified = true\n",
+            &[("ARNEB_OAUTH_ALLOW_MISSING_EMAIL_VERIFIED", "false")],
+        )
+        .unwrap();
+        assert!(!c.allow_missing_email_verified);
+    }
+
+    #[test]
+    fn oauth_required_scopes_must_be_scope_tokens() {
+        for bad in ["a b", "a\"b", "a\\b", "caf\u{e9}", ""] {
+            let c = OAuthConfig {
+                required_scopes: vec![bad.into()],
+                ..oauth_ok()
+            };
+            let err = c.validate().unwrap_err();
+            assert!(err.contains("required_scopes"), "{bad:?}: {err}");
+        }
+        let c = OAuthConfig {
+            required_scopes: vec!["arneb:query".into(), "api://x/.default".into()],
+            ..oauth_ok()
+        };
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn oauth_validate() {
+        let cases: Vec<(OAuthConfig, Option<&str>)> = vec![
+            (oauth_ok(), None),
+            (
+                OAuthConfig {
+                    resource: None,
+                    ..oauth_ok()
+                },
+                Some("resource"),
+            ),
+            (
+                OAuthConfig {
+                    resource: Some("https://db.example/other".into()),
+                    ..oauth_ok()
+                },
+                Some("/mcp"),
+            ),
+            (
+                OAuthConfig {
+                    issuer: Some("http://idp.example".into()),
+                    ..oauth_ok()
+                },
+                Some("https"),
+            ),
+            (
+                OAuthConfig {
+                    issuer: Some("http://127.0.0.1:8180/realms/arneb".into()),
+                    resource: Some("http://localhost/mcp".into()),
+                    ..oauth_ok()
+                },
+                None,
+            ),
+            (
+                OAuthConfig {
+                    resource: Some("https://db.example/mcp?q=1".into()),
+                    ..oauth_ok()
+                },
+                Some("query"),
+            ),
+            (
+                OAuthConfig {
+                    resource: Some("https://db.example/mcp#f".into()),
+                    ..oauth_ok()
+                },
+                Some("fragment"),
+            ),
+            (
+                OAuthConfig {
+                    user_claim: String::new(),
+                    ..oauth_ok()
+                },
+                Some("user_claim"),
+            ),
+            (
+                OAuthConfig {
+                    leeway_secs: 300,
+                    ..oauth_ok()
+                },
+                None,
+            ),
+            (
+                OAuthConfig {
+                    leeway_secs: 301,
+                    ..oauth_ok()
+                },
+                Some("leeway_secs"),
+            ),
+            (
+                OAuthConfig {
+                    jwks_cache_secs: 59,
+                    jwks_min_refresh_secs: 30,
+                    ..oauth_ok()
+                },
+                Some("jwks_cache_secs"),
+            ),
+            (
+                OAuthConfig {
+                    jwks_min_refresh_secs: 0,
+                    ..oauth_ok()
+                },
+                Some("jwks_min_refresh_secs"),
+            ),
+            (
+                OAuthConfig {
+                    jwks_min_refresh_secs: 3601,
+                    ..oauth_ok()
+                },
+                Some("jwks_min_refresh_secs"),
+            ),
+            (
+                OAuthConfig {
+                    jwks_uri: Some("http://idp.example/certs".into()),
+                    ..oauth_ok()
+                },
+                Some("https"),
+            ),
+            (
+                OAuthConfig {
+                    jwks_uri: Some("http://localhost:8180/certs".into()),
+                    ..oauth_ok()
+                },
+                None,
+            ),
+            (
+                OAuthConfig {
+                    jwks_max_stale_secs: 3599,
+                    ..oauth_ok()
+                },
+                Some("jwks_max_stale_secs"),
+            ),
+            (
+                OAuthConfig {
+                    jwks_max_stale_secs: 3600,
+                    ..oauth_ok()
+                },
+                None,
+            ),
+            // Client-id mode: ID tokens for the client share the aud, so a
+            // required scope must tell them apart.
+            (
+                OAuthConfig {
+                    audience: Some("arneb-client".into()),
+                    ..oauth_ok()
+                },
+                Some("required_scopes"),
+            ),
+            (
+                OAuthConfig {
+                    audience: Some("arneb-client".into()),
+                    required_scopes: vec!["arneb".into()],
+                    ..oauth_ok()
+                },
+                None,
+            ),
+            (
+                OAuthConfig {
+                    audience: Some("https://db.example/mcp".into()),
+                    ..oauth_ok()
+                },
+                None,
+            ),
+            // A GUID (Entra application id) is a client id too.
+            (
+                OAuthConfig {
+                    audience: Some("6f1c2a3b-0000-4000-8000-123456789abc".into()),
+                    ..oauth_ok()
+                },
+                Some("may be a client id"),
+            ),
+        ];
+        // Only the resource URL itself (up to normalization and a trailing
+        // slash) is exempt.
+        for audience in [
+            "https://db.example/mcp",
+            "https://db.example/mcp/",
+            "HTTPS://DB.example:443/mcp",
+        ] {
+            let c = OAuthConfig {
+                audience: Some(audience.into()),
+                ..oauth_ok()
+            };
+            assert_eq!(c.validate(), Ok(()), "{audience}");
+        }
+        // Everything else can be a client id: colon-bearing ids that parse
+        // as URLs, URL client ids (an MCP client-metadata document, a
+        // Keycloak URL client), another URL on the resource's host, an
+        // Entra application id URI, an Auth0 API identifier, a URN.
+        for audience in [
+            "arneb:mcp",
+            "mcp-client:prod",
+            "localhost:8080",
+            "https://app.example/client.json",
+            "https://db.example/other",
+            "https://db.example",
+            "api://6f1c2a3b-0000-4000-8000-123456789abc",
+            "https://api.corp.example",
+            "urn:arneb:mcp",
+        ] {
+            let mut c = OAuthConfig {
+                audience: Some(audience.into()),
+                ..oauth_ok()
+            };
+            let err = c.validate().unwrap_err();
+            assert!(err.contains("required_scopes"), "{audience}: {err}");
+            c.required_scopes = vec!["arneb".into()];
+            assert_eq!(c.validate(), Ok(()), "{audience} with a scope");
+        }
+        for (cfg, expect) in cases {
+            match (cfg.validate(), expect) {
+                (Ok(()), None) => {}
+                (Err(e), Some(needle)) => assert!(e.contains(needle), "{e} lacks {needle}"),
+                (got, want) => panic!("{cfg:?}: got {got:?}, wanted {want:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn effective_audience_defaults_to_resource() {
+        let mut c = oauth_ok();
+        assert_eq!(c.effective_audience(), Some("https://db.example/mcp"));
+        c.audience = Some("arneb-client".into());
+        assert_eq!(c.effective_audience(), Some("arneb-client"));
+        assert_eq!(OAuthConfig::default().effective_audience(), None);
+    }
+
+    #[test]
+    fn oauth_requires_password_auth_and_mcp() {
+        let c = oauth_ok();
+        let err = c.check_deployment(AuthType::None, true).unwrap_err();
+        assert!(
+            err.contains("[oauth] requires [auth] type = \"password\""),
+            "{err}"
+        );
+        let err = c.check_deployment(AuthType::Password, false).unwrap_err();
+        assert!(err.contains("[oauth] requires [mcp] enabled"), "{err}");
+        assert!(c.check_deployment(AuthType::Password, true).is_ok());
+        // OAuth off: no requirements.
+        let off = OAuthConfig::default();
+        assert!(off.check_deployment(AuthType::None, false).is_ok());
     }
 
     #[test]

@@ -43,6 +43,19 @@ Send one of these on each request:
 A missing or invalid credential gets `401` with
 `WWW-Authenticate: Bearer realm="arneb"`.
 
+With [`[oauth]`](/guide/configuration#oauth), `/mcp` also takes an OAuth
+access token (a JWT) from the configured identity provider, and its `401`
+challenge becomes `Bearer realm="arneb", resource_metadata="<url>"`. The
+route below is public and exists only then (otherwise `404`):
+
+| Route | Answers |
+|---|---|
+| `GET /.well-known/oauth-protected-resource/mcp` (the well-known path plus the path of `[oauth] resource`, and the bare well-known path when that path is exactly `/mcp`; any other path under it is `404`) | [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) metadata: `resource`, `authorization_servers`, `bearer_methods_supported`, `scopes_supported` when `required_scopes` is set. `Cache-Control: max-age=300`, CORS open. |
+
+A JWT on any `/api` route is an invalid bearer (`401`), and a token that
+fails validation gets the same `401` body as any other bad credential. A valid token
+for a user that does not exist is `403 forbidden`. See [MCP Server: OAuth](/guide/mcp#oauth).
+
 Under `type = "none"` there is nothing to prove. The caller is the user in
 the `X-Arneb-User` header, or `anonymous`. The `queries` access rules are
 not applied, and the session and token routes answer `auth_disabled`.
@@ -145,6 +158,7 @@ password auth without `[tls]` is a startup error; disable the listener with
 | `auth_disabled` | 409 | The route needs `[auth] type = "password"`. |
 | `conflict` | 409 | The change clashes with the current state: the name exists, the object changed while the call was being prepared (retry), or the change would remove your own manage privilege. |
 | `overloaded` | 503 | Too many pending password checks or sessions; retry (`Retry-After: 1`). |
+| `auth_provider_unavailable` | 503 | `/mcp` with `[oauth]`: a JWT arrived and the identity provider's signing keys could not be fetched, so no verdict is possible (`Retry-After: 5`). API tokens, sessions and Basic are unaffected. |
 | `audit_unavailable` | 503 | The [audit log](#audit-log) cannot be written, or the server is shutting down, so audited actions are refused before anything is applied; retry (`Retry-After: 5`). |
 | `internal` | 500 | An unexpected failure; the server log has the detail. |
 
@@ -163,7 +177,7 @@ All `/api/v2` routes need credentials, except `health` and `POST /sessions`.
 | `GET /api/v2/health` | `{"status","version","auth"}`; `auth` is `none` or `password`. Open. |
 | `POST /api/v2/sessions` | Body `{"user","password"}`. Returns `201 {"token","expires_ms"}`. Open. |
 | `DELETE /api/v2/sessions/current` | Ends the session whose token made the request (`204`). |
-| `GET /api/v2/whoami` | `{"user","via"}`; `via` is `token`, `session`, `basic` or `unauthenticated`. |
+| `GET /api/v2/whoami` | `{"user","via"}`; `via` is `token`, `session`, `basic`, `oauth` or `unauthenticated`. |
 | `POST /api/v2/tokens` | Mint a token (see above). `201`. |
 | `GET /api/v2/tokens` | `{"tokens":[{"id","name","created_ms","expires_ms"}]}` for the caller. |
 | `DELETE /api/v2/tokens/{id}` | Revoke the caller's token (`204`); an id that is not 16 lowercase hex is `invalid_argument`. |
@@ -933,7 +947,7 @@ curl -s -H "$H" "$B/audit?limit=2&action=token.issue"
 - `seq` increases with every entry, across restarts; a failed write, or a
   completed intent that is no longer listed, leaves a gap. After a crash, a seq that appears only in an ERROR line may be
   reused. `time_ms` is milliseconds since the Unix epoch.
-- `via` is how the user authenticated: `token`, `session` or `basic`.
+- `via` is how the user authenticated: `token`, `session`, `basic` or `oauth` (an OAuth access token on `/mcp`).
 - `target` names what the action acted on. A token is named by its 16-hex
   id only; the token itself is never recorded.
 - `outcome` is `"ok"`, or `{"error": "<code>"}` with the

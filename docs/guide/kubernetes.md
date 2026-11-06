@@ -125,6 +125,36 @@ restarts every pod.
 - With password auth, the Web UI binds to `127.0.0.1` unless `[web]
   bind_address` is set, so the Service's web port only answers when it is.
 
+## OAuth for MCP
+
+`[oauth]` (see [MCP Server: OAuth](/guide/mcp#oauth)) goes in the coordinator
+config like any other section, or in `ARNEB_OAUTH_*` through `extraEnv`.
+
+- **A TLS-terminating ingress is required** for anything but loopback. The
+  Web port speaks plain HTTP, so a `https` `resource` URL has to be served by
+  an ingress or proxy that terminates TLS in front of the coordinator's Web
+  port and forwards `/mcp` and `/.well-known/oauth-protected-resource`.
+  The metadata document is served at the host root, whatever the path of
+  `resource`: for `resource = https://h/arneb/mcp` its URL is
+  `https://h/.well-known/oauth-protected-resource/arneb/mcp`, so a proxy that
+  forwards only `/arneb/*` must route that path too, unchanged. Arneb
+  answers the document at that exact path (RFC 9728), so the proxy must not
+  strip `/arneb` from it. Only when `resource`'s path is exactly `/mcp`
+  does Arneb also answer the bare `/.well-known/oauth-protected-resource`
+  (for clients that only probe the root); behind a prefix the bare path is
+  `404`, and an ingress shared with other protected resources must not
+  route the host-wide bare path to Arneb, or Arneb would answer discovery
+  for them. Every other path under it is `404`.
+  `resource` is the public URL of that ingress plus `/mcp`; the IdP must put
+  the same URL in the token's `aud`. Arneb refuses a plain-`http` `issuer` or
+  `resource` unless the host is loopback.
+- **The coordinator pod must reach the issuer** (discovery document and JWKS)
+  over `https`. The image ships CA certificates, so a public CA works; for a
+  private CA, mount the bundle and point `SSL_CERT_FILE` at it with
+  `extraEnv`.
+- The Web port binds to `127.0.0.1` under password auth unless `[web]
+  bind_address` is set; set it so the ingress can reach the Service.
+
 ## Coordinator state
 
 Under `[auth] type = "password"` the coordinator keeps its users and

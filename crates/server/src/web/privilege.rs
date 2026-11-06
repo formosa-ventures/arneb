@@ -182,6 +182,7 @@ mod tests {
             } else {
                 AuthVia::Unauthenticated
             },
+            oauth_expires_ms: None,
         }
     }
 

@@ -77,7 +77,7 @@ pub enum AuditOutcome {
 pub struct AuditRecord {
     /// Who ran it.
     pub user: String,
-    /// How the user authenticated: `token`, `session` or `basic`.
+    /// How the user authenticated: `token`, `session`, `basic` or `oauth`.
     pub via: String,
     /// The action name, e.g. `token.issue`.
     pub action: String,

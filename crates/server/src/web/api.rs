@@ -105,25 +105,34 @@ impl BoundedQuery {
     }
 }
 
-/// Every [`QueryState`] by the lowercase name the bounded list reports it
-/// under, in lifecycle order.
-const QUERY_STATES: [(&str, QueryState); 8] = [
-    ("queued", QueryState::Queued),
-    ("planning", QueryState::Planning),
-    ("starting", QueryState::Starting),
-    ("running", QueryState::Running),
-    ("finishing", QueryState::Finishing),
-    ("finished", QueryState::Finished),
-    ("failed", QueryState::Failed),
-    ("cancelled", QueryState::Cancelled),
+/// Every [`QueryState`], in lifecycle order: the states the bounded list's
+/// `state` filter accepts, by [`state_name`].
+const QUERY_STATES: [QueryState; 8] = [
+    QueryState::Queued,
+    QueryState::Planning,
+    QueryState::Starting,
+    QueryState::Running,
+    QueryState::Finishing,
+    QueryState::Finished,
+    QueryState::Failed,
+    QueryState::Cancelled,
 ];
 
-/// The lowercase name of `state`, as the bounded list reports it.
+/// The lowercase name of `state`, as the bounded list reports it. The
+/// match is exhaustive, so a new [`QueryState`] does not compile until it
+/// has a name here; add it to [`QUERY_STATES`] too, so the filter accepts
+/// it (`every_reported_state_parses` checks the two agree).
 pub(super) fn state_name(state: QueryState) -> &'static str {
-    QUERY_STATES
-        .iter()
-        .find(|(_, s)| *s == state)
-        .map_or("unknown", |(name, _)| name)
+    match state {
+        QueryState::Queued => "queued",
+        QueryState::Planning => "planning",
+        QueryState::Starting => "starting",
+        QueryState::Running => "running",
+        QueryState::Finishing => "finishing",
+        QueryState::Finished => "finished",
+        QueryState::Failed => "failed",
+        QueryState::Cancelled => "cancelled",
+    }
 }
 
 /// The [`QueryState`] named `s` (any case). A name selects exactly that
@@ -131,11 +140,10 @@ pub(super) fn state_name(state: QueryState) -> &'static str {
 /// `finishing`. An unknown name is `invalid_argument` listing all eight.
 pub(super) fn parse_query_state(s: &str) -> Result<QueryState, ApiError> {
     QUERY_STATES
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(s.trim()))
-        .map(|(_, state)| *state)
+        .into_iter()
+        .find(|state| state_name(*state).eq_ignore_ascii_case(s.trim()))
         .ok_or_else(|| {
-            let names: Vec<&str> = QUERY_STATES.iter().map(|(n, _)| *n).collect();
+            let names: Vec<&str> = QUERY_STATES.into_iter().map(state_name).collect();
             ApiError::new(ErrorCode::InvalidArgument, format!("unknown state {s:?}"))
                 .with_hint(format!("state is one of {}", names.join(", ")))
         })
@@ -464,14 +472,20 @@ mod tests {
     /// itself, and nothing else does.
     #[test]
     fn every_reported_state_parses() {
-        for (name, state) in QUERY_STATES {
+        for state in QUERY_STATES {
+            let name = state_name(state);
             assert_eq!(format!("{state:?}").to_ascii_lowercase(), name);
             assert_eq!(parse_query_state(name).unwrap(), state);
             assert_eq!(parse_query_state(&name.to_uppercase()).unwrap(), state);
         }
+        // Each state is listed once.
+        let mut names: Vec<_> = QUERY_STATES.into_iter().map(state_name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), QUERY_STATES.len());
         let e = parse_query_state("bogus").unwrap_err();
         let hint = e.hint.clone().unwrap_or_default();
-        for (name, _) in QUERY_STATES {
+        for name in names {
             assert!(hint.contains(name), "{hint}");
         }
     }

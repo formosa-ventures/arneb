@@ -56,7 +56,14 @@ pub(super) async fn pbkdf2_slot(
         .acquire_pbkdf2_slot()
         .await
         .map_err(|e| match e {
-            arneb_protocol::SlotError::Overloaded => overloaded(),
+            // Not `overloaded()`: the caller already authenticated (often
+            // with a bearer token), and switching how it authenticates
+            // does not shorten this queue.
+            arneb_protocol::SlotError::Overloaded => ApiError::new(
+                ErrorCode::Overloaded,
+                "too many pending token issuances or password changes",
+            )
+            .with_hint("retry shortly"),
             arneb_protocol::SlotError::Closed => {
                 ApiError::new(ErrorCode::Internal, "token issuance is unavailable")
             }
@@ -1514,7 +1521,16 @@ pub(super) mod tests {
                 )
             })
             .collect();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Wait until every issuance is queued on a slot, rather than for a
+        // fixed time a loaded runner may not honor.
+        let limiter = state.basic.clone().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while limiter.issuance_waiters() < queued {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every issuance within budget queues for a slot");
         assert!(
             tasks.iter().all(|t| !t.is_finished()),
             "within budget: waiting"
@@ -1527,6 +1543,13 @@ pub(super) mod tests {
         .expect("an over-budget issuance must be refused at once");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "overloaded");
+        // The caller is already authenticated: no advice to switch to a
+        // bearer token, which would not shorten this queue.
+        assert_eq!(
+            body["error"]["message"],
+            "too many pending token issuances or password changes"
+        );
+        assert_eq!(body["error"]["hint"], "retry shortly");
         drop(held);
         for t in tasks {
             assert_eq!(t.await.unwrap().0, StatusCode::CREATED);

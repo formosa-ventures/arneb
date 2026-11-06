@@ -65,20 +65,22 @@ Workflow:
 6. Read rows: fetch_results from first_page.next_cursor, then each next_cursor until null.
 7. Done with a statement: cancel_query stops or frees it.
 
-Limits: a statement keeps max_rows rows (default {default_max_rows}, ceiling {max_rows}); truncated says more existed. Any ended result may be evicted (read ones first) and then answers not_found: resubmit. Pages hold {page_bytes} bytes by default; max_bytes allows up to {max_page_bytes}. Long cells and SQL text are cut. Listings take limit.
+Limits: a statement keeps max_rows rows (default {default_max_rows}, ceiling {max_rows}); truncated says more existed. Any ended result may be evicted and then answers not_found: resubmit. Pages hold {page_bytes} bytes by default; max_bytes allows up to {max_page_bytes}. Long cells and SQL text are cut. Listings take limit.
 
 Errors: a failed call returns a code and a hint. Use the hint and candidates (close matches for a misspelled name), then retry. A SQL error is a failed status.
 
 Operations: list_workers, get_worker, get_admission and list_audit_log need observe access. cordon_/drain_/uncordon_worker, set_admission_limits and config tools (create_*, update_*, set_*, drop_*, reseed_state) need manage; cancel_query on another's query needs manage or a queries kill rule (see whoami.privileges). Changes take dry_run and are audited.
 
-Queries run as your user and see only what it may see.";
+Queries run as your user and see only what the user may see.";
 
 /// The MCP handler: one per request (the service is stateless), cloned
 /// from the one [`mcp_service`] builds.
 #[derive(Clone)]
 pub struct ArnebMcp {
     pub(crate) state: WebState,
-    tool_router: ToolRouter<Self>,
+    /// Built once per service; shared, so the per-request clone of the
+    /// handler is a refcount bump, not a copy of every tool's copy.
+    tool_router: Arc<ToolRouter<Self>>,
     /// [`INSTRUCTIONS`] filled from the configured limits.
     instructions: Arc<str>,
 }
@@ -157,7 +159,7 @@ pub(super) fn mcp_service(
         .map_or_else(AgentLimits::default, |a| a.limits().clone());
     let values = tools::copy_values(&limits, settings.default_page_bytes);
     let handler = ArnebMcp {
-        tool_router: ArnebMcp::configured_router(&values),
+        tool_router: Arc::new(ArnebMcp::configured_router(&values)),
         instructions: tools::fill(INSTRUCTIONS, &values).into(),
         state,
     };

@@ -969,8 +969,8 @@ async fn run() -> Result<()> {
     };
     // Only the coordinator's Trino and Web listeners check Basic credentials
     // (workers serve neither). They share one PBKDF2 limiter and success
-    // cache, but each gets its own wait queue (`sibling`), so a flood on one
-    // port cannot 503 the other.
+    // cache, but each has its own wait queue (Web this handle, Trino its
+    // `sibling`), so a flood on one port cannot 503 the other.
     let basic_auth = password_users
         .clone()
         .filter(|_| serves_clients)
@@ -1364,9 +1364,9 @@ async fn run() -> Result<()> {
         memory_limit_bytes: budget.map(|b| b as u64),
         // Same source as `credentials_for_web` (the state store) whenever
         // that is set: password auth makes the state store the auth method.
-        basic: credentials_for_web
-            .as_ref()
-            .and(basic_auth.as_ref().map(|a| a.sibling())),
+        // The root handle (the Trino listener has its `sibling`), so no
+        // handle sits unused with a wait queue of its own.
+        basic: credentials_for_web.as_ref().and(basic_auth),
         credentials: credentials_for_web,
         state: state_for_web,
         audit: audit_log,
@@ -1499,15 +1499,18 @@ async fn run() -> Result<()> {
     }
 }
 
-/// How long the shutdown lets the Web API finish the requests it has
-/// accepted (an audited action among them) before closing its connections.
+/// How long the shutdown waits for the Web API to finish the requests it
+/// has accepted (an audited action among them) before it stops waiting.
 const WEB_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Stops the Web API gracefully: no new connections, idle keep-alive
 /// connections closed, requests in progress finished, for at most
-/// [`WEB_SHUTDOWN_WAIT`] (then the server task is aborted, logged at WARN;
-/// an audited action it had already handed to the blocking pool still runs
-/// to completion or is refused unwritten). Then flushes the audit log
+/// [`WEB_SHUTDOWN_WAIT`]. Past that it stops waiting (logged at WARN) and
+/// aborts the server task, which closes nothing: axum serves each
+/// connection in its own task, so a connection still in a request keeps
+/// running until the process exits. Any audited action on it is refused
+/// unwritten once the flush starts, and one it had already handed to the
+/// blocking pool still runs to completion. Then flushes the audit log
 /// ([`web::flush_audit`], itself bounded and logging at ERROR what it
 /// could not finish). Holds no lock.
 async fn stop_web_then_flush_audit(
@@ -1550,7 +1553,8 @@ async fn stop_web(
         if tokio::time::timeout(wait, &mut task).await.is_err() {
             tracing::warn!(
                 wait_ms = wait.as_millis() as u64,
-                "the web UI did not finish its requests in time; closing its connections"
+                "the web UI did not finish its requests in time; no longer waiting \
+                 (connections still in a request run until the process exits)"
             );
             task.abort();
         }
@@ -2236,12 +2240,15 @@ async fn load_stored_catalogs(
 /// The tracing filter: `rust_log` (when set and valid, else `info`), then
 /// `arneb::profile=info` under `--profile`, then `rmcp=warn` unless
 /// `rust_log` has a directive whose target is exactly `rmcp` (such as
-/// `rmcp=debug`). rmcp logs every tool result at debug, new API tokens
-/// included, so a global `debug` must not reach it, and it logs three info
-/// lines per stateless MCP request. A directive on the `rmcp` target itself
-/// is the operator opting in; one on a module (`rmcp::transport=warn`)
-/// keeps the cap, and tracing still applies it to that module because the
-/// most specific directive wins.
+/// `rmcp=debug`), or none of its directives could enable rmcp above warn
+/// (`off`, `error`, `warn`, `foo=debug`), where the cap would only act as a
+/// floor. rmcp logs every tool result at debug, new API tokens included, so
+/// a global `debug` must not reach it, and it logs three info lines per
+/// stateless MCP request. A directive on the `rmcp` target itself is the
+/// operator opting in; one on a module (`rmcp::transport=warn`) keeps the
+/// cap, and tracing still applies it to that module because the most
+/// specific directive wins. A field filter (`foo[{rmcp=2}]=trace`) is a
+/// directive on its target (`foo`).
 fn log_filter_directives(rust_log: Option<&str>, profile: bool) -> String {
     let base = rust_log
         .map(str::trim)
@@ -2251,13 +2258,48 @@ fn log_filter_directives(rust_log: Option<&str>, profile: bool) -> String {
     if profile {
         directives.push_str(",arneb::profile=info");
     }
-    let opts_in = base
-        .split(',')
-        .any(|d| d.split(['=', '[']).next().unwrap_or("").trim() == "rmcp");
-    if !opts_in {
+    let (opts_in, may_exceed_warn) = rmcp_directives(base);
+    if !opts_in && may_exceed_warn {
         directives.push_str(",rmcp=warn");
     }
     directives
+}
+
+/// For the `RUST_LOG` directives in `filter`: whether one targets exactly
+/// `rmcp`, and whether any could enable an rmcp event above warn (a
+/// default level, a span-only directive, or a target rmcp's start with,
+/// at info or more). Anything it cannot read counts as "could": the cap is
+/// then kept.
+fn rmcp_directives(filter: &str) -> (bool, bool) {
+    use tracing_subscriber::filter::LevelFilter;
+    let (mut opts_in, mut may_exceed_warn) = (false, false);
+    // Split as EnvFilter splits: on every comma (one inside a field filter
+    // makes the whole filter invalid, and the caller falls back to `info`).
+    for piece in filter.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        // The level follows the last `=`; with none, the piece is a default
+        // level, or a target enabled at every level. A level that does not
+        // parse (a `=` inside a field filter) counts as "could".
+        let (spec, level) = match piece.rfind('=') {
+            Some(i) => (
+                &piece[..i],
+                piece[i + 1..].trim().parse::<LevelFilter>().ok(),
+            ),
+            None => match piece.parse::<LevelFilter>() {
+                Ok(level) => ("", Some(level)),
+                Err(_) => (piece, Some(LevelFilter::TRACE)),
+            },
+        };
+        let target = spec.split('[').next().unwrap_or_default().trim();
+        if target == "rmcp" {
+            opts_in = true;
+        }
+        let reaches_rmcp =
+            target.is_empty() || "rmcp".starts_with(target) || target.starts_with("rmcp::");
+        if reaches_rmcp && level.is_none_or(|l| l > LevelFilter::WARN) {
+            may_exceed_warn = true;
+        }
+    }
+    (opts_in, may_exceed_warn)
 }
 
 #[cfg(test)]
@@ -3213,14 +3255,73 @@ mod tests {
         assert!(!enabled(&d, Probe::Transport, Level::INFO));
         // A target that only starts with the letters is not rmcp.
         assert_eq!(
-            log_filter_directives(Some("rmcpx=debug"), false),
-            "rmcpx=debug,rmcp=warn"
+            log_filter_directives(Some("info,rmcpx=debug"), false),
+            "info,rmcpx=debug,rmcp=warn"
         );
         // `--profile` composes with both.
         assert_eq!(
-            log_filter_directives(Some("warn"), true),
-            "warn,arneb::profile=info,rmcp=warn"
+            log_filter_directives(Some("info"), true),
+            "info,arneb::profile=info,rmcp=warn"
         );
+        assert_eq!(
+            log_filter_directives(Some("warn"), true),
+            "warn,arneb::profile=info"
+        );
+    }
+
+    /// #217 review: a comma inside a field filter does not split the
+    /// directive (so `rmcp=2` there is no opt-in), and the cap is never a
+    /// floor: under `off` or `error` rmcp warnings stay off.
+    #[test]
+    fn rmcp_cap_reads_field_filters_and_is_never_a_floor() {
+        use tracing::Level;
+        // EnvFilter splits on every comma, so a comma inside a field
+        // filter makes RUST_LOG invalid: the fallback keeps the cap.
+        let d = log_filter_directives(Some("debug,foo[{a=1,rmcp=2}]=trace"), false);
+        assert_eq!(d, "info,rmcp=warn");
+        // A field filter it accepts is one directive on its target.
+        let d = log_filter_directives(Some("debug,foo[{rmcp=2}]=trace"), false);
+        assert_eq!(d, "debug,foo[{rmcp=2}]=trace,rmcp=warn");
+        assert!(!enabled(&d, Probe::Service, Level::DEBUG));
+        for quiet in ["off", "error", "warn", "error,foo=debug"] {
+            let d = log_filter_directives(Some(quiet), false);
+            assert_eq!(d, quiet, "the cap would only raise rmcp");
+            for level in [Level::DEBUG, Level::INFO] {
+                assert!(!enabled(&d, Probe::Service, level), "{quiet}");
+            }
+        }
+        // With no default level, events of targets no directive names are
+        // off, so `rmcpx=debug` alone needs no cap either.
+        assert_eq!(
+            log_filter_directives(Some("rmcpx=debug"), false),
+            "rmcpx=debug"
+        );
+        for level in [Level::DEBUG, Level::INFO, Level::WARN] {
+            assert!(!enabled("rmcpx=debug", Probe::Service, level));
+        }
+        assert!(!enabled("off", Probe::Service, Level::WARN));
+        assert!(!enabled("error", Probe::Service, Level::WARN));
+        // Anything that could reach rmcp above warn keeps the cap: a
+        // default, a prefix of its name, a span-only directive, a bare
+        // target, or an rmcp module.
+        for loud in [
+            "info",
+            "DEBUG",
+            "3",
+            "off,r=debug",
+            "off,rm=info",
+            "off,[{a=1}]=trace",
+            "off,rmc",
+            "error,rmcp::service=debug",
+        ] {
+            let d = log_filter_directives(Some(loud), false);
+            assert!(d.ends_with(",rmcp=warn"), "{loud}: {d}");
+        }
+        assert!(!enabled(
+            &log_filter_directives(Some("off,r=debug"), false),
+            Probe::Service,
+            Level::DEBUG
+        ));
     }
 
     #[tokio::test]

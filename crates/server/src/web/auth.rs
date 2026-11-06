@@ -232,22 +232,6 @@ async fn oauth_identity(
 
     match oauth.validate(token).await {
         Ok(principal) => {
-            if let Err(e) = super::users::validate_name(&principal.user) {
-                tracing::debug!(target: "arneb::oauth", error = ?e, "mapped user name is not valid");
-                return Err(Box::new(
-                    ApiError::new(
-                        ErrorCode::Forbidden,
-                        format!(
-                            "the identity's '{}' claim is not a valid Arneb user name",
-                            oauth.settings().user_claim
-                        ),
-                    )
-                    .with_hint(
-                        "set [oauth] user_claim to a claim that holds a valid user name, or seed the user in [[auth.users]]",
-                    )
-                    .into_response(),
-                ));
-            }
             if state
                 .state
                 .as_ref()
@@ -276,6 +260,24 @@ async fn oauth_identity(
                 resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
             }
             Err(Box::new(resp))
+        }
+        // Checked in `validate` after the scope and before the email, so
+        // a claim no user can have never gets an email-specific 403.
+        Err(OAuthReject::InvalidUserName) => {
+            tracing::debug!(target: "arneb::oauth", "mapped user name is not valid");
+            Err(Box::new(
+                ApiError::new(
+                    ErrorCode::Forbidden,
+                    format!(
+                        "the identity's '{}' claim is not a valid Arneb user name",
+                        oauth.settings().user_claim
+                    ),
+                )
+                .with_hint(
+                    "set [oauth] user_claim to a claim that holds a valid user name, or seed the user in [[auth.users]]",
+                )
+                .into_response(),
+            ))
         }
         Err(OAuthReject::UnverifiedEmail) => Err(Box::new(
             ApiError::new(

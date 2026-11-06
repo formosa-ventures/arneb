@@ -344,9 +344,14 @@ impl CredentialSource for UserCredentials {
 /// The one per-process secret behind every decoy verifier (pgwire, Trino and
 /// Web Basic, config users and the state store alike); stable for the
 /// process so a probed user always gets the same fake salt on every path.
+/// The process-wide decoy secret, set by [`init_decoy_secret`].
+static DECOY_SECRET: OnceLock<[u8; KEY_LEN]> = OnceLock::new();
+
+/// The decoy secret, created on first use when [`init_decoy_secret`] was
+/// not called (a path without password auth, or a test); that lazy
+/// creation is the only one that can panic on a failing RNG.
 fn decoy_secret() -> &'static [u8; KEY_LEN] {
-    static SECRET: OnceLock<[u8; KEY_LEN]> = OnceLock::new();
-    SECRET.get_or_init(|| {
+    DECOY_SECRET.get_or_init(|| {
         let mut secret = [0u8; KEY_LEN];
         aws_lc_rs::rand::fill(&mut secret).expect("system random number generator failed");
         secret
@@ -356,12 +361,17 @@ fn decoy_secret() -> &'static [u8; KEY_LEN] {
 /// Creates the process-wide decoy secret now. Call once at startup when
 /// password auth is on so a failing system RNG fails startup with
 /// [`AuthConfigError::Random`] instead of panicking on the first login
-/// attempt for an unknown user. Idempotent.
+/// attempt for an unknown user. Idempotent; it fills the RNG once and
+/// never panics.
 pub fn init_decoy_secret() -> Result<(), AuthConfigError> {
-    // Probe the RNG first: `decoy_secret` would panic on failure.
-    let mut probe = [0u8; KEY_LEN];
-    aws_lc_rs::rand::fill(&mut probe).map_err(|_| AuthConfigError::Random)?;
-    decoy_secret();
+    if DECOY_SECRET.get().is_some() {
+        return Ok(());
+    }
+    let mut secret = [0u8; KEY_LEN];
+    aws_lc_rs::rand::fill(&mut secret).map_err(|_| AuthConfigError::Random)?;
+    // A concurrent first use may have set it meanwhile: either value is
+    // a fresh random secret, and every reader sees the one that won.
+    let _ = DECOY_SECRET.set(secret);
     Ok(())
 }
 
@@ -944,6 +954,17 @@ mod tests {
             UserCredentials::new(vec![("a".into(), v.clone()), ("a".into(), v)]),
             Err(AuthConfigError::DuplicateUser(u)) if u == "a"
         ));
+    }
+
+    /// `init_decoy_secret` is idempotent and keeps whatever secret is in
+    /// use: decoys made before and after it are the same.
+    #[test]
+    fn init_decoy_secret_is_idempotent_and_keeps_the_secret() {
+        init_decoy_secret().unwrap();
+        let before = decoy_verifier("mallory");
+        init_decoy_secret().unwrap();
+        assert_eq!(decoy_verifier("mallory").salt, before.salt);
+        assert_eq!(decoy_secret(), DECOY_SECRET.get().unwrap());
     }
 
     #[test]

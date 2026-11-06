@@ -1532,9 +1532,12 @@ pub fn secret_fields(spec: &CatalogConfig) -> Vec<&'static str> {
 ///   `app:1234/56@db`), unless that `@` plainly sits in a query value, see
 ///   [`at_in_query_value`] (`db:5432/x?user=a@b`,
 ///   `?application_name=a:b@c`);
-/// - or a query parameter's key, split loosely (on every `&`, key to the
-///   first `=`) and percent-decoded, contains `password` in any case
-///   (`?sslmode&password=x`, `?PASSWORD=x`, `?sslpassword=x`).
+/// - or the text after the first `?` or `#` (query keys, values and the
+///   fragment), percent-decoded, contains `password` in any case
+///   (`?sslmode&password=x`, `?PASSWORD=x`, `?sslpassword=x`,
+///   `?sslmode=require password=x`, `?sslmode=bad#password=x`). A value
+///   that only names the word (`?note=password`) is the same small false
+///   positive the keyword-string rule accepts.
 ///
 /// Without a leading `scheme://` (a libpq keyword string `host=db
 /// password=x`, even one with a `file:///` parameter, a mistyped
@@ -1565,11 +1568,13 @@ fn refused_url_may_hold_password(url: &str) -> bool {
         let host_start = ipv6_host_len(rest);
         rest[host_start..at].contains(':') && !at_in_query_value(rest, at)
     });
-    let query = rest.find('?').is_some_and(|q| {
-        rest[q + 1..]
-            .split('&')
-            .any(|segment| has_password(segment.split('=').next().unwrap_or_default()))
-    });
+    // Everything after the first `?` or `#`, keys, values and fragment
+    // alike, is read as the keyword-string branch reads its whole text:
+    // `?sslmode=require password=x` and `?sslmode=bad#password=x` hide a
+    // password in a value or the fragment, where no key holds it.
+    let query = rest
+        .find(['?', '#'])
+        .is_some_and(|q| has_password(&rest[q + 1..]));
     userinfo || query
 }
 
@@ -2337,7 +2342,6 @@ mod tests {
             "postgresql://db:5432/x?user=a@b",
             "postgresql://db/x?sslmod=require&application_name=a:b@c",
             "postgresql://[::1]:5432/x?user=a@b",
-            "postgresql://db/x?sslmod=require&note=password",
         ] {
             let s = pg(url);
             assert!(validate_spec(&s).is_err(), "{url}");
@@ -2374,6 +2378,14 @@ mod tests {
             "postgresql://app:12?user=x@db/x",
             "postgresql://app:12/x?y=z@db",
             "postgresql://[ab:cd]@db/x?sslmod=bad",
+            // Round 7: `password` inside a query value or in the fragment.
+            // The driver would not send it, but it is plainly meant as one,
+            // so the whole text after `?` or `#` is read the way a keyword
+            // string is; a value that merely says `password` costs the same
+            // small false positive as there.
+            "postgresql://db/x?sslmode=require password=hunter2",
+            "postgresql://db/x?sslmode=bad#password=hunter2",
+            "postgresql://db/x?sslmod=require&note=password",
         ] {
             let s = pg(url);
             assert!(validate_spec(&s).is_err(), "{url}");

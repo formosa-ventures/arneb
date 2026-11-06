@@ -51,14 +51,21 @@ const CACHE_CAPACITY: usize = 1024;
 /// misses wait for a slot. Cache hits never wait.
 const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
 /// Distinct cache misses allowed to wait for a verification slot on top of
-/// the [`MAX_CONCURRENT_VERIFICATIONS`] running ones. At 4 slots and tens of
-/// milliseconds per PBKDF2 derivation, 64 waiters is well under a second of
-/// queue: enough to absorb a burst of legitimate first polls, small enough
-/// that a flood is rejected (`503`) instead of delaying everyone.
+/// the [`MAX_CONCURRENT_VERIFICATIONS`] running ones, per listener (each
+/// [`BasicAuthenticator::sibling`] has its own queue). The limiter itself
+/// is shared, so its worst-case backlog is the sum over its handles: with
+/// the Web and Trino listeners, 2 × 68 verifications in flight plus
+/// [`MAX_QUEUED_ISSUANCES`] issuances, about 150 callers on the same 4
+/// slots. At tens of milliseconds per PBKDF2 derivation that
+/// is about a second or two of queue at worst: enough to absorb a burst of
+/// legitimate first polls, small enough that a flood is rejected (`503`)
+/// instead of delaying everyone for long.
 const MAX_QUEUED_VERIFICATIONS: usize = 64;
-/// Token issuances allowed to wait for a PBKDF2 slot (a budget separate from
-/// the per-listener verification queues); past that issuance is refused as
-/// overloaded, so an issue flood cannot queue ahead of Basic logins.
+/// Token issuances (and runtime password hashes) allowed to wait for a
+/// PBKDF2 slot, a budget separate from the verification queues; past that
+/// they are refused as overloaded. The shared limiter is a FIFO
+/// semaphore, so queued issuances do sit ahead of Basic verifications that
+/// arrive later: this bound caps that, it does not prevent it.
 const MAX_QUEUED_ISSUANCES: usize = 16;
 /// `Retry-After` (seconds) on the `503` returned when the queue is full.
 const OVERLOADED_RETRY_AFTER_SECS: &str = "1";
@@ -198,6 +205,13 @@ impl BasicAuthenticator {
     #[doc(hidden)]
     pub fn max_queued_issuances() -> usize {
         MAX_QUEUED_ISSUANCES
+    }
+
+    /// Callers of [`Self::acquire_pbkdf2_slot`] waiting for a slot now;
+    /// test hook.
+    #[doc(hidden)]
+    pub fn issuance_waiters(&self) -> usize {
+        self.slot_waiters.load(Ordering::Relaxed)
     }
 
     /// Like [`BasicAuthenticator::new`], counting PBKDF2 verifications in

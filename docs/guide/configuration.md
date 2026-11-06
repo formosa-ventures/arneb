@@ -246,9 +246,38 @@ client is cancelled on every worker: its tasks stop and their memory and
 output buffers are released. `arneb::cluster` logs `cancelling query on
 workers` on the coordinator and `query cancelled on worker` on each worker.
 
-The effective values are logged at startup on `arneb::config`. Set
-`max_running_queries = 0` and leave the other two unset to turn admission
-off.
+The effective values are logged at startup on `arneb::config`, with
+`admission_source = config|state`. Set `max_running_queries = 0` and leave
+the other two unset to turn admission off, unless limits were set at
+runtime (see below): then `PUT {"max_running_queries": 0}` instead.
+
+**Runtime changes.** A manager can change `max_running_queries` and
+`max_queued_queries` while the server runs, with `PUT /api/v2/admission` or
+the MCP `set_admission_limits` tool (see
+[HTTP API](/guide/http-api#admission-limits)). The change applies at once:
+
+- lowering the cap below the running count stops nothing; new queries queue
+  until fewer than the new cap run;
+- raising it, or setting `0` (unlimited), admits queued queries at once, in
+  arrival order, up to the new cap;
+- a shorter queue keeps the queries already queued, and refuses new ones
+  while the queue is at or over the new limit.
+
+The new limits are kept in the state store (`[state] path`) and win over
+`[admission]` and the `ARNEB_*` variables at the next start. Each knob whose
+config value differs from the stored one logs a WARN on `arneb::config`:
+
+```text
+[admission] max_running_queries / ARNEB_MAX_RUNNING_QUERIES = 8 is overridden by the runtime value 4 in the state store (DELETE /api/v2/admission returns to the config)
+```
+
+A stored value pins the limits across restarts and config edits: changing
+`[admission]` or the `ARNEB_*` variables has no effect on them until the
+stored value is gone. To go back to the config, call
+[`DELETE /api/v2/admission`](/guide/http-api#admission-limits) (MCP
+`reset_admission_limits`): it clears the stored limits and applies the
+config values the server started with, at once. `statement_timeout` and
+`query_max_memory_per_node` change only at startup.
 
 ## Query History
 
@@ -532,11 +561,13 @@ Limitations:
 ```toml
 [access_control]
 rules_file = "/etc/arneb/rules.json"
+admin_users = ["root"]
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `rules_file` | path | unset | Rules in Trino's file-based access control format (`ARNEB_ACCESS_CONTROL_RULES_FILE`). Read at startup on the coordinator and standalone server; an unreadable or unsupported file stops startup. Unset: every user reads every table. |
+| `admin_users` | list of strings | `[]` | Users who hold the manage privilege (`ARNEB_ADMIN_USERS`, comma-separated; whitespace is trimmed, blanks are dropped, an empty value counts as unset). Only effective under `[auth] type = "password"`; under `none` a WARN is logged at startup. Names that are not users in the state store are also warned about. |
 
 See [Access Control](/guide/access-control) for the rule format.
 
@@ -621,6 +652,70 @@ open so existing scrapers keep working.
 [access control](/guide/access-control). Scrapers of `/api/v1` need a token
 (or Basic). Under `type = "none"` nothing changes.
 
+### Upgrading to v0.2.0 (manage API)
+
+- **Write privileges.** `INSERT`, `DELETE` and `OWNERSHIP` are checked
+  against the `tables` rules on every protocol, and a `read-only` catalog
+  refuses writes (SQLSTATE `42501`, `PERMISSION_DENIED`, `forbidden`). A
+  rules file whose `tables` section grants only `SELECT` now refuses DDL and
+  DML; without a `tables` section nothing changes. See
+  [access control](/guide/access-control#supported-rules).
+- **`DELETE /api/v2/queries/{id}` answers `200` with a body** (the
+  [manage envelope](/guide/http-api#dry-runs-and-the-response-envelope))
+  instead of `204`, and now stops the query on pgwire and Trino too. Clients
+  that check for `204` must accept `200`. `DELETE /api/v1/queries/{id}` of a
+  query that already ended answers `204`.
+- **Observe is gated by `system_information`.** Once the rules file has a
+  `system_information` section, the cluster, worker, admission and audit
+  views need a rule that allows `read` (or the manage privilege). Without
+  the section, or without a rules file, they stay open as before.
+- **An admission controller always exists.** It is built even for
+  `max_running_queries = 0`, so the admission gauges are now reported at cap
+  0 (see [Observability](/guide/observability)).
+- **Stored admission limits pin values.** A limit set with `PUT
+  /api/v2/admission` is kept in the state file and wins over `[admission]`
+  and `ARNEB_MAX_*_QUERIES` at every start, each overridden knob logging a
+  WARN. To go back to the config, call `DELETE /api/v2/admission` (MCP
+  `reset_admission_limits`), which clears the stored limits and applies the
+  config values at once.
+- **New state.** The state file gains `cordons` and `settings` (readable by
+  older binaries, whose next write drops them), and the coordinator writes
+  the [audit log](#audit-log) next to it (`state.json` →
+  `state.json.audit.jsonl`). With no `[state] path` these live
+  in memory and are lost on restart.
+- **Revoking a token with a malformed id is `400 invalid_argument`**, and
+  the refusal is not audited.
+- **Under `[auth] type = "none"`, a Web API cancel now really stops the
+  query.** Before, cancelling a pgwire or Trino query only changed its
+  recorded state. Now any peer that can reach the Web port can stop any
+  query through `DELETE /api/v1/queries/{id}`, and `/api/v2` and MCP accept
+  a claimed `X-Arneb-User` as the query's owner. Do not expose the Web port
+  under `none`: bind it to loopback (`[web] bind_address = "127.0.0.1"`) or
+  use `[auth] type = "password"`.
+- **Under `none`, cancelling another user's query over `/api/v2` or MCP is
+  refused** with `403 manage_requires_auth` (it was allowed before). The
+  owner (the claimed `X-Arneb-User`) may still cancel it, and `/api/v1`
+  still lets any caller cancel any query.
+- **Killing another user's query needs a rule or manage.** Under password
+  auth with no rules file, or a rules file without a `queries` section, only
+  the query's owner or a manager may cancel it (on `/api/v1`, `/api/v2` and
+  MCP `cancel_query`). An explicit `queries` rule that allows `kill` still
+  grants it; add `{"allow": ["execute", "view", "kill"]}` for the old
+  open behavior.
+- **`DELETE /api/v1/queries/{id}` under password auth** follows the
+  [kill rule](/guide/http-api#cancel-any-query): cancelling another user's
+  query is audited, and the call can answer `503 audit_unavailable` (with an
+  error body and `Retry-After: 5`) while the audit log is unwritable.
+- **Hash fan-out counts only schedulable workers.** Distributed queries size
+  their hash partitions from the workers they are scheduled on, not from
+  every alive worker. A cordoned, draining or SIGTERM-draining worker no
+  longer counts, so queries use fewer partitions while one is out.
+- **`/metrics` is outside the observe layer.** A `system_information`
+  section does not hide the admission gauges, worker ids, `arneb_worker_up`
+  or heartbeat ages that `/metrics` serves. Set
+  [`metrics_auth = true`](#web-ui) (and keep the port private) if they must
+  not be public.
+
 ## State
 
 ```toml
@@ -629,8 +724,11 @@ path = "/var/lib/arneb/state.json"   # optional; ARNEB_STATE_PATH
 ```
 
 The coordinator (or standalone server) keeps its users and
-[API tokens](/guide/http-api#api-tokens) in one JSON state file. Workers never
-open it. Every write is atomic (write, fsync, rename) and the file is
+[API tokens](/guide/http-api#api-tokens) in one JSON state file, and the
+[audit log](#audit-log) in the same directory, named after the state file
+(`state.json` → `state.json.audit.jsonl`), so two state files in one directory
+keep separate audit logs. Workers never
+open them. Every write is atomic (write, fsync, rename) and the file is
 created with mode `0600`. The path's directory must be writable.
 
 - **Config users follow the config file.** On every start, the users from
@@ -646,8 +744,9 @@ created with mode `0600`. The path's directory must be writable.
   whose stored verifier is identical to the config's `password_hash`: it is
   adopted (marked config-managed, tokens kept) with an INFO line on
   `arneb::config`, so later config edits or removal apply to it.
-- **No `path`** keeps the state in memory. Startup logs a WARN, `no [state]
-  path: API tokens are lost on restart`, and the token API says so when it
+- **No `path`** keeps the state, and the audit log, in memory. Startup logs a
+  WARN, `no [state] path: API tokens, worker cordons, admission limits and
+  the audit log are lost on restart`, and the token API says so when it
   issues a token.
 - The effective path (and `--reseed-state`) is logged on `arneb::config`.
 - The state store is only used under `[auth] type = "password"`. Under
@@ -655,6 +754,84 @@ created with mode `0600`. The path's directory must be writable.
   logs an INFO line).
 - On Kubernetes the chart mounts a volume for it; see
   [Kubernetes](/guide/kubernetes#coordinator-state).
+
+## Audit Log
+
+```toml
+[audit]
+max_entries    = 10000   # ARNEB_AUDIT_MAX_ENTRIES
+retention_days = 90      # ARNEB_AUDIT_RETENTION_DAYS; 0 = no age limit
+```
+
+Under `[auth] type = "password"`, the coordinator records every audited
+action (token issue and revoke, and the manage actions) as JSON lines in
+`<state file name>.audit.jsonl`, in the directory of [`[state] path`](#state)
+and named after its full file name (`/var/lib/arneb/prod.json` →
+`/var/lib/arneb/prod.json.audit.jsonl`), mode `0600`. A log under the
+earlier name `audit.jsonl` in that directory is neither read nor migrated:
+the server logs a WARN on `arneb::audit` at startup naming it, and its
+entries do not appear in `GET /api/v2/audit`. Keep or archive it.
+An action writes an intent entry (outcome `pending`) before it is applied
+and a completion entry after; each is synced to disk, the completion before
+the response returns. Read it with
+[`GET /api/v2/audit`](/guide/http-api#audit-log).
+
+| Knob | Env | Default | Meaning |
+|---|---|---|---|
+| `max_entries` | `ARNEB_AUDIT_MAX_ENTRIES` | `10000` | Most entries kept, `1` to `1000000`. |
+| `retention_days` | `ARNEB_AUDIT_RETENTION_DAYS` | `90` | Days an entry is kept; `0` keeps entries of any age. |
+
+- **Compaction.** The file is rewritten atomically (temporary file, fsync,
+  rename, directory fsync), keeping at most the newest `max_entries` entries
+  younger than `retention_days`. The newest entry is always kept, so `seq`
+  keeps increasing across restarts. Compaction runs at startup when there is
+  something to drop, and whenever the file holds `max(max_entries / 10, 100)`
+  more lines than `max_entries`. Reads hide entries past `retention_days` at
+  once, the kept newest entry included. The `pending` intent of an action in
+  flight is never dropped, by age or by the cap, until its completion is
+  written.
+- **Torn lines.** A line that does not parse (for example, cut short by a
+  crash) is skipped with a WARN on `arneb::audit` naming its line number.
+  Startup never fails on it, and the startup compaction drops it.
+- **A failed write.** If the intent cannot be written, the action is
+  refused with `503 audit_unavailable` and nothing is applied. When the
+  write was attempted (it may have reached the disk) and the log reopens at
+  once, the intent is closed with outcome `{"error": "audit_unavailable"}`
+  (best effort), so a restart does not report it as interrupted; an intent
+  refused without a write gets no closing entry. If the completion cannot
+  be written, the action has already happened: the entry is logged in full
+  at ERROR on `arneb::audit`, its intent stays `pending` for now, and every
+  later audited action is refused with `503 audit_unavailable` until the
+  file can be written again. The server keeps that completion and appends
+  it first when the log reopens, so the known outcome still reaches the
+  file. It tries to reopen the log every 5 seconds in the background (no
+  audited action is needed), and once more when the server exits (a
+  graceful shutdown, or a fatal pgwire or Flight listener error); a
+  completion still unwritten then is logged at ERROR and its action is
+  recorded as `interrupted` at the next start. Before that last attempt, the
+  Web API stops gracefully: it accepts no new connections, closes idle ones,
+  and gives requests in progress up to 5 seconds to finish. Then new audited
+  actions are refused with `503 audit_unavailable` ("the server is shutting
+  down"; nothing is applied or written, including one still queued on the
+  blocking pool), and the server waits up to 10 seconds for audited actions
+  already running (a cancel waiting on its kill, a token issue), so their
+  completions get the same retry; one still running after that is logged at
+  ERROR and recorded as `interrupted` at the next start. An action that panics, or a cancel whose
+  kill ended without an outcome, is completed as `interrupted`, since it may
+  have taken effect. A `token.issue` that failed
+  has an empty `target`: its token id never became a token.
+- **Interrupted actions.** An intent with no completion at startup (the
+  server stopped while applying it, or before a failed completion could be
+  appended again, or the action panicked) is logged at
+  WARN on `arneb::audit` and recorded once as an entry with outcome
+  `interrupted`: the action may or may not have been applied. So no applied
+  action is ever missing from the log.
+- **No `[state] path`** keeps the log in memory, with a startup WARN; it is
+  lost on restart. Under `type = "none"` nothing is audited and the log stays
+  empty.
+- The effective values, the path and the number of entries loaded are logged
+  on `arneb::config` as `audit effective settings ([audit] / ARNEB_AUDIT_*)`.
+  An invalid value fails startup.
 
 ## Observability
 

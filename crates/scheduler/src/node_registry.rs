@@ -35,6 +35,84 @@ pub struct LostWorker {
     pub reason: String,
 }
 
+/// How an operator took a worker out of scheduling (manage-api D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CordonMode {
+    /// No new queries; nothing else is tracked.
+    Cordon,
+    /// No new queries, and the queries it runs are watched until none is left.
+    Drain,
+}
+
+/// A worker's coordinator-side scheduling state, separate from the
+/// lifecycle `draining` flag the worker itself reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulingState {
+    /// Takes new queries.
+    Schedulable,
+    /// Cordoned: takes no new queries.
+    Cordoned,
+    /// Drain requested; distributed queries still run on it.
+    Draining,
+    /// Drain requested; no distributed query runs on it.
+    Drained,
+}
+
+impl SchedulingState {
+    /// `schedulable`, `cordoned`, `draining` or `drained`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SchedulingState::Schedulable => "schedulable",
+            SchedulingState::Cordoned => "cordoned",
+            SchedulingState::Draining => "draining",
+            SchedulingState::Drained => "drained",
+        }
+    }
+}
+
+/// Cordons and in-flight counts, under one lock so a selection and its
+/// increments never interleave with a cordon change.
+#[derive(Debug, Default)]
+struct Scheduling {
+    cordons: HashMap<String, CordonMode>,
+    /// Distributed queries holding an [`InFlightGuard`] over each worker.
+    in_flight: HashMap<String, usize>,
+}
+
+fn lock(scheduling: &Mutex<Scheduling>) -> std::sync::MutexGuard<'_, Scheduling> {
+    scheduling.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Counts one distributed query on each worker it was given by
+/// [`NodeRegistry::schedule_workers`]; dropping it un-counts them.
+#[must_use = "dropping the guard ends the in-flight count at once"]
+pub struct InFlightGuard {
+    scheduling: Arc<Mutex<Scheduling>>,
+    worker_ids: Vec<String>,
+}
+
+impl std::fmt::Debug for InFlightGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InFlightGuard")
+            .field("worker_ids", &self.worker_ids)
+            .finish()
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut scheduling = lock(&self.scheduling);
+        for id in &self.worker_ids {
+            if let Some(count) = scheduling.in_flight.get_mut(id) {
+                *count -= 1;
+                if *count == 0 {
+                    scheduling.in_flight.remove(id);
+                }
+            }
+        }
+    }
+}
+
 /// Thread-safe registry of worker nodes.
 #[derive(Clone)]
 pub struct NodeRegistry {
@@ -49,6 +127,8 @@ pub struct NodeRegistry {
     /// Address of each worker that deregistered after a drain, so a query
     /// it still ran reports why it is gone. Cleared when the id rejoins.
     departed: Arc<Mutex<HashMap<String, String>>>,
+    /// Cordons and in-flight counts. Lock order: `workers`, then this.
+    scheduling: Arc<Mutex<Scheduling>>,
 }
 
 impl NodeRegistry {
@@ -60,6 +140,7 @@ impl NodeRegistry {
             version: env!("CARGO_PKG_VERSION"),
             rejected: Arc::new(Mutex::new(HashMap::new())),
             departed: Arc::new(Mutex::new(HashMap::new())),
+            scheduling: Arc::new(Mutex::new(Scheduling::default())),
         }
     }
 
@@ -253,15 +334,102 @@ impl NodeRegistry {
         workers.values().filter(|w| w.alive).cloned().collect()
     }
 
-    /// Alive workers that take new queries (not draining).
+    /// Alive workers that take new queries: neither draining (lifecycle)
+    /// nor cordoned (scheduling).
     pub fn active_workers(&self) -> Vec<WorkerInfo> {
         let mut workers = self.workers.write().unwrap();
         self.expire_silent(&mut workers);
-        workers
-            .values()
-            .filter(|w| w.alive && !w.draining)
-            .cloned()
-            .collect()
+        let scheduling = lock(&self.scheduling);
+        schedulable(&workers, &scheduling).cloned().collect()
+    }
+
+    /// [`Self::active_workers`], each counted as running one more
+    /// distributed query until the returned guard drops. Selection and
+    /// counting happen under the cordon lock, so once
+    /// [`Self::set_cordon`] returns no later selection includes that worker.
+    pub fn schedule_workers(&self) -> (Vec<WorkerInfo>, InFlightGuard) {
+        let mut workers = self.workers.write().unwrap();
+        self.expire_silent(&mut workers);
+        let mut scheduling = lock(&self.scheduling);
+        let picked: Vec<WorkerInfo> = schedulable(&workers, &scheduling).cloned().collect();
+        let worker_ids: Vec<String> = picked.iter().map(|w| w.worker_id.clone()).collect();
+        for id in &worker_ids {
+            *scheduling.in_flight.entry(id.clone()).or_default() += 1;
+        }
+        drop(scheduling);
+        let guard = InFlightGuard {
+            scheduling: Arc::clone(&self.scheduling),
+            worker_ids,
+        };
+        (picked, guard)
+    }
+
+    /// Cordon or drain `worker_id` (`Some`), or uncordon it (`None`). Any
+    /// id is accepted, registered or not; a cordon outlives the worker's
+    /// registration and applies again when it re-registers.
+    pub fn set_cordon(&self, worker_id: &str, mode: Option<CordonMode>) {
+        let mut scheduling = lock(&self.scheduling);
+        let before = match mode {
+            Some(mode) => scheduling.cordons.insert(worker_id.to_owned(), mode),
+            None => scheduling.cordons.remove(worker_id),
+        };
+        drop(scheduling);
+        if before != mode {
+            tracing::info!(
+                target: "arneb::cluster",
+                worker_id = %worker_id,
+                scheduling = match mode {
+                    Some(CordonMode::Cordon) => "cordoned",
+                    Some(CordonMode::Drain) => "draining",
+                    None => "schedulable",
+                },
+                "worker scheduling changed"
+            );
+        }
+    }
+
+    /// Replace the cordons with `cordons` (the state store's, at startup).
+    pub fn restore_cordons(&self, cordons: impl IntoIterator<Item = (String, CordonMode)>) {
+        lock(&self.scheduling).cordons = cordons.into_iter().collect();
+    }
+
+    /// The cordon on `worker_id`, if any.
+    pub fn cordon_of(&self, worker_id: &str) -> Option<CordonMode> {
+        lock(&self.scheduling).cordons.get(worker_id).copied()
+    }
+
+    /// Every cordoned or draining id, registered or not; sorted.
+    pub fn cordoned_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = lock(&self.scheduling).cordons.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// `worker_id`'s scheduling state.
+    pub fn scheduling_state(&self, worker_id: &str) -> SchedulingState {
+        let scheduling = lock(&self.scheduling);
+        match scheduling.cordons.get(worker_id) {
+            None => SchedulingState::Schedulable,
+            Some(CordonMode::Cordon) => SchedulingState::Cordoned,
+            Some(CordonMode::Drain) if scheduling.in_flight.contains_key(worker_id) => {
+                SchedulingState::Draining
+            }
+            Some(CordonMode::Drain) => SchedulingState::Drained,
+        }
+    }
+
+    /// Distributed queries running on `worker_id` (held guards over it).
+    pub fn in_flight(&self, worker_id: &str) -> usize {
+        lock(&self.scheduling)
+            .in_flight
+            .get(worker_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether `worker_id` is registered, alive or not.
+    pub fn is_known(&self, worker_id: &str) -> bool {
+        self.workers.read().unwrap().contains_key(worker_id)
     }
 
     /// Mark every worker silent past the heartbeat timeout as dead.
@@ -283,6 +451,16 @@ impl NodeRegistry {
         all
     }
 
+    /// Registered worker `worker_id`, alive or not, with liveness
+    /// re-evaluated against the heartbeat deadline.
+    pub fn worker(&self, worker_id: &str) -> Option<WorkerInfo> {
+        let timeout = self.heartbeat_timeout();
+        let mut workers = self.workers.write().unwrap();
+        let worker = workers.get_mut(worker_id)?;
+        expire(worker, Instant::now(), timeout);
+        Some(worker.clone())
+    }
+
     /// Returns the total number of registered workers (alive or dead).
     pub fn total_count(&self) -> usize {
         self.workers.read().unwrap().len()
@@ -297,6 +475,16 @@ impl NodeRegistry {
     pub fn remove_worker(&self, worker_id: &str) -> bool {
         self.workers.write().unwrap().remove(worker_id).is_some()
     }
+}
+
+/// The workers that take new queries: alive, not draining, not cordoned.
+fn schedulable<'a>(
+    workers: &'a HashMap<String, WorkerInfo>,
+    scheduling: &'a Scheduling,
+) -> impl Iterator<Item = &'a WorkerInfo> + 'a {
+    workers
+        .values()
+        .filter(|w| w.alive && !w.draining && !scheduling.cordons.contains_key(&w.worker_id))
 }
 
 /// Mark `worker` dead once it has been silent longer than `timeout`.
@@ -511,6 +699,119 @@ mod tests {
         registry.heartbeat("w2".into(), "host2:9090".into(), 256);
         assert_eq!(registry.alive_count(), 2);
         assert!(registry.lost_worker(&["w2".into()]).is_none());
+    }
+
+    fn ids(workers: Vec<WorkerInfo>) -> Vec<String> {
+        let mut ids: Vec<String> = workers.into_iter().map(|w| w.worker_id).collect();
+        ids.sort();
+        ids
+    }
+
+    fn two_workers() -> NodeRegistry {
+        let registry = NodeRegistry::new(30);
+        registry.heartbeat("w1".into(), "host1:9090".into(), 256);
+        registry.heartbeat("w2".into(), "host2:9090".into(), 256);
+        registry
+    }
+
+    #[test]
+    fn cordoned_worker_is_alive_but_not_scheduled() {
+        let registry = two_workers();
+        registry.set_cordon("w1", Some(CordonMode::Cordon));
+        assert_eq!(ids(registry.active_workers()), vec!["w2"]);
+        assert_eq!(ids(registry.alive_workers()), vec!["w1", "w2"]);
+        assert_eq!(registry.scheduling_state("w1"), SchedulingState::Cordoned);
+        assert_eq!(
+            registry.scheduling_state("w2"),
+            SchedulingState::Schedulable
+        );
+        let (picked, _guard) = registry.schedule_workers();
+        assert_eq!(ids(picked), vec!["w2"]);
+        assert_eq!(registry.cordoned_ids(), vec!["w1"]);
+
+        registry.set_cordon("w1", None);
+        assert_eq!(ids(registry.active_workers()), vec!["w1", "w2"]);
+        assert_eq!(registry.cordon_of("w1"), None);
+    }
+
+    #[test]
+    fn drain_goes_draining_then_drained() {
+        let registry = two_workers();
+        let (picked, guard) = registry.schedule_workers();
+        assert_eq!(ids(picked), vec!["w1", "w2"]);
+        assert_eq!(registry.in_flight("w1"), 1);
+        registry.set_cordon("w1", Some(CordonMode::Drain));
+        assert_eq!(registry.scheduling_state("w1"), SchedulingState::Draining);
+        drop(guard);
+        assert_eq!(registry.scheduling_state("w1"), SchedulingState::Drained);
+        assert_eq!(registry.in_flight("w1"), 0);
+        assert_eq!(registry.in_flight("w2"), 0);
+    }
+
+    #[test]
+    fn no_query_is_scheduled_onto_a_worker_cordoned_meanwhile() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let registry = two_workers();
+        let cordoned = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let schedulers: Vec<_> = (0..8)
+            .map(|_| {
+                let (registry, cordoned, stop) =
+                    (registry.clone(), Arc::clone(&cordoned), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let mut held = Vec::new();
+                    let mut late = 0usize;
+                    while !stop.load(Ordering::SeqCst) {
+                        let after_cordon = cordoned.load(Ordering::SeqCst);
+                        let (picked, guard) = registry.schedule_workers();
+                        if after_cordon {
+                            late += 1;
+                            assert!(
+                                picked.iter().all(|w| w.worker_id != "w1"),
+                                "a selection after the cordon included w1"
+                            );
+                        }
+                        held.push(guard);
+                        if held.len() > 4 {
+                            drop(held.remove(0));
+                        }
+                    }
+                    late
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        registry.set_cordon("w1", Some(CordonMode::Drain));
+        cordoned.store(true, Ordering::SeqCst);
+        let mut last = registry.in_flight("w1");
+        for _ in 0..2000 {
+            let now = registry.in_flight("w1");
+            assert!(
+                now <= last,
+                "w1's in-flight count rose from {last} to {now}"
+            );
+            last = now;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stop.store(true, Ordering::SeqCst);
+        let late: usize = schedulers.into_iter().map(|t| t.join().unwrap()).sum();
+        assert!(late > 0, "no selection ran after the cordon");
+        assert_eq!(registry.in_flight("w1"), 0);
+        assert_eq!(registry.scheduling_state("w1"), SchedulingState::Drained);
+    }
+
+    #[test]
+    fn restored_cordon_applies_when_the_worker_registers() {
+        let registry = NodeRegistry::new(30);
+        registry.restore_cordons([("w9".to_string(), CordonMode::Cordon)]);
+        assert!(!registry.is_known("w9"));
+        assert_eq!(registry.scheduling_state("w9"), SchedulingState::Cordoned);
+        registry.heartbeat("w9".into(), "host9:9090".into(), 256);
+        assert!(registry.is_known("w9"));
+        assert_eq!(registry.worker("w9").unwrap().address, "host9:9090");
+        assert!(registry.worker("w8").is_none());
+        assert!(registry.active_workers().is_empty());
+        assert_eq!(ids(registry.alive_workers()), vec!["w9"]);
     }
 
     #[test]

@@ -247,6 +247,16 @@ broadcast buffers that used to stay in memory for up to 600 s.
 The coordinator and standalone server stop on SIGTERM or Ctrl-C at once;
 they do not drain.
 
+To take a worker out of scheduling without stopping it, cordon or drain it
+from the coordinator's [HTTP API](/guide/http-api#workers)
+(`POST /api/v2/workers/{id}/cordon|drain|uncordon`, manage privilege). That
+is coordinator-side: the worker keeps running and heartbeating, its
+lifecycle `state` stays `active`, and the API reports a separate
+`scheduling` field (`cordoned`, `draining`, `drained`). A drained worker
+stays in the cluster until it is uncordoned or stopped. The cordon is kept
+in the state store across coordinator restarts. SIGTERM drain-then-exit,
+above, is unchanged and works the same on a cordoned worker.
+
 ## How It Works
 
 1. A SQL query arrives at the coordinator via pgwire

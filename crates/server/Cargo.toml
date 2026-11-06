@@ -88,6 +88,7 @@ parquet = { workspace = true, features = ["arrow"] }
 object_store.workspace = true
 
 [dev-dependencies]
+arneb-state = { path = "../state", features = ["test-hooks"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "io-util", "time", "signal", "test-util"] }
 pgwire = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

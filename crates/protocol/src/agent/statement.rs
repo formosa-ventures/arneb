@@ -151,6 +151,12 @@ pub(crate) struct Statement {
     /// Flipped to `true` once the statement is terminal.
     pub(crate) done: watch::Sender<bool>,
     pub(crate) abort: Mutex<Option<AbortHandle>>,
+    /// Runs the statement's work; kills and client cancels go through it,
+    /// so neither relabels work that already returned.
+    pub(crate) switch: arneb_scheduler::KillSwitch,
+    /// A reaper cancel is in flight, so later reaper passes do not start
+    /// another one while it waits on a poll of the work.
+    pub(crate) reaping: std::sync::atomic::AtomicBool,
 }
 
 impl Statement {
@@ -172,6 +178,8 @@ impl Statement {
             }),
             done: watch::channel(false).0,
             abort: Mutex::new(None),
+            switch: arneb_scheduler::KillSwitch::new(),
+            reaping: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -209,12 +217,20 @@ impl Statement {
     /// Moves a statement that is still executing to `phase` (terminal).
     /// Returns `false` when it had already ended.
     pub(crate) fn end(&self, phase: Phase) -> bool {
+        self.end_with(|| phase)
+    }
+
+    /// As [`Self::end`], with the phase decided by `phase` under the
+    /// statement's lock, and only when it has not ended yet, so that
+    /// recording the outcome in the tracker and choosing the phase are one
+    /// step against a concurrent cancel.
+    pub(crate) fn end_with(&self, phase: impl FnOnce() -> Phase) -> bool {
         {
             let mut inner = self.lock();
             if inner.phase.state().is_terminal() {
                 return false;
             }
-            inner.phase = phase;
+            inner.phase = phase();
             inner.ended = Some(Instant::now());
         }
         let _ = self.done.send(true);

@@ -14,8 +14,8 @@ pub mod tls;
 pub mod trino;
 
 pub use auth::{
-    decoy_verifier, init_decoy_secret, is_token_shaped, sha256, AuthConfigError, AuthMethod,
-    CredentialSource, ScramVerifier, UserCredentials,
+    decoy_verifier, init_decoy_secret, is_token_id, is_token_shaped, sha256, AuthConfigError,
+    AuthMethod, CredentialSource, ScramVerifier, UserCredentials,
 };
 pub use server::{ProtocolConfig, ProtocolServer};
 pub use tls::{PgwireTls, PgwireTlsMode, ServerTls, TlsConfigError};

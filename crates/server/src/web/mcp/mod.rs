@@ -58,16 +58,18 @@ Arneb is a distributed SQL engine over many data sources. Names are catalog.sche
 
 Workflow:
 1. Discover: list_catalogs, list_schemas, list_tables.
-2. Learn the table: describe_table for columns and types, sample_table for a few real rows.
-3. Check the query: explain_query plans it without running it.
-4. Run it: submit_query with wait_ms (up to {max_wait_ms}) so short queries return finished.
-5. While queued or running, poll get_query_status (with wait_ms) until finished, failed or cancelled.
-6. Read rows: a finished status carries first_page; start fetch_results from first_page.next_cursor and repeat with each next_cursor until it is null.
-7. When done with a statement, cancel_query stops it or, once ended, frees its rows.
+2. Learn: describe_table for columns, sample_table for rows.
+3. Check it: explain_query plans without running.
+4. Run: submit_query with wait_ms (up to {max_wait_ms}).
+5. If queued or running, poll get_query_status (with wait_ms) until it ends.
+6. Read rows: fetch_results from first_page.next_cursor, then each next_cursor until null.
+7. Done with a statement: cancel_query stops or frees it.
 
-Limits: a statement keeps at most max_rows rows (default {default_max_rows}, ceiling {max_rows}) and reports truncated when more existed. Any ended result may be evicted (read ones first); its id then answers not_found, so resubmit. Pages hold {page_bytes} bytes of rows by default; ask for up to {max_page_bytes} with max_bytes. Long cells and SQL text are cut. Listings take limit and report truncated.
+Limits: a statement keeps max_rows rows (default {default_max_rows}, ceiling {max_rows}); truncated says more existed. Any ended result may be evicted (read ones first) and then answers not_found: resubmit. Pages hold {page_bytes} bytes by default; max_bytes allows up to {max_page_bytes}. Long cells and SQL text are cut. Listings take limit.
 
-Errors: a failed tool call comes back as an error result with a code and a hint. Read the hint and any candidates (close matches for a misspelled name), fix the call, and retry. A SQL error after submit is a status with state failed, not an error result.
+Errors: a failed call returns a code and a hint. Use the hint and candidates (close matches for a misspelled name), then retry. A SQL error is a failed status.
+
+Operations: list_workers, get_worker, get_admission and list_audit_log need observe access. cordon_worker, drain_worker, uncordon_worker, set_admission_limits and cancel_query on another's query need the manage privilege or a queries kill rule (see whoami.privileges); each takes dry_run, so preview first. Actions are audited.
 
 Queries run as your user and see only what it may see.";
 
@@ -237,6 +239,9 @@ mod tests {
             start_time: std::time::Instant::now(),
             role: "standalone".into(),
             admission: None,
+            admission_changes: Default::default(),
+            cordon_changes: Default::default(),
+            max_running_queries: 8,
             max_queued_queries: 8,
             memory_pool: Arc::new(arneb_common::memory_pool::GreedyMemoryPool::new(1 << 20)),
             memory_limit_bytes: None,
@@ -245,7 +250,9 @@ mod tests {
                 .map(|c| arneb_protocol::BasicAuthenticator::new(c).unwrap()),
             credentials,
             state: password.then_some(store),
+            audit: crate::web::test_audit_log(),
             access_rules: None,
+            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), password),
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent: None,
@@ -351,6 +358,26 @@ mod tests {
         let (status, _, body) = rpc(router, Some(auth), "arneb.example.com", &whoami_body()).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         body["result"]["structuredContent"].clone()
+    }
+
+    #[tokio::test]
+    async fn whoami_privileges_follow_admin_users_and_the_section() {
+        let mut state = mcp_state(true, default_settings());
+        state.authorizer = crate::web::privilege::Authorizer::new(
+            Some(Arc::new(
+                arneb_catalog::AccessRules::from_json(
+                    r#"{"system_information":[{"user":"bob","allow":["read"]}]}"#,
+                )
+                .unwrap(),
+            )),
+            vec!["alice".into()],
+            true,
+        );
+        let router = build_router(state);
+        let w = whoami(router.clone(), &basic("alice", "secret")).await;
+        assert_eq!(w["privileges"], json!({"observe": true, "manage": true}));
+        let w = whoami(router, &basic("bob", "hunter2")).await;
+        assert_eq!(w["privileges"], json!({"observe": true, "manage": false}));
     }
 
     #[tokio::test]

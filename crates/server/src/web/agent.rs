@@ -233,7 +233,7 @@ async fn cancel(
     Extension(who): Extension<Identity>,
     Path(id): Path<String>,
 ) -> Result<Json<StatementStatus>, ApiError> {
-    Ok(Json(service(&state)?.cancel(&who.user, &id)?))
+    Ok(Json(service(&state)?.cancel(&who.user, &id).await?))
 }
 
 #[cfg(test)]
@@ -310,6 +310,9 @@ mod tests {
             start_time: std::time::Instant::now(),
             role: "standalone".into(),
             admission: None,
+            admission_changes: Default::default(),
+            cordon_changes: Default::default(),
+            max_running_queries: 8,
             max_queued_queries: 8,
             memory_pool: Arc::new(arneb_common::memory_pool::GreedyMemoryPool::new(1 << 20)),
             memory_limit_bytes: None,
@@ -318,7 +321,9 @@ mod tests {
                 .map(|c| arneb_protocol::BasicAuthenticator::new(c).unwrap()),
             credentials,
             state: password.then_some(store),
+            audit: crate::web::test_audit_log(),
             access_rules: None,
+            authorizer: crate::web::privilege::Authorizer::new(None, Vec::new(), password),
             metrics_auth: false,
             sessions: SessionStore::new(),
             agent,

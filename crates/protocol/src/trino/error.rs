@@ -75,6 +75,11 @@ impl TrinoError {
         Self::user(3, "USER_CANCELED", "Query was canceled")
     }
 
+    /// Killed by another user through the manage API (manage-api D7).
+    pub(crate) fn killed_by(user: &str) -> Self {
+        Self::user(3, "USER_CANCELED", format!("Query was killed by {user}"))
+    }
+
     pub(crate) fn abandoned() -> Self {
         Self::user(
             2,

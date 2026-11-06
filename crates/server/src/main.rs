@@ -3306,6 +3306,8 @@ mod tests {
         // target, or an rmcp module.
         for loud in [
             "info",
+            "DEBUG",
+            "3",
             "off,r=debug",
             "off,rm=info",
             "off,[{a=1}]=trace",

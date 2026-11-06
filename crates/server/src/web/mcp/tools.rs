@@ -437,7 +437,7 @@ fn respond<T: Serialize>(outcome: Result<T, ApiError>) -> Result<CallToolResult,
 impl ArnebMcp {
     /// The tool router with its copy filled from `values` (see
     /// [`copy_values`]): descriptions and input-schema descriptions. Built
-    /// once per service and cloned per request.
+    /// once per service and shared by every request.
     pub(super) fn configured_router(values: &[(&'static str, String)]) -> ToolRouter<Self> {
         let mut router = Self::tool_router();
         for route in router.map.values_mut() {
@@ -651,25 +651,24 @@ impl ArnebMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let who = identity(&ctx)?;
-        let outcome: Result<Explanation, ApiError> = async {
-            let svc = service(&self.state)?;
-            let req = ExplainRequest {
-                sql: a.sql,
-                catalog: a.catalog,
-                schema: a.schema,
-            };
-            Ok(svc
-                .explain(&who.user, &req, Some(self.page_bytes(svc)))
-                .await?)
-        }
-        .await;
-        match outcome {
-            // Like every tool, the text block repeats the JSON: MCP clients
-            // that only show the model text content still see the plan, and
-            // the MCP page budget bounds both copies.
-            Ok(x) => ok(&x),
-            Err(e) => Ok(tool_error(e)),
-        }
+        // Like every tool, the text block repeats the JSON: MCP clients
+        // that only show the model text content still see the plan, and
+        // the MCP page budget bounds both copies.
+        respond(
+            async {
+                let svc = service(&self.state)?;
+                let req = ExplainRequest {
+                    sql: a.sql,
+                    catalog: a.catalog,
+                    schema: a.schema,
+                };
+                let x: Explanation = svc
+                    .explain(&who.user, &req, Some(self.page_bytes(svc)))
+                    .await?;
+                Ok::<_, ApiError>(x)
+            }
+            .await,
+        )
     }
 
     /// `submit_query`: `POST /api/v2/statements`.
@@ -759,9 +758,9 @@ impl ArnebMcp {
     /// `DELETE /api/v2/queries/{id}`.
     #[tool(
         description = "Cancel a query by id. Your own statement from submit_query: a queued \
-                       or running one is cancelled and kept (get_query_status still reports \
-                       it); an ended one is released with its rows, returning its final status \
-                       without a first page. Any other id (including a statement already \
+                       or running one is cancelled and kept; an ended one, or one that ends \
+                       while being cancelled, is released with its rows (final status, no \
+                       first page; then not_found). Any other id (including a statement already \
                        released), or a dry_run, returns the manage envelope (dry_run, action, \
                        summary, changed, result); cancelling another user's query needs the \
                        manage privilege or an explicit queries rule allowing kill (with no \

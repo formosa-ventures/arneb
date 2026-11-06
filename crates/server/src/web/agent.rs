@@ -452,9 +452,32 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "not_found");
+        // Nor can another user release it: bob's DELETE is a 404 and the
+        // statement is still alice's to read.
+        let (status, _, body) = call(
+            &state,
+            Method::DELETE,
+            &format!("/api/v2/statements/{id}"),
+            &user("bob"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "not_found");
+        let (status, _, body) = call(
+            &state,
+            Method::GET,
+            &format!("/api/v2/statements/{id}"),
+            &me,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "finished");
 
         // DELETE on an ended statement answers its final state and
-        // releases it; a second DELETE finds nothing.
+        // releases it, with no first page (the rows are being released,
+        // not read); a second DELETE finds nothing.
         let (status, _, body) = call(
             &state,
             Method::DELETE,
@@ -465,6 +488,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["state"], "finished");
+        assert!(body.get("first_page").is_none_or(|p| p.is_null()), "{body}");
         let (status, _, body) = call(
             &state,
             Method::DELETE,

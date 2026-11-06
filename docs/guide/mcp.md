@@ -477,7 +477,9 @@ Differences from the HTTP routes:
 - **Cancel.** `cancel_query` with the id of your own statement from
   `submit_query` works like `DELETE /api/v2/statements/{id}` and returns the
   statement status: a running statement is cancelled and kept, an ended one
-  is released with its rows. Any other id (a query id from `list_queries`,
+  (or one that ends while being cancelled: the status then shows its final
+  state, not `cancelled`) is released with its rows, and the id answers
+  `not_found` from then on. Any other id (a query id from `list_queries`,
   or a statement already released or evicted), or any call with `dry_run`,
   works like `DELETE /api/v2/queries/{id}` and returns the manage envelope;
   killing another user's query needs the manage privilege or an explicit

@@ -42,9 +42,18 @@ pub struct IcebergTableProvider {
     columns: Vec<ColumnInfo>,
     properties: HashMap<String, String>,
     statistics: Option<TableStatistics>,
+    canonical_name: Option<(String, String)>,
 }
 
 impl IcebergTableProvider {
+    /// Record the `(schema, table)` the table is registered under in the
+    /// catalog that redirected to it, as that catalog stores them, so
+    /// access rules are checked on the stored name.
+    pub fn with_canonical_name(mut self, schema: String, table: String) -> Self {
+        self.canonical_name = Some((schema, table));
+        self
+    }
+
     /// Resolve an Iceberg table from its HMS table parameters.
     pub async fn resolve(
         storage: &StorageRegistry,
@@ -89,11 +98,16 @@ impl IcebergTableProvider {
             columns: cols.into_iter().map(|(_, c)| c).collect(),
             properties,
             statistics,
+            canonical_name: None,
         })
     }
 }
 
 impl TableProvider for IcebergTableProvider {
+    fn canonical_name(&self) -> Option<(String, String)> {
+        self.canonical_name.clone()
+    }
+
     fn schema(&self) -> Vec<ColumnInfo> {
         self.columns.clone()
     }

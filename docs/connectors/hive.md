@@ -34,6 +34,16 @@ SELECT * FROM datalake.demo.cities;
 --            catalog  schema table
 ```
 
+The schema is the HMS database, matched the way HMS matches it (trimmed
+and lowercased), so `datalake.DEMO.cities` reads `demo.cities`. Arneb reads
+from the metastore's default catalog: an HMS catalog-qualified database
+name (`"@spark#demo"`) is served only when it names the default catalog's
+own database, and reads as missing otherwise. If HMS cannot be reached,
+a query fails with an error instead of reporting a missing schema or
+table. A database or table an HMS authorization plugin (such as Ranger)
+refuses reads as missing (see
+[Access Control](/guide/access-control)).
+
 ## Storage Formats
 
 The file format comes from the table's HMS storage descriptor:

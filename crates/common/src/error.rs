@@ -176,6 +176,12 @@ pub enum PlanError {
         location: Option<Location>,
     },
 
+    /// A source the query reads could not be asked about a table (e.g. its
+    /// metastore is unreachable). Not a missing table and not an engine
+    /// bug: clients see it as an external failure to retry.
+    #[error("source unavailable: {0}")]
+    SourceUnavailable(String),
+
     /// An internal planner invariant was violated. These errors carry no
     /// location because they point at engine-internal state rather than
     /// user SQL.
@@ -199,6 +205,7 @@ impl PlanError {
             | PlanError::ParameterTypeConflict { location, .. } => *location,
             PlanError::TableNotFound(_)
             | PlanError::AccessDenied(_)
+            | PlanError::SourceUnavailable(_)
             | PlanError::InternalError(_) => None,
         }
     }
@@ -286,6 +293,12 @@ pub enum CatalogError {
     /// message is the denial, e.g. `Cannot select from table c.s.t`.
     #[error("Access Denied: {0}")]
     AccessDenied(String),
+
+    /// The source could not be asked whether the object exists (e.g. its
+    /// metastore is unreachable). Distinct from a not-found answer, so a
+    /// caller does not mistake an outage for a missing object.
+    #[error("catalog unavailable: {0}")]
+    Unavailable(String),
 }
 
 /// Errors from configuration loading.

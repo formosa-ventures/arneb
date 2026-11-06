@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use arneb_catalog::CatalogManager;
+use arneb_common::error::CatalogError;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 
@@ -59,10 +60,12 @@ pub(crate) async fn handle_search_path(
             Ok(MetadataResponse::Command("RESET".to_string())),
             Some(default_path(root)),
         )),
-        Command::Set(entries) => {
-            let path = resolve(root, session, entries).await;
-            Some((set_ok(), Some(path)))
-        }
+        // A source that can't be asked whether a schema exists fails the
+        // SET (keeping the current path) rather than skipping that entry.
+        Command::Set(entries) => match resolve(root, session, entries).await {
+            Ok(path) => Some((set_ok(), Some(path))),
+            Err(e) => Some((Err(e.to_string()), None)),
+        },
     }
 }
 
@@ -77,7 +80,7 @@ async fn resolve(
     root: &Arc<CatalogManager>,
     session: &CatalogManager,
     entries: Vec<String>,
-) -> SearchPath {
+) -> Result<SearchPath, CatalogError> {
     let candidates: Vec<(String, String)> = entries
         .iter()
         .filter(|e| *e != "$user")
@@ -91,18 +94,13 @@ async fn resolve(
     // pointing unqualified names at a schema that doesn't exist.
     let mut chosen = None;
     for (catalog, schema) in &candidates {
-        if !session.schema_visible(catalog, schema) {
-            continue;
-        }
-        if let Some(provider) = root.catalog(catalog) {
-            if provider.schema(schema).await.is_some() {
-                chosen = Some((catalog.clone(), schema.clone()));
-                break;
-            }
+        if session.visible_schema_exists(catalog, schema).await? {
+            chosen = Some((catalog.clone(), schema.clone()));
+            break;
         }
     }
     let display = entries.join(", ");
-    match chosen {
+    Ok(match chosen {
         Some((c, s)) if c != root.default_catalog() || s != root.default_schema() => SearchPath {
             display,
             catalog_manager: Arc::new(root.with_session_defaults(c, s)),
@@ -111,7 +109,7 @@ async fn resolve(
             display,
             catalog_manager: Arc::clone(root),
         },
-    }
+    })
 }
 
 pub(crate) fn show_result(column: &str, value: &str) -> MetadataResult {
@@ -222,6 +220,24 @@ mod tests {
                 _ => panic!("expected a command tag for {sql}"),
             }
         }
+    }
+
+    /// A schema lookup that fails (the metastore is unreachable) fails
+    /// the `SET` and keeps the current path, instead of skipping the entry
+    /// and falling back to the default schema.
+    #[tokio::test]
+    async fn set_fails_when_a_schema_lookup_fails() {
+        let root = Arc::new(CatalogManager::new("lake", "default"));
+        root.register_catalog(
+            "lake",
+            Arc::new(arneb_catalog::conformance::Unreachable::default()),
+        );
+        let (result, path) = handle_search_path("SET search_path = sales", &root, &root, None)
+            .await
+            .unwrap();
+        let err = result.err().expect("SET must fail");
+        assert!(err.contains("metastore down"), "{err}");
+        assert!(path.is_none(), "the current path must be kept");
     }
 
     #[test]

@@ -561,7 +561,9 @@ explicitly.
   tool result at `debug`, and a result can hold rows or a new API token from
   `create_token`, and it logs three `info` lines for every request. Arneb
   therefore caps the `rmcp` log target at `warn`, even under
-  `RUST_LOG=debug`; its warnings (a rejected `Origin` or `Host`) still log.
+  `RUST_LOG=debug`; its warnings (a rejected `Origin` or `Host`) still log,
+  unless `RUST_LOG` itself is quieter (`off`, `error`): the cap never raises
+  rmcp above what `RUST_LOG` asks for.
   A directive on an rmcp module, such as `RUST_LOG=debug,rmcp::transport=warn`,
   keeps the cap for the rest of rmcp and still applies to that module. Only
   a directive whose target is exactly `rmcp` (for example

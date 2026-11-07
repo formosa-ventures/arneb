@@ -28,6 +28,11 @@ This work joins v0.2.0's existing items: G6 stage 2b, the P1 SF30
 validation and the production checklist. It is done **first**. The
 production checklist gains a section for the agent interface.
 
+**Update 2026-11-07:** H1–H6 shipped as v0.2.0 before the acceptance
+scenario was run. Running it against a kind cluster, with the other
+production-ready items, is now the gate for a later v0.2.x (see the
+roadmap's release table).
+
 ## Goals
 
 1. **API first.** Every operation is a stable, versioned HTTP API. The MCP

@@ -1601,22 +1601,23 @@ impl<'a> QueryPlanner<'a> {
             },
             span,
         };
-        let placeholder = if spec.count_on_empty {
-            ast::Expr::Case {
-                operand: None,
-                conditions: vec![ast::Expr::IsNotNull {
-                    expr: Box::new(placeholder.clone()),
-                    span,
-                }],
-                results: vec![placeholder],
-                else_result: Some(Box::new(ast::Expr::Literal {
-                    value: ScalarValue::Int64(0),
-                    span,
-                })),
+        let match_key = ast::Expr::Column {
+            col_ref: ast::ColumnRef {
+                name: spec.plan.schema()[0].name.clone(),
+                table: None,
                 span,
-            }
-        } else {
-            placeholder
+            },
+            span,
+        };
+        let placeholder = ast::Expr::Case {
+            operand: None,
+            conditions: vec![ast::Expr::IsNotNull {
+                expr: Box::new(match_key),
+                span,
+            }],
+            results: vec![placeholder],
+            else_result: Some(Box::new(spec.empty_value.clone())),
+            span,
         };
         specs.push(spec);
         Ok(placeholder)
@@ -1651,10 +1652,9 @@ impl<'a> QueryPlanner<'a> {
             ast::SelectItem::ExprWithAlias { expr, .. } => expr.clone(),
             _ => return Ok(None),
         };
-        let count_on_empty = matches!(
-            &proj_expr,
-            ast::Expr::Function { name, .. } if name.eq_ignore_ascii_case("count")
-        );
+        let Some(empty_value) = aggregate_projection_on_empty(&proj_expr) else {
+            return Ok(None);
+        };
         let inner_where = match body.selection.clone() {
             Some(w) => w,
             None => return Ok(None),
@@ -1788,7 +1788,7 @@ impl<'a> QueryPlanner<'a> {
         Ok(Some(LeftJoinSpec {
             plan: proj_node,
             correlations: spec_correlations,
-            count_on_empty,
+            empty_value,
         }))
     }
 
@@ -3267,13 +3267,111 @@ fn contains_nested_subquery(expr: &ast::Expr) -> bool {
     }
 }
 
+fn aggregate_projection_on_empty(expr: &ast::Expr) -> Option<ast::Expr> {
+    match expr {
+        ast::Expr::Function { name, span, .. } if is_aggregate_function(name) => {
+            Some(ast::Expr::Literal {
+                value: if name.eq_ignore_ascii_case("count") {
+                    ScalarValue::Int64(0)
+                } else {
+                    ScalarValue::Null
+                },
+                span: *span,
+            })
+        }
+        ast::Expr::Function {
+            name,
+            args,
+            distinct,
+            span,
+        } => Some(ast::Expr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| match arg {
+                    ast::FunctionArg::Unnamed(expr) => {
+                        aggregate_projection_on_empty(expr).map(ast::FunctionArg::Unnamed)
+                    }
+                    ast::FunctionArg::Wildcard => Some(ast::FunctionArg::Wildcard),
+                })
+                .collect::<Option<Vec<_>>>()?,
+            distinct: *distinct,
+            span: *span,
+        }),
+        ast::Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => Some(ast::Expr::BinaryOp {
+            left: Box::new(aggregate_projection_on_empty(left)?),
+            op: *op,
+            right: Box::new(aggregate_projection_on_empty(right)?),
+            span: *span,
+        }),
+        ast::Expr::UnaryOp { op, expr, span } => Some(ast::Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(aggregate_projection_on_empty(expr)?),
+            span: *span,
+        }),
+        ast::Expr::Nested { expr, span } => Some(ast::Expr::Nested {
+            expr: Box::new(aggregate_projection_on_empty(expr)?),
+            span: *span,
+        }),
+        ast::Expr::Cast {
+            expr,
+            data_type,
+            span,
+        } => Some(ast::Expr::Cast {
+            expr: Box::new(aggregate_projection_on_empty(expr)?),
+            data_type: data_type.clone(),
+            span: *span,
+        }),
+        ast::Expr::IsNull { expr, span } => Some(ast::Expr::IsNull {
+            expr: Box::new(aggregate_projection_on_empty(expr)?),
+            span: *span,
+        }),
+        ast::Expr::IsNotNull { expr, span } => Some(ast::Expr::IsNotNull {
+            expr: Box::new(aggregate_projection_on_empty(expr)?),
+            span: *span,
+        }),
+        ast::Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            span,
+        } => Some(ast::Expr::Case {
+            operand: match operand {
+                Some(expr) => Some(Box::new(aggregate_projection_on_empty(expr)?)),
+                None => None,
+            },
+            conditions: conditions
+                .iter()
+                .map(aggregate_projection_on_empty)
+                .collect::<Option<Vec<_>>>()?,
+            results: results
+                .iter()
+                .map(aggregate_projection_on_empty)
+                .collect::<Option<Vec<_>>>()?,
+            else_result: match else_result {
+                Some(expr) => Some(Box::new(aggregate_projection_on_empty(expr)?)),
+                None => None,
+            },
+            span: *span,
+        }),
+        ast::Expr::Literal { .. } => Some(expr.clone()),
+        _ => None,
+    }
+}
+
 /// A pending LEFT JOIN extracted from a correlated scalar subquery in
 /// WHERE (e.g. TPC-H Q17's `< (SELECT 0.2 * AVG(...) FROM lineitem
 /// WHERE l_partkey = p_partkey)`). The inner is decorrelated by
 /// adding the correlation column(s) to GROUP BY, so the join attaches
 /// a per-correlation-key scalar value to each outer row. Outer rows
-/// without a matching key get NULL from the join; COUNT projections
-/// recover the empty-set value of zero in the residual predicate.
+/// without a matching key recover the projection's empty-set value in
+/// the residual predicate.
 ///
 /// Supports multi-column correlations (TPC-H Q20: scalar subquery
 /// correlated on both `ps_partkey` AND `ps_suppkey`).
@@ -3285,8 +3383,8 @@ struct LeftJoinSpec {
     /// One entry per correlation, paired with its index in
     /// `plan.schema()`.
     correlations: Vec<(ast::Expr, usize)>,
-    /// Whether the scalar projection is COUNT, which yields zero on an empty set.
-    count_on_empty: bool,
+    /// Value of the scalar projection when the correlated input is empty.
+    empty_value: ast::Expr,
 }
 
 struct CteSelfAggWindowSpec {

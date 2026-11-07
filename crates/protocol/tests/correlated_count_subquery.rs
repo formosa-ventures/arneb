@@ -170,3 +170,76 @@ async fn max_over_matched_keys() {
         table(&[&["214"]])
     );
 }
+
+// A projection over the aggregate takes its value on an empty input for an
+// unmatched outer row: count is 0 there and every other aggregate is NULL.
+// 751 outer rows (odd keys and the NULL key) have no row in `s`.
+
+#[tokio::test]
+async fn count_times_two_is_zero_when_no_inner_row_matches() {
+    assert_eq!(
+        rows("SELECT count(*) FROM t WHERE (SELECT count(*) * 2 FROM s WHERE sk = t.k) = 0").await,
+        table(&[&["751"]])
+    );
+}
+
+#[tokio::test]
+async fn count_plus_one_is_one_when_no_inner_row_matches() {
+    assert_eq!(
+        rows("SELECT count(*) FROM t WHERE (SELECT count(*) + 1 FROM s WHERE sk = t.k) = 1").await,
+        table(&[&["751"]])
+    );
+}
+
+#[tokio::test]
+async fn coalesced_sum_is_zero_when_no_inner_row_matches() {
+    // 751 unmatched rows plus the 150 matched keys whose sv sum is 0.
+    assert_eq!(
+        rows(
+            "SELECT count(*) FROM t \
+             WHERE (SELECT coalesce(sum(sv), 0) FROM s WHERE sk = t.k) = 0"
+        )
+        .await,
+        table(&[&["901"]])
+    );
+}
+
+#[tokio::test]
+async fn an_expression_that_is_null_on_empty_input_stays_null() {
+    // Failure path: sum(sv) + 1 is NULL on an empty input, so unmatched
+    // rows must not compare equal; only the 150 matched keys with sum 0 do.
+    assert_eq!(
+        rows("SELECT count(*) FROM t WHERE (SELECT sum(sv) + 1 FROM s WHERE sk = t.k) = 1").await,
+        table(&[&["150"]])
+    );
+}
+
+// A matched outer row whose projection is NULL keeps that NULL: only rows
+// with no inner match take the empty-input value. `s` has one row per even
+// key, so count(*) is 1 for the 750 matched rows.
+
+#[tokio::test]
+async fn a_null_projection_on_matched_rows_is_not_replaced() {
+    // count(*) = 0 only for the 751 unmatched rows; matched rows yield NULL.
+    assert_eq!(
+        rows(
+            "SELECT count(*) FROM t \
+             WHERE (SELECT CASE WHEN count(*) = 0 THEN 1 END FROM s WHERE sk = t.k) = 1"
+        )
+        .await,
+        table(&[&["751"]])
+    );
+}
+
+#[tokio::test]
+async fn nullif_of_count_on_matched_rows_stays_null() {
+    // nullif(1, 1) is NULL for matched rows; nullif(0, 1) = 0 for unmatched.
+    assert_eq!(
+        rows(
+            "SELECT count(*) FROM t \
+             WHERE (SELECT nullif(count(*), 1) FROM s WHERE sk = t.k) = 0"
+        )
+        .await,
+        table(&[&["751"]])
+    );
+}

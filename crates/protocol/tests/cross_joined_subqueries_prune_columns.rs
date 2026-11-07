@@ -153,7 +153,7 @@ fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>, ScanLog) {
     };
     let catalog_manager = Arc::new(CatalogManager::new("memory", "default"));
     catalog_manager.register_catalog("memory", catalog);
-    let mut registry = ConnectorRegistry::new();
+    let registry = ConnectorRegistry::new();
     registry.register("memory", Arc::new(factory));
     (catalog_manager, Arc::new(registry), log)
 }

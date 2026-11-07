@@ -1022,15 +1022,89 @@ fn evaluate_case_rows(
     rows: &[u32],
     registry: Option<&FunctionRegistry>,
 ) -> Result<ArrayRef, ExecutionError> {
+    if rows.len() == batch.num_rows()
+        && rows
+            .iter()
+            .enumerate()
+            .all(|(index, &row)| index == row as usize)
+    {
+        return evaluate(expr, batch, registry);
+    }
+    let mut referenced = vec![false; batch.num_columns()];
+    case_referenced_columns(expr, &mut referenced);
     let indices = UInt32Array::from(rows.to_vec());
     let columns = batch
         .columns()
         .iter()
-        .map(|column| arrow::compute::take(column, &indices, None))
+        .enumerate()
+        .map(|(index, column)| {
+            if referenced[index] {
+                arrow::compute::take(column, &indices, None)
+            } else {
+                Ok(column.slice(0, rows.len()))
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
     let selected = RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
     evaluate(expr, &selected, registry)
+}
+
+fn case_referenced_columns(expr: &PlanExpr, referenced: &mut [bool]) {
+    match expr {
+        PlanExpr::Column { index, .. } => {
+            if let Some(column) = referenced.get_mut(*index) {
+                *column = true;
+            }
+        }
+        PlanExpr::BinaryOp { left, right, .. } => {
+            case_referenced_columns(left, referenced);
+            case_referenced_columns(right, referenced);
+        }
+        PlanExpr::UnaryOp { expr, .. }
+        | PlanExpr::IsNull { expr, .. }
+        | PlanExpr::IsNotNull { expr, .. }
+        | PlanExpr::Cast { expr, .. } => case_referenced_columns(expr, referenced),
+        PlanExpr::Between {
+            expr, low, high, ..
+        } => {
+            case_referenced_columns(expr, referenced);
+            case_referenced_columns(low, referenced);
+            case_referenced_columns(high, referenced);
+        }
+        PlanExpr::InList { expr, list, .. } => {
+            case_referenced_columns(expr, referenced);
+            for item in list {
+                case_referenced_columns(item, referenced);
+            }
+        }
+        PlanExpr::Function { args, .. } => {
+            for arg in args {
+                case_referenced_columns(arg, referenced);
+            }
+        }
+        PlanExpr::CaseExpr {
+            operand,
+            when_clauses,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                case_referenced_columns(operand, referenced);
+            }
+            for (condition, result) in when_clauses {
+                case_referenced_columns(condition, referenced);
+                case_referenced_columns(result, referenced);
+            }
+            if let Some(else_result) = else_result {
+                case_referenced_columns(else_result, referenced);
+            }
+        }
+        PlanExpr::Literal { .. }
+        | PlanExpr::Wildcard
+        | PlanExpr::ScalarSubquery { .. }
+        | PlanExpr::Parameter { .. } => {}
+    }
 }
 
 fn expand_case_rows(

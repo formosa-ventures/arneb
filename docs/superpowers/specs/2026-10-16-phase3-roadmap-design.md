@@ -304,13 +304,13 @@ its own OpenSpec change.
 |---|---|---|---|
 | v0.1.6 (shipped 2026-10-25) | Concurrency reliability | G1, G2, G6 soak test (#177); G4 and G5 landed early (#178, #179) | Tier 1 + 2 |
 | v0.1.7 (shipped 2026-10-26) | Deployable, safe to share | P6 (#182); G3 (#183) and P4 stage 2 (#184, off by default) landed early; G6 client smoke in CI (#185) and queryable `pg_catalog`, stage 2a (#188) | Tier 1 + 2 + kind |
-| v0.1.8 | Correctness fixes (unplanned) | Wrong results from per-partition grace builds (#191) and right-preserved eager aggregation (#206); null-extended outer-join columns now nullable (#203); joins inside a parenthesized `FROM` (#202); no partial cross-fragment domain from copartitioned joins (#198); RustSec dependency bumps (#200, #210) | Tier 1 + CI cluster smoke + kind |
-| v0.1.9 onward (first) | Headless agent interface | H1–H6: state store, API tokens and authentication on every route; agent query API; remote MCP; manage API, write privileges and audit log; runtime config; MCP OAuth. See `2026-10-30-headless-agent-interface-design.md` | Tier 1 + 2 + kind |
+| v0.1.8 (shipped 2026-10-30) | Correctness fixes (unplanned) | Wrong results from per-partition grace builds (#191) and right-preserved eager aggregation (#206); null-extended outer-join columns now nullable (#203); joins inside a parenthesized `FROM` (#202); no partial cross-fragment domain from copartitioned joins (#198); RustSec dependency bumps (#200, #210) | Tier 1 + CI cluster smoke + kind |
+| v0.2.0 (shipped 2026-11-07) | Headless agent interface | H1–H6 (#215–#220): state store, API tokens and authentication on every route; agent query API; remote MCP; manage API, write privileges and audit log; runtime config; MCP OAuth. Access rules also checked on the connector-resolved name (#221). See `2026-10-30-headless-agent-interface-design.md` | Tier 1 + Tier 2 per change + CI cluster smoke + kind; the headless acceptance scenario has not been run yet |
 | after headless | Client gaps | G6 stage 2b: arrays, `json_build_object`, SQLAlchemy column reflection over pgwire, a Metabase run; `pg_catalog` follow-ups (#189) | Tier 1 + 2 |
 | in parallel | Large-scale memory | P1 SF30 validation, `dist-adaptive-partition` SF30 sweep (q18 SF30 still OOMs) | Tier 3 |
-| v0.2.0 | Production-ready, headless | Headless acceptance scenario green, scenario 1 checklist green, BI client smoke (G6), `docs/guide/production-checklist.md` | — |
+| v0.2.x (later) | Production-ready | Headless acceptance scenario green, scenario 1 checklist green, BI client smoke (G6), `docs/guide/production-checklist.md` | — |
 
-M4 follows v0.2.0.
+M4 follows the production-ready release.
 
 **Status (2026-10-30, v0.1.8):** G1–G5, P4 stage 2 and P6 are done. G1's
 root cause is still open in #139: no break has reproduced since the
@@ -322,6 +322,13 @@ remote agent can do every operation (H1–H6), and that work goes first. Left
 before v0.2.0: the headless interface, G6 stage 2b, the P1 SF30 validation (Tier 3),
 the production checklist, and the follow-ups in #156, #181, #187, #189,
 #199, #201 and #205.
+
+**Status (2026-11-07, v0.2.0):** v0.2.0 ships the headless agent interface
+(H1–H6) and the resolved-name access check (#221) ahead of the other items
+it was planned with. The production-ready gates move to a later v0.2.x:
+the headless acceptance scenario on a kind cluster, G6 stage 2b with the BI
+client smoke, the P1 SF30 validation (Tier 3), and the production
+checklist. The review follow-ups are in #226.
 
 **Order:** G1 first, because it makes the soak test and retry results
 unreliable. G4 and G5 before P6 ships, so the chart's rolling upgrade does

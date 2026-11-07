@@ -759,8 +759,8 @@ impl ArnebMcp {
     #[tool(
         description = "Cancel a query by id. Your own statement from submit_query: a queued \
                        or running one is cancelled and kept; an ended one, or one that ends \
-                       while being cancelled, is released with its rows (its status may show \
-                       any state, even cancelled or running; no first page; then not_found). Any other id (including a statement already \
+                       while being cancelled, is released with its rows (any status, no \
+                       first page; then not_found). Any other id (including a statement already \
                        released), or a dry_run, returns the manage envelope (dry_run, action, \
                        summary, changed, result); cancelling another user's query needs the \
                        manage privilege or an explicit queries rule allowing kill (with no \

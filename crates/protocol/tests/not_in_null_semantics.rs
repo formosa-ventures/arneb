@@ -137,3 +137,49 @@ async fn in_is_unchanged_by_a_null_in_the_subquery() {
         vec![vec!["1"]]
     );
 }
+
+// A UNION ALL reports its first branch's nullability, so these check that a
+// NULL coming from a later branch still counts.
+
+#[tokio::test]
+async fn a_null_in_a_later_union_branch_of_the_subquery_drops_every_row() {
+    assert_eq!(
+        not_in_count("SELECT y FROM u UNION ALL SELECT y FROM t").await,
+        vec![vec!["0"]]
+    );
+}
+
+#[tokio::test]
+async fn a_null_in_the_first_union_branch_of_the_subquery_drops_every_row() {
+    // Reverse order of the case above: the nullable branch comes first.
+    assert_eq!(
+        not_in_count("SELECT y FROM t UNION ALL SELECT y FROM u").await,
+        vec![vec!["0"]]
+    );
+}
+
+#[tokio::test]
+async fn a_null_outer_key_from_a_later_union_branch_is_dropped() {
+    // w(y) = 1, 1, 1, 2, 2, NULL; only the two 2s are not in u.
+    assert_eq!(
+        rows(
+            "SELECT count(*) FROM (SELECT y FROM u UNION ALL SELECT x FROM s) w \
+             WHERE y NOT IN (SELECT y FROM u)"
+        )
+        .await,
+        vec![vec!["2"]]
+    );
+}
+
+#[tokio::test]
+async fn a_union_whose_later_branch_has_nulls_reads_them() {
+    // Same union as above, no NOT IN: the NULL from s must come through.
+    assert_eq!(
+        rows(
+            "SELECT count(*) FROM (SELECT y FROM u UNION ALL SELECT x FROM s) w \
+             WHERE y IS NULL"
+        )
+        .await,
+        vec![vec!["1"]]
+    );
+}

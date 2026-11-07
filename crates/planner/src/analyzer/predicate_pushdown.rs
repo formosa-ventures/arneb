@@ -520,7 +520,12 @@ fn try_push_into(
             push_through_projection(*input, exprs, schema, conjunct)
         }
         L::UnionAll { inputs } => {
-            let schema = inputs.first().map(LogicalPlan::schema).unwrap_or_default();
+            let mut schema = inputs.first().map(LogicalPlan::schema).unwrap_or_default();
+            for input in inputs.iter().skip(1) {
+                for (column, branch_column) in schema.iter_mut().zip(input.schema()) {
+                    column.nullable |= branch_column.nullable;
+                }
+            }
             let mut kept = Vec::new();
             for input in inputs {
                 let branch = match input {

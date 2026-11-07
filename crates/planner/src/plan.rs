@@ -815,7 +815,13 @@ impl LogicalPlan {
                 if inputs.is_empty() {
                     vec![]
                 } else {
-                    inputs[0].schema()
+                    let mut schema = inputs[0].schema();
+                    for input in &inputs[1..] {
+                        for (column, branch_column) in schema.iter_mut().zip(input.schema()) {
+                            column.nullable |= branch_column.nullable;
+                        }
+                    }
+                    schema
                 }
             }
             LogicalPlan::Distinct { input } => input.schema(),

@@ -1802,8 +1802,11 @@ impl ExecutionPlan for RollupAggregateExec {
             }
             Ok::<_, ExecutionError>(())
         };
-        let (produced, results) =
+        let (produced, mut results) =
             futures::future::join(producer, futures::future::join_all(levels)).await;
+        if let Some(index) = results.iter().position(Result::is_err) {
+            return Err(results.swap_remove(index).unwrap_err());
+        }
         produced?;
         let arrow_schema = crate::datasource::column_info_to_arrow_schema(&self.output_schema);
         let mut output = Vec::new();
@@ -5944,6 +5947,87 @@ mod tests {
             Err(ExecutionError::ResourceExhausted(_)) => {}
             Err(other) => panic!("expected ResourceExhausted, got {other:?}"),
             Ok(_) => panic!("expected ResourceExhausted under a tight pool, got Ok (no fail-fast)"),
+        }
+    }
+
+    /// A ROLLUP level that runs out of memory stops reading its input. The
+    /// client must see that memory error (SQLSTATE 53200), not the
+    /// producer's failure to hand the next batch to the stopped level.
+    #[tokio::test]
+    async fn rollup_reports_a_failing_levels_own_error() {
+        use crate::memory_pool::{GreedyMemoryPool, MemoryPool};
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        // Several batches, so the producer still has batches to send after
+        // the finest level has failed on the first one.
+        let batches: Vec<RecordBatch> = (0..5)
+            .map(|b| {
+                let k: Vec<i32> = (b * 2000..(b + 1) * 2000).collect();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(arrow::array::Int32Array::from(k)),
+                        Arc::new(arrow::array::Int64Array::from(vec![1i64; 2000])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let column = |name: &str, data_type| ColumnInfo {
+            name: name.to_string(),
+            data_type,
+            nullable: false,
+        };
+        let source: Arc<dyn DataSource> = Arc::new(InMemoryDataSource::new(
+            vec![column("k", DataType::Int32), column("v", DataType::Int64)],
+            batches,
+        ));
+        let scan: Arc<dyn ExecutionPlan> = Arc::new(ScanExec {
+            source,
+            _table_name: "t".to_string(),
+            scan_context: ScanContext::default(),
+            dynamic_filters: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
+            dynamic_filter_collector: None,
+            dynamic_filtering_enabled: false,
+            dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+            scan_task_index: 0,
+            scan_task_count: 1,
+        });
+        let tiny_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(256));
+        let rollup = RollupAggregateExec {
+            input: scan,
+            group_by: vec![PlanExpr::Column {
+                index: 0,
+                name: "k".to_string(),
+                span: None,
+            }],
+            aggr_exprs: vec![PlanExpr::Function {
+                name: "COUNT".to_string(),
+                args: vec![PlanExpr::Column {
+                    index: 1,
+                    name: "v".to_string(),
+                    span: None,
+                }],
+                distinct: false,
+                span: None,
+            }],
+            output_schema: vec![
+                ColumnInfo {
+                    nullable: true,
+                    ..column("k", DataType::Int32)
+                },
+                column("cnt", DataType::Int64),
+                column("grouping_k", DataType::Int64),
+            ],
+            memory_pool: tiny_pool,
+        };
+        match rollup.execute(0).await {
+            Err(ExecutionError::ResourceExhausted(_)) => {}
+            Err(other) => panic!("expected ResourceExhausted, got {other:?}"),
+            Ok(_) => panic!("expected ResourceExhausted under a tight pool, got Ok"),
         }
     }
 

@@ -73,37 +73,48 @@ fn prune_recursive(frag: &mut PlanFragment, needed_at_root: &BTreeSet<usize>) {
         }
     }
 
-    // Collect the pushed projections by stage_id so we know what to
-    // wrap each child with.
-    let mut pushed: HashMap<StageId, Vec<usize>> = HashMap::new();
+    // Collect the columns the parent reads from each child, by stage_id.
+    let mut pushed: HashMap<StageId, BTreeSet<usize>> = HashMap::new();
     collect_pushed_projections(&pruned, &mut pushed);
 
-    // Now rewrite the parent's plan: strip `Projection > ExchangeNode`
-    // wrappers and replace with `ExchangeNode(pruned_schema)` directly.
-    // The parent's downstream operators already reference the projected
-    // (smaller) schema positions because `prune_for_columns` did the
-    // remap during step (a).
-    let collapsed = collapse_exchange_projections(pruned, &pushed);
+    // What each child will produce, in order: the columns the parent
+    // reads plus its hash-partition columns, ascending (as
+    // `wrap_child_with_projection` emits them), or its full schema when
+    // that is all of them or the parent doesn't reference the exchange
+    // (rare — a dead exchange — kept whole so no batch has an empty
+    // schema, which Arrow rejects).
+    let child_outputs: HashMap<StageId, Vec<usize>> = frag
+        .source_fragments
+        .iter()
+        .map(|child| {
+            let n_out = child.root.schema().len();
+            let mut cols = pushed
+                .get(&child.id)
+                .cloned()
+                .unwrap_or_else(|| (0..n_out).collect());
+            if let PartitioningScheme::Hash { columns, .. } = &child.output_partitioning {
+                cols.extend(columns.iter().copied());
+            }
+            let cols = if cols.len() >= n_out {
+                (0..n_out).collect()
+            } else {
+                cols.into_iter().collect()
+            };
+            (child.id, cols)
+        })
+        .collect();
+
+    // Now rewrite the parent's plan: each `Projection > ExchangeNode`
+    // reads the child's pruned output, and is dropped when it would only
+    // forward that output as is. The parent's downstream operators
+    // already reference the projected (smaller) schema positions because
+    // `prune_for_columns` did the remap during step (a).
+    let collapsed = collapse_exchange_projections(pruned, &child_outputs);
     frag.root = collapsed;
 
-    // For each source-fragment child, build its needed set + wrap +
-    // recurse.
+    // For each source-fragment child: wrap + recurse.
     for child in &mut frag.source_fragments {
-        // Default needed: child's output_partitioning hash cols only.
-        // If the parent referenced this child, take its pushed indices.
-        let child_schema_len = child.root.schema().len();
-        let mut child_needed: BTreeSet<usize> = match pushed.get(&child.id) {
-            Some(indices) => indices.iter().copied().collect(),
-            // If parent doesn't reference this exchange at all (rare —
-            // dead exchange — keep all to avoid building an empty-schema
-            // batch which Arrow rejects).
-            None => (0..child_schema_len).collect(),
-        };
-        if let PartitioningScheme::Hash { columns, .. } = &child.output_partitioning {
-            for &c in columns {
-                child_needed.insert(c);
-            }
-        }
+        let child_needed: BTreeSet<usize> = child_outputs[&child.id].iter().copied().collect();
 
         // Wrap child.root with Projection that selects only the cols
         // in child_needed. This means the WORKER produces only those
@@ -116,29 +127,23 @@ fn prune_recursive(frag: &mut PlanFragment, needed_at_root: &BTreeSet<usize>) {
 }
 
 /// Walk `plan` looking for the pattern `Projection { input: ExchangeNode { stage_id, .. }, exprs }`.
-/// For each, record the column indices the exprs reference into
-/// `out[stage_id]`. The exprs are guaranteed to be `Column { index }`
-/// by construction (`prune_for_columns` only emits column refs in
-/// these wrapping Projections).
-fn collect_pushed_projections(plan: &LogicalPlan, out: &mut HashMap<StageId, Vec<usize>>) {
+/// For each, add the column indices the exprs reference to
+/// `out[stage_id]`. A projection that is not only column refs (one the
+/// query planned, not `prune_for_columns`) asks for every column.
+fn collect_pushed_projections(plan: &LogicalPlan, out: &mut HashMap<StageId, BTreeSet<usize>>) {
     use LogicalPlan as L;
     match plan {
         L::Projection { input, exprs, .. } => {
-            if let L::ExchangeNode { stage_id, .. } = input.as_ref() {
-                let mut indices = Vec::with_capacity(exprs.len());
+            if let L::ExchangeNode { stage_id, schema } = input.as_ref() {
+                let indices = out.entry(*stage_id).or_default();
                 for e in exprs {
                     if let PlanExpr::Column { index, .. } = e {
-                        indices.push(*index);
+                        indices.insert(*index);
                     } else {
-                        // Mixed expr — fall back to "all cols" by
-                        // recording None. We don't have a structural
-                        // representation of "all"; the lookup will
-                        // miss this stage_id and the child will keep
-                        // its full output. Conservatively safe.
+                        indices.extend(0..schema.len());
                         return;
                     }
                 }
-                out.insert(*stage_id, indices);
                 return;
             }
             collect_pushed_projections(input, out);
@@ -175,9 +180,12 @@ fn collect_pushed_projections(plan: &LogicalPlan, out: &mut HashMap<StageId, Vec
     }
 }
 
-/// Replace `Projection { input: ExchangeNode { stage_id, schema }, exprs }` with
-/// `ExchangeNode { stage_id, schema: pruned }` directly — the child fragment now
-/// produces the pruned schema so the projection is redundant.
+/// Point each `Projection { input: ExchangeNode { stage_id, schema }, exprs }`
+/// at the columns the child fragment now produces (`pushed[stage_id]`, in
+/// order): the exchange gets the pruned schema and the exprs index into
+/// it. The projection is dropped when it forwards that output exactly; it
+/// stays when it reorders or repeats columns, which the child's ascending
+/// output does not.
 fn collapse_exchange_projections(
     plan: LogicalPlan,
     pushed: &HashMap<StageId, Vec<usize>>,
@@ -194,12 +202,39 @@ fn collapse_exchange_projections(
                 schema: full_schema,
             } = input.as_ref()
             {
-                if let Some(indices) = pushed.get(stage_id) {
-                    let pruned_schema: Vec<ColumnInfo> =
-                        indices.iter().map(|&i| full_schema[i].clone()).collect();
-                    return L::ExchangeNode {
+                let remapped: Option<Vec<PlanExpr>> = pushed.get(stage_id).and_then(|indices| {
+                    exprs
+                        .iter()
+                        .map(|e| match e {
+                            PlanExpr::Column { index, name, span } => {
+                                let index = indices.iter().position(|i| i == index)?;
+                                Some(PlanExpr::Column {
+                                    index,
+                                    name: name.clone(),
+                                    span: *span,
+                                })
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                });
+                if let Some(remapped) = remapped {
+                    let indices = &pushed[stage_id];
+                    let exchange = L::ExchangeNode {
                         stage_id: *stage_id,
-                        schema: pruned_schema,
+                        schema: indices.iter().map(|&i| full_schema[i].clone()).collect(),
+                    };
+                    let forwards_as_is = remapped.len() == indices.len()
+                        && remapped.iter().enumerate().all(
+                            |(pos, e)| matches!(e, PlanExpr::Column { index, .. } if *index == pos),
+                        );
+                    if forwards_as_is {
+                        return exchange;
+                    }
+                    return L::Projection {
+                        input: Box::new(exchange),
+                        exprs: remapped,
+                        schema,
                     };
                 }
             }
@@ -382,5 +417,141 @@ fn wrap_child_with_projection(child: &mut PlanFragment, needed: &BTreeSet<usize>
                 .get(c)
                 .expect("hash column must be retained in projection");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arneb_common::types::DataType;
+    use arneb_planner::FragmentType;
+
+    fn cols(names: &[&str]) -> Vec<ColumnInfo> {
+        names
+            .iter()
+            .map(|n| ColumnInfo {
+                name: (*n).to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            })
+            .collect()
+    }
+
+    fn column(index: usize, name: &str) -> PlanExpr {
+        PlanExpr::Column {
+            index,
+            name: name.to_string(),
+            span: None,
+        }
+    }
+
+    /// A child producing `c0..c3`, read by the parent through `exprs`.
+    fn tree(exprs: &[usize], child_partitioning: PartitioningScheme) -> PlanFragment {
+        let full = cols(&["c0", "c1", "c2", "c3"]);
+        let child = PlanFragment {
+            id: StageId(1),
+            fragment_type: FragmentType::Source,
+            root: LogicalPlan::ExchangeNode {
+                stage_id: StageId(9),
+                schema: full.clone(),
+            },
+            output_partitioning: child_partitioning,
+            source_fragments: vec![],
+        };
+        let exprs: Vec<PlanExpr> = exprs.iter().map(|&i| column(i, &full[i].name)).collect();
+        let schema = exprs
+            .iter()
+            .map(|e| match e {
+                PlanExpr::Column { index, .. } => full[*index].clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        PlanFragment {
+            id: StageId(2),
+            fragment_type: FragmentType::Fixed,
+            root: LogicalPlan::Projection {
+                input: Box::new(LogicalPlan::ExchangeNode {
+                    stage_id: StageId(1),
+                    schema: full,
+                }),
+                exprs,
+                schema,
+            },
+            output_partitioning: PartitioningScheme::Single,
+            source_fragments: vec![child],
+        }
+    }
+
+    /// The column names the parent's root returns, read through the
+    /// child's actual output (not the schema the parent's exchange claims).
+    fn root_output(root: &PlanFragment) -> Vec<String> {
+        fn names_of(plan: &LogicalPlan, child: &[ColumnInfo]) -> Vec<String> {
+            let names = |s: &[ColumnInfo]| s.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+            match plan {
+                LogicalPlan::ExchangeNode { schema, .. } => {
+                    assert_eq!(names(schema), names(child), "exchange schema");
+                    names(child)
+                }
+                LogicalPlan::Projection { input, exprs, .. } => {
+                    let input = names_of(input, child);
+                    exprs
+                        .iter()
+                        .map(|e| match e {
+                            PlanExpr::Column { index, .. } => input[*index].clone(),
+                            other => panic!("unexpected expr: {other:?}"),
+                        })
+                        .collect()
+                }
+                other => panic!("unexpected plan: {other:?}"),
+            }
+        }
+        names_of(&root.root, &root.source_fragments[0].root.schema())
+    }
+
+    fn pruned(exprs: &[usize], child_partitioning: PartitioningScheme) -> PlanFragment {
+        let mut root = tree(exprs, child_partitioning);
+        prune_fragment_tree(&mut root);
+        root
+    }
+
+    #[test]
+    fn a_reordering_projection_over_an_exchange_keeps_its_order() {
+        // #225: every column, reordered (the two sides of a self-join).
+        let root = pruned(&[2, 3, 0, 1], PartitioningScheme::Single);
+        assert_eq!(root_output(&root), ["c2", "c3", "c0", "c1"]);
+        // Some columns, reordered.
+        let root = pruned(&[3, 1], PartitioningScheme::Single);
+        assert_eq!(root.source_fragments[0].root.schema(), cols(&["c1", "c3"]));
+        assert_eq!(root_output(&root), ["c3", "c1"]);
+    }
+
+    #[test]
+    fn a_repeated_column_over_an_exchange_is_kept() {
+        let root = pruned(&[2, 2], PartitioningScheme::Single);
+        assert_eq!(root_output(&root), ["c2", "c2"]);
+    }
+
+    #[test]
+    fn a_projection_forwarding_the_childs_output_is_dropped() {
+        let root = pruned(&[0, 1, 2, 3], PartitioningScheme::Single);
+        assert!(matches!(root.root, LogicalPlan::ExchangeNode { .. }));
+        assert_eq!(root_output(&root), ["c0", "c1", "c2", "c3"]);
+        let root = pruned(&[0, 2], PartitioningScheme::Single);
+        assert_eq!(root.source_fragments[0].root.schema(), cols(&["c0", "c2"]));
+        assert_eq!(root_output(&root), ["c0", "c2"]);
+    }
+
+    #[test]
+    fn a_hash_column_the_parent_does_not_read_stays_out_of_its_output() {
+        let hash = PartitioningScheme::Hash {
+            columns: vec![3],
+            partition_count: 2,
+        };
+        let root = pruned(&[0], hash);
+        assert_eq!(root_output(&root), ["c0"]);
+        assert!(matches!(
+            root.source_fragments[0].output_partitioning,
+            PartitioningScheme::Hash { ref columns, .. } if columns == &[1]
+        ));
     }
 }

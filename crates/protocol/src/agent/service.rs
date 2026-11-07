@@ -632,12 +632,13 @@ impl AgentQueryService {
                 ),
             );
             // One reaper cancel at a time per statement: a kill may wait for
-            // a poll of the work for longer than the idle timeout. (Touched
-            // too, so the next passes skip it until then.)
-            let (before, touched) = statement.touch_from();
+            // a poll of the work for longer than the idle timeout. Touched
+            // only by the pass that wins, so one that skips it leaves the
+            // winner's touch for its `untouch` to undo.
             if statement.reaping.swap(true, Ordering::SeqCst) {
                 continue;
             }
+            let (before, touched) = statement.touch_from();
             // In its own task (one): a kill may wait for one poll of the
             // work, which must not hold up the rest of the pass.
             let tracker = Arc::clone(&self.tracker);

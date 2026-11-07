@@ -1207,6 +1207,32 @@ impl BatchSink for Vec<arrow::record_batch::RecordBatch> {
     }
 }
 
+struct CharPaddingSink<'a> {
+    schema: Vec<ColumnInfo>,
+    sink: &'a mut dyn BatchSink,
+    error: Option<ArnebError>,
+}
+
+impl BatchSink for CharPaddingSink<'_> {
+    fn push(&mut self, batch: RecordBatch) {
+        if self.error.is_none() {
+            match pad_char_columns(&self.schema, vec![batch]) {
+                Ok(batches) => {
+                    for batch in batches {
+                        self.sink.push(batch);
+                    }
+                }
+                Err(error) => self.error = Some(error),
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.error = None;
+        self.sink.reset();
+    }
+}
+
 /// A capped query: a `SELECT` produces at most `rows` rows, and every batch
 /// goes to `sink` as it arrives.
 pub(crate) struct RowCap<'a> {
@@ -1333,9 +1359,17 @@ pub(crate) async fn execute_query_capped(
             tracing::info!("routing query to distributed executor");
             let batches = match row_cap {
                 Some(cap) => {
+                    let mut sink = CharPaddingSink {
+                        schema: logical_plan.schema(),
+                        sink: cap.sink,
+                        error: None,
+                    };
                     executor
-                        .execute_into(logical_plan, &exec_ctx, cap.sink)
+                        .execute_into(logical_plan, &exec_ctx, &mut sink)
                         .await?;
+                    if let Some(error) = sink.error {
+                        return Err(error);
+                    }
                     Vec::new()
                 }
                 None => executor.execute(logical_plan, &exec_ctx).await?,
@@ -1373,7 +1407,9 @@ pub(crate) async fn execute_query_capped(
         Some(cap) => {
             use futures::StreamExt;
             while let Some(batch) = stream.next().await {
-                cap.sink.push(batch?);
+                for batch in pad_char_columns(&physical_plan.schema(), vec![batch?])? {
+                    cap.sink.push(batch);
+                }
             }
             Vec::new()
         }
@@ -3895,5 +3931,159 @@ mod tests {
             "GROUP BY position",
         )
         .await;
+    }
+
+    // ---- CHAR(n) padding on the streamed (row_cap) paths ----
+    //
+    // The agent API and MCP tools take a capped query's batches through a
+    // `BatchSink`. Those batches must be blank-padded like the collected
+    // ones, or clients get unpadded values labeled char(n).
+
+    fn char_catalog() -> (CatalogManager, ConnectorRegistry) {
+        use arneb_connectors::memory::{
+            MemoryCatalog, MemoryConnectorFactory, MemorySchema, MemoryTable,
+        };
+        let cols = vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            ColumnInfo {
+                name: "cat".to_string(),
+                data_type: DataType::Char(10),
+                nullable: true,
+            },
+        ];
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("id", arrow::datatypes::DataType::Int64, false),
+            Field::new("cat", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(arrow::array::StringArray::from(vec![Some("Books"), None])),
+            ],
+        )
+        .unwrap();
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table("t", Arc::new(MemoryTable::new(cols, vec![batch])));
+        let catalog = Arc::new(MemoryCatalog::new());
+        catalog.register_schema("default", schema);
+        let factory = MemoryConnectorFactory::new(catalog.clone(), "default");
+        let cm = CatalogManager::new("memory", "default");
+        cm.register_catalog("memory", catalog);
+        let reg = ConnectorRegistry::new();
+        reg.register("memory", Arc::new(factory));
+        (cm, reg)
+    }
+
+    /// An unpadded one-column `cat` batch, as a worker's root stage sends it.
+    fn unpadded_cat_batch(value: &str) -> arrow::record_batch::RecordBatch {
+        arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "cat",
+                arrow::datatypes::DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(arrow::array::StringArray::from(vec![Some(value)]))],
+        )
+        .unwrap()
+    }
+
+    /// Every non-null `cat` value the sink received, in order.
+    fn sink_cats(sink: &[arrow::record_batch::RecordBatch]) -> Vec<String> {
+        use arrow::array::AsArray;
+        sink.iter()
+            .flat_map(|b| {
+                let col =
+                    arrow::compute::cast(b.column(0), &arrow::datatypes::DataType::Utf8).unwrap();
+                col.as_string::<i32>()
+                    .iter()
+                    .flatten()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    async fn run_capped(
+        sql: &str,
+        executor: Option<&dyn DistributedExecutor>,
+    ) -> Vec<arrow::record_batch::RecordBatch> {
+        let (cm, reg) = char_catalog();
+        let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
+            Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
+        let mut sink: Vec<arrow::record_batch::RecordBatch> = Vec::new();
+        let (_plan, batches) = execute_query_capped(
+            sql,
+            &cm,
+            &reg,
+            executor,
+            &pool,
+            None,
+            Some(RowCap {
+                rows: 10,
+                sink: &mut sink,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            batches.is_empty(),
+            "a capped query returns its rows through the sink"
+        );
+        sink
+    }
+
+    #[tokio::test]
+    async fn capped_local_query_pads_the_char_values_it_streams() {
+        let sink = run_capped("SELECT cat FROM t ORDER BY id", None).await;
+        assert_eq!(sink_cats(&sink), vec![format!("{:<10}", "Books")]);
+    }
+
+    #[tokio::test]
+    async fn capped_distributed_query_pads_the_char_values_it_streams() {
+        let executor = MockDistributedExecutor {
+            batches: vec![unpadded_cat_batch("Books")],
+            calls: AtomicUsize::new(0),
+        };
+        let sink = run_capped("SELECT cat FROM t", Some(&executor)).await;
+        assert_eq!(sink_cats(&sink), vec![format!("{:<10}", "Books")]);
+    }
+
+    /// A distributed run retried after a lost worker resets the sink; the
+    /// reset must reach the caller's sink through any padding in between,
+    /// so the first run's rows are dropped and the re-run's are padded.
+    #[tokio::test]
+    async fn capped_distributed_retry_drops_the_first_run_and_pads_the_rerun() {
+        struct Retrying;
+        #[async_trait]
+        impl DistributedExecutor for Retrying {
+            async fn execute(
+                &self,
+                _plan: LogicalPlan,
+                _exec_ctx: &ExecutionContext,
+            ) -> Result<Vec<arrow::record_batch::RecordBatch>, ArnebError> {
+                unreachable!("a capped query streams through execute_into")
+            }
+            async fn execute_into(
+                &self,
+                _plan: LogicalPlan,
+                _exec_ctx: &ExecutionContext,
+                sink: &mut dyn BatchSink,
+            ) -> Result<(), ArnebError> {
+                sink.push(unpadded_cat_batch("Music"));
+                sink.reset();
+                sink.push(unpadded_cat_batch("Books"));
+                Ok(())
+            }
+            fn has_workers(&self) -> bool {
+                true
+            }
+        }
+        let sink = run_capped("SELECT cat FROM t", Some(&Retrying)).await;
+        assert_eq!(sink_cats(&sink), vec![format!("{:<10}", "Books")]);
     }
 }

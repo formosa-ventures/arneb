@@ -1,6 +1,7 @@
 //! ROUND over DECIMAL follows Trino: the value is rounded exactly, half away
 //! from zero, and the result stays DECIMAL — decimal(p + 1, s) with a scale
-//! argument, decimal(p - s + 1, 0) without one (precision capped at 38).
+//! argument, decimal(p - s + min(s, 1), 0) without one (precision capped at
+//! 38).
 //! Expected values and types were taken from Trino 484. TPC-DS q78 rounds a
 //! DECIMAL ratio this way.
 
@@ -130,4 +131,19 @@ async fn double_round_is_unchanged() {
         single("SELECT round(DOUBLE '1.025', 2)").await,
         ("1.02".to_string(), ArrowDataType::Float64)
     );
+}
+
+#[tokio::test]
+async fn without_a_scale_argument_an_integer_decimal_keeps_its_precision() {
+    // s = 0: nothing is rounded off, so no carry digit is added.
+    assert_round("SELECT round(CAST(5 AS DECIMAL(10,0)))", "5", 10, 0).await;
+    assert_round("SELECT round(CAST(9 AS DECIMAL(1,0)))", "9", 1, 0).await;
+    assert_round("SELECT round(CAST(5 AS DECIMAL(38,0)))", "5", 38, 0).await;
+}
+
+#[tokio::test]
+async fn without_a_scale_argument_a_fractional_decimal_gains_a_carry_digit() {
+    // s > 0 keeps p - s + 1: 9.99 rounds to 10.
+    assert_round("SELECT round(CAST(9.99 AS DECIMAL(3,2)))", "10", 2, 0).await;
+    assert_round("SELECT round(CAST(5 AS DECIMAL(10,2)))", "5", 9, 0).await;
 }

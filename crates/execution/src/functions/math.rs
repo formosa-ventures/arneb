@@ -416,7 +416,7 @@ impl ScalarFunction for RoundFunction {
                 precision: if arg_types.len() > 1 {
                     precision.saturating_add(1).min(38)
                 } else {
-                    (*precision as i16 - *scale as i16 + 1).min(38) as u8
+                    (*precision as i16 - *scale as i16 + (*scale > 0) as i16).min(38) as u8
                 },
                 scale: if arg_types.len() > 1 { *scale } else { 0 },
             }),

@@ -2278,11 +2278,15 @@ fn rmcp_directives(filter: &str) -> (bool, bool) {
     for piece in filter.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         // The level follows the last `=`; with none, the piece is a default
         // level, or a target enabled at every level. A level that does not
-        // parse (a `=` inside a field filter) counts as "could".
+        // parse (a `=` inside a field filter) counts as "could". An empty
+        // one is TRACE to EnvFilter (`LevelFilter`'s own parser reads ERROR).
         let (spec, level) = match piece.rfind('=') {
             Some(i) => (
                 &piece[..i],
-                piece[i + 1..].trim().parse::<LevelFilter>().ok(),
+                match piece[i + 1..].trim() {
+                    "" => Some(LevelFilter::TRACE),
+                    l => l.parse::<LevelFilter>().ok(),
+                },
             ),
             None => match piece.parse::<LevelFilter>() {
                 Ok(level) => ("", Some(level)),
@@ -3310,6 +3314,8 @@ mod tests {
             "3",
             "off,r=debug",
             "off,rm=info",
+            "r=",
+            "off,rm=",
             "off,[{a=1}]=trace",
             "off,rmc",
             "error,rmcp::service=debug",

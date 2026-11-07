@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.0](https://github.com/formosa-ventures/arneb/compare/v0.1.8...v0.2.0) (2026-11-07)
+
+
+### Features
+
+* agent query API (H2): discovery, explain, bounded async statements ([#216](https://github.com/formosa-ventures/arneb/issues/216)) ([2bae379](https://github.com/formosa-ventures/arneb/commit/2bae37991a6dd6d2246681f9cec920949b5d9160))
+* headless API auth — tokens, state file, /api/v2 (H1) ([#215](https://github.com/formosa-ventures/arneb/issues/215)) ([6541da7](https://github.com/formosa-ventures/arneb/commit/6541da7b18067dc63939683fb5c223dc0a84ef8e))
+* manage API (H4): privileges, cancel any query, cordon/drain, admission limits, audit log ([#218](https://github.com/formosa-ventures/arneb/issues/218)) ([fdab0c9](https://github.com/formosa-ventures/arneb/commit/fdab0c912be559692a732bdfcb4e862439f96236))
+* **mcp:** OAuth 2.1 resource server for /mcp (H6) ([#220](https://github.com/formosa-ventures/arneb/issues/220)) ([1bbaa87](https://github.com/formosa-ventures/arneb/commit/1bbaa878a465376c26c1745ee59b1a25ec9ff984))
+* remote MCP endpoint (H3): 18 agent tools over /api/v2 at /mcp ([#217](https://github.com/formosa-ventures/arneb/issues/217)) ([289341e](https://github.com/formosa-ventures/arneb/commit/289341e8bfeb7cea294ccf0247419692b57320c1))
+* **server:** runtime config — rules, users, catalogs and settings changed at runtime (H5) ([#219](https://github.com/formosa-ventures/arneb/issues/219)) ([1a265af](https://github.com/formosa-ventures/arneb/commit/1a265af14b5826f6b625645df8a8604d06adb0d0))
+* **sql-parser:** accept an alias on a parenthesized join ([#208](https://github.com/formosa-ventures/arneb/issues/208)) ([7f8a194](https://github.com/formosa-ventures/arneb/commit/7f8a1942c5738fd14b3d706f2020320ea7af7bd8))
+
+
+### Bug Fixes
+
+* **access:** check rules on the name the connector resolved ([#221](https://github.com/formosa-ventures/arneb/issues/221)) ([c7f35f0](https://github.com/formosa-ventures/arneb/commit/c7f35f0a120cf9683881ed2870014d88dceeb261))
+* keep column aliases on FROM tables and subqueries ([#211](https://github.com/formosa-ventures/arneb/issues/211)) ([3a044be](https://github.com/formosa-ventures/arneb/commit/3a044be893b1311c45ade45f1414ac451779f0bc))
+
 ## [0.1.8](https://github.com/formosa-ventures/arneb/compare/v0.1.7...v0.1.8) (2026-10-30)
 
 

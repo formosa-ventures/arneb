@@ -243,3 +243,42 @@ async fn min_max_count_per_rollup_level() {
         ])
     );
 }
+
+// ORDER BY on qualified ROLLUP keys, as with a plain GROUP BY. Expected rows
+// were taken from Trino 484, which sorts NULLs last in both directions.
+
+#[tokio::test]
+async fn order_by_a_qualified_rollup_key_that_is_not_selected() {
+    assert_eq!(
+        rows("SELECT sum(v) FROM s GROUP BY ROLLUP(s.a, s.b) ORDER BY s.b, s.a, sum(v)").await,
+        table(&[
+            &["5"],
+            &["3"],
+            &["7"],
+            &["1"],
+            &["12"],
+            &["4"],
+            &["7"],
+            &["1"],
+            &["20"],
+        ])
+    );
+}
+
+#[tokio::test]
+async fn order_by_a_selected_qualified_rollup_key_descending() {
+    assert_eq!(
+        rows("SELECT s.a, sum(v) FROM s GROUP BY ROLLUP(s.a, s.b) ORDER BY s.a DESC, sum(v)").await,
+        table(&[
+            &["2", "3"],
+            &["2", "4"],
+            &["2", "7"],
+            &["1", "5"],
+            &["1", "7"],
+            &["1", "12"],
+            &["NULL", "1"],
+            &["NULL", "1"],
+            &["NULL", "20"],
+        ])
+    );
+}

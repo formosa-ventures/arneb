@@ -519,6 +519,7 @@ impl<'a> QueryPlanner<'a> {
         let mut input_ctx = self.context_from_plan(input);
         if let ast::QueryBody::Select(body) = &query.body {
             let group_by = resolve_group_by_ordinals(body)?;
+            let group_by = rollup_group_by_keys(&group_by)?.unwrap_or(group_by);
             if !group_by.is_empty() {
                 for (col, key) in input_ctx.columns.iter_mut().zip(&group_by) {
                     col.0 = group_by_qualifier(key);
@@ -574,7 +575,8 @@ impl<'a> QueryPlanner<'a> {
                         ast::QueryBody::Select(body) => self.rewrite_aggregates_as_columns(
                             &ob.expr,
                             &input_ctx,
-                            resolve_group_by_ordinals(body)?.len(),
+                            rollup_group_by_keys(&resolve_group_by_ordinals(body)?)?
+                                .map_or_else(|| body.group_by.len(), |keys| keys.len()),
                         ),
                         _ => ob.expr.clone(),
                     };
@@ -781,27 +783,7 @@ impl<'a> QueryPlanner<'a> {
         // 3. GROUP BY / HAVING → Aggregate
         // Also handle implicit aggregate: SELECT SUM(x) FROM t (no GROUP BY but has aggregates)
         let mut group_by_ast = resolve_group_by_ordinals(body)?;
-        let rollup = if group_by_ast.len() == 1 {
-            match &group_by_ast[0] {
-                ast::Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("ROLLUP") => {
-                    let mut keys = Vec::with_capacity(args.len());
-                    for arg in args {
-                        match arg {
-                            ast::FunctionArg::Unnamed(expr) => keys.push(expr.clone()),
-                            _ => {
-                                return Err(PlanError::invalid_expression(
-                                    "ROLLUP requires expressions",
-                                ))
-                            }
-                        }
-                    }
-                    Some(keys)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let rollup = rollup_group_by_keys(&group_by_ast)?;
         if let Some(keys) = &rollup {
             group_by_ast = keys.clone();
         }
@@ -4352,6 +4334,22 @@ fn resolve_group_by_ordinals(body: &ast::SelectBody) -> Result<Vec<ast::Expr>, P
         }
     }
     Ok(out)
+}
+
+fn rollup_group_by_keys(group_by: &[ast::Expr]) -> Result<Option<Vec<ast::Expr>>, PlanError> {
+    let [ast::Expr::Function { name, args, .. }] = group_by else {
+        return Ok(None);
+    };
+    if !name.eq_ignore_ascii_case("ROLLUP") {
+        return Ok(None);
+    }
+    args.iter()
+        .map(|arg| match arg {
+            ast::FunctionArg::Unnamed(expr) => Ok(expr.clone()),
+            _ => Err(PlanError::invalid_expression("ROLLUP requires expressions")),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// If a GROUP BY AST expression is a qualified column reference

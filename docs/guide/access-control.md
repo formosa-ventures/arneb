@@ -154,7 +154,7 @@ Everyone can run queries and sees only their own.
 - When an HMS authorization plugin (Apache Ranger, storage-based or
   SQL-standard authorization) refuses Arneb's request for a database or
   table, the object reads as missing, and a refused listing as empty, as
-  before v0.1.9; any other HMS error is treated as an outage. HMS reports
+  before v0.2.0; any other HMS error is treated as an outage. HMS reports
   both the same way, so Arneb recognizes a refusal by the plugins'
   explicit phrases (`Permission denied: user ...` or `Permission denied:
   Principal ...`). An authentication failure, such as an expired Kerberos
@@ -168,8 +168,8 @@ Everyone can run queries and sees only their own.
 
 ## Upgrading from v0.1.8
 
-Before v0.1.9, rules were checked only on the names as written in the
-query. From v0.1.9 they are also checked on the stored names the Hive or
+Before v0.2.0, rules were checked only on the names as written in the
+query. From v0.2.0 they are also checked on the stored names the Hive or
 PostgreSQL connector resolved, so **an allow rule must match the stored
 name as well**. An allow rule written in another case than the stored
 name now refuses the read, and the error is the one a missing table gets,
@@ -186,7 +186,7 @@ For example, with a Hive catalog whose database is stored as `tpch`:
 }
 ```
 
-`SELECT * FROM TPCH.nation` worked on v0.1.8. On v0.1.9 it is refused,
+`SELECT * FROM TPCH.nation` worked on v0.1.8. On v0.2.0 it is refused,
 because the stored schema `tpch` does not match `TPCH`. Fix the rule by
 writing the stored name, `"schema": "tpch"`, or by making the pattern
 case-insensitive, `"schema": "(?i)tpch"`. Check every `catalog`, `schema`
@@ -210,8 +210,7 @@ Writes are checked on the target table after planning, on every protocol
 the write. A `read-only` catalog refuses every write
 (`Access Denied: Cannot create table lake.sales.x (catalog lake is
 read-only)`); a `none` catalog refuses everything. A refused write answers
-`Access Denied: Cannot <action> <catalog>.<schema>.<name> (requires
-<PRIVILEGE>)`, where `<action>` is `insert into table`, `delete from table`,
+`Access Denied: Cannot <action> <catalog>.<schema>.<name> (requires <PRIVILEGE>)`, where `<action>` is `insert into table`, `delete from table`,
 `create table`, `drop table`, `create view` or `drop view`: SQLSTATE `42501` on pgwire, `PERMISSION_DENIED` on Trino and
 `forbidden` in an agent or MCP statement status. The sources of CTAS and
 `INSERT ... SELECT` need `SELECT` as usual. `UPDATE` is accepted in rules
@@ -262,11 +261,9 @@ as `privileges: {"observe": bool, "manage": bool}`.
 
 A refusal is `403 forbidden` and its `hint` names what would grant it:
 
-- manage: `needs a system_information rule that allows write for user <u>,
-  or <u> in [access_control] admin_users`;
+- manage: `needs a system_information rule that allows write for user <u>, or <u> in [access_control] admin_users`;
 - observe: `needs a system_information rule that allows read for user <u>`;
-- cancelling another user's query: `needs a queries rule that allows kill
-  for queryOwner <owner>, or the manage privilege`.
+- cancelling another user's query: `needs a queries rule that allows kill for queryOwner <owner>, or the manage privilege`.
 
 A query's owner may always cancel it. Cancelling another user's query needs
 password auth, then an explicit `queries` rule that allows `kill` for that

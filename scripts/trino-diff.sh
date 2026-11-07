@@ -64,8 +64,10 @@ esac
 mkdir -p "$OUT"
 
 trino() {
+    local output_format=$1
+    shift
     docker compose exec -T trino trino --server http://localhost:8080 \
-        --catalog hive --schema "$SUITE" --output-format CSV_UNQUOTED "$@"
+        --catalog hive --schema "$SUITE" --output-format "$output_format" "$@"
 }
 
 # ---- pre-flight -----------------------------------------------------------
@@ -75,7 +77,7 @@ for s in s3 hive-metastore trino; do
     grep -qx "$s" <<<"$running" || fail "docker stack: $s is not running" "docker compose up -d && wait for the healthchecks"
 done
 echo "✓ docker stack up (s3, hive-metastore, trino)"
-count=$(trino --execute "$SEED_CHECK" 2>/dev/null | tail -1 | tr -d '"\r')
+count=$(trino CSV_UNQUOTED --execute "$SEED_CHECK" 2>/dev/null | tail -1 | tr -d '"\r')
 [ "$count" = "$SEED_EXPECT" ] || fail "$SUITE SF1 not seeded (got '${count:-nothing}', want $SEED_EXPECT)" "$SEED_CMD"
 echo "✓ $SUITE SF1 seeded"
 [ -x "$BIN" ] || fail "$BIN missing" "cargo build --release"
@@ -127,7 +129,7 @@ for q in "${QUERIES[@]}"; do
     [ -f "$sql" ] || { printf '[%3d/%d] %-5s missing file\n' "$n" "$total" "$q"; BAD+=("$q"); continue; }
 
     t0=$(date +%s.%N)
-    psql -h 127.0.0.1 -p "$PORT" -U test -d test -A -F , -t -q -v ON_ERROR_STOP=1 \
+    psql -h 127.0.0.1 -p "$PORT" -U test -d test -A -F , -t -q -P 'null=\N' -v ON_ERROR_STOP=1 \
         -c '\set VERBOSITY verbose' -f "$sql" \
         >"$OUT/arneb_$q.csv" 2>"$OUT/arneb_$q.err" &
     PSQL_PID=$!
@@ -156,7 +158,8 @@ for q in "${QUERIES[@]}"; do
     fi
 
     t0=$(date +%s.%N)
-    trino --execute "$(cat "$sql")" >"$OUT/trino_$q.csv" 2>"$OUT/trino_$q.err"
+    trino JSON --execute "$(cat "$sql")" 2>"$OUT/trino_$q.err" \
+        | python3 scripts/trino-diff-json-to-csv.py >"$OUT/trino_$q.csv" 2>>"$OUT/trino_$q.err"
     trc=$?
     tt=$(printf '%.1f' "$(echo "$(date +%s.%N) - $t0" | bc)")
     compare_keys=""

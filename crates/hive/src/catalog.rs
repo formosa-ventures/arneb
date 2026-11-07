@@ -298,14 +298,6 @@ impl HmsClient {
             })
             .unwrap_or_default();
 
-        let column_stats = self
-            .get_table_column_stats(db, table, &columns)
-            .await
-            .unwrap_or_else(|e| {
-                warn!("HMS column statistics unavailable for {db}.{table}: {e}");
-                HashMap::new()
-            });
-
         Ok(HiveTableMeta {
             db_name,
             table_name,
@@ -316,7 +308,7 @@ impl HmsClient {
             partition_columns,
             row_count,
             size_bytes,
-            column_stats,
+            column_stats: HashMap::new(),
             parameters,
         })
     }
@@ -771,7 +763,7 @@ fn not_found_unless_unreachable(
 impl HiveSchemaProvider {
     async fn load(&self, name: &str, allowed: TableGate<'_>) -> Result<TableLookup, CatalogError> {
         let qualified = format!("{}.{}", self.database, name);
-        let meta = match self.client.get_table(&self.database, name).await {
+        let mut meta = match self.client.get_table(&self.database, name).await {
             Ok(meta) => meta,
             Err(e) => return not_found_unless_unreachable(e, &qualified),
         };
@@ -799,6 +791,14 @@ impl HiveSchemaProvider {
                 }
             };
         }
+        meta.column_stats = self
+            .client
+            .get_table_column_stats(&meta.db_name, &meta.table_name, &meta.columns)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("HMS column statistics unavailable for {qualified}: {e}");
+                HashMap::new()
+            });
         // A partitioned table reads exactly the partitions registered in
         // HMS, each at its own location (as Trino and Hive do), not
         // whatever `key=value` directories sit under the table root.

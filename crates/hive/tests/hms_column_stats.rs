@@ -4,7 +4,11 @@
 //! seed (`docker compose run --rm tpcds-seed`).
 //! Run with: `cargo test -p arneb-hive --test hms_column_stats -- --ignored`
 
-use arneb_hive::catalog::HmsClient;
+use std::sync::Arc;
+
+use arneb_catalog::{CatalogProvider, SchemaProvider, TableLookup};
+use arneb_connectors::storage::StorageRegistry;
+use arneb_hive::catalog::{HiveCatalogProvider, HmsClient};
 use hive_metastore::ThriftHiveMetastoreClientBuilder;
 use pilota::FastStr;
 use volo_thrift::MaybeException;
@@ -12,21 +16,78 @@ use volo_thrift::MaybeException;
 const HMS_ADDR: &str = "127.0.0.1:9083";
 
 /// The seed writes tables through Trino, which records column statistics in
-/// HMS; the planner's join estimates need those NDVs.
+/// HMS; the planner's join estimates need those NDVs. They come with the
+/// table the schema provider serves, fetched once access is granted.
 #[tokio::test]
 #[ignore]
-async fn get_table_returns_hms_column_ndv() {
+async fn table_lookup_returns_hms_column_ndv() {
+    assert_eq!(
+        catalog_sales_item_ndv("tpcds", "catalog_sales").await,
+        Some(17_764)
+    );
+}
+
+/// The stats call uses the name HMS stored, not the spelling the query used.
+#[tokio::test]
+#[ignore]
+async fn table_lookup_under_another_spelling_returns_hms_column_ndv() {
+    assert_eq!(
+        catalog_sales_item_ndv("TPCDS", "CATALOG_SALES").await,
+        Some(17_764)
+    );
+}
+
+/// A denied table is refused before anything else is read from HMS.
+#[tokio::test]
+#[ignore]
+async fn a_denied_table_lookup_is_refused() {
+    let schema = tpcds_schema("tpcds").await;
+    assert!(matches!(
+        schema
+            .table_if_allowed("catalog_sales", &|_, _| false)
+            .await
+            .unwrap(),
+        TableLookup::Denied
+    ));
+}
+
+/// Fetching a table's metadata alone reads no column statistics: that call
+/// waits until the access check passed (and is skipped for an Iceberg
+/// redirect), so a denied table costs no extra HMS round trip.
+#[tokio::test]
+#[ignore]
+async fn get_table_alone_reads_no_column_statistics() {
     let client = HmsClient::new(HMS_ADDR).await.expect("connect to HMS");
     let meta = client
         .get_table("tpcds", "catalog_sales")
         .await
         .expect("tpcds.catalog_sales (seed with `docker compose run --rm tpcds-seed`)");
-    let item = meta
-        .column_stats
-        .get("cs_item_sk")
-        .expect("cs_item_sk column statistics");
-    // Trino `SHOW STATS FOR hive.tpcds.catalog_sales` reports 17764 at SF1.
-    assert_eq!(item.ndv, Some(17_764));
+    assert!(
+        meta.column_stats.is_empty(),
+        "{:?}",
+        meta.column_stats.keys()
+    );
+}
+
+async fn tpcds_schema(written: &str) -> Arc<dyn SchemaProvider> {
+    let client = Arc::new(HmsClient::new(HMS_ADDR).await.expect("connect to HMS"));
+    let catalog = HiveCatalogProvider::new(client, Arc::new(StorageRegistry::new()));
+    catalog
+        .try_schema(written)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("schema {written:?}"))
+}
+
+/// NDV of `cs_item_sk` on the table served for `schema`.`table`.
+async fn catalog_sales_item_ndv(schema: &str, table: &str) -> Option<u64> {
+    let schema = tpcds_schema(schema).await;
+    let TableLookup::Found(provider) = schema.table_if_allowed(table, &|_, _| true).await.unwrap()
+    else {
+        panic!("{table} not found (seed with `docker compose run --rm tpcds-seed`)");
+    };
+    let stats = provider.statistics().expect("table statistics");
+    stats.columns.get("cs_item_sk").and_then(|c| c.ndv)
 }
 
 /// A table nobody computed statistics for still resolves; it just has no NDVs.

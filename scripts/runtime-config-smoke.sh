@@ -24,6 +24,9 @@
 #   ARNEB_USER2 / ARNEB_PASSWORD2             a user without manage (required)
 #   PG_URL                postgresql://user:password@host:port/db the coordinator
 #                         and the workers can reach (required for the full run)
+#   PG_URL_HOST           the same database as this host reaches it, for the
+#                         expected row count (default PG_URL); e.g. when the
+#                         nodes run in kind and PG_URL names a host only they resolve
 #   ARNEB_PG_CATALOG      name of the catalog to create (default pg2)
 #   ARNEB_PG_SCHEMA       schema of the PostgreSQL TPC-H tables (default tpch_mixed)
 #   ARNEB_PG_TABLE        table to count across the workers (default customer)
@@ -97,7 +100,7 @@ fail() {
 redact() {
     local s
     s=$(cat)
-    for secret in "$ARNEB_ADMIN_PASSWORD" "$ARNEB_PASSWORD2" "${PG_URL:-}" "$TOKEN" "$NEW_PW"; do
+    for secret in "$ARNEB_ADMIN_PASSWORD" "$ARNEB_PASSWORD2" "${PG_URL:-}" "${PG_URL_HOST:-}" "$TOKEN" "$NEW_PW"; do
         [ -n "$secret" ] && s="${s//"$secret"/<secret>}"
     done
     printf '%s' "$s"
@@ -341,17 +344,18 @@ if [ "$AFTER_RESTART" = 1 ]; then
 fi
 
 STEP="0 setup"
-# psql gets PG_URL without its password, and the password through PGPASSWORD.
-PG_REST="${PG_URL#*://}"
+# psql gets PG_URL_HOST without its password, and the password through PGPASSWORD.
+PG_LOCAL_URL="${PG_URL_HOST:-$PG_URL}"
+PG_REST="${PG_LOCAL_URL#*://}"
 PG_USERINFO=""
 case "$PG_REST" in *@*) PG_USERINFO="${PG_REST%%@*}"; PG_REST="${PG_REST#*@}" ;; esac
 PG_PASS=""
 case "$PG_USERINFO" in *:*) PG_PASS="${PG_USERINFO#*:}"; PG_USERINFO="${PG_USERINFO%%:*}" ;; esac
 PG_PASS=$(printf '%b' "${PG_PASS//%/\\x}")   # percent-decode
-PG_NOPW_URL="${PG_URL%%://*}://${PG_USERINFO:+$PG_USERINFO@}$PG_REST"
+PG_NOPW_URL="${PG_LOCAL_URL%%://*}://${PG_USERINFO:+$PG_USERINFO@}$PG_REST"
 EXPECTED=$(PGPASSWORD="$PG_PASS" PGCONNECT_TIMEOUT=10 psql -X -tAq "$PG_NOPW_URL" \
     -c "SELECT count(*) FROM $PGSCHEMA.$PGTABLE" 2>&1 | redact) \
-    || fail "cannot count $PGSCHEMA.$PGTABLE through PG_URL: $EXPECTED"
+    || fail "cannot count $PGSCHEMA.$PGTABLE through PG_URL_HOST or PG_URL: $EXPECTED"
 NEW_PW=$(openssl rand -hex 16)
 req ADMIN GET "$API/whoami"
 expect_code 200 "admin whoami"

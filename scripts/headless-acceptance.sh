@@ -43,7 +43,7 @@
 #   KEYCLOAK_ISSUER       when set, run scripts/mcp-oauth-smoke.sh at the end
 #   ARNEB_CATALOG / ARNEB_SCHEMA / ARNEB_LONG_SQL / ARNEB_SMOKE_TIMEOUT_SECS /
 #   ARNEB_EXPECTED_LINEITEM / ARNEB_WORKER_LOGS / ARNEB_COORD_LOG /
-#   ARNEB_AUDIT_FILE / ARNEB_PG_SCHEMA / ARNEB_PG_TABLE   passed to the smokes
+#   ARNEB_AUDIT_FILE / ARNEB_PG_SCHEMA / ARNEB_PG_TABLE / PG_URL_HOST   passed to the smokes
 #
 # Passwords are passed to the smokes through the environment only.
 # scripts/manage-smoke.sh puts them on its curl command lines: run this only

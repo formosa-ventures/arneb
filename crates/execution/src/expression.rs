@@ -6,19 +6,38 @@
 use std::sync::Arc;
 
 use arneb_common::error::ExecutionError;
-use arneb_common::types::ScalarValue;
+use arneb_common::types::{char_storage_value, DataType, ScalarValue};
 use arneb_planner::analyzer::coercion_matrix::decimal_arithmetic_type;
 use arneb_planner::PlanExpr;
 use arneb_sql_parser::ast;
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    NullArray, StringArray,
+    NullArray, StringArray, UInt32Array,
 };
 use arrow::compute::kernels;
 use arrow::datatypes::DataType as ArrowDataType;
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::functions::{default_registry, FunctionRegistry};
+
+/// The stored form of a CHAR(`length`) column: each value of the Utf8
+/// array `array` truncated to `length` characters, without trailing blanks.
+fn char_storage_array(array: &ArrayRef, length: u32) -> Result<ArrayRef, ExecutionError> {
+    let strings = array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            ExecutionError::InvalidOperation(format!(
+                "CHAR({length}) cast expects a Utf8 array, got {}",
+                array.data_type()
+            ))
+        })?;
+    let stored: StringArray = strings
+        .iter()
+        .map(|v| v.map(|s| char_storage_value(s, length)))
+        .collect();
+    Ok(Arc::new(stored))
+}
 
 /// Process-wide default registry, lazily initialised on first use.
 /// Acts as a fallback when `evaluate` is called with `registry: None`
@@ -85,7 +104,10 @@ pub(crate) fn evaluate(
             let arr = evaluate(expr, batch, registry)?;
             let arrow_type: ArrowDataType = data_type.clone().into();
             let result = arrow::compute::cast(&arr, &arrow_type)?;
-            Ok(result)
+            match data_type {
+                DataType::Char(length) => char_storage_array(&result, *length),
+                _ => Ok(result),
+            }
         }
 
         PlanExpr::Between {
@@ -864,19 +886,21 @@ fn evaluate_case(
         None => None,
     };
 
-    // Track which rows have already been assigned a result
-    let mut assigned = vec![false; num_rows];
+    let mut remaining: Vec<u32> = (0..num_rows as u32).collect();
     // Collect (condition_mask, result_array) for each WHEN clause
     let mut branches: Vec<(BooleanArray, ArrayRef)> = Vec::new();
 
     for (cond, result) in when_clauses {
-        let cond_bool = if let Some(ref op_arr) = operand_arr {
+        let cond_bool = if remaining.is_empty() {
+            BooleanArray::from(Vec::<bool>::new())
+        } else if let Some(ref op_arr) = operand_arr {
             // Simple CASE: compare operand to condition value
-            let cond_arr = evaluate(cond, batch, registry)?;
-            compare_op(op_arr, &cond_arr, CompareOp::Eq)?
+            let cond_arr = evaluate_case_rows(cond, batch, &remaining, registry)?;
+            let op_arr = arrow::compute::take(op_arr, &UInt32Array::from(remaining.clone()), None)?;
+            compare_op(&op_arr, &cond_arr, CompareOp::Eq)?
         } else {
             // Searched CASE: condition should evaluate to boolean
-            let cond_arr = evaluate(cond, batch, registry)?;
+            let cond_arr = evaluate_case_rows(cond, batch, &remaining, registry)?;
             cond_arr
                 .as_any()
                 .downcast_ref::<BooleanArray>()
@@ -888,32 +912,32 @@ fn evaluate_case(
                 .clone()
         };
 
-        // Mask: only consider rows not yet assigned
-        // A NULL condition is treated as not-matched
-        let effective_mask: BooleanArray = (0..num_rows)
-            .map(|i| {
-                if assigned[i] || cond_bool.is_null(i) {
-                    Some(false)
-                } else {
-                    Some(cond_bool.value(i))
-                }
-            })
-            .collect();
-
-        // Mark newly assigned rows
-        for (i, flag) in assigned.iter_mut().enumerate().take(num_rows) {
-            if !effective_mask.is_null(i) && effective_mask.value(i) {
-                *flag = true;
+        let mut matched = Vec::new();
+        let mut next_remaining = Vec::new();
+        for (i, row) in remaining.into_iter().enumerate() {
+            if !cond_bool.is_null(i) && cond_bool.value(i) {
+                matched.push(row);
+            } else {
+                next_remaining.push(row);
             }
         }
-
-        let result_arr = evaluate(result, batch, registry)?;
+        remaining = next_remaining;
+        let mut mask = vec![false; num_rows];
+        for &row in &matched {
+            mask[row as usize] = true;
+        }
+        let effective_mask = BooleanArray::from(mask);
+        let result_arr = evaluate_case_rows(result, batch, &matched, registry)?;
+        let result_arr = expand_case_rows(&result_arr, &matched, num_rows)?;
         branches.push((effective_mask, result_arr));
     }
 
     // Evaluate ELSE if provided
     let else_arr = match else_result {
-        Some(el) => Some(evaluate(el, batch, registry)?),
+        Some(el) => {
+            let arr = evaluate_case_rows(el, batch, &remaining, registry)?;
+            Some(expand_case_rows(&arr, &remaining, num_rows)?)
+        }
         None => None,
     };
 
@@ -990,6 +1014,113 @@ fn evaluate_case(
     let result = arrow::compute::interleave(&source_refs, &indices)?;
 
     Ok(result)
+}
+
+fn evaluate_case_rows(
+    expr: &PlanExpr,
+    batch: &RecordBatch,
+    rows: &[u32],
+    registry: Option<&FunctionRegistry>,
+) -> Result<ArrayRef, ExecutionError> {
+    if rows.len() == batch.num_rows()
+        && rows
+            .iter()
+            .enumerate()
+            .all(|(index, &row)| index == row as usize)
+    {
+        return evaluate(expr, batch, registry);
+    }
+    let mut referenced = vec![false; batch.num_columns()];
+    case_referenced_columns(expr, &mut referenced);
+    let indices = UInt32Array::from(rows.to_vec());
+    let columns = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            if referenced[index] {
+                arrow::compute::take(column, &indices, None)
+            } else {
+                Ok(column.slice(0, rows.len()))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+    let selected = RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
+    evaluate(expr, &selected, registry)
+}
+
+fn case_referenced_columns(expr: &PlanExpr, referenced: &mut [bool]) {
+    match expr {
+        PlanExpr::Column { index, .. } => {
+            if let Some(column) = referenced.get_mut(*index) {
+                *column = true;
+            }
+        }
+        PlanExpr::BinaryOp { left, right, .. } => {
+            case_referenced_columns(left, referenced);
+            case_referenced_columns(right, referenced);
+        }
+        PlanExpr::UnaryOp { expr, .. }
+        | PlanExpr::IsNull { expr, .. }
+        | PlanExpr::IsNotNull { expr, .. }
+        | PlanExpr::Cast { expr, .. } => case_referenced_columns(expr, referenced),
+        PlanExpr::Between {
+            expr, low, high, ..
+        } => {
+            case_referenced_columns(expr, referenced);
+            case_referenced_columns(low, referenced);
+            case_referenced_columns(high, referenced);
+        }
+        PlanExpr::InList { expr, list, .. } => {
+            case_referenced_columns(expr, referenced);
+            for item in list {
+                case_referenced_columns(item, referenced);
+            }
+        }
+        PlanExpr::Function { args, .. } => {
+            for arg in args {
+                case_referenced_columns(arg, referenced);
+            }
+        }
+        PlanExpr::CaseExpr {
+            operand,
+            when_clauses,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                case_referenced_columns(operand, referenced);
+            }
+            for (condition, result) in when_clauses {
+                case_referenced_columns(condition, referenced);
+                case_referenced_columns(result, referenced);
+            }
+            if let Some(else_result) = else_result {
+                case_referenced_columns(else_result, referenced);
+            }
+        }
+        PlanExpr::Literal { .. }
+        | PlanExpr::Wildcard
+        | PlanExpr::ScalarSubquery { .. }
+        | PlanExpr::Parameter { .. } => {}
+    }
+}
+
+fn expand_case_rows(
+    arr: &ArrayRef,
+    rows: &[u32],
+    num_rows: usize,
+) -> Result<ArrayRef, ExecutionError> {
+    let mut indices = vec![None; num_rows];
+    for (index, &row) in rows.iter().enumerate() {
+        indices[row as usize] = Some(index as u32);
+    }
+    Ok(arrow::compute::take(
+        arr,
+        &UInt32Array::from(indices),
+        None,
+    )?)
 }
 
 /// Create a null array of the given type and length.

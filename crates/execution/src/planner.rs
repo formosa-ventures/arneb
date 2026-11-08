@@ -17,7 +17,7 @@ use crate::hash_join::{extract_equi_join_keys, HashJoinExec};
 use crate::memory_pool::{MemoryPool, UnboundedMemoryPool};
 use crate::operator::{
     AggregateOutputColumn, ExecutionPlan, ExplainExec, FilterExec, HashAggregateExec, LimitExec,
-    NestedLoopJoinExec, ProjectionExec, ScanExec, SortExec, TopKExec,
+    NestedLoopJoinExec, ProjectionExec, RollupAggregateExec, ScanExec, SortExec, TopKExec,
 };
 use crate::scan_context::ScanContext;
 
@@ -678,6 +678,7 @@ impl ExecutionContext {
             | LogicalPlan::Explain { input, .. }
             | LogicalPlan::Distinct { input }
             | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::RollupAggregate { input, .. }
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Window { input, .. }
@@ -736,7 +737,7 @@ impl ExecutionContext {
     ) -> Result<PlanExpr, ExecutionError> {
         match expr {
             PlanExpr::ScalarSubquery { subplan, span } => {
-                let exec = self.create_physical_plan(subplan)?;
+                let exec = coalesce_if_multi(self.create_physical_plan(subplan)?);
                 let stream = exec.execute(0).await?;
                 let batches = arneb_common::stream::collect_stream(stream)
                     .await
@@ -801,6 +802,93 @@ impl ExecutionContext {
                 expr: Box::new(Box::pin(self.resolve_scalar_subqueries(inner)).await?),
                 span: *span,
             }),
+            PlanExpr::Function {
+                name,
+                args,
+                distinct,
+                span,
+            } => {
+                let mut resolved = Vec::with_capacity(args.len());
+                for arg in args {
+                    resolved.push(Box::pin(self.resolve_scalar_subqueries(arg)).await?);
+                }
+                Ok(PlanExpr::Function {
+                    name: name.clone(),
+                    args: resolved,
+                    distinct: *distinct,
+                    span: *span,
+                })
+            }
+            PlanExpr::IsNull { expr, span } => Ok(PlanExpr::IsNull {
+                expr: Box::new(Box::pin(self.resolve_scalar_subqueries(expr)).await?),
+                span: *span,
+            }),
+            PlanExpr::IsNotNull { expr, span } => Ok(PlanExpr::IsNotNull {
+                expr: Box::new(Box::pin(self.resolve_scalar_subqueries(expr)).await?),
+                span: *span,
+            }),
+            PlanExpr::Between {
+                expr,
+                negated,
+                low,
+                high,
+                span,
+            } => Ok(PlanExpr::Between {
+                expr: Box::new(Box::pin(self.resolve_scalar_subqueries(expr)).await?),
+                negated: *negated,
+                low: Box::new(Box::pin(self.resolve_scalar_subqueries(low)).await?),
+                high: Box::new(Box::pin(self.resolve_scalar_subqueries(high)).await?),
+                span: *span,
+            }),
+            PlanExpr::InList {
+                expr,
+                list,
+                negated,
+                span,
+            } => {
+                let mut resolved = Vec::with_capacity(list.len());
+                for item in list {
+                    resolved.push(Box::pin(self.resolve_scalar_subqueries(item)).await?);
+                }
+                Ok(PlanExpr::InList {
+                    expr: Box::new(Box::pin(self.resolve_scalar_subqueries(expr)).await?),
+                    list: resolved,
+                    negated: *negated,
+                    span: *span,
+                })
+            }
+            PlanExpr::CaseExpr {
+                operand,
+                when_clauses,
+                else_result,
+                span,
+            } => {
+                let operand = match operand {
+                    Some(expr) => Some(Box::new(
+                        Box::pin(self.resolve_scalar_subqueries(expr)).await?,
+                    )),
+                    None => None,
+                };
+                let mut resolved = Vec::with_capacity(when_clauses.len());
+                for (condition, result) in when_clauses {
+                    resolved.push((
+                        Box::pin(self.resolve_scalar_subqueries(condition)).await?,
+                        Box::pin(self.resolve_scalar_subqueries(result)).await?,
+                    ));
+                }
+                let else_result = match else_result {
+                    Some(expr) => Some(Box::new(
+                        Box::pin(self.resolve_scalar_subqueries(expr)).await?,
+                    )),
+                    None => None,
+                };
+                Ok(PlanExpr::CaseExpr {
+                    operand,
+                    when_clauses: resolved,
+                    else_result,
+                    span: *span,
+                })
+            }
             _ => Ok(expr.clone()),
         }
     }
@@ -1072,6 +1160,7 @@ impl ExecutionContext {
                     right: coalesce_if_multi(right_plan),
                     join_type: *join_type,
                     condition: condition.clone(),
+                    memory_pool: self.memory_pool.clone(),
                 }))
             }
 
@@ -1135,6 +1224,19 @@ impl ExecutionContext {
                     memory_pool: self.memory_pool.clone(),
                 }))
             }
+
+            LogicalPlan::RollupAggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                schema,
+            } => Ok(Arc::new(RollupAggregateExec {
+                input: coalesce_if_multi(self.convert(input)?),
+                group_by: group_by.clone(),
+                aggr_exprs: aggr_exprs.clone(),
+                output_schema: schema.clone(),
+                memory_pool: self.memory_pool.clone(),
+            })),
 
             LogicalPlan::Sort { input, order_by } => {
                 let input_plan = coalesce_if_multi(self.convert(input)?);
@@ -1781,9 +1883,9 @@ fn rewrite_column_indices(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> P
 ///   the node's own expressions reference (parent needed becomes
 ///   irrelevant once the schema is rewritten). Output mapping is
 ///   identity since these nodes emit the same logical schema.
-/// - Join (INNER only): splits needed into per-side, recurses each,
-///   combines the per-side mappings into a joined mapping. Non-INNER
-///   joins bail out to preserve unmatched-row semantics.
+/// - Join (INNER, LEFT, CROSS): splits needed into per-side, recurses each,
+///   combines the per-side mappings into a joined mapping. RIGHT/FULL
+///   joins bail out.
 /// - Other variants: identity bail-out.
 pub fn prune_for_columns(
     plan: &arneb_planner::LogicalPlan,
@@ -1933,6 +2035,12 @@ pub fn prune_for_columns(
             aggr_exprs,
             schema,
         }
+        | L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        }
         | L::PartialAggregate {
             input,
             group_by,
@@ -1959,6 +2067,12 @@ pub fn prune_for_columns(
                 .map(|e| rewrite_column_indices(e, &child_mapping))
                 .collect();
             let rebuilt = match plan {
+                L::RollupAggregate { .. } => L::RollupAggregate {
+                    input: Box::new(new_input),
+                    group_by: new_group_by,
+                    aggr_exprs: new_aggr_exprs,
+                    schema: schema.clone(),
+                },
                 L::PartialAggregate { .. } => L::PartialAggregate {
                     input: Box::new(new_input),
                     group_by: new_group_by,
@@ -2024,12 +2138,15 @@ pub fn prune_for_columns(
             condition,
             dynamic_filter_ids,
         } => {
-            // INNER and LEFT joins are safe to column-prune: both
+            // INNER, LEFT, and CROSS joins are safe to column-prune: all
             // preserve schema structure identically (left || right),
             // pruning columns from a child is independent of row
             // preservation. RIGHT/FULL bail out — they'd require
             // swapping semantics that the planner doesn't model.
-            if !matches!(join_type, ast::JoinType::Inner | ast::JoinType::Left) {
+            if !matches!(
+                join_type,
+                ast::JoinType::Inner | ast::JoinType::Left | ast::JoinType::Cross
+            ) {
                 return (plan.clone(), identity_map(n_out));
             }
             let left_n = left.schema().len();
@@ -2576,6 +2693,7 @@ mod tests {
             }],
             partition_by: Vec::new(),
             order_by: Vec::new(),
+            rows_frame: false,
             output_name: name.to_lowercase(),
         };
         let plan = LogicalPlan::Window {
@@ -2819,6 +2937,7 @@ mod tests {
                 }],
                 partition_by: Vec::new(),
                 order_by: Vec::new(),
+                rows_frame: false,
                 output_name: "__cte_max".into(),
             }],
         };

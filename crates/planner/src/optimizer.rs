@@ -122,6 +122,17 @@ impl SimplifyFilters {
                 aggr_exprs,
                 schema,
             }),
+            LogicalPlan::RollupAggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                schema,
+            } => Ok(LogicalPlan::RollupAggregate {
+                input: Box::new(self.rewrite(*input)?),
+                group_by,
+                aggr_exprs,
+                schema,
+            }),
             LogicalPlan::Join {
                 left,
                 right,
@@ -218,6 +229,17 @@ impl ConstantFolding {
                 aggr_exprs,
                 schema,
             } => Ok(LogicalPlan::Aggregate {
+                input: Box::new(self.rewrite(*input)?),
+                group_by,
+                aggr_exprs,
+                schema,
+            }),
+            LogicalPlan::RollupAggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                schema,
+            } => Ok(LogicalPlan::RollupAggregate {
                 input: Box::new(self.rewrite(*input)?),
                 group_by,
                 aggr_exprs,
@@ -394,7 +416,7 @@ fn simplify_expr(expr: PlanExpr) -> PlanExpr {
 ///
 /// Folding is idempotent: running it twice on the same expression
 /// yields the same result (the result is already a `Literal`).
-fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
+pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
     match expr {
         PlanExpr::BinaryOp {
             left,

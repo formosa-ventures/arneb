@@ -412,7 +412,7 @@ impl<'a> QueryPlanner<'a> {
                 .insert(cte.name.clone(), cte_plan);
         }
 
-        let mut plan = self.plan_query_body(&query.body).await?;
+        let mut plan = self.plan_query_body(&query.body, &query.order_by).await?;
 
         // ORDER BY
         if !query.order_by.is_empty() {
@@ -517,6 +517,22 @@ impl<'a> QueryPlanner<'a> {
         exprs: &[PlanExpr],
     ) -> Result<Vec<SortExpr>, PlanError> {
         let mut input_ctx = self.context_from_plan(input);
+        if let ast::QueryBody::Select(body) = &query.body {
+            let group_by = resolve_group_by_ordinals(body)?;
+            let group_by = rollup_group_by_keys(&group_by)?.unwrap_or(group_by);
+            if !group_by.is_empty() {
+                for (col, key) in input_ctx.columns.iter_mut().zip(&group_by) {
+                    col.0 = group_by_qualifier(key);
+                }
+            } else if !matches!(input, LogicalPlan::Aggregate { .. }) {
+                let (_, from_ctx) = self.plan_from(&body.from).await?;
+                if input_ctx.columns.len() == from_ctx.columns.len() {
+                    for (col, source) in input_ctx.columns.iter_mut().zip(from_ctx.columns) {
+                        col.0 = source.0;
+                    }
+                }
+            }
+        }
         // Restore the qualifiers of selected columns. A wildcard expands to
         // several expressions, so items and exprs only line up without one.
         if let Some(items) = select_items.filter(|items| {
@@ -554,7 +570,18 @@ impl<'a> QueryPlanner<'a> {
             };
             let expr = match resolved {
                 Some(index) => exprs[index].clone(),
-                None => self.plan_expr(&ob.expr, &input_ctx).await?,
+                None => {
+                    let rewritten = match &query.body {
+                        ast::QueryBody::Select(body) => self.rewrite_aggregates_as_columns(
+                            &ob.expr,
+                            &input_ctx,
+                            rollup_group_by_keys(&resolve_group_by_ordinals(body)?)?
+                                .map_or_else(|| body.group_by.len(), |keys| keys.len()),
+                        ),
+                        _ => ob.expr.clone(),
+                    };
+                    self.plan_expr(&rewritten, &input_ctx).await?
+                }
             };
             order_by.push(SortExpr {
                 expr,
@@ -568,12 +595,17 @@ impl<'a> QueryPlanner<'a> {
     /// Plan a QueryBody (SELECT or set operation).
     #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
-    async fn plan_query_body(&self, body: &ast::QueryBody) -> Result<LogicalPlan, PlanError> {
+    async fn plan_query_body(
+        &self,
+        body: &ast::QueryBody,
+        order_by: &[ast::OrderByExpr],
+    ) -> Result<LogicalPlan, PlanError> {
         match body {
-            ast::QueryBody::Select(select) => self.plan_select(select).await,
+            ast::QueryBody::Select(select) => self.plan_select(select, order_by).await,
+            ast::QueryBody::Query(query) => self.plan_query(query).await,
             ast::QueryBody::SetOperation { op, left, right } => {
-                let left_plan = self.plan_query_body(left).await?;
-                let right_plan = self.plan_query_body(right).await?;
+                let left_plan = self.plan_query_body(left, &[]).await?;
+                let right_plan = self.plan_query_body(right, &[]).await?;
                 match op {
                     ast::SetOperator::UnionAll => Ok(LogicalPlan::UnionAll {
                         inputs: vec![left_plan, right_plan],
@@ -597,7 +629,11 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Plan a SelectBody: FROM → WHERE → GROUP BY/HAVING → SELECT projection.
-    async fn plan_select(&self, body: &ast::SelectBody) -> Result<LogicalPlan, PlanError> {
+    async fn plan_select(
+        &self,
+        body: &ast::SelectBody,
+        order_by: &[ast::OrderByExpr],
+    ) -> Result<LogicalPlan, PlanError> {
         // 1. FROM clause → base plan + context
         let (mut plan, mut ctx) = self.plan_from(&body.from).await?;
 
@@ -606,7 +642,7 @@ impl<'a> QueryPlanner<'a> {
             // Pre-pass: extract `EXISTS (...)` / `NOT EXISTS (...)`
             // sub-predicates from the WHERE AND-tree and rewrite each
             // one as a SemiJoin / AntiJoin against the outer plan.
-            // What remains becomes a plain FilterExec predicate.
+            // Nested subqueries in the remainder are planned separately.
             //
             // Correlation handling: each EXISTS subquery's inner
             // WHERE is split into AND parts; the one shape we
@@ -703,17 +739,54 @@ impl<'a> QueryPlanner<'a> {
             };
 
             if let Some(remaining) = residual {
-                let predicate = self.plan_expr(&remaining, &ctx).await?;
-                plan = LogicalPlan::Filter {
-                    input: Box::new(plan),
-                    predicate,
-                };
+                if contains_nested_subquery(&remaining) {
+                    let parts = split_and(&remaining);
+                    if parts.iter().any(|part| {
+                        matches!(
+                            part,
+                            ast::Expr::BinaryOp {
+                                op: ast::BinaryOp::Or,
+                                ..
+                            }
+                        ) && contains_nested_subquery(part)
+                    }) {
+                        let (ordinary, nested): (Vec<_>, Vec<_>) = parts
+                            .into_iter()
+                            .partition(|part| !contains_nested_subquery(part));
+                        if let Some(ordinary) = combine_and(ordinary) {
+                            let predicate = self.plan_expr(&ordinary, &ctx).await?;
+                            plan = LogicalPlan::Filter {
+                                input: Box::new(plan),
+                                predicate,
+                            };
+                        }
+                        if let Some(nested) = combine_and(nested) {
+                            plan = self
+                                .filter_nested_subqueries(plan, &nested, &ctx, PredicateTruth::True)
+                                .await?;
+                        }
+                    } else {
+                        plan = self
+                            .filter_nested_subqueries(plan, &remaining, &ctx, PredicateTruth::True)
+                            .await?;
+                    }
+                } else {
+                    let predicate = self.plan_expr(&remaining, &ctx).await?;
+                    plan = LogicalPlan::Filter {
+                        input: Box::new(plan),
+                        predicate,
+                    };
+                }
             }
         }
 
         // 3. GROUP BY / HAVING → Aggregate
         // Also handle implicit aggregate: SELECT SUM(x) FROM t (no GROUP BY but has aggregates)
-        let group_by_ast = resolve_group_by_ordinals(body)?;
+        let mut group_by_ast = resolve_group_by_ordinals(body)?;
+        let rollup = rollup_group_by_keys(&group_by_ast)?;
+        if let Some(keys) = &rollup {
+            group_by_ast = keys.clone();
+        }
         let has_group_by = !group_by_ast.is_empty();
         let mut aggr_exprs = self.collect_aggregates(&body.projection, &ctx).await?;
         // Aggregates can appear in HAVING without being in SELECT (e.g.
@@ -722,6 +795,10 @@ impl<'a> QueryPlanner<'a> {
         // the HAVING rewrite can replace the call with a column ref.
         if let Some(having) = &body.having {
             self.extract_aggregates(having, &ctx, &mut aggr_exprs)
+                .await?;
+        }
+        for item in order_by {
+            self.extract_aggregates(&item.expr, &ctx, &mut aggr_exprs)
                 .await?;
         }
         let has_aggregates = has_group_by || !aggr_exprs.is_empty();
@@ -741,11 +818,33 @@ impl<'a> QueryPlanner<'a> {
                 schema.push(self.expr_to_column_info(agg, &ctx));
             }
 
-            plan = LogicalPlan::Aggregate {
-                input: Box::new(plan),
-                group_by: group_by.clone(),
-                aggr_exprs: aggr_exprs.clone(),
-                schema: schema.clone(),
+            plan = if rollup.is_some() {
+                let key_count = group_by.len();
+                let mut output_schema = schema.clone();
+                for col in output_schema.iter_mut().take(key_count) {
+                    col.nullable = true;
+                }
+                for key in &group_by_ast {
+                    output_schema.push(ColumnInfo {
+                        name: format!("GROUPING({})", format_ast_unqualified(key)),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    });
+                }
+                schema = output_schema;
+                LogicalPlan::RollupAggregate {
+                    input: Box::new(plan),
+                    group_by,
+                    aggr_exprs: aggr_exprs.clone(),
+                    schema: schema.clone(),
+                }
+            } else {
+                LogicalPlan::Aggregate {
+                    input: Box::new(plan),
+                    group_by: group_by.clone(),
+                    aggr_exprs: aggr_exprs.clone(),
+                    schema: schema.clone(),
+                }
             };
 
             // Update context to reflect aggregate output.
@@ -790,7 +889,7 @@ impl<'a> QueryPlanner<'a> {
             }
         }
         if !window_calls.is_empty() {
-            let num_group_by = has_aggregates.then_some(body.group_by.len());
+            let num_group_by = has_aggregates.then_some(group_by_ast.len());
             plan = self
                 .plan_windows(plan, &mut ctx, &window_calls, num_group_by)
                 .await?;
@@ -862,6 +961,7 @@ impl<'a> QueryPlanner<'a> {
                 args,
                 partition_by,
                 order_by,
+                rows_frame,
                 ..
             } = call
             else {
@@ -922,6 +1022,7 @@ impl<'a> QueryPlanner<'a> {
                 args: fn_args,
                 partition_by: fn_partition,
                 order_by: fn_order,
+                rows_frame: *rows_frame,
                 output_name: call.to_string(),
             };
             match specs.iter_mut().find(|(k, _)| *k == key) {
@@ -1001,10 +1102,10 @@ impl<'a> QueryPlanner<'a> {
                     negated,
                     ..
                 } => {
-                    let spec = self
+                    let in_specs = self
                         .decorrelate_in_subquery(*expr, *subquery, outer_ctx, negated)
                         .await?;
-                    specs.push(spec);
+                    specs.extend(in_specs);
                 }
                 other => residual.push(other),
             }
@@ -1012,28 +1113,225 @@ impl<'a> QueryPlanner<'a> {
         Ok((combine_and(residual), specs))
     }
 
+    #[async_recursion]
+    async fn filter_nested_subqueries(
+        &self,
+        input: LogicalPlan,
+        expr: &ast::Expr,
+        ctx: &PlanningContext,
+        truth: PredicateTruth,
+    ) -> Result<LogicalPlan, PlanError> {
+        match expr {
+            ast::Expr::Nested { expr, .. } => {
+                self.filter_nested_subqueries(input, expr, ctx, truth).await
+            }
+            ast::Expr::UnaryOp {
+                op: ast::UnaryOp::Not,
+                expr,
+                ..
+            } => {
+                let inner_truth = match truth {
+                    PredicateTruth::True => PredicateTruth::False,
+                    PredicateTruth::False => PredicateTruth::True,
+                    PredicateTruth::NotTrue => PredicateTruth::NotFalse,
+                    PredicateTruth::NotFalse => PredicateTruth::NotTrue,
+                };
+                self.filter_nested_subqueries(input, expr, ctx, inner_truth)
+                    .await
+            }
+            ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOp::And,
+                right,
+                ..
+            } => match truth {
+                PredicateTruth::True | PredicateTruth::NotTrue => {
+                    if truth == PredicateTruth::True {
+                        let input = self
+                            .filter_nested_subqueries(input, left, ctx, truth)
+                            .await?;
+                        self.filter_nested_subqueries(input, right, ctx, truth)
+                            .await
+                    } else {
+                        let first = self
+                            .filter_nested_subqueries(input.clone(), left, ctx, truth)
+                            .await?;
+                        let rest = self
+                            .filter_nested_subqueries(input, left, ctx, PredicateTruth::True)
+                            .await?;
+                        let second = self
+                            .filter_nested_subqueries(rest, right, ctx, truth)
+                            .await?;
+                        Ok(LogicalPlan::UnionAll {
+                            inputs: vec![first, second],
+                        })
+                    }
+                }
+                PredicateTruth::False => {
+                    let first = self
+                        .filter_nested_subqueries(input.clone(), left, ctx, truth)
+                        .await?;
+                    let rest = self
+                        .filter_nested_subqueries(input, left, ctx, PredicateTruth::NotFalse)
+                        .await?;
+                    let second = self
+                        .filter_nested_subqueries(rest, right, ctx, truth)
+                        .await?;
+                    Ok(LogicalPlan::UnionAll {
+                        inputs: vec![first, second],
+                    })
+                }
+                PredicateTruth::NotFalse => {
+                    let input = self
+                        .filter_nested_subqueries(input, left, ctx, truth)
+                        .await?;
+                    self.filter_nested_subqueries(input, right, ctx, truth)
+                        .await
+                }
+            },
+            ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOp::Or,
+                right,
+                ..
+            } => match truth {
+                PredicateTruth::True | PredicateTruth::NotFalse => {
+                    let first = self
+                        .filter_nested_subqueries(input.clone(), left, ctx, truth)
+                        .await?;
+                    let rest = self
+                        .filter_nested_subqueries(
+                            input,
+                            left,
+                            ctx,
+                            if truth == PredicateTruth::True {
+                                PredicateTruth::NotTrue
+                            } else {
+                                PredicateTruth::False
+                            },
+                        )
+                        .await?;
+                    let second = self
+                        .filter_nested_subqueries(rest, right, ctx, truth)
+                        .await?;
+                    Ok(LogicalPlan::UnionAll {
+                        inputs: vec![first, second],
+                    })
+                }
+                PredicateTruth::False | PredicateTruth::NotTrue => {
+                    let input = self
+                        .filter_nested_subqueries(input, left, ctx, truth)
+                        .await?;
+                    self.filter_nested_subqueries(input, right, ctx, truth)
+                        .await
+                }
+            },
+            ast::Expr::Exists {
+                subquery, negated, ..
+            } => {
+                let anti = matches!(truth, PredicateTruth::False | PredicateTruth::NotTrue);
+                let spec = self
+                    .decorrelate_exists(*subquery.clone(), ctx, *negated ^ anti)
+                    .await?;
+                Ok(apply_semi_join(input, spec))
+            }
+            ast::Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+                ..
+            } => {
+                let requested = if *negated {
+                    match truth {
+                        PredicateTruth::True => PredicateTruth::False,
+                        PredicateTruth::False => PredicateTruth::True,
+                        PredicateTruth::NotTrue => PredicateTruth::NotFalse,
+                        PredicateTruth::NotFalse => PredicateTruth::NotTrue,
+                    }
+                } else {
+                    truth
+                };
+                let specs = match requested {
+                    PredicateTruth::True | PredicateTruth::False => {
+                        self.decorrelate_in_subquery(
+                            *expr.clone(),
+                            *subquery.clone(),
+                            ctx,
+                            requested == PredicateTruth::False,
+                        )
+                        .await?
+                    }
+                    PredicateTruth::NotTrue => {
+                        let mut specs = self
+                            .decorrelate_in_subquery(*expr.clone(), *subquery.clone(), ctx, false)
+                            .await?;
+                        specs[0].kind = SemiJoinKind::Anti;
+                        specs
+                    }
+                    PredicateTruth::NotFalse => {
+                        return Err(PlanError::invalid_expression(
+                            "IN subquery in this boolean context is not supported".to_string(),
+                        ));
+                    }
+                };
+                Ok(specs.into_iter().fold(input, apply_semi_join))
+            }
+            _ => {
+                let predicate = self.plan_expr(expr, ctx).await?;
+                let predicate = match truth {
+                    PredicateTruth::True => predicate,
+                    PredicateTruth::False => PlanExpr::UnaryOp {
+                        op: ast::UnaryOp::Not,
+                        expr: Box::new(predicate),
+                        span: None,
+                    },
+                    PredicateTruth::NotTrue | PredicateTruth::NotFalse => {
+                        let null = PlanExpr::IsNull {
+                            expr: Box::new(predicate.clone()),
+                            span: None,
+                        };
+                        let known = if truth == PredicateTruth::NotTrue {
+                            PlanExpr::UnaryOp {
+                                op: ast::UnaryOp::Not,
+                                expr: Box::new(predicate),
+                                span: None,
+                            }
+                        } else {
+                            predicate
+                        };
+                        PlanExpr::BinaryOp {
+                            left: Box::new(known),
+                            op: ast::BinaryOp::Or,
+                            right: Box::new(null),
+                            span: None,
+                        }
+                    }
+                };
+                Ok(LogicalPlan::Filter {
+                    input: Box::new(input),
+                    predicate,
+                })
+            }
+        }
+    }
+
     /// Decorrelate `<expr> IN (subquery)` / `<expr> NOT IN (subquery)`.
     /// Currently only the **uncorrelated** form is supported — the
     /// subquery may reference its own FROM tables but not the outer
     /// scope. The subquery must produce exactly one column.
     ///
-    /// Maps to `SemiJoin` (IN) / `AntiJoin` (NOT IN) with
-    /// `left_key = plan_expr(outer_expr, outer_ctx)` and
-    /// `right_key = Column(0)` of the subquery output.
+    /// Maps to `SemiJoin` (IN) / `AntiJoin` (NOT IN). Ordinary joins use
+    /// the outer expression and subquery output as their keys.
     ///
-    /// NOT IN NULL semantics: SQL defines `x NOT IN (S)` as NULL when
-    /// `x` is NULL or any element of `S` is NULL. AntiJoin treats both
-    /// as false (no-match → keep). For TPC-H Q18-style use against
-    /// non-nullable key columns the two coincide; nullable inputs
-    /// would silently disagree with strict SQL, so we accept the
-    /// approximation rather than synthesize the extra NULL-guard.
+    /// Nullable NOT IN also rejects rows when the subquery contains NULL,
+    /// and rejects a NULL outer key when the subquery is nonempty.
     async fn decorrelate_in_subquery(
         &self,
         outer_expr: ast::Expr,
         subquery: ast::Query,
         outer_ctx: &PlanningContext,
         negated: bool,
-    ) -> Result<SemiJoinSpec, PlanError> {
+    ) -> Result<Vec<SemiJoinSpec>, PlanError> {
         let subplan = self.plan_query(&subquery).await?;
         let sub_schema = subplan.schema();
         if sub_schema.len() != 1 {
@@ -1050,23 +1348,106 @@ impl<'a> QueryPlanner<'a> {
             span: None,
         };
 
-        Ok(SemiJoinSpec {
+        let outer_nullable = match &left_key {
+            PlanExpr::Column { index, .. } => outer_ctx.columns[*index].1.nullable,
+            PlanExpr::Literal { value, .. } => matches!(value, ScalarValue::Null),
+            _ => true,
+        };
+        let mut specs = Vec::new();
+        let null_check_plan = if negated && sub_schema[0].nullable {
+            Some(subplan.clone())
+        } else {
+            None
+        };
+        let nonempty_check_plan = if negated && outer_nullable {
+            Some(subplan.clone())
+        } else {
+            None
+        };
+        specs.push(SemiJoinSpec {
             kind: if negated {
                 SemiJoinKind::Anti
             } else {
                 SemiJoinKind::Semi
             },
             right_plan: subplan,
-            left_key,
+            left_key: left_key.clone(),
             right_key,
             residual: None,
-        })
+        });
+
+        let constant_key = PlanExpr::Literal {
+            value: ScalarValue::Int32(1),
+            span: None,
+        };
+        if let Some(plan) = null_check_plan {
+            specs.push(SemiJoinSpec {
+                kind: SemiJoinKind::Anti,
+                right_plan: LogicalPlan::Limit {
+                    input: Box::new(LogicalPlan::Filter {
+                        input: Box::new(plan),
+                        predicate: PlanExpr::IsNull {
+                            expr: Box::new(PlanExpr::Column {
+                                index: 0,
+                                name: sub_schema[0].name.clone(),
+                                span: None,
+                            }),
+                            span: None,
+                        },
+                    }),
+                    limit: Some(1),
+                    offset: None,
+                },
+                left_key: constant_key.clone(),
+                right_key: constant_key.clone(),
+                residual: None,
+            });
+        }
+        if let Some(plan) = nonempty_check_plan {
+            specs.push(SemiJoinSpec {
+                kind: SemiJoinKind::Anti,
+                right_plan: LogicalPlan::Limit {
+                    input: Box::new(plan),
+                    limit: Some(1),
+                    offset: None,
+                },
+                left_key: constant_key.clone(),
+                right_key: constant_key,
+                residual: Some(PlanExpr::BinaryOp {
+                    left: Box::new(PlanExpr::IsNull {
+                        expr: Box::new(left_key),
+                        span: None,
+                    }),
+                    op: ast::BinaryOp::And,
+                    right: Box::new(PlanExpr::BinaryOp {
+                        left: Box::new(PlanExpr::IsNull {
+                            expr: Box::new(PlanExpr::Column {
+                                index: outer_ctx.columns.len(),
+                                name: sub_schema[0].name.clone(),
+                                span: None,
+                            }),
+                            span: None,
+                        }),
+                        op: ast::BinaryOp::Or,
+                        right: Box::new(PlanExpr::IsNotNull {
+                            expr: Box::new(PlanExpr::Column {
+                                index: outer_ctx.columns.len(),
+                                name: sub_schema[0].name.clone(),
+                                span: None,
+                            }),
+                            span: None,
+                        }),
+                        span: None,
+                    }),
+                    span: None,
+                }),
+            });
+        }
+        Ok(specs)
     }
 
-    /// Walk the WHERE AND-tree pulling out top-level conjuncts of the
-    /// shape `<expr> <cmp> (correlated_scalar_subquery)` (and its
-    /// mirror). Each match is decorrelated into a [`LeftJoinSpec`] and
-    /// the AST node is rewritten to reference a synthesized column.
+    /// Walk the WHERE AND-tree, replacing correlated scalar subqueries
+    /// within comparison operands with values from [`LeftJoinSpec`]s.
     ///
     /// Conjuncts that don't match the shape are passed through
     /// unchanged. Returns `(residual_where, specs)`.
@@ -1087,11 +1468,7 @@ impl<'a> QueryPlanner<'a> {
         Ok((combine_and(residual), specs))
     }
 
-    /// If `part` is a comparison whose RHS (or LHS) is a correlated
-    /// scalar subquery we can decorrelate, return the predicate with
-    /// the subquery substituted for a placeholder column reference and
-    /// push a `LeftJoinSpec` onto `specs`. Otherwise return `part`
-    /// unchanged.
+    /// Rewrite scalar subqueries within the arithmetic operands of a comparison.
     async fn try_rewrite_scalar_subquery_predicate(
         &self,
         part: ast::Expr,
@@ -1125,34 +1502,70 @@ impl<'a> QueryPlanner<'a> {
             });
         }
 
-        let lhs_expr = *left;
-        let rhs_expr = *right;
-        let (sub_on_right, other, subquery) = if let ast::Expr::Subquery { query, .. } = &rhs_expr {
-            (true, lhs_expr.clone(), (**query).clone())
-        } else if let ast::Expr::Subquery { query, .. } = &lhs_expr {
-            (false, rhs_expr.clone(), (**query).clone())
-        } else {
-            return Ok(ast::Expr::BinaryOp {
-                left: Box::new(lhs_expr),
-                op,
-                right: Box::new(rhs_expr),
-                span,
-            });
-        };
+        let left = self.rewrite_scalar_operand(*left, outer_ctx, specs).await?;
+        let right = self
+            .rewrite_scalar_operand(*right, outer_ctx, specs)
+            .await?;
+        Ok(ast::Expr::BinaryOp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+            span,
+        })
+    }
 
-        let spec = match self
-            .try_make_leftjoin_spec(subquery, outer_ctx, specs.len())
-            .await?
-        {
-            Some(s) => s,
-            None => {
+    #[async_recursion]
+    async fn rewrite_scalar_operand(
+        &self,
+        expr: ast::Expr,
+        outer_ctx: &PlanningContext,
+        specs: &mut Vec<LeftJoinSpec>,
+    ) -> Result<ast::Expr, PlanError> {
+        let (subquery, span) = match expr {
+            ast::Expr::Subquery { query, span } => (*query, span),
+            ast::Expr::BinaryOp {
+                left,
+                op,
+                right,
+                span,
+            } if matches!(
+                op,
+                ast::BinaryOp::Plus
+                    | ast::BinaryOp::Minus
+                    | ast::BinaryOp::Multiply
+                    | ast::BinaryOp::Divide
+                    | ast::BinaryOp::Modulo
+            ) =>
+            {
+                let left = self.rewrite_scalar_operand(*left, outer_ctx, specs).await?;
+                let right = self
+                    .rewrite_scalar_operand(*right, outer_ctx, specs)
+                    .await?;
                 return Ok(ast::Expr::BinaryOp {
-                    left: Box::new(lhs_expr),
+                    left: Box::new(left),
                     op,
-                    right: Box::new(rhs_expr),
+                    right: Box::new(right),
                     span,
                 });
             }
+            ast::Expr::Nested { expr, span } => {
+                let expr = self.rewrite_scalar_operand(*expr, outer_ctx, specs).await?;
+                return Ok(ast::Expr::Nested {
+                    expr: Box::new(expr),
+                    span,
+                });
+            }
+            other => return Ok(other),
+        };
+
+        let Some(spec) = self
+            .try_make_leftjoin_spec(subquery.clone(), outer_ctx, specs.len())
+            .await?
+        else {
+            return Ok(ast::Expr::Subquery {
+                query: Box::new(subquery),
+                span,
+            });
         };
 
         let value_col_name = spec
@@ -1170,19 +1583,26 @@ impl<'a> QueryPlanner<'a> {
             },
             span,
         };
-        specs.push(spec);
-
-        let (new_left, new_right) = if sub_on_right {
-            (Box::new(other), Box::new(placeholder))
-        } else {
-            (Box::new(placeholder), Box::new(other))
-        };
-        Ok(ast::Expr::BinaryOp {
-            left: new_left,
-            op,
-            right: new_right,
+        let match_key = ast::Expr::Column {
+            col_ref: ast::ColumnRef {
+                name: spec.plan.schema()[0].name.clone(),
+                table: None,
+                span,
+            },
             span,
-        })
+        };
+        let placeholder = ast::Expr::Case {
+            operand: None,
+            conditions: vec![ast::Expr::IsNotNull {
+                expr: Box::new(match_key),
+                span,
+            }],
+            results: vec![placeholder],
+            else_result: Some(Box::new(spec.empty_value.clone())),
+            span,
+        };
+        specs.push(spec);
+        Ok(placeholder)
     }
 
     /// Try to decorrelate one scalar subquery body into a `[corr_key,
@@ -1214,6 +1634,9 @@ impl<'a> QueryPlanner<'a> {
             ast::SelectItem::ExprWithAlias { expr, .. } => expr.clone(),
             _ => return Ok(None),
         };
+        let Some(empty_value) = aggregate_projection_on_empty(&proj_expr) else {
+            return Ok(None);
+        };
         let inner_where = match body.selection.clone() {
             Some(w) => w,
             None => return Ok(None),
@@ -1232,6 +1655,13 @@ impl<'a> QueryPlanner<'a> {
         for part in parts {
             if let Some(pair) = try_match_correlation(&part, outer_ctx, &inner_ctx) {
                 correlations.push(pair);
+            } else if let Some((common, remainder)) =
+                factor_or_correlations(&part, outer_ctx, &inner_ctx)
+            {
+                correlations.extend(common);
+                if let Some(remainder) = remainder {
+                    inner_only_parts.push(remainder);
+                }
             } else if references_outer(&part, &inner_ctx) {
                 return Ok(None);
             } else {
@@ -1340,6 +1770,7 @@ impl<'a> QueryPlanner<'a> {
         Ok(Some(LeftJoinSpec {
             plan: proj_node,
             correlations: spec_correlations,
+            empty_value,
         }))
     }
 
@@ -1766,6 +2197,26 @@ impl<'a> QueryPlanner<'a> {
                 distinct,
                 ..
             } => {
+                if name.eq_ignore_ascii_case("GROUPING") {
+                    if let [ast::FunctionArg::Unnamed(key)] = args.as_slice() {
+                        let marker = format!("GROUPING({})", format_ast_unqualified(key));
+                        if let Some((index, (_, col))) = ctx
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .find(|(_, (_, col))| col.name.eq_ignore_ascii_case(&marker))
+                        {
+                            return Ok(PlanExpr::Column {
+                                index,
+                                name: col.name.clone(),
+                                span: node_span,
+                            });
+                        }
+                    }
+                    return Err(PlanError::invalid_expression(
+                        "GROUPING requires one ROLLUP grouping expression",
+                    ));
+                }
                 if args.is_empty() {
                     if let Some(literal) = session_literal(self.catalog, name, node_span) {
                         return Ok(literal);
@@ -2224,12 +2675,44 @@ impl<'a> QueryPlanner<'a> {
     /// Check if an expression contains any aggregate function.
     fn contains_aggregate(&self, expr: &ast::Expr) -> bool {
         match expr {
-            ast::Expr::Function { name, .. } => is_aggregate_function(name),
+            ast::Expr::Function { name, args, .. } => {
+                is_aggregate_function(name)
+                    || args.iter().any(|arg| match arg {
+                        ast::FunctionArg::Unnamed(expr) => self.contains_aggregate(expr),
+                        ast::FunctionArg::Wildcard => false,
+                    })
+            }
             ast::Expr::BinaryOp { left, right, .. } => {
                 self.contains_aggregate(left) || self.contains_aggregate(right)
             }
-            ast::Expr::UnaryOp { expr, .. } => self.contains_aggregate(expr),
-            ast::Expr::Nested { expr: inner, .. } => self.contains_aggregate(inner),
+            ast::Expr::UnaryOp { expr, .. }
+            | ast::Expr::IsNull { expr, .. }
+            | ast::Expr::IsNotNull { expr, .. }
+            | ast::Expr::Cast { expr, .. }
+            | ast::Expr::Nested { expr, .. } => self.contains_aggregate(expr),
+            ast::Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.contains_aggregate(expr)
+                    || self.contains_aggregate(low)
+                    || self.contains_aggregate(high)
+            }
+            ast::Expr::InList { expr, list, .. } => {
+                self.contains_aggregate(expr) || list.iter().any(|e| self.contains_aggregate(e))
+            }
+            ast::Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => operand
+                .iter()
+                .chain(else_result.iter())
+                .map(|e| &**e)
+                .chain(conditions)
+                .chain(results)
+                .any(|e| self.contains_aggregate(e)),
             _ => false,
         }
     }
@@ -2383,6 +2866,92 @@ impl<'a> QueryPlanner<'a> {
                 expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
                 span: *span,
             },
+            ast::Expr::Cast {
+                expr: inner,
+                data_type,
+                span,
+            } => ast::Expr::Cast {
+                expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
+                data_type: data_type.clone(),
+                span: *span,
+            },
+            ast::Expr::IsNull { expr: inner, span } => ast::Expr::IsNull {
+                expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
+                span: *span,
+            },
+            ast::Expr::IsNotNull { expr: inner, span } => ast::Expr::IsNotNull {
+                expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
+                span: *span,
+            },
+            ast::Expr::Between {
+                expr: inner,
+                negated,
+                low,
+                high,
+                span,
+            } => ast::Expr::Between {
+                expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
+                negated: *negated,
+                low: Box::new(self.rewrite_aggregates_as_columns(low, ctx, num_group_by)),
+                high: Box::new(self.rewrite_aggregates_as_columns(high, ctx, num_group_by)),
+                span: *span,
+            },
+            ast::Expr::InList {
+                expr: inner,
+                list,
+                negated,
+                span,
+            } => ast::Expr::InList {
+                expr: Box::new(self.rewrite_aggregates_as_columns(inner, ctx, num_group_by)),
+                list: list
+                    .iter()
+                    .map(|e| self.rewrite_aggregates_as_columns(e, ctx, num_group_by))
+                    .collect(),
+                negated: *negated,
+                span: *span,
+            },
+            ast::Expr::Function {
+                name,
+                args,
+                distinct,
+                span,
+            } => ast::Expr::Function {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| match arg {
+                        ast::FunctionArg::Unnamed(e) => ast::FunctionArg::Unnamed(
+                            self.rewrite_aggregates_as_columns(e, ctx, num_group_by),
+                        ),
+                        ast::FunctionArg::Wildcard => ast::FunctionArg::Wildcard,
+                    })
+                    .collect(),
+                distinct: *distinct,
+                span: *span,
+            },
+            ast::Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                span,
+            } => ast::Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(self.rewrite_aggregates_as_columns(e, ctx, num_group_by))),
+                conditions: conditions
+                    .iter()
+                    .map(|e| self.rewrite_aggregates_as_columns(e, ctx, num_group_by))
+                    .collect(),
+                results: results
+                    .iter()
+                    .map(|e| self.rewrite_aggregates_as_columns(e, ctx, num_group_by))
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(self.rewrite_aggregates_as_columns(e, ctx, num_group_by))),
+                span: *span,
+            },
             _ => expr.clone(),
         }
     }
@@ -2432,6 +3001,48 @@ impl<'a> QueryPlanner<'a> {
             }
             ast::Expr::Nested { expr: inner, .. } => {
                 self.extract_aggregates(inner, ctx, out).await?;
+            }
+            ast::Expr::Cast { expr, .. }
+            | ast::Expr::IsNull { expr, .. }
+            | ast::Expr::IsNotNull { expr, .. } => {
+                self.extract_aggregates(expr, ctx, out).await?;
+            }
+            ast::Expr::Function { args, .. } => {
+                for arg in args {
+                    if let ast::FunctionArg::Unnamed(e) = arg {
+                        self.extract_aggregates(e, ctx, out).await?;
+                    }
+                }
+            }
+            ast::Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+                ..
+            } => {
+                for e in operand
+                    .iter()
+                    .chain(else_result.iter())
+                    .map(|e| &**e)
+                    .chain(conditions)
+                    .chain(results)
+                {
+                    self.extract_aggregates(e, ctx, out).await?;
+                }
+            }
+            ast::Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.extract_aggregates(expr, ctx, out).await?;
+                self.extract_aggregates(low, ctx, out).await?;
+                self.extract_aggregates(high, ctx, out).await?;
+            }
+            ast::Expr::InList { expr, list, .. } => {
+                self.extract_aggregates(expr, ctx, out).await?;
+                for e in list {
+                    self.extract_aggregates(e, ctx, out).await?;
+                }
             }
             // `rank() OVER (ORDER BY sum(x))`: the inner aggregate is
             // computed by the Aggregate node below the Window.
@@ -2573,7 +3184,18 @@ impl<'a> QueryPlanner<'a> {
 fn is_aggregate_function(name: &str) -> bool {
     matches!(
         name.to_uppercase().as_str(),
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "BOOL_OR"
+        "COUNT"
+            | "SUM"
+            | "AVG"
+            | "MIN"
+            | "MAX"
+            | "BOOL_OR"
+            | "STDDEV_SAMP"
+            | "STDDEV"
+            | "STDDEV_POP"
+            | "VAR_SAMP"
+            | "VARIANCE"
+            | "VAR_POP"
     )
 }
 
@@ -2584,13 +3206,154 @@ enum SemiJoinKind {
     Anti,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PredicateTruth {
+    True,
+    False,
+    NotTrue,
+    NotFalse,
+}
+
+fn apply_semi_join(input: LogicalPlan, spec: SemiJoinSpec) -> LogicalPlan {
+    match spec.kind {
+        SemiJoinKind::Semi => LogicalPlan::SemiJoin {
+            left: Box::new(input),
+            right: Box::new(spec.right_plan),
+            left_key: spec.left_key,
+            right_key: spec.right_key,
+            residual: spec.residual,
+            dynamic_filter_ids: Vec::new(),
+            probe_side_filter_ids: Vec::new(),
+        },
+        SemiJoinKind::Anti => LogicalPlan::AntiJoin {
+            left: Box::new(input),
+            right: Box::new(spec.right_plan),
+            left_key: spec.left_key,
+            right_key: spec.right_key,
+            residual: spec.residual,
+            probe_side_filter_ids: Vec::new(),
+        },
+    }
+}
+
+fn contains_nested_subquery(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Exists { .. } | ast::Expr::InSubquery { .. } => true,
+        ast::Expr::BinaryOp { left, right, .. } => {
+            contains_nested_subquery(left) || contains_nested_subquery(right)
+        }
+        ast::Expr::UnaryOp { expr, .. } | ast::Expr::Nested { expr, .. } => {
+            contains_nested_subquery(expr)
+        }
+        _ => false,
+    }
+}
+
+fn aggregate_projection_on_empty(expr: &ast::Expr) -> Option<ast::Expr> {
+    match expr {
+        ast::Expr::Function { name, span, .. } if is_aggregate_function(name) => {
+            Some(ast::Expr::Literal {
+                value: if name.eq_ignore_ascii_case("count") {
+                    ScalarValue::Int64(0)
+                } else {
+                    ScalarValue::Null
+                },
+                span: *span,
+            })
+        }
+        ast::Expr::Function {
+            name,
+            args,
+            distinct,
+            span,
+        } => Some(ast::Expr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| match arg {
+                    ast::FunctionArg::Unnamed(expr) => {
+                        aggregate_projection_on_empty(expr).map(ast::FunctionArg::Unnamed)
+                    }
+                    ast::FunctionArg::Wildcard => Some(ast::FunctionArg::Wildcard),
+                })
+                .collect::<Option<Vec<_>>>()?,
+            distinct: *distinct,
+            span: *span,
+        }),
+        ast::Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => Some(ast::Expr::BinaryOp {
+            left: Box::new(aggregate_projection_on_empty(left)?),
+            op: *op,
+            right: Box::new(aggregate_projection_on_empty(right)?),
+            span: *span,
+        }),
+        ast::Expr::UnaryOp { op, expr, span } => Some(ast::Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(aggregate_projection_on_empty(expr)?),
+            span: *span,
+        }),
+        ast::Expr::Nested { expr, span } => Some(ast::Expr::Nested {
+            expr: Box::new(aggregate_projection_on_empty(expr)?),
+            span: *span,
+        }),
+        ast::Expr::Cast {
+            expr,
+            data_type,
+            span,
+        } => Some(ast::Expr::Cast {
+            expr: Box::new(aggregate_projection_on_empty(expr)?),
+            data_type: data_type.clone(),
+            span: *span,
+        }),
+        ast::Expr::IsNull { expr, span } => Some(ast::Expr::IsNull {
+            expr: Box::new(aggregate_projection_on_empty(expr)?),
+            span: *span,
+        }),
+        ast::Expr::IsNotNull { expr, span } => Some(ast::Expr::IsNotNull {
+            expr: Box::new(aggregate_projection_on_empty(expr)?),
+            span: *span,
+        }),
+        ast::Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            span,
+        } => Some(ast::Expr::Case {
+            operand: match operand {
+                Some(expr) => Some(Box::new(aggregate_projection_on_empty(expr)?)),
+                None => None,
+            },
+            conditions: conditions
+                .iter()
+                .map(aggregate_projection_on_empty)
+                .collect::<Option<Vec<_>>>()?,
+            results: results
+                .iter()
+                .map(aggregate_projection_on_empty)
+                .collect::<Option<Vec<_>>>()?,
+            else_result: match else_result {
+                Some(expr) => Some(Box::new(aggregate_projection_on_empty(expr)?)),
+                None => None,
+            },
+            span: *span,
+        }),
+        ast::Expr::Literal { .. } => Some(expr.clone()),
+        _ => None,
+    }
+}
+
 /// A pending LEFT JOIN extracted from a correlated scalar subquery in
 /// WHERE (e.g. TPC-H Q17's `< (SELECT 0.2 * AVG(...) FROM lineitem
 /// WHERE l_partkey = p_partkey)`). The inner is decorrelated by
 /// adding the correlation column(s) to GROUP BY, so the join attaches
 /// a per-correlation-key scalar value to each outer row. Outer rows
-/// without a matching key get NULL — matching the SQL semantics of an
-/// uncorrelated empty scalar subquery.
+/// without a matching key recover the projection's empty-set value in
+/// the residual predicate.
 ///
 /// Supports multi-column correlations (TPC-H Q20: scalar subquery
 /// correlated on both `ps_partkey` AND `ps_suppkey`).
@@ -2602,6 +3365,8 @@ struct LeftJoinSpec {
     /// One entry per correlation, paired with its index in
     /// `plan.schema()`.
     correlations: Vec<(ast::Expr, usize)>,
+    /// Value of the scalar projection when the correlated input is empty.
+    empty_value: ast::Expr,
 }
 
 struct CteSelfAggWindowSpec {
@@ -2809,6 +3574,7 @@ fn wrap_matching_cte_with_window(
                     }],
                     partition_by: Vec::new(),
                     order_by: Vec::new(),
+                    rows_frame: false,
                     output_name: "__cte_max".to_string(),
                 }],
             },
@@ -3146,6 +3912,107 @@ fn combine_and(parts: Vec<ast::Expr>) -> Option<ast::Expr> {
     })
 }
 
+fn split_or(expr: &ast::Expr) -> Vec<ast::Expr> {
+    let mut out = Vec::new();
+    fn go(expr: &ast::Expr, out: &mut Vec<ast::Expr>) {
+        match expr {
+            ast::Expr::BinaryOp {
+                left,
+                op: ast::BinaryOp::Or,
+                right,
+                ..
+            } => {
+                go(left, out);
+                go(right, out);
+            }
+            ast::Expr::Nested { expr, .. } => go(expr, out),
+            other => out.push(other.clone()),
+        }
+    }
+    go(expr, &mut out);
+    out
+}
+
+fn combine_or(parts: Vec<ast::Expr>) -> Option<ast::Expr> {
+    parts.into_iter().reduce(|acc, expr| ast::Expr::BinaryOp {
+        left: Box::new(acc),
+        op: ast::BinaryOp::Or,
+        right: Box::new(expr),
+        span: arneb_sql_parser::Span::empty(),
+    })
+}
+
+type CorrelationPair = (ast::Expr, ast::Expr);
+
+fn same_correlation(
+    left: &CorrelationPair,
+    right: &CorrelationPair,
+    outer_ctx: &PlanningContext,
+    inner_ctx: &PlanningContext,
+) -> bool {
+    fn column_index(expr: &ast::Expr, ctx: &PlanningContext) -> Option<usize> {
+        let ast::Expr::Column { col_ref, .. } = expr else {
+            return None;
+        };
+        ctx.resolve_column(&col_ref.name, col_ref.table.as_deref(), None)
+            .ok()
+            .map(|(index, _)| index)
+    }
+    column_index(&left.0, outer_ctx) == column_index(&right.0, outer_ctx)
+        && column_index(&left.1, inner_ctx) == column_index(&right.1, inner_ctx)
+}
+
+/// Pull equi-correlations shared by every OR branch above the disjunction.
+fn factor_or_correlations(
+    expr: &ast::Expr,
+    outer_ctx: &PlanningContext,
+    inner_ctx: &PlanningContext,
+) -> Option<(Vec<CorrelationPair>, Option<ast::Expr>)> {
+    let branches = split_or(expr);
+    if branches.len() < 2 {
+        return None;
+    }
+    let branch_parts: Vec<Vec<ast::Expr>> = branches.iter().map(split_and).collect();
+    let mut common: Vec<CorrelationPair> = branch_parts[0]
+        .iter()
+        .filter_map(|part| try_match_correlation(part, outer_ctx, inner_ctx))
+        .collect();
+    common.retain(|candidate| {
+        branch_parts.iter().skip(1).all(|parts| {
+            parts.iter().any(|part| {
+                try_match_correlation(part, outer_ctx, inner_ctx)
+                    .is_some_and(|pair| same_correlation(candidate, &pair, outer_ctx, inner_ctx))
+            })
+        })
+    });
+    if common.is_empty() {
+        return None;
+    }
+    let mut remainders = Vec::new();
+    for mut parts in branch_parts {
+        for pair in &common {
+            let index = parts.iter().position(|part| {
+                try_match_correlation(part, outer_ctx, inner_ctx).is_some_and(|candidate| {
+                    same_correlation(pair, &candidate, outer_ctx, inner_ctx)
+                })
+            })?;
+            parts.remove(index);
+        }
+        match combine_and(parts) {
+            Some(remainder) => remainders.push(remainder),
+            None => return Some((common, None)),
+        }
+    }
+    let remainder = combine_or(remainders);
+    if remainder
+        .as_ref()
+        .is_some_and(|expr| references_outer(expr, inner_ctx))
+    {
+        return None;
+    }
+    Some((common, remainder))
+}
+
 /// Return `Some((outer_key, inner_key))` when `expr` is an equi
 /// predicate `<column on one side> = <column on other side>` with
 /// one side resolving in `outer_ctx` only and the other side
@@ -3380,6 +4247,7 @@ fn collect_table_scan_refs(
         | L::Limit { input, .. }
         | L::Explain { input, .. }
         | L::Aggregate { input, .. }
+        | L::RollupAggregate { input, .. }
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Distinct { input }
@@ -3466,6 +4334,22 @@ fn resolve_group_by_ordinals(body: &ast::SelectBody) -> Result<Vec<ast::Expr>, P
         }
     }
     Ok(out)
+}
+
+fn rollup_group_by_keys(group_by: &[ast::Expr]) -> Result<Option<Vec<ast::Expr>>, PlanError> {
+    let [ast::Expr::Function { name, args, .. }] = group_by else {
+        return Ok(None);
+    };
+    if !name.eq_ignore_ascii_case("ROLLUP") {
+        return Ok(None);
+    }
+    args.iter()
+        .map(|arg| match arg {
+            ast::FunctionArg::Unnamed(expr) => Ok(expr.clone()),
+            _ => Err(PlanError::invalid_expression("ROLLUP requires expressions")),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// If a GROUP BY AST expression is a qualified column reference
@@ -4003,6 +4887,7 @@ mod tests {
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Explain { input, .. }
             | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::RollupAggregate { input, .. }
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Distinct { input }
@@ -4685,6 +5570,74 @@ mod tests {
                 ));
             }
             _ => panic!("expected Projection"),
+        }
+    }
+
+    // -- comma joins inside other operators and in an order with no
+    // predicate between the first two tables (TPC-DS shapes) --
+
+    fn cross_joins(plan: &LogicalPlan) -> usize {
+        plan.to_string().matches("Join: Cross").count()
+    }
+
+    #[tokio::test]
+    async fn comma_join_under_a_window_becomes_inner() {
+        let plan = plan_sql(
+            "SELECT u.name, sum(o.amount) OVER (PARTITION BY u.name) \
+             FROM users u, orders o WHERE u.id = o.user_id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cross_joins(&plan), 0, "{plan}");
+    }
+
+    #[tokio::test]
+    async fn comma_joins_in_both_union_all_branches_become_inner() {
+        let plan = plan_sql(
+            "SELECT u.name FROM users u, orders o WHERE u.id = o.user_id \
+             UNION ALL \
+             SELECT u.name FROM users u, orders o WHERE o.user_id = u.id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cross_joins(&plan), 0, "{plan}");
+    }
+
+    #[tokio::test]
+    async fn comma_join_whose_first_two_tables_share_no_predicate_is_reordered() {
+        // o1 and u are only connected through o2: FROM order alone would
+        // cross o1 with u first.
+        let plan = plan_sql(
+            "SELECT u.name FROM orders o1, users u, orders o2 \
+             WHERE o1.user_id = o2.order_id AND u.id = o2.user_id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cross_joins(&plan), 0, "{plan}");
+        assert_eq!(plan.to_string().matches("Join: Inner").count(), 2, "{plan}");
+    }
+
+    #[tokio::test]
+    async fn comma_join_reorder_ignores_predicate_order() {
+        let plan = plan_sql(
+            "SELECT u.name FROM orders o1, users u, orders o2 \
+             WHERE u.id = o2.user_id AND o1.user_id = o2.order_id",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cross_joins(&plan), 0, "{plan}");
+    }
+
+    #[tokio::test]
+    async fn comma_join_without_a_join_predicate_stays_cross() {
+        // Only one-sided predicates: this really is a cross product, and
+        // no condition may be invented.
+        for sql in [
+            "SELECT u.name FROM users u, orders o",
+            "SELECT u.name FROM users u, orders o WHERE u.age > 30 AND o.amount > 1",
+        ] {
+            let plan = plan_sql(sql).await.unwrap();
+            assert_eq!(cross_joins(&plan), 1, "{sql}\n{plan}");
         }
     }
 

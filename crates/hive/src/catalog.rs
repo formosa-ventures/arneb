@@ -25,11 +25,11 @@ use arneb_catalog::{
     CatalogProvider, ColumnStatistics, SchemaProvider, TableGate, TableLookup, TableProvider,
 };
 use arneb_common::error::{CatalogError, ConnectorError};
-use arneb_common::types::{ColumnInfo, DataType};
+use arneb_common::types::ColumnInfo;
 use arneb_connectors::storage::StorageRegistry;
 
 use crate::datasource::HivePartition;
-use crate::hive_type_to_arrow;
+use crate::hive_type_to_data_type;
 
 // ---------------------------------------------------------------------------
 // HiveTableMeta
@@ -298,19 +298,6 @@ impl HmsClient {
             })
             .unwrap_or_default();
 
-        // NOTE: HMS column NDV stats are intentionally NOT fetched in
-        // production yet. The infrastructure exists
-        // (`get_table_column_stats`) but a 2026-05-15 bench showed that
-        // adding NDV without retuning the cost function regresses
-        // multi-join queries by 8-24% (Q03/Q07/Q08). With accurate
-        // NDV, intermediate cardinality estimates shrink, and the
-        // partition-aware Selinger DP loses its "lineitem wins"
-        // heuristic that worked under inflated default NDVs. Re-enable
-        // alongside a cost-function redesign that accounts for executor
-        // parallelism differently — see
-        // `memory/project_joinreorder_disabled.md`.
-        let column_stats: HashMap<String, ColumnStatistics> = HashMap::new();
-
         Ok(HiveTableMeta {
             db_name,
             table_name,
@@ -321,7 +308,7 @@ impl HmsClient {
             partition_columns,
             row_count,
             size_bytes,
-            column_stats,
+            column_stats: HashMap::new(),
             parameters,
         })
     }
@@ -398,10 +385,6 @@ impl HmsClient {
     /// is normal for freshly-created tables that haven't been
     /// `ANALYZE`d. Errors are converted to empty so a stats fetch
     /// failure doesn't break catalog resolution.
-    /// Currently unused — wired but not called from `get_table` (see
-    /// note in `get_table`). Kept as the integration point for a
-    /// future cost-model retune that re-enables HMS column stats.
-    #[allow(dead_code)]
     async fn get_table_column_stats(
         &self,
         db: &str,
@@ -529,11 +512,8 @@ fn convert_field_schemas(
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        match hive_type_to_arrow(&hive_type) {
-            Ok(arrow_dt) => {
-                let data_type = DataType::try_from(arrow_dt).map_err(|e| {
-                    ConnectorError::UnsupportedOperation(format!("column {db}.{table}.{name}: {e}"))
-                })?;
+        match hive_type_to_data_type(&hive_type) {
+            Ok(data_type) => {
                 columns.push(ColumnInfo {
                     name,
                     data_type,
@@ -783,7 +763,7 @@ fn not_found_unless_unreachable(
 impl HiveSchemaProvider {
     async fn load(&self, name: &str, allowed: TableGate<'_>) -> Result<TableLookup, CatalogError> {
         let qualified = format!("{}.{}", self.database, name);
-        let meta = match self.client.get_table(&self.database, name).await {
+        let mut meta = match self.client.get_table(&self.database, name).await {
             Ok(meta) => meta,
             Err(e) => return not_found_unless_unreachable(e, &qualified),
         };
@@ -811,6 +791,14 @@ impl HiveSchemaProvider {
                 }
             };
         }
+        meta.column_stats = self
+            .client
+            .get_table_column_stats(&meta.db_name, &meta.table_name, &meta.columns)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("HMS column statistics unavailable for {qualified}: {e}");
+                HashMap::new()
+            });
         // A partitioned table reads exactly the partitions registered in
         // HMS, each at its own location (as Trino and Hive do), not
         // whatever `key=value` directories sit under the table root.

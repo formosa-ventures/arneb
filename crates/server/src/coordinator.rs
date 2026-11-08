@@ -1206,7 +1206,7 @@ fn collect_producers_from_plan(
                 out.push(DfProducer {
                     df_id: p.id,
                     stage_id,
-                    task_count: join_task_count,
+                    task_count,
                 });
             }
             collect_producers_from_plan(left, stage_id, task_count, join_task_count, out);
@@ -2263,7 +2263,75 @@ mod tests {
         assert_eq!(producers.len(), 1);
         assert_eq!(producers[0].df_id, df_id);
         assert_eq!(producers[0].stage_id, StageId(43));
-        assert_eq!(producers[0].task_count, 8);
+        // #205: a join reports once per task, under the task's partition
+        // index, so the coordinator can never collect more reports than the
+        // stage has tasks. Expecting the 8 output partitions left the filter
+        // waiting out the scan timeout.
+        assert_eq!(
+            producers[0].task_count,
+            effective_task_count_for_fragment(&fragment, 2, data_parallel_scan_enabled())
+        );
+    }
+
+    fn join_producer_fragment(
+        df_id: DynamicFilterId,
+        fragment_type: FragmentType,
+        partition_count: usize,
+    ) -> PlanFragment {
+        PlanFragment {
+            id: StageId(44),
+            fragment_type,
+            root: LogicalPlan::Join {
+                left: Box::new(scan()),
+                right: Box::new(scan()),
+                join_type: arneb_sql_parser::ast::JoinType::Inner,
+                condition: JoinCondition::None,
+                dynamic_filter_ids: vec![arneb_planner::DynamicFilterProducer {
+                    id: df_id,
+                    build_index: 0,
+                    probe_index: 0,
+                    column_name: "c0".to_string(),
+                }],
+            },
+            output_partitioning: PartitioningScheme::Hash {
+                columns: vec![0],
+                partition_count,
+            },
+            source_fragments: Vec::new(),
+        }
+    }
+
+    // #205 (TPC-DS q45): a single-task FIXED stage that hash-partitions its
+    // output gets exactly one report per join filter.
+    #[test]
+    fn join_filter_in_single_task_stage_expects_one_report() {
+        let df_id = DynamicFilterId(457);
+        let fragment = join_producer_fragment(df_id, FragmentType::Fixed, 2);
+        let scheduled =
+            effective_task_count_for_fragment(&fragment, 2, data_parallel_scan_enabled());
+        assert_eq!(scheduled, 1, "precondition: the stage runs one task");
+
+        let producers = collect_df_producers(&fragment, 2);
+
+        assert_eq!(producers.len(), 1);
+        assert_eq!(producers[0].df_id, df_id);
+        assert_eq!(producers[0].task_count, 1);
+    }
+
+    // Guard: a hash-partitioned stage really runs one task per partition, and
+    // each of them reports.
+    #[test]
+    fn join_filter_in_hash_partitioned_stage_expects_one_report_per_task() {
+        let df_id = DynamicFilterId(458);
+        let fragment = join_producer_fragment(df_id, FragmentType::HashPartitioned, 2);
+        let scheduled =
+            effective_task_count_for_fragment(&fragment, 2, data_parallel_scan_enabled());
+        assert_eq!(scheduled, 2, "precondition: one task per partition");
+
+        let producers = collect_df_producers(&fragment, 2);
+
+        assert_eq!(producers.len(), 1);
+        assert_eq!(producers[0].task_count, 2);
     }
 
     #[test]

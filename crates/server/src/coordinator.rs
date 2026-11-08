@@ -1260,6 +1260,7 @@ fn collect_producers_from_plan(
         | L::Sort { input, .. }
         | L::Limit { input, .. }
         | L::Aggregate { input, .. }
+        | L::RollupAggregate { input, .. }
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Distinct { input, .. }
@@ -1300,6 +1301,7 @@ fn collect_consumers_from_plan(plan: &LogicalPlan, stage_id: StageId, out: &mut 
         | L::Sort { input, .. }
         | L::Limit { input, .. }
         | L::Aggregate { input, .. }
+        | L::RollupAggregate { input, .. }
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Distinct { input, .. }
@@ -2189,6 +2191,100 @@ mod tests {
             scan_task_count_for_fragment(&FragmentType::Source, &root, 2, false),
             2
         );
+    }
+
+    // ---- #205 cause D: dynamic filters under a ROLLUP must be registered ----
+
+    fn df_join(df_id: DynamicFilterId) -> LogicalPlan {
+        LogicalPlan::Join {
+            left: Box::new(LogicalPlan::TableScan {
+                table: TableReference::table("t"),
+                schema: schema(),
+                alias: None,
+                properties: Default::default(),
+                dynamic_filters_consumed: vec![arneb_planner::DynamicFilterConsumer {
+                    id: df_id,
+                    column_index: 0,
+                    column_name: "c0".to_string(),
+                    probe_side: false,
+                }],
+            }),
+            right: Box::new(scan()),
+            join_type: arneb_sql_parser::ast::JoinType::Inner,
+            condition: JoinCondition::None,
+            dynamic_filter_ids: vec![arneb_planner::DynamicFilterProducer {
+                id: df_id,
+                build_index: 0,
+                probe_index: 0,
+                column_name: "c0".to_string(),
+            }],
+        }
+    }
+
+    fn rollup_over(input: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::RollupAggregate {
+            input: Box::new(input),
+            group_by: Vec::new(),
+            aggr_exprs: Vec::new(),
+            schema: schema(),
+        }
+    }
+
+    fn fixed_fragment(root: LogicalPlan) -> PlanFragment {
+        PlanFragment {
+            id: StageId(7),
+            fragment_type: FragmentType::Fixed,
+            root,
+            output_partitioning: PartitioningScheme::Single,
+            source_fragments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_join_under_a_rollup_registers_its_dynamic_filter() {
+        let df_id = DynamicFilterId(70);
+        let fragment = fixed_fragment(rollup_over(df_join(df_id)));
+
+        let producers = collect_df_producers(&fragment, 2);
+
+        assert_eq!(producers.len(), 1);
+        assert_eq!(producers[0].df_id, df_id);
+        assert_eq!(producers[0].stage_id, StageId(7));
+    }
+
+    #[test]
+    fn a_scan_under_a_rollup_registers_as_a_consumer() {
+        let df_id = DynamicFilterId(71);
+        let fragment = fixed_fragment(rollup_over(df_join(df_id)));
+
+        let consumers = collect_df_consumers(&fragment);
+
+        assert_eq!(consumers.len(), 1);
+        assert_eq!(consumers[0].df_id, df_id);
+        assert_eq!(consumers[0].stage_id, StageId(7));
+    }
+
+    #[test]
+    fn rollup_and_plain_union_branches_each_register_once() {
+        let rolled = DynamicFilterId(72);
+        let plain = DynamicFilterId(73);
+        let fragment = fixed_fragment(LogicalPlan::UnionAll {
+            inputs: vec![rollup_over(df_join(rolled)), df_join(plain)],
+        });
+
+        let mut producers: Vec<_> = collect_df_producers(&fragment, 2)
+            .into_iter()
+            .map(|p| p.df_id)
+            .collect();
+        producers.sort_by_key(|id| id.0);
+        let mut consumers: Vec<_> = collect_df_consumers(&fragment)
+            .into_iter()
+            .map(|c| c.df_id)
+            .collect();
+        consumers.sort_by_key(|id| id.0);
+
+        assert_eq!(producers, vec![rolled, plain]);
+        assert_eq!(consumers, vec![rolled, plain]);
     }
 
     #[test]

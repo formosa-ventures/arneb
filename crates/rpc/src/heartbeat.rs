@@ -3,6 +3,8 @@
 //! Workers periodically send heartbeat messages to the coordinator
 //! to register themselves and report health.
 
+use std::time::Duration;
+
 use arneb_common::error::ExecutionError;
 use arrow_flight::Action;
 use serde::{Deserialize, Serialize};
@@ -158,9 +160,46 @@ impl From<HeartbeatError> for ExecutionError {
     }
 }
 
+/// How long one heartbeat may take, connect included. Without a limit, a
+/// coordinator address that stops answering holds the heartbeat for the OS
+/// connect timeout (about two minutes on Linux), and the worker stays out of
+/// the cluster that long. That happens when Kubernetes replaces the
+/// coordinator pod: a connection can still be routed to the old pod's IP,
+/// which drops packets instead of refusing them.
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// [`send_heartbeat`] with explicit cluster security, keeping the
-/// rejected-secret case distinct. Returns the coordinator's reply.
+/// rejected-secret case distinct. Returns the coordinator's reply, or an
+/// error once [`HEARTBEAT_TIMEOUT`] passes without one.
 pub async fn send_heartbeat_with(
+    coordinator_address: &str,
+    message: &HeartbeatMessage,
+    security: &ClusterSecurity,
+) -> Result<HeartbeatReply, HeartbeatError> {
+    send_heartbeat_within(coordinator_address, message, security, HEARTBEAT_TIMEOUT).await
+}
+
+/// [`send_heartbeat_with`] ending at `limit`.
+async fn send_heartbeat_within(
+    coordinator_address: &str,
+    message: &HeartbeatMessage,
+    security: &ClusterSecurity,
+    limit: Duration,
+) -> Result<HeartbeatReply, HeartbeatError> {
+    tokio::time::timeout(
+        limit,
+        exchange_heartbeat(coordinator_address, message, security),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(HeartbeatError::Other(format!(
+            "coordinator at {coordinator_address}: no answer within {} ms",
+            limit.as_millis()
+        )))
+    })
+}
+
+async fn exchange_heartbeat(
     coordinator_address: &str,
     message: &HeartbeatMessage,
     security: &ClusterSecurity,
@@ -201,6 +240,39 @@ pub async fn send_heartbeat_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A coordinator address that accepts connections and never answers
+    /// (a replaced pod behind a Service) ends the heartbeat at the limit,
+    /// instead of holding it for the OS connect timeout.
+    #[tokio::test]
+    async fn a_silent_coordinator_ends_the_heartbeat_at_the_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = listener.accept().await {
+                held.push(conn);
+            }
+        });
+        let msg = HeartbeatMessage::new("w1".into(), "http://localhost:9091".into(), 8);
+        let started = std::time::Instant::now();
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            send_heartbeat_within(
+                &addr,
+                &msg,
+                &ClusterSecurity::default(),
+                std::time::Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("the heartbeat outlived its limit");
+        match sent {
+            Err(HeartbeatError::Other(m)) => assert!(m.contains("no answer within"), "{m}"),
+            other => panic!("want a timeout error, got {other:?}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
 
     #[test]
     fn heartbeat_encode_decode() {

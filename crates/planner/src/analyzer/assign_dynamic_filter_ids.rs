@@ -193,6 +193,17 @@ fn recurse_children(plan: LogicalPlan, alloc: &DynamicFilterIdAllocator) -> Logi
             aggr_exprs,
             schema,
         },
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => L::RollupAggregate {
+            input: Box::new(rewrite(*input, alloc)),
+            group_by,
+            aggr_exprs,
+            schema,
+        },
         L::PartialAggregate {
             input,
             group_by,

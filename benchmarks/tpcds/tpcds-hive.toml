@@ -1,0 +1,33 @@
+# TPC-DS configuration for Arneb (Hive + RustFS), SF1 by default.
+#
+# Prerequisites:
+#   docker compose up -d                        # start RustFS + HMS + Trino
+#   docker compose run --rm tpcds-seed          # seed TPC-DS SF1 into hive.tpcds
+#
+# Usage:
+#   cargo run --release --bin arneb -- --config benchmarks/tpcds/tpcds-hive.toml
+#
+# The queries under benchmarks/tpcds/queries/ use unqualified table names,
+# resolved against datalake.tpcds.
+
+bind_address = "127.0.0.1"
+port = 5432
+
+[storage.s3]
+region = "us-east-1"
+endpoint = "http://localhost:9000"
+allow_http = true
+access_key_id = "s3admin"
+secret_access_key = "s3adminsecret"
+
+[[catalogs]]
+name = "datalake"
+type = "hive"
+metastore_uri = "127.0.0.1:9083"
+default_schema = "tpcds"
+
+# A query that plans badly (e.g. a comma join whose predicate is not turned
+# into a join condition) must fail with a resource error, not take the
+# process down with it.
+[memory]
+query_max_memory_per_node = 4294967296

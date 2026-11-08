@@ -60,7 +60,13 @@ impl ExecutionPlan for UnionAllExec {
         if self.children.is_empty() {
             vec![]
         } else {
-            self.children[0].schema()
+            let mut schema = self.children[0].schema();
+            for child in &self.children[1..] {
+                for (column, branch_column) in schema.iter_mut().zip(child.schema()) {
+                    column.nullable |= branch_column.nullable;
+                }
+            }
+            schema
         }
     }
 
@@ -69,6 +75,7 @@ impl ExecutionPlan for UnionAllExec {
         _partition: usize,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
         let schema = build_schema(&self.schema());
+        let stream_schema = schema.clone();
         let children = self.children.clone();
         // Stream the children SEQUENTIALLY — drain child[0] fully, then
         // child[1], … — yielding each batch as it arrives. UNION ALL is
@@ -91,7 +98,7 @@ impl ExecutionPlan for UnionAllExec {
                     let batch = batch_res.map_err(|e| {
                         ExecutionError::upstream("union all input", e)
                     })?;
-                    yield batch;
+                    yield RecordBatch::try_new(stream_schema.clone(), batch.columns().to_vec())?;
                 }
             }
         };

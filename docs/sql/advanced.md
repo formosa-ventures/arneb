@@ -129,6 +129,23 @@ SELECT
 FROM orders;
 ```
 
+### ROWS Frame
+
+The default frame above is a RANGE frame: rows that tie on the ORDER BY key
+all get the same running total. A ROWS frame stops at the current row
+instead, even when later rows tie:
+
+```sql
+SELECT
+    order_date,
+    amount,
+    SUM(amount) OVER (ORDER BY order_date ROWS UNBOUNDED PRECEDING) AS running_total
+FROM orders;
+```
+
+`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` is the same frame. This is
+the only ROWS frame supported; other frame bounds are rejected.
+
 ## Set Operations
 
 Combine results from multiple queries.
@@ -207,3 +224,44 @@ FROM orders
 GROUP BY region
 ORDER BY COUNT(*) DESC;
 ```
+
+## GROUP BY ROLLUP
+
+`GROUP BY ROLLUP(a, b)` adds subtotal rows: it groups by `(a, b)`, then by
+`(a)`, then over all rows, with the rolled-up keys set to NULL.
+`GROUPING(x)` is 1 on rows where `x` was rolled up and 0 otherwise, which
+tells a subtotal's NULL apart from a NULL key value.
+
+```sql
+SELECT
+    region,
+    category,
+    SUM(revenue) AS total_revenue,
+    GROUPING(category) AS is_region_total
+FROM sales
+GROUP BY ROLLUP(region, category)
+ORDER BY region, is_region_total, category;
+```
+
+Limits:
+
+- `ROLLUP(...)` must be the whole GROUP BY clause: one ROLLUP, not mixed
+  with plain keys, and no composite elements such as `ROLLUP((a, b), c)`.
+- `CUBE` and `GROUPING SETS` are not supported.
+- `GROUPING` takes one argument and works only with `ROLLUP`; Trino's
+  multi-argument form and `GROUPING` over a plain GROUP BY are rejected.
+
+## Aggregate Functions
+
+COUNT, SUM, AVG, MIN and MAX, plus Trino's variance family:
+
+| Function | Result |
+|----------|--------|
+| `STDDEV_SAMP(x)`, `STDDEV(x)` | Sample standard deviation |
+| `STDDEV_POP(x)` | Population standard deviation |
+| `VAR_SAMP(x)`, `VARIANCE(x)` | Sample variance |
+| `VAR_POP(x)` | Population variance |
+
+The variance family returns DOUBLE and skips NULL inputs. It returns NULL
+when there are too few non-NULL values: none for the population forms,
+fewer than two for the sample forms.

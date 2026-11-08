@@ -1416,6 +1416,7 @@ impl TaskSources<'_> {
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::RollupAggregate { input, .. }
             // A1 map-side fuse puts a PartialAggregate directly over the scan in
             // a SOURCE fragment, so we must recurse through it (and its Final
             // counterpart) to reach the TableScan and register its data source.

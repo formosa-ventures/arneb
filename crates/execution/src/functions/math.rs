@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use arneb_common::error::ExecutionError;
 use arneb_common::types::DataType;
-use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array};
 use arrow::datatypes::{DataType as ArrowDataType, Float64Type, Int64Type};
 
 use super::args::{check_arity, float64, int64, invalid};
@@ -410,8 +410,19 @@ impl ScalarFunction for RoundFunction {
     fn name(&self) -> &str {
         "ROUND"
     }
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
-        Ok(DataType::Float64)
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        match arg_types.first() {
+            Some(DataType::Decimal128 { precision, scale }) => Ok(DataType::Decimal128 {
+                precision: if arg_types.len() > 1 {
+                    precision.saturating_add(1).min(38)
+                } else {
+                    (*precision as i16 - *scale as i16 + (*scale > 0) as i16).min(38) as u8
+                },
+                scale: if arg_types.len() > 1 { *scale } else { 0 },
+            }),
+            Some(DataType::Int32 | DataType::Int64) => Ok(DataType::Int64),
+            _ => Ok(DataType::Float64),
+        }
     }
     fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
         if args.is_empty() {
@@ -419,18 +430,94 @@ impl ScalarFunction for RoundFunction {
                 "ROUND requires at least 1 argument".to_string(),
             ));
         }
-        let arr = as_f64_array(&args[0])?;
-        let decimals = if args.len() > 1 {
-            let dec_arr = args[1]
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    ExecutionError::InvalidOperation("ROUND decimals must be integer".to_string())
-                })?;
-            Some(dec_arr)
+        let decimal_values = if args.len() > 1 {
+            if !matches!(
+                args[1].data_type(),
+                ArrowDataType::Int32 | ArrowDataType::Int64 | ArrowDataType::Null
+            ) {
+                return Err(ExecutionError::InvalidOperation(
+                    "ROUND decimals must be integer".to_string(),
+                ));
+            }
+            let casted = arrow::compute::cast(&args[1], &ArrowDataType::Int64).map_err(|e| {
+                ExecutionError::InvalidOperation(format!("ROUND decimals must be integer: {e}"))
+            })?;
+            Some(
+                casted
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone(),
+            )
         } else {
             None
         };
+        let decimals = decimal_values.as_ref();
+
+        if let ArrowDataType::Decimal128(precision, scale) = args[0].data_type() {
+            let arr = args[0].as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let input_types = if args.len() > 1 {
+                vec![
+                    DataType::Decimal128 {
+                        precision: *precision,
+                        scale: *scale,
+                    },
+                    DataType::Int64,
+                ]
+            } else {
+                vec![DataType::Decimal128 {
+                    precision: *precision,
+                    scale: *scale,
+                }]
+            };
+            let result_type = self.return_type(&input_types)?;
+            let DataType::Decimal128 {
+                precision: output_precision,
+                scale: output_scale,
+            } = result_type
+            else {
+                unreachable!()
+            };
+            let values: Vec<Option<i128>> = (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) || decimals.is_some_and(|d| d.is_null(i)) {
+                        return Ok(None);
+                    }
+                    let places = decimals.map_or(0, |d| d.value(i));
+                    let shift = *scale as i128 - places as i128;
+                    let value = arr.value(i);
+                    if shift <= 0 {
+                        return Ok(Some(value));
+                    }
+                    if shift > 38 {
+                        return Ok(Some(0));
+                    }
+                    let factor = 10i128.pow(shift as u32);
+                    let quotient = value / factor;
+                    let remainder = value % factor;
+                    let rounded = quotient
+                        + if remainder.abs() >= factor / 2 {
+                            value.signum()
+                        } else {
+                            0
+                        };
+                    let result = if decimals.is_some() {
+                        rounded.checked_mul(factor)
+                    } else {
+                        Some(rounded)
+                    };
+                    result.map(Some).ok_or_else(|| {
+                        ExecutionError::InvalidOperation("ROUND decimal overflow".to_string())
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let result = Decimal128Array::from(values)
+                .with_precision_and_scale(output_precision, output_scale)
+                .map_err(|e| ExecutionError::InvalidOperation(format!("ROUND decimal: {e}")))?;
+            return Ok(Arc::new(result));
+        }
+
+        let arr = as_f64_array(&args[0])?;
 
         let result: Float64Array = (0..arr.len())
             .map(|i| {

@@ -371,6 +371,7 @@ fn contains_table(plan: &LogicalPlan, target: &TableReference) -> bool {
         LogicalPlan::Projection { input, .. }
         | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::RollupAggregate { input, .. }
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. }
         | LogicalPlan::Sort { input, .. }
@@ -606,6 +607,17 @@ where
             aggr_exprs,
             schema,
         } => L::Aggregate {
+            input: Box::new(f(*input)),
+            group_by,
+            aggr_exprs,
+            schema,
+        },
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => L::RollupAggregate {
             input: Box::new(f(*input)),
             group_by,
             aggr_exprs,

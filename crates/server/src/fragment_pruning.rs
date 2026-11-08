@@ -154,6 +154,7 @@ fn collect_pushed_projections(plan: &LogicalPlan, out: &mut HashMap<StageId, BTr
         | L::Distinct { input }
         | L::Explain { input, .. }
         | L::Aggregate { input, .. }
+        | L::RollupAggregate { input, .. }
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Window { input, .. }
@@ -274,6 +275,17 @@ fn collapse_exchange_projections(
             aggr_exprs,
             schema,
         } => L::Aggregate {
+            input: Box::new(collapse_exchange_projections(*input, pushed)),
+            group_by,
+            aggr_exprs,
+            schema,
+        },
+        L::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => L::RollupAggregate {
             input: Box::new(collapse_exchange_projections(*input, pushed)),
             group_by,
             aggr_exprs,

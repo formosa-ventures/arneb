@@ -3,6 +3,7 @@
 use arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 
 use arneb_common::error::ConnectorError;
+use arneb_common::types::DataType;
 
 /// Convert a Hive type string to an Arrow DataType.
 ///
@@ -63,6 +64,30 @@ pub fn hive_type_to_arrow(hive_type: &str) -> Result<ArrowDataType, ConnectorErr
     }
 }
 
+/// Convert a Hive type string to an Arneb DataType.
+///
+/// Same mapping as [`hive_type_to_arrow`], except that `char(n)` keeps its
+/// length as [`DataType::Char`]; in Arrow it is indistinguishable from
+/// varchar.
+pub fn hive_type_to_data_type(hive_type: &str) -> Result<DataType, ConnectorError> {
+    let normalized = hive_type.trim().to_uppercase();
+    if let Some(rest) = normalized.strip_prefix("CHAR") {
+        return rest
+            .trim()
+            .strip_prefix('(')
+            .and_then(|r| r.strip_suffix(')'))
+            .and_then(|n| n.trim().parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .map(DataType::Char)
+            .ok_or_else(|| {
+                ConnectorError::UnsupportedOperation(format!("invalid CHAR length: {hive_type}"))
+            });
+    }
+    let arrow_dt = hive_type_to_arrow(hive_type)?;
+    DataType::try_from(arrow_dt)
+        .map_err(|e| ConnectorError::UnsupportedOperation(format!("{hive_type}: {e}")))
+}
+
 fn parse_decimal(normalized: &str) -> Result<ArrowDataType, ConnectorError> {
     // DECIMAL or DECIMAL(p) or DECIMAL(p,s)
     if normalized == "DECIMAL" || normalized == "NUMERIC" {
@@ -105,6 +130,26 @@ fn parse_decimal(normalized: &str) -> Result<ArrowDataType, ConnectorError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn char_columns_keep_their_length() {
+        use arneb_common::types::DataType;
+        assert_eq!(
+            hive_type_to_data_type("char(50)").unwrap(),
+            DataType::Char(50)
+        );
+        assert_eq!(
+            hive_type_to_data_type("CHAR(1)").unwrap(),
+            DataType::Char(1)
+        );
+        assert_eq!(
+            hive_type_to_data_type("varchar(255)").unwrap(),
+            DataType::Utf8
+        );
+        assert_eq!(hive_type_to_data_type("string").unwrap(), DataType::Utf8);
+        assert_eq!(hive_type_to_data_type("int").unwrap(), DataType::Int32);
+        assert!(hive_type_to_data_type("char(x)").is_err());
+    }
 
     #[test]
     fn test_integer_types() {

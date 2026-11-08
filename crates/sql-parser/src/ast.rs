@@ -173,11 +173,13 @@ pub struct Query {
     pub offset: Option<Box<Expr>>,
 }
 
-/// The body of a query — either a single SELECT or a set operation.
+/// The body of a query — a SELECT, a parenthesized query, or a set operation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryBody {
     /// A simple SELECT statement.
     Select(SelectBody),
+    /// A parenthesized query used as a set-operation operand.
+    Query(Box<Query>),
     /// A set operation (UNION ALL, UNION, INTERSECT, EXCEPT).
     SetOperation {
         /// The set operator.
@@ -380,6 +382,8 @@ pub enum Expr {
         partition_by: Vec<Expr>,
         /// ORDER BY expressions.
         order_by: Vec<OrderByExpr>,
+        /// Whether the frame ends at the current physical row.
+        rows_frame: bool,
         /// Source span.
         span: Span,
     },
@@ -794,6 +798,7 @@ impl fmt::Display for Expr {
                 args,
                 partition_by,
                 order_by,
+                rows_frame,
                 ..
             } => {
                 write!(f, "{name}(")?;
@@ -834,6 +839,9 @@ impl fmt::Display for Expr {
                             None => {}
                         }
                     }
+                }
+                if *rows_frame {
+                    write!(f, " ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW")?;
                 }
                 write!(f, ")")
             }

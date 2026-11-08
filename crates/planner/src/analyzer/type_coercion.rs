@@ -32,7 +32,7 @@
 //!   as-is.
 
 use arneb_common::error::PlanError;
-use arneb_common::types::{ColumnInfo, DataType, ScalarValue};
+use arneb_common::types::{ColumnInfo, DataType, ScalarValue, CHAR_MAX_LENGTH};
 use arneb_sql_parser::ast;
 
 use super::coercion_matrix::{common_supertype, lookup_cast, CoercionSite, Safety};
@@ -123,6 +123,29 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
                 .map(|e| coerce_expr(e, &input_schema, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(LogicalPlan::Aggregate {
+                input: Box::new(input),
+                group_by,
+                aggr_exprs,
+                schema,
+            })
+        }
+        LogicalPlan::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => {
+            let input = analyze_plan(*input, ctx)?;
+            let input_schema = input.schema();
+            let group_by = group_by
+                .into_iter()
+                .map(|e| coerce_expr(e, &input_schema, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            let aggr_exprs = aggr_exprs
+                .into_iter()
+                .map(|e| coerce_expr(e, &input_schema, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(LogicalPlan::RollupAggregate {
                 input: Box::new(input),
                 group_by,
                 aggr_exprs,
@@ -490,10 +513,21 @@ fn coerce_expr(
         } => {
             // Coerce children but do not unify argument types against
             // a signature — see the module-level note.
-            let args = args
+            let mut args = args
                 .into_iter()
                 .map(|a| coerce_expr(a, schema, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
+            // The length of a CHAR(n) value counts its blank padding.
+            if name.eq_ignore_ascii_case("length") && args.len() == 1 {
+                let arg = args.pop().expect("one argument");
+                args.push(pad_char_operand(arg, schema));
+            }
+            if (name.eq_ignore_ascii_case("substr") || name.eq_ignore_ascii_case("substring"))
+                && (args.len() == 2 || args.len() == 3)
+            {
+                let arg = args.remove(0);
+                args.insert(0, pad_char_operand(arg, schema));
+            }
             Ok(PlanExpr::Function {
                 name,
                 args,
@@ -543,8 +577,9 @@ fn unify_binary_operands(
     }
     // LIKE / NOT LIKE require Utf8 on both sides; our parser produces
     // Utf8-shaped operands by construction, so no coercion is attempted.
+    // A CHAR value is matched with its blank padding, as in Trino.
     if matches!(op, ast::BinaryOp::Like | ast::BinaryOp::NotLike) {
-        return Ok((left, right));
+        return Ok((pad_char_operand(left, schema), right));
     }
     // Parameter-type inference: if one side is an unbound `$n` and
     // the other has a known type, record the inference in `ctx` and
@@ -620,6 +655,31 @@ fn unify_binary_operands(
         maybe_cast(left, &lt, &supertype, site.left_is_literal(), location)?,
         maybe_cast(right, &rt, &supertype, site.right_is_literal(), location)?,
     ))
+}
+
+/// `expr` blank-padded to its declared length when it is a CHAR(n)
+/// value (stored without trailing blanks), for the operations that see
+/// the padding; any other expression is returned unchanged.
+fn pad_char_operand(expr: PlanExpr, schema: &[ColumnInfo]) -> PlanExpr {
+    let Some(DataType::Char(length)) = plan_expr_type(&expr, schema) else {
+        return expr;
+    };
+    PlanExpr::Function {
+        name: "rpad".to_string(),
+        args: vec![
+            expr,
+            PlanExpr::Literal {
+                value: ScalarValue::Int64(i64::from(length)),
+                span: None,
+            },
+            PlanExpr::Literal {
+                value: ScalarValue::Utf8(" ".to_string()),
+                span: None,
+            },
+        ],
+        distinct: false,
+        span: None,
+    }
 }
 
 fn unify_between(
@@ -777,12 +837,14 @@ fn unify_case(
         }
         (_, er, _) => er,
     };
-    // The operand of a simple CASE is compared against each WHEN
-    // condition. For MVP we do not rewrite the simple-CASE operand
-    // pair — conditions already flow through `coerce_expr`'s BinaryOp
-    // path when the simple CASE is desugared elsewhere. We pass it
-    // through unchanged.
-    Ok((operand, when_clauses, else_result))
+    if let Some(operand) = operand {
+        let (conditions, results): (Vec<_>, Vec<_>) = when_clauses.into_iter().unzip();
+        let (operand, conditions) = unify_in_list(*operand, conditions, schema, location)?;
+        let when_clauses = conditions.into_iter().zip(results).collect();
+        Ok((Some(Box::new(operand)), when_clauses, else_result))
+    } else {
+        Ok((None, when_clauses, else_result))
+    }
 }
 
 /// Align the output column types of every branch of a set operation
@@ -1002,7 +1064,10 @@ fn fallback_default_param(expr: PlanExpr, ctx: &mut AnalyzerContext) -> PlanExpr
 /// Apply `f` to every `PlanExpr` in `plan` (including in nested
 /// sub-plans). Recursively visits children so the transform reaches
 /// deeply-nested parameter nodes.
-fn walk_plan_exprs(plan: LogicalPlan, f: &mut dyn FnMut(PlanExpr) -> PlanExpr) -> LogicalPlan {
+pub(super) fn walk_plan_exprs(
+    plan: LogicalPlan,
+    f: &mut dyn FnMut(PlanExpr) -> PlanExpr,
+) -> LogicalPlan {
     match plan {
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(walk_plan_exprs(*input, f)),
@@ -1023,6 +1088,17 @@ fn walk_plan_exprs(plan: LogicalPlan, f: &mut dyn FnMut(PlanExpr) -> PlanExpr) -
             aggr_exprs,
             schema,
         } => LogicalPlan::Aggregate {
+            input: Box::new(walk_plan_exprs(*input, f)),
+            group_by: group_by.into_iter().map(|e| walk_expr(e, f)).collect(),
+            aggr_exprs: aggr_exprs.into_iter().map(|e| walk_expr(e, f)).collect(),
+            schema,
+        },
+        LogicalPlan::RollupAggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            schema,
+        } => LogicalPlan::RollupAggregate {
             input: Box::new(walk_plan_exprs(*input, f)),
             group_by: group_by.into_iter().map(|e| walk_expr(e, f)).collect(),
             aggr_exprs: aggr_exprs.into_iter().map(|e| walk_expr(e, f)).collect(),
@@ -1064,6 +1140,38 @@ fn walk_plan_exprs(plan: LogicalPlan, f: &mut dyn FnMut(PlanExpr) -> PlanExpr) -
             },
             dynamic_filter_ids: Vec::new(),
         },
+        LogicalPlan::SemiJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+            residual,
+            dynamic_filter_ids,
+            probe_side_filter_ids,
+        } => LogicalPlan::SemiJoin {
+            left: Box::new(walk_plan_exprs(*left, f)),
+            right: Box::new(walk_plan_exprs(*right, f)),
+            left_key: walk_expr(left_key, f),
+            right_key: walk_expr(right_key, f),
+            residual: residual.map(|e| walk_expr(e, f)),
+            dynamic_filter_ids,
+            probe_side_filter_ids,
+        },
+        LogicalPlan::AntiJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+            residual,
+            probe_side_filter_ids,
+        } => LogicalPlan::AntiJoin {
+            left: Box::new(walk_plan_exprs(*left, f)),
+            right: Box::new(walk_plan_exprs(*right, f)),
+            left_key: walk_expr(left_key, f),
+            right_key: walk_expr(right_key, f),
+            residual: residual.map(|e| walk_expr(e, f)),
+            probe_side_filter_ids,
+        },
         LogicalPlan::Explain { input, analyze } => LogicalPlan::Explain {
             input: Box::new(walk_plan_exprs(*input, f)),
             analyze,
@@ -1099,7 +1207,7 @@ fn walk_plan_exprs(plan: LogicalPlan, f: &mut dyn FnMut(PlanExpr) -> PlanExpr) -
     }
 }
 
-fn walk_expr(expr: PlanExpr, f: &mut dyn FnMut(PlanExpr) -> PlanExpr) -> PlanExpr {
+pub(super) fn walk_expr(expr: PlanExpr, f: &mut dyn FnMut(PlanExpr) -> PlanExpr) -> PlanExpr {
     // Recurse into children first so the transform sees leaves
     // before the parent applies.
     let expr = match expr {
@@ -1203,6 +1311,33 @@ fn maybe_cast(
 ) -> Result<PlanExpr, PlanError> {
     if from == target {
         return Ok(expr);
+    }
+    // CHAR(n) values are stored without trailing blanks, so a char needs
+    // no conversion to a wider char or to varchar, and a varchar becomes a
+    // char by dropping its trailing blanks. A varchar literal is trimmed
+    // in place: `char_col = 'lit'` stays a plain column-vs-literal
+    // comparison that scans can push down and prune row groups with. An
+    // implicit coercion never truncates, hence the maximum length.
+    match (from, target) {
+        (DataType::Char(_), DataType::Char(_) | DataType::Utf8) => return Ok(expr),
+        (DataType::Utf8, DataType::Char(_)) => {
+            if let PlanExpr::Literal {
+                value: ScalarValue::Utf8(value),
+                span,
+            } = &expr
+            {
+                return Ok(PlanExpr::Literal {
+                    value: ScalarValue::Utf8(value.trim_end_matches(' ').to_string()),
+                    span: *span,
+                });
+            }
+            return Ok(PlanExpr::Cast {
+                expr: Box::new(expr),
+                data_type: DataType::Char(CHAR_MAX_LENGTH),
+                span: None,
+            });
+        }
+        _ => {}
     }
     // A decimal literal against a DOUBLE operand (`double_col > 0.05`)
     // becomes a DOUBLE literal here rather than a `Cast`: the optimizer

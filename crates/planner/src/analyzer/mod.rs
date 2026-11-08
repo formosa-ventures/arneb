@@ -332,6 +332,9 @@ pub(crate) fn function_return_type(
             .or(Some(DataType::Float64)),
         "MIN" | "MAX" => args.first().and_then(|a| plan_expr_type(a, schema)),
         "BOOL_OR" => Some(DataType::Boolean),
+        "STDDEV_SAMP" | "STDDEV" | "STDDEV_POP" | "VAR_SAMP" | "VARIANCE" | "VAR_POP" => {
+            Some(DataType::Float64)
+        }
 
         // Scalar built-ins. Return types here MUST match the
         // corresponding `ScalarFunction::return_type` impls in
@@ -373,9 +376,16 @@ pub(crate) fn function_return_type(
 
         // String — Utf8 in, Utf8 out (except length/position which
         // return integer counts).
-        "UPPER" | "LOWER" | "SUBSTRING" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "CONCAT"
-        | "REPLACE" | "SPLIT_PART" | "REVERSE" | "LPAD" | "RPAD" | "CHR" | "CONCAT_WS"
-        | "TRANSLATE" | "REGEXP_EXTRACT" | "REGEXP_REPLACE" | "LIKE_ESCAPE" => Some(DataType::Utf8),
+        // Case mapping and trimming keep a CHAR(n) argument's type (Trino).
+        "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM" => {
+            match args.first().and_then(|a| plan_expr_type(a, schema)) {
+                Some(DataType::Char(length)) => Some(DataType::Char(length)),
+                _ => Some(DataType::Utf8),
+            }
+        }
+        "SUBSTRING" | "SUBSTR" | "CONCAT" | "REPLACE" | "SPLIT_PART" | "REVERSE" | "LPAD"
+        | "RPAD" | "CHR" | "CONCAT_WS" | "TRANSLATE" | "REGEXP_EXTRACT" | "REGEXP_REPLACE"
+        | "LIKE_ESCAPE" => Some(DataType::Utf8),
         "LENGTH"
         | "POSITION"
         | "STRPOS"
@@ -392,7 +402,23 @@ pub(crate) fn function_return_type(
         "TO_REGTYPE" => Some(DataType::Int64),
 
         // Math — preserve integer-ness when the input is integral.
-        "ROUND" | "CEIL" | "CEILING" | "FLOOR" | "ABS" => args
+        "ROUND" => args
+            .first()
+            .and_then(|a| plan_expr_type(a, schema))
+            .map(|t| match t {
+                DataType::Decimal128 { precision, scale } => DataType::Decimal128 {
+                    precision: if args.len() > 1 {
+                        precision.saturating_add(1).min(38)
+                    } else {
+                        (precision as i16 - scale as i16 + (scale > 0) as i16).min(38) as u8
+                    },
+                    scale: if args.len() > 1 { scale } else { 0 },
+                },
+                DataType::Int32 | DataType::Int64 => DataType::Int64,
+                _ => DataType::Float64,
+            })
+            .or(Some(DataType::Float64)),
+        "CEIL" | "CEILING" | "FLOOR" | "ABS" => args
             .first()
             .and_then(|a| plan_expr_type(a, schema))
             .map(|t| match t {

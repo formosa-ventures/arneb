@@ -21,11 +21,11 @@ Arneb supports a broad subset of ANSI SQL. This section documents all supported 
 Arneb supports the following query features:
 
 - **Joins**: INNER, LEFT, RIGHT, FULL OUTER, CROSS, and semi-joins
-- **Aggregations**: GROUP BY with HAVING, aggregate functions (COUNT, SUM, AVG, MIN, MAX)
+- **Aggregations**: GROUP BY with HAVING, `GROUP BY ROLLUP(...)` with `GROUPING(...)`, aggregate functions (COUNT, SUM, AVG, MIN, MAX, and the variance family STDDEV, STDDEV_SAMP, STDDEV_POP, VARIANCE, VAR_SAMP, VAR_POP)
 - **Subqueries**: Scalar, IN, and EXISTS subqueries
 - **CTEs**: Common Table Expressions via `WITH` clauses
 - **Set Operations**: UNION ALL, UNION, INTERSECT, EXCEPT
-- **Window Functions**: ROW_NUMBER, RANK, DENSE_RANK, and aggregate window functions with PARTITION BY and ORDER BY
+- **Window Functions**: ROW_NUMBER, RANK, DENSE_RANK, and aggregate window functions with PARTITION BY and ORDER BY, plus the `ROWS UNBOUNDED PRECEDING` frame
 - **Ordering and Limiting**: ORDER BY (including on aliases and aggregates), LIMIT, OFFSET
 
 ## Session Settings

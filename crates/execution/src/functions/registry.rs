@@ -114,6 +114,7 @@ pub fn default_registry() -> FunctionRegistry {
 
     // Trino-compatible alternate spellings.
     for (alias, target) in [
+        ("SUBSTR", "SUBSTRING"),
         ("CEILING", "CEIL"),
         ("POW", "POWER"),
         ("RAND", "RANDOM"),
@@ -167,6 +168,14 @@ mod tests {
         ] {
             assert!(reg.get(name).is_some(), "missing function: {name}");
         }
+    }
+
+    #[test]
+    fn substr_is_an_alias_of_substring() {
+        // Trino and TPC-DS spell it SUBSTR; the planner already types it.
+        let reg = default_registry();
+        assert!(reg.get("substr").is_some(), "missing function: substr");
+        assert!(reg.get("SUBSTR").is_some(), "missing function: SUBSTR");
     }
 
     /// Every function and alias added by trino-functions-batch1.

@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use arneb_common::error::ExecutionError;
+use arneb_common::numeric_cast::cast_fractional_to_integer;
 use arneb_common::types::{char_storage_value, DataType, ScalarValue};
 use arneb_planner::analyzer::coercion_matrix::decimal_arithmetic_type;
 use arneb_planner::PlanExpr;
@@ -103,7 +104,14 @@ pub(crate) fn evaluate(
         } => {
             let arr = evaluate(expr, batch, registry)?;
             let arrow_type: ArrowDataType = data_type.clone().into();
-            let result = arrow::compute::cast(&arr, &arrow_type)?;
+            let result = match cast_fractional_to_integer(
+                &arr,
+                &arrow_type,
+                &arrow::compute::CastOptions::default(),
+            )? {
+                Some(result) => result,
+                None => arrow::compute::cast(&arr, &arrow_type)?,
+            };
             match data_type {
                 DataType::Char(length) => char_storage_array(&result, *length),
                 _ => Ok(result),

@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use arneb_common::error::PlanError;
+use arneb_common::numeric_cast::cast_fractional_to_integer;
 use arneb_common::types::{char_storage_value, DataType, ScalarValue, TimeUnit};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
@@ -53,12 +54,15 @@ pub fn cast_scalar(value: &ScalarValue, target: &DataType) -> Result<ScalarValue
         safe: false,
         ..Default::default()
     };
-    let cast = cast_with_options(&source_array, &target_arrow, &options).map_err(|e| {
-        PlanError::InvalidLiteral {
+    let cast = cast_fractional_to_integer(&source_array, &target_arrow, &options)
+        .and_then(|result| match result {
+            Some(result) => Ok(result),
+            None => cast_with_options(&source_array, &target_arrow, &options),
+        })
+        .map_err(|e| PlanError::InvalidLiteral {
             message: format!("cannot cast literal {value} to {target}: {e}"),
             location: None,
-        }
-    })?;
+        })?;
     array_element_to_scalar(&cast, 0, target).map_err(|e| PlanError::InvalidLiteral {
         message: format!("cannot extract cast result for {value} as {target}: {e}"),
         location: None,

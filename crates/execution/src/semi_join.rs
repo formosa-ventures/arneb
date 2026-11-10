@@ -2912,51 +2912,55 @@ fn probe_batch_residual(
         // Reverted. Re-attempt only when probe parallelism / cache
         // locality is more predictable.
         let right_batch = &right_batches[batch_idx];
-        let left_idx = UInt32Array::from(cand_left.clone());
-        let right_idx = UInt32Array::from(cand_right);
+        for range in
+            crate::hash_join::joined_output_ranges(left_batch, right_batch, &cand_left, &cand_right)
+        {
+            let left_idx = UInt32Array::from(cand_left[range.clone()].to_vec());
+            let right_idx = UInt32Array::from(cand_right[range.clone()].to_vec());
 
-        let mask: BooleanArray = if let Some(spec) = specialized {
-            // Specialised path: take ONLY the two cols referenced by
-            // the residual, run Arrow's compare kernel directly. Saves
-            // the per-batch RecordBatch::try_new + expression tree walk
-            // + ~N unused-column takes that the generic path incurred.
-            let (a, b) = take_residual_pair(
-                &spec,
-                left_batch,
-                right_batch,
-                left_width,
-                &left_idx,
-                &right_idx,
-            )?;
-            typed_compare_mask(&a, &b, spec.op)?
-        } else {
-            // Generic path: materialise the joined batch, evaluate the
-            // residual expression. Used for residuals that aren't a
-            // simple two-column comparison (e.g. `Cast(...) < expr`,
-            // function calls, OR-trees).
-            let mut cols: Vec<ArrayRef> = Vec::with_capacity(joined_schema.fields().len());
-            for c in 0..left_batch.num_columns() {
-                cols.push(compute::take(left_batch.column(c), &left_idx, None)?);
-            }
-            for c in 0..right_batch.num_columns() {
-                cols.push(compute::take(right_batch.column(c), &right_idx, None)?);
-            }
-            let joined = RecordBatch::try_new(joined_schema.clone(), cols)?;
-            let mask_arr = expression::evaluate(residual, &joined, None)?;
-            mask_arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    ExecutionError::InvalidOperation(
-                        "semi-join residual predicate must evaluate to boolean".into(),
-                    )
-                })?
-                .clone()
-        };
+            let mask: BooleanArray = if let Some(spec) = specialized {
+                // Specialised path: take ONLY the two cols referenced by
+                // the residual, run Arrow's compare kernel directly. Saves
+                // the per-batch RecordBatch::try_new + expression tree walk
+                // + ~N unused-column takes that the generic path incurred.
+                let (a, b) = take_residual_pair(
+                    &spec,
+                    left_batch,
+                    right_batch,
+                    left_width,
+                    &left_idx,
+                    &right_idx,
+                )?;
+                typed_compare_mask(&a, &b, spec.op)?
+            } else {
+                // Generic path: materialise the joined batch, evaluate the
+                // residual expression. Used for residuals that aren't a
+                // simple two-column comparison (e.g. `Cast(...) < expr`,
+                // function calls, OR-trees).
+                let mut cols: Vec<ArrayRef> = Vec::with_capacity(joined_schema.fields().len());
+                for c in 0..left_batch.num_columns() {
+                    cols.push(compute::take(left_batch.column(c), &left_idx, None)?);
+                }
+                for c in 0..right_batch.num_columns() {
+                    cols.push(compute::take(right_batch.column(c), &right_idx, None)?);
+                }
+                let joined = RecordBatch::try_new(joined_schema.clone(), cols)?;
+                let mask_arr = expression::evaluate(residual, &joined, None)?;
+                mask_arr
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        ExecutionError::InvalidOperation(
+                            "semi-join residual predicate must evaluate to boolean".into(),
+                        )
+                    })?
+                    .clone()
+            };
 
-        for (i, lrow) in cand_left.into_iter().enumerate() {
-            if !mask.is_null(i) && mask.value(i) {
-                matched[lrow as usize] = true;
+            for (i, &lrow) in cand_left[range].iter().enumerate() {
+                if !mask.is_null(i) && mask.value(i) {
+                    matched[lrow as usize] = true;
+                }
             }
         }
     }
@@ -3028,43 +3032,47 @@ fn mark_left_matches_for_right_batch(
             continue;
         }
         let left_batch = &left_batches[batch_idx];
-        let left_idx = UInt32Array::from(cand_left.clone());
-        let right_idx = UInt32Array::from(cand_right);
+        for range in
+            crate::hash_join::joined_output_ranges(left_batch, right_batch, &cand_left, &cand_right)
+        {
+            let left_idx = UInt32Array::from(cand_left[range.clone()].to_vec());
+            let right_idx = UInt32Array::from(cand_right[range.clone()].to_vec());
 
-        let mask: BooleanArray = if let Some(spec) = specialized {
-            let (a, b) = take_residual_pair(
-                &spec,
-                left_batch,
-                right_batch,
-                left_batch.num_columns(),
-                &left_idx,
-                &right_idx,
-            )?;
-            typed_compare_mask(&a, &b, spec.op)?
-        } else {
-            let mut cols: Vec<ArrayRef> = Vec::with_capacity(joined_schema.fields().len());
-            for c in 0..left_batch.num_columns() {
-                cols.push(compute::take(left_batch.column(c), &left_idx, None)?);
-            }
-            for c in 0..right_batch.num_columns() {
-                cols.push(compute::take(right_batch.column(c), &right_idx, None)?);
-            }
-            let joined = RecordBatch::try_new(joined_schema.clone(), cols)?;
-            let mask_arr = expression::evaluate(residual, &joined, None)?;
-            mask_arr
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    ExecutionError::InvalidOperation(
-                        "semi-join residual predicate must evaluate to boolean".into(),
-                    )
-                })?
-                .clone()
-        };
+            let mask: BooleanArray = if let Some(spec) = specialized {
+                let (a, b) = take_residual_pair(
+                    &spec,
+                    left_batch,
+                    right_batch,
+                    left_batch.num_columns(),
+                    &left_idx,
+                    &right_idx,
+                )?;
+                typed_compare_mask(&a, &b, spec.op)?
+            } else {
+                let mut cols: Vec<ArrayRef> = Vec::with_capacity(joined_schema.fields().len());
+                for c in 0..left_batch.num_columns() {
+                    cols.push(compute::take(left_batch.column(c), &left_idx, None)?);
+                }
+                for c in 0..right_batch.num_columns() {
+                    cols.push(compute::take(right_batch.column(c), &right_idx, None)?);
+                }
+                let joined = RecordBatch::try_new(joined_schema.clone(), cols)?;
+                let mask_arr = expression::evaluate(residual, &joined, None)?;
+                mask_arr
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        ExecutionError::InvalidOperation(
+                            "semi-join residual predicate must evaluate to boolean".into(),
+                        )
+                    })?
+                    .clone()
+            };
 
-        for (i, left_row) in cand_left.into_iter().enumerate() {
-            if !mask.is_null(i) && mask.value(i) {
-                matched[batch_idx][left_row as usize] = true;
+            for (i, &left_row) in cand_left[range].iter().enumerate() {
+                if !mask.is_null(i) && mask.value(i) {
+                    matched[batch_idx][left_row as usize] = true;
+                }
             }
         }
     }

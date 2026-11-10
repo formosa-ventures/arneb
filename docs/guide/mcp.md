@@ -476,8 +476,10 @@ Differences from the HTTP routes:
   in `get_query` is cut at `max_cell_bytes` and flagged `sql_truncated`.
 - **Cancel.** `cancel_query` with the id of your own statement from
   `submit_query` works like `DELETE /api/v2/statements/{id}` and returns the
-  statement status: a running statement is cancelled and kept, an ended one
-  is released with its rows. Any other id (a query id from `list_queries`,
+  statement status: a running statement is cancelled and kept, and an ended
+  one, or one that ends while being cancelled, is released with its rows
+  (its status may show any state, including `cancelled` or still
+  `running`), and the id answers `not_found` from then on. Any other id (a query id from `list_queries`,
   or a statement already released or evicted), or any call with `dry_run`,
   works like `DELETE /api/v2/queries/{id}` and returns the manage envelope;
   killing another user's query needs the manage privilege or an explicit
@@ -561,7 +563,9 @@ explicitly.
   tool result at `debug`, and a result can hold rows or a new API token from
   `create_token`, and it logs three `info` lines for every request. Arneb
   therefore caps the `rmcp` log target at `warn`, even under
-  `RUST_LOG=debug`; its warnings (a rejected `Origin` or `Host`) still log.
+  `RUST_LOG=debug`; its warnings (a rejected `Origin` or `Host`) still log,
+  unless `RUST_LOG` itself is quieter (`off`, `error`): the cap never raises
+  rmcp above what `RUST_LOG` asks for.
   A directive on an rmcp module, such as `RUST_LOG=debug,rmcp::transport=warn`,
   keeps the cap for the rest of rmcp and still applies to that module. Only
   a directive whose target is exactly `rmcp` (for example

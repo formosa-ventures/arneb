@@ -878,9 +878,10 @@ the source of truth from the config file to the [state store](#state):
   `password`, a password in `connection_url` (a `connection_url` that fails
   validation counts when it may hold one: a `:` before its first `@`
   after `scheme://` (outside an IPv6 host), unless that `@` plainly sits
-  in a query value such as `db:5432/x?user=a@b`; a query parameter whose
-  key, split on every `&` and percent-decoded, contains `password` in any
-  case (`?sslmode&password=`, `?PASSWORD=`); or, with no `scheme://` (a
+  in a query value such as `db:5432/x?user=a@b`; `password` in any case
+  anywhere after the first `?` or `#` once percent-decoded, in a key, a
+  value or the fragment (`?sslmode&password=`, `?PASSWORD=`,
+  `?sslmode=require password=`, `#password=`); or, with no `scheme://` (a
   libpq `host=... password=...` string), any `password` or `user:pass@`
   shape; a mistyped URL with no password, such as `?sslmod=require`,
   does not stop the start, its catalog fails to build with a WARN),
@@ -1087,7 +1088,9 @@ the response returns. Read it with
   completion still unwritten then is logged at ERROR and its action is
   recorded as `interrupted` at the next start. Before that last attempt, the
   Web API stops gracefully: it accepts no new connections, closes idle ones,
-  and gives requests in progress up to 5 seconds to finish. Then new audited
+  and gives requests in progress up to 5 seconds to finish (one still
+  running after that is not cut off; its connection lives until the
+  process exits). Then new audited
   actions are refused with `503 audit_unavailable` ("the server is shutting
   down"; nothing is applied or written, including one still queued on the
   blocking pool), and the server waits up to 10 seconds for audited actions

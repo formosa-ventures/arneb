@@ -6,8 +6,8 @@ Connect with psql:
 
 Registered workers (Web UI API, port {{ .Values.coordinator.service.ports.web }}):
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "arneb.fullname" . }} 6432:{{ .Values.coordinator.service.ports.web }}
-{{- if .Values.auth.password }}
-  # [auth] type = "password" (auth.password=true): the API needs credentials.
+{{- if or .Values.auth.password (and (not .Values.existingConfigSecret) (regexMatch "(?m)^\\s*type\\s*=\\s*[\"']password[\"']" (.Values.config | default ""))) }}
+  # [auth] type = "password": the API needs credentials.
   # Mint an API token once with a configured user; the response shows it only once:
   curl -s -X POST localhost:6432/api/v2/tokens -u '<user>:<password>' \
     -H 'Content-Type: application/json' -d '{"name":"helm"}'

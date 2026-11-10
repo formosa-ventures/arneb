@@ -18,6 +18,7 @@ mod rules;
 pub mod session;
 mod settings;
 mod users;
+pub(crate) use users::is_valid_user_name;
 mod v2;
 mod workers;
 

@@ -732,6 +732,15 @@ impl CatalogManager {
     /// spellings are looked up before the fold is decided, so how many
     /// lookups a reference costs never depends on whether a name the user
     /// may not read exists.
+    ///
+    /// The price of that, accepted on purpose: a mixed-case schema or table
+    /// part costs one more source lookup (one more HMS `get_database` /
+    /// `get_table`, or PostgreSQL catalog round trip) even when the name as
+    /// written exists, and an `Err` from the lowercase lookup fails the
+    /// reference even though the name as written would have resolved.
+    /// All-lowercase references, the common case, take no lookups here.
+    /// Do not skip the second lookup when the first one finds the name:
+    /// that would make the count depend on existence again.
     pub async fn fold_reference_case(
         &self,
         reference: &TableReference,

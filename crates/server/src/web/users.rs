@@ -124,11 +124,17 @@ fn existing_user(store: &StateStore, name: &str) -> Result<UserInfo, ApiError> {
     find_user(store, name).ok_or_else(|| no_such_user(name))
 }
 
-pub(super) fn validate_name(name: &str) -> Result<(), ApiError> {
+/// Whether `name` is a valid user name: 1 to 64 characters of A-Z, a-z,
+/// 0-9, `_`, `.`, `@` and `-`.
+pub(crate) fn is_valid_user_name(name: &str) -> bool {
     let ok_chars = name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '@' | '-'));
-    if NAME_CHARS.contains(&name.chars().count()) && ok_chars {
+    NAME_CHARS.contains(&name.chars().count()) && ok_chars
+}
+
+pub(super) fn validate_name(name: &str) -> Result<(), ApiError> {
+    if is_valid_user_name(name) {
         return Ok(());
     }
     Err(

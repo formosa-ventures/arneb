@@ -83,7 +83,7 @@ aws-lc-rs = "1"
 base64 = "0.23"
 # OAuth resource server for /mcp: JWT validation on the aws-lc-rs backend and
 # JWKS fetching over the rustls/aws-lc-rs stack already in the tree.
-jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
 # HMS demo setup binary dependencies

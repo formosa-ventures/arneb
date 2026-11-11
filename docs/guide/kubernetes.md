@@ -3,7 +3,7 @@
 The Helm chart in `charts/arneb` runs one coordinator and a set of workers
 from the release image `ghcr.io/formosa-ventures/arneb`. Every release
 publishes the image for `linux/amd64` and `linux/arm64`, tagged with the
-full version (`0.2.0`), the minor version (`0.2`) and `latest`. <!-- x-release-please-version -->
+full version (`0.2.1`), the minor version (`0.2`) and `latest`. <!-- x-release-please-version -->
 
 ## Install
 

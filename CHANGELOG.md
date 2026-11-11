@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.1](https://github.com/formosa-ventures/arneb/compare/v0.2.0...v0.2.1) (2026-11-11)
+
+
+### Features
+
+* run all 103 TPC-DS queries cell-identical to Trino ([#224](https://github.com/formosa-ventures/arneb/issues/224)) ([f1e5cde](https://github.com/formosa-ventures/arneb/commit/f1e5cdef515c05b6d193ff24a559be3a2dee92a8))
+
+
+### Bug Fixes
+
+* **server:** keep a reordering projection over an exchange ([#225](https://github.com/formosa-ventures/arneb/issues/225)) ([#235](https://github.com/formosa-ventures/arneb/issues/235)) ([bcbfce3](https://github.com/formosa-ventures/arneb/commit/bcbfce35cf7cca5970426700d113f5e58493ba0d))
+* **server:** run the worker heartbeat loop on a dedicated thread ([#242](https://github.com/formosa-ventures/arneb/issues/242)) ([43a3ef9](https://github.com/formosa-ventures/arneb/commit/43a3ef9ae7cf952700de1653f10bed16d8dee42d))
+* v0.2.0 review follow-ups (secrets check, shutdown wording, agent/MCP/OAuth nits) ([#226](https://github.com/formosa-ventures/arneb/issues/226)) ([6dad43e](https://github.com/formosa-ventures/arneb/commit/6dad43e6c0aaebe45930dd7e43564da407a754e6))
+
 ## [0.2.0](https://github.com/formosa-ventures/arneb/compare/v0.1.8...v0.2.0) (2026-11-07)
 
 

@@ -1717,24 +1717,38 @@ async fn worker_heartbeat_loop_on_runtime(
         coordinator = %target.coordinator_address,
         "starting heartbeat loop"
     );
-    let mut in_flight: Option<tokio::task::JoinHandle<()>> = None;
+    let interval = std::time::Duration::from_secs(interval_secs);
+    let mut in_flight: Option<(tokio::task::JoinHandle<()>, tokio::time::Instant)> = None;
     loop {
         let current = *state.borrow_and_update();
         let sent_at = tokio::time::Instant::now();
-        if let Some(previous) = in_flight.take() {
+        if let Some((previous, previous_sent_at)) = in_flight.take() {
+            // A state change sends at once, so only a beat older than the
+            // interval counts as stalled (e.g. a replaced coordinator pod
+            // whose old IP drops packets).
+            let waited = sent_at - previous_sent_at;
+            if !previous.is_finished() && waited >= interval {
+                tracing::warn!(
+                    worker_id = %target.message.worker_id,
+                    coordinator = %target.coordinator_address,
+                    waited_ms = waited.as_millis() as u64,
+                    "heartbeat got no answer before the next one was due; dropping it"
+                );
+            }
             previous.abort();
         }
         let target = target.clone();
         let catalogs = catalogs.clone();
         let server_runtime = server_runtime.clone();
-        in_flight = Some(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let (Some(reply), Some(puller)) = (target.send(current).await, catalogs) {
                 server_runtime
                     .spawn(async move { puller.after_heartbeat_sent(&reply, sent_at).await });
             }
-        }));
+        });
+        in_flight = Some((handle, sent_at));
         tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
+            _ = tokio::time::sleep(interval) => {}
             changed = state.changed() => {
                 if changed.is_err() {
                     futures::future::pending::<()>().await;

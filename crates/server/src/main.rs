@@ -1575,6 +1575,7 @@ where
 }
 
 /// Where and as whom a worker heartbeats.
+#[derive(Clone)]
 struct HeartbeatTarget {
     coordinator_address: String,
     message: arneb_rpc::HeartbeatMessage,
@@ -1665,7 +1666,7 @@ async fn worker_heartbeat_loop(
     target: Option<&HeartbeatTarget>,
     catalogs: Option<&catalogs::CatalogPuller>,
     role: ServerRole,
-    mut state: tokio::sync::watch::Receiver<arneb_rpc::WorkerState>,
+    state: tokio::sync::watch::Receiver<arneb_rpc::WorkerState>,
     interval_secs: u64,
 ) {
     if !matches!(role, ServerRole::Worker) {
@@ -1674,18 +1675,64 @@ async fn worker_heartbeat_loop(
     let Some(target) = target else {
         return;
     };
+    let target = target.clone();
+    let catalogs = catalogs.cloned();
+    let server_runtime = tokio::runtime::Handle::current();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let (done, finished) = tokio::sync::oneshot::channel::<()>();
+    let thread = std::thread::Builder::new()
+        .name("worker-heartbeat".into())
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(async {
+                    tokio::select! {
+                        _ = worker_heartbeat_loop_on_runtime(target, catalogs, server_runtime, state, interval_secs) => {}
+                        _ = stopped => {}
+                    }
+                }),
+                Err(e) => tracing::error!(error = %e, "failed to start heartbeat runtime"),
+            }
+            let _ = done.send(());
+        });
+    if let Err(e) = thread {
+        tracing::error!(error = %e, "failed to start heartbeat thread");
+        return;
+    }
+    let _ = finished.await;
+    drop(stop);
+}
+
+async fn worker_heartbeat_loop_on_runtime(
+    target: HeartbeatTarget,
+    catalogs: Option<catalogs::CatalogPuller>,
+    server_runtime: tokio::runtime::Handle,
+    mut state: tokio::sync::watch::Receiver<arneb_rpc::WorkerState>,
+    interval_secs: u64,
+) {
     tracing::info!(
         worker_id = %target.message.worker_id,
         coordinator = %target.coordinator_address,
         "starting heartbeat loop"
     );
+    let mut in_flight: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         let current = *state.borrow_and_update();
         let sent_at = tokio::time::Instant::now();
-        if let (Some(reply), Some(puller)) = (target.send(current).await, catalogs) {
-            let puller = puller.clone();
-            tokio::spawn(async move { puller.after_heartbeat_sent(&reply, sent_at).await });
+        if let Some(previous) = in_flight.take() {
+            previous.abort();
         }
+        let target = target.clone();
+        let catalogs = catalogs.clone();
+        let server_runtime = server_runtime.clone();
+        in_flight = Some(tokio::spawn(async move {
+            if let (Some(reply), Some(puller)) = (target.send(current).await, catalogs) {
+                server_runtime
+                    .spawn(async move { puller.after_heartbeat_sent(&reply, sent_at).await });
+            }
+        }));
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
             changed = state.changed() => {
@@ -3343,5 +3390,153 @@ mod tests {
         .await;
         assert!(finished.is_err(), "a failed listener must not end select!");
         assert_eq!(logged, Some(std::io::ErrorKind::AddrInUse));
+    }
+
+    // ---- heartbeat delivery under load (TPC-DS SF30: a busy worker went 19–25 s
+    // without a heartbeat while both query threads ran operators, and the
+    // coordinator failed the query as "worker lost") ----
+
+    /// A coordinator in its own process: a Flight server on its own runtime and
+    /// thread, recording when each heartbeat arrives. With `black_hole_first`,
+    /// the worker reaches it through a TCP front that accepts the first
+    /// connection and never answers on it (a request the coordinator never
+    /// replies to), and forwards every later connection.
+    fn coordinator_on_its_own_thread(
+        black_hole_first: bool,
+    ) -> (String, Arc<std::sync::Mutex<Vec<std::time::Instant>>>) {
+        let beats = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = beats.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let state = arneb_rpc::FlightState::with_heartbeat_callback(Arc::new(move |_| {
+                    seen.lock().unwrap().push(std::time::Instant::now());
+                    Ok(arneb_rpc::HeartbeatReply::default())
+                }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let server = listener.local_addr().unwrap();
+                tokio::spawn(arneb_rpc::__serve_flight_for_test(listener, state));
+                if !black_hole_first {
+                    tx.send(format!("http://{server}")).unwrap();
+                    return futures::future::pending::<()>().await;
+                }
+                let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(format!("http://{}", front.local_addr().unwrap()))
+                    .unwrap();
+                let mut held = Vec::new();
+                loop {
+                    let (mut inbound, _) = front.accept().await.unwrap();
+                    if held.is_empty() {
+                        held.push(inbound);
+                        continue;
+                    }
+                    tokio::spawn(async move {
+                        let mut outbound = tokio::net::TcpStream::connect(server).await.unwrap();
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    });
+                }
+            });
+        });
+        (rx.recv().unwrap(), beats)
+    }
+
+    /// Run the worker's heartbeat loop (1 s interval) for `window` on a
+    /// two-thread runtime. With `busy`, one beat is sent first while the
+    /// runtime is idle (so connection setup is not what is measured), then
+    /// both worker threads are held by tasks that never yield for `busy`, the
+    /// way query operators held them.
+    fn run_heartbeat_loop_for(
+        addr: String,
+        window: std::time::Duration,
+        busy: Option<std::time::Duration>,
+    ) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let target = HeartbeatTarget {
+                coordinator_address: addr,
+                message: arneb_rpc::HeartbeatMessage::new(
+                    "w1".into(),
+                    "http://localhost:1".into(),
+                    8,
+                ),
+            };
+            if let Some(busy) = busy {
+                target
+                    .send(arneb_rpc::WorkerState::Active)
+                    .await
+                    .expect("warm-up beat");
+                let held = Arc::new(std::sync::Barrier::new(3));
+                for _ in 0..2 {
+                    let held = held.clone();
+                    tokio::spawn(async move {
+                        held.wait();
+                        std::thread::sleep(busy);
+                    });
+                }
+                held.wait();
+            }
+            let (_tx, rx) = tokio::sync::watch::channel(arneb_rpc::WorkerState::Active);
+            let _ = tokio::time::timeout(
+                window,
+                worker_heartbeat_loop(Some(&target), None, ServerRole::Worker, rx, 1),
+            )
+            .await;
+        });
+        // Dropping `rt` here waits for the blocking tasks to end.
+    }
+
+    /// Both query threads held for 8 s: the coordinator still hears from the
+    /// worker about once a second during the first 6 s (the coordinator's
+    /// default timeout is 10 s, so a gap that long fails the query).
+    #[test]
+    fn heartbeats_reach_the_coordinator_while_every_query_thread_is_busy() {
+        let (addr, beats) = coordinator_on_its_own_thread(false);
+        let start = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(6);
+        run_heartbeat_loop_for(addr, window, Some(std::time::Duration::from_secs(8)));
+        let in_window: Vec<f64> = beats
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.duration_since(start) <= window)
+            .map(|t| t.duration_since(start).as_secs_f64())
+            .collect();
+        // warm-up beat + one per second of the 6 s window, allowing slack.
+        assert!(
+            in_window.len() >= 5,
+            "heartbeats seen in the first 6 s while the query threads were busy (s since start): {in_window:?}"
+        );
+    }
+
+    /// The coordinator never answers the first heartbeat: the worker keeps
+    /// sending, so the beats after it still arrive.
+    #[test]
+    fn a_heartbeat_the_coordinator_never_answers_does_not_stop_the_next_ones() {
+        let (addr, beats) = coordinator_on_its_own_thread(true);
+        let start = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(8);
+        run_heartbeat_loop_for(addr, window, None);
+        let after_hang: Vec<f64> = beats
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.duration_since(start) <= window)
+            .map(|t| t.duration_since(start).as_secs_f64())
+            .collect();
+        // The first beat is the one that is never answered (and never
+        // reaches the handler, so it is not counted).
+        assert!(
+            after_hang.len() >= 3,
+            "heartbeats seen in the first 8 s after the coordinator never answered one (s since start): {after_hang:?}"
+        );
     }
 }

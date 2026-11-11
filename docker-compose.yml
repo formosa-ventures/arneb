@@ -257,7 +257,7 @@ services:
   # and the realm users' passwords are public, and the realm allows plain http.
   # Issuer: http://127.0.0.1:8180/realms/arneb
   keycloak:
-    image: quay.io/keycloak/keycloak:26.4.7
+    image: quay.io/keycloak/keycloak:26.8.2-1
     command: ["start-dev", "--import-realm", "--http-port", "8180"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin

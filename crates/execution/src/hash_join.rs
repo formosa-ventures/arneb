@@ -3372,16 +3372,19 @@ impl HashJoinExec {
     /// or zero-row → empty DistinctValues so the coord's per-
     /// partition counter still advances and the consumer doesn't
     /// time out on an empty-result query).
+    /// True when `emit_cross_fragment_dfs` will publish this join's filters.
+    fn publishes_cross_fragment_dfs(&self) -> bool {
+        self.dynamic_filtering_enabled
+            && !self.is_hash_copartitioned()
+            && matches!(self.join_type, ast::JoinType::Inner | ast::JoinType::Right)
+            && std::env::var_os("ARNEB_DISABLE_DF").is_none()
+            && !self.dynamic_filter_producers.is_empty()
+            && broadcast_df_enabled()
+            && self.dynamic_filter_publisher.is_some()
+    }
+
     fn emit_cross_fragment_dfs(&self, right_combined: Option<&RecordBatch>) {
-        let left_filterable = matches!(self.join_type, ast::JoinType::Inner | ast::JoinType::Right);
-        let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
-        if !self.dynamic_filtering_enabled
-            || self.is_hash_copartitioned()
-            || !left_filterable
-            || df_disabled
-            || self.dynamic_filter_producers.is_empty()
-            || !broadcast_df_enabled()
-        {
+        if !self.publishes_cross_fragment_dfs() {
             return;
         }
         let Some(publisher) = &self.dynamic_filter_publisher else {
@@ -3729,13 +3732,38 @@ impl HashJoinExec {
         }
 
         let t_build = Instant::now();
-        let build_result = build_with_spill(
+        let mut build_result = build_with_spill(
             right_stream,
             Arc::clone(&self.memory_pool),
             "HashJoinExec.single_build",
         )
         .await?;
         let build_ms = t_build.elapsed().as_millis() as u64;
+
+        let mut right_combined = None;
+        if let BuildChunksResult::Single {
+            batches,
+            schema: right_schema,
+            ..
+        } = &mut build_result
+        {
+            right_combined = if batches.is_empty() {
+                None
+            } else if batches.len() == 1 {
+                Some(batches.pop().unwrap())
+            } else {
+                let rs = right_schema
+                    .clone()
+                    .expect("schema set when batches non-empty");
+                Some(compute::concat_batches(&rs, batches.iter())?)
+            };
+            if let Some(right_batch) = &right_combined {
+                self.publish_broadcast_cross_fragment_dfs(0, right_batch)
+                    .await;
+            } else {
+                self.emit_cross_fragment_dfs(None);
+            }
+        }
 
         let t_left = Instant::now();
         // exec-memory-accounting D3: track the probe-side collect against the
@@ -3794,8 +3822,8 @@ impl HashJoinExec {
                     .await?
             }
             BuildChunksResult::Single {
-                batches,
-                schema: right_schema,
+                batches: _,
+                schema: _,
                 total_bytes: _,
                 total_rows: _,
                 reservation,
@@ -3804,22 +3832,6 @@ impl HashJoinExec {
                 // (covers the concatenated `right_combined`). This is the q18 fix.
                 held.push(left_reservation);
                 held.push(reservation);
-                let right_combined = if batches.is_empty() {
-                    None
-                } else if batches.len() == 1 {
-                    Some(batches.into_iter().next().unwrap())
-                } else {
-                    let rs = right_schema
-                        .clone()
-                        .expect("schema set when batches non-empty");
-                    Some(compute::concat_batches(&rs, batches.iter())?)
-                };
-                // A1.7 (2026-05-27): execute_single non-Grace path —
-                // publish before `execute_single_finish` runs probe.
-                if let Some(right_batch) = &right_combined {
-                    self.publish_broadcast_cross_fragment_dfs(0, right_batch)
-                        .await;
-                }
                 self.execute_single_finish(left_batches, right_combined)?
             }
             BuildChunksResult::Partitioned { .. } => {
@@ -4098,15 +4110,16 @@ impl HashJoinExec {
         let left_filterable = matches!(self.join_type, ast::JoinType::Inner | ast::JoinType::Right);
         let df_disabled = std::env::var_os("ARNEB_DISABLE_DF").is_some();
         if left_filterable && !df_disabled && !df_collectors.is_empty() {
-            let publish_cross_fragment = !matches!(build_result, BuildChunksResult::Single { .. });
             match probe_df {
                 ProbeDfInjection::Inject => {
-                    self.inject_grace_dynamic_filters(df_collectors, publish_cross_fragment);
+                    self.inject_grace_dynamic_filters(df_collectors, true);
                 }
                 // A copartitioned build publishes nothing cross-fragment:
                 // `publish_grace_cross_fragment_dfs` returns early for it.
                 ProbeDfInjection::Skip => {}
             }
+        } else if left_filterable && !df_disabled {
+            self.publish_grace_cross_fragment_dfs(&[]);
         }
 
         match build_result {
@@ -4392,9 +4405,17 @@ impl HashJoinExec {
         left_stream: SendableRecordBatchStream,
         right_stream: SendableRecordBatchStream,
     ) -> Result<SendableRecordBatchStream, ExecutionError> {
-        let left_batches = collect_stream(left_stream)
-            .await
-            .map_err(|e| ExecutionError::upstream("hash join left collect", e))?;
+        let publish_before_probe = self.publishes_cross_fragment_dfs();
+        let mut left_stream = Some(left_stream);
+        let left_batches = if publish_before_probe {
+            None
+        } else {
+            Some(
+                collect_stream(left_stream.take().unwrap())
+                    .await
+                    .map_err(|e| ExecutionError::upstream("hash join left collect", e))?,
+            )
+        };
         let right_batches = collect_stream(right_stream)
             .await
             .map_err(|e| ExecutionError::upstream("hash join right collect", e))?;
@@ -4413,6 +4434,12 @@ impl HashJoinExec {
         // (residual / outer joins). Same emit contract as the other
         // build paths.
         self.emit_cross_fragment_dfs(right_combined.as_ref());
+        let left_batches = match left_batches {
+            Some(batches) => batches,
+            None => collect_stream(left_stream.take().unwrap())
+                .await
+                .map_err(|e| ExecutionError::upstream("hash join left collect", e))?,
+        };
         self.execute_single_finish(left_batches, right_combined)
     }
 
@@ -7131,6 +7158,122 @@ mod tests {
         std::env::remove_var("ARNEB_GRACE_HJ");
     }
 
+    // #205: with Grace on (the shipped default), a join whose build fits in
+    // memory reports to the coordinator like any other producer. A producer
+    // that never reports leaves every subscribed probe scan waiting out the
+    // dynamic-filter timeout (TPC-H q07/q15/q20, most of TPC-DS).
+
+    async fn run_grace_join_and_capture(
+        join: HashJoinExec,
+        calls: &Arc<Mutex<Vec<(DynamicFilterId, Domain)>>>,
+        expected: usize,
+    ) {
+        let stream = join.execute(0).await.unwrap();
+        let _ = collect_stream(stream).await.unwrap();
+        wait_for_publish_calls(calls, expected).await;
+        // A late duplicate would also be wrong: give it time to show up.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn grace_join_with_small_build_publishes_its_domain() {
+        let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        let _grace = env_test_guard().await;
+        std::env::set_var("ARNEB_BROADCAST_DF", "true");
+        std::env::remove_var("ARNEB_DISABLE_DF");
+        std::env::set_var("ARNEB_GRACE_HJ", "1");
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let publisher = Arc::new(CapturingDynamicFilterPublisher {
+            calls: Arc::clone(&calls),
+        });
+        run_grace_join_and_capture(broadcast_df_join(publisher), &calls, 1).await;
+
+        std::env::remove_var("ARNEB_BROADCAST_DF");
+        std::env::remove_var("ARNEB_GRACE_HJ");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, DynamicFilterId(7));
+        match &calls[0].1 {
+            Domain::DistinctValues(values) => {
+                let mut values = values.clone();
+                values.sort_by_key(|v| match v {
+                    ScalarValue::Int32(v) => *v,
+                    other => panic!("expected Int32 value, got {other:?}"),
+                });
+                assert_eq!(
+                    values,
+                    vec![
+                        ScalarValue::Int32(2),
+                        ScalarValue::Int32(3),
+                        ScalarValue::Int32(5)
+                    ]
+                );
+            }
+            // Range is a sound encoding of the same keys; All would be sound
+            // but useless, so it is not accepted here.
+            Domain::Range { .. } => {}
+            other => panic!("expected the build keys, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn grace_join_with_empty_build_still_reports_once() {
+        let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        let _grace = env_test_guard().await;
+        std::env::set_var("ARNEB_BROADCAST_DF", "true");
+        std::env::remove_var("ARNEB_DISABLE_DF");
+        std::env::set_var("ARNEB_GRACE_HJ", "1");
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let publisher = Arc::new(CapturingDynamicFilterPublisher {
+            calls: Arc::clone(&calls),
+        });
+        let mut join = broadcast_df_join(publisher);
+        join.right = right_source_multi_batch(Vec::new());
+        run_grace_join_and_capture(join, &calls, 1).await;
+
+        std::env::remove_var("ARNEB_BROADCAST_DF");
+        std::env::remove_var("ARNEB_GRACE_HJ");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, DynamicFilterId(7));
+    }
+
+    #[tokio::test]
+    async fn grace_join_with_small_build_reports_every_producer_once() {
+        let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        let _grace = env_test_guard().await;
+        std::env::set_var("ARNEB_BROADCAST_DF", "true");
+        std::env::remove_var("ARNEB_DISABLE_DF");
+        std::env::set_var("ARNEB_GRACE_HJ", "1");
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let publisher = Arc::new(CapturingDynamicFilterPublisher {
+            calls: Arc::clone(&calls),
+        });
+        let mut join = broadcast_df_join(publisher);
+        join.dynamic_filter_producers
+            .push(arneb_planner::DynamicFilterProducer {
+                id: DynamicFilterId(8),
+                build_index: 0,
+                probe_index: 0,
+                column_name: "id".into(),
+            });
+        run_grace_join_and_capture(join, &calls, 2).await;
+
+        std::env::remove_var("ARNEB_BROADCAST_DF");
+        std::env::remove_var("ARNEB_GRACE_HJ");
+        let calls = calls.lock().unwrap();
+        let mut ids: Vec<DynamicFilterId> = calls.iter().map(|(id, _)| *id).collect();
+        ids.sort_by_key(|id| id.0);
+        assert_eq!(
+            ids,
+            vec![DynamicFilterId(7), DynamicFilterId(8)],
+            "{calls:?}"
+        );
+    }
+
     #[tokio::test]
     async fn copartitioned_join_publishes_no_partial_cross_fragment_domain() {
         // #192: every join partition of a task reports under the task's
@@ -9783,5 +9926,331 @@ mod tests {
             total, 2,
             "INNER residual must keep matches whose joined right.value > 0"
         );
+    }
+
+    // ---- #205 cause C: a producer must publish before it reads its own probe ----
+    //
+    // In a distributed task the probe scan and the DF-producing join can sit in
+    // the same fragment: the scan waits (on first poll) for the filter that
+    // this join publishes from its build. A join that drains its probe before
+    // publishing therefore stalls until the scan's DF timeout (TPC-DS q13).
+
+    type PublishCalls = Arc<Mutex<Vec<(DynamicFilterId, Domain)>>>;
+
+    /// Probe source that yields nothing until the build side has published.
+    #[derive(Debug)]
+    struct ProbeWaitsForPublish {
+        inner: Arc<dyn ExecutionPlan>,
+        calls: PublishCalls,
+    }
+
+    #[async_trait]
+    impl ExecutionPlan for ProbeWaitsForPublish {
+        fn schema(&self) -> Vec<ColumnInfo> {
+            self.inner.schema()
+        }
+
+        async fn execute(
+            &self,
+            partition: usize,
+        ) -> Result<SendableRecordBatchStream, ExecutionError> {
+            let inner = Arc::clone(&self.inner);
+            let calls = Arc::clone(&self.calls);
+            let schema = column_info_to_arrow_schema(&self.inner.schema());
+            let stream = async_stream::try_stream! {
+                let mut published = false;
+                for _ in 0..300 {
+                    if !calls.lock().unwrap().is_empty() {
+                        published = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                if !published {
+                    Err(ExecutionError::InvalidOperation(
+                        "probe was read before the build side published its filter".into(),
+                    ))?;
+                }
+                let mut s = inner.execute(partition).await?;
+                while let Some(batch) = s.next().await {
+                    let batch = batch.map_err(|e| ExecutionError::upstream("gated probe", e))?;
+                    yield batch;
+                }
+            };
+            Ok(Box::pin(AsyncBatchStream {
+                schema,
+                inner: Box::pin(stream),
+            }))
+        }
+
+        fn display_name(&self) -> &str {
+            "ProbeWaitsForPublish"
+        }
+    }
+
+    fn gated_probe_join(residual: Option<PlanExpr>) -> (HashJoinExec, PublishCalls) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let publisher = Arc::new(CapturingDynamicFilterPublisher {
+            calls: Arc::clone(&calls),
+        });
+        let mut join = broadcast_df_join(publisher);
+        join.left = Arc::new(ProbeWaitsForPublish {
+            inner: left_source(),
+            calls: Arc::clone(&calls),
+        });
+        join.residual = residual;
+        (join, calls)
+    }
+
+    /// Joined layout [left.id, left.name, right.id, right.value]: `left.id > 0`
+    /// keeps every equi-match and only reads the probe side.
+    fn always_true_residual() -> PlanExpr {
+        PlanExpr::BinaryOp {
+            left: Box::new(PlanExpr::Column {
+                index: 0,
+                name: "id".into(),
+                span: None,
+            }),
+            op: ast::BinaryOp::Gt,
+            right: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int32(0),
+                span: None,
+            }),
+            span: None,
+        }
+    }
+
+    async fn run_gated_join(join: HashJoinExec) -> Result<usize, String> {
+        let stream = join.execute(0).await.map_err(|e| e.to_string())?;
+        let batches = collect_stream(stream).await.map_err(|e| e.to_string())?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum())
+    }
+
+    #[tokio::test]
+    async fn residual_join_publishes_before_reading_its_probe() {
+        let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        let _grace = env_test_guard().await;
+        std::env::set_var("ARNEB_BROADCAST_DF", "true");
+        std::env::remove_var("ARNEB_DISABLE_DF");
+
+        let (join, calls) = gated_probe_join(Some(always_true_residual()));
+        let rows = run_gated_join(join).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        std::env::remove_var("ARNEB_BROADCAST_DF");
+        assert_eq!(rows, Ok(2));
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, DynamicFilterId(7));
+    }
+
+    #[tokio::test]
+    async fn residual_join_with_empty_build_publishes_before_reading_its_probe() {
+        let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        let _grace = env_test_guard().await;
+        std::env::set_var("ARNEB_BROADCAST_DF", "true");
+        std::env::remove_var("ARNEB_DISABLE_DF");
+
+        let (mut join, calls) = gated_probe_join(Some(always_true_residual()));
+        join.right = right_source_multi_batch(Vec::new());
+        let rows = run_gated_join(join).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        std::env::remove_var("ARNEB_BROADCAST_DF");
+        assert_eq!(rows, Ok(0));
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, DynamicFilterId(7));
+    }
+
+    #[tokio::test]
+    async fn non_grace_join_publishes_before_reading_its_probe() {
+        let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        let _grace = env_test_guard().await;
+        std::env::set_var("ARNEB_BROADCAST_DF", "true");
+        std::env::remove_var("ARNEB_DISABLE_DF");
+        std::env::set_var("ARNEB_GRACE_HJ", "0");
+
+        let (join, calls) = gated_probe_join(None);
+        let rows = run_gated_join(join).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        std::env::remove_var("ARNEB_BROADCAST_DF");
+        std::env::remove_var("ARNEB_GRACE_HJ");
+        assert_eq!(rows, Ok(2));
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, DynamicFilterId(7));
+    }
+
+    #[tokio::test]
+    async fn grace_join_publishes_before_reading_its_probe() {
+        let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        let _grace = env_test_guard().await;
+        std::env::set_var("ARNEB_BROADCAST_DF", "true");
+        std::env::remove_var("ARNEB_DISABLE_DF");
+        std::env::set_var("ARNEB_GRACE_HJ", "1");
+
+        let (join, calls) = gated_probe_join(None);
+        let rows = run_gated_join(join).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        std::env::remove_var("ARNEB_BROADCAST_DF");
+        std::env::remove_var("ARNEB_GRACE_HJ");
+        assert_eq!(rows, Ok(2));
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+    }
+
+    // ---- #205 cause C guard: without a filter to publish, keep reading the probe first ----
+    //
+    // The no-spill path (residual / outer joins) used to drain the probe before the
+    // build. The build side's exchange keeps receiving in the background meanwhile,
+    // so that order overlaps the two; reading the build first only pays off when the
+    // join has a filter to publish before its probe is read.
+
+    #[derive(Debug)]
+    struct ProbeMarksPolled {
+        inner: Arc<dyn ExecutionPlan>,
+        polled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ExecutionPlan for ProbeMarksPolled {
+        fn schema(&self) -> Vec<ColumnInfo> {
+            self.inner.schema()
+        }
+
+        async fn execute(
+            &self,
+            partition: usize,
+        ) -> Result<SendableRecordBatchStream, ExecutionError> {
+            let inner = Arc::clone(&self.inner);
+            let polled = Arc::clone(&self.polled);
+            let schema = column_info_to_arrow_schema(&self.inner.schema());
+            let stream = async_stream::try_stream! {
+                polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                let mut s = inner.execute(partition).await?;
+                while let Some(batch) = s.next().await {
+                    let batch = batch.map_err(|e| ExecutionError::upstream("marked probe", e))?;
+                    yield batch;
+                }
+            };
+            Ok(Box::pin(AsyncBatchStream {
+                schema,
+                inner: Box::pin(stream),
+            }))
+        }
+
+        fn display_name(&self) -> &str {
+            "ProbeMarksPolled"
+        }
+    }
+
+    /// Build source that yields nothing until the probe side has been polled.
+    #[derive(Debug)]
+    struct BuildWaitsForProbe {
+        inner: Arc<dyn ExecutionPlan>,
+        polled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ExecutionPlan for BuildWaitsForProbe {
+        fn schema(&self) -> Vec<ColumnInfo> {
+            self.inner.schema()
+        }
+
+        async fn execute(
+            &self,
+            partition: usize,
+        ) -> Result<SendableRecordBatchStream, ExecutionError> {
+            let inner = Arc::clone(&self.inner);
+            let polled = Arc::clone(&self.polled);
+            let schema = column_info_to_arrow_schema(&self.inner.schema());
+            let stream = async_stream::try_stream! {
+                let mut seen = false;
+                for _ in 0..300 {
+                    if polled.load(std::sync::atomic::Ordering::SeqCst) {
+                        seen = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                if !seen {
+                    Err(ExecutionError::InvalidOperation(
+                        "build was read before the probe".into(),
+                    ))?;
+                }
+                let mut s = inner.execute(partition).await?;
+                while let Some(batch) = s.next().await {
+                    let batch = batch.map_err(|e| ExecutionError::upstream("gated build", e))?;
+                    yield batch;
+                }
+            };
+            Ok(Box::pin(AsyncBatchStream {
+                schema,
+                inner: Box::pin(stream),
+            }))
+        }
+
+        fn display_name(&self) -> &str {
+            "BuildWaitsForProbe"
+        }
+    }
+
+    fn probe_first_residual_join(
+        producers: Vec<arneb_planner::DynamicFilterProducer>,
+    ) -> (HashJoinExec, PublishCalls) {
+        let calls: PublishCalls = Arc::new(Mutex::new(Vec::new()));
+        let publisher = Arc::new(CapturingDynamicFilterPublisher {
+            calls: Arc::clone(&calls),
+        });
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut join = broadcast_df_join(publisher);
+        join.left = Arc::new(ProbeMarksPolled {
+            inner: left_source(),
+            polled: Arc::clone(&polled),
+        });
+        join.right = Arc::new(BuildWaitsForProbe {
+            inner: right_source(),
+            polled,
+        });
+        join.residual = Some(always_true_residual());
+        join.dynamic_filter_producers = producers;
+        (join, calls)
+    }
+
+    #[tokio::test]
+    async fn residual_join_without_filters_reads_its_probe_first() {
+        let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        let _grace = env_test_guard().await;
+        std::env::set_var("ARNEB_BROADCAST_DF", "true");
+        std::env::remove_var("ARNEB_DISABLE_DF");
+
+        let (join, calls) = probe_first_residual_join(Vec::new());
+        let rows = run_gated_join(join).await;
+
+        std::env::remove_var("ARNEB_BROADCAST_DF");
+        assert_eq!(rows, Ok(2));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn residual_join_with_filters_off_reads_its_probe_first() {
+        let _env = BROADCAST_DF_TEST_ENV.lock().await;
+        let _grace = env_test_guard().await;
+        std::env::remove_var("ARNEB_BROADCAST_DF");
+        std::env::remove_var("ARNEB_DISABLE_DF");
+
+        let (join, calls) = probe_first_residual_join(vec![arneb_planner::DynamicFilterProducer {
+            id: DynamicFilterId(7),
+            build_index: 0,
+            probe_index: 0,
+            column_name: "id".into(),
+        }]);
+        let rows = run_gated_join(join).await;
+
+        assert_eq!(rows, Ok(2));
+        assert!(calls.lock().unwrap().is_empty());
     }
 }

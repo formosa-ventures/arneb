@@ -63,3 +63,51 @@ jobs:
           install_only: true
       - name: Smoke test
         run: scripts/k8s-smoke/run.sh "$RUNNER_TEMP/tpch"
+
+  acceptance:
+    # The headless acceptance scenario (scripts/headless-acceptance.sh) on
+    # kind, against a hive catalog (HMS + RustFS, TPC-H SF1 seeded by
+    # Trino), a PostgreSQL catalog and Keycloak, all from docker-compose.yml.
+    # See scripts/k8s-smoke/acceptance.sh.
+    name: kind (headless acceptance)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/arneb/Dockerfile
+          load: true
+          tags: arneb:ci
+          cache-from: type=gha,scope=kind
+      - name: Start HMS, RustFS and PostgreSQL
+        run: |
+          docker compose up -d --wait s3
+          docker compose run --rm s3-init
+          docker compose up -d --wait hive-metastore postgres trino trino-worker-1 trino-worker-2
+      - name: Seed TPC-H SF1 (hive and PostgreSQL)
+        run: |
+          docker compose run --rm tpch-seed
+          docker compose run --rm pg-tpch-seed
+          docker compose stop trino trino-worker-1 trino-worker-2
+      - name: Start Keycloak
+        run: |
+          docker compose --profile oauth up -d keycloak
+          for _ in $(seq 1 90); do
+            curl -sf http://127.0.0.1:8180/realms/arneb/.well-known/openid-configuration >/dev/null && exit 0
+            sleep 2
+          done
+          docker compose logs keycloak | tail -40; exit 1
+      - uses: azure/setup-helm@v5
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - name: Acceptance scenario
+        env:
+          KIND_CONNECT: >-
+            arneb-hive-metastore-1=hive-metastore arneb-s3-1=s3
+            arneb-postgres-1=postgres arneb-keycloak-1=keycloak
+        run: scripts/k8s-smoke/acceptance.sh

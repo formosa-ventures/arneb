@@ -1,5 +1,6 @@
 //! Hash join operator and supporting hash table.
 
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -9,7 +10,8 @@ use arneb_common::types::ColumnInfo;
 use arneb_planner::PlanExpr;
 use arneb_sql_parser::ast;
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, DictionaryArray, RecordBatch, UInt32Array,
+    Array, ArrayRef, AsArray, BinaryArray, BooleanArray, DictionaryArray, RecordBatch, StringArray,
+    UInt32Array,
 };
 use arrow::compute;
 use arrow::compute::kernels::{boolean, cmp};
@@ -411,17 +413,17 @@ impl MultiBatchBuild {
 /// INNER probe of one left batch against a [`MultiBatchBuild`]. Output rows
 /// are gathered with `compute::take` (left — one batch) + `compute::interleave`
 /// (right — across the build batches), so the wide build never concatenates.
-/// INNER + no-residual only (the grace single-build shape); returns `None`
-/// when no rows match. `output_schema` is the joined left++right schema.
+/// INNER + no-residual only (the grace single-build shape).
+/// `output_schema` is the joined left++right schema.
 fn probe_one_left_batch_multi_inner(
     left_batch: &RecordBatch,
     build: &MultiBatchBuild,
     left_keys: &[usize],
     output_schema: &Arc<Schema>,
-) -> Result<Option<RecordBatch>, ExecutionError> {
+) -> Result<Vec<RecordBatch>, ExecutionError> {
     let left_rows = left_batch.num_rows();
     if left_rows == 0 || build.batches.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let left_typed = TypedKeys::new(left_batch, left_keys)?;
     // Per-batch build key columns. Rebuilt per left batch (cheap downcasts)
@@ -480,7 +482,7 @@ fn probe_one_left_batch_multi_inner(
             }
         }
         if cand_left.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         let mut eq_mask: Option<BooleanArray> = None;
@@ -544,33 +546,70 @@ fn probe_one_left_batch_multi_inner(
         }
     }
     if cand_left.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
-    let left_idx = UInt32Array::from(cand_left);
-    let mut columns: Vec<ArrayRef> =
-        Vec::with_capacity(left_batch.num_columns() + build.num_columns());
-    for col_i in 0..left_batch.num_columns() {
-        columns.push(compute::take(left_batch.column(col_i), &left_idx, None)?);
+    let variable_cols: Vec<usize> = (0..left_batch.num_columns() + build.num_columns())
+        .filter(|&col| {
+            if col < left_batch.num_columns() {
+                is_variable_width(left_batch.column(col).as_ref())
+            } else {
+                is_variable_width(
+                    build.batches[0]
+                        .column(col - left_batch.num_columns())
+                        .as_ref(),
+                )
+            }
+        })
+        .collect();
+    let ranges = split_output_ranges_by(
+        cand_left.len(),
+        variable_cols.len(),
+        i32::MAX as usize,
+        |variable_col, row| {
+            let col = variable_cols[variable_col];
+            if col < left_batch.num_columns() {
+                variable_value_bytes(left_batch.column(col).as_ref(), cand_left[row] as usize)
+            } else {
+                let (batch, right_row) = cand_right[row];
+                variable_value_bytes(
+                    build.batches[batch]
+                        .column(col - left_batch.num_columns())
+                        .as_ref(),
+                    right_row,
+                )
+            }
+        },
+    );
+    let mut out = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let left_idx = UInt32Array::from(cand_left[range.clone()].to_vec());
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(left_batch.num_columns() + build.num_columns());
+        for col_i in 0..left_batch.num_columns() {
+            columns.push(compute::take(left_batch.column(col_i), &left_idx, None)?);
+        }
+        for col_i in 0..build.num_columns() {
+            let arrays: Vec<&dyn Array> = build
+                .batches
+                .iter()
+                .map(|b| b.column(col_i).as_ref())
+                .collect();
+            columns.push(compute::interleave(&arrays, &cand_right[range.clone()])?);
+        }
+        out.push(RecordBatch::try_new(output_schema.clone(), columns)?);
     }
-    // Right columns: interleave across the build batches (no concat → no
-    // input+output doubling on the wide payload).
-    for col_i in 0..build.num_columns() {
-        let arrays: Vec<&dyn Array> = build
-            .batches
-            .iter()
-            .map(|b| b.column(col_i).as_ref())
-            .collect();
-        columns.push(compute::interleave(&arrays, &cand_right)?);
-    }
-    Ok(Some(RecordBatch::try_new(output_schema.clone(), columns)?))
+    Ok(out)
 }
 
 fn vec_probe_key_types_supported(batch: &RecordBatch, key_indices: &[usize]) -> bool {
     key_indices.iter().all(|&i| {
         !matches!(
             batch.column(i).data_type(),
-            ArrowDataType::Float32 | ArrowDataType::Float64
+            ArrowDataType::Float32
+                | ArrowDataType::Float64
+                | ArrowDataType::Utf8
+                | ArrowDataType::Binary
         )
     })
 }
@@ -2532,14 +2571,16 @@ impl HashJoinExec {
                 if !cand_left.is_empty() {
                     for slice_start in (0..cand_left.len()).step_by(MULTIPASS_OUTPUT_BATCH_ROWS) {
                         let slice_end = (slice_start + MULTIPASS_OUTPUT_BATCH_ROWS).min(cand_left.len());
-                        let out_batch = build_joined_slice(
+                        let out_batches = build_joined_slice(
                             &left_combined,
                             &right_batch,
                             &cand_left[slice_start..slice_end],
                             &cand_right[slice_start..slice_end],
                             &output_schema_for_stream,
                         )?;
-                        yield out_batch;
+                        for out_batch in out_batches {
+                            yield out_batch;
+                        }
                     }
                 }
                 multipass_total_probe_ms += t_chunk_probe.elapsed().as_millis() as u64;
@@ -2669,14 +2710,16 @@ impl HashJoinExec {
                             {
                                 let slice_end = (slice_start + MULTIPASS_OUTPUT_BATCH_ROWS)
                                     .min(cand_left.len());
-                                let out = build_joined_slice(
+                                let out_batches = build_joined_slice(
                                     &left_batch,
                                     right_batch,
                                     &cand_left[slice_start..slice_end],
                                     &cand_right[slice_start..slice_end],
                                     &output_schema_for_stream,
                                 )?;
-                                yield out;
+                                for out in out_batches {
+                                    yield out;
+                                }
                             }
                         }
                         None => {
@@ -2793,14 +2836,16 @@ impl HashJoinExec {
                     {
                         let slice_end =
                             (slice_start + MULTIPASS_OUTPUT_BATCH_ROWS).min(cand_left.len());
-                        let out = build_joined_slice(
+                        let out_batches = build_joined_slice(
                             &probe_batch,
                             &combined,
                             &cand_left[slice_start..slice_end],
                             &cand_right[slice_start..slice_end],
                             &output_schema_for_stream,
                         )?;
-                        yield out;
+                        for out in out_batches {
+                            yield out;
+                        }
                     }
                 }
 
@@ -2937,14 +2982,16 @@ impl HashJoinExec {
                             {
                                 let slice_end = (slice_start + MULTIPASS_OUTPUT_BATCH_ROWS)
                                     .min(cand_left.len());
-                                let out = build_joined_slice(
+                                let out_batches = build_joined_slice(
                                     &left_batch,
                                     right_batch,
                                     &cand_left[slice_start..slice_end],
                                     &cand_right[slice_start..slice_end],
                                     &output_schema_for_stream,
                                 )?;
-                                yield out;
+                                for out in out_batches {
+                                    yield out;
+                                }
                             }
                         }
                         None => {
@@ -3056,14 +3103,16 @@ impl HashJoinExec {
                     {
                         let slice_end =
                             (slice_start + MULTIPASS_OUTPUT_BATCH_ROWS).min(cand_left.len());
-                        let out = build_joined_slice(
+                        let out_batches = build_joined_slice(
                             &probe_batch,
                             &combined,
                             &cand_left[slice_start..slice_end],
                             &cand_right[slice_start..slice_end],
                             &output_schema_for_stream,
                         )?;
-                        yield out;
+                        for out in out_batches {
+                            yield out;
+                        }
                     }
                 }
                 // Drop partition state before next p.
@@ -4675,35 +4724,28 @@ impl HashJoinExec {
                     pending.push(b);
                 }
                 if pending_rows >= STREAMING_OUTPUT_TARGET_ROWS {
-                    let merged = if pending.len() == 1 {
-                        pending.pop().expect("len == 1")
-                    } else {
-                        compute::concat_batches(&output_schema_for_stream, pending.iter())?
-                    };
-                    pending.clear();
+                    for merged in flush_join_pending(&mut pending, &output_schema_for_stream)? {
+                        output_rows += merged.num_rows() as u64;
+                        output_batches += 1;
+                        yield merged;
+                    }
                     pending_rows = 0;
+                }
+            }
+
+            // Flush any pending output below the target threshold.
+            if !pending.is_empty() {
+                for merged in flush_join_pending(&mut pending, &output_schema_for_stream)? {
                     output_rows += merged.num_rows() as u64;
                     output_batches += 1;
                     yield merged;
                 }
             }
 
-            // Flush any pending output below the target threshold.
-            if !pending.is_empty() {
-                let merged = if pending.len() == 1 {
-                    pending.pop().expect("len == 1")
-                } else {
-                    compute::concat_batches(&output_schema_for_stream, pending.iter())?
-                };
-                output_rows += merged.num_rows() as u64;
-                output_batches += 1;
-                yield merged;
-            }
-
             // RIGHT/FULL: one final unmatched-right tail batch after
             // every left batch has had a chance to update right_matched.
             if matches!(join_type, ast::JoinType::Right | ast::JoinType::Full) {
-                if let Some(tail) = build_unmatched_right_tail(
+                for tail in build_unmatched_right_tail(
                     &right_batch,
                     &right_matched,
                     &output_schema_for_stream,
@@ -4804,27 +4846,20 @@ impl HashJoinExec {
                     pending.push(b);
                 }
                 if pending_rows >= STREAMING_OUTPUT_TARGET_ROWS {
-                    let merged = if pending.len() == 1 {
-                        pending.pop().expect("len == 1")
-                    } else {
-                        compute::concat_batches(&output_schema_for_stream, pending.iter())?
-                    };
-                    pending.clear();
+                    for merged in flush_join_pending(&mut pending, &output_schema_for_stream)? {
+                        output_rows += merged.num_rows() as u64;
+                        output_batches += 1;
+                        yield merged;
+                    }
                     pending_rows = 0;
+                }
+            }
+            if !pending.is_empty() {
+                for merged in flush_join_pending(&mut pending, &output_schema_for_stream)? {
                     output_rows += merged.num_rows() as u64;
                     output_batches += 1;
                     yield merged;
                 }
-            }
-            if !pending.is_empty() {
-                let merged = if pending.len() == 1 {
-                    pending.pop().expect("len == 1")
-                } else {
-                    compute::concat_batches(&output_schema_for_stream, pending.iter())?
-                };
-                output_rows += merged.num_rows() as u64;
-                output_batches += 1;
-                yield merged;
             }
             tracing::info!(
                 target: "arneb::profile",
@@ -4930,7 +4965,7 @@ impl HashJoinExec {
                     continue;
                 }
                 probe_input_rows += left_batch.num_rows() as u64;
-                if let Some(out) = probe_one_left_batch_multi_inner(
+                for out in probe_one_left_batch_multi_inner(
                     &left_batch,
                     &build,
                     &left_keys,
@@ -5050,30 +5085,33 @@ impl HashJoinExec {
         if !left_indices.is_empty() {
             let use_dict_probe_build =
                 dict_probe_build && matches!(self.join_type, ast::JoinType::Inner);
-            let left_idx = UInt32Array::from(left_indices);
-            let right_idx = UInt32Array::from(right_indices);
-
-            let mut columns = Vec::new();
-            for col_i in 0..left_batch.num_columns() {
-                columns.push(compute::take(left_batch.column(col_i), &left_idx, None)?);
-            }
-            for col_i in 0..right_batch.num_columns() {
-                if use_dict_probe_build {
-                    let dict = DictionaryArray::<UInt32Type>::try_new(
-                        right_idx.clone(),
-                        right_batch.column(col_i).clone(),
-                    )?;
-                    columns.push(Arc::new(dict) as ArrayRef);
-                } else {
-                    columns.push(compute::take(right_batch.column(col_i), &right_idx, None)?);
-                }
-            }
             let batch_schema = if use_dict_probe_build {
                 self.build_dict_probe_output_schema(left_batch, right_batch)
             } else {
                 output_schema.clone()
             };
-            all_batches.push(RecordBatch::try_new(batch_schema, columns)?);
+            for range in
+                joined_output_ranges(left_batch, right_batch, &left_indices, &right_indices)
+            {
+                let left_idx = UInt32Array::from(left_indices[range.clone()].to_vec());
+                let right_idx = UInt32Array::from(right_indices[range].to_vec());
+                let mut columns = Vec::new();
+                for col_i in 0..left_batch.num_columns() {
+                    columns.push(compute::take(left_batch.column(col_i), &left_idx, None)?);
+                }
+                for col_i in 0..right_batch.num_columns() {
+                    if use_dict_probe_build {
+                        let dict = DictionaryArray::<UInt32Type>::try_new(
+                            right_idx.clone(),
+                            right_batch.column(col_i).clone(),
+                        )?;
+                        columns.push(Arc::new(dict) as ArrayRef);
+                    } else {
+                        columns.push(compute::take(right_batch.column(col_i), &right_idx, None)?);
+                    }
+                }
+                all_batches.push(RecordBatch::try_new(batch_schema.clone(), columns)?);
+            }
         }
 
         // LEFT/FULL: unmatched left rows with NULL right columns.
@@ -5087,19 +5125,21 @@ impl HashJoinExec {
                 .map(|(i, _)| i as u32)
                 .collect();
             if !unmatched.is_empty() {
-                let idx = UInt32Array::from(unmatched);
-                let mut cols: Vec<ArrayRef> = Vec::new();
-                for col_i in 0..left_batch.num_columns() {
-                    cols.push(compute::take(left_batch.column(col_i), &idx, None)?);
+                for range in take_output_ranges(left_batch, &unmatched) {
+                    let idx = UInt32Array::from(unmatched[range].to_vec());
+                    let mut cols: Vec<ArrayRef> = Vec::new();
+                    for col_i in 0..left_batch.num_columns() {
+                        cols.push(compute::take(left_batch.column(col_i), &idx, None)?);
+                    }
+                    let null_len = idx.len();
+                    for col_i in 0..right_batch.num_columns() {
+                        cols.push(arrow::array::new_null_array(
+                            right_batch.column(col_i).data_type(),
+                            null_len,
+                        ));
+                    }
+                    all_batches.push(RecordBatch::try_new(output_schema.clone(), cols)?);
                 }
-                let null_len = idx.len();
-                for col_i in 0..right_batch.num_columns() {
-                    cols.push(arrow::array::new_null_array(
-                        right_batch.column(col_i).data_type(),
-                        null_len,
-                    ));
-                }
-                all_batches.push(RecordBatch::try_new(output_schema.clone(), cols)?);
             }
         }
 
@@ -5114,19 +5154,21 @@ impl HashJoinExec {
                 .map(|(i, _)| i as u32)
                 .collect();
             if !unmatched.is_empty() {
-                let idx = UInt32Array::from(unmatched);
-                let null_len = idx.len();
-                let mut cols: Vec<ArrayRef> = Vec::new();
-                for col_i in 0..left_batch.num_columns() {
-                    cols.push(arrow::array::new_null_array(
-                        left_batch.column(col_i).data_type(),
-                        null_len,
-                    ));
+                for range in take_output_ranges(right_batch, &unmatched) {
+                    let idx = UInt32Array::from(unmatched[range].to_vec());
+                    let null_len = idx.len();
+                    let mut cols: Vec<ArrayRef> = Vec::new();
+                    for col_i in 0..left_batch.num_columns() {
+                        cols.push(arrow::array::new_null_array(
+                            left_batch.column(col_i).data_type(),
+                            null_len,
+                        ));
+                    }
+                    for col_i in 0..right_batch.num_columns() {
+                        cols.push(compute::take(right_batch.column(col_i), &idx, None)?);
+                    }
+                    all_batches.push(RecordBatch::try_new(output_schema.clone(), cols)?);
                 }
-                for col_i in 0..right_batch.num_columns() {
-                    cols.push(compute::take(right_batch.column(col_i), &idx, None)?);
-                }
-                all_batches.push(RecordBatch::try_new(output_schema.clone(), cols)?);
             }
         }
 
@@ -5151,32 +5193,30 @@ impl HashJoinExec {
             return Ok((cand_left, cand_right));
         }
 
-        let left_idx = UInt32Array::from(cand_left.clone());
-        let right_idx = UInt32Array::from(cand_right.clone());
-        let mut cols: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
-        for col_i in 0..left_batch.num_columns() {
-            cols.push(compute::take(left_batch.column(col_i), &left_idx, None)?);
-        }
-        for col_i in 0..right_batch.num_columns() {
-            cols.push(compute::take(right_batch.column(col_i), &right_idx, None)?);
-        }
-        let joined = RecordBatch::try_new(output_schema.clone(), cols)?;
-        let mask_arr = crate::expression::evaluate(residual, &joined, None)?;
-        let mask = mask_arr
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                ExecutionError::InvalidOperation(
-                    "hash join residual predicate must evaluate to boolean".into(),
-                )
-            })?;
-
         let mut kept_left = Vec::with_capacity(cand_left.len());
         let mut kept_right = Vec::with_capacity(cand_right.len());
-        for i in 0..mask.len() {
-            if !mask.is_null(i) && mask.value(i) {
-                kept_left.push(cand_left[i]);
-                kept_right.push(cand_right[i]);
+        for range in joined_output_ranges(left_batch, right_batch, &cand_left, &cand_right) {
+            let joined = build_joined_batch(
+                left_batch,
+                right_batch,
+                &cand_left[range.clone()],
+                &cand_right[range.clone()],
+                output_schema,
+            )?;
+            let mask_arr = crate::expression::evaluate(residual, &joined, None)?;
+            let mask = mask_arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    ExecutionError::InvalidOperation(
+                        "hash join residual predicate must evaluate to boolean".into(),
+                    )
+                })?;
+            for i in 0..mask.len() {
+                if !mask.is_null(i) && mask.value(i) {
+                    kept_left.push(cand_left[range.start + i]);
+                    kept_right.push(cand_right[range.start + i]);
+                }
             }
         }
         Ok((kept_left, kept_right))
@@ -5311,6 +5351,162 @@ const MULTIPASS_OUTPUT_BATCH_ROWS: usize = 1024;
 /// eliminates the `concat_batches(left)` OOM on multi-million-row
 /// probes (Q09).
 const STREAMING_OUTPUT_TARGET_ROWS: usize = 1024;
+
+fn variable_value_bytes(array: &dyn Array, row: usize) -> usize {
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        return values.value_length(row) as usize;
+    }
+    if let Some(values) = array.as_any().downcast_ref::<BinaryArray>() {
+        return values.value_length(row) as usize;
+    }
+    0
+}
+
+fn is_variable_width(array: &dyn Array) -> bool {
+    matches!(
+        array.data_type(),
+        ArrowDataType::Utf8 | ArrowDataType::Binary
+    )
+}
+
+fn split_output_ranges_by(
+    rows: usize,
+    columns: usize,
+    max_bytes: usize,
+    mut value_bytes: impl FnMut(usize, usize) -> usize,
+) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut totals = vec![0usize; columns];
+    let mut lengths = vec![0usize; columns];
+    let mut start = 0;
+    for row in 0..rows {
+        for (col, length) in lengths.iter_mut().enumerate() {
+            *length = value_bytes(col, row);
+        }
+        if row > start
+            && lengths
+                .iter()
+                .enumerate()
+                .any(|(col, &length)| totals[col] > max_bytes.saturating_sub(length))
+        {
+            ranges.push(start..row);
+            totals.fill(0);
+            start = row;
+        }
+        for (total, length) in totals.iter_mut().zip(&lengths) {
+            *total += *length;
+        }
+    }
+    if start < rows {
+        ranges.push(start..rows);
+    }
+    ranges
+}
+
+fn split_join_output_ranges(
+    columns: &[(&dyn Array, &[u32])],
+    max_bytes: usize,
+) -> Vec<Range<usize>> {
+    let rows = columns.first().map_or(0, |(_, indices)| indices.len());
+    split_output_ranges_by(rows, columns.len(), max_bytes, |col, row| {
+        let (array, indices) = columns[col];
+        variable_value_bytes(array, indices[row] as usize)
+    })
+}
+
+pub(crate) fn joined_output_ranges(
+    left_batch: &RecordBatch,
+    right_batch: &RecordBatch,
+    left_indices: &[u32],
+    right_indices: &[u32],
+) -> Vec<Range<usize>> {
+    let columns: Vec<(&dyn Array, &[u32])> = left_batch
+        .columns()
+        .iter()
+        .filter(|column| is_variable_width(column.as_ref()))
+        .map(|column| (column.as_ref(), left_indices))
+        .chain(
+            right_batch
+                .columns()
+                .iter()
+                .filter(|column| is_variable_width(column.as_ref()))
+                .map(|column| (column.as_ref(), right_indices)),
+        )
+        .collect();
+    if columns.is_empty() {
+        split_output_ranges_by(left_indices.len(), 0, i32::MAX as usize, |_, _| 0)
+    } else {
+        split_join_output_ranges(&columns, i32::MAX as usize)
+    }
+}
+
+fn take_output_ranges(batch: &RecordBatch, indices: &[u32]) -> Vec<Range<usize>> {
+    let columns: Vec<(&dyn Array, &[u32])> = batch
+        .columns()
+        .iter()
+        .filter(|column| is_variable_width(column.as_ref()))
+        .map(|column| (column.as_ref(), indices))
+        .collect();
+    if columns.is_empty() {
+        split_output_ranges_by(indices.len(), 0, i32::MAX as usize, |_, _| 0)
+    } else {
+        split_join_output_ranges(&columns, i32::MAX as usize)
+    }
+}
+
+fn flush_join_pending(
+    pending: &mut Vec<RecordBatch>,
+    schema: &Arc<Schema>,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+    let mut out = Vec::new();
+    let mut group = Vec::new();
+    let mut group_rows = 0usize;
+    let mut totals = vec![0usize; schema.fields().len()];
+    for batch in pending.drain(..) {
+        let bytes: Vec<usize> = batch
+            .columns()
+            .iter()
+            .map(|column| {
+                if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
+                    values.value_data().len()
+                } else if let Some(values) = column.as_any().downcast_ref::<BinaryArray>() {
+                    values.value_data().len()
+                } else {
+                    0
+                }
+            })
+            .collect();
+        if !group.is_empty()
+            && (group_rows + batch.num_rows() > STREAMING_OUTPUT_TARGET_ROWS
+                || totals
+                    .iter()
+                    .zip(&bytes)
+                    .any(|(&total, &bytes)| total > (i32::MAX as usize).saturating_sub(bytes)))
+        {
+            out.push(if group.len() == 1 {
+                group.pop().expect("len == 1")
+            } else {
+                compute::concat_batches(schema, group.iter())?
+            });
+            group.clear();
+            totals.fill(0);
+            group_rows = 0;
+        }
+        for (total, bytes) in totals.iter_mut().zip(bytes) {
+            *total += bytes;
+        }
+        group_rows += batch.num_rows();
+        group.push(batch);
+    }
+    if !group.is_empty() {
+        out.push(if group.len() == 1 {
+            group.pop().expect("len == 1")
+        } else {
+            compute::concat_batches(schema, group.iter())?
+        });
+    }
+    Ok(out)
+}
 
 /// Number of hash partitions Grace Hash Join (Phase 3b.5) carves the
 /// build/probe sides into. Power-of-2 to enable future AND-mask
@@ -5650,6 +5846,26 @@ fn build_joined_slice(
     cand_left: &[u32],
     cand_right: &[u32],
     output_schema: &Arc<Schema>,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+    let mut batches = Vec::new();
+    for range in joined_output_ranges(left_batch, right_batch, cand_left, cand_right) {
+        batches.push(build_joined_batch(
+            left_batch,
+            right_batch,
+            &cand_left[range.clone()],
+            &cand_right[range],
+            output_schema,
+        )?);
+    }
+    Ok(batches)
+}
+
+fn build_joined_batch(
+    left_batch: &RecordBatch,
+    right_batch: &RecordBatch,
+    cand_left: &[u32],
+    cand_right: &[u32],
+    output_schema: &Arc<Schema>,
 ) -> Result<RecordBatch, ExecutionError> {
     let left_idx = UInt32Array::from(cand_left.to_vec());
     let right_idx = UInt32Array::from(cand_right.to_vec());
@@ -5724,7 +5940,7 @@ fn probe_partition_batch_inmem(
             }
             for slice_start in (0..cand_left.len()).step_by(MULTIPASS_OUTPUT_BATCH_ROWS) {
                 let slice_end = (slice_start + MULTIPASS_OUTPUT_BATCH_ROWS).min(cand_left.len());
-                out.push(build_joined_slice(
+                out.extend(build_joined_slice(
                     left_batch,
                     right_batch,
                     &cand_left[slice_start..slice_end],
@@ -5823,16 +6039,13 @@ fn probe_one_left_batch(
 
     // Matched rows.
     if !left_indices.is_empty() {
-        let left_idx = UInt32Array::from(left_indices);
-        let right_idx = UInt32Array::from(right_indices);
-        let mut columns: Vec<ArrayRef> = Vec::new();
-        for col_i in 0..left_batch.num_columns() {
-            columns.push(compute::take(left_batch.column(col_i), &left_idx, None)?);
-        }
-        for col_i in 0..right_batch.num_columns() {
-            columns.push(compute::take(right_batch.column(col_i), &right_idx, None)?);
-        }
-        out.push(RecordBatch::try_new(output_schema.clone(), columns)?);
+        out.extend(build_joined_slice(
+            left_batch,
+            right_batch,
+            &left_indices,
+            &right_indices,
+            output_schema,
+        )?);
     }
 
     // LEFT/FULL: unmatched left rows with NULL right columns. This is
@@ -5846,19 +6059,21 @@ fn probe_one_left_batch(
             .map(|(i, _)| i as u32)
             .collect();
         if !unmatched.is_empty() {
-            let idx = UInt32Array::from(unmatched);
-            let null_len = idx.len();
-            let mut cols: Vec<ArrayRef> = Vec::new();
-            for col_i in 0..left_batch.num_columns() {
-                cols.push(compute::take(left_batch.column(col_i), &idx, None)?);
+            for range in take_output_ranges(left_batch, &unmatched) {
+                let idx = UInt32Array::from(unmatched[range].to_vec());
+                let null_len = idx.len();
+                let mut cols: Vec<ArrayRef> = Vec::new();
+                for col_i in 0..left_batch.num_columns() {
+                    cols.push(compute::take(left_batch.column(col_i), &idx, None)?);
+                }
+                for col_i in 0..right_batch.num_columns() {
+                    cols.push(arrow::array::new_null_array(
+                        right_batch.column(col_i).data_type(),
+                        null_len,
+                    ));
+                }
+                out.push(RecordBatch::try_new(output_schema.clone(), cols)?);
             }
-            for col_i in 0..right_batch.num_columns() {
-                cols.push(arrow::array::new_null_array(
-                    right_batch.column(col_i).data_type(),
-                    null_len,
-                ));
-            }
-            out.push(RecordBatch::try_new(output_schema.clone(), cols)?);
         }
     }
 
@@ -5880,32 +6095,30 @@ fn filter_candidates_free(
         return Ok((cand_left, cand_right));
     }
 
-    let left_idx = UInt32Array::from(cand_left.clone());
-    let right_idx = UInt32Array::from(cand_right.clone());
-    let mut cols: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
-    for col_i in 0..left_batch.num_columns() {
-        cols.push(compute::take(left_batch.column(col_i), &left_idx, None)?);
-    }
-    for col_i in 0..right_batch.num_columns() {
-        cols.push(compute::take(right_batch.column(col_i), &right_idx, None)?);
-    }
-    let joined = RecordBatch::try_new(output_schema.clone(), cols)?;
-    let mask_arr = crate::expression::evaluate(residual, &joined, None)?;
-    let mask = mask_arr
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| {
-            ExecutionError::InvalidOperation(
-                "hash join residual predicate must evaluate to boolean".into(),
-            )
-        })?;
-
     let mut kept_left = Vec::with_capacity(cand_left.len());
     let mut kept_right = Vec::with_capacity(cand_right.len());
-    for i in 0..mask.len() {
-        if !mask.is_null(i) && mask.value(i) {
-            kept_left.push(cand_left[i]);
-            kept_right.push(cand_right[i]);
+    for range in joined_output_ranges(left_batch, right_batch, &cand_left, &cand_right) {
+        let joined = build_joined_batch(
+            left_batch,
+            right_batch,
+            &cand_left[range.clone()],
+            &cand_right[range.clone()],
+            output_schema,
+        )?;
+        let mask_arr = crate::expression::evaluate(residual, &joined, None)?;
+        let mask = mask_arr
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                ExecutionError::InvalidOperation(
+                    "hash join residual predicate must evaluate to boolean".into(),
+                )
+            })?;
+        for i in 0..mask.len() {
+            if !mask.is_null(i) && mask.value(i) {
+                kept_left.push(cand_left[range.start + i]);
+                kept_right.push(cand_right[range.start + i]);
+            }
         }
     }
     Ok((kept_left, kept_right))
@@ -5913,14 +6126,13 @@ fn filter_candidates_free(
 
 /// Build the RIGHT/FULL unmatched-right tail batch. Emitted once at
 /// the end of the streaming probe, after every left batch has had a
-/// chance to mark its matches into `right_matched`. Returns `None` if
-/// nothing is unmatched (in which case the caller skips the yield).
+/// chance to mark its matches into `right_matched`.
 fn build_unmatched_right_tail(
     right_batch: &RecordBatch,
     right_matched: &[bool],
     output_schema: &Arc<Schema>,
     left_schema_template: &[ArrowDataType],
-) -> Result<Option<RecordBatch>, ExecutionError> {
+) -> Result<Vec<RecordBatch>, ExecutionError> {
     let unmatched: Vec<u32> = right_matched
         .iter()
         .enumerate()
@@ -5928,18 +6140,22 @@ fn build_unmatched_right_tail(
         .map(|(i, _)| i as u32)
         .collect();
     if unmatched.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let idx = UInt32Array::from(unmatched);
-    let null_len = idx.len();
-    let mut cols: Vec<ArrayRef> = Vec::new();
-    for dt in left_schema_template {
-        cols.push(arrow::array::new_null_array(dt, null_len));
+    let mut out = Vec::new();
+    for range in take_output_ranges(right_batch, &unmatched) {
+        let idx = UInt32Array::from(unmatched[range].to_vec());
+        let null_len = idx.len();
+        let mut cols: Vec<ArrayRef> = Vec::new();
+        for dt in left_schema_template {
+            cols.push(arrow::array::new_null_array(dt, null_len));
+        }
+        for col_i in 0..right_batch.num_columns() {
+            cols.push(compute::take(right_batch.column(col_i), &idx, None)?);
+        }
+        out.push(RecordBatch::try_new(output_schema.clone(), cols)?);
     }
-    for col_i in 0..right_batch.num_columns() {
-        cols.push(compute::take(right_batch.column(col_i), &idx, None)?);
-    }
-    Ok(Some(RecordBatch::try_new(output_schema.clone(), cols)?))
+    Ok(out)
 }
 
 /// `RecordBatchStream` adapter over a `Pin<Box<dyn Stream + Send>>`.
@@ -6126,6 +6342,90 @@ mod tests {
     };
 
     static BROADCAST_DF_TEST_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn joined_output_ranges_split_repeated_variable_width_values() {
+        let left = StringArray::from(vec![Some("abcd"), None, Some("xy")]);
+        let right = arrow::array::BinaryArray::from(vec![Some(&b"123"[..]), Some(&b"45"[..])]);
+        let left_indices = [0, 0, 1, 2];
+        let right_indices = [0, 1, 0, 1];
+        let columns: [(&dyn Array, &[u32]); 2] = [(&left, &left_indices), (&right, &right_indices)];
+
+        assert_eq!(
+            split_join_output_ranges(&columns, 5),
+            vec![0..1, 1..3, 3..4]
+        );
+    }
+
+    /// Byte-aware splitting exists only to keep a batch's Utf8/Binary
+    /// offsets under i32::MAX. A join output that cannot overflow must stay
+    /// one batch: SF30 q58 went 1.5x slower when every probe batch was cut
+    /// into 1024-row pieces, 40x more batches filled the 64-deep exchange
+    /// channel and ~6 GB of join output spilled to disk (main spilled 25 MB).
+    #[test]
+    fn output_ranges_without_variable_width_columns_stay_one_range() {
+        assert_eq!(
+            split_output_ranges_by(5000, 0, i32::MAX as usize, |_, _| 0),
+            vec![0..5000]
+        );
+    }
+
+    #[test]
+    fn output_ranges_with_small_variable_width_values_stay_one_range() {
+        let left = StringArray::from((0..5000).map(|i| Some(format!("k{i}"))).collect::<Vec<_>>());
+        let indices: Vec<u32> = (0..5000).collect();
+        let columns: [(&dyn Array, &[u32]); 1] = [(&left, &indices)];
+        assert_eq!(
+            split_join_output_ranges(&columns, i32::MAX as usize),
+            vec![0..5000]
+        );
+    }
+
+    #[test]
+    fn multi_batch_inner_probe_emits_one_batch_per_probe_batch_when_no_overflow() {
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("k", ArrowDataType::Int32, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+        ]));
+        let right_batches: Vec<RecordBatch> = (0..3)
+            .map(|b| {
+                let keys: Vec<i32> = (b * 1000..(b + 1) * 1000).collect();
+                let names: Vec<String> = keys.iter().map(|k| format!("n{k}")).collect();
+                RecordBatch::try_new(
+                    right_schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(keys)),
+                        Arc::new(StringArray::from(names)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let left_schema = Arc::new(Schema::new(vec![Field::new(
+            "k",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let left = RecordBatch::try_new(
+            left_schema,
+            vec![Arc::new(Int32Array::from((0..3000).collect::<Vec<i32>>()))],
+        )
+        .unwrap();
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("k", ArrowDataType::Int32, false),
+            Field::new("k", ArrowDataType::Int32, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+        ]));
+        let build = MultiBatchBuild::build(right_batches, &[0]).unwrap();
+        let out = probe_one_left_batch_multi_inner(&left, &build, &[0], &output_schema).unwrap();
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 3000, "every probe row matches exactly once");
+        assert_eq!(
+            out.len(),
+            1,
+            "3000 matches with ~5-byte strings cannot overflow i32 offsets, so the probe batch must not be cut up"
+        );
+    }
 
     #[derive(Debug)]
     struct CapturingDynamicFilterPublisher {
@@ -8677,6 +8977,182 @@ mod tests {
         );
     }
 
+    // ---- SF30 q85/q24/q30/q15 regression: a single-build probe batch with
+    // more than MULTIPASS_OUTPUT_BATCH_ROWS equi-match candidates must return
+    // each matching (left, right) pair exactly once ----
+
+    /// A build side of `n` rows that all share key 1: `id = 1`, `v = 0..n`,
+    /// and a Utf8 `tag` so the variable-width output path is exercised.
+    fn fanout_right_source(n: i32) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, false),
+            Field::new("v", ArrowDataType::Int32, false),
+            Field::new("tag", ArrowDataType::Utf8, false),
+        ]));
+        let tags: Vec<String> = (0..n).map(|i| format!("tag-{i}")).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1; n as usize])),
+                Arc::new(Int32Array::from((0..n).collect::<Vec<i32>>())),
+                Arc::new(StringArray::from(tags)),
+            ],
+        )
+        .unwrap();
+        let ds = InMemoryDataSource::new(
+            vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                },
+                ColumnInfo {
+                    name: "v".into(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                },
+                ColumnInfo {
+                    name: "tag".into(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                },
+            ],
+            vec![batch],
+        );
+        Arc::new(ScanExec {
+            source: Arc::new(ds),
+            _table_name: "right_fanout".into(),
+            scan_context: ScanContext::default(),
+            dynamic_filters: Default::default(),
+            dynamic_filters_consumed: Vec::new(),
+            dynamic_filter_collector: None,
+            dynamic_filtering_enabled: false,
+            dynamic_filtering_wait_timeout: std::time::Duration::from_secs(10),
+            scan_task_index: 0,
+            scan_task_count: 1,
+        })
+    }
+
+    /// Run `left_source()` (ids 1..4) INNER-joined to `fanout_right_source(n)`
+    /// on id, with `residual`, and return the right-side `v` values of every
+    /// output row in order.
+    async fn fanout_join_v_values(n: i32, residual: Option<PlanExpr>) -> Vec<i32> {
+        let pool: Arc<dyn crate::memory_pool::MemoryPool> =
+            Arc::new(crate::memory_pool::UnboundedMemoryPool::new());
+        let join = HashJoinExec {
+            left: left_source(),
+            right: fanout_right_source(n),
+            join_type: ast::JoinType::Inner,
+            left_keys: vec![0],
+            right_keys: vec![0],
+            residual,
+            build_state: Default::default(),
+            peak_build_bytes: Default::default(),
+            memory_pool: pool,
+            dynamic_filter_producers: Vec::new(),
+            dynamic_filter_publisher: None,
+            dynamic_filtering_enabled: false,
+            df_targets: Vec::new(),
+        };
+        let stream = join.execute(0).await.expect("execute");
+        let batches = collect_stream(stream).await.expect("collect");
+        let mut out = Vec::new();
+        for b in &batches {
+            // joined layout: left(id, name) ++ right(id, v, tag) → v at 3
+            let v = b.column(3).as_primitive::<datatypes::Int32Type>();
+            out.extend(v.values().iter().copied());
+        }
+        out
+    }
+
+    /// `right.v < 750` over 1500 candidates: 750 rows, each v once.
+    #[tokio::test]
+    async fn residual_over_more_than_1024_candidates_keeps_each_pair_once() {
+        let residual = PlanExpr::BinaryOp {
+            left: Box::new(PlanExpr::Column {
+                index: 3,
+                name: "v".into(),
+                span: None,
+            }),
+            op: ast::BinaryOp::Lt,
+            right: Box::new(PlanExpr::Literal {
+                value: arneb_common::types::ScalarValue::Int32(750),
+                span: None,
+            }),
+            span: None,
+        };
+        let mut v = fanout_join_v_values(1500, Some(residual)).await;
+        v.sort_unstable();
+        assert_eq!(v.len(), 750, "one output row per candidate that passes");
+        assert_eq!(
+            v,
+            (0..750).collect::<Vec<i32>>(),
+            "every passing v exactly once"
+        );
+    }
+
+    /// No residual, 1500 candidates: 1500 rows, each v once.
+    #[tokio::test]
+    async fn more_than_1024_matches_without_residual_keeps_each_pair_once() {
+        let mut v = fanout_join_v_values(1500, None).await;
+        v.sort_unstable();
+        assert_eq!(v.len(), 1500);
+        assert_eq!(v, (0..1500).collect::<Vec<i32>>());
+    }
+
+    /// Guard: the same shapes below the threshold.
+    #[tokio::test]
+    async fn fewer_than_1024_matches_keep_each_pair_once() {
+        let mut v = fanout_join_v_values(1000, None).await;
+        v.sort_unstable();
+        assert_eq!(v, (0..1000).collect::<Vec<i32>>());
+    }
+
+    /// `flush_join_pending` coalesces the small output batches a probe batch
+    /// produced. Every pending row must come out exactly once, also when a
+    /// flush closes a group of several batches and more batches follow
+    /// (TPC-DS q85/q24/q30/q15 at SF30 returned duplicated join rows).
+    #[test]
+    fn flush_join_pending_emits_every_pending_row_once() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", ArrowDataType::Int32, false),
+            Field::new("s", ArrowDataType::Utf8, false),
+        ]));
+        // 9 batches of 300 rows: v = 0..2700, each value once.
+        let mut pending: Vec<RecordBatch> = (0..9)
+            .map(|b| {
+                let v: Vec<i32> = (b * 300..(b + 1) * 300).collect();
+                let s: Vec<String> = v.iter().map(|x| format!("s{x}")).collect();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(v)),
+                        Arc::new(StringArray::from(s)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let out = flush_join_pending(&mut pending, &schema).unwrap();
+        assert!(pending.is_empty(), "pending is drained");
+        let mut v: Vec<i32> = out
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_primitive::<datatypes::Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(v.len(), 2700, "rows out == rows in");
+        v.sort_unstable();
+        assert_eq!(v, (0..2700).collect::<Vec<i32>>(), "each row exactly once");
+        assert!(out
+            .iter()
+            .all(|b| b.num_rows() <= STREAMING_OUTPUT_TARGET_ROWS + 300));
+    }
+
     // -----------------------------------------------------------------
     // Phase 3b.5c: build_with_partitioned_spill
     // -----------------------------------------------------------------
@@ -9125,9 +9601,9 @@ mod tests {
 
         // Multi-batch path (no concat).
         let build = MultiBatchBuild::build(right_batches.clone(), &[0]).unwrap();
-        let multi_out = probe_one_left_batch_multi_inner(&left, &build, &[0], &output_schema)
-            .unwrap()
-            .expect("non-empty INNER output");
+        let multi_batches =
+            probe_one_left_batch_multi_inner(&left, &build, &[0], &output_schema).unwrap();
+        let multi_out = compute::concat_batches(&output_schema, multi_batches.iter()).unwrap();
 
         // Reference: concat the build then probe the single batch.
         let right_combined = compute::concat_batches(&right_schema, right_batches.iter()).unwrap();
@@ -9253,18 +9729,18 @@ mod tests {
         };
 
         std::env::set_var("ARNEB_VEC_PROBE", "0");
-        let scalar = probe_one_left_batch_multi_inner(&left, &build, &[0], &output_schema)
-            .unwrap()
-            .expect("scalar output");
+        let scalar_batches =
+            probe_one_left_batch_multi_inner(&left, &build, &[0], &output_schema).unwrap();
         std::env::set_var("ARNEB_VEC_PROBE", "1");
-        let vectorized = probe_one_left_batch_multi_inner(&left, &build, &[0], &output_schema)
-            .unwrap()
-            .expect("vectorized output");
+        let vectorized_batches =
+            probe_one_left_batch_multi_inner(&left, &build, &[0], &output_schema).unwrap();
         std::env::remove_var("ARNEB_VEC_PROBE");
         std::env::remove_var("ARNEB_BUILD_COALESCE_BYTES");
 
-        let vectorized_rows = rows(vectorized);
-        let scalar_rows = rows(scalar);
+        let vectorized_rows =
+            rows(compute::concat_batches(&output_schema, vectorized_batches.iter()).unwrap());
+        let scalar_rows =
+            rows(compute::concat_batches(&output_schema, scalar_batches.iter()).unwrap());
         assert_eq!(vectorized_rows, scalar_rows);
         assert_eq!(scalar_rows.len(), 5);
     }

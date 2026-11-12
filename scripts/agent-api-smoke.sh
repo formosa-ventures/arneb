@@ -148,7 +148,11 @@ check '.state == "finished"' "Q6 did not finish"
 API_REVENUE=$(first_cell)
 PG_REVENUE=$(PGPASSWORD="${ARNEB_PASSWORD:-${ARNEB_TOKEN:-}}" psql "$ARNEB_PG" -XtAq \
     -c "${Q6/FROM lineitem/FROM $CATALOG.$SCHEMA.lineitem}") || fail "psql Q6 failed"
-[ "$API_REVENUE" = "$PG_REVENUE" ] || fail "revenue differs: api=$API_REVENUE psql=$PG_REVENUE"
+# A distributed SUM over doubles can add the partial sums in another order
+# on each run, so allow a difference in the last digits.
+awk -v a="$API_REVENUE" -v b="$PG_REVENUE" \
+    'BEGIN { d = a - b; if (d < 0) d = -d; m = (b < 0 ? -b : b); exit !(a != "" && d <= m * 1e-12) }' ||
+    fail "revenue differs: api=$API_REVENUE psql=$PG_REVENUE"
 echo "  revenue api=$API_REVENUE psql=$PG_REVENUE"
 pass
 

@@ -1099,19 +1099,75 @@ impl ExecutionContext {
                 condition,
                 dynamic_filter_ids,
             } => {
-                let left_plan = self.convert(left)?;
-                let right_plan = self.convert(right)?;
+                let mut left_plan = self.convert(left)?;
+                let mut right_plan = self.convert(right)?;
                 let left_col_count = left_plan.schema().len();
+                let right_col_count = right_plan.schema().len();
+                let mut expression_keys = false;
+                let mut split = extract_equi_join_keys(condition, left_col_count);
+                if let Some((pairs, residual)) =
+                    extract_expression_join_keys(condition, left_col_count)
+                {
+                    if pairs.iter().any(|(left, right)| {
+                        !matches!(
+                            (left, right),
+                            (PlanExpr::Column { .. }, PlanExpr::Column { .. })
+                        )
+                    }) {
+                        let mut left_exprs = Vec::new();
+                        let mut right_exprs = Vec::new();
+                        let mut left_schema = left_plan.schema();
+                        let mut right_schema = right_plan.schema();
+                        let mut key_pairs = Vec::new();
+                        for (left_key, right_key) in pairs {
+                            let left_index = left_schema.len();
+                            let right_index = right_schema.len();
+                            let left_type =
+                                arneb_planner::analyzer::plan_expr_type(&left_key, &left_schema);
+                            let right_type =
+                                arneb_planner::analyzer::plan_expr_type(&right_key, &right_schema);
+                            let (Some(left_type), Some(right_type)) = (left_type, right_type)
+                            else {
+                                key_pairs.clear();
+                                break;
+                            };
+                            left_exprs.push(left_key);
+                            right_exprs.push(right_key);
+                            left_schema.push(arneb_common::types::ColumnInfo {
+                                name: format!("__join_key_{left_index}"),
+                                data_type: left_type,
+                                nullable: true,
+                            });
+                            right_schema.push(arneb_common::types::ColumnInfo {
+                                name: format!("__join_key_{right_index}"),
+                                data_type: right_type,
+                                nullable: true,
+                            });
+                            key_pairs.push((left_index, right_index));
+                        }
+                        if !key_pairs.is_empty() {
+                            left_plan = append_join_keys(left_plan, left_exprs, left_schema);
+                            right_plan = append_join_keys(right_plan, right_exprs, right_schema);
+                            let residual = residual.map(|expr| {
+                                let mapping = (left_col_count..left_col_count + right_col_count)
+                                    .map(|index| (index, index + key_pairs.len()))
+                                    .collect();
+                                rewrite_column_indices(&expr, &mapping)
+                            });
+                            split = Some((key_pairs, residual));
+                            expression_keys = true;
+                        }
+                    }
+                }
 
                 // Try to use hash join for equi-join conditions. A residual
                 // non-equi predicate (e.g. `AND o_comment NOT LIKE '%x%'` in
                 // TPC-H Q13) is carried through and re-evaluated on each
                 // candidate match so outer-join semantics stay correct.
-                if let Some((key_pairs, residual)) =
-                    extract_equi_join_keys(condition, left_col_count)
-                {
+                if let Some((key_pairs, residual)) = split {
                     let (left_keys, right_keys): (Vec<usize>, Vec<usize>) =
                         key_pairs.into_iter().unzip();
+                    let expression_key_count = left_keys.len();
                     // Same-fragment dynamic-filter targets: for each probe key,
                     // the probe-subtree columns join-equal to it (its
                     // equivalence class). The build-side IN(...) filter is
@@ -1133,7 +1189,7 @@ impl ExecutionContext {
                         *join_type,
                         &self.inflight_budget,
                     );
-                    return Ok(HashJoinExec {
+                    let join = HashJoinExec {
                         left: left_arg,
                         right: right_arg,
                         join_type: *join_type,
@@ -1151,7 +1207,27 @@ impl ExecutionContext {
                         dynamic_filtering_enabled: self.dynamic_filtering_enabled,
                         df_targets,
                     }
-                    .new_arc());
+                    .new_arc();
+                    if expression_keys {
+                        let schema = logical.schema();
+                        let exprs = (0..schema.len())
+                            .map(|index| PlanExpr::Column {
+                                index: if index < left_col_count {
+                                    index
+                                } else {
+                                    index + expression_key_count
+                                },
+                                name: schema[index].name.clone(),
+                                span: None,
+                            })
+                            .collect();
+                        return Ok(Arc::new(ProjectionExec {
+                            input: join,
+                            exprs,
+                            output_schema: schema,
+                        }));
+                    }
+                    return Ok(join);
                 }
 
                 // Fall back to nested loop for non-equi joins.
@@ -2487,6 +2563,111 @@ fn coalesce_if_multi(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     } else {
         input
     }
+}
+
+fn append_join_keys(
+    input: Arc<dyn ExecutionPlan>,
+    keys: Vec<PlanExpr>,
+    output_schema: Vec<arneb_common::types::ColumnInfo>,
+) -> Arc<dyn ExecutionPlan> {
+    let mut exprs: Vec<PlanExpr> = input
+        .schema()
+        .iter()
+        .enumerate()
+        .map(|(index, column)| PlanExpr::Column {
+            index,
+            name: column.name.clone(),
+            span: None,
+        })
+        .collect();
+    exprs.extend(keys);
+    Arc::new(ProjectionExec {
+        input,
+        exprs,
+        output_schema,
+    })
+}
+
+type ExpressionJoinSplit = (Vec<(PlanExpr, PlanExpr)>, Option<PlanExpr>);
+
+fn extract_expression_join_keys(
+    condition: &arneb_planner::JoinCondition,
+    left_width: usize,
+) -> Option<ExpressionJoinSplit> {
+    fn collect(
+        expr: &PlanExpr,
+        left_width: usize,
+        keys: &mut Vec<(PlanExpr, PlanExpr)>,
+        residuals: &mut Vec<PlanExpr>,
+    ) {
+        if let PlanExpr::BinaryOp {
+            left,
+            op: arneb_sql_parser::ast::BinaryOp::And,
+            right,
+            ..
+        } = expr
+        {
+            collect(left, left_width, keys, residuals);
+            collect(right, left_width, keys, residuals);
+            return;
+        }
+        if let PlanExpr::BinaryOp {
+            left,
+            op: arneb_sql_parser::ast::BinaryOp::Eq,
+            right,
+            ..
+        } = expr
+        {
+            let mut left_columns = std::collections::BTreeSet::new();
+            let mut right_columns = std::collections::BTreeSet::new();
+            collect_column_indices_into(left, &mut left_columns);
+            collect_column_indices_into(right, &mut right_columns);
+            let pair = if !left_columns.is_empty()
+                && !right_columns.is_empty()
+                && left_columns.iter().all(|&i| i < left_width)
+                && right_columns.iter().all(|&i| i >= left_width)
+            {
+                Some((left.as_ref(), right.as_ref()))
+            } else if !left_columns.is_empty()
+                && !right_columns.is_empty()
+                && right_columns.iter().all(|&i| i < left_width)
+                && left_columns.iter().all(|&i| i >= left_width)
+            {
+                Some((right.as_ref(), left.as_ref()))
+            } else {
+                None
+            };
+            if let Some((left, right)) = pair {
+                let mapping = right_columns
+                    .union(&left_columns)
+                    .filter(|&&i| i >= left_width)
+                    .map(|&i| (i, i - left_width))
+                    .collect();
+                keys.push((left.clone(), rewrite_column_indices(right, &mapping)));
+                return;
+            }
+        }
+        residuals.push(expr.clone());
+    }
+
+    let arneb_planner::JoinCondition::On(expr) = condition else {
+        return None;
+    };
+    let mut keys = Vec::new();
+    let mut residuals = Vec::new();
+    collect(expr, left_width, &mut keys, &mut residuals);
+    if keys.is_empty() {
+        return None;
+    }
+    let residual = residuals
+        .into_iter()
+        .reduce(|left, right| PlanExpr::BinaryOp {
+            left: Box::new(left),
+            op: arneb_sql_parser::ast::BinaryOp::And,
+            right: Box::new(right),
+            span: None,
+        });
+    Some((keys, residual))
 }
 
 /// Target number of partitions for hash-repartitioned joins. Hardware-

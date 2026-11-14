@@ -156,6 +156,16 @@ fn is_fold_safe_cast_projection(exprs: &[PlanExpr], schema: &[ColumnInfo]) -> bo
         })
 }
 
+fn starts_with_whole_input_operator(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate { .. } | LogicalPlan::Limit { .. } => true,
+        LogicalPlan::Projection { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. } => starts_with_whole_input_operator(input),
+        _ => false,
+    }
+}
+
 fn simple_column_projection_indices(exprs: &[PlanExpr]) -> Option<Vec<usize>> {
     exprs
         .iter()
@@ -191,6 +201,54 @@ fn remap_fragment_partitioning_for_projection(
         PartitioningScheme::RoundRobin => Some(PartitioningScheme::RoundRobin),
         PartitioningScheme::Single => Some(PartitioningScheme::Single),
         PartitioningScheme::Broadcast => Some(PartitioningScheme::Broadcast),
+    }
+}
+
+fn fold_join_key_projection(
+    plan: LogicalPlan,
+    fragments: &mut [PlanFragment],
+    keys: &[usize],
+) -> LogicalPlan {
+    if let [fragment] = fragments {
+        let mapped_keys: Vec<Option<usize>> = keys.iter().copied().map(Some).collect();
+        if let Some((stage_id, mapped_keys)) = join_keys_at_exchange(&plan, mapped_keys, false) {
+            if fragment.id == stage_id
+                && fragment.fragment_type != FragmentType::Fixed
+                && (plan.schema().len() != fragment.root.schema().len()
+                    || keys
+                        .iter()
+                        .zip(mapped_keys)
+                        .any(|(&key, mapped)| mapped != Some(key)))
+            {
+                let schema = plan.schema();
+                let source = std::mem::replace(&mut fragment.root, LogicalPlan::OneRow);
+                fragment.root = replace_first_exchange_or_fallback(plan, stage_id, source);
+                return LogicalPlan::ExchangeNode { stage_id, schema };
+            }
+        }
+    }
+    plan
+}
+
+fn join_keys_at_exchange(
+    plan: &LogicalPlan,
+    keys: Vec<Option<usize>>,
+    saw_projection: bool,
+) -> Option<(StageId, Vec<Option<usize>>)> {
+    match plan {
+        LogicalPlan::Projection { input, exprs, .. } => {
+            let mapped = keys
+                .into_iter()
+                .map(|key| match key.and_then(|index| exprs.get(index)) {
+                    Some(PlanExpr::Column { index, .. }) => Some(*index),
+                    _ => None,
+                })
+                .collect();
+            join_keys_at_exchange(input, mapped, true)
+        }
+        LogicalPlan::Filter { input, .. } => join_keys_at_exchange(input, keys, saw_projection),
+        LogicalPlan::ExchangeNode { stage_id, .. } if saw_projection => Some((*stage_id, keys)),
+        _ => None,
     }
 }
 
@@ -1418,6 +1476,7 @@ pub struct PlanFragmenter {
     /// Internal, per-recursion override used when a SemiJoin/AntiJoin build is
     /// a high-cardinality aggregate and `ARNEB_PARTITIONED_SEMI_JOIN` is on.
     force_parallel_final_agg: bool,
+    join_child: bool,
 }
 
 impl PlanFragmenter {
@@ -1432,6 +1491,7 @@ impl PlanFragmenter {
             hash_partition_target_rows: DEFAULT_HASH_PARTITION_TARGET_ROWS,
             max_hash_partitions: DEFAULT_MAX_HASH_PARTITIONS,
             force_parallel_final_agg: false,
+            join_child: false,
         }
     }
 
@@ -1668,6 +1728,29 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
         id
     }
 
+    fn isolate_whole_input_join_child(
+        &mut self,
+        plan: LogicalPlan,
+        fragments: Vec<PlanFragment>,
+    ) -> (LogicalPlan, Vec<PlanFragment>) {
+        if fragments.is_empty() || !starts_with_whole_input_operator(&plan) {
+            return (plan, fragments);
+        }
+        let schema = plan.schema();
+        let fragment = PlanFragment {
+            id: self.next_id(),
+            fragment_type: FragmentType::Fixed,
+            root: plan,
+            output_partitioning: PartitioningScheme::Single,
+            source_fragments: fragments,
+        };
+        let exchange = LogicalPlan::ExchangeNode {
+            stage_id: fragment.id,
+            schema,
+        };
+        (exchange, vec![fragment])
+    }
+
     /// Fragments the given logical plan into a tree of [`PlanFragment`]s.
     pub fn fragment(&mut self, plan: LogicalPlan) -> PlanFragment {
         // Pre-fragmentation: decompose AVG into SUM/COUNT so AVG-bearing
@@ -1692,6 +1775,14 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
     /// Recursively split the plan. Returns (local plan, child fragments).
     fn split(&mut self, plan: LogicalPlan) -> (LogicalPlan, Vec<PlanFragment>) {
         self.split_with_parent_aggregate_projection(plan, None)
+    }
+
+    fn split_join_child(&mut self, plan: LogicalPlan) -> (LogicalPlan, Vec<PlanFragment>) {
+        let previous = self.join_child;
+        self.join_child = true;
+        let result = self.split(plan);
+        self.join_child = previous;
+        result
     }
 
     /// Recursively split the plan. `parent_aggregate_projection` is populated
@@ -2053,8 +2144,47 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                     }
                 }
 
-                let (left_plan, mut left_frags) = self.split(left_input);
-                let (right_plan, mut right_frags) = self.split(right_input);
+                let (left_plan, left_frags) = self.split_join_child(left_input);
+                let (right_plan, right_frags) = self.split_join_child(right_input);
+                // Only introduce a boundary when the original join would run
+                // in several tasks (or be folded into a multi-task probe).
+                // A fixed join can safely read the whole-input operator in
+                // its own fragment, and must retain that plan shape.
+                let single_frags = left_frags.len() == 1 && right_frags.len() == 1;
+                let would_partition = single_frags
+                    && left_frags[0].fragment_type != FragmentType::Fixed
+                    && right_frags[0].fragment_type != FragmentType::Fixed
+                    && left_plan.schema().len() == left_frags[0].root.schema().len()
+                    && right_plan.schema().len() == right_frags[0].root.schema().len()
+                    && extract_partitioning_equi_keys(&condition, left_plan.schema().len())
+                        .is_some();
+                let would_inline = matches!(join_type, arneb_sql_parser::ast::JoinType::Inner)
+                    && single_frags
+                    && matches!(
+                        left_frags[0].fragment_type,
+                        FragmentType::HashPartitioned | FragmentType::Source
+                    )
+                    && self.is_broadcast_eligible(
+                        &original_right_for_broadcast,
+                        &original_left_for_estimate,
+                    );
+                let (mut left_plan, mut left_frags) = if would_partition || would_inline {
+                    self.isolate_whole_input_join_child(left_plan, left_frags)
+                } else {
+                    (left_plan, left_frags)
+                };
+                let broadcast_build = self.is_broadcast_eligible(
+                    &original_right_for_broadcast,
+                    &original_left_for_estimate,
+                ) && !matches!(
+                    join_type,
+                    arneb_sql_parser::ast::JoinType::Right | arneb_sql_parser::ast::JoinType::Full
+                );
+                let (mut right_plan, mut right_frags) = if would_partition && !broadcast_build {
+                    self.isolate_whole_input_join_child(right_plan, right_frags)
+                } else {
+                    (right_plan, right_frags)
+                };
 
                 // Broadcast v2b (2026-06-03): INLINE a broadcast-build join
                 // into the probe fragment when the probe is already a
@@ -2188,6 +2318,30 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                 //        (Aggregate(ExchangeNode) right child) is the
                 //        canonical case.
                 let left_col_count = left_plan.schema().len();
+                if let Some((left_keys, right_keys)) =
+                    extract_partitioning_equi_keys(&condition, left_col_count)
+                {
+                    if left_frags.len() == 1
+                        && right_frags.len() == 1
+                        && left_frags[0].fragment_type != FragmentType::Fixed
+                        && right_frags[0].fragment_type != FragmentType::Fixed
+                        && left_plan.schema().len() == left_frags[0].root.schema().len()
+                        && right_plan.schema().len() == right_frags[0].root.schema().len()
+                        && (!self.is_broadcast_eligible(
+                            &original_right_for_broadcast,
+                            &original_left_for_estimate,
+                        ) || matches!(
+                            join_type,
+                            arneb_sql_parser::ast::JoinType::Right
+                                | arneb_sql_parser::ast::JoinType::Full
+                        ))
+                    {
+                        left_plan =
+                            fold_join_key_projection(left_plan, &mut left_frags, &left_keys);
+                        right_plan =
+                            fold_join_key_projection(right_plan, &mut right_frags, &right_keys);
+                    }
+                }
                 // dist-adaptive-partition: choose the hash fan-out from the
                 // cluster size and the rows flowing through this exchange
                 // (the larger of the two children being repartitioned), instead
@@ -2276,7 +2430,11 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                     // 0.496× = exactly half). Keeping the probe N-way both
                     // fixes correctness and preserves parallelism. Dormant
                     // when `broadcast_max_build_bytes` / `stats` are None.
-                    if self.is_broadcast_eligible(
+                    if !matches!(
+                        join_type,
+                        arneb_sql_parser::ast::JoinType::Right
+                            | arneb_sql_parser::ast::JoinType::Full
+                    ) && self.is_broadcast_eligible(
                         &original_right_for_broadcast,
                         &original_left_for_estimate,
                     ) {
@@ -2417,12 +2575,49 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                         &original_right_for_estimate,
                         right_key_index.expect("checked Some above"),
                     );
-                let (left_plan, mut left_frags) = self.split(*left);
+                let (mut left_plan, mut left_frags) = self.split_join_child(*left);
                 let previous_force_parallel_final_agg = self.force_parallel_final_agg;
                 self.force_parallel_final_agg =
                     previous_force_parallel_final_agg || prefer_hash_aggregate_build;
-                let (right_plan, mut right_frags) = self.split(*right);
+                let (mut right_plan, mut right_frags) = self.split_join_child(*right);
                 self.force_parallel_final_agg = previous_force_parallel_final_agg;
+
+                if partitioned_semi_join_enabled()
+                    && left_frags.len() == 1
+                    && right_frags.len() == 1
+                    && left_frags[0].fragment_type != FragmentType::Fixed
+                    && right_frags[0].fragment_type != FragmentType::Fixed
+                    && left_key_index.is_some()
+                    && right_key_index.is_some()
+                    && (peel_identity_projections_to_aggregate(&original_right_for_estimate)
+                        .is_none()
+                        || prefer_hash_aggregate_build)
+                {
+                    (left_plan, left_frags) =
+                        self.isolate_whole_input_join_child(left_plan, left_frags);
+                    (right_plan, right_frags) =
+                        self.isolate_whole_input_join_child(right_plan, right_frags);
+                }
+
+                if partitioned_semi_join_enabled()
+                    && left_frags.len() == 1
+                    && right_frags.len() == 1
+                    && left_frags[0].fragment_type != FragmentType::Fixed
+                    && right_frags[0].fragment_type != FragmentType::Fixed
+                    && left_plan.schema().len() == left_frags[0].root.schema().len()
+                    && right_plan.schema().len() == right_frags[0].root.schema().len()
+                    && (peel_identity_projections_to_aggregate(&original_right_for_estimate)
+                        .is_none()
+                        || prefer_hash_aggregate_build)
+                {
+                    if let (Some(left_index), Some(right_index)) = (left_key_index, right_key_index)
+                    {
+                        left_plan =
+                            fold_join_key_projection(left_plan, &mut left_frags, &[left_index]);
+                        right_plan =
+                            fold_join_key_projection(right_plan, &mut right_frags, &[right_index]);
+                    }
+                }
 
                 let single_frags = left_frags.len() == 1 && right_frags.len() == 1;
                 let schemas_align = single_frags
@@ -2573,12 +2768,49 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                         &original_right_for_estimate,
                         right_key_index.expect("checked Some above"),
                     );
-                let (left_plan, mut left_frags) = self.split(*left);
+                let (mut left_plan, mut left_frags) = self.split_join_child(*left);
                 let previous_force_parallel_final_agg = self.force_parallel_final_agg;
                 self.force_parallel_final_agg =
                     previous_force_parallel_final_agg || prefer_hash_aggregate_build;
-                let (right_plan, mut right_frags) = self.split(*right);
+                let (mut right_plan, mut right_frags) = self.split_join_child(*right);
                 self.force_parallel_final_agg = previous_force_parallel_final_agg;
+
+                if partitioned_semi_join_enabled()
+                    && left_frags.len() == 1
+                    && right_frags.len() == 1
+                    && left_frags[0].fragment_type != FragmentType::Fixed
+                    && right_frags[0].fragment_type != FragmentType::Fixed
+                    && left_key_index.is_some()
+                    && right_key_index.is_some()
+                    && (peel_identity_projections_to_aggregate(&original_right_for_estimate)
+                        .is_none()
+                        || prefer_hash_aggregate_build)
+                {
+                    (left_plan, left_frags) =
+                        self.isolate_whole_input_join_child(left_plan, left_frags);
+                    (right_plan, right_frags) =
+                        self.isolate_whole_input_join_child(right_plan, right_frags);
+                }
+
+                if partitioned_semi_join_enabled()
+                    && left_frags.len() == 1
+                    && right_frags.len() == 1
+                    && left_frags[0].fragment_type != FragmentType::Fixed
+                    && right_frags[0].fragment_type != FragmentType::Fixed
+                    && left_plan.schema().len() == left_frags[0].root.schema().len()
+                    && right_plan.schema().len() == right_frags[0].root.schema().len()
+                    && (peel_identity_projections_to_aggregate(&original_right_for_estimate)
+                        .is_none()
+                        || prefer_hash_aggregate_build)
+                {
+                    if let (Some(left_index), Some(right_index)) = (left_key_index, right_key_index)
+                    {
+                        left_plan =
+                            fold_join_key_projection(left_plan, &mut left_frags, &[left_index]);
+                        right_plan =
+                            fold_join_key_projection(right_plan, &mut right_frags, &[right_index]);
+                    }
+                }
 
                 let single_frags = left_frags.len() == 1 && right_frags.len() == 1;
                 let schemas_align = single_frags
@@ -2781,11 +3013,14 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                 let parallel_final = (parallel_final_agg_enabled()
                     || self.force_parallel_final_agg)
                     && n_group > 0
-                    && parent_projection_preserves_natural_aggregate_order(
-                        parent_aggregate_projection,
-                        n_group,
-                        aggr_exprs.len(),
-                    );
+                    && ((self.join_child
+                        && input_frags.len() == 1
+                        && input_frags[0].source_fragments.is_empty())
+                        || parent_projection_preserves_natural_aggregate_order(
+                            parent_aggregate_projection,
+                            n_group,
+                            aggr_exprs.len(),
+                        ));
                 let partial_hash_keys: Vec<usize> = (0..n_group).collect();
                 let partition_count = choose_partition_count(
                     self.worker_count,

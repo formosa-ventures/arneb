@@ -39,7 +39,10 @@ PG_LOCAL=6432
 WEB_LOCAL=7432
 
 # The scenario restarts nodes through this script; ACC_DIR carries the state.
+# A replaced pod's logs are kept in $ACC_DIR/pod.log for the secret scan at
+# the end, since most tokens are issued before the restarts.
 restart_coordinator() {
+    kubectl logs "deploy/$RELEASE-coordinator" -c coordinator >>"$ACC_DIR/pod.log"
     helm upgrade "$RELEASE" "$ROOT/charts/arneb" --reuse-values \
         --set-string "coordinator.podAnnotations.restartedAt=$(date +%s)" --wait --timeout 5m
     forward
@@ -50,6 +53,7 @@ restart_worker() {
     victim=$(kubectl get pods -l app.kubernetes.io/component=worker \
         -o jsonpath='{.items[?(@.metadata.name!="'"$ARNEB_WORKER1"'")].metadata.name}' | cut -d' ' -f1)
     echo "deleting $victim"
+    kubectl logs "$victim" >>"$ACC_DIR/pod.log"
     kubectl delete pod "$victim" --wait=true --timeout=120s
     kubectl rollout status "deploy/$RELEASE-worker" --timeout=120s
 }
@@ -208,17 +212,17 @@ export ARNEB_EXPECTED_LINEITEM="${ARNEB_EXPECTED_LINEITEM:-6001215}"
 export ARNEB_LONG_SQL="${ARNEB_LONG_SQL:-SELECT count(*) FROM lineitem a JOIN lineitem b ON a.l_suppkey = b.l_suppkey}"
 "$ROOT/scripts/headless-acceptance.sh" || { dump; exit 1; }
 
-echo "=== no token or JWT in the pod logs"
-kubectl logs "deploy/$RELEASE-coordinator" -c coordinator >"$ACC_DIR/coordinator.log"
+echo "=== no token or JWT in the pod logs, before and after the restarts"
+kubectl logs "deploy/$RELEASE-coordinator" -c coordinator >>"$ACC_DIR/pod.log"
 for pod in $(kubectl get pods -l app.kubernetes.io/component=worker -o name); do
-    kubectl logs "$pod" >>"$ACC_DIR/coordinator.log"
+    kubectl logs "$pod" >>"$ACC_DIR/pod.log"
 done
-if grep -nE 'arneb_[0-9a-f]{16}_[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.eyJ' "$ACC_DIR/coordinator.log" |
+if grep -nE 'arneb_[0-9a-f]{16}_[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.eyJ' "$ACC_DIR/pod.log" |
     sed -E 's/(arneb_[0-9a-f]{16}_)[A-Za-z0-9_-]+/\1<redacted>/g; s/eyJ[A-Za-z0-9_.-]+/eyJ…<redacted>/g'; then
     echo "a token or JWT is in the pod logs"; exit 1
 fi
 for secret in "$ADMIN_PW" "$USER2_PW"; do
-    if grep -qF -- "$secret" "$ACC_DIR/coordinator.log"; then echo "a password is in the pod logs"; exit 1; fi
+    if grep -qF -- "$secret" "$ACC_DIR/pod.log"; then echo "a password is in the pod logs"; exit 1; fi
 done
 
 echo "=== headless acceptance on kind passed"

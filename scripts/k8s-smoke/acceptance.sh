@@ -24,7 +24,7 @@
 #   SOCAT_IMAGE      the sidecar image (default alpine/socat:1.8.0.3)
 #   ARNEB_EXPECTED_LINEITEM  count(*) of lineitem (default 6001215, SF1)
 #   ARNEB_LONG_SQL   the long statement (default: a lineitem self-join on
-#                    l_suppkey, which runs for minutes at SF1)
+#                    l_partkey with a LIKE, about 15 s at SF1 on 4 CPUs)
 #   KEEP=1           leave the kind cluster running afterwards
 #
 # Needs kind, kubectl, helm, docker, curl, jq, openssl and psql. The
@@ -209,7 +209,10 @@ export ARNEB_RESTART_COORDINATOR="$SELF restart-coordinator"
 export ARNEB_RESTART_WORKER="$SELF restart-worker"
 export KEYCLOAK_ISSUER=http://127.0.0.1:8180/realms/arneb
 export ARNEB_EXPECTED_LINEITEM="${ARNEB_EXPECTED_LINEITEM:-6001215}"
-export ARNEB_LONG_SQL="${ARNEB_LONG_SQL:-SELECT count(*) FROM lineitem a JOIN lineitem b ON a.l_suppkey = b.l_suppkey}"
+# Not the l_suppkey self-join: about 600 matches per row there make a worker
+# run out of memory when it runs alone (#258), and a cancel does not stop a
+# statement that never yields, such as a cross join with string functions.
+export ARNEB_LONG_SQL="${ARNEB_LONG_SQL:-SELECT count(*) FROM lineitem a JOIN lineitem b ON a.l_partkey = b.l_partkey WHERE a.l_comment LIKE '%' || substr(b.l_comment, 3, 4) || '%'}"
 "$ROOT/scripts/headless-acceptance.sh" || { dump; exit 1; }
 
 echo "=== no token or JWT in the pod logs, before and after the restarts"

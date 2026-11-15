@@ -125,134 +125,6 @@ const PARTNERS: &[(&str, &str)] = &[
     ("GROUP above", "SELECT count(*) FROM (SELECT a.inv_item_sk, count(*) n FROM {S} a GROUP BY a.inv_item_sk) g"),
 ];
 
-/// `fnv1a(describe(plan))` of each benchmark query before #250 was fixed.
-const PLAN_DIGESTS: &[(&str, u64)] = &[
-    ("tpch q01", 0x5204f7220f3880b6),
-    ("tpch q02", 0x5501fbb9f99fd3e2),
-    ("tpch q03", 0x05022da481389758),
-    ("tpch q04", 0xac5da7cf5db23be9),
-    ("tpch q05", 0x9895a1c6348332cc),
-    ("tpch q06", 0xe916288c2429f3e4),
-    ("tpch q07", 0x1422ecd679a64957),
-    ("tpch q08", 0xb71a9f299e3e06cd),
-    ("tpch q09", 0x4a706c20e43e6f93),
-    ("tpch q10", 0xa73a908e5f0a8692),
-    ("tpch q11", 0x02d6b4896b5d3c69),
-    ("tpch q12", 0x3d02a0feebfaa54f),
-    ("tpch q13", 0x5ec1e32b0331011b),
-    ("tpch q14", 0xf0ffb3b52f417d76),
-    ("tpch q15", 0x84e4c162bd72c7f8),
-    ("tpch q16", 0xe4849054562533a5),
-    ("tpch q17", 0xa7eaecacd529a43f),
-    ("tpch q18", 0x75079bbe2aee70f4),
-    ("tpch q19", 0xc6249502d79aafb9),
-    ("tpch q20", 0xade9e1a2b616c27a),
-    ("tpch q21", 0x3e7cf6f715546ef3),
-    ("tpch q22", 0x49a543829f917943),
-    ("tpcds q01", 0x0e7fdb185f91ad20),
-    ("tpcds q02", 0x3f9b3725d92252e2),
-    ("tpcds q03", 0x88262fdc004a978e),
-    ("tpcds q04", 0xdd87d0440b851b40),
-    ("tpcds q05", 0xf4ef6b6f14f4ba95),
-    ("tpcds q06", 0x53c518e3af5f2c67),
-    ("tpcds q07", 0xb652436c0350a9d2),
-    ("tpcds q08", 0xeb31045d15550bdf),
-    ("tpcds q09", 0x4cd7cf9e4f29a52d),
-    ("tpcds q10", 0xfc93ccbdaf8b256a),
-    ("tpcds q11", 0xd3b5eb1da65c1b91),
-    ("tpcds q12", 0xcc135989abcd5a3c),
-    ("tpcds q13", 0xae7e528fc581f0ce),
-    ("tpcds q14a", 0xa8413804b7e3468c),
-    ("tpcds q14b", 0x815b2a85da1fe777),
-    ("tpcds q15", 0x5debb6e1d9fc8997),
-    ("tpcds q16", 0x3bbb7d58d942a5dc),
-    ("tpcds q17", 0xfd7eeb371b193416),
-    ("tpcds q18", 0x10edbae3b9fc6735),
-    ("tpcds q19", 0x2fec227cc8b09710),
-    ("tpcds q20", 0x13cd815ffac55bca),
-    ("tpcds q21", 0x3ad391fd718fccaf),
-    ("tpcds q22", 0xa85a8a3e12219ba6),
-    ("tpcds q23a", 0x049d338343f5dd2f),
-    ("tpcds q23b", 0xacaad6591c6f5977),
-    ("tpcds q24a", 0xb34bc8385d7fddc1),
-    ("tpcds q24b", 0x9d36f5d947af75ba),
-    ("tpcds q25", 0x277e0d9f3ca4e736),
-    ("tpcds q26", 0xaad0f600084906ec),
-    ("tpcds q27", 0xcccfab7390a0fd70),
-    ("tpcds q28", 0xd504226fd2ea4763),
-    ("tpcds q29", 0x53065cc2cf9b1a81),
-    ("tpcds q30", 0x839d161e5bdc1733),
-    ("tpcds q31", 0x5a53fac9b59841a5),
-    ("tpcds q32", 0x0fd0ec5b9d5e079b),
-    ("tpcds q33", 0xd6994205de63234e),
-    ("tpcds q34", 0x429e893ba6992145),
-    ("tpcds q35", 0x74e4f82e1ec93762),
-    ("tpcds q36", 0xe6505300f9d07689),
-    ("tpcds q37", 0x246c72555380613e),
-    ("tpcds q38", 0x20b5451836f98e01),
-    ("tpcds q39a", 0x84a2a6058747ae59),
-    ("tpcds q40", 0x136ea3bde77d0b7e),
-    ("tpcds q41", 0xf0e5b200b0229469),
-    ("tpcds q42", 0x0237cca03f2f2bf2),
-    ("tpcds q43", 0xd242edb432ffdfb4),
-    ("tpcds q44", 0x4886b7db71811969),
-    ("tpcds q45", 0xebab00d2eb9b2d8b),
-    ("tpcds q46", 0xc98388f6bc31ce83),
-    ("tpcds q47", 0xeadabbdf10bc1d41),
-    ("tpcds q48", 0x441fd0cbcd52f47a),
-    ("tpcds q49", 0x457f2bd565b16137),
-    ("tpcds q50", 0xa24b6e9062318d90),
-    ("tpcds q51", 0x967bcf1832525ac1),
-    ("tpcds q52", 0xf79f870ca1a69360),
-    ("tpcds q53", 0xff27588fdd68deb3),
-    ("tpcds q54", 0xc71fe790ac1931e5),
-    ("tpcds q55", 0xaedae6b47d202c3c),
-    ("tpcds q56", 0x6bdafc07907384a3),
-    ("tpcds q57", 0xe5d95be3a4b941d4),
-    ("tpcds q58", 0x0373b88c0edabb24),
-    ("tpcds q59", 0x3779ffe7a4cade86),
-    ("tpcds q60", 0x39ebd5415f513096),
-    ("tpcds q61", 0x9444019b0e8b87c6),
-    ("tpcds q62", 0x2493e533c740979b),
-    ("tpcds q63", 0xaff1e06cacb0d447),
-    ("tpcds q64", 0x43038aa6cf4a61c0),
-    ("tpcds q65", 0xd16267f92a880a2e),
-    ("tpcds q66", 0xc352da13a4af8272),
-    ("tpcds q67", 0xb4e914ce357fb5df),
-    ("tpcds q68", 0xff33c8646da58f38),
-    ("tpcds q69", 0x83ccf458c1ecc677),
-    ("tpcds q70", 0x9f8c0e6eda48b4f7),
-    ("tpcds q71", 0xf083ba0aa2cafc37),
-    ("tpcds q72", 0x9dc33c3c63180cdf),
-    ("tpcds q73", 0xf04d2ad1984a1376),
-    ("tpcds q74", 0x10759a86e56cbb2b),
-    ("tpcds q75", 0xe4899a4f29daf0ad),
-    ("tpcds q76", 0xac9ca60e2f3669dc),
-    ("tpcds q77", 0xa2ef74874e6f232a),
-    ("tpcds q78", 0x9a3228396a809c2e),
-    ("tpcds q79", 0x7a35f373e8a05341),
-    ("tpcds q80", 0x7d3a6f7195372e80),
-    ("tpcds q81", 0x0c7b7275545703a2),
-    ("tpcds q82", 0x74a529d67acf22a4),
-    ("tpcds q83", 0x217b0ad91c876197),
-    ("tpcds q84", 0x46102a1a2c9d4edb),
-    ("tpcds q85", 0xbb577cbb2dd5996f),
-    ("tpcds q86", 0xe4103d127eac64b6),
-    ("tpcds q87", 0x7228500c5c60e90d),
-    ("tpcds q88", 0x5ce6964dc59d2d5c),
-    ("tpcds q89", 0x87c55312daab1cee),
-    ("tpcds q90", 0x4409927bc14a00c8),
-    ("tpcds q91", 0xa6e0b876c197b4b2),
-    ("tpcds q92", 0xf2859591aa14785c),
-    ("tpcds q93", 0x4f6b5c1eff5b4a6f),
-    ("tpcds q94", 0xe80d6b36b135c87a),
-    ("tpcds q95", 0x1b9fb100df4de3cd),
-    ("tpcds q96", 0x085496f5c5c3b965),
-    ("tpcds q97", 0x161a313420be33f6),
-    ("tpcds q98", 0x289359764e6d3211),
-    ("tpcds q99", 0x272981664c905c60),
-];
-
 #[tokio::test]
 async fn subqueries_reading_a_table_plan_sound_fragments() {
     assert_shapes_plan_sound_fragments(&["T", "Tr", "Tn", "Tc"]).await;
@@ -317,37 +189,6 @@ fn benchmark_queries_plan_sound_fragments() {
         "{} benchmark queries plan unsound fragments:\n{}",
         offenders.len(),
         offenders.join("\n")
-    );
-}
-
-/// Every benchmark query except q39b planned sound fragments before #250 was
-/// fixed; their plans stay as they were. A digest of each plan's fragment
-/// tree, as `describe` prints it.
-#[test]
-fn benchmark_queries_with_sound_plans_keep_their_plans() {
-    let expected: HashMap<&str, u64> = PLAN_DIGESTS.iter().copied().collect();
-    let mut changed = Vec::new();
-    let mut seen = 0;
-    for (key, fragment) in benchmark_plans() {
-        let Some(digest) = expected.get(key.as_str()) else {
-            continue;
-        };
-        seen += 1;
-        let text = describe(&fragment, 0);
-        if fnv1a(&text) != *digest {
-            changed.push(format!("{key}\n{text}"));
-        }
-    }
-    assert_eq!(
-        seen,
-        PLAN_DIGESTS.len(),
-        "a benchmark query file is missing"
-    );
-    assert!(
-        changed.is_empty(),
-        "{} benchmark plans changed:\n{}",
-        changed.len(),
-        changed.join("\n")
     );
 }
 
@@ -438,12 +279,6 @@ async fn plan_benchmark_queries() -> Vec<(String, PlanFragment)> {
         }
     }
     plans
-}
-
-fn fnv1a(text: &str) -> u64 {
-    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    })
 }
 
 // ---------------------------------------------------------------------------

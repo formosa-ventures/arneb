@@ -97,6 +97,7 @@ other pod in the namespace that runs Arneb.
 | `worker.terminationGracePeriodSeconds` | drain timeout + 30 | Must stay above the drain timeout. |
 | `worker.podDisruptionBudget.enabled` | `true` | |
 | `coordinator.*` / `worker.*` `resources`, `nodeSelector`, `tolerations`, `affinity`, `podAnnotations`, `extraArgs` | empty | Per role. |
+| `coordinator.extraContainers` | `[]` | Sidecar containers in the coordinator pod, for example a proxy that makes a service reachable on localhost. |
 
 Pods run as uid 10001 with no added capabilities. Changing `config`
 restarts every pod.
@@ -115,6 +116,10 @@ restarts every pod.
   belongs in a Secret: create one with a `config.toml` key and set
   `existingConfigSecret`. Catalog passwords can also come from
   `ARNEB_CATALOG_<NAME>_PASSWORD` through `extraEnv` or `envFrom`.
+- **Trino listener under password auth.** The coordinator refuses to start
+  with `[auth] type = "password"` and the Trino listener on but no `[tls]`,
+  since Trino clients send passwords with Basic auth. Configure `[tls]`, or
+  set `coordinator.trino.enabled=false` if no Trino client connects.
 - **TLS.** Mount certificates with `extraVolumes` / `extraVolumeMounts` and
   point `[tls]` and `[cluster.tls]` at them. Workers advertise their pod IP,
   so each worker's cluster TLS certificate must carry its pod IP as an IP
@@ -213,3 +218,10 @@ docker build -f docker/arneb/Dockerfile -t arneb:ci .
 python scripts/k8s-smoke/gen_tpch.py /tmp/tpch 1
 scripts/k8s-smoke/run.sh /tmp/tpch
 ```
+
+`.github/workflows/acceptance.yml` runs the headless acceptance scenario
+(`scripts/k8s-smoke/acceptance.sh`) on kind: password auth, a hive catalog,
+OAuth through Keycloak, a coordinator restart by `helm upgrade` and a worker
+pod replaced. It takes 30–40 minutes, so it runs nightly, on demand, and on
+pull requests that touch the server, its protocols and cluster RPC, the
+chart, the image or the scripts.

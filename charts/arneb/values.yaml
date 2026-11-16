@@ -84,6 +84,9 @@ coordinator:
   affinity: {}
   podAnnotations: {}
   extraArgs: []
+  # Sidecar containers in the coordinator pod, e.g. a proxy that makes a
+  # service reachable on localhost.
+  extraContainers: []
 
 worker:
   replicas: 2

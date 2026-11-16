@@ -300,7 +300,11 @@ check '.state == "finished"' "Q6 did not finish after the uncordon"
 API_REVENUE=$(first_cell)
 psql_user2 "${Q6/FROM lineitem/FROM $CATALOG.$SCHEMA.lineitem}"
 [ "$PSQL_RC" = 0 ] || fail "psql Q6 failed: $PSQL_OUT"
-[ "$API_REVENUE" = "$PSQL_OUT" ] || fail "Q6 revenue differs: api=$API_REVENUE psql=$PSQL_OUT"
+# A distributed SUM over doubles can add the partial sums in another order
+# on each run, so allow a difference in the last digits.
+awk -v a="$API_REVENUE" -v b="$PSQL_OUT" \
+    'BEGIN { d = a - b; if (d < 0) d = -d; m = (b < 0 ? -b : b); exit !(a != "" && d <= m * 1e-12) }' ||
+    fail "Q6 revenue differs: api=$API_REVENUE psql=$PSQL_OUT"
 echo "  revenue=$API_REVENUE"
 pass
 

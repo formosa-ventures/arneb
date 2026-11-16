@@ -38,7 +38,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use arneb_common::identifiers::StageId;
 use arneb_common::types::ColumnInfo;
-use arneb_execution::prune_for_columns;
+use arneb_execution::{prune_for_columns, prune_for_columns_with_exchange_fallback};
 use arneb_planner::{LogicalPlan, PartitioningScheme, PlanExpr, PlanFragment};
 
 /// Entry point: prune the entire `PlanFragment` tree from the root down.
@@ -61,7 +61,21 @@ fn prune_recursive(frag: &mut PlanFragment, needed_at_root: &BTreeSet<usize>) {
     // Prune this fragment's logical plan. The pruning algorithm inserts
     // `Projection > ExchangeNode(full)` wrappers — those tell us which
     // columns each child fragment needs to send.
-    let (pruned, output_mapping) = prune_for_columns(&frag.root, &needed);
+    let exchange_fallback: HashMap<StageId, usize> = frag
+        .source_fragments
+        .iter()
+        .map(|child| {
+            let (_, mapping) = prune_for_columns(&child.root, &BTreeSet::new());
+            let index = mapping
+                .iter()
+                .min_by_key(|(_, new)| *new)
+                .map(|(old, _)| *old)
+                .unwrap_or(0);
+            (child.id, index)
+        })
+        .collect();
+    let (pruned, output_mapping) =
+        prune_for_columns_with_exchange_fallback(&frag.root, &needed, &exchange_fallback);
 
     // Re-index output_partitioning hash columns through the mapping
     // (their positions shifted because the root's schema shrank).
@@ -565,5 +579,279 @@ mod tests {
             root.source_fragments[0].output_partitioning,
             PartitioningScheme::Hash { ref columns, .. } if columns == &[1]
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // A plan that reads no column of its input (#258).
+    //
+    // Measured at TPC-H SF1 with a coordinator and one worker:
+    // `SELECT count(*) FROM lineitem a JOIN lineitem b ON a.l_suppkey =
+    // b.l_suppkey` read every lineitem column on both sides (186 bytes a
+    // row, where a single-node run reads 16), and shipped both sides'
+    // 32 columns out of the join (345 bytes a row) for the count. With
+    // about 600 matches a row that is about 212 MB a probe batch, and the
+    // worker grew past its memory limit. `count(*) FROM lineitem` alone
+    // read every column too.
+    // -----------------------------------------------------------------
+
+    mod no_column_read {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use arneb_catalog::{
+            CatalogManager, ColumnStatistics, MemoryCatalog, MemorySchema, TableProvider,
+            TableStatistics,
+        };
+        use arneb_common::types::{ColumnInfo, DataType};
+        use arneb_planner::{
+            LogicalOptimizer, LogicalPlan, PlanExpr, PlanFragment, PlanFragmenter, QueryPlanner,
+        };
+
+        use super::super::prune_fragment_tree;
+
+        const LINEITEM: &[(&str, DataType)] = &[
+            ("l_orderkey", DataType::Int64),
+            ("l_partkey", DataType::Int64),
+            ("l_suppkey", DataType::Int64),
+            ("l_linenumber", DataType::Int32),
+            ("l_quantity", DataType::Float64),
+            ("l_extendedprice", DataType::Float64),
+            ("l_discount", DataType::Float64),
+            ("l_tax", DataType::Float64),
+            ("l_returnflag", DataType::Utf8),
+            ("l_linestatus", DataType::Utf8),
+            ("l_shipdate", DataType::Date32),
+            ("l_commitdate", DataType::Date32),
+            ("l_receiptdate", DataType::Date32),
+            ("l_shipinstruct", DataType::Utf8),
+            ("l_shipmode", DataType::Utf8),
+            ("l_comment", DataType::Utf8),
+        ];
+
+        #[derive(Debug)]
+        struct StatsTable {
+            schema: Vec<ColumnInfo>,
+            stats: TableStatistics,
+        }
+
+        impl TableProvider for StatsTable {
+            fn schema(&self) -> Vec<ColumnInfo> {
+                self.schema.clone()
+            }
+            fn statistics(&self) -> Option<TableStatistics> {
+                Some(self.stats.clone())
+            }
+            fn canonical_name(&self) -> Option<(String, String)> {
+                None
+            }
+        }
+
+        /// `lineitem` with the SF1 row count and key distinct counts, so
+        /// a self-join on `l_suppkey` is hash-partitioned.
+        fn catalog() -> CatalogManager {
+            let manager = CatalogManager::new("default", "public");
+            let catalog = Arc::new(MemoryCatalog::new());
+            let schema = Arc::new(MemorySchema::new());
+            let columns = [
+                ("l_orderkey", 1_500_000u64),
+                ("l_partkey", 200_000),
+                ("l_suppkey", 10_000),
+            ]
+            .into_iter()
+            .map(|(name, ndv)| {
+                (
+                    name.to_string(),
+                    ColumnStatistics {
+                        ndv: Some(ndv),
+                        null_fraction: Some(0.0),
+                        min_value: None,
+                        max_value: None,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+            schema.register_table(
+                "lineitem",
+                Arc::new(StatsTable {
+                    schema: LINEITEM
+                        .iter()
+                        .map(|(name, data_type)| ColumnInfo {
+                            name: (*name).to_string(),
+                            data_type: data_type.clone(),
+                            nullable: false,
+                        })
+                        .collect(),
+                    stats: TableStatistics {
+                        row_count: Some(6_001_215),
+                        size_bytes: Some(255_970_446),
+                        columns,
+                    },
+                }),
+            );
+            catalog.register_schema("public", schema);
+            manager.register_catalog("default", catalog);
+            manager
+        }
+
+        /// The fragment tree the coordinator runs for `sql` on one worker:
+        /// planned, optimized, fragmented and pruned as `coordinator.rs`
+        /// does.
+        async fn pruned_fragments(sql: &str) -> PlanFragment {
+            let catalog = catalog();
+            let stmt = arneb_sql_parser::parse(sql).expect("parse");
+            let (plan, ctx) = QueryPlanner::new(&catalog)
+                .plan_statement_with_context(&stmt)
+                .await
+                .expect("plan");
+            let plan = LogicalOptimizer::default_rules()
+                .optimize(plan)
+                .expect("optimize");
+            let mut root = PlanFragmenter::new()
+                .with_broadcast_threshold(Some(100 * 1024 * 1024))
+                .with_stats(Some(ctx.catalog_stats.clone()))
+                .with_worker_count(1)
+                .fragment(plan);
+            prune_fragment_tree(&mut root);
+            root
+        }
+
+        fn fragments(root: &PlanFragment) -> Vec<&PlanFragment> {
+            let mut out = vec![root];
+            for child in &root.source_fragments {
+                out.extend(fragments(child));
+            }
+            out
+        }
+
+        /// The inputs of `plan`, for the walks below.
+        fn children(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
+            use LogicalPlan as L;
+            match plan {
+                L::Projection { input, .. }
+                | L::Filter { input, .. }
+                | L::Aggregate { input, .. }
+                | L::RollupAggregate { input, .. }
+                | L::Sort { input, .. }
+                | L::Limit { input, .. }
+                | L::Explain { input, .. }
+                | L::PartialAggregate { input, .. }
+                | L::FinalAggregate { input, .. }
+                | L::Distinct { input }
+                | L::Window { input, .. }
+                | L::AssignUniqueId { input, .. } => vec![input],
+                L::Join { left, right, .. }
+                | L::SemiJoin { left, right, .. }
+                | L::AntiJoin { left, right, .. }
+                | L::Intersect { left, right }
+                | L::Except { left, right } => vec![left, right],
+                L::UnionAll { inputs } => inputs.iter().collect(),
+                L::ScalarSubquery { subplan } => vec![subplan],
+                _ => vec![],
+            }
+        }
+
+        /// Column names of every exchange in `plan`.
+        fn exchanges(plan: &LogicalPlan, out: &mut Vec<Vec<String>>) {
+            if let LogicalPlan::ExchangeNode { schema, .. } = plan {
+                out.push(schema.iter().map(|c| c.name.clone()).collect());
+            }
+            for child in children(plan) {
+                exchanges(child, out);
+            }
+        }
+
+        /// The columns `plan` reads from each table scan: those a
+        /// projection right above the scan keeps, or all of the scan's.
+        fn columns_read(plan: &LogicalPlan, out: &mut Vec<Vec<String>>) {
+            if let LogicalPlan::Projection { input, exprs, .. } = plan {
+                if let LogicalPlan::TableScan { .. } = input.as_ref() {
+                    let scan = input.schema();
+                    if let Some(read) = exprs
+                        .iter()
+                        .map(|e| match e {
+                            PlanExpr::Column { index, .. } => Some(scan[*index].name.clone()),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>()
+                    {
+                        out.push(read);
+                        return;
+                    }
+                }
+            }
+            if let LogicalPlan::TableScan { .. } = plan {
+                out.push(plan.schema().iter().map(|c| c.name.clone()).collect());
+                return;
+            }
+            for child in children(plan) {
+                columns_read(child, out);
+            }
+        }
+
+        fn all_exchanges(root: &PlanFragment) -> Vec<Vec<String>> {
+            let mut out = Vec::new();
+            for fragment in fragments(root) {
+                exchanges(&fragment.root, &mut out);
+            }
+            out
+        }
+
+        fn all_columns_read(root: &PlanFragment) -> Vec<Vec<String>> {
+            let mut out = Vec::new();
+            for fragment in fragments(root) {
+                columns_read(&fragment.root, &mut out);
+            }
+            out
+        }
+
+        #[tokio::test]
+        async fn a_count_over_a_partitioned_join_ships_only_the_join_keys() {
+            let root = pruned_fragments(
+                "SELECT count(*) FROM lineitem a JOIN lineitem b ON a.l_suppkey = b.l_suppkey",
+            )
+            .await;
+            for read in all_columns_read(&root) {
+                assert_eq!(read, ["l_suppkey"], "a scan reads more than the join key");
+            }
+            for schema in all_exchanges(&root) {
+                assert!(
+                    !schema.is_empty(),
+                    "an exchange ships no column, so its batches cannot carry a row count"
+                );
+                assert!(
+                    schema.len() == 1,
+                    "an exchange ships {} columns where the count needs at most one: {schema:?}",
+                    schema.len()
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_count_of_a_table_reads_at_most_one_column() {
+            let root = pruned_fragments("SELECT count(*) FROM lineitem").await;
+            let read = all_columns_read(&root);
+            assert_eq!(read.len(), 1);
+            assert_eq!(
+                read[0].len(),
+                1,
+                "count(*) reads {} columns: {:?}",
+                read[0].len(),
+                read[0]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_join_that_reads_a_column_keeps_its_pruning() {
+            let root = pruned_fragments(
+                "SELECT sum(a.l_quantity) FROM lineitem a JOIN lineitem b ON a.l_suppkey = b.l_suppkey",
+            )
+            .await;
+            let mut read = all_columns_read(&root);
+            read.sort();
+            assert_eq!(read, [vec!["l_suppkey"], vec!["l_suppkey", "l_quantity"]]);
+            for schema in all_exchanges(&root) {
+                assert!(!schema.is_empty() && schema.len() <= 2, "{schema:?}");
+            }
+        }
     }
 }

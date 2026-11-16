@@ -1670,7 +1670,9 @@ mod tests {
     async fn a_cancelled_request_does_not_cancel_the_fetch() {
         let key = TestKey::ec("k1");
         let idp = TestIdp::start(&[&key]).await;
-        idp.set_mode(Mode::Slow(300));
+        // Well beyond the five 50 ms requests below, so the fetch is still
+        // running at the last one even on a slow CI runner.
+        idp.set_mode(Mode::Slow(1000));
         // The default 30 s jwks_min_refresh: a lost fetch would mean 503s.
         let v = validator(&idp, |_| {});
         let t = key.sign(&claims(&idp.issuer(), AUD));
@@ -1680,7 +1682,7 @@ mod tests {
             assert!(r.is_err());
         }
         // ...start one fetch between them, which completes on its own.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(idp.jwks_hits(), 1);
         v.validate(&t).await.unwrap();
         assert_eq!(idp.jwks_hits(), 1);

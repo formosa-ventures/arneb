@@ -222,6 +222,7 @@ scripts/k8s-smoke/run.sh /tmp/tpch
 `.github/workflows/acceptance.yml` runs the headless acceptance scenario
 (`scripts/k8s-smoke/acceptance.sh`) on kind: password auth, a hive catalog,
 OAuth through Keycloak, a coordinator restart by `helm upgrade` and a worker
-pod replaced. It takes 30–40 minutes, so it runs nightly, on demand, and on
+pod replaced. It takes 15–20 minutes, so it runs nightly, on demand, and on
 pull requests that touch the server, its protocols and cluster RPC, the
-chart, the image or the scripts.
+chart, the image, the scripts or the dependencies (`Cargo.lock`, a
+`Cargo.toml`).

@@ -606,23 +606,40 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 span,
             })
         }
-        sp::Expr::InList {
+        sp::Expr::In {
             expr,
-            list,
+            target,
             negated,
-        } => {
-            let e = convert_expr(*expr)?;
-            let items = list
-                .into_iter()
-                .map(convert_expr)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ast::Expr::InList {
-                expr: Box::new(e),
-                list: items,
-                negated,
-                span,
-            })
-        }
+            global: false,
+        } => match target {
+            sp::InTarget::List(list) => {
+                let e = convert_expr(*expr)?;
+                let items = list
+                    .into_iter()
+                    .map(convert_expr)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(ast::Expr::InList {
+                    expr: Box::new(e),
+                    list: items,
+                    negated,
+                    span,
+                })
+            }
+            sp::InTarget::Subquery(subquery) => {
+                let e = convert_expr(*expr)?;
+                let q = convert_query(*subquery)?;
+                Ok(ast::Expr::InSubquery {
+                    expr: Box::new(e),
+                    subquery: Box::new(q),
+                    negated,
+                    span,
+                })
+            }
+            // IN UNNEST(...) and IN <table> are other dialects' forms.
+            other => Err(ParseError::UnsupportedFeature(format!(
+                "expression: IN {other}"
+            ))),
+        },
         // `x = ANY (ARRAY[...])` / `x <> ALL (ARRAY[...])` over literal
         // arrays are IN lists; Arneb has no array type (pg-catalog-tables).
         sp::Expr::AnyOp {
@@ -743,20 +760,6 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 name: "ROLLUP".to_string(),
                 args,
                 distinct: false,
-                span,
-            })
-        }
-        sp::Expr::InSubquery {
-            expr,
-            subquery,
-            negated,
-        } => {
-            let e = convert_expr(*expr)?;
-            let q = convert_query(*subquery)?;
-            Ok(ast::Expr::InSubquery {
-                expr: Box::new(e),
-                subquery: Box::new(q),
-                negated,
                 span,
             })
         }
@@ -1526,6 +1529,9 @@ fn convert_join_constraint(
                 .collect();
             Ok(ast::JoinCondition::Using(cols))
         }
+        sp::JoinConstraint::UsingAlias(..) => Err(ParseError::UnsupportedFeature(
+            "JOIN ... USING (...) AS alias".to_string(),
+        )),
         sp::JoinConstraint::Natural => {
             Err(ParseError::UnsupportedFeature("NATURAL JOIN".to_string()))
         }

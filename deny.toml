@@ -24,6 +24,13 @@ ignore = [
     # Reachable via the streaming Decoder on a corrupt legacy frame, which
     # needs write access to the data lake. Accepted until #199.
     "RUSTSEC-2026-0403",
+    # chrono, chrono-tz and humantime were marked unmaintained together
+    # (chronotope/chrono#1768) with no replacement yet. chrono and chrono-tz
+    # come in through arrow, which Arneb is built on, and humantime through
+    # object_store. Unmaintained, not vulnerable; revisit when arrow moves.
+    "RUSTSEC-2026-0542",
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
 ]
 
 [licenses]

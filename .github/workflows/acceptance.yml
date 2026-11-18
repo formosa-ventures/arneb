@@ -5,9 +5,10 @@ name: Headless acceptance
 # PostgreSQL catalog and Keycloak, all from docker-compose.yml. See
 # scripts/k8s-smoke/acceptance.sh.
 #
-# It takes 30-40 minutes, so pull requests run it only when they touch what
+# It takes 15-20 minutes, so pull requests run it only when they touch what
 # it exercises: the server, its protocols and cluster RPC, the chart, the
-# image and the scripts. It also runs nightly on main and on demand.
+# image, the scripts and the dependencies. It also runs nightly on main and
+# on demand.
 
 on:
   pull_request:
@@ -20,6 +21,9 @@ on:
       - "charts/**"
       - "docker/arneb/**"
       - "docker-compose.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/*/Cargo.toml"
       - "scripts/*-smoke.sh"
       - "scripts/headless-acceptance.sh"
       - "scripts/k8s-smoke/acceptance.sh"

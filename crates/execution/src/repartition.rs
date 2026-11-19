@@ -663,6 +663,20 @@ mod tests {
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use std::sync::Arc;
 
+    #[test]
+    fn hash_repartition_accepts_exactly_the_hash_join_key_types() {
+        for array in crate::hash_join::sample_key_arrays() {
+            use std::hash::BuildHasher;
+            let mut hasher = ahash::RandomState::with_seeds(1, 2, 3, 4).build_hasher();
+            assert_eq!(
+                hash_one_cell_ahash(&array, 0, &mut hasher).is_ok(),
+                crate::hash_join::is_hash_join_key_type(array.data_type()),
+                "{:?}",
+                array.data_type()
+            );
+        }
+    }
+
     fn three_rows() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "id",

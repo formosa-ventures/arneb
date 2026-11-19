@@ -339,3 +339,35 @@ fn function_key_join_over_many_rows() {
         table(&[&[expected.to_string().as_str()]])
     );
 }
+
+#[test]
+fn expression_keys_of_a_type_the_hash_join_lacks_still_join() {
+    // date_trunc on a TIMESTAMP gives a TIMESTAMP key, which neither the hash
+    // join nor the hash repartition handles; the equality must still be
+    // evaluated (as a nested-loop condition) rather than fail the query.
+    assert_eq!(
+        rows_within_time_limit(
+            "SELECT count(*) \
+             FROM (SELECT TIMESTAMP '2026-01-01 10:00:00' AS t) a \
+             JOIN (SELECT TIMESTAMP '2026-01-01 11:00:00' AS u) b \
+             ON date_trunc('day', a.t) = date_trunc('day', b.u)"
+        ),
+        table(&[&["1"]])
+    );
+}
+
+#[test]
+fn unsupported_expression_key_beside_a_supported_one() {
+    // The INTEGER key hashes; the TIMESTAMP equality is checked on each
+    // candidate pair. Only (1, 10) falls on the same day.
+    assert_eq!(
+        rows_within_time_limit(
+            "SELECT a.k, b.k FROM a JOIN b \
+             ON a.k * 10 = b.k \
+             AND date_trunc('day', date_add('day', a.k, TIMESTAMP '2026-01-01 00:00:00')) \
+               = date_trunc('day', date_add('day', b.k - 10, TIMESTAMP '2026-01-02 12:00:00')) \
+             ORDER BY a.k"
+        ),
+        table(&[&["1", "10"]])
+    );
+}

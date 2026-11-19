@@ -1611,7 +1611,9 @@ mod tests {
         let v = validator(&idp, |s| {
             s.jwks_cache = Duration::from_millis(200);
             s.jwks_min_refresh = Duration::from_millis(10);
-            s.jwks_max_stale = Duration::from_millis(500);
+            // Far beyond jwks_cache, so the old keys still decide after
+            // it even when a slow CI runner stretches the steps below.
+            s.jwks_max_stale = Duration::from_millis(2000);
         });
         let t = key.sign(&claims(&idp.issuer(), AUD));
         v.validate(&t).await.unwrap();
@@ -1629,7 +1631,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(230)).await;
         v.validate(&t).await.unwrap();
         // ...and past jwks_max_stale nothing can.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(1800)).await;
         assert_eq!(v.validate(&t).await.unwrap_err(), OAuthReject::Unavailable);
         // The IdP returns: the next fetch serves again.
         idp.set_mode(Mode::Ok);

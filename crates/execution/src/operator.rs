@@ -1496,7 +1496,8 @@ impl NestedLoopJoinExec {
             }
         }
 
-        let has_pairs = !left_indices.is_empty();
+        let pair_count = left_indices.len();
+        let has_pairs = pair_count > 0;
         // Charge the output before `take` allocates it, then true it up
         // to the real batch size.
         let est_output = left_indices.len() * row_bytes;
@@ -1519,8 +1520,8 @@ impl NestedLoopJoinExec {
         drop((left_idx_arr, right_idx_arr));
         reservation.shrink(index_bytes);
         let mut output_charged = est_output;
-        if !result_columns.is_empty() && has_pairs {
-            let batch = RecordBatch::try_new(output_schema.clone(), result_columns)?;
+        if has_pairs {
+            let batch = batch_with_row_count(output_schema.clone(), result_columns, pair_count)?;
             self.settle_output(reservation, &mut output_charged, record_batch_bytes(&batch))?;
             all_batches.push(batch);
         } else {
@@ -1551,7 +1552,7 @@ impl NestedLoopJoinExec {
                             null_len,
                         ));
                     }
-                    let batch = RecordBatch::try_new(output_schema.clone(), cols)?;
+                    let batch = batch_with_row_count(output_schema.clone(), cols, null_len)?;
                     let mut charged = est;
                     drop(idx);
                     self.settle_output(reservation, &mut charged, record_batch_bytes(&batch))?;
@@ -1584,7 +1585,7 @@ impl NestedLoopJoinExec {
                     for col_i in 0..right_batch.num_columns() {
                         cols.push(compute::take(right_batch.column(col_i), &idx, None)?);
                     }
-                    let batch = RecordBatch::try_new(output_schema.clone(), cols)?;
+                    let batch = batch_with_row_count(output_schema.clone(), cols, null_len)?;
                     let mut charged = est;
                     drop(idx);
                     self.settle_output(reservation, &mut charged, record_batch_bytes(&batch))?;
@@ -1707,8 +1708,26 @@ impl NestedLoopJoinExec {
                 .into();
             cols.push(arrow::array::new_null_array(&dt, left_batch.num_rows()));
         }
-        Ok(vec![RecordBatch::try_new(arrow_schema, cols)?])
+        Ok(vec![batch_with_row_count(
+            arrow_schema,
+            cols,
+            left_batch.num_rows(),
+        )?])
     }
+}
+
+/// Builds a batch that keeps `rows` even when it has no column, which
+/// `RecordBatch::try_new` cannot: a join over a branch that carries no
+/// column (a pruned constant `SELECT`) still produces rows.
+fn batch_with_row_count(
+    schema: arrow::datatypes::SchemaRef,
+    columns: Vec<ArrayRef>,
+    rows: usize,
+) -> Result<RecordBatch, ExecutionError> {
+    let options = arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows));
+    Ok(RecordBatch::try_new_with_options(
+        schema, columns, &options,
+    )?)
 }
 
 // ===========================================================================
@@ -2094,7 +2113,7 @@ impl HashAggregateExec {
                 .iter()
                 .map(|info| {
                     if info.is_count_star {
-                        count_star_input_array(batch.column(0))
+                        count_star_input_array(&count_star_column(&batch))
                     } else {
                         expression::evaluate(&info.args[0], &batch, None)
                             .and_then(|c| materialize_dictionary_array(&c))
@@ -2153,7 +2172,7 @@ impl HashAggregateExec {
                 batch_res.map_err(|e| ExecutionError::upstream("aggregate input stream", e))?;
             for (i, info) in aggr_info.iter().enumerate() {
                 let col = if info.is_count_star {
-                    batch.column(0).clone()
+                    count_star_column(&batch)
                 } else {
                     expression::evaluate(&info.args[0], &batch, None)?
                 };
@@ -2354,7 +2373,7 @@ impl HashAggregateExec {
                 .iter()
                 .map(|info| {
                     if info.is_count_star {
-                        count_star_input_array(batch.column(0))
+                        count_star_input_array(&count_star_column(&batch))
                     } else {
                         expression::evaluate(&info.args[0], &batch, None)
                             .and_then(|c| materialize_dictionary_array(&c))
@@ -2478,7 +2497,7 @@ impl HashAggregateExec {
                     .iter()
                     .map(|info| {
                         if info.is_count_star {
-                            count_star_input_array(batch.column(0))
+                            count_star_input_array(&count_star_column(&batch))
                         } else {
                             expression::evaluate(&info.args[0], &batch, None)
                                 .and_then(|c| materialize_dictionary_array(&c))
@@ -2528,7 +2547,7 @@ impl HashAggregateExec {
             let group_ids: Vec<u32> = vec![0u32; n];
             for (i, info) in aggr_info.iter().enumerate() {
                 let col = if info.is_count_star {
-                    batch.column(0).clone()
+                    count_star_column(&batch)
                 } else {
                     expression::evaluate(&info.args[0], &batch, None)?
                 };
@@ -2951,7 +2970,7 @@ async fn build_partial_groups(
             })?;
             for (i, info) in aggr_info.iter().enumerate() {
                 let col = if info.is_count_star {
-                    batch.column(0).clone()
+                    count_star_column(&batch)
                 } else {
                     expression::evaluate(&info.args[0], &batch, None)?
                 };
@@ -2977,7 +2996,7 @@ async fn build_partial_groups(
             .iter()
             .map(|info| {
                 if info.is_count_star {
-                    count_star_input_array(batch.column(0))
+                    count_star_input_array(&count_star_column(&batch))
                 } else {
                     expression::evaluate(&info.args[0], &batch, None)
                         .and_then(|c| materialize_dictionary_array(&c))
@@ -3052,7 +3071,7 @@ async fn build_partial_groups_batch_aware(
             let group_ids: Vec<u32> = vec![0u32; n];
             for (i, info) in aggr_info.iter().enumerate() {
                 let col = if info.is_count_star {
-                    batch.column(0).clone()
+                    count_star_column(&batch)
                 } else {
                     expression::evaluate(&info.args[0], &batch, None)?
                 };
@@ -3078,7 +3097,7 @@ async fn build_partial_groups_batch_aware(
             .iter()
             .map(|info| {
                 if info.is_count_star {
-                    count_star_input_array(batch.column(0))
+                    count_star_input_array(&count_star_column(&batch))
                 } else {
                     expression::evaluate(&info.args[0], &batch, None)
                         .and_then(|c| materialize_dictionary_array(&c))
@@ -3706,7 +3725,7 @@ impl ExecutionPlan for StreamingHashAggregateExec {
                 .iter()
                 .map(|info| {
                     if info.is_count_star {
-                        count_star_input_array(batch.column(0))
+                        count_star_input_array(&count_star_column(batch))
                     } else {
                         expression::evaluate(&info.args[0], batch, None)
                             .and_then(|c| materialize_dictionary_array(&c))
@@ -4120,6 +4139,18 @@ fn group_key_array(arr: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
         return materialize_dictionary_array(arr);
     }
     dictionary_values_for_group_key(arr)
+}
+
+/// The array `count(*)` counts the rows of: any column works, since a
+/// `count(*)` accumulator counts length, not values. A zero-column batch
+/// (the input of `SELECT count(*)`, a bare `OneRow`) still has a row
+/// count, so it gets a null array of that length.
+fn count_star_column(batch: &RecordBatch) -> ArrayRef {
+    if batch.num_columns() == 0 {
+        arrow::array::new_null_array(&ArrowDataType::Null, batch.num_rows())
+    } else {
+        batch.column(0).clone()
+    }
 }
 
 fn count_star_input_array(arr: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
@@ -6162,6 +6193,50 @@ mod tests {
             Err(other) => panic!("expected ResourceExhausted, got {other:?}"),
             Ok(rows) => panic!("expected ResourceExhausted, got {rows} rows (no accounting)"),
         }
+    }
+
+    #[tokio::test]
+    async fn nested_loop_join_keeps_rows_of_zero_column_inputs() {
+        // `OneRowExec` emits one row and no column; the join output then
+        // has no column either but must still carry its row count.
+        let pool: Arc<dyn crate::memory_pool::MemoryPool> =
+            Arc::new(crate::memory_pool::UnboundedMemoryPool::new());
+        let cross =
+            |left: Arc<dyn ExecutionPlan>, right: Arc<dyn ExecutionPlan>| NestedLoopJoinExec {
+                left,
+                right,
+                join_type: ast::JoinType::Cross,
+                condition: arneb_planner::JoinCondition::None,
+                memory_pool: Arc::clone(&pool),
+            };
+        assert_eq!(
+            run_nlj(cross(Arc::new(OneRowExec), Arc::new(OneRowExec)))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            run_nlj(cross(
+                Arc::new(OneRowExec),
+                nlj_int_scan("b", vec![1, 2, 3])
+            ))
+            .await
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            run_nlj(cross(nlj_int_scan("a", vec![1, 2]), Arc::new(OneRowExec)))
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn count_star_column_counts_a_zero_column_batch() {
+        let schema = Arc::new(Schema::empty());
+        let batch = batch_with_row_count(schema, vec![], 4).unwrap();
+        assert_eq!(count_star_column(&batch).len(), 4);
     }
 
     #[tokio::test]

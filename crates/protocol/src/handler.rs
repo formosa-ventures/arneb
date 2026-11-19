@@ -3024,6 +3024,54 @@ mod tests {
         assert_eq!(batch.column(1).null_count(), 1);
     }
 
+    /// `count(*)` reads no column, so column pruning drops every column a
+    /// branch carries. Each branch must still report its row count, also
+    /// when it starts from a constant `SELECT` (an empty-schema `OneRow`).
+    #[tokio::test]
+    async fn count_star_keeps_row_count_when_no_column_is_read() {
+        let (cm, reg) = null_cmp_memory_env();
+        // t.a is (1, NULL, 3).
+        for (sql, expected) in [
+            ("SELECT count(*) FROM t", 3),
+            ("SELECT count(*) FROM (SELECT a + 1 AS b FROM t) s", 3),
+            ("SELECT count(*)", 1),
+            ("SELECT count(*) FROM (SELECT 1 AS x) s", 1),
+            ("SELECT count(*) FROM (SELECT 1 AS x) s WHERE 1 = 1", 1),
+            (
+                "SELECT count(*) FROM (SELECT 1 AS x) a CROSS JOIN (SELECT 2 AS y) b",
+                1,
+            ),
+            (
+                "SELECT count(*) FROM (SELECT 1 AS x UNION ALL SELECT 3) a \
+                 CROSS JOIN (SELECT 2 AS y) b",
+                2,
+            ),
+            ("SELECT count(*) FROM t CROSS JOIN (SELECT 1 AS x) s", 3),
+            ("SELECT count(*) FROM (SELECT 1 AS x) s CROSS JOIN t", 3),
+            (
+                "SELECT count(*) FROM t JOIN (SELECT 1 AS x) s ON t.a = s.x",
+                1,
+            ),
+            (
+                "SELECT count(*) FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) s",
+                3,
+            ),
+            (
+                "SELECT count(*) FROM (SELECT 1 AS x UNION ALL SELECT 2) a \
+                 CROSS JOIN (SELECT 1 AS y UNION ALL SELECT 2 UNION ALL SELECT 3) b",
+                6,
+            ),
+            // Unmatched left rows are NULL-extended: 1 matches, NULL and 3 do not.
+            (
+                "SELECT count(*) FROM t LEFT JOIN (SELECT 1 AS x) s ON t.a = s.x",
+                3,
+            ),
+            ("SELECT count(*) FROM t t1 LEFT JOIN t t2 ON t1.a > t2.a", 3),
+        ] {
+            assert_eq!(count_of(&run_sql(sql, &cm, &reg).await), expected, "{sql}");
+        }
+    }
+
     #[tokio::test]
     async fn overflowing_constant_expression_errors_instead_of_panicking() {
         let (cm, reg) = null_cmp_memory_env();

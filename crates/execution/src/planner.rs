@@ -1982,9 +1982,37 @@ pub fn prune_for_columns_with_exchange_fallback(
             schema,
         } => {
             if needed.is_empty() {
-                let (new_input, _) =
+                let (new_input, child_mapping) =
                     prune_for_columns_with_exchange_fallback(input, needed, exchange_fallback);
-                return (new_input, HashMap::new());
+                // Drop the projection only when its pruned input still
+                // carries a column. An empty-schema input (`OneRow`, the
+                // source of a constant `SELECT`) would leave this branch
+                // with zero-column batches, and several operators (the
+                // nested-loop join, `count(*)`) need a column to see the
+                // row count. Keep the first expression instead, the same
+                // "keep one" rule a scan follows.
+                if !new_input.schema().is_empty() || exprs.is_empty() {
+                    return (new_input, HashMap::new());
+                }
+                let mut child_needed = BTreeSet::new();
+                collect_column_indices_into(&exprs[0], &mut child_needed);
+                let (new_input, child_mapping) = if child_needed.is_empty() {
+                    (new_input, child_mapping)
+                } else {
+                    prune_for_columns_with_exchange_fallback(
+                        input,
+                        &child_needed,
+                        exchange_fallback,
+                    )
+                };
+                return (
+                    L::Projection {
+                        input: Box::new(new_input),
+                        exprs: vec![rewrite_column_indices(&exprs[0], &child_mapping)],
+                        schema: vec![schema[0].clone()],
+                    },
+                    HashMap::new(),
+                );
             }
             // Keep only the projection outputs the parent actually
             // references (`needed`). Without this, a Projection that
@@ -2617,6 +2645,43 @@ mod tests {
     use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn pruning_keeps_one_column_over_an_empty_schema_input() {
+        // `(SELECT 1 AS x) a CROSS JOIN (SELECT 2 AS y) b` under count(*):
+        // dropping either projection would leave a bare `OneRow` with no
+        // column, so each side keeps its first expression.
+        let one = |name: &str, v: i32| arneb_planner::LogicalPlan::Projection {
+            input: Box::new(arneb_planner::LogicalPlan::OneRow),
+            exprs: vec![PlanExpr::Literal {
+                value: ScalarValue::Int32(v),
+                span: None,
+            }],
+            schema: vec![ColumnInfo {
+                name: name.to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+            }],
+        };
+        let join = arneb_planner::LogicalPlan::Join {
+            left: Box::new(one("x", 1)),
+            right: Box::new(one("y", 2)),
+            join_type: ast::JoinType::Cross,
+            condition: JoinCondition::None,
+            dynamic_filter_ids: vec![],
+        };
+        let (pruned, _) = prune_for_columns(&join, &std::collections::BTreeSet::new());
+        let arneb_planner::LogicalPlan::Join { left, right, .. } = &pruned else {
+            panic!("expected a join, got {pruned:?}");
+        };
+        for side in [left, right] {
+            assert!(
+                matches!(side.as_ref(), arneb_planner::LogicalPlan::Projection { exprs, .. } if exprs.len() == 1),
+                "{side:?}"
+            );
+        }
+        assert_eq!(pruned.schema().len(), 2);
+    }
 
     fn test_context() -> (ExecutionContext, Vec<ColumnInfo>) {
         let schema = vec![

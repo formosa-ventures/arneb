@@ -115,6 +115,68 @@ fn setup() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
             ),
         ])),
     );
+    // b: values within half a unit of the integer bounds. Row 1 rounds onto
+    // the bound, row 2 rounds just past it.
+    schema.register_table(
+        "b",
+        Arc::new(table(vec![
+            ("k", DataType::Int32, Arc::new(Int32Array::from(vec![1, 2]))),
+            (
+                "hi_d",
+                DataType::Float64,
+                Arc::new(Float64Array::from(vec![2147483647.49, 2147483647.5])),
+            ),
+            (
+                "lo_d",
+                DataType::Float64,
+                Arc::new(Float64Array::from(vec![-2147483648.49, -2147483648.5])),
+            ),
+            (
+                "hi_r",
+                DataType::Float32,
+                Arc::new(Float32Array::from(vec![127.25_f32, 127.5])),
+            ),
+            (
+                "hi_m128",
+                DataType::Decimal128 {
+                    precision: 20,
+                    scale: 1,
+                },
+                Arc::new(
+                    Decimal128Array::from(vec![
+                        i64::MAX as i128 * 10 + 4,
+                        i64::MAX as i128 * 10 + 5,
+                    ])
+                    .with_precision_and_scale(20, 1)
+                    .unwrap(),
+                ),
+            ),
+            (
+                "lo_m64",
+                DataType::Decimal64 {
+                    precision: 5,
+                    scale: 1,
+                },
+                Arc::new(
+                    Decimal64Array::from(vec![-1284, -1285])
+                        .with_precision_and_scale(5, 1)
+                        .unwrap(),
+                ),
+            ),
+            (
+                "hi_m64",
+                DataType::Decimal64 {
+                    precision: 6,
+                    scale: 1,
+                },
+                Arc::new(
+                    Decimal64Array::from(vec![327674, 327675])
+                        .with_precision_and_scale(6, 1)
+                        .unwrap(),
+                ),
+            ),
+        ])),
+    );
     // sales: TPC-DS q54's shape, a per-customer sum of a DECIMAL(7, 2)
     // price, stored as Decimal128 like a Hive scan's. Customer 1 sums to
     // 430881.00, customer 2 to 430849.00.
@@ -297,4 +359,126 @@ async fn q54_segment_of_a_decimal_sum_rounds() {
     .await;
     // 430881.00 / 50 = 8617.62 -> 8618; 430849.00 / 50 = 8616.98 -> 8617.
     assert_eq!(got, vec![row(&["8617", "1"]), row(&["8618", "1"])]);
+}
+
+/// Run `sql` and return its error text; panics if it succeeds.
+async fn error(sql: &str) -> String {
+    let (cm, cr) = setup();
+    let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::new());
+    match arneb_protocol::__private::execute_query(sql, &cm, &cr, None, &pool).await {
+        Ok(_) => panic!("query succeeded, expected an error: {sql}"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// A value that rounds onto the bound is fine; one that rounds half a unit
+/// past it is an out-of-range error, as in Trino. Before, Arrow's truncated
+/// result (the bound itself) leaked through.
+#[tokio::test]
+async fn literals_rounding_past_the_integer_range_are_errors() {
+    let (got, _) = rows(
+        "SELECT CAST(2147483647.49e0 AS INTEGER), CAST(-2147483648.49e0 AS INTEGER), \
+         CAST(DECIMAL '9223372036854775807.4' AS BIGINT), \
+         CAST(DECIMAL '-9223372036854775808.4' AS BIGINT)",
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![row(&[
+            "2147483647",
+            "-2147483648",
+            "9223372036854775807",
+            "-9223372036854775808"
+        ])]
+    );
+    for sql in [
+        "SELECT CAST(2147483647.5e0 AS INTEGER)",
+        "SELECT CAST(-2147483648.5e0 AS INTEGER)",
+        "SELECT CAST(DECIMAL '9223372036854775807.5' AS BIGINT)",
+        "SELECT CAST(DECIMAL '-9223372036854775808.5' AS BIGINT)",
+        "SELECT CAST(DECIMAL '2147483647.5' AS INTEGER)",
+    ] {
+        let err = error(sql).await;
+        assert!(err.contains("out of range"), "{sql}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn columns_rounding_onto_the_integer_bound_keep_it() {
+    let (got, _) = rows(
+        "SELECT CAST(hi_d AS INTEGER), CAST(lo_d AS INTEGER), CAST(hi_r AS TINYINT), \
+         CAST(hi_m128 AS BIGINT), CAST(lo_m64 AS TINYINT), CAST(hi_m64 AS SMALLINT) \
+         FROM b WHERE k = 1",
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![row(&[
+            "2147483647",
+            "-2147483648",
+            "127",
+            "9223372036854775807",
+            "-128",
+            "32767"
+        ])]
+    );
+}
+
+#[tokio::test]
+async fn columns_rounding_past_the_integer_range_are_errors() {
+    for (column, target) in [
+        ("hi_d", "INTEGER"),
+        ("lo_d", "INTEGER"),
+        ("hi_r", "TINYINT"),
+        ("hi_m128", "BIGINT"),
+        ("lo_m64", "TINYINT"),
+        ("hi_m64", "SMALLINT"),
+    ] {
+        let sql = format!("SELECT CAST({column} AS {target}) FROM b");
+        let err = error(&sql).await;
+        assert!(err.contains("out of range"), "{sql}: {err}");
+    }
+    // The review's repro: a decimal column built from literals.
+    let sql = "SELECT CAST(m AS TINYINT) FROM \
+               (SELECT DECIMAL '127.5' AS m UNION ALL SELECT DECIMAL '-2.5') s";
+    let err = error(sql).await;
+    assert!(err.contains("out of range"), "{sql}: {err}");
+}
+
+/// TRY turns the out-of-range rows into NULL and keeps the others.
+#[tokio::test]
+async fn try_of_a_cast_rounding_past_the_range_is_null() {
+    let (got, _) = rows(
+        "SELECT TRY(CAST(hi_d AS INTEGER)), TRY(CAST(lo_d AS INTEGER)), \
+         TRY(CAST(hi_r AS TINYINT)), TRY(CAST(hi_m128 AS BIGINT)), \
+         TRY(CAST(lo_m64 AS TINYINT)), TRY(CAST(hi_m64 AS SMALLINT)) FROM b ORDER BY k",
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![
+            row(&[
+                "2147483647",
+                "-2147483648",
+                "127",
+                "9223372036854775807",
+                "-128",
+                "32767"
+            ]),
+            row(&["NULL", "NULL", "NULL", "NULL", "NULL", "NULL"]),
+        ]
+    );
+}
+
+/// Over a literal the cast would fail at plan-time folding; TRY still
+/// yields NULL rather than a planning error.
+#[tokio::test]
+async fn try_of_a_literal_cast_rounding_past_the_range_is_null() {
+    let (got, _) = rows(
+        "SELECT TRY(CAST(2147483647.5e0 AS INTEGER)), \
+         TRY(CAST(DECIMAL '9223372036854775807.5' AS BIGINT)), \
+         TRY(CAST(2147483647.49e0 AS INTEGER))",
+    )
+    .await;
+    assert_eq!(got, vec![row(&["NULL", "NULL", "2147483647"])]);
 }

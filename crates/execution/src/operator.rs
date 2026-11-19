@@ -786,6 +786,21 @@ fn domain_mask(
 }
 
 impl ScanExec {
+    fn clone_for_stream(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            _table_name: self._table_name.clone(),
+            scan_context: self.scan_context.clone(),
+            dynamic_filters: std::sync::Mutex::new(self.dynamic_filters.lock().unwrap().clone()),
+            dynamic_filters_consumed: self.dynamic_filters_consumed.clone(),
+            dynamic_filter_collector: self.dynamic_filter_collector.clone(),
+            dynamic_filtering_enabled: self.dynamic_filtering_enabled,
+            dynamic_filtering_wait_timeout: self.dynamic_filtering_wait_timeout,
+            scan_task_index: self.scan_task_index,
+            scan_task_count: self.scan_task_count,
+        }
+    }
+
     /// A1.4 helper: gather any cross-fragment DF Domains that have
     /// arrived (or wait up to the configured timeout for them) and
     /// convert each into pushdown state ready to merge with
@@ -844,6 +859,16 @@ impl ScanExec {
                         "scan resolved subscribed_df_id={} domain={}",
                         consumer.id, domain_variant
                     );
+                    if consumer.probe_side {
+                        out.late.push(LateFilter {
+                            source_index: consumer.column_index,
+                            domain: Arc::new(LateDomain {
+                                df_id: consumer.id,
+                                rx: std::sync::Mutex::new(None),
+                                resolved: std::sync::OnceLock::from(Some(domain.clone())),
+                            }),
+                        });
+                    }
                     out.resolved.push(DynamicFilterDomain {
                         column_index: consumer.column_index,
                         column_name,
@@ -916,13 +941,11 @@ impl ScanExec {
     }
 }
 
-#[async_trait]
-impl ExecutionPlan for ScanExec {
-    fn schema(&self) -> Vec<ColumnInfo> {
-        self.source.schema()
-    }
-
-    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream, ExecutionError> {
+impl ScanExec {
+    async fn open_partition(
+        &self,
+        partition: usize,
+    ) -> Result<SendableRecordBatchStream, ExecutionError> {
         // A scan task past the end of a source with fewer partitions than
         // scan tasks (e.g. a 1-partition table on 2 workers) owns nothing:
         // `strided_partition_count` reports 0 partitions, but the task still
@@ -1002,6 +1025,44 @@ impl ExecutionPlan for ScanExec {
             partition,
             live_batch_stream("ScanExec.live", stream),
         ))
+    }
+}
+
+#[async_trait]
+impl ExecutionPlan for ScanExec {
+    fn schema(&self) -> Vec<ColumnInfo> {
+        self.source.schema()
+    }
+
+    async fn execute(&self, partition: usize) -> Result<SendableRecordBatchStream, ExecutionError> {
+        if self.dynamic_filter_collector.is_some()
+            && self
+                .dynamic_filters_consumed
+                .iter()
+                .any(|c| self.dynamic_filtering_enabled || c.probe_side)
+        {
+            let scan = self.clone_for_stream();
+            let columns = self.source.schema();
+            let output: Vec<_> = match &self.scan_context.projection {
+                Some(proj) => proj
+                    .iter()
+                    .filter_map(|&i| columns.get(i).cloned())
+                    .collect(),
+                None => columns,
+            };
+            let schema = crate::datasource::column_info_to_arrow_schema(&output);
+            let inner = async_stream::try_stream! {
+                let mut stream = scan.open_partition(partition).await?;
+                while let Some(batch) = stream.next().await {
+                    yield batch.map_err(|e| ExecutionError::upstream("scan source stream", e))?;
+                }
+            };
+            return Ok(Box::pin(LimitOutputStream {
+                schema,
+                inner: Box::pin(inner),
+            }));
+        }
+        self.open_partition(partition).await
     }
 
     fn display_name(&self) -> &str {
@@ -6624,6 +6685,99 @@ mod tests {
         let stream = scan.execute(0).await.unwrap();
         let batches = collect_stream(stream).await.unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    }
+
+    // ---- #205: the cross-fragment wait must not block `execute()` ----
+    //
+    // A join opens its probe input before its build input. When the probe
+    // scan waits for a filter inside `execute()`, a build in the same task
+    // cannot start until the wait times out, so the filter it publishes
+    // always comes too late.
+
+    fn recording_scan_with_df(
+        collector: crate::dynamic_filter_collector::DynamicFilterCollector,
+        timeout: std::time::Duration,
+    ) -> (ScanExec, Arc<ContextRecordingSource>) {
+        let source = Arc::new(ContextRecordingSource {
+            inner: make_test_source(),
+            seen: Default::default(),
+        });
+        let mut scan =
+            build_scan_with_df(vec![consumer(0, 0, "id")], Some(collector), true, timeout);
+        scan.source = source.clone();
+        (scan, source)
+    }
+
+    #[tokio::test]
+    async fn df_scan_execute_returns_before_its_filter_resolves() {
+        let collector = crate::dynamic_filter_collector::DynamicFilterCollector::new();
+        let (scan, source) =
+            recording_scan_with_df(collector.clone(), std::time::Duration::from_secs(5));
+
+        let stream = tokio::time::timeout(std::time::Duration::from_millis(500), scan.execute(0))
+            .await
+            .expect("execute() must not wait for a cross-fragment filter")
+            .unwrap();
+
+        // Published after execute() returned, before the stream is polled:
+        // the scan must still read with it.
+        let domain = arneb_common::Domain::DistinctValues(vec![ScalarValue::Int32(2)]);
+        collector
+            .insert(arneb_common::DynamicFilterId(0), domain.clone())
+            .await;
+        collect_stream(stream).await.unwrap();
+
+        let seen = source.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the source is scanned exactly once");
+        assert_eq!(seen[0].dynamic_filter_domains.len(), 1);
+        assert_eq!(seen[0].dynamic_filter_domains[0].domain, domain);
+    }
+
+    #[tokio::test]
+    async fn df_scan_with_never_published_filter_waits_on_poll_then_reads_all() {
+        // Failure path: the producer never publishes. execute() still
+        // returns at once; the stream waits out the timeout, then reads
+        // every row without a filter.
+        let collector = crate::dynamic_filter_collector::DynamicFilterCollector::new();
+        let timeout = std::time::Duration::from_millis(1500);
+        let (scan, source) = recording_scan_with_df(collector, timeout);
+
+        let started = std::time::Instant::now();
+        let stream = tokio::time::timeout(std::time::Duration::from_millis(500), scan.execute(0))
+            .await
+            .expect("execute() must not wait for a cross-fragment filter")
+            .unwrap();
+        let batches = collect_stream(stream).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        assert!(
+            elapsed >= timeout,
+            "the stream must still wait for the filter (elapsed {elapsed:?})"
+        );
+        let seen = source.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].dynamic_filter_domains.is_empty());
+    }
+
+    #[tokio::test]
+    async fn df_scan_uses_filter_published_before_execute() {
+        // Reverse order: the filter is already there when the scan opens.
+        let domain = arneb_common::Domain::DistinctValues(vec![ScalarValue::Int32(2)]);
+        let collector = crate::dynamic_filter_collector::DynamicFilterCollector::with_pending([(
+            arneb_common::DynamicFilterId(0),
+            domain.clone(),
+        )]);
+        let (scan, source) = recording_scan_with_df(collector, std::time::Duration::from_secs(5));
+
+        collect_stream(scan.execute(0).await.unwrap())
+            .await
+            .unwrap();
+
+        let seen = source.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].dynamic_filter_domains.len(), 1);
+        assert_eq!(seen[0].dynamic_filter_domains[0].domain, domain);
     }
 
     // ---- CoalescingStream (N2-Q18) ----

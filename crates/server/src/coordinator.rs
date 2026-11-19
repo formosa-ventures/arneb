@@ -1206,7 +1206,7 @@ fn collect_producers_from_plan(
                 out.push(DfProducer {
                     df_id: p.id,
                     stage_id,
-                    task_count: join_task_count,
+                    task_count,
                 });
             }
             collect_producers_from_plan(left, stage_id, task_count, join_task_count, out);
@@ -1260,6 +1260,7 @@ fn collect_producers_from_plan(
         | L::Sort { input, .. }
         | L::Limit { input, .. }
         | L::Aggregate { input, .. }
+        | L::RollupAggregate { input, .. }
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Distinct { input, .. }
@@ -1300,6 +1301,7 @@ fn collect_consumers_from_plan(plan: &LogicalPlan, stage_id: StageId, out: &mut 
         | L::Sort { input, .. }
         | L::Limit { input, .. }
         | L::Aggregate { input, .. }
+        | L::RollupAggregate { input, .. }
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Distinct { input, .. }
@@ -2191,6 +2193,100 @@ mod tests {
         );
     }
 
+    // ---- #205 cause D: dynamic filters under a ROLLUP must be registered ----
+
+    fn df_join(df_id: DynamicFilterId) -> LogicalPlan {
+        LogicalPlan::Join {
+            left: Box::new(LogicalPlan::TableScan {
+                table: TableReference::table("t"),
+                schema: schema(),
+                alias: None,
+                properties: Default::default(),
+                dynamic_filters_consumed: vec![arneb_planner::DynamicFilterConsumer {
+                    id: df_id,
+                    column_index: 0,
+                    column_name: "c0".to_string(),
+                    probe_side: false,
+                }],
+            }),
+            right: Box::new(scan()),
+            join_type: arneb_sql_parser::ast::JoinType::Inner,
+            condition: JoinCondition::None,
+            dynamic_filter_ids: vec![arneb_planner::DynamicFilterProducer {
+                id: df_id,
+                build_index: 0,
+                probe_index: 0,
+                column_name: "c0".to_string(),
+            }],
+        }
+    }
+
+    fn rollup_over(input: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::RollupAggregate {
+            input: Box::new(input),
+            group_by: Vec::new(),
+            aggr_exprs: Vec::new(),
+            schema: schema(),
+        }
+    }
+
+    fn fixed_fragment(root: LogicalPlan) -> PlanFragment {
+        PlanFragment {
+            id: StageId(7),
+            fragment_type: FragmentType::Fixed,
+            root,
+            output_partitioning: PartitioningScheme::Single,
+            source_fragments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_join_under_a_rollup_registers_its_dynamic_filter() {
+        let df_id = DynamicFilterId(70);
+        let fragment = fixed_fragment(rollup_over(df_join(df_id)));
+
+        let producers = collect_df_producers(&fragment, 2);
+
+        assert_eq!(producers.len(), 1);
+        assert_eq!(producers[0].df_id, df_id);
+        assert_eq!(producers[0].stage_id, StageId(7));
+    }
+
+    #[test]
+    fn a_scan_under_a_rollup_registers_as_a_consumer() {
+        let df_id = DynamicFilterId(71);
+        let fragment = fixed_fragment(rollup_over(df_join(df_id)));
+
+        let consumers = collect_df_consumers(&fragment);
+
+        assert_eq!(consumers.len(), 1);
+        assert_eq!(consumers[0].df_id, df_id);
+        assert_eq!(consumers[0].stage_id, StageId(7));
+    }
+
+    #[test]
+    fn rollup_and_plain_union_branches_each_register_once() {
+        let rolled = DynamicFilterId(72);
+        let plain = DynamicFilterId(73);
+        let fragment = fixed_fragment(LogicalPlan::UnionAll {
+            inputs: vec![rollup_over(df_join(rolled)), df_join(plain)],
+        });
+
+        let mut producers: Vec<_> = collect_df_producers(&fragment, 2)
+            .into_iter()
+            .map(|p| p.df_id)
+            .collect();
+        producers.sort_by_key(|id| id.0);
+        let mut consumers: Vec<_> = collect_df_consumers(&fragment)
+            .into_iter()
+            .map(|c| c.df_id)
+            .collect();
+        consumers.sort_by_key(|id| id.0);
+
+        assert_eq!(producers, vec![rolled, plain]);
+        assert_eq!(consumers, vec![rolled, plain]);
+    }
+
     #[test]
     fn collect_df_producers_uses_effective_scan_task_count() {
         let df_id = DynamicFilterId(123);
@@ -2263,7 +2359,75 @@ mod tests {
         assert_eq!(producers.len(), 1);
         assert_eq!(producers[0].df_id, df_id);
         assert_eq!(producers[0].stage_id, StageId(43));
-        assert_eq!(producers[0].task_count, 8);
+        // #205: a join reports once per task, under the task's partition
+        // index, so the coordinator can never collect more reports than the
+        // stage has tasks. Expecting the 8 output partitions left the filter
+        // waiting out the scan timeout.
+        assert_eq!(
+            producers[0].task_count,
+            effective_task_count_for_fragment(&fragment, 2, data_parallel_scan_enabled())
+        );
+    }
+
+    fn join_producer_fragment(
+        df_id: DynamicFilterId,
+        fragment_type: FragmentType,
+        partition_count: usize,
+    ) -> PlanFragment {
+        PlanFragment {
+            id: StageId(44),
+            fragment_type,
+            root: LogicalPlan::Join {
+                left: Box::new(scan()),
+                right: Box::new(scan()),
+                join_type: arneb_sql_parser::ast::JoinType::Inner,
+                condition: JoinCondition::None,
+                dynamic_filter_ids: vec![arneb_planner::DynamicFilterProducer {
+                    id: df_id,
+                    build_index: 0,
+                    probe_index: 0,
+                    column_name: "c0".to_string(),
+                }],
+            },
+            output_partitioning: PartitioningScheme::Hash {
+                columns: vec![0],
+                partition_count,
+            },
+            source_fragments: Vec::new(),
+        }
+    }
+
+    // #205 (TPC-DS q45): a single-task FIXED stage that hash-partitions its
+    // output gets exactly one report per join filter.
+    #[test]
+    fn join_filter_in_single_task_stage_expects_one_report() {
+        let df_id = DynamicFilterId(457);
+        let fragment = join_producer_fragment(df_id, FragmentType::Fixed, 2);
+        let scheduled =
+            effective_task_count_for_fragment(&fragment, 2, data_parallel_scan_enabled());
+        assert_eq!(scheduled, 1, "precondition: the stage runs one task");
+
+        let producers = collect_df_producers(&fragment, 2);
+
+        assert_eq!(producers.len(), 1);
+        assert_eq!(producers[0].df_id, df_id);
+        assert_eq!(producers[0].task_count, 1);
+    }
+
+    // Guard: a hash-partitioned stage really runs one task per partition, and
+    // each of them reports.
+    #[test]
+    fn join_filter_in_hash_partitioned_stage_expects_one_report_per_task() {
+        let df_id = DynamicFilterId(458);
+        let fragment = join_producer_fragment(df_id, FragmentType::HashPartitioned, 2);
+        let scheduled =
+            effective_task_count_for_fragment(&fragment, 2, data_parallel_scan_enabled());
+        assert_eq!(scheduled, 2, "precondition: one task per partition");
+
+        let producers = collect_df_producers(&fragment, 2);
+
+        assert_eq!(producers.len(), 1);
+        assert_eq!(producers[0].task_count, 2);
     }
 
     #[test]

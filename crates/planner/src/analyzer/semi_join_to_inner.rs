@@ -2,7 +2,7 @@
 //!
 //! When a `SemiJoin`'s right side is **provably unique** on its
 //! `right_key` (typically because the subquery is a `GROUP BY
-//! right_key`-style aggregate), the SemiJoin's set-semantics
+//! right_key` aggregate), the SemiJoin's set-semantics
 //! collapse to plain equi-join semantics: each left row matches at
 //! most one right row, and the SemiJoin would emit the left row
 //! once. An InnerJoin emits the same left rows in the same order
@@ -20,9 +20,9 @@
 //! SemiJoin { left, right, left_key, right_key: Column(i), residual: None }
 //! where `right` matches:
 //!   Projection / Filter / Sort / Limit
-//!     ← Aggregate { group_by: [..., col@i', ...], ... }
+//!     ← Aggregate { group_by: [col@i'], ... }
 //! and `right_key`'s index `i` traces through the Projection's
-//! `Column`-only `exprs` back to a group_by column at index `i'`.
+//! `Column`-only `exprs` back to the sole group_by column.
 //! ```
 //!
 //! ## Rewrite
@@ -295,16 +295,15 @@ fn column_index(expr: &PlanExpr) -> Option<usize> {
 
 /// Return `true` if the column at `idx` in `plan`'s output schema
 /// can be traced — through column-only Projections and row-preserving
-/// nodes — back to a `group_by` column of an `Aggregate` underneath.
-/// That column is unique by definition (GROUP BY produces one row per
-/// distinct key tuple), so any downstream node that filters/sorts/
-/// limits/projects-by-column preserves uniqueness on it.
+/// nodes — back to the sole `group_by` column of an `Aggregate` underneath.
+/// GROUP BY produces one row per distinct key tuple, so a single key is
+/// unique through downstream filters, sorts, limits, and column projections.
 fn column_traces_to_aggregate_group_by(plan: &LogicalPlan, idx: usize) -> bool {
     match plan {
         LogicalPlan::Aggregate { group_by, .. } => {
-            // Aggregate's output schema is [group_by_cols.., aggr_cols..],
-            // so any index in [0..group_by.len()) is a unique key.
-            idx < group_by.len()
+            // Aggregate's output schema is [group_by_cols.., aggr_cols..].
+            // A group-by column is unique alone only when it is the sole key.
+            group_by.len() == 1 && idx == 0
         }
         LogicalPlan::Projection { exprs, input, .. } => match exprs.get(idx) {
             Some(PlanExpr::Column { index: j, .. }) => {

@@ -55,6 +55,7 @@ impl QueryPlanner<'_> {
         &self,
         items: &[ast::SelectItem],
         ctx: &PlanningContext,
+        num_group_by: Option<usize>,
     ) -> Result<Option<RewrittenSelectList>, PlanError> {
         let mut found: Vec<(ast::Query, arneb_sql_parser::Span)> = Vec::new();
         for item in items {
@@ -77,7 +78,8 @@ impl QueryPlanner<'_> {
         for (n, (query, span)) in found.iter().enumerate() {
             match self
                 .decorrelate_select_subquery(query, *span, ctx, n)
-                .await?
+                .await
+                .map_err(|e| outer_reference_error(e, ctx))?
             {
                 Some((replacement, join)) => {
                     replacements.push(Some(replacement));
@@ -90,20 +92,87 @@ impl QueryPlanner<'_> {
             return Ok(None);
         }
 
-        let mut items = items.to_vec();
+        let mut rewritten = Vec::with_capacity(items.len());
         let mut next = replacements.into_iter();
-        for item in &mut items {
-            if let ast::SelectItem::UnnamedExpr(expr)
-            | ast::SelectItem::ExprWithAlias { expr, .. } = item
-            {
-                for_each_scalar_subquery_mut(expr, &mut |e| {
-                    if let Some(Some(replacement)) = next.next() {
-                        *e = replacement;
-                    }
-                });
+        for item in items {
+            let (mut expr, alias) = match item {
+                ast::SelectItem::UnnamedExpr(expr) => (expr.clone(), None),
+                ast::SelectItem::ExprWithAlias { expr, alias } => {
+                    (expr.clone(), Some(alias.clone()))
+                }
+                other => {
+                    rewritten.push(other.clone());
+                    continue;
+                }
+            };
+            // The item's name, as the uncorrelated path would give it.
+            let mut named = expr.clone();
+            let mut replaced = false;
+            for_each_scalar_subquery_mut(&mut expr, &mut |e| {
+                if let Some(Some(replacement)) = next.next() {
+                    *e = replacement;
+                    replaced = true;
+                }
+            });
+            let alias = match alias {
+                Some(alias) => Some(alias),
+                None if replaced => {
+                    Some(self.unnamed_item_name(&mut named, ctx, num_group_by).await)
+                }
+                None => None,
+            };
+            rewritten.push(match alias {
+                Some(alias) => ast::SelectItem::ExprWithAlias { expr, alias },
+                None => ast::SelectItem::UnnamedExpr(expr),
+            });
+        }
+        let items = rewritten;
+        Ok(Some((items, joins)))
+    }
+
+    /// The output name an unnamed item gets when its subqueries are planned
+    /// on the uncorrelated path: each `(SELECT ...)` displays as
+    /// `(scalar_subquery)`. Planned with every subquery swapped for
+    /// `(SELECT NULL)`, so no helper column name leaks into it.
+    async fn unnamed_item_name(
+        &self,
+        expr: &mut ast::Expr,
+        ctx: &PlanningContext,
+        num_group_by: Option<usize>,
+    ) -> String {
+        let span = expr.span();
+        let null_query = ast::Query {
+            ctes: Vec::new(),
+            body: ast::QueryBody::Select(ast::SelectBody {
+                distinct: false,
+                projection: vec![ast::SelectItem::UnnamedExpr(ast::Expr::Literal {
+                    value: ScalarValue::Null,
+                    span,
+                })],
+                from: Vec::new(),
+                selection: None,
+                group_by: Vec::new(),
+                having: None,
+            }),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        for_each_scalar_subquery_mut(expr, &mut |e| {
+            *e = ast::Expr::Subquery {
+                query: Box::new(null_query.clone()),
+                span,
+            };
+        });
+        if let Some(num_group_by) = num_group_by {
+            if self.contains_aggregate(expr) {
+                *expr = self.rewrite_aggregates_as_columns(expr, ctx, num_group_by);
             }
         }
-        Ok(Some((items, joins)))
+        match self.plan_expr(expr, ctx).await {
+            Ok(planned) => self.expr_to_column_info(&planned, ctx).name,
+            Err(_) => "(scalar_subquery)".to_string(),
+        }
     }
 
     /// LEFT JOINs each decorrelated subquery onto `plan` and appends its
@@ -501,6 +570,43 @@ impl QueryPlanner<'_> {
             replacement,
             Some(SelectSubqueryJoin { plan, outer_keys }),
         )))
+    }
+}
+
+/// Turns a "column not found" raised while planning a subquery into the
+/// unsupported-correlation error when the column belongs to the enclosing
+/// scope `outer`: the subquery is correlated in a shape that is not
+/// decorrelated (its own CTE, a derived table, a correlation two levels
+/// deep, ...). Other errors pass through.
+#[inline(never)]
+pub(super) fn outer_reference_error(err: PlanError, outer: &PlanningContext) -> PlanError {
+    reference_error(err, outer, "correlated subquery")
+}
+
+/// [`outer_reference_error`] for a FROM item that reads an earlier FROM item
+/// (`LATERAL`).
+#[inline(never)]
+pub(super) fn lateral_reference_error(err: PlanError, left: &PlanningContext) -> PlanError {
+    reference_error(err, left, "correlated subquery (LATERAL)")
+}
+
+fn reference_error(err: PlanError, outer: &PlanningContext, what: &str) -> PlanError {
+    let PlanError::ColumnNotFound { name, location, .. } = &err else {
+        return err;
+    };
+    let (table, column) = match name.rsplit_once('.') {
+        Some((table, column)) => (Some(table), column),
+        None => (None, name.as_str()),
+    };
+    if matches!(
+        outer.resolve_column(column, table, None),
+        Err(PlanError::ColumnNotFound { .. })
+    ) {
+        return err;
+    }
+    PlanError::UnsupportedExpression {
+        message: format!("{what} referencing outer column {name} here is not supported"),
+        location: *location,
     }
 }
 

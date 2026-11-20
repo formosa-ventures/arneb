@@ -894,16 +894,20 @@ impl<'a> QueryPlanner<'a> {
         // 3a. Correlated scalar subqueries in the SELECT list: each becomes
         // a LEFT JOIN below the projection, and the item reads its columns.
         let decorrelated_items;
-        let select_items: &[ast::SelectItem] =
-            match Box::pin(self.rewrite_select_list_subqueries(&body.projection, &ctx)).await? {
-                Some((items, joins)) => {
-                    plan =
-                        Box::pin(self.attach_select_subquery_joins(plan, &mut ctx, joins)).await?;
-                    decorrelated_items = items;
-                    &decorrelated_items
-                }
-                None => &body.projection,
-            };
+        let select_items: &[ast::SelectItem] = match Box::pin(self.rewrite_select_list_subqueries(
+            &body.projection,
+            &ctx,
+            has_aggregates.then_some(group_by_ast.len()),
+        ))
+        .await?
+        {
+            Some((items, joins)) => {
+                plan = Box::pin(self.attach_select_subquery_joins(plan, &mut ctx, joins)).await?;
+                decorrelated_items = items;
+                &decorrelated_items
+            }
+            None => &body.projection,
+        };
 
         // 3b. Window functions: computed after WHERE / GROUP BY / HAVING and
         // before the projection (ORDER BY / LIMIT are applied above it).
@@ -2269,7 +2273,10 @@ impl<'a> QueryPlanner<'a> {
 
         // Multiple FROM items → implicit CROSS JOIN
         for twj in &from[1..] {
-            let (right_plan, right_ctx) = self.plan_table_with_joins(twj).await?;
+            let (right_plan, right_ctx) = self
+                .plan_table_with_joins(twj)
+                .await
+                .map_err(|e| select_subquery::lateral_reference_error(e, &ctx))?;
             ctx.columns.extend(right_ctx.columns);
             plan = LogicalPlan::Join {
                 left: Box::new(plan),
@@ -2291,7 +2298,10 @@ impl<'a> QueryPlanner<'a> {
         let (mut plan, mut ctx) = self.plan_table_factor(&twj.relation).await?;
 
         for join in &twj.joins {
-            let (right_plan, right_ctx) = self.plan_table_factor(&join.relation).await?;
+            let (right_plan, right_ctx) = self
+                .plan_table_factor(&join.relation)
+                .await
+                .map_err(|e| select_subquery::lateral_reference_error(e, &ctx))?;
             let left_len = ctx.columns.len();
             let using = match &join.condition {
                 ast::JoinCondition::Using(columns) => {
@@ -2701,7 +2711,10 @@ impl<'a> QueryPlanner<'a> {
             }),
             ast::Expr::Nested { expr: inner, .. } => self.plan_expr(inner, ctx).await,
             ast::Expr::Subquery { query, .. } => {
-                let subplan = self.plan_query(query).await?;
+                let subplan = self
+                    .plan_query(query)
+                    .await
+                    .map_err(|e| select_subquery::outer_reference_error(e, ctx))?;
                 Ok(PlanExpr::ScalarSubquery {
                     subplan: Box::new(subplan),
                     span: node_span,

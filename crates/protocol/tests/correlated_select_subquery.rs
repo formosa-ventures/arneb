@@ -580,3 +580,135 @@ async fn extended_protocol_plans_the_same() {
         ]
     );
 }
+
+/// Asserts the error is the clear unsupported-correlation one.
+async fn assert_clear_refusal(c: &tokio_postgres::Client, sql: &str) {
+    let message = error(c, sql).await;
+    assert!(message.contains("correlated subquery"), "{sql}: {message}");
+    assert!(message.contains("not supported"), "{sql}: {message}");
+    assert!(!message.contains("column not found"), "{sql}: {message}");
+}
+
+#[tokio::test]
+async fn correlated_subquery_with_its_own_cte_is_refused_clearly() {
+    let c = client().await;
+    assert_clear_refusal(
+        &c,
+        "SELECT id, (WITH c AS (SELECT * FROM i) SELECT v FROM c WHERE c.k = o.k) FROM o",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn correlated_derived_table_in_subquery_from_is_refused_clearly() {
+    let c = client().await;
+    assert_clear_refusal(
+        &c,
+        "SELECT id, (SELECT x.v FROM (SELECT v FROM i WHERE i.k = o.k) x) FROM o",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn lateral_is_refused_clearly() {
+    let c = client().await;
+    assert_clear_refusal(
+        &c,
+        "SELECT o.id, x.v FROM o, LATERAL (SELECT v FROM i WHERE i.k = o.k) x",
+    )
+    .await;
+    assert_clear_refusal(
+        &c,
+        "SELECT o.id, x.v FROM o CROSS JOIN LATERAL (SELECT v FROM i WHERE i.k = o.k) x",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn unqualified_two_level_correlation_is_refused_clearly() {
+    let c = client().await;
+    // `id` exists only in `o`, two levels up.
+    assert_clear_refusal(
+        &c,
+        "SELECT id, (SELECT v FROM i WHERE i.k = o.k \
+         AND i.v > (SELECT min(j.v) FROM j WHERE j.v > id)) FROM o",
+    )
+    .await;
+    // The middle subquery is not correlated itself.
+    assert_clear_refusal(
+        &c,
+        "SELECT id, (SELECT max(v) FROM i WHERE i.v > (SELECT min(j.v) FROM j WHERE j.v > id)) \
+         FROM o",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn uncorrelated_subquery_keeps_its_own_planning_error() {
+    let c = client().await;
+    let message = error(&c, "SELECT id, (SELECT nosuch FROM i) FROM o").await;
+    assert!(message.contains("column not found: nosuch"), "{message}");
+}
+
+#[tokio::test]
+async fn output_column_names_do_not_leak_helper_columns() {
+    let c = client().await;
+    let names = |sql: &'static str| {
+        let c = &c;
+        async move {
+            c.prepare(sql)
+                .await
+                .unwrap()
+                .columns()
+                .iter()
+                .map(|col| col.name().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    let uncorrelated = names("SELECT id, (SELECT max(v) FROM i) FROM o").await;
+    let correlated = names("SELECT id, (SELECT v FROM i WHERE i.k = o.k) FROM o").await;
+    assert_eq!(correlated, uncorrelated);
+    let uncorrelated =
+        names("SELECT CASE WHEN (SELECT max(v) FROM i) > 1 THEN (SELECT max(v) FROM i) END FROM o")
+            .await;
+    let correlated = names(
+        "SELECT CASE WHEN (SELECT v FROM i WHERE i.k = o.k) > 1 \
+         THEN (SELECT count(*) FROM i WHERE i.k = o.k) END FROM o",
+    )
+    .await;
+    assert_eq!(correlated, uncorrelated);
+    let grouped = names(
+        "SELECT o.k, count(*) + (SELECT count(*) FROM i WHERE i.k = o.k) FROM o GROUP BY o.k",
+    )
+    .await;
+    for name in correlated.iter().chain(&grouped) {
+        assert!(
+            !name.contains("__") && !name.to_lowercase().contains("single_row"),
+            "{name}"
+        );
+    }
+    // An explicit alias is kept.
+    assert_eq!(
+        names("SELECT (SELECT v FROM i WHERE i.k = o.k) AS val FROM o").await,
+        ["val"]
+    );
+}
+
+#[tokio::test]
+async fn order_by_unselected_column_below_a_window() {
+    let c = client().await;
+    // `i.v` is not selected, so the sort goes below the projection, whose
+    // input carries the window column after the FROM columns.
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT o.id, row_number() OVER (ORDER BY o.id DESC) AS rn \
+             FROM o JOIN i ON i.k = o.k ORDER BY i.v DESC"
+        )
+        .await,
+        vec![
+            vec![Some("3".into()), Some("1".into())],
+            vec![Some("1".into()), Some("2".into())],
+        ]
+    );
+}

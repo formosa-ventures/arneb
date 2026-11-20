@@ -2413,7 +2413,10 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
                 if name.eq_ignore_ascii_case("regclass") {
-                    return regclass_literal(self.catalog, args, node_span);
+                    return Box::pin(self.plan_regclass(args, ctx, node_span)).await;
+                }
+                if name.eq_ignore_ascii_case("json_build_object") && !args.len().is_multiple_of(2) {
+                    return Err(odd_json_build_object_args(node_span));
                 }
                 if name.eq_ignore_ascii_case("regtype") {
                     return match args.as_slice() {
@@ -2511,11 +2514,16 @@ impl<'a> QueryPlanner<'a> {
             }
             ast::Expr::Cast {
                 expr, data_type, ..
-            } => Ok(PlanExpr::Cast {
-                expr: Box::new(self.plan_expr(expr, ctx).await?),
-                data_type: data_type.clone(),
-                span: node_span,
-            }),
+            } => {
+                if is_regclass_to_text(expr, data_type) {
+                    return Box::pin(self.plan_regclass_name(expr, ctx, node_span)).await;
+                }
+                Ok(PlanExpr::Cast {
+                    expr: Box::new(self.plan_expr(expr, ctx).await?),
+                    data_type: data_type.clone(),
+                    span: node_span,
+                })
+            }
             ast::Expr::Nested { expr: inner, .. } => self.plan_expr(inner, ctx).await,
             ast::Expr::Subquery { query, .. } => {
                 let subplan = self
@@ -5025,6 +5033,132 @@ fn session_literal(
         value: ScalarValue::Utf8(value.to_string()),
         span,
     })
+}
+
+/// `CAST(<regclass expr> AS TEXT)`: the operand is a `regclass` conversion
+/// (possibly parenthesized) and the target a string type.
+fn is_regclass_to_text(expr: &ast::Expr, target: &DataType) -> bool {
+    if !matches!(target, DataType::Utf8 | DataType::LargeUtf8) {
+        return false;
+    }
+    match expr {
+        ast::Expr::Nested { expr, .. } => is_regclass_to_text(expr, target),
+        ast::Expr::Function { name, .. } => name.eq_ignore_ascii_case("regclass"),
+        _ => false,
+    }
+}
+
+fn odd_json_build_object_args(span: Option<arneb_sql_parser::Span>) -> PlanError {
+    PlanError::UnsupportedExpression {
+        message: "json_build_object requires an even number of arguments".to_string(),
+        location: span.map(|s| s.start),
+    }
+}
+
+impl QueryPlanner<'_> {
+    /// `<expr>::regclass`. A string literal folds to its oid at plan time
+    /// (no existence check). A text expression becomes
+    /// `__regclass_oid(name, ...)`, which checks the name exists when it
+    /// runs; anything else is already the oid.
+    #[inline(never)]
+    async fn plan_regclass(
+        &self,
+        args: &[ast::FunctionArg],
+        ctx: &PlanningContext,
+        span: Option<arneb_sql_parser::Span>,
+    ) -> Result<PlanExpr, PlanError> {
+        let [ast::FunctionArg::Unnamed(operand)] = args else {
+            return Err(PlanError::UnsupportedExpression {
+                message: "regclass takes one argument".to_string(),
+                location: span.map(|s| s.start),
+            });
+        };
+        if matches!(
+            operand,
+            ast::Expr::Literal {
+                value: ScalarValue::Utf8(_),
+                ..
+            }
+        ) {
+            return regclass_literal(self.catalog, args, span);
+        }
+        let planned = self.plan_expr(operand, ctx).await?;
+        let ctx_schema: Vec<ColumnInfo> = ctx.columns.iter().map(|(_, c)| c.clone()).collect();
+        match plan_expr_type(&planned, &ctx_schema) {
+            Some(DataType::Utf8 | DataType::LargeUtf8) => {
+                let mut call_args = vec![planned];
+                call_args.extend(self.regclass_scope(span).await);
+                Ok(PlanExpr::Function {
+                    order_by: None,
+                    name: "__regclass_oid".to_string(),
+                    args: call_args,
+                    distinct: false,
+                    span,
+                })
+            }
+            Some(DataType::Int64) => Ok(planned),
+            _ => Ok(PlanExpr::Cast {
+                expr: Box::new(planned),
+                data_type: DataType::Int64,
+                span,
+            }),
+        }
+    }
+
+    /// `CAST(<regclass expr> AS TEXT)`: the relation's name, from the
+    /// statement's catalog (`__regclass_name`).
+    #[inline(never)]
+    async fn plan_regclass_name(
+        &self,
+        operand: &ast::Expr,
+        ctx: &PlanningContext,
+        span: Option<arneb_sql_parser::Span>,
+    ) -> Result<PlanExpr, PlanError> {
+        let mut call_args = vec![self.plan_expr(operand, ctx).await?];
+        call_args.extend(self.regclass_scope(span).await);
+        Ok(PlanExpr::Function {
+            order_by: None,
+            name: "__regclass_name".to_string(),
+            args: call_args,
+            distinct: false,
+            span,
+        })
+    }
+
+    /// The literal arguments the runtime `regclass` functions take after
+    /// their operand: the session catalog and default schema, and the
+    /// relations the statement's catalog lists (see
+    /// [`arneb_common::pg_oid::RELATION_ENTRY_SEP`]).
+    async fn regclass_scope(&self, span: Option<arneb_sql_parser::Span>) -> Vec<PlanExpr> {
+        let database = self.catalog.default_catalog().to_string();
+        let mut list = String::new();
+        let mut push = |schema: &str, table: &str| {
+            if !list.is_empty() {
+                list.push(arneb_common::pg_oid::RELATION_ENTRY_SEP);
+            }
+            list.push_str(schema);
+            list.push(arneb_common::pg_oid::RELATION_FIELD_SEP);
+            list.push_str(table);
+        };
+        if let Some(relations) = self.catalog.regclass_relations() {
+            for (schema, table) in relations {
+                push(schema, table);
+            }
+        } else {
+            for schema in self.catalog.visible_schema_names(&database).await {
+                for table in self.catalog.visible_table_names(&database, &schema).await {
+                    push(&schema, &table);
+                }
+            }
+        }
+        [database, self.catalog.default_schema().to_string(), list]
+            .into_iter()
+            .map(|v| PlanExpr::Literal {
+                value: ScalarValue::Utf8(v),
+                span,
+            })
+            .collect()
+    }
 }
 
 /// `'<name>'::regclass` as the relation's oid (pg-catalog-tables), resolved

@@ -13,6 +13,9 @@ use crate::plan::{
     null_extend, JoinCondition, LogicalPlan, PlanExpr, SortExpr, SrfKind, WindowFunctionDef,
 };
 
+mod select_subquery;
+use select_subquery::SELECT_SUBQUERY_QUALIFIER;
+
 static CTE_SELF_AGG_WINDOW_TEST_OVERRIDE: OnceLock<std::sync::Mutex<Option<bool>>> =
     OnceLock::new();
 
@@ -533,7 +536,9 @@ impl<'a> QueryPlanner<'a> {
                 }
             } else if !matches!(input, LogicalPlan::Aggregate { .. }) {
                 let (_, from_ctx) = self.plan_from(&body.from).await?;
-                if input_ctx.columns.len() == from_ctx.columns.len() {
+                // Columns appended above the FROM (decorrelated SELECT-list
+                // subqueries) leave the FROM columns as a prefix.
+                if input_ctx.columns.len() >= from_ctx.columns.len() {
                     for (col, source) in input_ctx.columns.iter_mut().zip(from_ctx.columns) {
                         col.0 = source.0;
                     }
@@ -886,10 +891,24 @@ impl<'a> QueryPlanner<'a> {
             }
         }
 
+        // 3a. Correlated scalar subqueries in the SELECT list: each becomes
+        // a LEFT JOIN below the projection, and the item reads its columns.
+        let decorrelated_items;
+        let select_items: &[ast::SelectItem] =
+            match Box::pin(self.rewrite_select_list_subqueries(&body.projection, &ctx)).await? {
+                Some((items, joins)) => {
+                    plan =
+                        Box::pin(self.attach_select_subquery_joins(plan, &mut ctx, joins)).await?;
+                    decorrelated_items = items;
+                    &decorrelated_items
+                }
+                None => &body.projection,
+            };
+
         // 3b. Window functions: computed after WHERE / GROUP BY / HAVING and
         // before the projection (ORDER BY / LIMIT are applied above it).
         let mut window_calls = Vec::new();
-        for item in &body.projection {
+        for item in select_items {
             if let ast::SelectItem::UnnamedExpr(expr)
             | ast::SelectItem::ExprWithAlias { expr, .. } = item
             {
@@ -907,16 +926,15 @@ impl<'a> QueryPlanner<'a> {
         // whole SELECT items: evaluated by a ProjectSet below the projection,
         // which then reads each one as a column.
         let srf_items;
-        let projection_items = if body.projection.iter().any(|i| srf_call(i).is_some()) {
+        let projection_items = if select_items.iter().any(|i| srf_call(i).is_some()) {
             let num_group_by = has_aggregates.then_some(group_by_ast.len());
             let (set_plan, items) =
-                Box::pin(self.plan_project_set(plan, &mut ctx, &body.projection, num_group_by))
-                    .await?;
+                Box::pin(self.plan_project_set(plan, &mut ctx, select_items, num_group_by)).await?;
             plan = set_plan;
             srf_items = items;
             &srf_items
         } else {
-            &body.projection
+            select_items
         };
 
         // 4. Projection (SELECT list)
@@ -1997,20 +2015,44 @@ impl<'a> QueryPlanner<'a> {
             };
         }
 
+        self.build_aggregate_leftjoin_spec(
+            filtered_inner,
+            &inner_ctx,
+            correlations,
+            &proj_expr,
+            empty_value,
+            &suffix.to_string(),
+        )
+        .await
+    }
+
+    /// Group a filtered correlated subquery input by its inner correlation
+    /// keys and project `[corr_key_0, ..., value]` over the aggregates of
+    /// `proj_expr`. `correlations` are `(outer, inner)` pairs. `None` when
+    /// the projection has no aggregate.
+    async fn build_aggregate_leftjoin_spec(
+        &self,
+        filtered_inner: LogicalPlan,
+        inner_ctx: &PlanningContext,
+        correlations: Vec<(ast::Expr, ast::Expr)>,
+        proj_expr: &ast::Expr,
+        empty_value: ast::Expr,
+        suffix: &str,
+    ) -> Result<Option<LeftJoinSpec>, PlanError> {
         // Decorrelate by GROUP BY-ing on every inner correlation
         // column. Multi-correlation (Q20) lands here naturally — the
         // outer LEFT JOIN later AND-s all the key pairs.
         let mut group_by_exprs: Vec<PlanExpr> = Vec::with_capacity(correlations.len());
         let mut inner_corr_infos: Vec<ColumnInfo> = Vec::with_capacity(correlations.len());
         for (_, inner_ast) in &correlations {
-            let p = self.plan_expr(inner_ast, &inner_ctx).await?;
-            inner_corr_infos.push(self.expr_to_column_info(&p, &inner_ctx));
+            let p = self.plan_expr(inner_ast, inner_ctx).await?;
+            inner_corr_infos.push(self.expr_to_column_info(&p, inner_ctx));
             group_by_exprs.push(p);
         }
 
         // Collect aggregates referenced by the projection expression.
         let mut aggrs: Vec<PlanExpr> = Vec::new();
-        self.extract_aggregates(&proj_expr, &inner_ctx, &mut aggrs)
+        self.extract_aggregates(proj_expr, inner_ctx, &mut aggrs)
             .await?;
         if aggrs.is_empty() {
             // No aggregate ⇒ the scalar subquery isn't a single-row
@@ -2020,7 +2062,7 @@ impl<'a> QueryPlanner<'a> {
 
         let mut agg_schema: Vec<ColumnInfo> = inner_corr_infos.clone();
         for a in &aggrs {
-            agg_schema.push(self.expr_to_column_info(a, &inner_ctx));
+            agg_schema.push(self.expr_to_column_info(a, inner_ctx));
         }
         let agg_plan = LogicalPlan::Aggregate {
             input: Box::new(filtered_inner),
@@ -2035,7 +2077,7 @@ impl<'a> QueryPlanner<'a> {
         }
         let num_group_by = correlations.len();
         let rewritten_proj =
-            self.rewrite_aggregates_as_columns(&proj_expr, &post_agg_ctx, num_group_by);
+            self.rewrite_aggregates_as_columns(proj_expr, &post_agg_ctx, num_group_by);
         let projected_scalar = self.plan_expr(&rewritten_proj, &post_agg_ctx).await?;
         let value_name = format!("__corr_scalar_{suffix}");
         let scalar_info = ColumnInfo {
@@ -2775,6 +2817,7 @@ impl<'a> QueryPlanner<'a> {
                     for (i, (q, col)) in ctx.columns.iter().enumerate() {
                         if q.as_deref() == Some(WINDOW_QUALIFIER)
                             || q.as_deref() == Some(SRF_QUALIFIER)
+                            || q.as_deref() == Some(SELECT_SUBQUERY_QUALIFIER)
                             || ctx.merged.contains(&i)
                         {
                             continue;
@@ -2941,6 +2984,7 @@ impl<'a> QueryPlanner<'a> {
                     for (i, (q, col)) in ctx.columns.iter().enumerate() {
                         if q.as_deref() == Some(WINDOW_QUALIFIER)
                             || q.as_deref() == Some(SRF_QUALIFIER)
+                            || q.as_deref() == Some(SELECT_SUBQUERY_QUALIFIER)
                             || ctx.merged.contains(&i)
                         {
                             continue;

@@ -31,8 +31,9 @@ pub use fragment::{
 };
 pub use optimizer::{LogicalOptimizer, LogicalRule};
 pub use plan::{
-    null_extend, DynamicFilterConsumer, DynamicFilterProducer, JoinCondition, LogicalPlan,
-    PlanExpr, SortExpr, WindowFunctionDef,
+    map_array_contains, map_array_contains_ref, null_extend, try_map_array_contains,
+    try_map_array_contains_ref, DynamicFilterConsumer, DynamicFilterProducer, JoinCondition,
+    LogicalPlan, PlanExpr, SortExpr, WindowFunctionDef,
 };
 pub use planner::QueryPlanner;
 pub use properties::ActualProperties;

@@ -524,6 +524,12 @@ where
             negated,
             span,
         },
+        E::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| walk_columns(e, f)),
         E::Array {
             elements,
             element_type,

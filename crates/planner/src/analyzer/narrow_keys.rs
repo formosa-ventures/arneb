@@ -668,6 +668,10 @@ fn collect_inner_join_equivalence_expr_classes(
                 collect_inner_join_equivalence_expr_classes(item, classes);
             }
         }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_inner_join_equivalence_expr_classes(expr, classes);
+            collect_inner_join_equivalence_expr_classes(array, classes);
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -735,6 +739,10 @@ fn collect_expr_join_key_blocks(
             for item in elements {
                 collect_expr_join_key_blocks(item, stats, root_outputs, blocked);
             }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_expr_join_key_blocks(expr, stats, root_outputs, blocked);
+            collect_expr_join_key_blocks(array, stats, root_outputs, blocked);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -956,6 +964,10 @@ fn collect_expr_sources(expr: &PlanExpr, input: &LogicalPlan, sources: &mut Vec<
                 collect_expr_sources(item, input, sources);
             }
         }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_expr_sources(expr, input, sources);
+            collect_expr_sources(array, input, sources);
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -1029,6 +1041,10 @@ fn collect_joined_expr_sources(
             for item in elements {
                 collect_joined_expr_sources(item, left_input, right_input, sources);
             }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_joined_expr_sources(expr, left_input, right_input, sources);
+            collect_joined_expr_sources(array, left_input, right_input, sources);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -1396,6 +1412,14 @@ fn rewrite_expr(
             negated,
             span,
         },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| {
+            rewrite_expr(e, stats, root_outputs, blocked)
+        }),
         PlanExpr::Array {
             elements,
             element_type,
@@ -2469,6 +2493,10 @@ mod tests {
                     assert_expr_schema_lengths_consistent(item);
                 }
             }
+            PlanExpr::ArrayContains { expr, array, .. } => {
+                assert_expr_schema_lengths_consistent(expr);
+                assert_expr_schema_lengths_consistent(array);
+            }
             PlanExpr::CaseExpr {
                 operand,
                 when_clauses,
@@ -2583,6 +2611,10 @@ mod tests {
                 for item in elements {
                     assert_expr_subquery_key_types_match(item);
                 }
+            }
+            PlanExpr::ArrayContains { expr, array, .. } => {
+                assert_expr_subquery_key_types_match(expr);
+                assert_expr_subquery_key_types_match(array);
             }
             PlanExpr::CaseExpr {
                 operand,

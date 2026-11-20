@@ -903,6 +903,10 @@ fn collect_columns(expr: &PlanExpr, out: &mut BTreeSet<usize>) {
                 collect_columns(item, out);
             }
         }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_columns(expr, out);
+            collect_columns(array, out);
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -997,6 +1001,14 @@ fn rewrite_expr(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> PlanExpr {
             negated: *negated,
             span: *span,
         },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains_ref(expr, array, *negated, *span, |e| {
+            rewrite_expr(e, mapping)
+        }),
         PlanExpr::Array {
             elements,
             element_type,

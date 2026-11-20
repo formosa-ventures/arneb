@@ -214,6 +214,22 @@ pub enum PlanExpr {
         #[serde(skip)]
         span: Option<Span>,
     },
+    /// `expr = ANY (array)` (or `expr <> ALL (array)` when `negated`) over an
+    /// array-valued expression that is not an `ARRAY[...]` literal. Three-valued:
+    /// an empty array gives false (`<> ALL`: true), a NULL array or NULL `expr`
+    /// over a non-empty array gives NULL, and a NULL element is NULL unless a
+    /// match decides the result.
+    ArrayContains {
+        /// The value being searched for.
+        expr: Box<PlanExpr>,
+        /// The array, of type `List(t)` with `expr` coerced to `t`.
+        array: Box<PlanExpr>,
+        /// `true` for `<> ALL`.
+        negated: bool,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
+    },
     /// Extended-query-protocol placeholder (`$1`, `$2`, …).
     ///
     /// The analyzer's type-coercion pass walks surrounding operators
@@ -235,6 +251,82 @@ pub enum PlanExpr {
     },
 }
 
+/// Rebuilds `expr = ANY (array)` with `f` applied to both operands.
+///
+/// The tree walkers (analyzer passes, rewriters) route their
+/// [`PlanExpr::ArrayContains`] arm through these out-of-line helpers instead
+/// of spelling the rebuild inline: in a debug build each inline arm adds its
+/// temporaries to the frame of a function that recurses once per expression
+/// level, and deeply nested plans overflow a 2 MiB stack.
+#[inline(never)]
+#[allow(clippy::boxed_local)] // the caller's boxes are moved in, not rebuilt
+pub fn map_array_contains(
+    expr: Box<PlanExpr>,
+    array: Box<PlanExpr>,
+    negated: bool,
+    span: Option<Span>,
+    mut f: impl FnMut(PlanExpr) -> PlanExpr,
+) -> PlanExpr {
+    PlanExpr::ArrayContains {
+        expr: Box::new(f(*expr)),
+        array: Box::new(f(*array)),
+        negated,
+        span,
+    }
+}
+
+/// [`map_array_contains`] for a fallible `f`.
+#[inline(never)]
+#[allow(clippy::boxed_local)]
+pub fn try_map_array_contains<E>(
+    expr: Box<PlanExpr>,
+    array: Box<PlanExpr>,
+    negated: bool,
+    span: Option<Span>,
+    mut f: impl FnMut(PlanExpr) -> Result<PlanExpr, E>,
+) -> Result<PlanExpr, E> {
+    Ok(PlanExpr::ArrayContains {
+        expr: Box::new(f(*expr)?),
+        array: Box::new(f(*array)?),
+        negated,
+        span,
+    })
+}
+
+/// [`map_array_contains`] over borrowed operands.
+#[inline(never)]
+pub fn map_array_contains_ref(
+    expr: &PlanExpr,
+    array: &PlanExpr,
+    negated: bool,
+    span: Option<Span>,
+    mut f: impl FnMut(&PlanExpr) -> PlanExpr,
+) -> PlanExpr {
+    PlanExpr::ArrayContains {
+        expr: Box::new(f(expr)),
+        array: Box::new(f(array)),
+        negated,
+        span,
+    }
+}
+
+/// [`map_array_contains_ref`] for a fallible `f`.
+#[inline(never)]
+pub fn try_map_array_contains_ref<E>(
+    expr: &PlanExpr,
+    array: &PlanExpr,
+    negated: bool,
+    span: Option<Span>,
+    mut f: impl FnMut(&PlanExpr) -> Result<PlanExpr, E>,
+) -> Result<PlanExpr, E> {
+    Ok(PlanExpr::ArrayContains {
+        expr: Box::new(f(expr)?),
+        array: Box::new(f(array)?),
+        negated,
+        span,
+    })
+}
+
 impl PlanExpr {
     /// Returns the source span attached directly to this node, or `None`
     /// if it was synthesized by an analyzer/optimizer pass or is a
@@ -254,6 +346,7 @@ impl PlanExpr {
             | PlanExpr::ScalarSubquery { span, .. }
             | PlanExpr::CaseExpr { span, .. }
             | PlanExpr::Array { span, .. }
+            | PlanExpr::ArrayContains { span, .. }
             | PlanExpr::Parameter { span, .. } => *span,
             PlanExpr::Wildcard => None,
         }
@@ -287,6 +380,9 @@ impl PlanExpr {
                 .best_span()
                 .or_else(|| list.iter().find_map(|e| e.best_span())),
             PlanExpr::Array { elements, .. } => elements.iter().find_map(|e| e.best_span()),
+            PlanExpr::ArrayContains { expr, array, .. } => {
+                expr.best_span().or_else(|| array.best_span())
+            }
             PlanExpr::CaseExpr {
                 operand,
                 when_clauses,
@@ -1061,6 +1157,18 @@ impl fmt::Display for PlanExpr {
                     write!(f, "{e}")?;
                 }
                 write!(f, "]")
+            }
+            PlanExpr::ArrayContains {
+                expr,
+                array,
+                negated,
+                ..
+            } => {
+                if *negated {
+                    write!(f, "{expr} <> ALL ({array})")
+                } else {
+                    write!(f, "{expr} = ANY ({array})")
+                }
             }
             PlanExpr::Parameter {
                 index, type_hint, ..

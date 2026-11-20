@@ -800,6 +800,10 @@ where
                 visit_columns(item, callback);
             }
         }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            visit_columns(expr, callback);
+            visit_columns(array, callback);
+        }
         PlanExpr::Function { args, .. } => {
             for a in args {
                 visit_columns(a, callback);

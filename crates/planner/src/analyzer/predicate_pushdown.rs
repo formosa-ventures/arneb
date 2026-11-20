@@ -1095,6 +1095,10 @@ fn visit_column_pairs<F: FnMut(&str, usize)>(expr: &PlanExpr, callback: &mut F) 
                 visit_column_pairs(item, callback);
             }
         }
+        E::ArrayContains { expr, array, .. } => {
+            visit_column_pairs(expr, callback);
+            visit_column_pairs(array, callback);
+        }
         E::Function { args, .. } => {
             for a in args {
                 visit_column_pairs(a, callback);
@@ -1335,6 +1339,10 @@ fn visit_column_names<F: FnMut(&str)>(expr: &PlanExpr, callback: &mut F) {
                 visit_column_names(item, callback);
             }
         }
+        E::ArrayContains { expr, array, .. } => {
+            visit_column_names(expr, callback);
+            visit_column_names(array, callback);
+        }
         E::Function { args, .. } => {
             for a in args {
                 visit_column_names(a, callback);
@@ -1450,6 +1458,15 @@ fn rewrite_expr(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<PlanExpr> {
             negated: *negated,
             span: *span,
         },
+        E::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::try_map_array_contains_ref(expr, array, *negated, *span, |e| {
+            rewrite_expr(e, schema).ok_or(())
+        })
+        .ok()?,
         E::Array {
             elements,
             element_type,

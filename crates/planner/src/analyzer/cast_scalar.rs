@@ -44,6 +44,36 @@ pub fn cast_scalar(value: &ScalarValue, target: &DataType) -> Result<ScalarValue
             other => other,
         });
     }
+    if let DataType::List(element) = target {
+        let values = match value {
+            // `'{1,NULL}'::int[]`: PostgreSQL array text.
+            ScalarValue::Utf8(text) => arneb_common::array_text::parse_array_text(text)
+                .map_err(|message| PlanError::InvalidLiteral {
+                    message,
+                    location: None,
+                })?
+                .into_iter()
+                .map(|item| match item {
+                    Some(text) => cast_scalar(&ScalarValue::Utf8(text), element),
+                    None => Ok(ScalarValue::Null),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            ScalarValue::List { values, .. } => values
+                .iter()
+                .map(|v| cast_scalar(v, element))
+                .collect::<Result<Vec<_>, _>>()?,
+            other => {
+                return Err(PlanError::InvalidLiteral {
+                    message: format!("cannot cast literal {other} to {target}"),
+                    location: None,
+                })
+            }
+        };
+        return Ok(ScalarValue::List {
+            element: element.clone(),
+            values,
+        });
+    }
     let source_array =
         scalar_to_single_element_array(value).map_err(|e| PlanError::InvalidLiteral {
             message: format!("cannot build array for literal {value}: {e}"),
@@ -271,6 +301,41 @@ mod tests {
         let v = ScalarValue::Utf8("not-a-date".to_string());
         let err = cast_scalar(&v, &DataType::Date32).unwrap_err();
         assert!(matches!(err, PlanError::InvalidLiteral { .. }));
+    }
+
+    #[test]
+    fn cast_text_to_array_parses_postgres_syntax() {
+        let v = ScalarValue::Utf8("{1, NULL,3}".to_string());
+        let target = DataType::List(Box::new(DataType::Int64));
+        assert_eq!(
+            cast_scalar(&v, &target).unwrap(),
+            ScalarValue::List {
+                element: Box::new(DataType::Int64),
+                values: vec![
+                    ScalarValue::Int64(1),
+                    ScalarValue::Null,
+                    ScalarValue::Int64(3)
+                ],
+            }
+        );
+        assert!(cast_scalar(&ScalarValue::Utf8("{1,x}".to_string()), &target).is_err());
+        assert!(cast_scalar(&ScalarValue::Utf8("{1".to_string()), &target).is_err());
+    }
+
+    #[test]
+    fn cast_array_to_wider_element_type() {
+        let v = ScalarValue::List {
+            element: Box::new(DataType::Int32),
+            values: vec![ScalarValue::Int32(1), ScalarValue::Null],
+        };
+        let got = cast_scalar(&v, &DataType::List(Box::new(DataType::Int64))).unwrap();
+        assert_eq!(
+            got,
+            ScalarValue::List {
+                element: Box::new(DataType::Int64),
+                values: vec![ScalarValue::Int64(1), ScalarValue::Null],
+            }
+        );
     }
 
     #[test]

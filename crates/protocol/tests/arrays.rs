@@ -268,3 +268,158 @@ async fn simple_query_row_description_carries_the_array_oid() {
         }
     }
 }
+
+/// First column of every row of a simple query, in order.
+async fn column_text(client: &tokio_postgres::Client, sql: &str) -> Vec<Option<String>> {
+    client
+        .simple_query(sql)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r.get(0).map(str::to_string)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn any_over_array_expression() {
+    let client = connect(pg_server().await).await;
+    // An `ARRAY[...]` literal on the right is desugared to an IN list; the
+    // cast makes it an array-valued expression, which takes the new path.
+    let got = column_text(
+        &client,
+        "SELECT x FROM t WHERE x = ANY (ARRAY[4 - x, 3]::bigint[]) ORDER BY x",
+    )
+    .await;
+    assert_eq!(got, [Some("2".to_string()), Some("3".to_string())]);
+    let got = column_text(
+        &client,
+        "SELECT x FROM t WHERE x <> ALL (ARRAY[4 - x, 3]::bigint[]) ORDER BY x",
+    )
+    .await;
+    assert_eq!(got, [Some("1".to_string())]);
+}
+
+#[tokio::test]
+async fn any_array_param_binary() {
+    let client = connect(pg_server().await).await;
+    let stmt = client
+        .prepare("SELECT CAST(x AS VARCHAR) FROM t WHERE x = ANY($1) ORDER BY x")
+        .await
+        .unwrap();
+    assert_eq!(stmt.params()[0].oid(), 1016, "$1 is described as int8[]");
+    let rows = client.query(&stmt, &[&vec![1i64, 3]]).await.unwrap();
+    let got: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(got, ["1", "3"]);
+    let rows = client
+        .query(
+            "SELECT CAST(x AS VARCHAR) FROM t WHERE x = ANY($1) ORDER BY x",
+            &[&Vec::<i64>::new()],
+        )
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+}
+
+/// A parameter sent in text format.
+#[derive(Debug)]
+struct TextParam(&'static str);
+
+impl tokio_postgres::types::ToSql for TextParam {
+    fn to_sql(
+        &self,
+        _ty: &tokio_postgres::types::Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(self.0.as_bytes());
+        Ok(tokio_postgres::types::IsNull::No)
+    }
+    fn accepts(_ty: &tokio_postgres::types::Type) -> bool {
+        true
+    }
+    fn encode_format(&self, _ty: &tokio_postgres::types::Type) -> tokio_postgres::types::Format {
+        tokio_postgres::types::Format::Text
+    }
+    tokio_postgres::types::to_sql_checked!();
+}
+
+#[tokio::test]
+async fn any_array_param_text_format() {
+    let client = connect(pg_server().await).await;
+    let sql = "SELECT CAST(x AS VARCHAR) FROM t WHERE x = ANY($1) ORDER BY x";
+    let rows = client.query(sql, &[&TextParam("{1,3}")]).await.unwrap();
+    let got: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(got, ["1", "3"]);
+    let rows = client.query(sql, &[&TextParam("{}")]).await.unwrap();
+    assert!(rows.is_empty());
+    let rows = client
+        .query(sql, &[&TextParam(r#"{ 2 , NULL }"#)])
+        .await
+        .unwrap();
+    let got: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(got, ["2"]);
+}
+
+#[tokio::test]
+async fn any_array_text_param_with_quoted_elements() {
+    let client = connect(pg_server().await).await;
+    let rows = client
+        .query(
+            "SELECT $1::text = ANY($2)",
+            &[&"a b", &TextParam(r#"{"a b",c,"d\"e",NULL}"#)],
+        )
+        .await;
+    // `$2` has no int8[] hint from the left side here; it is inferred from
+    // the text operand, so the array is text[].
+    let rows = rows.unwrap();
+    assert!(rows[0].get::<_, bool>(0));
+}
+
+#[tokio::test]
+async fn any_array_param_null_semantics() {
+    let client = connect(pg_server().await).await;
+    for (sql, want) in [
+        ("SELECT 2 = ANY('{}'::int[])", Some("f")),
+        ("SELECT 2 = ANY(ARRAY[1,NULL])", None),
+        ("SELECT 2 <> ALL(ARRAY[1,NULL])", None),
+        ("SELECT 1 = ANY(ARRAY[1,NULL])", Some("t")),
+        ("SELECT 1 <> ALL(ARRAY[1,NULL])", Some("f")),
+        ("SELECT 3 <> ALL('{}'::int[])", Some("t")),
+        ("SELECT NULL = ANY('{1}'::int[])", None),
+        ("SELECT NULL = ANY('{}'::int[])", Some("f")),
+        ("SELECT 2 = ANY(NULL::int[])", None),
+        ("SELECT 2 = ANY('{1,NULL}'::int[])", None),
+        (
+            "SELECT 2 = ANY(ARRAY[x, 5]::bigint[]) FROM t WHERE x = 2",
+            Some("t"),
+        ),
+        ("SELECT 2 = ANY('{1,2}')", Some("t")),
+        (
+            "SELECT 5 = ANY(ARRAY[x, NULL]::bigint[]) FROM t WHERE x = 2",
+            None,
+        ),
+    ] {
+        assert_eq!(first_text(&client, sql).await.as_deref(), want, "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn array_text_cast_parses_postgres_syntax() {
+    let client = connect(pg_server().await).await;
+    assert_eq!(
+        first_text(&client, r#"SELECT '{1,NULL, 3}'::int[]"#)
+            .await
+            .unwrap(),
+        "{1,NULL,3}"
+    );
+    assert_eq!(
+        first_text(&client, r#"SELECT '{"a b",NULL,"NULL",c\,d}'::text[]"#)
+            .await
+            .unwrap(),
+        r#"{"a b",NULL,"NULL","c,d"}"#
+    );
+    assert!(client.simple_query("SELECT '{1,x}'::int[]").await.is_err());
+    assert!(client.simple_query("SELECT '{1,2'::int[]").await.is_err());
+}

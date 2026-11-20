@@ -656,7 +656,13 @@ fn bind_parameters(sql: &str, params: &[String]) -> String {
 /// A portal's parameters as SQL literals. A parameter is decoded by the type
 /// the client declared and the format it chose: psycopg 3 sends integers,
 /// floats and booleans in binary, JDBC and tokio-postgres mostly in text.
-fn extract_params(portal: &Portal<String>) -> PgWireResult<Vec<String>> {
+///
+/// A parameter the client did not declare takes its type from `inferred`
+/// (see [`infer_binary_param_types`]), keyed by 1-based index.
+fn extract_params(
+    portal: &Portal<String>,
+    inferred: &std::collections::HashMap<usize, Type>,
+) -> PgWireResult<Vec<String>> {
     (0..portal.parameter_len())
         .map(|i| {
             let declared = portal
@@ -665,10 +671,49 @@ fn extract_params(portal: &Portal<String>) -> PgWireResult<Vec<String>> {
                 .get(i)
                 .cloned()
                 .flatten()
+                .or_else(|| inferred.get(&(i + 1)).cloned())
                 .unwrap_or(Type::UNKNOWN);
             Ok(param_literal(portal, i, &declared)?.unwrap_or_else(|| "NULL".to_string()))
         })
         .collect()
+}
+
+/// The types the analyzer infers for the parameters of `portal` that arrive
+/// in binary without a declared type. tokio-postgres declares nothing in
+/// Parse and encodes each parameter as the type Describe reported, so those
+/// types have to be recomputed here. Empty when no parameter needs it.
+async fn infer_binary_param_types(
+    portal: &Portal<String>,
+    catalog_manager: &CatalogManager,
+) -> std::collections::HashMap<usize, Type> {
+    let undeclared_binary = (0..portal.parameter_len()).any(|i| {
+        portal.parameter_format.is_binary(i)
+            && matches!(portal.parameters.get(i), Some(Some(_)))
+            && portal
+                .statement
+                .parameter_types
+                .get(i)
+                .cloned()
+                .flatten()
+                .is_none_or(|t| t == Type::UNKNOWN)
+    });
+    if !undeclared_binary {
+        return std::collections::HashMap::new();
+    }
+    // Boxed: the planner future is large, and an unboxed one would sit in
+    // the stack frame of every Bind/Execute that awaits this function.
+    match Box::pin(plan_for_describe(
+        &portal.statement.statement,
+        catalog_manager,
+    ))
+    .await
+    {
+        Ok((_, types)) => types
+            .iter()
+            .map(|(index, t)| (*index, arneb_type_to_pg_param_type(t)))
+            .collect(),
+        Err(_) => std::collections::HashMap::new(),
+    }
 }
 
 /// One parameter as a SQL literal, `None` for NULL. A binary value of a type
@@ -684,6 +729,9 @@ fn param_literal(
         };
     }
     let quoted = |v: String| format!("'{}'", v.replace('\'', "''"));
+    if let Some(element) = array_param_element(declared) {
+        return array_param_literal(portal, i, &element);
+    }
     if portal.parameter_format.is_binary(i) {
         return Ok(match *declared {
             Type::INT2 => get!(i16, declared).map(|v| v.to_string()),
@@ -729,6 +777,195 @@ fn param_literal(
         _ if value.parse::<f64>().is_ok() => value,
         _ => quoted(value),
     }))
+}
+
+/// Element type of the array parameter types Arneb decodes.
+fn array_param_element(declared: &Type) -> Option<Type> {
+    Some(match *declared {
+        Type::INT2_ARRAY => Type::INT2,
+        Type::INT4_ARRAY => Type::INT4,
+        Type::INT8_ARRAY => Type::INT8,
+        Type::FLOAT4_ARRAY => Type::FLOAT4,
+        Type::FLOAT8_ARRAY => Type::FLOAT8,
+        Type::BOOL_ARRAY => Type::BOOL,
+        Type::TEXT_ARRAY => Type::TEXT,
+        Type::VARCHAR_ARRAY => Type::VARCHAR,
+        Type::BPCHAR_ARRAY => Type::BPCHAR,
+        Type::DATE_ARRAY => Type::DATE,
+        Type::TIMESTAMP_ARRAY => Type::TIMESTAMP,
+        Type::TIMESTAMPTZ_ARRAY => Type::TIMESTAMPTZ,
+        _ => return None,
+    })
+}
+
+/// SQL type of an array parameter's elements, `None` for an element type
+/// Arneb does not decode.
+fn array_element_sql_type(element: &Type) -> Option<&'static str> {
+    Some(match *element {
+        Type::INT2 => "SMALLINT",
+        Type::INT4 => "INTEGER",
+        Type::INT8 => "BIGINT",
+        Type::FLOAT4 => "REAL",
+        Type::FLOAT8 => "DOUBLE PRECISION",
+        Type::BOOL => "BOOLEAN",
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR => "TEXT",
+        Type::DATE => "DATE",
+        Type::TIMESTAMP => "TIMESTAMP",
+        Type::TIMESTAMPTZ => "TIMESTAMP WITH TIME ZONE",
+        _ => return None,
+    })
+}
+
+/// An array parameter (text `{1,NULL,"a b"}` or binary) as
+/// `CAST('<array text>' AS <element>[])`. Both formats end up as PostgreSQL
+/// array text that the engine's one array-text parser reads when the cast is
+/// planned, so a malformed array or element is an error, never a NULL.
+fn array_param_literal(
+    portal: &Portal<String>,
+    i: usize,
+    element: &Type,
+) -> PgWireResult<Option<String>> {
+    let unsupported = |why: String| {
+        PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+            "ERROR".to_owned(),
+            "0A000".to_owned(),
+            format!("parameter ${}: {why}", i + 1),
+        )))
+    };
+    let Some(Some(raw)) = portal.parameters.get(i) else {
+        return Ok(None);
+    };
+    let Some(sql_type) = array_element_sql_type(element) else {
+        return Err(unsupported(format!(
+            "arrays of {} are not supported",
+            element.name()
+        )));
+    };
+    let text = if portal.parameter_format.is_binary(i) {
+        let elements = decode_binary_array(raw, element).map_err(&unsupported)?;
+        let mut text = String::from("{");
+        for (n, item) in elements.iter().enumerate() {
+            if n > 0 {
+                text.push(',');
+            }
+            match item {
+                Some(item) => {
+                    text.push('"');
+                    for c in item.chars() {
+                        if matches!(c, '"' | '\\') {
+                            text.push('\\');
+                        }
+                        text.push(c);
+                    }
+                    text.push('"');
+                }
+                None => text.push_str("NULL"),
+            }
+        }
+        text.push('}');
+        text
+    } else {
+        String::from_utf8(raw.to_vec())
+            .map_err(|_| unsupported("array text is not valid UTF-8".to_owned()))?
+    };
+    Ok(Some(format!(
+        "CAST('{}' AS {sql_type}[])",
+        text.replace('\'', "''")
+    )))
+}
+
+/// Elements of a one-dimensional binary array, each in its PostgreSQL text
+/// form, `None` for NULL.
+fn decode_binary_array(raw: &[u8], element: &Type) -> Result<Vec<Option<String>>, String> {
+    fn take<'a>(raw: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
+        if raw.len() < n {
+            return Err("truncated binary array".to_owned());
+        }
+        let (head, tail) = raw.split_at(n);
+        *raw = tail;
+        Ok(head)
+    }
+    fn int(raw: &mut &[u8]) -> Result<i32, String> {
+        Ok(i32::from_be_bytes(take(raw, 4)?.try_into().unwrap()))
+    }
+    let mut rest = raw;
+    let ndim = int(&mut rest)?;
+    let _has_nulls = int(&mut rest)?;
+    let element_oid = int(&mut rest)?;
+    if u32::try_from(element_oid).ok() != Some(element.oid()) {
+        return Err(format!(
+            "binary array holds element type {element_oid}, declared {}",
+            element.name()
+        ));
+    }
+    match ndim {
+        0 => return Ok(Vec::new()),
+        1 => {}
+        _ => return Err("multidimensional arrays are not supported".to_owned()),
+    }
+    let len = int(&mut rest)?;
+    let _lower_bound = int(&mut rest)?;
+    let len = usize::try_from(len).map_err(|_| "negative array length".to_owned())?;
+    let pg_epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .ok_or("internal: epoch")?;
+    let mut out = Vec::with_capacity(len.min(raw.len()));
+    for _ in 0..len {
+        let n = int(&mut rest)?;
+        if n < 0 {
+            out.push(None);
+            continue;
+        }
+        let bytes = take(&mut rest, n as usize)?;
+        let bad = || format!("bad binary {} element", element.name());
+        let text = match *element {
+            Type::INT2 => i16::from_be_bytes(bytes.try_into().map_err(|_| bad())?).to_string(),
+            Type::INT4 => i32::from_be_bytes(bytes.try_into().map_err(|_| bad())?).to_string(),
+            Type::INT8 => i64::from_be_bytes(bytes.try_into().map_err(|_| bad())?).to_string(),
+            Type::FLOAT4 => float_text(f64::from(f32::from_be_bytes(
+                bytes.try_into().map_err(|_| bad())?,
+            ))),
+            Type::FLOAT8 => float_text(f64::from_be_bytes(bytes.try_into().map_err(|_| bad())?)),
+            Type::BOOL => match bytes {
+                [0] => "false".to_owned(),
+                [1] => "true".to_owned(),
+                _ => return Err(bad()),
+            },
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR => {
+                String::from_utf8(bytes.to_vec()).map_err(|_| bad())?
+            }
+            Type::DATE => {
+                let days = i32::from_be_bytes(bytes.try_into().map_err(|_| bad())?);
+                pg_epoch
+                    .date()
+                    .checked_add_signed(chrono::Duration::days(i64::from(days)))
+                    .ok_or_else(bad)?
+                    .to_string()
+            }
+            Type::TIMESTAMP | Type::TIMESTAMPTZ => {
+                let micros = i64::from_be_bytes(bytes.try_into().map_err(|_| bad())?);
+                pg_epoch
+                    .checked_add_signed(chrono::Duration::microseconds(micros))
+                    .ok_or_else(bad)?
+                    .format("%Y-%m-%d %H:%M:%S%.f")
+                    .to_string()
+            }
+            _ => return Err(bad()),
+        };
+        out.push(Some(text));
+    }
+    Ok(out)
+}
+
+/// A float in PostgreSQL's text form (`NaN`, `Infinity`, `-Infinity`).
+fn float_text(v: f64) -> String {
+    if v.is_nan() {
+        "NaN".to_owned()
+    } else if v.is_infinite() {
+        if v > 0.0 { "Infinity" } else { "-Infinity" }.to_owned()
+    } else {
+        v.to_string()
+    }
 }
 
 fn bool_literal(value: bool) -> String {
@@ -827,7 +1064,9 @@ impl ExtendedQueryHandler for ConnectionHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = &&portal.statement.statement;
-        let params = extract_params(portal)?;
+        let catalog_manager = self.session_catalog(client)?;
+        let inferred = infer_binary_param_types(portal, &catalog_manager).await;
+        let params = extract_params(portal, &inferred)?;
         let bound_sql = bind_parameters(sql, &params);
         let trimmed = bound_sql.trim();
 
@@ -841,7 +1080,6 @@ impl ExtendedQueryHandler for ConnectionHandler {
         }
 
         // Intercept session commands and metadata queries
-        let catalog_manager = self.session_catalog(client)?;
         if let Some(meta_result) = self.intercept(client, trimmed, &catalog_manager).await {
             return match meta_result {
                 Ok(resp) => metadata_to_response(resp),
@@ -952,14 +1190,15 @@ impl ExtendedQueryHandler for ConnectionHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = &target.statement.statement;
-        let params = extract_params(target)?;
+        let catalog_manager = self.session_catalog(client)?;
+        let inferred = infer_binary_param_types(target, &catalog_manager).await;
+        let params = extract_params(target, &inferred)?;
         let bound_sql = bind_parameters(sql, &params);
         let trimmed = bound_sql.trim();
 
         if trimmed.is_empty() {
             return Ok(DescribePortalResponse::no_data());
         }
-        let catalog_manager = self.session_catalog(client)?;
 
         // Intercept metadata queries
         if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) = self
@@ -1704,7 +1943,61 @@ async fn resolve_order_by_subqueries_distributed(
     Ok(resolved)
 }
 
-async fn resolve_expr_subqueries_distributed_inner(
+/// The `ArrayContains` arm of [`resolve_expr_subqueries_distributed_inner`],
+/// out of line. A plain function returning a boxed future, so the caller's
+/// future (which recurses once per plan level) holds a pointer rather than
+/// the helper's state.
+fn resolve_array_contains_subqueries<'a>(
+    ctx: &'a ExecutionContext,
+    executor: Option<&'a dyn DistributedExecutor>,
+    node: PlanExpr,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PlanExpr, ArnebError>> + Send + 'a>>
+{
+    Box::pin(async move {
+        let PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } = node
+        else {
+            return Ok(node);
+        };
+        let expr = Box::pin(resolve_expr_subqueries_distributed_inner(
+            ctx, executor, *expr,
+        ))
+        .await?;
+        let array = Box::pin(resolve_expr_subqueries_distributed_inner(
+            ctx, executor, *array,
+        ))
+        .await?;
+        Ok(PlanExpr::ArrayContains {
+            expr: Box::new(expr),
+            array: Box::new(array),
+            negated,
+            span,
+        })
+    })
+}
+
+/// Resolves the subqueries in `expr`. A plain function dispatching to the
+/// body below (or to the `ArrayContains` helper), so the body's future, which
+/// recurses once per plan level, carries no arm for the new variant.
+fn resolve_expr_subqueries_distributed_inner<'a>(
+    ctx: &'a ExecutionContext,
+    executor: Option<&'a dyn DistributedExecutor>,
+    expr: PlanExpr,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PlanExpr, ArnebError>> + Send + 'a>>
+{
+    if matches!(expr, PlanExpr::ArrayContains { .. }) {
+        return resolve_array_contains_subqueries(ctx, executor, expr);
+    }
+    Box::pin(resolve_expr_subqueries_distributed_body(
+        ctx, executor, expr,
+    ))
+}
+
+async fn resolve_expr_subqueries_distributed_body(
     ctx: &ExecutionContext,
     executor: Option<&dyn DistributedExecutor>,
     expr: PlanExpr,
@@ -1941,7 +2234,9 @@ async fn resolve_expr_subqueries_distributed_inner(
         PlanExpr::Column { .. }
         | PlanExpr::Literal { .. }
         | PlanExpr::Wildcard
-        | PlanExpr::Parameter { .. } => Ok(expr),
+        | PlanExpr::Parameter { .. }
+        // Dispatched by `resolve_expr_subqueries_distributed_inner`.
+        | PlanExpr::ArrayContains { .. } => Ok(expr),
     }
 }
 
@@ -2110,6 +2405,9 @@ fn expr_columns_in_range(expr: &PlanExpr, input_width: usize) -> bool {
         PlanExpr::Array { elements, .. } => elements
             .iter()
             .all(|item| expr_columns_in_range(item, input_width)),
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            expr_columns_in_range(expr, input_width) && expr_columns_in_range(array, input_width)
+        }
         PlanExpr::ScalarSubquery { subplan, .. } => plan_columns_in_range(subplan),
         PlanExpr::CaseExpr {
             operand,
@@ -2289,6 +2587,10 @@ fn expr_subplans(expr: &PlanExpr) -> Vec<&LogicalPlan> {
             PlanExpr::Array { elements, .. } => {
                 elements.iter().for_each(|item| walk(item, out));
             }
+            PlanExpr::ArrayContains { expr, array, .. } => {
+                walk(expr, out);
+                walk(array, out);
+            }
             PlanExpr::CaseExpr {
                 operand,
                 when_clauses,
@@ -2417,6 +2719,79 @@ async fn register_data_sources(
 
 #[cfg(test)]
 mod tests {
+    fn binary_array(oid: i32, elements: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for v in [1i32, 1, oid, elements.len() as i32, 1] {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        for e in elements {
+            match e {
+                Some(b) => {
+                    out.extend_from_slice(&(b.len() as i32).to_be_bytes());
+                    out.extend_from_slice(b);
+                }
+                None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn binary_arrays_decode_to_postgres_text() {
+        let ints = binary_array(
+            20,
+            &[
+                Some(&1i64.to_be_bytes()),
+                None,
+                Some(&(-3i64).to_be_bytes()),
+            ],
+        );
+        assert_eq!(
+            decode_binary_array(&ints, &Type::INT8).unwrap(),
+            [Some("1".to_string()), None, Some("-3".to_string())]
+        );
+        let text = binary_array(25, &[Some(b"a b"), Some(b"")]);
+        assert_eq!(
+            decode_binary_array(&text, &Type::TEXT).unwrap(),
+            [Some("a b".to_string()), Some(String::new())]
+        );
+        // 2000-01-02 and 2000-01-01 00:00:01.5.
+        let dates = binary_array(1082, &[Some(&1i32.to_be_bytes())]);
+        assert_eq!(
+            decode_binary_array(&dates, &Type::DATE).unwrap(),
+            [Some("2000-01-02".to_string())]
+        );
+        let stamps = binary_array(1114, &[Some(&1_500_000i64.to_be_bytes())]);
+        assert_eq!(
+            decode_binary_array(&stamps, &Type::TIMESTAMP).unwrap(),
+            [Some("2000-01-01 00:00:01.500".to_string())]
+        );
+        let floats = binary_array(701, &[Some(&f64::NAN.to_be_bytes())]);
+        assert_eq!(
+            decode_binary_array(&floats, &Type::FLOAT8).unwrap(),
+            [Some("NaN".to_string())]
+        );
+        // Empty array: ndim 0.
+        let mut empty = Vec::new();
+        for v in [0i32, 0, 20] {
+            empty.extend_from_slice(&v.to_be_bytes());
+        }
+        assert!(decode_binary_array(&empty, &Type::INT8).unwrap().is_empty());
+    }
+
+    #[test]
+    fn binary_arrays_reject_mismatches_and_truncation() {
+        let ints = binary_array(20, &[Some(&1i64.to_be_bytes())]);
+        assert!(decode_binary_array(&ints, &Type::INT4).is_err());
+        assert!(decode_binary_array(&ints[..ints.len() - 3], &Type::INT8).is_err());
+        let two_dims = {
+            let mut a = binary_array(20, &[]);
+            a[..4].copy_from_slice(&2i32.to_be_bytes());
+            a
+        };
+        assert!(decode_binary_array(&two_dims, &Type::INT8).is_err());
+    }
+
     /// A kill that lands after an INSERT's work completed but before
     /// `finish`: the kill is not applied and the statement reports its
     /// real result (PostgreSQL never reports a cancel after commit).

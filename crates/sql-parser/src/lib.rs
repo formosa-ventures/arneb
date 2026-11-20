@@ -1062,6 +1062,32 @@ mod tests {
     // -- CASE / COALESCE / NULLIF tests --
 
     #[test]
+    fn parse_any_all_over_non_literal_arrays() {
+        for sql in [
+            "SELECT 1 FROM t WHERE x = ANY ($1)",
+            "SELECT 1 FROM t WHERE x <> ALL (y)",
+            "SELECT 1 FROM t WHERE x = ANY ('{1}'::int[])",
+        ] {
+            let stmt = parse(sql).unwrap();
+            let Statement::Query { query, .. } = stmt else {
+                panic!("expected Query");
+            };
+            let selection = *select_body(&query).selection.clone().unwrap();
+            assert!(
+                matches!(selection, Expr::AnyAll { .. }),
+                "{sql}: {selection:?}"
+            );
+        }
+        // An ARRAY[...] literal stays an IN list.
+        let stmt = parse("SELECT 1 FROM t WHERE x = ANY (ARRAY[1, 2])").unwrap();
+        let Statement::Query { query, .. } = stmt else {
+            panic!("expected Query");
+        };
+        let selection = *select_body(&query).selection.clone().unwrap();
+        assert!(matches!(selection, Expr::InList { .. }));
+    }
+
+    #[test]
     fn parse_array_constructor() {
         let stmt = parse("SELECT ARRAY[1, x + 1, NULL] FROM t").unwrap();
         let Statement::Query { query, .. } = stmt else {
@@ -1386,7 +1412,14 @@ mod tests {
             assert_eq!(n, negated, "{sql}");
             assert!(!list.is_empty(), "{sql}");
         }
-        assert!(parse("SELECT x = ANY (y) FROM t").is_err());
+        // A non-literal array operand is `Expr::AnyAll`.
+        assert!(matches!(
+            projection("SELECT x = ANY (y) FROM t"),
+            Expr::AnyAll {
+                op: AnyAllOp::EqAny,
+                ..
+            }
+        ));
         assert!(parse("SELECT x > ANY (ARRAY[1]) FROM t").is_err());
     }
 

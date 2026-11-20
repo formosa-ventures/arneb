@@ -655,6 +655,15 @@ where
             negated,
             span,
         },
+        E::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::try_map_array_contains(expr, array, negated, span, |e| {
+            rewrite_expr(e, f).ok_or(())
+        })
+        .ok()?,
         E::Array {
             elements,
             element_type,

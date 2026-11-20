@@ -2427,6 +2427,9 @@ impl<'a> QueryPlanner<'a> {
                     span: node_span,
                 })
             }
+            ast::Expr::AnyAll {
+                expr, op, array, ..
+            } => Box::pin(self.plan_any_all(expr, *op, array, node_span, ctx)).await,
             ast::Expr::Parameter { index, .. } => Ok(PlanExpr::Parameter {
                 index: *index,
                 type_hint: None,
@@ -2721,6 +2724,24 @@ impl<'a> QueryPlanner<'a> {
         false
     }
 
+    /// `expr = ANY (array)` / `expr <> ALL (array)` over an array-valued
+    /// expression. Out of line so the recursive `plan_expr` future stays small.
+    async fn plan_any_all(
+        &self,
+        expr: &ast::Expr,
+        op: ast::AnyAllOp,
+        array: &ast::Expr,
+        span: Option<arneb_sql_parser::Span>,
+        ctx: &PlanningContext,
+    ) -> Result<PlanExpr, PlanError> {
+        Ok(PlanExpr::ArrayContains {
+            expr: Box::new(self.plan_expr(expr, ctx).await?),
+            array: Box::new(self.plan_expr(array, ctx).await?),
+            negated: matches!(op, ast::AnyAllOp::NotEqAll),
+            span,
+        })
+    }
+
     /// Check if an expression contains any aggregate function.
     fn contains_aggregate(&self, expr: &ast::Expr) -> bool {
         match expr {
@@ -2751,6 +2772,9 @@ impl<'a> QueryPlanner<'a> {
             }
             ast::Expr::Array { elements, .. } => {
                 elements.iter().any(|e| self.contains_aggregate(e))
+            }
+            ast::Expr::AnyAll { expr, array, .. } => {
+                self.contains_aggregate(expr) || self.contains_aggregate(array)
             }
             ast::Expr::Case {
                 operand,
@@ -2969,6 +2993,17 @@ impl<'a> QueryPlanner<'a> {
                     .collect(),
                 span: *span,
             },
+            ast::Expr::AnyAll {
+                expr,
+                op,
+                array,
+                span,
+            } => ast::Expr::AnyAll {
+                expr: Box::new(self.rewrite_aggregates_as_columns(expr, ctx, num_group_by)),
+                op: *op,
+                array: Box::new(self.rewrite_aggregates_as_columns(array, ctx, num_group_by)),
+                span: *span,
+            },
             ast::Expr::Function {
                 name,
                 args,
@@ -3117,6 +3152,11 @@ impl<'a> QueryPlanner<'a> {
                     self.extract_aggregates(e, ctx, out).await?;
                 }
             }
+            ast::Expr::AnyAll { expr, array, .. } => {
+                for e in [&**expr, &**array] {
+                    self.extract_aggregates(e, ctx, out).await?;
+                }
+            }
             // `rank() OVER (ORDER BY sum(x))`: the inner aggregate is
             // computed by the Aggregate node below the Window.
             ast::Expr::WindowFunction {
@@ -3197,6 +3237,7 @@ impl<'a> QueryPlanner<'a> {
             | PlanExpr::IsNotNull { .. }
             | PlanExpr::Between { .. }
             | PlanExpr::InList { .. }
+            | PlanExpr::ArrayContains { .. }
             | PlanExpr::Parameter { .. }
             | PlanExpr::ScalarSubquery { .. } => ColumnInfo {
                 name: expr.to_string(),
@@ -3887,6 +3928,14 @@ fn rewrite_expr_after_column_insert(
             data_type,
             span,
         },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| {
+            rewrite_expr_after_column_insert(e, inserted_index, scalar_subplan, scalar_replacement)
+        }),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -4563,6 +4612,21 @@ fn write_ast_unqualified(out: &mut String, expr: &ast::Expr) {
                 }
                 write_ast_unqualified(out, item);
             }
+            let _ = write!(out, ")");
+        }
+        ast::Expr::AnyAll {
+            expr, op, array, ..
+        } => {
+            write_ast_unqualified(out, expr);
+            let _ = write!(
+                out,
+                "{}",
+                match op {
+                    ast::AnyAllOp::EqAny => " = ANY (",
+                    ast::AnyAllOp::NotEqAll => " <> ALL (",
+                }
+            );
+            write_ast_unqualified(out, array);
             let _ = write!(out, ")");
         }
         ast::Expr::Array { elements, .. } => {

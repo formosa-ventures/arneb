@@ -538,6 +538,12 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
                 span,
             })
         }
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::try_map_array_contains(expr, array, negated, span, fold_constants),
         PlanExpr::Array {
             elements,
             element_type,

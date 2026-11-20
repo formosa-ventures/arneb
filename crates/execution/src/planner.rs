@@ -1832,6 +1832,10 @@ fn collect_column_indices_into(expr: &PlanExpr, out: &mut std::collections::BTre
                 collect_column_indices_into(e, out);
             }
         }
+        E::ArrayContains { expr, array, .. } => {
+            collect_column_indices_into(expr, out);
+            collect_column_indices_into(array, out);
+        }
         E::Function { args, .. } => {
             for a in args {
                 collect_column_indices_into(a, out);
@@ -1961,6 +1965,14 @@ fn rewrite_column_indices(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> P
             negated: *negated,
             span: *span,
         },
+        E::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => arneb_planner::map_array_contains_ref(expr, array, *negated, *span, |e| {
+            rewrite_column_indices(e, mapping)
+        }),
         E::Array {
             elements,
             element_type,

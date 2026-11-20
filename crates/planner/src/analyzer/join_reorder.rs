@@ -1795,6 +1795,15 @@ where
             negated: *negated,
             span: *span,
         },
+        E::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::try_map_array_contains_ref(expr, array, *negated, *span, |e| {
+            rewrite_expr(e, remap).ok_or(())
+        })
+        .ok()?,
         E::Array {
             elements,
             element_type,

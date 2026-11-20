@@ -589,6 +589,10 @@ fn collect_decimal64_columns_needing_wide(
                 collect_decimal64_column_refs(item, schema, used);
             }
         }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_decimal64_column_refs(expr, schema, used);
+            collect_decimal64_column_refs(array, schema, used);
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -654,6 +658,10 @@ fn collect_decimal64_column_refs(
             for item in elements {
                 collect_decimal64_column_refs(item, schema, used);
             }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_decimal64_column_refs(expr, schema, used);
+            collect_decimal64_column_refs(array, schema, used);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -737,6 +745,10 @@ fn block_expr_sources(expr: &PlanExpr, input: &LogicalPlan, blocked: &mut HashSe
                 block_expr_sources(item, input, blocked);
             }
         }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            block_expr_sources(expr, input, blocked);
+            block_expr_sources(array, input, blocked);
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -792,6 +804,10 @@ fn collect_expr_subquery_blocks(expr: &PlanExpr, blocked: &mut HashSet<ColumnSou
             for item in elements {
                 collect_expr_subquery_blocks(item, blocked);
             }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_expr_subquery_blocks(expr, blocked);
+            collect_expr_subquery_blocks(array, blocked);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -864,6 +880,10 @@ fn block_expr_sources_joined(
             for item in elements {
                 block_expr_sources_joined(item, left, right, blocked);
             }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            block_expr_sources_joined(expr, left, right, blocked);
+            block_expr_sources_joined(array, left, right, blocked);
         }
         PlanExpr::CaseExpr {
             operand,

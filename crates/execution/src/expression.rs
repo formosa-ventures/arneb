@@ -86,6 +86,17 @@ pub(crate) fn evaluate(
             build_list_array(arrays, element_type, batch.num_rows())
         }
 
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            ..
+        } => {
+            let value = evaluate(expr, batch, registry)?;
+            let list = evaluate(array, batch, registry)?;
+            array_contains(&value, &list, *negated)
+        }
+
         PlanExpr::BinaryOp {
             left, op, right, ..
         } => {
@@ -115,6 +126,11 @@ pub(crate) fn evaluate(
             expr, data_type, ..
         } => {
             let arr = evaluate(expr, batch, registry)?;
+            if let DataType::List(element) = data_type {
+                if matches!(arr.data_type(), ArrowDataType::Utf8 | ArrowDataType::LargeUtf8) {
+                    return text_to_list(&arr, element);
+                }
+            }
             let arrow_type: ArrowDataType = data_type.clone().into();
             let result = match cast_fractional_to_integer(
                 &arr,
@@ -578,6 +594,115 @@ fn build_list_array(
         arrow::compute::interleave(&refs, &indices)?
     };
     list_from_values(values, &elem_type, &vec![k; num_rows])
+}
+
+/// `value = ANY (list)` per row, or `value <> ALL (list)` when `negated`,
+/// with SQL's three-valued logic: an empty list is false (`<> ALL`: true)
+/// whatever `value` is, a NULL list is NULL, otherwise a match is true, a
+/// NULL `value` or a NULL element without a match is NULL, and no match is
+/// false.
+fn array_contains(
+    value: &ArrayRef,
+    list: &ArrayRef,
+    negated: bool,
+) -> Result<ArrayRef, ExecutionError> {
+    let rows = value.len();
+    if list.data_type() == &ArrowDataType::Null {
+        return Ok(Arc::new(BooleanArray::new_null(rows)));
+    }
+    let list = list.as_list_opt::<i32>().ok_or_else(|| {
+        ExecutionError::InvalidOperation(format!(
+            "ANY / ALL requires an array operand, got {}",
+            list.data_type()
+        ))
+    })?;
+    let elements = list.values();
+    let offsets = list.value_offsets();
+    // The row each element belongs to, so `value` can be compared with every
+    // element in one kernel call.
+    let mut owner = vec![0u32; elements.len()];
+    for r in 0..rows {
+        for slot in &mut owner[offsets[r] as usize..offsets[r + 1] as usize] {
+            *slot = r as u32;
+        }
+    }
+    let expanded = arrow::compute::take(value.as_ref(), &UInt32Array::from(owner), None)?;
+    let expanded = if expanded.data_type() == elements.data_type() {
+        expanded
+    } else {
+        arrow::compute::cast(&expanded, elements.data_type())?
+    };
+    let equal = compare_op(&expanded, elements, CompareOp::Eq)?;
+    let out: BooleanArray = (0..rows)
+        .map(|r| {
+            if list.is_null(r) {
+                return None;
+            }
+            let (start, end) = (offsets[r] as usize, offsets[r + 1] as usize);
+            let found = if start == end {
+                Some(false)
+            } else if value.is_null(r) {
+                None
+            } else {
+                let mut saw_null = false;
+                let mut hit = false;
+                for i in start..end {
+                    if equal.is_null(i) {
+                        saw_null = true;
+                    } else if equal.value(i) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if hit {
+                    Some(true)
+                } else if saw_null {
+                    None
+                } else {
+                    Some(false)
+                }
+            };
+            found.map(|b| b != negated)
+        })
+        .collect();
+    Ok(Arc::new(out))
+}
+
+/// Casts the text of each row (PostgreSQL array syntax, see
+/// [`arneb_common::array_text`]) to a list of `element`. A malformed array
+/// or an element that does not parse as `element` is an error, not NULL.
+fn text_to_list(array: &ArrayRef, element: &DataType) -> Result<ArrayRef, ExecutionError> {
+    let texts = arrow::compute::cast(array, &ArrowDataType::Utf8)?;
+    let texts = texts.as_string::<i32>();
+    let mut flat: Vec<Option<String>> = Vec::new();
+    let mut lengths = Vec::with_capacity(texts.len());
+    let mut valid = Vec::with_capacity(texts.len());
+    for text in texts.iter() {
+        match text {
+            Some(text) => {
+                let parsed = arneb_common::array_text::parse_array_text(text)
+                    .map_err(ExecutionError::InvalidOperation)?;
+                lengths.push(parsed.len());
+                valid.push(true);
+                flat.extend(parsed);
+            }
+            None => {
+                lengths.push(0);
+                valid.push(false);
+            }
+        }
+    }
+    let elem_type: ArrowDataType = element.clone().into();
+    let flat: ArrayRef = Arc::new(StringArray::from(flat));
+    let values = arrow::compute::cast_with_options(&flat, &elem_type, &CHECKED_CAST)?;
+    let field = Arc::new(arrow::datatypes::Field::new("item", elem_type, true));
+    let offsets = arrow::buffer::OffsetBuffer::from_lengths(lengths);
+    Ok(Arc::new(arrow::array::ListArray::try_new(
+        field,
+        offsets,
+        values,
+        Some(arrow::buffer::NullBuffer::from(valid)),
+    )?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,6 +1288,10 @@ fn case_referenced_columns(expr: &PlanExpr, referenced: &mut [bool]) {
             for item in elements {
                 case_referenced_columns(item, referenced);
             }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            case_referenced_columns(expr, referenced);
+            case_referenced_columns(array, referenced);
         }
         PlanExpr::Function { args, .. } => {
             for arg in args {

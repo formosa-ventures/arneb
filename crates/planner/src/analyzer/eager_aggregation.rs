@@ -909,6 +909,15 @@ where
             element_type: element_type.clone(),
             span: None,
         },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            ..
+        } => crate::try_map_array_contains_ref(expr, array, *negated, None, |e| {
+            remap_expr_columns(e, f).ok_or(())
+        })
+        .ok()?,
         PlanExpr::Between {
             expr,
             negated,
@@ -1198,6 +1207,14 @@ fn shift_column_indices(expr: PlanExpr, offset: usize) -> PlanExpr {
             negated,
             span,
         },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| {
+            shift_column_indices(e, offset)
+        }),
         PlanExpr::Array {
             elements,
             element_type,
@@ -1502,6 +1519,10 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             for item in elements {
                 collect_column_indices(item, cb);
             }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_column_indices(expr, cb);
+            collect_column_indices(array, cb);
         }
         PlanExpr::Between {
             expr, low, high, ..

@@ -642,8 +642,8 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 "expression: IN {other}"
             ))),
         },
-        // `x = ANY (ARRAY[...])` / `x <> ALL (ARRAY[...])` over literal
-        // arrays are IN lists; Arneb has no array type (pg-catalog-tables).
+        // `x = ANY (ARRAY[...])` / `x <> ALL (ARRAY[...])` over an `ARRAY[...]`
+        // literal are IN lists; any other array operand is `Expr::AnyAll`.
         sp::Expr::AnyOp {
             left,
             compare_op: sp::BinaryOperator::Eq,
@@ -1708,7 +1708,8 @@ fn is_custom_type(dt: &sp::DataType, name: &str) -> bool {
     }
 }
 
-/// `left IN (elements)` (or `NOT IN`) for `left = ANY (ARRAY[elements])`.
+/// `left IN (elements)` (or `NOT IN`) for `left = ANY (ARRAY[elements])`;
+/// any other array operand stays an [`ast::Expr::AnyAll`].
 fn array_in_list(
     left: sp::Expr,
     right: sp::Expr,
@@ -1716,9 +1717,16 @@ fn array_in_list(
     span: Span,
 ) -> Result<ast::Expr, ParseError> {
     let sp::Expr::Array(array) = right else {
-        return Err(ParseError::UnsupportedFeature(format!(
-            "ANY / ALL over {right}; only an ARRAY[...] literal is supported"
-        )));
+        return Ok(ast::Expr::AnyAll {
+            expr: Box::new(convert_expr(left)?),
+            op: if negated {
+                ast::AnyAllOp::NotEqAll
+            } else {
+                ast::AnyAllOp::EqAny
+            },
+            array: Box::new(convert_expr(right)?),
+            span,
+        });
     };
     let list = array
         .elem
@@ -1776,6 +1784,16 @@ pub(crate) fn convert_data_type(dt: sp::DataType) -> Result<DataType, ParseError
                     scale: 0,
                 }),
             }
+        }
+        sp::DataType::Array(sp::ArrayElemTypeDef::SquareBracket(element, None))
+        | sp::DataType::Array(sp::ArrayElemTypeDef::Qualified(element, None)) => {
+            let element = convert_data_type(*element)?;
+            if matches!(element, DataType::List(_)) {
+                return Err(ParseError::UnsupportedFeature(
+                    "multidimensional array types".to_string(),
+                ));
+            }
+            Ok(DataType::List(Box::new(element)))
         }
         sp::DataType::Date => Ok(DataType::Date32),
         sp::DataType::Timestamp(_, tz_info) => {

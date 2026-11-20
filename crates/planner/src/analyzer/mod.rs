@@ -174,7 +174,9 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
             _ => plan_expr_type(inner, schema),
         },
         PlanExpr::IsNull { .. } | PlanExpr::IsNotNull { .. } => Some(DataType::Boolean),
-        PlanExpr::Between { .. } | PlanExpr::InList { .. } => Some(DataType::Boolean),
+        PlanExpr::Between { .. } | PlanExpr::InList { .. } | PlanExpr::ArrayContains { .. } => {
+            Some(DataType::Boolean)
+        }
         PlanExpr::Cast { data_type, .. } => Some(data_type.clone()),
         PlanExpr::Function { name, args, .. } => function_return_type(name, args, schema),
         PlanExpr::CaseExpr {

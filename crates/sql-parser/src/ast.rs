@@ -409,6 +409,19 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// `expr = ANY (array)` or `expr <> ALL (array)` where `array` is not an
+    /// `ARRAY[...]` literal (those become [`Expr::InList`]): a parameter, a
+    /// cast, a column or any other array-valued expression.
+    AnyAll {
+        /// The left operand.
+        expr: Box<Expr>,
+        /// Which quantified comparison.
+        op: AnyAllOp,
+        /// The array operand.
+        array: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
     /// An extended-query-protocol parameter placeholder (`$1`, `$2`, …).
     ///
     /// Parameters only appear when the query is submitted via the
@@ -447,9 +460,19 @@ impl Expr {
             | Expr::WindowFunction { span, .. }
             | Expr::Case { span, .. }
             | Expr::Array { span, .. }
+            | Expr::AnyAll { span, .. }
             | Expr::Parameter { span, .. } => *span,
         }
     }
+}
+
+/// The quantified comparisons over an array operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnyAllOp {
+    /// `expr = ANY (array)`.
+    EqAny,
+    /// `expr <> ALL (array)`.
+    NotEqAll,
 }
 
 /// A reference to a column, optionally qualified by a table name.
@@ -781,6 +804,12 @@ impl fmt::Display for Expr {
                 }
                 write!(f, "]")
             }
+            Expr::AnyAll {
+                expr, op, array, ..
+            } => match op {
+                AnyAllOp::EqAny => write!(f, "{expr} = ANY ({array})"),
+                AnyAllOp::NotEqAll => write!(f, "{expr} <> ALL ({array})"),
+            },
             Expr::IsNull { expr, .. } => write!(f, "{expr} IS NULL"),
             Expr::IsNotNull { expr, .. } => write!(f, "{expr} IS NOT NULL"),
             Expr::Between {

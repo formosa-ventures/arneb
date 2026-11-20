@@ -368,6 +368,10 @@ fn collect_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
                 collect_indices(e, cb);
             }
         }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_indices(expr, cb);
+            collect_indices(array, cb);
+        }
         PlanExpr::Between {
             expr, low, high, ..
         } => {
@@ -478,6 +482,12 @@ fn walk_remap(expr: PlanExpr, f: &dyn Fn(usize) -> Option<usize>) -> PlanExpr {
             negated,
             span,
         },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| walk_remap(e, f)),
         PlanExpr::Array {
             elements,
             element_type,

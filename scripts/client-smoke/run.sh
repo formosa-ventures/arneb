@@ -5,7 +5,8 @@
 #   2. ROUNDS rounds of 20 concurrent queries with the admission cap lifted,
 #      zero failures (benchmarks/tpch/scripts/concurrency_soak.sh)
 #   3. client checks: psycopg2, psycopg 3, the Trino client, SQLAlchemy's
-#      Trino and postgresql dialects (clients.py)
+#      Trino and postgresql dialects, array and subquery queries compared
+#      with DuckDB (clients.py, which reads DATA_DIR)
 #   4. the dbt project in dbt/: debug, test, show and docs generate, with
 #      dbt-trino and dbt-postgres
 #
@@ -27,6 +28,7 @@ PYTHON=${PYTHON:-python3}
 DBT=$(dirname "$(command -v "$PYTHON")")/dbt
 ROUNDS=${ROUNDS:-3}
 RUN_DIR=${RUN_DIR:-$(mktemp -d)}
+export DATA_DIR
 export PGHOST=127.0.0.1 PGPORT=${PG_PORT:-15432} PGUSER=smoke PGDATABASE=arneb
 export TRINO_HOST=127.0.0.1 TRINO_PORT=${TRINO_PORT:-18080} PG_PORT=$PGPORT
 FAILED=()

@@ -77,3 +77,17 @@ schemars = "1"
 serde_json = "1"
 rust-embed = "8"
 mime_guess = "2"
+
+# Debug info for local dev and test builds: line tables only. Backtraces and
+# panics keep file:line, but variables and types are not described, so a
+# debugger can step but not inspect. Full debug info made target/debug the
+# bulk of target/ (see scripts/target-housekeeping.sh). Dependencies get no
+# debug info at all. For a debugging session, turn full debug info back on
+# for one build (in its own target dir, so the normal one is not rebuilt):
+#   cargo --config profile.dev.debug=true \
+#         --config 'profile.dev.package."*".debug=true' build
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

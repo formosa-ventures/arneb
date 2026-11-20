@@ -949,8 +949,17 @@ fn rewrite_expr(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> PlanExpr {
             name,
             args,
             distinct,
+            order_by,
             span,
         } => PlanExpr::Function {
+            order_by: order_by
+                .iter()
+                .map(|s| crate::plan::SortExpr {
+                    expr: rewrite_expr(&s.expr, mapping),
+                    asc: s.asc,
+                    nulls_first: s.nulls_first,
+                })
+                .collect(),
             name: name.clone(),
             args: args.iter().map(|e| rewrite_expr(e, mapping)).collect(),
             distinct: *distinct,
@@ -1142,6 +1151,7 @@ mod tests {
             input: Box::new(join),
             group_by: vec![col_expr(1, "s_name")],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: vec![],
                 name: "COUNT".to_string(),
                 args: Vec::new(),
                 distinct: false,

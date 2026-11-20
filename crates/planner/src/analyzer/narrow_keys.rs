@@ -1327,8 +1327,16 @@ fn rewrite_expr(
             name,
             args,
             distinct,
+            order_by,
             span,
         } => PlanExpr::Function {
+            order_by: order_by
+                .into_iter()
+                .map(|s| crate::plan::SortExpr {
+                    expr: rewrite_expr(s.expr, stats, root_outputs, blocked),
+                    ..s
+                })
+                .collect(),
             name,
             args: args
                 .into_iter()
@@ -2063,6 +2071,7 @@ mod tests {
             input: Box::new(filtered),
             group_by: vec![],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: vec![],
                 name: "COUNT".to_string(),
                 args: vec![lit_i64(1)],
                 distinct: false,
@@ -2183,6 +2192,7 @@ mod tests {
                 input: Box::new(filtered),
                 group_by: vec![col(3, "l_shipmode")],
                 aggr_exprs: vec![PlanExpr::Function {
+                    order_by: vec![],
                     name: "COUNT".to_string(),
                     args: vec![lit_i64(1)],
                     distinct: false,
@@ -3412,6 +3422,7 @@ mod tests {
             input: Box::new(join),
             group_by: Vec::new(),
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: vec![],
                 name: "SUM".to_string(),
                 args: vec![revenue_arg],
                 distinct: false,

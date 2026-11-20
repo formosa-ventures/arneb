@@ -118,6 +118,8 @@ pub enum PlanExpr {
         args: Vec<PlanExpr>,
         /// Whether DISTINCT was specified.
         distinct: bool,
+        /// `ORDER BY` inside an aggregate call (e.g. `array_agg(x ORDER BY y)`).
+        order_by: Vec<SortExpr>,
         /// Source span, if derived from user SQL.
         #[serde(skip)]
         span: Option<Span>,

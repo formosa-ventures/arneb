@@ -485,6 +485,7 @@ fn rewrite_one(
         span: None,
     };
     let agg_exprs = vec![PlanExpr::Function {
+        order_by: vec![],
         name: "BOOL_OR".to_string(),
         args: vec![bool_or_arg],
         distinct: false,
@@ -624,8 +625,16 @@ where
             name,
             args,
             distinct,
+            order_by,
             span,
         } => E::Function {
+            order_by: order_by
+                .into_iter()
+                .map(|s| crate::plan::SortExpr {
+                    expr: walk_columns(s.expr, f),
+                    ..s
+                })
+                .collect(),
             name,
             args: args.into_iter().map(|a| walk_columns(a, f)).collect(),
             distinct,

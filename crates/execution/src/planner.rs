@@ -806,13 +806,23 @@ impl ExecutionContext {
                 name,
                 args,
                 distinct,
+                order_by,
                 span,
             } => {
                 let mut resolved = Vec::with_capacity(args.len());
                 for arg in args {
                     resolved.push(Box::pin(self.resolve_scalar_subqueries(arg)).await?);
                 }
+                let mut resolved_order_by = Vec::with_capacity(order_by.len());
+                for s in order_by {
+                    resolved_order_by.push(arneb_planner::SortExpr {
+                        expr: Box::pin(self.resolve_scalar_subqueries(&s.expr)).await?,
+                        asc: s.asc,
+                        nulls_first: s.nulls_first,
+                    });
+                }
                 Ok(PlanExpr::Function {
+                    order_by: resolved_order_by,
                     name: name.clone(),
                     args: resolved,
                     distinct: *distinct,
@@ -1882,8 +1892,17 @@ fn rewrite_column_indices(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> P
             name,
             args,
             distinct,
+            order_by,
             span,
         } => E::Function {
+            order_by: order_by
+                .iter()
+                .map(|s| arneb_planner::SortExpr {
+                    expr: rewrite_column_indices(&s.expr, mapping),
+                    asc: s.asc,
+                    nulls_first: s.nulls_first,
+                })
+                .collect(),
             name: name.clone(),
             args: args
                 .iter()
@@ -3180,6 +3199,7 @@ mod tests {
                 input: Box::new(revenue_scan(revenue_schema)),
                 group_by: Vec::new(),
                 aggr_exprs: vec![PlanExpr::Function {
+                    order_by: vec![],
                     name: "MAX".into(),
                     args: vec![PlanExpr::Column {
                         index: 1,
@@ -3483,6 +3503,7 @@ mod tests {
                 group_by: vec![],
                 aggr_exprs: vec![
                     PlanExpr::Function {
+                        order_by: vec![],
                         name: "SUM".to_string(),
                         args: vec![PlanExpr::Column {
                             index: 0,
@@ -3493,6 +3514,7 @@ mod tests {
                         span: None,
                     },
                     PlanExpr::Function {
+                        order_by: vec![],
                         name: "SUM".to_string(),
                         args: vec![PlanExpr::Column {
                             index: 1,
@@ -3882,12 +3904,14 @@ mod tests {
             group_by: vec![],
             aggr_exprs: vec![
                 PlanExpr::Function {
+                    order_by: vec![],
                     name: "COUNT".to_string(),
                     args: vec![],
                     distinct: false,
                     span: None,
                 },
                 PlanExpr::Function {
+                    order_by: vec![],
                     name: "SUM".to_string(),
                     args: vec![PlanExpr::Column {
                         index: 2,
@@ -4097,6 +4121,7 @@ mod tests {
                     span: None,
                 }],
                 aggr_exprs: vec![PlanExpr::Function {
+                    order_by: vec![],
                     name: "COUNT".to_string(),
                     args: vec![],
                     distinct: false,
@@ -4696,6 +4721,7 @@ mod tests {
 
         // Test UPPER(name)
         let upper_expr = PlanExpr::Function {
+            order_by: vec![],
             name: "UPPER".to_string(),
             args: vec![PlanExpr::Column {
                 index: 0,
@@ -4713,6 +4739,7 @@ mod tests {
 
         // Test ABS(value)
         let abs_expr = PlanExpr::Function {
+            order_by: vec![],
             name: "ABS".to_string(),
             args: vec![PlanExpr::Column {
                 index: 1,

@@ -510,6 +510,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             // has the SQL NULL-propagating semantics `||` requires.
             if matches!(op, sp::BinaryOperator::StringConcat) {
                 return Ok(ast::Expr::Function {
+                    order_by: vec![],
                     name: "CONCAT".to_string(),
                     args: vec![ast::FunctionArg::Unnamed(l), ast::FunctionArg::Unnamed(r)],
                     distinct: false,
@@ -553,6 +554,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 if !backslash {
                     let pattern_span = r.span();
                     r = ast::Expr::Function {
+                        order_by: vec![],
                         name: "like_escape".to_string(),
                         args: vec![
                             ast::FunctionArg::Unnamed(r),
@@ -664,6 +666,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 .find(|reg| is_custom_type(&data_type, reg))
             {
                 return Ok(ast::Expr::Function {
+                    order_by: vec![],
                     name: reg.to_string(),
                     args: vec![ast::FunctionArg::Unnamed(e)],
                     distinct: false,
@@ -757,6 +760,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 )?));
             }
             Ok(ast::Expr::Function {
+                order_by: vec![],
                 name: "ROLLUP".to_string(),
                 args,
                 distinct: false,
@@ -836,6 +840,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 args.push(ast::FunctionArg::Unnamed(convert_expr(*for_e)?));
             }
             Ok(ast::Expr::Function {
+                order_by: vec![],
                 name: "SUBSTRING".to_string(),
                 args,
                 distinct: false,
@@ -859,6 +864,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
             };
             let arg = convert_expr(*expr)?;
             Ok(ast::Expr::Function {
+                order_by: vec![],
                 name: "EXTRACT".to_string(),
                 args: vec![
                     ast::FunctionArg::Unnamed(field_literal),
@@ -881,6 +887,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
         }
         // `POSITION(sub IN s)` → `POSITION(sub, s)`.
         sp::Expr::Position { expr, r#in } => Ok(ast::Expr::Function {
+            order_by: vec![],
             name: "POSITION".to_string(),
             args: vec![
                 ast::FunctionArg::Unnamed(convert_expr(*expr)?),
@@ -914,6 +921,7 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 args.push(ast::FunctionArg::Unnamed(convert_expr(chars.remove(0))?));
             }
             Ok(ast::Expr::Function {
+                order_by: vec![],
                 name: name.to_string(),
                 args,
                 distinct: false,
@@ -937,6 +945,7 @@ fn is_plain_ceil_floor(field: &sp::CeilFloorKind) -> bool {
 /// Build a single-argument scalar function call `name(expr)`.
 fn unary_function_call(name: &str, expr: sp::Expr, span: Span) -> Result<ast::Expr, ParseError> {
     Ok(ast::Expr::Function {
+        order_by: vec![],
         name: name.to_string(),
         args: vec![ast::FunctionArg::Unnamed(convert_expr(expr)?)],
         distinct: false,
@@ -1115,6 +1124,17 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
     };
     let name_upper = name.to_uppercase();
 
+    if func.filter.is_some() {
+        return Err(ParseError::UnsupportedFeature(format!(
+            "FILTER (WHERE ...) on {name}(...)"
+        )));
+    }
+    if !func.within_group.is_empty() {
+        return Err(ParseError::UnsupportedFeature(format!(
+            "WITHIN GROUP on {name}(...)"
+        )));
+    }
+
     // Desugar COALESCE(a, b, ...) → CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ... ELSE last END
     if name_upper == "COALESCE" {
         let raw_args = match func.args {
@@ -1249,8 +1269,8 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
         });
     }
 
-    let (args, is_distinct) = match func.args {
-        sp::FunctionArguments::None => (vec![], false),
+    let (args, is_distinct, agg_order_by) = match func.args {
+        sp::FunctionArguments::None => (vec![], false, vec![]),
         sp::FunctionArguments::Subquery(_) => {
             return Err(ParseError::UnsupportedFeature(
                 "subquery as function argument".to_string(),
@@ -1264,7 +1284,23 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
                 .into_iter()
                 .map(convert_function_arg)
                 .collect::<Result<Vec<_>, _>>()?;
-            (args, distinct_flag)
+            let mut agg_order_by = Vec::new();
+            for clause in arg_list.clauses {
+                match clause {
+                    sp::FunctionArgumentClause::OrderBy(items) => {
+                        agg_order_by = items
+                            .into_iter()
+                            .map(convert_order_by_expr)
+                            .collect::<Result<Vec<_>, _>>()?;
+                    }
+                    other => {
+                        return Err(ParseError::UnsupportedFeature(format!(
+                            "{other} inside {name}(...)"
+                        )));
+                    }
+                }
+            }
+            (args, distinct_flag, agg_order_by)
         }
     };
 
@@ -1345,6 +1381,7 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
         name,
         args,
         distinct: is_distinct,
+        order_by: agg_order_by,
         span,
     })
 }

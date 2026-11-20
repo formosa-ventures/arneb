@@ -288,6 +288,8 @@ pub enum Expr {
         args: Vec<FunctionArg>,
         /// Whether DISTINCT was specified (e.g., `COUNT(DISTINCT x)`).
         distinct: bool,
+        /// `ORDER BY` inside the call (e.g., `array_agg(x ORDER BY y)`).
+        order_by: Vec<OrderByExpr>,
         /// Source span covering the call.
         span: Span,
     },
@@ -733,6 +735,7 @@ impl fmt::Display for Expr {
                 name,
                 args,
                 distinct,
+                order_by,
                 ..
             } => {
                 write!(f, "{name}(")?;
@@ -744,6 +747,19 @@ impl fmt::Display for Expr {
                         write!(f, ", ")?;
                     }
                     write!(f, "{arg}")?;
+                }
+                for (i, ob) in order_by.iter().enumerate() {
+                    write!(f, "{}{}", if i == 0 { " ORDER BY " } else { ", " }, ob.expr)?;
+                    match ob.asc {
+                        Some(true) => write!(f, " ASC")?,
+                        Some(false) => write!(f, " DESC")?,
+                        None => {}
+                    }
+                    match ob.nulls_first {
+                        Some(true) => write!(f, " NULLS FIRST")?,
+                        Some(false) => write!(f, " NULLS LAST")?,
+                        None => {}
+                    }
                 }
                 write!(f, ")")
             }

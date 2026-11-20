@@ -2161,6 +2161,7 @@ mod tests {
                 nullable: true,
             }];
             let call = PlanExpr::Function {
+                order_by: vec![],
                 name: func.into(),
                 args: vec![PlanExpr::Column {
                     index: 0,

@@ -1808,8 +1808,19 @@ where
             name,
             args,
             distinct,
+            order_by,
             span,
         } => E::Function {
+            order_by: order_by
+                .iter()
+                .map(|s| {
+                    Some(crate::plan::SortExpr {
+                        expr: rewrite_expr(&s.expr, remap)?,
+                        asc: s.asc,
+                        nulls_first: s.nulls_first,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
             name: name.clone(),
             args: args
                 .iter()

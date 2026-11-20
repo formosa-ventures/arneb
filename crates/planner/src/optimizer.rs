@@ -567,6 +567,7 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
             name,
             args,
             distinct,
+            order_by,
             span,
         } => {
             // TRY(expr) must turn its argument's errors into NULL, so a
@@ -583,7 +584,17 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let order_by = order_by
+                .into_iter()
+                .map(|s| {
+                    Ok(crate::plan::SortExpr {
+                        expr: fold_constants(s.expr)?,
+                        ..s
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(PlanExpr::Function {
+                order_by,
                 name,
                 args,
                 distinct,

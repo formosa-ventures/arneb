@@ -402,8 +402,16 @@ fn shift_columns(expr: PlanExpr, delta: usize) -> PlanExpr {
             name,
             args,
             distinct,
+            order_by,
             span,
         } => E::Function {
+            order_by: order_by
+                .into_iter()
+                .map(|s| crate::plan::SortExpr {
+                    expr: shift_columns(s.expr, delta),
+                    ..s
+                })
+                .collect(),
             name,
             args: args.into_iter().map(|a| shift_columns(a, delta)).collect(),
             distinct,
@@ -527,6 +535,7 @@ mod tests {
             input: Box::new(lineitem),
             group_by: vec![col_ref(0, "l_orderkey")],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: vec![],
                 name: "SUM".to_string(),
                 args: vec![col_ref(1, "l_quantity")],
                 distinct: false,

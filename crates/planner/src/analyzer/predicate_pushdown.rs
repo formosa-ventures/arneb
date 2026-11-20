@@ -1453,8 +1453,19 @@ fn rewrite_expr(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<PlanExpr> {
             name,
             args,
             distinct,
+            order_by,
             span,
         } => E::Function {
+            order_by: order_by
+                .iter()
+                .map(|s| {
+                    Some(crate::plan::SortExpr {
+                        expr: rewrite_expr(&s.expr, schema)?,
+                        asc: s.asc,
+                        nulls_first: s.nulls_first,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
             name: name.clone(),
             args: args
                 .iter()

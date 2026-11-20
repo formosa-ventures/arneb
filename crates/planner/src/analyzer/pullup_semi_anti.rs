@@ -608,8 +608,18 @@ where
             name,
             args,
             distinct,
+            order_by,
             span,
         } => E::Function {
+            order_by: order_by
+                .into_iter()
+                .map(|s| {
+                    Some(crate::plan::SortExpr {
+                        expr: rewrite_expr(s.expr, f)?,
+                        ..s
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
             name,
             args: args
                 .into_iter()

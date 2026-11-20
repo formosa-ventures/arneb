@@ -2054,6 +2054,7 @@ mod tests {
 
     fn func(name: &str, args: Vec<PlanExpr>) -> PlanExpr {
         PlanExpr::Function {
+            order_by: vec![],
             name: name.to_string(),
             args,
             distinct: false,

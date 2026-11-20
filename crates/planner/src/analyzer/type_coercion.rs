@@ -509,6 +509,7 @@ fn coerce_expr(
             name,
             args,
             distinct,
+            order_by,
             span,
         } => {
             // Coerce children but do not unify argument types against
@@ -528,7 +529,17 @@ fn coerce_expr(
                 let arg = args.remove(0);
                 args.insert(0, pad_char_operand(arg, schema));
             }
+            let order_by = order_by
+                .into_iter()
+                .map(|s| {
+                    Ok(crate::plan::SortExpr {
+                        expr: coerce_expr(s.expr, schema, ctx)?,
+                        ..s
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(PlanExpr::Function {
+                order_by,
                 name,
                 args,
                 distinct,
@@ -665,6 +676,7 @@ fn pad_char_operand(expr: PlanExpr, schema: &[ColumnInfo]) -> PlanExpr {
         return expr;
     };
     PlanExpr::Function {
+        order_by: vec![],
         name: "rpad".to_string(),
         args: vec![
             expr,
@@ -1286,8 +1298,16 @@ pub(super) fn walk_expr(expr: PlanExpr, f: &mut dyn FnMut(PlanExpr) -> PlanExpr)
             name,
             args,
             distinct,
+            order_by,
             span,
         } => PlanExpr::Function {
+            order_by: order_by
+                .into_iter()
+                .map(|s| crate::plan::SortExpr {
+                    expr: walk_expr(s.expr, f),
+                    ..s
+                })
+                .collect(),
             name,
             args: args.into_iter().map(|a| walk_expr(a, f)).collect(),
             distinct,

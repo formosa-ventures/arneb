@@ -1732,6 +1732,7 @@ async fn resolve_expr_subqueries_distributed_inner(
             name,
             args,
             distinct,
+            order_by,
             span,
         } => {
             let mut resolved_args = Vec::with_capacity(args.len());
@@ -1743,7 +1744,18 @@ async fn resolve_expr_subqueries_distributed_inner(
                     .await?,
                 );
             }
+            let mut resolved_order_by = Vec::with_capacity(order_by.len());
+            for s in order_by {
+                resolved_order_by.push(arneb_planner::SortExpr {
+                    expr: Box::pin(resolve_expr_subqueries_distributed_inner(
+                        ctx, executor, s.expr,
+                    ))
+                    .await?,
+                    ..s
+                });
+            }
             Ok(PlanExpr::Function {
+                order_by: resolved_order_by,
                 name,
                 args: resolved_args,
                 distinct,

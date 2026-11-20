@@ -4940,12 +4940,14 @@ mod tests {
             group_by: vec![],
             aggr_exprs: vec![
                 PlanExpr::Function {
+                    order_by: vec![],
                     name: "COUNT".to_string(),
                     args: vec![],
                     distinct: false,
                     span: None,
                 },
                 PlanExpr::Function {
+                    order_by: vec![],
                     name: "SUM".to_string(),
                     args: vec![PlanExpr::Column {
                         index: 2,
@@ -5049,6 +5051,7 @@ mod tests {
         }];
         let partial_aggr_exprs = vec![
             PlanExpr::Function {
+                order_by: vec![],
                 name: "SUM".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -5059,6 +5062,7 @@ mod tests {
                 span: None,
             },
             PlanExpr::Function {
+                order_by: vec![],
                 name: "SUM".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 2,
@@ -5071,6 +5075,7 @@ mod tests {
         ];
         let final_aggr_exprs = vec![
             PlanExpr::Function {
+                order_by: vec![],
                 name: "SUM".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -5081,6 +5086,7 @@ mod tests {
                 span: None,
             },
             PlanExpr::Function {
+                order_by: vec![],
                 name: "SUM".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 2,
@@ -5228,6 +5234,7 @@ mod tests {
                     span: None,
                 }],
                 aggr_exprs: vec![PlanExpr::Function {
+                    order_by: vec![],
                     name: "COUNT".to_string(),
                     args: vec![],
                     distinct: false,
@@ -5379,6 +5386,7 @@ mod tests {
             span: None,
         }];
         let aggr_exprs = vec![PlanExpr::Function {
+            order_by: vec![],
             name: "SUM".to_string(),
             args: vec![PlanExpr::Column {
                 index: 1,
@@ -5552,30 +5560,35 @@ mod tests {
         };
         let aggr_exprs = vec![
             PlanExpr::Function {
+                order_by: vec![],
                 name: "SUM".to_string(),
                 args: vec![value_col()],
                 distinct: false,
                 span: None,
             },
             PlanExpr::Function {
+                order_by: vec![],
                 name: "COUNT".to_string(),
                 args: vec![value_col()],
                 distinct: false,
                 span: None,
             },
             PlanExpr::Function {
+                order_by: vec![],
                 name: "AVG".to_string(),
                 args: vec![value_col()],
                 distinct: false,
                 span: None,
             },
             PlanExpr::Function {
+                order_by: vec![],
                 name: "MIN".to_string(),
                 args: vec![value_col()],
                 distinct: false,
                 span: None,
             },
             PlanExpr::Function {
+                order_by: vec![],
                 name: "MAX".to_string(),
                 args: vec![value_col()],
                 distinct: false,
@@ -5747,6 +5760,7 @@ mod tests {
             },
         ];
         let aggr_exprs = vec![PlanExpr::Function {
+            order_by: vec![],
             name: "SUM".to_string(),
             args: vec![PlanExpr::BinaryOp {
                 left: Box::new(PlanExpr::Column {
@@ -5910,6 +5924,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: vec![],
                 name: "COUNT".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -6010,6 +6025,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: vec![],
                 name: "COUNT".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -6097,6 +6113,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: vec![],
                 name: "COUNT".to_string(),
                 args: vec![PlanExpr::Column {
                     index: 1,

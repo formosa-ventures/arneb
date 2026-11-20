@@ -1627,4 +1627,34 @@ mod tests {
             ("CONCAT".to_string(), 2)
         );
     }
+
+    #[test]
+    fn function_filter_is_refused() {
+        match parse("SELECT count(*) FILTER (WHERE x > 1) FROM t") {
+            Err(ParseError::UnsupportedFeature(msg)) => assert!(msg.contains("FILTER"), "{msg}"),
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_within_group_is_refused() {
+        match parse("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t") {
+            Err(ParseError::UnsupportedFeature(msg)) => {
+                assert!(msg.contains("WITHIN GROUP"), "{msg}")
+            }
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_order_by_is_kept() {
+        let Expr::Function { order_by, .. } =
+            first_projection("SELECT array_agg(a ORDER BY b DESC) FROM t")
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(order_by.len(), 1);
+        assert!(matches!(&order_by[0].expr, Expr::Column { col_ref, .. } if col_ref.name == "b"));
+        assert_eq!(order_by[0].asc, Some(false));
+    }
 }

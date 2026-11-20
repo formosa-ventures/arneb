@@ -1105,6 +1105,7 @@ mod tests {
             input: Box::new(project),
             group_by: Vec::new(),
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: vec![],
                 name: "SUM".to_string(),
                 args: vec![col(0, "product")],
                 distinct: false,
@@ -1217,6 +1218,7 @@ mod tests {
             input: Box::new(join),
             group_by: Vec::new(),
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: vec![],
                 name: "SUM".to_string(),
                 args: vec![col(1, "l_extendedprice")],
                 distinct: false,

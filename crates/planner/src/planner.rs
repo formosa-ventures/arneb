@@ -2195,8 +2195,14 @@ impl<'a> QueryPlanner<'a> {
                 name,
                 args,
                 distinct,
+                order_by,
                 ..
             } => {
+                if !order_by.is_empty() && !name.eq_ignore_ascii_case("ARRAY_AGG") {
+                    return Err(PlanError::invalid_expression(format!(
+                        "ORDER BY inside {name}(...) is not supported"
+                    )));
+                }
                 if name.eq_ignore_ascii_case("GROUPING") {
                     if let [ast::FunctionArg::Unnamed(key)] = args.as_slice() {
                         let marker = format!("GROUPING({})", format_ast_unqualified(key));
@@ -2242,6 +2248,7 @@ impl<'a> QueryPlanner<'a> {
                             }),
                         // `typoid::regtype`: shown as the type's name.
                         [ast::FunctionArg::Unnamed(e)] => Ok(PlanExpr::Function {
+                            order_by: vec![],
                             name: "format_type".to_string(),
                             args: vec![
                                 self.plan_expr(e, ctx).await?,
@@ -2267,10 +2274,19 @@ impl<'a> QueryPlanner<'a> {
                     };
                     plan_args.push(plan_arg);
                 }
+                let mut plan_order_by = Vec::with_capacity(order_by.len());
+                for ob in order_by {
+                    plan_order_by.push(SortExpr {
+                        expr: self.plan_expr(&ob.expr, ctx).await?,
+                        asc: ob.asc.unwrap_or(true),
+                        nulls_first: ob.nulls_first.unwrap_or(false),
+                    });
+                }
                 Ok(PlanExpr::Function {
                     name: name.clone(),
                     args: plan_args,
                     distinct: *distinct,
+                    order_by: plan_order_by,
                     span: node_span,
                 })
             }
@@ -2914,8 +2930,17 @@ impl<'a> QueryPlanner<'a> {
                 name,
                 args,
                 distinct,
+                order_by,
                 span,
             } => ast::Expr::Function {
+                order_by: order_by
+                    .iter()
+                    .map(|ob| ast::OrderByExpr {
+                        expr: self.rewrite_aggregates_as_columns(&ob.expr, ctx, num_group_by),
+                        asc: ob.asc,
+                        nulls_first: ob.nulls_first,
+                    })
+                    .collect(),
                 name: name.clone(),
                 args: args
                     .iter()
@@ -3265,8 +3290,19 @@ fn aggregate_projection_on_empty(expr: &ast::Expr) -> Option<ast::Expr> {
             name,
             args,
             distinct,
+            order_by,
             span,
         } => Some(ast::Expr::Function {
+            order_by: order_by
+                .iter()
+                .map(|ob| {
+                    aggregate_projection_on_empty(&ob.expr).map(|expr| ast::OrderByExpr {
+                        expr,
+                        asc: ob.asc,
+                        nulls_first: ob.nulls_first,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
             name: name.clone(),
             args: args
                 .iter()
@@ -3691,8 +3727,21 @@ fn rewrite_expr_after_column_insert(
             name,
             args,
             distinct,
+            order_by,
             span,
         } => PlanExpr::Function {
+            order_by: order_by
+                .into_iter()
+                .map(|s| SortExpr {
+                    expr: rewrite_expr_after_column_insert(
+                        s.expr,
+                        inserted_index,
+                        scalar_subplan,
+                        scalar_replacement,
+                    ),
+                    ..s
+                })
+                .collect(),
             name,
             args: args
                 .into_iter()
@@ -5021,6 +5070,7 @@ mod tests {
     #[test]
     fn test_plan_expr_display_function() {
         let expr = PlanExpr::Function {
+            order_by: vec![],
             name: "COUNT".into(),
             args: vec![PlanExpr::Wildcard],
             distinct: false,
@@ -5511,6 +5561,7 @@ mod tests {
             discounted_price,
             promo_case.clone(),
             PlanExpr::Function {
+                order_by: vec![],
                 name: "SUM".into(),
                 args: vec![promo_case],
                 distinct: false,
@@ -5527,6 +5578,7 @@ mod tests {
                 span: None,
             },
             PlanExpr::Function {
+                order_by: vec![],
                 name: "COUNT".into(),
                 args: vec![PlanExpr::Wildcard],
                 distinct: false,

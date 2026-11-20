@@ -1459,6 +1459,7 @@ mod tests {
             }],
             aggr_exprs: vec![
                 PlanExpr::Function {
+                    order_by: vec![],
                     name: "SUM".to_string(),
                     args: vec![PlanExpr::Column {
                         index: 1,
@@ -1469,6 +1470,7 @@ mod tests {
                     span: None,
                 },
                 PlanExpr::Function {
+                    order_by: vec![],
                     name: "COUNT".to_string(),
                     args: vec![],
                     distinct: false,

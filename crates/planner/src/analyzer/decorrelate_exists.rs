@@ -380,6 +380,7 @@ fn contains_table(plan: &LogicalPlan, target: &TableReference) -> bool {
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Window { input, .. }
+        | LogicalPlan::ProjectSet { input, .. }
         | LogicalPlan::AssignUniqueId { input, .. }
         | LogicalPlan::Explain { input, .. } => contains_table(input, target),
         LogicalPlan::Join { left, right, .. }
@@ -616,6 +617,11 @@ where
             input: Box::new(f(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(f(*input)), srfs, schema),
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(f(*input)),
             id_column,

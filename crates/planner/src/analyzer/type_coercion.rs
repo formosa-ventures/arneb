@@ -369,6 +369,11 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
             sql,
             plan: Box::new(analyze_plan(*plan, ctx)?),
         }),
+        LogicalPlan::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => analyze_project_set(*input, srfs, schema, ctx),
         LogicalPlan::Window { input, functions } => Ok(LogicalPlan::Window {
             input: Box::new(analyze_plan(*input, ctx)?),
             functions,
@@ -386,6 +391,27 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
         | LogicalPlan::DropView { .. }
         | LogicalPlan::OneRow) => Ok(leaf),
     }
+}
+
+/// Out of line so the recursive `analyze_plan` frame stays small.
+#[inline(never)]
+fn analyze_project_set(
+    input: LogicalPlan,
+    srfs: Vec<(crate::plan::SrfKind, PlanExpr)>,
+    schema: Vec<ColumnInfo>,
+    ctx: &mut AnalyzerContext,
+) -> Result<LogicalPlan, PlanError> {
+    let input = analyze_plan(input, ctx)?;
+    let input_schema = input.schema();
+    let srfs = srfs
+        .into_iter()
+        .map(|(kind, e)| Ok((kind, coerce_expr(e, &input_schema, ctx)?)))
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    Ok(LogicalPlan::rebuild_project_set(
+        Box::new(input),
+        srfs,
+        schema,
+    ))
 }
 
 // ---------------------------------------------------------------------------

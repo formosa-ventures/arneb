@@ -4107,7 +4107,7 @@ impl ExecutionPlan for AssignUniqueIdExec {
 // ===========================================================================
 
 /// A stream that applies a mapping function to each batch from an input stream.
-struct MapStream<F> {
+pub(crate) struct MapStream<F> {
     input: SendableRecordBatchStream,
     schema: arrow::datatypes::SchemaRef,
     map_fn: F,
@@ -4117,7 +4117,7 @@ impl<F> MapStream<F>
 where
     F: FnMut(RecordBatch) -> Result<RecordBatch, ExecutionError> + Send + Unpin,
 {
-    fn new(
+    pub(crate) fn new(
         input: SendableRecordBatchStream,
         schema: arrow::datatypes::SchemaRef,
         map_fn: F,

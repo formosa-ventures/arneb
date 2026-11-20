@@ -152,6 +152,21 @@ fn state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
             ),
         ]),
     );
+    // `arrs(a BIGINT[])` holding a NULL array and an empty array (ruling R1:
+    // stands in for `FROM (VALUES ...) v(a)`, which Arneb does not parse).
+    let item = Arc::new(Field::new("item", ArrowDataType::Int64, true));
+    let mut lists =
+        arrow::array::ListBuilder::new(arrow::array::Int64Builder::new()).with_field(item.clone());
+    lists.append_null();
+    lists.append(true);
+    default_schema.register_table(
+        "arrs",
+        mem(vec![(
+            "a",
+            ArrowDataType::List(item),
+            Arc::new(lists.finish()) as ArrayRef,
+        )]),
+    );
     let file = Arc::new(MemoryCatalog::new());
     file.register_schema("default", default_schema);
     let cm = CatalogManager::new("file", "default");
@@ -715,4 +730,186 @@ async fn bool_and_basic() {
         column_text(&client, "SELECT bool_and(b) FROM bools WHERE g = 3").await,
         [None]
     );
+}
+
+/// Message of a query that must fail.
+async fn error_message(client: &tokio_postgres::Client, sql: &str) -> String {
+    let err = client
+        .simple_query(sql)
+        .await
+        .expect_err(&format!("{sql} must be refused"));
+    err.as_db_error()
+        .map_or_else(|| err.to_string(), |e| e.message().to_string())
+}
+
+fn texts(values: &[&str]) -> Vec<Option<String>> {
+    values.iter().map(|v| Some(v.to_string())).collect()
+}
+
+#[tokio::test]
+async fn unnest_literal() {
+    let client = connect(pg_server().await).await;
+    assert_eq!(
+        column_text(&client, "SELECT unnest(ARRAY[1,2,3])").await,
+        texts(&["1", "2", "3"])
+    );
+    let stmt = client.prepare("SELECT unnest(ARRAY[1,2,3])").await.unwrap();
+    assert_eq!(stmt.columns()[0].type_().oid(), 20, "int8");
+}
+
+#[tokio::test]
+async fn generate_subscripts_basic() {
+    let client = connect(pg_server().await).await;
+    assert_eq!(
+        column_text(&client, "SELECT generate_subscripts(ARRAY['a','b'], 1)").await,
+        texts(&["1", "2"])
+    );
+    let stmt = client
+        .prepare("SELECT generate_subscripts(ARRAY['a','b'], 1)")
+        .await
+        .unwrap();
+    assert_eq!(stmt.columns()[0].type_().oid(), 23, "int4");
+}
+
+#[tokio::test]
+async fn srf_zip_pads_with_null() {
+    let client = connect(pg_server().await).await;
+    let got = all_rows(
+        &client,
+        "SELECT 'x' AS c, unnest(ARRAY[1,2,3]), unnest(ARRAY['a'])",
+    )
+    .await;
+    let row = |n: &str, s: Option<&str>| {
+        vec![
+            Some("x".to_string()),
+            Some(n.to_string()),
+            s.map(str::to_string),
+        ]
+    };
+    assert_eq!(got, [row("1", Some("a")), row("2", None), row("3", None)]);
+}
+
+#[tokio::test]
+async fn srf_zip_with_input_rows_and_aliases() {
+    let client = connect(pg_server().await).await;
+    // Each input row repeats once per element; the SRF's alias names it,
+    // and SQLAlchemy's shape (unnest + generate_subscripts side by side)
+    // lines elements up with their positions.
+    let got = all_rows(
+        &client,
+        "SELECT x, unnest(ARRAY[x, x * 10]) AS v, generate_subscripts(ARRAY[x, x * 10], 1) AS i \
+         FROM t WHERE x < 3",
+    )
+    .await;
+    let row = |a: &str, b: &str, c: &str| texts(&[a, b, c]);
+    assert_eq!(
+        got,
+        [
+            row("1", "1", "1"),
+            row("1", "10", "2"),
+            row("2", "2", "1"),
+            row("2", "20", "2")
+        ]
+    );
+    let stmt = client
+        .prepare("SELECT unnest(ARRAY[x]) AS v FROM t")
+        .await
+        .unwrap();
+    assert_eq!(stmt.columns()[0].name(), "v");
+}
+
+#[tokio::test]
+async fn srf_null_and_empty_yield_no_rows() {
+    let client = connect(pg_server().await).await;
+    assert!(column_text(&client, "SELECT unnest(a) FROM arrs")
+        .await
+        .is_empty());
+    assert!(
+        column_text(&client, "SELECT generate_subscripts(a, 1) FROM arrs")
+            .await
+            .is_empty()
+    );
+    assert!(column_text(&client, "SELECT unnest(CAST('{}' AS int[]))")
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn srf_over_array_agg_subquery() {
+    let client = connect(pg_server().await).await;
+    assert_eq!(
+        column_text(
+            &client,
+            "SELECT unnest(arr) FROM (SELECT array_agg(n_name ORDER BY n_name) arr FROM nation) s"
+        )
+        .await,
+        texts(&["A", "B", "C", "D", "E", "F"])
+    );
+}
+
+#[tokio::test]
+async fn srf_in_where_is_refused() {
+    let client = connect(pg_server().await).await;
+    let message = error_message(&client, "SELECT x FROM t WHERE unnest(ARRAY[x]) = 1").await;
+    assert!(
+        message.contains("set-returning function") && message.contains("not supported here"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn srf_nested_in_expression_is_refused() {
+    let client = connect(pg_server().await).await;
+    let message = error_message(&client, "SELECT unnest(ARRAY[1]) + 1").await;
+    assert!(
+        message.contains("set-returning function") && message.contains("not supported here"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn generate_subscripts_dim_other_than_1_is_refused() {
+    let client = connect(pg_server().await).await;
+    let message = error_message(&client, "SELECT generate_subscripts(ARRAY[1], 2)").await;
+    assert!(
+        message.contains("generate_subscripts") && message.contains("dimension 1"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn srf_shapes_used_by_reflection() {
+    let client = connect(pg_server().await).await;
+    // Over an aggregate in the same SELECT.
+    assert_eq!(
+        column_text(
+            &client,
+            "SELECT unnest(array_agg(x ORDER BY x DESC)) FROM t"
+        )
+        .await,
+        texts(&["3", "2", "1"])
+    );
+    // In a derived table filtered, joined and ordered outside.
+    let got = all_rows(
+        &client,
+        "SELECT s.k, s.v, t.x FROM \
+         (SELECT x AS k, unnest(ARRAY[x, x * 10]) AS v, generate_subscripts(ARRAY[x, x * 10], 1) AS i \
+          FROM t) s JOIN t ON t.x = s.k \
+         WHERE s.i = 2 AND s.v > 10 ORDER BY s.v",
+    )
+    .await;
+    assert_eq!(got, [texts(&["2", "20", "2"]), texts(&["3", "30", "3"])]);
+    // The same SRF twice, and next to `*`.
+    let got = all_rows(
+        &client,
+        "SELECT *, unnest(ARRAY[x]), unnest(ARRAY[x]) FROM t WHERE x = 1",
+    )
+    .await;
+    assert_eq!(got, [texts(&["1", "1", "1"])]);
+    let stmt = client
+        .prepare("SELECT unnest(ARRAY[x]), generate_subscripts(ARRAY[x], 1) FROM t")
+        .await
+        .unwrap();
+    let names: Vec<&str> = stmt.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["unnest", "generate_subscripts"]);
 }

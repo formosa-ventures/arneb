@@ -271,6 +271,11 @@ fn push_down(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(push_down(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(push_down(*input)), srfs, schema),
         L::Distinct { input } => L::Distinct {
             input: Box::new(push_down(*input)),
         },

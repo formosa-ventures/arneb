@@ -113,6 +113,7 @@ fn summarize_node(plan: &LogicalPlan) -> String {
         L::Intersect { .. } => "Intersect".to_string(),
         L::Except { .. } => "Except".to_string(),
         L::Window { functions, .. } => format!("Window (n={})", functions.len()),
+        L::ProjectSet { srfs, .. } => format!("ProjectSet (n={})", srfs.len()),
         L::ExchangeNode { stage_id, .. } => format!("Exchange (stage={stage_id})"),
         L::CreateTable { name, .. } => format!("CreateTable({})", name),
         L::DropTable { name, .. } => format!("DropTable({})", name),
@@ -148,6 +149,7 @@ pub fn plan_children(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Window { input, .. }
+        | L::ProjectSet { input, .. }
         | L::AssignUniqueId { input, .. } => vec![input.as_ref()],
         L::Join { left, right, .. }
         | L::SemiJoin { left, right, .. }

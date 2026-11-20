@@ -427,6 +427,7 @@ fn collect_join_key_sources(
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Window { input, .. }
+        | LogicalPlan::ProjectSet { input, .. }
         | LogicalPlan::AssignUniqueId { input, .. } => {
             collect_join_key_sources(input, keys_by_table);
         }
@@ -588,6 +589,7 @@ fn collect_inner_join_equivalence_classes(
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Window { input, .. }
+        | LogicalPlan::ProjectSet { input, .. }
         | LogicalPlan::AssignUniqueId { input, .. } => {
             collect_inner_join_equivalence_classes(input, classes);
         }
@@ -839,6 +841,12 @@ fn block_plan_sources(plan: &LogicalPlan, blocked: &mut HashSet<ColumnSource>) {
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::AssignUniqueId { input, .. } => block_plan_sources(input, blocked),
+        LogicalPlan::ProjectSet { input, srfs, .. } => {
+            block_plan_sources(input, blocked);
+            for (_, expr) in srfs {
+                blocked.extend(expr_sources(expr, input));
+            }
+        }
         LogicalPlan::Window { input, functions } => {
             block_plan_sources(input, blocked);
             for function in functions {
@@ -2400,6 +2408,13 @@ mod tests {
             | LogicalPlan::Explain { input, .. }
             | LogicalPlan::Distinct { input }
             | LogicalPlan::AssignUniqueId { input, .. } => assert_schema_lengths_consistent(input),
+            LogicalPlan::ProjectSet { input, srfs, .. } => {
+                assert_eq!(plan.schema().len(), input.schema().len() + srfs.len());
+                for (_, expr) in srfs {
+                    assert_expr_schema_lengths_consistent(expr);
+                }
+                assert_schema_lengths_consistent(input);
+            }
             LogicalPlan::Window { input, functions } => {
                 assert_eq!(plan.schema().len(), input.schema().len() + functions.len());
                 for function in functions {

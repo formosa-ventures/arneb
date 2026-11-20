@@ -146,6 +146,12 @@ fn collect_decimal_carry_and_blocks(
             }
             collect_decimal_carry_and_blocks(input, carried_by_parent, carried, blocked);
         }
+        LogicalPlan::ProjectSet { input, srfs, .. } => {
+            for (_, expr) in srfs {
+                collect_expr_subquery_blocks(expr, blocked);
+            }
+            collect_decimal_carry_and_blocks(input, carried_by_parent, carried, blocked);
+        }
         LogicalPlan::PartialAggregate {
             input,
             group_by,
@@ -426,6 +432,15 @@ fn rewrite_plan(plan: LogicalPlan, candidates: &HashSet<ColumnSource>) -> Logica
             input: Box::new(rewrite_plan(*input, candidates)),
             functions,
         },
+        LogicalPlan::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => {
+            let input = rewrite_plan(*input, candidates);
+            let input = castback_input_if_needed(input, srfs.iter().map(|(_, e)| e));
+            LogicalPlan::rebuild_project_set(Box::new(input), srfs, schema)
+        }
         LogicalPlan::AssignUniqueId { input, id_column } => LogicalPlan::AssignUniqueId {
             input: Box::new(rewrite_plan(*input, candidates)),
             id_column,

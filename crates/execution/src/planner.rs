@@ -682,6 +682,7 @@ impl ExecutionContext {
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Window { input, .. }
+            | LogicalPlan::ProjectSet { input, .. }
             | LogicalPlan::AssignUniqueId { input, .. }
             | LogicalPlan::ScalarSubquery { subplan: input } => {
                 Self::all_scans_have_row_count(input, stats)
@@ -1659,6 +1660,20 @@ impl ExecutionContext {
                 Ok(Arc::new(crate::window::WindowExec::new(
                     child,
                     functions.clone(),
+                )))
+            }
+
+            LogicalPlan::ProjectSet {
+                input,
+                srfs,
+                schema,
+            } => {
+                // Stateless per input row: keep multi-partition input.
+                let child = self.convert(input)?;
+                Ok(Arc::new(crate::project_set::ProjectSetExec::new(
+                    child,
+                    srfs.clone(),
+                    schema.clone(),
                 )))
             }
 

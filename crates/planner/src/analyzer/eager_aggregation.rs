@@ -235,6 +235,11 @@ fn rewrite(plan: LogicalPlan, stats: &CatalogStats) -> LogicalPlan {
             input: Box::new(rewrite(*input, stats)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(rewrite(*input, stats)), srfs, schema),
         L::Explain { input, analyze } => L::Explain {
             input: Box::new(rewrite(*input, stats)),
             analyze,

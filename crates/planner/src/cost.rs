@@ -187,6 +187,9 @@ pub fn estimated_cardinality(plan: &LogicalPlan, stats: &CatalogStats) -> Cost {
 
         LogicalPlan::Window { input, .. } => estimated_cardinality(input, stats),
 
+        // Unknown fan-out per row; assume one row per input row.
+        LogicalPlan::ProjectSet { input, .. } => estimated_cardinality(input, stats),
+
         LogicalPlan::AssignUniqueId { input, .. } => estimated_cardinality(input, stats),
 
         LogicalPlan::Join {

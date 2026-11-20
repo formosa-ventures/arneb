@@ -776,6 +776,89 @@ pub enum LogicalPlan {
     /// surrounding `Projection` evaluates literal/constant expressions
     /// against this one-row batch to produce the actual output.
     OneRow,
+    /// Evaluates the set-returning functions of a `SELECT` list (`unnest`,
+    /// `generate_subscripts`). Each input row yields `max(len_i)` rows,
+    /// the input columns repeated, followed by one column per SRF; shorter
+    /// SRF results pad with NULL, and a NULL or empty array has length 0
+    /// (PostgreSQL 10+ semantics). Sits below the final `Projection`.
+    ProjectSet {
+        /// Input plan.
+        input: Box<LogicalPlan>,
+        /// The SRFs, each with its array argument (evaluated against the
+        /// input).
+        srfs: Vec<(SrfKind, PlanExpr)>,
+        /// Output schema: the input columns, then one column per SRF.
+        schema: Vec<ColumnInfo>,
+    },
+}
+
+impl LogicalPlan {
+    /// Rebuilds a [`LogicalPlan::ProjectSet`] over a (possibly rewritten)
+    /// `input`: the SRF columns keep their place at the end of `schema`,
+    /// and the input part is refreshed from `input`, so passes that permute
+    /// or retype the input's columns keep the schema in step.
+    #[inline(never)]
+    pub fn rebuild_project_set(
+        input: Box<LogicalPlan>,
+        srfs: Vec<(SrfKind, PlanExpr)>,
+        schema: Vec<ColumnInfo>,
+    ) -> LogicalPlan {
+        let mut out = input.schema();
+        out.extend(schema.into_iter().rev().take(srfs.len()).rev());
+        LogicalPlan::ProjectSet {
+            input,
+            srfs,
+            schema: out,
+        }
+    }
+}
+
+/// A set-returning function a [`LogicalPlan::ProjectSet`] evaluates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SrfKind {
+    /// `unnest(array)`: one row per element.
+    Unnest,
+    /// `generate_subscripts(array, 1)`: the subscripts `1..=len`.
+    GenerateSubscripts,
+}
+
+impl SrfKind {
+    /// The SQL function name.
+    pub fn name(self) -> &'static str {
+        match self {
+            SrfKind::Unnest => "unnest",
+            SrfKind::GenerateSubscripts => "generate_subscripts",
+        }
+    }
+
+    /// The SRF a function name denotes, if any.
+    pub fn from_name(name: &str) -> Option<SrfKind> {
+        if name.eq_ignore_ascii_case("unnest") {
+            Some(SrfKind::Unnest)
+        } else if name.eq_ignore_ascii_case("generate_subscripts") {
+            Some(SrfKind::GenerateSubscripts)
+        } else {
+            None
+        }
+    }
+
+    /// The output column type for an argument of type `array`: the element
+    /// type for `unnest`, `Int32` for `generate_subscripts`.
+    pub fn output_type(self, array: &DataType) -> DataType {
+        match (self, array) {
+            (SrfKind::Unnest, DataType::List(element)) => (**element).clone(),
+            (SrfKind::Unnest, _) => DataType::Null,
+            (SrfKind::GenerateSubscripts, _) => DataType::Int32,
+        }
+    }
+
+    /// Display of a call with argument `arg`.
+    pub fn display(self, arg: &PlanExpr) -> String {
+        match self {
+            SrfKind::Unnest => format!("unnest({arg})"),
+            SrfKind::GenerateSubscripts => format!("generate_subscripts({arg}, 1)"),
+        }
+    }
 }
 
 /// A window function definition within a Window plan node.
@@ -903,6 +986,7 @@ impl LogicalPlan {
             // AssignUniqueId / Explain) stays short-circuitable by an outer
             // LIMIT.
             LogicalPlan::Projection { input, .. }
+            | LogicalPlan::ProjectSet { input, .. }
             | LogicalPlan::Filter { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::AssignUniqueId { input, .. }
@@ -929,6 +1013,7 @@ impl LogicalPlan {
             LogicalPlan::Explain { input, .. } => input.writes_data(),
             LogicalPlan::TableScan { .. }
             | LogicalPlan::Projection { .. }
+            | LogicalPlan::ProjectSet { .. }
             | LogicalPlan::Filter { .. }
             | LogicalPlan::Join { .. }
             | LogicalPlan::Aggregate { .. }
@@ -956,6 +1041,7 @@ impl LogicalPlan {
         match self {
             LogicalPlan::TableScan { schema, .. } => schema.clone(),
             LogicalPlan::Projection { schema, .. } => schema.clone(),
+            LogicalPlan::ProjectSet { schema, .. } => schema.clone(),
             LogicalPlan::Filter { input, .. } => input.schema(),
             LogicalPlan::Join {
                 left,
@@ -1425,6 +1511,11 @@ fn fmt_plan(plan: &LogicalPlan, f: &mut fmt::Formatter<'_>, indent: usize) -> fm
             fmt_plan(input, f, indent + 1)
         }
         LogicalPlan::OneRow => writeln!(f, "{pad}OneRow"),
+        LogicalPlan::ProjectSet { input, srfs, .. } => {
+            let calls: Vec<String> = srfs.iter().map(|(k, e)| k.display(e)).collect();
+            writeln!(f, "{pad}ProjectSet: [{}]", calls.join(", "))?;
+            fmt_plan(input, f, indent + 1)
+        }
     }
 }
 

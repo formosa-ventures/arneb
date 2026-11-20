@@ -9,7 +9,9 @@ use arneb_common::types::{ColumnInfo, DataType, ScalarValue};
 use arneb_sql_parser::ast;
 
 use crate::analyzer::{plan_expr_type, Analyzer, AnalyzerContext};
-use crate::plan::{null_extend, JoinCondition, LogicalPlan, PlanExpr, SortExpr, WindowFunctionDef};
+use crate::plan::{
+    null_extend, JoinCondition, LogicalPlan, PlanExpr, SortExpr, SrfKind, WindowFunctionDef,
+};
 
 static CTE_SELF_AGG_WINDOW_TEST_OVERRIDE: OnceLock<std::sync::Mutex<Option<bool>>> =
     OnceLock::new();
@@ -895,14 +897,30 @@ impl<'a> QueryPlanner<'a> {
                 .await?;
         }
 
+        // 3c. Set-returning functions (`unnest`, `generate_subscripts`) as
+        // whole SELECT items: evaluated by a ProjectSet below the projection,
+        // which then reads each one as a column.
+        let srf_items;
+        let projection_items = if body.projection.iter().any(|i| srf_call(i).is_some()) {
+            let num_group_by = has_aggregates.then_some(group_by_ast.len());
+            let (set_plan, items) =
+                Box::pin(self.plan_project_set(plan, &mut ctx, &body.projection, num_group_by))
+                    .await?;
+            plan = set_plan;
+            srf_items = items;
+            &srf_items
+        } else {
+            &body.projection
+        };
+
         // 4. Projection (SELECT list)
         // After aggregate, SELECT expressions that ARE aggregate functions should reference
         // the aggregate output columns by index, not re-resolve their arguments.
         let (proj_exprs, proj_schema) = if has_aggregates {
-            self.plan_aggregate_projection(&body.projection, &ctx, &group_by_ast)
+            self.plan_aggregate_projection(projection_items, &ctx, &group_by_ast)
                 .await?
         } else {
-            self.plan_projection(&body.projection, &ctx).await?
+            self.plan_projection(projection_items, &ctx).await?
         };
 
         plan = LogicalPlan::Projection {
@@ -1062,6 +1080,81 @@ impl<'a> QueryPlanner<'a> {
             ctx.columns.push((Some(WINDOW_QUALIFIER.to_string()), col));
         }
         Ok(plan)
+    }
+
+    /// Plans the SELECT items that are set-returning function calls into a
+    /// `ProjectSet` above `plan`. Each SRF becomes a column appended to `ctx`
+    /// (under [`SRF_QUALIFIER`]), and the returned SELECT list reads it as a
+    /// column reference, named like PostgreSQL does (`unnest`) unless the
+    /// item has an alias. `num_group_by` is set when the SELECT aggregates.
+    async fn plan_project_set(
+        &self,
+        plan: LogicalPlan,
+        ctx: &mut PlanningContext,
+        items: &[ast::SelectItem],
+        num_group_by: Option<usize>,
+    ) -> Result<(LogicalPlan, Vec<ast::SelectItem>), PlanError> {
+        let input_schema = plan.schema();
+        let mut srfs: Vec<(SrfKind, PlanExpr)> = Vec::new();
+        let mut schema = input_schema.clone();
+        let mut rewritten = Vec::with_capacity(items.len());
+        for item in items {
+            let Some((kind, call)) = srf_call(item) else {
+                rewritten.push(item.clone());
+                continue;
+            };
+            let array = srf_array_argument(kind, call)?;
+            let array = match num_group_by {
+                Some(n) => self.rewrite_aggregates_as_columns(array, ctx, n),
+                None => array.clone(),
+            };
+            let planned = self.plan_expr(&array, ctx).await?;
+            // Typed against the planning context the argument was resolved in.
+            let ctx_schema: Vec<ColumnInfo> = ctx.columns.iter().map(|(_, c)| c.clone()).collect();
+            let array_type = plan_expr_type(&planned, &ctx_schema).unwrap_or(DataType::Null);
+            if !matches!(array_type, DataType::List(_) | DataType::Null) {
+                return Err(PlanError::invalid_expression(format!(
+                    "function {}({array_type}) does not exist: {} takes an array",
+                    kind.name(),
+                    kind.name()
+                )));
+            }
+            let mut name = kind.display(&planned);
+            if schema.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
+                name = format!("{name}#{}", srfs.len() + 1);
+            }
+            let column = ColumnInfo {
+                name: name.clone(),
+                data_type: kind.output_type(&array_type),
+                nullable: true,
+            };
+            ctx.columns
+                .push((Some(SRF_QUALIFIER.to_string()), column.clone()));
+            schema.push(column);
+            srfs.push((kind, planned));
+            let reference = ast::Expr::Column {
+                col_ref: ast::ColumnRef {
+                    name,
+                    table: Some(SRF_QUALIFIER.to_string()),
+                    span: arneb_sql_parser::Span::empty(),
+                },
+                span: arneb_sql_parser::Span::empty(),
+            };
+            let alias = match item {
+                ast::SelectItem::ExprWithAlias { alias, .. } => alias.clone(),
+                _ => kind.name().to_string(),
+            };
+            rewritten.push(ast::SelectItem::ExprWithAlias {
+                expr: reference,
+                alias,
+            });
+        }
+        let plan = LogicalPlan::ProjectSet {
+            input: Box::new(plan),
+            srfs,
+            schema,
+        };
+        Ok((plan, rewritten))
     }
 
     /// Split the WHERE-clause AND-tree, pull every `EXISTS (...)` /
@@ -2220,6 +2313,9 @@ impl<'a> QueryPlanner<'a> {
                 order_by,
                 ..
             } => {
+                if SrfKind::from_name(name).is_some() {
+                    return Err(srf_not_supported_here(name, node_span));
+                }
                 if !order_by.is_empty() {
                     check_aggregate_order_by(name)?;
                 }
@@ -2473,7 +2569,10 @@ impl<'a> QueryPlanner<'a> {
                 ast::SelectItem::Wildcard => {
                     // Expand * to all columns (not the window results)
                     for (i, (q, col)) in ctx.columns.iter().enumerate() {
-                        if q.as_deref() == Some(WINDOW_QUALIFIER) || ctx.merged.contains(&i) {
+                        if q.as_deref() == Some(WINDOW_QUALIFIER)
+                            || q.as_deref() == Some(SRF_QUALIFIER)
+                            || ctx.merged.contains(&i)
+                        {
                             continue;
                         }
                         exprs.push(PlanExpr::Column {
@@ -2636,7 +2735,10 @@ impl<'a> QueryPlanner<'a> {
                 }
                 ast::SelectItem::Wildcard => {
                     for (i, (q, col)) in ctx.columns.iter().enumerate() {
-                        if q.as_deref() == Some(WINDOW_QUALIFIER) || ctx.merged.contains(&i) {
+                        if q.as_deref() == Some(WINDOW_QUALIFIER)
+                            || q.as_deref() == Some(SRF_QUALIFIER)
+                            || ctx.merged.contains(&i)
+                        {
                             continue;
                         }
                         exprs.push(PlanExpr::Column {
@@ -4302,6 +4404,83 @@ fn references_outer(expr: &ast::Expr, inner_ctx: &PlanningContext) -> bool {
 /// columns, so `*` expansion skips them.
 const WINDOW_QUALIFIER: &str = "\u{0}window";
 
+/// Context qualifier of the columns a `ProjectSet` appends (one per SRF).
+const SRF_QUALIFIER: &str = "\u{0}srf";
+
+/// The SRF and its arguments when a SELECT item is a set-returning function
+/// call (possibly parenthesized, possibly aliased).
+fn srf_call(item: &ast::SelectItem) -> Option<(SrfKind, &ast::Expr)> {
+    let (ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. }) = item
+    else {
+        return None;
+    };
+    let mut expr = expr;
+    while let ast::Expr::Nested { expr: inner, .. } = expr {
+        expr = inner;
+    }
+    match expr {
+        ast::Expr::Function { name, .. } => SrfKind::from_name(name).map(|kind| (kind, expr)),
+        _ => None,
+    }
+}
+
+/// The array argument of an SRF call, checking its shape: `unnest(array)`
+/// and `generate_subscripts(array, 1)`.
+fn srf_array_argument(kind: SrfKind, call: &ast::Expr) -> Result<&ast::Expr, PlanError> {
+    let ast::Expr::Function {
+        args,
+        distinct,
+        order_by,
+        ..
+    } = call
+    else {
+        unreachable!("srf_call returns function calls");
+    };
+    if *distinct || !order_by.is_empty() {
+        return Err(PlanError::UnsupportedExpression {
+            message: format!(
+                "DISTINCT and ORDER BY are not supported in {}()",
+                kind.name()
+            ),
+            location: None,
+        });
+    }
+    match (kind, args.as_slice()) {
+        (SrfKind::Unnest, [ast::FunctionArg::Unnamed(array)]) => Ok(array),
+        (SrfKind::Unnest, _) => Err(PlanError::UnsupportedExpression {
+            message: "unnest takes exactly one array argument".to_string(),
+            location: None,
+        }),
+        (
+            SrfKind::GenerateSubscripts,
+            [ast::FunctionArg::Unnamed(array), ast::FunctionArg::Unnamed(ast::Expr::Literal {
+                value: ScalarValue::Int64(1) | ScalarValue::Int32(1),
+                ..
+            })],
+        ) => Ok(array),
+        (SrfKind::GenerateSubscripts, _) => Err(PlanError::UnsupportedExpression {
+            message: "generate_subscripts is supported only as generate_subscripts(array, 1): \
+                      arrays have dimension 1"
+                .to_string(),
+            location: None,
+        }),
+    }
+}
+
+/// The error for an SRF call anywhere but as a whole SELECT item. Out of
+/// line so `plan_expr`'s recursive frame stays small.
+#[inline(never)]
+fn srf_not_supported_here(name: &str, span: Option<arneb_sql_parser::Span>) -> PlanError {
+    PlanError::UnsupportedExpression {
+        message: format!(
+            "set-returning function {}() is not supported here; it is supported only as a \
+             whole SELECT-list item",
+            name.to_ascii_lowercase()
+        ),
+        location: span.map(|s| s.start),
+    }
+}
+
 /// Collects the distinct (by display string) window-function calls in `expr`.
 fn collect_window_calls(expr: &ast::Expr, out: &mut Vec<ast::Expr>) {
     use ast::Expr as E;
@@ -4450,6 +4629,7 @@ fn collect_table_scan_refs(
         | L::FinalAggregate { input, .. }
         | L::Distinct { input }
         | L::Window { input, .. }
+        | L::ProjectSet { input, .. }
         | L::AssignUniqueId { input, .. } => collect_table_scan_refs(input, sink),
         L::Join { left, right, .. }
         | L::SemiJoin { left, right, .. }
@@ -5581,6 +5761,70 @@ mod tests {
                 assert!(matches!(input.as_ref(), LogicalPlan::Projection { .. }));
             }
             _ => panic!("expected Explain"),
+        }
+    }
+
+    #[tokio::test]
+    async fn srfs_plan_a_project_set_below_the_projection() {
+        let plan = plan_sql(
+            "EXPLAIN SELECT id, unnest(ARRAY[id, age]) AS v, generate_subscripts(ARRAY[id], 1) \
+             FROM users",
+        )
+        .await
+        .unwrap();
+        let text = plan.to_string();
+        assert!(
+            text.contains(
+                "ProjectSet: [unnest(ARRAY[id, CAST(age AS Int64)]), \
+                 generate_subscripts(ARRAY[id], 1)]"
+            ),
+            "{text}"
+        );
+        let LogicalPlan::Explain { input, .. } = &plan else {
+            panic!("expected Explain");
+        };
+        let LogicalPlan::Projection { input, schema, .. } = input.as_ref() else {
+            panic!("expected Projection, got {input}");
+        };
+        assert_eq!(schema[1].name, "v");
+        let LogicalPlan::ProjectSet {
+            srfs,
+            schema: set_schema,
+            ..
+        } = input.as_ref()
+        else {
+            panic!("expected ProjectSet, got {input}");
+        };
+        assert_eq!(srfs.len(), 2);
+        assert_eq!(srfs[0].0, SrfKind::Unnest);
+        assert_eq!(srfs[1].0, SrfKind::GenerateSubscripts);
+        // users(id, name, age), then one column per SRF.
+        assert_eq!(set_schema.len(), 5);
+        assert_eq!(set_schema[3].data_type, DataType::Int64);
+        assert!(set_schema[3].nullable);
+        assert_eq!(set_schema[4].data_type, DataType::Int32);
+        // Workers receive plans as JSON.
+        let json = serde_json::to_string(input.as_ref()).unwrap();
+        let back: LogicalPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.to_string(), input.to_string());
+
+        // Queries without SRFs keep their plan shape.
+        let plain = plan_sql("SELECT id FROM users").await.unwrap();
+        assert!(!plain.to_string().contains("ProjectSet"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn srf_outside_a_select_item_is_refused() {
+        for sql in [
+            "SELECT id FROM users WHERE unnest(ARRAY[id]) = 1",
+            "SELECT unnest(ARRAY[id]) + 1 FROM users",
+            "SELECT id FROM users ORDER BY unnest(ARRAY[id])",
+        ] {
+            let err = plan_sql(sql).await.expect_err(sql).to_string();
+            assert!(
+                err.contains("set-returning function") && err.contains("not supported here"),
+                "{sql}: {err}"
+            );
         }
     }
 

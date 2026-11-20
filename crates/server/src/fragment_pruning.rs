@@ -172,6 +172,7 @@ fn collect_pushed_projections(plan: &LogicalPlan, out: &mut HashMap<StageId, BTr
         | L::PartialAggregate { input, .. }
         | L::FinalAggregate { input, .. }
         | L::Window { input, .. }
+        | L::ProjectSet { input, .. }
         | L::AssignUniqueId { input, .. } => collect_pushed_projections(input, out),
         L::Join { left, right, .. } => {
             collect_pushed_projections(left, out);
@@ -331,6 +332,15 @@ fn collapse_exchange_projections(
             input: Box::new(collapse_exchange_projections(*input, pushed)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(
+            Box::new(collapse_exchange_projections(*input, pushed)),
+            srfs,
+            schema,
+        ),
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(collapse_exchange_projections(*input, pushed)),
             id_column,
@@ -738,6 +748,7 @@ mod tests {
                 | L::FinalAggregate { input, .. }
                 | L::Distinct { input }
                 | L::Window { input, .. }
+                | L::ProjectSet { input, .. }
                 | L::AssignUniqueId { input, .. } => vec![input],
                 L::Join { left, right, .. }
                 | L::SemiJoin { left, right, .. }

@@ -33,7 +33,7 @@ pub use optimizer::{LogicalOptimizer, LogicalRule};
 pub use plan::{
     map_array_contains, map_array_contains_ref, null_extend, try_map_array_contains,
     try_map_array_contains_ref, DynamicFilterConsumer, DynamicFilterProducer, JoinCondition,
-    LogicalPlan, PlanExpr, SortExpr, WindowFunctionDef,
+    LogicalPlan, PlanExpr, SortExpr, SrfKind, WindowFunctionDef,
 };
 pub use planner::QueryPlanner;
 pub use properties::ActualProperties;

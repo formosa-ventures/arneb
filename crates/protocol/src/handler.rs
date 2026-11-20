@@ -7,7 +7,9 @@ use arneb_common::stream::collect_stream;
 use arneb_common::types::{char_padded_value, ColumnInfo, DataType, ScalarValue};
 use arneb_connectors::ConnectorRegistry;
 use arneb_execution::{ExecutionContext, ExecutionPlan};
-use arneb_planner::{JoinCondition, LogicalOptimizer, LogicalPlan, PlanExpr, QueryPlanner};
+use arneb_planner::{
+    JoinCondition, LogicalOptimizer, LogicalPlan, PlanExpr, QueryPlanner, SrfKind,
+};
 use arrow::array::AsArray;
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
@@ -1734,6 +1736,28 @@ fn pad_char_columns(
 }
 
 /// Walk a logical plan and resolve any scalar subqueries in expressions.
+/// `resolve_plan_subqueries` for a `ProjectSet`. Out of line so the
+/// recursive future stays small.
+async fn resolve_project_set_subqueries(
+    ctx: &ExecutionContext,
+    distributed_executor: Option<&dyn DistributedExecutor>,
+    input: LogicalPlan,
+    srfs: Vec<(SrfKind, PlanExpr)>,
+    schema: Vec<arneb_common::types::ColumnInfo>,
+) -> Result<LogicalPlan, ArnebError> {
+    let input = Box::pin(resolve_plan_subqueries(ctx, distributed_executor, input)).await?;
+    let mut resolved = Vec::with_capacity(srfs.len());
+    for (kind, expr) in srfs {
+        let expr = resolve_expr_subqueries_distributed(ctx, distributed_executor, expr).await?;
+        resolved.push((kind, expr));
+    }
+    Ok(LogicalPlan::rebuild_project_set(
+        Box::new(input),
+        resolved,
+        schema,
+    ))
+}
+
 async fn resolve_plan_subqueries(
     ctx: &ExecutionContext,
     distributed_executor: Option<&dyn DistributedExecutor>,
@@ -1827,6 +1851,20 @@ async fn resolve_plan_subqueries(
                 input: Box::new(input),
                 functions,
             })
+        }
+        LogicalPlan::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => {
+            Box::pin(resolve_project_set_subqueries(
+                ctx,
+                distributed_executor,
+                *input,
+                srfs,
+                schema,
+            ))
+            .await
         }
         LogicalPlan::UnionAll { inputs } => {
             let mut resolved = Vec::with_capacity(inputs.len());
@@ -2365,6 +2403,13 @@ fn plan_columns_in_range(plan: &LogicalPlan) -> bool {
         LogicalPlan::CreateTableAsSelect { source, .. }
         | LogicalPlan::InsertInto { source, .. } => plan_columns_in_range(source),
         LogicalPlan::CreateView { plan, .. } => plan_columns_in_range(plan),
+        LogicalPlan::ProjectSet { input, srfs, .. } => {
+            let width = input.schema().len();
+            plan_columns_in_range(input)
+                && srfs
+                    .iter()
+                    .all(|(_, expr)| expr_columns_in_range(expr, width))
+        }
         LogicalPlan::Window { input, functions } => {
             let width = input.schema().len();
             plan_columns_in_range(input)
@@ -2718,6 +2763,7 @@ async fn register_data_sources(
         }
         LogicalPlan::Distinct { input }
         | LogicalPlan::Window { input, .. }
+        | LogicalPlan::ProjectSet { input, .. }
         | LogicalPlan::AssignUniqueId { input, .. } => {
             register_data_sources(input, catalog_manager, registry, ctx).await?;
         }

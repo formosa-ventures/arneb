@@ -442,6 +442,24 @@ fn recurse_remap(
             )
         }
 
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => {
+            let (input, t) = tr(*input);
+            let srfs = srfs
+                .into_iter()
+                .map(|(kind, e)| (kind, remap_one(e, &t)))
+                .collect();
+            // Like Window: the SRF columns are appended after the (possibly
+            // permuted) input, so the input's table carries through.
+            (
+                LogicalPlan::rebuild_project_set(Box::new(input), srfs, schema),
+                t,
+            )
+        }
+
         L::Join {
             left,
             right,
@@ -663,6 +681,11 @@ where
             input: Box::new(f(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(f(*input)), srfs, schema),
         L::Aggregate {
             input,
             group_by,
@@ -1972,6 +1995,10 @@ fn indices_consistent(plan: &LogicalPlan) -> bool {
                     && all_ok(&f.partition_by, &s)
                     && f.order_by.iter().all(|o| refs_ok(&o.expr, &s))
             }) && indices_consistent(input)
+        }
+        L::ProjectSet { input, srfs, .. } => {
+            let s = input.schema();
+            srfs.iter().all(|(_, e)| refs_ok(e, &s)) && indices_consistent(input)
         }
         L::Join {
             left,

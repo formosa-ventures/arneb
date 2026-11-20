@@ -336,6 +336,7 @@ fn all_scans_have_row_count(plan: &LogicalPlan, stats: &crate::cost::CatalogStat
         | LogicalPlan::PartialAggregate { input, .. }
         | LogicalPlan::FinalAggregate { input, .. }
         | LogicalPlan::Window { input, .. }
+        | LogicalPlan::ProjectSet { input, .. }
         | LogicalPlan::AssignUniqueId { input, .. }
         | LogicalPlan::ScalarSubquery { subplan: input } => all_scans_have_row_count(input, stats),
         LogicalPlan::Join { left, right, .. }
@@ -1154,6 +1155,15 @@ fn remove_dynamic_filter_consumers_for_join(
             input: Box::new(remove_dynamic_filter_consumers_for_join(*input, producers)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(
+            Box::new(remove_dynamic_filter_consumers_for_join(*input, producers)),
+            srfs,
+            schema,
+        ),
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(remove_dynamic_filter_consumers_for_join(*input, producers)),
             id_column,
@@ -1799,6 +1809,21 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
     /// Recursively split the plan. Returns (local plan, child fragments).
     fn split(&mut self, plan: LogicalPlan) -> (LogicalPlan, Vec<PlanFragment>) {
         self.split_with_parent_aggregate_projection(plan, None)
+    }
+
+    /// Out of line so the recursive `split` frame stays small.
+    #[inline(never)]
+    fn split_project_set(
+        &mut self,
+        input: LogicalPlan,
+        srfs: Vec<(crate::plan::SrfKind, PlanExpr)>,
+        schema: Vec<ColumnInfo>,
+    ) -> (LogicalPlan, Vec<PlanFragment>) {
+        let (input_plan, frags) = self.split(input);
+        (
+            LogicalPlan::rebuild_project_set(Box::new(input_plan), srfs, schema),
+            frags,
+        )
     }
 
     fn split_join_child(&mut self, plan: LogicalPlan) -> (LogicalPlan, Vec<PlanFragment>) {
@@ -3200,6 +3225,13 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                 (exchange, vec![fragment])
             }
 
+            // Like a plain Projection: evaluated in its input's fragment.
+            LogicalPlan::ProjectSet {
+                input,
+                srfs,
+                schema,
+            } => self.split_project_set(*input, srfs, schema),
+
             LogicalPlan::Window { input, functions } => {
                 let (input_plan, input_frags) = self.split(*input);
                 let window_plan = LogicalPlan::Window {
@@ -3443,6 +3475,13 @@ fn recurse_avg_children(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(rewrite_avg_for_split(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => {
+            LogicalPlan::rebuild_project_set(Box::new(rewrite_avg_for_split(*input)), srfs, schema)
+        }
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(rewrite_avg_for_split(*input)),
             id_column,
@@ -3875,6 +3914,17 @@ fn replace_first_exchange(
                 replacement,
             )
         }
+        LogicalPlan::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => {
+            let (input, replacement) = replace_first_exchange(*input, target, replacement);
+            (
+                LogicalPlan::rebuild_project_set(Box::new(input), srfs, schema),
+                replacement,
+            )
+        }
         LogicalPlan::AssignUniqueId { input, id_column } => {
             let (input, replacement) = replace_first_exchange(*input, target, replacement);
             (
@@ -4131,6 +4181,7 @@ mod tests {
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Window { input, .. }
+            | LogicalPlan::ProjectSet { input, .. }
             | LogicalPlan::AssignUniqueId { input, .. } => {
                 count_table_scans_in_plan(input, table_name)
             }

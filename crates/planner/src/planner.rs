@@ -494,8 +494,8 @@ impl<'a> QueryPlanner<'a> {
         }
 
         // LIMIT / OFFSET
-        let limit = self.eval_limit_expr(query.limit.as_deref())?;
-        let offset = self.eval_limit_expr(query.offset.as_deref())?;
+        let limit = self.eval_limit_expr(query.limit.as_deref()).await?;
+        let offset = self.eval_limit_expr(query.offset.as_deref()).await?;
         if limit.is_some() || offset.is_some() {
             plan = LogicalPlan::Limit {
                 input: Box::new(plan),
@@ -3484,36 +3484,54 @@ impl<'a> QueryPlanner<'a> {
         ctx
     }
 
-    /// Evaluate a LIMIT/OFFSET expression to a usize.
-    fn eval_limit_expr(&self, expr: Option<&ast::Expr>) -> Result<Option<usize>, PlanError> {
-        match expr {
-            None => Ok(None),
-            Some(ast::Expr::Literal {
-                value: ScalarValue::Int64(n),
-                ..
-            }) => {
-                if *n < 0 {
-                    return Err(PlanError::invalid_expression(
-                        "LIMIT/OFFSET must be non-negative".to_string(),
-                    ));
-                }
-                Ok(Some(*n as usize))
-            }
-            Some(ast::Expr::Literal {
-                value: ScalarValue::Int32(n),
-                ..
-            }) => {
-                if *n < 0 {
-                    return Err(PlanError::invalid_expression(
-                        "LIMIT/OFFSET must be non-negative".to_string(),
-                    ));
-                }
-                Ok(Some(*n as usize))
-            }
-            Some(_) => Err(PlanError::invalid_expression(
-                "LIMIT/OFFSET must be an integer literal".to_string(),
-            )),
+    /// Evaluate a LIMIT/OFFSET expression to a usize. Any constant that
+    /// folds to an integer is accepted, such as `3`, `CAST(3 AS INTEGER)`
+    /// or `$1::INTEGER` with the parameter already substituted.
+    async fn eval_limit_expr(&self, expr: Option<&ast::Expr>) -> Result<Option<usize>, PlanError> {
+        let Some(expr) = expr else {
+            return Ok(None);
+        };
+        let not_constant = || {
+            PlanError::invalid_expression(
+                "LIMIT/OFFSET must be a constant integer expression".to_string(),
+            )
+        };
+        let planned = self
+            .plan_expr(expr, &PlanningContext::new())
+            .await
+            .map_err(|_| not_constant())?;
+        let folded = crate::optimizer::fold_constants(planned)?;
+        // Describe plans the statement before Bind with its placeholders
+        // still in place, and only reports the output columns. Execution
+        // substitutes the bound text first, so it never reaches this arm.
+        let is_param = |e: &PlanExpr| matches!(e, PlanExpr::Parameter { .. });
+        if is_param(&folded) || matches!(&folded, PlanExpr::Cast { expr, .. } if is_param(expr)) {
+            return Ok(None);
         }
+        // `1::SMALLINT` keeps its range-checked cast over the literal.
+        let value = match &folded {
+            PlanExpr::Literal { value, .. } => value,
+            PlanExpr::Cast { expr, .. } => match &**expr {
+                PlanExpr::Literal { value, .. } => value,
+                _ => return Err(not_constant()),
+            },
+            _ => return Err(not_constant()),
+        };
+        let n = match value {
+            ScalarValue::Int32(n) => i64::from(*n),
+            ScalarValue::Int64(n) => *n,
+            _ => {
+                return Err(PlanError::invalid_expression(
+                    "LIMIT/OFFSET must be an integer".to_string(),
+                ))
+            }
+        };
+        if n < 0 {
+            return Err(PlanError::invalid_expression(
+                "LIMIT/OFFSET must be non-negative".to_string(),
+            ));
+        }
+        Ok(Some(n as usize))
     }
 }
 
@@ -6002,6 +6020,39 @@ mod tests {
                 assert_eq!(*offset, Some(5));
             }
             _ => panic!("expected Limit at top"),
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_offset_accept_constant_integer_expressions() {
+        for (sql, want_limit, want_offset) in [
+            ("SELECT id FROM users LIMIT CAST(2 AS INTEGER)", 2, None),
+            (
+                "SELECT id FROM users LIMIT 2::BIGINT OFFSET 1::INTEGER",
+                2,
+                Some(1),
+            ),
+            ("SELECT id FROM users LIMIT 1 + 2", 3, None),
+        ] {
+            match plan_sql(sql).await.unwrap() {
+                LogicalPlan::Limit { limit, offset, .. } => {
+                    assert_eq!(limit, Some(want_limit), "{sql}");
+                    assert_eq!(offset, want_offset, "{sql}");
+                }
+                other => panic!("expected Limit for {sql}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_rejects_non_constant_and_negative() {
+        for sql in [
+            "SELECT id FROM users LIMIT id",
+            "SELECT id FROM users LIMIT -1",
+            "SELECT id FROM users LIMIT 'x'",
+        ] {
+            let err = plan_sql(sql).await.unwrap_err().to_string();
+            assert!(err.contains("LIMIT/OFFSET must be"), "{sql}: {err}");
         }
     }
 

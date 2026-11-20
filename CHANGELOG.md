@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.2.1](https://github.com/formosa-ventures/arneb/compare/v0.2.0...v0.2.1) (2026-11-20)
+
+
+### Features
+
+* run all 103 TPC-DS queries cell-identical to Trino ([#224](https://github.com/formosa-ventures/arneb/issues/224)) ([f1e5cde](https://github.com/formosa-ventures/arneb/commit/f1e5cdef515c05b6d193ff24a559be3a2dee92a8))
+
+
+### Bug Fixes
+
+* **execution:** hash-join on expression equality keys ([#253](https://github.com/formosa-ventures/arneb/issues/253)) ([a07bb5d](https://github.com/formosa-ventures/arneb/commit/a07bb5dda0778b571411b131fb7dea6d370d8ab9))
+* **execution:** round half away from zero casting to integers ([#240](https://github.com/formosa-ventures/arneb/issues/240)) ([a4e1a0b](https://github.com/formosa-ventures/arneb/commit/a4e1a0b9d91a28a2ee31be864f39817561b5fe70))
+* **execution:** split join output by bytes to avoid overflow ([#243](https://github.com/formosa-ventures/arneb/issues/243)) ([9720b3c](https://github.com/formosa-ventures/arneb/commit/9720b3c17a5c75755d6f29c5204c3dedb2c419ba))
+* **planner:** keep IN over a multi-key GROUP BY as a semi join ([#241](https://github.com/formosa-ventures/arneb/issues/241)) ([2a6d08d](https://github.com/formosa-ventures/arneb/commit/2a6d08ddca790ebdfd4332819d60f76298b7582a))
+* **planner:** keep multi-task fragments sound ([#257](https://github.com/formosa-ventures/arneb/issues/257)) ([d2cb484](https://github.com/formosa-ventures/arneb/commit/d2cb484aa3af4ec05e859800f534764c8fe09a51))
+* **rpc:** end a worker heartbeat after 5 seconds ([#252](https://github.com/formosa-ventures/arneb/issues/252)) ([9035da5](https://github.com/formosa-ventures/arneb/commit/9035da53065c9f2dfe387f43403910ea41e5ce38))
+* **server:** keep a reordering projection over an exchange ([#225](https://github.com/formosa-ventures/arneb/issues/225)) ([#235](https://github.com/formosa-ventures/arneb/issues/235)) ([bcbfce3](https://github.com/formosa-ventures/arneb/commit/bcbfce35cf7cca5970426700d113f5e58493ba0d))
+* **server:** log a heartbeat dropped for getting no answer ([#254](https://github.com/formosa-ventures/arneb/issues/254)) ([62edc26](https://github.com/formosa-ventures/arneb/commit/62edc2629a9ac9a7db1e51e4c8608ee387b65e85))
+* **server:** read one column when a plan needs none ([#259](https://github.com/formosa-ventures/arneb/issues/259)) ([3df261b](https://github.com/formosa-ventures/arneb/commit/3df261bb2d106c54fc7c79a5a348081cecdc5e0a))
+* **server:** run the worker heartbeat loop on a dedicated thread ([#242](https://github.com/formosa-ventures/arneb/issues/242)) ([43a3ef9](https://github.com/formosa-ventures/arneb/commit/43a3ef9ae7cf952700de1653f10bed16d8dee42d))
+* stop distributed dynamic filters from stalling scans ([#234](https://github.com/formosa-ventures/arneb/issues/234)) ([744d19d](https://github.com/formosa-ventures/arneb/commit/744d19da890cf2764b32e4610a093cd542f47bba))
+* v0.2.0 review follow-ups (secrets check, shutdown wording, agent/MCP/OAuth nits) ([#226](https://github.com/formosa-ventures/arneb/issues/226)) ([6dad43e](https://github.com/formosa-ventures/arneb/commit/6dad43e6c0aaebe45930dd7e43564da407a754e6))
+
 ## [0.2.0](https://github.com/formosa-ventures/arneb/compare/v0.1.8...v0.2.0) (2026-11-07)
 
 

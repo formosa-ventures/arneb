@@ -3758,6 +3758,40 @@ fn wrap_matching_cte_with_window(
     }
 }
 
+/// The `Array` arm of [`rewrite_expr_after_column_insert`], out of line so
+/// the recursive function's frame stays small.
+#[inline(never)]
+fn rewrite_array_after_column_insert(
+    expr: PlanExpr,
+    inserted_index: usize,
+    scalar_subplan: &LogicalPlan,
+    scalar_replacement: &PlanExpr,
+) -> PlanExpr {
+    let PlanExpr::Array {
+        elements,
+        element_type,
+        span,
+    } = expr
+    else {
+        return expr;
+    };
+    PlanExpr::Array {
+        elements: elements
+            .into_iter()
+            .map(|e| {
+                rewrite_expr_after_column_insert(
+                    e,
+                    inserted_index,
+                    scalar_subplan,
+                    scalar_replacement,
+                )
+            })
+            .collect(),
+        element_type,
+        span,
+    }
+}
+
 fn rewrite_expr_after_column_insert(
     expr: PlanExpr,
     inserted_index: usize,
@@ -3936,6 +3970,12 @@ fn rewrite_expr_after_column_insert(
         } => crate::map_array_contains(expr, array, negated, span, |e| {
             rewrite_expr_after_column_insert(e, inserted_index, scalar_subplan, scalar_replacement)
         }),
+        PlanExpr::Array { .. } => rewrite_array_after_column_insert(
+            expr,
+            inserted_index,
+            scalar_subplan,
+            scalar_replacement,
+        ),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -4774,6 +4814,42 @@ mod tests {
     use arneb_catalog::{CatalogManager, MemoryCatalog, MemorySchema, MemoryTable};
     use arneb_common::types::ColumnInfo;
     use std::sync::Arc;
+
+    #[test]
+    fn column_insert_shifts_columns_inside_arrays_and_array_contains() {
+        let col = |index: usize| PlanExpr::Column {
+            index,
+            name: format!("c{index}"),
+            span: None,
+        };
+        let array = PlanExpr::Array {
+            elements: vec![col(0), col(2)],
+            element_type: DataType::Int64,
+            span: None,
+        };
+        // A column inserted at index 1 moves column 2 to 3 and leaves 0.
+        let shifted = shift_plan_expr_columns(array.clone(), 1);
+        let PlanExpr::Array { elements, .. } = &shifted else {
+            panic!("expected Array, got {shifted}");
+        };
+        assert!(matches!(elements[0], PlanExpr::Column { index: 0, .. }));
+        assert!(matches!(elements[1], PlanExpr::Column { index: 3, .. }));
+        let contains = PlanExpr::ArrayContains {
+            expr: Box::new(col(5)),
+            array: Box::new(array),
+            negated: false,
+            span: None,
+        };
+        let shifted = shift_plan_expr_columns(contains, 1);
+        let PlanExpr::ArrayContains { expr, array, .. } = &shifted else {
+            panic!("expected ArrayContains");
+        };
+        assert!(matches!(**expr, PlanExpr::Column { index: 6, .. }));
+        let PlanExpr::Array { elements, .. } = &**array else {
+            panic!("expected Array");
+        };
+        assert!(matches!(elements[1], PlanExpr::Column { index: 3, .. }));
+    }
 
     const Q15_SQL: &str = include_str!("../../../benchmarks/tpch/queries/q15.sql");
 

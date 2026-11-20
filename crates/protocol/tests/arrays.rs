@@ -423,3 +423,57 @@ async fn array_text_cast_parses_postgres_syntax() {
     assert!(client.simple_query("SELECT '{1,x}'::int[]").await.is_err());
     assert!(client.simple_query("SELECT '{1,2'::int[]").await.is_err());
 }
+
+#[tokio::test]
+async fn binary_scalar_param_from_tokio_postgres() {
+    let client = connect(pg_server().await).await;
+    let rows = client
+        .query("SELECT CAST(x AS VARCHAR) FROM t WHERE x = $1", &[&2i64])
+        .await
+        .unwrap();
+    let got: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(got, ["2"]);
+}
+
+#[tokio::test]
+async fn constant_array_any_explains_as_an_in_list() {
+    let client = connect(pg_server().await).await;
+    let plan = |sql: &'static str| {
+        let client = &client;
+        async move {
+            column_text(client, sql)
+                .await
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
+    let text = plan("EXPLAIN SELECT x FROM t WHERE x = ANY('{1,3}'::bigint[])").await;
+    assert!(text.contains(" IN ("), "{text}");
+    assert!(!text.contains("ANY"), "{text}");
+    let text = plan("EXPLAIN SELECT x FROM t WHERE x <> ALL('{1,3}'::bigint[])").await;
+    assert!(text.contains("NOT IN ("), "{text}");
+    // Semantics survive the rewrite.
+    for (sql, want) in [
+        ("SELECT 2 = ANY('{1,NULL}'::bigint[])", None),
+        ("SELECT 1 = ANY('{1,NULL}'::bigint[])", Some("t")),
+        ("SELECT 2 <> ALL('{1,NULL}'::bigint[])", None),
+        ("SELECT NULL = ANY('{}'::bigint[])", Some("f")),
+        ("SELECT NULL <> ALL('{}'::bigint[])", Some("t")),
+    ] {
+        assert_eq!(first_text(&client, sql).await.as_deref(), want, "{sql}");
+    }
+    // An empty constant array filters every row (= ANY) or none (<> ALL).
+    assert!(
+        column_text(&client, "SELECT x FROM t WHERE x = ANY('{}'::bigint[])")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        column_text(&client, "SELECT x FROM t WHERE x <> ALL('{}'::bigint[])")
+            .await
+            .len(),
+        3
+    );
+}

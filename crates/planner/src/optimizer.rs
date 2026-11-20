@@ -416,6 +416,81 @@ fn simplify_expr(expr: PlanExpr) -> PlanExpr {
 ///
 /// Folding is idempotent: running it twice on the same expression
 /// yields the same result (the result is already a `Literal`).
+/// `expr = ANY (array)` once both operands are folded. A constant array (a
+/// bound parameter, `'{1,2}'::int[]`) becomes an IN list, which is evaluated
+/// without expanding the array per row and takes the IN-list pushdown paths;
+/// an empty one is a constant (false for `= ANY`, true for `<> ALL`, whatever
+/// `expr` is, as in PostgreSQL). Three-valued logic carries over: a NULL
+/// element is a NULL list item.
+#[inline(never)]
+#[allow(clippy::boxed_local)]
+fn fold_array_contains(
+    expr: Box<PlanExpr>,
+    array: Box<PlanExpr>,
+    negated: bool,
+    span: Option<arneb_sql_parser::Span>,
+) -> Result<PlanExpr, PlanError> {
+    let expr = fold_constants(*expr)?;
+    let array = fold_constants(*array)?;
+    if let PlanExpr::Literal {
+        value: ScalarValue::List { element, values },
+        ..
+    } = array
+    {
+        if values.is_empty() {
+            return Ok(PlanExpr::Literal {
+                value: ScalarValue::Boolean(negated),
+                span,
+            });
+        }
+        // An untyped NULL value takes the element type, like the NULL items.
+        let expr = if matches!(
+            expr,
+            PlanExpr::Literal {
+                value: ScalarValue::Null,
+                ..
+            }
+        ) {
+            PlanExpr::Cast {
+                expr: Box::new(expr),
+                data_type: (*element).clone(),
+                span: None,
+            }
+        } else {
+            expr
+        };
+        return Ok(PlanExpr::InList {
+            expr: Box::new(expr),
+            list: values
+                .into_iter()
+                .map(|value| {
+                    let null = matches!(value, ScalarValue::Null);
+                    let literal = PlanExpr::Literal { value, span: None };
+                    // A NULL item carries the element type: IN-list items
+                    // must match the tested expression's type.
+                    if null {
+                        PlanExpr::Cast {
+                            expr: Box::new(literal),
+                            data_type: (*element).clone(),
+                            span: None,
+                        }
+                    } else {
+                        literal
+                    }
+                })
+                .collect(),
+            negated,
+            span,
+        });
+    }
+    Ok(PlanExpr::ArrayContains {
+        expr: Box::new(expr),
+        array: Box::new(array),
+        negated,
+        span,
+    })
+}
+
 pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
     match expr {
         PlanExpr::BinaryOp {
@@ -543,7 +618,7 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
             array,
             negated,
             span,
-        } => crate::try_map_array_contains(expr, array, negated, span, fold_constants),
+        } => fold_array_contains(expr, array, negated, span),
         PlanExpr::Array {
             elements,
             element_type,

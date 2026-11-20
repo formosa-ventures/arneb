@@ -686,18 +686,24 @@ async fn infer_binary_param_types(
     portal: &Portal<String>,
     catalog_manager: &CatalogManager,
 ) -> std::collections::HashMap<usize, Type> {
-    let undeclared_binary = (0..portal.parameter_len()).any(|i| {
-        portal.parameter_format.is_binary(i)
-            && matches!(portal.parameters.get(i), Some(Some(_)))
-            && portal
-                .statement
-                .parameter_types
-                .get(i)
-                .cloned()
-                .flatten()
-                .is_none_or(|t| t == Type::UNKNOWN)
-    });
-    if !undeclared_binary {
+    // 1-based indexes of the binary, non-NULL parameters with no declared type.
+    // Only these take an inferred type; every other parameter keeps the
+    // decoding it had before.
+    let undeclared_binary: Vec<usize> = (0..portal.parameter_len())
+        .filter(|&i| {
+            portal.parameter_format.is_binary(i)
+                && matches!(portal.parameters.get(i), Some(Some(_)))
+                && portal
+                    .statement
+                    .parameter_types
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .is_none_or(|t| t == Type::UNKNOWN)
+        })
+        .map(|i| i + 1)
+        .collect();
+    if undeclared_binary.is_empty() {
         return std::collections::HashMap::new();
     }
     // Boxed: the planner future is large, and an unboxed one would sit in
@@ -710,9 +716,17 @@ async fn infer_binary_param_types(
     {
         Ok((_, types)) => types
             .iter()
+            .filter(|(index, _)| undeclared_binary.contains(index))
             .map(|(index, t)| (*index, arneb_type_to_pg_param_type(t)))
             .collect(),
-        Err(_) => std::collections::HashMap::new(),
+        Err(error) => {
+            tracing::debug!(
+                target: "arneb::protocol",
+                %error,
+                "could not infer binary parameter types; decoding them as undeclared"
+            );
+            std::collections::HashMap::new()
+        }
     }
 }
 

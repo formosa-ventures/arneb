@@ -51,6 +51,10 @@ pub struct QueryPlanner<'a> {
     /// scope. Scoping is enforced via snapshot-restore around each
     /// `plan_query` call.
     cte_plans: std::sync::Mutex<std::collections::HashMap<String, LogicalPlan>>,
+    /// `$N` placeholders found in LIMIT/OFFSET. They leave no node in the
+    /// plan, so the analyzer never sees them; they are seeded into the
+    /// analyzer context as int8, which is what PostgreSQL reports.
+    limit_params: std::sync::Mutex<std::collections::HashMap<usize, DataType>>,
 }
 
 /// Tracks the available columns from resolved tables during planning.
@@ -193,6 +197,7 @@ impl<'a> QueryPlanner<'a> {
         Self {
             catalog,
             cte_plans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            limit_params: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -221,6 +226,9 @@ impl<'a> QueryPlanner<'a> {
     ) -> Result<(LogicalPlan, AnalyzerContext), PlanError> {
         let plan = self.plan_statement_inner(stmt).await?;
         let mut ctx = AnalyzerContext::new();
+        if let Ok(limit_params) = self.limit_params.lock() {
+            ctx.param_types.extend(limit_params.clone());
+        }
         // Populate per-query statistics for cost-based passes. Walks
         // every `TableScan` in the plan, asks each `TableProvider` for
         // its statistics, and seeds `AnalyzerContext::catalog_stats`.
@@ -3504,8 +3512,18 @@ impl<'a> QueryPlanner<'a> {
         // Describe plans the statement before Bind with its placeholders
         // still in place, and only reports the output columns. Execution
         // substitutes the bound text first, so it never reaches this arm.
-        let is_param = |e: &PlanExpr| matches!(e, PlanExpr::Parameter { .. });
-        if is_param(&folded) || matches!(&folded, PlanExpr::Cast { expr, .. } if is_param(expr)) {
+        let param_index = |e: &PlanExpr| match e {
+            PlanExpr::Parameter { index, .. } => Some(*index),
+            _ => None,
+        };
+        let placeholder = param_index(&folded).or_else(|| match &folded {
+            PlanExpr::Cast { expr, .. } => param_index(expr),
+            _ => None,
+        });
+        if let Some(index) = placeholder {
+            if let Ok(mut limit_params) = self.limit_params.lock() {
+                limit_params.insert(index, DataType::Int64);
+            }
             return Ok(None);
         }
         // `1::SMALLINT` keeps its range-checked cast over the literal.

@@ -404,19 +404,7 @@ fn simplify_expr(expr: PlanExpr) -> PlanExpr {
     }
 }
 
-/// Fold constant expressions at plan time.
-///
-/// Covers:
-/// - `BinaryOp(Literal, Literal) → Literal` via [`eval_binary_op`].
-/// - `Cast(Literal, T) → Literal` via
-///   [`crate::analyzer::cast_scalar::cast_scalar`]. An invalid
-///   literal produces [`PlanError::InvalidLiteral`] so the query
-///   fails at plan time rather than mid-stream (e.g.,
-///   `DATE '1998-13-45'`).
-///
-/// Folding is idempotent: running it twice on the same expression
-/// yields the same result (the result is already a `Literal`).
-/// `expr = ANY (array)` once both operands are folded. A constant array (a
+/// Fold `expr = ANY (array)` once both operands are folded. A constant array (a
 /// bound parameter, `'{1,2}'::int[]`) becomes an IN list, which is evaluated
 /// without expanding the array per row and takes the IN-list pushdown paths;
 /// an empty one is a constant (false for `= ANY`, true for `<> ALL`, whatever
@@ -531,6 +519,18 @@ fn small_integer_cast(
     })
 }
 
+/// Fold constant expressions at plan time.
+///
+/// Covers:
+/// - `BinaryOp(Literal, Literal) → Literal` via [`eval_binary_op`].
+/// - `Cast(Literal, T) → Literal` via
+///   [`crate::analyzer::cast_scalar::cast_scalar`]. An invalid
+///   literal produces [`PlanError::InvalidLiteral`] so the query
+///   fails at plan time rather than mid-stream (e.g.,
+///   `DATE '1998-13-45'`).
+///
+/// Folding is idempotent: running it twice on the same expression
+/// yields the same result (the result is already a `Literal`).
 pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
     match expr {
         PlanExpr::BinaryOp {

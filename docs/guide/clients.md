@@ -15,7 +15,7 @@ SF1 Parquet, with the client versions pinned in
 | `trino-python-client` 0.340 (DB-API) | Trino | `SHOW CATALOGS`, `current_catalog` / `current_schema`, an upper-case table name |
 | SQLAlchemy 2.1 Trino dialect (Superset's path) | Trino | Inspector: schemas, tables, columns, keys, indexes, table comment; a reflected table queried with `GROUP BY` / `ORDER BY` / `LIMIT` |
 | dbt-trino 1.10 | Trino | `dbt debug`, `dbt test` (not-null, unique, relationships, accepted-values tests on sources and an ephemeral model), `dbt show`, `dbt docs generate` |
-| SQLAlchemy 2.1 postgresql dialect (psycopg2 and psycopg 3) | pgwire | Inspector: schemas, tables, `has_table`, views, columns, primary key, foreign keys, indexes, unique and check constraints (the last four empty, because Arneb has none); `Table(..., autoload_with=engine)` queried with `GROUP BY` / `ORDER BY` / `LIMIT`; no `pg_catalog` fallback answer is counted. Also checks that arrays needing quotes round-trip through psycopg 3 |
+| SQLAlchemy 2.1 postgresql dialect (psycopg2 and psycopg 3) | pgwire | Inspector: schemas, tables, `has_table`, views, columns, primary key, foreign keys, indexes, unique and check constraints (the last five empty, because Arneb has none); `Table(..., autoload_with=engine)` queried with `GROUP BY` / `ORDER BY` / `LIMIT`; no `pg_catalog` fallback answer is counted. Also checks that arrays needing quotes round-trip through psycopg 3 |
 | dbt-postgres 1.11 | pgwire | `dbt debug`, `dbt test`, `dbt show`, `dbt docs generate` (the same project as dbt-trino) |
 
 The same job checks the 22 TPC-H queries against DuckDB and runs 5 rounds of

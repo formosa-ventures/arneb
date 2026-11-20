@@ -1418,7 +1418,65 @@ pub(super) fn walk_plan_exprs(
             sql,
             plan: Box::new(walk_plan_exprs(*plan, f)),
         },
+        LogicalPlan::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => walk_project_set(*input, srfs, schema, f),
+        LogicalPlan::Window { input, functions } => walk_window(*input, functions, f),
+        LogicalPlan::AssignUniqueId { input, id_column } => LogicalPlan::AssignUniqueId {
+            input: Box::new(walk_plan_exprs(*input, f)),
+            id_column,
+        },
         other => other,
+    }
+}
+
+#[inline(never)]
+fn walk_project_set(
+    input: LogicalPlan,
+    srfs: Vec<(crate::plan::SrfKind, PlanExpr)>,
+    schema: Vec<ColumnInfo>,
+    f: &mut dyn FnMut(PlanExpr) -> PlanExpr,
+) -> LogicalPlan {
+    LogicalPlan::ProjectSet {
+        input: Box::new(walk_plan_exprs(input, f)),
+        srfs: srfs
+            .into_iter()
+            .map(|(kind, e)| (kind, walk_expr(e, f)))
+            .collect(),
+        schema,
+    }
+}
+
+#[inline(never)]
+fn walk_window(
+    input: LogicalPlan,
+    functions: Vec<crate::plan::WindowFunctionDef>,
+    f: &mut dyn FnMut(PlanExpr) -> PlanExpr,
+) -> LogicalPlan {
+    LogicalPlan::Window {
+        input: Box::new(walk_plan_exprs(input, f)),
+        functions: functions
+            .into_iter()
+            .map(|mut w| {
+                w.args = w.args.into_iter().map(|e| walk_expr(e, f)).collect();
+                w.partition_by = w
+                    .partition_by
+                    .into_iter()
+                    .map(|e| walk_expr(e, f))
+                    .collect();
+                w.order_by = w
+                    .order_by
+                    .into_iter()
+                    .map(|s| SortExpr {
+                        expr: walk_expr(s.expr, f),
+                        ..s
+                    })
+                    .collect();
+                w
+            })
+            .collect(),
     }
 }
 
@@ -2251,6 +2309,58 @@ mod tests {
             }],
         };
         let (_, ctx) = run_with_ctx(plan).unwrap();
+        assert_eq!(ctx.param_types.get(&1), Some(&DataType::Utf8));
+    }
+
+    #[test]
+    fn unresolved_parameter_below_project_set_and_window_is_defaulted() {
+        let schema = vec![ColumnInfo {
+            name: "a".into(),
+            data_type: DataType::Int32,
+            nullable: false,
+        }];
+        // A parameter among the SRF arguments, and one in a window argument
+        // below it: both must be reached by the default-type walk.
+        let window = LogicalPlan::Window {
+            input: Box::new(scan(schema.clone())),
+            functions: vec![crate::plan::WindowFunctionDef {
+                name: "SUM".into(),
+                args: vec![param(2)],
+                partition_by: vec![],
+                order_by: vec![],
+                rows_frame: false,
+                output_name: "s".into(),
+            }],
+        };
+        let plan = LogicalPlan::ProjectSet {
+            input: Box::new(window),
+            srfs: vec![(crate::plan::SrfKind::Unnest, param(1))],
+            schema: schema.clone(),
+        };
+        let walked = default_unresolved_parameters(plan, &mut AnalyzerContext::new());
+        let mut untyped = 0;
+        walk_plan_exprs(walked, &mut |e| {
+            if matches!(
+                e,
+                PlanExpr::Parameter {
+                    type_hint: None,
+                    ..
+                }
+            ) {
+                untyped += 1;
+            }
+            e
+        });
+        // The default pass records a type for each, so none is left untyped
+        // in the context either.
+        let mut ctx = AnalyzerContext::new();
+        let plan = LogicalPlan::ProjectSet {
+            input: Box::new(scan(schema.clone())),
+            srfs: vec![(crate::plan::SrfKind::Unnest, param(1))],
+            schema,
+        };
+        default_unresolved_parameters(plan, &mut ctx);
+        assert_eq!(untyped, 0);
         assert_eq!(ctx.param_types.get(&1), Some(&DataType::Utf8));
     }
 

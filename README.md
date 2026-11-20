@@ -8,6 +8,7 @@
 [![Dependency audit](https://img.shields.io/github/actions/workflow/status/formosa-ventures/arneb/deny.yml?branch=main&label=cargo-deny)](https://github.com/formosa-ventures/arneb/actions/workflows/deny.yml)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange?logo=rust)](https://arneb.io/guide/quickstart)
 [![TPC-H 22/22 vs Trino](https://img.shields.io/badge/TPC--H-22%2F22%20vs%20Trino-brightgreen)](#arneb-vs-trino--tpc-h-sf10)
+[![TPC-DS 103/103 vs Trino](https://img.shields.io/badge/TPC--DS-103%2F103%20vs%20Trino-brightgreen)](https://arneb.io/guide/performance#tpc-ds)
 [![SF10 vs Trino](https://img.shields.io/badge/SF10%20vs%20Trino-2.3%C3%97%20faster%20%C2%B7%200.14%C3%97%20memory-brightgreen)](https://arneb.io/guide/performance)
 [![Last commit](https://img.shields.io/github/last-commit/formosa-ventures/arneb)](https://github.com/formosa-ventures/arneb/commits/main)
 
@@ -165,6 +166,7 @@ claimed are in [benchmark methodology](#benchmark-methodology);
 - **Distributed Architecture**: Coordinator/Worker separation with Arrow Flight RPC; data-parallel scans, hash-partitioned joins, semi/anti joins and final aggregates, and key-set filters published from the small side of a large semi/anti join to the scans on the big side
 - **Web UI**: Dashboard with query monitoring, cluster overview, and worker status
 - **TPC-H Benchmark**: 22/22 queries cell-identical to Trino, ~7× lower peak memory and faster on all 22 at SF10 (and on all 22 at SF30 cold), with a one-command benchmark harness and comparison tooling
+- **TPC-DS**: all 103 queries (Trino 484's form of the 99) run as written and are cell-identical to Trino at SF1; `scripts/trino-diff.sh --suite tpcds` checks them — see [Performance → TPC-DS](docs/guide/performance.md#tpc-ds)
 
 ## Releases
 

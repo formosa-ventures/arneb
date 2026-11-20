@@ -170,6 +170,32 @@ Every one of these is on by default, with an `ARNEB_*` variable to switch it
 off for A/B comparisons; see
 [Query Engine Levers](/guide/configuration#query-engine-levers).
 
+## TPC-DS
+
+Arneb runs all 103 TPC-DS query files (Trino 484's form of the 99 queries,
+with the `a`/`b` variants) as written, and every result is identical to
+Trino's cell by cell at SF1. The queries are in
+[`benchmarks/tpcds/queries`](https://github.com/formosa-ventures/arneb/tree/main/benchmarks/tpcds/queries)
+and the Hive config is `benchmarks/tpcds/tpcds-hive.toml`.
+
+On the local bench (a coordinator plus two workers, 2 CPUs each, cold), all
+103 used less time and memory than Trino when this landed in
+[#224](https://github.com/formosa-ventures/arneb/pull/224): the worst latency
+ratio was 0.30 (q64) and the worst memory ratio 0.38 (q11), Arneb ÷ Trino.
+That is SF1 on one host and one run, so treat it as a correctness milestone
+with a performance sanity check, not a benchmark result like the TPC-H tables
+above.
+
+Check correctness against a running Trino with:
+
+```bash
+scripts/trino-diff.sh --suite tpcds
+```
+
+It diffs every query with a float tolerance, tells NULL from an empty string,
+and classifies each failure (parse, plan, exec, memory, timeout, crash,
+trino-err). `--suite tpch` does the same for the 22 TPC-H queries.
+
 ## Limits
 
 - One host and one run per protocol per query for each table. Repeated SF10

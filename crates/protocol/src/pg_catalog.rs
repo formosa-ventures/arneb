@@ -185,6 +185,10 @@ const TABLES: &[(&str, &[&str])] = &[
     ),
     ("pg_collation", &["oid#", "collname", "collnamespace#"]),
     ("pg_opclass", &["oid#", "opcname", "opcdefault?"]),
+    (
+        "pg_inherits",
+        &["inhrelid#", "inhparent#", "inhseqno#", "inhdetachpending?"],
+    ),
 ];
 
 /// Whether `sql` reads one of the provided `pg_catalog` tables.
@@ -459,6 +463,7 @@ async fn build(
         ("pg_sequence", table("pg_sequence")),
         ("pg_collation", table("pg_collation")),
         ("pg_opclass", table("pg_opclass")),
+        ("pg_inherits", table("pg_inherits")),
     ] {
         pg_schema.register_table(name, table.into_memory_table());
     }

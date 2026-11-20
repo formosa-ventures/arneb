@@ -351,3 +351,24 @@ async fn serial_sequence_chain_plans() {
     assert!(r.iter().all(|row| row[1].is_none()));
     assert_eq!(fallbacks(), before);
 }
+
+/// A binary `i64` parameter over a pg_catalog table: the binary decoding
+/// infers its type over the same catalog Describe plans against, so the
+/// oid is read as an int and not as text.
+#[tokio::test]
+async fn binary_oid_parameter_over_pg_class() {
+    let before = fallbacks();
+    let client = connect(pg_server(None).await).await;
+    let oid = one(&client, "SELECT oid FROM pg_class WHERE relname = 'nation'").await[0]
+        .clone()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    let rows = client
+        .query("SELECT relname FROM pg_class WHERE oid = $1", &[&oid])
+        .await
+        .unwrap();
+    let names: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(names, ["nation"]);
+    assert_eq!(fallbacks(), before);
+}

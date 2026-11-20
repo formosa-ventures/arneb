@@ -718,12 +718,16 @@ async fn infer_binary_param_types(
     }
     // Boxed: the planner future is large, and an unboxed one would sit in
     // the stack frame of every Bind/Execute that awaits this function.
-    match Box::pin(plan_for_describe(
-        &portal.statement.statement,
-        catalog_manager,
-    ))
-    .await
-    {
+    // A pg_catalog statement is planned over its catalog tables, exactly as
+    // Describe does, so its parameters infer the same types.
+    let sql = &portal.statement.statement;
+    let planned = if crate::pg_catalog::references_pg_catalog(sql) {
+        let (pg_catalog, _) = crate::pg_catalog::catalog_for(sql, catalog_manager).await;
+        Box::pin(plan_for_describe(sql, &pg_catalog)).await
+    } else {
+        Box::pin(plan_for_describe(sql, catalog_manager)).await
+    };
+    match planned {
         Ok((_, types)) => types
             .iter()
             .filter(|(index, _)| undeclared_binary.contains(index))

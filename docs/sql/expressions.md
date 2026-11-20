@@ -229,8 +229,8 @@ FROM customer;
 
 - The subquery must have at least one equality correlation
   (`inner_col = outer_col`); it is planned as a left join on those keys, so
-  an outer row with no match gets `NULL` (`count(*)` included, as in a
-  plain scalar subquery without a `GROUP BY`).
+  an unmatched row gets `NULL`; an aggregate subquery gets its empty-set
+  value (`count(*)` → 0), as in PostgreSQL.
 - A subquery that yields more than one row for an outer row fails with
   `more than one row returned by a subquery used as an expression`, but
   only for rows where the expression is evaluated: a `CASE` branch that is not

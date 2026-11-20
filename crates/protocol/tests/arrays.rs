@@ -951,3 +951,33 @@ async fn limit_accepts_a_bound_parameter_with_a_cast() {
         "{err:?}"
     );
 }
+
+/// A typed parameter below a `ProjectSet`: the analyzer walks through the
+/// SRF node, so `$1` is typed int8 and the binary value decodes.
+#[tokio::test]
+async fn parameter_below_project_set() {
+    let client = connect(pg_server().await).await;
+    let rows = client
+        .query(
+            "SELECT unnest(ARRAY[CAST(x AS VARCHAR), 'z']) FROM t WHERE x = $1",
+            &[&2i64],
+        )
+        .await
+        .unwrap();
+    let got: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(got, ["2", "z"]);
+}
+
+/// A `$N` in LIMIT is reported as int8 at Describe, so tokio-postgres
+/// encodes an `i64` in binary.
+#[tokio::test]
+async fn limit_parameter_is_int8() {
+    let client = connect(pg_server().await).await;
+    let stmt = client
+        .prepare("SELECT x FROM t ORDER BY x LIMIT $1")
+        .await
+        .unwrap();
+    assert_eq!(stmt.params(), [tokio_postgres::types::Type::INT8]);
+    let rows = client.query(&stmt, &[&2i64]).await.unwrap();
+    assert_eq!(rows.len(), 2);
+}

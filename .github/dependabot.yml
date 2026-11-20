@@ -1,43 +1,42 @@
 version: 2
 
+# Every dependency update lands in ONE pull request a month. Dependabot keeps
+# that PR up to date: when a newer version turns up before it is merged, the
+# next run refreshes the same PR instead of opening another one. Major
+# updates are included, so the PR can need code changes before it compiles;
+# fix them on the PR branch, or add an `ignore` entry below to hold one back.
+# Security updates are not affected by this and still open on their own.
+multi-ecosystem-groups:
+  all-dependencies:
+    schedule:
+      interval: monthly
+
 updates:
   - package-ecosystem: cargo
     directory: /
-    schedule:
-      interval: weekly
-      day: monday
-    groups:
-      minor-and-patch:
-        update-types:
-          - minor
-          - patch
+    patterns: ["*"]
+    multi-ecosystem-group: all-dependencies
 
   - package-ecosystem: github-actions
     directory: /
-    schedule:
-      interval: weekly
-      day: monday
-    groups:
-      actions:
-        update-types:
-          - minor
-          - patch
+    patterns: ["*"]
+    multi-ecosystem-group: all-dependencies
 
   # Image tags in docker-compose.yml. Dependabot ignores floating tags, so
-  # this only works because the Trino services are pinned (483 at the time
-  # of writing). A Trino bump changes the bench baseline and the seed
-  # layout, so merge it together with a re-seed and a fresh bench run.
+  # this only works for pinned tags. Trino is held back: a Trino bump changes
+  # the bench baseline and the seed layout, so it is done by hand together
+  # with a re-seed and a fresh bench run.
   - package-ecosystem: docker-compose
     directory: /
-    schedule:
-      interval: weekly
-      day: monday
+    patterns: ["*"]
+    multi-ecosystem-group: all-dependencies
+    ignore:
+      - dependency-name: trinodb/trino
 
   # Base images of the two Dockerfiles (rust, debian, apache/hive).
   - package-ecosystem: docker
     directories:
       - /docker/arneb-bench
       - /docker/hive-metastore
-    schedule:
-      interval: weekly
-      day: monday
+    patterns: ["*"]
+    multi-ecosystem-group: all-dependencies

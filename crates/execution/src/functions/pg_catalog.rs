@@ -1,8 +1,13 @@
 //! PostgreSQL system catalog functions that pgwire clients call while
 //! reading `pg_catalog` (pg-catalog-tables): `format_type`,
 //! `pg_get_userbyid`, `pg_table_is_visible`, `pg_is_other_temp_schema`,
-//! `obj_description`, `col_description` and `to_regtype`.
+//! `obj_description`, `col_description` and `to_regtype`; the constraint,
+//! index, default and sequence definition functions SQLAlchemy reflection
+//! calls (Arneb has none of those objects, so they return NULL); and the
+//! runtime `regclass` conversions the planner emits (`__regclass_name`,
+//! `__regclass_oid`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arneb_common::error::ExecutionError;
@@ -11,7 +16,7 @@ use arneb_common::types::DataType;
 use arrow::array::{new_null_array, Array, ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::DataType as ArrowDataType;
 
-use super::args::{check_arity, int64, utf8};
+use super::args::{check_arity, int64, invalid, utf8};
 use super::registry::ScalarFunction;
 
 pub(crate) fn all_pg_catalog_functions() -> Vec<Arc<dyn ScalarFunction>> {
@@ -35,6 +40,32 @@ pub(crate) fn all_pg_catalog_functions() -> Vec<Arc<dyn ScalarFunction>> {
             name: "COL_DESCRIPTION",
             min_args: 2,
         }),
+        Arc::new(NullTextFunction {
+            name: "PG_GET_CONSTRAINTDEF",
+            min_args: 1,
+            max_args: 2,
+        }),
+        Arc::new(NullTextFunction {
+            name: "PG_GET_EXPR",
+            min_args: 2,
+            max_args: 3,
+        }),
+        Arc::new(NullTextFunction {
+            name: "PG_GET_INDEXDEF",
+            min_args: 1,
+            max_args: 3,
+        }),
+        Arc::new(NullTextFunction {
+            name: "PG_GET_SERIAL_SEQUENCE",
+            min_args: 2,
+            max_args: 2,
+        }),
+        Arc::new(ConstantBoolFunction {
+            name: "PG_COLLATION_IS_VISIBLE",
+            value: true,
+        }),
+        Arc::new(RegclassName),
+        Arc::new(RegclassOid),
     ]
 }
 
@@ -164,6 +195,170 @@ impl ScalarFunction for NoDescriptionFunction {
     }
 }
 
+/// A definition function (`pg_get_constraintdef`, `pg_get_expr`,
+/// `pg_get_indexdef`, `pg_get_serial_sequence`): Arneb has no constraints,
+/// defaults, indexes or sequences, so the answer is always NULL.
+#[derive(Debug)]
+struct NullTextFunction {
+    name: &'static str,
+    min_args: usize,
+    max_args: usize,
+}
+
+impl ScalarFunction for NullTextFunction {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Utf8)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        check_arity(self.name, args, self.min_args, self.max_args)?;
+        Ok(new_null_array(&ArrowDataType::Utf8, args[0].len()))
+    }
+}
+
+/// The relations a `regclass` conversion sees: its session catalog and
+/// default schema, and the `(schema, table)` of every relation the
+/// statement's catalog lists. The planner passes them as the last three
+/// arguments (literals), the way session defaults reach a function.
+struct RegclassScope {
+    catalog: String,
+    default_schema: String,
+    /// Oid to `(schema, table)`; PostgreSQL's own system relations are
+    /// always there.
+    relations: HashMap<i64, (String, String)>,
+}
+
+impl RegclassScope {
+    fn from_args(name: &str, args: &[ArrayRef]) -> Result<Option<Self>, ExecutionError> {
+        check_arity(name, args, 4, 4)?;
+        if args[0].is_empty() {
+            return Ok(None);
+        }
+        let text = |i: usize| -> Result<String, ExecutionError> {
+            let a = utf8(&args[i], name)?;
+            Ok(if a.is_null(0) {
+                String::new()
+            } else {
+                a.value(0).to_string()
+            })
+        };
+        let (catalog, default_schema, list) = (text(1)?, text(2)?, text(3)?);
+        let mut relations = HashMap::new();
+        for entry in list
+            .split(pg_oid::RELATION_ENTRY_SEP)
+            .filter(|e| !e.is_empty())
+        {
+            if let Some((schema, table)) = entry.split_once(pg_oid::RELATION_FIELD_SEP) {
+                relations.insert(
+                    pg_oid::relation_oid(&catalog, schema, table),
+                    (schema.to_string(), table.to_string()),
+                );
+            }
+        }
+        for (table, oid) in pg_oid::SYSTEM_RELATIONS {
+            relations
+                .entry(*oid)
+                .or_insert_with(|| (pg_oid::PG_CATALOG.to_string(), table.to_string()));
+        }
+        Ok(Some(Self {
+            catalog,
+            default_schema,
+            relations,
+        }))
+    }
+
+    /// PostgreSQL's `regclassout`: the name, qualified unless the schema is
+    /// the default one or `pg_catalog`.
+    fn name_of(&self, oid: i64) -> String {
+        match self.relations.get(&oid) {
+            Some((schema, table))
+                if *schema == self.default_schema || schema == pg_oid::PG_CATALOG =>
+            {
+                quote_ident(table)
+            }
+            Some((schema, table)) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
+            None => oid.to_string(),
+        }
+    }
+}
+
+/// `ident`, double-quoted when PostgreSQL would quote it.
+fn quote_ident(ident: &str) -> String {
+    let plain = ident
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && ident
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$');
+    if plain {
+        ident.to_string()
+    } else {
+        format!("\"{}\"", ident.replace('"', "\"\""))
+    }
+}
+
+/// `__regclass_name(oid, catalog, default_schema, relations)`: what
+/// `CAST(<regclass> AS TEXT)` plans to. The relation's name, or the number
+/// for an oid the catalog does not list.
+#[derive(Debug)]
+struct RegclassName;
+
+impl ScalarFunction for RegclassName {
+    fn name(&self) -> &str {
+        "__REGCLASS_NAME"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Utf8)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        let Some(scope) = RegclassScope::from_args("__REGCLASS_NAME", args)? else {
+            return Ok(new_null_array(&ArrowDataType::Utf8, 0));
+        };
+        let oids = int64(&args[0], "__REGCLASS_NAME")?;
+        let result: StringArray = oids.iter().map(|o| o.map(|o| scope.name_of(o))).collect();
+        Ok(Arc::new(result))
+    }
+}
+
+/// `__regclass_oid(name, catalog, default_schema, relations)`: what
+/// `CAST(<text> AS REGCLASS)` plans to. NULL gives NULL; a name no relation
+/// of the catalog has fails as PostgreSQL does.
+#[derive(Debug)]
+struct RegclassOid;
+
+impl ScalarFunction for RegclassOid {
+    fn name(&self) -> &str {
+        "__REGCLASS_OID"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Int64)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        let Some(scope) = RegclassScope::from_args("__REGCLASS_OID", args)? else {
+            return Ok(new_null_array(&ArrowDataType::Int64, 0));
+        };
+        let names = utf8(&args[0], "__REGCLASS_OID")?;
+        let mut out = Vec::with_capacity(names.len());
+        for name in names.iter() {
+            out.push(match name {
+                None => None,
+                Some(name) => {
+                    let oid = pg_oid::regclass_oid(name, &scope.catalog, &scope.default_schema)
+                        .ok_or_else(|| invalid(format!("invalid name syntax: \"{name}\"")))?;
+                    if !scope.relations.contains_key(&oid) {
+                        return Err(invalid(format!("relation \"{name}\" does not exist")));
+                    }
+                    Some(oid)
+                }
+            });
+        }
+        Ok(Arc::new(Int64Array::from(out)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +421,64 @@ mod tests {
         .evaluate(&[ints(&[Some(1)]), ints(&[Some(1)])])
         .unwrap();
         assert_eq!(none.null_count(), 1);
+    }
+
+    fn scope_args(first: ArrayRef) -> Vec<ArrayRef> {
+        let n = first.len();
+        let col = |v: &str| -> ArrayRef { Arc::new(StringArray::from(vec![v; n])) };
+        let relations = format!(
+            "default{f}nation{e}staging{f}Raw Data{e}pg_catalog{f}pg_class",
+            f = pg_oid::RELATION_FIELD_SEP,
+            e = pg_oid::RELATION_ENTRY_SEP
+        );
+        vec![first, col("file"), col("default"), col(&relations)]
+    }
+
+    #[test]
+    fn regclass_names_and_oids_round_trip() {
+        let nation = pg_oid::relation_oid("file", "default", "nation");
+        let raw = pg_oid::relation_oid("file", "staging", "Raw Data");
+        let out = RegclassName
+            .evaluate(&scope_args(ints(&[
+                Some(nation),
+                Some(raw),
+                Some(1259),
+                Some(7),
+                None,
+            ])))
+            .unwrap();
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(out.value(0), "nation");
+        assert_eq!(out.value(1), "staging.\"Raw Data\"");
+        assert_eq!(out.value(2), "pg_class");
+        assert_eq!(out.value(3), "7");
+        assert!(out.is_null(4));
+
+        let names: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("nation"),
+            None,
+            Some("pg_type"),
+        ]));
+        let out = RegclassOid.evaluate(&scope_args(names)).unwrap();
+        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(out.value(0), nation);
+        assert!(out.is_null(1));
+        assert_eq!(out.value(2), 1247);
+
+        let missing: ArrayRef = Arc::new(StringArray::from(vec!["nope"]));
+        let err = RegclassOid.evaluate(&scope_args(missing)).unwrap_err();
+        assert!(err.to_string().contains("relation \"nope\" does not exist"));
+    }
+
+    #[test]
+    fn definition_functions_are_null() {
+        let out = NullTextFunction {
+            name: "PG_GET_CONSTRAINTDEF",
+            min_args: 1,
+            max_args: 2,
+        }
+        .evaluate(&[ints(&[Some(1), Some(2)])])
+        .unwrap();
+        assert_eq!(out.null_count(), 2);
     }
 }

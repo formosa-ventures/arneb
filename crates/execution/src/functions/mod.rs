@@ -3,6 +3,7 @@
 mod args;
 mod conditional;
 mod date;
+mod json;
 mod math;
 mod pg_catalog;
 mod regexp;

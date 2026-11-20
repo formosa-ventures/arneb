@@ -202,6 +202,18 @@ pub enum PlanExpr {
         #[serde(skip)]
         span: Option<Span>,
     },
+    /// `ARRAY[e1, e2, ...]`. Type coercion casts every element to
+    /// `element_type`, the common supertype of the elements.
+    Array {
+        /// The element expressions.
+        elements: Vec<PlanExpr>,
+        /// Type of every element after coercion. `Null` until the type
+        /// coercion pass fills it in.
+        element_type: DataType,
+        /// Source span, if derived from user SQL.
+        #[serde(skip)]
+        span: Option<Span>,
+    },
     /// Extended-query-protocol placeholder (`$1`, `$2`, …).
     ///
     /// The analyzer's type-coercion pass walks surrounding operators
@@ -241,6 +253,7 @@ impl PlanExpr {
             | PlanExpr::Cast { span, .. }
             | PlanExpr::ScalarSubquery { span, .. }
             | PlanExpr::CaseExpr { span, .. }
+            | PlanExpr::Array { span, .. }
             | PlanExpr::Parameter { span, .. } => *span,
             PlanExpr::Wildcard => None,
         }
@@ -273,6 +286,7 @@ impl PlanExpr {
             PlanExpr::InList { expr, list, .. } => expr
                 .best_span()
                 .or_else(|| list.iter().find_map(|e| e.best_span())),
+            PlanExpr::Array { elements, .. } => elements.iter().find_map(|e| e.best_span()),
             PlanExpr::CaseExpr {
                 operand,
                 when_clauses,
@@ -1037,6 +1051,16 @@ impl fmt::Display for PlanExpr {
                     write!(f, " ELSE {el}")?;
                 }
                 write!(f, " END")
+            }
+            PlanExpr::Array { elements, .. } => {
+                write!(f, "ARRAY[")?;
+                for (i, e) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                write!(f, "]")
             }
             PlanExpr::Parameter {
                 index, type_hint, ..

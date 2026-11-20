@@ -775,6 +775,14 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 span,
             })
         }
+        sp::Expr::Array(arr) => {
+            let elements = arr
+                .elem
+                .into_iter()
+                .map(convert_expr)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ast::Expr::Array { elements, span })
+        }
         sp::Expr::Case {
             operand,
             conditions,

@@ -3187,6 +3187,11 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
                 collect_column_indices(e, cb);
             }
         }
+        PlanExpr::Array { elements, .. } => {
+            for e in elements {
+                collect_column_indices(e, cb);
+            }
+        }
         PlanExpr::Between {
             expr, low, high, ..
         } => {
@@ -3290,6 +3295,18 @@ fn remap_column_indices(
                 .map(|e| remap_column_indices(e, remap))
                 .collect(),
             negated,
+            span,
+        },
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements
+                .into_iter()
+                .map(|e| remap_column_indices(e, remap))
+                .collect(),
+            element_type,
             span,
         },
         PlanExpr::Between {

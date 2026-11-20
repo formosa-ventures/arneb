@@ -897,6 +897,18 @@ where
             negated: *negated,
             span: None,
         },
+        PlanExpr::Array {
+            elements,
+            element_type,
+            ..
+        } => PlanExpr::Array {
+            elements: elements
+                .iter()
+                .map(|item| remap_expr_columns(item, f))
+                .collect::<Option<Vec<_>>>()?,
+            element_type: element_type.clone(),
+            span: None,
+        },
         PlanExpr::Between {
             expr,
             negated,
@@ -1186,6 +1198,18 @@ fn shift_column_indices(expr: PlanExpr, offset: usize) -> PlanExpr {
             negated,
             span,
         },
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements
+                .into_iter()
+                .map(|item| shift_column_indices(item, offset))
+                .collect(),
+            element_type,
+            span,
+        },
         PlanExpr::Between {
             expr,
             negated,
@@ -1471,6 +1495,11 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
         PlanExpr::InList { expr, list, .. } => {
             collect_column_indices(expr, cb);
             for item in list {
+                collect_column_indices(item, cb);
+            }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
                 collect_column_indices(item, cb);
             }
         }

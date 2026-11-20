@@ -1062,6 +1062,21 @@ mod tests {
     // -- CASE / COALESCE / NULLIF tests --
 
     #[test]
+    fn parse_array_constructor() {
+        let stmt = parse("SELECT ARRAY[1, x + 1, NULL] FROM t").unwrap();
+        let Statement::Query { query, .. } = stmt else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(e @ Expr::Array { elements, .. }) => {
+                assert_eq!(elements.len(), 3);
+                assert_eq!(e.to_string(), "ARRAY[1, x + 1, NULL]");
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_searched_case() {
         let stmt = parse("SELECT CASE WHEN x > 1 THEN 'a' WHEN x > 2 THEN 'b' ELSE 'c' END FROM t")
             .unwrap();

@@ -1090,6 +1090,11 @@ fn visit_column_pairs<F: FnMut(&str, usize)>(expr: &PlanExpr, callback: &mut F) 
                 visit_column_pairs(item, callback);
             }
         }
+        E::Array { elements, .. } => {
+            for item in elements {
+                visit_column_pairs(item, callback);
+            }
+        }
         E::Function { args, .. } => {
             for a in args {
                 visit_column_pairs(a, callback);
@@ -1325,6 +1330,11 @@ fn visit_column_names<F: FnMut(&str)>(expr: &PlanExpr, callback: &mut F) {
                 visit_column_names(item, callback);
             }
         }
+        E::Array { elements, .. } => {
+            for item in elements {
+                visit_column_names(item, callback);
+            }
+        }
         E::Function { args, .. } => {
             for a in args {
                 visit_column_names(a, callback);
@@ -1438,6 +1448,18 @@ fn rewrite_expr(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<PlanExpr> {
                 .map(|e| rewrite_expr(e, schema))
                 .collect::<Option<Vec<_>>>()?,
             negated: *negated,
+            span: *span,
+        },
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements
+                .iter()
+                .map(|e| rewrite_expr(e, schema))
+                .collect::<Option<Vec<_>>>()?,
+            element_type: element_type.clone(),
             span: *span,
         },
         E::Cast {

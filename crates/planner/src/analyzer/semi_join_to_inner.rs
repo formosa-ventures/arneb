@@ -443,6 +443,18 @@ fn shift_columns(expr: PlanExpr, delta: usize) -> PlanExpr {
             negated,
             span,
         },
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements
+                .into_iter()
+                .map(|e| shift_columns(e, delta))
+                .collect(),
+            element_type,
+            span,
+        },
         E::Cast {
             expr,
             data_type,

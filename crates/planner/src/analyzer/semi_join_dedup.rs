@@ -363,6 +363,11 @@ fn collect_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
                 collect_indices(e, cb);
             }
         }
+        PlanExpr::Array { elements, .. } => {
+            for e in elements {
+                collect_indices(e, cb);
+            }
+        }
         PlanExpr::Between {
             expr, low, high, ..
         } => {
@@ -471,6 +476,15 @@ fn walk_remap(expr: PlanExpr, f: &dyn Fn(usize) -> Option<usize>) -> PlanExpr {
             expr: Box::new(walk_remap(*expr, f)),
             list: list.into_iter().map(|e| walk_remap(e, f)).collect(),
             negated,
+            span,
+        },
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements.into_iter().map(|e| walk_remap(e, f)).collect(),
+            element_type,
             span,
         },
         PlanExpr::Between {

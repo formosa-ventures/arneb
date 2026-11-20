@@ -655,6 +655,18 @@ where
             negated,
             span,
         },
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements
+                .into_iter()
+                .map(|a| rewrite_expr(a, f))
+                .collect::<Option<Vec<_>>>()?,
+            element_type,
+            span,
+        },
         E::Cast {
             expr,
             data_type,

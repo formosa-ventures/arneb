@@ -898,6 +898,11 @@ fn collect_columns(expr: &PlanExpr, out: &mut BTreeSet<usize>) {
                 collect_columns(item, out);
             }
         }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_columns(item, out);
+            }
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -990,6 +995,15 @@ fn rewrite_expr(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> PlanExpr {
             expr: Box::new(rewrite_expr(expr, mapping)),
             list: list.iter().map(|e| rewrite_expr(e, mapping)).collect(),
             negated: *negated,
+            span: *span,
+        },
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements.iter().map(|e| rewrite_expr(e, mapping)).collect(),
+            element_type: element_type.clone(),
             span: *span,
         },
         PlanExpr::Cast {

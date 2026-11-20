@@ -833,6 +833,18 @@ fn remap_expr_for_swapped_join(
             negated,
             span,
         },
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements
+                .into_iter()
+                .map(|item| remap_expr_for_swapped_join(item, old_left_width, old_right_width))
+                .collect(),
+            element_type,
+            span,
+        },
         PlanExpr::Cast {
             expr,
             data_type,

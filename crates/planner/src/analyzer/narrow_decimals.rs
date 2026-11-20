@@ -584,6 +584,11 @@ fn collect_decimal64_columns_needing_wide(
                 collect_decimal64_column_refs(item, schema, used);
             }
         }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_decimal64_column_refs(item, schema, used);
+            }
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -642,6 +647,11 @@ fn collect_decimal64_column_refs(
         PlanExpr::InList { expr, list, .. } => {
             collect_decimal64_column_refs(expr, schema, used);
             for item in list {
+                collect_decimal64_column_refs(item, schema, used);
+            }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
                 collect_decimal64_column_refs(item, schema, used);
             }
         }
@@ -722,6 +732,11 @@ fn block_expr_sources(expr: &PlanExpr, input: &LogicalPlan, blocked: &mut HashSe
                 block_expr_sources(item, input, blocked);
             }
         }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                block_expr_sources(item, input, blocked);
+            }
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -770,6 +785,11 @@ fn collect_expr_subquery_blocks(expr: &PlanExpr, blocked: &mut HashSet<ColumnSou
         PlanExpr::InList { expr, list, .. } => {
             collect_expr_subquery_blocks(expr, blocked);
             for item in list {
+                collect_expr_subquery_blocks(item, blocked);
+            }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
                 collect_expr_subquery_blocks(item, blocked);
             }
         }
@@ -837,6 +857,11 @@ fn block_expr_sources_joined(
         PlanExpr::InList { expr, list, .. } => {
             block_expr_sources_joined(expr, left, right, blocked);
             for item in list {
+                block_expr_sources_joined(item, left, right, blocked);
+            }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
                 block_expr_sources_joined(item, left, right, blocked);
             }
         }

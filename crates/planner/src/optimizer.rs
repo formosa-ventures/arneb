@@ -538,6 +538,43 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
                 span,
             })
         }
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => {
+            let elements = elements
+                .into_iter()
+                .map(fold_constants)
+                .collect::<Result<Vec<_>, _>>()?;
+            // Fold to a list literal once type coercion has fixed the
+            // element type and every element is a literal.
+            if element_type != DataType::Null
+                && elements
+                    .iter()
+                    .all(|e| matches!(e, PlanExpr::Literal { .. }))
+            {
+                let values = elements
+                    .iter()
+                    .filter_map(|e| match e {
+                        PlanExpr::Literal { value, .. } => Some(value.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                return Ok(PlanExpr::Literal {
+                    value: ScalarValue::List {
+                        element: Box::new(element_type),
+                        values,
+                    },
+                    span,
+                });
+            }
+            Ok(PlanExpr::Array {
+                elements,
+                element_type,
+                span,
+            })
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,

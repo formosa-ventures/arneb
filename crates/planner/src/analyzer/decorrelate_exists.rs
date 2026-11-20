@@ -524,6 +524,15 @@ where
             negated,
             span,
         },
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements.into_iter().map(|e| walk_columns(e, f)).collect(),
+            element_type,
+            span,
+        },
         E::Cast {
             expr,
             data_type,

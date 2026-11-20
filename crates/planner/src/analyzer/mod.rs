@@ -214,6 +214,20 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
             }
             acc
         }
+        PlanExpr::Array { elements, .. } => {
+            // Computed from the elements rather than the (post-coercion)
+            // `element_type` field so it is right before coercion too.
+            let types = elements
+                .iter()
+                .map(|e| plan_expr_type(e, schema))
+                .collect::<Option<Vec<_>>>()?;
+            let element = match variadic_supertype(&types)? {
+                // `ARRAY[NULL]` is text[] in PostgreSQL.
+                DataType::Null => DataType::Utf8,
+                t => t,
+            };
+            Some(DataType::List(Box::new(element)))
+        }
         PlanExpr::Parameter { type_hint, .. } => type_hint.clone(),
         PlanExpr::ScalarSubquery { subplan, .. } => {
             subplan.schema().first().map(|col| col.data_type.clone())

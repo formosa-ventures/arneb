@@ -1795,6 +1795,18 @@ where
             negated: *negated,
             span: *span,
         },
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements
+                .iter()
+                .map(|e| rewrite_expr(e, remap))
+                .collect::<Option<Vec<_>>>()?,
+            element_type: element_type.clone(),
+            span: *span,
+        },
         E::Cast {
             expr,
             data_type,

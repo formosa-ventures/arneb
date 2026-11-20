@@ -795,6 +795,11 @@ where
                 visit_columns(item, callback);
             }
         }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                visit_columns(item, callback);
+            }
+        }
         PlanExpr::Function { args, .. } => {
             for a in args {
                 visit_columns(a, callback);

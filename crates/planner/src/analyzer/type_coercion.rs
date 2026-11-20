@@ -486,6 +486,13 @@ fn coerce_expr(
                 span,
             })
         }
+        PlanExpr::Array { elements, span, .. } => {
+            let elements = elements
+                .into_iter()
+                .map(|e| coerce_expr(e, schema, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            unify_array(elements, schema, span)
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -771,6 +778,56 @@ fn unify_in_list(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok((maybe_cast(expr, &et, &target, expr_lit, location)?, list))
+}
+
+/// Casts every element of an `ARRAY[...]` to the common supertype of the
+/// elements (the `CASE` branch rules), and records it as `element_type`.
+fn unify_array(
+    elements: Vec<PlanExpr>,
+    schema: &[ColumnInfo],
+    span: Option<arneb_sql_parser::Span>,
+) -> Result<PlanExpr, PlanError> {
+    let location = span.map(|s| s.start);
+    let types: Vec<Option<DataType>> = elements.iter().map(|e| plan_expr_type(e, schema)).collect();
+    let mut target: Option<DataType> = None;
+    for (t, e) in types.iter().zip(&elements) {
+        let Some(t) = t else { continue };
+        if *t == DataType::Null {
+            continue;
+        }
+        target = Some(match target {
+            None => t.clone(),
+            Some(acc) => {
+                let site = CoercionSite::CaseBranch {
+                    left_is_literal: false,
+                    right_is_literal: is_literal_like(e),
+                };
+                common_supertype(&acc, t, site).ok_or_else(|| PlanError::TypeMismatch {
+                    expected: acc.clone(),
+                    found: t.clone(),
+                    location,
+                })?
+            }
+        });
+    }
+    // `ARRAY[NULL]` is text[] in PostgreSQL.
+    let element_type = target.unwrap_or(DataType::Utf8);
+    let elements = elements
+        .into_iter()
+        .zip(types)
+        .map(|(e, t)| match t {
+            Some(t) if t != element_type => {
+                let lit = is_literal_like(&e);
+                maybe_cast(e, &t, &element_type, lit, location)
+            }
+            _ => Ok(e),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PlanExpr::Array {
+        elements,
+        element_type,
+        span,
+    })
 }
 
 #[allow(clippy::type_complexity)]
@@ -1278,6 +1335,15 @@ pub(super) fn walk_expr(expr: PlanExpr, f: &mut dyn FnMut(PlanExpr) -> PlanExpr)
             expr: Box::new(walk_expr(*expr, f)),
             list: list.into_iter().map(|e| walk_expr(e, f)).collect(),
             negated,
+            span,
+        },
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements.into_iter().map(|e| walk_expr(e, f)).collect(),
+            element_type,
             span,
         },
         PlanExpr::Cast {

@@ -74,6 +74,18 @@ pub(crate) fn evaluate(
 
         PlanExpr::Literal { value, .. } => scalar_to_array(value, batch.num_rows()),
 
+        PlanExpr::Array {
+            elements,
+            element_type,
+            ..
+        } => {
+            let arrays = elements
+                .iter()
+                .map(|e| evaluate(e, batch, registry))
+                .collect::<Result<Vec<_>, _>>()?;
+            build_list_array(arrays, element_type, batch.num_rows())
+        }
+
         PlanExpr::BinaryOp {
             left, op, right, ..
         } => {
@@ -445,6 +457,16 @@ pub(crate) fn scalar_to_array(
     num_rows: usize,
 ) -> Result<ArrayRef, ExecutionError> {
     match value {
+        ScalarValue::List { element, values } => {
+            let elem_type: ArrowDataType = element.as_ref().clone().into();
+            let values_array = crate::operator::scalars_to_array(values, &elem_type)?;
+            let one = list_from_values(values_array, &elem_type, &[values.len()])?;
+            if num_rows == 1 {
+                return Ok(one);
+            }
+            let indices = arrow::array::UInt32Array::from(vec![0u32; num_rows]);
+            arrow::compute::take(one.as_ref(), &indices, None).map_err(ExecutionError::from)
+        }
         ScalarValue::Null => Ok(Arc::new(NullArray::new(num_rows))),
         ScalarValue::Boolean(v) => Ok(Arc::new(BooleanArray::from(vec![*v; num_rows]))),
         ScalarValue::Int32(v) => Ok(Arc::new(Int32Array::from(vec![*v; num_rows]))),
@@ -505,6 +527,57 @@ pub(crate) fn scalar_to_array(
             "unsupported scalar type for array conversion".to_string(),
         )),
     }
+}
+
+/// Wraps `values` (the concatenated elements) in a `ListArray` whose rows
+/// have the given lengths.
+fn list_from_values(
+    values: ArrayRef,
+    elem_type: &ArrowDataType,
+    lengths: &[usize],
+) -> Result<ArrayRef, ExecutionError> {
+    // Same field shape as `DataType::List` converts to.
+    let field = Arc::new(arrow::datatypes::Field::new(
+        "item",
+        elem_type.clone(),
+        true,
+    ));
+    let offsets = arrow::buffer::OffsetBuffer::from_lengths(lengths.iter().copied());
+    Ok(Arc::new(arrow::array::ListArray::try_new(
+        field, offsets, values, None,
+    )?))
+}
+
+/// Builds one list per row from `arrays`, the element arrays of an
+/// `ARRAY[...]` constructor (each `num_rows` long): row `r` holds
+/// `arrays[0][r], arrays[1][r], ...`.
+fn build_list_array(
+    arrays: Vec<ArrayRef>,
+    element_type: &DataType,
+    num_rows: usize,
+) -> Result<ArrayRef, ExecutionError> {
+    let elem_type: ArrowDataType = element_type.clone().into();
+    let arrays = arrays
+        .into_iter()
+        .map(|a| {
+            if a.data_type() == &elem_type {
+                Ok(a)
+            } else {
+                arrow::compute::cast(&a, &elem_type)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let k = arrays.len();
+    let values = if k == 0 {
+        arrow::array::new_empty_array(&elem_type)
+    } else {
+        let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+        let indices: Vec<(usize, usize)> = (0..num_rows)
+            .flat_map(|r| (0..k).map(move |i| (i, r)))
+            .collect();
+        arrow::compute::interleave(&refs, &indices)?
+    };
+    list_from_values(values, &elem_type, &vec![k; num_rows])
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +1159,11 @@ fn case_referenced_columns(expr: &PlanExpr, referenced: &mut [bool]) {
                 case_referenced_columns(item, referenced);
             }
         }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                case_referenced_columns(item, referenced);
+            }
+        }
         PlanExpr::Function { args, .. } => {
             for arg in args {
                 case_referenced_columns(arg, referenced);
@@ -1140,6 +1218,64 @@ fn new_null_array(data_type: &ArrowDataType, len: usize) -> ArrayRef {
 mod tests {
     use super::*;
     use arrow::datatypes::{Field, Schema};
+
+    #[test]
+    fn array_constructor_builds_one_list_per_row() {
+        let batch = make_batch();
+        let col = |index| PlanExpr::Column {
+            index,
+            name: String::new(),
+            span: None,
+        };
+        // ARRAY[a, CAST(b AS INT)] over rows of (Int32, Int64).
+        let expr = PlanExpr::Array {
+            elements: vec![
+                col(0),
+                PlanExpr::Cast {
+                    expr: Box::new(col(1)),
+                    data_type: DataType::Int32,
+                    span: None,
+                },
+            ],
+            element_type: DataType::Int32,
+            span: None,
+        };
+        let out = evaluate(&expr, &batch, None).unwrap();
+        assert_eq!(out.len(), batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let ScalarValue::List { element, values } =
+                crate::operator::extract_scalar(&out, row).unwrap()
+            else {
+                panic!("expected a list");
+            };
+            assert_eq!(*element, DataType::Int32);
+            assert_eq!(values.len(), 2);
+        }
+    }
+
+    #[test]
+    fn list_literal_round_trips_through_arrays() {
+        let v = ScalarValue::List {
+            element: Box::new(DataType::Int64),
+            values: vec![
+                ScalarValue::Int64(7),
+                ScalarValue::Null,
+                ScalarValue::Int64(9),
+            ],
+        };
+        let arr = scalar_to_array(&v, 3).unwrap();
+        assert_eq!(arr.len(), 3);
+        for row in 0..3 {
+            assert_eq!(crate::operator::extract_scalar(&arr, row).unwrap(), v);
+        }
+        let column = crate::operator::scalars_to_array(
+            &[v.clone(), ScalarValue::Null],
+            &arr.data_type().clone(),
+        )
+        .unwrap();
+        assert_eq!(column.len(), 2);
+        assert!(column.is_null(1));
+    }
 
     fn make_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![

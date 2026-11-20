@@ -108,6 +108,11 @@ fn arrow_type_to_pg(dt: &arrow::datatypes::DataType) -> Type {
         ADT::Int32 => Type::INT4,
         ADT::Float64 => Type::FLOAT8,
         ADT::Utf8 => Type::VARCHAR,
+        ADT::List(field) | ADT::LargeList(field) => {
+            let element = arneb_common::types::DataType::try_from(field.data_type().clone())
+                .unwrap_or(arneb_common::types::DataType::Utf8);
+            crate::encoding::array_pg_type(&element)
+        }
         _ => Type::TEXT,
     }
 }
@@ -793,6 +798,7 @@ fn arneb_type_to_pg_param_type(t: &arneb_common::types::DataType) -> Type {
         }
         DT::Binary => Type::BYTEA,
         DT::Decimal128 { .. } => Type::NUMERIC,
+        DT::List(element) => crate::encoding::array_pg_type(element),
         _ => Type::TEXT,
     }
 }
@@ -1852,6 +1858,26 @@ async fn resolve_expr_subqueries_distributed_inner(
                 span,
             })
         }
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => {
+            let mut resolved = Vec::with_capacity(elements.len());
+            for item in elements {
+                resolved.push(
+                    Box::pin(resolve_expr_subqueries_distributed_inner(
+                        ctx, executor, item,
+                    ))
+                    .await?,
+                );
+            }
+            Ok(PlanExpr::Array {
+                elements: resolved,
+                element_type,
+                span,
+            })
+        }
         PlanExpr::Cast {
             expr,
             data_type,
@@ -2079,6 +2105,9 @@ fn expr_columns_in_range(expr: &PlanExpr, input_width: usize) -> bool {
                     .iter()
                     .all(|item| expr_columns_in_range(item, input_width))
         }
+        PlanExpr::Array { elements, .. } => elements
+            .iter()
+            .all(|item| expr_columns_in_range(item, input_width)),
         PlanExpr::ScalarSubquery { subplan, .. } => plan_columns_in_range(subplan),
         PlanExpr::CaseExpr {
             operand,
@@ -2254,6 +2283,9 @@ fn expr_subplans(expr: &PlanExpr) -> Vec<&LogicalPlan> {
             PlanExpr::InList { expr, list, .. } => {
                 walk(expr, out);
                 list.iter().for_each(|item| walk(item, out));
+            }
+            PlanExpr::Array { elements, .. } => {
+                elements.iter().for_each(|item| walk(item, out));
             }
             PlanExpr::CaseExpr {
                 operand,

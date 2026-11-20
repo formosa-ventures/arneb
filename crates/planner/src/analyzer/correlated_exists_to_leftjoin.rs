@@ -666,6 +666,15 @@ where
             negated,
             span,
         },
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements.into_iter().map(|e| walk_columns(e, f)).collect(),
+            element_type,
+            span,
+        },
         E::Cast {
             expr,
             data_type,
@@ -721,6 +730,11 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
         E::InList { expr, list, .. } => {
             collect_column_indices(expr, cb);
             for e in list {
+                collect_column_indices(e, cb);
+            }
+        }
+        E::Array { elements, .. } => {
+            for e in elements {
                 collect_column_indices(e, cb);
             }
         }

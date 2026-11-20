@@ -663,6 +663,11 @@ fn collect_inner_join_equivalence_expr_classes(
                 collect_inner_join_equivalence_expr_classes(item, classes);
             }
         }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_inner_join_equivalence_expr_classes(item, classes);
+            }
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -723,6 +728,11 @@ fn collect_expr_join_key_blocks(
         PlanExpr::InList { expr, list, .. } => {
             collect_expr_join_key_blocks(expr, stats, root_outputs, blocked);
             for item in list {
+                collect_expr_join_key_blocks(item, stats, root_outputs, blocked);
+            }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
                 collect_expr_join_key_blocks(item, stats, root_outputs, blocked);
             }
         }
@@ -941,6 +951,11 @@ fn collect_expr_sources(expr: &PlanExpr, input: &LogicalPlan, sources: &mut Vec<
                 collect_expr_sources(item, input, sources);
             }
         }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_expr_sources(item, input, sources);
+            }
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -1007,6 +1022,11 @@ fn collect_joined_expr_sources(
         PlanExpr::InList { expr, list, .. } => {
             collect_joined_expr_sources(expr, left_input, right_input, sources);
             for item in list {
+                collect_joined_expr_sources(item, left_input, right_input, sources);
+            }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
                 collect_joined_expr_sources(item, left_input, right_input, sources);
             }
         }
@@ -1374,6 +1394,18 @@ fn rewrite_expr(
                 .map(|item| rewrite_expr(item, stats, root_outputs, blocked))
                 .collect(),
             negated,
+            span,
+        },
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements
+                .into_iter()
+                .map(|item| rewrite_expr(item, stats, root_outputs, blocked))
+                .collect(),
+            element_type,
             span,
         },
         PlanExpr::Cast {
@@ -2432,6 +2464,11 @@ mod tests {
                     assert_expr_schema_lengths_consistent(item);
                 }
             }
+            PlanExpr::Array { elements, .. } => {
+                for item in elements {
+                    assert_expr_schema_lengths_consistent(item);
+                }
+            }
             PlanExpr::CaseExpr {
                 operand,
                 when_clauses,
@@ -2539,6 +2576,11 @@ mod tests {
             PlanExpr::InList { expr, list, .. } => {
                 assert_expr_subquery_key_types_match(expr);
                 for item in list {
+                    assert_expr_subquery_key_types_match(item);
+                }
+            }
+            PlanExpr::Array { elements, .. } => {
+                for item in elements {
                     assert_expr_subquery_key_types_match(item);
                 }
             }

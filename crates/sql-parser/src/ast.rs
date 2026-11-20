@@ -402,6 +402,13 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// An `ARRAY[e1, e2, ...]` constructor.
+    Array {
+        /// The element expressions.
+        elements: Vec<Expr>,
+        /// Source span.
+        span: Span,
+    },
     /// An extended-query-protocol parameter placeholder (`$1`, `$2`, …).
     ///
     /// Parameters only appear when the query is submitted via the
@@ -439,6 +446,7 @@ impl Expr {
             | Expr::Exists { span, .. }
             | Expr::WindowFunction { span, .. }
             | Expr::Case { span, .. }
+            | Expr::Array { span, .. }
             | Expr::Parameter { span, .. } => *span,
         }
     }
@@ -762,6 +770,16 @@ impl fmt::Display for Expr {
                     }
                 }
                 write!(f, ")")
+            }
+            Expr::Array { elements, .. } => {
+                write!(f, "ARRAY[")?;
+                for (i, e) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                write!(f, "]")
             }
             Expr::IsNull { expr, .. } => write!(f, "{expr} IS NULL"),
             Expr::IsNotNull { expr, .. } => write!(f, "{expr} IS NOT NULL"),

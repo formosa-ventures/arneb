@@ -1827,6 +1827,11 @@ fn collect_column_indices_into(expr: &PlanExpr, out: &mut std::collections::BTre
                 collect_column_indices_into(e, out);
             }
         }
+        E::Array { elements, .. } => {
+            for e in elements {
+                collect_column_indices_into(e, out);
+            }
+        }
         E::Function { args, .. } => {
             for a in args {
                 collect_column_indices_into(a, out);
@@ -1954,6 +1959,18 @@ fn rewrite_column_indices(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> P
                 .map(|a| rewrite_column_indices(a, mapping))
                 .collect(),
             negated: *negated,
+            span: *span,
+        },
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements
+                .iter()
+                .map(|a| rewrite_column_indices(a, mapping))
+                .collect(),
+            element_type: element_type.clone(),
             span: *span,
         },
         E::Cast {

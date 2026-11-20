@@ -1985,6 +1985,25 @@ pub(crate) fn scalar_from_array(
                 timezone: tz.as_ref().map(|s| s.to_string()),
             })
         }
+        List(_) | LargeList(_) => {
+            if arr.is_null(index) {
+                return Ok(ScalarValue::Null);
+            }
+            let (child, element) = match arr.data_type() {
+                List(field) => (arr.as_list::<i32>().value(index), field.data_type().clone()),
+                LargeList(field) => (arr.as_list::<i64>().value(index), field.data_type().clone()),
+                other => unreachable!("matched a list type, got {other:?}"),
+            };
+            let element = arneb_common::types::DataType::try_from(element)
+                .map_err(|e| ExecutionError::InvalidOperation(e.to_string()))?;
+            let values = (0..child.len())
+                .map(|i| crate::operator::extract_scalar(&child, i))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ScalarValue::List {
+                element: Box::new(element),
+                values,
+            })
+        }
         dt => Err(ExecutionError::InvalidOperation(format!(
             "cannot extract scalar from type {dt:?}"
         ))),

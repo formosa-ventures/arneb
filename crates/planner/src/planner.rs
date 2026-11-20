@@ -2408,6 +2408,25 @@ impl<'a> QueryPlanner<'a> {
                     span: node_span,
                 })
             }
+            ast::Expr::Array { elements, .. } => {
+                if elements.is_empty() {
+                    return Err(PlanError::invalid_expression(
+                        "cannot determine the type of an empty ARRAY[]; cast it, e.g. \
+                         ARRAY[]::integer[]"
+                            .to_string(),
+                    ));
+                }
+                let mut planned = Vec::with_capacity(elements.len());
+                for e in elements {
+                    planned.push(self.plan_expr(e, ctx).await?);
+                }
+                Ok(PlanExpr::Array {
+                    elements: planned,
+                    // Filled in by the type-coercion pass.
+                    element_type: DataType::Null,
+                    span: node_span,
+                })
+            }
             ast::Expr::Parameter { index, .. } => Ok(PlanExpr::Parameter {
                 index: *index,
                 type_hint: None,
@@ -2730,6 +2749,9 @@ impl<'a> QueryPlanner<'a> {
             ast::Expr::InList { expr, list, .. } => {
                 self.contains_aggregate(expr) || list.iter().any(|e| self.contains_aggregate(e))
             }
+            ast::Expr::Array { elements, .. } => {
+                elements.iter().any(|e| self.contains_aggregate(e))
+            }
             ast::Expr::Case {
                 operand,
                 conditions,
@@ -2940,6 +2962,13 @@ impl<'a> QueryPlanner<'a> {
                 negated: *negated,
                 span: *span,
             },
+            ast::Expr::Array { elements, span } => ast::Expr::Array {
+                elements: elements
+                    .iter()
+                    .map(|e| self.rewrite_aggregates_as_columns(e, ctx, num_group_by))
+                    .collect(),
+                span: *span,
+            },
             ast::Expr::Function {
                 name,
                 args,
@@ -3080,6 +3109,11 @@ impl<'a> QueryPlanner<'a> {
             ast::Expr::InList { expr, list, .. } => {
                 self.extract_aggregates(expr, ctx, out).await?;
                 for e in list {
+                    self.extract_aggregates(e, ctx, out).await?;
+                }
+            }
+            ast::Expr::Array { elements, .. } => {
+                for e in elements {
                     self.extract_aggregates(e, ctx, out).await?;
                 }
             }
@@ -4530,6 +4564,16 @@ fn write_ast_unqualified(out: &mut String, expr: &ast::Expr) {
                 write_ast_unqualified(out, item);
             }
             let _ = write!(out, ")");
+        }
+        ast::Expr::Array { elements, .. } => {
+            let _ = write!(out, "ARRAY[");
+            for (i, item) in elements.iter().enumerate() {
+                if i > 0 {
+                    let _ = write!(out, ", ");
+                }
+                write_ast_unqualified(out, item);
+            }
+            let _ = write!(out, "]");
         }
         ast::Expr::Cast {
             expr, data_type, ..

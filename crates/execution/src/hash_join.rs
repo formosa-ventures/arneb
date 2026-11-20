@@ -614,6 +614,24 @@ fn vec_probe_key_types_supported(batch: &RecordBatch, key_indices: &[usize]) -> 
     })
 }
 
+/// Whether a key column of this type can be hash-joined: both
+/// [`TypedCol::from_array`] and the hash repartition
+/// (`repartition::hash_one_cell_ahash`) accept it. Those two dispatch
+/// matches must stay in step with this list; tests in both modules check it.
+pub(crate) fn is_hash_join_key_type(data_type: &ArrowDataType) -> bool {
+    matches!(
+        data_type,
+        ArrowDataType::Int32
+            | ArrowDataType::Int64
+            | ArrowDataType::Utf8
+            | ArrowDataType::Boolean
+            | ArrowDataType::Float32
+            | ArrowDataType::Float64
+            | ArrowDataType::Date32
+            | ArrowDataType::Decimal128(_, _)
+    )
+}
+
 /// Pre-downcasted key columns for one batch. Lifts the data-type
 /// match + downcast OUT of the per-row hot loop. Reduces probe-loop
 /// per-row work from `O(keys × type_match + downcast + value)` to
@@ -6353,6 +6371,48 @@ fn collect_equi_keys(
     }
 }
 
+/// One non-null value of each of a spread of Arrow types, supported as hash
+/// keys or not, for tests that check a dispatch match against
+/// [`is_hash_join_key_type`].
+#[cfg(test)]
+pub(crate) fn sample_key_arrays() -> Vec<ArrayRef> {
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::TimeUnit;
+    let int: ArrayRef = Arc::new(Int32Array::from(vec![1]));
+    let text: ArrayRef = Arc::new(StringArray::from(vec!["1"]));
+    [
+        ArrowDataType::Boolean,
+        ArrowDataType::Int8,
+        ArrowDataType::Int16,
+        ArrowDataType::Int32,
+        ArrowDataType::Int64,
+        ArrowDataType::UInt32,
+        ArrowDataType::Float32,
+        ArrowDataType::Float64,
+        ArrowDataType::Decimal128(10, 2),
+        ArrowDataType::Decimal64(10, 2),
+        ArrowDataType::Utf8,
+        ArrowDataType::LargeUtf8,
+        ArrowDataType::Binary,
+        ArrowDataType::Date32,
+        ArrowDataType::Date64,
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    ]
+    .iter()
+    .map(|data_type| {
+        let source = if matches!(data_type, ArrowDataType::Binary) {
+            &text
+        } else {
+            &int
+        };
+        let array = arrow::compute::cast(source, data_type).unwrap();
+        assert!(array.is_valid(0), "{data_type:?}");
+        array
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -6367,6 +6427,18 @@ mod tests {
     use arrow::array::{
         Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
     };
+
+    #[test]
+    fn typed_col_accepts_exactly_the_hash_join_key_types() {
+        for array in sample_key_arrays() {
+            assert_eq!(
+                TypedCol::from_array(&array).is_ok(),
+                is_hash_join_key_type(array.data_type()),
+                "{:?}",
+                array.data_type()
+            );
+        }
+    }
 
     static BROADCAST_DF_TEST_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

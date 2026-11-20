@@ -1111,14 +1111,25 @@ impl<'a> QueryPlanner<'a> {
             let planned = self.plan_expr(&array, ctx).await?;
             // Typed against the planning context the argument was resolved in.
             let ctx_schema: Vec<ColumnInfo> = ctx.columns.iter().map(|(_, c)| c.clone()).collect();
-            let array_type = plan_expr_type(&planned, &ctx_schema).unwrap_or(DataType::Null);
-            if !matches!(array_type, DataType::List(_) | DataType::Null) {
-                return Err(PlanError::invalid_expression(format!(
-                    "function {}({array_type}) does not exist: {} takes an array",
-                    kind.name(),
-                    kind.name()
-                )));
-            }
+            let array_type = match plan_expr_type(&planned, &ctx_schema) {
+                Some(t @ DataType::List(_)) => t,
+                // An untyped NULL or parameter: the element type is unknown,
+                // as PostgreSQL also refuses. `CAST(NULL AS int[])` is typed.
+                None | Some(DataType::Null) => {
+                    return Err(PlanError::invalid_expression(format!(
+                        "could not determine the type of the argument of {}(); cast it to an \
+                         array type, e.g. CAST(NULL AS integer[])",
+                        kind.name()
+                    )))
+                }
+                Some(other) => {
+                    return Err(PlanError::invalid_expression(format!(
+                        "function {}({other}) does not exist: {} takes an array",
+                        kind.name(),
+                        kind.name()
+                    )))
+                }
+            };
             let mut name = kind.display(&planned);
             if schema.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
                 name = format!("{name}#{}", srfs.len() + 1);

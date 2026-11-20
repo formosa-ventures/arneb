@@ -1735,7 +1735,6 @@ fn pad_char_columns(
         .collect()
 }
 
-/// Walk a logical plan and resolve any scalar subqueries in expressions.
 /// `resolve_plan_subqueries` for a `ProjectSet`. Out of line so the
 /// recursive future stays small.
 async fn resolve_project_set_subqueries(
@@ -1758,6 +1757,7 @@ async fn resolve_project_set_subqueries(
     ))
 }
 
+/// Walk a logical plan and resolve any scalar subqueries in expressions.
 async fn resolve_plan_subqueries(
     ctx: &ExecutionContext,
     distributed_executor: Option<&dyn DistributedExecutor>,

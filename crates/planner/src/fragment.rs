@@ -6215,6 +6215,63 @@ mod tests {
         out
     }
 
+    /// Broadcast v2b inlines the probe's scan fragment under the join. A
+    /// ProjectSet between the join and the probe exchange must survive
+    /// that inlining, with the scan beneath it in the worker fragment.
+    #[test]
+    fn inline_broadcast_join_keeps_project_set_over_the_probe_scan() {
+        let col = |index: usize, name: &str| PlanExpr::Column {
+            index,
+            name: name.into(),
+            span: None,
+        };
+        let probe = LogicalPlan::rebuild_project_set(
+            Box::new(scan_with_columns("fact_t", &["f_id", "arr"])),
+            vec![(crate::plan::SrfKind::Unnest, col(1, "arr"))],
+            vec![ColumnInfo {
+                name: "unnest(arr)".into(),
+                data_type: DataType::Int32,
+                nullable: true,
+            }],
+        );
+        let plan = LogicalPlan::Join {
+            left: Box::new(probe),
+            right: Box::new(scan_with_columns("dim_t", &["d_id"])),
+            join_type: ast::JoinType::Inner,
+            condition: crate::plan::JoinCondition::On(PlanExpr::BinaryOp {
+                left: Box::new(col(0, "f_id")),
+                op: ast::BinaryOp::Eq,
+                right: Box::new(col(3, "d_id")),
+                span: None,
+            }),
+            dynamic_filter_ids: Vec::new(),
+        };
+        let mut frag = PlanFragmenter::new()
+            .with_broadcast_threshold(Some(1024))
+            .with_stats(Some(std::sync::Arc::new(
+                stats_for_inline_broadcast_df_regen(),
+            )));
+        let result = frag.fragment(plan);
+
+        assert_eq!(result.source_fragments.len(), 1, "{result:?}");
+        let probe_frag = &result.source_fragments[0];
+        let LogicalPlan::Join { left, .. } = &probe_frag.root else {
+            panic!("expected the join inlined into the probe fragment: {probe_frag:?}");
+        };
+        let LogicalPlan::ProjectSet { input, srfs, .. } = left.as_ref() else {
+            panic!("expected ProjectSet over the probe scan, got {left}");
+        };
+        assert_eq!(srfs.len(), 1);
+        assert!(
+            matches!(input.as_ref(), LogicalPlan::TableScan { table, .. } if table.table == "fact_t"),
+            "{input}"
+        );
+        assert_eq!(
+            probe_frag.source_fragments[0].output_partitioning,
+            PartitioningScheme::Broadcast
+        );
+    }
+
     #[test]
     fn inline_broadcast_join_regenerates_dynamic_filter_on_fact_probe_scan() {
         let _swap_df_regen = set_swap_df_regen_for_test(true);

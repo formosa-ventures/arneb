@@ -913,3 +913,15 @@ async fn srf_shapes_used_by_reflection() {
     let names: Vec<&str> = stmt.columns().iter().map(|c| c.name()).collect();
     assert_eq!(names, ["unnest", "generate_subscripts"]);
 }
+
+#[tokio::test]
+async fn srf_argument_of_unknown_type_is_refused() {
+    let client = connect(pg_server().await).await;
+    let message = error_message(&client, "SELECT unnest(NULL)").await;
+    assert!(message.contains("unnest"), "{message}");
+    assert!(message.contains("type"), "{message}");
+    // A typed NULL array is fine: no rows.
+    assert!(column_text(&client, "SELECT unnest(CAST(NULL AS int[]))")
+        .await
+        .is_empty());
+}

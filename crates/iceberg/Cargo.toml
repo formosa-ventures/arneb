@@ -23,7 +23,7 @@ bytes.workspace = true
 # Avro object-container reader for Iceberg manifest lists / manifests.
 # Deflate (Iceberg's default manifest codec) is built in; snappy and
 # zstandard cover the other codecs writers commonly pick.
-apache-avro = { version = "0.22", default-features = false, features = ["snappy", "zstandard"] }
+apache-avro = { version = "0.23", default-features = false, features = ["snappy", "zstandard"] }
 # gzip-compressed `*.gz.metadata.json` table metadata.
 flate2 = "1"
 

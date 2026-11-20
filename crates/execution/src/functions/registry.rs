@@ -301,6 +301,8 @@ mod tests {
             scale: 2,
         };
         let cases: Vec<(&str, Vec<DataType>)> = vec![
+            ("__single_row_check", vec![i.clone(), s.clone()]),
+            ("__single_row_check", vec![i.clone(), dec.clone()]),
             ("greatest", vec![i32t.clone(), i.clone()]),
             ("least", vec![i.clone(), f.clone()]),
             ("greatest", vec![dec.clone(), dec.clone()]),

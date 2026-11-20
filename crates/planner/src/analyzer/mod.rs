@@ -373,6 +373,8 @@ pub(crate) fn function_return_type(
             .or(Some(DataType::Float64)),
         "MIN" | "MAX" => args.first().and_then(|a| plan_expr_type(a, schema)),
         "BOOL_OR" | "BOOL_AND" => Some(DataType::Boolean),
+        // Planted by SELECT-list subquery decorrelation: returns its value.
+        "__SINGLE_ROW_CHECK" => args.get(1).and_then(|a| plan_expr_type(a, schema)),
         "ARRAY_AGG" => args
             .first()
             .and_then(|a| plan_expr_type(a, schema))

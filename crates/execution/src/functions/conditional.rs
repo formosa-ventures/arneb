@@ -22,7 +22,45 @@ pub(crate) fn all_conditional_functions() -> Vec<Arc<dyn ScalarFunction>> {
     vec![
         Arc::new(ExtremumFunction { greatest: true }),
         Arc::new(ExtremumFunction { greatest: false }),
+        Arc::new(SingleRowCheck),
     ]
+}
+
+/// `__single_row_check(rows, value)`: internal, planted by the planner when
+/// it decorrelates a non-aggregate scalar subquery in a SELECT list. `rows`
+/// is the number of subquery rows matching the outer row; the function
+/// returns `value` unchanged and raises PostgreSQL's error when any row it
+/// is evaluated on has more than one match. It sits in a `CASE` branch, so
+/// it only sees the rows that take that branch.
+#[derive(Debug)]
+struct SingleRowCheck;
+
+impl ScalarFunction for SingleRowCheck {
+    fn name(&self) -> &str {
+        "__SINGLE_ROW_CHECK"
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        match arg_types {
+            [_, value] => Ok(value.clone()),
+            _ => Err(invalid("__single_row_check requires 2 arguments")),
+        }
+    }
+
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        check_arity("__single_row_check", args, 2, 2)?;
+        let rows = arrow::compute::cast(&args[0], &arrow::datatypes::DataType::Int64)?;
+        let rows = rows
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("cast to Int64");
+        if rows.iter().any(|n| n.is_some_and(|n| n > 1)) {
+            return Err(ExecutionError::InvalidOperation(
+                "more than one row returned by a subquery used as an expression".to_string(),
+            ));
+        }
+        Ok(args[1].clone())
+    }
 }
 
 /// `GREATEST(v1, ..., vn)` / `LEAST(v1, ..., vn)`.

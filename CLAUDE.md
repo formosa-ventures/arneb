@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Arneb** — A Trino alternative built in Rust. Distributed SQL query engine for federated queries across heterogeneous data sources.
 
-**Status**: Phases 1, 2 and 2.5 complete; Phase 3 (production readiness + federation) in progress. TPC-H 22/22 cell-identical to Trino at SF10 and SF30.
+**Status**: Phases 1, 2 and 2.5 complete; Phase 3 (production readiness + federation) in progress. TPC-H 22/22 cell-identical to Trino at SF10 and SF30; TPC-DS 103/103 cell-identical at SF1.
 
 ## Build & Development Commands
 
@@ -221,18 +221,18 @@ SQL String
 
 ### Key Dependencies
 
-- **Apache Arrow** (`arrow` v54): Columnar memory format for all intermediate data.
-- **sqlparser-rs** (`sqlparser` v0.61): SQL dialect parsing into AST.
+- **Apache Arrow** (`arrow` v60): Columnar memory format for all intermediate data.
+- **sqlparser-rs** (`sqlparser` v0.64): SQL dialect parsing into AST.
 - **tokio** (v1): Async runtime for the protocol server.
-- **pgwire** (v0.25): PostgreSQL wire protocol v3 implementation.
+- **pgwire** (v0.42): PostgreSQL wire protocol v3 implementation.
 - **axum** (v0.8): HTTP framework for Web UI.
 - **rust-embed** (v8): Embeds frontend assets into binary.
 - **clap** (v4): CLI argument parsing for the server binary.
 - **tracing** / **tracing-subscriber**: Structured logging throughout.
 - **thiserror** / **anyhow**: Error handling (thiserror for libraries, anyhow for the binary).
-- **object_store** (v0.11, `aws` feature): Unified S3/GCS/Azure/local filesystem abstraction.
-- **parquet** (v58): Parquet file reader/writer. Supported compression codecs: Snappy, Gzip, Zstd, LZ4, Brotli, and uncompressed.
-- **volo-thrift** (v0.10) / **pilota** (v0.11): Async Thrift runtime backing the `hive-metastore` crate. Note: the generated client uses `DefaultMakeCodec::buffered()` (plain TBinaryProtocol) to talk to real HMS servers, not the default TT-Header framing.
+- **object_store** (v0.14, `aws` feature): Unified S3/GCS/Azure/local filesystem abstraction.
+- **parquet** (v60): Parquet file reader/writer. Supported compression codecs: Snappy, Gzip, Zstd, LZ4, Brotli, and uncompressed.
+- **volo-thrift** (v0.12) / **pilota** (v0.13): Async Thrift runtime backing the `hive-metastore` crate. Note: the generated client uses `DefaultMakeCodec::buffered()` (plain TBinaryProtocol) to talk to real HMS servers, not the default TT-Header framing.
 
 ### Design Principles
 
@@ -251,7 +251,7 @@ CASE WHEN, COALESCE, NULLIF, CAST, BETWEEN, IN, LIKE, IS NULL/NOT NULL, arithmet
 SELECT, EXPLAIN, CREATE TABLE, DROP TABLE, CREATE TABLE AS SELECT, INSERT INTO, DELETE FROM, CREATE VIEW, DROP VIEW
 
 ### Advanced DQL
-CTEs (WITH), UNION ALL/UNION/INTERSECT/EXCEPT, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX OVER), GROUP BY with HAVING, ORDER BY on aggregates/aliases
+CTEs (WITH), UNION ALL/UNION/INTERSECT/EXCEPT, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX OVER, `ROWS UNBOUNDED PRECEDING` frames), GROUP BY with HAVING, GROUP BY ROLLUP with GROUPING, ORDER BY on aggregates/aliases
 
 ### Scalar Functions (90, Trino semantics — full reference in `docs/sql/functions.md`)
 Conditional: IF (desugared to CASE in the parser), TRY (handled in `expression.rs`), GREATEST, LEAST
@@ -280,7 +280,7 @@ Adding a function: implement `ScalarFunction` in `crates/execution/src/functions
 - M2 federation MVP: RDBMS connector framework + PostgreSQL connector (done, #158), cross-source join (done, #167)
 - M3 survives failure: fault tolerance stage 1 fail-clean (done, #171) + stage 2 query retry (done, #184; off by default), Prometheus metrics + slow-query log (done, #172), query history + `system.runtime.queries` (done, #173), worker drain + version handshake (done, #178/#179), GHCR images + Helm (done, #182)
 - M4 wider federation: MySQL connector, aggregate/TopN/join pushdown
-- Path to production (v0.1.6 → v0.2.0): concurrency fix + soak test, worker drain + version handshake, Helm, authorization, query retry, client smoke + queryable pg_catalog (all done by v0.1.7); left: the headless agent interface first (H1–H6: API tokens + auth, agent query API, remote MCP, manage API + audit, runtime config, MCP OAuth — `docs/superpowers/specs/2026-10-30-headless-agent-interface-design.md`), then G6 stage 2b (arrays, SQLAlchemy reflection, Metabase), P1 SF30 validation, production checklist — see "Path to production" in the roadmap doc
+- Path to production (v0.1.6 → v0.2.0): concurrency fix + soak test, worker drain + version handshake, Helm, authorization, query retry, client smoke + queryable pg_catalog (all done by v0.1.7); the headless agent interface (H1–H6, `docs/superpowers/specs/2026-10-30-headless-agent-interface-design.md`) shipped in v0.2.0 and its acceptance scenario runs on kind in CI (#255); left: G6 stage 2b (arrays, SQLAlchemy reflection, Metabase), P1 SF30 validation, production checklist — see "Path to production" in the roadmap doc
 
 ### OpenSpec Structure
 

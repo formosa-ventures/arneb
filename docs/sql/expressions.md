@@ -94,6 +94,13 @@ SELECT CAST(price AS INTEGER) FROM products;
 SELECT CAST('2024-01-15' AS DATE) AS order_date;
 ```
 
+Casting a DOUBLE, REAL or DECIMAL to an integer type (TINYINT, SMALLINT,
+INTEGER, BIGINT) rounds half away from zero, as Trino does: `2.5` becomes
+`3` and `-2.5` becomes `-3`. A value whose rounded result does not fit the
+target type is an error, for example `CAST(2147483647.5e0 AS INTEGER)` or
+`CAST(DECIMAL '9223372036854775807.5' AS BIGINT)`; wrap the cast in [`TRY`](/sql/functions#try) to get
+`NULL` instead.
+
 ## BETWEEN
 
 Test whether a value falls within a range (inclusive).

@@ -18,7 +18,7 @@ hero:
 
 features:
   - title: Faster and Leaner than Trino
-    details: On all 22 TPC-H queries, cell-identical results. SF10 2.3× faster warm at about a seventh of Trino's peak memory; SF30 3.5× faster cold at 0.22× the memory.
+    details: On all 22 TPC-H queries, cell-identical results. SF10 2.3× faster warm at about a seventh of Trino's peak memory; SF30 3.5× faster cold at 0.22× the memory. All 103 TPC-DS queries are cell-identical to Trino at SF1.
     link: /guide/performance
     linkText: See the numbers
   - title: Arrow-Native

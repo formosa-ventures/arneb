@@ -27,7 +27,7 @@ Arneb supports the following query features:
 - **CTEs**: Common Table Expressions via `WITH` clauses
 - **Set Operations**: UNION ALL, UNION, INTERSECT, EXCEPT
 - **Window Functions**: ROW_NUMBER, RANK, DENSE_RANK, and aggregate window functions with PARTITION BY and ORDER BY, plus the `ROWS UNBOUNDED PRECEDING` frame
-- **Ordering and Limiting**: ORDER BY (including on aliases and aggregates), LIMIT, OFFSET
+- **Ordering and Limiting**: ORDER BY (including on aliases and aggregates), LIMIT, OFFSET (any constant integer expression, such as `LIMIT $1::INTEGER` from a driver; not a column)
 
 ## Session Settings
 

@@ -10,6 +10,7 @@ Unless stated otherwise, a function returns `NULL` when any argument is `NULL`. 
 | [String](#string-functions) | `UPPER`, `LOWER`, `SUBSTRING`/`SUBSTR`, `TRIM`, `LTRIM`, `RTRIM`, `CONCAT`, `\|\|`, `CONCAT_WS`, `LENGTH`, `REPLACE`, `POSITION`, `STRPOS`, `SPLIT_PART`, `STARTS_WITH`, `REVERSE`, `LPAD`, `RPAD`, `CHR`, `CODEPOINT`, `TRANSLATE`, `LEVENSHTEIN_DISTANCE`, `HAMMING_DISTANCE` |
 | [Regular expression](#regular-expression-functions) | `REGEXP_LIKE`, `REGEXP_EXTRACT`, `REGEXP_REPLACE`, `REGEXP_COUNT` |
 | [Math](#math-functions) | `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `TRUNCATE`, `MOD`, `POWER`/`POW`, `SQRT`, `CBRT`, `EXP`, `LN`, `LOG2`, `LOG10`, `LOG`, `SIGN`, `PI`, `E`, `RANDOM`/`RAND`, `DEGREES`, `RADIANS`, `SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `ATAN2`, `SINH`, `COSH`, `TANH`, `NAN`, `INFINITY`, `IS_NAN`, `IS_FINITE`, `IS_INFINITE` |
+| [Array and JSON](#array-and-json-functions) | `ARRAY_AGG`, `BOOL_AND`, `UNNEST`, `GENERATE_SUBSCRIPTS`, `JSON_BUILD_OBJECT` (plus `ARRAY[...]` and `= ANY` — see [Expressions](/sql/expressions)) |
 | [Date and time](#date-and-time-functions) | `CURRENT_DATE`, `NOW`/`CURRENT_TIMESTAMP`/`LOCALTIMESTAMP`, `EXTRACT`, `YEAR`, `QUARTER`, `MONTH`, `WEEK`/`WEEK_OF_YEAR`, `DAY`/`DAY_OF_MONTH`, `DAY_OF_WEEK`/`DOW`, `DAY_OF_YEAR`/`DOY`, `YEAR_OF_WEEK`/`YOW`, `HOUR`, `MINUTE`, `SECOND`, `MILLISECOND`, `DATE_TRUNC`, `DATE_ADD`, `DATE_DIFF`, `LAST_DAY_OF_MONTH`, `DATE`, `FROM_UNIXTIME`, `TO_UNIXTIME`, `DATE_FORMAT`, `DATE_PARSE`, `FORMAT_DATETIME` |
 
 ## Conditional Functions
@@ -471,6 +472,37 @@ SIN(x)  COS(x)  TAN(x)  ASIN(x)  ACOS(x)  ATAN(x)  ATAN2(y, x)
 SINH(x) COSH(x) TANH(x)  DEGREES(x)  RADIANS(x)
 ```
 
+## Array and JSON Functions
+
+These exist mainly for PostgreSQL clients reading `pg_catalog`; they also
+work on your own tables, in standalone and distributed mode.
+
+| Function | Result |
+|---|---|
+| `ARRAY_AGG(x [ORDER BY k [ASC\|DESC] [NULLS FIRST\|LAST], ...])` | The values of `x` in a group as an array, `NULL`s included. An empty input gives one `NULL` row (no `GROUP BY`). `DISTINCT` is refused. |
+| `BOOL_AND(b)` | `true` if every non-`NULL` value is true, `NULL` for no values. The counterpart of `BOOL_OR`. |
+| `UNNEST(array)` | One row per element. |
+| `GENERATE_SUBSCRIPTS(array, 1)` | One row per index, from 1. Only dimension 1. |
+| `JSON_BUILD_OBJECT(k1, v1, k2, v2, ...)` | A JSON object as text, e.g. `{"a" : 1, "b" : "x"}` (PostgreSQL's spacing). An odd argument count is a planning error. |
+
+```sql
+SELECT n_regionkey, array_agg(n_name ORDER BY n_name) FROM nation GROUP BY 1;
+SELECT r, unnest(a), generate_subscripts(a, 1) FROM (SELECT 1 r, ARRAY[10, 20] a) s;
+```
+
+Rules and limits:
+- `array_agg` is the only aggregate that accepts `ORDER BY`. `FILTER` and
+  `WITHIN GROUP` are refused on every function. It runs in a single phase
+  (no partial aggregation on workers), and fails at run time over `smallint`,
+  `tinyint`, `bytea` and `decimal64` values.
+- `UNNEST` and `GENERATE_SUBSCRIPTS` are accepted only as whole `SELECT`
+  items, not nested in another expression, and an argument with no type
+  (a bare `NULL`) is refused. Several in one `SELECT` zip by position and
+  pad the shorter ones with `NULL`; a `NULL` or empty array yields no rows.
+- `JSON_BUILD_OBJECT` returns text, not a JSON type.
+- A `smallint` column compared with a literal is widened to a wider integer,
+  so the comparison is not pushed into the connector.
+
 ## Date and Time Functions
 
 DATE values are days since 1970-01-01. TIMESTAMP values returned by these functions have microsecond precision and no time zone. Arneb does not yet have a session time zone: all functions behave as if the Trino session time zone were UTC.
@@ -660,14 +692,18 @@ accepted on any function name.
 | `PG_TABLE_IS_VISIBLE(oid)` | `true` |
 | `PG_IS_OTHER_TEMP_SCHEMA(oid)` | `false` |
 | `OBJ_DESCRIPTION(oid[, catalog])`, `COL_DESCRIPTION(oid, column)` | `NULL`, because Arneb stores no comments. |
+| `CURRENT_SETTING(name[, missing_ok])` | The value of a fixed set of static settings (the ones `SHOW` answers, such as `server_version` and `standard_conforming_strings`). An unknown name is an error, or `NULL` when `missing_ok` is true; `search_path` is per session, so use `SHOW search_path`. |
+| `PG_GET_INDEXDEF(oid[, column, pretty])` | `NULL`, because Arneb has no indexes. |
 | `TO_REGTYPE(name)` | The oid of a built-in type, by `typname` (`int4`) or SQL name (`integer`). `NULL` when there is none. |
 
 `'name'::regclass` (or `CAST('name' AS REGCLASS)`) is the oid that
 `pg_class` reports for that relation:
 - An unqualified name is looked up first among PostgreSQL's system
   relations, then in the session's schema.
-- The argument must be a string literal.
+- A string literal is resolved at plan time; a `text` or column argument is resolved at run time, and a name no relation has fails there, as in PostgreSQL. `CAST(oid_column AS text)` on a `regclass` gives the relation's name.
 - Unlike PostgreSQL, the relation does not have to exist.
+
+`SHOW default_table_access_method` answers `heap`. `pg_inherits` is an empty table.
 
 `'int4'::regtype` is the type's oid. A `regtype` cast of an oid column,
 such as `atttypid::regtype`, gives the type's name, as `FORMAT_TYPE` does.
@@ -685,4 +721,4 @@ such as `atttypid::regtype`, gives the type's name, as `FORMAT_TYPE` does.
 - **`TRY`** turns every evaluation error into `NULL`; Trino only catches a fixed set of error codes (in practice the same ones scalar evaluation raises).
 - **`GREATEST`/`LEAST` with `NaN`** use IEEE total order (`NaN` is the largest value).
 - **`FORMAT_DATETIME`** fraction widths other than 3, 6 or 9 `S` letters round up to the next of those widths.
-- Not yet available: `LEFT`/`RIGHT` (not Trino functions either), `TO_HEX`/`FROM_HEX` and other `VARBINARY` functions, `SPLIT` / `REGEXP_EXTRACT_ALL` and other array-returning functions, `AT TIME ZONE`, `INTERVAL` arithmetic beyond day units, JSON and URL functions.
+- Not yet available: `LEFT`/`RIGHT` (not Trino functions either), `TO_HEX`/`FROM_HEX` and other `VARBINARY` functions, `SPLIT` / `REGEXP_EXTRACT_ALL` and other array functions beyond those above, `AT TIME ZONE`, `INTERVAL` arithmetic beyond day units, other JSON functions and URL functions.

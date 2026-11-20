@@ -159,6 +159,26 @@ SELECT * FROM orders WHERE shipped_at IS NULL;
 SELECT * FROM users WHERE email IS NOT NULL;
 ```
 
+## ARRAY constructor and ANY / ALL
+
+`ARRAY[a, b, ...]` builds a one-dimensional array. The elements must have
+one common type (integers widen to the widest integer or to `double`; text
+stays text); `NULL` elements are allowed. Over pgwire an array is sent as a
+PostgreSQL array literal (`{1,2,NULL}`), quoting elements that are empty,
+contain a comma, quote, backslash, brace or whitespace, are `NULL` text, or
+are nested. Over the Trino protocol it is an `array(...)` of its element
+type, which the Python client returns as a `list`.
+
+```sql
+SELECT ARRAY[1, 2, 3], ARRAY['a,b', NULL];
+```
+
+`x = ANY (array)` and `x <> ALL (array)` work over an array expression or an
+array bind parameter (for example `= ANY($1)` with `{}` or `{1,NULL}`):
+`= ANY` over an empty array is false, and over an array with a `NULL` element
+it is `NULL` unless another element matches. Array subscripts and array
+operators other than these are not supported.
+
 ## Subquery Expressions
 
 ### Scalar Subquery
@@ -192,3 +212,30 @@ matches.
 SELECT * FROM customers c
 WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);
 ```
+
+### Correlated scalar subquery in the SELECT list
+
+A scalar subquery in the `SELECT` list (or under a `CASE` branch) may refer to
+the outer row:
+
+```sql
+SELECT c_custkey,
+       (SELECT count(*) FROM orders WHERE o_custkey = c_custkey),
+       CASE WHEN c_acctbal < 0
+            THEN (SELECT r_name FROM region WHERE r_regionkey = c_nationkey % 5)
+       END
+FROM customer;
+```
+
+- The subquery must have at least one equality correlation
+  (`inner_col = outer_col`); it is planned as a left join on those keys, so
+  an outer row with no match gets `NULL` (`count(*)` included, as in a
+  plain scalar subquery without a `GROUP BY`).
+- A subquery that yields more than one row for an outer row fails with
+  `more than one row returned by a subquery used as an expression`, but
+  only for rows where the expression is evaluated: a `CASE` branch that is not
+  taken does not raise.
+- A correlated subquery over a CTE, a derived table or `LATERAL`, one
+  correlated through two levels, and one with no equality correlation are
+  refused with a planning error. An outer reference that cannot be
+  decorrelated is never silently ignored.

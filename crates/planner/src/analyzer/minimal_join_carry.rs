@@ -1146,7 +1146,7 @@ mod tests {
             input: Box::new(join),
             group_by: vec![col_expr(1, "s_name")],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "COUNT".to_string(),
                 args: Vec::new(),
                 distinct: false,

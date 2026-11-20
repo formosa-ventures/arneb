@@ -529,7 +529,7 @@ mod tests {
             input: Box::new(lineitem),
             group_by: vec![col_ref(0, "l_orderkey")],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "SUM".to_string(),
                 args: vec![col_ref(1, "l_quantity")],
                 distinct: false,

@@ -2265,7 +2265,7 @@ impl<'a> QueryPlanner<'a> {
                             }),
                         // `typoid::regtype`: shown as the type's name.
                         [ast::FunctionArg::Unnamed(e)] => Ok(PlanExpr::Function {
-                            order_by: vec![],
+                            order_by: None,
                             name: "format_type".to_string(),
                             args: vec![
                                 self.plan_expr(e, ctx).await?,
@@ -2292,9 +2292,9 @@ impl<'a> QueryPlanner<'a> {
                     plan_args.push(plan_arg);
                 }
                 let plan_order_by = if order_by.is_empty() {
-                    Vec::new()
+                    None
                 } else {
-                    self.plan_call_order_by(order_by, ctx).await?
+                    Some(Box::new(self.plan_call_order_by(order_by, ctx).await?))
                 };
                 Ok(PlanExpr::Function {
                     name: name.clone(),
@@ -5091,7 +5091,7 @@ mod tests {
     #[test]
     fn test_plan_expr_display_function() {
         let expr = PlanExpr::Function {
-            order_by: vec![],
+            order_by: None,
             name: "COUNT".into(),
             args: vec![PlanExpr::Wildcard],
             distinct: false,
@@ -5582,7 +5582,7 @@ mod tests {
             discounted_price,
             promo_case.clone(),
             PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "SUM".into(),
                 args: vec![promo_case],
                 distinct: false,
@@ -5599,7 +5599,7 @@ mod tests {
                 span: None,
             },
             PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "COUNT".into(),
                 args: vec![PlanExpr::Wildcard],
                 distinct: false,

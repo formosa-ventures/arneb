@@ -823,7 +823,7 @@ mod tests {
     #[test]
     fn unknown_expression_uses_default() {
         let predicate = PlanExpr::Function {
-            order_by: vec![],
+            order_by: None,
             name: "weird_udf".to_string(),
             args: vec![col("c")],
             distinct: false,

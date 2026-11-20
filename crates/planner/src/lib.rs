@@ -3,6 +3,10 @@
 //! Converts parsed SQL AST into a logical query plan tree that the
 //! optimizer and execution engine consume.
 
+// `PlanExpr::Function::order_by` is `Option<Box<Vec<_>>>` on purpose: it keeps
+// the variant (and so `PlanExpr`) small; see `plan::size_tests`.
+#![allow(clippy::box_collection)]
+
 pub mod analyzer;
 pub mod cost;
 pub mod dynamic_filter;

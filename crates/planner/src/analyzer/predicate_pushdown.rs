@@ -1456,16 +1456,9 @@ fn rewrite_expr(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<PlanExpr> {
             order_by,
             span,
         } => E::Function {
-            order_by: order_by
-                .iter()
-                .map(|s| {
-                    Some(crate::plan::SortExpr {
-                        expr: rewrite_expr(&s.expr, schema)?,
-                        asc: s.asc,
-                        nulls_first: s.nulls_first,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?,
+            order_by: crate::plan::SortExpr::try_map_exprs_ref(order_by, &mut |e| {
+                rewrite_expr(e, schema)
+            })?,
             name: name.clone(),
             args: args
                 .iter()

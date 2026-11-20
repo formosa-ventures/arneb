@@ -280,14 +280,14 @@ fn build_supplier_aggregate(
         group_by: vec![col(key_idx, &key_col.name)],
         aggr_exprs: vec![
             PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "MIN".to_string(),
                 args: vec![col(supp_idx, &supp_col.name)],
                 distinct: false,
                 span: None,
             },
             PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "MAX".to_string(),
                 args: vec![col(supp_idx, &supp_col.name)],
                 distinct: false,

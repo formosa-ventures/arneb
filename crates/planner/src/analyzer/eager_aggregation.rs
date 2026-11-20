@@ -780,7 +780,7 @@ fn build_rewrite(
                 AggKind::Max => "MAX",
             };
             PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: name.to_string(),
                 args: vec![PlanExpr::Column {
                     index: idx,
@@ -864,16 +864,9 @@ where
             order_by,
             ..
         } => PlanExpr::Function {
-            order_by: order_by
-                .iter()
-                .map(|s| {
-                    Some(crate::plan::SortExpr {
-                        expr: remap_expr_columns(&s.expr, f)?,
-                        asc: s.asc,
-                        nulls_first: s.nulls_first,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?,
+            order_by: crate::plan::SortExpr::try_map_exprs_ref(order_by, &mut |e| {
+                remap_expr_columns(e, f)
+            })?,
             name: name.clone(),
             args: args
                 .iter()
@@ -1435,16 +1428,9 @@ fn remap_expr_to_side(expr: &PlanExpr, side: Side, left_width: usize) -> Option<
             order_by,
             ..
         } => PlanExpr::Function {
-            order_by: order_by
-                .iter()
-                .map(|s| {
-                    Some(crate::plan::SortExpr {
-                        expr: remap_expr_to_side(&s.expr, side, left_width)?,
-                        asc: s.asc,
-                        nulls_first: s.nulls_first,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?,
+            order_by: crate::plan::SortExpr::try_map_exprs_ref(order_by, &mut |e| {
+                remap_expr_to_side(e, side, left_width)
+            })?,
             name: name.clone(),
             args: args
                 .iter()
@@ -1668,7 +1654,7 @@ mod tests {
             input: Box::new(join),
             group_by: vec![group_by],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: function_name.to_string(),
                 args: vec![col(2, "o_orderkey")],
                 distinct: false,
@@ -1695,7 +1681,7 @@ mod tests {
             input: Box::new(join),
             group_by: vec![col(0, "c_custkey")],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "COUNT".to_string(),
                 args: vec![col(2, "o_orderkey")],
                 distinct: false,
@@ -1707,7 +1693,7 @@ mod tests {
 
     fn sum_expr(arg: PlanExpr) -> PlanExpr {
         PlanExpr::Function {
-            order_by: vec![],
+            order_by: None,
             name: "SUM".to_string(),
             args: vec![arg],
             distinct: false,

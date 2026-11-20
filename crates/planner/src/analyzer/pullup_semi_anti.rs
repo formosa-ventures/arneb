@@ -611,15 +611,7 @@ where
             order_by,
             span,
         } => E::Function {
-            order_by: order_by
-                .into_iter()
-                .map(|s| {
-                    Some(crate::plan::SortExpr {
-                        expr: rewrite_expr(s.expr, f)?,
-                        ..s
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?,
+            order_by: crate::plan::SortExpr::try_map_exprs(order_by, &mut |e| rewrite_expr(e, f))?,
             name,
             args: args
                 .into_iter()

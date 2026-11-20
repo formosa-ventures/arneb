@@ -119,7 +119,10 @@ pub enum PlanExpr {
         /// Whether DISTINCT was specified.
         distinct: bool,
         /// `ORDER BY` inside an aggregate call (e.g. `array_agg(x ORDER BY y)`).
-        order_by: Vec<SortExpr>,
+        /// `None` means no ORDER BY, never `Some` of an empty vec. Boxed so
+        /// this variant does not grow `PlanExpr` (deep plans recurse on it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        order_by: Option<Box<Vec<SortExpr>>>,
         /// Source span, if derived from user SQL.
         #[serde(skip)]
         span: Option<Span>,
@@ -314,36 +317,80 @@ pub struct SortExpr {
 }
 
 impl SortExpr {
-    /// Rewrites every sort key. Out-of-line so the recursive expression
-    /// rewriters that call it keep small stack frames.
+    /// Rewrites every sort key of an aggregate call's `ORDER BY`.
+    /// Out-of-line so the recursive expression rewriters that call it keep
+    /// small stack frames.
     #[inline(never)]
     pub fn map_exprs(
-        order_by: Vec<SortExpr>,
+        order_by: Option<Box<Vec<SortExpr>>>,
         f: &mut dyn FnMut(PlanExpr) -> PlanExpr,
-    ) -> Vec<SortExpr> {
-        order_by
-            .into_iter()
-            .map(|s| SortExpr {
-                expr: f(s.expr),
-                ..s
-            })
-            .collect()
+    ) -> Option<Box<Vec<SortExpr>>> {
+        order_by.map(|v| {
+            Box::new(
+                v.into_iter()
+                    .map(|s| SortExpr {
+                        expr: f(s.expr),
+                        ..s
+                    })
+                    .collect(),
+            )
+        })
+    }
+
+    /// Fallible [`SortExpr::map_exprs`]: the outer `None` means a key could
+    /// not be rewritten.
+    #[inline(never)]
+    pub fn try_map_exprs(
+        order_by: Option<Box<Vec<SortExpr>>>,
+        f: &mut dyn FnMut(PlanExpr) -> Option<PlanExpr>,
+    ) -> Option<Option<Box<Vec<SortExpr>>>> {
+        let Some(v) = order_by else { return Some(None) };
+        let mut out = Vec::with_capacity(v.len());
+        for s in *v {
+            out.push(SortExpr {
+                expr: f(s.expr)?,
+                asc: s.asc,
+                nulls_first: s.nulls_first,
+            });
+        }
+        Some(Some(Box::new(out)))
+    }
+
+    /// Fallible [`SortExpr::map_exprs_ref`].
+    #[inline(never)]
+    pub fn try_map_exprs_ref(
+        order_by: &Option<Box<Vec<SortExpr>>>,
+        f: &mut dyn FnMut(&PlanExpr) -> Option<PlanExpr>,
+    ) -> Option<Option<Box<Vec<SortExpr>>>> {
+        let Some(v) = order_by else { return Some(None) };
+        let mut out = Vec::with_capacity(v.len());
+        for s in v.iter() {
+            out.push(SortExpr {
+                expr: f(&s.expr)?,
+                asc: s.asc,
+                nulls_first: s.nulls_first,
+            });
+        }
+        Some(Some(Box::new(out)))
     }
 
     /// Like [`SortExpr::map_exprs`], over borrowed keys.
     #[inline(never)]
     pub fn map_exprs_ref(
-        order_by: &[SortExpr],
+        order_by: &Option<Box<Vec<SortExpr>>>,
         f: &mut dyn FnMut(&PlanExpr) -> PlanExpr,
-    ) -> Vec<SortExpr> {
-        order_by
-            .iter()
-            .map(|s| SortExpr {
-                expr: f(&s.expr),
-                asc: s.asc,
-                nulls_first: s.nulls_first,
-            })
-            .collect()
+    ) -> Option<Box<Vec<SortExpr>>> {
+        order_by.as_ref().map(|v| {
+            Box::new(
+                v.iter()
+                    .map(|s| SortExpr {
+                        expr: f(&s.expr),
+                        asc: s.asc,
+                        nulls_first: s.nulls_first,
+                    })
+                    .collect(),
+            )
+        })
     }
 }
 
@@ -919,7 +966,7 @@ impl fmt::Display for PlanExpr {
                     }
                     write!(f, "{arg}")?;
                 }
-                for (i, s) in order_by.iter().enumerate() {
+                for (i, s) in order_by.iter().flat_map(|v| v.iter()).enumerate() {
                     write!(f, "{}{}", if i == 0 { " ORDER BY " } else { ", " }, s.expr)?;
                     write!(f, "{}", if s.asc { " ASC" } else { " DESC" })?;
                     write!(
@@ -1381,5 +1428,20 @@ mod tests {
             offset: Some(5),
         };
         assert!(!offset_only.may_stop_input_early());
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::PlanExpr;
+
+    /// `PlanExpr` is passed by value through deeply recursive planner and
+    /// analyzer passes, so its size sets their stack-frame size. Growing it
+    /// overflowed the 2 MB default test stack (`scalar_subquery_inside_subquery`),
+    /// which is why `Function::order_by` is boxed. Do not raise this bound (it was 96 before `order_by`; `Function` is
+    /// one byte over 96 with the boxed field, so 112 is the current size).
+    #[test]
+    fn plan_expr_stays_small() {
+        assert!(std::mem::size_of::<PlanExpr>() <= 112);
     }
 }

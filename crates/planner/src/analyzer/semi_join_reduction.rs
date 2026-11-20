@@ -856,7 +856,7 @@ ORDER BY s_name";
                 input: Box::new(scan("lineitem", &["l_partkey", "l_suppkey", "l_quantity"])),
                 group_by: vec![col(0, "l_partkey"), col(1, "l_suppkey")],
                 aggr_exprs: vec![PlanExpr::Function {
-                    order_by: vec![],
+                    order_by: None,
                     name: "SUM".to_string(),
                     args: vec![col(2, "l_quantity")],
                     distinct: false,

@@ -395,19 +395,19 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
 /// Out-of-line so the recursive `coerce_expr` frame stays small.
 #[inline(never)]
 fn coerce_order_by(
-    order_by: Vec<crate::plan::SortExpr>,
+    order_by: Option<Box<Vec<crate::plan::SortExpr>>>,
     schema: &[ColumnInfo],
     ctx: &mut AnalyzerContext,
-) -> Result<Vec<crate::plan::SortExpr>, PlanError> {
-    order_by
-        .into_iter()
-        .map(|s| {
-            Ok(crate::plan::SortExpr {
-                expr: coerce_expr(s.expr, schema, ctx)?,
-                ..s
-            })
-        })
-        .collect()
+) -> Result<Option<Box<Vec<crate::plan::SortExpr>>>, PlanError> {
+    let Some(v) = order_by else { return Ok(None) };
+    let mut out = Vec::with_capacity(v.len());
+    for s in *v {
+        out.push(crate::plan::SortExpr {
+            expr: coerce_expr(s.expr, schema, ctx)?,
+            ..s
+        });
+    }
+    Ok(Some(Box::new(out)))
 }
 
 fn coerce_expr(
@@ -686,7 +686,7 @@ fn pad_char_operand(expr: PlanExpr, schema: &[ColumnInfo]) -> PlanExpr {
         return expr;
     };
     PlanExpr::Function {
-        order_by: vec![],
+        order_by: None,
         name: "rpad".to_string(),
         args: vec![
             expr,

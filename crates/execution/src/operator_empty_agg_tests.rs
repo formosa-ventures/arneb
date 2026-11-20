@@ -23,7 +23,7 @@ fn col(index: usize, name: &str) -> PlanExpr {
 
 fn func(name: &str, arg: Option<PlanExpr>, distinct: bool) -> PlanExpr {
     PlanExpr::Function {
-        order_by: vec![],
+        order_by: None,
         name: name.to_string(),
         args: arg.into_iter().collect(),
         distinct,

@@ -600,17 +600,17 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
 /// Out-of-line so the recursive `fold_constants` frame stays small.
 #[inline(never)]
 fn fold_order_by(
-    order_by: Vec<crate::plan::SortExpr>,
-) -> Result<Vec<crate::plan::SortExpr>, PlanError> {
-    order_by
-        .into_iter()
-        .map(|s| {
-            Ok(crate::plan::SortExpr {
-                expr: fold_constants(s.expr)?,
-                ..s
-            })
-        })
-        .collect()
+    order_by: Option<Box<Vec<crate::plan::SortExpr>>>,
+) -> Result<Option<Box<Vec<crate::plan::SortExpr>>>, PlanError> {
+    let Some(v) = order_by else { return Ok(None) };
+    let mut out = Vec::with_capacity(v.len());
+    for s in *v {
+        out.push(crate::plan::SortExpr {
+            expr: fold_constants(s.expr)?,
+            ..s
+        });
+    }
+    Ok(Some(Box::new(out)))
 }
 
 /// Evaluate a binary operation on two scalar values.

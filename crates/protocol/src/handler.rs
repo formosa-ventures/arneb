@@ -1762,13 +1762,14 @@ async fn resolve_expr_subqueries_distributed_inner(
                     .await?,
                 );
             }
-            let resolved_order_by = if order_by.is_empty() {
-                Vec::new()
-            } else {
-                Box::pin(resolve_order_by_subqueries_distributed(
-                    ctx, executor, order_by,
-                ))
-                .await?
+            let resolved_order_by = match order_by {
+                None => None,
+                Some(keys) => Some(Box::new(
+                    Box::pin(resolve_order_by_subqueries_distributed(
+                        ctx, executor, *keys,
+                    ))
+                    .await?,
+                )),
             };
             Ok(PlanExpr::Function {
                 order_by: resolved_order_by,

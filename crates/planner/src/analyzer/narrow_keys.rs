@@ -2067,7 +2067,7 @@ mod tests {
             input: Box::new(filtered),
             group_by: vec![],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "COUNT".to_string(),
                 args: vec![lit_i64(1)],
                 distinct: false,
@@ -2188,7 +2188,7 @@ mod tests {
                 input: Box::new(filtered),
                 group_by: vec![col(3, "l_shipmode")],
                 aggr_exprs: vec![PlanExpr::Function {
-                    order_by: vec![],
+                    order_by: None,
                     name: "COUNT".to_string(),
                     args: vec![lit_i64(1)],
                     distinct: false,
@@ -3418,7 +3418,7 @@ mod tests {
             input: Box::new(join),
             group_by: Vec::new(),
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "SUM".to_string(),
                 args: vec![revenue_arg],
                 distinct: false,

@@ -3626,7 +3626,7 @@ fn rewrite_avg_aggregate(
                 // SUM(x) — BIGINT for integer x, DOUBLE for float x.
                 let sum_idx = n_group + inner_aggr_exprs.len();
                 let sum_expr = PlanExpr::Function {
-                    order_by: vec![],
+                    order_by: None,
                     name: "SUM".into(),
                     args: vec![arg.clone()],
                     distinct: false,
@@ -3643,7 +3643,7 @@ fn rewrite_avg_aggregate(
                 // COUNT(x) — non-null count of the same argument.
                 let count_idx = n_group + inner_aggr_exprs.len();
                 inner_aggr_exprs.push(PlanExpr::Function {
-                    order_by: vec![],
+                    order_by: None,
                     name: "COUNT".into(),
                     args: vec![arg.clone()],
                     distinct: false,
@@ -3969,7 +3969,7 @@ fn build_final_aggr_expr(
         .map(|c| c.name.clone())
         .unwrap_or_default();
     PlanExpr::Function {
-        order_by: vec![],
+        order_by: None,
         name: final_name,
         args: vec![PlanExpr::Column {
             index: partial_idx,
@@ -4350,7 +4350,7 @@ mod tests {
             input: Box::new(lineitem),
             group_by: vec![column(0, "l_suppkey")],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "SUM".into(),
                 args: vec![column(1, "l_extendedprice")],
                 distinct: false,
@@ -4519,7 +4519,7 @@ mod tests {
                 input: Box::new(scan_with_columns("right_table", &["r_payload", "r_id"])),
                 group_by: vec![column(1, "r_id")],
                 aggr_exprs: vec![PlanExpr::Function {
-                    order_by: vec![],
+                    order_by: None,
                     name: "SUM".into(),
                     args: vec![column(0, "r_payload")],
                     distinct: false,
@@ -4955,7 +4955,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "COUNT".into(),
                 args: vec![],
                 distinct: false,
@@ -5004,14 +5004,14 @@ mod tests {
             group_by: vec![column(1, "o_year")],
             aggr_exprs: vec![
                 PlanExpr::Function {
-                    order_by: vec![],
+                    order_by: None,
                     name: "SUM".into(),
                     args: vec![column(3, "volume")],
                     distinct: false,
                     span: None,
                 },
                 PlanExpr::Function {
-                    order_by: vec![],
+                    order_by: None,
                     name: "SUM".into(),
                     args: vec![PlanExpr::CaseExpr {
                         operand: None,
@@ -5122,7 +5122,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "SUM".into(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -5203,7 +5203,7 @@ mod tests {
                 },
             ],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "SUM".into(),
                 args: vec![PlanExpr::Column {
                     index: 2,
@@ -5290,7 +5290,7 @@ mod tests {
                 },
             ],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "SUM".into(),
                 args: vec![PlanExpr::Column {
                     index: 2,
@@ -5381,7 +5381,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "COUNT".into(),
                 args: vec![],
                 distinct: false,
@@ -5413,7 +5413,7 @@ mod tests {
             input: Box::new(scan("t")),
             group_by: vec![],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "COUNT".into(),
                 args: vec![],
                 distinct: false,
@@ -5447,7 +5447,7 @@ mod tests {
             input: Box::new(scan("t")),
             group_by: vec![],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "COUNT".into(),
                 args: vec![PlanExpr::Column {
                     index: 0,
@@ -5519,7 +5519,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "AVG".into(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -5615,7 +5615,7 @@ mod tests {
                 span: None,
             }],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "SUM".into(),
                 args: vec![PlanExpr::Column {
                     index: 1,
@@ -5673,7 +5673,7 @@ mod tests {
             input: Box::new(scan("t")),
             group_by: vec![],
             aggr_exprs: vec![PlanExpr::Function {
-                order_by: vec![],
+                order_by: None,
                 name: "AVG".into(),
                 args: vec![PlanExpr::Column {
                     index: 0,

@@ -485,7 +485,7 @@ fn rewrite_one(
         span: None,
     };
     let agg_exprs = vec![PlanExpr::Function {
-        order_by: vec![],
+        order_by: None,
         name: "BOOL_OR".to_string(),
         args: vec![bool_or_arg],
         distinct: false,

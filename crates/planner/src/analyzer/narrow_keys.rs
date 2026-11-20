@@ -645,9 +645,12 @@ fn collect_inner_join_equivalence_expr_classes(
         | PlanExpr::Cast { expr, .. } => {
             collect_inner_join_equivalence_expr_classes(expr, classes);
         }
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_inner_join_equivalence_expr_classes(arg, classes);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_inner_join_equivalence_expr_classes(&s.expr, classes);
             }
         }
         PlanExpr::Between {
@@ -717,9 +720,12 @@ fn collect_expr_join_key_blocks(
         | PlanExpr::Cast { expr, .. } => {
             collect_expr_join_key_blocks(expr, stats, root_outputs, blocked);
         }
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_expr_join_key_blocks(arg, stats, root_outputs, blocked);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_expr_join_key_blocks(&s.expr, stats, root_outputs, blocked);
             }
         }
         PlanExpr::Between {
@@ -941,9 +947,12 @@ fn collect_expr_sources(expr: &PlanExpr, input: &LogicalPlan, sources: &mut Vec<
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => collect_expr_sources(expr, input, sources),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_expr_sources(arg, input, sources);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_expr_sources(&s.expr, input, sources);
             }
         }
         PlanExpr::Between {
@@ -1019,9 +1028,12 @@ fn collect_joined_expr_sources(
         | PlanExpr::Cast { expr, .. } => {
             collect_joined_expr_sources(expr, left_input, right_input, sources);
         }
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_joined_expr_sources(arg, left_input, right_input, sources);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_joined_expr_sources(&s.expr, left_input, right_input, sources);
             }
         }
         PlanExpr::Between {

@@ -5,6 +5,8 @@
 
 use arneb_common::error::ExecutionError;
 use arneb_common::types::{ScalarValue, TimeUnit};
+use std::sync::Arc;
+
 use arrow::array::{Array, ArrayRef, AsArray, UInt32Array};
 use arrow::datatypes;
 
@@ -931,6 +933,13 @@ pub(crate) fn create_accumulator(
         "MIN" => Box::new(MinAccumulator::new()),
         "MAX" => Box::new(MaxAccumulator::new()),
         "BOOL_OR" => Box::new(BoolOrAccumulator::new()),
+        "BOOL_AND" => Box::new(BoolAndAccumulator::new()),
+        "ARRAY_AGG" if distinct => {
+            return Err(ExecutionError::InvalidOperation(
+                "ARRAY_AGG(DISTINCT) is not supported".to_string(),
+            ))
+        }
+        "ARRAY_AGG" => Box::new(ArrayAggAccumulator::default()),
         name if variance_mode(name).is_some() => {
             let (sample, stddev) = variance_mode(name).unwrap();
             Box::new(VarianceAccumulator {
@@ -1035,6 +1044,428 @@ impl Accumulator for BoolOrAccumulator {
 
     fn reset(&mut self) {
         self.state = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BOOL_AND (tri-state, the dual of BOOL_OR)
+// ---------------------------------------------------------------------------
+
+/// Folds `v` into a `bool_and` state: NULL inputs are skipped, FALSE is
+/// sticky, and the state is NULL only when no non-NULL value was seen.
+fn bool_and_fold(state: Option<bool>, v: bool) -> Option<bool> {
+    Some(state.unwrap_or(true) && v)
+}
+
+fn bool_and_combine(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x && y),
+        (x, None) | (None, x) => x,
+    }
+}
+
+/// `bool_and(col)` over a Boolean column. Skips NULL inputs; NULL when no
+/// non-NULL value was seen.
+#[derive(Debug, Default)]
+pub(crate) struct BoolAndAccumulator {
+    state: Option<bool>,
+}
+
+impl BoolAndAccumulator {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Accumulator for BoolAndAccumulator {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn merge(&mut self, other: &dyn Accumulator) -> Result<(), ExecutionError> {
+        let other = other
+            .as_any()
+            .downcast_ref::<BoolAndAccumulator>()
+            .ok_or_else(|| {
+                ExecutionError::InvalidOperation(
+                    "BoolAndAccumulator::merge: type mismatch".to_string(),
+                )
+            })?;
+        self.state = bool_and_combine(self.state, other.state);
+        Ok(())
+    }
+
+    fn update_batch(&mut self, values: &ArrayRef) -> Result<(), ExecutionError> {
+        let arr = values
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .ok_or_else(|| {
+                ExecutionError::InvalidOperation(
+                    "BoolAndAccumulator: expected BooleanArray".to_string(),
+                )
+            })?;
+        for i in 0..arr.len() {
+            if !arr.is_null(i) {
+                self.state = bool_and_fold(self.state, arr.value(i));
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate(&self) -> Result<ScalarValue, ExecutionError> {
+        Ok(self.state.map_or(ScalarValue::Null, ScalarValue::Boolean))
+    }
+
+    fn reset(&mut self) {
+        self.state = None;
+    }
+}
+
+/// Per-group `bool_and`.
+#[derive(Debug, Default)]
+pub(crate) struct GroupedBoolAndAccumulator {
+    state: Vec<Option<bool>>,
+}
+
+impl GroupedAccumulator for GroupedBoolAndAccumulator {
+    fn ensure_capacity(&mut self, n: usize) {
+        if self.state.len() < n {
+            self.state.resize(n, None);
+        }
+    }
+
+    fn add_input(&mut self, group_ids: &[u32], values: &ArrayRef) -> Result<(), ExecutionError> {
+        let arr = values
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .ok_or_else(|| {
+                ExecutionError::InvalidOperation("BOOL_AND expects a Boolean argument".to_string())
+            })?;
+        for (i, &g) in group_ids.iter().enumerate() {
+            if !arr.is_null(i) {
+                let slot = &mut self.state[g as usize];
+                *slot = bool_and_fold(*slot, arr.value(i));
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate(&self, group_id: u32) -> Result<ScalarValue, ExecutionError> {
+        Ok(self
+            .state
+            .get(group_id as usize)
+            .copied()
+            .flatten()
+            .map_or(ScalarValue::Null, ScalarValue::Boolean))
+    }
+
+    fn num_groups(&self) -> usize {
+        self.state.len()
+    }
+
+    fn merge_from(
+        &mut self,
+        other: &dyn GroupedAccumulator,
+        group_remap: &[u32],
+    ) -> Result<(), ExecutionError> {
+        let other = other
+            .as_any()
+            .downcast_ref::<GroupedBoolAndAccumulator>()
+            .ok_or_else(|| {
+                ExecutionError::InvalidOperation(
+                    "GroupedBoolAndAccumulator::merge_from: type mismatch".to_string(),
+                )
+            })?;
+        for (g, &o_slot) in other.state.iter().enumerate() {
+            let dest = group_remap[g] as usize;
+            if self.state.len() <= dest {
+                self.state.resize(dest + 1, None);
+            }
+            self.state[dest] = bool_and_combine(self.state[dest], o_slot);
+        }
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ARRAY_AGG [ORDER BY ...]
+// ---------------------------------------------------------------------------
+//
+// The operator hands `ARRAY_AGG` one `StructArray` per batch (see
+// `pack_array_agg_input`): field 0 `v` is the value, fields 1.. are the
+// ORDER BY keys. Each key field's name carries its direction
+// (`k<i>_<a|d><f|l>`: ascending/descending, nulls first/last), which keeps
+// the `Accumulator`/`GroupedAccumulator` signatures and factories unchanged.
+
+/// Packs the value and ORDER BY keys of an `ARRAY_AGG` into one struct.
+/// `keys` holds `(array, ascending, nulls_first)`.
+pub(crate) fn pack_array_agg_input(
+    value: ArrayRef,
+    keys: Vec<(ArrayRef, bool, bool)>,
+) -> Result<ArrayRef, ExecutionError> {
+    use arrow::datatypes::Field;
+    let materialize = |a: ArrayRef| crate::operator::materialize_dictionary_array(&a);
+    let mut fields = vec![Field::new("v", value.data_type().clone(), true)];
+    let mut arrays = vec![materialize(value)?];
+    fields[0] = Field::new("v", arrays[0].data_type().clone(), true);
+    for (i, (key, asc, nulls_first)) in keys.into_iter().enumerate() {
+        let key = materialize(key)?;
+        let name = format!(
+            "k{i}_{}{}",
+            if asc { 'a' } else { 'd' },
+            if nulls_first { 'f' } else { 'l' }
+        );
+        fields.push(Field::new(name, key.data_type().clone(), true));
+        arrays.push(key);
+    }
+    let packed = arrow::array::StructArray::try_new(fields.into(), arrays, None)?;
+    Ok(Arc::new(packed))
+}
+
+/// One buffered `ARRAY_AGG` input row.
+#[derive(Debug, Clone)]
+struct ArrayAggRow {
+    keys: Vec<ScalarValue>,
+    value: ScalarValue,
+}
+
+/// Rows of one group plus what the packed input says about them.
+#[derive(Debug, Default)]
+struct ArrayAggBuffer {
+    rows: Vec<ArrayAggRow>,
+}
+
+/// What a packed batch declares: element type and key directions.
+#[derive(Debug, Clone)]
+struct ArrayAggShape {
+    element: arneb_common::types::DataType,
+    /// `(ascending, nulls_first)` per key.
+    dirs: Vec<(bool, bool)>,
+}
+
+/// Splits a packed batch into its shape and per-column arrays.
+fn unpack_array_agg(
+    values: &ArrayRef,
+) -> Result<(ArrayAggShape, &arrow::array::StructArray), ExecutionError> {
+    let packed = values.as_struct_opt().ok_or_else(|| {
+        ExecutionError::InvalidOperation("ARRAY_AGG: expected a packed struct input".to_string())
+    })?;
+    let fields = packed.fields();
+    let element = arneb_common::types::DataType::try_from(fields[0].data_type().clone())
+        .map_err(|e| ExecutionError::InvalidOperation(format!("ARRAY_AGG: {e}")))?;
+    let dirs = fields[1..]
+        .iter()
+        .map(|f| {
+            let n = f.name();
+            (n.contains("_a"), n.ends_with('f'))
+        })
+        .collect();
+    Ok((ArrayAggShape { element, dirs }, packed))
+}
+
+impl ArrayAggBuffer {
+    fn push_batch(&mut self, packed: &arrow::array::StructArray) -> Result<(), ExecutionError> {
+        let cols = packed.columns();
+        for i in 0..packed.len() {
+            let scalar = |c: &ArrayRef| crate::operator::extract_scalar(c, i);
+            self.rows.push(ArrayAggRow {
+                value: scalar(&cols[0])?,
+                keys: cols[1..].iter().map(scalar).collect::<Result<_, _>>()?,
+            });
+        }
+        Ok(())
+    }
+
+    /// The group's array, or NULL when it has no rows.
+    fn finish(&self, shape: Option<&ArrayAggShape>) -> ScalarValue {
+        let Some(shape) = shape.filter(|_| !self.rows.is_empty()) else {
+            return ScalarValue::Null;
+        };
+        let mut rows: Vec<&ArrayAggRow> = self.rows.iter().collect();
+        if !shape.dirs.is_empty() {
+            rows.sort_by(|a, b| cmp_array_agg_keys(&a.keys, &b.keys, &shape.dirs));
+        }
+        ScalarValue::List {
+            element: Box::new(shape.element.clone()),
+            values: rows.into_iter().map(|r| r.value.clone()).collect(),
+        }
+    }
+}
+
+fn cmp_array_agg_keys(
+    a: &[ScalarValue],
+    b: &[ScalarValue],
+    dirs: &[(bool, bool)],
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for ((x, y), &(asc, nulls_first)) in a.iter().zip(b).zip(dirs) {
+        let ord = match (
+            matches!(x, ScalarValue::Null),
+            matches!(y, ScalarValue::Null),
+        ) {
+            (true, true) => Ordering::Equal,
+            // NULLS FIRST/LAST is absolute, independent of ASC/DESC.
+            (true, false) => {
+                if nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => {
+                let o = cmp_scalar(x, y);
+                if asc {
+                    o
+                } else {
+                    o.reverse()
+                }
+            }
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Total order over two non-NULL scalars of the same type.
+fn cmp_scalar(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
+    use ScalarValue as S;
+    match (a, b) {
+        (S::Boolean(x), S::Boolean(y)) => x.cmp(y),
+        (S::Int32(x), S::Int32(y)) | (S::Date32(x), S::Date32(y)) => x.cmp(y),
+        (S::Int64(x), S::Int64(y)) => x.cmp(y),
+        (S::Float32(x), S::Float32(y)) => x.total_cmp(y),
+        (S::Float64(x), S::Float64(y)) => x.total_cmp(y),
+        (S::Utf8(x), S::Utf8(y)) => x.cmp(y),
+        (S::Binary(x), S::Binary(y)) => x.cmp(y),
+        (S::Decimal128 { value: x, .. }, S::Decimal128 { value: y, .. }) => x.cmp(y),
+        (S::Timestamp { value: x, .. }, S::Timestamp { value: y, .. }) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// `array_agg(value [ORDER BY keys])` for one group.
+#[derive(Debug, Default)]
+pub(crate) struct ArrayAggAccumulator {
+    shape: Option<ArrayAggShape>,
+    buffer: ArrayAggBuffer,
+}
+
+impl Accumulator for ArrayAggAccumulator {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn update_batch(&mut self, values: &ArrayRef) -> Result<(), ExecutionError> {
+        let (shape, packed) = unpack_array_agg(values)?;
+        self.shape.get_or_insert(shape);
+        self.buffer.push_batch(packed)
+    }
+
+    fn merge(&mut self, other: &dyn Accumulator) -> Result<(), ExecutionError> {
+        let other = other
+            .as_any()
+            .downcast_ref::<ArrayAggAccumulator>()
+            .ok_or_else(|| {
+                ExecutionError::InvalidOperation(
+                    "ArrayAggAccumulator::merge: type mismatch".to_string(),
+                )
+            })?;
+        if self.shape.is_none() {
+            self.shape = other.shape.clone();
+        }
+        self.buffer.rows.extend(other.buffer.rows.iter().cloned());
+        Ok(())
+    }
+
+    fn evaluate(&self) -> Result<ScalarValue, ExecutionError> {
+        Ok(self.buffer.finish(self.shape.as_ref()))
+    }
+
+    fn reset(&mut self) {
+        self.buffer.rows.clear();
+    }
+}
+
+/// Per-group `array_agg`.
+#[derive(Debug, Default)]
+pub(crate) struct GroupedArrayAggAccumulator {
+    shape: Option<ArrayAggShape>,
+    groups: Vec<ArrayAggBuffer>,
+}
+
+impl GroupedAccumulator for GroupedArrayAggAccumulator {
+    fn ensure_capacity(&mut self, n: usize) {
+        if self.groups.len() < n {
+            self.groups.resize_with(n, ArrayAggBuffer::default);
+        }
+    }
+
+    fn add_input(&mut self, group_ids: &[u32], values: &ArrayRef) -> Result<(), ExecutionError> {
+        let (shape, packed) = unpack_array_agg(values)?;
+        self.shape.get_or_insert(shape);
+        let cols = packed.columns();
+        for (i, &g) in group_ids.iter().enumerate() {
+            let scalar = |c: &ArrayRef| crate::operator::extract_scalar(c, i);
+            self.groups[g as usize].rows.push(ArrayAggRow {
+                value: scalar(&cols[0])?,
+                keys: cols[1..].iter().map(scalar).collect::<Result<_, _>>()?,
+            });
+        }
+        Ok(())
+    }
+
+    fn evaluate(&self, group_id: u32) -> Result<ScalarValue, ExecutionError> {
+        Ok(self
+            .groups
+            .get(group_id as usize)
+            .map_or(ScalarValue::Null, |g| g.finish(self.shape.as_ref())))
+    }
+
+    fn num_groups(&self) -> usize {
+        self.groups.len()
+    }
+
+    fn merge_from(
+        &mut self,
+        other: &dyn GroupedAccumulator,
+        group_remap: &[u32],
+    ) -> Result<(), ExecutionError> {
+        let other = other
+            .as_any()
+            .downcast_ref::<GroupedArrayAggAccumulator>()
+            .ok_or_else(|| {
+                ExecutionError::InvalidOperation(
+                    "GroupedArrayAggAccumulator::merge_from: type mismatch".to_string(),
+                )
+            })?;
+        if self.shape.is_none() {
+            self.shape = other.shape.clone();
+        }
+        for (g, buf) in other.groups.iter().enumerate() {
+            let dest = group_remap[g] as usize;
+            if self.groups.len() <= dest {
+                self.groups.resize_with(dest + 1, ArrayAggBuffer::default);
+            }
+            self.groups[dest].rows.extend(buf.rows.iter().cloned());
+        }
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -1810,6 +2241,8 @@ pub(crate) fn create_grouped_accumulator(
         "MIN" => Box::new(GroupedMinAccumulator::new()),
         "MAX" => Box::new(GroupedMaxAccumulator::new()),
         "BOOL_OR" => Box::new(GroupedBoolOrAccumulator::new()),
+        "BOOL_AND" => Box::new(GroupedBoolAndAccumulator::default()),
+        "ARRAY_AGG" => Box::new(GroupedArrayAggAccumulator::default()),
         name if variance_mode(name).is_some() => {
             let (sample, stddev) = variance_mode(name).unwrap();
             Box::new(GroupedVarianceAccumulator {
@@ -2144,6 +2577,66 @@ mod tests {
     /// The planner's declared SUM/AVG type (`function_return_type`), the
     /// Trino result type, and what both accumulator flavours produce must
     /// all agree — `AggregateExec` rejects any mismatch at runtime.
+    #[test]
+    fn array_agg_and_bool_and_types_agree_and_merge() {
+        use arneb_common::types::{ColumnInfo, DataType};
+        use arneb_planner::analyzer::plan_expr_type;
+        use arneb_planner::PlanExpr;
+
+        let schema = [ColumnInfo {
+            name: "x".into(),
+            data_type: DataType::Int64,
+            nullable: true,
+        }];
+        let call = |name: &str| PlanExpr::Function {
+            order_by: None,
+            name: name.into(),
+            args: vec![PlanExpr::Column {
+                index: 0,
+                name: "x".into(),
+                span: None,
+            }],
+            distinct: false,
+            span: None,
+        };
+        assert_eq!(
+            plan_expr_type(&call("ARRAY_AGG"), &schema),
+            Some(DataType::List(Box::new(DataType::Int64)))
+        );
+        assert_eq!(
+            plan_expr_type(&call("BOOL_AND"), &schema),
+            Some(DataType::Boolean)
+        );
+
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(3), None, Some(1)]));
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let packed = pack_array_agg_input(values, vec![(keys, false, false)]).unwrap();
+        let want = ScalarValue::List {
+            element: Box::new(DataType::Int64),
+            values: vec![
+                ScalarValue::Int64(1),
+                ScalarValue::Null,
+                ScalarValue::Int64(3),
+            ],
+        };
+        let mut single = create_accumulator("ARRAY_AGG", false, false).unwrap();
+        single.update_batch(&packed).unwrap();
+        assert_eq!(single.evaluate().unwrap(), want);
+        // Merging two halves sorts across both.
+        let mut a = create_accumulator("ARRAY_AGG", false, false).unwrap();
+        a.update_batch(&packed.slice(0, 1)).unwrap();
+        let mut b = create_accumulator("ARRAY_AGG", false, false).unwrap();
+        b.update_batch(&packed.slice(1, 2)).unwrap();
+        a.merge(b.as_ref()).unwrap();
+        assert_eq!(a.evaluate().unwrap(), want);
+        let mut grouped = create_grouped_accumulator("ARRAY_AGG", false, false).unwrap();
+        grouped.ensure_capacity(2);
+        grouped.add_input(&[1, 1, 1], &packed).unwrap();
+        assert_eq!(grouped.evaluate(1).unwrap(), want);
+        assert_eq!(grouped.evaluate(0).unwrap(), ScalarValue::Null);
+        assert!(create_accumulator("ARRAY_AGG", false, true).is_err());
+    }
+
     #[test]
     fn planner_and_accumulator_types_agree() {
         use arneb_common::types::{ColumnInfo, DataType};

@@ -983,7 +983,12 @@ fn aggregate_single_column_arg_index(aggr_expr: &PlanExpr) -> Option<usize> {
 }
 
 fn aggregate_single_column_arg(aggr_expr: &PlanExpr) -> Option<&PlanExpr> {
-    let PlanExpr::Function { args, .. } = aggr_expr else {
+    let PlanExpr::Function {
+        args,
+        order_by: None,
+        ..
+    } = aggr_expr
+    else {
         return None;
     };
     let [arg] = args.as_slice() else {
@@ -1501,9 +1506,12 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             collect_column_indices(right, cb);
         }
         PlanExpr::UnaryOp { expr, .. } => collect_column_indices(expr, cb),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_column_indices(arg, cb);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_column_indices(&s.expr, cb);
             }
         }
         PlanExpr::IsNull { expr, .. } | PlanExpr::IsNotNull { expr, .. } => {

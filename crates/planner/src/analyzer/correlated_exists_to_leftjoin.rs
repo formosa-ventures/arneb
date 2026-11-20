@@ -720,9 +720,12 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             collect_column_indices(right, cb);
         }
         E::UnaryOp { expr, .. } => collect_column_indices(expr, cb),
-        E::Function { args, .. } => {
+        E::Function { args, order_by, .. } => {
             for a in args {
                 collect_column_indices(a, cb);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_column_indices(&s.expr, cb);
             }
         }
         E::IsNull { expr, .. } | E::IsNotNull { expr, .. } => collect_column_indices(expr, cb),

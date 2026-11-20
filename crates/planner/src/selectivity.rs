@@ -373,6 +373,8 @@ fn is_aggregate_function_call(expr: &PlanExpr) -> bool {
                 | "MIN"
                 | "MAX"
                 | "BOOL_OR"
+                | "BOOL_AND"
+                | "ARRAY_AGG"
                 | "STDDEV_SAMP"
                 | "STDDEV"
                 | "STDDEV_POP"

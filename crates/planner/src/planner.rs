@@ -2154,10 +2154,13 @@ impl<'a> QueryPlanner<'a> {
     ) -> Result<Vec<SortExpr>, PlanError> {
         let mut out = Vec::with_capacity(order_by.len());
         for ob in order_by {
+            let asc = ob.asc.unwrap_or(true);
             out.push(SortExpr {
                 expr: self.plan_expr(&ob.expr, ctx).await?,
-                asc: ob.asc.unwrap_or(true),
-                nulls_first: ob.nulls_first.unwrap_or(false),
+                asc,
+                // PostgreSQL: NULLs sort as larger than any value, so they
+                // come last for ASC and first for DESC unless stated.
+                nulls_first: ob.nulls_first.unwrap_or(!asc),
             });
         }
         Ok(out)
@@ -2219,6 +2222,11 @@ impl<'a> QueryPlanner<'a> {
             } => {
                 if !order_by.is_empty() {
                     check_aggregate_order_by(name)?;
+                }
+                if *distinct && name.eq_ignore_ascii_case("ARRAY_AGG") {
+                    return Err(PlanError::invalid_expression(
+                        "DISTINCT is not supported in array_agg",
+                    ));
                 }
                 if name.eq_ignore_ascii_case("GROUPING") {
                     if let [ast::FunctionArg::Unnamed(key)] = args.as_slice() {
@@ -3304,6 +3312,8 @@ fn is_aggregate_function(name: &str) -> bool {
             | "MIN"
             | "MAX"
             | "BOOL_OR"
+            | "BOOL_AND"
+            | "ARRAY_AGG"
             | "STDDEV_SAMP"
             | "STDDEV"
             | "STDDEV_POP"
@@ -4324,11 +4334,14 @@ fn collect_window_calls(expr: &ast::Expr, out: &mut Vec<ast::Expr>) {
                 collect_window_calls(e, out);
             }
         }
-        E::Function { args, .. } => {
+        E::Function { args, order_by, .. } => {
             for a in args {
                 if let ast::FunctionArg::Unnamed(e) = a {
                     collect_window_calls(e, out);
                 }
+            }
+            for o in order_by {
+                collect_window_calls(&o.expr, out);
             }
         }
         E::Case {
@@ -4378,11 +4391,14 @@ fn walk_columns(expr: &ast::Expr, cb: &mut impl FnMut(&ast::ColumnRef)) {
                 walk_columns(e, cb);
             }
         }
-        E::Function { args, .. } => {
+        E::Function { args, order_by, .. } => {
             for a in args {
                 if let ast::FunctionArg::Unnamed(e) = a {
                     walk_columns(e, cb);
                 }
+            }
+            for o in order_by {
+                walk_columns(&o.expr, cb);
             }
         }
         E::Case {

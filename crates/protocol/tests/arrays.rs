@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Date32Array, Int64Array};
+use arrow::array::{ArrayRef, BooleanArray, Date32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use tokio::net::TcpListener;
@@ -57,6 +57,100 @@ fn state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
             }],
             vec![dbatch],
         )),
+    );
+    // Aggregation fixtures.
+    let mem = |cols: Vec<(&str, ArrowDataType, ArrayRef)>| {
+        let schema = Arc::new(Schema::new(
+            cols.iter()
+                .map(|(n, t, _)| Field::new(*n, t.clone(), true))
+                .collect::<Vec<_>>(),
+        ));
+        let infos = cols
+            .iter()
+            .map(|(n, t, _)| ColumnInfo {
+                name: n.to_string(),
+                data_type: DataType::try_from(t.clone()).unwrap(),
+                nullable: true,
+            })
+            .collect();
+        let batch =
+            RecordBatch::try_new(schema, cols.into_iter().map(|(_, _, a)| a).collect()).unwrap();
+        Arc::new(MemoryTable::new(infos, vec![batch]))
+    };
+    let i64s = |v: Vec<Option<i64>>| Arc::new(Int64Array::from(v)) as ArrayRef;
+    let strs = |v: Vec<Option<&str>>| Arc::new(StringArray::from(v)) as ArrayRef;
+    default_schema.register_table(
+        "nation",
+        mem(vec![
+            (
+                "n_nationkey",
+                ArrowDataType::Int64,
+                i64s((1..=6).map(Some).collect()),
+            ),
+            (
+                "n_regionkey",
+                ArrowDataType::Int64,
+                i64s(vec![Some(0), Some(1), Some(0), Some(1), Some(0), Some(1)]),
+            ),
+            (
+                "n_name",
+                ArrowDataType::Utf8,
+                strs(vec![
+                    Some("A"),
+                    Some("D"),
+                    Some("B"),
+                    Some("F"),
+                    Some("C"),
+                    Some("E"),
+                ]),
+            ),
+        ]),
+    );
+    default_schema.register_table(
+        "multi",
+        mem(vec![
+            (
+                "v",
+                ArrowDataType::Utf8,
+                strs(vec![Some("a"), Some("b"), Some("c"), Some("d"), Some("e")]),
+            ),
+            (
+                "k1",
+                ArrowDataType::Int64,
+                i64s(vec![Some(2), Some(1), Some(2), Some(1), Some(2)]),
+            ),
+            (
+                "k2",
+                ArrowDataType::Int64,
+                i64s(vec![Some(5), None, Some(7), Some(3), None]),
+            ),
+        ]),
+    );
+    default_schema.register_table(
+        "nulls",
+        mem(vec![("x", ArrowDataType::Int64, i64s(vec![None, None]))]),
+    );
+    default_schema.register_table(
+        "bools",
+        mem(vec![
+            (
+                "g",
+                ArrowDataType::Int64,
+                i64s(vec![Some(1), Some(1), Some(2), Some(2), Some(3), Some(3)]),
+            ),
+            (
+                "b",
+                ArrowDataType::Boolean,
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(true),
+                    Some(true),
+                    Some(false),
+                    None,
+                    None,
+                ])) as ArrayRef,
+            ),
+        ]),
     );
     let file = Arc::new(MemoryCatalog::new());
     file.register_schema("default", default_schema);
@@ -475,5 +569,150 @@ async fn constant_array_any_explains_as_an_in_list() {
             .await
             .len(),
         3
+    );
+}
+
+/// Every row of a simple query as text columns.
+async fn all_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Option<String>>> {
+    client
+        .simple_query(sql)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => {
+                Some((0..r.len()).map(|i| r.get(i).map(str::to_string)).collect())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn array_agg_order_by() {
+    let client = connect(pg_server().await).await;
+    let got = all_rows(
+        &client,
+        "SELECT n_regionkey, array_agg(n_name ORDER BY n_name DESC) FROM nation GROUP BY 1 ORDER BY 1",
+    )
+    .await;
+    let want = |a: &str, b: &str| vec![Some(a.to_string()), Some(b.to_string())];
+    assert_eq!(got, [want("0", "{C,B,A}"), want("1", "{F,E,D}")]);
+    let stmt = client
+        .prepare("SELECT array_agg(n_name ORDER BY n_name) FROM nation")
+        .await
+        .unwrap();
+    assert_eq!(stmt.columns()[0].type_().oid(), 1015, "varchar[]");
+}
+
+#[tokio::test]
+async fn array_agg_order_by_column_not_otherwise_selected() {
+    let client = connect(pg_server().await).await;
+    // `n_nationkey` is used only as a sort key; column pruning must keep it.
+    assert_eq!(
+        first_text(
+            &client,
+            "SELECT array_agg(n_name ORDER BY n_nationkey DESC) FROM nation"
+        )
+        .await
+        .unwrap(),
+        "{E,C,F,B,D,A}"
+    );
+    // Grouped, with the key also absent from the GROUP BY output.
+    let got = column_text(
+        &client,
+        "SELECT array_agg(n_name ORDER BY n_nationkey DESC) FROM nation GROUP BY n_regionkey ORDER BY n_regionkey",
+    )
+    .await;
+    assert_eq!(
+        got,
+        [Some("{C,B,A}".to_string()), Some("{E,F,D}".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn array_agg_multi_key_order_with_nulls_last() {
+    let client = connect(pg_server().await).await;
+    // k1 asc: (b,d) then (a,c,e). Within k1=1: k2 DESC NULLS LAST: d(3), b(NULL).
+    // Within k1=2: c(7), a(5), e(NULL).
+    assert_eq!(
+        first_text(
+            &client,
+            "SELECT array_agg(v ORDER BY k1, k2 DESC NULLS LAST) FROM multi"
+        )
+        .await
+        .unwrap(),
+        "{d,b,c,a,e}"
+    );
+    // Default for ASC is NULLS LAST; explicit NULLS FIRST flips it.
+    assert_eq!(
+        first_text(&client, "SELECT array_agg(v ORDER BY k1, k2) FROM multi")
+            .await
+            .unwrap(),
+        "{d,b,a,c,e}"
+    );
+    assert_eq!(
+        first_text(
+            &client,
+            "SELECT array_agg(v ORDER BY k1, k2 NULLS FIRST) FROM multi"
+        )
+        .await
+        .unwrap(),
+        "{b,d,e,a,c}"
+    );
+}
+
+#[tokio::test]
+async fn array_agg_nulls_and_empty_input() {
+    let client = connect(pg_server().await).await;
+    assert_eq!(
+        first_text(&client, "SELECT array_agg(x) FROM nulls")
+            .await
+            .unwrap(),
+        "{NULL,NULL}"
+    );
+    let got = column_text(&client, "SELECT array_agg(x) FROM t WHERE false").await;
+    assert_eq!(got, [None], "one row, NULL");
+    let got = column_text(&client, "SELECT array_agg(x ORDER BY x) FROM t WHERE false").await;
+    assert_eq!(got, [None]);
+}
+
+#[tokio::test]
+async fn array_agg_distinct_is_refused() {
+    let client = connect(pg_server().await).await;
+    let err = client
+        .simple_query("SELECT array_agg(DISTINCT x) FROM t")
+        .await
+        .expect_err("array_agg(DISTINCT) must be refused");
+    let message = err
+        .as_db_error()
+        .map_or_else(|| err.to_string(), |e| e.message().to_string());
+    assert!(message.contains("DISTINCT"), "{message}");
+}
+
+#[tokio::test]
+async fn bool_and_basic() {
+    let client = connect(pg_server().await).await;
+    let got = all_rows(
+        &client,
+        "SELECT g, bool_and(b) FROM bools GROUP BY g ORDER BY g",
+    )
+    .await;
+    let row = |g: &str, v: Option<&str>| vec![Some(g.to_string()), v.map(str::to_string)];
+    assert_eq!(
+        got,
+        [row("1", Some("t")), row("2", Some("f")), row("3", None)]
+    );
+    assert_eq!(
+        column_text(&client, "SELECT bool_and(b) FROM bools WHERE g = 1").await,
+        [Some("t".to_string())]
+    );
+    assert_eq!(
+        column_text(&client, "SELECT bool_and(b) FROM bools WHERE g = 2").await,
+        [Some("f".to_string())]
+    );
+    assert_eq!(
+        column_text(&client, "SELECT bool_and(b) FROM bools WHERE g = 3").await,
+        [None]
     );
 }

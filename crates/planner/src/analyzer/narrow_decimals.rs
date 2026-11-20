@@ -560,9 +560,12 @@ fn collect_decimal64_columns_needing_wide(
             collect_decimal64_column_refs(left, schema, used);
             collect_decimal64_column_refs(right, schema, used);
         }
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_decimal64_column_refs(arg, schema, used);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_decimal64_column_refs(&s.expr, schema, used);
             }
         }
         PlanExpr::UnaryOp { expr, .. }
@@ -636,9 +639,12 @@ fn collect_decimal64_column_refs(
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => collect_decimal64_column_refs(expr, schema, used),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_decimal64_column_refs(arg, schema, used);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_decimal64_column_refs(&s.expr, schema, used);
             }
         }
         PlanExpr::Between {
@@ -692,13 +698,31 @@ fn block_direct_aggregate_decimal_sources(
     input: &LogicalPlan,
     blocked: &mut HashSet<ColumnSource>,
 ) {
-    if let PlanExpr::Function { name, args, .. } = expr {
-        if matches!(name.to_uppercase().as_str(), "SUM" | "AVG") {
-            for arg in args {
-                if let PlanExpr::Column { index, .. } = arg {
-                    blocked.extend(trace_output_column(input, *index).blockable_sources());
+    if let PlanExpr::Function {
+        name,
+        args,
+        order_by,
+        ..
+    } = expr
+    {
+        match name.to_uppercase().as_str() {
+            "SUM" | "AVG" => {
+                for arg in args {
+                    if let PlanExpr::Column { index, .. } = arg {
+                        blocked.extend(trace_output_column(input, *index).blockable_sources());
+                    }
                 }
             }
+            // `array_agg` buffers `Decimal128` scalars and orders by them.
+            "ARRAY_AGG" => {
+                for e in args
+                    .iter()
+                    .chain(order_by.iter().flat_map(|v| v.iter().map(|s| &s.expr)))
+                {
+                    block_expr_sources(e, input, blocked);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -722,9 +746,12 @@ fn block_expr_sources(expr: &PlanExpr, input: &LogicalPlan, blocked: &mut HashSe
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => block_expr_sources(expr, input, blocked),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 block_expr_sources(arg, input, blocked);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                block_expr_sources(&s.expr, input, blocked);
             }
         }
         PlanExpr::Between {
@@ -782,9 +809,12 @@ fn collect_expr_subquery_blocks(expr: &PlanExpr, blocked: &mut HashSet<ColumnSou
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => collect_expr_subquery_blocks(expr, blocked),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_expr_subquery_blocks(arg, blocked);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_expr_subquery_blocks(&s.expr, blocked);
             }
         }
         PlanExpr::Between {
@@ -858,9 +888,12 @@ fn block_expr_sources_joined(
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => block_expr_sources_joined(expr, left, right, blocked),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 block_expr_sources_joined(arg, left, right, blocked);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                block_expr_sources_joined(&s.expr, left, right, blocked);
             }
         }
         PlanExpr::Between {

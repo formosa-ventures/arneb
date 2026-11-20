@@ -2400,9 +2400,14 @@ fn expr_columns_in_range(expr: &PlanExpr, input_width: usize) -> bool {
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => expr_columns_in_range(expr, input_width),
-        PlanExpr::Function { args, .. } => args
-            .iter()
-            .all(|expr| expr_columns_in_range(expr, input_width)),
+        PlanExpr::Function { args, order_by, .. } => {
+            args.iter()
+                .all(|expr| expr_columns_in_range(expr, input_width))
+                && order_by
+                    .iter()
+                    .flat_map(|v| v.iter())
+                    .all(|s| expr_columns_in_range(&s.expr, input_width))
+        }
         PlanExpr::Between {
             expr, low, high, ..
         } => {
@@ -2586,7 +2591,12 @@ fn expr_subplans(expr: &PlanExpr) -> Vec<&LogicalPlan> {
             | PlanExpr::IsNull { expr, .. }
             | PlanExpr::IsNotNull { expr, .. }
             | PlanExpr::Cast { expr, .. } => walk(expr, out),
-            PlanExpr::Function { args, .. } => args.iter().for_each(|a| walk(a, out)),
+            PlanExpr::Function { args, order_by, .. } => {
+                args.iter().for_each(|a| walk(a, out));
+                for s in order_by.iter().flat_map(|v| v.iter()) {
+                    walk(&s.expr, out);
+                }
+            }
             PlanExpr::Between {
                 expr, low, high, ..
             } => {

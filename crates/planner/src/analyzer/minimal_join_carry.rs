@@ -880,9 +880,12 @@ fn collect_columns(expr: &PlanExpr, out: &mut BTreeSet<usize>) {
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => collect_columns(expr, out),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_columns(arg, out);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_columns(&s.expr, out);
             }
         }
         PlanExpr::Between {

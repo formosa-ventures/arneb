@@ -804,9 +804,12 @@ where
             visit_columns(expr, callback);
             visit_columns(array, callback);
         }
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for a in args {
                 visit_columns(a, callback);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                visit_columns(&s.expr, callback);
             }
         }
         PlanExpr::CaseExpr {

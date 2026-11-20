@@ -3173,9 +3173,12 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             collect_column_indices(right, cb);
         }
         PlanExpr::UnaryOp { expr, .. } => collect_column_indices(expr, cb),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for a in args {
                 collect_column_indices(a, cb);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_column_indices(&s.expr, cb);
             }
         }
         PlanExpr::IsNull { expr, .. } | PlanExpr::IsNotNull { expr, .. } => {

@@ -372,7 +372,11 @@ pub(crate) fn function_return_type(
             })
             .or(Some(DataType::Float64)),
         "MIN" | "MAX" => args.first().and_then(|a| plan_expr_type(a, schema)),
-        "BOOL_OR" => Some(DataType::Boolean),
+        "BOOL_OR" | "BOOL_AND" => Some(DataType::Boolean),
+        "ARRAY_AGG" => args
+            .first()
+            .and_then(|a| plan_expr_type(a, schema))
+            .map(|t| DataType::List(Box::new(t))),
         "STDDEV_SAMP" | "STDDEV" | "STDDEV_POP" | "VAR_SAMP" | "VARIANCE" | "VAR_POP" => {
             Some(DataType::Float64)
         }

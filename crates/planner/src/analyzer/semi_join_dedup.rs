@@ -349,9 +349,12 @@ fn collect_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             collect_indices(right, cb);
         }
         PlanExpr::UnaryOp { expr, .. } => collect_indices(expr, cb),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for a in args {
                 collect_indices(a, cb);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_indices(&s.expr, cb);
             }
         }
         PlanExpr::IsNull { expr, .. } | PlanExpr::IsNotNull { expr, .. } => {

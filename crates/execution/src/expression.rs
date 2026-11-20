@@ -1293,9 +1293,12 @@ fn case_referenced_columns(expr: &PlanExpr, referenced: &mut [bool]) {
             case_referenced_columns(expr, referenced);
             case_referenced_columns(array, referenced);
         }
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 case_referenced_columns(arg, referenced);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                case_referenced_columns(&s.expr, referenced);
             }
         }
         PlanExpr::CaseExpr {

@@ -1836,9 +1836,12 @@ fn collect_column_indices_into(expr: &PlanExpr, out: &mut std::collections::BTre
             collect_column_indices_into(expr, out);
             collect_column_indices_into(array, out);
         }
-        E::Function { args, .. } => {
+        E::Function { args, order_by, .. } => {
             for a in args {
                 collect_column_indices_into(a, out);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_column_indices_into(&s.expr, out);
             }
         }
         E::ScalarSubquery { .. } => {

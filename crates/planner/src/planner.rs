@@ -1110,6 +1110,38 @@ impl<'a> QueryPlanner<'a> {
         Ok(plan)
     }
 
+    /// `generate_subscripts`' dimension must be a constant that folds to 1
+    /// (`1`, `1::INTEGER`, ...): Arneb arrays have one dimension. Out of line
+    /// so `plan_project_set`'s future stays small.
+    #[inline(never)]
+    async fn check_generate_subscripts_dim(
+        &self,
+        dim: &ast::Expr,
+        ctx: &PlanningContext,
+    ) -> Result<(), PlanError> {
+        let planned = Box::pin(self.plan_expr(dim, ctx)).await?;
+        let is_one = |e: &PlanExpr| {
+            matches!(
+                e,
+                PlanExpr::Literal {
+                    value: ScalarValue::Int32(1) | ScalarValue::Int64(1),
+                    ..
+                }
+            )
+        };
+        match crate::optimizer::fold_constants(planned) {
+            Ok(e) if is_one(&e) => Ok(()),
+            // `1::SMALLINT`: there is no SMALLINT literal, so the fold keeps
+            // the (range-checked) cast over a BIGINT literal.
+            Ok(PlanExpr::Cast {
+                expr,
+                data_type: DataType::Int8 | DataType::Int16,
+                ..
+            }) if is_one(&expr) => Ok(()),
+            _ => Err(generate_subscripts_dim_error()),
+        }
+    }
+
     /// Plans the SELECT items that are set-returning function calls into a
     /// `ProjectSet` above `plan`. Each SRF becomes a column appended to `ctx`
     /// (under [`SRF_QUALIFIER`]), and the returned SELECT list reads it as a
@@ -1132,6 +1164,11 @@ impl<'a> QueryPlanner<'a> {
                 continue;
             };
             let array = srf_array_argument(kind, call)?;
+            if let Some(dim) =
+                generate_subscripts_dim(call).filter(|_| kind == SrfKind::GenerateSubscripts)
+            {
+                self.check_generate_subscripts_dim(dim, ctx).await?;
+            }
             let array = match num_group_by {
                 Some(n) => self.rewrite_aggregates_as_columns(array, ctx, n),
                 None => array.clone(),
@@ -4720,19 +4757,32 @@ fn srf_array_argument(kind: SrfKind, call: &ast::Expr) -> Result<&ast::Expr, Pla
             message: "unnest takes exactly one array argument".to_string(),
             location: None,
         }),
+        // The dimension is checked once planned: any constant folding to 1.
         (
             SrfKind::GenerateSubscripts,
-            [ast::FunctionArg::Unnamed(array), ast::FunctionArg::Unnamed(ast::Expr::Literal {
-                value: ScalarValue::Int64(1) | ScalarValue::Int32(1),
-                ..
-            })],
+            [ast::FunctionArg::Unnamed(array), ast::FunctionArg::Unnamed(_)],
         ) => Ok(array),
-        (SrfKind::GenerateSubscripts, _) => Err(PlanError::UnsupportedExpression {
-            message: "generate_subscripts is supported only as generate_subscripts(array, 1): \
-                      arrays have dimension 1"
-                .to_string(),
-            location: None,
-        }),
+        (SrfKind::GenerateSubscripts, _) => Err(generate_subscripts_dim_error()),
+    }
+}
+
+/// The dimension argument of a `generate_subscripts(array, dim)` call.
+fn generate_subscripts_dim(call: &ast::Expr) -> Option<&ast::Expr> {
+    match call {
+        ast::Expr::Function { args, .. } => match args.as_slice() {
+            [_, ast::FunctionArg::Unnamed(dim)] => Some(dim),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn generate_subscripts_dim_error() -> PlanError {
+    PlanError::UnsupportedExpression {
+        message: "generate_subscripts is supported only as generate_subscripts(array, 1): \
+                  arrays have dimension 1"
+            .to_string(),
+        location: None,
     }
 }
 
@@ -5011,6 +5061,23 @@ fn group_by_qualifier(expr: &ast::Expr) -> Option<String> {
     }
 }
 
+/// An aggregate call's `ORDER BY`, written as `PlanExpr`'s Display writes it
+/// (direction and NULLS placement spelled out, with `plan_call_order_by`'s
+/// defaults), so `find_aggregate_index` matches the aggregate's output name.
+fn write_call_order_by_unqualified(out: &mut String, order_by: &[ast::OrderByExpr]) {
+    for (i, ob) in order_by.iter().enumerate() {
+        out.push_str(if i == 0 { " ORDER BY " } else { ", " });
+        write_ast_unqualified(out, &ob.expr);
+        let asc = ob.asc.unwrap_or(true);
+        out.push_str(if asc { " ASC" } else { " DESC" });
+        out.push_str(if ob.nulls_first.unwrap_or(!asc) {
+            " NULLS FIRST"
+        } else {
+            " NULLS LAST"
+        });
+    }
+}
+
 /// Format an AST expression, stripping column qualifiers and unwrapping
 /// parenthesized `Nested` nodes. Produces a string that matches the
 /// Display of an equivalent `PlanExpr`:
@@ -5056,6 +5123,7 @@ fn write_ast_unqualified(out: &mut String, expr: &ast::Expr) {
             name,
             args,
             distinct,
+            order_by,
             ..
         } => {
             let _ = write!(out, "{name}(");
@@ -5073,6 +5141,7 @@ fn write_ast_unqualified(out: &mut String, expr: &ast::Expr) {
                     }
                 }
             }
+            write_call_order_by_unqualified(out, order_by);
             let _ = write!(out, ")");
         }
         ast::Expr::IsNull { expr, .. } => {
@@ -6159,6 +6228,35 @@ mod tests {
         }
     }
 
+    /// The dimension of `generate_subscripts` is any constant that folds to 1
+    /// (psycopg 3 sends `1::INTEGER`); anything else is refused.
+    #[tokio::test]
+    async fn generate_subscripts_dim_is_a_constant_folding_to_1() {
+        for dim in [
+            "1",
+            "1::INTEGER",
+            "CAST(1 AS SMALLINT)",
+            "(1)",
+            "2 - 1",
+            "CAST(1.2 AS INTEGER)",
+        ] {
+            let sql = format!("EXPLAIN SELECT generate_subscripts(ARRAY[id], {dim}) FROM users");
+            let plan = plan_sql(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert!(
+                plan.to_string()
+                    .contains("ProjectSet: [generate_subscripts(ARRAY[id], 1)]"),
+                "{sql}: {plan}"
+            );
+        }
+        for dim in ["2", "2::INTEGER", "id", "NULL"] {
+            let sql = format!("SELECT generate_subscripts(ARRAY[id], {dim}) FROM users");
+            let err = plan_sql(&sql).await.unwrap_err().to_string();
+            assert!(err.contains("dimension 1"), "{sql}: {err}");
+        }
+    }
+
     #[tokio::test]
     async fn srfs_plan_a_project_set_below_the_projection() {
         let plan = plan_sql(
@@ -6900,6 +6998,37 @@ mod tests {
                 }
             }
             _ => panic!("expected Projection"),
+        }
+    }
+
+    /// An aggregate with `ORDER BY` beside another aggregate: the SELECT item
+    /// must find its own aggregate slot, whose name carries the planned
+    /// `ORDER BY` (SQLAlchemy's pk/unique/index reflection queries).
+    #[tokio::test]
+    async fn test_ordered_aggregate_beside_another_resolves() {
+        for sql in [
+            "SELECT array_agg(u.name ORDER BY u.id) AS a, count(*) AS c FROM users u",
+            "SELECT count(*) AS c, array_agg(name ORDER BY id DESC) AS a, \
+                    array_agg(name ORDER BY id DESC NULLS LAST) AS b FROM users",
+        ] {
+            let plan = plan_sql(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let LogicalPlan::Projection { exprs, input, .. } = &plan else {
+                panic!("expected Projection: {plan:?}");
+            };
+            let LogicalPlan::Aggregate { aggr_exprs, .. } = input.as_ref() else {
+                panic!("expected Aggregate input");
+            };
+            assert_eq!(aggr_exprs.len(), exprs.len(), "{sql}");
+            let mut slots: Vec<usize> = exprs
+                .iter()
+                .map(|e| match e {
+                    PlanExpr::Column { index, .. } => *index,
+                    other => panic!("{sql}: expected Column, got {other:?}"),
+                })
+                .collect();
+            slots.sort_unstable();
+            slots.dedup();
+            assert_eq!(slots.len(), exprs.len(), "{sql}: slots collide");
         }
     }
 

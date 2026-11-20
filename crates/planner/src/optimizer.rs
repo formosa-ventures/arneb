@@ -569,9 +569,19 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
             distinct,
             span,
         } => {
+            // TRY(expr) must turn its argument's errors into NULL, so a
+            // fold that fails (say an out-of-range literal cast) leaves the
+            // argument as it was for TRY to catch at execution time.
+            let is_try = name.eq_ignore_ascii_case("TRY");
             let args = args
                 .into_iter()
-                .map(fold_constants)
+                .map(|arg| {
+                    if is_try {
+                        Ok(fold_constants(arg.clone()).unwrap_or(arg))
+                    } else {
+                        fold_constants(arg)
+                    }
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(PlanExpr::Function {
                 name,

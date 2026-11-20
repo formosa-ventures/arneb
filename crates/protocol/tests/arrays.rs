@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{ArrayRef, Date32Array, Int64Array};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use tokio::net::TcpListener;
@@ -36,6 +36,28 @@ fn state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
     ));
     let default_schema = Arc::new(MemorySchema::new());
     default_schema.register_table("t", t);
+    // `dt(d DATE)` holding 2024-01-01.
+    let dschema = Arc::new(Schema::new(vec![Field::new(
+        "d",
+        ArrowDataType::Date32,
+        false,
+    )]));
+    let dbatch = RecordBatch::try_new(
+        dschema,
+        vec![Arc::new(Date32Array::from(vec![19723])) as ArrayRef],
+    )
+    .unwrap();
+    default_schema.register_table(
+        "dt",
+        Arc::new(MemoryTable::new(
+            vec![ColumnInfo {
+                name: "d".to_string(),
+                data_type: DataType::Date32,
+                nullable: false,
+            }],
+            vec![dbatch],
+        )),
+    );
     let file = Arc::new(MemoryCatalog::new());
     file.register_schema("default", default_schema);
     let cm = CatalogManager::new("file", "default");
@@ -180,4 +202,69 @@ async fn array_null_and_text_types() {
     );
     let stmt = client.prepare("SELECT ARRAY['a', 'b']").await.unwrap();
     assert_eq!(stmt.columns()[0].type_().oid(), 1015);
+}
+
+#[tokio::test]
+async fn array_over_date_column_plans_and_evaluates_the_same_type() {
+    let client = connect(pg_server().await).await;
+    let sql = "SELECT ARRAY[d, '2024-01-01'] FROM dt";
+    let stmt = client.prepare(sql).await.unwrap();
+    assert_eq!(stmt.columns()[0].type_().oid(), 1182, "date[]");
+    assert_eq!(
+        first_text(&client, sql).await.unwrap(),
+        "{2024-01-01,2024-01-01}"
+    );
+}
+
+/// Reads one backend message: (tag, body).
+async fn read_msg(s: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+    use tokio::io::AsyncReadExt;
+    let tag = s.read_u8().await.unwrap();
+    let len = s.read_i32().await.unwrap() as usize;
+    let mut body = vec![0; len - 4];
+    s.read_exact(&mut body).await.unwrap();
+    (tag, body)
+}
+
+#[tokio::test]
+async fn simple_query_row_description_carries_the_array_oid() {
+    use tokio::io::AsyncWriteExt;
+    let port = pg_server().await;
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    // Startup message: protocol 3.0, user and database.
+    let mut params = Vec::new();
+    for (k, v) in [("user", "smoke"), ("database", "file")] {
+        params.extend_from_slice(k.as_bytes());
+        params.push(0);
+        params.extend_from_slice(v.as_bytes());
+        params.push(0);
+    }
+    params.push(0);
+    let mut startup = Vec::new();
+    startup.extend_from_slice(&((8 + params.len()) as i32).to_be_bytes());
+    startup.extend_from_slice(&196608i32.to_be_bytes());
+    startup.extend_from_slice(&params);
+    s.write_all(&startup).await.unwrap();
+    while read_msg(&mut s).await.0 != b'Z' {}
+    // Simple Query.
+    let sql = b"SELECT ARRAY[1,2]\0";
+    let mut q = vec![b'Q'];
+    q.extend_from_slice(&((4 + sql.len()) as i32).to_be_bytes());
+    q.extend_from_slice(sql);
+    s.write_all(&q).await.unwrap();
+    loop {
+        let (tag, body) = read_msg(&mut s).await;
+        assert_ne!(tag, b'Z', "no RowDescription before ReadyForQuery");
+        if tag == b'T' {
+            // i16 field count, then name\0, i32 table oid, i16 attr, i32 type oid.
+            assert_eq!(i16::from_be_bytes([body[0], body[1]]), 1);
+            let name_end = body[2..].iter().position(|b| *b == 0).unwrap() + 2;
+            let o = name_end + 1 + 4 + 2;
+            let oid = i32::from_be_bytes(body[o..o + 4].try_into().unwrap());
+            assert_eq!(oid, 1016, "int8[]");
+            break;
+        }
+    }
 }

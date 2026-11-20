@@ -215,17 +215,9 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
             acc
         }
         PlanExpr::Array { elements, .. } => {
-            // Computed from the elements rather than the (post-coercion)
-            // `element_type` field so it is right before coercion too.
-            let types = elements
-                .iter()
-                .map(|e| plan_expr_type(e, schema))
-                .collect::<Option<Vec<_>>>()?;
-            let element = match variadic_supertype(&types)? {
-                // `ARRAY[NULL]` is text[] in PostgreSQL.
-                DataType::Null => DataType::Utf8,
-                t => t,
-            };
+            // Same helper as `unify_array`, so the planned and evaluated
+            // types agree.
+            let element = array_element_type(elements, schema).ok()?;
             Some(DataType::List(Box::new(element)))
         }
         PlanExpr::Parameter { type_hint, .. } => type_hint.clone(),
@@ -234,6 +226,39 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
         }
         PlanExpr::Wildcard => None,
     }
+}
+
+/// Element type of `ARRAY[elements]`: the common supertype of the typed,
+/// non-NULL elements under the `CASE` branch rules, or `Utf8` when there is
+/// none (`ARRAY[NULL]` is text[] in PostgreSQL). `Err((accumulated, found))`
+/// on two elements with no common type. Shared by `plan_expr_type` and the
+/// type-coercion pass.
+pub(crate) fn array_element_type(
+    elements: &[PlanExpr],
+    schema: &[ColumnInfo],
+) -> Result<DataType, (DataType, DataType)> {
+    let mut target: Option<DataType> = None;
+    for e in elements {
+        let Some(t) = plan_expr_type(e, schema) else {
+            continue;
+        };
+        if t == DataType::Null {
+            continue;
+        }
+        target = Some(match target {
+            None => t,
+            Some(acc) => coercion_matrix::common_supertype(
+                &acc,
+                &t,
+                coercion_matrix::CoercionSite::CaseBranch {
+                    left_is_literal: false,
+                    right_is_literal: is_literal_like(e),
+                },
+            )
+            .ok_or((acc, t))?,
+        });
+    }
+    Ok(target.unwrap_or(DataType::Utf8))
 }
 
 /// `(precision, scale)` of each operand of decimal arithmetic, or `None`

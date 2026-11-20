@@ -198,8 +198,10 @@ pub fn encode_pg_array_text(array: &dyn Array, row: usize) -> String {
         } else if nested {
             out.push_str(&encode_pg_array_text(elements.as_ref(), i));
         } else {
-            let text = encode_value(elements.as_ref(), i).unwrap_or_default();
-            push_array_element(&mut out, &text);
+            match encode_value(elements.as_ref(), i) {
+                Some(text) => push_array_element(&mut out, &text),
+                None => out.push_str("NULL"),
+            }
         }
     }
     out.push('}');
@@ -385,6 +387,23 @@ mod tests {
             None,
         );
         assert_eq!(encode_pg_array_text(&outer, 0), "{{1,NULL,3},NULL}");
+    }
+
+    #[test]
+    fn pg_array_text_renders_untyped_null_elements_as_null() {
+        let values: ArrayRef = Arc::new(NullArray::new(2));
+        let field = Arc::new(arrow::datatypes::Field::new(
+            "item",
+            arrow_types::DataType::Null,
+            true,
+        ));
+        let list = ListArray::new(
+            field,
+            arrow::buffer::OffsetBuffer::from_lengths([2]),
+            values,
+            None,
+        );
+        assert_eq!(encode_pg_array_text(&list, 0), "{NULL,NULL}");
     }
 
     #[test]

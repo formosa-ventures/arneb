@@ -109,9 +109,11 @@ fn arrow_type_to_pg(dt: &arrow::datatypes::DataType) -> Type {
         ADT::Float64 => Type::FLOAT8,
         ADT::Utf8 => Type::VARCHAR,
         ADT::List(field) | ADT::LargeList(field) => {
-            let element = arneb_common::types::DataType::try_from(field.data_type().clone())
-                .unwrap_or(arneb_common::types::DataType::Utf8);
-            crate::encoding::array_pg_type(&element)
+            // An element type Arneb cannot name falls back to text[].
+            match arneb_common::types::DataType::try_from(field.data_type().clone()) {
+                Ok(element) => crate::encoding::array_pg_type(&element),
+                Err(_) => Type::TEXT_ARRAY,
+            }
         }
         _ => Type::TEXT,
     }

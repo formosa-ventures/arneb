@@ -789,29 +789,14 @@ fn unify_array(
 ) -> Result<PlanExpr, PlanError> {
     let location = span.map(|s| s.start);
     let types: Vec<Option<DataType>> = elements.iter().map(|e| plan_expr_type(e, schema)).collect();
-    let mut target: Option<DataType> = None;
-    for (t, e) in types.iter().zip(&elements) {
-        let Some(t) = t else { continue };
-        if *t == DataType::Null {
-            continue;
-        }
-        target = Some(match target {
-            None => t.clone(),
-            Some(acc) => {
-                let site = CoercionSite::CaseBranch {
-                    left_is_literal: false,
-                    right_is_literal: is_literal_like(e),
-                };
-                common_supertype(&acc, t, site).ok_or_else(|| PlanError::TypeMismatch {
-                    expected: acc.clone(),
-                    found: t.clone(),
-                    location,
-                })?
+    let element_type =
+        super::array_element_type(&elements, schema).map_err(|(expected, found)| {
+            PlanError::TypeMismatch {
+                expected,
+                found,
+                location,
             }
-        });
-    }
-    // `ARRAY[NULL]` is text[] in PostgreSQL.
-    let element_type = target.unwrap_or(DataType::Utf8);
+        })?;
     let elements = elements
         .into_iter()
         .zip(types)

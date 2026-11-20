@@ -491,6 +491,46 @@ fn fold_array_contains(
     })
 }
 
+/// A literal cast to TINYINT / SMALLINT. `ScalarValue` has no such
+/// variant, so the cast stays (evaluated at run time) over the literal as a
+/// BIGINT; the range is checked here, as the fold of any other cast would.
+#[inline(never)]
+fn small_integer_cast(
+    value: &ScalarValue,
+    data_type: DataType,
+    span: Option<arneb_sql_parser::Span>,
+) -> Result<PlanExpr, PlanError> {
+    let location = span.map(|s| s.start);
+    let as_int64 = crate::analyzer::cast_scalar::cast_scalar(value, &DataType::Int64).map_err(
+        |e| match e {
+            PlanError::InvalidLiteral { message, .. } => {
+                PlanError::InvalidLiteral { message, location }
+            }
+            other => other,
+        },
+    )?;
+    let (min, max) = match data_type {
+        DataType::Int8 => (i8::MIN as i64, i8::MAX as i64),
+        _ => (i16::MIN as i64, i16::MAX as i64),
+    };
+    if let ScalarValue::Int64(v) = as_int64 {
+        if v < min || v > max {
+            return Err(PlanError::InvalidLiteral {
+                message: format!("cannot cast literal {value} to {data_type}: out of range"),
+                location,
+            });
+        }
+    }
+    Ok(PlanExpr::Cast {
+        expr: Box::new(PlanExpr::Literal {
+            value: as_int64,
+            span,
+        }),
+        data_type,
+        span,
+    })
+}
+
 pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
     match expr {
         PlanExpr::BinaryOp {
@@ -545,6 +585,11 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
                     ..
                 }
             ) && data_type != DataType::Null;
+            if let (PlanExpr::Literal { value, .. }, false, DataType::Int8 | DataType::Int16) =
+                (&expr, is_typed_null, &data_type)
+            {
+                return small_integer_cast(value, data_type, span);
+            }
             if let (PlanExpr::Literal { value, .. }, false) = (&expr, is_typed_null) {
                 // Fold the cast: Arrow's strict-mode cast surfaces
                 // parse errors (e.g., malformed DATE literal) as a
@@ -885,6 +930,23 @@ mod tests {
         let result = opt.optimize(plan).unwrap();
         // SimplifyFilters should remove the WHERE true filter.
         assert!(matches!(result, LogicalPlan::TableScan { .. }));
+    }
+
+    /// `ScalarValue` has no SMALLINT / TINYINT: a literal cast to one stays a
+    /// cast (evaluated at run time) instead of failing the fold.
+    #[test]
+    fn cast_to_small_integer_stays_a_cast() {
+        for target in [DataType::Int16, DataType::Int8] {
+            let cast = PlanExpr::Cast {
+                expr: Box::new(PlanExpr::Literal {
+                    value: ScalarValue::Int64(0),
+                    span: None,
+                }),
+                data_type: target.clone(),
+                span: None,
+            };
+            assert_eq!(fold_constants(cast.clone()).unwrap(), cast, "{target}");
+        }
     }
 
     // -- SimplifyFilters tests --

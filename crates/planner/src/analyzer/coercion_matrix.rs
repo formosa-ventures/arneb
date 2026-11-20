@@ -57,6 +57,10 @@ pub struct CoercionRule {
 /// rule applicability. Exact types can be expressed as `Exact(dt)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypePattern {
+    /// The `Int8` variant (TINYINT).
+    Int8,
+    /// The `Int16` variant (SMALLINT).
+    Int16,
     /// The `Int32` variant.
     Int32,
     /// The `Int64` variant.
@@ -80,7 +84,9 @@ impl TypePattern {
     fn matches(self, dt: &DataType) -> bool {
         matches!(
             (self, dt),
-            (TypePattern::Int32, DataType::Int32)
+            (TypePattern::Int8, DataType::Int8)
+                | (TypePattern::Int16, DataType::Int16)
+                | (TypePattern::Int32, DataType::Int32)
                 | (TypePattern::Int64, DataType::Int64)
                 | (TypePattern::Float32, DataType::Float32)
                 | (TypePattern::Float64, DataType::Float64)
@@ -97,6 +103,43 @@ impl TypePattern {
 /// behavior is order-independent.
 const MATRIX: &[CoercionRule] = &[
     // --- Numeric widening ---
+    // TINYINT / SMALLINT widen losslessly to every wider integer and to
+    // DOUBLE (PostgreSQL's int2 → int4/int8 implicit casts).
+    CoercionRule {
+        from: TypePattern::Int8,
+        to: TypePattern::Int16,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int8,
+        to: TypePattern::Int32,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int8,
+        to: TypePattern::Int64,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int8,
+        to: TypePattern::Float64,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int16,
+        to: TypePattern::Int32,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int16,
+        to: TypePattern::Int64,
+        safety: Safety::AlwaysSafe,
+    },
+    CoercionRule {
+        from: TypePattern::Int16,
+        to: TypePattern::Float64,
+        safety: Safety::AlwaysSafe,
+    },
     CoercionRule {
         from: TypePattern::Int32,
         to: TypePattern::Int64,
@@ -265,7 +308,7 @@ impl CoercionSite {
 ///    allowed (with any needed `LiteralOnly` gate satisfied), pick
 ///    `b`; if `b → a` is allowed, pick `a`; if both are allowed, pick
 ///    the one with the higher precedence in the numeric tower
-///    (Int32 < Int64 < Float32 < Float64 < Decimal).
+///    (Int8 < Int16 < Int32 < Int64 < Float32 < Float64 < Decimal).
 /// 4. Otherwise, try a two-step bridge through `Float64` or `Decimal`
 ///    for the well-known numeric-vs-decimal case.
 pub fn common_supertype(a: &DataType, b: &DataType, site: CoercionSite) -> Option<DataType> {
@@ -318,6 +361,16 @@ pub fn common_supertype(a: &DataType, b: &DataType, site: CoercionSite) -> Optio
     }
 
     // Int ↔ Decimal: widen integer into the decimal's space.
+    if let (DataType::Int8, DataType::Decimal128 { precision, scale })
+    | (DataType::Decimal128 { precision, scale }, DataType::Int8) = (a, b)
+    {
+        return Some(decimal_supertype(3, 0, *precision, *scale));
+    }
+    if let (DataType::Int16, DataType::Decimal128 { precision, scale })
+    | (DataType::Decimal128 { precision, scale }, DataType::Int16) = (a, b)
+    {
+        return Some(decimal_supertype(5, 0, *precision, *scale));
+    }
     if let (DataType::Int32, DataType::Decimal128 { precision, scale })
     | (DataType::Decimal128 { precision, scale }, DataType::Int32) = (a, b)
     {
@@ -486,6 +539,37 @@ mod tests {
             assert_eq!(common_supertype(&DataType::Null, &t, site), Some(t.clone()));
             assert_eq!(lookup_cast(&DataType::Null, &t), Some(Safety::AlwaysSafe));
         }
+    }
+
+    /// SMALLINT / TINYINT widen to every wider integer, as in PostgreSQL
+    /// (`attnum > 0::SMALLINT` against a BIGINT column), column to column.
+    #[test]
+    fn small_integers_widen() {
+        let columns = CoercionSite::Binary {
+            left_is_literal: false,
+            right_is_literal: false,
+        };
+        for (a, b, want) in [
+            (DataType::Int64, DataType::Int16, DataType::Int64),
+            (DataType::Int16, DataType::Int32, DataType::Int32),
+            (DataType::Int8, DataType::Int16, DataType::Int16),
+            (DataType::Int8, DataType::Int64, DataType::Int64),
+            (DataType::Int16, DataType::Float64, DataType::Float64),
+            (DataType::Int16, dec(4, 2), dec(7, 2)),
+            (DataType::Int8, dec(15, 2), dec(15, 2)),
+        ] {
+            assert_eq!(
+                common_supertype(&a, &b, columns),
+                Some(want.clone()),
+                "{a} {b}"
+            );
+            assert_eq!(common_supertype(&b, &a, columns), Some(want), "{b} {a}");
+        }
+        assert_eq!(
+            lookup_cast(&DataType::Int16, &DataType::Int64),
+            Some(Safety::AlwaysSafe)
+        );
+        assert_eq!(lookup_cast(&DataType::Int64, &DataType::Int16), None);
     }
 
     #[test]

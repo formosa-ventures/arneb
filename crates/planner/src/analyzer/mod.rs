@@ -454,6 +454,7 @@ pub(crate) fn function_return_type(
         | "PG_GET_INDEXDEF"
         | "PG_GET_SERIAL_SEQUENCE"
         | "JSON_BUILD_OBJECT"
+        | "CURRENT_SETTING"
         | "__REGCLASS_NAME" => Some(DataType::Utf8),
         "PG_TABLE_IS_VISIBLE" | "PG_IS_OTHER_TEMP_SCHEMA" | "PG_COLLATION_IS_VISIBLE" => {
             Some(DataType::Boolean)

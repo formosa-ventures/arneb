@@ -5,13 +5,14 @@
 //! index, default and sequence definition functions SQLAlchemy reflection
 //! calls (Arneb has none of those objects, so they return NULL); and the
 //! runtime `regclass` conversions the planner emits (`__regclass_name`,
-//! `__regclass_oid`).
+//! `__regclass_oid`); and `current_setting`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use arneb_common::error::ExecutionError;
 use arneb_common::pg_oid;
+use arneb_common::pg_settings;
 use arneb_common::types::DataType;
 use arrow::array::{new_null_array, Array, ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::DataType as ArrowDataType;
@@ -66,7 +67,70 @@ pub(crate) fn all_pg_catalog_functions() -> Vec<Arc<dyn ScalarFunction>> {
         }),
         Arc::new(RegclassName),
         Arc::new(RegclassOid),
+        Arc::new(CurrentSettingFunction),
     ]
+}
+
+/// `current_setting(name [, missing_ok])`: the value of a server setting
+/// ([`pg_settings::server_setting`], the table `SHOW` reads). An unknown
+/// name is PostgreSQL's error, or NULL with `missing_ok`. `search_path` is
+/// per session and answered only by `SHOW search_path`.
+#[derive(Debug)]
+struct CurrentSettingFunction;
+
+impl ScalarFunction for CurrentSettingFunction {
+    fn name(&self) -> &str {
+        "CURRENT_SETTING"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Utf8)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        check_arity("CURRENT_SETTING", args, 1, 2)?;
+        let names = utf8(&args[0], "CURRENT_SETTING")?;
+        let missing_ok = match args.get(1) {
+            Some(arg) => Some(boolean(arg)?),
+            None => None,
+        };
+        let mut out = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            let Some(name) = name else {
+                out.push(None);
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            if let Some(value) = pg_settings::server_setting(&lower) {
+                out.push(Some(value));
+                continue;
+            }
+            if missing_ok
+                .as_ref()
+                .is_some_and(|m| m.is_valid(i) && m.value(i))
+            {
+                out.push(None);
+                continue;
+            }
+            return Err(invalid(if lower == "search_path" {
+                "current_setting('search_path') is not supported; use SHOW search_path".to_string()
+            } else {
+                format!("unrecognized configuration parameter \"{name}\"")
+            }));
+        }
+        Ok(Arc::new(StringArray::from(out)))
+    }
+}
+
+fn boolean(arg: &ArrayRef) -> Result<BooleanArray, ExecutionError> {
+    let cast = arrow::compute::cast(arg, &ArrowDataType::Boolean).map_err(|e| {
+        invalid(format!(
+            "CURRENT_SETTING: missing_ok must be a boolean: {e}"
+        ))
+    })?;
+    Ok(cast
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("cast to Boolean yields BooleanArray")
+        .clone())
 }
 
 /// `format_type(type_oid, typmod)`: the SQL name of a type
@@ -365,6 +429,40 @@ mod tests {
 
     fn ints(values: &[Option<i64>]) -> ArrayRef {
         Arc::new(Int64Array::from(values.to_vec()))
+    }
+
+    #[test]
+    fn current_setting_reads_server_settings() {
+        let names: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("default_table_access_method"),
+            Some("Server_Version"),
+            None,
+        ]));
+        let out = CurrentSettingFunction.evaluate(&[names]).unwrap();
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(out.value(0), "heap");
+        assert_eq!(out.value(1), pg_settings::SERVER_VERSION);
+        assert!(out.is_null(2));
+
+        let unknown: ArrayRef = Arc::new(StringArray::from(vec!["no_such"]));
+        let err = CurrentSettingFunction
+            .evaluate(std::slice::from_ref(&unknown))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unrecognized configuration parameter"),
+            "{err}"
+        );
+        let ok: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+        let out = CurrentSettingFunction.evaluate(&[unknown, ok]).unwrap();
+        assert!(out.is_null(0));
+
+        let search_path: ArrayRef = Arc::new(StringArray::from(vec!["search_path"]));
+        let err = CurrentSettingFunction
+            .evaluate(&[search_path])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SHOW search_path"), "{err}");
     }
 
     #[test]

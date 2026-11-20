@@ -382,6 +382,7 @@ mod tests {
             ),
             ("pg_get_serial_sequence", vec![s.clone(), s.clone()]),
             ("pg_collation_is_visible", vec![i.clone()]),
+            ("current_setting", vec![s.clone(), DataType::Boolean]),
             ("json_build_object", vec![s.clone(), i.clone()]),
             (
                 "__regclass_name",

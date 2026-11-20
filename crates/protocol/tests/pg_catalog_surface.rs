@@ -169,7 +169,13 @@ async fn new_attribute_columns_have_defaults() {
 async fn new_catalog_tables_are_empty_and_typed() {
     let before = fallbacks();
     let client = connect(pg_server(None).await).await;
-    for table in ["pg_index", "pg_sequence", "pg_collation", "pg_opclass"] {
+    for table in [
+        "pg_index",
+        "pg_sequence",
+        "pg_collation",
+        "pg_opclass",
+        "pg_inherits",
+    ] {
         let r = one(&client, &format!("SELECT count(*) FROM {table}")).await;
         assert_eq!(r, [Some("0".into())], "{table}");
     }
@@ -201,6 +207,28 @@ async fn new_catalog_tables_are_empty_and_typed() {
             .await
             .is_empty()
     );
+    assert!(rows(
+        &client,
+        "SELECT inhrelid, inhparent, inhseqno, inhdetachpending FROM pg_inherits"
+    )
+    .await
+    .is_empty());
+    assert_eq!(fallbacks(), before);
+}
+
+/// `current_setting` reads the same server settings `SHOW` does
+/// (SQLAlchemy's table-options query reads `default_table_access_method`).
+#[tokio::test]
+async fn current_setting_reads_server_settings() {
+    let before = fallbacks();
+    let client = connect(pg_server(None).await).await;
+    let r = one(
+        &client,
+        "SELECT current_setting('default_table_access_method'), \
+         pg_catalog.current_setting('server_version'), current_setting('nope', true)",
+    )
+    .await;
+    assert_eq!(r, [Some("heap".into()), Some("14.0".into()), None]);
     assert_eq!(fallbacks(), before);
 }
 

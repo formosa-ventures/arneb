@@ -1467,7 +1467,7 @@ mod tests {
                 h
             },
             &claims(&iss, AUD),
-            &EncodingKey::from_secret(b"public-key-bytes"),
+            &EncodingKey::from_secret(b"public-key-bytes").unwrap(),
         )
         .unwrap();
         assert_eq!(reject(hs).await, invalid("bad_algorithm"));

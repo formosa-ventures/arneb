@@ -55,7 +55,10 @@ pub use functions::{default_registry, FunctionRegistry, ScalarFunction};
 pub use operator::ExecutionPlan;
 pub use optimizer::{OptimizationRule, PhysicalPlanOptimizer};
 pub use partitioning::Partitioning;
-pub use planner::{prune_for_columns, ExecutionContext, DEFAULT_DYNAMIC_FILTERING_WAIT_TIMEOUT};
+pub use planner::{
+    prune_for_columns, prune_for_columns_with_exchange_fallback, ExecutionContext,
+    DEFAULT_DYNAMIC_FILTERING_WAIT_TIMEOUT,
+};
 pub use repartition::RepartitionExec;
 // QueryCoordinator is in the server crate (avoids execution↔rpc cycle)
 pub use scan_context::{ConnectorCapabilities, DynamicFilterDomain, ScanContext};

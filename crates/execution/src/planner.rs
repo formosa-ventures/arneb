@@ -1989,6 +1989,16 @@ pub fn prune_for_columns(
     plan: &arneb_planner::LogicalPlan,
     needed: &std::collections::BTreeSet<usize>,
 ) -> (arneb_planner::LogicalPlan, HashMap<usize, usize>) {
+    prune_for_columns_with_exchange_fallback(plan, needed, &HashMap::new())
+}
+
+/// Prune a fragment while using a surviving column from each child stage
+/// when only its row count is needed.
+pub fn prune_for_columns_with_exchange_fallback(
+    plan: &arneb_planner::LogicalPlan,
+    needed: &std::collections::BTreeSet<usize>,
+    exchange_fallback: &HashMap<arneb_common::identifiers::StageId, usize>,
+) -> (arneb_planner::LogicalPlan, HashMap<usize, usize>) {
     use arneb_common::types::ColumnInfo;
     use arneb_planner::{JoinCondition, LogicalPlan as L, PlanExpr};
     use arneb_sql_parser::ast;
@@ -2004,16 +2014,16 @@ pub fn prune_for_columns(
             properties,
             dynamic_filters_consumed,
         } => {
-            // Skip pruning when the parent needs every column anyway,
-            // OR when the parent needs zero columns. The zero case
-            // (e.g. `SELECT COUNT(*) FROM t`) would otherwise produce
-            // an empty-schema scan, which `RecordBatch::try_new`
-            // rejects with "must either specify a row count or at
-            // least one column".
-            if needed.is_empty() || needed.len() >= n_out {
+            // Keep one column when only the row count is needed so
+            // record batches can still carry their row count.
+            if needed.len() >= n_out {
                 return (plan.clone(), identity_map(n_out));
             }
-            let indices: Vec<usize> = needed.iter().copied().collect();
+            let indices: Vec<usize> = if needed.is_empty() {
+                vec![0]
+            } else {
+                needed.iter().copied().collect()
+            };
             let proj_exprs: Vec<PlanExpr> = indices
                 .iter()
                 .map(|&i| PlanExpr::Column {
@@ -2053,7 +2063,8 @@ pub fn prune_for_columns(
         L::Filter { input, predicate } => {
             let mut child_needed = needed.clone();
             collect_column_indices_into(predicate, &mut child_needed);
-            let (new_input, child_mapping) = prune_for_columns(input, &child_needed);
+            let (new_input, child_mapping) =
+                prune_for_columns_with_exchange_fallback(input, &child_needed, exchange_fallback);
             let new_predicate = rewrite_column_indices(predicate, &child_mapping);
             (
                 L::Filter {
@@ -2068,6 +2079,39 @@ pub fn prune_for_columns(
             exprs,
             schema,
         } => {
+            if needed.is_empty() {
+                let (new_input, child_mapping) =
+                    prune_for_columns_with_exchange_fallback(input, needed, exchange_fallback);
+                // Drop the projection only when its pruned input still
+                // carries a column. An empty-schema input (`OneRow`, the
+                // source of a constant `SELECT`) would leave this branch
+                // with zero-column batches, and several operators (the
+                // nested-loop join, `count(*)`) need a column to see the
+                // row count. Keep the first expression instead, the same
+                // "keep one" rule a scan follows.
+                if !new_input.schema().is_empty() || exprs.is_empty() {
+                    return (new_input, HashMap::new());
+                }
+                let mut child_needed = BTreeSet::new();
+                collect_column_indices_into(&exprs[0], &mut child_needed);
+                let (new_input, child_mapping) = if child_needed.is_empty() {
+                    (new_input, child_mapping)
+                } else {
+                    prune_for_columns_with_exchange_fallback(
+                        input,
+                        &child_needed,
+                        exchange_fallback,
+                    )
+                };
+                return (
+                    L::Projection {
+                        input: Box::new(new_input),
+                        exprs: vec![rewrite_column_indices(&exprs[0], &child_mapping)],
+                        schema: vec![schema[0].clone()],
+                    },
+                    HashMap::new(),
+                );
+            }
             // Keep only the projection outputs the parent actually
             // references (`needed`). Without this, a Projection that
             // forwards every input column acts as an opaque barrier:
@@ -2076,16 +2120,17 @@ pub fn prune_for_columns(
             // scans (Q18 saw 32-col Projection → 6-col Aggregate;
             // pre-aggregate data movement dominated runtime).
             //
-            // Bail out (keep all exprs) when the parent needs every
-            // col anyway or when it needs zero (e.g. `SELECT COUNT(*)`
-            // at the root — dropping all exprs would produce a
-            // zero-column plan that `RecordBatch::try_new` rejects).
-            if needed.is_empty() || needed.len() >= exprs.len() {
+            // Keep all expressions when the parent needs every column.
+            if needed.len() >= exprs.len() {
                 let mut child_needed = BTreeSet::new();
                 for e in exprs {
                     collect_column_indices_into(e, &mut child_needed);
                 }
-                let (new_input, child_mapping) = prune_for_columns(input, &child_needed);
+                let (new_input, child_mapping) = prune_for_columns_with_exchange_fallback(
+                    input,
+                    &child_needed,
+                    exchange_fallback,
+                );
                 let new_exprs: Vec<PlanExpr> = exprs
                     .iter()
                     .map(|e| rewrite_column_indices(e, &child_mapping))
@@ -2108,7 +2153,8 @@ pub fn prune_for_columns(
             for e in &kept_exprs {
                 collect_column_indices_into(e, &mut child_needed);
             }
-            let (new_input, child_mapping) = prune_for_columns(input, &child_needed);
+            let (new_input, child_mapping) =
+                prune_for_columns_with_exchange_fallback(input, &child_needed, exchange_fallback);
             let new_exprs: Vec<PlanExpr> = kept_exprs
                 .iter()
                 .map(|e| rewrite_column_indices(e, &child_mapping))
@@ -2155,7 +2201,8 @@ pub fn prune_for_columns(
             for e in group_by.iter().chain(aggr_exprs.iter()) {
                 collect_column_indices_into(e, &mut child_needed);
             }
-            let (new_input, child_mapping) = prune_for_columns(input, &child_needed);
+            let (new_input, child_mapping) =
+                prune_for_columns_with_exchange_fallback(input, &child_needed, exchange_fallback);
             let new_group_by: Vec<PlanExpr> = group_by
                 .iter()
                 .map(|e| rewrite_column_indices(e, &child_mapping))
@@ -2197,7 +2244,8 @@ pub fn prune_for_columns(
             for s in order_by {
                 collect_column_indices_into(&s.expr, &mut child_needed);
             }
-            let (new_input, child_mapping) = prune_for_columns(input, &child_needed);
+            let (new_input, child_mapping) =
+                prune_for_columns_with_exchange_fallback(input, &child_needed, exchange_fallback);
             let new_order_by: Vec<arneb_planner::SortExpr> = order_by
                 .iter()
                 .map(|s| arneb_planner::SortExpr {
@@ -2219,7 +2267,8 @@ pub fn prune_for_columns(
             limit,
             offset,
         } => {
-            let (new_input, child_mapping) = prune_for_columns(input, needed);
+            let (new_input, child_mapping) =
+                prune_for_columns_with_exchange_fallback(input, needed, exchange_fallback);
             (
                 L::Limit {
                     input: Box::new(new_input),
@@ -2276,8 +2325,10 @@ pub fn prune_for_columns(
                 }
             }
 
-            let (new_left, left_mapping) = prune_for_columns(left, &left_needed);
-            let (new_right, right_mapping) = prune_for_columns(right, &right_needed);
+            let (new_left, left_mapping) =
+                prune_for_columns_with_exchange_fallback(left, &left_needed, exchange_fallback);
+            let (new_right, right_mapping) =
+                prune_for_columns_with_exchange_fallback(right, &right_needed, exchange_fallback);
 
             let new_left_n = new_left.schema().len();
             let mut combined: HashMap<usize, usize> = HashMap::new();
@@ -2369,8 +2420,10 @@ pub fn prune_for_columns(
                 }
             }
 
-            let (new_left, left_mapping) = prune_for_columns(left, &left_needed);
-            let (new_right, right_mapping) = prune_for_columns(right, &right_needed);
+            let (new_left, left_mapping) =
+                prune_for_columns_with_exchange_fallback(left, &left_needed, exchange_fallback);
+            let (new_right, right_mapping) =
+                prune_for_columns_with_exchange_fallback(right, &right_needed, exchange_fallback);
 
             let new_left_width = new_left.schema().len();
             let new_left_key = rewrite_column_indices(left_key, &left_mapping);
@@ -2477,10 +2530,14 @@ pub fn prune_for_columns(
             // pushes the Projection INTO the upstream fragment would
             // give worker-side wins too, but even this parent-side
             // pruning is a strict improvement.
-            if needed.is_empty() || needed.len() >= n_out {
+            if needed.len() >= n_out {
                 return (plan.clone(), identity_map(n_out));
             }
-            let indices: Vec<usize> = needed.iter().copied().collect();
+            let indices: Vec<usize> = if needed.is_empty() {
+                vec![*exchange_fallback.get(stage_id).unwrap_or(&0)]
+            } else {
+                needed.iter().copied().collect()
+            };
             let proj_exprs: Vec<PlanExpr> = indices
                 .iter()
                 .map(|&i| PlanExpr::Column {
@@ -2805,6 +2862,43 @@ mod tests {
     use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn pruning_keeps_one_column_over_an_empty_schema_input() {
+        // `(SELECT 1 AS x) a CROSS JOIN (SELECT 2 AS y) b` under count(*):
+        // dropping either projection would leave a bare `OneRow` with no
+        // column, so each side keeps its first expression.
+        let one = |name: &str, v: i32| arneb_planner::LogicalPlan::Projection {
+            input: Box::new(arneb_planner::LogicalPlan::OneRow),
+            exprs: vec![PlanExpr::Literal {
+                value: ScalarValue::Int32(v),
+                span: None,
+            }],
+            schema: vec![ColumnInfo {
+                name: name.to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+            }],
+        };
+        let join = arneb_planner::LogicalPlan::Join {
+            left: Box::new(one("x", 1)),
+            right: Box::new(one("y", 2)),
+            join_type: ast::JoinType::Cross,
+            condition: JoinCondition::None,
+            dynamic_filter_ids: vec![],
+        };
+        let (pruned, _) = prune_for_columns(&join, &std::collections::BTreeSet::new());
+        let arneb_planner::LogicalPlan::Join { left, right, .. } = &pruned else {
+            panic!("expected a join, got {pruned:?}");
+        };
+        for side in [left, right] {
+            assert!(
+                matches!(side.as_ref(), arneb_planner::LogicalPlan::Projection { exprs, .. } if exprs.len() == 1),
+                "{side:?}"
+            );
+        }
+        assert_eq!(pruned.schema().len(), 2);
+    }
 
     fn test_context() -> (ExecutionContext, Vec<ColumnInfo>) {
         let schema = vec![

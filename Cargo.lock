@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-catalog"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arneb-common",
  "async-trait",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-common"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-connectors"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arneb-catalog",
  "arneb-common",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-execution"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash 0.8.12",
  "arneb-catalog",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-hive"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arneb-catalog",
  "arneb-common",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-iceberg"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "apache-avro",
  "arneb-catalog",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-planner"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arneb-catalog",
  "arneb-common",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-postgresql"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arneb-catalog",
  "arneb-common",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arneb-catalog",
  "arneb-common",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-rdbms"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arneb-common",
  "arneb-planner",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-rpc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arneb-common",
  "arneb-planner",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-scheduler"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arneb-common",
  "thiserror 2.0.21",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arneb-catalog",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-sql-parser"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arneb-common",
  "chrono",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "arneb-state"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arneb-protocol",
  "aws-lc-rs",
@@ -2173,7 +2173,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hive-metastore"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2184,7 +2184,7 @@ dependencies = [
 
 [[package]]
 name = "hive-metastore-thrift-build"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pilota-build",
  "volo-build",

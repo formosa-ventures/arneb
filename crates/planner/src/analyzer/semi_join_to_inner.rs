@@ -405,13 +405,7 @@ fn shift_columns(expr: PlanExpr, delta: usize) -> PlanExpr {
             order_by,
             span,
         } => E::Function {
-            order_by: order_by
-                .into_iter()
-                .map(|s| crate::plan::SortExpr {
-                    expr: shift_columns(s.expr, delta),
-                    ..s
-                })
-                .collect(),
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| shift_columns(e, delta)),
             name,
             args: args.into_iter().map(|a| shift_columns(a, delta)).collect(),
             distinct,

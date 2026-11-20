@@ -730,6 +730,23 @@ impl ExecutionContext {
             && left_rows * 4.0 < right_rows
     }
 
+    /// Out-of-line so the recursive future of `resolve_scalar_subqueries`
+    /// does not grow (stack depth) for the rare aggregate `ORDER BY`.
+    async fn resolve_order_by_subqueries(
+        &self,
+        order_by: &[arneb_planner::SortExpr],
+    ) -> Result<Vec<arneb_planner::SortExpr>, ExecutionError> {
+        let mut resolved = Vec::with_capacity(order_by.len());
+        for s in order_by {
+            resolved.push(arneb_planner::SortExpr {
+                expr: self.resolve_scalar_subqueries(&s.expr).await?,
+                asc: s.asc,
+                nulls_first: s.nulls_first,
+            });
+        }
+        Ok(resolved)
+    }
+
     /// Pre-evaluate scalar subqueries in a PlanExpr, replacing them with Literal values.
     pub async fn resolve_scalar_subqueries(
         &self,
@@ -813,14 +830,11 @@ impl ExecutionContext {
                 for arg in args {
                     resolved.push(Box::pin(self.resolve_scalar_subqueries(arg)).await?);
                 }
-                let mut resolved_order_by = Vec::with_capacity(order_by.len());
-                for s in order_by {
-                    resolved_order_by.push(arneb_planner::SortExpr {
-                        expr: Box::pin(self.resolve_scalar_subqueries(&s.expr)).await?,
-                        asc: s.asc,
-                        nulls_first: s.nulls_first,
-                    });
-                }
+                let resolved_order_by = if order_by.is_empty() {
+                    Vec::new()
+                } else {
+                    Box::pin(self.resolve_order_by_subqueries(order_by)).await?
+                };
                 Ok(PlanExpr::Function {
                     order_by: resolved_order_by,
                     name: name.clone(),
@@ -1895,14 +1909,9 @@ fn rewrite_column_indices(expr: &PlanExpr, mapping: &HashMap<usize, usize>) -> P
             order_by,
             span,
         } => E::Function {
-            order_by: order_by
-                .iter()
-                .map(|s| arneb_planner::SortExpr {
-                    expr: rewrite_column_indices(&s.expr, mapping),
-                    asc: s.asc,
-                    nulls_first: s.nulls_first,
-                })
-                .collect(),
+            order_by: arneb_planner::SortExpr::map_exprs_ref(order_by, &mut |e| {
+                rewrite_column_indices(e, mapping)
+            }),
             name: name.clone(),
             args: args
                 .iter()

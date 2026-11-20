@@ -313,6 +313,40 @@ pub struct SortExpr {
     pub nulls_first: bool,
 }
 
+impl SortExpr {
+    /// Rewrites every sort key. Out-of-line so the recursive expression
+    /// rewriters that call it keep small stack frames.
+    #[inline(never)]
+    pub fn map_exprs(
+        order_by: Vec<SortExpr>,
+        f: &mut dyn FnMut(PlanExpr) -> PlanExpr,
+    ) -> Vec<SortExpr> {
+        order_by
+            .into_iter()
+            .map(|s| SortExpr {
+                expr: f(s.expr),
+                ..s
+            })
+            .collect()
+    }
+
+    /// Like [`SortExpr::map_exprs`], over borrowed keys.
+    #[inline(never)]
+    pub fn map_exprs_ref(
+        order_by: &[SortExpr],
+        f: &mut dyn FnMut(&PlanExpr) -> PlanExpr,
+    ) -> Vec<SortExpr> {
+        order_by
+            .iter()
+            .map(|s| SortExpr {
+                expr: f(&s.expr),
+                asc: s.asc,
+                nulls_first: s.nulls_first,
+            })
+            .collect()
+    }
+}
+
 /// A logical query plan node.
 ///
 /// Each node represents a relational algebra operation and carries
@@ -872,6 +906,7 @@ impl fmt::Display for PlanExpr {
                 name,
                 args,
                 distinct,
+                order_by,
                 ..
             } => {
                 write!(f, "{name}(")?;
@@ -883,6 +918,19 @@ impl fmt::Display for PlanExpr {
                         write!(f, ", ")?;
                     }
                     write!(f, "{arg}")?;
+                }
+                for (i, s) in order_by.iter().enumerate() {
+                    write!(f, "{}{}", if i == 0 { " ORDER BY " } else { ", " }, s.expr)?;
+                    write!(f, "{}", if s.asc { " ASC" } else { " DESC" })?;
+                    write!(
+                        f,
+                        "{}",
+                        if s.nulls_first {
+                            " NULLS FIRST"
+                        } else {
+                            " NULLS LAST"
+                        }
+                    )?;
                 }
                 write!(f, ")")
             }

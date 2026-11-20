@@ -448,13 +448,7 @@ fn walk_remap(expr: PlanExpr, f: &dyn Fn(usize) -> Option<usize>) -> PlanExpr {
             order_by,
             span,
         } => PlanExpr::Function {
-            order_by: order_by
-                .into_iter()
-                .map(|s| crate::plan::SortExpr {
-                    expr: walk_remap(s.expr, f),
-                    ..s
-                })
-                .collect(),
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| walk_remap(e, f)),
             name,
             args: args.into_iter().map(|a| walk_remap(a, f)).collect(),
             distinct,

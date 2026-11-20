@@ -3259,13 +3259,9 @@ fn remap_column_indices(
             order_by,
             span,
         } => PlanExpr::Function {
-            order_by: order_by
-                .into_iter()
-                .map(|s| arneb_planner::SortExpr {
-                    expr: remap_column_indices(s.expr, remap),
-                    ..s
-                })
-                .collect(),
+            order_by: arneb_planner::SortExpr::map_exprs(order_by, &mut |e| {
+                remap_column_indices(e, remap)
+            }),
             name,
             args: args
                 .into_iter()

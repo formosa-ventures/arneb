@@ -1657,4 +1657,20 @@ mod tests {
         assert!(matches!(&order_by[0].expr, Expr::Column { col_ref, .. } if col_ref.name == "b"));
         assert_eq!(order_by[0].asc, Some(false));
     }
+
+    #[test]
+    fn window_aggregate_order_by_is_refused() {
+        match parse("SELECT sum(x ORDER BY y) OVER () FROM t") {
+            Err(ParseError::UnsupportedFeature(msg)) => assert!(msg.contains("ORDER BY"), "{msg}"),
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_call_filter_is_refused() {
+        match parse("SELECT sum(x) FILTER (WHERE x > 1) OVER () FROM t") {
+            Err(ParseError::UnsupportedFeature(msg)) => assert!(msg.contains("FILTER"), "{msg}"),
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
 }

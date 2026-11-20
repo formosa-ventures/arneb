@@ -2144,6 +2144,25 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Convert an AST expression to a PlanExpr, resolving column references.
+    /// Plans an aggregate call's `ORDER BY`. Kept out of `plan_expr` so the
+    /// recursive future (and with it the stack depth) stays small.
+    #[async_recursion]
+    async fn plan_call_order_by(
+        &self,
+        order_by: &[ast::OrderByExpr],
+        ctx: &PlanningContext,
+    ) -> Result<Vec<SortExpr>, PlanError> {
+        let mut out = Vec::with_capacity(order_by.len());
+        for ob in order_by {
+            out.push(SortExpr {
+                expr: self.plan_expr(&ob.expr, ctx).await?,
+                asc: ob.asc.unwrap_or(true),
+                nulls_first: ob.nulls_first.unwrap_or(false),
+            });
+        }
+        Ok(out)
+    }
+
     #[allow(clippy::only_used_in_recursion)]
     #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
@@ -2198,10 +2217,8 @@ impl<'a> QueryPlanner<'a> {
                 order_by,
                 ..
             } => {
-                if !order_by.is_empty() && !name.eq_ignore_ascii_case("ARRAY_AGG") {
-                    return Err(PlanError::invalid_expression(format!(
-                        "ORDER BY inside {name}(...) is not supported"
-                    )));
+                if !order_by.is_empty() {
+                    check_aggregate_order_by(name)?;
                 }
                 if name.eq_ignore_ascii_case("GROUPING") {
                     if let [ast::FunctionArg::Unnamed(key)] = args.as_slice() {
@@ -2274,14 +2291,11 @@ impl<'a> QueryPlanner<'a> {
                     };
                     plan_args.push(plan_arg);
                 }
-                let mut plan_order_by = Vec::with_capacity(order_by.len());
-                for ob in order_by {
-                    plan_order_by.push(SortExpr {
-                        expr: self.plan_expr(&ob.expr, ctx).await?,
-                        asc: ob.asc.unwrap_or(true),
-                        nulls_first: ob.nulls_first.unwrap_or(false),
-                    });
-                }
+                let plan_order_by = if order_by.is_empty() {
+                    Vec::new()
+                } else {
+                    self.plan_call_order_by(order_by, ctx).await?
+                };
                 Ok(PlanExpr::Function {
                     name: name.clone(),
                     args: plan_args,
@@ -3730,18 +3744,14 @@ fn rewrite_expr_after_column_insert(
             order_by,
             span,
         } => PlanExpr::Function {
-            order_by: order_by
-                .into_iter()
-                .map(|s| SortExpr {
-                    expr: rewrite_expr_after_column_insert(
-                        s.expr,
-                        inserted_index,
-                        scalar_subplan,
-                        scalar_replacement,
-                    ),
-                    ..s
-                })
-                .collect(),
+            order_by: SortExpr::map_exprs(order_by, &mut |e| {
+                rewrite_expr_after_column_insert(
+                    e,
+                    inserted_index,
+                    scalar_subplan,
+                    scalar_replacement,
+                )
+            }),
             name,
             args: args
                 .into_iter()
@@ -4637,6 +4647,17 @@ fn regclass_literal(
         value: ScalarValue::Int64(oid),
         span,
     })
+}
+
+/// Aggregate `ORDER BY` is accepted only in `array_agg`.
+fn check_aggregate_order_by(name: &str) -> Result<(), PlanError> {
+    if name.eq_ignore_ascii_case("ARRAY_AGG") {
+        Ok(())
+    } else {
+        Err(PlanError::invalid_expression(format!(
+            "ORDER BY inside {name}(...) is not supported"
+        )))
+    }
 }
 
 #[cfg(test)]

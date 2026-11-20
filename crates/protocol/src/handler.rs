@@ -1678,6 +1678,24 @@ async fn resolve_expr_subqueries_distributed(
 /// subqueries nested *inside* each subquery's plan are resolved (TPC-H Q11's
 /// `SUM(..) / (SELECT COUNT(*) ..)`), leaving the outer one for
 /// `ExecutionContext::resolve_scalar_subqueries`.
+async fn resolve_order_by_subqueries_distributed(
+    ctx: &ExecutionContext,
+    executor: Option<&dyn DistributedExecutor>,
+    order_by: Vec<arneb_planner::SortExpr>,
+) -> Result<Vec<arneb_planner::SortExpr>, ArnebError> {
+    let mut resolved = Vec::with_capacity(order_by.len());
+    for s in order_by {
+        resolved.push(arneb_planner::SortExpr {
+            expr: Box::pin(resolve_expr_subqueries_distributed_inner(
+                ctx, executor, s.expr,
+            ))
+            .await?,
+            ..s
+        });
+    }
+    Ok(resolved)
+}
+
 async fn resolve_expr_subqueries_distributed_inner(
     ctx: &ExecutionContext,
     executor: Option<&dyn DistributedExecutor>,
@@ -1744,16 +1762,14 @@ async fn resolve_expr_subqueries_distributed_inner(
                     .await?,
                 );
             }
-            let mut resolved_order_by = Vec::with_capacity(order_by.len());
-            for s in order_by {
-                resolved_order_by.push(arneb_planner::SortExpr {
-                    expr: Box::pin(resolve_expr_subqueries_distributed_inner(
-                        ctx, executor, s.expr,
-                    ))
-                    .await?,
-                    ..s
-                });
-            }
+            let resolved_order_by = if order_by.is_empty() {
+                Vec::new()
+            } else {
+                Box::pin(resolve_order_by_subqueries_distributed(
+                    ctx, executor, order_by,
+                ))
+                .await?
+            };
             Ok(PlanExpr::Function {
                 order_by: resolved_order_by,
                 name,

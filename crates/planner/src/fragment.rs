@@ -763,13 +763,9 @@ fn remap_expr_for_swapped_join(
             order_by,
             span,
         } => PlanExpr::Function {
-            order_by: order_by
-                .into_iter()
-                .map(|s| crate::plan::SortExpr {
-                    expr: remap_expr_for_swapped_join(s.expr, old_left_width, old_right_width),
-                    ..s
-                })
-                .collect(),
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| {
+                remap_expr_for_swapped_join(e, old_left_width, old_right_width)
+            }),
             name,
             args: args
                 .into_iter()

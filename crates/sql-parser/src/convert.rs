@@ -1306,6 +1306,11 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
 
     // Check for window function (OVER clause)
     if let Some(over) = func.over {
+        if !agg_order_by.is_empty() {
+            return Err(ParseError::UnsupportedFeature(format!(
+                "ORDER BY inside {name}(...) in a window function"
+            )));
+        }
         match over {
             sp::WindowType::WindowSpec(spec) => {
                 let rows_frame = match spec.window_frame {

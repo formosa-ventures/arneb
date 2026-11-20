@@ -628,13 +628,7 @@ where
             order_by,
             span,
         } => E::Function {
-            order_by: order_by
-                .into_iter()
-                .map(|s| crate::plan::SortExpr {
-                    expr: walk_columns(s.expr, f),
-                    ..s
-                })
-                .collect(),
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| walk_columns(e, f)),
             name,
             args: args.into_iter().map(|a| walk_columns(a, f)).collect(),
             distinct,

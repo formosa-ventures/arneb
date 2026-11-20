@@ -392,6 +392,24 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
 // Expression walker
 // ---------------------------------------------------------------------------
 
+/// Out-of-line so the recursive `coerce_expr` frame stays small.
+#[inline(never)]
+fn coerce_order_by(
+    order_by: Vec<crate::plan::SortExpr>,
+    schema: &[ColumnInfo],
+    ctx: &mut AnalyzerContext,
+) -> Result<Vec<crate::plan::SortExpr>, PlanError> {
+    order_by
+        .into_iter()
+        .map(|s| {
+            Ok(crate::plan::SortExpr {
+                expr: coerce_expr(s.expr, schema, ctx)?,
+                ..s
+            })
+        })
+        .collect()
+}
+
 fn coerce_expr(
     expr: PlanExpr,
     schema: &[ColumnInfo],
@@ -529,15 +547,7 @@ fn coerce_expr(
                 let arg = args.remove(0);
                 args.insert(0, pad_char_operand(arg, schema));
             }
-            let order_by = order_by
-                .into_iter()
-                .map(|s| {
-                    Ok(crate::plan::SortExpr {
-                        expr: coerce_expr(s.expr, schema, ctx)?,
-                        ..s
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let order_by = coerce_order_by(order_by, schema, ctx)?;
             Ok(PlanExpr::Function {
                 order_by,
                 name,
@@ -1122,8 +1132,7 @@ pub(super) fn walk_plan_exprs(
                 .into_iter()
                 .map(|s| SortExpr {
                     expr: walk_expr(s.expr, f),
-                    asc: s.asc,
-                    nulls_first: s.nulls_first,
+                    ..s
                 })
                 .collect(),
         },
@@ -1301,13 +1310,7 @@ pub(super) fn walk_expr(expr: PlanExpr, f: &mut dyn FnMut(PlanExpr) -> PlanExpr)
             order_by,
             span,
         } => PlanExpr::Function {
-            order_by: order_by
-                .into_iter()
-                .map(|s| crate::plan::SortExpr {
-                    expr: walk_expr(s.expr, f),
-                    ..s
-                })
-                .collect(),
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| walk_expr(e, f)),
             name,
             args: args.into_iter().map(|a| walk_expr(a, f)).collect(),
             distinct,

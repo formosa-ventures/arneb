@@ -1330,13 +1330,9 @@ fn rewrite_expr(
             order_by,
             span,
         } => PlanExpr::Function {
-            order_by: order_by
-                .into_iter()
-                .map(|s| crate::plan::SortExpr {
-                    expr: rewrite_expr(s.expr, stats, root_outputs, blocked),
-                    ..s
-                })
-                .collect(),
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| {
+                rewrite_expr(e, stats, root_outputs, blocked)
+            }),
             name,
             args: args
                 .into_iter()

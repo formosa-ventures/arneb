@@ -861,9 +861,19 @@ where
             name,
             args,
             distinct,
+            order_by,
             ..
         } => PlanExpr::Function {
-            order_by: vec![],
+            order_by: order_by
+                .iter()
+                .map(|s| {
+                    Some(crate::plan::SortExpr {
+                        expr: remap_expr_columns(&s.expr, f)?,
+                        asc: s.asc,
+                        nulls_first: s.nulls_first,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
             name: name.clone(),
             args: args
                 .iter()
@@ -1150,13 +1160,9 @@ fn shift_column_indices(expr: PlanExpr, offset: usize) -> PlanExpr {
             order_by,
             span,
         } => PlanExpr::Function {
-            order_by: order_by
-                .into_iter()
-                .map(|s| crate::plan::SortExpr {
-                    expr: shift_column_indices(s.expr, offset),
-                    ..s
-                })
-                .collect(),
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| {
+                shift_column_indices(e, offset)
+            }),
             name,
             args: args
                 .into_iter()
@@ -1426,9 +1432,19 @@ fn remap_expr_to_side(expr: &PlanExpr, side: Side, left_width: usize) -> Option<
             name,
             args,
             distinct,
+            order_by,
             ..
         } => PlanExpr::Function {
-            order_by: vec![],
+            order_by: order_by
+                .iter()
+                .map(|s| {
+                    Some(crate::plan::SortExpr {
+                        expr: remap_expr_to_side(&s.expr, side, left_width)?,
+                        asc: s.asc,
+                        nulls_first: s.nulls_first,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
             name: name.clone(),
             args: args
                 .iter()

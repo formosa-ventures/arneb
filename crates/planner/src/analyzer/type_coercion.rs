@@ -2393,6 +2393,109 @@ mod tests {
         ));
     }
 
+    fn timestamp_tz() -> DataType {
+        DataType::Timestamp {
+            unit: arneb_common::types::TimeUnit::Microsecond,
+            timezone: Some("+00:00".into()),
+        }
+    }
+
+    fn cast_to(data_type: &DataType, expr: PlanExpr) -> PlanExpr {
+        PlanExpr::Cast {
+            expr: Box::new(expr),
+            data_type: data_type.clone(),
+            span: None,
+        }
+    }
+
+    fn date_schema() -> Vec<ColumnInfo> {
+        vec![ColumnInfo {
+            name: "d".into(),
+            data_type: DataType::Date32,
+            nullable: false,
+        }]
+    }
+
+    fn date_lit(day: i32) -> PlanExpr {
+        lit(ScalarValue::Date32(day))
+    }
+
+    #[test]
+    fn between_date_column_and_timestamp_bounds_compares_as_timestamp() {
+        // Metabase's relative-date filter:
+        // `d BETWEEN CAST(... AS timestamptz) AND CAST(... AS timestamptz)`.
+        let ts = timestamp_tz();
+        let plan = filter(
+            scan(date_schema()),
+            PlanExpr::Between {
+                expr: Box::new(col(0, "d")),
+                negated: false,
+                low: Box::new(cast_to(&ts, date_lit(1))),
+                high: Box::new(cast_to(&ts, date_lit(30))),
+                span: None,
+            },
+        );
+        let LogicalPlan::Filter { predicate, .. } = run(plan).unwrap() else {
+            panic!()
+        };
+        let PlanExpr::Between { expr, .. } = predicate else {
+            panic!()
+        };
+        assert!(
+            matches!(expr.as_ref(), PlanExpr::Cast { data_type, .. } if *data_type == ts),
+            "the date operand compares as the timestamp type: {expr:?}"
+        );
+    }
+
+    #[test]
+    fn in_list_mixing_date_and_timestamp_compares_as_timestamp() {
+        let ts = timestamp_tz();
+        let plan = filter(
+            scan(date_schema()),
+            PlanExpr::InList {
+                expr: Box::new(col(0, "d")),
+                list: vec![date_lit(1), cast_to(&ts, date_lit(2))],
+                negated: false,
+                span: None,
+            },
+        );
+        let LogicalPlan::Filter { predicate, .. } = run(plan).unwrap() else {
+            panic!()
+        };
+        let PlanExpr::InList { expr, list, .. } = predicate else {
+            panic!()
+        };
+        assert!(matches!(expr.as_ref(), PlanExpr::Cast { data_type, .. } if *data_type == ts));
+        assert!(matches!(&list[0], PlanExpr::Cast { data_type, .. } if *data_type == ts));
+    }
+
+    #[test]
+    fn date_between_dates_keeps_date_comparison() {
+        // TPC-H shape (`l_shipdate BETWEEN DATE .. AND DATE ..`): no cast.
+        let plan = filter(
+            scan(date_schema()),
+            PlanExpr::Between {
+                expr: Box::new(col(0, "d")),
+                negated: false,
+                low: Box::new(date_lit(1)),
+                high: Box::new(date_lit(30)),
+                span: None,
+            },
+        );
+        let LogicalPlan::Filter { predicate, .. } = run(plan).unwrap() else {
+            panic!()
+        };
+        let PlanExpr::Between {
+            expr, low, high, ..
+        } = predicate
+        else {
+            panic!()
+        };
+        assert!(matches!(expr.as_ref(), PlanExpr::Column { .. }));
+        assert!(matches!(low.as_ref(), PlanExpr::Literal { .. }));
+        assert!(matches!(high.as_ref(), PlanExpr::Literal { .. }));
+    }
+
     #[test]
     fn in_list_unifies_literal_elements() {
         let schema = vec![ColumnInfo {

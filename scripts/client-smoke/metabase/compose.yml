@@ -1,0 +1,27 @@
+# Tier 2 Metabase check (README.md). Run it as compose project arneb-mb:
+#   docker compose -p arneb-mb -f scripts/client-smoke/metabase/compose.yml up -d
+# metabase: the pinned Metabase LTS, with its application DB in the
+#   container (H2), so `down` gives a fresh, un-set-up Metabase next time.
+#   It reaches an Arneb cluster on the host as host.docker.internal.
+# pgcap: a PostgreSQL that logs every statement (log_statement=all), the
+#   reference the probe is compared with and the source capture.py reads.
+services:
+  metabase:
+    image: metabase/metabase:v0.64.8.3
+    ports: ["127.0.0.1:13300:3000"]
+    environment:
+      MB_DB_TYPE: h2
+      MB_ANON_TRACKING_ENABLED: "false"
+      MB_CHECK_FOR_UPDATES: "false"
+      JAVA_TIMEZONE: UTC
+    extra_hosts: ["host.docker.internal:host-gateway"]
+  pgcap:
+    image: postgres:17
+    ports: ["127.0.0.1:15499:5432"]
+    environment:
+      POSTGRES_USER: smoke
+      POSTGRES_DB: arneb
+      POSTGRES_HOST_AUTH_METHOD: trust
+    # capture.py splits the log on the @@...@@ prefix (%c = session id).
+    command: ["postgres", "-c", "log_statement=all", "-c", "log_min_messages=warning",
+              "-c", "log_line_prefix=@@%m|%c|%v@@ "]

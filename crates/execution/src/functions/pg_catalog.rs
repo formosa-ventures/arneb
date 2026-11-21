@@ -72,7 +72,269 @@ pub(crate) fn all_pg_catalog_functions() -> Vec<Arc<dyn ScalarFunction>> {
         Arc::new(RegclassOid),
         Arc::new(CurrentSettingFunction),
         Arc::new(CurrentSchemasFunction),
+        Arc::new(FormatFunction),
     ]
+}
+
+/// PostgreSQL's reserved, column-name and type/function-name keywords: the
+/// words `quote_ident` (and so `format('%I')`) double-quotes. Hardcoded from
+/// PostgreSQL's keyword table (sqlparser's keyword lists follow its own
+/// grammar, not PostgreSQL's quoting rules), sorted for binary search.
+const QUOTED_KEYWORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "boolean",
+    "both",
+    "case",
+    "cast",
+    "char",
+    "character",
+    "check",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "dec",
+    "decimal",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "float",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "inout",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "json",
+    "json_array",
+    "json_arrayagg",
+    "json_exists",
+    "json_object",
+    "json_objectagg",
+    "json_query",
+    "json_scalar",
+    "json_serialize",
+    "json_table",
+    "json_value",
+    "lateral",
+    "leading",
+    "least",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "merge_action",
+    "national",
+    "natural",
+    "nchar",
+    "none",
+    "normalize",
+    "not",
+    "notnull",
+    "null",
+    "nullif",
+    "numeric",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "outer",
+    "overlaps",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "real",
+    "references",
+    "returning",
+    "right",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "similar",
+    "smallint",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "varchar",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
+];
+
+/// `format(template, args...)`: PostgreSQL's `%s`, `%I`, `%L` and `%%`
+/// specifiers. Positional (`%1$s`) and width forms are refused. A NULL
+/// template gives NULL.
+#[derive(Debug)]
+struct FormatFunction;
+
+impl FormatFunction {
+    fn format_row(template: &str, args: &[Option<&str>]) -> Result<String, ExecutionError> {
+        let mut out = String::with_capacity(template.len());
+        let mut next = 0;
+        let mut chars = template.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            let Some(spec) = chars.next() else {
+                return Err(invalid("unterminated format() type specifier"));
+            };
+            if spec == '%' {
+                out.push('%');
+                continue;
+            }
+            if !matches!(spec, 's' | 'I' | 'L') {
+                return Err(invalid(if spec.is_ascii_alphabetic() {
+                    format!("unrecognized format() type specifier \"{spec}\"")
+                } else {
+                    "unsupported format specifier".to_string()
+                }));
+            }
+            let Some(arg) = args.get(next) else {
+                return Err(invalid("too few arguments for format()"));
+            };
+            next += 1;
+            match (spec, arg) {
+                ('s', arg) => out.push_str(arg.unwrap_or("")),
+                ('I', Some(v)) => out.push_str(&quote_ident(v)),
+                ('I', None) => {
+                    return Err(invalid(
+                        "null values cannot be formatted as an SQL identifier",
+                    ))
+                }
+                (_, Some(v)) => {
+                    out.push('\'');
+                    out.push_str(&v.replace('\'', "''"));
+                    out.push('\'');
+                }
+                (_, None) => out.push_str("NULL"),
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl ScalarFunction for FormatFunction {
+    fn name(&self) -> &str {
+        "FORMAT"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Utf8)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        self.invoke(args, 0)
+    }
+    fn invoke(&self, args: &[ArrayRef], num_rows: usize) -> Result<ArrayRef, ExecutionError> {
+        let Some(first) = args.first() else {
+            return Err(invalid("FORMAT requires at least 1 argument"));
+        };
+        let _ = num_rows;
+        let template = utf8(first, "FORMAT")?;
+        let values: Vec<StringArray> = args[1..]
+            .iter()
+            .map(|a| utf8(a, "FORMAT"))
+            .collect::<Result<_, _>>()?;
+        let mut out = StringBuilder::new();
+        for row in 0..template.len() {
+            if template.is_null(row) {
+                out.append_null();
+                continue;
+            }
+            let row_args: Vec<Option<&str>> = values
+                .iter()
+                .map(|v| (!v.is_null(row)).then(|| v.value(row)))
+                .collect();
+            out.append_value(Self::format_row(template.value(row), &row_args)?);
+        }
+        Ok(Arc::new(out.finish()))
+    }
 }
 
 /// `current_schemas(include_implicit)`: the session's search path as an
@@ -396,7 +658,8 @@ impl RegclassScope {
     }
 }
 
-/// `ident`, double-quoted when PostgreSQL would quote it.
+/// `ident`, double-quoted when PostgreSQL would quote it (`quote_ident`):
+/// not a plain lowercase name, or a keyword.
 fn quote_ident(ident: &str) -> String {
     let plain = ident
         .chars()
@@ -404,7 +667,8 @@ fn quote_ident(ident: &str) -> String {
         .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
         && ident
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$');
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$')
+        && QUOTED_KEYWORDS.binary_search(&ident).is_err();
     if plain {
         ident.to_string()
     } else {
@@ -525,6 +789,40 @@ mod tests {
         assert_eq!(out.value(0), "integer");
         assert_eq!(out.value(1), "numeric(12,2)");
         assert!(out.is_null(2));
+    }
+
+    fn fmt(template: &str, args: &[Option<&str>]) -> Result<Option<String>, ExecutionError> {
+        let mut cols: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![template]))];
+        for a in args {
+            cols.push(Arc::new(StringArray::from(vec![*a])));
+        }
+        let out = FormatFunction.evaluate(&cols)?;
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        Ok((!out.is_null(0)).then(|| out.value(0).to_string()))
+    }
+
+    #[test]
+    fn format_specifiers() {
+        let ok = |t: &str, a: &[Option<&str>]| fmt(t, a).unwrap().unwrap();
+        assert_eq!(ok("%s.%s", &[Some("a"), Some("b")]), "a.b");
+        assert_eq!(ok("%I", &[Some("Mixed Case")]), "\"Mixed Case\"");
+        assert_eq!(ok("%I", &[Some("abc")]), "abc");
+        assert_eq!(ok("%I", &[Some("select")]), "\"select\"");
+        assert_eq!(ok("%I", &[Some("a\"b")]), "\"a\"\"b\"");
+        assert_eq!(ok("%L", &[Some("it's")]), "'it''s'");
+        assert_eq!(ok("%L", &[None]), "NULL");
+        assert_eq!(ok("%s", &[None]), "");
+        assert_eq!(ok("100%%", &[]), "100%");
+        let err = |t: &str, a: &[Option<&str>]| fmt(t, a).unwrap_err().to_string();
+        assert!(err("%s", &[]).contains("too few arguments"));
+        assert!(err("%I", &[None]).contains("null values cannot be formatted"));
+        assert!(err("%1$s", &[Some("a")]).contains("unsupported format specifier"));
+        assert!(err("%10s", &[Some("a")]).contains("unsupported format specifier"));
+    }
+
+    #[test]
+    fn quoted_keywords_are_sorted() {
+        assert!(QUOTED_KEYWORDS.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

@@ -153,6 +153,8 @@ const TABLES: &[(&str, &[&str])] = &[
             "conindid#",
             "confrelid#",
             "convalidated?",
+            "conkey[]#",
+            "confkey[]#",
         ],
     ),
     (
@@ -182,6 +184,14 @@ const TABLES: &[(&str, &[&str])] = &[
             "seqcache#",
             "seqcycle?",
         ],
+    ),
+    (
+        "pg_stat_user_tables",
+        &["relid#", "schemaname", "relname", "n_live_tup#"],
+    ),
+    (
+        "pg_enum",
+        &["oid#", "enumtypid#", "enumsortorder#", "enumlabel"],
     ),
     ("pg_collation", &["oid#", "collname", "collnamespace#"]),
     ("pg_opclass", &["oid#", "opcname", "opcdefault?"]),
@@ -388,6 +398,18 @@ async fn build(
         }
     }
 
+    // One row per user relation `pg_class` lists (the catalog's own tables
+    // are system tables, not user tables); no statistics, so zero live rows.
+    let mut stat_user_tables = table("pg_stat_user_tables");
+    for rel in relations.iter().filter(|r| r.schema != PG_CATALOG) {
+        stat_user_tables.push(vec![
+            i(pg_oid::relation_oid(&database, &rel.schema, &rel.name)),
+            s(&rel.schema),
+            s(&rel.name),
+            i(0),
+        ]);
+    }
+
     let mut types = table("pg_type");
     for ty in PG_TYPES {
         types.push(vec![
@@ -459,6 +481,8 @@ async fn build(
         ("pg_description", table("pg_description")),
         ("pg_attrdef", table("pg_attrdef")),
         ("pg_constraint", table("pg_constraint")),
+        ("pg_stat_user_tables", stat_user_tables),
+        ("pg_enum", table("pg_enum")),
         ("pg_index", table("pg_index")),
         ("pg_sequence", table("pg_sequence")),
         ("pg_collation", table("pg_collation")),

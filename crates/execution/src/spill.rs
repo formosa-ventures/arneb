@@ -111,6 +111,162 @@ fn drop_page_cache(file: &File) {
     }
 }
 
+/// Default `ARNEB_SPILL_MIN_FREE_BYTES`: always leave 1 GiB free on the
+/// spill directory's filesystem for the rest of the host. An absolute
+/// floor rather than Trino's used-space fraction
+/// (`spiller-max-used-space-threshold`, 0.9): on a large disk a fraction
+/// refuses to spill with plenty left (a 1 TB laptop disk at 99% still has
+/// 10 GB), and on a small one it allows too little.
+const DEFAULT_SPILL_MIN_FREE_BYTES: u64 = 1 << 30;
+
+/// Limits on what this process may spill to disk. Checked before every
+/// spill write, so a runaway query fails with `ResourceExhausted` instead
+/// of filling the disk under every other process on the host.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SpillLimits {
+    /// Refuse a write that would leave less than this many bytes free on
+    /// the spill filesystem. `0` disables the check.
+    min_free_bytes: u64,
+    /// Refuse a write that would take this process's live spill bytes
+    /// past this. `None`: no byte limit.
+    max_bytes: Option<u64>,
+}
+
+/// Parse a byte-count variable. `Err` for a value that is not a whole
+/// number, so a typo is reported instead of silently changing the limit.
+fn parse_bytes(raw: &str) -> Result<u64, ()> {
+    raw.trim().parse::<u64>().map_err(|_| ())
+}
+
+fn spill_limits() -> SpillLimits {
+    #[cfg(test)]
+    if let Some(limits) = SPILL_LIMITS_OVERRIDE.with(|o| o.get()) {
+        return limits;
+    }
+    static LIMITS: OnceLock<SpillLimits> = OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let read = |name: &str| -> Option<u64> {
+            let raw = std::env::var(name).ok()?;
+            match parse_bytes(&raw) {
+                Ok(v) => Some(v),
+                Err(()) => {
+                    tracing::warn!(
+                        target: "arneb::config",
+                        variable = name,
+                        value = %raw,
+                        "not a byte count; using the default"
+                    );
+                    None
+                }
+            }
+        };
+        let min_free_bytes =
+            read("ARNEB_SPILL_MIN_FREE_BYTES").unwrap_or(DEFAULT_SPILL_MIN_FREE_BYTES);
+        let max_bytes = read("ARNEB_SPILL_MAX_BYTES").filter(|&b| b > 0);
+        tracing::info!(
+            target: "arneb::config",
+            ARNEB_SPILL_MIN_FREE_BYTES = min_free_bytes,
+            ARNEB_SPILL_MAX_BYTES = max_bytes,
+            spill_dir = %std::env::temp_dir().display(),
+            "spill disk limits effective value (default: keep 1 GiB free on the spill \
+             filesystem; no per-node byte limit; 0 disables either)"
+        );
+        SpillLimits {
+            min_free_bytes,
+            max_bytes,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static SPILL_LIMITS_OVERRIDE: std::cell::Cell<Option<SpillLimits>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct SpillLimitsOverride;
+
+#[cfg(test)]
+impl Drop for SpillLimitsOverride {
+    fn drop(&mut self) {
+        SPILL_LIMITS_OVERRIDE.with(|o| o.set(None));
+    }
+}
+
+/// Override this thread's spill limits until the guard drops.
+#[cfg(test)]
+fn override_spill_limits(limits: SpillLimits) -> SpillLimitsOverride {
+    SPILL_LIMITS_OVERRIDE.with(|o| o.set(Some(limits)));
+    SpillLimitsOverride
+}
+
+/// Live spill bytes in this process: added per write, released when the
+/// writer or its sealed file is dropped (and the file removed).
+static SPILLED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes this process currently holds in spill files (an in-memory-size
+/// estimate), as counted against `ARNEB_SPILL_MAX_BYTES`.
+pub fn live_spill_bytes() -> u64 {
+    SPILLED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Whether one more `incoming`-byte write may go to disk, given the live
+/// spill bytes and the spill filesystem's free bytes (`None`: unknown).
+fn check_spill_limits(
+    limits: SpillLimits,
+    spilled_now: u64,
+    incoming: u64,
+    free_bytes: Option<u64>,
+) -> Result<(), String> {
+    if let Some(max) = limits.max_bytes {
+        if spilled_now.saturating_add(incoming) > max {
+            return Err(format!(
+                "spill limit exceeded: this node holds {spilled_now} bytes of spill and the next \
+                 write adds {incoming}, past ARNEB_SPILL_MAX_BYTES = {max}"
+            ));
+        }
+    }
+    if limits.min_free_bytes > 0 {
+        if let Some(free) = free_bytes {
+            if free < limits.min_free_bytes.saturating_add(incoming) {
+                return Err(format!(
+                    "spill disk full: {free} bytes free on the spill filesystem, and the next \
+                     write of {incoming} bytes would leave less than ARNEB_SPILL_MIN_FREE_BYTES = {}",
+                    limits.min_free_bytes
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bytes available to unprivileged users on the filesystem holding `dir`,
+/// as `df` reports them. `None` when unknown.
+#[cfg(unix)]
+fn free_bytes(dir: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a valid NUL-terminated C string and `stat` points
+    // to writable memory of the right type; statvfs only writes into it,
+    // and it is read only after a zero (success) return.
+    #[allow(unsafe_code)]
+    let stat = unsafe {
+        if libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) != 0 {
+            return None;
+        }
+        stat.assume_init()
+    };
+    #[allow(clippy::unnecessary_cast)] // the field widths differ by platform
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_dir: &std::path::Path) -> Option<u64> {
+    None
+}
+
 /// Generate a unique temp-file path under `/tmp` (or the platform's
 /// equivalent). Format: `arneb-<prefix>-<pid>-<counter>.arrow`. The
 /// counter is process-local; combined with the pid it's safe across
@@ -186,12 +342,25 @@ impl SpillWriter {
         let writer = self.writer.as_mut().ok_or_else(|| {
             ExecutionError::InvalidOperation("spill: write after finish".to_string())
         })?;
+        let size = crate::operator::record_batch_bytes(batch);
+        let dir = self
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        check_spill_limits(
+            spill_limits(),
+            SPILLED_BYTES.load(Ordering::Relaxed),
+            size as u64,
+            free_bytes(dir),
+        )
+        .map_err(ExecutionError::ResourceExhausted)?;
         writer.write(batch).map_err(|e| {
             ExecutionError::InvalidOperation(format!("spill: arrow IPC write failed: {e}"))
         })?;
         // Approximate on-wire bytes via in-memory batch size. Arrow IPC
-        // streams without compression are within ~5% of in-memory.
-        let size = crate::operator::record_batch_bytes(batch);
+        // streams without compression are within ~5% of in-memory (an
+        // over-estimate with compression, which errs toward the limit).
+        SPILLED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
         self.bytes_written += size;
         self.num_batches += 1;
         Ok(size)
@@ -269,6 +438,7 @@ impl Drop for SpillWriter {
         // `SpillFile` owns the cleanup, so we skip.
         if self.cleanup_on_drop {
             let _ = std::fs::remove_file(&self.path);
+            SPILLED_BYTES.fetch_sub(self.bytes_written as u64, Ordering::Relaxed);
         }
     }
 }
@@ -344,6 +514,7 @@ impl SpillFile {
 impl Drop for SpillFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        SPILLED_BYTES.fetch_sub(self.bytes_written as u64, Ordering::Relaxed);
     }
 }
 
@@ -915,5 +1086,85 @@ mod tests {
             Some(CompressionType::LZ4_FRAME),
             "ARNEB_SPILL_COMPRESSION must ship as lz4; set it to 0 to opt out"
         );
+    }
+
+    #[test]
+    fn spill_limits_allow_a_write_under_both_limits() {
+        let limits = SpillLimits {
+            min_free_bytes: 100,
+            max_bytes: Some(1000),
+        };
+        assert!(check_spill_limits(limits, 400, 500, Some(10_000)).is_ok());
+    }
+
+    #[test]
+    fn spill_limits_refuse_past_the_node_byte_limit() {
+        let limits = SpillLimits {
+            min_free_bytes: 0,
+            max_bytes: Some(1000),
+        };
+        let err = check_spill_limits(limits, 600, 500, Some(u64::MAX)).unwrap_err();
+        assert!(err.contains("ARNEB_SPILL_MAX_BYTES = 1000"), "{err}");
+    }
+
+    #[test]
+    fn spill_limits_refuse_a_write_that_eats_into_the_free_floor() {
+        let limits = SpillLimits {
+            min_free_bytes: 1000,
+            max_bytes: None,
+        };
+        // 1400 free - 500 written leaves 900 < 1000.
+        let err = check_spill_limits(limits, 0, 500, Some(1400)).unwrap_err();
+        assert!(err.contains("ARNEB_SPILL_MIN_FREE_BYTES = 1000"), "{err}");
+        assert!(check_spill_limits(limits, 0, 400, Some(1400)).is_ok());
+    }
+
+    #[test]
+    fn spill_limits_disabled_by_zero_or_an_unknown_free_space() {
+        let off = SpillLimits {
+            min_free_bytes: 0,
+            max_bytes: None,
+        };
+        assert!(check_spill_limits(off, u64::MAX / 2, 1, Some(0)).is_ok());
+        let on = SpillLimits {
+            min_free_bytes: 1 << 30,
+            max_bytes: None,
+        };
+        assert!(check_spill_limits(on, 0, 1, None).is_ok());
+    }
+
+    #[test]
+    fn spill_byte_counts_parse_whole_numbers_only() {
+        assert_eq!(parse_bytes(" 1073741824 "), Ok(1 << 30));
+        assert_eq!(parse_bytes("0"), Ok(0));
+        assert!(parse_bytes("1GB").is_err());
+        assert!(parse_bytes("-1").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_dir_free_bytes_are_known() {
+        assert!(free_bytes(&std::env::temp_dir()).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_writer_refuses_a_write_past_the_free_floor_and_cleans_up() {
+        let _limits = override_spill_limits(SpillLimits {
+            min_free_bytes: u64::MAX / 2,
+            max_bytes: None,
+        });
+        let mut writer = SpillWriter::new(schema_int_str(), "test_disk_limit").unwrap();
+        let path = writer.path.clone();
+        let err = writer
+            .write(&batch_int_str(&[1, 2], &[Some("a"), None]))
+            .unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::ResourceExhausted(ref m) if m.contains("ARNEB_SPILL_MIN_FREE_BYTES")),
+            "{err:?}"
+        );
+        assert_eq!(writer.bytes_written(), 0, "a refused batch is not counted");
+        drop(writer);
+        assert!(!path.exists(), "the refused spill file is removed");
     }
 }

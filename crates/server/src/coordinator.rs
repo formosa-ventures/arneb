@@ -3,6 +3,7 @@
 //! Lives in the server crate because it depends on both trino-rpc and trino-execution,
 //! which can't depend on each other.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use arneb_common::error::{ArnebError, ExecutionError};
@@ -30,6 +31,90 @@ fn dfrpc_domain_variant(domain: &arneb_common::Domain) -> String {
     }
 }
 
+/// The first task failure of each running distributed query, as its
+/// workers report it (`report_task_failure`). Without it the coordinator
+/// learns of a failure only when a consumer reads the failed task's
+/// output, which can be much later (a `UNION ALL` drains its inputs in
+/// order) and then as a downstream fragment's knock-on error (#279).
+#[derive(Clone, Default)]
+pub struct TaskFailures {
+    waiting: Arc<
+        std::sync::Mutex<
+            HashMap<QueryId, tokio::sync::oneshot::Sender<arneb_rpc::TaskFailureReport>>,
+        >,
+    >,
+}
+
+impl TaskFailures {
+    /// Deliver a worker's report to its query. Only the first failure of a
+    /// query counts; later ones, and reports for queries that are no
+    /// longer running here, are dropped.
+    pub fn report(&self, report: arneb_rpc::TaskFailureReport) {
+        let waiting = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&report.query_id);
+        if let Some(tx) = waiting {
+            let _ = tx.send(report);
+        }
+    }
+
+    /// Wait for `query_id`'s first task failure until the guard drops.
+    fn watch(
+        &self,
+        query_id: QueryId,
+    ) -> (
+        tokio::sync::oneshot::Receiver<arneb_rpc::TaskFailureReport>,
+        TaskFailureWatch,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(query_id, tx);
+        (
+            rx,
+            TaskFailureWatch {
+                failures: self.clone(),
+                query_id,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn watching(&self) -> usize {
+        self.waiting.lock().unwrap().len()
+    }
+}
+
+/// Stops watching a query's task failures when its attempt ends.
+struct TaskFailureWatch {
+    failures: TaskFailures,
+    query_id: QueryId,
+}
+
+impl Drop for TaskFailureWatch {
+    fn drop(&mut self) {
+        self.failures
+            .waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.query_id);
+    }
+}
+
+/// Resolves with the first reported task failure; never resolves when the
+/// watch ended without one.
+async fn first_task_failure(
+    rx: tokio::sync::oneshot::Receiver<arneb_rpc::TaskFailureReport>,
+) -> arneb_rpc::TaskFailureReport {
+    match rx.await {
+        Ok(report) => report,
+        Err(_) => std::future::pending().await,
+    }
+}
+
 /// Orchestrates distributed query execution across multiple workers.
 pub struct QueryCoordinator {
     node_registry: NodeRegistry,
@@ -42,6 +127,9 @@ pub struct QueryCoordinator {
     df_registry: DynamicFilterServiceRegistry,
     /// P4 stage 2: re-run settings, `None` when retry is off.
     retry: Option<QueryRetry>,
+    /// Workers' task-failure reports, shared with the FlightState
+    /// `task_failure_callback` registered in `main.rs`.
+    task_failures: TaskFailures,
 }
 
 impl QueryCoordinator {
@@ -50,7 +138,15 @@ impl QueryCoordinator {
             node_registry,
             df_registry,
             retry: None,
+            task_failures: TaskFailures::default(),
         }
+    }
+
+    /// Fail a query as soon as a worker reports one of its tasks failed;
+    /// share `failures` with the coordinator's Flight `task_failure_callback`.
+    pub fn with_task_failures(mut self, failures: TaskFailures) -> Self {
+        self.task_failures = failures;
+        self
     }
 
     /// Re-run read-only queries that fail because a worker was lost
@@ -167,6 +263,8 @@ impl QueryCoordinator {
         // The protocol layer records the statement in the query tracker;
         // this id only keys the distributed tasks.
         let query_id = QueryId::new();
+        // Registered before any task is dispatched, so no report is missed.
+        let (task_failed, _task_failure_watch) = self.task_failures.watch(query_id);
 
         // The DF service is built shortly after fragmentation, once we
         // know which DF ids exist + how many partitions each producer
@@ -444,6 +542,19 @@ impl QueryCoordinator {
                 Err(lost_worker_error(&lost))
             }
             result = run => result.map_err(|e| attribute_worker_failure(e, &workers, &self.node_registry)),
+            // After `run`: when the result is complete in the same poll,
+            // a late failure of a task nobody needs any more is not an error.
+            report = first_task_failure(task_failed) => {
+                tracing::warn!(
+                    target: "arneb::cluster",
+                    query_id = %query_id,
+                    task_id = %report.task_id,
+                    error = %report.message,
+                    "task failed on a worker; failing the query"
+                );
+                let error = report.failure().into_execution_error(format_args!("task {} failed", report.task_id));
+                Err(attribute_worker_failure(error, &workers, &self.node_registry))
+            }
         }
         .map_err(|error| AttemptError { error, worker_ids })?;
 
@@ -2119,6 +2230,49 @@ mod tests {
 
     /// Dropping the future of a query whose tasks are dispatched (here: a
     /// future parked on a guard, like `execute` awaiting the root stage)
+    fn failure_report(query_id: QueryId, task: &str) -> arneb_rpc::TaskFailureReport {
+        arneb_rpc::TaskFailureReport::new(
+            query_id,
+            task,
+            &arneb_rpc::TaskFailure::resource_exhausted(format!("{task} over its limit")),
+        )
+    }
+
+    /// #279: a watched query gets its first task failure; later reports,
+    /// reports for other queries and reports after the attempt ended are
+    /// dropped.
+    #[tokio::test]
+    async fn a_query_gets_only_its_own_first_task_failure() {
+        let failures = TaskFailures::default();
+        let (q, other) = (QueryId::new(), QueryId::new());
+        let (rx, watch) = failures.watch(q);
+        failures.report(failure_report(other, "other.0.0"));
+        failures.report(failure_report(q, "q.2.1"));
+        failures.report(failure_report(q, "q.0.0"));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), first_task_failure(rx))
+            .await
+            .unwrap();
+        assert_eq!(first.task_id, "q.2.1");
+        assert!(matches!(
+            first.failure().into_execution_error("task q.2.1 failed"),
+            ExecutionError::ResourceExhausted(_)
+        ));
+        drop(watch);
+        assert_eq!(failures.watching(), 0);
+
+        // An attempt that ends without a failure stops watching, and never
+        // resolves on its own.
+        let (rx, watch) = failures.watch(q);
+        drop(watch);
+        assert_eq!(failures.watching(), 0);
+        failures.report(failure_report(q, "late.0.0"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), first_task_failure(rx))
+                .await
+                .is_err()
+        );
+    }
+
     /// cancels it on the workers.
     #[tokio::test]
     async fn dropping_the_query_future_cancels_on_workers() {

@@ -280,6 +280,10 @@ times out, is cancelled (Trino `DELETE`), fails in one fragment or loses its
 client is cancelled on every worker: its tasks stop and their memory and
 output buffers are released. `arneb::cluster` logs `cancelling query on
 workers` on the coordinator and `query cancelled on worker` on each worker.
+A worker reports a failed task to the coordinator as soon as it fails, so the
+query fails at once with that task's error (`53200` for a memory or spill
+limit), not later with a downstream fragment's knock-on error; the coordinator
+logs `task failed on a worker; failing the query`.
 
 The effective values are logged at startup on `arneb::config`, with
 `admission_source = config|state`. Set `max_running_queries = 0` and leave

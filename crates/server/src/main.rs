@@ -543,6 +543,9 @@ async fn run() -> Result<()> {
     // shared between QueryCoordinator (registers on execute) and the
     // FlightState `df_report_callback` (routes worker reports in).
     let df_registry = arneb_scheduler::DynamicFilterServiceRegistry::new();
+    // #279: workers report task failures here so the coordinator fails the
+    // query at once instead of when a consumer next reads the failed task.
+    let task_failures = coordinator::TaskFailures::default();
 
     // Where and as whom a worker heartbeats; built here so the task
     // manager's catalog puller shares the worker id and coordinator.
@@ -596,6 +599,8 @@ async fn run() -> Result<()> {
             if matches!(role, ServerRole::Coordinator) {
                 let live = live_catalogs.clone();
                 state.set_catalog_source(Arc::new(move || live.snapshot()));
+                let failures = task_failures.clone();
+                state.set_task_failure_callback(Arc::new(move |report| failures.report(report)));
             }
             // A1.3: route worker DF reports into the per-query
             // `DynamicFilterService`. The callback is sync (`Fn`),
@@ -724,7 +729,8 @@ async fn run() -> Result<()> {
             );
             let coord =
                 coordinator::QueryCoordinator::new(node_registry.clone(), df_registry.clone())
-                    .with_retry(retry);
+                    .with_retry(retry)
+                    .with_task_failures(task_failures.clone());
             Some(Arc::new(coord))
         }
         _ => None,

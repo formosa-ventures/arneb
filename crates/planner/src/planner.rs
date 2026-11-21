@@ -2403,12 +2403,47 @@ impl<'a> QueryPlanner<'a> {
             }),
             ast::Expr::BinaryOp {
                 left, op, right, ..
-            } => Ok(PlanExpr::BinaryOp {
-                left: Box::new(self.plan_expr(left, ctx).await?),
-                op: *op,
-                right: Box::new(self.plan_expr(right, ctx).await?),
-                span: node_span,
-            }),
+            } => {
+                // `x ± INTERVAL` and `INTERVAL + x`: lowered by `x`'s type.
+                let interval = match (left.as_ref(), op, right.as_ref()) {
+                    (
+                        operand,
+                        ast::BinaryOp::Plus | ast::BinaryOp::Minus,
+                        ast::Expr::Interval {
+                            value, unit, span, ..
+                        },
+                    ) => Some((operand, *value, *unit, *span, false)),
+                    (
+                        ast::Expr::Interval {
+                            value, unit, span, ..
+                        },
+                        ast::BinaryOp::Plus,
+                        operand,
+                    ) => Some((operand, *value, *unit, *span, true)),
+                    _ => None,
+                };
+                if let Some((operand, value, unit, interval_span, interval_first)) = interval {
+                    let operand = self.plan_expr(operand, ctx).await?;
+                    return plan_interval_arithmetic(
+                        operand,
+                        IntervalOperand {
+                            op: *op,
+                            value,
+                            unit,
+                            span: interval_span,
+                            first: interval_first,
+                        },
+                        ctx,
+                        node_span,
+                    );
+                }
+                Ok(PlanExpr::BinaryOp {
+                    left: Box::new(self.plan_expr(left, ctx).await?),
+                    op: *op,
+                    right: Box::new(self.plan_expr(right, ctx).await?),
+                    span: node_span,
+                })
+            }
             ast::Expr::UnaryOp { op, expr, .. } => Ok(PlanExpr::UnaryOp {
                 op: *op,
                 expr: Box::new(self.plan_expr(expr, ctx).await?),
@@ -2658,6 +2693,7 @@ impl<'a> QueryPlanner<'a> {
                 type_hint: None,
                 span: node_span,
             }),
+            ast::Expr::Interval { .. } => Err(interval_outside_arithmetic(node_span)),
         }
     }
 
@@ -3609,6 +3645,113 @@ fn apply_semi_join(input: LogicalPlan, spec: SemiJoinSpec) -> LogicalPlan {
             probe_side_filter_ids: Vec::new(),
         },
     }
+}
+
+/// The interval side of `x ± INTERVAL` / `INTERVAL + x`.
+struct IntervalOperand {
+    op: ast::BinaryOp,
+    value: i64,
+    unit: ast::IntervalUnit,
+    span: arneb_sql_parser::Span,
+    /// The interval is the left operand (`INTERVAL + x`).
+    first: bool,
+}
+
+fn interval_outside_arithmetic(span: Option<arneb_sql_parser::Span>) -> PlanError {
+    PlanError::UnsupportedExpression {
+        message: "interval outside date/timestamp arithmetic".to_string(),
+        location: span.map(|s| s.start),
+    }
+}
+
+/// Lowers `x ± INTERVAL` by the planned type of `x`:
+/// - DATE ± days stays integer-day arithmetic (`d - 90`), the form
+///   TPC-H plans with, so it is still DATE;
+/// - DATE ± years/quarters/months/weeks is `date_add(unit, ±n, d)`, DATE;
+/// - DATE ± hours/minutes/seconds is
+///   `date_add(unit, ±n, CAST(d AS TIMESTAMP))`, TIMESTAMP;
+/// - TIMESTAMP ± any unit is `date_add(unit, ±n, ts)`, TIMESTAMP.
+///
+/// Any other operand type is unsupported.
+#[inline(never)]
+fn plan_interval_arithmetic(
+    operand: PlanExpr,
+    interval: IntervalOperand,
+    ctx: &PlanningContext,
+    span: Option<arneb_sql_parser::Span>,
+) -> Result<PlanExpr, PlanError> {
+    use ast::IntervalUnit;
+    let schema: Vec<ColumnInfo> = ctx.columns.iter().map(|(_, col)| col.clone()).collect();
+    let operand_type = plan_expr_type(&operand, &schema);
+    let out_of_range = || PlanError::UnsupportedExpression {
+        message: format!("interval value out of range: {}", interval.value),
+        location: Some(interval.span.start),
+    };
+    let target = match (&operand_type, interval.unit) {
+        (Some(DataType::Date32), IntervalUnit::Day) => {
+            let days = PlanExpr::Literal {
+                value: ScalarValue::Int32(
+                    i32::try_from(interval.value).map_err(|_| out_of_range())?,
+                ),
+                span: Some(interval.span),
+            };
+            let (left, right) = if interval.first {
+                (days, operand)
+            } else {
+                (operand, days)
+            };
+            return Ok(PlanExpr::BinaryOp {
+                left: Box::new(left),
+                op: interval.op,
+                right: Box::new(right),
+                span,
+            });
+        }
+        (
+            Some(DataType::Date32),
+            IntervalUnit::Hour | IntervalUnit::Minute | IntervalUnit::Second,
+        ) => PlanExpr::Cast {
+            expr: Box::new(operand),
+            data_type: DataType::Timestamp {
+                unit: arneb_common::types::TimeUnit::Microsecond,
+                timezone: None,
+            },
+            span: None,
+        },
+        (Some(DataType::Date32 | DataType::Timestamp { .. }), _) => operand,
+        (other, _) => {
+            return Err(PlanError::UnsupportedExpression {
+                message: format!(
+                    "interval arithmetic needs a DATE or TIMESTAMP operand, got {}",
+                    other
+                        .as_ref()
+                        .map_or_else(|| "an unknown type".to_string(), |t| t.to_string())
+                ),
+                location: span.map(|s| s.start),
+            });
+        }
+    };
+    let count = match interval.op {
+        ast::BinaryOp::Minus => interval.value.checked_neg().ok_or_else(out_of_range)?,
+        _ => interval.value,
+    };
+    Ok(PlanExpr::Function {
+        name: "date_add".to_string(),
+        args: vec![
+            PlanExpr::Literal {
+                value: ScalarValue::Utf8(interval.unit.name().to_string()),
+                span: None,
+            },
+            PlanExpr::Literal {
+                value: ScalarValue::Int64(count),
+                span: Some(interval.span),
+            },
+            target,
+        ],
+        distinct: false,
+        order_by: None,
+        span,
+    })
 }
 
 fn contains_nested_subquery(expr: &ast::Expr) -> bool {
@@ -5490,6 +5633,100 @@ mod tests {
             .lock()
             .expect("CTE self-agg window override lock poisoned") = None;
         plan
+    }
+
+    /// The projection expressions of `sql` over the q15 `lineitem`
+    /// fixture (`l_shipdate DATE`).
+    async fn lineitem_projection(sql: &str) -> Result<Vec<PlanExpr>, PlanError> {
+        let catalog = q15_catalog();
+        let planner = QueryPlanner::new(&catalog);
+        let stmt = arneb_sql_parser::parse(sql).expect("parse");
+        match planner.plan_statement(&stmt).await? {
+            LogicalPlan::Projection { exprs, .. } => Ok(exprs),
+            other => panic!("expected a projection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn interval_arithmetic_lowering() {
+        let exprs = lineitem_projection(
+            "SELECT l_shipdate - INTERVAL '90' DAY, l_shipdate + INTERVAL '90 days', \
+             INTERVAL '1' DAY + l_shipdate, l_shipdate - INTERVAL '1 month', \
+             l_shipdate + INTERVAL '2' HOUR FROM lineitem",
+        )
+        .await
+        .unwrap();
+        // DATE ± days stays integer-day arithmetic (the TPC-H form).
+        for (expr, op) in [
+            (&exprs[0], ast::BinaryOp::Minus),
+            (&exprs[1], ast::BinaryOp::Plus),
+        ] {
+            match expr {
+                PlanExpr::BinaryOp {
+                    left, op: o, right, ..
+                } => {
+                    assert_eq!(*o, op);
+                    assert!(matches!(left.as_ref(), PlanExpr::Column { .. }), "{expr}");
+                    assert!(
+                        matches!(
+                            right.as_ref(),
+                            PlanExpr::Literal {
+                                value: ScalarValue::Int32(90),
+                                ..
+                            }
+                        ),
+                        "{expr}"
+                    );
+                }
+                other => panic!("expected date - days, got {other}"),
+            }
+        }
+        assert!(
+            matches!(
+                &exprs[2],
+                PlanExpr::BinaryOp { left, .. }
+                    if matches!(left.as_ref(), PlanExpr::Literal { value: ScalarValue::Int32(1), .. })
+            ),
+            "{}",
+            exprs[2]
+        );
+        // Other units call date_add, negated for `-`.
+        let PlanExpr::Function { name, args, .. } = &exprs[3] else {
+            panic!("expected date_add, got {}", exprs[3]);
+        };
+        assert_eq!(name, "date_add");
+        assert!(
+            matches!(&args[0], PlanExpr::Literal { value: ScalarValue::Utf8(u), .. } if u == "month")
+        );
+        assert!(matches!(
+            &args[1],
+            PlanExpr::Literal {
+                value: ScalarValue::Int64(-1),
+                ..
+            }
+        ));
+        assert!(matches!(&args[2], PlanExpr::Column { .. }));
+        // A sub-day unit on a DATE goes through TIMESTAMP.
+        let PlanExpr::Function { args, .. } = &exprs[4] else {
+            panic!("expected date_add, got {}", exprs[4]);
+        };
+        assert!(matches!(
+            &args[2],
+            PlanExpr::Cast {
+                data_type: DataType::Timestamp { .. },
+                ..
+            }
+        ));
+
+        for sql in [
+            "SELECT INTERVAL '1 day' FROM lineitem",
+            "SELECT INTERVAL '1 day' - l_shipdate FROM lineitem",
+            "SELECT l_suppkey + INTERVAL '1 day' FROM lineitem",
+            "SELECT l_shipdate * INTERVAL '1 day' FROM lineitem",
+        ] {
+            let err = lineitem_projection(sql).await.unwrap_err().to_string();
+            assert!(err.contains("interval"), "{sql}: {err}");
+        }
     }
 
     fn cte_self_agg_window_test_lock() -> &'static tokio::sync::Mutex<()> {

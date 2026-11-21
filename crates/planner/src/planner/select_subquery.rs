@@ -764,6 +764,7 @@ fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
         E::Column { .. }
         | E::Literal { .. }
         | E::Parameter { .. }
+        | E::Interval { .. }
         | E::Subquery { .. }
         | E::Exists { .. } => Vec::new(),
         E::BinaryOp { left, right, .. } => vec![left, right],
@@ -820,6 +821,7 @@ fn children_mut(expr: &mut ast::Expr) -> Vec<&mut ast::Expr> {
         E::Column { .. }
         | E::Literal { .. }
         | E::Parameter { .. }
+        | E::Interval { .. }
         | E::Subquery { .. }
         | E::Exists { .. } => Vec::new(),
         E::BinaryOp { left, right, .. } => vec![left, right],

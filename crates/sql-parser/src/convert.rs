@@ -1033,90 +1033,86 @@ fn lower_regex_operator(
     })
 }
 
-/// Convert `INTERVAL '<n>' <unit>` into an integer literal whose
-/// value is the interval in `<unit>` natural units. Only supports
-/// constant integer-valued intervals with a single leading time
-/// unit (DAY / MONTH / YEAR / HOUR / MINUTE / SECOND), which covers
-/// every interval expression used by the TPC-H reference queries.
-///
-/// The folded integer then participates in arithmetic via Arrow's
-/// numeric kernels — `Date32 - Int32` yields a `Date32` shifted by
-/// that many days, matching SQL `DATE - INTERVAL 'n' DAY` semantics
-/// at the bit level (Date32 is days-since-epoch).
-///
-/// For non-DAY units the folded literal still has unit semantics
-/// (months / hours / etc.); downstream arithmetic must handle the
-/// unit through the typed expression evaluator. TPC-H only uses DAY,
-/// so non-DAY intervals are reported as `UnsupportedFeature` until a
-/// concrete query needs them.
-fn convert_interval(interval: sp::Interval, span: Span) -> Result<ast::Expr, ParseError> {
+/// The signed count and unit of a single-unit interval literal:
+/// `INTERVAL 'n' UNIT` or PostgreSQL's `INTERVAL 'n unit'` /
+/// `INTERVAL '-n units'`. Anything else (multi-part strings such as
+/// `'1 day 2 hours'`, `DAY TO HOUR`, fractions) is refused.
+fn interval_parts(iv: &sp::Interval) -> Result<(i64, ast::IntervalUnit), ParseError> {
+    use ast::IntervalUnit;
     use sp::DateTimeField;
 
-    // Resolve the numeric value from the inner expression. TPC-H
-    // queries spell intervals as `INTERVAL '90' DAY`, where the
-    // value parses to a string literal. We also accept a plain
-    // numeric literal in case other queries use that form.
-    let value_str = match interval.value.as_ref() {
+    let unsupported = |what: String| ParseError::UnsupportedFeature(format!("interval {what}"));
+    let text = match iv.value.as_ref() {
         sp::Expr::Value(v) => match &v.value {
             sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => s.clone(),
             sp::Value::Number(n, _) => n.clone(),
-            other => {
-                return Err(ParseError::UnsupportedFeature(format!(
-                    "interval value: {other:?}"
-                )));
-            }
+            other => return Err(unsupported(format!("value: {other:?}"))),
         },
-        other => {
-            return Err(ParseError::UnsupportedFeature(format!(
-                "interval value expression: {other}"
-            )));
+        other => return Err(unsupported(format!("value expression: {other}"))),
+    };
+    if iv.last_field.is_some() {
+        return Err(unsupported(format!("with a range qualifier: '{text}'")));
+    }
+    let (count, unit) = match &iv.leading_field {
+        Some(field) => {
+            let unit = match field {
+                DateTimeField::Year | DateTimeField::Years => IntervalUnit::Year,
+                DateTimeField::Quarter => IntervalUnit::Quarter,
+                DateTimeField::Month | DateTimeField::Months => IntervalUnit::Month,
+                DateTimeField::Week(None) | DateTimeField::Weeks => IntervalUnit::Week,
+                DateTimeField::Day | DateTimeField::Days => IntervalUnit::Day,
+                DateTimeField::Hour | DateTimeField::Hours => IntervalUnit::Hour,
+                DateTimeField::Minute | DateTimeField::Minutes => IntervalUnit::Minute,
+                DateTimeField::Second | DateTimeField::Seconds => IntervalUnit::Second,
+                other => return Err(unsupported(format!("unit: {other}"))),
+            };
+            (text.trim(), unit)
+        }
+        None => {
+            let mut words = text.split_whitespace();
+            let (Some(count), Some(unit), None) = (words.next(), words.next(), words.next()) else {
+                return Err(unsupported(format!(
+                    "'{text}': only a single 'n unit' interval is supported"
+                )));
+            };
+            let unit = IntervalUnit::from_name(unit)
+                .ok_or_else(|| unsupported(format!("unit: '{unit}' in '{text}'")))?;
+            (count, unit)
         }
     };
-    let n: i64 = value_str.trim().parse().map_err(|_| {
-        ParseError::UnsupportedFeature(format!("interval value not an integer: '{value_str}'"))
-    })?;
+    let value = count
+        .parse::<i64>()
+        .map_err(|_| unsupported(format!("value not an integer: '{text}'")))?;
+    Ok((value, unit))
+}
 
-    let unit = interval.leading_field.ok_or_else(|| {
-        ParseError::UnsupportedFeature("interval without leading unit".to_string())
-    })?;
-
-    match unit {
-        DateTimeField::Day | DateTimeField::Days => {
-            // Days fit in Int32 for all realistic ranges.
-            Ok(ast::Expr::Literal {
-                value: arneb_common::types::ScalarValue::Int32(n as i32),
-                span,
-            })
-        }
-        // Year / Month / Hour / Minute / Second intervals are not
-        // exercised by any TPC-H query in our set; until they are,
-        // surface as unsupported so we don't silently mis-evaluate
-        // a non-DAY interval as days.
-        other => Err(ParseError::UnsupportedFeature(format!(
-            "interval unit: {other:?}"
-        ))),
-    }
+/// Convert an interval literal into [`ast::Expr::Interval`]. The
+/// planner lowers it as an operand of `+`/`-` on a date or timestamp
+/// (a DATE ± DAY interval stays plain integer-day arithmetic, the form
+/// the TPC-H queries plan with) and rejects it anywhere else.
+fn convert_interval(interval: sp::Interval, span: Span) -> Result<ast::Expr, ParseError> {
+    let (value, unit) = interval_parts(&interval)?;
+    Ok(ast::Expr::Interval { value, unit, span })
 }
 
 /// Constant-fold `DATE 'YYYY-MM-DD' ± INTERVAL 'N' UNIT` to a single
-/// `Literal(Date32)`. Returns `None` if the operands aren't both
-/// literals or the date string fails to parse — caller falls back to
-/// normal `BinaryOp` conversion (which will error if no runtime
-/// handler exists for the operand types).
+/// `Literal(Date32)`. Returns `None` if the typed string is not a
+/// parseable DATE literal or the unit is finer than a day — caller
+/// falls back to normal `BinaryOp` conversion, which the planner lowers.
 ///
 /// Calendar arithmetic via `chrono`:
-/// - DAY: `NaiveDate ± Duration::days`
+/// - DAY / WEEK: `NaiveDate ± Duration::days`
 /// - MONTH: `NaiveDate::checked_add/sub_months` (handles month-end
 ///   clipping per ISO/SQL semantics).
-/// - YEAR: same as MONTH × 12.
+/// - QUARTER / YEAR: same as MONTH × 3 / × 12.
 fn try_fold_date_interval(
     ts: &sp::TypedString,
     op: &sp::BinaryOperator,
     iv: &sp::Interval,
     span: Span,
 ) -> Result<Option<ast::Expr>, ParseError> {
+    use ast::IntervalUnit;
     use chrono::{Months, NaiveDate};
-    use sp::DateTimeField;
 
     // Only fold when the typed-string is a DATE literal.
     if !matches!(ts.data_type, sp::DataType::Date) {
@@ -1131,53 +1127,34 @@ fn try_fold_date_interval(
         Err(_) => return Ok(None),
     };
 
-    // Extract the interval value + unit.
-    let value_str = match iv.value.as_ref() {
-        sp::Expr::Value(v) => match &v.value {
-            sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => s.clone(),
-            sp::Value::Number(n, _) => n.clone(),
-            _ => return Ok(None),
-        },
+    let (n, unit) = interval_parts(iv)?;
+    let n = match op {
+        sp::BinaryOperator::Plus => Some(n),
+        sp::BinaryOperator::Minus => n.checked_neg(),
         _ => return Ok(None),
     };
-    let n: i64 = match value_str.trim().parse() {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
+    let shift_months = |months: i64| -> Option<NaiveDate> {
+        let magnitude = Months::new(u32::try_from(months.unsigned_abs()).ok()?);
+        if months >= 0 {
+            date.checked_add_months(magnitude)
+        } else {
+            date.checked_sub_months(magnitude)
+        }
     };
-    let unit = iv.leading_field.as_ref().ok_or_else(|| {
-        ParseError::UnsupportedFeature("interval without leading unit".to_string())
-    })?;
-
+    let shift_days = |days: i64| -> Option<NaiveDate> {
+        date.checked_add_signed(chrono::Duration::try_days(days)?)
+    };
     let new_date = match unit {
-        DateTimeField::Day | DateTimeField::Days => {
-            let delta = chrono::Duration::days(n);
-            match op {
-                sp::BinaryOperator::Plus => date.checked_add_signed(delta),
-                sp::BinaryOperator::Minus => date.checked_sub_signed(delta),
-                _ => return Ok(None),
-            }
-        }
-        DateTimeField::Month | DateTimeField::Months => {
-            let months = Months::new(n as u32);
-            match op {
-                sp::BinaryOperator::Plus => date.checked_add_months(months),
-                sp::BinaryOperator::Minus => date.checked_sub_months(months),
-                _ => return Ok(None),
-            }
-        }
-        DateTimeField::Year | DateTimeField::Years => {
-            let months = Months::new((n * 12) as u32);
-            match op {
-                sp::BinaryOperator::Plus => date.checked_add_months(months),
-                sp::BinaryOperator::Minus => date.checked_sub_months(months),
-                _ => return Ok(None),
-            }
-        }
-        _ => return Ok(None),
+        IntervalUnit::Day => n.and_then(shift_days),
+        IntervalUnit::Week => n.and_then(|n| n.checked_mul(7)).and_then(shift_days),
+        IntervalUnit::Month => n.and_then(shift_months),
+        IntervalUnit::Quarter => n.and_then(|n| n.checked_mul(3)).and_then(shift_months),
+        IntervalUnit::Year => n.and_then(|n| n.checked_mul(12)).and_then(shift_months),
+        IntervalUnit::Hour | IntervalUnit::Minute | IntervalUnit::Second => return Ok(None),
     };
     let new_date = new_date.ok_or_else(|| {
         ParseError::UnsupportedFeature(format!(
-            "date interval arithmetic overflow: {date} {op:?} {n} {unit:?}"
+            "date interval arithmetic overflow: {date} {op:?} {unit:?}"
         ))
     })?;
 

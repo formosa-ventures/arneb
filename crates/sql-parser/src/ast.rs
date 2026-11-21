@@ -437,6 +437,72 @@ pub enum Expr {
         /// Source span covering the placeholder literal.
         span: Span,
     },
+    /// A single-unit interval literal: `INTERVAL '3' MONTH`,
+    /// `INTERVAL '-1 months'`. Intervals are not a value type; the
+    /// planner lowers `date/timestamp ± interval` and rejects an
+    /// interval anywhere else.
+    Interval {
+        /// The signed count of `unit`s.
+        value: i64,
+        /// The unit.
+        unit: IntervalUnit,
+        /// Source span.
+        span: Span,
+    },
+}
+
+/// The unit of an [`Expr::Interval`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntervalUnit {
+    /// Years.
+    Year,
+    /// Quarters (3 months).
+    Quarter,
+    /// Months.
+    Month,
+    /// Weeks (7 days).
+    Week,
+    /// Days.
+    Day,
+    /// Hours.
+    Hour,
+    /// Minutes.
+    Minute,
+    /// Seconds.
+    Second,
+}
+
+impl IntervalUnit {
+    /// The lower-case unit name, as `date_add` takes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            IntervalUnit::Year => "year",
+            IntervalUnit::Quarter => "quarter",
+            IntervalUnit::Month => "month",
+            IntervalUnit::Week => "week",
+            IntervalUnit::Day => "day",
+            IntervalUnit::Hour => "hour",
+            IntervalUnit::Minute => "minute",
+            IntervalUnit::Second => "second",
+        }
+    }
+
+    /// Parses a singular or plural unit name, ignoring case.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let lower = name.to_ascii_lowercase();
+        let singular = lower.strip_suffix('s').unwrap_or(&lower);
+        Some(match singular {
+            "year" => IntervalUnit::Year,
+            "quarter" => IntervalUnit::Quarter,
+            "month" => IntervalUnit::Month,
+            "week" => IntervalUnit::Week,
+            "day" => IntervalUnit::Day,
+            "hour" => IntervalUnit::Hour,
+            "minute" => IntervalUnit::Minute,
+            "second" => IntervalUnit::Second,
+            _ => return None,
+        })
+    }
 }
 
 impl Expr {
@@ -461,7 +527,8 @@ impl Expr {
             | Expr::Case { span, .. }
             | Expr::Array { span, .. }
             | Expr::AnyAll { span, .. }
-            | Expr::Parameter { span, .. } => *span,
+            | Expr::Parameter { span, .. }
+            | Expr::Interval { span, .. } => *span,
         }
     }
 }
@@ -935,6 +1002,9 @@ impl fmt::Display for Expr {
                 write!(f, " END")
             }
             Expr::Parameter { index, .. } => write!(f, "${index}"),
+            Expr::Interval { value, unit, .. } => {
+                write!(f, "INTERVAL '{value}' {}", unit.name().to_ascii_uppercase())
+            }
         }
     }
 }

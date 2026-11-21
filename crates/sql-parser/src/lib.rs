@@ -1780,4 +1780,64 @@ mod tests {
         let err = parse("SELECT a ~ '(' FROM t").unwrap_err().to_string();
         assert!(err.contains("invalid regular expression in ~"), "{err}");
     }
+
+    #[test]
+    fn interval_string_forms() {
+        for (sql, value, unit) in [
+            ("SELECT INTERVAL '1 day'", 1, IntervalUnit::Day),
+            ("SELECT INTERVAL '-30 year'", -30, IntervalUnit::Year),
+            ("SELECT INTERVAL '2 months'", 2, IntervalUnit::Month),
+            ("SELECT INTERVAL '-1 months'", -1, IntervalUnit::Month),
+            ("SELECT INTERVAL '3 quarters'", 3, IntervalUnit::Quarter),
+            ("SELECT INTERVAL '1 week'", 1, IntervalUnit::Week),
+            ("SELECT INTERVAL '2 hours'", 2, IntervalUnit::Hour),
+            ("SELECT INTERVAL '5 minute'", 5, IntervalUnit::Minute),
+            ("SELECT INTERVAL '7 seconds'", 7, IntervalUnit::Second),
+            ("SELECT INTERVAL '1' DAY", 1, IntervalUnit::Day),
+            ("SELECT INTERVAL '3' MONTH", 3, IntervalUnit::Month),
+            ("SELECT INTERVAL '-2' HOUR", -2, IntervalUnit::Hour),
+        ] {
+            match first_projection(sql) {
+                Expr::Interval {
+                    value: v, unit: u, ..
+                } => assert_eq!((v, u), (value, unit), "{sql}"),
+                other => panic!("{sql}: expected Interval, got {other:?}"),
+            }
+        }
+        for sql in [
+            "SELECT INTERVAL '1 day 2 hours'",
+            "SELECT INTERVAL '1 fortnight'",
+            "SELECT INTERVAL 'x day'",
+        ] {
+            match parse(sql) {
+                Err(ParseError::UnsupportedFeature(msg)) => {
+                    assert!(msg.contains("interval"), "{sql}: {msg}")
+                }
+                other => panic!("{sql}: expected UnsupportedFeature, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn date_literal_interval_string_still_folds() {
+        // 2000-02-29 is day 11016: month ends clamp.
+        for (sql, days) in [
+            ("SELECT DATE '2000-01-31' + INTERVAL '1 month'", 11016),
+            ("SELECT DATE '2000-01-31' + INTERVAL '1' MONTH", 11016),
+            ("SELECT DATE '2000-03-31' - INTERVAL '1 month'", 11016),
+            ("SELECT DATE '2000-03-31' + INTERVAL '-1 months'", 11016),
+            ("SELECT DATE '2000-03-01' - INTERVAL '1 day'", 11016),
+            ("SELECT DATE '2000-03-07' - INTERVAL '1 week'", 11016),
+            ("SELECT DATE '1999-11-30' + INTERVAL '1 quarter'", 11016),
+            ("SELECT INTERVAL '1 year' + DATE '1999-02-28'", 11016 - 1),
+        ] {
+            match first_projection(sql) {
+                Expr::Literal {
+                    value: ScalarValue::Date32(d),
+                    ..
+                } => assert_eq!(d, days, "{sql}"),
+                other => panic!("{sql}: expected Date32 literal, got {other:?}"),
+            }
+        }
+    }
 }

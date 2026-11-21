@@ -691,6 +691,34 @@ fn unify_binary_operands(
         return Ok((left, right));
     }
 
+    // DATE compared with TIMESTAMP compares as TIMESTAMP (midnight), as
+    // in PostgreSQL and Trino: `d >= date_trunc('year', now())`.
+    let comparison = matches!(
+        op,
+        ast::BinaryOp::Eq
+            | ast::BinaryOp::NotEq
+            | ast::BinaryOp::Lt
+            | ast::BinaryOp::LtEq
+            | ast::BinaryOp::Gt
+            | ast::BinaryOp::GtEq
+    );
+    if comparison {
+        let to_timestamp = |expr: PlanExpr, ts: &DataType| PlanExpr::Cast {
+            expr: Box::new(expr),
+            data_type: ts.clone(),
+            span: None,
+        };
+        match (&lt, &rt) {
+            (DataType::Date32, DataType::Timestamp { .. }) => {
+                return Ok((to_timestamp(left, &rt), right));
+            }
+            (DataType::Timestamp { .. }, DataType::Date32) => {
+                return Ok((left, to_timestamp(right, &lt)));
+            }
+            _ => {}
+        }
+    }
+
     // Decimal arithmetic: operands keep their own precision/scale (an
     // integer side becomes DECIMAL(10|19, 0)); the executor computes the
     // Trino result type from them, so no common supertype is forced.

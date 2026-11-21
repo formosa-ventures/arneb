@@ -489,12 +489,12 @@ fn partial_agg_over_join_enabled() -> bool {
 
     *ENABLED.get_or_init(|| {
         let enabled = std::env::var("ARNEB_PARTIAL_AGG_OVER_JOIN")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
+            .map(|v| v != "0")
+            .unwrap_or(true);
         tracing::info!(
             target: "arneb::config",
             partial_agg_over_join = enabled,
-            "ARNEB_PARTIAL_AGG_OVER_JOIN effective value (default off; =1 to fuse partial aggregation into join-output fragments)"
+            "ARNEB_PARTIAL_AGG_OVER_JOIN effective value (default on; =0 to keep the partial aggregate in its own fragment after a join)"
         );
         enabled
     })
@@ -3092,7 +3092,7 @@ build_bytes={build_bytes} probe_bytes={probe_bytes} build_root={} probe_root={}"
                     }
                 }
 
-                // q08 partial-over-join (default off): when a decomposable
+                // q08 partial-over-join (default on): when a decomposable
                 // grouped aggregate consumes the output of a single worker-side
                 // join fragment, push the PartialAggregate into that fragment
                 // so join batches are reduced before the fragment exchange.

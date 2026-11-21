@@ -4489,7 +4489,19 @@ pub(crate) fn scalars_to_array(
                     _ => None,
                 })
                 .collect();
-            Ok(Arc::new(arr))
+            // `ScalarValue` carries TINYINT/SMALLINT values as INTEGER.
+            match data_type {
+                ArrowDataType::Int8 | ArrowDataType::Int16 => {
+                    let options = arrow::compute::CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    };
+                    Ok(arrow::compute::cast_with_options(
+                        &arr, data_type, &options,
+                    )?)
+                }
+                _ => Ok(Arc::new(arr)),
+            }
         }
         Some(ScalarValue::Int64(_)) => {
             let arr: Int64Array = values
@@ -4722,6 +4734,20 @@ mod tests {
         assert_eq!(date_arr.value(0), 19000);
         assert!(date_arr.is_null(1));
         assert_eq!(date_arr.value(2), 19500);
+    }
+
+    /// INTEGER scalars narrow to a requested TINYINT/SMALLINT column (the
+    /// scalars carry small integers as INTEGER); out of range is an error.
+    #[test]
+    fn scalars_to_array_narrows_to_small_integers() {
+        let values = vec![ScalarValue::Int32(-7), ScalarValue::Null];
+        let arr = scalars_to_array(&values, &ArrowDataType::Int16).unwrap();
+        assert_eq!(arr.data_type(), &ArrowDataType::Int16);
+        assert_eq!(arr.as_primitive::<datatypes::Int16Type>().value(0), -7);
+        assert!(arr.is_null(1));
+        let arr = scalars_to_array(&values, &ArrowDataType::Int8).unwrap();
+        assert_eq!(arr.data_type(), &ArrowDataType::Int8);
+        assert!(scalars_to_array(&[ScalarValue::Int32(1 << 20)], &ArrowDataType::Int16).is_err());
     }
 
     /// exec-memory-accounting 4.5: a batch decoded from one IPC message body

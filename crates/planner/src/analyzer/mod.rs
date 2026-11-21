@@ -151,6 +151,21 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
             } else {
                 let lt = plan_expr_type(left, schema)?;
                 let rt = plan_expr_type(right, schema)?;
+                // `date - date` is a number of days (PostgreSQL). An
+                // untyped string literal side is coerced to DATE.
+                if is_date_difference(op, left, &lt, right, &rt) {
+                    return Some(DataType::Int32);
+                }
+                // `date ± integer days` stays DATE (the executor's
+                // `date_int_mix` path).
+                let date_and_int = matches!(
+                    (&lt, &rt),
+                    (DataType::Date32, DataType::Int32 | DataType::Int64)
+                        | (DataType::Int32 | DataType::Int64, DataType::Date32)
+                );
+                if date_and_int && matches!(op, ast::BinaryOp::Plus | ast::BinaryOp::Minus) {
+                    return Some(DataType::Date32);
+                }
                 // An untyped string literal takes the numeric operand's
                 // type (see `TypeCoercion`).
                 if is_untyped_string_literal(left) && is_numeric_type(&rt) {
@@ -573,6 +588,24 @@ pub(crate) fn function_return_type(
 
         _ => None, // unknown / scalar built-in — defer.
     }
+}
+
+/// `date - date`, where either side may instead be an untyped string
+/// literal (which type coercion casts to DATE).
+fn is_date_difference(
+    op: &ast::BinaryOp,
+    left: &PlanExpr,
+    lt: &DataType,
+    right: &PlanExpr,
+    rt: &DataType,
+) -> bool {
+    let date_like = |e: &PlanExpr, t: &DataType| {
+        *t == DataType::Date32 || (*t == DataType::Utf8 && is_untyped_string_literal(e))
+    };
+    matches!(op, ast::BinaryOp::Minus)
+        && (*lt == DataType::Date32 || *rt == DataType::Date32)
+        && date_like(left, lt)
+        && date_like(right, rt)
 }
 
 /// The canonical timestamp type produced by the date/time scalar

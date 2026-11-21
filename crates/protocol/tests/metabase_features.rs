@@ -112,7 +112,7 @@ async fn rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Option<Stri
     client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .unwrap_or_else(|e| panic!("{sql}: {:?}", e.as_db_error().map(|d| d.message())))
         .into_iter()
         .filter_map(|m| match m {
             SimpleQueryMessage::Row(r) => {
@@ -190,4 +190,80 @@ async fn untyped_literal_numbers() {
         message.contains("invalid input syntax for type bigint: \"abc\""),
         "{message}"
     );
+}
+
+/// The RowDescription type OID of a statement's first column.
+async fn first_oid(client: &tokio_postgres::Client, sql: &str) -> u32 {
+    let stmt = client
+        .prepare(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    stmt.columns()[0].type_().oid()
+}
+
+#[tokio::test]
+async fn interval_arithmetic() {
+    let client = connect().await;
+    // Month ends clamp: 2000-03-31 minus a month is 2000-02-29.
+    assert_eq!(
+        rows(&client, "SELECT d - INTERVAL '1 month' FROM dt ORDER BY d").await,
+        [text("1995-12-02"), text("2000-02-29")]
+    );
+    let day = "SELECT d + INTERVAL '1 day' FROM dt ORDER BY d";
+    assert_eq!(
+        rows(&client, day).await,
+        [text("1996-01-03"), text("2000-04-01")]
+    );
+    assert_eq!(first_oid(&client, day).await, 1082, "date");
+    // 02:00 on 1996-01-02, in Arneb's existing timestamp-to-varchar
+    // text (the same as `CAST(TIMESTAMP '1996-01-02 02:00:00' AS VARCHAR)`).
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT CAST(d + INTERVAL '2 hours' AS VARCHAR) FROM dt ORDER BY d LIMIT 1"
+        )
+        .await,
+        rows(
+            &client,
+            "SELECT CAST(TIMESTAMP '1996-01-02 02:00:00' AS VARCHAR)"
+        )
+        .await
+    );
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT CAST(d + INTERVAL '2 hours' AS VARCHAR) FROM dt ORDER BY d LIMIT 1"
+        )
+        .await,
+        [text("1996-01-02T02:00:00")]
+    );
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT count(*) FROM dt WHERE d >= DATE_TRUNC('year', NOW() + INTERVAL '-40 year')"
+        )
+        .await,
+        [text("2")]
+    );
+    // Metabase's Sunday-based week: PostgreSQL gives 1995-12-31.
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT CAST(DATE_TRUNC('week', d + INTERVAL '1 day') AS DATE) + INTERVAL '-1 day' \
+             FROM dt ORDER BY d LIMIT 1"
+        )
+        .await,
+        [text("1995-12-31")]
+    );
+    let diff = "SELECT CAST('2000-01-01' AS DATE) - d FROM dt ORDER BY d";
+    assert_eq!(rows(&client, diff).await, [text("1460"), text("-90")]);
+    assert_eq!(first_oid(&client, diff).await, 23, "int4");
+    let err = client
+        .simple_query("SELECT INTERVAL '1 day'")
+        .await
+        .expect_err("a bare interval is unsupported");
+    let message = err
+        .as_db_error()
+        .map_or_else(|| err.to_string(), |e| e.message().to_string());
+    assert!(message.contains("interval"), "{message}");
 }

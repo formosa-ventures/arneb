@@ -929,6 +929,15 @@ fn arithmetic_op(
     right: &ArrayRef,
     op: ArithOp,
 ) -> Result<ArrayRef, ExecutionError> {
+    // `date - date` is the number of days between them (PostgreSQL).
+    if matches!(op, ArithOp::Sub)
+        && left.data_type() == &ArrowDataType::Date32
+        && right.data_type() == &ArrowDataType::Date32
+    {
+        let li = arrow::compute::cast(left, &ArrowDataType::Int32)?;
+        let ri = arrow::compute::cast(right, &ArrowDataType::Int32)?;
+        return Ok(kernels::numeric::sub(&li, &ri)?);
+    }
     // Date ± integer is a valid mismatched-type combination —
     // Arrow's `numeric::add/sub` handles `Date32 + Int32 = Date32`
     // (and Int64) directly at the kernel level, matching SQL
@@ -939,8 +948,8 @@ fn arithmetic_op(
     // manually. Date32 is `days-since-epoch` stored as i32 — we cast
     // the Date32 column to Int32, do the integer arithmetic, then
     // cast back to Date32. Matches SQL `DATE - INTERVAL 'N' DAY`
-    // semantics after `convert_interval` folds the interval to an
-    // integer day count.
+    // semantics after the planner lowers a day interval on a date to
+    // an integer day count.
     let date_int_mix = matches!(
         (left.data_type(), right.data_type()),
         (ArrowDataType::Date32, ArrowDataType::Int32)

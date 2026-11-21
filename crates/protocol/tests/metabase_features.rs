@@ -151,3 +151,31 @@ async fn regex_operators() {
         .map_or_else(|| err.to_string(), |e| e.message().to_string());
     assert!(message.contains('~'), "{message}");
 }
+
+#[tokio::test]
+async fn untyped_literal_numbers() {
+    let client = connect().await;
+    assert_eq!(
+        rows(&client, "SELECT count(*) FROM t WHERE x = '2'").await,
+        [text("1")]
+    );
+    assert_eq!(
+        rows(&client, "SELECT NULLIF(x, '1') FROM t ORDER BY x").await,
+        [vec![None], text("2"), text("3")]
+    );
+    assert_eq!(
+        rows(&client, "SELECT COALESCE(x, '0') + 1 FROM t ORDER BY x").await,
+        [text("2"), text("3"), text("4")]
+    );
+    let err = client
+        .simple_query("SELECT count(*) FROM t WHERE x = 'abc'")
+        .await
+        .expect_err("non-numeric literal");
+    let message = err
+        .as_db_error()
+        .map_or_else(|| err.to_string(), |e| e.message().to_string());
+    assert!(
+        message.contains("invalid input syntax for type bigint: \"abc\""),
+        "{message}"
+    );
+}

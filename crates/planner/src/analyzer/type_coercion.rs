@@ -100,6 +100,17 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
                 .into_iter()
                 .map(|e| coerce_expr(e, &input_schema, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
+            // The planner typed a projection it could not unify as NULL;
+            // coercion may have made the expression typable (an untyped
+            // string literal resolved against a number).
+            let mut schema = schema;
+            for (column, expr) in schema.iter_mut().zip(&exprs) {
+                if column.data_type == DataType::Null {
+                    if let Some(resolved) = plan_expr_type(expr, &input_schema) {
+                        column.data_type = resolved;
+                    }
+                }
+            }
             Ok(LogicalPlan::Projection {
                 input: Box::new(input),
                 exprs,
@@ -659,6 +670,16 @@ fn unify_binary_operands(
         return Ok((left, right));
     }
 
+    // An untyped string literal against a numeric operand takes that
+    // operand's type (`bigint_col = '0'`), as in PostgreSQL. Literals
+    // only: a string column against a numeric one still mismatches.
+    if let Some(left) = resolve_string_literal(&left, &rt, location)? {
+        return unify_binary_operands(left, right, op, schema, location, ctx);
+    }
+    if let Some(right) = resolve_string_literal(&right, &lt, location)? {
+        return unify_binary_operands(left, right, op, schema, location, ctx);
+    }
+
     // Date ± integer-days arithmetic: SQL semantics yields a Date
     // shifted by N days. We keep the operands at their declared
     // types (Date32 and Int32 / Int64) so the executor calls Arrow's
@@ -715,6 +736,105 @@ fn unify_binary_operands(
         maybe_cast(left, &lt, &supertype, site.left_is_literal(), location)?,
         maybe_cast(right, &rt, &supertype, site.right_is_literal(), location)?,
     ))
+}
+
+/// `expr` as a numeric literal when it is a string literal and `other`
+/// is a numeric type; `None` when the rule does not apply.
+fn resolve_string_literal(
+    expr: &PlanExpr,
+    other: &DataType,
+    location: Option<arneb_common::error::Location>,
+) -> Result<Option<PlanExpr>, PlanError> {
+    let PlanExpr::Literal {
+        value: ScalarValue::Utf8(text),
+        span,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        other,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128 { .. }
+    ) {
+        return Ok(None);
+    }
+    let value = coerce_string_literal_to_numeric(text, other).map_err(|e| match e {
+        PlanError::InvalidLiteral { message, .. } => {
+            PlanError::InvalidLiteral { message, location }
+        }
+        e => e,
+    })?;
+    Ok(Some(PlanExpr::Literal { value, span: *span }))
+}
+
+/// Parses the string literal `lit` as a value of the numeric type
+/// `target`. Integer targets yield an `Int32` (SMALLINT / INTEGER) or
+/// `Int64` literal and decimals a literal with the digits' own
+/// precision and scale, so the usual unification then widens them.
+/// Failures use PostgreSQL's `invalid input syntax for type <name>`.
+fn coerce_string_literal_to_numeric(
+    lit: &str,
+    target: &DataType,
+) -> Result<ScalarValue, PlanError> {
+    let (name, bounds): (&str, Option<(i64, i64)>) = match target {
+        DataType::Int8 | DataType::Int16 => ("smallint", Some((i16::MIN.into(), i16::MAX.into()))),
+        DataType::Int32 => ("integer", Some((i32::MIN.into(), i32::MAX.into()))),
+        DataType::Int64 => ("bigint", None),
+        DataType::Decimal128 { .. } => ("numeric", None),
+        _ => ("double precision", None),
+    };
+    let invalid = || PlanError::InvalidLiteral {
+        message: format!("invalid input syntax for type {name}: \"{lit}\""),
+        location: None,
+    };
+    let trimmed = lit.trim();
+    match target {
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            let n: i64 = trimmed.parse().map_err(|_| invalid())?;
+            if let Some((lo, hi)) = bounds {
+                if n < lo || n > hi {
+                    return Err(PlanError::InvalidLiteral {
+                        message: format!("value \"{lit}\" is out of range for type {name}"),
+                        location: None,
+                    });
+                }
+            }
+            Ok(if *target == DataType::Int64 {
+                ScalarValue::Int64(n)
+            } else {
+                ScalarValue::Int32(n as i32)
+            })
+        }
+        DataType::Decimal128 { .. } => {
+            let unsigned = trimmed.trim_start_matches(['+', '-']);
+            let negative = trimmed.starts_with('-');
+            if trimmed.len() - unsigned.len() > 1 {
+                return Err(invalid());
+            }
+            let (int_part, frac_part) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+            let digits = format!("{int_part}{frac_part}");
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) || digits.len() > 38
+            {
+                return Err(invalid());
+            }
+            let magnitude: i128 = digits.parse().map_err(|_| invalid())?;
+            Ok(ScalarValue::Decimal128 {
+                value: if negative { -magnitude } else { magnitude },
+                precision: digits.len().max(1) as u8,
+                scale: frac_part.len() as i8,
+            })
+        }
+        _ => {
+            let n: f64 = trimmed.parse().map_err(|_| invalid())?;
+            Ok(ScalarValue::Float64(n))
+        }
+    }
 }
 
 /// `expr` blank-padded to its declared length when it is a CHAR(n)
@@ -982,6 +1102,49 @@ fn unify_case(
     ),
     PlanError,
 > {
+    // An untyped string literal arm takes the type of a numeric arm
+    // (`COALESCE(n, '0')`); non-literal arms are left to the supertype
+    // rules below.
+    let numeric_arm = when_clauses
+        .iter()
+        .map(|(_, r)| r)
+        .chain(else_result.as_deref())
+        .filter(|e| {
+            !matches!(
+                e,
+                PlanExpr::Literal {
+                    value: ScalarValue::Utf8(_),
+                    ..
+                }
+            )
+        })
+        .filter_map(|e| plan_expr_type(e, schema))
+        .find(|t| {
+            matches!(
+                t,
+                DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Decimal128 { .. }
+            )
+        });
+    let (when_clauses, else_result) = match numeric_arm {
+        Some(numeric) => {
+            let resolve = |e: PlanExpr| -> Result<PlanExpr, PlanError> {
+                Ok(resolve_string_literal(&e, &numeric, location)?.unwrap_or(e))
+            };
+            let when_clauses = when_clauses
+                .into_iter()
+                .map(|(c, r)| Ok((c, resolve(r)?)))
+                .collect::<Result<Vec<_>, PlanError>>()?;
+            let else_result = else_result.map(|e| resolve(*e).map(Box::new)).transpose()?;
+            (when_clauses, else_result)
+        }
+        None => (when_clauses, else_result),
+    };
     // Unify result arms (THEN + ELSE).
     let mut target: Option<DataType> = None;
     let result_types: Vec<Option<DataType>> = when_clauses
@@ -1720,6 +1883,72 @@ mod tests {
     fn run(plan: LogicalPlan) -> Result<LogicalPlan, PlanError> {
         let mut ctx = AnalyzerContext::new();
         Analyzer::new(vec![Box::new(TypeCoercion::new())]).run(plan, &mut ctx)
+    }
+
+    #[test]
+    fn string_literal_coerces_to_numeric_operand() {
+        let schema = vec![ColumnInfo {
+            name: "x".into(),
+            data_type: DataType::Int64,
+            nullable: true,
+        }];
+        let pred = PlanExpr::BinaryOp {
+            left: Box::new(col(0, "x")),
+            op: ast::BinaryOp::Eq,
+            right: Box::new(lit(ScalarValue::Utf8("0".into()))),
+            span: None,
+        };
+        let out = run(filter(scan(schema), pred)).unwrap();
+        let LogicalPlan::Filter { predicate, .. } = out else {
+            panic!("expected Filter");
+        };
+        let PlanExpr::BinaryOp { right, .. } = predicate else {
+            panic!("expected BinaryOp");
+        };
+        assert!(matches!(
+            *right,
+            PlanExpr::Literal {
+                value: ScalarValue::Int64(0),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn string_literal_coercion_is_literal_only() {
+        let schema = vec![
+            ColumnInfo {
+                name: "s".into(),
+                data_type: DataType::Utf8,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "n".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+        ];
+        let pred = PlanExpr::BinaryOp {
+            left: Box::new(col(0, "s")),
+            op: ast::BinaryOp::Eq,
+            right: Box::new(col(1, "n")),
+            span: None,
+        };
+        let err = run(filter(scan(schema.clone()), pred)).unwrap_err();
+        assert!(matches!(err, PlanError::TypeMismatch { .. }), "{err}");
+
+        let bad = PlanExpr::BinaryOp {
+            left: Box::new(col(1, "n")),
+            op: ast::BinaryOp::Eq,
+            right: Box::new(lit(ScalarValue::Utf8("abc".into()))),
+            span: None,
+        };
+        let err = run(filter(scan(schema), bad)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid input syntax for type bigint: \"abc\""),
+            "{err}"
+        );
     }
 
     #[test]

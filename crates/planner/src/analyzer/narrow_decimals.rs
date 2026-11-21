@@ -728,8 +728,9 @@ fn block_direct_aggregate_decimal_sources(
                     }
                 }
             }
-            // `array_agg` buffers `Decimal128` scalars and orders by them.
-            "ARRAY_AGG" => {
+            // `array_agg` and the percentiles buffer `Decimal128` scalars
+            // and order by them.
+            "ARRAY_AGG" | "PERCENTILE_CONT" | "PERCENTILE_DISC" => {
                 for e in args
                     .iter()
                     .chain(order_by.iter().flat_map(|v| v.iter().map(|s| &s.expr)))

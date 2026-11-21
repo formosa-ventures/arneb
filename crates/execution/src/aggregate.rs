@@ -940,6 +940,13 @@ pub(crate) fn create_accumulator(
             ))
         }
         "ARRAY_AGG" => Box::new(ArrayAggAccumulator::default()),
+        "PERCENTILE_CONT" | "PERCENTILE_DISC" if distinct => {
+            return Err(ExecutionError::InvalidOperation(format!(
+                "{upper}(DISTINCT) is not supported"
+            )))
+        }
+        "PERCENTILE_CONT" => Box::new(PercentileAccumulator::new(true)),
+        "PERCENTILE_DISC" => Box::new(PercentileAccumulator::new(false)),
         name if variance_mode(name).is_some() => {
             let (sample, stddev) = variance_mode(name).unwrap();
             Box::new(VarianceAccumulator {
@@ -1460,6 +1467,258 @@ impl GroupedAccumulator for GroupedArrayAggAccumulator {
                 self.groups.resize_with(dest + 1, ArrayAggBuffer::default);
             }
             self.groups[dest].rows.extend(buf.rows.iter().cloned());
+        }
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PERCENTILE_CONT / PERCENTILE_DISC (ordered-set aggregates)
+// ---------------------------------------------------------------------------
+//
+// Like `ARRAY_AGG ORDER BY`, the values are buffered per group and the
+// aggregate is single-phase. The operator packs each batch (see
+// `pack_percentile_input`) as field 0 `v_a`/`v_d`, the WITHIN GROUP value
+// with its direction in the name, and field 1 `f`, the constant fraction.
+
+/// Packs the fraction and the WITHIN GROUP value of a percentile.
+pub(crate) fn pack_percentile_input(
+    fraction: ArrayRef,
+    value: ArrayRef,
+    ascending: bool,
+) -> Result<ArrayRef, ExecutionError> {
+    use arrow::datatypes::{DataType as ArrowType, Field};
+    let value = crate::operator::materialize_dictionary_array(&value)?;
+    let fraction = arrow::compute::cast(&fraction, &ArrowType::Float64)?;
+    let name = if ascending { "v_a" } else { "v_d" };
+    let fields = vec![
+        Field::new(name, value.data_type().clone(), true),
+        Field::new("f", ArrowType::Float64, true),
+    ];
+    let packed = arrow::array::StructArray::try_new(fields.into(), vec![value, fraction], None)?;
+    Ok(Arc::new(packed))
+}
+
+/// What a packed percentile batch declares.
+#[derive(Debug, Clone)]
+struct PercentileShape {
+    ascending: bool,
+    fraction: f64,
+}
+
+fn unpack_percentile(
+    values: &ArrayRef,
+) -> Result<(Option<PercentileShape>, &arrow::array::StructArray), ExecutionError> {
+    let packed = values.as_struct_opt().ok_or_else(|| {
+        ExecutionError::InvalidOperation("PERCENTILE: expected a packed struct input".to_string())
+    })?;
+    let fraction = packed.column(1).as_primitive::<datatypes::Float64Type>();
+    let shape = (!packed.is_empty() && fraction.is_valid(0)).then(|| PercentileShape {
+        ascending: packed.fields()[0].name() == "v_a",
+        fraction: fraction.value(0),
+    });
+    Ok((shape, packed))
+}
+
+/// Appends row `row`'s value of `packed` to `out` unless it is NULL.
+fn push_percentile_value(
+    out: &mut Vec<ScalarValue>,
+    packed: &arrow::array::StructArray,
+    row: usize,
+) -> Result<(), ExecutionError> {
+    let col = packed.column(0);
+    if col.is_valid(row) {
+        out.push(crate::operator::extract_scalar(col, row)?);
+    }
+    Ok(())
+}
+
+fn scalar_to_f64(v: &ScalarValue) -> Result<f64, ExecutionError> {
+    use ScalarValue as S;
+    Ok(match v {
+        S::Int32(x) => f64::from(*x),
+        S::Int64(x) => *x as f64,
+        S::Float32(x) => f64::from(*x),
+        S::Float64(x) => *x,
+        S::Decimal128 { value, scale, .. } => *value as f64 / 10f64.powi(i32::from(*scale)),
+        other => {
+            return Err(ExecutionError::InvalidOperation(format!(
+                "PERCENTILE_CONT: unsupported value {other:?}"
+            )))
+        }
+    })
+}
+
+/// PostgreSQL's rule over one group's non-NULL values: sort them by the
+/// key's direction, then `percentile_disc` takes row `ceil(f*N)` (1-based,
+/// at least 1) and `percentile_cont` interpolates at `f*(N-1)`.
+fn finish_percentile(
+    values: &[ScalarValue],
+    shape: Option<&PercentileShape>,
+    continuous: bool,
+) -> Result<ScalarValue, ExecutionError> {
+    let Some(shape) = shape.filter(|_| !values.is_empty()) else {
+        return Ok(ScalarValue::Null);
+    };
+    let mut sorted: Vec<&ScalarValue> = values.iter().collect();
+    sorted.sort_by(|a, b| {
+        let o = cmp_scalar(a, b);
+        if shape.ascending {
+            o
+        } else {
+            o.reverse()
+        }
+    });
+    let n = sorted.len();
+    let f = shape.fraction;
+    if !continuous {
+        let row = ((f * n as f64).ceil() as usize).clamp(1, n);
+        return Ok(sorted[row - 1].clone());
+    }
+    let pos = f * (n - 1) as f64;
+    let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+    let lo_v = scalar_to_f64(sorted[lo])?;
+    if lo == hi {
+        return Ok(ScalarValue::Float64(lo_v));
+    }
+    let hi_v = scalar_to_f64(sorted[hi])?;
+    Ok(ScalarValue::Float64(
+        lo_v + (hi_v - lo_v) * (pos - lo as f64),
+    ))
+}
+
+/// `percentile_cont` / `percentile_disc` for one group.
+#[derive(Debug)]
+pub(crate) struct PercentileAccumulator {
+    continuous: bool,
+    shape: Option<PercentileShape>,
+    values: Vec<ScalarValue>,
+}
+
+impl PercentileAccumulator {
+    fn new(continuous: bool) -> Self {
+        Self {
+            continuous,
+            shape: None,
+            values: Vec::new(),
+        }
+    }
+}
+
+impl Accumulator for PercentileAccumulator {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn update_batch(&mut self, values: &ArrayRef) -> Result<(), ExecutionError> {
+        let (shape, packed) = unpack_percentile(values)?;
+        if self.shape.is_none() {
+            self.shape = shape;
+        }
+        for row in 0..packed.len() {
+            push_percentile_value(&mut self.values, packed, row)?;
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, other: &dyn Accumulator) -> Result<(), ExecutionError> {
+        let other = other
+            .as_any()
+            .downcast_ref::<PercentileAccumulator>()
+            .ok_or_else(|| {
+                ExecutionError::InvalidOperation(
+                    "PercentileAccumulator::merge: type mismatch".to_string(),
+                )
+            })?;
+        if self.shape.is_none() {
+            self.shape = other.shape.clone();
+        }
+        self.values.extend(other.values.iter().cloned());
+        Ok(())
+    }
+
+    fn evaluate(&self) -> Result<ScalarValue, ExecutionError> {
+        finish_percentile(&self.values, self.shape.as_ref(), self.continuous)
+    }
+
+    fn reset(&mut self) {
+        self.values.clear();
+    }
+}
+
+/// Per-group `percentile_cont` / `percentile_disc`.
+#[derive(Debug)]
+pub(crate) struct GroupedPercentileAccumulator {
+    continuous: bool,
+    shape: Option<PercentileShape>,
+    groups: Vec<Vec<ScalarValue>>,
+}
+
+impl GroupedPercentileAccumulator {
+    fn new(continuous: bool) -> Self {
+        Self {
+            continuous,
+            shape: None,
+            groups: Vec::new(),
+        }
+    }
+}
+
+impl GroupedAccumulator for GroupedPercentileAccumulator {
+    fn ensure_capacity(&mut self, n: usize) {
+        if self.groups.len() < n {
+            self.groups.resize_with(n, Vec::new);
+        }
+    }
+
+    fn add_input(&mut self, group_ids: &[u32], values: &ArrayRef) -> Result<(), ExecutionError> {
+        let (shape, packed) = unpack_percentile(values)?;
+        if self.shape.is_none() {
+            self.shape = shape;
+        }
+        for (row, &g) in group_ids.iter().enumerate() {
+            push_percentile_value(&mut self.groups[g as usize], packed, row)?;
+        }
+        Ok(())
+    }
+
+    fn evaluate(&self, group_id: u32) -> Result<ScalarValue, ExecutionError> {
+        match self.groups.get(group_id as usize) {
+            Some(values) => finish_percentile(values, self.shape.as_ref(), self.continuous),
+            None => Ok(ScalarValue::Null),
+        }
+    }
+
+    fn num_groups(&self) -> usize {
+        self.groups.len()
+    }
+
+    fn merge_from(
+        &mut self,
+        other: &dyn GroupedAccumulator,
+        group_remap: &[u32],
+    ) -> Result<(), ExecutionError> {
+        let other = other
+            .as_any()
+            .downcast_ref::<GroupedPercentileAccumulator>()
+            .ok_or_else(|| {
+                ExecutionError::InvalidOperation(
+                    "GroupedPercentileAccumulator::merge_from: type mismatch".to_string(),
+                )
+            })?;
+        if self.shape.is_none() {
+            self.shape = other.shape.clone();
+        }
+        for (g, values) in other.groups.iter().enumerate() {
+            let dest = group_remap[g] as usize;
+            if self.groups.len() <= dest {
+                self.groups.resize_with(dest + 1, Vec::new);
+            }
+            self.groups[dest].extend(values.iter().cloned());
         }
         Ok(())
     }
@@ -2243,6 +2502,8 @@ pub(crate) fn create_grouped_accumulator(
         "BOOL_OR" => Box::new(GroupedBoolOrAccumulator::new()),
         "BOOL_AND" => Box::new(GroupedBoolAndAccumulator::default()),
         "ARRAY_AGG" => Box::new(GroupedArrayAggAccumulator::default()),
+        "PERCENTILE_CONT" => Box::new(GroupedPercentileAccumulator::new(true)),
+        "PERCENTILE_DISC" => Box::new(GroupedPercentileAccumulator::new(false)),
         name if variance_mode(name).is_some() => {
             let (sample, stddev) = variance_mode(name).unwrap();
             Box::new(GroupedVarianceAccumulator {
@@ -2635,6 +2896,104 @@ mod tests {
         assert_eq!(grouped.evaluate(1).unwrap(), want);
         assert_eq!(grouped.evaluate(0).unwrap(), ScalarValue::Null);
         assert!(create_accumulator("ARRAY_AGG", false, true).is_err());
+    }
+
+    /// `percentile_cont` / `percentile_disc` follow PostgreSQL: NULLs are
+    /// skipped, DESC sorts descending (not `1 - f`), an empty group is
+    /// NULL, and the planner's types match what the accumulators produce.
+    #[test]
+    fn percentile_accumulators_follow_postgresql() {
+        use arneb_common::types::{ColumnInfo, DataType};
+        use arneb_planner::analyzer::plan_expr_type;
+        use arneb_planner::PlanExpr;
+
+        let schema = [ColumnInfo {
+            name: "x".into(),
+            data_type: DataType::Int64,
+            nullable: true,
+        }];
+        let call = |name: &str| PlanExpr::Function {
+            order_by: None,
+            name: name.into(),
+            args: vec![
+                PlanExpr::Literal {
+                    value: ScalarValue::Float64(0.5),
+                    span: None,
+                },
+                PlanExpr::Column {
+                    index: 0,
+                    name: "x".into(),
+                    span: None,
+                },
+            ],
+            distinct: false,
+            span: None,
+        };
+        assert_eq!(
+            plan_expr_type(&call("PERCENTILE_CONT"), &schema),
+            Some(DataType::Float64)
+        );
+        assert_eq!(
+            plan_expr_type(&call("PERCENTILE_DISC"), &schema),
+            Some(DataType::Int64)
+        );
+
+        let run = |name: &str, f: f64, asc: bool, xs: Vec<Option<i64>>| {
+            let n = xs.len();
+            let values: ArrayRef = Arc::new(Int64Array::from(xs));
+            let fraction: ArrayRef = Arc::new(Float64Array::from(vec![f; n]));
+            let packed = pack_percentile_input(fraction, values, asc).unwrap();
+            let mut single = create_accumulator(name, false, false).unwrap();
+            single.update_batch(&packed).unwrap();
+            // Merging two halves, and the grouped flavour, agree.
+            let mut a = create_accumulator(name, false, false).unwrap();
+            a.update_batch(&packed.slice(0, n / 2)).unwrap();
+            let mut b = create_accumulator(name, false, false).unwrap();
+            b.update_batch(&packed.slice(n / 2, n - n / 2)).unwrap();
+            a.merge(b.as_ref()).unwrap();
+            let mut grouped = create_grouped_accumulator(name, false, false).unwrap();
+            grouped.ensure_capacity(2);
+            grouped.add_input(&vec![1; n], &packed).unwrap();
+            let got = single.evaluate().unwrap();
+            assert_eq!(a.evaluate().unwrap(), got);
+            assert_eq!(grouped.evaluate(1).unwrap(), got);
+            assert_eq!(grouped.evaluate(0).unwrap(), ScalarValue::Null);
+            got
+        };
+        let f64v = ScalarValue::Float64;
+        let ints = || vec![Some(3), None, Some(1), Some(2)];
+        assert_eq!(run("PERCENTILE_CONT", 0.5, true, ints()), f64v(2.0));
+        assert_eq!(run("PERCENTILE_CONT", 0.25, true, ints()), f64v(1.5));
+        assert_eq!(run("PERCENTILE_CONT", 0.25, false, ints()), f64v(2.5));
+        assert_eq!(run("PERCENTILE_CONT", 0.0, true, ints()), f64v(1.0));
+        assert_eq!(run("PERCENTILE_CONT", 1.0, true, ints()), f64v(3.0));
+        assert_eq!(
+            run("PERCENTILE_DISC", 0.5, true, ints()),
+            ScalarValue::Int64(2)
+        );
+        assert_eq!(
+            run("PERCENTILE_DISC", 0.0, true, ints()),
+            ScalarValue::Int64(1)
+        );
+        // DESC is not `1 - f`: over 1..4 the ascending median is 2, the
+        // descending one 3.
+        let four = || vec![Some(1), Some(2), Some(3), Some(4)];
+        assert_eq!(
+            run("PERCENTILE_DISC", 0.5, true, four()),
+            ScalarValue::Int64(2)
+        );
+        assert_eq!(
+            run("PERCENTILE_DISC", 0.5, false, four()),
+            ScalarValue::Int64(3)
+        );
+        assert_eq!(run("PERCENTILE_CONT", 0.5, true, four()), f64v(2.5));
+        assert_eq!(
+            run("PERCENTILE_CONT", 0.5, true, vec![None, None]),
+            ScalarValue::Null
+        );
+        assert_eq!(run("PERCENTILE_DISC", 0.5, true, vec![]), ScalarValue::Null);
+        // DISTINCT is refused.
+        assert!(create_accumulator("PERCENTILE_CONT", false, true).is_err());
     }
 
     #[test]

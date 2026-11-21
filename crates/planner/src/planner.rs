@@ -2538,6 +2538,11 @@ impl<'a> QueryPlanner<'a> {
                 } else {
                     Some(Box::new(self.plan_call_order_by(order_by, ctx).await?))
                 };
+                if is_percentile(name) {
+                    let schema: Vec<ColumnInfo> =
+                        ctx.columns.iter().map(|(_, col)| col.clone()).collect();
+                    check_percentile_call(name, &plan_args, &schema, node_span)?;
+                }
                 Ok(PlanExpr::Function {
                     name: name.clone(),
                     args: plan_args,
@@ -3593,6 +3598,8 @@ fn is_aggregate_function(name: &str) -> bool {
             | "BOOL_OR"
             | "BOOL_AND"
             | "ARRAY_AGG"
+            | "PERCENTILE_CONT"
+            | "PERCENTILE_DISC"
             | "STDDEV_SAMP"
             | "STDDEV"
             | "STDDEV_POP"
@@ -5447,9 +5454,94 @@ fn regclass_literal(
     })
 }
 
-/// Aggregate `ORDER BY` is accepted only in `array_agg`.
+/// `percentile_cont` / `percentile_disc`, the ordered-set aggregates.
+fn is_percentile(name: &str) -> bool {
+    name.eq_ignore_ascii_case("PERCENTILE_CONT") || name.eq_ignore_ascii_case("PERCENTILE_DISC")
+}
+
+/// Validates `percentile_*(f, x)` (the parser's form of `percentile_*(f)
+/// WITHIN GROUP (ORDER BY x)`): `f` is a constant number in [0, 1] (the
+/// executor casts it to DOUBLE); `percentile_cont` needs a numeric `x`.
+fn check_percentile_call(
+    name: &str,
+    args: &[PlanExpr],
+    schema: &[ColumnInfo],
+    span: Option<arneb_sql_parser::Span>,
+) -> Result<(), PlanError> {
+    let location = span.map(|s| s.start);
+    let [fraction, key] = args else {
+        return Err(PlanError::InvalidExpression {
+            message: format!("{name} requires WITHIN GROUP (ORDER BY ...)"),
+            location,
+        });
+    };
+    let value = match fraction {
+        PlanExpr::Literal { value, .. } => scalar_as_f64(value),
+        PlanExpr::UnaryOp {
+            op: ast::UnaryOp::Minus,
+            expr,
+            ..
+        } => match &**expr {
+            PlanExpr::Literal { value, .. } => scalar_as_f64(value).map(|v| -v),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(value) = value else {
+        return Err(PlanError::InvalidExpression {
+            message: format!("{name} requires a constant numeric fraction"),
+            location,
+        });
+    };
+    if !(0.0..=1.0).contains(&value) {
+        return Err(PlanError::InvalidExpression {
+            message: format!("percentile value {value} is not between 0 and 1"),
+            location,
+        });
+    }
+    if name.eq_ignore_ascii_case("PERCENTILE_CONT") {
+        let numeric = match plan_expr_type(key, schema) {
+            None => true,
+            Some(t) => matches!(
+                t,
+                DataType::Null
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Decimal128 { .. }
+            ),
+        };
+        if !numeric {
+            return Err(PlanError::InvalidExpression {
+                message: format!("{name} requires a numeric WITHIN GROUP expression"),
+                location,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A numeric literal as `f64`.
+fn scalar_as_f64(value: &ScalarValue) -> Option<f64> {
+    match value {
+        ScalarValue::Int32(v) => Some(f64::from(*v)),
+        ScalarValue::Int64(v) => Some(*v as f64),
+        ScalarValue::Float32(v) => Some(f64::from(*v)),
+        ScalarValue::Float64(v) => Some(*v),
+        ScalarValue::Decimal128 { value, scale, .. } => {
+            Some(*value as f64 / 10f64.powi(i32::from(*scale)))
+        }
+        _ => None,
+    }
+}
+
+/// Aggregate `ORDER BY` is accepted only in `array_agg`, and as the
+/// `WITHIN GROUP` key of `percentile_cont` / `percentile_disc`.
 fn check_aggregate_order_by(name: &str) -> Result<(), PlanError> {
-    if name.eq_ignore_ascii_case("ARRAY_AGG") {
+    if name.eq_ignore_ascii_case("ARRAY_AGG") || is_percentile(name) {
         Ok(())
     } else {
         Err(PlanError::invalid_expression(format!(
@@ -7198,6 +7290,61 @@ mod tests {
             slots.sort_unstable();
             slots.dedup();
             assert_eq!(slots.len(), exprs.len(), "{sql}: slots collide");
+        }
+    }
+
+    /// `percentile_*(f) WITHIN GROUP (ORDER BY x)`: the fraction is a
+    /// constant in [0, 1], `percentile_cont` is DOUBLE over a
+    /// numeric key, `percentile_disc` keeps the key's type.
+    #[tokio::test]
+    async fn test_percentile_calls_are_validated_and_typed() {
+        let plan = plan_sql(
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id), \
+                    percentile_disc(1) WITHIN GROUP (ORDER BY name DESC) FROM users",
+        )
+        .await
+        .unwrap();
+        let LogicalPlan::Projection { input, schema, .. } = &plan else {
+            panic!("expected Projection: {plan:?}");
+        };
+        assert_eq!(schema[0].data_type, DataType::Float64);
+        assert_eq!(schema[1].data_type, DataType::Utf8);
+        let LogicalPlan::Aggregate { aggr_exprs, .. } = input.as_ref() else {
+            panic!("expected Aggregate input");
+        };
+        // `percentile_disc(f, name)` ordered by `name DESC`.
+        let PlanExpr::Function { args, order_by, .. } = &aggr_exprs[1] else {
+            panic!("expected Function");
+        };
+        assert_eq!(args.len(), 2);
+        assert!(matches!(&args[1], PlanExpr::Column { name, .. } if name == "name"));
+        let order_by = order_by.as_deref().expect("WITHIN GROUP key");
+        assert_eq!(order_by.len(), 1);
+        assert!(!order_by[0].asc);
+        for (sql, want) in [
+            (
+                "SELECT percentile_cont(1.5) WITHIN GROUP (ORDER BY id) FROM users",
+                "between 0 and 1",
+            ),
+            (
+                "SELECT percentile_disc(-0.1) WITHIN GROUP (ORDER BY id) FROM users",
+                "between 0 and 1",
+            ),
+            (
+                "SELECT percentile_cont(id) WITHIN GROUP (ORDER BY id) FROM users",
+                "constant numeric fraction",
+            ),
+            (
+                "SELECT percentile_cont(ARRAY[0.5]) WITHIN GROUP (ORDER BY id) FROM users",
+                "constant numeric fraction",
+            ),
+            (
+                "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY name) FROM users",
+                "numeric",
+            ),
+        ] {
+            let err = plan_sql(sql).await.expect_err(sql).to_string();
+            assert!(err.contains(want), "{sql}: {err}");
         }
     }
 

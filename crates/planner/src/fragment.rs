@@ -5536,6 +5536,51 @@ mod tests {
         assert!(matches!(result.root, LogicalPlan::Aggregate { .. }));
     }
 
+    #[test]
+    fn fragment_percentile_aggregate_stays_single_phase() {
+        // Percentiles buffer every value of a group, like `array_agg ORDER
+        // BY`: never split into partial and final.
+        let col = PlanExpr::Column {
+            index: 0,
+            name: "id".into(),
+            span: None,
+        };
+        for name in ["percentile_cont", "percentile_disc"] {
+            let plan = LogicalPlan::Aggregate {
+                input: Box::new(scan("t")),
+                group_by: vec![],
+                aggr_exprs: vec![PlanExpr::Function {
+                    order_by: Some(Box::new(vec![SortExpr {
+                        expr: col.clone(),
+                        asc: true,
+                        nulls_first: false,
+                    }])),
+                    name: name.into(),
+                    args: vec![
+                        PlanExpr::Literal {
+                            value: arneb_common::types::ScalarValue::Float64(0.5),
+                            span: None,
+                        },
+                        col.clone(),
+                    ],
+                    distinct: false,
+                    span: None,
+                }],
+                schema: vec![ColumnInfo {
+                    name: name.into(),
+                    data_type: DataType::Float64,
+                    nullable: true,
+                }],
+            };
+            let result = PlanFragmenter::new().fragment(plan);
+            assert!(
+                matches!(result.root, LogicalPlan::Aggregate { .. }),
+                "{name}: {:?}",
+                result.root
+            );
+        }
+    }
+
     /// A two-column scan (`key` Int32, `v` Float64) so an aggregate can
     /// AVG over a Float64 column — the q01 shape (decimals load as DOUBLE).
     fn scan_key_value(name: &str) -> LogicalPlan {

@@ -116,9 +116,12 @@ Notes on the evidence:
 - Retiring the `pg_catalog` fallback or the substring interception of
   `information_schema`. Both stay as the net for statements the engine
   cannot run. The engine is tried first.
-- The pre-existing `bind_parameters` `$N` injection and the binary result
-  format. Both are tracked separately. pgJDBC gets text results, which it
-  handles.
+- The pre-existing `bind_parameters` `$N` injection. It is tracked
+  separately.
+- (Was a non-goal, now in scope as Task 10, ruling R9.) The binary result
+  format: pgJDBC switches a server-prepared statement to binary results
+  after 5 executions, and Arneb's text answer then broke Metabase's sync
+  (53 of 61 columns). Results now honor the Bind format codes.
 
 ## Anti-goals (failure even if the tests pass)
 

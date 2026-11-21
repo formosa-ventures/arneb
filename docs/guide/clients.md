@@ -46,7 +46,7 @@ Add a database of type **PostgreSQL**:
 | Database name | Any name; Arneb does not use it (see below) |
 | Username, Password | An Arneb user, if [authentication](/guide/configuration#authentication) is on; otherwise any user name |
 | Use a secure connection (SSL) | Off, unless pgwire [TLS](/guide/configuration#tls) is configured |
-| Additional JDBC connection string options | **`binaryTransfer=false`** (required, see the gaps below) |
+| Additional JDBC connection string options | None needed: pgJDBC's defaults work, binary results included |
 | Schemas | All, or the schemas to show |
 
 One Metabase database shows one Arneb catalog: the session's catalog, which
@@ -58,7 +58,7 @@ sends no `SET search_path`, so it always shows the default catalog.
 
 ### What works
 
-With `binaryTransfer=false`, Metabase's sync finds all 8 TPC-H tables and
+With pgJDBC's default settings, Metabase's sync finds all 8 TPC-H tables and
 61 columns, with the same Metabase types (`base_type`) and database types
 as against PostgreSQL 17 holding the same DDL, and no statement is answered
 by the `pg_catalog` fallback. These work, with the same results as DuckDB
@@ -82,13 +82,6 @@ subscripts, field access, untyped literals) and
 
 ### Known gaps
 
-- **`binaryTransfer=false` is required.** Arneb sends every result column
-  as text, even when the client asks for binary. pgJDBC asks for binary
-  once a statement has run 5 times on a connection (it then prepares it on
-  the server), and misreads the text: in a sync, some tables after the
-  fifth end up with no fields, with
-  `ArrayIndexOutOfBoundsException: Index 1 out of bounds for length 1` in
-  Metabase's log. Binary result encoding is a follow-up.
 - **Day of week is ISO.** `EXTRACT(DOW ...)` follows Trino (Monday = 1 …
   Sunday = 7), not PostgreSQL (Sunday = 0), so Metabase's "day of week"
   grouping labels Sunday as day 8 instead of day 1. The counts per day are
@@ -169,6 +162,17 @@ subscripts, field access, untyped literals) and
 - **Binary parameters** other than integers, floats, booleans, text, dates
   and timestamps (for example `bytea`, `uuid`, `numeric`) are refused with
   SQLSTATE `0A000`; send them in text format.
+- **Result formats.** Over the extended protocol, each result column comes
+  back in the format the client asked for in Bind: text, binary, or one
+  format per column. pgJDBC switches a statement to binary results from its
+  5th execution on, and tokio-postgres asks for binary always. Binary
+  encodings cover `bool`, `int2`/`int4`/`int8`, `float4`/`float8`,
+  `numeric`, `text`/`varchar`/`bpchar`, `bytea`, `date`, `timestamp` and
+  one-dimensional arrays of these. A result column of another type
+  requested in binary is refused with SQLSTATE `0A000` naming the type
+  (multi-dimensional arrays, for example); a binary `timestamp` keeps
+  microseconds, as PostgreSQL does. The simple query protocol is always
+  text.
 
 ## Running it locally
 

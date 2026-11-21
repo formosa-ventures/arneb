@@ -266,8 +266,54 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
         PlanExpr::ScalarSubquery { subplan, .. } => {
             subplan.schema().first().map(|col| col.data_type.clone())
         }
+        PlanExpr::ArrayElement(pair) => array_element_result_type(&pair.0, schema),
+        PlanExpr::GetField(pair) => get_field_result_type(&pair.0, &pair.1, schema),
         PlanExpr::Wildcard => None,
     }
+}
+
+/// The type of `array[i]`: the element type of a `List` operand.
+#[inline(never)]
+fn array_element_result_type(array: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType> {
+    match plan_expr_type(array, schema)? {
+        DataType::List(element) => Some(*element),
+        DataType::Null => Some(DataType::Null),
+        _ => None,
+    }
+}
+
+/// The type of `(expr).field`: the named field's type of a `Struct` operand.
+#[inline(never)]
+fn get_field_result_type(expr: &PlanExpr, field: &str, schema: &[ColumnInfo]) -> Option<DataType> {
+    match plan_expr_type(expr, schema)? {
+        DataType::Struct(fields) => struct_field_type(&fields, field).cloned(),
+        _ => None,
+    }
+}
+
+/// Checks `(expr).field` against the operand's type `operand`: an unknown
+/// field of a struct, or a field of a non-composite type, is an error (as in
+/// PostgreSQL). An undetermined type (`None`, or an untyped NULL) passes;
+/// the type-coercion pass checks it again once typed.
+pub fn check_get_field(operand: Option<&DataType>, field: &str) -> Result<(), PlanError> {
+    match operand {
+        None | Some(DataType::Null) => Ok(()),
+        Some(DataType::Struct(fields)) if struct_field_type(fields, field).is_some() => Ok(()),
+        Some(t @ DataType::Struct(_)) => Err(PlanError::invalid_expression(format!(
+            "column \"{field}\" not found in data type {t}"
+        ))),
+        Some(t) => Err(PlanError::invalid_expression(format!(
+            "column notation .{field} applied to type {t}, which is not a composite type"
+        ))),
+    }
+}
+
+/// The type of the field `name` (case-insensitive) of a struct type.
+pub fn struct_field_type<'a>(fields: &'a [(String, DataType)], name: &str) -> Option<&'a DataType> {
+    fields
+        .iter()
+        .find(|(f, _)| f.eq_ignore_ascii_case(name))
+        .map(|(_, t)| t)
 }
 
 /// Element type of `ARRAY[elements]`: the common supertype of the typed,
@@ -527,6 +573,7 @@ pub(crate) fn function_return_type(
             Some(DataType::Boolean)
         }
         "TO_REGTYPE" | "__REGCLASS_OID" => Some(DataType::Int64),
+        "CURRENT_SCHEMAS" => Some(DataType::List(Box::new(DataType::Utf8))),
 
         // Math — preserve integer-ness when the input is integral.
         "ROUND" => args

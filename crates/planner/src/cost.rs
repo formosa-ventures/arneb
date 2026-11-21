@@ -807,6 +807,11 @@ where
             visit_columns(expr, callback);
             visit_columns(array, callback);
         }
+        PlanExpr::ArrayElement(pair) => {
+            visit_columns(&pair.0, callback);
+            visit_columns(&pair.1, callback);
+        }
+        PlanExpr::GetField(pair) => visit_columns(&pair.0, callback),
         PlanExpr::Function { args, order_by, .. } => {
             for a in args {
                 visit_columns(a, callback);

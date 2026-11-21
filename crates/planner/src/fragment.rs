@@ -842,6 +842,12 @@ fn remap_expr_for_swapped_join(
         } => crate::map_array_contains(expr, array, negated, span, |e| {
             remap_expr_for_swapped_join(e, old_left_width, old_right_width)
         }),
+        PlanExpr::ArrayElement(pair) => crate::map_array_element(pair, |e| {
+            remap_expr_for_swapped_join(e, old_left_width, old_right_width)
+        }),
+        PlanExpr::GetField(pair) => crate::map_get_field(pair, |e| {
+            remap_expr_for_swapped_join(e, old_left_width, old_right_width)
+        }),
         PlanExpr::Array {
             elements,
             element_type,

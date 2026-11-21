@@ -34,7 +34,7 @@ use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 
 use crate::auth::{AuthMethod, AuthStartupHandler};
-use crate::encoding::{column_info_to_field_info, encode_record_batches};
+use crate::encoding::{column_info_to_field_info, encode_record_batches, refuse_composite_columns};
 use crate::session::{handle_search_path, SearchPath};
 
 /// Trait for distributed query execution. Implemented by QueryCoordinator
@@ -633,6 +633,7 @@ impl SimpleQueryHandler for ConnectionHandler {
         match result {
             Ok((plan, batches)) => {
                 let columns = plan.schema();
+                refuse_composite_columns(&columns)?;
                 let field_info = column_info_to_field_info(&columns);
                 let schema = Arc::new(field_info);
 
@@ -1189,6 +1190,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
         match result {
             Ok((plan, batches)) => {
                 let columns = plan.schema();
+                refuse_composite_columns(&columns)?;
                 let field_info = column_info_to_field_info(&columns);
                 let schema = Arc::new(field_info);
                 let (rows, _row_count) = encode_record_batches(&schema, &batches)?;
@@ -2071,8 +2073,8 @@ async fn resolve_order_by_subqueries_distributed(
     Ok(resolved)
 }
 
-/// The `ArrayContains` arm of [`resolve_expr_subqueries_distributed_inner`],
-/// out of line. A plain function returning a boxed future, so the caller's
+/// The `ArrayContains`, `ArrayElement` and `GetField` arms of
+/// [`resolve_expr_subqueries_distributed_inner`], out of line. A plain function returning a boxed future, so the caller's
 /// future (which recurses once per plan level) holds a pointer rather than
 /// the helper's state.
 fn resolve_array_contains_subqueries<'a>(
@@ -2082,14 +2084,27 @@ fn resolve_array_contains_subqueries<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PlanExpr, ArnebError>> + Send + 'a>>
 {
     Box::pin(async move {
-        let PlanExpr::ArrayContains {
-            expr,
-            array,
-            negated,
-            span,
-        } = node
-        else {
-            return Ok(node);
+        let resolve =
+            |e: PlanExpr| Box::pin(resolve_expr_subqueries_distributed_inner(ctx, executor, e));
+        let (expr, array, negated, span) = match node {
+            PlanExpr::ArrayContains {
+                expr,
+                array,
+                negated,
+                span,
+            } => (expr, array, negated, span),
+            PlanExpr::ArrayElement(pair) => {
+                let (array, index) = *pair;
+                let array = resolve(array).await?;
+                let index = resolve(index).await?;
+                return Ok(PlanExpr::ArrayElement(Box::new((array, index))));
+            }
+            PlanExpr::GetField(pair) => {
+                let (expr, field) = *pair;
+                let expr = resolve(expr).await?;
+                return Ok(PlanExpr::GetField(Box::new((expr, field))));
+            }
+            other => return Ok(other),
         };
         let expr = Box::pin(resolve_expr_subqueries_distributed_inner(
             ctx, executor, *expr,
@@ -2117,7 +2132,10 @@ fn resolve_expr_subqueries_distributed_inner<'a>(
     expr: PlanExpr,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PlanExpr, ArnebError>> + Send + 'a>>
 {
-    if matches!(expr, PlanExpr::ArrayContains { .. }) {
+    if matches!(
+        expr,
+        PlanExpr::ArrayContains { .. } | PlanExpr::ArrayElement(_) | PlanExpr::GetField(_)
+    ) {
         return resolve_array_contains_subqueries(ctx, executor, expr);
     }
     Box::pin(resolve_expr_subqueries_distributed_body(
@@ -2364,7 +2382,9 @@ async fn resolve_expr_subqueries_distributed_body(
         | PlanExpr::Wildcard
         | PlanExpr::Parameter { .. }
         // Dispatched by `resolve_expr_subqueries_distributed_inner`.
-        | PlanExpr::ArrayContains { .. } => Ok(expr),
+        | PlanExpr::ArrayContains { .. }
+        | PlanExpr::ArrayElement(_)
+        | PlanExpr::GetField(_) => Ok(expr),
     }
 }
 
@@ -2548,6 +2568,11 @@ fn expr_columns_in_range(expr: &PlanExpr, input_width: usize) -> bool {
         PlanExpr::ArrayContains { expr, array, .. } => {
             expr_columns_in_range(expr, input_width) && expr_columns_in_range(array, input_width)
         }
+        PlanExpr::ArrayElement(pair) => {
+            expr_columns_in_range(&pair.0, input_width)
+                && expr_columns_in_range(&pair.1, input_width)
+        }
+        PlanExpr::GetField(pair) => expr_columns_in_range(&pair.0, input_width),
         PlanExpr::ScalarSubquery { subplan, .. } => plan_columns_in_range(subplan),
         PlanExpr::CaseExpr {
             operand,
@@ -2736,6 +2761,11 @@ fn expr_subplans(expr: &PlanExpr) -> Vec<&LogicalPlan> {
                 walk(expr, out);
                 walk(array, out);
             }
+            PlanExpr::ArrayElement(pair) => {
+                walk(&pair.0, out);
+                walk(&pair.1, out);
+            }
+            PlanExpr::GetField(pair) => walk(&pair.0, out),
             PlanExpr::CaseExpr {
                 operand,
                 when_clauses,

@@ -97,6 +97,10 @@ pub(crate) fn evaluate(
             array_contains(&value, &list, *negated)
         }
 
+        PlanExpr::ArrayElement(pair) => evaluate_array_element(pair, batch, registry),
+
+        PlanExpr::GetField(pair) => evaluate_get_field(pair, batch, registry),
+
         PlanExpr::BinaryOp {
             left, op, right, ..
         } => {
@@ -601,6 +605,98 @@ fn build_list_array(
 /// whatever `value` is, a NULL list is NULL, otherwise a match is true, a
 /// NULL `value` or a NULL element without a match is NULL, and no match is
 /// false.
+/// `array[index]`: out of line so the recursive `evaluate` frame stays small.
+#[inline(never)]
+fn evaluate_array_element(
+    pair: &(PlanExpr, PlanExpr),
+    batch: &RecordBatch,
+    registry: Option<&FunctionRegistry>,
+) -> Result<ArrayRef, ExecutionError> {
+    let list = evaluate(&pair.0, batch, registry)?;
+    let index = evaluate(&pair.1, batch, registry)?;
+    array_element(&list, &index)
+}
+
+/// The element at the 1-based `index` of each row of `list`; NULL for a NULL
+/// array or index, or an index outside `1..=len`.
+pub(crate) fn array_element(list: &ArrayRef, index: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+    let rows = list.len();
+    let Some(list) = list.as_any().downcast_ref::<arrow::array::ListArray>() else {
+        // An untyped NULL array.
+        if list.null_count() == rows {
+            return Ok(arrow::array::new_null_array(&ArrowDataType::Null, rows));
+        }
+        return Err(ExecutionError::InvalidOperation(format!(
+            "cannot subscript type {} because it is not an array",
+            list.data_type()
+        )));
+    };
+    let index = kernels::cast::cast(index, &ArrowDataType::Int64)?;
+    let index = index
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("cast to Int64 yields Int64Array");
+    let offsets = list.value_offsets();
+    let positions: arrow::array::UInt32Array = (0..rows)
+        .map(|row| {
+            if list.is_null(row) || index.is_null(row) {
+                return None;
+            }
+            let (start, end) = (offsets[row] as i64, offsets[row + 1] as i64);
+            let i = index.value(row);
+            (i >= 1 && i <= end - start).then(|| (start + i - 1) as u32)
+        })
+        .collect();
+    Ok(kernels::take::take(
+        list.values().as_ref(),
+        &positions,
+        None,
+    )?)
+}
+
+/// `(expr).field`: out of line so the recursive `evaluate` frame stays small.
+#[inline(never)]
+fn evaluate_get_field(
+    pair: &(PlanExpr, String),
+    batch: &RecordBatch,
+    registry: Option<&FunctionRegistry>,
+) -> Result<ArrayRef, ExecutionError> {
+    let value = evaluate(&pair.0, batch, registry)?;
+    get_field(&value, &pair.1)
+}
+
+/// The field `name` (case-insensitive) of each row of a struct array; NULL
+/// where the struct is NULL.
+pub(crate) fn get_field(value: &ArrayRef, name: &str) -> Result<ArrayRef, ExecutionError> {
+    let rows = value.len();
+    let Some(st) = value.as_any().downcast_ref::<arrow::array::StructArray>() else {
+        if value.null_count() == rows {
+            return Ok(arrow::array::new_null_array(&ArrowDataType::Null, rows));
+        }
+        return Err(ExecutionError::InvalidOperation(format!(
+            "column notation .{name} applied to type {}, which is not a composite type",
+            value.data_type()
+        )));
+    };
+    let position = st
+        .fields()
+        .iter()
+        .position(|f| f.name().eq_ignore_ascii_case(name))
+        .ok_or_else(|| {
+            ExecutionError::InvalidOperation(format!(
+                "column \"{name}\" not found in data type {}",
+                value.data_type()
+            ))
+        })?;
+    let column = st.column(position).clone();
+    let Some(outer) = st.nulls() else {
+        return Ok(column);
+    };
+    let nulls = arrow::buffer::NullBuffer::union(Some(outer), column.nulls());
+    let data = column.to_data().into_builder().nulls(nulls).build()?;
+    Ok(arrow::array::make_array(data))
+}
+
 fn array_contains(
     value: &ArrayRef,
     list: &ArrayRef,
@@ -1312,6 +1408,11 @@ fn case_referenced_columns(expr: &PlanExpr, referenced: &mut [bool]) {
             case_referenced_columns(expr, referenced);
             case_referenced_columns(array, referenced);
         }
+        PlanExpr::ArrayElement(pair) => {
+            case_referenced_columns(&pair.0, referenced);
+            case_referenced_columns(&pair.1, referenced);
+        }
+        PlanExpr::GetField(pair) => case_referenced_columns(&pair.0, referenced),
         PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 case_referenced_columns(arg, referenced);
@@ -1868,6 +1969,44 @@ mod tests {
         assert!(!arr.value(0));
         assert!(arr.value(1));
         assert!(!arr.value(2));
+    }
+
+    #[test]
+    fn array_element_is_one_based_and_null_out_of_range() {
+        use arrow::array::{Int64Builder, ListBuilder};
+        // Rows: [10, 20, 30] (sliced past a leading [0]), NULL, [].
+        let mut b = ListBuilder::new(Int64Builder::new());
+        b.values().append_value(0);
+        b.append(true);
+        b.values().append_slice(&[10, 20, 30]);
+        b.append(true);
+        b.append_null();
+        b.append(true);
+        let list: ArrayRef = Arc::new(b.finish().slice(1, 3));
+        let at = |index: Vec<Option<i64>>| {
+            let out =
+                array_element(&list, &(Arc::new(Int64Array::from(index)) as ArrayRef)).unwrap();
+            out.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(at(vec![Some(1), Some(1), Some(1)]), [Some(10), None, None]);
+        assert_eq!(at(vec![Some(3), Some(2), Some(0)]), [Some(30), None, None]);
+        assert_eq!(at(vec![Some(4), None, Some(-1)]), [None, None, None]);
+        assert_eq!(at(vec![Some(0), Some(1), Some(1)]), [None, None, None]);
+        assert_eq!(at(vec![None, Some(1), Some(1)]), [None, None, None]);
+        // An Int32 index is accepted too.
+        let out = array_element(
+            &list,
+            &(Arc::new(Int32Array::from(vec![2, 1, 1])) as ArrayRef),
+        )
+        .unwrap();
+        assert_eq!(
+            out.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            20
+        );
     }
 
     #[test]

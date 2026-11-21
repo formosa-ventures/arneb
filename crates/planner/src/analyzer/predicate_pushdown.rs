@@ -1104,6 +1104,11 @@ fn visit_column_pairs<F: FnMut(&str, usize)>(expr: &PlanExpr, callback: &mut F) 
             visit_column_pairs(expr, callback);
             visit_column_pairs(array, callback);
         }
+        E::ArrayElement(pair) => {
+            visit_column_pairs(&pair.0, callback);
+            visit_column_pairs(&pair.1, callback);
+        }
+        E::GetField(pair) => visit_column_pairs(&pair.0, callback),
         E::Function { args, order_by, .. } => {
             for a in args {
                 visit_column_pairs(a, callback);
@@ -1363,6 +1368,11 @@ fn visit_column_names<F: FnMut(&str)>(expr: &PlanExpr, callback: &mut F) {
             visit_column_names(expr, callback);
             visit_column_names(array, callback);
         }
+        E::ArrayElement(pair) => {
+            visit_column_names(&pair.0, callback);
+            visit_column_names(&pair.1, callback);
+        }
+        E::GetField(pair) => visit_column_names(&pair.0, callback),
         E::Function { args, order_by, .. } => {
             for a in args {
                 visit_column_names(a, callback);
@@ -1490,6 +1500,12 @@ fn rewrite_expr(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<PlanExpr> {
             rewrite_expr(e, schema).ok_or(())
         })
         .ok()?,
+        E::ArrayElement(pair) => {
+            crate::try_map_array_element_ref(pair, |e| rewrite_expr(e, schema).ok_or(())).ok()?
+        }
+        E::GetField(pair) => {
+            crate::try_map_get_field_ref(pair, |e| rewrite_expr(e, schema).ok_or(())).ok()?
+        }
         E::Array {
             elements,
             element_type,

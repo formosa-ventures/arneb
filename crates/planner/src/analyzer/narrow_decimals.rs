@@ -611,6 +611,11 @@ fn collect_decimal64_columns_needing_wide(
             collect_decimal64_column_refs(expr, schema, used);
             collect_decimal64_column_refs(array, schema, used);
         }
+        PlanExpr::ArrayElement(pair) => {
+            collect_decimal64_column_refs(&pair.0, schema, used);
+            collect_decimal64_column_refs(&pair.1, schema, used);
+        }
+        PlanExpr::GetField(pair) => collect_decimal64_column_refs(&pair.0, schema, used),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -684,6 +689,11 @@ fn collect_decimal64_column_refs(
             collect_decimal64_column_refs(expr, schema, used);
             collect_decimal64_column_refs(array, schema, used);
         }
+        PlanExpr::ArrayElement(pair) => {
+            collect_decimal64_column_refs(&pair.0, schema, used);
+            collect_decimal64_column_refs(&pair.1, schema, used);
+        }
+        PlanExpr::GetField(pair) => collect_decimal64_column_refs(&pair.0, schema, used),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -792,6 +802,11 @@ fn block_expr_sources(expr: &PlanExpr, input: &LogicalPlan, blocked: &mut HashSe
             block_expr_sources(expr, input, blocked);
             block_expr_sources(array, input, blocked);
         }
+        PlanExpr::ArrayElement(pair) => {
+            block_expr_sources(&pair.0, input, blocked);
+            block_expr_sources(&pair.1, input, blocked);
+        }
+        PlanExpr::GetField(pair) => block_expr_sources(&pair.0, input, blocked),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -855,6 +870,11 @@ fn collect_expr_subquery_blocks(expr: &PlanExpr, blocked: &mut HashSet<ColumnSou
             collect_expr_subquery_blocks(expr, blocked);
             collect_expr_subquery_blocks(array, blocked);
         }
+        PlanExpr::ArrayElement(pair) => {
+            collect_expr_subquery_blocks(&pair.0, blocked);
+            collect_expr_subquery_blocks(&pair.1, blocked);
+        }
+        PlanExpr::GetField(pair) => collect_expr_subquery_blocks(&pair.0, blocked),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -934,6 +954,11 @@ fn block_expr_sources_joined(
             block_expr_sources_joined(expr, left, right, blocked);
             block_expr_sources_joined(array, left, right, blocked);
         }
+        PlanExpr::ArrayElement(pair) => {
+            block_expr_sources_joined(&pair.0, left, right, blocked);
+            block_expr_sources_joined(&pair.1, left, right, blocked);
+        }
+        PlanExpr::GetField(pair) => block_expr_sources_joined(&pair.0, left, right, blocked),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,

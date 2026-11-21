@@ -230,6 +230,14 @@ pub enum PlanExpr {
         #[serde(skip)]
         span: Option<Span>,
     },
+    /// `array[index]`: the element at a 1-based index of a `List` value, of
+    /// the element type. NULL when the array or index is NULL, or the index
+    /// is out of range. Boxed so this variant does not grow `PlanExpr`.
+    ArrayElement(Box<(PlanExpr, PlanExpr)>),
+    /// `(expr).field`: a field of a `Struct` value, by name (matched
+    /// case-insensitively). An unknown field is a plan-time error. Boxed so
+    /// this variant does not grow `PlanExpr`.
+    GetField(Box<(PlanExpr, String)>),
     /// Extended-query-protocol placeholder (`$1`, `$2`, …).
     ///
     /// The analyzer's type-coercion pass walks surrounding operators
@@ -327,6 +335,88 @@ pub fn try_map_array_contains_ref<E>(
     })
 }
 
+/// Rebuilds `array[index]` with `f` applied to both operands. Like
+/// [`map_array_contains`], out of line to keep recursive walkers' frames small;
+/// the `_ref` and `try_` forms follow the same pattern.
+#[inline(never)]
+#[allow(clippy::boxed_local)]
+pub fn map_array_element(
+    pair: Box<(PlanExpr, PlanExpr)>,
+    mut f: impl FnMut(PlanExpr) -> PlanExpr,
+) -> PlanExpr {
+    let (array, index) = *pair;
+    PlanExpr::ArrayElement(Box::new((f(array), f(index))))
+}
+
+/// [`map_array_element`] for a fallible `f`.
+#[inline(never)]
+#[allow(clippy::boxed_local)]
+pub fn try_map_array_element<E>(
+    pair: Box<(PlanExpr, PlanExpr)>,
+    mut f: impl FnMut(PlanExpr) -> Result<PlanExpr, E>,
+) -> Result<PlanExpr, E> {
+    let (array, index) = *pair;
+    Ok(PlanExpr::ArrayElement(Box::new((f(array)?, f(index)?))))
+}
+
+/// [`map_array_element`] over borrowed operands.
+#[inline(never)]
+pub fn map_array_element_ref(
+    pair: &(PlanExpr, PlanExpr),
+    mut f: impl FnMut(&PlanExpr) -> PlanExpr,
+) -> PlanExpr {
+    PlanExpr::ArrayElement(Box::new((f(&pair.0), f(&pair.1))))
+}
+
+/// [`map_array_element_ref`] for a fallible `f`.
+#[inline(never)]
+pub fn try_map_array_element_ref<E>(
+    pair: &(PlanExpr, PlanExpr),
+    mut f: impl FnMut(&PlanExpr) -> Result<PlanExpr, E>,
+) -> Result<PlanExpr, E> {
+    Ok(PlanExpr::ArrayElement(Box::new((f(&pair.0)?, f(&pair.1)?))))
+}
+
+/// Rebuilds `(expr).field` with `f` applied to the operand.
+#[inline(never)]
+#[allow(clippy::boxed_local)]
+pub fn map_get_field(
+    pair: Box<(PlanExpr, String)>,
+    f: impl FnOnce(PlanExpr) -> PlanExpr,
+) -> PlanExpr {
+    let (expr, field) = *pair;
+    PlanExpr::GetField(Box::new((f(expr), field)))
+}
+
+/// [`map_get_field`] for a fallible `f`.
+#[inline(never)]
+#[allow(clippy::boxed_local)]
+pub fn try_map_get_field<E>(
+    pair: Box<(PlanExpr, String)>,
+    f: impl FnOnce(PlanExpr) -> Result<PlanExpr, E>,
+) -> Result<PlanExpr, E> {
+    let (expr, field) = *pair;
+    Ok(PlanExpr::GetField(Box::new((f(expr)?, field))))
+}
+
+/// [`map_get_field`] over a borrowed operand.
+#[inline(never)]
+pub fn map_get_field_ref(
+    pair: &(PlanExpr, String),
+    f: impl FnOnce(&PlanExpr) -> PlanExpr,
+) -> PlanExpr {
+    PlanExpr::GetField(Box::new((f(&pair.0), pair.1.clone())))
+}
+
+/// [`map_get_field_ref`] for a fallible `f`.
+#[inline(never)]
+pub fn try_map_get_field_ref<E>(
+    pair: &(PlanExpr, String),
+    f: impl FnOnce(&PlanExpr) -> Result<PlanExpr, E>,
+) -> Result<PlanExpr, E> {
+    Ok(PlanExpr::GetField(Box::new((f(&pair.0)?, pair.1.clone()))))
+}
+
 impl PlanExpr {
     /// Returns the source span attached directly to this node, or `None`
     /// if it was synthesized by an analyzer/optimizer pass or is a
@@ -348,7 +438,7 @@ impl PlanExpr {
             | PlanExpr::Array { span, .. }
             | PlanExpr::ArrayContains { span, .. }
             | PlanExpr::Parameter { span, .. } => *span,
-            PlanExpr::Wildcard => None,
+            PlanExpr::Wildcard | PlanExpr::ArrayElement(_) | PlanExpr::GetField(_) => None,
         }
     }
 
@@ -383,6 +473,8 @@ impl PlanExpr {
             PlanExpr::ArrayContains { expr, array, .. } => {
                 expr.best_span().or_else(|| array.best_span())
             }
+            PlanExpr::ArrayElement(pair) => pair.0.best_span().or_else(|| pair.1.best_span()),
+            PlanExpr::GetField(pair) => pair.0.best_span(),
             PlanExpr::CaseExpr {
                 operand,
                 when_clauses,
@@ -820,6 +912,9 @@ pub enum SrfKind {
     Unnest,
     /// `generate_subscripts(array, 1)`: the subscripts `1..=len`.
     GenerateSubscripts,
+    /// `information_schema._pg_expandarray(array)`: one
+    /// `STRUCT(x elem, n INT4)` per element, `n` its 1-based subscript.
+    ExpandArray,
 }
 
 impl SrfKind {
@@ -828,6 +923,7 @@ impl SrfKind {
         match self {
             SrfKind::Unnest => "unnest",
             SrfKind::GenerateSubscripts => "generate_subscripts",
+            SrfKind::ExpandArray => "_pg_expandarray",
         }
     }
 
@@ -837,6 +933,10 @@ impl SrfKind {
             Some(SrfKind::Unnest)
         } else if name.eq_ignore_ascii_case("generate_subscripts") {
             Some(SrfKind::GenerateSubscripts)
+        } else if name.eq_ignore_ascii_case("information_schema._pg_expandarray")
+            || name.eq_ignore_ascii_case("_pg_expandarray")
+        {
+            Some(SrfKind::ExpandArray)
         } else {
             None
         }
@@ -849,6 +949,11 @@ impl SrfKind {
             (SrfKind::Unnest, DataType::List(element)) => (**element).clone(),
             (SrfKind::Unnest, _) => DataType::Null,
             (SrfKind::GenerateSubscripts, _) => DataType::Int32,
+            (SrfKind::ExpandArray, DataType::List(element)) => DataType::Struct(vec![
+                ("x".to_string(), (**element).clone()),
+                ("n".to_string(), DataType::Int32),
+            ]),
+            (SrfKind::ExpandArray, _) => DataType::Null,
         }
     }
 
@@ -857,6 +962,7 @@ impl SrfKind {
         match self {
             SrfKind::Unnest => format!("unnest({arg})"),
             SrfKind::GenerateSubscripts => format!("generate_subscripts({arg}, 1)"),
+            SrfKind::ExpandArray => format!("_pg_expandarray({arg})"),
         }
     }
 }
@@ -1256,6 +1362,8 @@ impl fmt::Display for PlanExpr {
                     write!(f, "{expr} = ANY ({array})")
                 }
             }
+            PlanExpr::ArrayElement(pair) => write!(f, "({})[{}]", pair.0, pair.1),
+            PlanExpr::GetField(pair) => write!(f, "({}).{}", pair.0, pair.1),
             PlanExpr::Parameter {
                 index, type_hint, ..
             } => match type_hint {

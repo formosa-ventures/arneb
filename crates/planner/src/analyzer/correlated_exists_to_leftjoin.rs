@@ -677,6 +677,8 @@ where
             negated,
             span,
         } => crate::map_array_contains(expr, array, negated, span, |e| walk_columns(e, f)),
+        E::ArrayElement(pair) => crate::map_array_element(pair, |e| walk_columns(e, f)),
+        E::GetField(pair) => crate::map_get_field(pair, |e| walk_columns(e, f)),
         E::Array {
             elements,
             element_type,
@@ -756,6 +758,11 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             collect_column_indices(expr, cb);
             collect_column_indices(array, cb);
         }
+        E::ArrayElement(pair) => {
+            collect_column_indices(&pair.0, cb);
+            collect_column_indices(&pair.1, cb);
+        }
+        E::GetField(pair) => collect_column_indices(&pair.0, cb),
         E::Cast { expr, .. } => collect_column_indices(expr, cb),
         E::CaseExpr {
             operand,

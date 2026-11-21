@@ -923,6 +923,12 @@ where
             remap_expr_columns(e, f).ok_or(())
         })
         .ok()?,
+        PlanExpr::ArrayElement(pair) => {
+            crate::try_map_array_element_ref(pair, |e| remap_expr_columns(e, f).ok_or(())).ok()?
+        }
+        PlanExpr::GetField(pair) => {
+            crate::try_map_get_field_ref(pair, |e| remap_expr_columns(e, f).ok_or(())).ok()?
+        }
         PlanExpr::Between {
             expr,
             negated,
@@ -1537,6 +1543,11 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             collect_column_indices(expr, cb);
             collect_column_indices(array, cb);
         }
+        PlanExpr::ArrayElement(pair) => {
+            collect_column_indices(&pair.0, cb);
+            collect_column_indices(&pair.1, cb);
+        }
+        PlanExpr::GetField(pair) => collect_column_indices(&pair.0, cb),
         PlanExpr::Between {
             expr, low, high, ..
         } => {

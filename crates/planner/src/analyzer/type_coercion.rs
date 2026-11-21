@@ -525,6 +525,8 @@ fn coerce_expr(
             negated,
             span,
         } => coerce_array_contains(*expr, *array, negated, span, schema, ctx),
+        PlanExpr::ArrayElement(pair) => coerce_array_element(pair, schema, ctx),
+        PlanExpr::GetField(pair) => coerce_get_field(pair, schema, ctx),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -969,6 +971,55 @@ fn coerce_array_contains(
         negated,
         span,
     })
+}
+
+/// `coerce_expr` for [`PlanExpr::ArrayElement`]: the operand must be an
+/// array (or an untyped NULL) and the index an integer. Out of line so the
+/// recursive `coerce_expr` frame stays small.
+#[inline(never)]
+#[allow(clippy::boxed_local)]
+fn coerce_array_element(
+    pair: Box<(PlanExpr, PlanExpr)>,
+    schema: &[ColumnInfo],
+    ctx: &mut AnalyzerContext,
+) -> Result<PlanExpr, PlanError> {
+    let (array, index) = *pair;
+    let array = coerce_expr(array, schema, ctx)?;
+    let index = coerce_expr(index, schema, ctx)?;
+    match plan_expr_type(&array, schema) {
+        None | Some(DataType::Null) | Some(DataType::List(_)) => {}
+        Some(t) => {
+            return Err(PlanError::invalid_expression(format!(
+                "cannot subscript type {t} because it is not an array"
+            )))
+        }
+    }
+    match plan_expr_type(&index, schema) {
+        None
+        | Some(DataType::Null)
+        | Some(DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64) => {}
+        Some(t) => {
+            return Err(PlanError::invalid_expression(format!(
+                "array subscript must have type integer, not {t}"
+            )))
+        }
+    }
+    Ok(PlanExpr::ArrayElement(Box::new((array, index))))
+}
+
+/// `coerce_expr` for [`PlanExpr::GetField`]: checks the field exists in the
+/// (now typed) operand.
+#[inline(never)]
+#[allow(clippy::boxed_local)]
+fn coerce_get_field(
+    pair: Box<(PlanExpr, String)>,
+    schema: &[ColumnInfo],
+    ctx: &mut AnalyzerContext,
+) -> Result<PlanExpr, PlanError> {
+    let (expr, field) = *pair;
+    let expr = coerce_expr(expr, schema, ctx)?;
+    super::check_get_field(plan_expr_type(&expr, schema).as_ref(), &field)?;
+    Ok(PlanExpr::GetField(Box::new((expr, field))))
 }
 
 /// Aligns the operands of `expr = ANY (array)`: the array must be a
@@ -1718,6 +1769,8 @@ pub(super) fn walk_expr(expr: PlanExpr, f: &mut dyn FnMut(PlanExpr) -> PlanExpr)
             negated,
             span,
         } => crate::map_array_contains(expr, array, negated, span, |e| walk_expr(e, f)),
+        PlanExpr::ArrayElement(pair) => crate::map_array_element(pair, |e| walk_expr(e, f)),
+        PlanExpr::GetField(pair) => crate::map_get_field(pair, |e| walk_expr(e, f)),
         PlanExpr::Array {
             elements,
             element_type,

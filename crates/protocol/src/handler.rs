@@ -140,6 +140,8 @@ pub struct HandlerFactory {
     /// (file-based-access-control). Live: each statement checks against the
     /// rules current when it is planned (runtime-config D3).
     pub access_rules: arneb_catalog::RulesHandle,
+    /// Backend keys of this server's connections, for pgwire CancelRequest.
+    pub backend_keys: Arc<crate::cancel::BackendKeys>,
 }
 
 impl PgWireServerHandlers for HandlerFactory {
@@ -177,7 +179,12 @@ impl PgWireServerHandlers for HandlerFactory {
         Arc::new(AuthStartupHandler::new(
             self.auth.clone(),
             self.tls_required,
+            Arc::clone(&self.backend_keys),
         ))
+    }
+
+    fn cancel_handler(&self) -> Arc<impl pgwire::api::cancel::CancelHandler> {
+        Arc::new(self.backend_keys.cancel_handler())
     }
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {
@@ -348,7 +355,8 @@ impl ConnectionHandler {
     /// Run `work` (admission wait plus execution) under the connection's
     /// `statement_timeout`, timed from statement receipt. On expiry the
     /// work future is dropped, which cancels the query on its workers, and
-    /// the client gets `ERROR 57014`.
+    /// the client gets `ERROR 57014`. (A pgwire CancelRequest drops it the
+    /// same way, one level up, in pgwire; see `crate::cancel`.)
     async fn with_timeout<C: ClientInfo, T>(
         &self,
         client: &C,

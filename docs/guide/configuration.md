@@ -276,7 +276,9 @@ and Trino sessions use the `query_max_execution_time` (excludes queue time)
 and `query_max_run_time` (includes it) session properties; see
 [SQL Overview](/sql/overview#session-settings) and
 [Trino Clients](/guide/trino-clients#time-limits-and-queuing). A query that
-times out, is cancelled (Trino `DELETE`), fails in one fragment or loses its
+times out, is cancelled (a pgwire cancel request such as psql's Ctrl-C, see
+[Cancelling a statement](/sql/overview#cancelling-a-statement), or Trino
+`DELETE`), fails in one fragment or loses its
 client is cancelled on every worker: its tasks stop and their memory and
 output buffers are released. `arneb::cluster` logs `cancelling query on
 workers` on the coordinator and `query cancelled on worker` on each worker.

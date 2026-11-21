@@ -174,6 +174,7 @@ impl ProtocolServer {
             statement_timeout: self.statement_timeout,
             query_tracker: self.query_tracker.clone(),
             access_rules: self.access_rules.clone(),
+            backend_keys: Arc::default(),
         });
         let acceptor = self.tls.as_ref().map(|t| t.acceptor.clone());
 

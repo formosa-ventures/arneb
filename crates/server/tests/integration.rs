@@ -34,6 +34,7 @@ async fn start_test_server(
         statement_timeout: None,
         query_tracker: Default::default(),
         access_rules: Default::default(),
+        backend_keys: Default::default(),
     });
 
     tokio::spawn(async move {

@@ -270,6 +270,26 @@ async fn interval_arithmetic() {
     let diff = "SELECT CAST('2000-01-01' AS DATE) - d FROM dt ORDER BY d";
     assert_eq!(rows(&client, diff).await, [text("1460"), text("-90")]);
     assert_eq!(first_oid(&client, diff).await, 23, "int4");
+    // A DATE against TIMESTAMP bounds compares as TIMESTAMP (Metabase's
+    // x-ray "last 30 days" card); 2000-03-31 00:00 is inside the bounds.
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT count(*) FROM dt WHERE d BETWEEN \
+             CAST(CAST(DATE '2000-03-31' AS DATE) AS TIMESTAMPTZ) AND \
+             CAST(CAST(DATE '2000-04-01' + INTERVAL '-1 day' AS DATE) AS TIMESTAMPTZ)"
+        )
+        .await,
+        [text("1")]
+    );
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT count(*) FROM dt WHERE d IN (CAST(DATE '1996-01-02' AS TIMESTAMP), DATE '2000-03-31')"
+        )
+        .await,
+        [text("2")]
+    );
     let err = client
         .simple_query("SELECT INTERVAL '1 day'")
         .await

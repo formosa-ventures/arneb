@@ -200,6 +200,16 @@ const MATRIX: &[CoercionRule] = &[
         // `common_supertype` narrows further when scales shrink.
         safety: Safety::AlwaysSafe,
     },
+    // --- Date → timestamp ---
+    // A DATE widens to a TIMESTAMP at midnight, as PostgreSQL's implicit
+    // `date → timestamp[tz]` cast and Trino do: `d BETWEEN ts1 AND ts2`,
+    // `d IN (ts, ...)`, `COALESCE(d, ts)`. The binary comparison operators
+    // already compare this way (`unify_binary_operands`).
+    CoercionRule {
+        from: TypePattern::Date32,
+        to: TypePattern::AnyTimestamp,
+        safety: Safety::AlwaysSafe,
+    },
     // --- String → date/time (LITERAL ONLY) ---
     CoercionRule {
         from: TypePattern::Utf8,
@@ -609,6 +619,27 @@ mod tests {
         assert_eq!(
             lookup_cast(&DataType::Utf8, &ts_us()),
             Some(Safety::LiteralOnly)
+        );
+    }
+
+    #[test]
+    fn date_widens_to_timestamp_but_not_back() {
+        assert_eq!(
+            lookup_cast(&DataType::Date32, &ts_us()),
+            Some(Safety::AlwaysSafe)
+        );
+        assert_eq!(lookup_cast(&ts_us(), &DataType::Date32), None);
+        let site = CoercionSite::Binary {
+            left_is_literal: false,
+            right_is_literal: false,
+        };
+        assert_eq!(
+            common_supertype(&DataType::Date32, &ts_us(), site),
+            Some(ts_us())
+        );
+        assert_eq!(
+            common_supertype(&ts_us(), &DataType::Date32, CoercionSite::UnionColumn),
+            Some(ts_us())
         );
     }
 

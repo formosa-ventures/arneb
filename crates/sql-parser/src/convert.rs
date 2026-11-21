@@ -517,6 +517,18 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                     span,
                 });
             }
+            // PostgreSQL regex match operators lower to `regexp_like`;
+            // `~*` / `!~*` prefix the pattern with the `(?i)` flag and
+            // `!~` / `!~*` negate the result.
+            if let Some((negated, insensitive, symbol)) = match op {
+                sp::BinaryOperator::PGRegexMatch => Some((false, false, "~")),
+                sp::BinaryOperator::PGRegexIMatch => Some((false, true, "~*")),
+                sp::BinaryOperator::PGRegexNotMatch => Some((true, false, "!~")),
+                sp::BinaryOperator::PGRegexNotIMatch => Some((true, true, "!~*")),
+                _ => None,
+            } {
+                return lower_regex_operator(l, r, negated, insensitive, symbol, span);
+            }
             let bin_op = convert_binary_op(op)?;
             Ok(ast::Expr::BinaryOp {
                 left: Box::new(l),
@@ -958,6 +970,66 @@ fn unary_function_call(name: &str, expr: sp::Expr, span: Span) -> Result<ast::Ex
         args: vec![ast::FunctionArg::Unnamed(convert_expr(expr)?)],
         distinct: false,
         span,
+    })
+}
+
+/// Lowers `l ~ r` (and the `~*`, `!~`, `!~*` variants) to `regexp_like`.
+/// A constant pattern is validated here so the error names the operator.
+fn lower_regex_operator(
+    l: ast::Expr,
+    r: ast::Expr,
+    negated: bool,
+    insensitive: bool,
+    symbol: &str,
+    span: Span,
+) -> Result<ast::Expr, ParseError> {
+    let literal = |text: String| ast::Expr::Literal {
+        value: ScalarValue::Utf8(text),
+        span,
+    };
+    let pattern = match r {
+        ast::Expr::Literal {
+            value: ScalarValue::Utf8(p),
+            ..
+        } => {
+            let p = if insensitive { format!("(?i){p}") } else { p };
+            if let Err(e) = regex::Regex::new(&p) {
+                return Err(ParseError::UnsupportedFeature(format!(
+                    "invalid regular expression in {symbol}: {e}"
+                )));
+            }
+            literal(p)
+        }
+        other if insensitive => ast::Expr::Function {
+            order_by: vec![],
+            name: "CONCAT".to_string(),
+            args: vec![
+                ast::FunctionArg::Unnamed(literal("(?i)".to_string())),
+                ast::FunctionArg::Unnamed(other),
+            ],
+            distinct: false,
+            span,
+        },
+        other => other,
+    };
+    let call = ast::Expr::Function {
+        order_by: vec![],
+        name: "regexp_like".to_string(),
+        args: vec![
+            ast::FunctionArg::Unnamed(l),
+            ast::FunctionArg::Unnamed(pattern),
+        ],
+        distinct: false,
+        span,
+    };
+    Ok(if negated {
+        ast::Expr::UnaryOp {
+            op: ast::UnaryOp::Not,
+            expr: Box::new(call),
+            span,
+        }
+    } else {
+        call
     })
 }
 

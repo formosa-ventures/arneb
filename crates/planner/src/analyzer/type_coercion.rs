@@ -100,17 +100,6 @@ fn analyze_plan(plan: LogicalPlan, ctx: &mut AnalyzerContext) -> Result<LogicalP
                 .into_iter()
                 .map(|e| coerce_expr(e, &input_schema, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
-            // The planner typed a projection it could not unify as NULL;
-            // coercion may have made the expression typable (an untyped
-            // string literal resolved against a number).
-            let mut schema = schema;
-            for (column, expr) in schema.iter_mut().zip(&exprs) {
-                if column.data_type == DataType::Null {
-                    if let Some(resolved) = plan_expr_type(expr, &input_schema) {
-                        column.data_type = resolved;
-                    }
-                }
-            }
             Ok(LogicalPlan::Projection {
                 input: Box::new(input),
                 exprs,

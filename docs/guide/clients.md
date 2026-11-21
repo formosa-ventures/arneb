@@ -15,7 +15,7 @@ SF1 Parquet, with the client versions pinned in
 | `trino-python-client` 0.340 (DB-API) | Trino | `SHOW CATALOGS`, `current_catalog` / `current_schema`, an upper-case table name |
 | SQLAlchemy 2.1 Trino dialect (Superset's path) | Trino | Inspector: schemas, tables, columns, keys, indexes, table comment; a reflected table queried with `GROUP BY` / `ORDER BY` / `LIMIT` |
 | dbt-trino 1.10 | Trino | `dbt debug`, `dbt test` (not-null, unique, relationships, accepted-values tests on sources and an ephemeral model), `dbt show`, `dbt docs generate` |
-| SQLAlchemy 2.1 postgresql dialect (psycopg2 and psycopg 3) | pgwire | Inspector: schemas, tables, `has_table`, views; a query (reflecting a table's columns is not supported yet, see below) |
+| SQLAlchemy 2.1 postgresql dialect (psycopg2 and psycopg 3) | pgwire | Inspector: schemas, tables, `has_table`, views, columns, primary key, foreign keys, indexes, unique and check constraints (the last five empty, because Arneb has none); `Table(..., autoload_with=engine)` queried with `GROUP BY` / `ORDER BY` / `LIMIT`; no `pg_catalog` fallback answer is counted. Also checks that arrays needing quotes round-trip through psycopg 3 |
 | dbt-postgres 1.11 | pgwire | `dbt debug`, `dbt test`, `dbt show`, `dbt docs generate` (the same project as dbt-trino) |
 
 The same job checks the 22 TPC-H queries against DuckDB and runs 5 rounds of
@@ -41,16 +41,32 @@ against Arneb yet.
   - These work: joins, filters, unqualified names, `'name'::regclass`,
     `= ANY (ARRAY[...])`, and the
     [catalog functions](/sql/functions#postgresql-catalog-functions).
-  - Arneb has no array type, so a query that needs arrays (`unnest`,
-    `array_agg`, `indkey`) gets the old fixed answer: the whole first
-    `pg_catalog` table it names, whatever it asks for. So does a query that
-    needs `json_build_object` or a correlated subquery in `CASE`.
-    Each such answer is logged at `warn` on `arneb::protocol` with its SQL
-    and counted in `arneb_pg_catalog_fallbacks_total`.
-  - That is how SQLAlchemy's postgresql dialect reflects columns, keys and
-    indexes, so `Table(..., autoload_with=engine)` and `get_columns` do not
-    work over pgwire yet. Metabase's PostgreSQL driver has not been tried.
-  - Use the Trino protocol for these for now.
+  - Reflection queries from SQLAlchemy's postgresql dialect run in the
+    engine, with `ARRAY[...]`, `array_agg`, `unnest`, `generate_subscripts`,
+    `json_build_object` and correlated subqueries in the `SELECT` list (see
+    [Expressions](/sql/expressions) and [Functions](/sql/functions)). Over
+    `pg_catalog`, `pg_index`, `pg_inherits`, `pg_sequence`, `pg_collation`
+    and `pg_opclass` are empty, and `current_setting()` answers a fixed set
+    of settings.
+  - A statement the engine cannot plan still gets the old fixed answer:
+    the whole first `pg_catalog` table it names, whatever it asks for. Each
+    such answer is logged at `warn` on `arneb::protocol` with its SQL and
+    counted in `arneb_pg_catalog_fallbacks_total`. Metabase's PostgreSQL
+    driver has not been tried.
+  - Array and correlated-subquery limits (see the expression and function
+    pages for the full rules):
+    - `array_agg` over `smallint`, `tinyint`, `bytea` and `decimal64`
+      values fails at run time.
+    - Aggregate `ORDER BY` works in `array_agg` only. `FILTER` and
+      `WITHIN GROUP` are refused.
+    - `unnest` and `generate_subscripts` work only as whole `SELECT`
+      items. `generate_subscripts` takes dimension 1 only, and an untyped
+      argument is refused.
+    - A correlated subquery in the `SELECT` list needs at least one
+      equality correlation. A correlated subquery over a CTE, a derived
+      table or `LATERAL`, or correlated through two levels, is refused.
+    - A `smallint` column compared with a literal is widened, so the
+      comparison is not pushed into the connector.
   - A query that mixes `pg_catalog` tables with your own tables cannot see
     your tables.
 - **Several statements in one simple-query message** (`BEGIN; SELECT 1;

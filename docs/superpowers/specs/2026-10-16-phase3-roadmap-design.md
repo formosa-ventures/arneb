@@ -340,6 +340,8 @@ dependencies, and nightly (#255). Left for the production-ready v0.2.x: G6
 stage 2b with the BI client smoke, the P1 SF30 validation (Tier 3), and the
 production checklist (#258 goes on it).
 
+**Status (2026-11-21):** G6 stage 2b-1 is done: arrays, `json_build_object`, correlated `SELECT`-list subqueries and SQLAlchemy postgresql-dialect reflection run over pgwire with no `pg_catalog` fallback, checked in the client smoke on the 1+2 cluster. The Metabase run (stage 2b-2) remains.
+
 **Order:** G1 first, because it makes the soak test and retry results
 unreliable. G4 and G5 before P6 ships, so the chart's rolling upgrade does
 not fail queries. G3 before v0.2.0 is announced.

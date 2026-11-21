@@ -170,6 +170,12 @@ pub fn pg_catalog_fallback() {
     PG_CATALOG_FALLBACKS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// How many pgwire `pg_catalog` statements were answered with the fixed
+/// result instead of running in the engine, since the process started.
+pub fn pg_catalog_fallbacks() -> u64 {
+    PG_CATALOG_FALLBACKS.load(Ordering::Relaxed)
+}
+
 struct ExchangeMetrics {
     breaks_resumed: AtomicU64,
     breaks_failed: AtomicU64,

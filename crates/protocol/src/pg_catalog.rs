@@ -21,11 +21,13 @@ use arneb_execution::memory_pool::MemoryPool;
 use arrow::datatypes::Field;
 
 use crate::encoding::datatype_to_pg_type;
-use crate::memory_table::{s, Cell, TableBuilder};
+use crate::memory_table::{s, Cell, TableBuilder, NULL};
 use crate::metadata::MetadataResponse;
 
 /// The `pg_catalog` tables provided, with their columns. A trailing `#`
-/// marks a `BIGINT` column, `?` a `BOOLEAN` one; the rest are `VARCHAR`.
+/// marks a `BIGINT` column, `?` a `BOOLEAN` one; the rest are `VARCHAR`. A
+/// `[]` before that marker makes it an array (`indkey[]#` is `BIGINT[]`,
+/// `reloptions[]` is `VARCHAR[]`).
 const TABLES: &[(&str, &[&str])] = &[
     ("pg_namespace", &["oid#", "nspname", "nspowner#", "nspacl"]),
     (
@@ -48,7 +50,7 @@ const TABLES: &[(&str, &[&str])] = &[
             "relhassubclass?",
             "relrowsecurity?",
             "relispartition?",
-            "reloptions",
+            "reloptions[]",
         ],
     ),
     (
@@ -153,6 +155,40 @@ const TABLES: &[(&str, &[&str])] = &[
             "convalidated?",
         ],
     ),
+    (
+        "pg_index",
+        &[
+            "indexrelid#",
+            "indrelid#",
+            "indisprimary?",
+            "indisunique?",
+            "indisvalid?",
+            "indnkeyatts#",
+            "indnullsnotdistinct?",
+            "indpred",
+            "indkey[]#",
+            "indclass[]#",
+            "indoption[]#",
+        ],
+    ),
+    (
+        "pg_sequence",
+        &[
+            "seqrelid#",
+            "seqstart#",
+            "seqincrement#",
+            "seqmin#",
+            "seqmax#",
+            "seqcache#",
+            "seqcycle?",
+        ],
+    ),
+    ("pg_collation", &["oid#", "collname", "collnamespace#"]),
+    ("pg_opclass", &["oid#", "opcname", "opcdefault?"]),
+    (
+        "pg_inherits",
+        &["inhrelid#", "inhparent#", "inhseqno#", "inhdetachpending?"],
+    ),
 ];
 
 /// Whether `sql` reads one of the provided `pg_catalog` tables.
@@ -212,8 +248,6 @@ fn i(v: i64) -> Cell {
 fn b(v: bool) -> Cell {
     Cell::Bool(Some(v))
 }
-
-const NULL: Cell = Cell::Str(None);
 
 /// An empty table of `name`, typed by its column spec in [`TABLES`].
 fn table(name: &str) -> TableBuilder {
@@ -425,6 +459,11 @@ async fn build(
         ("pg_description", table("pg_description")),
         ("pg_attrdef", table("pg_attrdef")),
         ("pg_constraint", table("pg_constraint")),
+        ("pg_index", table("pg_index")),
+        ("pg_sequence", table("pg_sequence")),
+        ("pg_collation", table("pg_collation")),
+        ("pg_opclass", table("pg_opclass")),
+        ("pg_inherits", table("pg_inherits")),
     ] {
         pg_schema.register_table(name, table.into_memory_table());
     }
@@ -435,7 +474,14 @@ async fn build(
     if default_schema != PG_CATALOG {
         catalog.register_schema(&default_schema, pg_schema);
     }
-    let catalog_manager = CatalogManager::new(database.clone(), default_schema.clone());
+    // `regclass` casts name the relations listed above, not the tables of
+    // this per-statement catalog.
+    let listed = relations
+        .iter()
+        .map(|r| (r.schema.clone(), r.name.clone()))
+        .collect();
+    let catalog_manager = CatalogManager::new(database.clone(), default_schema.clone())
+        .with_regclass_relations(listed);
     catalog_manager.register_catalog(&database, catalog.clone());
     let registry = ConnectorRegistry::new();
     registry.register(

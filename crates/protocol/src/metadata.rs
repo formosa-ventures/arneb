@@ -145,7 +145,7 @@ fn make_result(schema: Arc<Schema>, batch: RecordBatch) -> MetaResult {
 // ---------------------------------------------------------------------------
 
 /// The PostgreSQL version Arneb reports (`server_version`).
-const PG_SERVER_VERSION: &str = "14.0";
+const PG_SERVER_VERSION: &str = arneb_common::pg_settings::SERVER_VERSION;
 
 /// The parameters sent at startup. They agree with [`show_value`]:
 /// drivers read `server_version` from here (psycopg2, JDBC) and others
@@ -634,22 +634,10 @@ fn transaction_tag(lower: &str) -> Option<&'static str> {
     }
 }
 
-/// PostgreSQL's value for a setting clients commonly read with `SHOW`.
+/// PostgreSQL's value for a setting clients commonly read with `SHOW`
+/// (the same table `current_setting()` reads); empty when Arneb has none.
 fn show_value(name: &str) -> &'static str {
-    match name {
-        "server_version" => PG_SERVER_VERSION,
-        "server_version_num" => "140000",
-        "standard_conforming_strings" | "integer_datetimes" => "on",
-        "transaction isolation level" | "default_transaction_isolation" => "read committed",
-        "transaction_read_only" | "default_transaction_read_only" | "is_superuser" => "off",
-        "client_encoding" | "server_encoding" => "UTF8",
-        "datestyle" => "ISO, YMD",
-        "intervalstyle" => "postgres",
-        "timezone" => "Etc/UTC",
-        "max_identifier_length" => "63",
-        "lc_collate" | "lc_ctype" => "C",
-        _ => "",
-    }
+    arneb_common::pg_settings::server_setting(name).unwrap_or("")
 }
 
 fn handle_show(lower: &str) -> MetaResult {

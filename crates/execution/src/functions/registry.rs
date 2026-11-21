@@ -107,6 +107,11 @@ pub fn default_registry() -> FunctionRegistry {
         reg.register(f);
     }
 
+    // json_build_object (text result; no JSON type).
+    for f in super::json::all_json_functions() {
+        reg.register(f);
+    }
+
     // PostgreSQL catalog functions pgwire clients call.
     for f in super::pg_catalog::all_pg_catalog_functions() {
         reg.register(f);
@@ -301,6 +306,8 @@ mod tests {
             scale: 2,
         };
         let cases: Vec<(&str, Vec<DataType>)> = vec![
+            ("__single_row_check", vec![i.clone(), s.clone()]),
+            ("__single_row_check", vec![i.clone(), dec.clone()]),
             ("greatest", vec![i32t.clone(), i.clone()]),
             ("least", vec![i.clone(), f.clone()]),
             ("greatest", vec![dec.clone(), dec.clone()]),
@@ -367,6 +374,24 @@ mod tests {
             ("pg_is_other_temp_schema", vec![i.clone()]),
             ("obj_description", vec![i.clone(), s.clone()]),
             ("col_description", vec![i.clone(), i32t.clone()]),
+            ("pg_get_constraintdef", vec![i.clone(), DataType::Boolean]),
+            ("pg_get_expr", vec![s.clone(), i.clone(), DataType::Boolean]),
+            (
+                "pg_get_indexdef",
+                vec![i.clone(), i32t.clone(), DataType::Boolean],
+            ),
+            ("pg_get_serial_sequence", vec![s.clone(), s.clone()]),
+            ("pg_collation_is_visible", vec![i.clone()]),
+            ("current_setting", vec![s.clone(), DataType::Boolean]),
+            ("json_build_object", vec![s.clone(), i.clone()]),
+            (
+                "__regclass_name",
+                vec![i.clone(), s.clone(), s.clone(), s.clone()],
+            ),
+            (
+                "__regclass_oid",
+                vec![s.clone(), s.clone(), s.clone(), s.clone()],
+            ),
         ];
         let reg = default_registry();
         for (name, arg_types) in cases {

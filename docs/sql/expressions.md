@@ -23,6 +23,78 @@ Arneb supports a wide range of SQL expressions for filtering, transforming, and 
 | `<=` | Less than or equal | `age <= 65` |
 | `>=` | Greater than or equal | `score >= 90` |
 
+## Regular Expression Match Operators
+
+PostgreSQL's POSIX match operators. Each is the same as a
+[`REGEXP_LIKE`](/sql/functions#regexp_like) call:
+
+| Operator | Meaning | Same as |
+|----------|---------|---------|
+| `a ~ p` | `a` matches `p` | `regexp_like(a, p)` |
+| `a ~* p` | matches, ignoring case | `regexp_like(a, '(?i)' \|\| p)` |
+| `a !~ p` | does not match | `NOT regexp_like(a, p)` |
+| `a !~* p` | does not match, ignoring case | `NOT regexp_like(a, '(?i)' \|\| p)` |
+
+```sql
+SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname !~ '^pg_';
+SELECT * FROM users WHERE email ~* '@example\.com$';
+```
+
+- A match is found anywhere in the string unless the pattern is anchored
+  (`^`, `$`), as in PostgreSQL.
+- A `NULL` operand gives `NULL`.
+- The patterns use the Rust `regex` syntax. PostgreSQL-only syntax such as
+  back-references (`\1`) and look-around (`(?=...)`, `(?<=...)`) is refused.
+  A constant pattern is checked at planning time, with an error that names
+  the operator.
+
+## Untyped String Literals
+
+A quoted literal compared with, or combined with, a number takes the
+number's type, as PostgreSQL's untyped literals do:
+
+```sql
+SELECT * FROM t WHERE int_col = '0';         -- same as int_col = 0
+SELECT NULLIF(n_live_tup, '0') FROM ...;     -- BIGINT
+SELECT COALESCE(x, '0') + 1 FROM t;
+```
+
+- Only a string *literal* is converted. A text column compared with a number
+  column is still a type error.
+- A literal that is not a number of that type is an error:
+  `x = 'abc'` gives `invalid input syntax for type bigint: "abc"`.
+
+## Dates, Timestamps and Intervals
+
+An interval can be written in the SQL form `INTERVAL '3' MONTH` or in
+PostgreSQL's string form `INTERVAL '3 months'` / `INTERVAL '-1 day'`. The
+units are `YEAR`, `QUARTER`, `MONTH`, `WEEK`, `DAY`, `HOUR`, `MINUTE` and
+`SECOND`, singular or plural.
+
+| Expression | Result |
+|------------|--------|
+| `date ± INTERVAL 'n' DAY` (or `WEEK`) | `DATE` |
+| `date ± INTERVAL 'n' MONTH` (or `QUARTER`, `YEAR`) | `DATE`; the day is clamped to the end of a shorter month (`DATE '2000-03-31' - INTERVAL '1 month'` is `2000-02-29`) |
+| `date ± INTERVAL 'n' HOUR` (or `MINUTE`, `SECOND`) | `TIMESTAMP` |
+| `timestamp ± INTERVAL ...` | `TIMESTAMP` |
+| `date - date` | `INTEGER`, the number of days (PostgreSQL; Trino has no such operator) |
+| `date ± integer` | `DATE` |
+
+```sql
+SELECT o_orderdate + INTERVAL '1 month' FROM orders;
+SELECT count(*) FROM orders WHERE o_orderdate >= date_trunc('year', now() + INTERVAL '-30 year');
+SELECT DATE '2000-01-01' - o_orderdate FROM orders;   -- days
+```
+
+- An interval is not a value of its own: it can only be added to or
+  subtracted from a `DATE` or `TIMESTAMP`. `SELECT INTERVAL '1 day'` and
+  `INTERVAL '1 day' * 2` are refused.
+- A string with several parts (`INTERVAL '1 day 2 hours'`) and
+  `INTERVAL '...' DAY TO SECOND` are refused.
+- A `DATE` compared with a `TIMESTAMP` (`=`, `<`, `BETWEEN`, `IN`, ...)
+  compares as a `TIMESTAMP` at midnight, and a `DATE` widens to `TIMESTAMP`
+  where the two meet in `CASE`, `COALESCE` or a `UNION`.
+
 ## Logical Operators
 
 | Operator | Description | Example |
@@ -113,6 +185,9 @@ expression BETWEEN low AND high
 SELECT * FROM orders WHERE total BETWEEN 100 AND 500;
 ```
 
+A `DATE` tested against `TIMESTAMP` bounds compares as a `TIMESTAMP` (see
+[Dates, Timestamps and Intervals](#dates-timestamps-and-intervals)).
+
 ## IN
 
 Test whether a value matches any value in a list or subquery.
@@ -166,8 +241,43 @@ SELECT ARRAY[1, 2, 3], ARRAY['a,b', NULL];
 `x = ANY (array)` and `x <> ALL (array)` work over an array expression or an
 array bind parameter (for example `= ANY($1)` with `{}` or `{1,NULL}`):
 `= ANY` over an empty array is false, and over an array with a `NULL` element
-it is `NULL` unless another element matches. Array subscripts and array
-operators other than these are not supported.
+it is `NULL` unless another element matches. Array operators other than
+these are not supported.
+
+### Array subscripts
+
+`array[i]` is the element at 1-based position `i`. Wrap any expression other
+than a column in parentheses: `(ARRAY[10, 20, 30])[2]` is `20`.
+
+```sql
+SELECT nspname FROM pg_catalog.pg_namespace
+WHERE nspname = (pg_catalog.current_schemas(true))[1];
+```
+
+- A position out of range (including `0` and negative positions) gives
+  `NULL`, as does a `NULL` array or a `NULL` position.
+- The position must be an integer. Slices (`a[1:2]`) are refused, and
+  arrays have one dimension, so `a[1][1]` is a type error.
+
+## Composite Field Access
+
+`(expr).field` reads one field of a composite (row) value. In Arneb the
+composite values come from `information_schema._pg_expandarray(array)`, a
+set-returning function that yields one `(x, n)` row per element (the
+element and its 1-based position), which PostgreSQL drivers use to list key
+columns:
+
+```sql
+SELECT (information_schema._pg_expandarray(ARRAY[7, 8])).n;   -- 1, 2
+SELECT (k.e).x, (k.e).n
+FROM (SELECT information_schema._pg_expandarray(ARRAY[7, 8]) AS e) k;
+```
+
+- An unaliased `(expr).field` column is named after the field, as in
+  PostgreSQL.
+- An unknown field is an error naming it. A composite value itself cannot be
+  sent to a client: selecting `_pg_expandarray(...)` without a field fails
+  with `composite values are not supported over pgwire`.
 
 ## Subquery Expressions
 

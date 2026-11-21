@@ -32,3 +32,6 @@ Thumbs.db
 # Frontend
 web/node_modules/
 /.dev-certs/
+
+# Metabase Tier 2 probe admin password (scripts/client-smoke/metabase/probe.py)
+scripts/client-smoke/metabase/.probe-password

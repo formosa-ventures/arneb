@@ -22,10 +22,94 @@ The same job checks the 22 TPC-H queries against DuckDB and runs 5 rounds of
 20 concurrent queries with the admission cap lifted, failing on any error.
 
 Superset itself and Metabase are not started in CI. Superset reaches Trino
-through the SQLAlchemy dialect checked above. Metabase's Trino driver uses
-the Trino JDBC driver; the `system.jdbc` tables its metadata queries read
-are covered by the protocol test suite, but Metabase itself has not been run
-against Arneb yet.
+through the SQLAlchemy dialect checked above. Metabase is checked by hand
+over pgwire ([below](#metabase)); in CI, the `metabase_corpus` protocol test
+runs every statement Metabase sent during that check. Metabase's Trino
+driver uses the Trino JDBC driver; the `system.jdbc` tables its metadata
+queries read are covered by the protocol test suite, but that driver has
+not been run against Arneb.
+
+## Metabase
+
+Checked by hand with Metabase v0.64.8.3 and its built-in **PostgreSQL**
+driver (pgJDBC), on the client-smoke cluster (a coordinator and two workers
+on TPC-H SF1). The steps and scripts are in
+`scripts/client-smoke/metabase/README.md`.
+
+### Connecting
+
+Add a database of type **PostgreSQL**:
+
+| Setting | Value |
+|---|---|
+| Host, Port | The coordinator and its pgwire port (`5432` by default) |
+| Database name | Any name; Arneb does not use it (see below) |
+| Username, Password | An Arneb user, if [authentication](/guide/configuration#authentication) is on; otherwise any user name |
+| Use a secure connection (SSL) | Off, unless pgwire [TLS](/guide/configuration#tls) is configured |
+| Additional JDBC connection string options | **`binaryTransfer=false`** (required, see the gaps below) |
+| Schemas | All, or the schemas to show |
+
+One Metabase database shows one Arneb catalog: the session's catalog, which
+is the server's default (`current_database()` returns its name).
+`information_schema` and `pg_catalog` describe only the session's catalog,
+as PostgreSQL's describe only the current database. A client that issues
+`SET search_path TO catalog.schema` sees that catalog instead. Metabase
+sends no `SET search_path`, so it always shows the default catalog.
+
+### What works
+
+With `binaryTransfer=false`, Metabase's sync finds all 8 TPC-H tables and
+61 columns, with the same Metabase types (`base_type`) and database types
+as against PostgreSQL 17 holding the same DDL, and no statement is answered
+by the `pg_catalog` fallback. These work, with the same results as DuckDB
+on the same data apart from the day-of-week and decimal-average gaps below:
+- native SQL questions, including a `{{variable}}` parameter;
+- table preview, count, sum, average, min, max, standard deviation,
+  distinct count, median (`percentile_cont`);
+- grouping by month, year, quarter of year, week and a numeric binning;
+- date range and relative date filters ("last 30 years"), `contains` and
+  `starts with`;
+- sorting by an aggregate with a limit, custom expressions (arithmetic,
+  `CASE`, string functions, `datetime-diff`, `get-year`), cumulative count,
+  explicit joins and nested questions;
+- filter drop-downs (field values) and the x-ray of a table.
+
+The SQL features this needed are general and documented in
+[Expressions](/sql/expressions) (regex operators, intervals, `date - date`,
+subscripts, field access, untyped literals) and
+[Functions](/sql/functions) (`format`, `percentile_cont`/`percentile_disc`,
+`current_schemas`, `col_description`).
+
+### Known gaps
+
+- **`binaryTransfer=false` is required.** Arneb sends every result column
+  as text, even when the client asks for binary. pgJDBC asks for binary
+  once a statement has run 5 times on a connection (it then prepares it on
+  the server), and misreads the text: in a sync, some tables after the
+  fifth end up with no fields, with
+  `ArrayIndexOutOfBoundsException: Index 1 out of bounds for length 1` in
+  Metabase's log. Binary result encoding is a follow-up.
+- **Day of week is ISO.** `EXTRACT(DOW ...)` follows Trino (Monday = 1 …
+  Sunday = 7), not PostgreSQL (Sunday = 0), so Metabase's "day of week"
+  grouping labels Sunday as day 8 instead of day 1. The counts per day are
+  right.
+- **Averages of decimals keep the column's scale** (Trino's rule), so
+  Metabase shows `151219.54` where PostgreSQL shows `151219.5376…`.
+- **No views or constraints in the catalog.** `views`, primary and foreign
+  keys are always empty, so Metabase finds no keys and no table
+  relationships; set them in the table metadata settings.
+- **No row counts.** `pg_stat_user_tables.n_live_tup` is 0, so Metabase
+  shows no estimated row counts.
+- **Regular expressions are Rust's `regex` syntax.** POSIX-only syntax
+  (back-references, look-around) in a native question or a regex filter is
+  refused.
+- **One-part intervals only.** `INTERVAL '1 day 2 hours'` and
+  `INTERVAL '...' DAY TO SECOND` are refused; `INTERVAL '-30 year'` and
+  `INTERVAL '3' MONTH` work.
+- **Column names of unaliased expressions** are the expression's text
+  (`upper(n_name)`, `1 + 1`), where PostgreSQL uses the function name or
+  `?column?`. Metabase aliases every column it generates, so this only shows
+  in native questions.
 
 ## Not supported yet
 
@@ -61,14 +145,13 @@ against Arneb yet.
     `information_schema.tables`, `columns` or `schemata` across every
     visible catalog), whatever it asks for. Each
     such answer is logged at `warn` on `arneb::protocol` with its SQL and
-    counted in `arneb_pg_catalog_fallbacks_total`. Metabase's PostgreSQL
-    driver has not been tried.
+    counted in `arneb_pg_catalog_fallbacks_total`.
   - Array and correlated-subquery limits (see the expression and function
     pages for the full rules):
     - `array_agg` over `smallint`, `tinyint`, `bytea` and `decimal64`
       values fails at run time.
-    - Aggregate `ORDER BY` works in `array_agg` only. `FILTER` and
-      `WITHIN GROUP` are refused.
+    - Aggregate `ORDER BY` works in `array_agg` only, and `WITHIN GROUP`
+      in `percentile_cont`/`percentile_disc` only. `FILTER` is refused.
     - `unnest` and `generate_subscripts` work only as whole `SELECT`
       items. `generate_subscripts` takes dimension 1 only, and an untyped
       argument is refused.

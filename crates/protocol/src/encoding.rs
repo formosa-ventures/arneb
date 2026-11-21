@@ -361,22 +361,18 @@ fn format_decimal128(value: i128, _precision: u8, scale: i8) -> Option<String> {
     ))
 }
 
-/// The error for a struct (composite) value reaching the client: composites
-/// stay inside the plan (`(expr).field` reads them).
-fn composite_error() -> PgWireError {
+/// The error for a struct (composite) column requested in binary: there is
+/// no binary composite encoding here. In text, a struct goes as Arrow
+/// displays it (`{x: 1, n: a}`).
+fn composite_binary_error(field: &FieldInfo) -> PgWireError {
     PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
         "ERROR".to_string(),
         "0A000".to_string(),
-        "composite values are not supported over pgwire".to_string(),
+        format!(
+            "binary result format is not supported for composite values (column \"{}\")",
+            field.name()
+        ),
     )))
-}
-
-fn has_struct(dt: &DataType) -> bool {
-    match dt {
-        DataType::Struct(_) => true,
-        DataType::List(element) => has_struct(element),
-        _ => false,
-    }
 }
 
 fn has_arrow_struct(dt: &arrow_types::DataType) -> bool {
@@ -389,15 +385,6 @@ fn has_arrow_struct(dt: &arrow_types::DataType) -> bool {
     }
 }
 
-/// Refuses result columns of a struct type (or an array of one): there is no
-/// pgwire encoding for composite values.
-pub fn refuse_composite_columns(columns: &[ColumnInfo]) -> PgWireResult<()> {
-    if columns.iter().any(|c| has_struct(&c.data_type)) {
-        return Err(composite_error());
-    }
-    Ok(())
-}
-
 /// Encodes `Vec<RecordBatch>` into a vector of pgwire `PgWireResult<DataRow>` entries
 /// suitable for streaming. Returns the encoded rows and total row count.
 pub fn encode_record_batches(
@@ -408,14 +395,6 @@ pub fn encode_record_batches(
     let mut total_count = 0usize;
 
     for batch in batches {
-        if batch
-            .schema()
-            .fields()
-            .iter()
-            .any(|f| has_arrow_struct(f.data_type()))
-        {
-            return Err(composite_error());
-        }
         let num_rows = batch.num_rows();
         total_count += num_rows;
         let columns: Vec<ArrayRef> = batch
@@ -441,6 +420,9 @@ pub fn encode_record_batches(
             .collect();
         for (field, array) in schema.iter().zip(&columns) {
             if field.format() == FieldFormat::Binary {
+                if has_arrow_struct(array.data_type()) {
+                    return Err(composite_binary_error(field));
+                }
                 check_binary(field, array.data_type())?;
             }
         }

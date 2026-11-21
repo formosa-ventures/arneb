@@ -453,11 +453,13 @@ async fn array_subscripts_and_composites() {
             cells(&[Some("3"), Some("2")]),
         ]
     );
-    // Composites stay inside the plan.
-    let message = error_message(
-        &client,
-        "SELECT information_schema._pg_expandarray(ARRAY[1])",
-    )
-    .await;
-    assert_eq!(message, "composite values are not supported over pgwire");
+    // A composite reaching the client goes in text, as Arrow displays it.
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT information_schema._pg_expandarray(ARRAY[7])"
+        )
+        .await,
+        [cells(&[Some("{x: 7, n: 1}")])]
+    );
 }

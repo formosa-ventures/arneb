@@ -90,6 +90,9 @@ Notes on the evidence:
 4. The 25 probe questions and native SQL with a `{{variable}}` parameter
    pass end to end against Arneb, with the same results as DuckDB on SF1
    where the result is data.
+   - Result (2026-11-21): 18 of 20 data results match DuckDB; the two
+     deviations are by ruling: `EXTRACT(DOW)` keeps Trino's numbering (R10)
+     and a decimal `avg` keeps the column's scale (R11).
 5. These features are general engine features, documented, and usable in
    user SQL:
    - regex operators `~`, `!~`, `~*`, `!~*`;
@@ -242,7 +245,7 @@ for numbers (`objsubid = '0'`, `NULLIF(n_live_tup, '0')`).
   - Unknown field names are a plan-time error.
 - Struct values over pgwire are outside this change: getPrimaryKeys
   selects them only inside the subquery. A struct reaching the client is
-  refused with a clear error, unless it's already supported. (Text was:
+  refused with a clear error, unless it's already supported. (Resolution:
   a struct column goes as Arrow displays it, `{x: 1, n: a}`, as before this
   change; a binary request for one is refused with `0A000`.)
 

@@ -99,6 +99,11 @@ subscripts, field access, untyped literals) and
 - **One-part intervals only.** `INTERVAL '1 day 2 hours'` and
   `INTERVAL '...' DAY TO SECOND` are refused; `INTERVAL '-30 year'` and
   `INTERVAL '3' MONTH` work.
+- **Medians and percentiles are not memory-accounted.** `percentile_cont`
+  and `percentile_disc` buffer every value of a group on one node, outside
+  the query memory pool, so a large ungrouped median (Metabase's "Median"
+  over a big table) can exhaust the node's memory instead of failing with
+  a memory-limit error.
 - **Column names of unaliased expressions** are the expression's text
   (`upper(n_name)`, `1 + 1`), where PostgreSQL uses the function name or
   `?column?`. Metabase aliases every column it generates, so this only shows
@@ -139,6 +144,9 @@ subscripts, field access, untyped literals) and
     visible catalog), whatever it asks for. Each
     such answer is logged at `warn` on `arneb::protocol` with its SQL and
     counted in `arneb_pg_catalog_fallbacks_total`.
+  - So an `information_schema` statement answered by that fallback lists
+    every visible catalog, while the same statement run in the engine
+    lists only the session's catalog.
   - Array and correlated-subquery limits (see the expression and function
     pages for the full rules):
     - `array_agg` over `smallint`, `tinyint`, `bytea` and `decimal64`

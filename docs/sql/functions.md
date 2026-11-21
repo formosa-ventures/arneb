@@ -531,7 +531,10 @@ These are PostgreSQL's ordered-set aggregates, which Metabase's "Median" and
   `OVER` are refused.
 - They run in a single phase (no partial aggregation on workers) and buffer
   every value of a group, like `array_agg`, and like it they fail at run time
-  over `smallint`, `tinyint`, `bytea` and `decimal64` values.
+  over `bytea` and `decimal64` values.
+- Known gap: the buffered values are not counted against the query memory
+  limit, so a large ungrouped percentile (all values on one node) can
+  exhaust memory instead of failing with a memory-limit error.
 
 ## Date and Time Functions
 

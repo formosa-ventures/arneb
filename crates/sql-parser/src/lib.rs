@@ -1829,4 +1829,63 @@ mod tests {
     fn dollar_placeholders_reject_sql_that_does_not_tokenize() {
         assert!(dollar_placeholders("SELECT 'unterminated $1").is_err());
     }
+
+    // -- Regex operators --
+
+    fn regexp_like_args(e: &Expr) -> &[FunctionArg] {
+        match e {
+            Expr::Function { name, args, .. } if name == "regexp_like" => args,
+            other => panic!("expected regexp_like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regex_operators_lower_to_regexp_like() {
+        // `~` -> regexp_like(a, p)
+        let e = first_projection("SELECT a ~ 'x' FROM t");
+        let args = regexp_like_args(&e);
+        assert_eq!(args.len(), 2);
+        assert!(matches!(
+            &args[1],
+            FunctionArg::Unnamed(Expr::Literal { value: ScalarValue::Utf8(s), .. }) if s == "x"
+        ));
+
+        // `~*` with a literal folds the (?i) prefix into the literal.
+        let e = first_projection("SELECT a ~* 'x' FROM t");
+        assert!(matches!(
+            &regexp_like_args(&e)[1],
+            FunctionArg::Unnamed(Expr::Literal { value: ScalarValue::Utf8(s), .. }) if s == "(?i)x"
+        ));
+
+        // `!~` -> NOT regexp_like(..)
+        let e = first_projection("SELECT a !~ 'x' FROM t");
+        let Expr::UnaryOp { op, expr, .. } = &e else {
+            panic!("expected NOT, got {e:?}");
+        };
+        assert_eq!(*op, UnaryOp::Not);
+        regexp_like_args(expr);
+
+        // `!~*` with a non-literal pattern uses CONCAT('(?i)', p).
+        let e = first_projection("SELECT a !~* b FROM t");
+        let Expr::UnaryOp { expr, .. } = &e else {
+            panic!("expected NOT, got {e:?}");
+        };
+        let args = regexp_like_args(expr);
+        match &args[1] {
+            FunctionArg::Unnamed(Expr::Function { name, args, .. }) => {
+                assert_eq!(name, "CONCAT");
+                assert!(matches!(
+                    &args[0],
+                    FunctionArg::Unnamed(Expr::Literal { value: ScalarValue::Utf8(s), .. }) if s == "(?i)"
+                ));
+            }
+            other => panic!("expected CONCAT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regex_operator_rejects_invalid_constant_pattern() {
+        let err = parse("SELECT a ~ '(' FROM t").unwrap_err().to_string();
+        assert!(err.contains("invalid regular expression in ~"), "{err}");
+    }
 }

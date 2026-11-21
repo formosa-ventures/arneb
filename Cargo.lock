@@ -505,6 +505,7 @@ version = "0.2.2"
 dependencies = [
  "arneb-common",
  "chrono",
+ "regex",
  "serde",
  "sqlparser",
 ]

@@ -102,6 +102,7 @@ runs the in-binary defaults.
 | Selective-dim-first join order | on | `ARNEB_SELECTIVE_DIM_FIRST=0` | Join-order scoring charges each left-deep intermediate at full cardinality, so filtered dimensions join before the fact table. |
 | Eager aggregation | on | `ARNEB_EAGER_AGG=0` | Pre-aggregates below a join when the group keys are the join keys (q13: orders 45M → 4.5M rows before the join). |
 | Parallel final aggregate | on | `ARNEB_PARALLEL_FINAL_AGG=0` | Hash-partitions the final aggregate across workers instead of a single-partition merge. |
+| Partial aggregate over a join | on | `ARNEB_PARTIAL_AGG_OVER_JOIN=0` | Runs the partial aggregate inside the join's fragment, so each join task sends its aggregated partials instead of every joined row through the exchange (`SELECT count(*)` over a lineitem self-join at SF1: 1.8 billion rows → 1 per task; worker memory 2.7 GB → 0.2 GB). |
 | Aggregate pre-size | on | `ARNEB_AGG_PRESIZE=0` | Sizes hash-aggregate tables from the planner's group estimate (capped) to avoid rehash cascades. |
 | Adaptive aggregate pre-size | on | `ARNEB_AGG_PRESIZE_ADAPTIVE=0` | Exact final-from-partials sizing plus data-driven partial growth for high-cardinality `GROUP BY`. |
 | Data-parallel scan | on | `ARNEB_DATA_PARALLEL_SCAN=0` | Splits a fact-table scan across all workers (M×N fan-out) instead of one worker per table. |

@@ -35,7 +35,7 @@ pub use exchange_client::ExchangeClient;
 pub use flight_service::{
     serve_flight, start_flight_server, BufferKind, CancelQueryCallback, DfNotifyCallback,
     DfReportCallback, FlightState, HeartbeatCallback, ReleaseQueryCallback, TaskCallback,
-    TaskStatusCallback, TaskStatusResponse,
+    TaskFailureCallback, TaskStatusCallback, TaskStatusResponse,
 };
 pub use heartbeat::{
     send_heartbeat, send_heartbeat_with, HeartbeatError, HeartbeatMessage, HeartbeatReply,
@@ -50,10 +50,10 @@ pub use security::{
     ClusterTls, FlightClient, MIN_CLUSTER_SECRET_LEN,
 };
 pub use task_descriptor::{SourceExchange, TaskDescriptor};
-pub use task_error::TaskFailure;
+pub use task_error::{TaskFailure, TaskFailureReport};
 pub use task_submission::{
     cancel_query, cancel_query_with, notify_dynamic_filter, release_query, report_dynamic_filters,
-    submit_task, submit_task_with,
+    report_task_failure, submit_task, submit_task_with,
 };
 
 /// Test helper: create a FlightServiceServer for integration tests.

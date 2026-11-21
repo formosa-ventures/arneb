@@ -81,6 +81,25 @@ pub async fn report_dynamic_filters(
     drain_ack(stream, "report_dynamic_filters").await
 }
 
+/// Worker → coord: a task failed. Best effort: the coordinator also
+/// learns of the failure when a consumer reads the task's output.
+pub async fn report_task_failure(
+    coord_address: &str,
+    report: &crate::task_error::TaskFailureReport,
+) -> Result<(), String> {
+    let mut client = connect(coord_address, cluster_security()).await?;
+    let action = Action {
+        r#type: "report_task_failure".to_string(),
+        body: report.encode().into(),
+    };
+    let stream = client
+        .do_action(action)
+        .await
+        .map_err(|e| format!("report_task_failure RPC failed: {e}"))?
+        .into_inner();
+    drain_ack(stream, "report_task_failure").await
+}
+
 /// Coord → worker: notify a worker task that a dynamic filter resolved.
 ///
 /// A1.3 (2026-05-27): defined but currently has no producer call site.

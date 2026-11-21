@@ -2744,6 +2744,10 @@ impl<'a> QueryPlanner<'a> {
                         span: None,
                     });
                 }
+                if let Some(kind) = privilege_object_kind(name) {
+                    return Box::pin(self.plan_has_privilege(kind, name, plan_args, node_span))
+                        .await;
+                }
                 let plan_order_by = if order_by.is_empty() {
                     None
                 } else {
@@ -5629,7 +5633,9 @@ fn using_pairs(
 
 /// A session function the planner folds to a literal: `current_catalog` and
 /// `current_schema` (Trino's niladic forms) and `current_database()` (a
-/// call, `call`), from the session's defaults. `None` for any other name.
+/// call, `call`), from the session's defaults; `current_user`,
+/// `session_user` and `current_role` from the session's user when the
+/// catalog knows it. `None` for any other name.
 fn session_literal(
     catalog: &CatalogManager,
     name: &str,
@@ -5641,6 +5647,8 @@ fn session_literal(
         catalog.default_catalog()
     } else if is("current_schema") {
         catalog.default_schema()
+    } else if is("current_user") || is("session_user") || is("current_role") {
+        catalog.session_user()?
     } else {
         return None;
     };
@@ -5660,9 +5668,23 @@ fn session_function_name(expr: &ast::Expr) -> Option<String> {
         _ => return None,
     };
     let lower = name.to_ascii_lowercase();
-    let folds = matches!(lower.as_str(), "current_catalog" | "current_schema")
-        || (call && lower == "current_database");
+    let folds = matches!(
+        lower.as_str(),
+        "current_catalog" | "current_schema" | "current_user" | "session_user" | "current_role"
+    ) || (call && lower == "current_database");
     folds.then_some(lower)
+}
+
+/// The object kind `__has_privilege` checks for a privilege function.
+fn privilege_object_kind(name: &str) -> Option<&'static str> {
+    [
+        ("has_table_privilege", "table"),
+        ("has_any_column_privilege", "any_column"),
+        ("has_schema_privilege", "schema"),
+    ]
+    .into_iter()
+    .find(|(n, _)| name.eq_ignore_ascii_case(n))
+    .map(|(_, kind)| kind)
 }
 
 /// `CAST(<regclass expr> AS TEXT)`: the operand is a `regclass` conversion
@@ -5749,6 +5771,69 @@ impl QueryPlanner<'_> {
         Ok(PlanExpr::Function {
             order_by: None,
             name: "__regclass_name".to_string(),
+            args: call_args,
+            distinct: false,
+            span,
+        })
+    }
+
+    /// `has_table_privilege`, `has_any_column_privilege` or
+    /// `has_schema_privilege` (`([role,] object, privilege)`) as
+    /// `__has_privilege`, with the session's user and privileges as
+    /// literals: the runtime check cannot reach the catalog.
+    #[inline(never)]
+    async fn plan_has_privilege(
+        &self,
+        kind: &str,
+        name: &str,
+        mut args: Vec<PlanExpr>,
+        span: Option<arneb_sql_parser::Span>,
+    ) -> Result<PlanExpr, PlanError> {
+        let literal = |v: String| PlanExpr::Literal {
+            value: ScalarValue::Utf8(v),
+            span,
+        };
+        let session_user = self.catalog.session_user().unwrap_or_default().to_string();
+        match args.len() {
+            2 => args.insert(0, literal(session_user.clone())),
+            3 => {}
+            n => {
+                return Err(PlanError::UnsupportedExpression {
+                    message: format!("function {name} takes 2 or 3 arguments, got {n}"),
+                    location: span.map(|s| s.start),
+                })
+            }
+        }
+        let privileges = self.catalog.session_privileges().await;
+        let schemas = privileges
+            .schemas
+            .join(&arneb_common::pg_oid::RELATION_ENTRY_SEP.to_string());
+        let field = arneb_common::pg_oid::RELATION_FIELD_SEP;
+        let tables = privileges
+            .tables
+            .iter()
+            .map(|(schema, table, held)| {
+                let letters: String = arneb_common::pg_oid::TABLE_PRIVILEGE_LETTERS
+                    .iter()
+                    .filter(|(_, p)| held.iter().any(|h| h.to_string() == *p))
+                    .map(|(letter, _)| *letter)
+                    .collect();
+                format!("{schema}{field}{table}{field}{letters}")
+            })
+            .collect::<Vec<_>>()
+            .join(&arneb_common::pg_oid::RELATION_ENTRY_SEP.to_string());
+        let mut call_args = vec![literal(kind.to_string())];
+        call_args.extend(args);
+        call_args.extend([
+            literal(session_user),
+            literal(self.catalog.default_catalog().to_string()),
+            literal(self.catalog.default_schema().to_string()),
+            literal(schemas),
+            literal(tables),
+        ]);
+        Ok(PlanExpr::Function {
+            order_by: None,
+            name: "__has_privilege".to_string(),
             args: call_args,
             distinct: false,
             span,
@@ -7033,6 +7118,13 @@ mod tests {
         }
     }
 
+    async fn plan_with(catalog: &CatalogManager, sql: &str) -> Result<LogicalPlan, PlanError> {
+        let planner = QueryPlanner::new(catalog);
+        planner
+            .plan_statement(&arneb_sql_parser::parse(sql).expect("parse failed"))
+            .await
+    }
+
     /// The projected expressions and column names of a plain `SELECT`.
     fn projection(plan: &LogicalPlan) -> (Vec<String>, Vec<String>) {
         let LogicalPlan::Projection { exprs, schema, .. } = plan else {
@@ -7046,10 +7138,11 @@ mod tests {
 
     #[tokio::test]
     async fn session_functions_fold_and_keep_their_names() {
-        let catalog = test_catalog();
-        let plan = plan_sql(
-            "SELECT current_database(), current_catalog, current_schema, \
-             current_database() AS db",
+        let catalog = test_catalog().with_session_user("alice");
+        let plan = plan_with(
+            &catalog,
+            "SELECT current_database(), current_catalog, current_user, session_user, \
+             current_schema, current_database() AS db",
         )
         .await
         .unwrap();
@@ -7058,10 +7151,19 @@ mod tests {
         assert_eq!(
             projection(&plan),
             (
-                vec![db.clone(), db.clone(), schema, db],
+                vec![
+                    db.clone(),
+                    db.clone(),
+                    "'alice'".to_string(),
+                    "'alice'".to_string(),
+                    schema,
+                    db
+                ],
                 [
                     "current_database",
                     "current_catalog",
+                    "current_user",
+                    "session_user",
                     "current_schema",
                     "db"
                 ]
@@ -7069,8 +7171,66 @@ mod tests {
                 .to_vec()
             )
         );
-        // A bare `current_database` is a column reference, as in PostgreSQL.
+        // Without a known user `current_user` does not fold; a bare
+        // `current_database` is a column reference, as in PostgreSQL.
+        let (exprs, _) = projection(&plan_sql("SELECT current_user").await.unwrap());
+        assert!(!exprs[0].starts_with('\''), "{exprs:?}");
         assert!(plan_sql("SELECT current_database").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn privilege_functions_carry_the_session_privileges() {
+        let catalog = test_catalog().with_session_user("alice");
+        let plan = plan_with(
+            &catalog,
+            "SELECT has_table_privilege('t', 'select'), \
+             has_any_column_privilege(current_user, 't', 'update'), \
+             has_schema_privilege('alice', 's', 'usage')",
+        )
+        .await
+        .unwrap();
+        let LogicalPlan::Projection { exprs, schema, .. } = &plan else {
+            panic!("expected Projection, got {plan}");
+        };
+        let privileges = catalog.session_privileges().await;
+        for (expr, (kind, role)) in exprs.iter().zip([
+            ("table", "alice"),
+            ("any_column", "alice"),
+            ("schema", "alice"),
+        ]) {
+            let PlanExpr::Function { name, args, .. } = expr else {
+                panic!("expected a call, got {expr}");
+            };
+            assert_eq!(name, "__has_privilege");
+            assert_eq!(args.len(), 9, "{expr}");
+            assert_eq!(args[0].to_string(), format!("'{kind}'"));
+            assert_eq!(args[1].to_string(), format!("'{role}'"));
+            assert_eq!(args[4].to_string(), "'alice'");
+            assert_eq!(
+                args[5].to_string(),
+                format!("'{}'", catalog.default_catalog())
+            );
+            // Every visible table is listed with all four privileges.
+            let PlanExpr::Literal {
+                value: ScalarValue::Utf8(tables),
+                ..
+            } = &args[8]
+            else {
+                panic!("tables literal: {}", args[8]);
+            };
+            let entries = tables
+                .split(arneb_common::pg_oid::RELATION_ENTRY_SEP)
+                .filter(|e| !e.is_empty())
+                .count();
+            assert_eq!(entries, privileges.tables.len());
+            assert!(tables.ends_with("SIUD"), "{tables:?}");
+        }
+        assert!(schema.iter().all(|c| c.data_type == DataType::Boolean));
+        let err = plan_sql("SELECT has_table_privilege('t')")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("takes 2 or 3 arguments"), "{err}");
     }
 
     #[tokio::test]

@@ -5,7 +5,9 @@
 //! index, default and sequence definition functions SQLAlchemy reflection
 //! calls (Arneb has none of those objects, so they return NULL); and the
 //! runtime `regclass` conversions the planner emits (`__regclass_name`,
-//! `__regclass_oid`); and `current_setting`.
+//! `__regclass_oid`); the privilege check `has_table_privilege`,
+//! `has_any_column_privilege` and `has_schema_privilege` plan to
+//! (`__has_privilege`); and `current_setting`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,6 +72,7 @@ pub(crate) fn all_pg_catalog_functions() -> Vec<Arc<dyn ScalarFunction>> {
         }),
         Arc::new(RegclassName),
         Arc::new(RegclassOid),
+        Arc::new(HasPrivilegeFunction),
         Arc::new(CurrentSettingFunction),
         Arc::new(CurrentSchemasFunction),
         Arc::new(FormatFunction),
@@ -748,6 +751,206 @@ impl ScalarFunction for RegclassOid {
     }
 }
 
+/// What `has_*_privilege` asks about.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrivilegeObject {
+    Table,
+    AnyColumn,
+    Schema,
+}
+
+impl PrivilegeObject {
+    fn parse(kind: &str) -> Result<Self, ExecutionError> {
+        match kind {
+            "table" => Ok(Self::Table),
+            "any_column" => Ok(Self::AnyColumn),
+            "schema" => Ok(Self::Schema),
+            other => Err(invalid(format!(
+                "__HAS_PRIVILEGE: unknown object kind {other}"
+            ))),
+        }
+    }
+
+    fn function(self) -> &'static str {
+        match self {
+            Self::Table => "has_table_privilege",
+            Self::AnyColumn => "has_any_column_privilege",
+            Self::Schema => "has_schema_privilege",
+        }
+    }
+
+    /// Whether a holder of `held` (letters of [`pg_oid::TABLE_PRIVILEGE_LETTERS`]) has
+    /// `privilege`, for a privilege PostgreSQL accepts on this kind of
+    /// object. Privileges Arneb has no operation for (`TRUNCATE`,
+    /// `REFERENCES`, `TRIGGER`, `MAINTAIN`) and grant options are never
+    /// held: Arneb has no `GRANT`.
+    fn holds(self, privilege: &str, held: &str) -> Result<bool, ExecutionError> {
+        let upper = privilege.trim().to_ascii_uppercase();
+        let (name, grant_option) = match upper.strip_suffix("WITH GRANT OPTION") {
+            Some(name) => (name.trim_end(), true),
+            None => (upper.as_str(), false),
+        };
+        let accepted: &[&str] = match self {
+            Self::Table => &[
+                "SELECT",
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+                "TRUNCATE",
+                "REFERENCES",
+                "TRIGGER",
+                "MAINTAIN",
+            ],
+            Self::AnyColumn => &["SELECT", "INSERT", "UPDATE", "REFERENCES"],
+            Self::Schema => &["USAGE", "CREATE"],
+        };
+        if !accepted.contains(&name) {
+            return Err(invalid(format!(
+                "unrecognized privilege type: \"{}\"",
+                privilege.trim()
+            )));
+        }
+        if self == Self::Schema && name == "CREATE" {
+            return Err(invalid(
+                "has_schema_privilege: the CREATE privilege is not supported",
+            ));
+        }
+        if grant_option {
+            return Ok(false);
+        }
+        Ok(match self {
+            Self::Schema => true,
+            _ => pg_oid::TABLE_PRIVILEGE_LETTERS
+                .iter()
+                .any(|(letter, p)| *p == name && held.contains(*letter)),
+        })
+    }
+}
+
+/// `__has_privilege(kind, role, object, privileges, session_user, catalog,
+/// default_schema, schemas, tables)`: what `has_table_privilege`,
+/// `has_any_column_privilege` and `has_schema_privilege` plan to. The
+/// planner passes the session's privileges as the last five arguments
+/// (literals): `schemas` lists the usable schemas, `tables` holds
+/// `schema<US>table<US>letters` entries. Arneb has no column privileges, so
+/// a column privilege is the table's.
+///
+/// Only the session user's privileges are known, so another `role` fails.
+/// The object is a (possibly quoted, qualified) name or, for a table, an
+/// oid; one that does not exist fails as in PostgreSQL. `privileges` is a
+/// comma-separated list, true when any of them is held. NULL gives NULL.
+#[derive(Debug)]
+struct HasPrivilegeFunction;
+
+impl ScalarFunction for HasPrivilegeFunction {
+    fn name(&self) -> &str {
+        "__HAS_PRIVILEGE"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::Boolean)
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        const NAME: &str = "__HAS_PRIVILEGE";
+        check_arity(NAME, args, 9, 9)?;
+        let rows = args[2].len();
+        if rows == 0 {
+            return Ok(Arc::new(BooleanArray::from(Vec::<bool>::new())));
+        }
+        let text = |i: usize| -> Result<String, ExecutionError> {
+            let a = utf8(&args[i], NAME)?;
+            Ok(if a.is_null(0) {
+                String::new()
+            } else {
+                a.value(0).to_string()
+            })
+        };
+        let kind = PrivilegeObject::parse(&text(0)?)?;
+        let (session_user, catalog, default_schema) = (text(4)?, text(5)?, text(6)?);
+        let (schemas, tables) = (text(7)?, text(8)?);
+        let schemas: Vec<&str> = schemas
+            .split(pg_oid::RELATION_ENTRY_SEP)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut held_by_oid = HashMap::new();
+        for entry in tables
+            .split(pg_oid::RELATION_ENTRY_SEP)
+            .filter(|e| !e.is_empty())
+        {
+            let mut fields = entry.split(pg_oid::RELATION_FIELD_SEP);
+            if let (Some(schema), Some(table), Some(letters)) =
+                (fields.next(), fields.next(), fields.next())
+            {
+                held_by_oid.insert(pg_oid::relation_oid(&catalog, schema, table), letters);
+            }
+        }
+        let roles = utf8(&args[1], NAME)?;
+        let privileges = utf8(&args[3], NAME)?;
+        let object_names = (kind == PrivilegeObject::Schema
+            || !matches!(
+                args[2].data_type(),
+                ArrowDataType::Int64 | ArrowDataType::Int32
+            ))
+        .then(|| utf8(&args[2], NAME))
+        .transpose()?;
+        let object_oids = match object_names {
+            None => Some(int64(&args[2], NAME)?),
+            Some(_) => None,
+        };
+        let mut out = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let object_null = match (&object_names, &object_oids) {
+                (Some(names), _) => names.is_null(row),
+                (_, Some(oids)) => oids.is_null(row),
+                _ => unreachable!(),
+            };
+            if roles.is_null(row) || privileges.is_null(row) || object_null {
+                out.push(None);
+                continue;
+            }
+            let role = roles.value(row);
+            if !session_user.is_empty() && role != session_user {
+                return Err(invalid(format!(
+                    "{}: only the session user's privileges are known, not role \"{role}\"",
+                    kind.function()
+                )));
+            }
+            let held = match kind {
+                PrivilegeObject::Schema => {
+                    let schema = object_names.as_ref().unwrap().value(row);
+                    if !schemas.contains(&schema) {
+                        return Err(invalid(format!("schema \"{schema}\" does not exist")));
+                    }
+                    ""
+                }
+                _ => {
+                    let (oid, shown) = match (&object_names, &object_oids) {
+                        (Some(names), _) => {
+                            let name = names.value(row);
+                            let oid = pg_oid::regclass_oid(name, &catalog, &default_schema)
+                                .ok_or_else(|| {
+                                    invalid(format!("invalid name syntax: \"{name}\""))
+                                })?;
+                            (oid, name.to_string())
+                        }
+                        (_, Some(oids)) => (oids.value(row), oids.value(row).to_string()),
+                        _ => unreachable!(),
+                    };
+                    held_by_oid
+                        .get(&oid)
+                        .copied()
+                        .ok_or_else(|| invalid(format!("relation \"{shown}\" does not exist")))?
+                }
+            };
+            let mut any = false;
+            for privilege in privileges.value(row).split(',') {
+                any |= kind.holds(privilege, held)?;
+            }
+            out.push(Some(any));
+        }
+        Ok(Arc::new(BooleanArray::from(out)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,6 +1117,147 @@ mod tests {
             e = pg_oid::RELATION_ENTRY_SEP
         );
         vec![first, col("file"), col("default"), col(&relations)]
+    }
+
+    /// `__has_privilege` over `default.nation` (all four privileges) and
+    /// `default.ro` (SELECT only), for session user `alice`.
+    fn privilege(kind: &str, role: &str, object: ArrayRef, privileges: &str) -> ArrayRef {
+        let n = object.len();
+        let col = |v: &str| -> ArrayRef { Arc::new(StringArray::from(vec![v; n])) };
+        let tables = format!(
+            "default{f}nation{f}SIUD{e}default{f}ro{f}S",
+            f = pg_oid::RELATION_FIELD_SEP,
+            e = pg_oid::RELATION_ENTRY_SEP
+        );
+        let schemas = format!("default{}pg_catalog", pg_oid::RELATION_ENTRY_SEP);
+        let args = vec![
+            col(kind),
+            col(role),
+            object,
+            col(privileges),
+            col("alice"),
+            col("file"),
+            col("default"),
+            col(&schemas),
+            col(&tables),
+        ];
+        HasPrivilegeFunction
+            .evaluate(&args)
+            .unwrap_or_else(|e| Arc::new(StringArray::from(vec![e.to_string()])) as ArrayRef)
+    }
+
+    fn bools(a: &ArrayRef) -> Vec<Option<bool>> {
+        match a.as_any().downcast_ref::<BooleanArray>() {
+            Some(b) => b.iter().collect(),
+            None => panic!(
+                "{}",
+                a.as_any().downcast_ref::<StringArray>().unwrap().value(0)
+            ),
+        }
+    }
+
+    fn err(a: &ArrayRef) -> String {
+        a.as_any()
+            .downcast_ref::<StringArray>()
+            .expect("an error")
+            .value(0)
+            .to_string()
+    }
+
+    fn names(values: &[Option<&str>]) -> ArrayRef {
+        Arc::new(StringArray::from(values.to_vec()))
+    }
+
+    #[test]
+    fn has_table_privilege_reads_the_session_grants() {
+        let objects = || names(&[Some("nation"), Some("\"default\".\"ro\""), Some("RO"), None]);
+        assert_eq!(
+            bools(&privilege("table", "alice", objects(), "select")),
+            [Some(true), Some(true), Some(true), None]
+        );
+        assert_eq!(
+            bools(&privilege("table", "alice", objects(), "INSERT")),
+            [Some(true), Some(false), Some(false), None]
+        );
+        // Any of a list; grant options and privileges with no Arneb
+        // operation are never held.
+        assert_eq!(
+            bools(&privilege("table", "alice", objects(), "insert, select")),
+            [Some(true), Some(true), Some(true), None]
+        );
+        for p in ["select with grant option", "TRUNCATE", "references"] {
+            assert_eq!(
+                bools(&privilege("table", "alice", objects(), p)),
+                [Some(false), Some(false), Some(false), None],
+                "{p}"
+            );
+        }
+        // By oid.
+        let oid = pg_oid::relation_oid("file", "default", "ro");
+        assert_eq!(
+            bools(&privilege("table", "alice", ints(&[Some(oid)]), "update")),
+            [Some(false)]
+        );
+        // A column privilege is the table's.
+        assert_eq!(
+            bools(&privilege("any_column", "alice", objects(), "update")),
+            [Some(true), Some(false), Some(false), None]
+        );
+    }
+
+    #[test]
+    fn has_privilege_refuses_what_it_cannot_answer() {
+        let nation = || names(&[Some("nation")]);
+        for (kind, role, object, p, want) in [
+            (
+                "table",
+                "alice",
+                names(&[Some("nope")]),
+                "select",
+                "relation \"nope\" does not exist",
+            ),
+            ("table", "bob", nation(), "select", "not role \"bob\""),
+            (
+                "table",
+                "alice",
+                nation(),
+                "usage",
+                "unrecognized privilege type: \"usage\"",
+            ),
+            (
+                "any_column",
+                "alice",
+                nation(),
+                "delete",
+                "unrecognized privilege type",
+            ),
+            (
+                "schema",
+                "alice",
+                names(&[Some("nope")]),
+                "usage",
+                "schema \"nope\" does not exist",
+            ),
+            (
+                "schema",
+                "alice",
+                names(&[Some("default")]),
+                "create",
+                "CREATE privilege is not supported",
+            ),
+        ] {
+            let e = err(&privilege(kind, role, object, p));
+            assert!(e.contains(want), "{kind} {p}: {e}");
+        }
+    }
+
+    #[test]
+    fn has_schema_privilege_is_usage_of_a_listed_schema() {
+        let schemas = names(&[Some("default"), Some("pg_catalog"), None]);
+        assert_eq!(
+            bools(&privilege("schema", "alice", schemas, "USAGE")),
+            [Some(true), Some(true), None]
+        );
     }
 
     #[test]

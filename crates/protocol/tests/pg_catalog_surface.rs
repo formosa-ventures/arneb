@@ -424,6 +424,43 @@ async fn enum_is_empty() {
     assert_eq!(fallbacks(), before);
 }
 
+/// `pg_tables` lists what `pg_class` lists (every relation is a table);
+/// Arneb has no views or materialized views.
+#[tokio::test]
+async fn pg_tables_lists_relations_and_views_are_empty() {
+    let before = fallbacks();
+    let client = connect(pg_server(None).await).await;
+    let r = rows(
+        &client,
+        "SELECT schemaname, tablename, tableowner, hasindexes FROM pg_tables \
+         WHERE schemaname !~ '^pg_' ORDER BY 1, 2",
+    )
+    .await;
+    let names: Vec<_> = r
+        .iter()
+        .map(|row| {
+            format!(
+                "{}.{}",
+                row[0].as_deref().unwrap(),
+                row[1].as_deref().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(names, ["default.nation", "default.region", "staging.raw"]);
+    assert!(r.iter().all(|row| row[3].as_deref() == Some("f")), "{r:?}");
+    let class = one(&client, "SELECT count(*) FROM pg_class").await;
+    let tables = one(&client, "SELECT count(*) FROM pg_tables").await;
+    assert_eq!(class, tables);
+    for sql in [
+        "SELECT schemaname, viewname, viewowner, definition FROM pg_views",
+        "SELECT schemaname, matviewname, matviewowner, tablespace, hasindexes, \
+         ispopulated, definition FROM pg_matviews",
+    ] {
+        assert!(rows(&client, sql).await.is_empty(), "{sql}");
+    }
+    assert_eq!(fallbacks(), before);
+}
+
 #[tokio::test]
 async fn constraint_key_arrays() {
     let before = fallbacks();

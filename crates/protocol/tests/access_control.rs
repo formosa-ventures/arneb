@@ -375,6 +375,55 @@ async fn information_schema_and_stat_tables_hide_denied_tables() {
     assert_eq!(rows, [["0"]]);
 }
 
+/// `current_user` and the `has_*_privilege` functions report the
+/// connection's user and what the rules grant them, in a plain statement
+/// and in one over `pg_catalog`.
+#[tokio::test]
+async fn privilege_functions_follow_the_rules() {
+    let port = pg_server(Arc::new(QueryTracker::new())).await;
+    let alice = pg(port, "alice").await;
+    let rows = pg_rows(
+        &alice
+            .simple_query(
+                "SELECT current_user, has_table_privilege('open_t', 'select'), \
+                 has_table_privilege(current_user, 'default.open_t', 'insert'), \
+                 has_schema_privilege('default', 'usage')",
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(rows, [["alice", "t", "f", "t"]]);
+    // `secret` is hidden from alice: it does not exist for her.
+    let (_, message) = pg_error(&alice, "SELECT has_table_privilege('secret', 'select')").await;
+    assert!(
+        message.contains("relation \"secret\" does not exist"),
+        "{message}"
+    );
+    let (_, message) = pg_error(
+        &alice,
+        "SELECT has_table_privilege('bob', 'open_t', 'select')",
+    )
+    .await;
+    assert!(message.contains("not role \"bob\""), "{message}");
+    let over_pg_tables = "SELECT tablename, \
+         has_table_privilege('\"' || schemaname || '\".\"' || tablename || '\"', 'select, insert'), \
+         has_any_column_privilege(current_user, schemaname || '.' || tablename, 'update') \
+         FROM pg_catalog.pg_tables WHERE schemaname = 'default' ORDER BY 1";
+    let rows = pg_rows(&alice.simple_query(over_pg_tables).await.unwrap());
+    assert_eq!(rows, [["open_t", "t", "f"]]);
+
+    let writer = pg(port, "writer").await;
+    let rows = pg_rows(&writer.simple_query(over_pg_tables).await.unwrap());
+    assert_eq!(rows, [["open_t", "t", "f"], ["secret", "t", "f"]]);
+    let rows = pg_rows(
+        &writer
+            .simple_query("SELECT has_table_privilege('secret', 'delete')")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(rows, [["t"]]);
+}
+
 #[tokio::test]
 async fn trino_checks_reads_and_listings() {
     let base = trino_server(Arc::new(QueryTracker::new())).await;

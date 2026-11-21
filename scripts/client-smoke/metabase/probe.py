@@ -20,7 +20,7 @@ Usage: probe.py METABASE_URL HOST PORT [DB_NAME]
                 comparing the data with DuckDB
   --jdbc-options
                 Metabase's "Additional JDBC connection string options" for
-                the database, e.g. binaryTransfer=false
+                the database (none are needed for Arneb)
 
 Prints one OK/FAIL line per check, FIELD lines (table, column,
 database_type, base_type) for diffing two runs, and finally

@@ -34,8 +34,12 @@ use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 
 use crate::auth::{AuthMethod, AuthStartupHandler};
-use crate::encoding::{column_info_to_field_info, encode_record_batches, refuse_composite_columns};
+use crate::encoding::{
+    column_info_to_field_info, encode_record_batches, refuse_composite_columns,
+    with_described_types, with_result_formats,
+};
 use crate::session::{handle_search_path, SearchPath};
+use pgwire::api::portal::Format;
 
 /// Trait for distributed query execution. Implemented by QueryCoordinator
 /// in the server crate and injected into the protocol handler.
@@ -314,6 +318,7 @@ impl ConnectionHandler {
         &self,
         client: &C,
         sql: &str,
+        format: &Format,
     ) -> Option<PgWireResult<Response>> {
         use crate::timeout::{Command, SessionTimeout};
         if crate::timeout::is_reset_all(sql) {
@@ -350,7 +355,7 @@ impl ConnectionHandler {
                         ExecutionError::InvalidOperation(e),
                     ))
                 })
-                .and_then(metadata_to_response),
+                .and_then(|resp| metadata_to_response(resp, format)),
         )
     }
 
@@ -553,6 +558,89 @@ impl ConnectionHandler {
 
     /// Like [`Self::intercept`] but without updating the connection's state,
     /// for Describe: it must report the same columns Execute will return.
+    /// The parameter and result types Describe Statement reports for `sql`
+    /// (placeholders unbound).
+    async fn describe_statement<C: ClientInfo + Sync>(
+        &self,
+        client: &C,
+        sql: &str,
+    ) -> PgWireResult<DescribeStatementResponse> {
+        if sql.trim().is_empty() {
+            return Ok(DescribeStatementResponse::no_data());
+        }
+        let catalog_manager = self.session_catalog(client)?;
+        let param_count = count_placeholders(sql);
+        let describe = |fields, param_type_map: std::collections::HashMap<_, _>| {
+            let param_types: Vec<Type> = (1..=param_count)
+                .map(|i| {
+                    param_type_map
+                        .get(&i)
+                        .map(arneb_type_to_pg_param_type)
+                        .unwrap_or(Type::TEXT)
+                })
+                .collect();
+            DescribeStatementResponse::new(param_types, fields)
+        };
+
+        // A pg_catalog or information_schema statement is planned over its
+        // catalog tables, so its parameters get types (pg-catalog-tables).
+        if crate::pg_catalog::references_catalog_tables(sql) {
+            let (pg_catalog, _) = crate::pg_catalog::catalog_for(sql, &catalog_manager).await;
+            if let Ok((fields, param_type_map)) = plan_for_describe(sql, &pg_catalog).await {
+                return Ok(describe(fields, param_type_map));
+            }
+        }
+
+        // Intercept metadata queries for Describe too
+        if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) = self
+            .describe_intercept(client, sql.trim(), &catalog_manager)
+            .await
+        {
+            let field_info: Vec<FieldInfo> = fields
+                .iter()
+                .map(|f| {
+                    let pg_type = arrow_type_to_pg(f.data_type());
+                    FieldInfo::new(f.name().clone(), None, None, pg_type, FieldFormat::Text)
+                })
+                .collect();
+            return Ok(DescribeStatementResponse::new(vec![], field_info));
+        }
+        if let Some(Ok(crate::metadata::MetadataResponse::Command(_))) = self
+            .describe_intercept(client, sql.trim(), &catalog_manager)
+            .await
+        {
+            return Ok(DescribeStatementResponse::no_data());
+        }
+
+        // Count parameter placeholders. The analyzer infers types
+        // during planning and returns them in `ctx.param_types` —
+        // we translate them to PG OIDs here. Any indices the
+        // analyzer didn't see (e.g., because planning failed)
+        // fall back to `Type::TEXT` to preserve the legacy behavior
+        // for clients that don't care about precise types.
+        let (fields, param_type_map) = plan_for_describe(sql, &catalog_manager)
+            .await
+            .unwrap_or_else(|_| (Vec::new(), std::collections::HashMap::new()));
+        Ok(describe(fields, param_type_map))
+    }
+
+    /// `fields` (the executed or bound-portal columns) with the binary ones
+    /// typed as Describe Statement reported them, for a statement with
+    /// placeholders: see [`with_described_types`].
+    async fn binary_as_described<C: ClientInfo + Sync>(
+        &self,
+        client: &C,
+        sql: &str,
+        fields: Vec<FieldInfo>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        if count_placeholders(sql) == 0 || fields.iter().all(|f| f.format() != FieldFormat::Binary)
+        {
+            return Ok(fields);
+        }
+        let described = self.describe_statement(client, sql).await?;
+        Ok(with_described_types(fields, &described.fields))
+    }
+
     async fn describe_intercept<C: ClientInfo + Sync>(
         &self,
         client: &C,
@@ -603,7 +691,7 @@ impl SimpleQueryHandler for ConnectionHandler {
         }
 
         tracing::debug!(query = trimmed, "processing simple query");
-        if let Some(response) = self.timeout_command(client, trimmed) {
+        if let Some(response) = self.timeout_command(client, trimmed, &Format::UnifiedText) {
             return response.map(|r| vec![r]);
         }
 
@@ -612,7 +700,7 @@ impl SimpleQueryHandler for ConnectionHandler {
         let catalog_manager = self.session_catalog(client)?;
         if let Some(meta_result) = self.intercept(client, trimmed, &catalog_manager).await {
             return match meta_result {
-                Ok(resp) => metadata_to_response(resp).map(|r| vec![r]),
+                Ok(resp) => metadata_to_response(resp, &Format::UnifiedText).map(|r| vec![r]),
                 Err(e) => Err(arneb_error_to_pg_error(&ArnebError::Execution(
                     arneb_common::error::ExecutionError::InvalidOperation(e),
                 ))),
@@ -1104,14 +1192,15 @@ impl ExtendedQueryHandler for ConnectionHandler {
         }
 
         tracing::debug!(query = trimmed, "processing extended query");
-        if let Some(response) = self.timeout_command(client, trimmed) {
+        let format = &portal.result_column_format;
+        if let Some(response) = self.timeout_command(client, trimmed, format) {
             return response;
         }
 
         // Intercept session commands and metadata queries
         if let Some(meta_result) = self.intercept(client, trimmed, &catalog_manager).await {
             return match meta_result {
-                Ok(resp) => metadata_to_response(resp),
+                Ok(resp) => metadata_to_response(resp, format),
                 Err(e) => Err(arneb_error_to_pg_error(&ArnebError::Execution(
                     arneb_common::error::ExecutionError::InvalidOperation(e),
                 ))),
@@ -1127,7 +1216,8 @@ impl ExtendedQueryHandler for ConnectionHandler {
             Ok((plan, batches)) => {
                 let columns = plan.schema();
                 refuse_composite_columns(&columns)?;
-                let field_info = column_info_to_field_info(&columns);
+                let field_info = with_result_formats(column_info_to_field_info(&columns), format)?;
+                let field_info = self.binary_as_described(&*client, sql, field_info).await?;
                 let schema = Arc::new(field_info);
                 let (rows, _row_count) = encode_record_batches(&schema, &batches)?;
                 let data_row_stream = stream::iter(rows);
@@ -1148,64 +1238,7 @@ impl ExtendedQueryHandler for ConnectionHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let sql = &target.statement;
-        if sql.trim().is_empty() {
-            return Ok(DescribeStatementResponse::no_data());
-        }
-        let catalog_manager = self.session_catalog(client)?;
-        let param_count = count_placeholders(sql);
-        let describe = |fields, param_type_map: std::collections::HashMap<_, _>| {
-            let param_types: Vec<Type> = (1..=param_count)
-                .map(|i| {
-                    param_type_map
-                        .get(&i)
-                        .map(arneb_type_to_pg_param_type)
-                        .unwrap_or(Type::TEXT)
-                })
-                .collect();
-            DescribeStatementResponse::new(param_types, fields)
-        };
-
-        // A pg_catalog or information_schema statement is planned over its
-        // catalog tables, so its parameters get types (pg-catalog-tables).
-        if crate::pg_catalog::references_catalog_tables(sql) {
-            let (pg_catalog, _) = crate::pg_catalog::catalog_for(sql, &catalog_manager).await;
-            if let Ok((fields, param_type_map)) = plan_for_describe(sql, &pg_catalog).await {
-                return Ok(describe(fields, param_type_map));
-            }
-        }
-
-        // Intercept metadata queries for Describe too
-        if let Some(Ok(crate::metadata::MetadataResponse::Query(fields, _))) = self
-            .describe_intercept(client, sql.trim(), &catalog_manager)
-            .await
-        {
-            let field_info: Vec<FieldInfo> = fields
-                .iter()
-                .map(|f| {
-                    let pg_type = arrow_type_to_pg(f.data_type());
-                    FieldInfo::new(f.name().clone(), None, None, pg_type, FieldFormat::Text)
-                })
-                .collect();
-            return Ok(DescribeStatementResponse::new(vec![], field_info));
-        }
-        if let Some(Ok(crate::metadata::MetadataResponse::Command(_))) = self
-            .describe_intercept(client, sql.trim(), &catalog_manager)
-            .await
-        {
-            return Ok(DescribeStatementResponse::no_data());
-        }
-
-        // Count parameter placeholders. The analyzer infers types
-        // during planning and returns them in `ctx.param_types` —
-        // we translate them to PG OIDs here. Any indices the
-        // analyzer didn't see (e.g., because planning failed)
-        // fall back to `Type::TEXT` to preserve the legacy behavior
-        // for clients that don't care about precise types.
-        let (fields, param_type_map) = plan_for_describe(sql, &catalog_manager)
-            .await
-            .unwrap_or_else(|_| (Vec::new(), std::collections::HashMap::new()));
-        Ok(describe(fields, param_type_map))
+        self.describe_statement(client, &target.statement).await
     }
 
     async fn do_describe_portal<C>(
@@ -1242,7 +1275,10 @@ impl ExtendedQueryHandler for ConnectionHandler {
                     FieldInfo::new(f.name().clone(), None, None, pg_type, FieldFormat::Text)
                 })
                 .collect();
-            return Ok(DescribePortalResponse::new(field_info));
+            return Ok(DescribePortalResponse::new(describe_formats(
+                field_info,
+                &target.result_column_format,
+            )));
         }
         if let Some(Ok(crate::metadata::MetadataResponse::Command(_))) = self
             .describe_intercept(client, trimmed, &catalog_manager)
@@ -1254,6 +1290,8 @@ impl ExtendedQueryHandler for ConnectionHandler {
         let fields = plan_for_schema(trimmed, &catalog_manager)
             .await
             .unwrap_or_default();
+        let fields = describe_formats(fields, &target.result_column_format);
+        let fields = self.binary_as_described(&*client, sql, fields).await?;
         Ok(DescribePortalResponse::new(fields))
     }
 }
@@ -1281,8 +1319,22 @@ fn count_placeholders(sql: &str) -> usize {
     max_idx
 }
 
-/// A session command's result as a pgwire response.
-fn metadata_to_response(resp: crate::metadata::MetadataResponse) -> PgWireResult<Response> {
+/// A portal's columns with the result formats its Bind asked for, as
+/// Describe Portal reports them. A format count that does not match is
+/// left for Execute to refuse, so a planning error is not masked here.
+fn describe_formats(fields: Vec<FieldInfo>, format: &Format) -> Vec<FieldInfo> {
+    match with_result_formats(fields.clone(), format) {
+        Ok(formatted) => formatted,
+        Err(_) => fields,
+    }
+}
+
+/// A session command's result as a pgwire response, in the result
+/// `format` the client asked for (text for the simple protocol).
+fn metadata_to_response(
+    resp: crate::metadata::MetadataResponse,
+    format: &Format,
+) -> PgWireResult<Response> {
     match resp {
         crate::metadata::MetadataResponse::Query(fields, batches) => {
             let field_info: Vec<FieldInfo> = fields
@@ -1297,7 +1349,7 @@ fn metadata_to_response(resp: crate::metadata::MetadataResponse) -> PgWireResult
                     )
                 })
                 .collect();
-            let schema = Arc::new(field_info);
+            let schema = Arc::new(with_result_formats(field_info, format)?);
             let (rows, _) = encode_record_batches(&schema, &batches)?;
             Ok(Response::Query(QueryResponse::new(
                 schema,

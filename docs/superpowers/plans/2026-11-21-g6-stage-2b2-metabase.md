@@ -388,3 +388,71 @@
 - [ ] **Step 3:** Write the docs.
 - [ ] **Step 4:** Run `cargo fmt -- --check`, clippy, and `cargo test --workspace`. All pass.
 - [ ] **Step 5:** Commit `test(smoke): Metabase Tier 2 probe and capture tooling; docs`.
+
+### Task 10: Honor the client's requested result format (binary) over the extended protocol
+
+Added by controller Ruling R9 after Task 9's end-to-end run.
+
+**Evidence:**
+- A fresh Metabase (pgJDBC, default settings) syncs only 53 of 61 columns.
+- pgJDBC asks for binary results from a statement's 5th execution on (server-prepared statements). Arneb always sends text, and pgJDBC then misreads it: `ArrayIndexOutOfBoundsException: Index 1 out of bounds for length 1`.
+- The same root cause makes tokio-postgres `query()` fail on BIGINT/int8 results ("failed to fill whole buffer"). That is a known pre-existing issue.
+- With `binaryTransfer=false` everything passes.
+
+**Goal:** over the extended protocol, each result column uses the format code the client sent in Bind:
+- none, which means all text;
+- one code, which applies to all columns;
+- or one code per column.
+
+The simple query protocol stays text, as PostgreSQL requires.
+
+**Files:**
+- Modify `crates/protocol/src/encoding.rs`.
+  - Today `FieldInfo` is built with `FieldFormat::Text` (~line 50).
+  - `encode_record_batches` uses `encode_field_with_type_and_format` or `encode_field` (~360-376).
+- Modify `crates/protocol/src/handler.rs`.
+  - `FieldInfo::new(..., FieldFormat::Text)` at ~1187, ~1242 and ~1296. These are the Describe portal/statement and Execute paths.
+  - The Execute path must build the `FieldInfo`s with the portal's result format codes. Use pgwire 0.42's portal API (`portal.result_column_format`, or the equivalent; check the crate source in `~/.cargo/registry`).
+  - Describe Portal must report the same formats.
+  - Describe Statement has no portal yet, so it keeps Text, as PostgreSQL does.
+- Tests: create `crates/protocol/tests/binary_results.rs`.
+
+**Requirements:**
+- **Types with a binary encoding.** Every type Arneb returns over pgwire must encode correctly in binary when it is asked for:
+  - bool, int2, int4, int8, float4, float8;
+  - numeric (from Decimal128 and Decimal64), text/varchar/bpchar, date;
+  - timestamp (and timestamptz if Arneb emits it), bytea;
+  - the array types from stage 2b-1: `int8[]`, `text[]` and the other `_` types `encoding.rs` already maps.
+- **Library first.** Use pgwire/postgres-types' `ToSql` binary encodings wherever they exist; don't hand-roll a wire format the library provides.
+- **Hand-rolled numeric.** If numeric needs one, follow PostgreSQL's NUMERIC binary format: ndigits, weight, sign, dscale, then base-10000 digits. The unit tests must cover:
+  - 0, a negative value, scale 2, and a large value with 38 digits;
+  - a value smaller than 1 (`0.05`);
+  - NULL.
+- **Unsupported types.** A type with no binary encoding, requested in binary, must give a clear error naming the type (SQLSTATE 0A000). It must never be silently sent as text.
+- **Text unchanged.** Results requested as text must stay byte-identical to today's.
+
+**Tests (`binary_results.rs`, through pgwire with tokio-postgres):**
+- `tokio_postgres_query_reads_binary_results`: `client.query()` (which asks for binary) over `SELECT` of one column of each type above, with known values, including NULLs. Assert each value decoded through `row.get::<_, T>()`:
+  - `i16`, `i32`, `i64`, `f32`, `f64`, `bool`, `String`;
+  - `chrono::NaiveDate` / `NaiveDateTime`, if the chrono feature is available to tests; otherwise decode the date as `i32` days via a raw check;
+  - `rust_decimal::Decimal`, if available; otherwise compare the numeric through a `CAST(... AS VARCHAR)` sibling column and assert the binary column decodes without error through a custom `FromSql`;
+  - `Vec<i64>` and `Vec<String>` for arrays.
+- `mixed_formats_per_column`: a raw extended-protocol exchange (tokio-postgres `prepare` + `query` with explicit formats, if the API allows it; otherwise a minimal hand-written Bind with format codes `[0, 1]`) returns column 1 as text and column 2 as binary.
+- `simple_query_stays_text`: `simple_query` results are unchanged.
+- One regression assertion that Metabase's failing case now works. The exact statement is pgJDBC's `getColumns` query from `docs/superpowers/specs/2026-11-21-g6-stage-2b2/metabase-captured.sql`; grep `TABLE_CAT` for the `result.TABLE_CAT` statements. Run it 6 times through a prepared statement with binary results.
+- Existing test files that worked around the binary issue with `simple_query` keep passing. Don't rewrite them.
+
+**Docs:** update `docs/guide/clients.md` and `scripts/client-smoke/metabase/README.md`, where Task 9 documented `binaryTransfer=false` as required. Remove that requirement: default pgJDBC settings now work. Note binary results support in the pgwire docs, if the protocol docs mention text-only.
+
+**Verify:**
+- `cargo test -p arneb-protocol` (all binaries), then `cargo test --workspace`, fmt, and clippy.
+- Then Tier 2:
+  1. Release build.
+  2. `scripts/client-smoke/cluster.sh start <sf1data> <run dir>`.
+  3. In Metabase (`arneb-mb`, http://127.0.0.1:13300), remove the Arneb database added with `binaryTransfer=false`, or add a new one without it.
+  4. Run `scripts/client-smoke/metabase/probe.py http://127.0.0.1:13300 host.docker.internal 15432 <new db name> --expect-tables 8 --expect-fields 61` with default JDBC settings.
+  5. Expected: `PROBE … fail=0 tables=8 fields=61`, and the fallback delta is 0.
+- `scripts/client-smoke/run.sh <sf1data>` gives ALL STEPS PASSED.
+- The TPC-H EXPLAIN diff stays empty.
+
+**Commit:** `feat(protocol): honor requested binary result formats over the extended protocol`.

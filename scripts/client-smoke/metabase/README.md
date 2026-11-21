@@ -41,7 +41,6 @@ psql -h 127.0.0.1 -p 15499 -U smoke -d arneb -v ON_ERROR_STOP=1 \
 python3 scripts/client-smoke/metabase/probe.py http://127.0.0.1:13300 \
     host.docker.internal 15432 arneb \
     --expect-tables 8 --expect-fields 61 \
-    --jdbc-options binaryTransfer=false \
     --metrics http://127.0.0.1:16432/metrics \
     --json /tmp/mb-arneb.json | tee /tmp/mb-arneb.txt
 
@@ -64,10 +63,11 @@ The data results differ between the two (PostgreSQL holds a few rows);
 compare the Arneb ones in `/tmp/mb-arneb.json` with DuckDB on the same SF1
 data instead.
 
-Without `--jdbc-options binaryTransfer=false`, the Arneb run reports
-`fields=53`: pgJDBC asks for binary results once a statement has run 5
-times, and Arneb sends text, so the sync loses the fields of two tables
-(see `docs/guide/clients.md`).
+The probe uses pgJDBC's default settings. pgJDBC asks for binary results
+once a statement has run 5 times on a connection, and Arneb answers in the
+formats it asks for. Before binary results were supported, the sync lost
+the fields of two tables (`fields=53`) unless the database had
+`--jdbc-options binaryTransfer=false`.
 
 The probe sets Metabase up with the admin `probe@example.com` and a random
 password, which it keeps in `.probe-password` next to `probe.py`

@@ -2733,7 +2733,10 @@ impl<'a> QueryPlanner<'a> {
                     };
                     plan_args.push(plan_arg);
                 }
-                if name.eq_ignore_ascii_case("current_schemas") && plan_args.len() == 1 {
+                if name.eq_ignore_ascii_case("current_schemas") {
+                    if plan_args.len() != 1 {
+                        return Err(current_schemas_arity_error(plan_args.len(), node_span));
+                    }
                     // The session's search path, as `current_schema` reads it.
                     plan_args.push(PlanExpr::Literal {
                         value: ScalarValue::Utf8(self.catalog.default_schema().to_string()),
@@ -5098,6 +5101,16 @@ fn generate_subscripts_dim_error() -> PlanError {
     }
 }
 
+/// `current_schemas` takes exactly one boolean argument (PostgreSQL). Out of
+/// line so `plan_expr`'s recursive frame stays small.
+#[inline(never)]
+fn current_schemas_arity_error(args: usize, span: Option<arneb_sql_parser::Span>) -> PlanError {
+    PlanError::UnsupportedExpression {
+        message: format!("function current_schemas takes exactly one boolean argument, got {args}"),
+        location: span.map(|s| s.start),
+    }
+}
+
 /// The error for an SRF call anywhere but as a whole SELECT item. Out of
 /// line so `plan_expr`'s recursive frame stays small.
 #[inline(never)]
@@ -7015,6 +7028,14 @@ mod tests {
             schema[0].data_type,
             DataType::List(Box::new(DataType::Utf8))
         );
+        // PostgreSQL has only current_schemas(boolean).
+        for sql in [
+            "SELECT current_schemas(true, 'x')",
+            "SELECT current_schemas()",
+        ] {
+            let err = plan_sql(sql).await.unwrap_err().to_string();
+            assert!(err.contains("exactly one boolean argument"), "{sql}: {err}");
+        }
     }
 
     #[tokio::test]

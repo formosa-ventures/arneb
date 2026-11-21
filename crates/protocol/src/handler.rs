@@ -35,8 +35,7 @@ use pgwire::messages::PgWireBackendMessage;
 
 use crate::auth::{AuthMethod, AuthStartupHandler};
 use crate::encoding::{
-    column_info_to_field_info, encode_record_batches, refuse_composite_columns,
-    with_described_types, with_result_formats,
+    column_info_to_field_info, encode_record_batches, with_described_types, with_result_formats,
 };
 use crate::session::{handle_search_path, SearchPath};
 use pgwire::api::portal::Format;
@@ -564,8 +563,6 @@ impl ConnectionHandler {
         self.metadata(sql, catalog_manager).await
     }
 
-    /// Like [`Self::intercept`] but without updating the connection's state,
-    /// for Describe: it must report the same columns Execute will return.
     /// The parameter and result types Describe Statement reports for `sql`
     /// (placeholders unbound).
     async fn describe_statement<C: ClientInfo + Sync>(
@@ -649,6 +646,8 @@ impl ConnectionHandler {
         Ok(with_described_types(fields, &described.fields))
     }
 
+    /// Like [`Self::intercept`] but without updating the connection's state,
+    /// for Describe: it must report the same columns Execute will return.
     async fn describe_intercept<C: ClientInfo + Sync>(
         &self,
         client: &C,
@@ -728,7 +727,6 @@ impl SimpleQueryHandler for ConnectionHandler {
         match result {
             Ok((plan, batches)) => {
                 let columns = plan.schema();
-                refuse_composite_columns(&columns)?;
                 let field_info = column_info_to_field_info(&columns);
                 let schema = Arc::new(field_info);
 
@@ -1287,7 +1285,6 @@ impl ExtendedQueryHandler for ConnectionHandler {
         match result {
             Ok((plan, batches)) => {
                 let columns = plan.schema();
-                refuse_composite_columns(&columns)?;
                 let field_info = with_result_formats(column_info_to_field_info(&columns), format)?;
                 let field_info = self.binary_as_described(&*client, sql, field_info).await?;
                 let schema = Arc::new(field_info);

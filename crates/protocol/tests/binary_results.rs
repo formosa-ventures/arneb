@@ -11,9 +11,9 @@ use std::sync::Arc;
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int16Array, Int32Array, Int64Array, Int64Builder, ListBuilder, StringArray, StringBuilder,
-    TimestampMicrosecondArray,
+    StructArray, TimestampMicrosecondArray,
 };
-use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+use arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::{Buf, BytesMut};
 use chrono::{NaiveDate, NaiveDateTime};
@@ -130,9 +130,41 @@ fn nation() -> Arc<MemoryTable> {
     ))
 }
 
+/// `file.default.composite`: a struct column, as a Parquet file with a
+/// nested group reads.
+fn composite() -> Arc<MemoryTable> {
+    let fields = Fields::from(vec![
+        Field::new("x", ArrowDataType::Int32, true),
+        Field::new("n", ArrowDataType::Utf8, true),
+    ]);
+    let p = StructArray::new(
+        fields.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["a"])),
+        ],
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "p",
+        ArrowDataType::Struct(fields),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(p) as ArrayRef]).unwrap();
+    Arc::new(MemoryTable::new(
+        vec![ColumnInfo {
+            name: "p".into(),
+            data_type: DataType::try_from(schema.field(0).data_type().clone()).unwrap(),
+            nullable: true,
+        }],
+        vec![batch],
+    ))
+}
+
 async fn pg_server() -> u16 {
     let schema = Arc::new(MemorySchema::new());
     schema.register_table("typed", typed());
+    schema.register_table("composite", composite());
     schema.register_table("nation", nation());
     let file = Arc::new(MemoryCatalog::new());
     file.register_schema("default", schema);
@@ -449,31 +481,139 @@ async fn simple_query_stays_text() {
     );
 }
 
-/// pgJDBC's `getPrimaryKeys` statement (the `result.TABLE_CAT` query in
-/// `metabase-captured.sql`): Metabase's sync runs it once per table, and
-/// pgJDBC asks for binary results from the 5th execution on.
+/// A struct column is sent in text, over the simple and the extended
+/// protocol, as Arrow displays it; a binary request for it is refused, since
+/// there is no binary composite encoding here.
 #[tokio::test]
-async fn metabase_primary_key_query_survives_binary_executions() {
-    let sql = std::fs::read_to_string(concat!(
+async fn struct_columns_go_as_text_and_refuse_binary() {
+    let port = pg_server().await;
+    let client = connect(port).await;
+    let messages = client
+        .simple_query("SELECT p FROM composite")
+        .await
+        .unwrap();
+    let row = messages
+        .iter()
+        .find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(row.get(0), Some("{x: 1, n: a}"));
+
+    let mut stream = raw_connect(port).await;
+    let (formats, cells) = bound_query(&mut stream, "SELECT p FROM composite", &[0])
+        .await
+        .unwrap();
+    assert_eq!(formats, vec![0]);
+    assert_eq!(cells[0].as_deref(), Some(&b"{x: 1, n: a}"[..]));
+
+    let err = bound_query(&mut stream, "SELECT p FROM composite", &[1])
+        .await
+        .unwrap_err();
+    assert!(err.starts_with("0A000"), "{err}");
+}
+
+fn captured_statement(pred: impl Fn(&str) -> bool) -> String {
+    std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../docs/superpowers/specs/2026-11-21-g6-stage-2b2/metabase-captured.sql"
     ))
     .unwrap()
-    .lines()
-    .find(|l| l.contains("result.TABLE_CAT") && l.contains("ct.relname = 'nation'"))
+    .split("\n;;;;\n")
+    .map(str::trim)
+    .find(|s| pred(s))
     .unwrap()
-    .to_string();
+    .to_string()
+}
+
+/// Decodes `row[col]` by its described type, so a cell whose bytes do not
+/// match the type fails.
+fn decode_cell(row: &tokio_postgres::Row, col: usize) -> Option<String> {
+    let ty = row.columns()[col].type_().clone();
+    let cell = match ty {
+        Type::BOOL => row
+            .try_get::<_, Option<bool>>(col)
+            .map(|v| v.map(|b| b.to_string())),
+        Type::INT2 => row
+            .try_get::<_, Option<i16>>(col)
+            .map(|v| v.map(|i| i.to_string())),
+        Type::INT4 => row
+            .try_get::<_, Option<i32>>(col)
+            .map(|v| v.map(|i| i.to_string())),
+        Type::INT8 => row
+            .try_get::<_, Option<i64>>(col)
+            .map(|v| v.map(|i| i.to_string())),
+        Type::TEXT | Type::VARCHAR | Type::NAME | Type::BPCHAR => {
+            row.try_get::<_, Option<String>>(col)
+        }
+        other => panic!("column {col}: unexpected type {other}"),
+    };
+    cell.unwrap_or_else(|e| panic!("column {col} ({ty}): {e}"))
+}
+
+/// Metabase's sync-fields statement (`"information_schema"."columns"` joined
+/// to the primary keys, `UNION ALL` materialized views) from
+/// `metabase-captured.sql`: pgJDBC asks for binary results from a prepared
+/// statement's 5th execution on, so six executions cover both formats.
+/// Every cell decodes by its described type each time.
+#[tokio::test]
+async fn metabase_sync_fields_query_survives_binary_executions() {
+    let sql = captured_statement(|s| {
+        s.contains(r#"FROM "information_schema"."columns" AS "c""#) && s.contains("IN ('default')")
+    });
     let client = connect(pg_server().await).await;
     let stmt = client.prepare(&sql).await.unwrap();
     for _ in 0..6 {
         let rows = client.query(&stmt, &[]).await.unwrap();
-        for row in rows {
-            for col in 0..row.len() {
-                row.try_get::<_, Option<RawAny>>(col).unwrap();
-            }
-        }
+        let decoded: Vec<Vec<Option<String>>> = rows
+            .iter()
+            .map(|row| (0..row.len()).map(|col| decode_cell(row, col)).collect())
+            .collect();
+        let col = |name: &str| {
+            rows[0]
+                .columns()
+                .iter()
+                .position(|c| c.name() == name)
+                .unwrap()
+        };
+        let (table, column, position) = (col("table-name"), col("name"), col("database-position"));
+        let mut nation: Vec<_> = decoded
+            .iter()
+            .filter(|r| r[table].as_deref() == Some("nation"))
+            .map(|r| (r[column].clone().unwrap(), r[position].clone().unwrap()))
+            .collect();
+        nation.sort();
+        assert_eq!(
+            nation,
+            [
+                ("n_name".to_string(), "1".to_string()),
+                ("n_nationkey".to_string(), "0".to_string())
+            ]
+        );
     }
-    // A statement with rows, executed 6 times in binary, decodes each time.
+}
+
+/// pgJDBC's `getPrimaryKeys` statement (`result.TABLE_CAT`), whose
+/// composites stay inside the subquery: it executes 6 times with binary
+/// results requested. The memory tables have no primary keys, so it returns
+/// no rows; the row decoding is covered above.
+#[tokio::test]
+async fn metabase_primary_key_query_executes_in_binary() {
+    let sql = captured_statement(|s| {
+        s.contains("result.TABLE_CAT") && s.contains("ct.relname = 'nation'")
+    });
+    let client = connect(pg_server().await).await;
+    let stmt = client.prepare(&sql).await.unwrap();
+    for _ in 0..6 {
+        assert!(client.query(&stmt, &[]).await.unwrap().is_empty());
+    }
+}
+
+/// A statement with rows, executed 6 times in binary, decodes each time.
+#[tokio::test]
+async fn prepared_rows_survive_binary_executions() {
+    let client = connect(pg_server().await).await;
     let stmt = client
         .prepare("SELECT n_nationkey, n_name FROM nation ORDER BY n_nationkey")
         .await

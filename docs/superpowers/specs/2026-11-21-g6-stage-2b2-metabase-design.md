@@ -242,7 +242,9 @@ for numbers (`objsubid = '0'`, `NULLIF(n_live_tup, '0')`).
   - Unknown field names are a plan-time error.
 - Struct values over pgwire are outside this change: getPrimaryKeys
   selects them only inside the subquery. A struct reaching the client is
-  refused with a clear error, unless it's already supported.
+  refused with a clear error, unless it's already supported. (Text was:
+  a struct column goes as Arrow displays it, `{x: 1, n: a}`, as before this
+  change; a binary request for one is refused with `0A000`.)
 
 ### 7. Catalog surface (crates/protocol)
 

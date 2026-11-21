@@ -600,11 +600,6 @@ fn build_list_array(
     list_from_values(values, &elem_type, &vec![k; num_rows])
 }
 
-/// `value = ANY (list)` per row, or `value <> ALL (list)` when `negated`,
-/// with SQL's three-valued logic: an empty list is false (`<> ALL`: true)
-/// whatever `value` is, a NULL list is NULL, otherwise a match is true, a
-/// NULL `value` or a NULL element without a match is NULL, and no match is
-/// false.
 /// `array[index]`: out of line so the recursive `evaluate` frame stays small.
 #[inline(never)]
 fn evaluate_array_element(
@@ -623,7 +618,7 @@ pub(crate) fn array_element(list: &ArrayRef, index: &ArrayRef) -> Result<ArrayRe
     let rows = list.len();
     let Some(list) = list.as_any().downcast_ref::<arrow::array::ListArray>() else {
         // An untyped NULL array.
-        if list.null_count() == rows {
+        if list.data_type() == &ArrowDataType::Null {
             return Ok(arrow::array::new_null_array(&ArrowDataType::Null, rows));
         }
         return Err(ExecutionError::InvalidOperation(format!(
@@ -670,7 +665,7 @@ fn evaluate_get_field(
 pub(crate) fn get_field(value: &ArrayRef, name: &str) -> Result<ArrayRef, ExecutionError> {
     let rows = value.len();
     let Some(st) = value.as_any().downcast_ref::<arrow::array::StructArray>() else {
-        if value.null_count() == rows {
+        if value.data_type() == &ArrowDataType::Null {
             return Ok(arrow::array::new_null_array(&ArrowDataType::Null, rows));
         }
         return Err(ExecutionError::InvalidOperation(format!(
@@ -697,6 +692,11 @@ pub(crate) fn get_field(value: &ArrayRef, name: &str) -> Result<ArrayRef, Execut
     Ok(arrow::array::make_array(data))
 }
 
+/// `value = ANY (list)` per row, or `value <> ALL (list)` when `negated`,
+/// with SQL's three-valued logic: an empty list is false (`<> ALL`: true)
+/// whatever `value` is, a NULL list is NULL, otherwise a match is true, a
+/// NULL `value` or a NULL element without a match is NULL, and no match is
+/// false.
 fn array_contains(
     value: &ArrayRef,
     list: &ArrayRef,
@@ -1997,6 +1997,20 @@ mod tests {
             out.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
             20
         );
+    }
+
+    #[test]
+    fn subscript_and_field_of_an_untyped_null_are_null() {
+        let null: ArrayRef = Arc::new(NullArray::new(2));
+        let index: ArrayRef = Arc::new(Int64Array::from(vec![1, 1]));
+        let out = array_element(&null, &index).unwrap();
+        assert_eq!((out.len(), out.data_type()), (2, &ArrowDataType::Null));
+        let out = get_field(&null, "x").unwrap();
+        assert_eq!((out.len(), out.data_type()), (2, &ArrowDataType::Null));
+        // A non-NULL non-array is still refused.
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        assert!(array_element(&ints, &index).is_err());
+        assert!(get_field(&ints, "x").is_err());
     }
 
     #[test]

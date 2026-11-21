@@ -915,6 +915,15 @@ impl ExecutionContext {
                     span: *span,
                 })
             }
+            PlanExpr::ArrayElement(pair) => {
+                let array = Box::pin(self.resolve_scalar_subqueries(&pair.0)).await?;
+                let index = Box::pin(self.resolve_scalar_subqueries(&pair.1)).await?;
+                Ok(PlanExpr::ArrayElement(Box::new((array, index))))
+            }
+            PlanExpr::GetField(pair) => {
+                let inner = Box::pin(self.resolve_scalar_subqueries(&pair.0)).await?;
+                Ok(PlanExpr::GetField(Box::new((inner, pair.1.clone()))))
+            }
             _ => Ok(expr.clone()),
         }
     }

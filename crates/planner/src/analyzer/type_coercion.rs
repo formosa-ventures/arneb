@@ -720,6 +720,25 @@ fn unify_binary_operands(
             _ => {}
         }
     }
+    // The matrix's DATE → TIMESTAMP widening serves comparisons, BETWEEN,
+    // IN, CASE and set operations. Arithmetic between the two
+    // (`timestamp - date`, `date + timestamp`) stays unsupported.
+    if !comparison
+        && matches!(
+            (&lt, &rt),
+            (DataType::Date32, DataType::Timestamp { .. })
+                | (DataType::Timestamp { .. }, DataType::Date32)
+        )
+    {
+        let name = |t: &DataType| match t {
+            DataType::Date32 => "date",
+            _ => "timestamp",
+        };
+        return Err(PlanError::UnsupportedExpression {
+            message: format!("operator does not exist: {} {op} {}", name(&lt), name(&rt)),
+            location,
+        });
+    }
 
     // Decimal arithmetic: operands keep their own precision/scale (an
     // integer side becomes DECIMAL(10|19, 0)); the executor computes the
@@ -2418,6 +2437,42 @@ mod tests {
 
     fn date_lit(day: i32) -> PlanExpr {
         lit(ScalarValue::Date32(day))
+    }
+
+    /// The DATE → TIMESTAMP widening is for comparisons, BETWEEN, IN, CASE
+    /// and set operations: `timestamp - date` and `date + timestamp` stay
+    /// unsupported, refused at plan time naming the operator.
+    #[test]
+    fn date_timestamp_arithmetic_is_a_plan_time_error() {
+        let ts = timestamp_tz();
+        for (left, op, right, want) in [
+            (
+                cast_to(&ts, date_lit(1)),
+                ast::BinaryOp::Minus,
+                col(0, "d"),
+                "operator does not exist: timestamp - date",
+            ),
+            (
+                col(0, "d"),
+                ast::BinaryOp::Plus,
+                cast_to(&ts, date_lit(1)),
+                "operator does not exist: date + timestamp",
+            ),
+        ] {
+            let pred = PlanExpr::BinaryOp {
+                left: Box::new(PlanExpr::BinaryOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                    span: None,
+                }),
+                op: ast::BinaryOp::Eq,
+                right: Box::new(cast_to(&ts, date_lit(2))),
+                span: None,
+            };
+            let err = run(filter(scan(date_schema()), pred)).unwrap_err();
+            assert!(err.to_string().contains(want), "{err}");
+        }
     }
 
     #[test]

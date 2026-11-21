@@ -339,6 +339,20 @@ async fn interval_arithmetic() {
         .await,
         [text("2")]
     );
+    // Arithmetic between DATE and TIMESTAMP stays unsupported, at plan time.
+    for (sql, want) in [
+        (
+            "SELECT CAST(d AS TIMESTAMP) - d FROM dt",
+            "operator does not exist: timestamp - date",
+        ),
+        (
+            "SELECT d + CAST(d AS TIMESTAMP) FROM dt",
+            "operator does not exist: date + timestamp",
+        ),
+    ] {
+        let message = error_message(&client, sql).await;
+        assert!(message.contains(want), "{sql}: {message}");
+    }
     let err = client
         .simple_query("SELECT INTERVAL '1 day'")
         .await

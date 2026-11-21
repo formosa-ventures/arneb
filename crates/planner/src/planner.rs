@@ -2392,7 +2392,8 @@ impl<'a> QueryPlanner<'a> {
                 );
                 // The parser reads a bare `current_schema` as a column.
                 if resolved.is_err() && col_ref.table.is_none() {
-                    if let Some(literal) = session_literal(self.catalog, &col_ref.name, node_span)
+                    if let Some(literal) =
+                        session_literal(self.catalog, &col_ref.name, false, node_span)
                     {
                         return Ok(literal);
                     }
@@ -2487,7 +2488,7 @@ impl<'a> QueryPlanner<'a> {
                     ));
                 }
                 if args.is_empty() {
-                    if let Some(literal) = session_literal(self.catalog, name, node_span) {
+                    if let Some(literal) = session_literal(self.catalog, name, true, node_span) {
                         return Ok(literal);
                     }
                 }
@@ -2730,7 +2731,12 @@ impl<'a> QueryPlanner<'a> {
             match item {
                 ast::SelectItem::UnnamedExpr(expr) => {
                     let plan_expr = self.plan_expr(expr, ctx).await?;
-                    let col_info = self.expr_to_column_info(&plan_expr, ctx);
+                    let mut col_info = self.expr_to_column_info(&plan_expr, ctx);
+                    if matches!(plan_expr, PlanExpr::Literal { .. }) {
+                        if let Some(name) = session_function_name(expr) {
+                            col_info.name = name;
+                        }
+                    }
                     exprs.push(plan_expr);
                     schema.push(col_info);
                 }
@@ -5429,16 +5435,18 @@ fn using_pairs(
 }
 
 /// A session function the planner folds to a literal: `current_catalog` and
-/// `current_schema` (Trino's niladic forms), from the session's defaults.
-/// `None` for any other name.
+/// `current_schema` (Trino's niladic forms) and `current_database()` (a
+/// call, `call`), from the session's defaults. `None` for any other name.
 fn session_literal(
     catalog: &CatalogManager,
     name: &str,
+    call: bool,
     span: Option<arneb_sql_parser::Span>,
 ) -> Option<PlanExpr> {
-    let value = if name.eq_ignore_ascii_case("current_catalog") {
+    let is = |n: &str| name.eq_ignore_ascii_case(n);
+    let value = if is("current_catalog") || (call && is("current_database")) {
         catalog.default_catalog()
-    } else if name.eq_ignore_ascii_case("current_schema") {
+    } else if is("current_schema") {
         catalog.default_schema()
     } else {
         return None;
@@ -5447,6 +5455,21 @@ fn session_literal(
         value: ScalarValue::Utf8(value.to_string()),
         span,
     })
+}
+
+/// The column name PostgreSQL gives an unaliased niladic session function
+/// (`current_catalog`, `current_database()`, ...) that the planner folds to
+/// a literal: the function's name, not the literal's text.
+fn session_function_name(expr: &ast::Expr) -> Option<String> {
+    let (name, call) = match expr {
+        ast::Expr::Column { col_ref, .. } if col_ref.table.is_none() => (&col_ref.name, false),
+        ast::Expr::Function { name, args, .. } if args.is_empty() => (name, true),
+        _ => return None,
+    };
+    let lower = name.to_ascii_lowercase();
+    let folds = matches!(lower.as_str(), "current_catalog" | "current_schema")
+        || (call && lower == "current_database");
+    folds.then_some(lower)
 }
 
 /// `CAST(<regclass expr> AS TEXT)`: the operand is a `regclass` conversion
@@ -6815,6 +6838,46 @@ mod tests {
             let err = plan_sql(sql).await.unwrap_err().to_string();
             assert!(err.contains(want), "{sql}: {err}");
         }
+    }
+
+    /// The projected expressions and column names of a plain `SELECT`.
+    fn projection(plan: &LogicalPlan) -> (Vec<String>, Vec<String>) {
+        let LogicalPlan::Projection { exprs, schema, .. } = plan else {
+            panic!("expected Projection, got {plan}");
+        };
+        (
+            exprs.iter().map(ToString::to_string).collect(),
+            schema.iter().map(|c| c.name.clone()).collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn session_functions_fold_and_keep_their_names() {
+        let catalog = test_catalog();
+        let plan = plan_sql(
+            "SELECT current_database(), current_catalog, current_schema, \
+             current_database() AS db",
+        )
+        .await
+        .unwrap();
+        let db = format!("'{}'", catalog.default_catalog());
+        let schema = format!("'{}'", catalog.default_schema());
+        assert_eq!(
+            projection(&plan),
+            (
+                vec![db.clone(), db.clone(), schema, db],
+                [
+                    "current_database",
+                    "current_catalog",
+                    "current_schema",
+                    "db"
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
+        // A bare `current_database` is a column reference, as in PostgreSQL.
+        assert!(plan_sql("SELECT current_database").await.is_err());
     }
 
     #[tokio::test]

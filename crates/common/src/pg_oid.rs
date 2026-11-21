@@ -53,6 +53,16 @@ pub const RELATION_FIELD_SEP: char = '\u{1f}';
 /// Separates the entries of that list.
 pub const RELATION_ENTRY_SEP: char = '\u{1e}';
 
+/// The letter for each table privilege in the table list the planner hands
+/// the runtime privilege check (`schema`, `table` and the letters of the
+/// privileges held, separated by [`RELATION_FIELD_SEP`]).
+pub const TABLE_PRIVILEGE_LETTERS: [(char, &str); 4] = [
+    ('S', "SELECT"),
+    ('I', "INSERT"),
+    ('U', "UPDATE"),
+    ('D', "DELETE"),
+];
+
 /// The PostgreSQL oid of system relation `name`, if it is one.
 pub fn system_relation_oid(name: &str) -> Option<i64> {
     SYSTEM_RELATIONS

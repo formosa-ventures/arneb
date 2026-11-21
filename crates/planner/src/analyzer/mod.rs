@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arneb_common::error::PlanError;
-use arneb_common::types::{ColumnInfo, DataType};
+use arneb_common::types::{ColumnInfo, DataType, ScalarValue};
 use arneb_sql_parser::ast;
 
 use crate::cost::CatalogStats;
@@ -151,6 +151,29 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
             } else {
                 let lt = plan_expr_type(left, schema)?;
                 let rt = plan_expr_type(right, schema)?;
+                // `date - date` is a number of days (PostgreSQL). An
+                // untyped string literal side is coerced to DATE.
+                if is_date_difference(op, left, &lt, right, &rt) {
+                    return Some(DataType::Int32);
+                }
+                // `date ± integer days` stays DATE (the executor's
+                // `date_int_mix` path).
+                let date_and_int = matches!(
+                    (&lt, &rt),
+                    (DataType::Date32, DataType::Int32 | DataType::Int64)
+                        | (DataType::Int32 | DataType::Int64, DataType::Date32)
+                );
+                if date_and_int && matches!(op, ast::BinaryOp::Plus | ast::BinaryOp::Minus) {
+                    return Some(DataType::Date32);
+                }
+                // An untyped string literal takes the numeric operand's
+                // type (see `TypeCoercion`).
+                if is_untyped_string_literal(left) && is_numeric_type(&rt) {
+                    return Some(rt);
+                }
+                if is_untyped_string_literal(right) && is_numeric_type(&lt) {
+                    return Some(lt);
+                }
                 // Decimal arithmetic has its own (Trino) result type.
                 if let Some((l, r)) = decimal_arithmetic_operands(left, &lt, right, &rt) {
                     let (precision, scale) = coercion_matrix::decimal_arithmetic_type(op, l, r)?;
@@ -184,9 +207,23 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
             else_result,
             ..
         } => {
-            // Unify all THEN + ELSE arms.
+            // Unify all THEN + ELSE arms. Untyped string literals take
+            // the type of a numeric arm, so they do not take part.
+            let results = || {
+                when_clauses
+                    .iter()
+                    .map(|(_, r)| r)
+                    .chain(else_result.as_deref())
+            };
+            let skip_strings = results()
+                .filter(|r| !is_untyped_string_literal(r))
+                .filter_map(|r| plan_expr_type(r, schema))
+                .any(|t| is_numeric_type(&t));
             let mut acc: Option<DataType> = None;
             for (_, result) in when_clauses {
+                if skip_strings && is_untyped_string_literal(result) {
+                    continue;
+                }
                 let rt = plan_expr_type(result, schema)?;
                 acc = Some(match acc {
                     None => rt,
@@ -200,7 +237,10 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
                     )?,
                 });
             }
-            if let Some(er) = else_result {
+            if let Some(er) = else_result
+                .as_deref()
+                .filter(|e| !(skip_strings && is_untyped_string_literal(e)))
+            {
                 let rt = plan_expr_type(er, schema)?;
                 acc = Some(match acc {
                     None => rt,
@@ -226,8 +266,54 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
         PlanExpr::ScalarSubquery { subplan, .. } => {
             subplan.schema().first().map(|col| col.data_type.clone())
         }
+        PlanExpr::ArrayElement(pair) => array_element_result_type(&pair.0, schema),
+        PlanExpr::GetField(pair) => get_field_result_type(&pair.0, &pair.1, schema),
         PlanExpr::Wildcard => None,
     }
+}
+
+/// The type of `array[i]`: the element type of a `List` operand.
+#[inline(never)]
+fn array_element_result_type(array: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType> {
+    match plan_expr_type(array, schema)? {
+        DataType::List(element) => Some(*element),
+        DataType::Null => Some(DataType::Null),
+        _ => None,
+    }
+}
+
+/// The type of `(expr).field`: the named field's type of a `Struct` operand.
+#[inline(never)]
+fn get_field_result_type(expr: &PlanExpr, field: &str, schema: &[ColumnInfo]) -> Option<DataType> {
+    match plan_expr_type(expr, schema)? {
+        DataType::Struct(fields) => struct_field_type(&fields, field).cloned(),
+        _ => None,
+    }
+}
+
+/// Checks `(expr).field` against the operand's type `operand`: an unknown
+/// field of a struct, or a field of a non-composite type, is an error (as in
+/// PostgreSQL). An undetermined type (`None`, or an untyped NULL) passes;
+/// the type-coercion pass checks it again once typed.
+pub fn check_get_field(operand: Option<&DataType>, field: &str) -> Result<(), PlanError> {
+    match operand {
+        None | Some(DataType::Null) => Ok(()),
+        Some(DataType::Struct(fields)) if struct_field_type(fields, field).is_some() => Ok(()),
+        Some(t @ DataType::Struct(_)) => Err(PlanError::invalid_expression(format!(
+            "column \"{field}\" not found in data type {t}"
+        ))),
+        Some(t) => Err(PlanError::invalid_expression(format!(
+            "column notation .{field} applied to type {t}, which is not a composite type"
+        ))),
+    }
+}
+
+/// The type of the field `name` (case-insensitive) of a struct type.
+pub fn struct_field_type<'a>(fields: &'a [(String, DataType)], name: &str) -> Option<&'a DataType> {
+    fields
+        .iter()
+        .find(|(f, _)| f.eq_ignore_ascii_case(name))
+        .map(|(_, t)| t)
 }
 
 /// Element type of `ARRAY[elements]`: the common supertype of the typed,
@@ -311,6 +397,30 @@ fn is_boolean_result_op(op: &ast::BinaryOp) -> bool {
     )
 }
 
+/// `expr` is a bare string literal (untyped in PostgreSQL terms).
+fn is_untyped_string_literal(expr: &PlanExpr) -> bool {
+    matches!(
+        expr,
+        PlanExpr::Literal {
+            value: ScalarValue::Utf8(_),
+            ..
+        }
+    )
+}
+
+fn is_numeric_type(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128 { .. }
+    )
+}
+
 /// Returns true if `expr` is (or folds to) a literal. Used to gate
 /// `Safety::LiteralOnly` matrix rules.
 ///
@@ -382,6 +492,9 @@ pub(crate) fn function_return_type(
         "STDDEV_SAMP" | "STDDEV" | "STDDEV_POP" | "VAR_SAMP" | "VARIANCE" | "VAR_POP" => {
             Some(DataType::Float64)
         }
+        // `percentile_*(f, x)`: DOUBLE, or the type of the WITHIN GROUP key.
+        "PERCENTILE_CONT" => Some(DataType::Float64),
+        "PERCENTILE_DISC" => args.get(1).and_then(|a| plan_expr_type(a, schema)),
 
         // Scalar built-ins. Return types here MUST match the
         // corresponding `ScalarFunction::return_type` impls in
@@ -451,12 +564,15 @@ pub(crate) fn function_return_type(
         | "PG_GET_INDEXDEF"
         | "PG_GET_SERIAL_SEQUENCE"
         | "JSON_BUILD_OBJECT"
+        | "FORMAT"
         | "CURRENT_SETTING"
         | "__REGCLASS_NAME" => Some(DataType::Utf8),
-        "PG_TABLE_IS_VISIBLE" | "PG_IS_OTHER_TEMP_SCHEMA" | "PG_COLLATION_IS_VISIBLE" => {
-            Some(DataType::Boolean)
-        }
+        "PG_TABLE_IS_VISIBLE"
+        | "PG_IS_OTHER_TEMP_SCHEMA"
+        | "PG_COLLATION_IS_VISIBLE"
+        | "__HAS_PRIVILEGE" => Some(DataType::Boolean),
         "TO_REGTYPE" | "__REGCLASS_OID" => Some(DataType::Int64),
+        "CURRENT_SCHEMAS" => Some(DataType::List(Box::new(DataType::Utf8))),
 
         // Math — preserve integer-ness when the input is integral.
         "ROUND" => args
@@ -521,6 +637,24 @@ pub(crate) fn function_return_type(
 
         _ => None, // unknown / scalar built-in — defer.
     }
+}
+
+/// `date - date`, where either side may instead be an untyped string
+/// literal (which type coercion casts to DATE).
+fn is_date_difference(
+    op: &ast::BinaryOp,
+    left: &PlanExpr,
+    lt: &DataType,
+    right: &PlanExpr,
+    rt: &DataType,
+) -> bool {
+    let date_like = |e: &PlanExpr, t: &DataType| {
+        *t == DataType::Date32 || (*t == DataType::Utf8 && is_untyped_string_literal(e))
+    };
+    matches!(op, ast::BinaryOp::Minus)
+        && (*lt == DataType::Date32 || *rt == DataType::Date32)
+        && date_like(left, lt)
+        && date_like(right, rt)
 }
 
 /// The canonical timestamp type produced by the date/time scalar

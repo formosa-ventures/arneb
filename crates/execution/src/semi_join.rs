@@ -3199,6 +3199,11 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             collect_column_indices(expr, cb);
             collect_column_indices(array, cb);
         }
+        PlanExpr::ArrayElement(pair) => {
+            collect_column_indices(&pair.0, cb);
+            collect_column_indices(&pair.1, cb);
+        }
+        PlanExpr::GetField(pair) => collect_column_indices(&pair.0, cb),
         PlanExpr::Between {
             expr, low, high, ..
         } => {
@@ -3312,6 +3317,12 @@ fn remap_column_indices(
         } => arneb_planner::map_array_contains(expr, array, negated, span, |e| {
             remap_column_indices(e, remap)
         }),
+        PlanExpr::ArrayElement(pair) => {
+            arneb_planner::map_array_element(pair, |e| remap_column_indices(e, remap))
+        }
+        PlanExpr::GetField(pair) => {
+            arneb_planner::map_get_field(pair, |e| remap_column_indices(e, remap))
+        }
         PlanExpr::Array {
             elements,
             element_type,

@@ -1827,6 +1827,12 @@ where
             rewrite_expr(e, remap).ok_or(())
         })
         .ok()?,
+        E::ArrayElement(pair) => {
+            crate::try_map_array_element_ref(pair, |e| rewrite_expr(e, remap).ok_or(())).ok()?
+        }
+        E::GetField(pair) => {
+            crate::try_map_get_field_ref(pair, |e| rewrite_expr(e, remap).ok_or(())).ok()?
+        }
         E::Array {
             elements,
             element_type,

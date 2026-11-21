@@ -27,7 +27,6 @@ pub(crate) type MetadataResult = Result<MetadataResponse, String>;
 pub(crate) async fn try_handle_metadata(
     sql: &str,
     catalog_manager: &CatalogManager,
-    user: Option<&str>,
 ) -> Option<MetadataResult> {
     let lower = sql.trim().to_lowercase();
 
@@ -36,23 +35,19 @@ pub(crate) async fn try_handle_metadata(
         return Some(handle_version());
     }
 
-    // information_schema
-    if lower.contains("information_schema.tables") {
-        return Some(handle_info_tables(catalog_manager).await);
-    }
-    if lower.contains("information_schema.columns") {
-        return Some(handle_info_columns(catalog_manager).await);
-    }
-    if lower.contains("information_schema.schemata") {
-        return Some(handle_info_schemata(catalog_manager).await);
-    }
-
-    // current_database(), current_schema(), current_user
-    if lower.contains("current_database()")
-        || lower.contains("current_schema()")
-        || lower.contains("current_user")
-    {
-        return Some(handle_current_info(&lower, catalog_manager, user));
+    // information_schema: the fixed whole-table results, reached only as
+    // the fallback for a statement naming these tables that the engine
+    // could not run (the handler sends those to the engine first).
+    if crate::pg_catalog::references_information_schema(sql) {
+        if lower.contains("information_schema.tables") {
+            return Some(handle_info_tables(catalog_manager).await);
+        }
+        if lower.contains("information_schema.columns") {
+            return Some(handle_info_columns(catalog_manager).await);
+        }
+        if lower.contains("information_schema.schemata") {
+            return Some(handle_info_schemata(catalog_manager).await);
+        }
     }
 
     // Transactions: every statement is read-only and autocommitted, so
@@ -576,37 +571,6 @@ async fn handle_info_schemata(catalog_manager: &CatalogManager) -> MetaResult {
             Arc::new(StringArray::from(catalogs)),
             Arc::new(StringArray::from(schemas)),
         ],
-    )
-    .map_err(|e| e.to_string())?;
-    make_result(schema, batch)
-}
-
-// ---------------------------------------------------------------------------
-// current_database() / current_schema() / current_user
-// ---------------------------------------------------------------------------
-
-fn handle_current_info(
-    lower: &str,
-    catalog_manager: &CatalogManager,
-    user: Option<&str>,
-) -> MetaResult {
-    // current_schema() reflects the connection's search_path; current_user
-    // is the connection's user; current_database() is the default catalog.
-    let (name, value) = if lower.contains("current_schema()") {
-        ("current_schema", catalog_manager.default_schema())
-    } else if lower.contains("current_database()") {
-        ("current_database", catalog_manager.default_catalog())
-    } else {
-        ("current_user", user.unwrap_or(""))
-    };
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        name,
-        ArrowDataType::Utf8,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(StringArray::from(vec![value.to_string()]))],
     )
     .map_err(|e| e.to_string())?;
     make_result(schema, batch)

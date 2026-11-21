@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use arneb_catalog::CatalogManager;
+use arneb_catalog::{CatalogManager, SessionPrivileges, TablePrivilege};
 use arneb_common::error::ArnebError;
 use arneb_common::pg_oid::{self, PG_CATALOG, PG_TYPES};
 use arneb_common::types::{ColumnInfo, DataType};
@@ -194,6 +194,35 @@ const TABLES: &[(&str, &[&str])] = &[
     (
         "pg_enum",
         &["oid#", "enumtypid#", "enumsortorder#", "enumlabel"],
+    ),
+    (
+        "pg_tables",
+        &[
+            "schemaname",
+            "tablename",
+            "tableowner",
+            "tablespace",
+            "hasindexes?",
+            "hasrules?",
+            "hastriggers?",
+            "rowsecurity?",
+        ],
+    ),
+    (
+        "pg_views",
+        &["schemaname", "viewname", "viewowner", "definition"],
+    ),
+    (
+        "pg_matviews",
+        &[
+            "schemaname",
+            "matviewname",
+            "matviewowner",
+            "tablespace",
+            "hasindexes?",
+            "ispopulated?",
+            "definition",
+        ],
     ),
     ("pg_collation", &["oid#", "collname", "collnamespace#"]),
     ("pg_opclass", &["oid#", "opcname", "opcdefault?"]),
@@ -559,6 +588,22 @@ async fn build(
         ]);
     }
 
+    // Every relation is a table (`relkind` 'r'); Arneb has no views or
+    // materialized views here.
+    let mut tables = table("pg_tables");
+    for rel in &relations {
+        tables.push(vec![
+            s(&rel.schema),
+            s(&rel.name),
+            s(pg_oid::OWNER_ROLE_NAME),
+            NULL,
+            b(false),
+            b(false),
+            b(false),
+            b(false),
+        ]);
+    }
+
     let info_schema = information_schema(&database, &schemas, &relations);
 
     let mut types = table("pg_type");
@@ -634,6 +679,9 @@ async fn build(
         ("pg_constraint", table("pg_constraint")),
         ("pg_stat_user_tables", stat_user_tables),
         ("pg_enum", table("pg_enum")),
+        ("pg_tables", tables),
+        ("pg_views", table("pg_views")),
+        ("pg_matviews", table("pg_matviews")),
         ("pg_index", table("pg_index")),
         ("pg_sequence", table("pg_sequence")),
         ("pg_collation", table("pg_collation")),
@@ -656,8 +704,12 @@ async fn build(
         .iter()
         .map(|r| (r.schema.clone(), r.name.clone()))
         .collect();
-    let catalog_manager = CatalogManager::new(database.clone(), default_schema.clone())
-        .with_regclass_relations(listed);
+    let mut catalog_manager = CatalogManager::new(database.clone(), default_schema.clone())
+        .with_regclass_relations(listed)
+        .with_session_privileges(session_privileges(session, &database, &schemas, &relations));
+    if let Some(user) = session.session_user() {
+        catalog_manager = catalog_manager.with_session_user(user);
+    }
     catalog_manager.register_catalog(&database, catalog.clone());
     let registry = ConnectorRegistry::new();
     registry.register(
@@ -665,6 +717,40 @@ async fn build(
         Arc::new(MemoryConnectorFactory::new(catalog, &default_schema)),
     );
     (catalog_manager, registry)
+}
+
+/// What `has_*_privilege` reports for `session`: the schemas `pg_namespace`
+/// lists are usable; the user relations carry the privileges the access
+/// rules grant, the catalog's own tables `SELECT`.
+fn session_privileges(
+    session: &CatalogManager,
+    database: &str,
+    schemas: &[String],
+    relations: &[Relation],
+) -> SessionPrivileges {
+    let mut usable = vec![PG_CATALOG.to_string(), INFORMATION_SCHEMA.to_string()];
+    usable.extend(
+        schemas
+            .iter()
+            .filter(|s| !usable.contains(s))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let tables = relations
+        .iter()
+        .map(|rel| {
+            let held = if rel.schema == PG_CATALOG {
+                vec![TablePrivilege::Select]
+            } else {
+                session.table_privileges_held(database, &rel.schema, &rel.name)
+            };
+            (rel.schema.clone(), rel.name.clone(), held)
+        })
+        .collect();
+    SessionPrivileges {
+        schemas: usable,
+        tables,
+    }
 }
 
 /// The `information_schema` tables over the user relations of `database`

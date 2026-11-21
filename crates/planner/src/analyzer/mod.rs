@@ -567,9 +567,10 @@ pub(crate) fn function_return_type(
         | "FORMAT"
         | "CURRENT_SETTING"
         | "__REGCLASS_NAME" => Some(DataType::Utf8),
-        "PG_TABLE_IS_VISIBLE" | "PG_IS_OTHER_TEMP_SCHEMA" | "PG_COLLATION_IS_VISIBLE" => {
-            Some(DataType::Boolean)
-        }
+        "PG_TABLE_IS_VISIBLE"
+        | "PG_IS_OTHER_TEMP_SCHEMA"
+        | "PG_COLLATION_IS_VISIBLE"
+        | "__HAS_PRIVILEGE" => Some(DataType::Boolean),
         "TO_REGTYPE" | "__REGCLASS_OID" => Some(DataType::Int64),
         "CURRENT_SCHEMAS" => Some(DataType::List(Box::new(DataType::Utf8))),
 

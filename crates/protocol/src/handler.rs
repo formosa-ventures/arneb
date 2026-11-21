@@ -471,16 +471,18 @@ impl ConnectionHandler {
             || Arc::clone(&self.catalog_manager),
             |p| Arc::clone(&p.catalog_manager),
         );
-        // One snapshot per statement: planning and the privilege checks
-        // all see the rules current when the statement started.
-        let Some(rules) = self.access_rules.current() else {
-            return Ok(base);
-        };
         let user = client
             .metadata()
             .get(pgwire::api::METADATA_USER)
             .cloned()
             .unwrap_or_default();
+        // The connection's user, for `current_user` and `has_*_privilege`.
+        let base = base.with_session_user(user.as_str());
+        // One snapshot per statement: planning and the privilege checks
+        // all see the rules current when the statement started.
+        let Some(rules) = self.access_rules.current() else {
+            return Ok(Arc::new(base));
+        };
         let view = base.with_access(user, rules);
         view.check_execute()
             .map_err(|e| arneb_error_to_pg_error(&e.into()))?;
@@ -491,13 +493,11 @@ impl ConnectionHandler {
     /// read runs in the engine over the session's catalog tables
     /// (pg-catalog-tables), falling back to the fixed result when the engine
     /// cannot run it; everything else goes to the fixed handlers.
-    async fn metadata<C: ClientInfo>(
+    async fn metadata(
         &self,
-        client: &C,
         sql: &str,
         catalog_manager: &CatalogManager,
     ) -> Option<crate::metadata::MetadataResult> {
-        let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
         if crate::pg_catalog::references_catalog_tables(sql) {
             let error = match crate::pg_catalog::run(sql, catalog_manager, &self.memory_pool).await
             {
@@ -509,8 +509,7 @@ impl ConnectionHandler {
                 fixed = crate::metadata::fixed_pg_catalog(sql, catalog_manager).await;
             }
             if fixed.is_none() && crate::pg_catalog::references_information_schema(sql) {
-                fixed = crate::metadata::try_handle_metadata(sql, catalog_manager, user.as_deref())
-                    .await;
+                fixed = crate::metadata::try_handle_metadata(sql, catalog_manager).await;
             }
             let Some(fixed) = fixed else {
                 return Some(Err(error.to_string()));
@@ -524,7 +523,7 @@ impl ConnectionHandler {
             );
             return Some(fixed);
         }
-        crate::metadata::try_handle_metadata(sql, catalog_manager, user.as_deref()).await
+        crate::metadata::try_handle_metadata(sql, catalog_manager).await
     }
 
     /// Handle `SET`/`SHOW`/`RESET search_path` (updating the connection's
@@ -549,7 +548,7 @@ impl ConnectionHandler {
             }
             return Some(result);
         }
-        self.metadata(client, sql, catalog_manager).await
+        self.metadata(sql, catalog_manager).await
     }
 
     /// Like [`Self::intercept`] but without updating the connection's state,
@@ -586,7 +585,7 @@ impl ConnectionHandler {
         {
             return Some(result);
         }
-        self.metadata(client, sql, catalog_manager).await
+        self.metadata(sql, catalog_manager).await
     }
 }
 

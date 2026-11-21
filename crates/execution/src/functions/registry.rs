@@ -394,6 +394,7 @@ mod tests {
                 "__regclass_oid",
                 vec![s.clone(), s.clone(), s.clone(), s.clone()],
             ),
+            ("__has_privilege", vec![s.clone(); 9]),
         ];
         let reg = default_registry();
         for (name, arg_types) in cases {

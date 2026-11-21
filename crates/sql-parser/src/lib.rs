@@ -59,6 +59,71 @@ pub fn parse(sql: &str) -> Result<Statement, ParseError> {
     convert::convert_statement(statements.into_iter().next().unwrap())
 }
 
+/// A `$N` parameter placeholder in a SQL string, as the tokenizer sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DollarPlaceholder {
+    /// Byte range of the placeholder (`$` included) in the input SQL.
+    pub range: std::ops::Range<usize>,
+    /// The parameter number `N`, 1-based.
+    pub number: usize,
+}
+
+/// Finds the `$N` placeholders in `sql` with the same tokenizer [`parse`]
+/// uses, so a `$1` inside a string literal, a quoted identifier, a comment
+/// or a dollar-quoted string is not a placeholder.
+///
+/// # Errors
+///
+/// Returns [`ParseError::InvalidSyntax`] when `sql` does not tokenize, for
+/// example an unterminated string literal.
+pub fn dollar_placeholders(sql: &str) -> Result<Vec<DollarPlaceholder>, ParseError> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+
+    let tokens = Tokenizer::new(&GenericDialect {}, sql)
+        .tokenize_with_location()
+        .map_err(|e| ParseError::InvalidSyntax(e.to_string()))?;
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(sql.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let mut placeholders = Vec::new();
+    for token in tokens {
+        let Token::Placeholder(text) = &token.token else {
+            continue;
+        };
+        let Some(number) = text
+            .strip_prefix('$')
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|digits| digits.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let start = byte_offset(sql, &line_starts, token.span.start).ok_or_else(|| {
+            ParseError::InvalidSyntax(format!("cannot locate placeholder {text}"))
+        })?;
+        let range = start..start + text.len();
+        if sql.get(range.clone()) != Some(text.as_str()) {
+            return Err(ParseError::InvalidSyntax(format!(
+                "cannot locate placeholder {text}"
+            )));
+        }
+        placeholders.push(DollarPlaceholder { range, number });
+    }
+    Ok(placeholders)
+}
+
+/// Byte offset of a tokenizer [`Location`] (1-based line, 1-based column
+/// counted in chars).
+fn byte_offset(sql: &str, line_starts: &[usize], at: Location) -> Option<usize> {
+    let line_start = *line_starts.get(usize::try_from(at.line).ok()?.checked_sub(1)?)?;
+    let column = usize::try_from(at.column).ok()?.checked_sub(1)?;
+    let rest = &sql[line_start..];
+    match rest.char_indices().nth(column) {
+        Some((i, _)) => Some(line_start + i),
+        None if rest.chars().count() == column => Some(sql.len()),
+        None => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1720,5 +1785,48 @@ mod tests {
             Err(ParseError::UnsupportedFeature(msg)) => assert!(msg.contains("FILTER"), "{msg}"),
             other => panic!("expected UnsupportedFeature, got {other:?}"),
         }
+    }
+
+    // -- `$N` placeholders --
+
+    fn placeholder_numbers(sql: &str) -> Vec<(String, usize)> {
+        dollar_placeholders(sql)
+            .unwrap()
+            .into_iter()
+            .map(|p| (sql[p.range].to_string(), p.number))
+            .collect()
+    }
+
+    #[test]
+    fn dollar_placeholders_are_found_with_their_numbers() {
+        assert_eq!(
+            placeholder_numbers("SELECT $1, $10 FROM t WHERE a = $2"),
+            vec![
+                ("$1".to_string(), 1),
+                ("$10".to_string(), 10),
+                ("$2".to_string(), 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn dollar_placeholders_skip_quoted_text_and_comments() {
+        let sql = "SELECT '$1', 'it''s $2', E'\\' $3', \"$4\", `$5`, $$ $6 $$, $q$ $7 $q$, \
+                   a$8 -- $9\n /* $10 /* $11 */ */ + $12";
+        assert_eq!(placeholder_numbers(sql), vec![("$12".to_string(), 12)]);
+    }
+
+    #[test]
+    fn dollar_placeholders_locate_multibyte_and_multiline_text() {
+        let sql = "SELECT 'é漢', $1\n  ,\t$2";
+        assert_eq!(
+            placeholder_numbers(sql),
+            vec![("$1".to_string(), 1), ("$2".to_string(), 2)]
+        );
+    }
+
+    #[test]
+    fn dollar_placeholders_reject_sql_that_does_not_tokenize() {
+        assert!(dollar_placeholders("SELECT 'unterminated $1").is_err());
     }
 }

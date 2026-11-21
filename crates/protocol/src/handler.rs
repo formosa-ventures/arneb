@@ -654,13 +654,33 @@ impl SimpleQueryHandler for ConnectionHandler {
 
 /// Substitute `$1`, `$2`, ... placeholders with parameter values, each
 /// already a SQL literal (see [`extract_params`]).
+///
+/// One pass over the placeholders the SQL tokenizer finds, so a `$N` inside
+/// a string literal, a quoted identifier or a comment stays as written, and
+/// a parameter value is never scanned again (a value containing `$1` cannot
+/// pull another parameter into the statement). A `$N` with no matching
+/// parameter is left for the parser to reject. SQL that does not tokenize is
+/// returned unchanged so the parser reports the syntax error.
 fn bind_parameters(sql: &str, params: &[String]) -> String {
-    let mut result = sql.to_string();
-    // Replace in reverse order ($10 before $1) to avoid partial matches
-    for (i, literal) in params.iter().enumerate().rev() {
-        result = result.replace(&format!("${}", i + 1), literal);
+    let Ok(placeholders) = arneb_sql_parser::dollar_placeholders(sql) else {
+        return sql.to_string();
+    };
+    let mut bound = String::with_capacity(sql.len());
+    let mut copied = 0;
+    for placeholder in placeholders {
+        let Some(literal) = placeholder
+            .number
+            .checked_sub(1)
+            .and_then(|i| params.get(i))
+        else {
+            continue;
+        };
+        bound.push_str(&sql[copied..placeholder.range.start]);
+        bound.push_str(literal);
+        copied = placeholder.range.end;
     }
-    result
+    bound.push_str(&sql[copied..]);
+    bound
 }
 
 /// A portal's parameters as SQL literals. A parameter is decoded by the type
@@ -4649,5 +4669,55 @@ mod tests {
         }
         let sink = run_capped("SELECT cat FROM t", Some(&Retrying)).await;
         assert_eq!(sink_cats(&sink), vec![format!("{:<10}", "Books")]);
+    }
+
+    // -- `$N` parameter binding --
+
+    #[test]
+    fn bind_parameters_substitutes_each_placeholder_once() {
+        let params = ["'x'".to_string(), "2".to_string()];
+        assert_eq!(
+            bind_parameters("SELECT $1, $2, $1", &params),
+            "SELECT 'x', 2, 'x'"
+        );
+    }
+
+    /// A parameter value is never rescanned: a value that contains `$1`
+    /// stays inside its literal, so a quote in another parameter cannot
+    /// close that literal and inject SQL.
+    #[test]
+    fn a_parameter_value_containing_a_placeholder_is_not_rebound() {
+        let params = ["'''); DROP TABLE t; --'".to_string(), "'$1'".to_string()];
+        let bound = bind_parameters("SELECT * FROM t WHERE a = $1 AND b = $2", &params);
+        assert_eq!(
+            bound,
+            "SELECT * FROM t WHERE a = '''); DROP TABLE t; --' AND b = '$1'"
+        );
+        let Ok(ast::Statement::Query { .. }) = arneb_sql_parser::parse(&bound) else {
+            panic!("bound SQL must stay a single query: {bound}");
+        };
+    }
+
+    #[test]
+    fn placeholders_inside_quotes_and_comments_are_left_alone() {
+        let params = ["1".to_string()];
+        assert_eq!(
+            bind_parameters("SELECT '$1' AS \"$1\" -- $1\n , $1", &params),
+            "SELECT '$1' AS \"$1\" -- $1\n , 1"
+        );
+    }
+
+    #[test]
+    fn a_placeholder_beyond_the_parameters_is_left_for_the_parser() {
+        let params = ["1".to_string()];
+        assert_eq!(bind_parameters("SELECT $1, $2", &params), "SELECT 1, $2");
+        assert_eq!(bind_parameters("SELECT $0", &params), "SELECT $0");
+        assert_eq!(bind_parameters("SELECT $10", &params), "SELECT $10");
+    }
+
+    #[test]
+    fn sql_that_does_not_tokenize_is_returned_unchanged() {
+        let params = ["1".to_string()];
+        assert_eq!(bind_parameters("SELECT '$1", &params), "SELECT '$1");
     }
 }

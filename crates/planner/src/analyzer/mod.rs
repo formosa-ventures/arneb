@@ -449,6 +449,9 @@ pub(crate) fn function_return_type(
         "STDDEV_SAMP" | "STDDEV" | "STDDEV_POP" | "VAR_SAMP" | "VARIANCE" | "VAR_POP" => {
             Some(DataType::Float64)
         }
+        // `percentile_*(f, x)`: DOUBLE, or the type of the WITHIN GROUP key.
+        "PERCENTILE_CONT" => Some(DataType::Float64),
+        "PERCENTILE_DISC" => args.get(1).and_then(|a| plan_expr_type(a, schema)),
 
         // Scalar built-ins. Return types here MUST match the
         // corresponding `ScalarFunction::return_type` impls in

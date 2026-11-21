@@ -279,3 +279,69 @@ async fn interval_arithmetic() {
         .map_or_else(|| err.to_string(), |e| e.message().to_string());
     assert!(message.contains("interval"), "{message}");
 }
+
+/// The error message of a statement that must fail.
+async fn error_message(client: &tokio_postgres::Client, sql: &str) -> String {
+    let err = client.simple_query(sql).await.expect_err(sql);
+    err.as_db_error()
+        .map_or_else(|| err.to_string(), |e| e.message().to_string())
+}
+
+#[tokio::test]
+async fn ordered_set_percentiles() {
+    let client = connect().await;
+    let cases = [
+        (
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t",
+            Some("2"),
+        ),
+        (
+            "SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY x) FROM t",
+            Some("1.5"),
+        ),
+        (
+            "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM t",
+            Some("2"),
+        ),
+        (
+            "SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY x DESC) FROM t",
+            Some("2.5"),
+        ),
+        (
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM e",
+            None,
+        ),
+        (
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t WHERE x = 3",
+            Some("3"),
+        ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(
+            rows(&client, sql).await,
+            [vec![want.map(str::to_string)]],
+            "{sql}"
+        );
+    }
+    // Grouped: odd {1, 3} and even {2} both have median 2.
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT x % 2, percentile_cont(0.5) WITHIN GROUP (ORDER BY x) \
+             FROM t GROUP BY x % 2 ORDER BY 1"
+        )
+        .await,
+        [
+            vec![Some("0".to_string()), Some("2".to_string())],
+            vec![Some("1".to_string()), Some("2".to_string())],
+        ]
+    );
+    let message = error_message(
+        &client,
+        "SELECT percentile_cont(1.5) WITHIN GROUP (ORDER BY x) FROM t",
+    )
+    .await;
+    assert!(message.contains("between 0 and 1"), "{message}");
+    let message = error_message(&client, "SELECT sum(x) WITHIN GROUP (ORDER BY x) FROM t").await;
+    assert!(message.contains("WITHIN GROUP"), "{message}");
+}

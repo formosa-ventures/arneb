@@ -1167,7 +1167,7 @@ fn try_fold_date_interval(
 }
 
 /// Convert a `sqlparser` [`sp::Function`] into a arneb [`ast::Expr::Function`].
-fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseError> {
+fn convert_function(mut func: sp::Function, span: Span) -> Result<ast::Expr, ParseError> {
     // Identifier quotes are dropped (`"sum"(x)` is `sum(x)`), and so is a
     // `pg_catalog.` qualifier: PostgreSQL's search path always holds
     // pg_catalog, so clients qualify its functions freely.
@@ -1186,10 +1186,18 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
             "FILTER (WHERE ...) on {name}(...)"
         )));
     }
-    if !func.within_group.is_empty() {
+    // Ordered-set aggregates: `percentile_cont(f) WITHIN GROUP (ORDER BY x)`
+    // becomes `percentile_cont(f, x)` with `x` (and its direction) also as
+    // the aggregate's ORDER BY. Every other function refuses WITHIN GROUP.
+    let is_ordered_set = matches!(name_upper.as_str(), "PERCENTILE_CONT" | "PERCENTILE_DISC");
+    let within_group = std::mem::take(&mut func.within_group);
+    if !within_group.is_empty() && !is_ordered_set {
         return Err(ParseError::UnsupportedFeature(format!(
             "WITHIN GROUP on {name}(...)"
         )));
+    }
+    if is_ordered_set {
+        return convert_ordered_set_aggregate(func, name, within_group, span);
     }
 
     // Desugar COALESCE(a, b, ...) → CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ... ELSE last END
@@ -1444,6 +1452,59 @@ fn convert_function(func: sp::Function, span: Span) -> Result<ast::Expr, ParseEr
         args,
         distinct: is_distinct,
         order_by: agg_order_by,
+        span,
+    })
+}
+
+/// `percentile_cont`/`percentile_disc(f) WITHIN GROUP (ORDER BY x)` as
+/// `name(f, x)` with ORDER BY `x`: one fraction, one sort key, and no
+/// DISTINCT, in-argument ORDER BY or OVER.
+fn convert_ordered_set_aggregate(
+    func: sp::Function,
+    name: String,
+    within_group: Vec<sp::OrderByExpr>,
+    span: Span,
+) -> Result<ast::Expr, ParseError> {
+    if func.over.is_some() {
+        return Err(ParseError::UnsupportedFeature(format!(
+            "{name}(...) as a window function"
+        )));
+    }
+    let fraction = match func.args {
+        sp::FunctionArguments::List(arg_list)
+            if arg_list.duplicate_treatment.is_none()
+                && arg_list.clauses.is_empty()
+                && arg_list.args.len() == 1 =>
+        {
+            match convert_function_arg(arg_list.args.into_iter().next().unwrap())? {
+                ast::FunctionArg::Unnamed(e) => e,
+                ast::FunctionArg::Wildcard => {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "{name} requires a fraction argument"
+                    )))
+                }
+            }
+        }
+        _ => {
+            return Err(ParseError::InvalidSyntax(format!(
+                "{name} takes one fraction argument: {name}(f) WITHIN GROUP (ORDER BY x)"
+            )))
+        }
+    };
+    if within_group.len() != 1 {
+        return Err(ParseError::InvalidSyntax(format!(
+            "{name} requires WITHIN GROUP (ORDER BY x) with exactly one sort key"
+        )));
+    }
+    let key = convert_order_by_expr(within_group.into_iter().next().unwrap())?;
+    Ok(ast::Expr::Function {
+        name,
+        args: vec![
+            ast::FunctionArg::Unnamed(fraction),
+            ast::FunctionArg::Unnamed(key.expr.clone()),
+        ],
+        distinct: false,
+        order_by: vec![key],
         span,
     })
 }

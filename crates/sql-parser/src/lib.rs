@@ -1751,11 +1751,55 @@ mod tests {
 
     #[test]
     fn function_within_group_is_refused() {
-        match parse("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t") {
-            Err(ParseError::UnsupportedFeature(msg)) => {
-                assert!(msg.contains("WITHIN GROUP"), "{msg}")
+        for sql in [
+            "SELECT sum(x) WITHIN GROUP (ORDER BY x) FROM t",
+            "SELECT array_agg(x) WITHIN GROUP (ORDER BY x) FROM t",
+        ] {
+            match parse(sql) {
+                Err(ParseError::UnsupportedFeature(msg)) => {
+                    assert!(msg.contains("WITHIN GROUP"), "{msg}")
+                }
+                other => panic!("expected UnsupportedFeature, got {other:?}"),
             }
-            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn percentile_within_group_becomes_fraction_key_and_order_by() {
+        let Expr::Function {
+            name,
+            args,
+            order_by,
+            distinct,
+            ..
+        } = first_projection("SELECT percentile_disc(0.25) WITHIN GROUP (ORDER BY x DESC) FROM t")
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(name, "percentile_disc");
+        assert!(!distinct);
+        assert_eq!(args.len(), 2);
+        assert!(matches!(
+            &args[0],
+            FunctionArg::Unnamed(Expr::Literal { .. })
+        ));
+        assert!(
+            matches!(&args[1], FunctionArg::Unnamed(Expr::Column { col_ref, .. }) if col_ref.name == "x")
+        );
+        assert_eq!(order_by.len(), 1);
+        assert_eq!(order_by[0].asc, Some(false));
+    }
+
+    #[test]
+    fn percentile_needs_one_key_and_no_window() {
+        for sql in [
+            "SELECT percentile_cont(0.5) FROM t",
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x, y) FROM t",
+            "SELECT percentile_cont(0.5, 0.6) WITHIN GROUP (ORDER BY x) FROM t",
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) OVER () FROM t",
+            "SELECT percentile_cont(0.5) FILTER (WHERE x > 1) WITHIN GROUP (ORDER BY x) FROM t",
+        ] {
+            assert!(parse(sql).is_err(), "{sql}");
         }
     }
 

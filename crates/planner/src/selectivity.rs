@@ -375,6 +375,8 @@ fn is_aggregate_function_call(expr: &PlanExpr) -> bool {
                 | "BOOL_OR"
                 | "BOOL_AND"
                 | "ARRAY_AGG"
+                | "PERCENTILE_CONT"
+                | "PERCENTILE_DISC"
                 | "STDDEV_SAMP"
                 | "STDDEV"
                 | "STDDEV_POP"

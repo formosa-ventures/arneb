@@ -385,6 +385,7 @@ mod tests {
             ("current_setting", vec![s.clone(), DataType::Boolean]),
             ("current_schemas", vec![DataType::Boolean, s.clone()]),
             ("json_build_object", vec![s.clone(), i.clone()]),
+            ("format", vec![s.clone(), i.clone(), s.clone()]),
             (
                 "__regclass_name",
                 vec![i.clone(), s.clone(), s.clone(), s.clone()],

@@ -372,3 +372,122 @@ async fn binary_oid_parameter_over_pg_class() {
     assert_eq!(names, ["nation"]);
     assert_eq!(fallbacks(), before);
 }
+
+#[tokio::test]
+async fn stat_user_tables_lists_visible_tables() {
+    let before = fallbacks();
+    let client = connect(pg_server(None).await).await;
+    let r = rows(
+        &client,
+        "SELECT schemaname, relname, n_live_tup FROM pg_stat_user_tables ORDER BY relname",
+    )
+    .await;
+    let expected: Vec<Vec<Option<String>>> = [
+        ("default", "nation"),
+        ("staging", "raw"),
+        ("default", "region"),
+    ]
+    .iter()
+    .map(|(s, n)| vec![Some(s.to_string()), Some(n.to_string()), Some("0".into())])
+    .collect();
+    assert_eq!(r, expected);
+    // The same relations pg_class lists as user tables, with the same oids.
+    let joined = one(
+        &client,
+        "SELECT count(*) FROM pg_stat_user_tables st JOIN pg_class c ON c.oid = st.relid \
+         WHERE c.relkind = 'r' AND c.relname = st.relname",
+    )
+    .await;
+    assert_eq!(joined, [Some("3".into())]);
+    // NULLIF(n_live_tup, '0') is NULL for a zero count.
+    let r = one(
+        &client,
+        "SELECT NULLIF(n_live_tup, '0') FROM pg_stat_user_tables LIMIT 1",
+    )
+    .await;
+    assert_eq!(r, [None]);
+    assert_eq!(fallbacks(), before);
+}
+
+#[tokio::test]
+async fn enum_is_empty() {
+    let before = fallbacks();
+    let client = connect(pg_server(None).await).await;
+    let r = one(&client, "SELECT count(*) FROM pg_enum").await;
+    assert_eq!(r, [Some("0".into())]);
+    assert!(rows(
+        &client,
+        "SELECT oid, enumtypid, enumsortorder, enumlabel FROM pg_enum"
+    )
+    .await
+    .is_empty());
+    assert_eq!(fallbacks(), before);
+}
+
+#[tokio::test]
+async fn constraint_key_arrays() {
+    let before = fallbacks();
+    let client = connect(pg_server(None).await).await;
+    assert!(rows(&client, "SELECT conkey, confkey FROM pg_constraint")
+        .await
+        .is_empty());
+    assert!(rows(
+        &client,
+        "SELECT unnest(conkey), unnest(confkey) FROM pg_constraint"
+    )
+    .await
+    .is_empty());
+    // The columns are BIGINT arrays: indexing one plans and types.
+    let r = one(
+        &client,
+        "SELECT count(*) FROM (SELECT conkey[1] AS k FROM pg_constraint) t",
+    )
+    .await;
+    assert_eq!(r, [Some("0".into())]);
+    assert_eq!(fallbacks(), before);
+}
+
+#[tokio::test]
+async fn col_description_is_null() {
+    let before = fallbacks();
+    let client = connect(pg_server(None).await).await;
+    let r = one(
+        &client,
+        "SELECT col_description(CAST('nation'::regclass AS OID), 1), obj_description(1), \
+         obj_description(1, 'pg_class')",
+    )
+    .await;
+    assert_eq!(r, [None, None, None]);
+    let r = one(
+        &client,
+        "SELECT col_description(CAST(CAST(format('%I.%I', CAST('default' AS TEXT), \
+         CAST('nation' AS TEXT)) AS REGCLASS) AS OID), 2)",
+    )
+    .await;
+    assert_eq!(r, [None]);
+    assert_eq!(fallbacks(), before);
+}
+
+#[tokio::test]
+async fn format_over_pgwire() {
+    let before = fallbacks();
+    let client = connect(pg_server(None).await).await;
+    let r = one(
+        &client,
+        "SELECT format('%s', udt_name), format('\"%s\".\"%s\"', 'a', 'b'), \
+         format('%I.%I', 'Mixed', 'select'), format('%L', 'it''s'), format('%s|%s', 1, NULL) \
+         FROM (SELECT 'int4' AS udt_name) t",
+    )
+    .await;
+    assert_eq!(
+        r,
+        [
+            Some("int4".into()),
+            Some("\"a\".\"b\"".into()),
+            Some("\"Mixed\".\"select\"".into()),
+            Some("'it''s'".into()),
+            Some("1|".into())
+        ]
+    );
+    assert_eq!(fallbacks(), before);
+}

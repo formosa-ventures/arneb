@@ -1532,7 +1532,18 @@ fn push_percentile_value(
 ) -> Result<(), ExecutionError> {
     let col = packed.column(0);
     if col.is_valid(row) {
-        out.push(crate::operator::extract_scalar(col, row)?);
+        // `ScalarValue` has no TINYINT/SMALLINT: keep them as INTEGER (a
+        // `percentile_disc` result narrows back in `scalars_to_array`).
+        let value = match col.data_type() {
+            arrow::datatypes::DataType::Int8 => ScalarValue::Int32(i32::from(
+                col.as_primitive::<datatypes::Int8Type>().value(row),
+            )),
+            arrow::datatypes::DataType::Int16 => ScalarValue::Int32(i32::from(
+                col.as_primitive::<datatypes::Int16Type>().value(row),
+            )),
+            _ => crate::operator::extract_scalar(col, row)?,
+        };
+        out.push(value);
     }
     Ok(())
 }

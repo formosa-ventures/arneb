@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Date32Array, Int64Array, StringArray};
+use arrow::array::{
+    ArrayRef, Date32Array, Decimal128Array, Int16Array, Int64Array, Int8Array, StringArray,
+};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use tokio::net::TcpListener;
@@ -33,9 +35,36 @@ fn one_column(name: &str, arrow_type: ArrowDataType, values: ArrayRef) -> Arc<Me
     ))
 }
 
+/// A memory table of `(k BIGINT, v <v's type>)`.
+fn keyed(keys: Vec<i64>, v: ArrayRef) -> Arc<MemoryTable> {
+    let v_type = v.data_type().clone();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", ArrowDataType::Int64, true),
+        Field::new("v", v_type.clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(keys)), v]).unwrap();
+    Arc::new(MemoryTable::new(
+        vec![
+            ColumnInfo {
+                name: "k".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+            ColumnInfo {
+                name: "v".to_string(),
+                data_type: DataType::try_from(v_type).unwrap(),
+                nullable: true,
+            },
+        ],
+        vec![batch],
+    ))
+}
+
 /// Registers the fixture tables under `file.default`:
 /// `words(w VARCHAR)`, `t(x BIGINT)` = 1,2,3, `e(x BIGINT)` empty and
-/// `dt(d DATE)` = 2000-03-31, 1996-01-02.
+/// `dt(d DATE)` = 2000-03-31, 1996-01-02; `(k, v)` tables `sm` (SMALLINT),
+/// `ti` (TINYINT) = (1,1), (1,2), (1,4), (2,10) and `num` (DECIMAL(10,2)) =
+/// (1,1.00), (1,2.50), (2,3.25), (2,4.00), (2,10.10).
 fn state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
     let schema = Arc::new(MemorySchema::new());
     schema.register_table(
@@ -69,6 +98,26 @@ fn state() -> (Arc<CatalogManager>, Arc<ConnectorRegistry>) {
             "d",
             ArrowDataType::Date32,
             Arc::new(Date32Array::from(vec![11047, 9497])),
+        ),
+    );
+    let keys = vec![1, 1, 1, 2];
+    schema.register_table(
+        "sm",
+        keyed(keys.clone(), Arc::new(Int16Array::from(vec![1, 2, 4, 10]))),
+    );
+    schema.register_table(
+        "ti",
+        keyed(keys, Arc::new(Int8Array::from(vec![1, 2, 4, 10]))),
+    );
+    schema.register_table(
+        "num",
+        keyed(
+            vec![1, 1, 2, 2, 2],
+            Arc::new(
+                Decimal128Array::from(vec![100, 250, 325, 400, 1010])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
         ),
     );
     let file = Arc::new(MemoryCatalog::new());
@@ -364,6 +413,62 @@ async fn ordered_set_percentiles() {
     assert!(message.contains("between 0 and 1"), "{message}");
     let message = error_message(&client, "SELECT sum(x) WITHIN GROUP (ORDER BY x) FROM t").await;
     assert!(message.contains("WITHIN GROUP"), "{message}");
+}
+
+/// `percentile_cont` interpolates over small-integer and decimal keys too;
+/// `percentile_disc` returns a value of the key's own type.
+#[tokio::test]
+async fn percentiles_over_small_integers_and_decimals() {
+    let client = connect().await;
+    for table in ["sm", "ti"] {
+        assert_eq!(
+            rows(
+                &client,
+                &format!(
+                    "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v), \
+                     percentile_disc(0.5) WITHIN GROUP (ORDER BY v) FROM {table}"
+                )
+            )
+            .await,
+            [cells(&[Some("3"), Some("2")])],
+            "{table}"
+        );
+        assert_eq!(
+            rows(
+                &client,
+                &format!(
+                    "SELECT k, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) \
+                     FROM {table} GROUP BY k ORDER BY k"
+                )
+            )
+            .await,
+            [
+                cells(&[Some("1"), Some("2")]),
+                cells(&[Some("2"), Some("10")])
+            ],
+            "{table}"
+        );
+    }
+    let grouped = "SELECT k, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS c, \
+                   percentile_disc(0.5) WITHIN GROUP (ORDER BY v) AS d \
+                   FROM num GROUP BY k ORDER BY k";
+    assert_eq!(
+        rows(&client, grouped).await,
+        [
+            cells(&[Some("1"), Some("1.75"), Some("1.00")]),
+            cells(&[Some("2"), Some("4"), Some("4.00")])
+        ]
+    );
+    let stmt = client.prepare(grouped).await.unwrap();
+    let types: Vec<_> = stmt.columns().iter().map(|c| c.type_().clone()).collect();
+    assert_eq!(
+        types,
+        [
+            tokio_postgres::types::Type::INT8,
+            tokio_postgres::types::Type::FLOAT8,
+            tokio_postgres::types::Type::NUMERIC
+        ]
+    );
 }
 
 fn cells(v: &[Option<&str>]) -> Vec<Option<String>> {

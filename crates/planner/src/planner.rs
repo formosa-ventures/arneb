@@ -2615,21 +2615,13 @@ impl<'a> QueryPlanner<'a> {
                 left, op, right, ..
             } => {
                 // `x ± INTERVAL` and `INTERVAL + x`: lowered by `x`'s type.
-                let interval = match (left.as_ref(), op, right.as_ref()) {
-                    (
-                        operand,
-                        ast::BinaryOp::Plus | ast::BinaryOp::Minus,
-                        ast::Expr::Interval {
-                            value, unit, span, ..
-                        },
-                    ) => Some((operand, *value, *unit, *span, false)),
-                    (
-                        ast::Expr::Interval {
-                            value, unit, span, ..
-                        },
-                        ast::BinaryOp::Plus,
-                        operand,
-                    ) => Some((operand, *value, *unit, *span, true)),
+                let interval = match (as_interval(left), op, as_interval(right)) {
+                    (None, ast::BinaryOp::Plus | ast::BinaryOp::Minus, Some((value, unit, span))) => {
+                        Some((left.as_ref(), value, unit, span, false))
+                    }
+                    (Some((value, unit, span)), ast::BinaryOp::Plus, None) => {
+                        Some((right.as_ref(), value, unit, span, true))
+                    }
                     _ => None,
                 };
                 if let Some((operand, value, unit, interval_span, interval_first)) = interval {
@@ -3850,6 +3842,16 @@ struct IntervalOperand {
     first: bool,
 }
 
+/// The count, unit and span of an interval literal, looking through
+/// parentheses: `d + (INTERVAL '1 day')`.
+fn as_interval(expr: &ast::Expr) -> Option<(i64, ast::IntervalUnit, arneb_sql_parser::Span)> {
+    match expr {
+        ast::Expr::Interval { value, unit, span } => Some((*value, *unit, *span)),
+        ast::Expr::Nested { expr, .. } => as_interval(expr),
+        _ => None,
+    }
+}
+
 fn interval_outside_arithmetic(span: Option<arneb_sql_parser::Span>) -> PlanError {
     PlanError::UnsupportedExpression {
         message: "interval outside date/timestamp arithmetic".to_string(),
@@ -3881,7 +3883,9 @@ fn plan_interval_arithmetic(
         location: Some(interval.span.start),
     };
     let target = match (&operand_type, interval.unit) {
-        (Some(DataType::Date32), IntervalUnit::Day) => {
+        // An operand of unknown type (a parameter on the describe path)
+        // keeps the integer-day form a DAY interval always had.
+        (Some(DataType::Date32) | None, IntervalUnit::Day) => {
             let days = PlanExpr::Literal {
                 value: ScalarValue::Int32(
                     i32::try_from(interval.value).map_err(|_| out_of_range())?,
@@ -5840,6 +5844,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn interval_day_on_untyped_operand_keeps_integer_days() {
+        let parameter = || PlanExpr::Parameter {
+            index: 1,
+            type_hint: None,
+            span: None,
+        };
+        let interval = |unit| IntervalOperand {
+            op: ast::BinaryOp::Minus,
+            value: 90,
+            unit,
+            span: arneb_sql_parser::Span::empty(),
+            first: false,
+        };
+        let ctx = PlanningContext::new();
+        let planned =
+            plan_interval_arithmetic(parameter(), interval(ast::IntervalUnit::Day), &ctx, None)
+                .unwrap();
+        match planned {
+            PlanExpr::BinaryOp {
+                left, op, right, ..
+            } => {
+                assert_eq!(op, ast::BinaryOp::Minus);
+                assert!(matches!(*left, PlanExpr::Parameter { index: 1, .. }));
+                assert!(matches!(
+                    *right,
+                    PlanExpr::Literal {
+                        value: ScalarValue::Int32(90),
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected $1 - 90, got {other}"),
+        }
+        // Other units still need a known DATE or TIMESTAMP operand.
+        let err =
+            plan_interval_arithmetic(parameter(), interval(ast::IntervalUnit::Month), &ctx, None)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("interval"), "{err}");
+    }
+
     #[tokio::test]
     async fn interval_arithmetic_lowering() {
         let exprs = lineitem_projection(
@@ -5910,6 +5956,16 @@ mod tests {
                 ..
             }
         ));
+
+        // Parentheses around the interval change nothing.
+        let nested = lineitem_projection("SELECT l_shipdate + (INTERVAL '1 month') FROM lineitem")
+            .await
+            .unwrap();
+        assert!(
+            matches!(&nested[0], PlanExpr::Function { name, .. } if name == "date_add"),
+            "{}",
+            nested[0]
+        );
 
         for sql in [
             "SELECT INTERVAL '1 day' FROM lineitem",

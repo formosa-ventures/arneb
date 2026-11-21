@@ -215,20 +215,32 @@ async fn interval_arithmetic() {
         [text("1996-01-03"), text("2000-04-01")]
     );
     assert_eq!(first_oid(&client, day).await, 1082, "date");
-    // 02:00 on 1996-01-02, in Arneb's existing timestamp-to-varchar
-    // text (the same as `CAST(TIMESTAMP '1996-01-02 02:00:00' AS VARCHAR)`).
+    assert_eq!(
+        rows(&client, "SELECT d + (INTERVAL '1 day') FROM dt ORDER BY d").await,
+        [text("1996-01-03"), text("2000-04-01")]
+    );
+    assert_eq!(
+        rows(&client, "SELECT d + INTERVAL '1 week' FROM dt ORDER BY d").await,
+        [text("1996-01-09"), text("2000-04-07")]
+    );
+    // 2000-03-31 + 3 months clamps to 2000-06-30.
     assert_eq!(
         rows(
             &client,
-            "SELECT CAST(d + INTERVAL '2 hours' AS VARCHAR) FROM dt ORDER BY d LIMIT 1"
+            "SELECT d + INTERVAL '1 quarter' FROM dt ORDER BY d"
         )
         .await,
+        [text("1996-04-02"), text("2000-06-30")]
+    );
+    assert_eq!(
         rows(
             &client,
-            "SELECT CAST(TIMESTAMP '1996-01-02 02:00:00' AS VARCHAR)"
+            "SELECT CAST(CAST(d AS TIMESTAMP) + INTERVAL '1 day' AS VARCHAR) FROM dt ORDER BY d LIMIT 1"
         )
-        .await
+        .await,
+        [text("1996-01-03T00:00:00")]
     );
+    // 02:00 on 1996-01-02, in Arneb's existing timestamp-to-varchar text.
     assert_eq!(
         rows(
             &client,

@@ -167,6 +167,18 @@ async fn untyped_literal_numbers() {
         rows(&client, "SELECT COALESCE(x, '0') + 1 FROM t ORDER BY x").await,
         [text("2"), text("3"), text("4")]
     );
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT COALESCE(NULLIF(x, 1), '0') FROM t ORDER BY x"
+        )
+        .await,
+        [text("0"), text("2"), text("3")]
+    );
+    assert_eq!(
+        rows(&client, "SELECT sum(COALESCE(x, '0')) FROM t").await,
+        [text("6")]
+    );
     let err = client
         .simple_query("SELECT count(*) FROM t WHERE x = 'abc'")
         .await

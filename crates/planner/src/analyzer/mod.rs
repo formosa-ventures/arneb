@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arneb_common::error::PlanError;
-use arneb_common::types::{ColumnInfo, DataType};
+use arneb_common::types::{ColumnInfo, DataType, ScalarValue};
 use arneb_sql_parser::ast;
 
 use crate::cost::CatalogStats;
@@ -151,6 +151,14 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
             } else {
                 let lt = plan_expr_type(left, schema)?;
                 let rt = plan_expr_type(right, schema)?;
+                // An untyped string literal takes the numeric operand's
+                // type (see `TypeCoercion`).
+                if is_untyped_string_literal(left) && is_numeric_type(&rt) {
+                    return Some(rt);
+                }
+                if is_untyped_string_literal(right) && is_numeric_type(&lt) {
+                    return Some(lt);
+                }
                 // Decimal arithmetic has its own (Trino) result type.
                 if let Some((l, r)) = decimal_arithmetic_operands(left, &lt, right, &rt) {
                     let (precision, scale) = coercion_matrix::decimal_arithmetic_type(op, l, r)?;
@@ -184,9 +192,23 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
             else_result,
             ..
         } => {
-            // Unify all THEN + ELSE arms.
+            // Unify all THEN + ELSE arms. Untyped string literals take
+            // the type of a numeric arm, so they do not take part.
+            let results = || {
+                when_clauses
+                    .iter()
+                    .map(|(_, r)| r)
+                    .chain(else_result.as_deref())
+            };
+            let skip_strings = results()
+                .filter(|r| !is_untyped_string_literal(r))
+                .filter_map(|r| plan_expr_type(r, schema))
+                .any(|t| is_numeric_type(&t));
             let mut acc: Option<DataType> = None;
             for (_, result) in when_clauses {
+                if skip_strings && is_untyped_string_literal(result) {
+                    continue;
+                }
                 let rt = plan_expr_type(result, schema)?;
                 acc = Some(match acc {
                     None => rt,
@@ -200,7 +222,10 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
                     )?,
                 });
             }
-            if let Some(er) = else_result {
+            if let Some(er) = else_result
+                .as_deref()
+                .filter(|e| !(skip_strings && is_untyped_string_literal(e)))
+            {
                 let rt = plan_expr_type(er, schema)?;
                 acc = Some(match acc {
                     None => rt,
@@ -308,6 +333,30 @@ fn is_boolean_result_op(op: &ast::BinaryOp) -> bool {
             | ast::BinaryOp::Or
             | ast::BinaryOp::Like
             | ast::BinaryOp::NotLike
+    )
+}
+
+/// `expr` is a bare string literal (untyped in PostgreSQL terms).
+fn is_untyped_string_literal(expr: &PlanExpr) -> bool {
+    matches!(
+        expr,
+        PlanExpr::Literal {
+            value: ScalarValue::Utf8(_),
+            ..
+        }
+    )
+}
+
+fn is_numeric_type(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128 { .. }
     )
 }
 

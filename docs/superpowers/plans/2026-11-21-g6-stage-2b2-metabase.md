@@ -110,7 +110,6 @@
   - In `metabase_features.rs`, `untyped_literal_numbers`:
     - `SELECT count(*) FROM t WHERE x = '2'` → `1`.
     - `SELECT NULLIF(x, '1') FROM t ORDER BY x` → `NULL`, `2`, `3`.
-    - `SELECT COALESCE(NULL, '5') + 1`: leave it out, because it is ambiguous (no numeric operand).
     - `SELECT count(*) FROM t WHERE x = 'abc'` → error containing `invalid input syntax for type bigint: "abc"`.
 - [ ] **Step 2:** The new tests fail with `type mismatch: expected Int64, found Utf8`.
 - [ ] **Step 3:** Implement it in the binary-comparison, arithmetic and `NULLIF`/`COALESCE` unification paths. The literal side only.
@@ -148,7 +147,7 @@
     - `SELECT d - INTERVAL '1 month' FROM dt ORDER BY d` → `1995-12-02`, `2000-02-29`.
     - `SELECT d + INTERVAL '1 day' FROM dt ORDER BY d` → `1996-01-03`, `2000-04-01`. The type is DATE (RowDescription OID 1082).
     - `SELECT CAST(d + INTERVAL '2 hours' AS VARCHAR) FROM dt ORDER BY d LIMIT 1` → `1996-01-02 02:00:00`.
-    - `SELECT count(*) FROM dt WHERE d >= DATE_TRUNC('year', NOW() + INTERVAL '-30 year')` → `2`. This holds for any run date before 2026+30.
+    - `SELECT count(*) FROM dt WHERE d >= DATE_TRUNC('year', NOW() + INTERVAL '-40 year')` → `2` (holds until 2036).
     - `SELECT CAST(DATE_TRUNC('week', d + INTERVAL '1 day') AS DATE) + INTERVAL '-1 day' FROM dt ORDER BY d LIMIT 1` → `1995-12-31`, PostgreSQL's answer for Metabase's Sunday-week.
     - `SELECT CAST('2000-01-01' AS DATE) - d FROM dt ORDER BY d` → `1460`, `-90`. The type is INT4 (OID 23).
     - `SELECT INTERVAL '1 day'` → error containing `interval`.

@@ -454,6 +454,8 @@ fn shift_columns(expr: PlanExpr, delta: usize) -> PlanExpr {
             negated,
             span,
         } => crate::map_array_contains(expr, array, negated, span, |e| shift_columns(e, delta)),
+        E::ArrayElement(pair) => crate::map_array_element(pair, |e| shift_columns(e, delta)),
+        E::GetField(pair) => crate::map_get_field(pair, |e| shift_columns(e, delta)),
         E::Array {
             elements,
             element_type,

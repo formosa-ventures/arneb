@@ -669,6 +669,12 @@ where
             rewrite_expr(e, f).ok_or(())
         })
         .ok()?,
+        E::ArrayElement(pair) => {
+            crate::try_map_array_element(pair, |e| rewrite_expr(e, f).ok_or(())).ok()?
+        }
+        E::GetField(pair) => {
+            crate::try_map_get_field(pair, |e| rewrite_expr(e, f).ok_or(())).ok()?
+        }
         E::Array {
             elements,
             element_type,

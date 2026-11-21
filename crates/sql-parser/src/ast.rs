@@ -449,6 +449,25 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// `expr[index]`: a 1-based array subscript (PostgreSQL). Slices
+    /// (`expr[a:b]`) are refused by the parser.
+    Subscript {
+        /// The array expression.
+        expr: Box<Expr>,
+        /// The 1-based index.
+        index: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
+    /// `(expr).field`: a field of a composite (struct) value.
+    FieldAccess {
+        /// The composite expression (usually parenthesized).
+        expr: Box<Expr>,
+        /// The field name, unquoted.
+        field: String,
+        /// Source span.
+        span: Span,
+    },
 }
 
 /// The unit of an [`Expr::Interval`].
@@ -528,7 +547,9 @@ impl Expr {
             | Expr::Array { span, .. }
             | Expr::AnyAll { span, .. }
             | Expr::Parameter { span, .. }
-            | Expr::Interval { span, .. } => *span,
+            | Expr::Interval { span, .. }
+            | Expr::Subscript { span, .. }
+            | Expr::FieldAccess { span, .. } => *span,
         }
     }
 }
@@ -1005,6 +1026,8 @@ impl fmt::Display for Expr {
             Expr::Interval { value, unit, .. } => {
                 write!(f, "INTERVAL '{value}' {}", unit.name().to_ascii_uppercase())
             }
+            Expr::Subscript { expr, index, .. } => write!(f, "{expr}[{index}]"),
+            Expr::FieldAccess { expr, field, .. } => write!(f, "{expr}.{field}"),
         }
     }
 }

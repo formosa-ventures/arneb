@@ -948,10 +948,49 @@ pub(crate) fn convert_expr(expr: sp::Expr) -> Result<ast::Expr, ParseError> {
                 span,
             })
         }
+        sp::Expr::CompoundFieldAccess { root, access_chain } => {
+            convert_compound_access(*root, access_chain, span)
+        }
         other => Err(ParseError::UnsupportedFeature(format!(
             "expression: {other}"
         ))),
     }
+}
+
+/// `root[i]...` and `(root).field...`: array subscripts and composite field
+/// accesses, applied left to right. Slices (`[a:b]`) are refused.
+#[inline(never)]
+fn convert_compound_access(
+    root: sp::Expr,
+    access_chain: Vec<sp::AccessExpr>,
+    span: Span,
+) -> Result<ast::Expr, ParseError> {
+    let mut expr = convert_expr(root)?;
+    for access in access_chain {
+        expr = match access {
+            sp::AccessExpr::Subscript(sp::Subscript::Index { index }) => ast::Expr::Subscript {
+                expr: Box::new(expr),
+                index: Box::new(convert_expr(index)?),
+                span,
+            },
+            sp::AccessExpr::Subscript(sp::Subscript::Slice { .. }) => {
+                return Err(ParseError::UnsupportedFeature(
+                    "array slice (expr[lower:upper])".to_string(),
+                ))
+            }
+            sp::AccessExpr::Dot(sp::Expr::Identifier(ident)) => ast::Expr::FieldAccess {
+                expr: Box::new(expr),
+                field: ident.value,
+                span,
+            },
+            sp::AccessExpr::Dot(other) => {
+                return Err(ParseError::UnsupportedFeature(format!(
+                    "field access .{other}"
+                )))
+            }
+        };
+    }
+    Ok(expr)
 }
 
 /// True for the plain `CEIL(x)` / `FLOOR(x)` form (no `TO <unit>`, no scale).

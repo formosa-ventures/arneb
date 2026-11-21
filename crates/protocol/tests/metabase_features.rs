@@ -345,3 +345,99 @@ async fn ordered_set_percentiles() {
     let message = error_message(&client, "SELECT sum(x) WITHIN GROUP (ORDER BY x) FROM t").await;
     assert!(message.contains("WITHIN GROUP"), "{message}");
 }
+
+fn cells(v: &[Option<&str>]) -> Vec<Option<String>> {
+    v.iter().map(|c| c.map(str::to_string)).collect()
+}
+
+#[tokio::test]
+async fn array_subscripts_and_composites() {
+    let client = connect().await;
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT (ARRAY[10,20,30])[1], (ARRAY[10,20,30])[3], (ARRAY[10,20,30])[0], \
+             (ARRAY[10,20,30])[-1], (ARRAY[10,20,30])[4]"
+        )
+        .await,
+        [cells(&[Some("10"), Some("30"), None, None, None])]
+    );
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT (CAST(NULL AS BIGINT[]))[1], (ARRAY[1])[CAST(NULL AS BIGINT)]"
+        )
+        .await,
+        [cells(&[None, None])]
+    );
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT (pg_catalog.current_schemas(true))[1], (current_schemas(false))[1]"
+        )
+        .await,
+        [cells(&[Some("pg_catalog"), Some("default")])]
+    );
+    // An SRF in a subquery, its struct read through an outer column (the
+    // JDBC getPrimaryKeys shape).
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT k.n, (k.e).x, (k.e).n FROM \
+             (SELECT information_schema._pg_expandarray(ARRAY[7,8]) AS e, 0 AS n) k ORDER BY 2"
+        )
+        .await,
+        [
+            cells(&[Some("0"), Some("7"), Some("1")]),
+            cells(&[Some("0"), Some("8"), Some("2")]),
+        ]
+    );
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT (information_schema._pg_expandarray(ARRAY[5])).n"
+        )
+        .await,
+        [text("1")]
+    );
+    let message = error_message(
+        &client,
+        "SELECT (information_schema._pg_expandarray(ARRAY[5])).zz",
+    )
+    .await;
+    assert!(message.contains("zz"), "{message}");
+    let message = error_message(&client, "SELECT (ARRAY[1,2])[1:2]").await;
+    assert!(message.contains("slice"), "{message}");
+    // A column index, and the getPrimaryKeys filter: the struct column of a
+    // subquery compared field-wise in the outer WHERE, beside a lockstep
+    // `(srf).n` of the same call.
+    assert_eq!(
+        rows(&client, "SELECT x, (ARRAY[10,20,30])[x] FROM t ORDER BY x").await,
+        [
+            cells(&[Some("1"), Some("10")]),
+            cells(&[Some("2"), Some("20")]),
+            cells(&[Some("3"), Some("30")]),
+        ]
+    );
+    assert_eq!(
+        rows(
+            &client,
+            "SELECT result.v, result.key_seq FROM (SELECT t.x AS v, \
+             (information_schema._pg_expandarray(ARRAY[1,3])).n AS key_seq, \
+             information_schema._pg_expandarray(ARRAY[1,3]) AS keys FROM t) result \
+             WHERE result.v = (result.keys).x ORDER BY result.key_seq"
+        )
+        .await,
+        [
+            cells(&[Some("1"), Some("1")]),
+            cells(&[Some("3"), Some("2")]),
+        ]
+    );
+    // Composites stay inside the plan.
+    let message = error_message(
+        &client,
+        "SELECT information_schema._pg_expandarray(ARRAY[1])",
+    )
+    .await;
+    assert_eq!(message, "composite values are not supported over pgwire");
+}

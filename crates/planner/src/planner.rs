@@ -1218,12 +1218,19 @@ impl<'a> QueryPlanner<'a> {
                 },
                 span: arneb_sql_parser::Span::empty(),
             };
+            let (ast::SelectItem::UnnamedExpr(item_expr)
+            | ast::SelectItem::ExprWithAlias {
+                expr: item_expr, ..
+            }) = item
+            else {
+                unreachable!("srf_call matches expression items");
+            };
             let alias = match item {
                 ast::SelectItem::ExprWithAlias { alias, .. } => alias.clone(),
-                _ => kind.name().to_string(),
+                _ => srf_item_field(item_expr).unwrap_or(kind.name()).to_string(),
             };
             rewritten.push(ast::SelectItem::ExprWithAlias {
-                expr: reference,
+                expr: replace_srf_call(item_expr, reference),
                 alias,
             });
         }
@@ -2533,6 +2540,13 @@ impl<'a> QueryPlanner<'a> {
                     };
                     plan_args.push(plan_arg);
                 }
+                if name.eq_ignore_ascii_case("current_schemas") && plan_args.len() == 1 {
+                    // The session's search path, as `current_schema` reads it.
+                    plan_args.push(PlanExpr::Literal {
+                        value: ScalarValue::Utf8(self.catalog.default_schema().to_string()),
+                        span: None,
+                    });
+                }
                 let plan_order_by = if order_by.is_empty() {
                     None
                 } else {
@@ -2691,6 +2705,12 @@ impl<'a> QueryPlanner<'a> {
                 span: node_span,
             }),
             ast::Expr::Interval { .. } => Err(interval_outside_arithmetic(node_span)),
+            ast::Expr::Subscript { expr, index, .. } => {
+                Box::pin(self.plan_subscript(expr, index, ctx)).await
+            }
+            ast::Expr::FieldAccess { expr, field, .. } => {
+                Box::pin(self.plan_field_access(expr, field, ctx)).await
+            }
         }
     }
 
@@ -2988,6 +3008,35 @@ impl<'a> QueryPlanner<'a> {
         false
     }
 
+    /// `array[index]`. The operand and index types are checked by the
+    /// type-coercion pass. Out of line so the recursive `plan_expr` future
+    /// stays small.
+    async fn plan_subscript(
+        &self,
+        array: &ast::Expr,
+        index: &ast::Expr,
+        ctx: &PlanningContext,
+    ) -> Result<PlanExpr, PlanError> {
+        let array = self.plan_expr(array, ctx).await?;
+        let index = self.plan_expr(index, ctx).await?;
+        Ok(PlanExpr::ArrayElement(Box::new((array, index))))
+    }
+
+    /// `(expr).field`: an unknown field of a typed struct operand is a
+    /// plan-time error. Out of line so the recursive `plan_expr` future
+    /// stays small.
+    async fn plan_field_access(
+        &self,
+        expr: &ast::Expr,
+        field: &str,
+        ctx: &PlanningContext,
+    ) -> Result<PlanExpr, PlanError> {
+        let planned = self.plan_expr(expr, ctx).await?;
+        let schema: Vec<ColumnInfo> = ctx.columns.iter().map(|(_, c)| c.clone()).collect();
+        crate::analyzer::check_get_field(plan_expr_type(&planned, &schema).as_ref(), field)?;
+        Ok(PlanExpr::GetField(Box::new((planned, field.to_string()))))
+    }
+
     /// `expr = ANY (array)` / `expr <> ALL (array)` over an array-valued
     /// expression. Out of line so the recursive `plan_expr` future stays small.
     async fn plan_any_all(
@@ -3040,6 +3089,10 @@ impl<'a> QueryPlanner<'a> {
             ast::Expr::AnyAll { expr, array, .. } => {
                 self.contains_aggregate(expr) || self.contains_aggregate(array)
             }
+            ast::Expr::Subscript { expr, index, .. } => {
+                self.contains_aggregate(expr) || self.contains_aggregate(index)
+            }
+            ast::Expr::FieldAccess { expr, .. } => self.contains_aggregate(expr),
             ast::Expr::Case {
                 operand,
                 conditions,
@@ -3268,6 +3321,16 @@ impl<'a> QueryPlanner<'a> {
                 array: Box::new(self.rewrite_aggregates_as_columns(array, ctx, num_group_by)),
                 span: *span,
             },
+            ast::Expr::Subscript { expr, index, span } => ast::Expr::Subscript {
+                expr: Box::new(self.rewrite_aggregates_as_columns(expr, ctx, num_group_by)),
+                index: Box::new(self.rewrite_aggregates_as_columns(index, ctx, num_group_by)),
+                span: *span,
+            },
+            ast::Expr::FieldAccess { expr, field, span } => ast::Expr::FieldAccess {
+                expr: Box::new(self.rewrite_aggregates_as_columns(expr, ctx, num_group_by)),
+                field: field.clone(),
+                span: *span,
+            },
             ast::Expr::Function {
                 name,
                 args,
@@ -3416,10 +3479,16 @@ impl<'a> QueryPlanner<'a> {
                     self.extract_aggregates(e, ctx, out).await?;
                 }
             }
-            ast::Expr::AnyAll { expr, array, .. } => {
+            ast::Expr::AnyAll { expr, array, .. }
+            | ast::Expr::Subscript {
+                expr, index: array, ..
+            } => {
                 for e in [&**expr, &**array] {
                     self.extract_aggregates(e, ctx, out).await?;
                 }
+            }
+            ast::Expr::FieldAccess { expr, .. } => {
+                self.extract_aggregates(expr, ctx, out).await?;
             }
             // `rank() OVER (ORDER BY sum(x))`: the inner aggregate is
             // computed by the Aggregate node below the Window.
@@ -3505,6 +3574,12 @@ impl<'a> QueryPlanner<'a> {
             | PlanExpr::Parameter { .. }
             | PlanExpr::ScalarSubquery { .. } => ColumnInfo {
                 name: expr.to_string(),
+                data_type: inferred_type(),
+                nullable: true,
+            },
+            // PostgreSQL names `(expr).field` after the field.
+            PlanExpr::GetField(pair) => ColumnInfo {
+                name: pair.1.clone(),
                 data_type: inferred_type(),
                 nullable: true,
             },
@@ -4385,6 +4460,12 @@ fn rewrite_expr_after_column_insert(
         } => crate::map_array_contains(expr, array, negated, span, |e| {
             rewrite_expr_after_column_insert(e, inserted_index, scalar_subplan, scalar_replacement)
         }),
+        PlanExpr::ArrayElement(pair) => crate::map_array_element(pair, |e| {
+            rewrite_expr_after_column_insert(e, inserted_index, scalar_subplan, scalar_replacement)
+        }),
+        PlanExpr::GetField(pair) => crate::map_get_field(pair, |e| {
+            rewrite_expr_after_column_insert(e, inserted_index, scalar_subplan, scalar_replacement)
+        }),
         PlanExpr::Array { .. } => rewrite_array_after_column_insert(
             expr,
             inserted_index,
@@ -4717,12 +4798,48 @@ fn srf_call(item: &ast::SelectItem) -> Option<(SrfKind, &ast::Expr)> {
     else {
         return None;
     };
-    let mut expr = expr;
-    while let ast::Expr::Nested { expr: inner, .. } = expr {
-        expr = inner;
-    }
+    srf_call_expr(expr)
+}
+
+/// The SRF call `expr` is, possibly parenthesized and under field accesses
+/// (`(_pg_expandarray(a)).n`).
+fn srf_call_expr(expr: &ast::Expr) -> Option<(SrfKind, &ast::Expr)> {
     match expr {
+        ast::Expr::Nested { expr: inner, .. } | ast::Expr::FieldAccess { expr: inner, .. } => {
+            srf_call_expr(inner)
+        }
         ast::Expr::Function { name, .. } => SrfKind::from_name(name).map(|kind| (kind, expr)),
+        _ => None,
+    }
+}
+
+/// `expr` with its SRF call (see [`srf_call_expr`]) replaced by `column`,
+/// keeping the field accesses above it.
+fn replace_srf_call(expr: &ast::Expr, column: ast::Expr) -> ast::Expr {
+    match expr {
+        ast::Expr::Nested { expr: inner, span } => ast::Expr::Nested {
+            expr: Box::new(replace_srf_call(inner, column)),
+            span: *span,
+        },
+        ast::Expr::FieldAccess {
+            expr: inner,
+            field,
+            span,
+        } => ast::Expr::FieldAccess {
+            expr: Box::new(replace_srf_call(inner, column)),
+            field: field.clone(),
+            span: *span,
+        },
+        _ => column,
+    }
+}
+
+/// The outermost field an SRF SELECT item reads (`n` for
+/// `(_pg_expandarray(a)).n`), PostgreSQL's name for the column.
+fn srf_item_field(expr: &ast::Expr) -> Option<&str> {
+    match expr {
+        ast::Expr::Nested { expr, .. } => srf_item_field(expr),
+        ast::Expr::FieldAccess { field, .. } => Some(field),
         _ => None,
     }
 }
@@ -4760,6 +4877,11 @@ fn srf_array_argument(kind: SrfKind, call: &ast::Expr) -> Result<&ast::Expr, Pla
             [ast::FunctionArg::Unnamed(array), ast::FunctionArg::Unnamed(_)],
         ) => Ok(array),
         (SrfKind::GenerateSubscripts, _) => Err(generate_subscripts_dim_error()),
+        (SrfKind::ExpandArray, [ast::FunctionArg::Unnamed(array)]) => Ok(array),
+        (SrfKind::ExpandArray, _) => Err(PlanError::UnsupportedExpression {
+            message: "_pg_expandarray takes exactly one array argument".to_string(),
+            location: None,
+        }),
     }
 }
 
@@ -4815,7 +4937,12 @@ fn collect_window_calls(expr: &ast::Expr, out: &mut Vec<ast::Expr>) {
         | E::IsNull { expr, .. }
         | E::IsNotNull { expr, .. }
         | E::Cast { expr, .. }
-        | E::Nested { expr, .. } => collect_window_calls(expr, out),
+        | E::Nested { expr, .. }
+        | E::FieldAccess { expr, .. } => collect_window_calls(expr, out),
+        E::Subscript { expr, index, .. } => {
+            collect_window_calls(expr, out);
+            collect_window_calls(index, out);
+        }
         E::Between {
             expr, low, high, ..
         } => {
@@ -4872,7 +4999,12 @@ fn walk_columns(expr: &ast::Expr, cb: &mut impl FnMut(&ast::ColumnRef)) {
         | E::IsNull { expr, .. }
         | E::IsNotNull { expr, .. }
         | E::Cast { expr, .. }
-        | E::Nested { expr, .. } => walk_columns(expr, cb),
+        | E::Nested { expr, .. }
+        | E::FieldAccess { expr, .. } => walk_columns(expr, cb),
+        E::Subscript { expr, index, .. } => {
+            walk_columns(expr, cb);
+            walk_columns(index, cb);
+        }
         E::Between {
             expr, low, high, ..
         } => {
@@ -5199,6 +5331,16 @@ fn write_ast_unqualified(out: &mut String, expr: &ast::Expr) {
             );
             write_ast_unqualified(out, array);
             let _ = write!(out, ")");
+        }
+        ast::Expr::Subscript { expr, index, .. } => {
+            write_ast_unqualified(out, expr);
+            let _ = write!(out, "[");
+            write_ast_unqualified(out, index);
+            let _ = write!(out, "]");
+        }
+        ast::Expr::FieldAccess { expr, field, .. } => {
+            write_ast_unqualified(out, expr);
+            let _ = write!(out, ".{field}");
         }
         ast::Expr::Array { elements, .. } => {
             let _ = write!(out, "ARRAY[");
@@ -5591,6 +5733,27 @@ mod tests {
             panic!("expected Array");
         };
         assert!(matches!(elements[1], PlanExpr::Column { index: 3, .. }));
+    }
+
+    #[test]
+    fn column_insert_shifts_columns_inside_subscripts_and_field_access() {
+        let col = |index: usize| PlanExpr::Column {
+            index,
+            name: format!("c{index}"),
+            span: None,
+        };
+        let element = PlanExpr::ArrayElement(Box::new((col(2), col(0))));
+        let field = PlanExpr::GetField(Box::new((element, "x".to_string())));
+        let shifted = shift_plan_expr_columns(field, 1);
+        let PlanExpr::GetField(pair) = &shifted else {
+            panic!("expected GetField, got {shifted}");
+        };
+        assert_eq!(pair.1, "x");
+        let PlanExpr::ArrayElement(inner) = &pair.0 else {
+            panic!("expected ArrayElement");
+        };
+        assert!(matches!(inner.0, PlanExpr::Column { index: 3, .. }));
+        assert!(matches!(inner.1, PlanExpr::Column { index: 0, .. }));
     }
 
     const Q15_SQL: &str = include_str!("../../../benchmarks/tpch/queries/q15.sql");
@@ -6565,6 +6728,100 @@ mod tests {
         // Queries without SRFs keep their plan shape.
         let plain = plan_sql("SELECT id FROM users").await.unwrap();
         assert!(!plain.to_string().contains("ProjectSet"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn expandarray_yields_a_struct_read_by_field() {
+        let plan = plan_sql(
+            "EXPLAIN SELECT (information_schema._pg_expandarray(ARRAY[id])).n, \
+             information_schema._pg_expandarray(ARRAY[id]) AS k FROM users",
+        )
+        .await
+        .unwrap();
+        let LogicalPlan::Explain { input, .. } = &plan else {
+            panic!("expected Explain");
+        };
+        let LogicalPlan::Projection {
+            input,
+            exprs,
+            schema,
+        } = input.as_ref()
+        else {
+            panic!("expected Projection, got {input}");
+        };
+        // PostgreSQL names `(srf).n` after the field.
+        assert_eq!(schema[0].name, "n");
+        assert_eq!(schema[0].data_type, DataType::Int32);
+        assert!(matches!(exprs[0], PlanExpr::GetField(_)), "{}", exprs[0]);
+        let element = DataType::Struct(vec![
+            ("x".to_string(), DataType::Int64),
+            ("n".to_string(), DataType::Int32),
+        ]);
+        assert_eq!(schema[1].data_type, element);
+        let LogicalPlan::ProjectSet { srfs, .. } = input.as_ref() else {
+            panic!("expected ProjectSet, got {input}");
+        };
+        assert!(srfs.iter().all(|(k, _)| *k == SrfKind::ExpandArray));
+        // Workers receive plans as JSON.
+        let json = serde_json::to_string(input.as_ref()).unwrap();
+        let back: LogicalPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.to_string(), input.to_string());
+    }
+
+    #[tokio::test]
+    async fn subscripts_and_field_access_are_typed() {
+        let plan = plan_sql("SELECT (ARRAY[id, age])[2], (ARRAY[name])[id] FROM users")
+            .await
+            .unwrap();
+        let LogicalPlan::Projection { exprs, schema, .. } = &plan else {
+            panic!("expected Projection, got {plan}");
+        };
+        assert!(
+            matches!(exprs[0], PlanExpr::ArrayElement(_)),
+            "{}",
+            exprs[0]
+        );
+        assert_eq!(schema[0].data_type, DataType::Int64);
+        assert_eq!(schema[1].data_type, DataType::Utf8);
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: LogicalPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.to_string(), plan.to_string());
+
+        for (sql, want) in [
+            (
+                "SELECT (information_schema._pg_expandarray(ARRAY[1])).zz",
+                "column \"zz\" not found in data type",
+            ),
+            ("SELECT (id).x FROM users", "not a composite type"),
+            ("SELECT (id)[1] FROM users", "not an array"),
+            (
+                "SELECT (ARRAY[1])[name] FROM users",
+                "array subscript must have type integer",
+            ),
+        ] {
+            let err = plan_sql(sql).await.unwrap_err().to_string();
+            assert!(err.contains(want), "{sql}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn current_schemas_reads_the_session_search_path() {
+        let plan = plan_sql("SELECT current_schemas(true)").await.unwrap();
+        let LogicalPlan::Projection { exprs, schema, .. } = &plan else {
+            panic!("expected Projection, got {plan}");
+        };
+        let PlanExpr::Function { args, .. } = &exprs[0] else {
+            panic!("expected a call, got {}", exprs[0]);
+        };
+        // The catalog's default schema rides along as the search path.
+        assert_eq!(
+            args[1].to_string(),
+            format!("'{}'", test_catalog().default_schema())
+        );
+        assert_eq!(
+            schema[0].data_type,
+            DataType::List(Box::new(DataType::Utf8))
+        );
     }
 
     #[tokio::test]

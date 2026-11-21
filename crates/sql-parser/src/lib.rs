@@ -1588,6 +1588,29 @@ mod tests {
 
     // -- Trino function-syntax lowering (trino-functions-batch1) --
 
+    #[test]
+    fn parse_subscripts_and_field_access() {
+        let Expr::Subscript { expr, index, .. } = first_projection("SELECT (ARRAY[1, 2])[1]")
+        else {
+            panic!("expected Subscript");
+        };
+        assert!(matches!(*expr, Expr::Nested { .. }));
+        assert_eq!(index.to_string(), "1");
+        // `(k.e).x`: a field of a qualified column.
+        let Expr::FieldAccess { expr, field, .. } = first_projection("SELECT (k.e).x FROM k")
+        else {
+            panic!("expected FieldAccess");
+        };
+        assert_eq!(field, "x");
+        assert_eq!(expr.to_string(), "(k.e)");
+        // A chain applies left to right.
+        let e = first_projection("SELECT (f(a)).x[2] FROM t");
+        assert_eq!(e.to_string(), "(f(a)).x[2]");
+        assert!(matches!(e, Expr::Subscript { .. }));
+        let err = parse("SELECT (ARRAY[1, 2])[1:2]").unwrap_err();
+        assert!(err.to_string().contains("slice"), "{err}");
+    }
+
     fn first_projection(sql: &str) -> Expr {
         let stmt = parse(sql).unwrap();
         let Statement::Query { query, .. } = stmt else {

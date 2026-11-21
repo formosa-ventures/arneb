@@ -14,7 +14,10 @@ use arneb_common::error::ExecutionError;
 use arneb_common::pg_oid;
 use arneb_common::pg_settings;
 use arneb_common::types::DataType;
-use arrow::array::{new_null_array, Array, ArrayRef, BooleanArray, Int64Array, StringArray};
+use arrow::array::{
+    new_null_array, Array, ArrayRef, BooleanArray, Int64Array, ListBuilder, StringArray,
+    StringBuilder,
+};
 use arrow::datatypes::DataType as ArrowDataType;
 
 use super::args::{check_arity, int64, invalid, utf8};
@@ -68,7 +71,52 @@ pub(crate) fn all_pg_catalog_functions() -> Vec<Arc<dyn ScalarFunction>> {
         Arc::new(RegclassName),
         Arc::new(RegclassOid),
         Arc::new(CurrentSettingFunction),
+        Arc::new(CurrentSchemasFunction),
     ]
+}
+
+/// `current_schemas(include_implicit)`: the session's search path as an
+/// array, with `pg_catalog` first when `include_implicit` is true (PostgreSQL's
+/// order). The planner appends the search path as a second argument (the
+/// session's default schema, as `current_schema` reads it); NULL for a NULL
+/// argument.
+#[derive(Debug)]
+struct CurrentSchemasFunction;
+
+impl ScalarFunction for CurrentSchemasFunction {
+    fn name(&self) -> &str {
+        "CURRENT_SCHEMAS"
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType, ExecutionError> {
+        Ok(DataType::List(Box::new(DataType::Utf8)))
+    }
+    fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+        check_arity("CURRENT_SCHEMAS", args, 2, 2)?;
+        let include_implicit =
+            arrow::compute::cast(&args[0], &ArrowDataType::Boolean).map_err(|e| {
+                invalid(format!(
+                    "CURRENT_SCHEMAS: the argument must be a boolean: {e}"
+                ))
+            })?;
+        let include_implicit = include_implicit
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("cast to Boolean yields BooleanArray");
+        let path = utf8(&args[1], "CURRENT_SCHEMAS")?;
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for i in 0..include_implicit.len() {
+            if include_implicit.is_null(i) || path.is_null(i) {
+                builder.append(false);
+                continue;
+            }
+            if include_implicit.value(i) {
+                builder.values().append_value("pg_catalog");
+            }
+            builder.values().append_value(path.value(i));
+            builder.append(true);
+        }
+        Ok(Arc::new(builder.finish()))
+    }
 }
 
 /// `current_setting(name [, missing_ok])`: the value of a server setting

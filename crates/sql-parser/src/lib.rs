@@ -1062,6 +1062,47 @@ mod tests {
     // -- CASE / COALESCE / NULLIF tests --
 
     #[test]
+    fn parse_any_all_over_non_literal_arrays() {
+        for sql in [
+            "SELECT 1 FROM t WHERE x = ANY ($1)",
+            "SELECT 1 FROM t WHERE x <> ALL (y)",
+            "SELECT 1 FROM t WHERE x = ANY ('{1}'::int[])",
+        ] {
+            let stmt = parse(sql).unwrap();
+            let Statement::Query { query, .. } = stmt else {
+                panic!("expected Query");
+            };
+            let selection = *select_body(&query).selection.clone().unwrap();
+            assert!(
+                matches!(selection, Expr::AnyAll { .. }),
+                "{sql}: {selection:?}"
+            );
+        }
+        // An ARRAY[...] literal stays an IN list.
+        let stmt = parse("SELECT 1 FROM t WHERE x = ANY (ARRAY[1, 2])").unwrap();
+        let Statement::Query { query, .. } = stmt else {
+            panic!("expected Query");
+        };
+        let selection = *select_body(&query).selection.clone().unwrap();
+        assert!(matches!(selection, Expr::InList { .. }));
+    }
+
+    #[test]
+    fn parse_array_constructor() {
+        let stmt = parse("SELECT ARRAY[1, x + 1, NULL] FROM t").unwrap();
+        let Statement::Query { query, .. } = stmt else {
+            panic!("expected Query");
+        };
+        match &select_body(&query).projection[0] {
+            SelectItem::UnnamedExpr(e @ Expr::Array { elements, .. }) => {
+                assert_eq!(elements.len(), 3);
+                assert_eq!(e.to_string(), "ARRAY[1, x + 1, NULL]");
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_searched_case() {
         let stmt = parse("SELECT CASE WHEN x > 1 THEN 'a' WHEN x > 2 THEN 'b' ELSE 'c' END FROM t")
             .unwrap();
@@ -1371,7 +1412,14 @@ mod tests {
             assert_eq!(n, negated, "{sql}");
             assert!(!list.is_empty(), "{sql}");
         }
-        assert!(parse("SELECT x = ANY (y) FROM t").is_err());
+        // A non-literal array operand is `Expr::AnyAll`.
+        assert!(matches!(
+            projection("SELECT x = ANY (y) FROM t"),
+            Expr::AnyAll {
+                op: AnyAllOp::EqAny,
+                ..
+            }
+        ));
         assert!(parse("SELECT x > ANY (ARRAY[1]) FROM t").is_err());
     }
 
@@ -1626,5 +1674,51 @@ mod tests {
             function_name_and_arity(&first_projection("SELECT a || 'b' FROM t")),
             ("CONCAT".to_string(), 2)
         );
+    }
+
+    #[test]
+    fn function_filter_is_refused() {
+        match parse("SELECT count(*) FILTER (WHERE x > 1) FROM t") {
+            Err(ParseError::UnsupportedFeature(msg)) => assert!(msg.contains("FILTER"), "{msg}"),
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_within_group_is_refused() {
+        match parse("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t") {
+            Err(ParseError::UnsupportedFeature(msg)) => {
+                assert!(msg.contains("WITHIN GROUP"), "{msg}")
+            }
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_order_by_is_kept() {
+        let Expr::Function { order_by, .. } =
+            first_projection("SELECT array_agg(a ORDER BY b DESC) FROM t")
+        else {
+            panic!("expected function");
+        };
+        assert_eq!(order_by.len(), 1);
+        assert!(matches!(&order_by[0].expr, Expr::Column { col_ref, .. } if col_ref.name == "b"));
+        assert_eq!(order_by[0].asc, Some(false));
+    }
+
+    #[test]
+    fn window_aggregate_order_by_is_refused() {
+        match parse("SELECT sum(x ORDER BY y) OVER () FROM t") {
+            Err(ParseError::UnsupportedFeature(msg)) => assert!(msg.contains("ORDER BY"), "{msg}"),
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_call_filter_is_refused() {
+        match parse("SELECT sum(x) FILTER (WHERE x > 1) OVER () FROM t") {
+            Err(ParseError::UnsupportedFeature(msg)) => assert!(msg.contains("FILTER"), "{msg}"),
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
     }
 }

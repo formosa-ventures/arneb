@@ -173,6 +173,11 @@ where
             input: Box::new(f(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(f(*input)), srfs, schema),
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(f(*input)),
             id_column,
@@ -608,8 +613,10 @@ where
             name,
             args,
             distinct,
+            order_by,
             span,
         } => E::Function {
+            order_by: crate::plan::SortExpr::try_map_exprs(order_by, &mut |e| rewrite_expr(e, f))?,
             name,
             args: args
                 .into_iter()
@@ -651,6 +658,27 @@ where
                 .map(|a| rewrite_expr(a, f))
                 .collect::<Option<Vec<_>>>()?,
             negated,
+            span,
+        },
+        E::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::try_map_array_contains(expr, array, negated, span, |e| {
+            rewrite_expr(e, f).ok_or(())
+        })
+        .ok()?,
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements
+                .into_iter()
+                .map(|a| rewrite_expr(a, f))
+                .collect::<Option<Vec<_>>>()?,
+            element_type,
             span,
         },
         E::Cast {

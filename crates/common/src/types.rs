@@ -454,6 +454,15 @@ pub enum ScalarValue {
         /// Optional timezone identifier.
         timezone: Option<String>,
     },
+    /// Array value. `element` is boxed so the variant stays within the size
+    /// of the largest existing variant (`ScalarValue` is embedded in
+    /// `PlanExpr::Literal`, whose size is capped).
+    List {
+        /// Element type; `values` may hold `Null` of any element type.
+        element: Box<DataType>,
+        /// The elements.
+        values: Vec<ScalarValue>,
+    },
 }
 
 impl ScalarValue {
@@ -479,6 +488,7 @@ impl ScalarValue {
                 unit: *unit,
                 timezone: timezone.clone(),
             },
+            ScalarValue::List { element, .. } => DataType::List(element.clone()),
         }
     }
 }
@@ -511,6 +521,16 @@ impl fmt::Display for ScalarValue {
                 }
                 write!(f, ")")
             }
+            ScalarValue::List { values, .. } => {
+                write!(f, "ARRAY[")?;
+                for (i, v) in values.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -518,6 +538,19 @@ impl fmt::Display for ScalarValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_scalar_type_and_size() {
+        let v = ScalarValue::List {
+            element: Box::new(DataType::Int32),
+            values: vec![ScalarValue::Int32(1), ScalarValue::Null],
+        };
+        assert_eq!(v.data_type(), DataType::List(Box::new(DataType::Int32)));
+        assert_eq!(v.to_string(), "ARRAY[1, NULL]");
+        // `ScalarValue` sits inside `PlanExpr::Literal`, whose size is capped
+        // for stack depth; the list variant must not grow it.
+        assert!(std::mem::size_of::<ScalarValue>() <= 48);
+    }
 
     // -- CHAR(n) --
 

@@ -373,6 +373,8 @@ fn is_aggregate_function_call(expr: &PlanExpr) -> bool {
                 | "MIN"
                 | "MAX"
                 | "BOOL_OR"
+                | "BOOL_AND"
+                | "ARRAY_AGG"
                 | "STDDEV_SAMP"
                 | "STDDEV"
                 | "STDDEV_POP"
@@ -823,6 +825,7 @@ mod tests {
     #[test]
     fn unknown_expression_uses_default() {
         let predicate = PlanExpr::Function {
+            order_by: None,
             name: "weird_udf".to_string(),
             args: vec![col("c")],
             distinct: false,

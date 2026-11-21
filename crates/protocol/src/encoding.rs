@@ -24,8 +24,21 @@ pub fn datatype_to_pg_type(dt: &DataType) -> Type {
         DataType::Binary => Type::BYTEA,
         DataType::Date32 => Type::DATE,
         DataType::Timestamp { .. } => Type::TIMESTAMP,
+        DataType::List(element) => array_pg_type(element),
         _ => Type::TEXT,
     }
+}
+
+/// The PostgreSQL array type over `element`'s type (`int8[]` for `Int64`),
+/// or `text[]` when the element type has no array type of its own.
+pub fn array_pg_type(element: &DataType) -> Type {
+    let oid = i64::from(datatype_to_pg_type(element).oid());
+    arneb_common::pg_oid::PG_TYPES
+        .iter()
+        .find(|t| t.oid == oid)
+        .and_then(|t| u32::try_from(t.array_oid).ok())
+        .and_then(Type::from_oid)
+        .unwrap_or(Type::TEXT_ARRAY)
 }
 
 /// Converts a slice of `ColumnInfo` into pgwire `FieldInfo` entries for RowDescription.
@@ -147,8 +160,72 @@ fn encode_value(array: &dyn Array, row: usize) -> Option<String> {
             let materialized = arrow::compute::cast(array, value_type.as_ref()).ok()?;
             encode_value(materialized.as_ref(), row)
         }
+        arrow_types::DataType::List(_) | arrow_types::DataType::LargeList(_) => {
+            Some(encode_pg_array_text(array, row))
+        }
         _ => arrow::util::display::array_value_to_string(array, row).ok(),
     }
+}
+
+/// PostgreSQL text form (`{a,b,"c d",NULL}`) of the list at `row`.
+///
+/// An element is double-quoted when it is empty, equals `NULL` in any case,
+/// or contains a comma, double quote, backslash, brace or whitespace;
+/// inside the quotes only `"` and `\` are backslash-escaped. A NULL element
+/// prints bare `NULL`, and a nested list prints as a nested `{...}` without
+/// quotes. A NULL list prints as `NULL`; a non-list array prints the value
+/// itself.
+pub fn encode_pg_array_text(array: &dyn Array, row: usize) -> String {
+    if array.is_null(row) {
+        return "NULL".to_string();
+    }
+    let elements: ArrayRef = match array.data_type() {
+        arrow_types::DataType::List(_) => array.as_list::<i32>().value(row),
+        arrow_types::DataType::LargeList(_) => array.as_list::<i64>().value(row),
+        _ => return encode_value(array, row).unwrap_or_else(|| "NULL".to_string()),
+    };
+    let nested = matches!(
+        elements.data_type(),
+        arrow_types::DataType::List(_) | arrow_types::DataType::LargeList(_)
+    );
+    let mut out = String::from("{");
+    for i in 0..elements.len() {
+        if i > 0 {
+            out.push(',');
+        }
+        if elements.is_null(i) {
+            out.push_str("NULL");
+        } else if nested {
+            out.push_str(&encode_pg_array_text(elements.as_ref(), i));
+        } else {
+            match encode_value(elements.as_ref(), i) {
+                Some(text) => push_array_element(&mut out, &text),
+                None => out.push_str("NULL"),
+            }
+        }
+    }
+    out.push('}');
+    out
+}
+
+fn push_array_element(out: &mut String, text: &str) {
+    let needs_quotes = text.is_empty()
+        || text.eq_ignore_ascii_case("null")
+        || text
+            .chars()
+            .any(|c| matches!(c, ',' | '"' | '\\' | '{' | '}') || c.is_whitespace());
+    if !needs_quotes {
+        out.push_str(text);
+        return;
+    }
+    out.push('"');
+    for c in text.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
 }
 
 /// PostgreSQL text form of a timestamp `value` counted in `1 / per_sec`
@@ -226,11 +303,33 @@ pub fn encode_record_batches(
             .collect::<Result<_, _>>()
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
 
+        let is_array_col: Vec<bool> = schema
+            .iter()
+            .map(|f| {
+                let oid = i64::from(f.datatype().oid());
+                arneb_common::pg_oid::PG_TYPES
+                    .iter()
+                    .any(|t| t.array_oid == oid)
+            })
+            .collect();
         let mut encoder = DataRowEncoder::new(schema.clone());
         for row_idx in 0..num_rows {
-            for array in &columns {
+            for (col_idx, array) in columns.iter().enumerate() {
                 let value = encode_value(array.as_ref(), row_idx);
-                encoder.encode_field(&value)?;
+                let field = &schema[col_idx];
+                if is_array_col[col_idx] {
+                    // `encode_value` already produced the `{...}` literal;
+                    // typed as an array, pgwire would quote it again as a
+                    // single element.
+                    encoder.encode_field_with_type_and_format(
+                        &value,
+                        &Type::TEXT,
+                        field.format(),
+                        field.format_options().as_ref(),
+                    )?;
+                } else {
+                    encoder.encode_field(&value)?;
+                }
             }
             rows.push(Ok(encoder.take_row()));
         }
@@ -241,6 +340,93 @@ pub fn encode_record_batches(
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{ListArray, StringArray};
+    use arrow::datatypes::Int32Type;
+
+    #[test]
+    fn pg_array_text_quotes_and_nests() {
+        let strings = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), None, Some(3)]),
+            None,
+            Some(vec![]),
+        ]);
+        assert_eq!(encode_pg_array_text(&strings, 0), "{1,NULL,3}");
+        assert_eq!(encode_pg_array_text(&strings, 1), "NULL");
+        assert_eq!(encode_pg_array_text(&strings, 2), "{}");
+
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some(""),
+            Some("x y"),
+            Some("Null"),
+            None,
+        ]));
+        let field = Arc::new(arrow::datatypes::Field::new(
+            "item",
+            arrow_types::DataType::Utf8,
+            true,
+        ));
+        let offsets = arrow::buffer::OffsetBuffer::from_lengths([5]);
+        let list = ListArray::new(field, offsets, values, None);
+        assert_eq!(
+            encode_pg_array_text(&list, 0),
+            r#"{a,"","x y","Null",NULL}"#
+        );
+
+        // A list of lists nests without quoting the inner braces.
+        let inner: ArrayRef = Arc::new(strings);
+        let outer_field = Arc::new(arrow::datatypes::Field::new(
+            "item",
+            inner.data_type().clone(),
+            true,
+        ));
+        let outer = ListArray::new(
+            outer_field,
+            arrow::buffer::OffsetBuffer::from_lengths([2]),
+            inner.slice(0, 2),
+            None,
+        );
+        assert_eq!(encode_pg_array_text(&outer, 0), "{{1,NULL,3},NULL}");
+    }
+
+    #[test]
+    fn pg_array_text_renders_untyped_null_elements_as_null() {
+        let values: ArrayRef = Arc::new(NullArray::new(2));
+        let field = Arc::new(arrow::datatypes::Field::new(
+            "item",
+            arrow_types::DataType::Null,
+            true,
+        ));
+        let list = ListArray::new(
+            field,
+            arrow::buffer::OffsetBuffer::from_lengths([2]),
+            values,
+            None,
+        );
+        assert_eq!(encode_pg_array_text(&list, 0), "{NULL,NULL}");
+    }
+
+    #[test]
+    fn array_type_oids() {
+        use arneb_common::types::DataType as DT;
+        assert_eq!(
+            datatype_to_pg_type(&DT::List(Box::new(DT::Int32))).oid(),
+            1007
+        );
+        assert_eq!(
+            datatype_to_pg_type(&DT::List(Box::new(DT::Int64))).oid(),
+            1016
+        );
+        assert_eq!(
+            datatype_to_pg_type(&DT::List(Box::new(DT::Utf8))).oid(),
+            1015
+        );
+        // A struct element maps to text, whose array type is text[].
+        assert_eq!(
+            datatype_to_pg_type(&DT::List(Box::new(DT::Struct(vec![])))).oid(),
+            1009
+        );
+    }
     use super::*;
     use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
@@ -345,16 +531,11 @@ mod tests {
 
     #[test]
     fn test_encode_unhandled_type_formats_one_cell() {
-        // Types without a dedicated arm (here a LIST) render the single
+        // Types without a dedicated arm (here a TIME32) render the single
         // cell, not the debug dump of the whole array.
-        let arr: ArrayRef = Arc::new(
-            ListArray::from_iter_primitive::<arrow_types::Int32Type, _, _>(vec![
-                Some(vec![Some(1), Some(2)]),
-                Some(vec![Some(3)]),
-            ]),
-        );
-        assert_eq!(encode_value(arr.as_ref(), 0), Some("[1, 2]".to_string()));
-        assert_eq!(encode_value(arr.as_ref(), 1), Some("[3]".to_string()));
+        let arr: ArrayRef = Arc::new(Time32SecondArray::from(vec![3661, 60]));
+        assert_eq!(encode_value(arr.as_ref(), 0), Some("01:01:01".to_string()));
+        assert_eq!(encode_value(arr.as_ref(), 1), Some("00:01:00".to_string()));
     }
 
     #[test]

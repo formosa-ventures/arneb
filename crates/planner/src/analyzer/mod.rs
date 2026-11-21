@@ -174,7 +174,9 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
             _ => plan_expr_type(inner, schema),
         },
         PlanExpr::IsNull { .. } | PlanExpr::IsNotNull { .. } => Some(DataType::Boolean),
-        PlanExpr::Between { .. } | PlanExpr::InList { .. } => Some(DataType::Boolean),
+        PlanExpr::Between { .. } | PlanExpr::InList { .. } | PlanExpr::ArrayContains { .. } => {
+            Some(DataType::Boolean)
+        }
         PlanExpr::Cast { data_type, .. } => Some(data_type.clone()),
         PlanExpr::Function { name, args, .. } => function_return_type(name, args, schema),
         PlanExpr::CaseExpr {
@@ -214,12 +216,51 @@ pub fn plan_expr_type(expr: &PlanExpr, schema: &[ColumnInfo]) -> Option<DataType
             }
             acc
         }
+        PlanExpr::Array { elements, .. } => {
+            // Same helper as `unify_array`, so the planned and evaluated
+            // types agree.
+            let element = array_element_type(elements, schema).ok()?;
+            Some(DataType::List(Box::new(element)))
+        }
         PlanExpr::Parameter { type_hint, .. } => type_hint.clone(),
         PlanExpr::ScalarSubquery { subplan, .. } => {
             subplan.schema().first().map(|col| col.data_type.clone())
         }
         PlanExpr::Wildcard => None,
     }
+}
+
+/// Element type of `ARRAY[elements]`: the common supertype of the typed,
+/// non-NULL elements under the `CASE` branch rules, or `Utf8` when there is
+/// none (`ARRAY[NULL]` is text[] in PostgreSQL). `Err((accumulated, found))`
+/// on two elements with no common type. Shared by `plan_expr_type` and the
+/// type-coercion pass.
+pub(crate) fn array_element_type(
+    elements: &[PlanExpr],
+    schema: &[ColumnInfo],
+) -> Result<DataType, (DataType, DataType)> {
+    let mut target: Option<DataType> = None;
+    for e in elements {
+        let Some(t) = plan_expr_type(e, schema) else {
+            continue;
+        };
+        if t == DataType::Null {
+            continue;
+        }
+        target = Some(match target {
+            None => t,
+            Some(acc) => coercion_matrix::common_supertype(
+                &acc,
+                &t,
+                coercion_matrix::CoercionSite::CaseBranch {
+                    left_is_literal: false,
+                    right_is_literal: is_literal_like(e),
+                },
+            )
+            .ok_or((acc, t))?,
+        });
+    }
+    Ok(target.unwrap_or(DataType::Utf8))
 }
 
 /// `(precision, scale)` of each operand of decimal arithmetic, or `None`
@@ -331,7 +372,11 @@ pub(crate) fn function_return_type(
             })
             .or(Some(DataType::Float64)),
         "MIN" | "MAX" => args.first().and_then(|a| plan_expr_type(a, schema)),
-        "BOOL_OR" => Some(DataType::Boolean),
+        "BOOL_OR" | "BOOL_AND" => Some(DataType::Boolean),
+        "ARRAY_AGG" => args
+            .first()
+            .and_then(|a| plan_expr_type(a, schema))
+            .map(|t| DataType::List(Box::new(t))),
         "STDDEV_SAMP" | "STDDEV" | "STDDEV_POP" | "VAR_SAMP" | "VARIANCE" | "VAR_POP" => {
             Some(DataType::Float64)
         }

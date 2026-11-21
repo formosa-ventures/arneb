@@ -416,6 +416,81 @@ fn simplify_expr(expr: PlanExpr) -> PlanExpr {
 ///
 /// Folding is idempotent: running it twice on the same expression
 /// yields the same result (the result is already a `Literal`).
+/// `expr = ANY (array)` once both operands are folded. A constant array (a
+/// bound parameter, `'{1,2}'::int[]`) becomes an IN list, which is evaluated
+/// without expanding the array per row and takes the IN-list pushdown paths;
+/// an empty one is a constant (false for `= ANY`, true for `<> ALL`, whatever
+/// `expr` is, as in PostgreSQL). Three-valued logic carries over: a NULL
+/// element is a NULL list item.
+#[inline(never)]
+#[allow(clippy::boxed_local)]
+fn fold_array_contains(
+    expr: Box<PlanExpr>,
+    array: Box<PlanExpr>,
+    negated: bool,
+    span: Option<arneb_sql_parser::Span>,
+) -> Result<PlanExpr, PlanError> {
+    let expr = fold_constants(*expr)?;
+    let array = fold_constants(*array)?;
+    if let PlanExpr::Literal {
+        value: ScalarValue::List { element, values },
+        ..
+    } = array
+    {
+        if values.is_empty() {
+            return Ok(PlanExpr::Literal {
+                value: ScalarValue::Boolean(negated),
+                span,
+            });
+        }
+        // An untyped NULL value takes the element type, like the NULL items.
+        let expr = if matches!(
+            expr,
+            PlanExpr::Literal {
+                value: ScalarValue::Null,
+                ..
+            }
+        ) {
+            PlanExpr::Cast {
+                expr: Box::new(expr),
+                data_type: (*element).clone(),
+                span: None,
+            }
+        } else {
+            expr
+        };
+        return Ok(PlanExpr::InList {
+            expr: Box::new(expr),
+            list: values
+                .into_iter()
+                .map(|value| {
+                    let null = matches!(value, ScalarValue::Null);
+                    let literal = PlanExpr::Literal { value, span: None };
+                    // A NULL item carries the element type: IN-list items
+                    // must match the tested expression's type.
+                    if null {
+                        PlanExpr::Cast {
+                            expr: Box::new(literal),
+                            data_type: (*element).clone(),
+                            span: None,
+                        }
+                    } else {
+                        literal
+                    }
+                })
+                .collect(),
+            negated,
+            span,
+        });
+    }
+    Ok(PlanExpr::ArrayContains {
+        expr: Box::new(expr),
+        array: Box::new(array),
+        negated,
+        span,
+    })
+}
+
 pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
     match expr {
         PlanExpr::BinaryOp {
@@ -538,6 +613,49 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
                 span,
             })
         }
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => fold_array_contains(expr, array, negated, span),
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => {
+            let elements = elements
+                .into_iter()
+                .map(fold_constants)
+                .collect::<Result<Vec<_>, _>>()?;
+            // Fold to a list literal once type coercion has fixed the
+            // element type and every element is a literal.
+            if element_type != DataType::Null
+                && elements
+                    .iter()
+                    .all(|e| matches!(e, PlanExpr::Literal { .. }))
+            {
+                let values = elements
+                    .iter()
+                    .filter_map(|e| match e {
+                        PlanExpr::Literal { value, .. } => Some(value.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                return Ok(PlanExpr::Literal {
+                    value: ScalarValue::List {
+                        element: Box::new(element_type),
+                        values,
+                    },
+                    span,
+                });
+            }
+            Ok(PlanExpr::Array {
+                elements,
+                element_type,
+                span,
+            })
+        }
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -567,6 +685,7 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
             name,
             args,
             distinct,
+            order_by,
             span,
         } => {
             // TRY(expr) must turn its argument's errors into NULL, so a
@@ -583,7 +702,9 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let order_by = fold_order_by(order_by)?;
             Ok(PlanExpr::Function {
+                order_by,
                 name,
                 args,
                 distinct,
@@ -592,6 +713,22 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
         }
         other => Ok(other),
     }
+}
+
+/// Out-of-line so the recursive `fold_constants` frame stays small.
+#[inline(never)]
+fn fold_order_by(
+    order_by: Option<Box<Vec<crate::plan::SortExpr>>>,
+) -> Result<Option<Box<Vec<crate::plan::SortExpr>>>, PlanError> {
+    let Some(v) = order_by else { return Ok(None) };
+    let mut out = Vec::with_capacity(v.len());
+    for s in *v {
+        out.push(crate::plan::SortExpr {
+            expr: fold_constants(s.expr)?,
+            ..s
+        });
+    }
+    Ok(Some(Box::new(out)))
 }
 
 /// Evaluate a binary operation on two scalar values.

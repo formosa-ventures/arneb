@@ -180,6 +180,11 @@ where
             input: Box::new(f(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(f(*input)), srfs, schema),
         L::AssignUniqueId { input, id_column } => L::AssignUniqueId {
             input: Box::new(f(*input)),
             id_column,
@@ -485,6 +490,7 @@ fn rewrite_one(
         span: None,
     };
     let agg_exprs = vec![PlanExpr::Function {
+        order_by: None,
         name: "BOOL_OR".to_string(),
         args: vec![bool_or_arg],
         distinct: false,
@@ -624,8 +630,10 @@ where
             name,
             args,
             distinct,
+            order_by,
             span,
         } => E::Function {
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| walk_columns(e, f)),
             name,
             args: args.into_iter().map(|a| walk_columns(a, f)).collect(),
             distinct,
@@ -661,6 +669,21 @@ where
             expr: Box::new(walk_columns(*expr, f)),
             list: list.into_iter().map(|e| walk_columns(e, f)).collect(),
             negated,
+            span,
+        },
+        E::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| walk_columns(e, f)),
+        E::Array {
+            elements,
+            element_type,
+            span,
+        } => E::Array {
+            elements: elements.into_iter().map(|e| walk_columns(e, f)).collect(),
+            element_type,
             span,
         },
         E::Cast {
@@ -702,9 +725,12 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             collect_column_indices(right, cb);
         }
         E::UnaryOp { expr, .. } => collect_column_indices(expr, cb),
-        E::Function { args, .. } => {
+        E::Function { args, order_by, .. } => {
             for a in args {
                 collect_column_indices(a, cb);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_column_indices(&s.expr, cb);
             }
         }
         E::IsNull { expr, .. } | E::IsNotNull { expr, .. } => collect_column_indices(expr, cb),
@@ -720,6 +746,15 @@ fn collect_column_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             for e in list {
                 collect_column_indices(e, cb);
             }
+        }
+        E::Array { elements, .. } => {
+            for e in elements {
+                collect_column_indices(e, cb);
+            }
+        }
+        E::ArrayContains { expr, array, .. } => {
+            collect_column_indices(expr, cb);
+            collect_column_indices(array, cb);
         }
         E::Cast { expr, .. } => collect_column_indices(expr, cb),
         E::CaseExpr {

@@ -288,6 +288,8 @@ pub enum Expr {
         args: Vec<FunctionArg>,
         /// Whether DISTINCT was specified (e.g., `COUNT(DISTINCT x)`).
         distinct: bool,
+        /// `ORDER BY` inside the call (e.g., `array_agg(x ORDER BY y)`).
+        order_by: Vec<OrderByExpr>,
         /// Source span covering the call.
         span: Span,
     },
@@ -400,6 +402,26 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// An `ARRAY[e1, e2, ...]` constructor.
+    Array {
+        /// The element expressions.
+        elements: Vec<Expr>,
+        /// Source span.
+        span: Span,
+    },
+    /// `expr = ANY (array)` or `expr <> ALL (array)` where `array` is not an
+    /// `ARRAY[...]` literal (those become [`Expr::InList`]): a parameter, a
+    /// cast, a column or any other array-valued expression.
+    AnyAll {
+        /// The left operand.
+        expr: Box<Expr>,
+        /// Which quantified comparison.
+        op: AnyAllOp,
+        /// The array operand.
+        array: Box<Expr>,
+        /// Source span.
+        span: Span,
+    },
     /// An extended-query-protocol parameter placeholder (`$1`, `$2`, …).
     ///
     /// Parameters only appear when the query is submitted via the
@@ -437,9 +459,20 @@ impl Expr {
             | Expr::Exists { span, .. }
             | Expr::WindowFunction { span, .. }
             | Expr::Case { span, .. }
+            | Expr::Array { span, .. }
+            | Expr::AnyAll { span, .. }
             | Expr::Parameter { span, .. } => *span,
         }
     }
+}
+
+/// The quantified comparisons over an array operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnyAllOp {
+    /// `expr = ANY (array)`.
+    EqAny,
+    /// `expr <> ALL (array)`.
+    NotEqAll,
 }
 
 /// A reference to a column, optionally qualified by a table name.
@@ -733,6 +766,7 @@ impl fmt::Display for Expr {
                 name,
                 args,
                 distinct,
+                order_by,
                 ..
             } => {
                 write!(f, "{name}(")?;
@@ -745,8 +779,37 @@ impl fmt::Display for Expr {
                     }
                     write!(f, "{arg}")?;
                 }
+                for (i, ob) in order_by.iter().enumerate() {
+                    write!(f, "{}{}", if i == 0 { " ORDER BY " } else { ", " }, ob.expr)?;
+                    match ob.asc {
+                        Some(true) => write!(f, " ASC")?,
+                        Some(false) => write!(f, " DESC")?,
+                        None => {}
+                    }
+                    match ob.nulls_first {
+                        Some(true) => write!(f, " NULLS FIRST")?,
+                        Some(false) => write!(f, " NULLS LAST")?,
+                        None => {}
+                    }
+                }
                 write!(f, ")")
             }
+            Expr::Array { elements, .. } => {
+                write!(f, "ARRAY[")?;
+                for (i, e) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                write!(f, "]")
+            }
+            Expr::AnyAll {
+                expr, op, array, ..
+            } => match op {
+                AnyAllOp::EqAny => write!(f, "{expr} = ANY ({array})"),
+                AnyAllOp::NotEqAll => write!(f, "{expr} <> ALL ({array})"),
+            },
             Expr::IsNull { expr, .. } => write!(f, "{expr} IS NULL"),
             Expr::IsNotNull { expr, .. } => write!(f, "{expr} IS NOT NULL"),
             Expr::Between {

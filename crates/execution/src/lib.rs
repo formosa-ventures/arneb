@@ -31,6 +31,7 @@ mod operator;
 mod optimizer;
 pub mod partitioning;
 mod planner;
+mod project_set;
 pub mod repartition;
 pub mod spill;
 // query_coordinator lives in server crate to avoid circular deps

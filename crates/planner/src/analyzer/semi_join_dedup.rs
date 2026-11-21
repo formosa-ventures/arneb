@@ -231,6 +231,11 @@ fn rewrite(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(rewrite(*input)),
             functions,
         },
+        L::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => LogicalPlan::rebuild_project_set(Box::new(rewrite(*input)), srfs, schema),
         L::Explain { input, analyze } => L::Explain {
             input: Box::new(rewrite(*input)),
             analyze,
@@ -349,9 +354,12 @@ fn collect_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             collect_indices(right, cb);
         }
         PlanExpr::UnaryOp { expr, .. } => collect_indices(expr, cb),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for a in args {
                 collect_indices(a, cb);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_indices(&s.expr, cb);
             }
         }
         PlanExpr::IsNull { expr, .. } | PlanExpr::IsNotNull { expr, .. } => {
@@ -362,6 +370,15 @@ fn collect_indices<F: FnMut(usize)>(expr: &PlanExpr, cb: &mut F) {
             for e in list {
                 collect_indices(e, cb);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for e in elements {
+                collect_indices(e, cb);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_indices(expr, cb);
+            collect_indices(array, cb);
         }
         PlanExpr::Between {
             expr, low, high, ..
@@ -445,8 +462,10 @@ fn walk_remap(expr: PlanExpr, f: &dyn Fn(usize) -> Option<usize>) -> PlanExpr {
             name,
             args,
             distinct,
+            order_by,
             span,
         } => PlanExpr::Function {
+            order_by: crate::plan::SortExpr::map_exprs(order_by, &mut |e| walk_remap(e, f)),
             name,
             args: args.into_iter().map(|a| walk_remap(a, f)).collect(),
             distinct,
@@ -469,6 +488,21 @@ fn walk_remap(expr: PlanExpr, f: &dyn Fn(usize) -> Option<usize>) -> PlanExpr {
             expr: Box::new(walk_remap(*expr, f)),
             list: list.into_iter().map(|e| walk_remap(e, f)).collect(),
             negated,
+            span,
+        },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| walk_remap(e, f)),
+        PlanExpr::Array {
+            elements,
+            element_type,
+            span,
+        } => PlanExpr::Array {
+            elements: elements.into_iter().map(|e| walk_remap(e, f)).collect(),
+            element_type,
             span,
         },
         PlanExpr::Between {

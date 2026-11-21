@@ -380,6 +380,7 @@ mod tests {
                 })
                 .collect();
             let expr = PlanExpr::Function {
+                order_by: None,
                 name: name.to_string(),
                 args: (0..arg_types.len())
                     .map(|idx| PlanExpr::Column {

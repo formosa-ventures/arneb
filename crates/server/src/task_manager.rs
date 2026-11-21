@@ -1423,6 +1423,9 @@ impl TaskSources<'_> {
             | LogicalPlan::PartialAggregate { input, .. }
             | LogicalPlan::FinalAggregate { input, .. }
             | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::Window { input, .. }
+            | LogicalPlan::ProjectSet { input, .. }
+            | LogicalPlan::AssignUniqueId { input, .. }
             | LogicalPlan::Explain { input, .. } => self.register(input, ctx).await,
             LogicalPlan::Join { left, right, .. }
             | LogicalPlan::SemiJoin { left, right, .. }
@@ -1702,6 +1705,112 @@ mod tests {
             .await
             .expect("schema-only scan in the pushed default catalog");
         assert_eq!(pulls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A worker registers the scans below every pass-through node. Broadcast
+    /// v2b inlines a probe scan under its join, so a worker fragment can be
+    /// `Join(Projection(ProjectSet(TableScan)), ..)`; Window and
+    /// AssignUniqueId wrap scans the same way.
+    #[tokio::test]
+    async fn scans_below_project_set_window_and_assign_unique_id_are_registered() {
+        use arneb_connectors::memory::{MemoryCatalog, MemoryConnectorFactory, MemorySchema};
+        use arneb_execution::memory_pool::UnboundedMemoryPool;
+        use arneb_planner::{PlanExpr, SrfKind};
+
+        let id = arneb_common::types::ColumnInfo {
+            name: "id".into(),
+            data_type: arneb_common::types::DataType::Int64,
+            nullable: false,
+        };
+        let mem = Arc::new(MemoryCatalog::new());
+        let schema = Arc::new(MemorySchema::new());
+        schema.register_table(
+            "users",
+            Arc::new(arneb_connectors::memory::MemoryTable::new(
+                vec![id.clone()],
+                vec![],
+            )),
+        );
+        // The join's other side scans a different table, so only the
+        // ProjectSet side can register `users`.
+        schema.register_table(
+            "small",
+            Arc::new(arneb_connectors::memory::MemoryTable::new(
+                vec![id.clone()],
+                vec![],
+            )),
+        );
+        mem.register_schema("default", schema);
+        let registry = Arc::new(ConnectorRegistry::new());
+        registry.register(
+            "memory",
+            Arc::new(MemoryConnectorFactory::new(mem, "default")),
+        );
+        let tm = TaskManager::new(
+            FlightState::new(),
+            Arc::new(CatalogManager::new("memory", "default")),
+            registry,
+            Arc::new(UnboundedMemoryPool::new()),
+        );
+        let scan_of = |name: &str| LogicalPlan::TableScan {
+            table: TableReference::table(name),
+            schema: vec![id.clone()],
+            alias: None,
+            properties: Default::default(),
+            dynamic_filters_consumed: vec![],
+        };
+        let scan = || scan_of("users");
+        let column = PlanExpr::Column {
+            index: 0,
+            name: "id".into(),
+            span: None,
+        };
+        let project_set = LogicalPlan::rebuild_project_set(
+            Box::new(scan()),
+            vec![(
+                SrfKind::Unnest,
+                PlanExpr::Array {
+                    elements: vec![column.clone()],
+                    element_type: arneb_common::types::DataType::Int64,
+                    span: None,
+                },
+            )],
+            vec![arneb_common::types::ColumnInfo {
+                name: "unnest".into(),
+                data_type: arneb_common::types::DataType::Int64,
+                nullable: true,
+            }],
+        );
+        let probe = LogicalPlan::Projection {
+            schema: vec![id.clone()],
+            exprs: vec![column],
+            input: Box::new(project_set),
+        };
+        let plans = [
+            LogicalPlan::Join {
+                left: Box::new(probe),
+                right: Box::new(scan_of("small")),
+                join_type: arneb_sql_parser::ast::JoinType::Inner,
+                condition: arneb_planner::JoinCondition::None,
+                dynamic_filter_ids: vec![],
+            },
+            LogicalPlan::Window {
+                input: Box::new(scan()),
+                functions: vec![],
+            },
+            LogicalPlan::AssignUniqueId {
+                input: Box::new(scan()),
+                id_column: "__rowid".into(),
+            },
+        ];
+        for plan in plans {
+            let mut ctx = arneb_execution::ExecutionContext::new();
+            tm.register_data_sources(&plan, &mut ctx, None)
+                .await
+                .unwrap();
+            ctx.create_physical_plan(&plan)
+                .unwrap_or_else(|e| panic!("scan not registered under {plan}: {e}"));
+        }
     }
 
     /// A memory-backed catalog holding `default.users`.

@@ -146,6 +146,12 @@ fn collect_decimal_carry_and_blocks(
             }
             collect_decimal_carry_and_blocks(input, carried_by_parent, carried, blocked);
         }
+        LogicalPlan::ProjectSet { input, srfs, .. } => {
+            for (_, expr) in srfs {
+                collect_expr_subquery_blocks(expr, blocked);
+            }
+            collect_decimal_carry_and_blocks(input, carried_by_parent, carried, blocked);
+        }
         LogicalPlan::PartialAggregate {
             input,
             group_by,
@@ -426,6 +432,15 @@ fn rewrite_plan(plan: LogicalPlan, candidates: &HashSet<ColumnSource>) -> Logica
             input: Box::new(rewrite_plan(*input, candidates)),
             functions,
         },
+        LogicalPlan::ProjectSet {
+            input,
+            srfs,
+            schema,
+        } => {
+            let input = rewrite_plan(*input, candidates);
+            let input = castback_input_if_needed(input, srfs.iter().map(|(_, e)| e));
+            LogicalPlan::rebuild_project_set(Box::new(input), srfs, schema)
+        }
         LogicalPlan::AssignUniqueId { input, id_column } => LogicalPlan::AssignUniqueId {
             input: Box::new(rewrite_plan(*input, candidates)),
             id_column,
@@ -560,9 +575,12 @@ fn collect_decimal64_columns_needing_wide(
             collect_decimal64_column_refs(left, schema, used);
             collect_decimal64_column_refs(right, schema, used);
         }
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_decimal64_column_refs(arg, schema, used);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_decimal64_column_refs(&s.expr, schema, used);
             }
         }
         PlanExpr::UnaryOp { expr, .. }
@@ -583,6 +601,15 @@ fn collect_decimal64_columns_needing_wide(
             for item in list {
                 collect_decimal64_column_refs(item, schema, used);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_decimal64_column_refs(item, schema, used);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_decimal64_column_refs(expr, schema, used);
+            collect_decimal64_column_refs(array, schema, used);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -627,9 +654,12 @@ fn collect_decimal64_column_refs(
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => collect_decimal64_column_refs(expr, schema, used),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_decimal64_column_refs(arg, schema, used);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_decimal64_column_refs(&s.expr, schema, used);
             }
         }
         PlanExpr::Between {
@@ -644,6 +674,15 @@ fn collect_decimal64_column_refs(
             for item in list {
                 collect_decimal64_column_refs(item, schema, used);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_decimal64_column_refs(item, schema, used);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_decimal64_column_refs(expr, schema, used);
+            collect_decimal64_column_refs(array, schema, used);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -674,13 +713,31 @@ fn block_direct_aggregate_decimal_sources(
     input: &LogicalPlan,
     blocked: &mut HashSet<ColumnSource>,
 ) {
-    if let PlanExpr::Function { name, args, .. } = expr {
-        if matches!(name.to_uppercase().as_str(), "SUM" | "AVG") {
-            for arg in args {
-                if let PlanExpr::Column { index, .. } = arg {
-                    blocked.extend(trace_output_column(input, *index).blockable_sources());
+    if let PlanExpr::Function {
+        name,
+        args,
+        order_by,
+        ..
+    } = expr
+    {
+        match name.to_uppercase().as_str() {
+            "SUM" | "AVG" => {
+                for arg in args {
+                    if let PlanExpr::Column { index, .. } = arg {
+                        blocked.extend(trace_output_column(input, *index).blockable_sources());
+                    }
                 }
             }
+            // `array_agg` buffers `Decimal128` scalars and orders by them.
+            "ARRAY_AGG" => {
+                for e in args
+                    .iter()
+                    .chain(order_by.iter().flat_map(|v| v.iter().map(|s| &s.expr)))
+                {
+                    block_expr_sources(e, input, blocked);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -704,9 +761,12 @@ fn block_expr_sources(expr: &PlanExpr, input: &LogicalPlan, blocked: &mut HashSe
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => block_expr_sources(expr, input, blocked),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 block_expr_sources(arg, input, blocked);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                block_expr_sources(&s.expr, input, blocked);
             }
         }
         PlanExpr::Between {
@@ -721,6 +781,15 @@ fn block_expr_sources(expr: &PlanExpr, input: &LogicalPlan, blocked: &mut HashSe
             for item in list {
                 block_expr_sources(item, input, blocked);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                block_expr_sources(item, input, blocked);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            block_expr_sources(expr, input, blocked);
+            block_expr_sources(array, input, blocked);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -755,9 +824,12 @@ fn collect_expr_subquery_blocks(expr: &PlanExpr, blocked: &mut HashSet<ColumnSou
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => collect_expr_subquery_blocks(expr, blocked),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 collect_expr_subquery_blocks(arg, blocked);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                collect_expr_subquery_blocks(&s.expr, blocked);
             }
         }
         PlanExpr::Between {
@@ -772,6 +844,15 @@ fn collect_expr_subquery_blocks(expr: &PlanExpr, blocked: &mut HashSet<ColumnSou
             for item in list {
                 collect_expr_subquery_blocks(item, blocked);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                collect_expr_subquery_blocks(item, blocked);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            collect_expr_subquery_blocks(expr, blocked);
+            collect_expr_subquery_blocks(array, blocked);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -822,9 +903,12 @@ fn block_expr_sources_joined(
         | PlanExpr::IsNull { expr, .. }
         | PlanExpr::IsNotNull { expr, .. }
         | PlanExpr::Cast { expr, .. } => block_expr_sources_joined(expr, left, right, blocked),
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Function { args, order_by, .. } => {
             for arg in args {
                 block_expr_sources_joined(arg, left, right, blocked);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                block_expr_sources_joined(&s.expr, left, right, blocked);
             }
         }
         PlanExpr::Between {
@@ -839,6 +923,15 @@ fn block_expr_sources_joined(
             for item in list {
                 block_expr_sources_joined(item, left, right, blocked);
             }
+        }
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                block_expr_sources_joined(item, left, right, blocked);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            block_expr_sources_joined(expr, left, right, blocked);
+            block_expr_sources_joined(array, left, right, blocked);
         }
         PlanExpr::CaseExpr {
             operand,
@@ -1105,6 +1198,7 @@ mod tests {
             input: Box::new(project),
             group_by: Vec::new(),
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "SUM".to_string(),
                 args: vec![col(0, "product")],
                 distinct: false,
@@ -1217,6 +1311,7 @@ mod tests {
             input: Box::new(join),
             group_by: Vec::new(),
             aggr_exprs: vec![PlanExpr::Function {
+                order_by: None,
                 name: "SUM".to_string(),
                 args: vec![col(1, "l_extendedprice")],
                 distinct: false,

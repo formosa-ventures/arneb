@@ -9,7 +9,9 @@ use arneb_common::types::{ColumnInfo, DataType, ScalarValue};
 use arneb_sql_parser::ast;
 
 use crate::analyzer::{plan_expr_type, Analyzer, AnalyzerContext};
-use crate::plan::{null_extend, JoinCondition, LogicalPlan, PlanExpr, SortExpr, WindowFunctionDef};
+use crate::plan::{
+    null_extend, JoinCondition, LogicalPlan, PlanExpr, SortExpr, SrfKind, WindowFunctionDef,
+};
 
 static CTE_SELF_AGG_WINDOW_TEST_OVERRIDE: OnceLock<std::sync::Mutex<Option<bool>>> =
     OnceLock::new();
@@ -895,14 +897,30 @@ impl<'a> QueryPlanner<'a> {
                 .await?;
         }
 
+        // 3c. Set-returning functions (`unnest`, `generate_subscripts`) as
+        // whole SELECT items: evaluated by a ProjectSet below the projection,
+        // which then reads each one as a column.
+        let srf_items;
+        let projection_items = if body.projection.iter().any(|i| srf_call(i).is_some()) {
+            let num_group_by = has_aggregates.then_some(group_by_ast.len());
+            let (set_plan, items) =
+                Box::pin(self.plan_project_set(plan, &mut ctx, &body.projection, num_group_by))
+                    .await?;
+            plan = set_plan;
+            srf_items = items;
+            &srf_items
+        } else {
+            &body.projection
+        };
+
         // 4. Projection (SELECT list)
         // After aggregate, SELECT expressions that ARE aggregate functions should reference
         // the aggregate output columns by index, not re-resolve their arguments.
         let (proj_exprs, proj_schema) = if has_aggregates {
-            self.plan_aggregate_projection(&body.projection, &ctx, &group_by_ast)
+            self.plan_aggregate_projection(projection_items, &ctx, &group_by_ast)
                 .await?
         } else {
-            self.plan_projection(&body.projection, &ctx).await?
+            self.plan_projection(projection_items, &ctx).await?
         };
 
         plan = LogicalPlan::Projection {
@@ -1062,6 +1080,92 @@ impl<'a> QueryPlanner<'a> {
             ctx.columns.push((Some(WINDOW_QUALIFIER.to_string()), col));
         }
         Ok(plan)
+    }
+
+    /// Plans the SELECT items that are set-returning function calls into a
+    /// `ProjectSet` above `plan`. Each SRF becomes a column appended to `ctx`
+    /// (under [`SRF_QUALIFIER`]), and the returned SELECT list reads it as a
+    /// column reference, named like PostgreSQL does (`unnest`) unless the
+    /// item has an alias. `num_group_by` is set when the SELECT aggregates.
+    async fn plan_project_set(
+        &self,
+        plan: LogicalPlan,
+        ctx: &mut PlanningContext,
+        items: &[ast::SelectItem],
+        num_group_by: Option<usize>,
+    ) -> Result<(LogicalPlan, Vec<ast::SelectItem>), PlanError> {
+        let input_schema = plan.schema();
+        let mut srfs: Vec<(SrfKind, PlanExpr)> = Vec::new();
+        let mut schema = input_schema.clone();
+        let mut rewritten = Vec::with_capacity(items.len());
+        for item in items {
+            let Some((kind, call)) = srf_call(item) else {
+                rewritten.push(item.clone());
+                continue;
+            };
+            let array = srf_array_argument(kind, call)?;
+            let array = match num_group_by {
+                Some(n) => self.rewrite_aggregates_as_columns(array, ctx, n),
+                None => array.clone(),
+            };
+            let planned = self.plan_expr(&array, ctx).await?;
+            // Typed against the planning context the argument was resolved in.
+            let ctx_schema: Vec<ColumnInfo> = ctx.columns.iter().map(|(_, c)| c.clone()).collect();
+            let array_type = match plan_expr_type(&planned, &ctx_schema) {
+                Some(t @ DataType::List(_)) => t,
+                // An untyped NULL or parameter: the element type is unknown,
+                // as PostgreSQL also refuses. `CAST(NULL AS int[])` is typed.
+                None | Some(DataType::Null) => {
+                    return Err(PlanError::invalid_expression(format!(
+                        "could not determine the type of the argument of {}(); cast it to an \
+                         array type, e.g. CAST(NULL AS integer[])",
+                        kind.name()
+                    )))
+                }
+                Some(other) => {
+                    return Err(PlanError::invalid_expression(format!(
+                        "function {}({other}) does not exist: {} takes an array",
+                        kind.name(),
+                        kind.name()
+                    )))
+                }
+            };
+            let mut name = kind.display(&planned);
+            if schema.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
+                name = format!("{name}#{}", srfs.len() + 1);
+            }
+            let column = ColumnInfo {
+                name: name.clone(),
+                data_type: kind.output_type(&array_type),
+                nullable: true,
+            };
+            ctx.columns
+                .push((Some(SRF_QUALIFIER.to_string()), column.clone()));
+            schema.push(column);
+            srfs.push((kind, planned));
+            let reference = ast::Expr::Column {
+                col_ref: ast::ColumnRef {
+                    name,
+                    table: Some(SRF_QUALIFIER.to_string()),
+                    span: arneb_sql_parser::Span::empty(),
+                },
+                span: arneb_sql_parser::Span::empty(),
+            };
+            let alias = match item {
+                ast::SelectItem::ExprWithAlias { alias, .. } => alias.clone(),
+                _ => kind.name().to_string(),
+            };
+            rewritten.push(ast::SelectItem::ExprWithAlias {
+                expr: reference,
+                alias,
+            });
+        }
+        let plan = LogicalPlan::ProjectSet {
+            input: Box::new(plan),
+            srfs,
+            schema,
+        };
+        Ok((plan, rewritten))
     }
 
     /// Split the WHERE-clause AND-tree, pull every `EXISTS (...)` /
@@ -2144,6 +2248,28 @@ impl<'a> QueryPlanner<'a> {
     }
 
     /// Convert an AST expression to a PlanExpr, resolving column references.
+    /// Plans an aggregate call's `ORDER BY`. Kept out of `plan_expr` so the
+    /// recursive future (and with it the stack depth) stays small.
+    #[async_recursion]
+    async fn plan_call_order_by(
+        &self,
+        order_by: &[ast::OrderByExpr],
+        ctx: &PlanningContext,
+    ) -> Result<Vec<SortExpr>, PlanError> {
+        let mut out = Vec::with_capacity(order_by.len());
+        for ob in order_by {
+            let asc = ob.asc.unwrap_or(true);
+            out.push(SortExpr {
+                expr: self.plan_expr(&ob.expr, ctx).await?,
+                asc,
+                // PostgreSQL: NULLs sort as larger than any value, so they
+                // come last for ASC and first for DESC unless stated.
+                nulls_first: ob.nulls_first.unwrap_or(!asc),
+            });
+        }
+        Ok(out)
+    }
+
     #[allow(clippy::only_used_in_recursion)]
     #[allow(clippy::double_must_use)] // async_recursion emits a bare #[must_use]
     #[async_recursion]
@@ -2195,8 +2321,20 @@ impl<'a> QueryPlanner<'a> {
                 name,
                 args,
                 distinct,
+                order_by,
                 ..
             } => {
+                if SrfKind::from_name(name).is_some() {
+                    return Err(srf_not_supported_here(name, node_span));
+                }
+                if !order_by.is_empty() {
+                    check_aggregate_order_by(name)?;
+                }
+                if *distinct && name.eq_ignore_ascii_case("ARRAY_AGG") {
+                    return Err(PlanError::invalid_expression(
+                        "DISTINCT is not supported in array_agg",
+                    ));
+                }
                 if name.eq_ignore_ascii_case("GROUPING") {
                     if let [ast::FunctionArg::Unnamed(key)] = args.as_slice() {
                         let marker = format!("GROUPING({})", format_ast_unqualified(key));
@@ -2242,6 +2380,7 @@ impl<'a> QueryPlanner<'a> {
                             }),
                         // `typoid::regtype`: shown as the type's name.
                         [ast::FunctionArg::Unnamed(e)] => Ok(PlanExpr::Function {
+                            order_by: None,
                             name: "format_type".to_string(),
                             args: vec![
                                 self.plan_expr(e, ctx).await?,
@@ -2267,10 +2406,16 @@ impl<'a> QueryPlanner<'a> {
                     };
                     plan_args.push(plan_arg);
                 }
+                let plan_order_by = if order_by.is_empty() {
+                    None
+                } else {
+                    Some(Box::new(self.plan_call_order_by(order_by, ctx).await?))
+                };
                 Ok(PlanExpr::Function {
                     name: name.clone(),
                     args: plan_args,
                     distinct: *distinct,
+                    order_by: plan_order_by,
                     span: node_span,
                 })
             }
@@ -2378,6 +2523,28 @@ impl<'a> QueryPlanner<'a> {
                     span: node_span,
                 })
             }
+            ast::Expr::Array { elements, .. } => {
+                if elements.is_empty() {
+                    return Err(PlanError::invalid_expression(
+                        "cannot determine the type of an empty ARRAY[]; cast it, e.g. \
+                         ARRAY[]::integer[]"
+                            .to_string(),
+                    ));
+                }
+                let mut planned = Vec::with_capacity(elements.len());
+                for e in elements {
+                    planned.push(self.plan_expr(e, ctx).await?);
+                }
+                Ok(PlanExpr::Array {
+                    elements: planned,
+                    // Filled in by the type-coercion pass.
+                    element_type: DataType::Null,
+                    span: node_span,
+                })
+            }
+            ast::Expr::AnyAll {
+                expr, op, array, ..
+            } => Box::pin(self.plan_any_all(expr, *op, array, node_span, ctx)).await,
             ast::Expr::Parameter { index, .. } => Ok(PlanExpr::Parameter {
                 index: *index,
                 type_hint: None,
@@ -2413,7 +2580,10 @@ impl<'a> QueryPlanner<'a> {
                 ast::SelectItem::Wildcard => {
                     // Expand * to all columns (not the window results)
                     for (i, (q, col)) in ctx.columns.iter().enumerate() {
-                        if q.as_deref() == Some(WINDOW_QUALIFIER) || ctx.merged.contains(&i) {
+                        if q.as_deref() == Some(WINDOW_QUALIFIER)
+                            || q.as_deref() == Some(SRF_QUALIFIER)
+                            || ctx.merged.contains(&i)
+                        {
                             continue;
                         }
                         exprs.push(PlanExpr::Column {
@@ -2576,7 +2746,10 @@ impl<'a> QueryPlanner<'a> {
                 }
                 ast::SelectItem::Wildcard => {
                     for (i, (q, col)) in ctx.columns.iter().enumerate() {
-                        if q.as_deref() == Some(WINDOW_QUALIFIER) || ctx.merged.contains(&i) {
+                        if q.as_deref() == Some(WINDOW_QUALIFIER)
+                            || q.as_deref() == Some(SRF_QUALIFIER)
+                            || ctx.merged.contains(&i)
+                        {
                             continue;
                         }
                         exprs.push(PlanExpr::Column {
@@ -2672,6 +2845,24 @@ impl<'a> QueryPlanner<'a> {
         false
     }
 
+    /// `expr = ANY (array)` / `expr <> ALL (array)` over an array-valued
+    /// expression. Out of line so the recursive `plan_expr` future stays small.
+    async fn plan_any_all(
+        &self,
+        expr: &ast::Expr,
+        op: ast::AnyAllOp,
+        array: &ast::Expr,
+        span: Option<arneb_sql_parser::Span>,
+        ctx: &PlanningContext,
+    ) -> Result<PlanExpr, PlanError> {
+        Ok(PlanExpr::ArrayContains {
+            expr: Box::new(self.plan_expr(expr, ctx).await?),
+            array: Box::new(self.plan_expr(array, ctx).await?),
+            negated: matches!(op, ast::AnyAllOp::NotEqAll),
+            span,
+        })
+    }
+
     /// Check if an expression contains any aggregate function.
     fn contains_aggregate(&self, expr: &ast::Expr) -> bool {
         match expr {
@@ -2699,6 +2890,12 @@ impl<'a> QueryPlanner<'a> {
             }
             ast::Expr::InList { expr, list, .. } => {
                 self.contains_aggregate(expr) || list.iter().any(|e| self.contains_aggregate(e))
+            }
+            ast::Expr::Array { elements, .. } => {
+                elements.iter().any(|e| self.contains_aggregate(e))
+            }
+            ast::Expr::AnyAll { expr, array, .. } => {
+                self.contains_aggregate(expr) || self.contains_aggregate(array)
             }
             ast::Expr::Case {
                 operand,
@@ -2910,12 +3107,39 @@ impl<'a> QueryPlanner<'a> {
                 negated: *negated,
                 span: *span,
             },
+            ast::Expr::Array { elements, span } => ast::Expr::Array {
+                elements: elements
+                    .iter()
+                    .map(|e| self.rewrite_aggregates_as_columns(e, ctx, num_group_by))
+                    .collect(),
+                span: *span,
+            },
+            ast::Expr::AnyAll {
+                expr,
+                op,
+                array,
+                span,
+            } => ast::Expr::AnyAll {
+                expr: Box::new(self.rewrite_aggregates_as_columns(expr, ctx, num_group_by)),
+                op: *op,
+                array: Box::new(self.rewrite_aggregates_as_columns(array, ctx, num_group_by)),
+                span: *span,
+            },
             ast::Expr::Function {
                 name,
                 args,
                 distinct,
+                order_by,
                 span,
             } => ast::Expr::Function {
+                order_by: order_by
+                    .iter()
+                    .map(|ob| ast::OrderByExpr {
+                        expr: self.rewrite_aggregates_as_columns(&ob.expr, ctx, num_group_by),
+                        asc: ob.asc,
+                        nulls_first: ob.nulls_first,
+                    })
+                    .collect(),
                 name: name.clone(),
                 args: args
                     .iter()
@@ -3044,6 +3268,16 @@ impl<'a> QueryPlanner<'a> {
                     self.extract_aggregates(e, ctx, out).await?;
                 }
             }
+            ast::Expr::Array { elements, .. } => {
+                for e in elements {
+                    self.extract_aggregates(e, ctx, out).await?;
+                }
+            }
+            ast::Expr::AnyAll { expr, array, .. } => {
+                for e in [&**expr, &**array] {
+                    self.extract_aggregates(e, ctx, out).await?;
+                }
+            }
             // `rank() OVER (ORDER BY sum(x))`: the inner aggregate is
             // computed by the Aggregate node below the Window.
             ast::Expr::WindowFunction {
@@ -3124,6 +3358,7 @@ impl<'a> QueryPlanner<'a> {
             | PlanExpr::IsNotNull { .. }
             | PlanExpr::Between { .. }
             | PlanExpr::InList { .. }
+            | PlanExpr::ArrayContains { .. }
             | PlanExpr::Parameter { .. }
             | PlanExpr::ScalarSubquery { .. } => ColumnInfo {
                 name: expr.to_string(),
@@ -3190,6 +3425,8 @@ fn is_aggregate_function(name: &str) -> bool {
             | "MIN"
             | "MAX"
             | "BOOL_OR"
+            | "BOOL_AND"
+            | "ARRAY_AGG"
             | "STDDEV_SAMP"
             | "STDDEV"
             | "STDDEV_POP"
@@ -3265,8 +3502,19 @@ fn aggregate_projection_on_empty(expr: &ast::Expr) -> Option<ast::Expr> {
             name,
             args,
             distinct,
+            order_by,
             span,
         } => Some(ast::Expr::Function {
+            order_by: order_by
+                .iter()
+                .map(|ob| {
+                    aggregate_projection_on_empty(&ob.expr).map(|expr| ast::OrderByExpr {
+                        expr,
+                        asc: ob.asc,
+                        nulls_first: ob.nulls_first,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
             name: name.clone(),
             args: args
                 .iter()
@@ -3633,6 +3881,40 @@ fn wrap_matching_cte_with_window(
     }
 }
 
+/// The `Array` arm of [`rewrite_expr_after_column_insert`], out of line so
+/// the recursive function's frame stays small.
+#[inline(never)]
+fn rewrite_array_after_column_insert(
+    expr: PlanExpr,
+    inserted_index: usize,
+    scalar_subplan: &LogicalPlan,
+    scalar_replacement: &PlanExpr,
+) -> PlanExpr {
+    let PlanExpr::Array {
+        elements,
+        element_type,
+        span,
+    } = expr
+    else {
+        return expr;
+    };
+    PlanExpr::Array {
+        elements: elements
+            .into_iter()
+            .map(|e| {
+                rewrite_expr_after_column_insert(
+                    e,
+                    inserted_index,
+                    scalar_subplan,
+                    scalar_replacement,
+                )
+            })
+            .collect(),
+        element_type,
+        span,
+    }
+}
+
 fn rewrite_expr_after_column_insert(
     expr: PlanExpr,
     inserted_index: usize,
@@ -3691,8 +3973,17 @@ fn rewrite_expr_after_column_insert(
             name,
             args,
             distinct,
+            order_by,
             span,
         } => PlanExpr::Function {
+            order_by: SortExpr::map_exprs(order_by, &mut |e| {
+                rewrite_expr_after_column_insert(
+                    e,
+                    inserted_index,
+                    scalar_subplan,
+                    scalar_replacement,
+                )
+            }),
             name,
             args: args
                 .into_iter()
@@ -3794,6 +4085,20 @@ fn rewrite_expr_after_column_insert(
             data_type,
             span,
         },
+        PlanExpr::ArrayContains {
+            expr,
+            array,
+            negated,
+            span,
+        } => crate::map_array_contains(expr, array, negated, span, |e| {
+            rewrite_expr_after_column_insert(e, inserted_index, scalar_subplan, scalar_replacement)
+        }),
+        PlanExpr::Array { .. } => rewrite_array_after_column_insert(
+            expr,
+            inserted_index,
+            scalar_subplan,
+            scalar_replacement,
+        ),
         PlanExpr::CaseExpr {
             operand,
             when_clauses,
@@ -4110,6 +4415,83 @@ fn references_outer(expr: &ast::Expr, inner_ctx: &PlanningContext) -> bool {
 /// columns, so `*` expansion skips them.
 const WINDOW_QUALIFIER: &str = "\u{0}window";
 
+/// Context qualifier of the columns a `ProjectSet` appends (one per SRF).
+const SRF_QUALIFIER: &str = "\u{0}srf";
+
+/// The SRF and its arguments when a SELECT item is a set-returning function
+/// call (possibly parenthesized, possibly aliased).
+fn srf_call(item: &ast::SelectItem) -> Option<(SrfKind, &ast::Expr)> {
+    let (ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. }) = item
+    else {
+        return None;
+    };
+    let mut expr = expr;
+    while let ast::Expr::Nested { expr: inner, .. } = expr {
+        expr = inner;
+    }
+    match expr {
+        ast::Expr::Function { name, .. } => SrfKind::from_name(name).map(|kind| (kind, expr)),
+        _ => None,
+    }
+}
+
+/// The array argument of an SRF call, checking its shape: `unnest(array)`
+/// and `generate_subscripts(array, 1)`.
+fn srf_array_argument(kind: SrfKind, call: &ast::Expr) -> Result<&ast::Expr, PlanError> {
+    let ast::Expr::Function {
+        args,
+        distinct,
+        order_by,
+        ..
+    } = call
+    else {
+        unreachable!("srf_call returns function calls");
+    };
+    if *distinct || !order_by.is_empty() {
+        return Err(PlanError::UnsupportedExpression {
+            message: format!(
+                "DISTINCT and ORDER BY are not supported in {}()",
+                kind.name()
+            ),
+            location: None,
+        });
+    }
+    match (kind, args.as_slice()) {
+        (SrfKind::Unnest, [ast::FunctionArg::Unnamed(array)]) => Ok(array),
+        (SrfKind::Unnest, _) => Err(PlanError::UnsupportedExpression {
+            message: "unnest takes exactly one array argument".to_string(),
+            location: None,
+        }),
+        (
+            SrfKind::GenerateSubscripts,
+            [ast::FunctionArg::Unnamed(array), ast::FunctionArg::Unnamed(ast::Expr::Literal {
+                value: ScalarValue::Int64(1) | ScalarValue::Int32(1),
+                ..
+            })],
+        ) => Ok(array),
+        (SrfKind::GenerateSubscripts, _) => Err(PlanError::UnsupportedExpression {
+            message: "generate_subscripts is supported only as generate_subscripts(array, 1): \
+                      arrays have dimension 1"
+                .to_string(),
+            location: None,
+        }),
+    }
+}
+
+/// The error for an SRF call anywhere but as a whole SELECT item. Out of
+/// line so `plan_expr`'s recursive frame stays small.
+#[inline(never)]
+fn srf_not_supported_here(name: &str, span: Option<arneb_sql_parser::Span>) -> PlanError {
+    PlanError::UnsupportedExpression {
+        message: format!(
+            "set-returning function {}() is not supported here; it is supported only as a \
+             whole SELECT-list item",
+            name.to_ascii_lowercase()
+        ),
+        location: span.map(|s| s.start),
+    }
+}
+
 /// Collects the distinct (by display string) window-function calls in `expr`.
 fn collect_window_calls(expr: &ast::Expr, out: &mut Vec<ast::Expr>) {
     use ast::Expr as E;
@@ -4142,11 +4524,14 @@ fn collect_window_calls(expr: &ast::Expr, out: &mut Vec<ast::Expr>) {
                 collect_window_calls(e, out);
             }
         }
-        E::Function { args, .. } => {
+        E::Function { args, order_by, .. } => {
             for a in args {
                 if let ast::FunctionArg::Unnamed(e) = a {
                     collect_window_calls(e, out);
                 }
+            }
+            for o in order_by {
+                collect_window_calls(&o.expr, out);
             }
         }
         E::Case {
@@ -4196,11 +4581,14 @@ fn walk_columns(expr: &ast::Expr, cb: &mut impl FnMut(&ast::ColumnRef)) {
                 walk_columns(e, cb);
             }
         }
-        E::Function { args, .. } => {
+        E::Function { args, order_by, .. } => {
             for a in args {
                 if let ast::FunctionArg::Unnamed(e) = a {
                     walk_columns(e, cb);
                 }
+            }
+            for o in order_by {
+                walk_columns(&o.expr, cb);
             }
         }
         E::Case {
@@ -4252,6 +4640,7 @@ fn collect_table_scan_refs(
         | L::FinalAggregate { input, .. }
         | L::Distinct { input }
         | L::Window { input, .. }
+        | L::ProjectSet { input, .. }
         | L::AssignUniqueId { input, .. } => collect_table_scan_refs(input, sink),
         L::Join { left, right, .. }
         | L::SemiJoin { left, right, .. }
@@ -4472,6 +4861,31 @@ fn write_ast_unqualified(out: &mut String, expr: &ast::Expr) {
             }
             let _ = write!(out, ")");
         }
+        ast::Expr::AnyAll {
+            expr, op, array, ..
+        } => {
+            write_ast_unqualified(out, expr);
+            let _ = write!(
+                out,
+                "{}",
+                match op {
+                    ast::AnyAllOp::EqAny => " = ANY (",
+                    ast::AnyAllOp::NotEqAll => " <> ALL (",
+                }
+            );
+            write_ast_unqualified(out, array);
+            let _ = write!(out, ")");
+        }
+        ast::Expr::Array { elements, .. } => {
+            let _ = write!(out, "ARRAY[");
+            for (i, item) in elements.iter().enumerate() {
+                if i > 0 {
+                    let _ = write!(out, ", ");
+                }
+                write_ast_unqualified(out, item);
+            }
+            let _ = write!(out, "]");
+        }
         ast::Expr::Cast {
             expr, data_type, ..
         } => {
@@ -4590,12 +5004,59 @@ fn regclass_literal(
     })
 }
 
+/// Aggregate `ORDER BY` is accepted only in `array_agg`.
+fn check_aggregate_order_by(name: &str) -> Result<(), PlanError> {
+    if name.eq_ignore_ascii_case("ARRAY_AGG") {
+        Ok(())
+    } else {
+        Err(PlanError::invalid_expression(format!(
+            "ORDER BY inside {name}(...) is not supported"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arneb_catalog::{CatalogManager, MemoryCatalog, MemorySchema, MemoryTable};
     use arneb_common::types::ColumnInfo;
     use std::sync::Arc;
+
+    #[test]
+    fn column_insert_shifts_columns_inside_arrays_and_array_contains() {
+        let col = |index: usize| PlanExpr::Column {
+            index,
+            name: format!("c{index}"),
+            span: None,
+        };
+        let array = PlanExpr::Array {
+            elements: vec![col(0), col(2)],
+            element_type: DataType::Int64,
+            span: None,
+        };
+        // A column inserted at index 1 moves column 2 to 3 and leaves 0.
+        let shifted = shift_plan_expr_columns(array.clone(), 1);
+        let PlanExpr::Array { elements, .. } = &shifted else {
+            panic!("expected Array, got {shifted}");
+        };
+        assert!(matches!(elements[0], PlanExpr::Column { index: 0, .. }));
+        assert!(matches!(elements[1], PlanExpr::Column { index: 3, .. }));
+        let contains = PlanExpr::ArrayContains {
+            expr: Box::new(col(5)),
+            array: Box::new(array),
+            negated: false,
+            span: None,
+        };
+        let shifted = shift_plan_expr_columns(contains, 1);
+        let PlanExpr::ArrayContains { expr, array, .. } = &shifted else {
+            panic!("expected ArrayContains");
+        };
+        assert!(matches!(**expr, PlanExpr::Column { index: 6, .. }));
+        let PlanExpr::Array { elements, .. } = &**array else {
+            panic!("expected Array");
+        };
+        assert!(matches!(elements[1], PlanExpr::Column { index: 3, .. }));
+    }
 
     const Q15_SQL: &str = include_str!("../../../benchmarks/tpch/queries/q15.sql");
 
@@ -5021,6 +5482,7 @@ mod tests {
     #[test]
     fn test_plan_expr_display_function() {
         let expr = PlanExpr::Function {
+            order_by: None,
             name: "COUNT".into(),
             args: vec![PlanExpr::Wildcard],
             distinct: false,
@@ -5313,6 +5775,70 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn srfs_plan_a_project_set_below_the_projection() {
+        let plan = plan_sql(
+            "EXPLAIN SELECT id, unnest(ARRAY[id, age]) AS v, generate_subscripts(ARRAY[id], 1) \
+             FROM users",
+        )
+        .await
+        .unwrap();
+        let text = plan.to_string();
+        assert!(
+            text.contains(
+                "ProjectSet: [unnest(ARRAY[id, CAST(age AS Int64)]), \
+                 generate_subscripts(ARRAY[id], 1)]"
+            ),
+            "{text}"
+        );
+        let LogicalPlan::Explain { input, .. } = &plan else {
+            panic!("expected Explain");
+        };
+        let LogicalPlan::Projection { input, schema, .. } = input.as_ref() else {
+            panic!("expected Projection, got {input}");
+        };
+        assert_eq!(schema[1].name, "v");
+        let LogicalPlan::ProjectSet {
+            srfs,
+            schema: set_schema,
+            ..
+        } = input.as_ref()
+        else {
+            panic!("expected ProjectSet, got {input}");
+        };
+        assert_eq!(srfs.len(), 2);
+        assert_eq!(srfs[0].0, SrfKind::Unnest);
+        assert_eq!(srfs[1].0, SrfKind::GenerateSubscripts);
+        // users(id, name, age), then one column per SRF.
+        assert_eq!(set_schema.len(), 5);
+        assert_eq!(set_schema[3].data_type, DataType::Int64);
+        assert!(set_schema[3].nullable);
+        assert_eq!(set_schema[4].data_type, DataType::Int32);
+        // Workers receive plans as JSON.
+        let json = serde_json::to_string(input.as_ref()).unwrap();
+        let back: LogicalPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.to_string(), input.to_string());
+
+        // Queries without SRFs keep their plan shape.
+        let plain = plan_sql("SELECT id FROM users").await.unwrap();
+        assert!(!plain.to_string().contains("ProjectSet"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn srf_outside_a_select_item_is_refused() {
+        for sql in [
+            "SELECT id FROM users WHERE unnest(ARRAY[id]) = 1",
+            "SELECT unnest(ARRAY[id]) + 1 FROM users",
+            "SELECT id FROM users ORDER BY unnest(ARRAY[id])",
+        ] {
+            let err = plan_sql(sql).await.expect_err(sql).to_string();
+            assert!(
+                err.contains("set-returning function") && err.contains("not supported here"),
+                "{sql}: {err}"
+            );
+        }
+    }
+
     /// EXPLAIN output MUST be position-independent: two parses of the
     /// same query with different whitespace should produce byte-identical
     /// plan text (and JSON). This guards D7 — `#[serde(skip)]` on
@@ -5511,6 +6037,7 @@ mod tests {
             discounted_price,
             promo_case.clone(),
             PlanExpr::Function {
+                order_by: None,
                 name: "SUM".into(),
                 args: vec![promo_case],
                 distinct: false,
@@ -5527,6 +6054,7 @@ mod tests {
                 span: None,
             },
             PlanExpr::Function {
+                order_by: None,
                 name: "COUNT".into(),
                 args: vec![PlanExpr::Wildcard],
                 distinct: false,

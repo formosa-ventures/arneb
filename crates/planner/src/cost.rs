@@ -187,6 +187,9 @@ pub fn estimated_cardinality(plan: &LogicalPlan, stats: &CatalogStats) -> Cost {
 
         LogicalPlan::Window { input, .. } => estimated_cardinality(input, stats),
 
+        // Unknown fan-out per row; assume one row per input row.
+        LogicalPlan::ProjectSet { input, .. } => estimated_cardinality(input, stats),
+
         LogicalPlan::AssignUniqueId { input, .. } => estimated_cardinality(input, stats),
 
         LogicalPlan::Join {
@@ -795,9 +798,21 @@ where
                 visit_columns(item, callback);
             }
         }
-        PlanExpr::Function { args, .. } => {
+        PlanExpr::Array { elements, .. } => {
+            for item in elements {
+                visit_columns(item, callback);
+            }
+        }
+        PlanExpr::ArrayContains { expr, array, .. } => {
+            visit_columns(expr, callback);
+            visit_columns(array, callback);
+        }
+        PlanExpr::Function { args, order_by, .. } => {
             for a in args {
                 visit_columns(a, callback);
+            }
+            for s in order_by.iter().flat_map(|v| v.iter()) {
+                visit_columns(&s.expr, callback);
             }
         }
         PlanExpr::CaseExpr {

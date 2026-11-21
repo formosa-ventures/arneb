@@ -36,15 +36,19 @@ pub(crate) async fn try_handle_metadata(
         return Some(handle_version());
     }
 
-    // information_schema
-    if lower.contains("information_schema.tables") {
-        return Some(handle_info_tables(catalog_manager).await);
-    }
-    if lower.contains("information_schema.columns") {
-        return Some(handle_info_columns(catalog_manager).await);
-    }
-    if lower.contains("information_schema.schemata") {
-        return Some(handle_info_schemata(catalog_manager).await);
+    // information_schema: the fixed whole-table results, reached only as
+    // the fallback for a statement naming these tables that the engine
+    // could not run (the handler sends those to the engine first).
+    if crate::pg_catalog::references_information_schema(sql) {
+        if lower.contains("information_schema.tables") {
+            return Some(handle_info_tables(catalog_manager).await);
+        }
+        if lower.contains("information_schema.columns") {
+            return Some(handle_info_columns(catalog_manager).await);
+        }
+        if lower.contains("information_schema.schemata") {
+            return Some(handle_info_schemata(catalog_manager).await);
+        }
     }
 
     // current_database(), current_schema(), current_user

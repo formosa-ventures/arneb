@@ -487,23 +487,32 @@ impl ConnectionHandler {
         Ok(Arc::new(view))
     }
 
-    /// Answer a metadata statement: a `pg_catalog` read runs in the engine
-    /// over the session's catalog tables (pg-catalog-tables), falling back
-    /// to the fixed result when the engine cannot run it; everything else
-    /// goes to the fixed handlers.
+    /// Answer a metadata statement: a `pg_catalog` or `information_schema`
+    /// read runs in the engine over the session's catalog tables
+    /// (pg-catalog-tables), falling back to the fixed result when the engine
+    /// cannot run it; everything else goes to the fixed handlers.
     async fn metadata<C: ClientInfo>(
         &self,
         client: &C,
         sql: &str,
         catalog_manager: &CatalogManager,
     ) -> Option<crate::metadata::MetadataResult> {
-        if crate::pg_catalog::references_pg_catalog(sql) {
+        let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
+        if crate::pg_catalog::references_catalog_tables(sql) {
             let error = match crate::pg_catalog::run(sql, catalog_manager, &self.memory_pool).await
             {
                 Ok(response) => return Some(Ok(response)),
                 Err(error) => error,
             };
-            let Some(fixed) = crate::metadata::fixed_pg_catalog(sql, catalog_manager).await else {
+            let mut fixed = None;
+            if crate::pg_catalog::references_pg_catalog(sql) {
+                fixed = crate::metadata::fixed_pg_catalog(sql, catalog_manager).await;
+            }
+            if fixed.is_none() && crate::pg_catalog::references_information_schema(sql) {
+                fixed = crate::metadata::try_handle_metadata(sql, catalog_manager, user.as_deref())
+                    .await;
+            }
+            let Some(fixed) = fixed else {
                 return Some(Err(error.to_string()));
             };
             arneb_common::metrics::pg_catalog_fallback();
@@ -515,7 +524,6 @@ impl ConnectionHandler {
             );
             return Some(fixed);
         }
-        let user = client.metadata().get(pgwire::api::METADATA_USER).cloned();
         crate::metadata::try_handle_metadata(sql, catalog_manager, user.as_deref()).await
     }
 
@@ -711,10 +719,11 @@ async fn infer_binary_param_types(
     }
     // Boxed: the planner future is large, and an unboxed one would sit in
     // the stack frame of every Bind/Execute that awaits this function.
-    // A pg_catalog statement is planned over its catalog tables, exactly as
-    // Describe does, so its parameters infer the same types.
+    // A pg_catalog or information_schema statement is planned over its
+    // catalog tables, exactly as Describe does, so its parameters infer the
+    // same types.
     let sql = &portal.statement.statement;
-    let planned = if crate::pg_catalog::references_pg_catalog(sql) {
+    let planned = if crate::pg_catalog::references_catalog_tables(sql) {
         let (pg_catalog, _) = crate::pg_catalog::catalog_for(sql, catalog_manager).await;
         Box::pin(plan_for_describe(sql, &pg_catalog)).await
     } else {
@@ -1158,9 +1167,9 @@ impl ExtendedQueryHandler for ConnectionHandler {
             DescribeStatementResponse::new(param_types, fields)
         };
 
-        // A pg_catalog statement is planned over its catalog tables, so its
-        // parameters get types (pg-catalog-tables).
-        if crate::pg_catalog::references_pg_catalog(sql) {
+        // A pg_catalog or information_schema statement is planned over its
+        // catalog tables, so its parameters get types (pg-catalog-tables).
+        if crate::pg_catalog::references_catalog_tables(sql) {
             let (pg_catalog, _) = crate::pg_catalog::catalog_for(sql, &catalog_manager).await;
             if let Ok((fields, param_type_map)) = plan_for_describe(sql, &pg_catalog).await {
                 return Ok(describe(fields, param_type_map));

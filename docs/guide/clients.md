@@ -38,6 +38,14 @@ against Arneb yet.
     `pg_attribute`, `pg_type`, `pg_database`, `pg_roles`, `pg_am` and
     `pg_tablespace`. `pg_depend`, `pg_description`, `pg_attrdef` and
     `pg_constraint` are there too, always empty.
+  - `information_schema` reads run in the engine the same way, over
+    `schemata`, `tables`, `columns`, `views`, `table_constraints` and
+    `key_column_usage`, and can join `pg_catalog` tables. They describe the
+    session's catalog only (PostgreSQL's current database; set
+    `search_path` to `catalog.schema` to switch). `columns` reports
+    PostgreSQL's `data_type` and `udt_name` spellings. `views`,
+    `table_constraints` and `key_column_usage` are always empty, and every
+    table is a `BASE TABLE`; listing Arneb views there is a follow-up.
   - These work: joins, filters, unqualified names, `'name'::regclass`,
     `= ANY (ARRAY[...])`, and the
     [catalog functions](/sql/functions#postgresql-catalog-functions).
@@ -49,7 +57,9 @@ against Arneb yet.
     and `pg_opclass` are empty, and `current_setting()` answers a fixed set
     of settings.
   - A statement the engine cannot plan still gets the old fixed answer:
-    the whole first `pg_catalog` table it names, whatever it asks for. Each
+    the whole first `pg_catalog` table it names (or the whole of
+    `information_schema.tables`, `columns` or `schemata` across every
+    visible catalog), whatever it asks for. Each
     such answer is logged at `warn` on `arneb::protocol` with its SQL and
     counted in `arneb_pg_catalog_fallbacks_total`. Metabase's PostgreSQL
     driver has not been tried.

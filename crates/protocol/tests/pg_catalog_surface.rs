@@ -491,3 +491,152 @@ async fn format_over_pgwire() {
     );
     assert_eq!(fallbacks(), before);
 }
+
+#[tokio::test]
+async fn information_schema_runs_in_engine() {
+    let before = fallbacks();
+    let client = connect(pg_server(None).await).await;
+    // Quoted, as Metabase writes it; the WHERE filter applies (the fixed
+    // handler returned every table's columns whatever the query asked).
+    let r = rows(
+        &client,
+        "SELECT column_name, udt_name, data_type, is_nullable \
+         FROM \"information_schema\".\"columns\" WHERE table_name = 'nation' \
+         ORDER BY ordinal_position",
+    )
+    .await;
+    let expected: Vec<Vec<Option<String>>> = [
+        ["n_nationkey", "int8", "bigint", "NO"],
+        ["n_name", "varchar", "character varying", "YES"],
+        ["n_price", "numeric", "numeric", "YES"],
+    ]
+    .iter()
+    .map(|row| row.iter().map(|v| Some(v.to_string())).collect())
+    .collect();
+    assert_eq!(r, expected);
+
+    let r = rows(
+        &client,
+        "SELECT table_catalog, table_schema, udt_catalog, udt_schema, column_default, \
+         is_identity, is_generated, character_maximum_length, numeric_precision, \
+         numeric_scale, datetime_precision \
+         FROM information_schema.columns WHERE table_name = 'nation' ORDER BY ordinal_position",
+    )
+    .await;
+    let n = |v: &str| Some(v.to_string());
+    let common = [
+        n("file"),
+        n("default"),
+        n("file"),
+        n("pg_catalog"),
+        None,
+        n("NO"),
+        n("NEVER"),
+    ];
+    let tail = [
+        [None, n("64"), n("0"), None],
+        [None, None, None, None],
+        [None, n("12"), n("2"), None],
+    ];
+    let expected: Vec<Vec<Option<String>>> = tail
+        .iter()
+        .map(|t| common.iter().chain(t.iter()).cloned().collect())
+        .collect();
+    assert_eq!(r, expected);
+
+    let tables = rows(
+        &client,
+        "SELECT table_catalog, table_schema, table_name, table_type \
+         FROM information_schema.tables WHERE table_schema = 'default' ORDER BY table_name",
+    )
+    .await;
+    assert_eq!(
+        tables,
+        [
+            [n("file"), n("default"), n("nation"), n("BASE TABLE")],
+            [n("file"), n("default"), n("region"), n("BASE TABLE")],
+        ]
+    );
+    let schemata = rows(
+        &client,
+        "SELECT catalog_name, schema_name FROM information_schema.schemata \
+         WHERE schema_name NOT IN ('pg_catalog', 'information_schema') ORDER BY 2",
+    )
+    .await;
+    assert_eq!(
+        schemata,
+        [[n("file"), n("default")], [n("file"), n("staging")]]
+    );
+    for empty in ["views", "table_constraints", "key_column_usage"] {
+        let r = rows(
+            &client,
+            &format!("SELECT count(*) FROM information_schema.{empty}"),
+        )
+        .await;
+        assert_eq!(r, [[n("0")]], "{empty}");
+    }
+    assert_eq!(fallbacks(), before);
+}
+
+#[tokio::test]
+async fn information_schema_joins_pg_catalog() {
+    let before = fallbacks();
+    let client = connect(pg_server(None).await).await;
+    let r = rows(
+        &client,
+        "SELECT c.column_name FROM information_schema.columns c \
+         JOIN pg_catalog.pg_namespace n ON n.nspname = c.table_schema \
+         WHERE c.table_name = 'nation' ORDER BY 1",
+    )
+    .await;
+    assert_eq!(column(&r, 0), ["n_name", "n_nationkey", "n_price"]);
+    // Metabase's primary-key subquery over the (empty) constraint tables.
+    let r = rows(
+        &client,
+        "SELECT \"c\".\"column_name\", \"pk\".\"column_name\" IS NOT NULL AS \"pk?\" \
+         FROM \"information_schema\".\"columns\" AS \"c\" LEFT JOIN \
+         (SELECT \"tc\".\"table_schema\", \"tc\".\"table_name\", \"kc\".\"column_name\" \
+          FROM \"information_schema\".\"table_constraints\" AS \"tc\" \
+          INNER JOIN \"information_schema\".\"key_column_usage\" AS \"kc\" \
+          ON (\"tc\".\"constraint_name\" = \"kc\".\"constraint_name\") \
+          AND (\"tc\".\"table_schema\" = \"kc\".\"table_schema\") \
+          AND (\"tc\".\"table_name\" = \"kc\".\"table_name\") \
+          WHERE \"tc\".\"constraint_type\" = 'PRIMARY KEY') AS \"pk\" \
+         ON (\"c\".\"table_schema\" = \"pk\".\"table_schema\") \
+         AND (\"c\".\"table_name\" = \"pk\".\"table_name\") \
+         AND (\"c\".\"column_name\" = \"pk\".\"column_name\") \
+         WHERE \"c\".\"table_schema\" IN ('default') AND \"c\".\"table_name\" IN ('region')",
+    )
+    .await;
+    assert_eq!(r, [[Some("r_regionkey".into()), Some("f".into())]]);
+    assert_eq!(fallbacks(), before);
+}
+
+#[tokio::test]
+async fn format_over_information_schema_rows() {
+    let before = fallbacks();
+    let client = connect(pg_server(None).await).await;
+    // A literal template beside a column argument, over several rows.
+    let r = rows(
+        &client,
+        "SELECT FORMAT('%s', \"c\".\"udt_name\"), FORMAT('%I.%I', table_schema, table_name) \
+         FROM \"information_schema\".\"columns\" AS \"c\" \
+         ORDER BY table_schema, table_name, ordinal_position",
+    )
+    .await;
+    assert_eq!(
+        column(&r, 0),
+        ["int8", "varchar", "numeric", "int4", "varchar"]
+    );
+    assert_eq!(
+        column(&r, 1),
+        [
+            "\"default\".nation",
+            "\"default\".nation",
+            "\"default\".nation",
+            "\"default\".region",
+            "staging.raw"
+        ]
+    );
+    assert_eq!(fallbacks(), before);
+}

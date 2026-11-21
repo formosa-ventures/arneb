@@ -275,7 +275,6 @@ async fn pgwire_checks_reads_listings_and_execute() {
             .await
             .unwrap(),
     );
-    // The metadata intercept returns its full row whatever the projection.
     let names: Vec<&[String]> = tables.iter().map(|r| &r[..3]).collect();
     assert_eq!(names, vec![["memory", "default", "open_t"]]);
 
@@ -308,20 +307,72 @@ async fn pgwire_checks_reads_listings_and_execute() {
     }
     alice.simple_query("RESET search_path").await.unwrap();
 
+    // information_schema covers the session's catalog (PostgreSQL's current
+    // database), like pg_catalog; the search path's catalog selects it.
     let admin = pg(port, "admin").await;
-    let tables = pg_rows(
-        &admin
-            .simple_query("SELECT table_name FROM information_schema.tables")
-            .await
-            .unwrap(),
-    );
-    assert_eq!(tables.len(), 3, "{tables:?}");
+    let sql = "SELECT table_name FROM information_schema.tables ORDER BY 1";
+    let tables = pg_rows(&admin.simple_query(sql).await.unwrap());
+    assert_eq!(tables, [["open_t"], ["secret"]], "{tables:?}");
+    admin
+        .simple_query("SET search_path TO lake.sales")
+        .await
+        .unwrap();
+    let tables = pg_rows(&admin.simple_query(sql).await.unwrap());
+    assert_eq!(tables, [["orders"]], "{tables:?}");
 
     let carol = pg(port, "carol").await;
     assert_eq!(
         pg_error(&carol, "SELECT 1").await,
         ("42501".into(), "Access Denied: Cannot execute query".into())
     );
+}
+
+#[tokio::test]
+async fn information_schema_and_stat_tables_hide_denied_tables() {
+    let port = pg_server(Arc::new(QueryTracker::new())).await;
+    let columns = "SELECT table_schema, table_name, column_name \
+                   FROM information_schema.columns ORDER BY 1, 2";
+    let stats = "SELECT schemaname, relname FROM pg_stat_user_tables ORDER BY 1, 2";
+
+    // alice may read memory.default.open_t only: `secret` (same catalog)
+    // and lake.sales.orders (denied catalog) are absent from both, also
+    // when her search path names the denied schema.
+    let alice = pg(port, "alice").await;
+    for path in [None, Some("lake.sales")] {
+        if let Some(path) = path {
+            alice
+                .simple_query(&format!("SET search_path TO {path}"))
+                .await
+                .unwrap();
+        }
+        let rows = pg_rows(&alice.simple_query(columns).await.unwrap());
+        assert_eq!(rows, [["default", "open_t", "n"]], "{path:?}");
+        let rows = pg_rows(&alice.simple_query(stats).await.unwrap());
+        assert_eq!(rows, [["default", "open_t"]], "{path:?}");
+    }
+
+    // admin sees orders once the search path selects its catalog, so the
+    // absence above is the access view, not the scope. Neither listing
+    // includes the catalog's own schemas.
+    let admin = pg(port, "admin").await;
+    admin
+        .simple_query("SET search_path TO lake.sales")
+        .await
+        .unwrap();
+    let rows = pg_rows(&admin.simple_query(columns).await.unwrap());
+    assert_eq!(rows, [["sales", "orders", "n"]]);
+    let rows = pg_rows(&admin.simple_query(stats).await.unwrap());
+    assert_eq!(rows, [["sales", "orders"]]);
+    let rows = pg_rows(
+        &admin
+            .simple_query(
+                "SELECT count(*) FROM pg_stat_user_tables \
+                 WHERE schemaname IN ('information_schema', 'pg_catalog')",
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(rows, [["0"]]);
 }
 
 #[tokio::test]

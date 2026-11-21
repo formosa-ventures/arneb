@@ -309,29 +309,42 @@ impl ScalarFunction for FormatFunction {
         Ok(DataType::Utf8)
     }
     fn evaluate(&self, args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
-        self.invoke(args, 0)
+        let rows = args.iter().map(|a| a.len()).max().unwrap_or(0);
+        self.invoke(args, rows)
     }
+    /// Each argument has `num_rows` values, or one that applies to every
+    /// row (a constant); any other length is refused.
     fn invoke(&self, args: &[ArrayRef], num_rows: usize) -> Result<ArrayRef, ExecutionError> {
         let Some(first) = args.first() else {
             return Err(invalid("FORMAT requires at least 1 argument"));
         };
-        let _ = num_rows;
+        if let Some(bad) = args.iter().find(|a| a.len() != num_rows && a.len() != 1) {
+            return Err(invalid(format!(
+                "FORMAT: an argument has {} values for {num_rows} rows",
+                bad.len()
+            )));
+        }
+        let at = |a: &StringArray, row: usize| if a.len() == 1 { 0 } else { row };
         let template = utf8(first, "FORMAT")?;
         let values: Vec<StringArray> = args[1..]
             .iter()
             .map(|a| utf8(a, "FORMAT"))
             .collect::<Result<_, _>>()?;
         let mut out = StringBuilder::new();
-        for row in 0..template.len() {
-            if template.is_null(row) {
+        for row in 0..num_rows {
+            let t = at(&template, row);
+            if template.is_null(t) {
                 out.append_null();
                 continue;
             }
             let row_args: Vec<Option<&str>> = values
                 .iter()
-                .map(|v| (!v.is_null(row)).then(|| v.value(row)))
+                .map(|v| {
+                    let r = at(v, row);
+                    (!v.is_null(r)).then(|| v.value(r))
+                })
                 .collect();
-            out.append_value(Self::format_row(template.value(row), &row_args)?);
+            out.append_value(Self::format_row(template.value(t), &row_args)?);
         }
         Ok(Arc::new(out.finish()))
     }
@@ -818,6 +831,31 @@ mod tests {
         assert!(err("%I", &[None]).contains("null values cannot be formatted"));
         assert!(err("%1$s", &[Some("a")]).contains("unsupported format specifier"));
         assert!(err("%10s", &[Some("a")]).contains("unsupported format specifier"));
+    }
+
+    #[test]
+    fn format_broadcasts_constant_arguments() {
+        let strs = |v: &[Option<&str>]| -> ArrayRef { Arc::new(StringArray::from(v.to_vec())) };
+        let column = strs(&[Some("int4"), None, Some("varchar")]);
+        // A one-value template (a constant) beside a three-row column.
+        for template in [strs(&[Some("<%s>")]), strs(&[Some("<%s>"); 3])] {
+            let out = FormatFunction
+                .invoke(&[template, Arc::clone(&column)], 3)
+                .unwrap();
+            let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+            let got: Vec<&str> = (0..out.len()).map(|r| out.value(r)).collect();
+            assert_eq!(got, ["<int4>", "<>", "<varchar>"]);
+        }
+        // `evaluate` takes the row count from the longest argument.
+        let out = FormatFunction
+            .evaluate(&[strs(&[Some("%s")]), Arc::clone(&column)])
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        let err = FormatFunction
+            .invoke(&[strs(&[Some("%s"); 2]), column], 3)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 values for 3 rows"), "{err}");
     }
 
     #[test]

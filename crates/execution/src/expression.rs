@@ -156,7 +156,8 @@ pub(crate) fn evaluate(
                     // A cast Arrow cannot do at all is an engine error, not
                     // a bad value; the analyzer should not have planned it.
                     if arrow::compute::can_cast_types(arr.data_type(), &arrow_type) {
-                        data_error(e, DataErrorKind::of_cast(arr.data_type(), &arrow_type))
+                        let kind = DataErrorKind::of_cast_error(arr.data_type(), &arrow_type, &e);
+                        data_error(e, kind)
                     } else {
                         ExecutionError::from(e)
                     }

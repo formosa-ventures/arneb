@@ -87,7 +87,7 @@ pub fn arneb_error_to_pg_error_with_source(
 fn data_error_sqlstate(kind: arneb_common::error::DataErrorKind) -> &'static str {
     use arneb_common::error::DataErrorKind;
     match kind {
-        DataErrorKind::NumericValueOutOfRange => "22003",
+        DataErrorKind::NumericValueOutOfRange | DataErrorKind::NanToInteger => "22003",
         DataErrorKind::InvalidTextRepresentation => "22P02",
         DataErrorKind::InvalidDatetimeFormat => "22007",
         DataErrorKind::DivisionByZero => "22012",

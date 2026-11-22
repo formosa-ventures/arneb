@@ -205,9 +205,9 @@ impl TrinoError {
 fn data_error_code(kind: DataErrorKind) -> (i64, &'static str) {
     match kind {
         DataErrorKind::NumericValueOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE"),
-        DataErrorKind::InvalidTextRepresentation | DataErrorKind::InvalidDatetimeFormat => {
-            (9, "INVALID_CAST_ARGUMENT")
-        }
+        DataErrorKind::InvalidTextRepresentation
+        | DataErrorKind::InvalidDatetimeFormat
+        | DataErrorKind::NanToInteger => (9, "INVALID_CAST_ARGUMENT"),
         DataErrorKind::DivisionByZero => (8, "DIVISION_BY_ZERO"),
         _ => (0, "GENERIC_USER_ERROR"),
     }

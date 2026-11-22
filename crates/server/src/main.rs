@@ -90,6 +90,7 @@ pub mod coordinator;
 mod drain;
 pub mod dynamic_filter;
 mod fragment_pruning;
+mod liveness;
 pub mod memory_probe;
 pub mod memory_profile;
 mod oauth;
@@ -536,6 +537,10 @@ async fn run() -> Result<()> {
         );
     }
     arneb_rpc::install_cluster_security(cluster_security);
+    if matches!(role, ServerRole::Coordinator) {
+        // #245: a silent worker is probed before its queries fail.
+        liveness::start(node_registry.clone());
+    }
     let query_tracker = Arc::new(arneb_scheduler::QueryTracker::with_history_limit(
         config.observability.query_history_size,
     ));

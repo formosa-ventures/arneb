@@ -179,8 +179,20 @@ cluster keeps serving (unless [query retry](#query-retry) is on):
   worker dead, so the next query runs on the remaining workers.
 - **The worker hangs** (stuck process, network partition). It stops sending
   heartbeats. Once `heartbeat_timeout_secs` passes (default 10 s, with a
-  heartbeat every `heartbeat_interval_secs`, default 2 s), its queries fail
-  with `worker '<id>' (<address>) lost: no heartbeat for <n> s`.
+  heartbeat every `heartbeat_interval_secs`, default 2 s), the coordinator
+  treats it as *suspect*: no new query is scheduled on it, and the
+  coordinator pings its Flight port, waiting up to half the heartbeat
+  timeout (at least 1 s). If the worker does not answer, its queries fail
+  with `worker '<id>' (<address>) lost: no heartbeat for <n> s`, about 15 s
+  after its last heartbeat with the defaults. If it answers, it stays in the
+  cluster and its queries go on.
+- **A late heartbeat is not always a dead worker.** A coordinator busy with
+  a heavy fragment can read heartbeats late. The probe runs on its own
+  thread, so it still reaches the worker and keeps the queries running. The
+  coordinator logs `worker heartbeat timeout, marking as suspect until
+  probed`, then `worker answered the liveness probe; keeping it` or `worker
+  did not answer the liveness probe, marking as dead` on `arneb::cluster`.
+  `GET /api/v2/workers` shows a probed worker as `"suspect": true`.
 - In both cases the coordinator cancels the query's tasks on every other
   worker, so they release their memory right away.
 - **A worker that comes back** (restarted or unfrozen) rejoins with its next
@@ -215,8 +227,9 @@ runs again from the start on the remaining workers, like Trino's
   and the number of re-runs. Startup logs the effective
   policy on `arneb::config`.
 
-A hung worker is detected only after `heartbeat_timeout_secs`, so a re-run
-after one starts about 10 s after the hang, plus the delay.
+A hung worker is detected only after `heartbeat_timeout_secs` and an
+unanswered probe, so a re-run after one starts about 15 s after the hang
+with the defaults, plus the delay.
 
 `benchmarks/tpch/scripts/fault_injection.sh` checks all of this on the local
 bench cluster by killing and pausing a worker during SF10 q09. With

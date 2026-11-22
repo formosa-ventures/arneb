@@ -296,9 +296,70 @@ fn convert_set_expr(expr: sp::SetExpr) -> Result<ast::QueryBody, ParseError> {
                 right: Box::new(r),
             })
         }
+        sp::SetExpr::Values(values) => convert_values(values),
         other => Err(ParseError::UnsupportedFeature(format!(
             "query body: {other}"
         ))),
+    }
+}
+
+/// `VALUES (a, b), (c, d)` as a query body: a `UNION ALL` of one-row
+/// `SELECT`s whose columns are named `_col0`, `_col1`, ... as in Trino
+/// (rename them with a table alias, `AS v(x, y)`). The `UNION ALL` gives
+/// the rows a common type the way the set operation does. It is built as a
+/// balanced tree so a long `VALUES` list does not nest deeply.
+fn convert_values(values: sp::Values) -> Result<ast::QueryBody, ParseError> {
+    let width = values.rows.first().map_or(0, |row| row.content.len());
+    if width == 0 {
+        return Err(ParseError::InvalidSyntax(
+            "VALUES needs at least one row with at least one column".to_string(),
+        ));
+    }
+    let rows = values
+        .rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if row.content.len() != width {
+                return Err(ParseError::InvalidSyntax(format!(
+                    "VALUES row {} has {} columns, expected {width}",
+                    i + 1,
+                    row.content.len()
+                )));
+            }
+            let projection = row
+                .content
+                .into_iter()
+                .enumerate()
+                .map(|(c, expr)| {
+                    Ok(ast::SelectItem::ExprWithAlias {
+                        expr: convert_expr(expr)?,
+                        alias: format!("_col{c}"),
+                    })
+                })
+                .collect::<Result<Vec<_>, ParseError>>()?;
+            Ok(ast::QueryBody::Select(ast::SelectBody {
+                distinct: false,
+                projection,
+                from: Vec::new(),
+                selection: None,
+                group_by: Vec::new(),
+                having: None,
+            }))
+        })
+        .collect::<Result<Vec<_>, ParseError>>()?;
+    Ok(union_all_balanced(rows))
+}
+
+fn union_all_balanced(mut rows: Vec<ast::QueryBody>) -> ast::QueryBody {
+    if rows.len() == 1 {
+        return rows.pop().expect("one row");
+    }
+    let right = rows.split_off(rows.len() / 2);
+    ast::QueryBody::SetOperation {
+        op: ast::SetOperator::UnionAll,
+        left: Box::new(union_all_balanced(rows)),
+        right: Box::new(union_all_balanced(right)),
     }
 }
 

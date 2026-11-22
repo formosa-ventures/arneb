@@ -132,13 +132,17 @@ pub(crate) fn evaluate(
                 }
             }
             let arrow_type: ArrowDataType = data_type.clone().into();
-            let result = match cast_fractional_to_integer(
-                &arr,
-                &arrow_type,
-                &arrow::compute::CastOptions::default(),
-            )? {
+            // Strict, as in Trino and as the plan-time fold (`cast_scalar`):
+            // a value the target cannot hold (`3000000000` as INTEGER,
+            // `'abc'` as INTEGER, NaN as BIGINT) is an error, never a silent
+            // NULL. `TRY(CAST(...))` turns the failing rows into NULL.
+            let options = arrow::compute::CastOptions {
+                safe: false,
+                ..Default::default()
+            };
+            let result = match cast_fractional_to_integer(&arr, &arrow_type, &options)? {
                 Some(result) => result,
-                None => arrow::compute::cast(&arr, &arrow_type)?,
+                None => arrow::compute::cast_with_options(&arr, &arrow_type, &options)?,
             };
             match data_type {
                 DataType::Char(length) => char_storage_array(&result, *length),
@@ -1931,6 +1935,86 @@ mod tests {
         assert!(arr.value(0)); // "hello" matches
         assert!(!arr.value(1)); // "world" doesn't
         assert!(!arr.value(2)); // "foo" doesn't
+    }
+
+    /// `CAST(x AS data_type)` over column 0.
+    fn cast_x(data_type: arneb_common::types::DataType) -> PlanExpr {
+        PlanExpr::Cast {
+            expr: Box::new(PlanExpr::Column {
+                index: 0,
+                name: "x".to_string(),
+                span: None,
+            }),
+            data_type,
+            span: None,
+        }
+    }
+
+    fn single_column_batch(column: ArrayRef) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            column.data_type().clone(),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![column]).unwrap()
+    }
+
+    /// A runtime CAST to a type that cannot hold the value is an error, as in
+    /// Trino and as the plan-time fold of the same literal, never a silent NULL.
+    #[test]
+    fn a_runtime_cast_the_target_cannot_hold_is_an_error() {
+        use arneb_common::types::DataType as T;
+        let cases: Vec<(ArrayRef, T)> = vec![
+            (Arc::new(Int64Array::from(vec![1, 3_000_000_000])), T::Int32),
+            (Arc::new(Int64Array::from(vec![70_000])), T::Int16),
+            (Arc::new(Int32Array::from(vec![300])), T::Int8),
+            (Arc::new(StringArray::from(vec!["12", "abc"])), T::Int32),
+            (Arc::new(Float64Array::from(vec![f64::NAN])), T::Int64),
+            (Arc::new(StringArray::from(vec!["1998-13-45"])), T::Date32),
+        ];
+        for (column, data_type) in cases {
+            let batch = single_column_batch(column);
+            let expr = cast_x(data_type.clone());
+            let err =
+                evaluate(&expr, &batch, None).expect_err(&format!("CAST to {data_type} must fail"));
+            assert!(
+                err.to_string().to_lowercase().contains("cast"),
+                "{data_type}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_runtime_cast_in_range_keeps_its_values_and_nulls() {
+        let column: ArrayRef =
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(-2_147_483_648)]));
+        let batch = single_column_batch(column);
+        let expr = cast_x(arneb_common::types::DataType::Int32);
+        let result = evaluate(&expr, &batch, None).unwrap();
+        let ints = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(
+            ints.iter().collect::<Vec<_>>(),
+            vec![Some(1), None, Some(i32::MIN)]
+        );
+    }
+
+    /// `TRY(CAST(...))` still turns only the failing rows into NULL.
+    #[test]
+    fn try_turns_only_the_failing_cast_rows_into_null() {
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![7, 3_000_000_000, -1]));
+        let batch = single_column_batch(column);
+        let expr = PlanExpr::Function {
+            name: "TRY".to_string(),
+            args: vec![cast_x(arneb_common::types::DataType::Int32)],
+            distinct: false,
+            span: None,
+        };
+        let result = evaluate(&expr, &batch, None).unwrap();
+        let ints = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(
+            ints.iter().collect::<Vec<_>>(),
+            vec![Some(7), None, Some(-1)]
+        );
     }
 
     #[test]

@@ -144,6 +144,27 @@ impl PlanningContext {
     }
 }
 
+/// Gives both inputs of a set operation the same column types now, at
+/// planning time, so whatever is planned on top of it (an outer query over
+/// a `UNION ALL` in a derived table, say) sees the unified type rather than
+/// the left input's. The analyzer aligns them again after coercion; that
+/// pass is then a no-op. Inputs with an untyped (NULL or parameter) column
+/// are left for the analyzer, which infers those types first.
+fn align_set_op_inputs(
+    left: LogicalPlan,
+    right: LogicalPlan,
+) -> Result<(LogicalPlan, LogicalPlan), PlanError> {
+    let untyped = |plan: &LogicalPlan| plan.schema().iter().any(|c| c.data_type == DataType::Null);
+    if untyped(&left) || untyped(&right) || left.schema().len() != right.schema().len() {
+        return Ok((left, right));
+    }
+    let mut aligned =
+        crate::analyzer::type_coercion::align_set_op_branches(vec![left, right])?.into_iter();
+    let left = aligned.next().expect("two inputs");
+    let right = aligned.next().expect("two inputs");
+    Ok((left, right))
+}
+
 fn apply_table_column_aliases(
     plan: LogicalPlan,
     column_aliases: &[String],
@@ -608,6 +629,7 @@ impl<'a> QueryPlanner<'a> {
             ast::QueryBody::SetOperation { op, left, right } => {
                 let left_plan = self.plan_query_body(left, &[]).await?;
                 let right_plan = self.plan_query_body(right, &[]).await?;
+                let (left_plan, right_plan) = align_set_op_inputs(left_plan, right_plan)?;
                 match op {
                     ast::SetOperator::UnionAll => Ok(LogicalPlan::UnionAll {
                         inputs: vec![left_plan, right_plan],

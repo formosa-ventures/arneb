@@ -624,55 +624,27 @@ impl DataSource for PreResolvedParquetDataSource {
                 self.path, self.splits
             )));
         }
-        let meta = self.store.head(&self.path).await.map_err(|e| {
-            ExecutionError::InvalidOperation(format!(
-                "failed to stat Parquet file '{}': {}",
-                self.path, e
-            ))
-        })?;
-
-        let reader =
-            crate::parquet_scan::ParquetObjectReader::new(self.store.clone(), meta.location)
-                .with_file_size(meta.size);
-
-        let mut builder =
-            parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder::new(reader)
-                .await
-                .map_err(|e| {
-                    ExecutionError::InvalidOperation(format!("Parquet reader error: {e}"))
-                })?;
-
-        if self.splits > 1 {
-            let total_rows: usize = builder
-                .metadata()
-                .row_groups()
-                .iter()
-                .map(|rg| rg.num_rows().max(0) as usize)
-                .sum();
-            builder = builder.with_row_selection(crate::parquet_scan::compute_split_selection(
-                total_rows,
-                partition,
-                self.splits,
-            ));
-        }
-
-        if let Some(ref projection) = ctx.projection {
-            let mask = parquet::arrow::ProjectionMask::roots(
-                builder.parquet_schema(),
-                projection.iter().copied(),
-            );
-            builder = builder.with_projection(mask);
-        }
-
-        let arrow_schema = builder.schema().clone();
+        // The shared scan Hive and Iceberg use: row-group pruning and
+        // `RowFilter` pushdown of the scan's filters and dynamic filter
+        // domains, projection, the scan batch size, and this split's row
+        // range. Pruning keeps every split's range over the same rows, so
+        // the splits still cover the file exactly once.
+        let builder = crate::parquet_scan::open_parquet_builder(&self.store, &self.path).await?;
         let buffer_bytes = crate::parquet_scan::row_group_buffer_bytes(
             builder.metadata(),
             ctx.projection.as_deref(),
         );
-
-        let stream = builder.build().map_err(|e| {
-            ExecutionError::InvalidOperation(format!("Parquet reader build error: {e}"))
-        })?;
+        let stream = crate::parquet_scan::build_split_stream(
+            builder,
+            &self.path,
+            &ctx.filters,
+            &ctx.dynamic_filter_domains,
+            ctx.projection.as_deref(),
+            ctx.batch_size,
+            partition,
+            self.splits,
+        )?;
+        let arrow_schema = stream.schema().clone();
 
         // Phase 3b.7b (2026-05-21): true streaming. Same change as
         // ParquetDataSource::scan above.
@@ -1438,6 +1410,91 @@ mod tests {
             // 450_000 rows allow at most 4 splits of MIN_ROWS_PER_SPLIT rows.
             assert_eq!(ds.partition_count(), expected, "target {target}");
         }
+    }
+
+    async fn read_ids_with(
+        ds: &Arc<dyn DataSource>,
+        ctx: &ScanContext,
+        partition: usize,
+    ) -> Vec<i32> {
+        let stream = ds.scan(ctx, partition).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    fn id_cmp(op: arneb_sql_parser::ast::BinaryOp, value: i32) -> arneb_planner::PlanExpr {
+        use arneb_common::types::ScalarValue;
+        use arneb_planner::PlanExpr;
+        PlanExpr::BinaryOp {
+            left: Box::new(PlanExpr::Column {
+                index: 0,
+                name: "id".to_string(),
+                span: None,
+            }),
+            op,
+            right: Box::new(PlanExpr::Literal {
+                value: ScalarValue::Int32(value),
+                span: None,
+            }),
+            span: None,
+        }
+    }
+
+    /// A registered Parquet table's scan applies its filters in the reader:
+    /// row groups outside them are skipped and the rest filtered row by
+    /// row, in every split, and the splits still cover the matches once.
+    #[tokio::test]
+    async fn a_registered_parquet_scan_pushes_its_filters_into_every_split() {
+        let factory = register_ids(450_000).await;
+        for splits in [1, 4] {
+            let ds = factory
+                .create_data_source(&TableReference::table("ids"), &[], &parallelism(splits))
+                .await
+                .unwrap();
+            assert_eq!(ds.partition_count(), splits);
+            // 120_000..=130_000 lies in row groups 2 (100k..150k) only.
+            let ctx = ScanContext::default().with_filters(vec![
+                id_cmp(arneb_sql_parser::ast::BinaryOp::GtEq, 120_000),
+                id_cmp(arneb_sql_parser::ast::BinaryOp::LtEq, 130_000),
+            ]);
+            let mut all = Vec::new();
+            for p in 0..splits {
+                all.extend(read_ids_with(&ds, &ctx, p).await);
+            }
+            all.sort_unstable();
+            assert_eq!(
+                all,
+                (120_000..=130_000).collect::<Vec<_>>(),
+                "{splits} splits"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registered_parquet_scan_uses_the_scan_batch_size() {
+        let factory = register_ids(100_000).await;
+        let ds = factory
+            .create_data_source(&TableReference::table("ids"), &[], &parallelism(1))
+            .await
+            .unwrap();
+        let ctx = ScanContext {
+            batch_size: Some(1_000),
+            ..Default::default()
+        };
+        let stream = ds.scan(&ctx, 0).await.unwrap();
+        let batches = arneb_common::stream::collect_stream(stream).await.unwrap();
+        assert!(batches.iter().all(|b| b.num_rows() <= 1_000));
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 100_000);
     }
 
     #[tokio::test]

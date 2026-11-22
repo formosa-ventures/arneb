@@ -186,9 +186,16 @@ cluster keeps serving (unless [query retry](#query-retry) is on):
   with `worker '<id>' (<address>) lost: no heartbeat for <n> s`, about 15 s
   after its last heartbeat with the defaults. If it answers, it stays in the
   cluster and its queries go on.
-- **A late heartbeat is not always a dead worker.** A coordinator busy with
-  a heavy fragment can read heartbeats late. The probe runs on its own
-  thread, so it still reaches the worker and keeps the queries running. The
+- **A late heartbeat is not always a dead worker.** Every node serves Flight
+  (heartbeats, probes, cancels, task status) on its own two-thread
+  `arneb-control` runtime, while query operators and the encoding of
+  exchange output run on the execution runtime. Fragments that keep every
+  execution thread busy therefore do not delay heartbeats. A heartbeat that
+  still arrives at least half a heartbeat timeout after the previous one is
+  logged as `worker heartbeat arrived late` with the gap (`gap_ms`) on
+  `arneb::cluster`. If one is late enough to miss its deadline, the probe
+  runs on its own thread, so it still reaches the worker and keeps the
+  queries running. The
   coordinator logs `worker heartbeat timeout, marking as suspect until
   probed`, then `worker answered the liveness probe; keeping it` or `worker
   did not answer the liveness probe, marking as dead` on `arneb::cluster`.

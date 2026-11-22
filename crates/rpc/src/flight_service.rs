@@ -113,6 +113,10 @@ pub struct FlightState {
     release_query_callback: Option<ReleaseQueryCallback>,
     catalog_sync_callback: Option<CatalogSyncCallback>,
     catalog_source: Option<CatalogSourceCallback>,
+    /// Where the work behind a request runs when this server is served on
+    /// its own control runtime: task execution and the encoding of `do_get`
+    /// output. `None` runs it on the serving runtime.
+    execution: Option<tokio::runtime::Handle>,
 }
 
 impl Default for FlightState {
@@ -129,6 +133,7 @@ impl Default for FlightState {
             release_query_callback: None,
             catalog_sync_callback: None,
             catalog_source: None,
+            execution: None,
         }
     }
 }
@@ -198,6 +203,16 @@ impl FlightState {
     /// a worker pulls.
     pub fn set_catalog_source(&mut self, source: Arc<dyn Fn() -> CatalogSet + Send + Sync>) {
         self.catalog_source = Some(source);
+    }
+
+    /// Run the work behind requests on `handle` instead of the runtime that
+    /// serves Flight (#244). The callbacks run inside `handle`'s context,
+    /// so the tasks they spawn (a submitted fragment, a dynamic filter
+    /// report) land there, and `do_get` output is encoded there. The
+    /// serving runtime then only parses requests and moves frames, so a
+    /// saturated execution runtime cannot delay heartbeats or cancels.
+    pub fn set_execution_runtime(&mut self, handle: tokio::runtime::Handle) {
+        self.execution = Some(handle);
     }
 
     /// Register a partitioned output buffer for a task. A2.1.2 renamed
@@ -277,6 +292,38 @@ impl TrinoFlightService {
     /// Creates a new Flight service with the given shared state.
     pub fn new(state: FlightState) -> Self {
         Self { state }
+    }
+
+    /// Enter the execution runtime, if one is set, so a callback's
+    /// `tokio::spawn` lands there. Hold it only across synchronous code.
+    fn enter_execution(&self) -> Option<tokio::runtime::EnterGuard<'_>> {
+        self.state.execution.as_ref().map(|h| h.enter())
+    }
+
+    /// Poll `stream` on the execution runtime and hand its frames over a
+    /// small channel, so the encoding work stays off the serving runtime.
+    /// The pump stops as soon as the response is dropped.
+    fn on_execution(&self, stream: BoxedStream<FlightData>) -> BoxedStream<FlightData> {
+        let Some(handle) = &self.state.execution else {
+            return stream;
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        handle.spawn(async move {
+            let mut stream = stream;
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    _ = tx.closed() => break,
+                    next = futures::StreamExt::next(&mut stream) => next,
+                };
+                let Some(item) = next else { break };
+                if tx.send(item).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut rx = rx;
+        Box::pin(futures::stream::poll_fn(move |cx| rx.poll_recv(cx)))
     }
 }
 
@@ -409,7 +456,7 @@ impl FlightService for TrinoFlightService {
                     format!("{task_id}:{partition_id}"),
                 );
                 Ok(Response::new(ServedStream::wrap(
-                    stream,
+                    self.on_execution(stream),
                     ticket_str,
                     "partitioned",
                     peer,
@@ -427,7 +474,7 @@ impl FlightService for TrinoFlightService {
                 let failure = buffer.failure_handle();
                 let flight_stream = async_stream_broadcast(schema, stream, failure);
                 Ok(Response::new(ServedStream::wrap(
-                    flight_stream,
+                    self.on_execution(flight_stream),
                     ticket_str,
                     "broadcast",
                     peer,
@@ -435,7 +482,11 @@ impl FlightService for TrinoFlightService {
             }
             None => {
                 if let Some(ref cb) = self.state.task_status_callback {
-                    match cb(task_id) {
+                    let status = {
+                        let _runtime = self.enter_execution();
+                        cb(task_id)
+                    };
+                    match status {
                         Some(TaskStatusResponse::Running) => {
                             return Err(Status::unavailable(format!(
                                 "task '{task_id}' running, buffer not yet registered"
@@ -477,7 +528,10 @@ impl FlightService for TrinoFlightService {
                 );
 
                 let reply = match self.state.heartbeat_callback {
-                    Some(ref callback) => callback(msg).map_err(Status::failed_precondition)?,
+                    Some(ref callback) => {
+                        let _runtime = self.enter_execution();
+                        callback(msg).map_err(Status::failed_precondition)?
+                    }
                     None => HeartbeatReply::default(),
                 };
 
@@ -506,6 +560,7 @@ impl FlightService for TrinoFlightService {
                 );
 
                 if let Some(ref callback) = self.state.task_callback {
+                    let _runtime = self.enter_execution();
                     callback(descriptor);
                 } else {
                     return Err(Status::unavailable("worker has no task manager registered"));
@@ -551,6 +606,7 @@ impl FlightService for TrinoFlightService {
                 );
 
                 if let Some(ref callback) = self.state.df_report_callback {
+                    let _runtime = self.enter_execution();
                     callback(req);
                 }
                 // No callback registered = inert during A1.3; still ack
@@ -575,7 +631,10 @@ impl FlightService for TrinoFlightService {
                 } else {
                     (&self.state.release_query_callback, "released")
                 };
-                let ended = callback.as_ref().map_or(0, |cb| cb(query_id));
+                let ended = {
+                    let _runtime = self.enter_execution();
+                    callback.as_ref().map_or(0, |cb| cb(query_id))
+                };
                 let result = arrow_flight::Result {
                     body: format!("{verb} {ended}").into(),
                 };
@@ -594,6 +653,7 @@ impl FlightService for TrinoFlightService {
                 );
 
                 if let Some(ref callback) = self.state.df_notify_callback {
+                    let _runtime = self.enter_execution();
                     callback(req);
                 }
 
@@ -617,7 +677,15 @@ impl FlightService for TrinoFlightService {
                     catalogs = set.catalogs.len(),
                     "received catalog sync"
                 );
-                let failed = callback(set).await.map_err(Status::internal)?;
+                let sync = callback(set);
+                let failed = match &self.state.execution {
+                    Some(handle) => handle
+                        .spawn(sync)
+                        .await
+                        .map_err(|e| Status::internal(format!("catalog sync stopped: {e}")))?,
+                    None => sync.await,
+                }
+                .map_err(Status::internal)?;
                 let reply = crate::catalog_sync::CatalogSyncReply { failed };
                 let result = arrow_flight::Result {
                     body: serde_json::to_vec(&reply)

@@ -333,6 +333,20 @@ impl NodeRegistry {
                 if draining { "worker draining" } else { "worker active again" }
             );
         }
+        // A beat this far apart from the previous one means a stall on one
+        // side: a worker that could not send, or this node too busy to read.
+        let gap = entry.last_heartbeat.elapsed();
+        if (entry.alive || entry.suspect)
+            && gap * 2 >= std::time::Duration::from_secs(self.heartbeat_timeout_secs)
+        {
+            tracing::warn!(
+                target: "arneb::cluster",
+                worker_id = %worker_id,
+                gap_ms = gap.as_millis() as u64,
+                timeout_secs = self.heartbeat_timeout_secs,
+                "worker heartbeat arrived late"
+            );
+        }
         entry.last_heartbeat = Instant::now();
         entry.address = address;
         entry.max_splits = max_splits;

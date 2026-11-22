@@ -3593,20 +3593,28 @@ mod tests {
         let (cm, reg) = null_cmp_memory_env();
         let pool: Arc<dyn arneb_execution::memory_pool::MemoryPool> =
             Arc::new(arneb_execution::memory_pool::UnboundedMemoryPool::new());
-        for sql in [
-            "SELECT 9223372036854775807 + 1",
-            "SELECT 9223372036854775807 * 2",
-            "SELECT 1 / 0",
+        use arneb_common::error::DataErrorKind;
+        for (sql, expected) in [
+            (
+                "SELECT 9223372036854775807 + 1",
+                DataErrorKind::NumericValueOutOfRange,
+            ),
+            (
+                "SELECT 9223372036854775807 * 2",
+                DataErrorKind::NumericValueOutOfRange,
+            ),
+            ("SELECT 1 / 0", DataErrorKind::DivisionByZero),
         ] {
             let err = execute_query(sql, &cm, &reg, None, &pool)
                 .await
                 .err()
                 .unwrap_or_else(|| panic!("expected an error: {sql}"));
-            let msg = err.to_string();
-            assert!(
-                msg.contains("overflow") || msg.contains("Divide by zero"),
-                "{sql}: {msg}"
-            );
+            match err {
+                ArnebError::Execution(ExecutionError::Data { kind, .. }) => {
+                    assert_eq!(kind, expected, "{sql}")
+                }
+                other => panic!("{sql}: expected a data error, got {other:?}"),
+            }
         }
     }
 

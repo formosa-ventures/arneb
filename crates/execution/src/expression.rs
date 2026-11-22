@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use arneb_common::error::ExecutionError;
+use arneb_common::error::{DataErrorKind, ExecutionError};
 use arneb_common::numeric_cast::cast_fractional_to_integer;
 use arneb_common::types::{char_storage_value, DataType, ScalarValue};
 use arneb_planner::analyzer::coercion_matrix::decimal_arithmetic_type;
@@ -147,10 +147,20 @@ pub(crate) fn evaluate(
                 safe: false,
                 ..Default::default()
             };
-            let result = match cast_fractional_to_integer(&arr, &arrow_type, &options)? {
-                Some(result) => result,
-                None => arrow::compute::cast_with_options(&arr, &arrow_type, &options)?,
-            };
+            let result = cast_fractional_to_integer(&arr, &arrow_type, &options)
+                .and_then(|result| match result {
+                    Some(result) => Ok(result),
+                    None => arrow::compute::cast_with_options(&arr, &arrow_type, &options),
+                })
+                .map_err(|e| {
+                    // A cast Arrow cannot do at all is an engine error, not
+                    // a bad value; the analyzer should not have planned it.
+                    if arrow::compute::can_cast_types(arr.data_type(), &arrow_type) {
+                        data_error(e, DataErrorKind::of_cast(arr.data_type(), &arrow_type))
+                    } else {
+                        ExecutionError::from(e)
+                    }
+                })?;
             match data_type {
                 DataType::Char(length) => char_storage_array(&result, *length),
                 _ => Ok(result),
@@ -1105,22 +1115,45 @@ fn decimal_arithmetic(
         ArithOp::Div if scale > l.1 => {
             let p = (l.0 as i8 + scale - l.1).min(38) as u8;
             let rescaled = ArrowDataType::Decimal128(p, scale);
-            let left = arrow::compute::cast_with_options(left, &rescaled, &CHECKED_CAST)?;
+            let left = arrow::compute::cast_with_options(left, &rescaled, &CHECKED_CAST)
+                .map_err(decimal_overflow)?;
             kernels::numeric::div(&left, right)?
         }
         ArithOp::Div => kernels::numeric::div(left, right)?,
         ArithOp::Rem => kernels::numeric::rem(left, right)?,
     };
     let target = ArrowDataType::Decimal128(precision, scale);
-    let result = arrow::compute::cast_with_options(&raw, &target, &CHECKED_CAST)?;
+    let result = arrow::compute::cast_with_options(&raw, &target, &CHECKED_CAST)
+        .map_err(decimal_overflow)?;
     // At the 38-digit clamp the kernels' i128 math can still hold a value
     // wider than 38 digits that the cast does not re-check.
     if precision == 38 {
         result
             .as_primitive::<arrow::datatypes::Decimal128Type>()
-            .validate_decimal_precision(precision)?;
+            .validate_decimal_precision(precision)
+            .map_err(decimal_overflow)?;
     }
     Ok(result)
+}
+
+/// A decimal result that does not fit its type (Trino `Decimal overflow`).
+fn decimal_overflow(err: arrow::error::ArrowError) -> ExecutionError {
+    data_error(err, DataErrorKind::NumericValueOutOfRange)
+}
+
+/// `err`, raised on a bad value, as a data error of `kind`. The message is
+/// Arrow's without its variant prefix (`Cast error: `).
+fn data_error(err: arrow::error::ArrowError, kind: DataErrorKind) -> ExecutionError {
+    use arrow::error::ArrowError;
+    let message = match err {
+        ArrowError::CastError(m)
+        | ArrowError::InvalidArgumentError(m)
+        | ArrowError::ComputeError(m)
+        | ArrowError::ParseError(m)
+        | ArrowError::ArithmeticOverflow(m) => m,
+        other => other.to_string(),
+    };
+    ExecutionError::Data { kind, message }
 }
 
 /// Casts that fail on overflow instead of yielding NULL.

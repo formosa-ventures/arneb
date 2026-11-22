@@ -1,7 +1,9 @@
 //! Mapping from [`ArnebError`] to the Trino `QueryError` JSON object.
 
 use arneb_common::diagnostic::{render_plan_error, SourceFile};
-use arneb_common::error::{ArnebError, CatalogError, ConnectorError, Location, PlanError};
+use arneb_common::error::{
+    ArnebError, CatalogError, ConnectorError, DataErrorKind, ExecutionError, Location, PlanError,
+};
 use serde_json::{json, Value};
 
 /// A Trino `QueryError`: the `(errorCode, errorName, errorType)` triple
@@ -119,6 +121,12 @@ impl TrinoError {
                 "EXCEEDED_LOCAL_MEMORY_LIMIT",
                 INSUFFICIENT_RESOURCES,
             ),
+            // A bad value, at plan time or at run time.
+            ArnebError::Plan(PlanError::Data { kind, .. })
+            | ArnebError::Execution(ExecutionError::Data { kind, .. }) => {
+                let (code, name) = data_error_code(*kind);
+                (code, name, USER_ERROR)
+            }
             ArnebError::Parse(_) => (1, "SYNTAX_ERROR", USER_ERROR),
             ArnebError::Plan(e) => match e {
                 PlanError::TableNotFound(_) => (46, "TABLE_NOT_FOUND", USER_ERROR),
@@ -188,6 +196,20 @@ impl TrinoError {
             v["errorLocation"] = json!({"lineNumber": loc.line, "columnNumber": loc.column});
         }
         v
+    }
+}
+
+/// Trino's `StandardErrorCode` for a data error, as Trino raises it for the
+/// same failure: a string that does not cast is `INVALID_CAST_ARGUMENT`, a
+/// number that does not fit is `NUMERIC_VALUE_OUT_OF_RANGE`.
+fn data_error_code(kind: DataErrorKind) -> (i64, &'static str) {
+    match kind {
+        DataErrorKind::NumericValueOutOfRange => (19, "NUMERIC_VALUE_OUT_OF_RANGE"),
+        DataErrorKind::InvalidTextRepresentation | DataErrorKind::InvalidDatetimeFormat => {
+            (9, "INVALID_CAST_ARGUMENT")
+        }
+        DataErrorKind::DivisionByZero => (8, "DIVISION_BY_ZERO"),
+        _ => (0, "GENERIC_USER_ERROR"),
     }
 }
 

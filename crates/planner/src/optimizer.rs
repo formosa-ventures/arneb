@@ -410,7 +410,7 @@ fn simplify_expr(expr: PlanExpr) -> PlanExpr {
 /// - `BinaryOp(Literal, Literal) → Literal` via [`eval_binary_op`].
 /// - `Cast(Literal, T) → Literal` via
 ///   [`crate::analyzer::cast_scalar::cast_scalar`]. An invalid
-///   literal produces [`PlanError::InvalidLiteral`] so the query
+///   literal produces [`PlanError::Data`] so the query
 ///   fails at plan time rather than mid-stream (e.g.,
 ///   `DATE '1998-13-45'`).
 ///
@@ -550,17 +550,8 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
                 // stays a cast, evaluated at run time, but a value that does
                 // not fit still fails here, like a folded cast.
                 if !crate::analyzer::cast_scalar::folds_to_scalar(&data_type) {
-                    crate::analyzer::cast_scalar::check_cast(value, &data_type).map_err(
-                        |e| match e {
-                            PlanError::InvalidLiteral { message, .. } => {
-                                PlanError::InvalidLiteral {
-                                    message,
-                                    location: span.map(|s| s.start),
-                                }
-                            }
-                            other => other,
-                        },
-                    )?;
+                    crate::analyzer::cast_scalar::check_cast(value, &data_type)
+                        .map_err(|e| at_cast(e, span))?;
                     return Ok(PlanExpr::Cast {
                         expr: Box::new(expr),
                         data_type,
@@ -569,22 +560,11 @@ pub(crate) fn fold_constants(expr: PlanExpr) -> Result<PlanExpr, PlanError> {
                 }
                 // Fold the cast: Arrow's strict-mode cast surfaces
                 // parse errors (e.g., malformed DATE literal) as a
-                // `PlanError::InvalidLiteral`. Enrich the error with
-                // the `Cast` node's span-derived location so the
-                // diagnostic renderer can point at the offending
-                // literal.
-                let folded =
-                    crate::analyzer::cast_scalar::cast_scalar(value, &data_type).map_err(|e| {
-                        match e {
-                            PlanError::InvalidLiteral { message, .. } => {
-                                PlanError::InvalidLiteral {
-                                    message,
-                                    location: span.map(|s| s.start),
-                                }
-                            }
-                            other => other,
-                        }
-                    })?;
+                // `PlanError::Data`. Enrich the error with the `Cast`
+                // node's span-derived location so the diagnostic renderer
+                // can point at the offending literal.
+                let folded = crate::analyzer::cast_scalar::cast_scalar(value, &data_type)
+                    .map_err(|e| at_cast(e, span))?;
                 return Ok(PlanExpr::Literal {
                     value: folded,
                     span,
@@ -750,6 +730,24 @@ fn fold_order_by(
         });
     }
     Ok(Some(Box::new(out)))
+}
+
+/// A plan-time cast failure located at the `Cast` node's span, so the
+/// diagnostic renderer can point at the offending literal.
+fn at_cast(err: PlanError, span: Option<arneb_sql_parser::Span>) -> PlanError {
+    let at = span.map(|s| s.start);
+    match err {
+        PlanError::InvalidLiteral { message, .. } => PlanError::InvalidLiteral {
+            message,
+            location: at,
+        },
+        PlanError::Data { kind, message, .. } => PlanError::Data {
+            kind,
+            message,
+            location: at,
+        },
+        other => other,
+    }
 }
 
 /// Evaluate a binary operation on two scalar values.
@@ -1254,7 +1252,7 @@ mod tests {
             span: None,
         })
         .unwrap_err();
-        assert!(matches!(err, PlanError::InvalidLiteral { .. }));
+        assert!(matches!(err, PlanError::Data { .. }));
     }
 
     #[test]

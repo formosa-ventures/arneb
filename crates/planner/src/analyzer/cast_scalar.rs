@@ -7,13 +7,13 @@
 //! conversion but authoritative: if Arrow can cast the runtime
 //! array, Arrow can cast the literal.
 //!
-//! Parse failures (e.g., `DATE '1998-13-45'`) surface as
-//! [`PlanError::InvalidLiteral`] so the query fails at plan time
-//! rather than mid-stream.
+//! Parse failures (e.g., `DATE '1998-13-45'`) and out-of-range values
+//! surface as [`PlanError::Data`] so the query fails at plan time rather
+//! than mid-stream, with the SQLSTATE the run-time cast would give.
 
 use std::sync::Arc;
 
-use arneb_common::error::PlanError;
+use arneb_common::error::{DataErrorKind, PlanError};
 use arneb_common::numeric_cast::cast_fractional_to_integer;
 use arneb_common::types::{char_storage_value, DataType, ScalarValue, TimeUnit};
 use arrow::array::{
@@ -21,12 +21,12 @@ use arrow::array::{
     Int32Array, Int64Array, NullArray, StringArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow::compute::{cast_with_options, CastOptions};
+use arrow::compute::{can_cast_types, cast_with_options, CastOptions};
 use arrow::datatypes::DataType as ArrowDataType;
 
 /// Cast a literal from its current representation to `target`,
-/// returning the converted `ScalarValue` or a `PlanError::InvalidLiteral`
-/// if the cast fails.
+/// returning the converted `ScalarValue` or a `PlanError::Data` if the
+/// value does not cast.
 ///
 /// Strict mode (`safe: false`) is used so parse failures become
 /// errors rather than silent nulls — this matches the user's
@@ -120,9 +120,21 @@ fn cast_to_array(value: &ScalarValue, target: &DataType) -> Result<ArrayRef, Pla
             Some(result) => Ok(result),
             None => cast_with_options(&source_array, &target_arrow, &options),
         })
-        .map_err(|e| PlanError::InvalidLiteral {
-            message: format!("cannot cast literal {value} to {target}: {e}"),
-            location: None,
+        .map_err(|e| {
+            let message = format!("cannot cast literal {value} to {target}: {e}");
+            let source_arrow = source_array.data_type();
+            if can_cast_types(source_arrow, &target_arrow) {
+                PlanError::Data {
+                    kind: DataErrorKind::of_cast(source_arrow, &target_arrow),
+                    message,
+                    location: None,
+                }
+            } else {
+                PlanError::InvalidLiteral {
+                    message,
+                    location: None,
+                }
+            }
         })
 }
 
@@ -327,7 +339,13 @@ mod tests {
     fn cast_invalid_utf8_date_returns_plan_error() {
         let v = ScalarValue::Utf8("not-a-date".to_string());
         let err = cast_scalar(&v, &DataType::Date32).unwrap_err();
-        assert!(matches!(err, PlanError::InvalidLiteral { .. }));
+        assert!(matches!(
+            err,
+            PlanError::Data {
+                kind: DataErrorKind::InvalidDatetimeFormat,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -411,7 +429,13 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(err, PlanError::InvalidLiteral { .. }));
+        assert!(matches!(
+            err,
+            PlanError::Data {
+                kind: DataErrorKind::InvalidDatetimeFormat,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -421,18 +445,22 @@ mod tests {
             assert!(check_cast(&ScalarValue::Int64(5), &target).is_ok());
             assert!(check_cast(&ScalarValue::Null, &target).is_ok());
         }
-        assert!(matches!(
-            check_cast(&ScalarValue::Int64(70_000), &DataType::Int16),
-            Err(PlanError::InvalidLiteral { .. })
-        ));
-        assert!(matches!(
-            check_cast(&ScalarValue::Int64(300), &DataType::Int8),
-            Err(PlanError::InvalidLiteral { .. })
-        ));
-        assert!(matches!(
-            check_cast(&ScalarValue::Utf8("x".into()), &DataType::Int16),
-            Err(PlanError::InvalidLiteral { .. })
-        ));
+        let kind = |value: ScalarValue, target: DataType| match check_cast(&value, &target) {
+            Err(PlanError::Data { kind, .. }) => kind,
+            other => panic!("expected a data error, got {other:?}"),
+        };
+        assert_eq!(
+            kind(ScalarValue::Int64(70_000), DataType::Int16),
+            DataErrorKind::NumericValueOutOfRange
+        );
+        assert_eq!(
+            kind(ScalarValue::Int64(300), DataType::Int8),
+            DataErrorKind::NumericValueOutOfRange
+        );
+        assert_eq!(
+            kind(ScalarValue::Utf8("x".into()), DataType::Int16),
+            DataErrorKind::InvalidTextRepresentation
+        );
         assert!(folds_to_scalar(&DataType::Int32));
     }
 }

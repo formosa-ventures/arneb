@@ -163,6 +163,19 @@ pub enum PlanError {
         location: Option<Location>,
     },
 
+    /// A constant the planner folds is bad for its type (e.g.
+    /// `CAST('abc' AS INTEGER)`, `CAST(300 AS TINYINT)`): the plan-time
+    /// twin of [`ExecutionError::Data`], with the same kinds.
+    #[error("{message}")]
+    Data {
+        /// What is wrong with the value.
+        kind: DataErrorKind,
+        /// Human-readable description of the bad value.
+        message: String,
+        /// Source position of the offending expression, if known.
+        location: Option<Location>,
+    },
+
     /// Extended-query parameter inferred as two incompatible types at
     /// different usage sites (e.g., `$1` used in `a <= $1` against a
     /// Date column AND in `b = $1` against an Int column).
@@ -202,6 +215,7 @@ impl PlanError {
             | PlanError::UnsupportedExpression { location, .. }
             | PlanError::AmbiguousReference { location, .. }
             | PlanError::InvalidLiteral { location, .. }
+            | PlanError::Data { location, .. }
             | PlanError::ParameterTypeConflict { location, .. } => *location,
             PlanError::TableNotFound(_)
             | PlanError::AccessDenied(_)
@@ -236,7 +250,18 @@ impl PlanError {
 pub enum ExecutionError {
     /// An error propagated from the Arrow compute layer.
     #[error("arrow error: {0}")]
-    ArrowError(#[from] arrow::error::ArrowError),
+    ArrowError(#[source] arrow::error::ArrowError),
+
+    /// A value the query computed is bad for its type: a cast the target
+    /// cannot hold, an overflow, a division by zero (SQL class 22). The
+    /// message is what the client sees.
+    #[error("{message}")]
+    Data {
+        /// What is wrong with the value; decides the SQLSTATE / Trino code.
+        kind: DataErrorKind,
+        /// Human-readable description of the bad value.
+        message: String,
+    },
 
     /// An operation that is not valid in the current execution context.
     #[error("invalid operation: {0}")]
@@ -250,6 +275,87 @@ pub enum ExecutionError {
     /// effect (e.g. a query kill whose task was dropped mid-kill).
     #[error("interrupted: {0}")]
     Interrupted(String),
+}
+
+/// Arrow's own error variants say when a kernel hit a bad value
+/// (`DivideByZero`, `ArithmeticOverflow`); those become
+/// [`ExecutionError::Data`]. Everything else stays an Arrow error. A failed
+/// cast is a `CastError` whether the value or the cast is at fault, so the
+/// cast site classifies it with [`DataErrorKind::of_cast`] instead.
+impl From<arrow::error::ArrowError> for ExecutionError {
+    fn from(err: arrow::error::ArrowError) -> Self {
+        use arrow::error::ArrowError;
+        match err {
+            ArrowError::DivideByZero => ExecutionError::Data {
+                kind: DataErrorKind::DivisionByZero,
+                message: "Division by zero".to_string(),
+            },
+            ArrowError::ArithmeticOverflow(message) => ExecutionError::Data {
+                kind: DataErrorKind::NumericValueOutOfRange,
+                message,
+            },
+            other => ExecutionError::ArrowError(other),
+        }
+    }
+}
+
+/// What is wrong with a value in a data error (SQL class 22). Each protocol
+/// maps it to its own code: pgwire SQLSTATE, Trino `StandardErrorCode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DataErrorKind {
+    /// A number does not fit the target type (a narrowing cast, an
+    /// arithmetic overflow). pgwire `22003`, Trino `NUMERIC_VALUE_OUT_OF_RANGE`.
+    NumericValueOutOfRange,
+    /// A string is not a valid number or boolean. pgwire `22P02`, Trino
+    /// `INVALID_CAST_ARGUMENT`.
+    InvalidTextRepresentation,
+    /// A string is not a valid date, time or timestamp. pgwire `22007`,
+    /// Trino `INVALID_CAST_ARGUMENT`.
+    InvalidDatetimeFormat,
+    /// Division (or modulo) by zero. pgwire `22012`, Trino `DIVISION_BY_ZERO`.
+    DivisionByZero,
+}
+
+impl DataErrorKind {
+    /// The kind of a failed cast of a value from `from` to `to`, decided by
+    /// the types alone: a string that does not parse, or a value outside
+    /// the target's range.
+    pub fn of_cast(from: &arrow::datatypes::DataType, to: &arrow::datatypes::DataType) -> Self {
+        use arrow::datatypes::DataType as A;
+        let from_text = matches!(from, A::Utf8 | A::LargeUtf8 | A::Utf8View);
+        let to_datetime = matches!(
+            to,
+            A::Date32 | A::Date64 | A::Timestamp(..) | A::Time32(_) | A::Time64(_)
+        );
+        match (from_text, to_datetime) {
+            (true, true) => Self::InvalidDatetimeFormat,
+            (true, false) => Self::InvalidTextRepresentation,
+            (false, _) => Self::NumericValueOutOfRange,
+        }
+    }
+
+    /// Stable name of the kind, used to carry it across the exchange wire.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::NumericValueOutOfRange => "numeric-value-out-of-range",
+            Self::InvalidTextRepresentation => "invalid-text-representation",
+            Self::InvalidDatetimeFormat => "invalid-datetime-format",
+            Self::DivisionByZero => "division-by-zero",
+        }
+    }
+
+    /// The kind a [`Self::tag`] names.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        [
+            Self::NumericValueOutOfRange,
+            Self::InvalidTextRepresentation,
+            Self::InvalidDatetimeFormat,
+            Self::DivisionByZero,
+        ]
+        .into_iter()
+        .find(|kind| kind.tag() == tag)
+    }
 }
 
 /// Errors from data source connectors.
@@ -346,6 +452,7 @@ impl ExecutionError {
             ArnebError::Execution(ExecutionError::ResourceExhausted(msg)) => {
                 ExecutionError::ResourceExhausted(msg)
             }
+            ArnebError::Execution(data @ ExecutionError::Data { .. }) => data,
             other => ExecutionError::InvalidOperation(format!("{context}: {other}")),
         }
     }
@@ -523,6 +630,94 @@ mod tests {
         let cfg_err = ConfigError::FileNotFound("/etc/trino.toml".to_string());
         let arneb_err: ArnebError = cfg_err.into();
         assert!(matches!(arneb_err, ArnebError::Config(_)));
+    }
+
+    #[test]
+    fn arrow_bad_value_errors_become_data_errors() {
+        use arrow::error::ArrowError;
+        let kind = |e: ArrowError| match ExecutionError::from(e) {
+            ExecutionError::Data { kind, .. } => Some(kind),
+            _ => None,
+        };
+        assert_eq!(
+            kind(ArrowError::DivideByZero),
+            Some(DataErrorKind::DivisionByZero)
+        );
+        assert_eq!(
+            kind(ArrowError::ArithmeticOverflow("1 + 2".into())),
+            Some(DataErrorKind::NumericValueOutOfRange)
+        );
+        // A cast error may be the cast's fault, not the value's: the cast
+        // site decides, so the conversion leaves it an Arrow error.
+        assert_eq!(kind(ArrowError::CastError("x".into())), None);
+        assert_eq!(kind(ArrowError::ComputeError("x".into())), None);
+    }
+
+    #[test]
+    fn data_errors_survive_upstream_wrapping_with_their_message() {
+        let root = ExecutionError::Data {
+            kind: DataErrorKind::InvalidTextRepresentation,
+            message: "Cannot cast string 'abc' to value of Int32 type".into(),
+        };
+        let once = ExecutionError::upstream("aggregate input stream", root);
+        let twice = ExecutionError::upstream("TopKExec.input", once);
+        assert!(matches!(
+            &twice,
+            ExecutionError::Data {
+                kind: DataErrorKind::InvalidTextRepresentation,
+                ..
+            }
+        ));
+        assert_eq!(
+            twice.to_string(),
+            "Cannot cast string 'abc' to value of Int32 type"
+        );
+    }
+
+    #[test]
+    fn cast_failures_are_classified_by_their_types() {
+        use arrow::datatypes::{DataType as A, TimeUnit};
+        assert_eq!(
+            DataErrorKind::of_cast(&A::Utf8, &A::Int32),
+            DataErrorKind::InvalidTextRepresentation
+        );
+        assert_eq!(
+            DataErrorKind::of_cast(&A::Utf8, &A::Boolean),
+            DataErrorKind::InvalidTextRepresentation
+        );
+        assert_eq!(
+            DataErrorKind::of_cast(&A::Utf8, &A::Date32),
+            DataErrorKind::InvalidDatetimeFormat
+        );
+        assert_eq!(
+            DataErrorKind::of_cast(&A::Utf8, &A::Timestamp(TimeUnit::Microsecond, None)),
+            DataErrorKind::InvalidDatetimeFormat
+        );
+        assert_eq!(
+            DataErrorKind::of_cast(&A::Int64, &A::Int32),
+            DataErrorKind::NumericValueOutOfRange
+        );
+        assert_eq!(
+            DataErrorKind::of_cast(&A::Float64, &A::Int32),
+            DataErrorKind::NumericValueOutOfRange
+        );
+        assert_eq!(
+            DataErrorKind::of_cast(&A::Int64, &A::Decimal128(5, 0)),
+            DataErrorKind::NumericValueOutOfRange
+        );
+    }
+
+    #[test]
+    fn data_error_kinds_round_trip_through_their_tag() {
+        for kind in [
+            DataErrorKind::NumericValueOutOfRange,
+            DataErrorKind::InvalidTextRepresentation,
+            DataErrorKind::InvalidDatetimeFormat,
+            DataErrorKind::DivisionByZero,
+        ] {
+            assert_eq!(DataErrorKind::from_tag(kind.tag()), Some(kind));
+        }
+        assert_eq!(DataErrorKind::from_tag("resource-exhausted"), None);
     }
 
     #[test]

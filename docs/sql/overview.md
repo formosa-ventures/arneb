@@ -78,6 +78,20 @@ that arrives while the connection is idle does nothing.
 | `53000` | The admission queue is full (`max_queued_queries`). |
 | `57014` | The statement timed out (`statement_timeout`). |
 
+### Data errors
+
+A value the query computes that its type cannot hold is a data error, with
+the code PostgreSQL (pgwire) or Trino (Trino protocol) gives the same
+failure. It is the same whether the planner folds the expression or a worker
+evaluates it. [`TRY`](/sql/functions#try) turns any of these into `NULL`.
+
+| SQLSTATE | Trino `errorName` (`errorCode`) | Example |
+|---|---|---|
+| `22003` | `NUMERIC_VALUE_OUT_OF_RANGE` (19) | `CAST(300 AS TINYINT)`, an INTEGER `+` that overflows, a DECIMAL result too wide for its type |
+| `22P02` | `INVALID_CAST_ARGUMENT` (9) | `CAST('abc' AS INTEGER)` |
+| `22007` | `INVALID_CAST_ARGUMENT` (9) | `CAST('2024-13-45' AS DATE)` |
+| `22012` | `DIVISION_BY_ZERO` (8) | `x / 0`, `x % 0` on integers |
+
 ## Further Reading
 
 - [Expressions](/sql/expressions) — operators, CASE, CAST, LIKE, and more

@@ -4309,6 +4309,12 @@ pub(crate) fn scalars_to_array(
     values: &[ScalarValue],
     data_type: &ArrowDataType,
 ) -> Result<ArrayRef, ExecutionError> {
+    // `ScalarValue` has no 8- or 16-bit integer: TINYINT and SMALLINT
+    // values travel as Int32 and narrow back to the declared type here.
+    if matches!(data_type, ArrowDataType::Int8 | ArrowDataType::Int16) {
+        let wide = scalars_to_array(values, &ArrowDataType::Int32)?;
+        return Ok(arrow::compute::cast(&wide, data_type)?);
+    }
     let first_type = values.iter().find(|v| !matches!(v, ScalarValue::Null));
     match first_type {
         None => Ok(array::new_null_array(data_type, values.len())),

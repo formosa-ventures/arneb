@@ -746,6 +746,16 @@ fn compare_op(
     let right = right.clone();
 
     match left.data_type() {
+        ArrowDataType::Int8 => {
+            let l = left.as_primitive::<Int8Type>();
+            let r = right.as_primitive::<Int8Type>();
+            typed_cmp(l, r, op)
+        }
+        ArrowDataType::Int16 => {
+            let l = left.as_primitive::<Int16Type>();
+            let r = right.as_primitive::<Int16Type>();
+            typed_cmp(l, r, op)
+        }
         ArrowDataType::Int32 => {
             let l = left.as_primitive::<Int32Type>();
             let r = right.as_primitive::<Int32Type>();

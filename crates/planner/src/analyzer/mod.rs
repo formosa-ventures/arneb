@@ -265,7 +265,8 @@ pub(crate) fn array_element_type(
 
 /// `(precision, scale)` of each operand of decimal arithmetic, or `None`
 /// unless one side is DECIMAL and the other DECIMAL or an integer. As in
-/// Trino, INTEGER is DECIMAL(10,0) and BIGINT DECIMAL(19,0); an integer
+/// Trino, TINYINT is DECIMAL(3,0), SMALLINT DECIMAL(5,0), INTEGER
+/// DECIMAL(10,0) and BIGINT DECIMAL(19,0); an integer
 /// literal that fits INTEGER is typed INTEGER (our literals are all Int64).
 pub(crate) fn decimal_arithmetic_operands(
     left: &PlanExpr,
@@ -276,6 +277,8 @@ pub(crate) fn decimal_arithmetic_operands(
     fn operand(expr: &PlanExpr, ty: &DataType) -> Option<(u8, i8)> {
         match (ty, expr) {
             (DataType::Decimal128 { precision, scale }, _) => Some((*precision, *scale)),
+            (DataType::Int8, _) => Some((3, 0)),
+            (DataType::Int16, _) => Some((5, 0)),
             (DataType::Int32, _) => Some((10, 0)),
             (
                 DataType::Int64,
